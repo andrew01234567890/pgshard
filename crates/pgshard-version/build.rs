@@ -8,13 +8,15 @@ use semver::Version;
 fn main() {
     println!("cargo::rerun-if-env-changed=PGSHARD_BUILD_VERSION");
     println!("cargo::rerun-if-env-changed=PGSHARD_GIT_SHA");
-    println!("cargo::rerun-if-changed=../../.git/HEAD");
+    emit_git_rerun_paths();
 
-    let sha = env::var("PGSHARD_GIT_SHA")
-        .ok()
-        .filter(|value| full_sha(value))
-        .or_else(git_sha)
-        .unwrap_or_else(|| "unknown".to_owned());
+    let sha = match env::var("PGSHARD_GIT_SHA") {
+        Ok(value) => {
+            assert!(full_sha(&value), "invalid explicit pgshard source SHA");
+            value
+        }
+        Err(_) => git_sha().unwrap_or_else(|| "unknown".to_owned()),
+    };
     let version = env::var("PGSHARD_BUILD_VERSION")
         .ok()
         .map(|value| value.trim_start_matches('v').to_owned())
@@ -24,6 +26,19 @@ fn main() {
     Version::parse(&version).expect("invalid pgshard build version");
     println!("cargo::rustc-env=PGSHARD_BUILD_VERSION={version}");
     println!("cargo::rustc-env=PGSHARD_GIT_SHA={sha}");
+}
+
+fn emit_git_rerun_paths() {
+    for git_path in ["HEAD", "refs/tags", "packed-refs"] {
+        if let Some(path) = command(&["rev-parse", "--git-path", git_path]) {
+            println!("cargo::rerun-if-changed={path}");
+        }
+    }
+    if let Some(head_ref) = command(&["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = command(&["rev-parse", "--git-path", &head_ref])
+    {
+        println!("cargo::rerun-if-changed={path}");
+    }
 }
 
 fn git_sha() -> Option<String> {

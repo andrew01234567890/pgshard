@@ -69,6 +69,12 @@ jobs:
             "$force_all" || grep -Eq "$1" "$RUNNER_TEMP/changed-files"
           }
 
+          exists_at_head_or_base() {
+            [[ -e "$1" ]] || {
+              [[ -n "$base" ]] && git cat-file -e "${base}:$1" 2>/dev/null
+            }
+          }
+
           emit_component() {
             local output="$1"
             local exists="$2"
@@ -90,26 +96,28 @@ jobs:
           kind_exists=false
           performance_exists=false
 
-          [[ -f Cargo.toml ]] && rust_exists=true
-          [[ -f buf.yaml ]] && proto_exists=true
-          [[ -f operator/go.mod ]] && go_exists=true
-          [[ -f website/package.json ]] && website_exists=true
-          [[ -f ui/package.json ]] && ui_exists=true
-          [[ -f tests/integration/Cargo.toml ]] && integration_exists=true
-          [[ -f deploy/docker-bake.hcl ]] && images_exists=true
-          [[ -f tests/e2e/Cargo.toml ]] && kind_exists=true
-          [[ -f benchmarks/Cargo.toml ]] && performance_exists=true
+          exists_at_head_or_base Cargo.toml && rust_exists=true
+          exists_at_head_or_base buf.yaml && proto_exists=true
+          exists_at_head_or_base operator/go.mod && go_exists=true
+          exists_at_head_or_base website/package.json && website_exists=true
+          exists_at_head_or_base ui/package.json && ui_exists=true
+          exists_at_head_or_base tests/integration/Cargo.toml && integration_exists=true
+          exists_at_head_or_base deploy/docker-bake.hcl && images_exists=true
+          exists_at_head_or_base tests/e2e/Cargo.toml && kind_exists=true
+          exists_at_head_or_base benchmarks/Cargo.toml && performance_exists=true
 
-          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^\.github/workflows/'
-          emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^\.github/workflows/'
-          emit_component go "$go_exists" '^operator/|^proto/|^\.github/workflows/'
-          emit_component website "$website_exists" '^website/|^docs/|^\.github/workflows/'
-          emit_component ui "$ui_exists" '^ui/|^proto/|^\.github/workflows/'
-          emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^\.github/workflows/'
-          emit_component images "$images_exists" '^deploy/|^Dockerfile|/Dockerfile$|^crates/|^operator/|^ui/|^\.github/workflows/'
-          emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^\.github/workflows/'
-          emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^\.github/workflows/'
-          echo "website_exists=${website_exists}" >> "$GITHUB_OUTPUT"
+          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
+          emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component go "$go_exists" '^operator/|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/workflows/'
+          emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component images "$images_exists" '^deploy/|^Dockerfile|/Dockerfile$|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
+          emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
+          emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^Makefile$|^\.github/workflows/'
+          current_website_exists=false
+          [[ -f website/package.json ]] && current_website_exists=true
+          echo "website_exists=${current_website_exists}" >> "$GITHUB_OUTPUT"
 
   repository-policy:
     name: Repository policy
@@ -125,7 +133,7 @@ jobs:
           go-version: "1.26.5"
           cache: false
       - name: Validate workflow contracts
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+        run: make actions-check
       - name: Validate title and public content
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -164,14 +172,8 @@ jobs:
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
           fallback: none
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Check dependencies, licenses, and sources
-        run: cargo deny --locked check
-      - name: Check RustSec advisories
-        run: cargo audit --deny warnings
+      - name: Run Rust static policy
+        run: make rust-static
 
   rust-test:
     name: Rust / tests
@@ -186,7 +188,40 @@ jobs:
       - name: Select repository Rust toolchain
         run: rustup show active-toolchain
       - name: Run workspace tests
-        run: cargo test --workspace --all-features --locked
+        run: make rust-test
+      - name: Verify explicit identity from a source archive
+        env:
+          ARCHIVE_VERSION: 9.8.7-archive-test
+        run: |
+          archive_dir="$RUNNER_TEMP/source-archive"
+          mkdir -p "$archive_dir"
+          git archive HEAD | tar -x -C "$archive_dir"
+          cd "$archive_dir"
+          PGSHARD_BUILD_VERSION="$ARCHIVE_VERSION" \
+          PGSHARD_GIT_SHA="$GITHUB_SHA" \
+          PGSHARD_EXPECTED_VERSION="$ARCHIVE_VERSION" \
+          PGSHARD_EXPECTED_SHA="$GITHUB_SHA" \
+            cargo test --locked -p pgshard-version
+      - name: Verify tag-only build identity invalidation
+        run: |
+          tag_dir="$RUNNER_TEMP/tag-invalidation"
+          mkdir -p "$tag_dir"
+          git archive HEAD | tar -x -C "$tag_dir"
+          cd "$tag_dir"
+          git init --quiet --initial-branch=main
+          git config user.name "pgshard CI"
+          git config user.email "noreply@github.com"
+          git add --all
+          git commit --quiet --message "test: create archive fixture"
+          fixture_sha="$(git rev-parse HEAD)"
+          development_version="0.0.0-dev+${fixture_sha:0:12}"
+          PGSHARD_EXPECTED_VERSION="$development_version" \
+          PGSHARD_EXPECTED_SHA="$fixture_sha" \
+            cargo test --locked -p pgshard-version
+          git tag v9.8.7
+          PGSHARD_EXPECTED_VERSION="9.8.7" \
+          PGSHARD_EXPECTED_SHA="$fixture_sha" \
+            cargo test --locked -p pgshard-version
 
   protobuf:
     name: Protobuf contracts
@@ -202,12 +237,8 @@ jobs:
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           version: 1.71.0
-      - name: Check formatting
-        run: buf format --diff --exit-code
-      - name: Lint contracts
-        run: buf lint
-      - name: Build descriptors
-        run: buf build
+      - name: Validate protobuf contracts
+        run: make proto-check
       - name: Reject protobuf breaking changes
         if: github.event_name == 'pull_request'
         env:
@@ -263,15 +294,8 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: website/package-lock.json
-      - name: Install dependencies
-        working-directory: website
-        run: npm ci
       - name: Run documentation checks
-        working-directory: website
-        run: |
-          npm run check
-          test -f build/index.html
-          npm audit --audit-level=high
+        run: make docs-check
       - name: Store Pages candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -462,6 +486,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.aggregate.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
+      checks: read
       contents: write
     concurrency:
       group: pgshard-source-release

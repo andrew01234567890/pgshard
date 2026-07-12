@@ -28,4 +28,14 @@ mod tests {
     fn source_identity_is_bounded() {
         assert!(GIT_SHA == "unknown" || GIT_SHA.len() == 40);
     }
+
+    #[test]
+    fn explicit_archive_identity_matches_build_inputs() {
+        if let Some(expected) = option_env!("PGSHARD_EXPECTED_VERSION") {
+            assert_eq!(VERSION, expected);
+        }
+        if let Some(expected) = option_env!("PGSHARD_EXPECTED_SHA") {
+            assert_eq!(GIT_SHA, expected);
+        }
+    }
 }

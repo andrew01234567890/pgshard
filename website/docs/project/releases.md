@@ -26,6 +26,18 @@ Runtime version strings are derived from the exact release tag when building a
 tagged commit. Untagged builds report a development SemVer containing the commit
 SHA; workspace package metadata is not presented as the running release version.
 
+GitHub's generated source archives do not contain Git metadata. A reproducible
+archive build therefore supplies the tag version and the full commit SHA shown
+on the release page explicitly:
+
+```bash
+make release-build VERSION=0.1.0 SHA=<40-character-release-commit>
+```
+
+The build rejects malformed explicit SHAs or versions. CI extracts a source
+archive without `.git`, builds it with explicit inputs, and asserts that the
+compiled identity matches both values.
+
 ## Publishing boundary
 
 Milestone 1 does **not** publish container images, Helm charts, operator bundles, binaries, crates, npm packages, SBOMs, or provenance to a registry or GitHub Release. Releases contain generated notes and GitHub's source archives only. Short-lived CI artifacts are used internally for KIND jobs.

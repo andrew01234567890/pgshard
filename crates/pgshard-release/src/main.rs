@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 const FIRST_VERSION: Version = Version::new(0, 1, 0);
 const RELEASE_MARKER: &str = "crates/pgshard-release/Cargo.toml";
 const NOREPLY_EMAIL: &str = "13841202+andrew01234567890@users.noreply.github.com";
+const RELEASE_HELPER_SOURCE: &str = "crates/pgshard-release/src/main.rs";
 
 #[derive(Debug, Parser)]
 #[command(about = "Create deterministic source-only pgshard releases")]
@@ -87,6 +88,14 @@ struct PullRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct PullRequestDetails {
+    number: u64,
+    node_id: String,
+    head: PullRef,
+    commits: usize,
+}
+
+#[derive(Debug, Deserialize)]
 struct Login {
     login: String,
 }
@@ -100,6 +109,7 @@ struct PullRef {
 
 #[derive(Debug, Deserialize)]
 struct PullCommit {
+    sha: String,
     author: Option<Login>,
     commit: CommitData,
 }
@@ -113,6 +123,24 @@ struct CommitData {
 #[derive(Debug, Deserialize)]
 struct CommitVerification {
     verified: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRuns {
+    check_runs: Vec<CheckRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRun {
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    app: CheckApp,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckApp {
+    slug: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,14 +203,38 @@ fn audit(base: &str, head: &str) -> Result<()> {
     let messages = git(&["log", "--format=%B", &range])?;
     audit_content("commit messages", &messages)?;
 
-    let names = git(&["diff", "--diff-filter=ACMR", "--name-only", &range, "--"])?;
-    for path in names.lines() {
-        audit_content("repository path", path)?;
-        let content = git(&["show", &format!("{head}:{path}")])?;
-        audit_content(path, &content)?;
+    let commits = git(&["rev-list", "--reverse", &range])?;
+    for commit in commits.lines() {
+        let names = git(&[
+            "diff-tree",
+            "--root",
+            "-m",
+            "--no-commit-id",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-r",
+            commit,
+            "--",
+        ])?;
+        for path in names.lines() {
+            audit_repository_path(path)?;
+            let content = git(&["show", &format!("{commit}:{path}")])?;
+            audit_content(path, &content)?;
+        }
     }
     println!("public repository audit passed for {range}");
     Ok(())
+}
+
+fn audit_repository_path(path: &str) -> Result<()> {
+    ensure!(
+        !path.is_empty()
+            && path.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+            }),
+        "repository path contains unsupported characters"
+    );
+    audit_content("repository path", path)
 }
 
 fn is_noreply(email: &str) -> bool {
@@ -199,12 +251,30 @@ fn audit_content(path: &str, content: &str) -> Result<()> {
         ["AK", "IA"].concat(),
     ];
     for line in content.lines() {
-        ensure!(
-            !forbidden.iter().any(|pattern| line.contains(pattern)),
-            "content in {path} matched a forbidden sensitive-data pattern"
-        );
+        if let Some(pattern) = forbidden.iter().find(|pattern| line.contains(*pattern)) {
+            ensure!(
+                is_legacy_scanner_fixture(path, line, pattern),
+                "content in {path} matched a forbidden sensitive-data pattern"
+            );
+        }
     }
     Ok(())
+}
+
+fn is_legacy_scanner_fixture(path: &str, line: &str, pattern: &str) -> bool {
+    if path != RELEASE_HELPER_SOURCE {
+        return false;
+    }
+    let line = line.trim();
+    if line == format!("{pattern:?},") {
+        return true;
+    }
+    let home_test = format!(
+        "assert!(audit_added_lines(\"bad.md\", \"+path from {pattern}example\").is_err());"
+    );
+    let token_test =
+        format!("assert!(audit_added_lines(\"bad.md\", \"+{pattern}example\").is_err());");
+    line == home_test || line == token_test
 }
 
 fn publish(requested_sha: &str) -> Result<()> {
@@ -247,6 +317,8 @@ fn publish_one(repository: &str, release: &PlannedRelease) -> Result<()> {
         return Ok(());
     }
 
+    ensure_ci_passed(repository, &release.sha)?;
+
     let tag = format!("v{}", release.version);
     if let Some(tag_sha) = tag_target(&tag)? {
         ensure!(
@@ -287,6 +359,35 @@ fn publish_one(repository: &str, release: &PlannedRelease) -> Result<()> {
         })?
     );
     Ok(())
+}
+
+fn ensure_ci_passed(repository: &str, sha: &str) -> Result<()> {
+    let response = run(
+        "gh",
+        [
+            "api",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &format!(
+                "repos/{repository}/commits/{sha}/check-runs?check_name=CI%20aggregate&filter=latest&per_page=10"
+            ),
+        ],
+    )?;
+    let checks: CheckRuns = serde_json::from_str(&response)?;
+    ensure!(
+        ci_passed(&checks),
+        "commit {sha} does not have a successful exact-head CI aggregate check"
+    );
+    Ok(())
+}
+
+fn ci_passed(checks: &CheckRuns) -> bool {
+    checks.check_runs.iter().any(|check| {
+        check.name == "CI aggregate"
+            && check.app.slug == "github-actions"
+            && check.status == "completed"
+            && check.conclusion.as_deref() == Some("success")
+    })
 }
 
 fn release_plan(sha: &str) -> Result<Vec<PlannedRelease>> {
@@ -395,8 +496,17 @@ fn parse_bump(message: &str) -> Result<Bump> {
         "commit description must not have surrounding whitespace"
     );
 
-    let breaking_subject = prefix.ends_with('!');
-    let prefix = prefix.trim_end_matches('!');
+    let trailing_bangs = prefix
+        .chars()
+        .rev()
+        .take_while(|character| *character == '!')
+        .count();
+    ensure!(
+        trailing_bangs <= 1,
+        "Conventional Commit subject permits at most one breaking-change marker"
+    );
+    let breaking_subject = trailing_bangs == 1;
+    let prefix = prefix.strip_suffix('!').unwrap_or(prefix);
     let kind = if let Some((kind, scope)) = prefix.split_once('(') {
         ensure!(
             scope.ends_with(')')
@@ -482,6 +592,33 @@ fn release_notes(repository: &str, sha: &str, subject: &str, previous_tag: Optio
 }
 
 fn dependabot_automerge(repository: &str, requested_sha: &str) -> Result<()> {
+    validate_dependabot_context(repository, requested_sha)?;
+    let Some(pull) = matching_dependabot_pull(repository, requested_sha)? else {
+        println!("no open Dependabot pull request matches {requested_sha}");
+        return Ok(());
+    };
+    let commits = load_dependabot_commits(repository, &pull, requested_sha)?;
+    ensure!(
+        dependabot_commits_verified(&commits, requested_sha),
+        "every auto-merged commit must be verified and authored by Dependabot"
+    );
+    if !dependabot_patch_only(commits.iter().map(|commit| commit.commit.message.as_str())) {
+        println!(
+            "Dependabot pull request #{} is not a verified patch-only update",
+            pull.number
+        );
+        return Ok(());
+    }
+
+    enable_dependabot_automerge(&pull, requested_sha)?;
+    println!(
+        "enabled checked squash auto-merge for Dependabot pull request #{}",
+        pull.number
+    );
+    Ok(())
+}
+
+fn validate_dependabot_context(repository: &str, requested_sha: &str) -> Result<()> {
     ensure!(
         env::var("GITHUB_ACTIONS").as_deref() == Ok("true"),
         "Dependabot auto-merge may only run in GitHub Actions"
@@ -504,59 +641,85 @@ fn dependabot_automerge(repository: &str, requested_sha: &str) -> Result<()> {
                 .all(|character| character.is_ascii_hexdigit()),
         "head SHA must be a complete hexadecimal object ID"
     );
+    Ok(())
+}
 
+fn matching_dependabot_pull(repository: &str, requested_sha: &str) -> Result<Option<PullRequest>> {
     let pulls_json = run(
         "gh",
         [
             "api",
             "-H",
             "Accept: application/vnd.github+json",
-            &format!("repos/{repository}/commits/{requested_sha}/pulls"),
+            &format!("repos/{repository}/commits/{requested_sha}/pulls?per_page=100"),
         ],
     )?;
     let pulls: Vec<PullRequest> = serde_json::from_str(&pulls_json)?;
+    ensure!(
+        pulls.len() < 100,
+        "associated-pull lookup reached its page limit and is ambiguous"
+    );
     let mut eligible = pulls.into_iter().filter(|pull| {
         pull.state == "open"
             && pull.user.login == "dependabot[bot]"
             && pull.base.name == "main"
             && pull.head.sha == requested_sha
     });
-    let Some(pull) = eligible.next() else {
-        println!("no open Dependabot pull request matches {requested_sha}");
-        return Ok(());
-    };
+    let pull = eligible.next();
     ensure!(
         eligible.next().is_none(),
         "multiple Dependabot pull requests match one head SHA"
     );
+    Ok(pull)
+}
 
-    let commits_json = run(
+fn load_dependabot_commits(
+    repository: &str,
+    pull: &PullRequest,
+    requested_sha: &str,
+) -> Result<Vec<PullCommit>> {
+    let details_json = run(
         "gh",
-        [
-            "api",
-            &format!("repos/{repository}/pulls/{}/commits", pull.number),
-        ],
+        ["api", &format!("repos/{repository}/pulls/{}", pull.number)],
     )?;
-    let commits: Vec<PullCommit> = serde_json::from_str(&commits_json)?;
+    let details: PullRequestDetails = serde_json::from_str(&details_json)?;
     ensure!(
-        !commits.is_empty(),
-        "Dependabot pull request has no commits"
+        details.number == pull.number
+            && details.node_id == pull.node_id
+            && details.head.sha == requested_sha,
+        "Dependabot pull request changed during verification"
     );
     ensure!(
-        commits.iter().all(|commit| {
-            commit.author.as_ref().map(|author| author.login.as_str()) == Some("dependabot[bot]")
-                && commit.commit.verification.verified
-        }),
-        "every auto-merged commit must be verified and authored by Dependabot"
+        details.commits <= 250,
+        "Dependabot pull request exceeds the verifiable commit limit"
     );
-    if !dependabot_patch_only(commits.iter().map(|commit| commit.commit.message.as_str())) {
-        println!(
-            "Dependabot pull request #{} is not a verified patch-only update",
-            pull.number
-        );
-        return Ok(());
+    let mut commits = Vec::with_capacity(details.commits);
+    for page in 1..=3 {
+        let commits_json = run(
+            "gh",
+            [
+                "api",
+                &format!(
+                    "repos/{repository}/pulls/{}/commits?per_page=100&page={page}",
+                    pull.number
+                ),
+            ],
+        )?;
+        let mut page_commits: Vec<PullCommit> = serde_json::from_str(&commits_json)?;
+        let page_len = page_commits.len();
+        commits.append(&mut page_commits);
+        if page_len < 100 {
+            break;
+        }
     }
+    ensure!(
+        commits.len() == details.commits,
+        "Dependabot commit pagination was incomplete"
+    );
+    Ok(commits)
+}
 
+fn enable_dependabot_automerge(pull: &PullRequest, requested_sha: &str) -> Result<()> {
     run(
         "gh",
         [
@@ -574,11 +737,15 @@ fn dependabot_automerge(repository: &str, requested_sha: &str) -> Result<()> {
             &format!("oid={requested_sha}"),
         ],
     )?;
-    println!(
-        "enabled checked squash auto-merge for Dependabot pull request #{}",
-        pull.number
-    );
     Ok(())
+}
+
+fn dependabot_commits_verified(commits: &[PullCommit], requested_sha: &str) -> bool {
+    commits.last().map(|commit| commit.sha.as_str()) == Some(requested_sha)
+        && commits.iter().all(|commit| {
+            commit.author.as_ref().map(|author| author.login.as_str()) == Some("dependabot[bot]")
+                && commit.commit.verification.verified
+        })
 }
 
 fn dependabot_patch_only<'a>(messages: impl IntoIterator<Item = &'a str>) -> bool {
@@ -707,6 +874,8 @@ mod tests {
         assert!(parse_bump("feat(foo)bar): change").is_err());
         assert!(parse_bump("feat(foo)): change").is_err());
         assert!(parse_bump("feat:  padded").is_err());
+        assert!(parse_bump("feat!!: change").is_err());
+        assert!(parse_bump("feat(scope)!!: change").is_err());
     }
 
     #[test]
@@ -723,6 +892,13 @@ mod tests {
         let token = format!("{}{}example", "github", "_pat_");
         assert!(audit_content("bad.md", &private_path).is_err());
         assert!(audit_content("bad.md", &token).is_err());
+        assert!(audit_content(RELEASE_HELPER_SOURCE, include_str!("main.rs")).is_ok());
+
+        let old_pattern = ["github", "_pat_"].concat();
+        let old_detector_line = format!("    {old_pattern:?},");
+        assert!(audit_content(RELEASE_HELPER_SOURCE, &old_detector_line).is_ok());
+        let disguised_leak = format!("let value = \"{old_pattern}actual-value\";");
+        assert!(audit_content(RELEASE_HELPER_SOURCE, &disguised_leak).is_err());
     }
 
     #[test]
@@ -733,5 +909,103 @@ mod tests {
         assert!(dependabot_patch_only([patch]));
         assert!(!dependabot_patch_only([mixed]));
         assert!(!dependabot_patch_only([incomplete]));
+    }
+
+    #[test]
+    fn dependabot_verification_covers_commits_beyond_first_page() {
+        let mut commits: Vec<PullCommit> = (0..31)
+            .map(|index| PullCommit {
+                sha: format!("{index:040x}"),
+                author: Some(Login {
+                    login: "dependabot[bot]".to_owned(),
+                }),
+                commit: CommitData {
+                    message: "chore: patch dependency".to_owned(),
+                    verification: CommitVerification { verified: true },
+                },
+            })
+            .collect();
+        let head = commits.last().expect("head commit").sha.clone();
+        assert!(dependabot_commits_verified(&commits, &head));
+        commits[30].author = Some(Login {
+            login: "maintainer".to_owned(),
+        });
+        assert!(!dependabot_commits_verified(&commits, &head));
+    }
+
+    #[test]
+    fn release_requires_successful_github_actions_aggregate() {
+        let successful: CheckRuns = serde_json::from_value(serde_json::json!({
+            "check_runs": [{
+                "name": "CI aggregate",
+                "status": "completed",
+                "conclusion": "success",
+                "app": {"slug": "github-actions"}
+            }]
+        }))
+        .expect("valid checks response");
+        assert!(ci_passed(&successful));
+
+        let failed: CheckRuns = serde_json::from_value(serde_json::json!({
+            "check_runs": [{
+                "name": "CI aggregate",
+                "status": "completed",
+                "conclusion": "failure",
+                "app": {"slug": "github-actions"}
+            }]
+        }))
+        .expect("valid checks response");
+        assert!(!ci_passed(&failed));
+    }
+
+    #[test]
+    fn every_workspace_crate_is_non_publishable() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let output = Command::new("cargo")
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .current_dir(workspace)
+            .output()
+            .expect("run cargo metadata");
+        assert!(output.status.success());
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("metadata JSON");
+        for package in metadata["packages"].as_array().expect("package list") {
+            assert_eq!(
+                package["publish"],
+                serde_json::json!([]),
+                "{} must set publish = false",
+                package["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn ci_guards_component_deletion_and_rust_policy_changes() {
+        let workflow = include_str!("../../../.github/workflows/ci.yml");
+        for manifest in [
+            "Cargo.toml",
+            "buf.yaml",
+            "operator/go.mod",
+            "website/package.json",
+            "ui/package.json",
+            "tests/integration/Cargo.toml",
+            "deploy/docker-bake.hcl",
+            "tests/e2e/Cargo.toml",
+            "benchmarks/Cargo.toml",
+        ] {
+            assert!(
+                workflow.contains(&format!("exists_at_head_or_base {manifest}")),
+                "CI must check {manifest} at both head and base"
+            );
+        }
+        for policy in ["deny\\.toml", "rustfmt\\.toml", "^\\.cargo/", "^Makefile"] {
+            assert!(
+                workflow.contains(policy),
+                "Rust CI trigger must include {policy}"
+            );
+        }
     }
 }

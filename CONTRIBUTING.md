@@ -25,11 +25,11 @@ macOS and Windows development and runtime support are out of scope.
 ## Local checks
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-cargo run --locked -p pgshard-release -- audit --base origin/main --head HEAD
+make check
 ```
 
-Additional Go, UI, documentation, integration, KIND, performance, and Jepsen
-checks become required as those workspaces are introduced.
+This is the same Rust, RustSec, license, protobuf, documentation, actionlint and
+public-history policy used by CI. It requires Rust 1.97, cargo-deny 0.20.2,
+cargo-audit 0.22.2, Buf 1.71, Go 1.26, and Node.js 22. Go operator, UI,
+integration, KIND, performance, and Jepsen/Elle targets join this command when
+their workspaces land.

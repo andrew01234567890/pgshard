@@ -1,5 +1,7 @@
 //! Core identifiers and deterministic routing primitives shared by pgshard.
 
+use std::cmp::Ordering;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use xxhash_rust::xxh3::Xxh3;
@@ -20,8 +22,11 @@ pub struct CatalogEpoch(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RoutingEpoch(pub u64);
 
-/// A `PostgreSQL` WAL location encoded as a monotonically increasing integer.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// A `PostgreSQL` WAL location encoded as an integer.
+///
+/// It is monotonic only within one timeline. Bare LSN values deliberately do
+/// not implement ordering because ordering across a failover fork is invalid.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PgLsn(pub u64);
 
 /// A half-open range in the unsigned 64-bit hash keyspace.
@@ -84,7 +89,9 @@ pub enum ShardKey<'a> {
     Integer(i64),
     /// UUID bytes in network order.
     Uuid(&'a [u8; 16]),
-    /// UTF-8 text bytes.
+    /// UTF-8 text bytes from a `PostgreSQL` database using the deterministic,
+    /// byte-distinguishing built-in `C` collation for this shard-key column.
+    /// Catalog registration must enforce that precondition.
     Text(&'a str),
     /// Arbitrary byte string.
     Bytes(&'a [u8]),
@@ -163,6 +170,51 @@ pub struct VectorPosition {
     pub lsn: PgLsn,
 }
 
+impl VectorPosition {
+    /// Compares positions only when they describe the same shard and timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error rather than inventing an ordering across shards or WAL
+    /// histories.
+    pub fn checked_cmp(&self, other: &Self) -> Result<Ordering, PositionComparisonError> {
+        if self.shard_id != other.shard_id {
+            return Err(PositionComparisonError::DifferentShard {
+                left: self.shard_id,
+                right: other.shard_id,
+            });
+        }
+        if self.timeline != other.timeline {
+            return Err(PositionComparisonError::DifferentTimeline {
+                left: self.timeline,
+                right: other.timeline,
+            });
+        }
+        Ok(self.lsn.0.cmp(&other.lsn.0))
+    }
+}
+
+/// Invalid attempt to order unrelated WAL positions.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PositionComparisonError {
+    /// Positions came from different shards.
+    #[error("cannot compare WAL positions from shards {left:?} and {right:?}")]
+    DifferentShard {
+        /// Left shard.
+        left: ShardId,
+        /// Right shard.
+        right: ShardId,
+    },
+    /// Positions came from different `PostgreSQL` timelines.
+    #[error("cannot compare WAL positions from timelines {left} and {right}")]
+    DifferentTimeline {
+        /// Left timeline.
+        left: u32,
+        /// Right timeline.
+        right: u32,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +252,11 @@ mod tests {
         assert_ne!(
             hash.hash(ShardKey::Text("42")),
             hash.hash(ShardKey::Bytes(b"42"))
+        );
+        assert_ne!(
+            hash.hash(ShardKey::Text("A")),
+            hash.hash(ShardKey::Text("a")),
+            "byte-distinguishing C collation is a routing precondition"
         );
     }
 
@@ -258,5 +315,37 @@ mod tests {
                 4_209_940_504_094_720_787,
             ]
         );
+    }
+
+    #[test]
+    fn wal_ordering_rejects_forked_timelines_and_shards() {
+        let base = VectorPosition {
+            shard_id: ShardId(1),
+            timeline: 7,
+            lsn: PgLsn(100),
+        };
+        let later = VectorPosition {
+            lsn: PgLsn(200),
+            ..base.clone()
+        };
+        assert_eq!(base.checked_cmp(&later), Ok(Ordering::Less));
+
+        let fork = VectorPosition {
+            timeline: 8,
+            ..later.clone()
+        };
+        assert!(matches!(
+            later.checked_cmp(&fork),
+            Err(PositionComparisonError::DifferentTimeline { .. })
+        ));
+
+        let other_shard = VectorPosition {
+            shard_id: ShardId(2),
+            ..later.clone()
+        };
+        assert!(matches!(
+            later.checked_cmp(&other_shard),
+            Err(PositionComparisonError::DifferentShard { .. })
+        ));
     }
 }

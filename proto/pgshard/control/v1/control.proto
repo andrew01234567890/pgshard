@@ -84,7 +84,15 @@ message GetStatusResponse {
 }
 
 // OperationEnvelope is deliberately generic: operation-specific contracts live
-// in their owning versioned packages. operation_id is the idempotency key.
+// in their owning versioned packages. operation_id is the cluster-global
+// idempotency key across all operation types and executors. On first acceptance,
+// the server durably stores every field below, including the exact payload bytes
+// and deadline. A replay must match every stored value. Reusing an ID with any
+// different value is an idempotency conflict, never a replay. Milestone 1 never
+// garbage-collects an accepted ID: its immutable envelope fingerprint and latest
+// state, including a terminal outcome, remain as a permanent tombstone so a
+// delayed retry cannot execute again. The server's comparison fingerprint is
+// opaque and versioned; clients do not compute it.
 message OperationEnvelope {
   string operation_id = 1;
   string cluster_id = 2;
@@ -106,12 +114,17 @@ enum OperationAcceptance {
   OPERATION_ACCEPTANCE_UNSPECIFIED = 0;
   OPERATION_ACCEPTANCE_ACCEPTED = 1;
   OPERATION_ACCEPTANCE_IDEMPOTENT_REPLAY = 2;
+  OPERATION_ACCEPTANCE_IDEMPOTENCY_CONFLICT = 3;
 }
 
 // ExecuteOperationResponse confirms durable acceptance or an idempotent replay.
 message ExecuteOperationResponse {
   string operation_id = 1;
   OperationAcceptance acceptance = 2;
+  // Opaque server fingerprint of the originally accepted immutable envelope.
+  // On conflict this lets a caller compare retries without exposing the
+  // original payload. Clients must not derive meaning from its length or bytes.
+  bytes request_fingerprint = 3;
 }
 
 // OperationState is the generic execution lifecycle.

@@ -32,7 +32,29 @@ Jepsen/Elle check the guarantees actually offered: atomic final cross-shard outc
 - Prometheus, OpenTelemetry Collector, Grafana, and Tempo for metric/trace assertions.
 - HPA and fixed pooler deployments.
 - PostgreSQL and orchestrator failures at every durable 2PC boundary.
+- Delayed `PREPARE TRANSACTION` commands before, during and after each
+  participant fence acknowledgement and the coordinator abort CAS.
+- Operation replay across executor crashes for same ID/same canonical envelope,
+  plus stable conflict for same ID with each individual field changed and a
+  delayed replay after terminal-state retention boundaries.
 - Active DDL, reshard, and CDC streams during failover.
+- CDC reconnect/replay before every chunk and terminal event, including a
+  transaction exactly at and one byte/event above configured flow limits, a
+  checkpoint emitted while the data window is exactly full, and individual
+  snapshot/relation/reshard events at and above their byte limit.
+- CDC token tampering, future-token acknowledgement, cross-stream/configuration
+  replay, duplicate and stale acknowledgements, and signing-key rotation.
+- CDC snapshot initialization with failures and delayed DDL, 2PC recovery,
+  reshard activation, topology publication, and semantic configuration mutation
+  at every barrier boundary.
+- CDC disconnect and gateway crash at every snapshot relation/chunk boundary,
+  plus snapshot-holder, slot, and primary loss during row copy; resume must use
+  the retained snapshot or require a clean resnapshot without a silent gap.
+- CDC managed DDL activation, relation swap/drop, and holder failure during row
+  copy; copy-lifetime relation locks must prevent mixed schemas or storage.
+- CDC disconnect and gateway crash after `SnapshotComplete` but before its
+  checkpoint acknowledgement, including durable-spool write failure and
+  retention expiry; replay must come from the old spool or require resnapshot.
 
 ## Pooler performance
 

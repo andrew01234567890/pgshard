@@ -38,7 +38,15 @@ Named prepared statements are virtualized at the pooler. Their routing plan is i
 
 ## Keys and constraints
 
-A registered sharded table has one immutable shard-key column. Supported key types are integer, UUID, text, and bytea. Primary and unique constraints include the shard key so PostgreSQL can enforce them locally. Sequences are shard-local and do not promise a gapless or globally ordered value stream.
+A registered sharded table has one immutable shard-key column. Supported key
+types are integer, UUID, text, and bytea. Text keys require database encoding
+`UTF8` and the built-in deterministic, byte-distinguishing `C` collation on the
+key column. Registration rejects ICU, nondeterministic, case-insensitive and
+other collations, and a later collation change is managed DDL that fails before
+activation. This ensures values equal under PostgreSQL equality cannot hash to
+different shards. Primary and unique constraints include the shard key so
+PostgreSQL can enforce them locally. Sequences are shard-local and do not promise
+a gapless or globally ordered value stream.
 
 ## Roles and grants
 

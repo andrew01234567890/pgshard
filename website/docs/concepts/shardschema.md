@@ -33,6 +33,10 @@ explicit online reshard into a new hash space; ordinary catalog updates cannot
 rewrite them. Rust golden vectors cover every supported key type, numeric and
 empty boundaries, XXH3 length boundaries, and seed extremes.
 
+Catalog registration records and validates text-key encoding and collation.
+Milestone 1 accepts only `UTF8` plus PostgreSQL's built-in `C` collation so
+database equality and byte hashing cannot disagree across shards.
+
 Epochs, WAL positions and 64-bit range bounds use decimal strings in JSON-facing
 interfaces because JavaScript numbers cannot represent them exactly. The Rust
 core therefore does not derive generic Serde encodings for `u64`/`u128` catalog
