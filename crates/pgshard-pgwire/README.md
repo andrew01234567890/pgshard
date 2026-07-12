@@ -15,8 +15,10 @@ must also reject plaintext that arrives before it begins the accepted handshake
 to preserve PostgreSQL 18's complete protocol-confusion defense.
 
 This crate does not open a socket, terminate TLS, authenticate users, parse SQL,
-pool connections, or proxy a message. A caller must enforce the protocol phase;
-recognizing a frame type does not make that frame legal in the current session.
+pool connections, or proxy a message. A caller must supply the current protocol
+phase; the decoder rejects illegal known tags from their first byte, before
+trusting or buffering the body length. Body-specific legality still belongs to
+the eventual session state machine.
 
 `cargo bench -p pgshard-pgwire --bench decode_frontend` measures framing alone.
 It is not a substitute for the planned end-to-end pooler/PgBouncer comparison.

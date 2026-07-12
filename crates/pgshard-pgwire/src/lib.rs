@@ -73,9 +73,10 @@ impl ProtocolVersion {
         self.major == 3
     }
 
-    /// Whether `PostgreSQL` 18 requires a version-negotiation response.
+    /// Whether the requested version alone requires a `PostgreSQL` 18
+    /// version-negotiation response.
     #[must_use]
-    pub const fn needs_postgres18_negotiation(self) -> bool {
+    pub const fn version_requires_postgres18_negotiation(self) -> bool {
         self.major == 3 && self.minor > LATEST_PROTOCOL_MINOR
     }
 }
@@ -103,6 +104,26 @@ pub enum StartupFrame<'a> {
     },
 }
 
+impl StartupFrame<'_> {
+    /// Whether `PostgreSQL` 18 must send `NegotiateProtocolVersion`.
+    ///
+    /// `PostgreSQL` 18 responds for either a newer protocol-three minor version
+    /// or any unrecognized startup parameter in the reserved `_pq_.` namespace.
+    #[must_use]
+    pub fn requires_postgres18_negotiation(self) -> bool {
+        match self {
+            Self::Startup {
+                protocol,
+                parameters,
+            } => {
+                protocol.version_requires_postgres18_negotiation()
+                    || parameters.has_postgres18_protocol_option()
+            }
+            Self::SslRequest | Self::GssEncryptionRequest | Self::CancelRequest { .. } => false,
+        }
+    }
+}
+
 /// Validated startup parameter bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StartupParameters<'a> {
@@ -116,6 +137,10 @@ impl<'a> StartupParameters<'a> {
         StartupParameterIter {
             remaining: self.bytes,
         }
+    }
+
+    fn has_postgres18_protocol_option(self) -> bool {
+        self.iter().any(|(name, _)| name.starts_with(b"_pq_."))
     }
 }
 
@@ -184,6 +209,46 @@ pub enum FrontendTag {
     CopyDone,
     /// COPY failure.
     CopyFail,
+}
+
+/// Session phase used to reject illegal message types before body buffering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrontendPhase {
+    /// Authentication exchange; only the overloaded `p` response is legal.
+    Authentication,
+    /// Ordinary post-authentication query protocol.
+    Regular,
+    /// Frontend-to-server COPY stream.
+    CopyIn,
+}
+
+impl FrontendPhase {
+    const fn allows(self, tag: FrontendTag) -> bool {
+        match self {
+            Self::Authentication => matches!(tag, FrontendTag::AuthenticationResponse),
+            Self::Regular => matches!(
+                tag,
+                FrontendTag::Bind
+                    | FrontendTag::Close
+                    | FrontendTag::Describe
+                    | FrontendTag::Execute
+                    | FrontendTag::FunctionCall
+                    | FrontendTag::Flush
+                    | FrontendTag::Parse
+                    | FrontendTag::Query
+                    | FrontendTag::Sync
+                    | FrontendTag::Terminate
+            ),
+            Self::CopyIn => matches!(
+                tag,
+                FrontendTag::CopyData
+                    | FrontendTag::CopyDone
+                    | FrontendTag::CopyFail
+                    | FrontendTag::Flush
+                    | FrontendTag::Sync
+            ),
+        }
+    }
 }
 
 impl FrontendTag {
@@ -330,6 +395,7 @@ pub fn decode_startup(input: &[u8]) -> Result<Decode<StartupFrame<'_>>, DecodeEr
 /// above the applicable PostgreSQL/caller bound.
 pub fn decode_frontend(
     input: &[u8],
+    phase: FrontendPhase,
     maximum_large_message_length: usize,
 ) -> Result<Decode<FrontendFrame<'_>>, DecodeError> {
     if !(4..=MAX_LARGE_MESSAGE_LENGTH).contains(&maximum_large_message_length) {
@@ -343,6 +409,9 @@ pub fn decode_frontend(
         return Ok(Decode::Incomplete { required: 1 });
     };
     let tag = FrontendTag::from_byte(tag_byte).ok_or(DecodeError::UnknownFrontendTag(tag_byte))?;
+    if !phase.allows(tag) {
+        return Err(DecodeError::UnexpectedTagForPhase { phase, tag });
+    }
     if input.len() < 5 {
         return Ok(Decode::Incomplete { required: 5 });
     }
@@ -505,6 +574,14 @@ pub enum DecodeError {
     /// The byte is not a `PostgreSQL` 18 frontend message tag.
     #[error("unknown PostgreSQL 18 frontend message tag {0}")]
     UnknownFrontendTag(u8),
+    /// A known tag is illegal in the current session phase.
+    #[error("frontend message {tag:?} is not allowed during {phase:?}")]
+    UnexpectedTagForPhase {
+        /// Current session phase.
+        phase: FrontendPhase,
+        /// Rejected known tag.
+        tag: FrontendTag,
+    },
 }
 
 #[cfg(test)]
@@ -546,7 +623,8 @@ mod tests {
         assert_eq!(protocol.major(), 3);
         assert_eq!(protocol.minor(), 2);
         assert!(protocol.is_postgres18_supported_major());
-        assert!(!protocol.needs_postgres18_negotiation());
+        assert!(!protocol.version_requires_postgres18_negotiation());
+        assert!(!frame.requires_postgres18_negotiation());
         assert_eq!(
             parameters.iter().collect::<Vec<_>>(),
             vec![
@@ -566,7 +644,7 @@ mod tests {
         else {
             panic!("unexpected decode");
         };
-        assert!(protocol.needs_postgres18_negotiation());
+        assert!(protocol.version_requires_postgres18_negotiation());
 
         for major in [2, 4] {
             let packet = startup(protocol_code(major, 0), b"\0");
@@ -579,6 +657,27 @@ mod tests {
             };
             assert!(!protocol.is_postgres18_supported_major());
         }
+    }
+
+    #[test]
+    fn reserved_protocol_options_require_negotiation_at_version_32() {
+        let packet = startup(
+            protocol_code(3, 2),
+            b"user\0alice\0_pq_.future_feature\0enabled\0\0",
+        );
+        let Decode::Complete { frame, .. } = decode_startup(&packet).expect("startup") else {
+            panic!("unexpected decode");
+        };
+        assert!(frame.requires_postgres18_negotiation());
+
+        let packet = startup(
+            protocol_code(3, 2),
+            b"user\0alice\0application_name\0test\0\0",
+        );
+        let Decode::Complete { frame, .. } = decode_startup(&packet).expect("startup") else {
+            panic!("unexpected decode");
+        };
+        assert!(!frame.requires_postgres18_negotiation());
     }
 
     #[test]
@@ -690,10 +789,25 @@ mod tests {
 
     #[test]
     fn decodes_every_postgres18_frontend_tag() {
-        for byte in b"BCDEFHPQSXpdcf" {
-            let packet = frontend(*byte, b"body");
+        for (byte, phase) in [
+            (b'B', FrontendPhase::Regular),
+            (b'C', FrontendPhase::Regular),
+            (b'D', FrontendPhase::Regular),
+            (b'E', FrontendPhase::Regular),
+            (b'F', FrontendPhase::Regular),
+            (b'H', FrontendPhase::Regular),
+            (b'P', FrontendPhase::Regular),
+            (b'Q', FrontendPhase::Regular),
+            (b'S', FrontendPhase::Regular),
+            (b'X', FrontendPhase::Regular),
+            (b'p', FrontendPhase::Authentication),
+            (b'd', FrontendPhase::CopyIn),
+            (b'c', FrontendPhase::CopyIn),
+            (b'f', FrontendPhase::CopyIn),
+        ] {
+            let packet = frontend(byte, b"body");
             assert!(matches!(
-                decode_frontend(&packet, DEFAULT_LARGE_MESSAGE_LENGTH),
+                decode_frontend(&packet, phase, DEFAULT_LARGE_MESSAGE_LENGTH),
                 Ok(Decode::Complete { consumed, .. }) if consumed == packet.len()
             ));
         }
@@ -704,7 +818,11 @@ mod tests {
         let first = frontend(b'Q', b"select 1\0");
         for split in 0..first.len() {
             assert!(matches!(
-                decode_frontend(&first[..split], DEFAULT_LARGE_MESSAGE_LENGTH),
+                decode_frontend(
+                    &first[..split],
+                    FrontendPhase::Regular,
+                    DEFAULT_LARGE_MESSAGE_LENGTH,
+                ),
                 Ok(Decode::Incomplete { .. })
             ));
         }
@@ -712,13 +830,18 @@ mod tests {
         let mut input = first.clone();
         input.extend_from_slice(&second);
         let Decode::Complete { consumed, .. } =
-            decode_frontend(&input, DEFAULT_LARGE_MESSAGE_LENGTH).expect("first")
+            decode_frontend(&input, FrontendPhase::Regular, DEFAULT_LARGE_MESSAGE_LENGTH)
+                .expect("first")
         else {
             panic!("first frame incomplete");
         };
         assert_eq!(consumed, first.len());
         assert!(matches!(
-            decode_frontend(&input[consumed..], DEFAULT_LARGE_MESSAGE_LENGTH),
+            decode_frontend(
+                &input[consumed..],
+                FrontendPhase::Regular,
+                DEFAULT_LARGE_MESSAGE_LENGTH,
+            ),
             Ok(Decode::Complete { consumed, .. }) if consumed == second.len()
         ));
     }
@@ -726,7 +849,11 @@ mod tests {
     #[test]
     fn unknown_tags_and_untrusted_lengths_fail_before_buffering() {
         assert_eq!(
-            decode_frontend(b"Z\xff\xff\xff\xff", DEFAULT_LARGE_MESSAGE_LENGTH),
+            decode_frontend(
+                b"Z\xff\xff\xff\xff",
+                FrontendPhase::Regular,
+                DEFAULT_LARGE_MESSAGE_LENGTH,
+            ),
             Err(DecodeError::UnknownFrontendTag(b'Z'))
         );
         let oversized = u32::try_from(DEFAULT_LARGE_MESSAGE_LENGTH + 1)
@@ -735,7 +862,11 @@ mod tests {
         let mut header = vec![b'Q'];
         header.extend_from_slice(&oversized);
         assert!(matches!(
-            decode_frontend(&header, DEFAULT_LARGE_MESSAGE_LENGTH),
+            decode_frontend(
+                &header,
+                FrontendPhase::Regular,
+                DEFAULT_LARGE_MESSAGE_LENGTH,
+            ),
             Err(DecodeError::FrameTooLarge { .. })
         ));
 
@@ -743,15 +874,45 @@ mod tests {
             let mut header = vec![b'Q'];
             header.extend_from_slice(&invalid.to_be_bytes());
             assert!(matches!(
-                decode_frontend(&header, DEFAULT_LARGE_MESSAGE_LENGTH),
+                decode_frontend(
+                    &header,
+                    FrontendPhase::Regular,
+                    DEFAULT_LARGE_MESSAGE_LENGTH,
+                ),
                 Err(DecodeError::InvalidLength { .. })
             ));
         }
 
         for invalid in [3, MAX_LARGE_MESSAGE_LENGTH + 1] {
             assert!(matches!(
-                decode_frontend(&[], invalid),
+                decode_frontend(&[], FrontendPhase::Regular, invalid),
                 Err(DecodeError::InvalidMaximum { actual, .. }) if actual == invalid
+            ));
+        }
+    }
+
+    #[test]
+    fn phase_illegal_tags_fail_before_their_lengths_are_trusted() {
+        for (tag, phase) in [
+            (b'Q', FrontendPhase::Authentication),
+            (b'Q', FrontendPhase::CopyIn),
+            (b'B', FrontendPhase::CopyIn),
+            (b'p', FrontendPhase::Regular),
+            (b'd', FrontendPhase::Regular),
+        ] {
+            let mut header = vec![tag];
+            header.extend_from_slice(
+                &u32::try_from(MAX_LARGE_MESSAGE_LENGTH)
+                    .expect("maximum fits")
+                    .to_be_bytes(),
+            );
+            assert!(matches!(
+                decode_frontend(&header, phase, DEFAULT_LARGE_MESSAGE_LENGTH),
+                Err(DecodeError::UnexpectedTagForPhase { .. })
+            ));
+            assert!(matches!(
+                decode_frontend(&header[..1], phase, DEFAULT_LARGE_MESSAGE_LENGTH),
+                Err(DecodeError::UnexpectedTagForPhase { .. })
             ));
         }
     }
@@ -759,10 +920,16 @@ mod tests {
     #[test]
     fn small_messages_keep_the_postgres18_limit() {
         let exact = frontend(b'S', &vec![0; SMALL_MESSAGE_LENGTH - 4]);
-        assert!(decode_frontend(&exact, DEFAULT_LARGE_MESSAGE_LENGTH).is_ok());
+        assert!(
+            decode_frontend(&exact, FrontendPhase::Regular, DEFAULT_LARGE_MESSAGE_LENGTH,).is_ok()
+        );
         let oversized = frontend(b'S', &vec![0; SMALL_MESSAGE_LENGTH - 3]);
         assert!(matches!(
-            decode_frontend(&oversized, DEFAULT_LARGE_MESSAGE_LENGTH),
+            decode_frontend(
+                &oversized,
+                FrontendPhase::Regular,
+                DEFAULT_LARGE_MESSAGE_LENGTH,
+            ),
             Err(DecodeError::FrameTooLarge {
                 maximum: SMALL_MESSAGE_LENGTH,
                 ..
@@ -776,13 +943,24 @@ mod tests {
             b'p',
             &vec![0; AUTHENTICATION_MESSAGE_LENGTH.saturating_sub(4)],
         );
-        assert!(decode_frontend(&exact, DEFAULT_LARGE_MESSAGE_LENGTH).is_ok());
+        assert!(
+            decode_frontend(
+                &exact,
+                FrontendPhase::Authentication,
+                DEFAULT_LARGE_MESSAGE_LENGTH,
+            )
+            .is_ok()
+        );
         let oversized = frontend(
             b'p',
             &vec![0; AUTHENTICATION_MESSAGE_LENGTH.saturating_sub(3)],
         );
         assert!(matches!(
-            decode_frontend(&oversized, DEFAULT_LARGE_MESSAGE_LENGTH),
+            decode_frontend(
+                &oversized,
+                FrontendPhase::Authentication,
+                DEFAULT_LARGE_MESSAGE_LENGTH,
+            ),
             Err(DecodeError::FrameTooLarge {
                 maximum: AUTHENTICATION_MESSAGE_LENGTH,
                 ..

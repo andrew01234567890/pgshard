@@ -3,7 +3,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use pgshard_pgwire::{DEFAULT_LARGE_MESSAGE_LENGTH, Decode, decode_frontend};
+use pgshard_pgwire::{DEFAULT_LARGE_MESSAGE_LENGTH, Decode, FrontendPhase, decode_frontend};
 
 const ITERATIONS: u64 = 5_000_000;
 
@@ -21,7 +21,12 @@ fn main() {
         let Decode::Complete {
             frame: decoded,
             consumed,
-        } = decode_frontend(black_box(&frame), DEFAULT_LARGE_MESSAGE_LENGTH).expect("decode")
+        } = decode_frontend(
+            black_box(&frame),
+            FrontendPhase::Regular,
+            DEFAULT_LARGE_MESSAGE_LENGTH,
+        )
+        .expect("decode")
         else {
             panic!("complete benchmark frame was incomplete");
         };
