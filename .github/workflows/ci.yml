@@ -119,6 +119,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
         shell: bash
@@ -126,7 +127,7 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" == pull_request ]]; then
             cargo run --locked -p pgshard-release -- validate --subject "$PR_TITLE"
-            cargo run --locked -p pgshard-release -- audit --base "$PR_BASE_SHA" --head "$GITHUB_SHA"
+            cargo run --locked -p pgshard-release -- audit --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
           elif [[ "$EVENT_NAME" == push && -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
             cargo run --locked -p pgshard-release -- validate
             cargo run --locked -p pgshard-release -- audit --base "$PUSH_BEFORE_SHA" --head "$GITHUB_SHA"
