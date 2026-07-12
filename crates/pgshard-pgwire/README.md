@@ -20,5 +20,9 @@ phase; the decoder rejects illegal known tags from their first byte, before
 trusting or buffering the body length. Body-specific legality still belongs to
 the eventual session state machine.
 
+Debug output reports only frame metadata and lengths. It never renders startup
+values, cancellation authentication keys, SQL, authentication data, or other
+frontend bodies.
+
 `cargo bench -p pgshard-pgwire --bench decode_frontend` measures framing alone.
 It is not a substitute for the planned end-to-end pooler/PgBouncer comparison.

@@ -4,6 +4,8 @@
 //! byte-level messages; a pooler must still reject messages that are invalid in
 //! the current authentication, query, copy, or transaction phase.
 
+use std::fmt;
+
 use thiserror::Error;
 
 /// Maximum body size accepted by `PostgreSQL` 18 for a startup packet.
@@ -82,7 +84,7 @@ impl ProtocolVersion {
 }
 
 /// One decoded startup-phase frame.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum StartupFrame<'a> {
     /// A regular protocol startup request.
     Startup {
@@ -102,6 +104,28 @@ pub enum StartupFrame<'a> {
         /// Opaque one-to-256-byte cancellation authentication key.
         key: &'a [u8],
     },
+}
+
+impl fmt::Debug for StartupFrame<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Startup {
+                protocol,
+                parameters,
+            } => formatter
+                .debug_struct("Startup")
+                .field("protocol", protocol)
+                .field("parameter_count", &parameters.iter().count())
+                .finish(),
+            Self::SslRequest => formatter.write_str("SslRequest"),
+            Self::GssEncryptionRequest => formatter.write_str("GssEncryptionRequest"),
+            Self::CancelRequest { backend_pid, key } => formatter
+                .debug_struct("CancelRequest")
+                .field("backend_pid", backend_pid)
+                .field("key_length", &key.len())
+                .finish(),
+        }
+    }
 }
 
 impl StartupFrame<'_> {
@@ -126,9 +150,18 @@ impl StartupFrame<'_> {
 }
 
 /// Validated startup parameter bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct StartupParameters<'a> {
     bytes: &'a [u8],
+}
+
+impl fmt::Debug for StartupParameters<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StartupParameters")
+            .field("parameter_count", &self.iter().count())
+            .finish()
+    }
 }
 
 impl<'a> StartupParameters<'a> {
@@ -146,7 +179,7 @@ impl<'a> StartupParameters<'a> {
 }
 
 /// Iterator over validated startup name/value pairs.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StartupParameterIter<'a> {
     remaining: &'a [u8],
 }
@@ -289,10 +322,20 @@ impl FrontendTag {
 }
 
 /// One decoded post-startup frontend frame.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct FrontendFrame<'a> {
     tag: FrontendTag,
     body: &'a [u8],
+}
+
+impl fmt::Debug for FrontendFrame<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FrontendFrame")
+            .field("tag", &self.tag)
+            .field("body_length", &self.body.len())
+            .finish()
+    }
 }
 
 impl<'a> FrontendFrame<'a> {
@@ -983,5 +1026,54 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn debug_output_redacts_startup_cancel_and_frontend_payloads() {
+        let startup_packet = startup(
+            protocol_code(3, 2),
+            b"user\0alice\0options\0do-not-log-this\0\0",
+        );
+        let Decode::Complete {
+            frame: startup_frame,
+            ..
+        } = decode_startup(&startup_packet).expect("startup")
+        else {
+            panic!("complete startup frame was incomplete");
+        };
+        let startup_debug = format!("{startup_frame:?}");
+        assert!(!startup_debug.contains("do-not-log-this"));
+        assert!(startup_debug.contains("parameter_count"));
+
+        let mut cancel_body = 42_u32.to_be_bytes().to_vec();
+        cancel_body.extend_from_slice(b"do-not-log-this");
+        let cancel_packet = startup(CANCEL_REQUEST_CODE, &cancel_body);
+        let Decode::Complete {
+            frame: cancel_frame,
+            ..
+        } = decode_startup(&cancel_packet).expect("cancel")
+        else {
+            panic!("complete cancel frame was incomplete");
+        };
+        let cancel_debug = format!("{cancel_frame:?}");
+        assert!(!cancel_debug.contains("do-not-log-this"));
+        assert!(cancel_debug.contains("key_length"));
+
+        let frontend_packet = frontend(b'Q', b"do-not-log-this\0");
+        let Decode::Complete {
+            frame: frontend_frame,
+            ..
+        } = decode_frontend(
+            &frontend_packet,
+            FrontendPhase::Regular,
+            DEFAULT_LARGE_MESSAGE_LENGTH,
+        )
+        .expect("frontend")
+        else {
+            panic!("complete frontend frame was incomplete");
+        };
+        let frontend_debug = format!("{frontend_frame:?}");
+        assert!(!frontend_debug.contains("do-not-log-this"));
+        assert!(frontend_debug.contains("body_length"));
     }
 }
