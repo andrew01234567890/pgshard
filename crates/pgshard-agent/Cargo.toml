@@ -1,0 +1,22 @@
+[package]
+name = "pgshard-agent"
+description = "PostgreSQL instance agent runtime for pgshard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = "0.8.4"
+clap = { workspace = true, features = ["env"] }
+pgshard-types = { path = "../pgshard-types" }
+serde.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.46.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+url = "2.5.4"
+
+[lints]
+workspace = true
