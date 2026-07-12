@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pgshard_types::{PgLsn, ShardId};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 /// Stable identity assigned by the operator.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -38,8 +38,10 @@ pub struct PostgresObservation {
     /// Current `PostgreSQL` timeline.
     pub timeline: u32,
     /// Last locally flushed WAL position, when applicable.
+    #[serde(serialize_with = "serialize_optional_lsn")]
     pub flush_lsn: Option<PgLsn>,
     /// Last replayed WAL position, when applicable.
+    #[serde(serialize_with = "serialize_optional_lsn")]
     pub replay_lsn: Option<PgLsn>,
 }
 
@@ -49,9 +51,31 @@ pub struct FencingLease {
     /// Instance authorized by the lease.
     pub owner_instance: String,
     /// Strictly positive fencing epoch.
+    #[serde(serialize_with = "serialize_u64_decimal")]
     pub epoch: u64,
     /// Lease expiration as Unix time in milliseconds.
     pub valid_until_unix_ms: u64,
+}
+
+// Serde's `serialize_with` callback ABI passes the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_u64_decimal<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+// Serde's `serialize_with` callback ABI passes `&Option<T>`.
+#[allow(clippy::ref_option)]
+fn serialize_optional_lsn<S>(value: &Option<PgLsn>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(PgLsn(lsn)) => serializer.serialize_some(&lsn.to_string()),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Externally reportable agent state.
@@ -296,5 +320,19 @@ mod tests {
                 reason: ReadinessReason::Ready,
             }
         );
+    }
+
+    #[test]
+    fn status_json_uses_exact_decimal_strings() {
+        let state = AgentState::with_identity(identity());
+        state.set_postgres(primary());
+        state.install_lease(FencingLease {
+            owner_instance: "instance-1".to_owned(),
+            epoch: u64::MAX,
+            valid_until_unix_ms: 200,
+        });
+        let json = serde_json::to_value(state.snapshot()).expect("serialize status");
+        assert_eq!(json["lease"]["epoch"], u64::MAX.to_string());
+        assert_eq!(json["postgres"]["flush_lsn"], "100");
     }
 }

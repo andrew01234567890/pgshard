@@ -1,10 +1,10 @@
-//! Durable-operation identity and conservative per-shard lease ownership.
+//! In-memory operation identity and conservative per-shard lease ownership.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use pgshard_types::ShardId;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use thiserror::Error;
 
 /// Stable identity assigned to one orchestrator process.
@@ -107,11 +107,21 @@ pub struct ShardLease {
     /// Owning orchestrator.
     pub owner_id: String,
     /// Monotonically increasing fencing epoch.
+    #[serde(serialize_with = "serialize_u64_decimal")]
     pub epoch: u64,
     /// Operation whose execution is fenced by this lease.
     pub operation_id: OperationId,
     /// Expiration timestamp in Unix milliseconds.
     pub expires_at_unix_ms: u64,
+}
+
+// Serde's `serialize_with` callback ABI passes the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_u64_decimal<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
 }
 
 /// Result of a conservative lease acquisition.
@@ -136,6 +146,26 @@ pub struct OrchSnapshot {
     pub failover_automation_enabled: bool,
     /// Whether operation and lease records survive process restart.
     pub persistence_enabled: bool,
+}
+
+/// Machine-readable reason the orchestrator is not yet safe to serve control
+/// operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchReadinessReason {
+    /// No stable operator-assigned identity exists.
+    IdentityMissing,
+    /// Operations and fencing epochs are currently in memory only.
+    PersistenceUnavailable,
+}
+
+/// Fail-closed orchestrator readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct OrchReadiness {
+    /// Always false until durable state and recovery are wired.
+    pub ready: bool,
+    /// Exact reason control operations are unavailable.
+    pub reason: OrchReadinessReason,
 }
 
 #[derive(Debug, Default)]
@@ -164,14 +194,23 @@ impl OrchState {
         }
     }
 
-    /// Returns whether the runtime has a stable identity.
+    /// Returns whether the runtime can safely serve control operations.
     #[must_use]
-    pub fn is_ready(&self) -> bool {
-        self.inner
+    pub fn readiness(&self) -> OrchReadiness {
+        let has_identity = self
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .identity
-            .is_some()
+            .is_some();
+        OrchReadiness {
+            ready: false,
+            reason: if has_identity {
+                OrchReadinessReason::PersistenceUnavailable
+            } else {
+                OrchReadinessReason::IdentityMissing
+            },
+        }
     }
 
     /// Returns a consistent reportable snapshot.
@@ -391,8 +430,17 @@ mod tests {
 
     #[test]
     fn readiness_requires_identity() {
-        assert!(!OrchState::default().is_ready());
-        assert!(OrchState::with_identity(identity()).is_ready());
+        assert_eq!(
+            OrchState::default().readiness().reason,
+            OrchReadinessReason::IdentityMissing
+        );
+        assert_eq!(
+            OrchState::with_identity(identity()).readiness(),
+            OrchReadiness {
+                ready: false,
+                reason: OrchReadinessReason::PersistenceUnavailable,
+            }
+        );
     }
 
     #[test]
@@ -465,5 +513,18 @@ mod tests {
             state.acquire_lease(lease("missing", "orch-0", 1, 200), 100),
             Err(OrchError::UnknownOperation(_))
         ));
+    }
+
+    #[test]
+    fn status_json_preserves_fencing_epoch_exactly() {
+        let state = OrchState::with_identity(identity());
+        state
+            .register_operation(operation("op-1", 1, OperationKind::Backup))
+            .expect("register");
+        state
+            .acquire_lease(lease("op-1", "orch-0", u64::MAX, 200), 100)
+            .expect("acquire");
+        let json = serde_json::to_value(state.snapshot()).expect("serialize status");
+        assert_eq!(json["leases"][0]["epoch"], u64::MAX.to_string());
     }
 }

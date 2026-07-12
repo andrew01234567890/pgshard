@@ -24,6 +24,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         bind = %config.http_bind,
         lease_ttl_ms = config.lease_ttl_ms,
+        version = pgshard_version::VERSION,
+        git_sha = pgshard_version::GIT_SHA,
         "starting orchestrator HTTP server; persistence and automated failover remain disabled"
     );
     pgshard_orch::http::serve(config.http_bind, state, shutdown_signal()).await?;

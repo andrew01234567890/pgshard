@@ -38,10 +38,16 @@ pub async fn serve(
 #[derive(Serialize)]
 struct Health {
     status: &'static str,
+    version: &'static str,
+    git_sha: &'static str,
 }
 
 async fn health() -> Json<Health> {
-    Json(Health { status: "alive" })
+    Json(Health {
+        status: "alive",
+        version: pgshard_version::VERSION,
+        git_sha: pgshard_version::GIT_SHA,
+    })
 }
 
 async fn readiness(State(state): State<AgentState>) -> Response {
@@ -81,6 +87,9 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
             "# HELP pgshard_agent_up Whether the process health endpoint is running.\n",
             "# TYPE pgshard_agent_up gauge\n",
             "pgshard_agent_up 1\n",
+            "# HELP pgshard_agent_build_info Build identity for this process.\n",
+            "# TYPE pgshard_agent_build_info gauge\n",
+            "pgshard_agent_build_info{{version=\"{}\",git_sha=\"{}\"}} 1\n",
             "# HELP pgshard_agent_ready Whether identity, fencing, and PostgreSQL state are ready.\n",
             "# TYPE pgshard_agent_ready gauge\n",
             "pgshard_agent_ready {}\n",
@@ -97,6 +106,8 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
             "# TYPE pgshard_agent_postgres_replay_lsn gauge\n",
             "pgshard_agent_postgres_replay_lsn {replay_lsn}\n"
         ),
+        pgshard_version::VERSION,
+        pgshard_version::GIT_SHA,
         u8::from(readiness.ready),
         epoch = epoch,
         timeline = timeline,

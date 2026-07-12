@@ -37,34 +37,26 @@ pub async fn serve(
 #[derive(Serialize)]
 struct Health {
     status: &'static str,
-}
-
-#[derive(Serialize)]
-struct Ready {
-    ready: bool,
-    reason: &'static str,
+    version: &'static str,
+    git_sha: &'static str,
 }
 
 async fn health() -> Json<Health> {
-    Json(Health { status: "alive" })
+    Json(Health {
+        status: "alive",
+        version: pgshard_version::VERSION,
+        git_sha: pgshard_version::GIT_SHA,
+    })
 }
 
 async fn readiness(State(state): State<OrchState>) -> Response {
-    let ready = state.is_ready();
-    let response = Ready {
-        ready,
-        reason: if ready {
-            "identity_established"
-        } else {
-            "identity_missing"
-        },
-    };
-    let status = if ready {
+    let readiness = state.readiness();
+    let status = if readiness.ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(response)).into_response()
+    (status, Json(readiness)).into_response()
 }
 
 async fn status(State(state): State<OrchState>) -> Json<OrchSnapshot> {
@@ -73,12 +65,16 @@ async fn status(State(state): State<OrchState>) -> Json<OrchSnapshot> {
 
 async fn metrics(State(state): State<OrchState>) -> impl IntoResponse {
     let snapshot = state.snapshot();
-    let ready = u8::from(snapshot.identity.is_some());
+    let readiness = state.readiness();
+    let ready = u8::from(readiness.ready);
     let body = format!(
         concat!(
             "# HELP pgshard_orch_up Whether the process health endpoint is running.\n",
             "# TYPE pgshard_orch_up gauge\n",
             "pgshard_orch_up 1\n",
+            "# HELP pgshard_orch_build_info Build identity for this process.\n",
+            "# TYPE pgshard_orch_build_info gauge\n",
+            "pgshard_orch_build_info{{version=\"{}\",git_sha=\"{}\"}} 1\n",
             "# HELP pgshard_orch_ready Whether the orchestrator identity is established.\n",
             "# TYPE pgshard_orch_ready gauge\n",
             "pgshard_orch_ready {ready}\n",
@@ -95,6 +91,8 @@ async fn metrics(State(state): State<OrchState>) -> impl IntoResponse {
             "# TYPE pgshard_orch_persistence_enabled gauge\n",
             "pgshard_orch_persistence_enabled 0\n"
         ),
+        pgshard_version::VERSION,
+        pgshard_version::GIT_SHA,
         snapshot.operation_count,
         snapshot.leases.len(),
         ready = ready,

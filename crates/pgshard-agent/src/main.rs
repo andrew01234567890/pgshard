@@ -21,7 +21,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let state = AgentState::with_identity(config.identity);
-    tracing::info!(bind = %config.http_bind, "starting agent HTTP server");
+    tracing::info!(
+        bind = %config.http_bind,
+        version = pgshard_version::VERSION,
+        git_sha = pgshard_version::GIT_SHA,
+        "starting agent HTTP server"
+    );
     pgshard_agent::http::serve(config.http_bind, state, shutdown_signal()).await?;
     tracing::info!("agent shutdown complete");
     Ok(())
