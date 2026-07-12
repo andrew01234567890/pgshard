@@ -46,10 +46,23 @@ pub enum OperationKind {
 pub struct OperationSpec {
     /// Idempotency key.
     pub id: OperationId,
+    /// Cluster-global namespace containing the operation.
+    pub cluster_id: String,
     /// Shard owned while the operation runs.
     pub shard_id: ShardId,
     /// Operation class.
     pub kind: OperationKind,
+    /// Exact immutable operation-specific request bytes.
+    pub payload: Vec<u8>,
+    /// Catalog epoch required when execution begins.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub required_catalog_epoch: u64,
+    /// Fencing epoch required when execution begins.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub required_fencing_epoch: u64,
+    /// Immutable caller deadline in Unix microseconds.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub deadline_unix_micros: u64,
 }
 
 /// Current operation progress.
@@ -112,6 +125,7 @@ pub struct ShardLease {
     /// Operation whose execution is fenced by this lease.
     pub operation_id: OperationId,
     /// Expiration timestamp in Unix milliseconds.
+    #[serde(serialize_with = "serialize_u64_decimal")]
     pub expires_at_unix_ms: u64,
 }
 
@@ -252,6 +266,14 @@ impl OrchState {
             }
             return Err(OrchError::OperationConflict(spec.id));
         }
+        let identity = inner.identity.as_ref().ok_or(OrchError::IdentityMissing)?;
+        if identity.cluster_id != spec.cluster_id {
+            return Err(OrchError::OperationClusterMismatch {
+                operation_id: spec.id,
+                expected: identity.cluster_id.clone(),
+                requested: spec.cluster_id,
+            });
+        }
         inner.operations.insert(
             spec.id.clone(),
             OperationRecord {
@@ -280,6 +302,13 @@ impl OrchState {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = inner.identity.as_ref().ok_or(OrchError::IdentityMissing)?;
+        if request.owner_id != identity.orchestrator_id {
+            return Err(OrchError::LeaseOwnerMismatch {
+                expected: identity.orchestrator_id.clone(),
+                requested: request.owner_id,
+            });
+        }
         let operation = inner
             .operations
             .get(&request.operation_id)
@@ -291,8 +320,11 @@ impl OrchState {
                 requested: request.shard_id,
             });
         }
-        if request.owner_id.is_empty() || request.expires_at_unix_ms <= now_unix_ms {
+        if request.expires_at_unix_ms <= now_unix_ms {
             return Err(OrchError::InvalidLeaseRequest);
+        }
+        if request.epoch == u64::MAX {
+            return Err(OrchError::FencingEpochExhausted);
         }
         if let Some(existing) = inner.leases.get(&request.shard_id) {
             let identical = existing.owner_id == request.owner_id
@@ -359,12 +391,25 @@ fn validate_operation_id(operation_id: &OperationId) -> Result<(), OrchError> {
 /// Operation registry or lease ownership failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum OrchError {
+    /// State has no stable operator-assigned identity.
+    #[error("orchestrator identity is missing")]
+    IdentityMissing,
     /// The operation ID is unsafe or empty.
     #[error("invalid operation ID {0:?}")]
     InvalidOperationId(OperationId),
     /// The same operation ID was reused with different immutable input.
     #[error("operation ID {0:?} is already assigned to different input")]
     OperationConflict(OperationId),
+    /// The operation targets a different cluster.
+    #[error("operation {operation_id:?} belongs to cluster {requested:?}, not {expected:?}")]
+    OperationClusterMismatch {
+        /// Operation ID.
+        operation_id: OperationId,
+        /// Configured cluster.
+        expected: String,
+        /// Requested cluster.
+        requested: String,
+    },
     /// The lease refers to an unregistered operation.
     #[error("unknown operation ID {0:?}")]
     UnknownOperation(OperationId),
@@ -378,9 +423,20 @@ pub enum OrchError {
         /// Requested shard.
         requested: ShardId,
     },
-    /// Lease owner is empty or expiration is not in the future.
-    #[error("lease owner must be non-empty and expiration must be in the future")]
+    /// Lease expiration is not in the future.
+    #[error("lease expiration must be in the future")]
     InvalidLeaseRequest,
+    /// A process cannot request ownership under another orchestrator identity.
+    #[error("lease owner {requested:?} does not match this orchestrator {expected:?}")]
+    LeaseOwnerMismatch {
+        /// Configured orchestrator identity.
+        expected: String,
+        /// Requested owner.
+        requested: String,
+    },
+    /// The maximum epoch cannot be leased because no later owner could fence it.
+    #[error("maximum fencing epoch is reserved and cannot be leased")]
+    FencingEpochExhausted,
     /// A different live lease already owns the shard.
     #[error("shard {shard_id:?} is held at epoch {epoch}")]
     LeaseHeld {
@@ -413,8 +469,13 @@ mod tests {
     fn operation(id: &str, shard: u32, kind: OperationKind) -> OperationSpec {
         OperationSpec {
             id: OperationId(id.to_owned()),
+            cluster_id: "cluster-1".to_owned(),
             shard_id: ShardId(shard),
             kind,
+            payload: vec![1, 2, 3],
+            required_catalog_epoch: 7,
+            required_fencing_epoch: 11,
+            deadline_unix_micros: 1_000_000,
         }
     }
 
@@ -452,13 +513,41 @@ mod tests {
             RegistrationOutcome::Created
         );
         assert_eq!(
-            state.register_operation(spec).expect("same operation"),
+            state
+                .register_operation(spec.clone())
+                .expect("same operation"),
             RegistrationOutcome::Existing
         );
-        assert!(matches!(
-            state.register_operation(operation("op-1", 1, OperationKind::Restore)),
-            Err(OrchError::OperationConflict(_))
-        ));
+
+        let mut variants = Vec::new();
+        let mut changed = spec.clone();
+        changed.cluster_id = "another-cluster".to_owned();
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.shard_id = ShardId(2);
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.kind = OperationKind::Restore;
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.payload.push(4);
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.required_catalog_epoch += 1;
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.required_fencing_epoch += 1;
+        variants.push(changed);
+        let mut changed = spec;
+        changed.deadline_unix_micros += 1;
+        variants.push(changed);
+
+        for changed in variants {
+            assert!(matches!(
+                state.register_operation(changed),
+                Err(OrchError::OperationConflict(_))
+            ));
+        }
     }
 
     #[test]
@@ -478,6 +567,14 @@ mod tests {
         );
         assert!(matches!(
             state.acquire_lease(lease("op-1", "orch-1", 2, 200), 100),
+            Err(OrchError::LeaseOwnerMismatch { .. })
+        ));
+
+        state
+            .register_operation(operation("op-2", 1, OperationKind::Backup))
+            .expect("register competitor");
+        assert!(matches!(
+            state.acquire_lease(lease("op-2", "orch-0", 2, 200), 100),
             Err(OrchError::LeaseHeld { .. })
         ));
     }
@@ -492,7 +589,7 @@ mod tests {
             .acquire_lease(lease("op-1", "orch-0", 4, 200), 100)
             .expect("acquire");
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-1", 4, 300), 200),
+            state.acquire_lease(lease("op-1", "orch-0", 4, 300), 200),
             Err(OrchError::StaleEpoch {
                 requested: 4,
                 minimum: 5
@@ -500,7 +597,7 @@ mod tests {
         ));
         assert_eq!(
             state
-                .acquire_lease(lease("op-1", "orch-1", 5, 300), 200)
+                .acquire_lease(lease("op-1", "orch-0", 5, 300), 200)
                 .expect("new term"),
             LeaseOutcome::Acquired
         );
@@ -516,15 +613,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_cross_cluster_operations_and_maximum_epoch() {
+        let state = OrchState::with_identity(identity());
+        let mut foreign = operation("foreign", 1, OperationKind::Backup);
+        foreign.cluster_id = "another-cluster".to_owned();
+        assert!(matches!(
+            state.register_operation(foreign),
+            Err(OrchError::OperationClusterMismatch { .. })
+        ));
+
+        state
+            .register_operation(operation("op-max", 1, OperationKind::Failover))
+            .expect("register");
+        assert_eq!(
+            state.acquire_lease(lease("op-max", "orch-0", u64::MAX, 200), 100),
+            Err(OrchError::FencingEpochExhausted)
+        );
+    }
+
+    #[test]
     fn status_json_preserves_fencing_epoch_exactly() {
         let state = OrchState::with_identity(identity());
         state
             .register_operation(operation("op-1", 1, OperationKind::Backup))
             .expect("register");
         state
-            .acquire_lease(lease("op-1", "orch-0", u64::MAX, 200), 100)
+            .acquire_lease(lease("op-1", "orch-0", u64::MAX - 1, 200), 100)
             .expect("acquire");
         let json = serde_json::to_value(state.snapshot()).expect("serialize status");
-        assert_eq!(json["leases"][0]["epoch"], u64::MAX.to_string());
+        assert_eq!(json["leases"][0]["epoch"], (u64::MAX - 1).to_string());
+        assert_eq!(json["leases"][0]["expires_at_unix_ms"], "200");
     }
 }

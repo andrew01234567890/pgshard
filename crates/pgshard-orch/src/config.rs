@@ -101,6 +101,9 @@ fn validate_identifier(name: &'static str, value: &str) -> Result<(), ConfigErro
 }
 
 fn validate_otlp_endpoint(value: &str) -> Result<Url, ConfigError> {
+    if value.trim() != value {
+        return Err(ConfigError::UnsafeOtlpEndpoint(value.to_owned()));
+    }
     let endpoint = Url::parse(value).map_err(|source| ConfigError::InvalidOtlpEndpoint {
         value: value.to_owned(),
         source,
@@ -109,6 +112,8 @@ fn validate_otlp_endpoint(value: &str) -> Result<Url, ConfigError> {
         || endpoint.host_str().is_none()
         || !endpoint.username().is_empty()
         || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
     {
         return Err(ConfigError::UnsafeOtlpEndpoint(value.to_owned()));
     }
@@ -183,5 +188,21 @@ mod tests {
             OrchConfig::try_parse_from(args),
             Err(ConfigError::Arguments(_))
         ));
+    }
+
+    #[test]
+    fn rejects_otlp_query_fragment_and_whitespace() {
+        for endpoint in [
+            "https://collector:4317?token=value",
+            "https://collector:4317/#fragment",
+            " https://collector:4317",
+        ] {
+            let mut values = args();
+            values.extend(["--otlp-endpoint", endpoint]);
+            assert!(matches!(
+                OrchConfig::try_parse_from(values),
+                Err(ConfigError::UnsafeOtlpEndpoint(_))
+            ));
+        }
     }
 }

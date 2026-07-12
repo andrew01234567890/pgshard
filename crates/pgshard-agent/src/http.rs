@@ -72,6 +72,10 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
         .postgres
         .as_ref()
         .map_or(0, |postgres| postgres.timeline);
+    let postgres_fencing_epoch = snapshot
+        .postgres
+        .as_ref()
+        .map_or(0, |postgres| postgres.fencing_epoch);
     let flush_lsn = snapshot
         .postgres
         .as_ref()
@@ -99,6 +103,9 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
             "# HELP pgshard_agent_postgres_timeline Current observed PostgreSQL timeline.\n",
             "# TYPE pgshard_agent_postgres_timeline gauge\n",
             "pgshard_agent_postgres_timeline {timeline}\n",
+            "# HELP pgshard_agent_postgres_fencing_epoch Durable fencing epoch observed inside PostgreSQL.\n",
+            "# TYPE pgshard_agent_postgres_fencing_epoch gauge\n",
+            "pgshard_agent_postgres_fencing_epoch {postgres_fencing_epoch}\n",
             "# HELP pgshard_agent_postgres_flush_lsn Current flush LSN encoded as an integer.\n",
             "# TYPE pgshard_agent_postgres_flush_lsn gauge\n",
             "pgshard_agent_postgres_flush_lsn {flush_lsn}\n",
@@ -111,6 +118,7 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
         u8::from(readiness.ready),
         epoch = epoch,
         timeline = timeline,
+        postgres_fencing_epoch = postgres_fencing_epoch,
         flush_lsn = flush_lsn,
         replay_lsn = replay_lsn,
     );

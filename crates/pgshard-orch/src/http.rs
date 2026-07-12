@@ -75,7 +75,7 @@ async fn metrics(State(state): State<OrchState>) -> impl IntoResponse {
             "# HELP pgshard_orch_build_info Build identity for this process.\n",
             "# TYPE pgshard_orch_build_info gauge\n",
             "pgshard_orch_build_info{{version=\"{}\",git_sha=\"{}\"}} 1\n",
-            "# HELP pgshard_orch_ready Whether the orchestrator identity is established.\n",
+            "# HELP pgshard_orch_ready Whether durable orchestration state and recovery are available.\n",
             "# TYPE pgshard_orch_ready gauge\n",
             "pgshard_orch_ready {ready}\n",
             "# HELP pgshard_orch_operations Registered idempotent operations.\n",
