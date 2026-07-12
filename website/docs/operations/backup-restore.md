@@ -5,7 +5,14 @@ description: Coordinated multi-shard backup sets with pgBackRest and restore acr
 
 # Backup and restore
 
-pgshard uses pgBackRest with a separate stanza and repository prefix for each shard. One physical backup per shard protects its primary and replicas because they share physical history.
+:::info Milestone 1 design contract
+This page specifies the required behavior. Coordinated backup and restore are not
+implemented in the foundation release; see [implementation status](../project/status.md).
+:::
+
+The Milestone 1 design uses pgBackRest with a separate stanza and repository
+prefix for each shard. One physical backup per shard protects its primary and
+replicas because they share physical history.
 
 The preferred source is the healthiest, most caught-up secondary. pgBackRest's standby backup still coordinates with the primary. If no safe secondary exists, pgshard falls back to the primary and records that decision in status, events, and metrics.
 
@@ -14,14 +21,28 @@ The preferred source is the healthiest, most caught-up secondary. pgBackRest's s
 ```mermaid
 flowchart LR
   B[Back up every shard concurrently] --> V[Verify base backups]
-  V --> G[Brief write barrier]
+  V --> G[Cluster mutation barrier]
   G --> D[Drain distributed transactions]
   D --> L[Record restore LSN and timeline per shard]
   L --> W[Verify required WAL archived]
   W --> M[Publish immutable cluster manifest]
 ```
 
-The manifest identifies the cluster, PostgreSQL major, catalog/routing epoch, source topology, every pgBackRest backup ID, restore LSN/timeline, checksums, and backup source role. A backup is usable only when all shard members, WAL, and the final manifest exist. Retention treats the complete set as one unit.
+The barrier is acquired through a monotonically fenced `shardschema` operation.
+Poolers stop new application writes and drain 2PC. The DDL, role/grant, reshard,
+backup/restore, topology and operator reconcilers stop starting or activating
+mutations at the same barrier. A safety failover invalidates the attempt and
+forces a fresh backup set rather than silently changing its timeline.
+
+While the barrier is held, the coordinator records frozen catalog, routing,
+schema, authorization, topology and fencing epochs before capturing each
+shard's restore LSN and timeline. Those epoch values and the complete mutation
+barrier identity are part of the immutable manifest.
+
+The manifest also identifies the cluster, PostgreSQL major, source topology,
+every pgBackRest backup ID, checksums, and backup source role. A backup is usable
+only when every shard backup, required WAL object, and the final manifest exist.
+Retention treats the complete set as one unit.
 
 :::caution Recovery point boundary
 Milestone 1 restores coordinated backup-set points. Arbitrary wall-clock cross-shard PITR is not supported because a distributed commit can straddle a timestamp.
@@ -38,4 +59,6 @@ Restore accepts an empty target only:
 5. If the requested shard count differs, provision non-serving targets and run the normal reshard workflow.
 6. Publish services only after validation succeeds.
 
-Backups are tested against an S3-compatible MinIO deployment in KIND, including standby selection, primary fallback, interrupted uploads, missing objects, and same/different-count restore.
+The required KIND suite will use an S3-compatible MinIO deployment and cover
+standby selection, primary fallback, interrupted uploads, missing objects, and
+same/different-count restore. It is not present in the foundation release.

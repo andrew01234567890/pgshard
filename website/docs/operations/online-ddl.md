@@ -5,7 +5,14 @@ description: Non-blocking schema migration and client-visible atomic activation.
 
 # Online DDL
 
-Schema changes are submitted as durable `PgShardDDL` jobs. pgshard applies safe native operations directly and converts supported blocking rewrites into online shadow-table migrations.
+:::info Milestone 1 design contract
+The DDL job, shadow-copy and activation runtime are not implemented in the
+foundation release; see [implementation status](../project/status.md).
+:::
+
+Schema changes will be submitted as durable `PgShardDDL` jobs. The controller
+will apply safe native operations directly and convert supported blocking
+rewrites into online shadow-table migrations.
 
 ## Workflow
 

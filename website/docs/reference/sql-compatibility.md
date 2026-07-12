@@ -5,9 +5,16 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 
 # SQL compatibility
 
-The pooler speaks PostgreSQL simple and extended query protocols and supports parameter-aware routing. Compatibility depends on whether a statement can be proven to target one shard.
+:::warning Planned compatibility, not current support
+No pooler endpoint exists in the foundation release. The table below is the
+Milestone 1 acceptance contract; see [implementation status](../project/status.md).
+:::
 
-| Behavior | Milestone 1 |
+The planned pooler will speak PostgreSQL simple and extended query protocols and
+support parameter-aware routing. Compatibility depends on whether a statement
+can be proven to target one shard.
+
+| Behavior | Milestone 1 target |
 |---|---|
 | Single-shard PostgreSQL statement | Supported, subject to managed DDL/session limits |
 | Multi-row insert across shards | Supported through 2PC |

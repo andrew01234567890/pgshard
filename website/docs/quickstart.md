@@ -1,65 +1,33 @@
 ---
 title: Quickstart
 sidebar_position: 2
-description: Create a local pgshard cluster on KIND.
+description: Validate the current pgshard foundation source.
 ---
 
 # Quickstart
 
-The Milestone 1 quickstart targets a local [KIND](https://kind.sigs.k8s.io/) cluster. Commands shown here describe the intended public interface; mark incomplete commands clearly until their implementation lands.
+There is no installable pgshard cluster in the foundation release. The operator
+chart, custom resources, container build and KIND environment are planned and
+will appear here only after their end-to-end tests pass.
 
-:::info Implementation status
-The project is being built incrementally. The repository's release notes identify the first version in which each command becomes available.
-:::
+## Validate the current source
 
-## Prerequisites
-
-- A container runtime
-- `kubectl`
-- KIND
-- Helm
-- PostgreSQL `psql` 18
-
-## Create the cluster
+The supported development environment is Linux with Rust 1.97, Node.js 22 and
+Buf 1.71. From a checkout:
 
 ```bash
-kind create cluster --name pgshard
-helm install pgshard ./deploy/charts/pgshard-operator \
-  --namespace pgshard-system --create-namespace
-kubectl apply -f examples/quickstart.yaml
-kubectl wait --for=condition=Ready pgshardcluster/quickstart --timeout=10m
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+buf format --diff --exit-code
+buf lint
+buf build
+cd website
+npm ci
+npm run check
+npm audit --audit-level=high
 ```
 
-The example creates multiple shards with three PostgreSQL members per shard and two pooler replicas. For local development, reduce replicas only through the cluster resource; do not edit generated StatefulSets.
-
-## Connect
-
-```bash
-kubectl port-forward service/quickstart-rw 5432:5432
-psql 'postgresql://app@localhost:5432/app?sslmode=require'
-```
-
-Use the service that matches the workload:
-
-- `quickstart-rw` supports reads and writes through shard primaries.
-- `quickstart-ro` is read-only and uses replicas without primary fallback.
-- `quickstart-r` is read-only, prefers replicas, and can fall back to a primary.
-
-## Define a sharded table
-
-Table placement is declarative. A sharded table has one immutable shard-key column, and every primary or unique key includes that column.
-
-```yaml
-apiVersion: pgshard.io/v1alpha1
-kind: PgShardTable
-metadata:
-  name: accounts
-spec:
-  clusterRef: quickstart
-  database: app
-  schema: public
-  table: accounts
-  shardKey: account_id
-```
-
-Continue with [SQL compatibility](./reference/sql-compatibility.md) before moving an existing application.
+These commands validate contracts, core types, release policy and documentation;
+they do not start PostgreSQL or prove a sharding runtime. Follow [implementation
+status](./project/status.md) for the first version with a real cluster quickstart.

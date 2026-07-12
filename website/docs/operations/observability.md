@@ -5,7 +5,14 @@ description: Prometheus metrics, OpenTelemetry traces, Grafana dashboards, and c
 
 # Observability
 
-Every Rust service provides health, readiness, Prometheus metrics, and OTLP export. Internal gRPC propagates W3C trace context. Query values are disabled in telemetry by default.
+:::info Milestone 1 design contract
+These signals and the Grafana/Tempo test stack are planned. No runtime telemetry
+is shipped by the foundation release; see [implementation status](../project/status.md).
+:::
+
+Every Milestone 1 Rust service will expose health, readiness, Prometheus metrics,
+and OTLP export. Internal gRPC will propagate W3C trace context. Query values
+will be disabled in telemetry by default.
 
 ## Pooler signals
 
@@ -26,4 +33,8 @@ Metrics use a `pgshard_` prefix and bounded-cardinality labels. SQL text, bind v
 
 ## Included stack
 
-The distribution provides Prometheus recording rules and alerts, Grafana dashboards, and OpenTelemetry Collector examples. KIND tests install Prometheus, Grafana, Tempo, and the Collector; they execute a traced sharded transaction, retrieve it from Tempo, query pooler metrics from Prometheus, and verify dashboard and datasource health.
+The Milestone 1 distribution will provide Prometheus recording rules and alerts,
+Grafana dashboards, and OpenTelemetry Collector examples. The required KIND
+tests will install Prometheus, Grafana, Tempo, and the Collector; execute a
+traced sharded transaction; retrieve it from Tempo; query pooler metrics from
+Prometheus; and verify dashboard and datasource health.

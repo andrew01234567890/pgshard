@@ -25,11 +25,12 @@ message StreamChangesRequest {
 
 // OpenRequest selects a preconfigured stream and its initial position.
 message OpenRequest {
+  // stream_id is authoritative. Its durable configuration selects exactly one
+  // database; clients cannot override that database at open time.
   string stream_id = 1;
-  string database = 2;
-  StartMode start_mode = 3;
-  bytes resume_token = 4;
-  FlowControlRequest initial_flow_control = 5;
+  StartMode start_mode = 2;
+  bytes resume_token = 3;
+  FlowControlRequest initial_flow_control = 4;
 }
 
 // StartMode selects how an OpenRequest begins delivery.
@@ -93,12 +94,17 @@ message StreamChangesResponse {
 }
 
 // Opened confirms the resolved stream identity and delivery guarantees.
+enum DeliverySemantics {
+  DELIVERY_SEMANTICS_UNSPECIFIED = 0;
+  DELIVERY_SEMANTICS_AT_LEAST_ONCE = 1;
+}
+
 message Opened {
   string stream_id = 1;
   string cluster_id = 2;
   string database_id = 3;
   VectorPosition start_position = 4;
-  string delivery_semantics = 5;
+  DeliverySemantics delivery_semantics = 5;
 }
 
 // ShardPosition is one shard's durable logical-WAL coordinate.
@@ -108,9 +114,9 @@ message ShardPosition {
   uint64 lsn = 3;
 }
 
-// VectorPosition identifies a cluster-wide resume boundary. shard_positions are
-// ordered by shard_id for canonical token encoding. The opaque resume_token is
-// integrity protected by the server and is the value clients acknowledge.
+// VectorPosition identifies cluster-wide progress. shard_positions are ordered
+// by shard_id for canonical encoding. A VectorPosition is never itself
+// acknowledgeable: only Checkpoint.resume_token can be acknowledged.
 message VectorPosition {
   string cluster_id = 1;
   string database_id = 2;
@@ -119,7 +125,6 @@ message VectorPosition {
   uint64 schema_epoch = 5;
   uint64 reshard_journal_generation = 6;
   repeated ShardPosition shard_positions = 7;
-  bytes resume_token = 8;
 }
 
 // SnapshotBegin marks the position from which concurrent changes are retained.
@@ -203,7 +208,11 @@ message Transaction {
   string distributed_transaction_id = 3;
 }
 
-// Begin starts one shard-local transaction.
+// Begin starts one shard-local transaction. Milestone 1 buffers or spills all
+// pgoutput transaction-stream chunks until the terminal outcome is known.
+// Aborted transactions emit no Begin or row events. For a committed transaction
+// the Begin, row events, and Commit (or Prepare and CommitPrepared) are emitted
+// contiguously in source order only after commit is known.
 message Begin {
   Transaction transaction = 1;
   uint64 final_lsn = 2;
@@ -240,8 +249,9 @@ message Truncate {
   bool restart_identity = 4;
 }
 
-// Prepare marks a PostgreSQL prepared transaction. Participant events preserve
-// shard order but do not imply a globally ordered distributed commit.
+// Prepare marks a PostgreSQL prepared transaction whose final commit is already
+// known to the stream implementation. Participant events preserve shard order
+// but do not imply a globally ordered distributed commit.
 message Prepare {
   Transaction transaction = 1;
   string gid = 2;
@@ -259,7 +269,8 @@ message CommitPrepared {
   uint64 commit_time_unix_micros = 5;
 }
 
-// RollbackPrepared aborts a previously prepared shard transaction.
+// RollbackPrepared reports a prepared rollback without exposing its discarded
+// row images.
 message RollbackPrepared {
   Transaction transaction = 1;
   string gid = 2;
@@ -283,9 +294,17 @@ message Schema {
   bytes schema_fingerprint = 4;
 }
 
-// Heartbeat reports current source progress even when no rows change.
+// SourceProgress is diagnostic, non-acknowledgeable WAL progress. source_position
+// may be ahead of fully_delivered_position while a transaction is buffered.
+message SourceProgress {
+  repeated ShardPosition source_positions = 1;
+  VectorPosition fully_delivered_position = 2;
+}
+
+// Heartbeat reports diagnostic source progress even when no rows change. It
+// intentionally contains no resume token.
 message Heartbeat {
-  VectorPosition position = 1;
+  SourceProgress progress = 1;
   uint64 source_time_unix_micros = 2;
 }
 
@@ -314,12 +333,15 @@ message ReshardJournal {
   repeated ReshardMapping mappings = 5;
 }
 
-// Checkpoint is an acknowledgement boundary. Delivery after this checkpoint is
-// at least once until its resume_token is acknowledged.
+// Checkpoint is the only acknowledgement boundary. It is emitted only after all
+// transactions covered by position have emitted a terminal Commit,
+// CommitPrepared, or RollbackPrepared event. Delivery after this checkpoint is
+// at least once until resume_token is acknowledged.
 message Checkpoint {
   VectorPosition position = 1;
-  uint64 events_since_previous = 2;
-  uint64 bytes_since_previous = 3;
+  bytes resume_token = 2;
+  uint64 events_since_previous = 3;
+  uint64 bytes_since_previous = 4;
 }
 
 // ResnapshotReason explains why a prior token can no longer resume safely.

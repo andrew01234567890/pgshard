@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
+      proto: ${{ steps.detect.outputs.proto }}
       go: ${{ steps.detect.outputs.go }}
       website: ${{ steps.detect.outputs.website }}
       website_exists: ${{ steps.detect.outputs.website_exists }}
@@ -32,7 +33,7 @@ jobs:
       performance: ${{ steps.detect.outputs.performance }}
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
 
@@ -80,6 +81,7 @@ jobs:
           }
 
           rust_exists=false
+          proto_exists=false
           go_exists=false
           website_exists=false
           ui_exists=false
@@ -89,6 +91,7 @@ jobs:
           performance_exists=false
 
           [[ -f Cargo.toml ]] && rust_exists=true
+          [[ -f buf.yaml ]] && proto_exists=true
           [[ -f operator/go.mod ]] && go_exists=true
           [[ -f website/package.json ]] && website_exists=true
           [[ -f ui/package.json ]] && ui_exists=true
@@ -97,14 +100,15 @@ jobs:
           [[ -f tests/e2e/Cargo.toml ]] && kind_exists=true
           [[ -f benchmarks/Cargo.toml ]] && performance_exists=true
 
-          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^\.github/workflows/ci\.yml$'
-          emit_component go "$go_exists" '^operator/|^proto/|^\.github/workflows/ci\.yml$'
-          emit_component website "$website_exists" '^website/|^docs/|^\.github/workflows/ci\.yml$'
-          emit_component ui "$ui_exists" '^ui/|^proto/|^\.github/workflows/ci\.yml$'
-          emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^\.github/workflows/ci\.yml$'
-          emit_component images "$images_exists" '^deploy/|^Dockerfile|/Dockerfile$|^crates/|^operator/|^ui/|^\.github/workflows/ci\.yml$'
-          emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^\.github/workflows/ci\.yml$'
-          emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'
+          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^\.github/workflows/'
+          emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^\.github/workflows/'
+          emit_component go "$go_exists" '^operator/|^proto/|^\.github/workflows/'
+          emit_component website "$website_exists" '^website/|^docs/|^\.github/workflows/'
+          emit_component ui "$ui_exists" '^ui/|^proto/|^\.github/workflows/'
+          emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^\.github/workflows/'
+          emit_component images "$images_exists" '^deploy/|^Dockerfile|/Dockerfile$|^crates/|^operator/|^ui/|^\.github/workflows/'
+          emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^\.github/workflows/'
+          emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^\.github/workflows/'
           echo "website_exists=${website_exists}" >> "$GITHUB_OUTPUT"
 
   repository-policy:
@@ -112,9 +116,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out complete history
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+      - name: Select actionlint Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.5"
+          cache: false
+      - name: Validate workflow contracts
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: Validate title and public content
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -135,37 +146,6 @@ jobs:
             cargo run --locked -p pgshard-release -- validate
           fi
 
-  dependabot-automerge:
-    name: Dependabot patch auto-merge
-    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - name: Read Dependabot update metadata
-        id: metadata
-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
-        with:
-          github-token: ${{ github.token }}
-      - name: Enable checked squash auto-merge for patch updates
-        if: steps.metadata.outputs.update-type == 'version-update:semver-patch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_ID: ${{ github.event.pull_request.node_id }}
-          HEAD_OID: ${{ github.event.pull_request.head.sha }}
-          HEADLINE: ${{ github.event.pull_request.title }}
-          AUTHOR_EMAIL: 13841202+andrew01234567890@users.noreply.github.com
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh api graphql \
-            -f query='mutation($id: ID!, $headline: String!, $authorEmail: String!, $oid: GitObjectID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH, commitHeadline: $headline, authorEmail: $authorEmail, expectedHeadOid: $oid}) { pullRequest { autoMergeRequest { enabledAt } } } }' \
-            -f id="$PR_ID" \
-            -f headline="$HEADLINE" \
-            -f authorEmail="$AUTHOR_EMAIL" \
-            -f oid="$HEAD_OID"
-
   rust-static:
     name: Rust / static checks
     needs: changes
@@ -173,16 +153,25 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Select repository Rust toolchain
         run: |
           set -euo pipefail
           rustup show active-toolchain
           rustup component add rustfmt clippy
+      - name: Install pinned Rust policy tools
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+          fallback: none
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Check dependencies, licenses, and sources
+        run: cargo deny --locked check
+      - name: Check RustSec advisories
+        run: cargo audit --deny warnings
 
   rust-test:
     name: Rust / tests
@@ -191,11 +180,44 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
       - name: Select repository Rust toolchain
         run: rustup show active-toolchain
       - name: Run workspace tests
         run: cargo test --workspace --all-features --locked
+
+  protobuf:
+    name: Protobuf contracts
+    needs: changes
+    if: needs.changes.outputs.proto == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Install pinned Buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: 1.71.0
+      - name: Check formatting
+        run: buf format --diff --exit-code
+      - name: Lint contracts
+        run: buf lint
+      - name: Build descriptors
+        run: buf build
+      - name: Reject protobuf breaking changes
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git cat-file -e "$BASE_SHA:buf.yaml" 2>/dev/null; then
+            buf breaking --against ".git#ref=$BASE_SHA"
+          else
+            echo "No protobuf contract exists at the pull request base; skipping initial breaking comparison."
+          fi
 
   go-operator:
     name: Go operator
@@ -207,9 +229,9 @@ jobs:
         working-directory: operator
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: operator/go.mod
           cache-dependency-path: operator/go.sum
@@ -234,9 +256,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "22"
           cache: npm
@@ -246,22 +268,12 @@ jobs:
         run: npm ci
       - name: Run documentation checks
         working-directory: website
-        shell: bash
         run: |
-          set -euo pipefail
-          for script in lint test linkcheck; do
-            if node -e "process.exit(require('./package.json').scripts?.['$script'] ? 0 : 1)"; then
-              npm run "$script"
-            fi
-          done
-          if ! node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
-            echo "website/package.json must define a build script" >&2
-            exit 1
-          fi
-          npm run build
+          npm run check
           test -f build/index.html
+          npm audit --audit-level=high
       - name: Store Pages candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pages-site
           path: website/build
@@ -275,9 +287,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "22"
           cache: npm
@@ -309,7 +321,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Run integration suite
         env:
           PGSHARD_INTEGRATION_SUITE: ${{ matrix.suite }}
@@ -322,14 +334,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Build OCI archives without publishing
         env:
           PGSHARD_IMAGE_OUTPUT: artifacts/images
           PGSHARD_IMAGE_PUSH: "false"
         run: docker buildx bake --file deploy/docker-bake.hcl ci
       - name: Store local OCI archives
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kind-images
           path: artifacts/images/*.tar
@@ -356,10 +368,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Download local OCI archives
         if: needs.images.result == 'success'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: kind-images
           path: artifacts/images
@@ -380,7 +392,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
       - name: Run performance suite
@@ -390,7 +402,7 @@ jobs:
         run: cargo run --locked -p pgshard-bench -- --suite "$PGSHARD_PERFORMANCE_SUITE"
       - name: Store performance results
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: performance-${{ matrix.suite }}
           path: artifacts/performance/${{ matrix.suite }}
@@ -403,9 +415,9 @@ jobs:
     needs:
       - changes
       - repository-policy
-      - dependabot-automerge
       - rust-static
       - rust-test
+      - protobuf
       - go-operator
       - website
       - ui
@@ -420,9 +432,9 @@ jobs:
           JOB_RESULTS: >-
             changes=${{ needs.changes.result }}
             repository-policy=${{ needs.repository-policy.result }}
-            dependabot-automerge=${{ needs.dependabot-automerge.result }}
             rust-static=${{ needs.rust-static.result }}
             rust-test=${{ needs.rust-test.result }}
+            protobuf=${{ needs.protobuf.result }}
             go-operator=${{ needs.go-operator.result }}
             website=${{ needs.website.result }}
             ui=${{ needs.ui.result }}
@@ -456,7 +468,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Check out complete history
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
       - name: Select repository Rust toolchain
@@ -491,16 +503,16 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Configure GitHub Pages
-        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - name: Download documentation site
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: pages-site
           path: _site
       - name: Package Pages artifact
-        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: _site
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

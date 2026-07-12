@@ -5,7 +5,13 @@ description: Change the number of shards while traffic continues.
 
 # Online resharding
 
-Online resharding changes equal ranges in pgshard's versioned 64-bit hash space while applications continue to use the old routing epoch.
+:::info Milestone 1 design contract
+The copy, catch-up, journal and activation runtime are not implemented in the
+foundation release; see [implementation status](../project/status.md).
+:::
+
+Online resharding will change equal ranges in pgshard's versioned 64-bit hash
+space while applications continue to use the old routing epoch.
 
 ```mermaid
 flowchart LR

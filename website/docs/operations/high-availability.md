@@ -5,7 +5,15 @@ description: Replication, leases, fencing, promotion, restarts, and buffering.
 
 # High availability
 
-Each shard defaults to one primary and two physical streaming replicas spread across failure domains. PostgreSQL uses `synchronous_commit=on` with `ANY 1` synchronous standby acknowledgement. An explicit asynchronous policy is a durability downgrade and is surfaced as such.
+:::info Milestone 1 design contract
+The HA agent, lease integration, promotion and rolling-restart controller are not
+implemented in the foundation release; see [implementation status](../project/status.md).
+:::
+
+The target default is one primary and two physical streaming replicas per shard,
+spread across failure domains. PostgreSQL will use `synchronous_commit=on` with
+`ANY 1` synchronous standby acknowledgement. An explicit asynchronous policy is
+a durability downgrade and must be surfaced as such.
 
 ## Primary fencing
 

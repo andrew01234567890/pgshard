@@ -1,0 +1,35 @@
+name: Dependabot auto-merge
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  enable:
+    name: Enable verified patch auto-merge
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # workflow_run uses the trusted default-branch implementation. Never
+      # check out or execute the pull request head in this privileged workflow.
+      - name: Check out trusted automation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Enable auto-merge after exact-head verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: >-
+          cargo run --locked -p pgshard-release -- dependabot-automerge
+          --repository "$GITHUB_REPOSITORY" --sha "$HEAD_SHA"

@@ -5,6 +5,12 @@ description: Unit, integration, KIND, Jepsen/Elle, observability, backup, and pe
 
 # Testing strategy
 
+:::info Current boundary
+Foundation unit, contract, policy and documentation checks exist. Runtime,
+integration, KIND, Jepsen/Elle and PgBouncer comparison suites below are required
+Milestone 1 work and are not yet implemented; see [implementation status](../project/status.md).
+:::
+
 One GitHub Actions workflow fans out into independent jobs and ends in one required aggregate result. Pull requests run focused checks; scheduled invocations expand Kubernetes versions, fault duration, fuzzing, and performance samples.
 
 ## Test layers

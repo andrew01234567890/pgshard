@@ -12,5 +12,9 @@ serde.workspace = true
 thiserror.workspace = true
 xxhash-rust.workspace = true
 
+[[bench]]
+name = "routing_hash"
+harness = false
+
 [lints]
 workspace = true

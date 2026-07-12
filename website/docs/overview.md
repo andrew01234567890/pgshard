@@ -8,17 +8,24 @@ description: Learn what pgshard is, what Milestone 1 provides, and where its cor
 
 # pgshard documentation
 
-pgshard is a PostgreSQL 18 sharding platform with a latency-sensitive Rust data plane and a Kubernetes-native Go operator. It combines PostgreSQL wire-compatible routing and pooling with shard orchestration, coordinated backup/restore, online schema changes, online resharding, and `pgoutput` change streams.
+pgshard is the design and implementation of a PostgreSQL 18 sharding platform
+with a latency-sensitive Rust data plane and a Kubernetes-native Go operator.
+Milestone 1 targets PostgreSQL wire-compatible routing and pooling, shard
+orchestration, coordinated backup/restore, online schema changes, online
+resharding, and `pgoutput` change streams.
 
 :::caution Alpha milestone
-Milestone 1 is an alpha engineering target, not a production-readiness claim. Use the documented compatibility and consistency boundaries when evaluating it.
+Milestone 1 is an alpha engineering target, not a production-readiness claim.
+Most runtime features are not implemented yet. Check the [implementation
+status](./project/status.md) before using any command or guarantee.
 :::
 
 ## Choose a path
 
 | If you want to… | Start here |
 |---|---|
-| Run a development cluster | [Quickstart](./quickstart.md) |
+| Validate the current source | [Quickstart](./quickstart.md) |
+| See what is actually implemented | [Implementation status](./project/status.md) |
 | Understand component and trust boundaries | [Architecture](./concepts/architecture.md) |
 | Evaluate transaction guarantees | [Distributed transactions](./concepts/distributed-transactions.md) |
 | Check supported SQL | [SQL compatibility](./reference/sql-compatibility.md) |
@@ -27,7 +34,7 @@ Milestone 1 is an alpha engineering target, not a production-readiness claim. Us
 | Consume a cluster change stream | [Change streams](./concepts/change-streams.md) |
 | Contribute safely | [Development](./project/development.md) |
 
-## Milestone 1 invariants
+## Milestone 1 target invariants
 
 - PostgreSQL 18 is the only supported major.
 - Durable shard metadata lives in the `shardschema` database on `shard-0000`; etcd contains leases, not the authoritative shard map.

@@ -5,7 +5,16 @@ description: Components, durable state, and request paths in pgshard.
 
 # Architecture
 
-pgshard separates the latency-sensitive data path from declarative Kubernetes reconciliation. Rust components route queries, manage PostgreSQL instances, decode WAL, and recover distributed operations. The Go operator translates custom resources into cluster resources and configuration.
+:::info Target architecture
+This diagram describes the Milestone 1 target. Only the foundation items listed
+in [implementation status](../project/status.md) currently exist.
+:::
+
+The target architecture separates the latency-sensitive data path from
+declarative Kubernetes reconciliation. Rust components will route queries,
+manage PostgreSQL instances, decode WAL, and recover distributed operations. The
+Go operator will translate custom resources into cluster resources and
+configuration.
 
 ```mermaid
 flowchart LR

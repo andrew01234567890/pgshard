@@ -5,7 +5,15 @@ description: VStream-like change data capture using PostgreSQL pgoutput.
 
 # Change streams
 
-pgshard exposes a cluster change stream derived from PostgreSQL 18 `pgoutput`. It is similar in purpose to Vitess VStream: clients consume one logical stream across shards while positions remain a vector rather than an invented global WAL order.
+:::info Milestone 1 design contract
+This page specifies the required behavior. The `pgoutput` stream runtime is not
+implemented in the foundation release; see [implementation status](../project/status.md).
+:::
+
+Milestone 1 will expose a cluster change stream derived from PostgreSQL 18
+`pgoutput`. It is similar in purpose to Vitess VStream: clients consume one
+logical stream across shards while positions remain a vector rather than an
+invented global WAL order.
 
 ## Guarantees
 
@@ -14,6 +22,16 @@ pgshard exposes a cluster change stream derived from PostgreSQL 18 `pgoutput`. I
 - Never claim strict order between independent shards.
 - Carry distributed-transaction identifiers without pretending participant events are one globally ordered batch.
 - Protect resume tokens with cluster, database, configuration, epoch, timeline, per-shard LSN, and reshard-journal generation.
+
+Only a `Checkpoint` carries an acknowledgeable resume token. Heartbeats expose
+non-acknowledgeable source progress and the last fully delivered position, so a
+consumer cannot acknowledge past buffered WAL it has never received.
+
+Milestone 1 buffers or spills PostgreSQL streaming-transaction chunks until the
+terminal outcome is known. Aborted transactions expose no row events. A committed
+transaction's begin, row events and terminal commit are emitted contiguously in
+source order. Prepared rows remain buffered until `COMMIT PREPARED`; no checkpoint
+can advance beyond an unresolved prepared transaction.
 
 Consumers must durably apply a checkpoint before acknowledging it. Reconnection can replay changes after the last acknowledgement; consumers therefore need idempotency or deduplication. Exactly-once delivery is not claimed.
 

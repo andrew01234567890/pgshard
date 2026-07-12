@@ -101,11 +101,17 @@ message ExecuteOperationRequest {
   OperationEnvelope operation = 1;
 }
 
+// OperationAcceptance is the mutually exclusive result of submission.
+enum OperationAcceptance {
+  OPERATION_ACCEPTANCE_UNSPECIFIED = 0;
+  OPERATION_ACCEPTANCE_ACCEPTED = 1;
+  OPERATION_ACCEPTANCE_IDEMPOTENT_REPLAY = 2;
+}
+
 // ExecuteOperationResponse confirms durable acceptance or an idempotent replay.
 message ExecuteOperationResponse {
   string operation_id = 1;
-  bool accepted = 2;
-  bool already_exists = 3;
+  OperationAcceptance acceptance = 2;
 }
 
 // OperationState is the generic execution lifecycle.

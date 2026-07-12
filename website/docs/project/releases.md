@@ -10,12 +10,21 @@ Every successful new commit on `main` receives exactly one SemVer tag and a sour
 ## Version calculation
 
 - The first foundation squash commit is `v0.1.0`.
-- Before 1.0, `feat`, `!`, or `BREAKING CHANGE` increments the minor version.
+- Before 1.0, `feat`, `!`, or a `BREAKING CHANGE:` footer increments the minor version.
 - `fix`, `perf`, `refactor`, `revert`, `docs`, `test`, `build`, `ci`, and `chore` increment patch.
-- Promotion to 1.0 requires explicit authorization and the configured major-version label.
+- Promotion to 1.0 is an explicit maintainer decision and is not performed by the automated pre-1.0 calculator.
 - Pull request titles follow Conventional Commits because squash merge makes the title the `main` commit subject.
 
-The release job is serialized and idempotent. It creates no version-bump commit, preventing release loops. Documentation-only and CI-only default-branch commits still receive patch releases.
+The release job is serialized and idempotent. Queue order is not trusted: each
+invocation finds the nearest SemVer tag on the selected commit's first-parent
+history and publishes every untagged first-parent commit oldest-first. A
+descendant job may therefore safely run before its ancestor's job. It creates no
+version-bump commit, preventing release loops. Documentation-only and CI-only
+default-branch commits still receive patch releases.
+
+Runtime version strings are derived from the exact release tag when building a
+tagged commit. Untagged builds report a development SemVer containing the commit
+SHA; workspace package metadata is not presented as the running release version.
 
 ## Publishing boundary
 

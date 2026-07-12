@@ -5,7 +5,15 @@ description: How pgshard stores and distributes its authoritative topology.
 
 # Shard metadata and `shardschema`
 
-`shardschema` is a dedicated PostgreSQL database on stable `shard-0000`. Physical streaming replication protects it with the rest of that shard. It is authoritative for logical topology; etcd is used only for ephemeral leases and fencing.
+:::info Milestone 1 design contract
+The catalog schema and cache listener are not implemented in the foundation
+release; see [implementation status](../project/status.md).
+:::
+
+`shardschema` will be a dedicated PostgreSQL database on stable `shard-0000`.
+Physical streaming replication will protect it with the rest of that shard. It
+will be authoritative for logical topology; etcd is used only for ephemeral
+leases and fencing.
 
 ## Catalog contents
 
@@ -18,6 +26,19 @@ The internal `pgshard_catalog` schema records:
 - Backup-set manifests, CDC vector acknowledgements, and reshard journals.
 
 Password material is never stored in `shardschema`.
+
+Each cluster has one routing-hash record containing algorithm version `1` and a
+creation-time seed. Both columns are insert-only. Changing either requires an
+explicit online reshard into a new hash space; ordinary catalog updates cannot
+rewrite them. Rust golden vectors cover every supported key type, numeric and
+empty boundaries, XXH3 length boundaries, and seed extremes.
+
+Epochs, WAL positions and 64-bit range bounds use decimal strings in JSON-facing
+interfaces because JavaScript numbers cannot represent them exactly. The Rust
+core therefore does not derive generic Serde encodings for `u64`/`u128` catalog
+types. Protobuf's standard JSON mapping likewise encodes 64-bit integers as
+strings; the exclusive keyspace end `2^64` is represented by an absent optional
+range end.
 
 ## Cache protocol
 
