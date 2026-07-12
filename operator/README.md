@@ -59,8 +59,7 @@ generation commands above in a clean checkout, then run:
 git diff --exit-code -- api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac config/webhook
 ```
 
-The current repository workflow runs formatting, `go vet ./...`, and
-`go test -race ./...`. It does not yet run `go build ./...`,
-`go tool govulncheck ./...`, or the generation-and-diff sequence above; those
-are the exact remaining CI follow-up commands. No helper shell scripts or
-`hack` directory are required.
+The repository `make go-check` target and the Go operator CI job run formatting,
+module tidy/verification, `go vet ./...`, `go test -race ./...`,
+`go build ./...`, `go tool govulncheck ./...`, and the generation-and-diff
+sequence above. No helper shell scripts or `hack` directory are required.

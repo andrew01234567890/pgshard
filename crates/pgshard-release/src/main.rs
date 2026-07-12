@@ -985,6 +985,7 @@ mod tests {
     #[test]
     fn ci_guards_component_deletion_and_rust_policy_changes() {
         let workflow = include_str!("../../../.github/workflows/ci.yml");
+        let makefile = include_str!("../../../Makefile");
         for manifest in [
             "Cargo.toml",
             "buf.yaml",
@@ -1007,5 +1008,20 @@ mod tests {
                 "Rust CI trigger must include {policy}"
             );
         }
+        for command in [
+            "go mod tidy",
+            "go mod verify",
+            "go test -race ./...",
+            "go vet ./...",
+            "go build ./...",
+            "go tool govulncheck ./...",
+            "go tool controller-gen",
+        ] {
+            assert!(
+                makefile.contains(command),
+                "operator CI target must run {command}"
+            );
+        }
+        assert!(workflow.contains("run: make go-check"));
     }
 }

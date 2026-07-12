@@ -28,8 +28,10 @@ macOS and Windows development and runtime support are out of scope.
 make check
 ```
 
-This is the same Rust, RustSec, license, protobuf, documentation, actionlint and
-public-history policy used by CI. It requires Rust 1.97, cargo-deny 0.20.2,
-cargo-audit 0.22.2, Buf 1.71, Go 1.26, and Node.js 22. Go operator, UI,
-integration, KIND, performance, and Jepsen/Elle targets join this command when
-their workspaces land.
+This is the same Rust, RustSec, license, protobuf, Go operator, documentation,
+actionlint and public-history policy used by CI. It requires Rust 1.97,
+cargo-deny 0.20.2, cargo-audit 0.22.2, Buf 1.71, Go 1.26, and Node.js 22. The Go
+checks include module consistency, race tests, vet, build, vulnerability
+analysis, and reproducible controller-generated manifests. UI, integration,
+KIND, performance, and Jepsen/Elle targets join this command when their
+workspaces land.

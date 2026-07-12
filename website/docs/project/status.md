@@ -15,8 +15,9 @@ in the same pull request whenever implementation status changes.
 | Control and change-stream contracts | Buf-linted alpha protobuf definitions | Implemented in source |
 | Public-repository, CI and release policy | Parallel CI, privacy audit, source-only SemVer tooling | Implemented in source |
 | Documentation site | Typed Docusaurus build and link validation | Implemented in source |
-| Go operator and Kubernetes resources | No merged runtime or installable manifests | Planned |
-| PostgreSQL lifecycle and HA | No merged agent, fencing, promotion or restart controller | Planned |
+| Go operator API and supporting resources | Defaulting/validation, generated CRD/RBAC/webhook, deterministic ConfigMaps/Services/workloads/HPA/PDB/NetworkPolicy, pruning and fake-client tests | Implemented in source; deliberately not a database cluster |
+| Rust agent and orchestrator foundations | Linux HTTP health/readiness/status/metrics, exact integer reporting, fail-closed fencing/lease models; orchestrator persistence remains disabled | Implemented in source; deliberately not ready for control traffic |
+| PostgreSQL lifecycle and HA | No bootstrap, physical replication, durable lease integration, promotion or restart controller | Planned |
 | Pooling and SQL routing | No PostgreSQL wire endpoint | Planned |
 | `shardschema` catalog and cache | No catalog migrations or listener | Planned |
 | Cross-shard 2PC and recovery | Design only; no executable coordinator | Planned |
@@ -27,6 +28,8 @@ in the same pull request whenever implementation status changes.
 | Admin UI, Prometheus and OpenTelemetry | Design only | Planned |
 | KIND, Jepsen/Elle and PgBouncer comparison | Test plan only | Planned |
 
-No development cluster can be installed from the foundation source alone. No
+No development database cluster can be installed from the current source. The
+operator does not create PostgreSQL Pods or PVCs, the pooler has no wire
+endpoint, and supporting Services are not usable application endpoints. No
 runtime correctness, availability or performance guarantee is claimed until its
 implementation and required tests are merged and listed here.
