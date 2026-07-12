@@ -5,6 +5,7 @@
 //! before invoking this hot-path core.
 
 use pgshard_catalog::{CatalogSnapshot, DatabaseId, ShardKeyType, TableName};
+pub use pgshard_pgwire::{ClientEncoding, ClientEncodingError};
 use pgshard_types::{CatalogEpoch, RoutingHashV1, ShardId, ShardKey};
 use thiserror::Error;
 
@@ -16,42 +17,6 @@ pub enum ParameterFormat {
     /// `PostgreSQL` binary format.
     Binary,
 }
-
-/// Proof that the frontend session is pinned to `PostgreSQL`'s canonical `UTF8`
-/// client encoding.
-///
-/// The pooler must rebuild this token from authoritative session state after
-/// startup and after every accepted setting change. It must reject any attempt
-/// to select another encoding before routing or forwarding more statements.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClientEncoding {
-    _private: (),
-}
-
-impl ClientEncoding {
-    /// Validates `PostgreSQL`'s canonical reported client-encoding name.
-    ///
-    /// Aliases and case variants are deliberately rejected. The session layer
-    /// obtains this value from canonical PostgreSQL-compatible state, not
-    /// directly from untrusted startup bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless `value` is exactly `UTF8`.
-    pub fn require_utf8(value: &str) -> Result<Self, ClientEncodingError> {
-        if value == "UTF8" {
-            Ok(Self { _private: () })
-        } else {
-            Err(ClientEncodingError)
-        }
-    }
-}
-
-/// A session selected an encoding whose `PostgreSQL` conversion semantics are
-/// not implemented by the router.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-#[error("pooler sessions must use canonical PostgreSQL client_encoding UTF8")]
-pub struct ClientEncodingError;
 
 /// Immutable result attached to a planned request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

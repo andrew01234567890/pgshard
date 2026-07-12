@@ -4,7 +4,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use pgshard_pgwire::{
-    DEFAULT_LARGE_MESSAGE_LENGTH, Decode, FrontendPhase, decode_bind, decode_frontend,
+    ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, FrontendPhase, decode_bind,
+    decode_frontend,
 };
 
 const ITERATIONS: u64 = 5_000_000;
@@ -39,6 +40,7 @@ fn fixture() -> Vec<u8> {
 
 fn main() {
     let frame = fixture();
+    let client_encoding = ClientEncoding::require_utf8("UTF8").expect("UTF8");
     let started = Instant::now();
     let mut digest = 0_usize;
     for _ in 0..ITERATIONS {
@@ -50,7 +52,7 @@ fn main() {
         .expect("frame decode") else {
             panic!("complete benchmark frame was incomplete");
         };
-        let bind = decode_bind(frame).expect("bind decode");
+        let bind = decode_bind(frame, client_encoding).expect("bind decode");
         for parameter in bind.parameters().iter() {
             digest = digest.wrapping_add(parameter.value().map_or(0, <[u8]>::len));
         }

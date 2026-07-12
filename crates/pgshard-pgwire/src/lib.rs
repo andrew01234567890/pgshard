@@ -40,6 +40,37 @@ const fn protocol_code(major: u16, minor: u16) -> u32 {
     (major as u32) << 16 | minor as u32
 }
 
+/// Proof that the frontend session is pinned to `PostgreSQL`'s canonical
+/// `UTF8` client encoding.
+///
+/// The session layer must rebuild this token from authoritative state after
+/// startup and every accepted setting change. It must reject any attempt to
+/// select another encoding before decoding more query-protocol bodies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientEncoding {
+    _private: (),
+}
+
+impl ClientEncoding {
+    /// Validates `PostgreSQL`'s canonical reported client-encoding name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `value` is exactly `UTF8`.
+    pub fn require_utf8(value: &str) -> Result<Self, ClientEncodingError> {
+        if value == "UTF8" {
+            Ok(Self { _private: () })
+        } else {
+            Err(ClientEncodingError)
+        }
+    }
+}
+
+/// A session selected an encoding whose conversion semantics are unsupported.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("pooler sessions must use canonical PostgreSQL client_encoding UTF8")]
+pub struct ClientEncodingError;
+
 /// Result of attempting to decode one complete frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Decode<T> {

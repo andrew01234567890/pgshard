@@ -1,44 +1,52 @@
 //! Zero-copy `PostgreSQL` 18 frontend message-body decoding.
 
+use std::fmt;
+
 use thiserror::Error;
 
-use crate::{FrontendFrame, FrontendTag};
+use crate::{ClientEncoding, FrontendFrame, FrontendTag};
 
 /// Simple-query message body.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct QueryMessage<'a> {
-    query: &'a [u8],
+    query: &'a str,
 }
 
 impl<'a> QueryMessage<'a> {
-    /// Returns the query bytes without their wire terminator.
-    ///
-    /// The session layer must validate them against its pinned client encoding
-    /// before SQL parsing.
+    /// Returns the UTF-8 query without its wire terminator.
     #[must_use]
-    pub const fn query(self) -> &'a [u8] {
+    pub const fn query(self) -> &'a str {
         self.query
     }
 }
 
+impl fmt::Debug for QueryMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QueryMessage")
+            .field("query_length", &self.query.len())
+            .finish()
+    }
+}
+
 /// Extended-query `Parse` message body.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct ParseMessage<'a> {
-    statement_name: &'a [u8],
-    query: &'a [u8],
+    statement_name: &'a str,
+    query: &'a str,
     parameter_type_bytes: &'a [u8],
 }
 
 impl<'a> ParseMessage<'a> {
     /// Returns the prepared-statement name; empty denotes the unnamed statement.
     #[must_use]
-    pub const fn statement_name(self) -> &'a [u8] {
+    pub const fn statement_name(self) -> &'a str {
         self.statement_name
     }
 
-    /// Returns SQL bytes without their wire terminator.
+    /// Returns the UTF-8 SQL text without its wire terminator.
     #[must_use]
-    pub const fn query(self) -> &'a [u8] {
+    pub const fn query(self) -> &'a str {
         self.query
     }
 
@@ -57,8 +65,19 @@ impl<'a> ParseMessage<'a> {
     }
 }
 
+impl fmt::Debug for ParseMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParseMessage")
+            .field("statement_name_length", &self.statement_name.len())
+            .field("query_length", &self.query.len())
+            .field("parameter_type_count", &self.parameter_type_count())
+            .finish()
+    }
+}
+
 /// Iterator over big-endian parameter type OIDs.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ParameterTypeIter<'a> {
     remaining: &'a [u8],
 }
@@ -100,10 +119,10 @@ impl FormatCode {
 }
 
 /// Extended-query `Bind` message body.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct BindMessage<'a> {
-    portal_name: &'a [u8],
-    statement_name: &'a [u8],
+    portal_name: &'a str,
+    statement_name: &'a str,
     parameters: BindParameters<'a>,
     result_format_bytes: &'a [u8],
 }
@@ -111,13 +130,13 @@ pub struct BindMessage<'a> {
 impl<'a> BindMessage<'a> {
     /// Returns the portal name; empty denotes the unnamed portal.
     #[must_use]
-    pub const fn portal_name(self) -> &'a [u8] {
+    pub const fn portal_name(self) -> &'a str {
         self.portal_name
     }
 
     /// Returns the prepared-statement name; empty denotes the unnamed statement.
     #[must_use]
-    pub const fn statement_name(self) -> &'a [u8] {
+    pub const fn statement_name(self) -> &'a str {
         self.statement_name
     }
 
@@ -142,12 +161,33 @@ impl<'a> BindMessage<'a> {
     }
 }
 
+impl fmt::Debug for BindMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BindMessage")
+            .field("portal_name_length", &self.portal_name.len())
+            .field("statement_name_length", &self.statement_name.len())
+            .field("parameter_count", &self.parameters.len())
+            .field("result_format_count", &self.result_format_count())
+            .finish()
+    }
+}
+
 /// Validated zero-copy bound parameter collection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct BindParameters<'a> {
     format_bytes: &'a [u8],
     value_bytes: &'a [u8],
     count: u16,
+}
+
+impl fmt::Debug for BindParameters<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BindParameters")
+            .field("parameter_count", &self.len())
+            .finish()
+    }
 }
 
 impl<'a> BindParameters<'a> {
@@ -176,10 +216,21 @@ impl<'a> BindParameters<'a> {
 }
 
 /// One bound parameter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct BindParameter<'a> {
     format: FormatCode,
     value: Option<&'a [u8]>,
+}
+
+impl fmt::Debug for BindParameter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BindParameter")
+            .field("format", &self.format)
+            .field("is_null", &self.value.is_none())
+            .field("value_length", &self.value.map(<[u8]>::len))
+            .finish()
+    }
 }
 
 impl<'a> BindParameter<'a> {
@@ -197,7 +248,7 @@ impl<'a> BindParameter<'a> {
 }
 
 /// Iterator over validated bound parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BindParameterIter<'a> {
     format_bytes: &'a [u8],
     value_bytes: &'a [u8],
@@ -252,7 +303,7 @@ impl<'a> Iterator for BindParameterIter<'a> {
 impl ExactSizeIterator for BindParameterIter<'_> {}
 
 /// Iterator over validated format codes.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FormatCodeIter<'a> {
     remaining: &'a [u8],
 }
@@ -278,16 +329,16 @@ impl Iterator for FormatCodeIter<'_> {
 impl ExactSizeIterator for FormatCodeIter<'_> {}
 
 /// Extended-query `Execute` message body.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct ExecuteMessage<'a> {
-    portal_name: &'a [u8],
+    portal_name: &'a str,
     max_rows: u32,
 }
 
 impl<'a> ExecuteMessage<'a> {
     /// Returns the portal name; empty denotes the unnamed portal.
     #[must_use]
-    pub const fn portal_name(self) -> &'a [u8] {
+    pub const fn portal_name(self) -> &'a str {
         self.portal_name
     }
 
@@ -298,15 +349,28 @@ impl<'a> ExecuteMessage<'a> {
     }
 }
 
+impl fmt::Debug for ExecuteMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecuteMessage")
+            .field("portal_name_length", &self.portal_name.len())
+            .field("max_rows", &self.max_rows)
+            .finish()
+    }
+}
+
 /// Decodes a complete simple-query body.
 ///
 /// # Errors
 ///
 /// Rejects the wrong frame tag, a missing string terminator, or trailing data.
-pub fn decode_query(frame: FrontendFrame<'_>) -> Result<QueryMessage<'_>, MessageError> {
+pub fn decode_query(
+    frame: FrontendFrame<'_>,
+    _client_encoding: ClientEncoding,
+) -> Result<QueryMessage<'_>, MessageError> {
     require_tag(frame, FrontendTag::Query)?;
     let mut cursor = Cursor::new(frame.body());
-    let query = cursor.cstring("query")?;
+    let query = cursor.cstring_utf8("query")?;
     cursor.finish()?;
     Ok(QueryMessage { query })
 }
@@ -317,11 +381,14 @@ pub fn decode_query(frame: FrontendFrame<'_>) -> Result<QueryMessage<'_>, Messag
 ///
 /// Rejects the wrong tag, missing strings/counts/OIDs, arithmetic overflow, or
 /// trailing bytes.
-pub fn decode_parse(frame: FrontendFrame<'_>) -> Result<ParseMessage<'_>, MessageError> {
+pub fn decode_parse(
+    frame: FrontendFrame<'_>,
+    _client_encoding: ClientEncoding,
+) -> Result<ParseMessage<'_>, MessageError> {
     require_tag(frame, FrontendTag::Parse)?;
     let mut cursor = Cursor::new(frame.body());
-    let statement_name = cursor.cstring("statement name")?;
-    let query = cursor.cstring("query")?;
+    let statement_name = cursor.cstring_utf8("statement name")?;
+    let query = cursor.cstring_utf8("query")?;
     let count = usize::from(cursor.u16("parameter type count")?);
     let byte_count = count.checked_mul(4).ok_or(MessageError::LengthOverflow)?;
     let parameter_type_bytes = cursor.take(byte_count, "parameter type OIDs")?;
@@ -339,11 +406,14 @@ pub fn decode_parse(frame: FrontendFrame<'_>) -> Result<ParseMessage<'_>, Messag
 ///
 /// Rejects the wrong tag, truncated or negative non-NULL values, unsupported
 /// format codes, format/parameter count mismatches, overflow, or trailing data.
-pub fn decode_bind(frame: FrontendFrame<'_>) -> Result<BindMessage<'_>, MessageError> {
+pub fn decode_bind(
+    frame: FrontendFrame<'_>,
+    _client_encoding: ClientEncoding,
+) -> Result<BindMessage<'_>, MessageError> {
     require_tag(frame, FrontendTag::Bind)?;
     let mut cursor = Cursor::new(frame.body());
-    let portal_name = cursor.cstring("portal name")?;
-    let statement_name = cursor.cstring("statement name")?;
+    let portal_name = cursor.cstring_utf8("portal name")?;
+    let statement_name = cursor.cstring_utf8("statement name")?;
 
     let format_count = usize::from(cursor.u16("parameter format count")?);
     let format_byte_count = format_count
@@ -400,15 +470,19 @@ pub fn decode_bind(frame: FrontendFrame<'_>) -> Result<BindMessage<'_>, MessageE
 ///
 /// Rejects the wrong tag, a missing portal terminator/row count, or trailing
 /// bytes.
-pub fn decode_execute(frame: FrontendFrame<'_>) -> Result<ExecuteMessage<'_>, MessageError> {
+pub fn decode_execute(
+    frame: FrontendFrame<'_>,
+    _client_encoding: ClientEncoding,
+) -> Result<ExecuteMessage<'_>, MessageError> {
     require_tag(frame, FrontendTag::Execute)?;
     let mut cursor = Cursor::new(frame.body());
-    let portal_name = cursor.cstring("portal name")?;
+    let portal_name = cursor.cstring_utf8("portal name")?;
     let max_rows = cursor.i32("maximum rows")?;
-    if max_rows < 0 {
-        return Err(MessageError::InvalidMaximumRows(max_rows));
-    }
-    let max_rows = u32::try_from(max_rows).map_err(|_| MessageError::LengthOverflow)?;
+    let max_rows = if max_rows <= 0 {
+        0
+    } else {
+        u32::try_from(max_rows).map_err(|_| MessageError::LengthOverflow)?
+    };
     cursor.finish()?;
     Ok(ExecuteMessage {
         portal_name,
@@ -463,7 +537,7 @@ impl<'a> Cursor<'a> {
         self.position
     }
 
-    fn cstring(&mut self, field: &'static str) -> Result<&'a [u8], MessageError> {
+    fn cstring_utf8(&mut self, field: &'static str) -> Result<&'a str, MessageError> {
         let remaining = &self.bytes[self.position..];
         let end = remaining
             .iter()
@@ -471,7 +545,7 @@ impl<'a> Cursor<'a> {
             .ok_or(MessageError::MissingTerminator(field))?;
         let value = &remaining[..end];
         self.position += end + 1;
-        Ok(value)
+        std::str::from_utf8(value).map_err(|_| MessageError::InvalidUtf8(field))
     }
 
     fn u16(&mut self, field: &'static str) -> Result<u16, MessageError> {
@@ -520,6 +594,9 @@ pub enum MessageError {
     /// A zero-terminated field has no terminator in the frame body.
     #[error("{0} is missing its zero terminator")]
     MissingTerminator(&'static str),
+    /// A protocol C-string is not valid under pinned `client_encoding=UTF8`.
+    #[error("{0} is not valid UTF8")]
+    InvalidUtf8(&'static str),
     /// A fixed-width or length-prefixed field extends beyond the frame body.
     #[error("{0} is truncated")]
     Truncated(&'static str),
@@ -540,9 +617,6 @@ pub enum MessageError {
     /// A parameter length is negative but not the NULL sentinel `-1`.
     #[error("invalid bind parameter length {0}")]
     InvalidParameterLength(i32),
-    /// An execute row limit has its sign bit set.
-    #[error("invalid execute maximum row count {0}")]
-    InvalidMaximumRows(i32),
     /// Valid fields did not consume the exact frame body.
     #[error("message has {0} trailing bytes")]
     TrailingData(usize),
@@ -551,6 +625,10 @@ pub enum MessageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn utf8() -> ClientEncoding {
+        ClientEncoding::require_utf8("UTF8").expect("UTF8")
+    }
 
     fn frame(tag: u8, body: &[u8]) -> FrontendFrame<'_> {
         FrontendFrame {
@@ -569,29 +647,33 @@ mod tests {
 
     #[test]
     fn decodes_query_parse_and_execute_exactly() {
-        let query = decode_query(frame(b'Q', b"select 1\0")).expect("query");
-        assert_eq!(query.query(), b"select 1");
+        let query = decode_query(frame(b'Q', b"select 1\0"), utf8()).expect("query");
+        assert_eq!(query.query(), "select 1");
 
         let mut parse_body = b"find\0select * from t where id = $1\0".to_vec();
         push_i16(&mut parse_body, 2);
         parse_body.extend_from_slice(&20_u32.to_be_bytes());
         parse_body.extend_from_slice(&0_u32.to_be_bytes());
-        let parse = decode_parse(frame(b'P', &parse_body)).expect("parse");
-        assert_eq!(parse.statement_name(), b"find");
+        let parse = decode_parse(frame(b'P', &parse_body), utf8()).expect("parse");
+        assert_eq!(parse.statement_name(), "find");
         assert_eq!(parse.parameter_types().collect::<Vec<_>>(), vec![20, 0]);
 
         let mut execute_body = b"portal\0".to_vec();
         execute_body.extend_from_slice(&42_u32.to_be_bytes());
-        let execute = decode_execute(frame(b'E', &execute_body)).expect("execute");
-        assert_eq!(execute.portal_name(), b"portal");
+        let execute = decode_execute(frame(b'E', &execute_body), utf8()).expect("execute");
+        assert_eq!(execute.portal_name(), "portal");
         assert_eq!(execute.max_rows(), 42);
 
-        let mut negative_execute = b"portal\0".to_vec();
-        push_i32(&mut negative_execute, -1);
-        assert_eq!(
-            decode_execute(frame(b'E', &negative_execute)),
-            Err(MessageError::InvalidMaximumRows(-1))
-        );
+        for maximum_rows in [-1, i32::MIN] {
+            let mut negative_execute = b"portal\0".to_vec();
+            push_i32(&mut negative_execute, maximum_rows);
+            assert_eq!(
+                decode_execute(frame(b'E', &negative_execute), utf8())
+                    .expect("PostgreSQL normalizes nonpositive limits")
+                    .max_rows(),
+                0
+            );
+        }
     }
 
     #[test]
@@ -610,9 +692,9 @@ mod tests {
         push_i16(&mut body, 0);
         push_i16(&mut body, 1);
 
-        let bind = decode_bind(frame(b'B', &body)).expect("bind");
-        assert_eq!(bind.portal_name(), b"portal");
-        assert_eq!(bind.statement_name(), b"statement");
+        let bind = decode_bind(frame(b'B', &body), utf8()).expect("bind");
+        assert_eq!(bind.portal_name(), "portal");
+        assert_eq!(bind.statement_name(), "statement");
         assert_eq!(
             bind.parameters().iter().collect::<Vec<_>>(),
             vec![
@@ -658,7 +740,7 @@ mod tests {
         .expect("frame") else {
             panic!("complete frame was incomplete");
         };
-        let bind = decode_bind(frame).expect("bind");
+        let bind = decode_bind(frame, utf8()).expect("bind");
         assert_eq!(consumed, bytes.len());
         assert_eq!(
             bind.parameters().iter().next(),
@@ -698,7 +780,7 @@ mod tests {
             push_i32(&mut body, 1);
             body.push(b'b');
             push_i16(&mut body, 0);
-            let actual = decode_bind(frame(b'B', &body))
+            let actual = decode_bind(frame(b'B', &body), utf8())
                 .expect("bind")
                 .parameters()
                 .iter()
@@ -716,7 +798,7 @@ mod tests {
         push_i16(&mut mismatch, 1);
         push_i16(&mut mismatch, 1);
         assert!(matches!(
-            decode_bind(frame(b'B', &mismatch)),
+            decode_bind(frame(b'B', &mismatch), utf8()),
             Err(MessageError::ParameterFormatCountMismatch { .. })
         ));
 
@@ -726,7 +808,7 @@ mod tests {
         push_i16(&mut invalid_format, 0);
         push_i16(&mut invalid_format, 0);
         assert_eq!(
-            decode_bind(frame(b'B', &invalid_format)),
+            decode_bind(frame(b'B', &invalid_format), utf8()),
             Err(MessageError::InvalidFormatCode(2))
         );
 
@@ -735,7 +817,7 @@ mod tests {
         push_i16(&mut negative, 1);
         push_i32(&mut negative, -2);
         assert_eq!(
-            decode_bind(frame(b'B', &negative)),
+            decode_bind(frame(b'B', &negative), utf8()),
             Err(MessageError::InvalidParameterLength(-2))
         );
     }
@@ -746,7 +828,7 @@ mod tests {
         push_i16(&mut parse, 1);
         parse.extend_from_slice(&20_u32.to_be_bytes());
         for split in 0..parse.len() {
-            assert!(decode_parse(frame(b'P', &parse[..split])).is_err());
+            assert!(decode_parse(frame(b'P', &parse[..split]), utf8()).is_err());
         }
 
         let mut bind = b"portal\0statement\0".to_vec();
@@ -758,23 +840,90 @@ mod tests {
         push_i16(&mut bind, 1);
         push_i16(&mut bind, 0);
         for split in 0..bind.len() {
-            assert!(decode_bind(frame(b'B', &bind[..split])).is_err());
+            assert!(decode_bind(frame(b'B', &bind[..split]), utf8()).is_err());
         }
     }
 
     #[test]
     fn typed_decoders_reject_wrong_tags_and_trailing_bytes() {
         assert!(matches!(
-            decode_query(frame(b'P', b"\0\0\0\0")),
+            decode_query(frame(b'P', b"\0\0\0\0"), utf8()),
             Err(MessageError::WrongTag { .. })
         ));
         assert_eq!(
-            decode_query(frame(b'Q', b"select 1\0x")),
+            decode_query(frame(b'Q', b"select 1\0x"), utf8()),
             Err(MessageError::TrailingData(1))
         );
         assert_eq!(
             require_empty_body(frame(b'S', b"x")),
             Err(MessageError::TrailingData(1))
         );
+    }
+
+    #[test]
+    fn every_query_protocol_cstring_requires_valid_utf8() {
+        assert_eq!(
+            decode_query(frame(b'Q', b"\xff\0"), utf8()),
+            Err(MessageError::InvalidUtf8("query"))
+        );
+
+        let mut parse_statement = b"\xff\0select 1\0".to_vec();
+        push_i16(&mut parse_statement, 0);
+        assert_eq!(
+            decode_parse(frame(b'P', &parse_statement), utf8()),
+            Err(MessageError::InvalidUtf8("statement name"))
+        );
+        let mut parse_query = b"name\0\xff\0".to_vec();
+        push_i16(&mut parse_query, 0);
+        assert_eq!(
+            decode_parse(frame(b'P', &parse_query), utf8()),
+            Err(MessageError::InvalidUtf8("query"))
+        );
+
+        let mut bind_portal = b"\xff\0statement\0".to_vec();
+        push_i16(&mut bind_portal, 0);
+        push_i16(&mut bind_portal, 0);
+        push_i16(&mut bind_portal, 0);
+        assert_eq!(
+            decode_bind(frame(b'B', &bind_portal), utf8()),
+            Err(MessageError::InvalidUtf8("portal name"))
+        );
+        let mut bind_statement = b"portal\0\xff\0".to_vec();
+        push_i16(&mut bind_statement, 0);
+        push_i16(&mut bind_statement, 0);
+        push_i16(&mut bind_statement, 0);
+        assert_eq!(
+            decode_bind(frame(b'B', &bind_statement), utf8()),
+            Err(MessageError::InvalidUtf8("statement name"))
+        );
+
+        let mut execute = b"\xff\0".to_vec();
+        push_i32(&mut execute, 0);
+        assert_eq!(
+            decode_execute(frame(b'E', &execute), utf8()),
+            Err(MessageError::InvalidUtf8("portal name"))
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_sql_names_and_bind_values() {
+        let query = decode_query(frame(b'Q', b"do-not-log-this\0"), utf8()).expect("query");
+        assert!(!format!("{query:?}").contains("do-not-log-this"));
+
+        let mut parse_body = b"do-not-log-this\0do-not-log-this\0".to_vec();
+        push_i16(&mut parse_body, 0);
+        let parse = decode_parse(frame(b'P', &parse_body), utf8()).expect("parse");
+        assert!(!format!("{parse:?}").contains("do-not-log-this"));
+
+        let mut bind_body = b"do-not-log-this\0do-not-log-this\0".to_vec();
+        push_i16(&mut bind_body, 0);
+        push_i16(&mut bind_body, 1);
+        push_i32(&mut bind_body, 15);
+        bind_body.extend_from_slice(b"do-not-log-this");
+        push_i16(&mut bind_body, 0);
+        let bind = decode_bind(frame(b'B', &bind_body), utf8()).expect("bind");
+        let bind_debug = format!("{bind:?} {:?}", bind.parameters().iter().next());
+        assert!(!bind_debug.contains("do-not-log-this"));
+        assert!(bind_debug.contains("value_length"));
     }
 }
