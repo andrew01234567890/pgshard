@@ -1,0 +1,19 @@
+[package]
+name = "pgshard-pgwire"
+description = "Bounded zero-copy PostgreSQL 18 frontend frame decoder for pgshard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+
+[[bench]]
+name = "decode_frontend"
+harness = false
+
+[lints]
+workspace = true
