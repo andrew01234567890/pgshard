@@ -1,0 +1,348 @@
+syntax = "proto3";
+
+package pgshard.stream.v1;
+
+// ChangeStream exposes a durable, cluster-wide change feed backed by PostgreSQL
+// pgoutput. Delivery is at least once from the last acknowledged checkpoint.
+// Events retain transaction order within a shard, but no global ordering across
+// shards is promised.
+service ChangeStream {
+  // StreamChanges opens one logical stream and exchanges flow-control and
+  // checkpoint acknowledgements while events are delivered.
+  rpc StreamChanges(stream StreamChangesRequest) returns (stream StreamChangesResponse);
+}
+
+// StreamChangesRequest is a client-to-server stream control message. Open must
+// be the first message and may occur only once.
+message StreamChangesRequest {
+  oneof request {
+    OpenRequest open = 1;
+    AcknowledgeRequest acknowledge = 2;
+    FlowControlRequest flow_control = 3;
+    CloseRequest close = 4;
+  }
+}
+
+// OpenRequest selects a preconfigured stream and its initial position.
+message OpenRequest {
+  string stream_id = 1;
+  string database = 2;
+  StartMode start_mode = 3;
+  bytes resume_token = 4;
+  FlowControlRequest initial_flow_control = 5;
+}
+
+// StartMode selects how an OpenRequest begins delivery.
+enum StartMode {
+  START_MODE_UNSPECIFIED = 0;
+  // Begin with changes committed after the stream is opened.
+  START_MODE_LATEST = 1;
+  // Emit a coordinated snapshot and then changes without an unreported gap.
+  START_MODE_SNAPSHOT = 2;
+  // Resume after the checkpoint encoded by OpenRequest.resume_token.
+  START_MODE_RESUME = 3;
+}
+
+// AcknowledgeRequest confirms that the client durably processed a checkpoint.
+// The server may advance replication-slot feedback no further than this token.
+message AcknowledgeRequest {
+  bytes resume_token = 1;
+}
+
+// FlowControlRequest bounds data sent but not covered by an acknowledgement.
+// Zero values request the stream's configured defaults.
+message FlowControlRequest {
+  uint64 max_unacknowledged_events = 1;
+  uint64 max_unacknowledged_bytes = 2;
+}
+
+// CloseRequest asks the server to finish the RPC without deleting durable stream
+// state or its last acknowledged checkpoint.
+message CloseRequest {
+  string reason = 1;
+}
+
+// StreamChangesResponse contains exactly one stream lifecycle or data event.
+message StreamChangesResponse {
+  // Monotonically increases for this RPC only and resets after reconnect.
+  uint64 sequence = 1;
+  uint64 emitted_at_unix_micros = 2;
+
+  oneof event {
+    Opened opened = 10;
+    SnapshotBegin snapshot_begin = 11;
+    Relation relation = 12;
+    SnapshotRow snapshot_row = 13;
+    SnapshotComplete snapshot_complete = 14;
+    Begin begin = 15;
+    Insert insert = 16;
+    Update update = 17;
+    Delete delete = 18;
+    Truncate truncate = 19;
+    Prepare prepare = 20;
+    CommitPrepared commit_prepared = 21;
+    RollbackPrepared rollback_prepared = 22;
+    Commit commit = 23;
+    Schema schema = 24;
+    Heartbeat heartbeat = 25;
+    ReshardJournal reshard_journal = 26;
+    Checkpoint checkpoint = 27;
+    ResnapshotRequired resnapshot_required = 28;
+    StreamError error = 29;
+  }
+}
+
+// Opened confirms the resolved stream identity and delivery guarantees.
+message Opened {
+  string stream_id = 1;
+  string cluster_id = 2;
+  string database_id = 3;
+  VectorPosition start_position = 4;
+  string delivery_semantics = 5;
+}
+
+// ShardPosition is one shard's durable logical-WAL coordinate.
+message ShardPosition {
+  string shard_id = 1;
+  uint32 timeline = 2;
+  uint64 lsn = 3;
+}
+
+// VectorPosition identifies a cluster-wide resume boundary. shard_positions are
+// ordered by shard_id for canonical token encoding. The opaque resume_token is
+// integrity protected by the server and is the value clients acknowledge.
+message VectorPosition {
+  string cluster_id = 1;
+  string database_id = 2;
+  bytes stream_configuration_hash = 3;
+  uint64 routing_epoch = 4;
+  uint64 schema_epoch = 5;
+  uint64 reshard_journal_generation = 6;
+  repeated ShardPosition shard_positions = 7;
+  bytes resume_token = 8;
+}
+
+// SnapshotBegin marks the position from which concurrent changes are retained.
+message SnapshotBegin {
+  VectorPosition position = 1;
+}
+
+// ReplicaIdentity describes which old tuple data pgoutput can provide.
+enum ReplicaIdentity {
+  REPLICA_IDENTITY_UNSPECIFIED = 0;
+  REPLICA_IDENTITY_DEFAULT = 1;
+  REPLICA_IDENTITY_NOTHING = 2;
+  REPLICA_IDENTITY_FULL = 3;
+  REPLICA_IDENTITY_INDEX = 4;
+}
+
+// Relation describes a table version used by subsequent tuple events.
+message Relation {
+  string shard_id = 1;
+  uint32 relation_id = 2;
+  string namespace = 3;
+  string name = 4;
+  ReplicaIdentity replica_identity = 5;
+  repeated RelationField fields = 6;
+  uint64 schema_epoch = 7;
+}
+
+// RelationField is a PostgreSQL column in relation order.
+message RelationField {
+  uint32 index = 1;
+  string name = 2;
+  uint32 type_oid = 3;
+  int32 type_modifier = 4;
+  bool is_replica_identity = 5;
+}
+
+// ColumnValue is a PostgreSQL text-format tuple value. OID and type_modifier are
+// repeated here so an event remains unambiguous if relation metadata is cached
+// independently. unchanged_toast means the prior toasted value was not sent;
+// it is not SQL NULL or an empty value.
+message ColumnValue {
+  uint32 column_index = 1;
+  uint32 type_oid = 2;
+  int32 type_modifier = 3;
+
+  oneof content {
+    bytes value = 10;
+    NullValue null = 11;
+    UnchangedToastValue unchanged_toast = 12;
+  }
+}
+
+// NullValue explicitly represents SQL NULL.
+message NullValue {}
+
+// UnchangedToastValue explicitly represents pgoutput's unchanged-TOAST marker.
+message UnchangedToastValue {}
+
+// Tuple is one complete or replica-identity PostgreSQL tuple image.
+message Tuple {
+  repeated ColumnValue columns = 1;
+}
+
+// SnapshotRow is a row copied from a shard's exported snapshot.
+message SnapshotRow {
+  string shard_id = 1;
+  uint32 relation_id = 2;
+  Tuple row = 3;
+}
+
+// SnapshotComplete transitions the stream from copied rows to retained changes.
+message SnapshotComplete {
+  VectorPosition change_start_position = 1;
+}
+
+// Transaction identifies a transaction within one PostgreSQL shard.
+message Transaction {
+  string shard_id = 1;
+  uint32 xid = 2;
+  // Set for participants of a pgshard distributed transaction.
+  string distributed_transaction_id = 3;
+}
+
+// Begin starts one shard-local transaction.
+message Begin {
+  Transaction transaction = 1;
+  uint64 final_lsn = 2;
+  uint64 commit_time_unix_micros = 3;
+}
+
+// Insert carries a new tuple image.
+message Insert {
+  Transaction transaction = 1;
+  uint32 relation_id = 2;
+  Tuple new_row = 3;
+}
+
+// Update carries the available old identity and the new tuple image.
+message Update {
+  Transaction transaction = 1;
+  uint32 relation_id = 2;
+  Tuple old_key = 3;
+  Tuple new_row = 4;
+}
+
+// Delete carries the old replica-identity tuple.
+message Delete {
+  Transaction transaction = 1;
+  uint32 relation_id = 2;
+  Tuple old_key = 3;
+}
+
+// Truncate carries all relations affected by one pgoutput truncate event.
+message Truncate {
+  Transaction transaction = 1;
+  repeated uint32 relation_ids = 2;
+  bool cascade = 3;
+  bool restart_identity = 4;
+}
+
+// Prepare marks a PostgreSQL prepared transaction. Participant events preserve
+// shard order but do not imply a globally ordered distributed commit.
+message Prepare {
+  Transaction transaction = 1;
+  string gid = 2;
+  uint64 prepare_lsn = 3;
+  uint64 end_lsn = 4;
+  uint64 prepare_time_unix_micros = 5;
+}
+
+// CommitPrepared commits a previously prepared shard transaction.
+message CommitPrepared {
+  Transaction transaction = 1;
+  string gid = 2;
+  uint64 commit_lsn = 3;
+  uint64 end_lsn = 4;
+  uint64 commit_time_unix_micros = 5;
+}
+
+// RollbackPrepared aborts a previously prepared shard transaction.
+message RollbackPrepared {
+  Transaction transaction = 1;
+  string gid = 2;
+  uint64 end_lsn = 3;
+  uint64 rollback_time_unix_micros = 4;
+}
+
+// Commit completes a non-prepared shard transaction.
+message Commit {
+  Transaction transaction = 1;
+  uint64 commit_lsn = 2;
+  uint64 end_lsn = 3;
+  uint64 commit_time_unix_micros = 4;
+}
+
+// Schema announces a managed schema activation after every shard acknowledges it.
+message Schema {
+  uint64 previous_schema_epoch = 1;
+  uint64 schema_epoch = 2;
+  string operation_id = 3;
+  bytes schema_fingerprint = 4;
+}
+
+// Heartbeat reports current source progress even when no rows change.
+message Heartbeat {
+  VectorPosition position = 1;
+  uint64 source_time_unix_micros = 2;
+}
+
+// KeyRange is a half-open unsigned 64-bit hash interval. An empty end encodes
+// 2^64 so the final interval does not wrap.
+message KeyRange {
+  fixed64 start = 1;
+  optional fixed64 end = 2;
+}
+
+// ReshardMapping allows old resume positions to cross one topology activation.
+message ReshardMapping {
+  string source_shard_id = 1;
+  KeyRange key_range = 2;
+  ShardPosition source_fence_position = 3;
+  string target_shard_id = 4;
+  ShardPosition target_start_position = 5;
+}
+
+// ReshardJournal is durably emitted before a stream changes shard topology.
+message ReshardJournal {
+  string operation_id = 1;
+  uint64 generation = 2;
+  uint64 previous_routing_epoch = 3;
+  uint64 routing_epoch = 4;
+  repeated ReshardMapping mappings = 5;
+}
+
+// Checkpoint is an acknowledgement boundary. Delivery after this checkpoint is
+// at least once until its resume_token is acknowledged.
+message Checkpoint {
+  VectorPosition position = 1;
+  uint64 events_since_previous = 2;
+  uint64 bytes_since_previous = 3;
+}
+
+// ResnapshotReason explains why a prior token can no longer resume safely.
+enum ResnapshotReason {
+  RESNAPSHOT_REASON_UNSPECIFIED = 0;
+  RESNAPSHOT_REASON_WAL_REMOVED = 1;
+  RESNAPSHOT_REASON_INACTIVE_TTL = 2;
+  RESNAPSHOT_REASON_RESTORED_TIMELINE = 3;
+  RESNAPSHOT_REASON_CONFIGURATION_CHANGED = 4;
+  RESNAPSHOT_REASON_JOURNAL_UNAVAILABLE = 5;
+  RESNAPSHOT_REASON_SLOT_LOST = 6;
+}
+
+// ResnapshotRequired terminates delivery without silently skipping changes.
+message ResnapshotRequired {
+  ResnapshotReason reason = 1;
+  string message = 2;
+  VectorPosition last_available_position = 3;
+}
+
+// StreamError reports an RPC-level error that is not a data event.
+message StreamError {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}

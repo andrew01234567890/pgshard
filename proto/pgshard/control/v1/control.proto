@@ -1,0 +1,140 @@
+syntax = "proto3";
+
+package pgshard.control.v1;
+
+// ControlPlane exposes the minimum internal agent contract needed for health,
+// fencing-aware shard observation, and idempotent operation execution.
+service ControlPlane {
+  // GetStatus returns one component's current identity, health, and shard state.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  // ExecuteOperation accepts an idempotent, fencing-aware operation envelope.
+  rpc ExecuteOperation(ExecuteOperationRequest) returns (ExecuteOperationResponse);
+  // GetOperation returns the durable execution status for an operation ID.
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+}
+
+// ComponentKind is a runtime component type.
+enum ComponentKind {
+  COMPONENT_KIND_UNSPECIFIED = 0;
+  COMPONENT_KIND_POOLER = 1;
+  COMPONENT_KIND_AGENT = 2;
+  COMPONENT_KIND_ORCHESTRATOR = 3;
+  COMPONENT_KIND_STREAM = 4;
+  COMPONENT_KIND_ADMIN = 5;
+  COMPONENT_KIND_OPERATOR = 6;
+}
+
+// ComponentIdentity names one runtime process without relying on network address.
+message ComponentIdentity {
+  string cluster_id = 1;
+  string component_id = 2;
+  ComponentKind kind = 3;
+  string version = 4;
+  string kubernetes_namespace = 5;
+  string kubernetes_pod = 6;
+}
+
+// HealthState is the component's serving state.
+enum HealthState {
+  HEALTH_STATE_UNSPECIFIED = 0;
+  HEALTH_STATE_STARTING = 1;
+  HEALTH_STATE_READY = 2;
+  HEALTH_STATE_DEGRADED = 3;
+  HEALTH_STATE_NOT_READY = 4;
+}
+
+// ComponentHealth provides bounded human-readable context for health checks.
+message ComponentHealth {
+  HealthState state = 1;
+  uint64 observed_at_unix_micros = 2;
+  string reason = 3;
+  string message = 4;
+}
+
+// ShardRole is an observed PostgreSQL role, never a promotion command.
+enum ShardRole {
+  SHARD_ROLE_UNSPECIFIED = 0;
+  SHARD_ROLE_PRIMARY = 1;
+  SHARD_ROLE_REPLICA = 2;
+  SHARD_ROLE_FENCED = 3;
+}
+
+// ShardStatus reports the WAL and fencing facts used for safe routing and failover.
+message ShardStatus {
+  string shard_id = 1;
+  string instance_id = 2;
+  ShardRole role = 3;
+  uint32 timeline = 4;
+  uint64 current_lsn = 5;
+  uint64 receive_lsn = 6;
+  uint64 replay_lsn = 7;
+  uint64 fencing_epoch = 8;
+  bool lease_valid = 9;
+  uint64 lease_expires_at_unix_micros = 10;
+}
+
+// GetStatusRequest targets the receiving component.
+message GetStatusRequest {}
+
+// GetStatusResponse returns process health and any locally observed shards.
+message GetStatusResponse {
+  ComponentIdentity identity = 1;
+  ComponentHealth health = 2;
+  repeated ShardStatus shards = 3;
+}
+
+// OperationEnvelope is deliberately generic: operation-specific contracts live
+// in their owning versioned packages. operation_id is the idempotency key.
+message OperationEnvelope {
+  string operation_id = 1;
+  string cluster_id = 2;
+  string shard_id = 3;
+  string operation_type = 4;
+  bytes payload = 5;
+  uint64 required_catalog_epoch = 6;
+  uint64 required_fencing_epoch = 7;
+  uint64 deadline_unix_micros = 8;
+}
+
+// ExecuteOperationRequest submits an operation to its selected executor.
+message ExecuteOperationRequest {
+  OperationEnvelope operation = 1;
+}
+
+// ExecuteOperationResponse confirms durable acceptance or an idempotent replay.
+message ExecuteOperationResponse {
+  string operation_id = 1;
+  bool accepted = 2;
+  bool already_exists = 3;
+}
+
+// OperationState is the generic execution lifecycle.
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  OPERATION_STATE_PENDING = 1;
+  OPERATION_STATE_RUNNING = 2;
+  OPERATION_STATE_SUCCEEDED = 3;
+  OPERATION_STATE_FAILED = 4;
+  OPERATION_STATE_CANCELLED = 5;
+}
+
+// OperationStatus reports execution without duplicating business-specific state.
+message OperationStatus {
+  string operation_id = 1;
+  OperationState state = 2;
+  uint64 observed_at_unix_micros = 3;
+  string error_code = 4;
+  string error_message = 5;
+  bool retryable = 6;
+  bytes result = 7;
+}
+
+// GetOperationRequest selects one idempotent operation.
+message GetOperationRequest {
+  string operation_id = 1;
+}
+
+// GetOperationResponse returns the operation's current generic status.
+message GetOperationResponse {
+  OperationStatus operation = 1;
+}

@@ -1,0 +1,16 @@
+version: v2
+
+modules:
+  - path: proto
+
+lint:
+  use:
+    - STANDARD
+  # Public API names are pgshard.stream.v1.ChangeStream and
+  # pgshard.control.v1.ControlPlane; keep those stable alpha contract names.
+  except:
+    - SERVICE_SUFFIX
+
+breaking:
+  use:
+    - FILE
