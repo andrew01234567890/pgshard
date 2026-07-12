@@ -116,8 +116,9 @@ impl StartupFrame<'_> {
                 protocol,
                 parameters,
             } => {
-                protocol.version_requires_postgres18_negotiation()
-                    || parameters.has_postgres18_protocol_option()
+                protocol.is_postgres18_supported_major()
+                    && (protocol.version_requires_postgres18_negotiation()
+                        || parameters.has_postgres18_protocol_option())
             }
             Self::SslRequest | Self::GssEncryptionRequest | Self::CancelRequest { .. } => false,
         }
@@ -678,6 +679,22 @@ mod tests {
             panic!("unexpected decode");
         };
         assert!(!frame.requires_postgres18_negotiation());
+
+        for major in [2, 4] {
+            let packet = startup(
+                protocol_code(major, 0),
+                b"user\0alice\0_pq_.future_feature\0enabled\0\0",
+            );
+            let Decode::Complete { frame, .. } = decode_startup(&packet).expect("startup") else {
+                panic!("unexpected decode");
+            };
+            assert!(matches!(
+                frame,
+                StartupFrame::Startup { protocol, .. }
+                    if !protocol.is_postgres18_supported_major()
+            ));
+            assert!(!frame.requires_postgres18_negotiation());
+        }
     }
 
     #[test]
