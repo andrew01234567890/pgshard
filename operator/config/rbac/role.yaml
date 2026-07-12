@@ -1,0 +1,28 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - pgshard.io
+  resources:
+  - pgshardclusters
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - pgshard.io
+  resources:
+  - pgshardclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - pgshard.io
+  resources:
+  - pgshardclusters/status
+  verbs:
+  - get
+  - patch
+  - update
