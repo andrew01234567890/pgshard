@@ -6,7 +6,9 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 # SQL compatibility
 
 :::warning Planned compatibility, not current support
-No pooler endpoint exists in the foundation release. The table below is the
+No pooler endpoint, SQL parser, or statement planner exists yet. The source has
+only a fail-closed core that routes an already-resolved, non-NULL shard-key bind
+parameter against one immutable catalog snapshot. The table below is the
 Milestone 1 acceptance contract; see [implementation status](../project/status.md).
 :::
 

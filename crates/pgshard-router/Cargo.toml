@@ -1,6 +1,6 @@
 [package]
-name = "pgshard-catalog"
-description = "Validated shardschema snapshots and lock-free cache for pgshard"
+name = "pgshard-router"
+description = "Fail-closed bound-parameter routing core for pgshard"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,15 +9,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-arc-swap.workspace = true
-blake3.workspace = true
+pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 thiserror.workspace = true
-tokio-postgres.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

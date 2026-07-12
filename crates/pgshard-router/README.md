@@ -1,0 +1,18 @@
+# pgshard router core
+
+This non-publishable Rust crate implements the small, fail-closed routing core
+used after a caller has resolved a registered table and its shard-key bind
+parameter. It attaches the exact catalog epoch, canonical version-one hash, and
+logical shard to the resulting plan.
+
+This is not a pooler. It does not parse SQL, speak the PostgreSQL wire protocol,
+manage backend connections, identify a statement's shard-key expression, or
+execute a request. Until those layers exist, no client can use this crate as a
+database endpoint.
+
+`bigint`, UUID, and `bytea` values require PostgreSQL binary bind format. The
+crate intentionally does not approximate PostgreSQL's text input grammars.
+`text` accepts either bind format after strict UTF-8 validation because the
+catalog contract requires UTF-8 and the built-in `C` collation. Unknown
+databases and tables, NULL keys, malformed lengths, ambiguous formats, and
+invalid text all fail closed.

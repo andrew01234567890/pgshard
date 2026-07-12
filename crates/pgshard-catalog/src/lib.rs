@@ -6,12 +6,14 @@
 //! data and can be lost without affecting correctness because callers poll.
 
 mod cache;
+mod loader;
 mod model;
 
 pub use cache::{
     CacheError, CatalogCache, CatalogNotification, InstallOutcome, NotificationError,
     RefreshDecision, RequestEpochError,
 };
+pub use loader::{LoadError, listen_and_refresh, load_snapshot, refresh};
 pub use model::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, IdentifierError,
     RegisteredTable, RoutingHashConfig, ShardKeyType, ShardRoute, SnapshotError, TableName,

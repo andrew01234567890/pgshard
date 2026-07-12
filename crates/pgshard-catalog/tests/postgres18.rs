@@ -10,6 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::task::JoinHandle;
 use tokio_postgres::{AsyncMessage, Client, Error as PgError, IsolationLevel, NoTls};
+use uuid::Uuid;
+
+use pgshard_catalog::{CatalogCache, DatabaseId, InstallOutcome};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -594,6 +597,35 @@ async fn commit_valid_activation(
     Ok(activated_catalog_epoch)
 }
 
+async fn assert_loader_contract(
+    client: &mut Client,
+    fixture: &Fixture,
+    routing_epoch: i64,
+) -> TestResult {
+    let cache = CatalogCache::new();
+    assert_eq!(
+        pgshard_catalog::listen_and_refresh(client, &cache).await?,
+        InstallOutcome::Installed
+    );
+    let snapshot = cache.current_for_planning()?;
+    let database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
+    let database = snapshot
+        .database(database_id)
+        .ok_or("loaded snapshot omitted active logical database")?;
+    assert_eq!(database.epochs().routing().0, u64::try_from(routing_epoch)?);
+    assert_eq!(database.routes().len(), 2);
+    assert!(
+        database
+            .table(&pgshard_catalog::TableName::new("public", "events")?)
+            .is_some()
+    );
+    assert_eq!(
+        pgshard_catalog::refresh(client, &cache).await?,
+        InstallOutcome::AlreadyCurrent
+    );
+    Ok(())
+}
+
 async fn assert_rollback_contract(
     client: &mut Client,
     listener: &CatalogListener,
@@ -898,6 +930,7 @@ async fn migration_and_activation_contract() -> TestResult {
     let listener = connect_listener(&database_url).await?;
     let activated_epoch =
         commit_valid_activation(&mut client, &listener, &fixture, &routing).await?;
+    assert_loader_contract(&mut client, &fixture, routing.valid_epoch).await?;
     assert_rollback_contract(&mut client, &listener, &fixture, &routing, activated_epoch).await?;
     assert_routing_epoch_cannot_regress(&client, &listener, &fixture, routing.valid_epoch).await?;
     assert_repeatable_read_activation_fences_concurrent_range_mutation(
