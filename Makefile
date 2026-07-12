@@ -1,4 +1,4 @@
-.PHONY: check rust-check rust-static rust-test proto-check go-check go-format-check go-generated-check docs-check actions-check public-check release-build
+.PHONY: check rust-check rust-static rust-test catalog-test proto-check go-check go-format-check go-generated-check docs-check actions-check public-check release-build
 
 check: rust-check proto-check go-check docs-check actions-check public-check
 
@@ -12,6 +12,10 @@ rust-static:
 
 rust-test:
 	cargo test --workspace --all-features --locked
+
+catalog-test:
+	@test -n "$(PGSHARD_TEST_DATABASE_URL)" || (echo "PGSHARD_TEST_DATABASE_URL is required" >&2; exit 1)
+	cargo test --locked -p pgshard-catalog --test postgres18 -- --ignored --test-threads=1
 
 proto-check:
 	buf format --diff --exit-code

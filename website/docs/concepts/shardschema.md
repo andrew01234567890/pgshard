@@ -5,25 +5,29 @@ description: How pgshard stores and distributes its authoritative topology.
 
 # Shard metadata and `shardschema`
 
-:::info Milestone 1 design contract
-The catalog schema and cache listener are not implemented in the foundation
-release; see [implementation status](../project/status.md).
+:::info Current implementation boundary
+The PostgreSQL 18 migration, validated Rust snapshot model, canonical checksum,
+multi-epoch lock-free cache, and live database contract test exist in source.
+The pooler snapshot loader and LISTEN/reconnect task are not wired yet; see
+[implementation status](../project/status.md).
 :::
 
-`shardschema` will be a dedicated PostgreSQL database on stable `shard-0000`.
+`shardschema` is a dedicated PostgreSQL database on stable `shard-0000`.
 Physical streaming replication will protect it with the rest of that shard. It
-will be authoritative for logical topology; etcd is used only for ephemeral
+is authoritative for logical topology; etcd is used only for ephemeral
 leases and fencing.
 
 ## Catalog contents
 
-The internal `pgshard_catalog` schema records:
+The current internal `pgshard_catalog` migration records:
 
 - Databases, registered tables, shard-key types and hash versions.
 - Shard identities and non-overlapping half-open key ranges.
 - Routing, schema, authorization, and catalog epochs.
-- Durable DDL, reshard, backup, restore, role, grant, and change-stream operations.
-- Backup-set manifests, CDC vector acknowledgements, and reshard journals.
+- Permanent fixed-size operation tombstones for idempotency.
+
+Durable DDL, reshard, backup/restore and change-stream journals remain planned
+extensions; the current schema does not claim to store them.
 
 Password material is never stored in `shardschema`.
 
@@ -46,14 +50,26 @@ range end.
 
 ## Cache protocol
 
-1. A component transactionally reads a complete catalog snapshot and its epoch.
-2. It validates range coverage, references, and the snapshot checksum.
-3. It swaps the cache atomically.
-4. PostgreSQL `NOTIFY` wakes listeners after later commits.
-5. A notification never carries authoritative data; listeners re-read the newer snapshot.
-6. Polling and reconnect handle lost notifications.
+1. A listener commits `LISTEN pgshard_catalog_changed` before its first read.
+2. It transactionally reads a complete catalog snapshot and its epoch.
+3. It validates range coverage, references, epochs, identities and the canonical checksum.
+4. It swaps the immutable cache state atomically.
+5. PostgreSQL `NOTIFY` sends only the committed positive decimal epoch.
+6. A notification is a wake-up hint, never authoritative data; duplicate and stale hints are ignored.
+7. Polling and reconnect recover lost notifications by rereading a complete snapshot.
 
-A request retains the epoch with which it was planned. Components reject a request if that epoch is fenced before execution or activation.
+A request retains the exact immutable snapshot with which it was planned. The
+cache retains installed snapshots across newer publications and removes old
+ones only when an explicit monotonic fence retires them. Components reject a
+request if its epoch is unknown, future, or fenced before execution or
+activation.
+
+The migration is transactional and idempotent, requires PostgreSQL 18 or newer,
+and must run in a pre-created UTF8 database named exactly `shardschema`. It
+creates NOLOGIN reader/admin group roles, revokes public access and exposes
+activation through a dual compare-and-swap over the global catalog epoch and
+the prior active routing epoch. Activated routes and identity history are
+immutable.
 
 ## Stable catalog host
 
