@@ -1,0 +1,31 @@
+:root {
+  --ifm-color-primary: #195f8f;
+  --ifm-color-primary-dark: #165681;
+  --ifm-color-primary-darker: #15517a;
+  --ifm-color-primary-darkest: #114364;
+  --ifm-color-primary-light: #1c689d;
+  --ifm-color-primary-lighter: #1d6da4;
+  --ifm-color-primary-lightest: #217bb9;
+  --ifm-code-font-size: 94%;
+  --ifm-font-family-base: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --ifm-heading-font-weight: 650;
+  --ifm-navbar-shadow: 0 1px 0 rgba(25, 95, 143, 0.15);
+  --docusaurus-highlighted-code-line-bg: rgba(25, 95, 143, 0.1);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #65b7e8;
+  --ifm-color-primary-dark: #49aae3;
+  --ifm-color-primary-darker: #3ba3e1;
+  --ifm-color-primary-darkest: #2088c5;
+  --ifm-color-primary-light: #81c4ed;
+  --ifm-color-primary-lighter: #8fcaf0;
+  --ifm-color-primary-lightest: #bae0f6;
+  --docusaurus-highlighted-code-line-bg: rgba(101, 183, 232, 0.14);
+}
+
+.navbar__title {letter-spacing: -0.02em;}
+.theme-doc-markdown h1 {letter-spacing: -0.025em;}
+.theme-doc-markdown table {display: table; width: 100%;}
+.hero--primary {background: linear-gradient(130deg, #0c314c, #195f8f 58%, #257aa7);}
+.alert--danger {border-left-width: 5px;}
