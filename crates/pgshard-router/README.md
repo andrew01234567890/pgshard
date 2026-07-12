@@ -16,3 +16,7 @@ crate intentionally does not approximate PostgreSQL's text input grammars.
 catalog contract requires UTF-8 and the built-in `C` collation. Unknown
 databases and tables, NULL keys, malformed lengths, ambiguous formats, and
 invalid text all fail closed.
+
+`cargo bench -p pgshard-router --bench route_bound_parameter` measures the
+complete immutable-snapshot lookup, decode, hash, and range-routing core. It is
+a microbenchmark, not the planned end-to-end comparison against PgBouncer.

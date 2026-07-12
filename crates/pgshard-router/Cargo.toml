@@ -16,5 +16,9 @@ thiserror.workspace = true
 [dev-dependencies]
 uuid.workspace = true
 
+[[bench]]
+name = "route_bound_parameter"
+harness = false
+
 [lints]
 workspace = true
