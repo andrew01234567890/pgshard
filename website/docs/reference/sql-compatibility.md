@@ -36,6 +36,11 @@ can be proven to target one shard.
 
 Safe session settings are replayed when a transaction receives a backend. Temporary objects, `LISTEN`, session advisory locks, holdable cursors, and backend-bound state are rejected because they cannot move safely between pooled connections or enter PostgreSQL prepared transactions.
 
+The pooler pins `client_encoding` to canonical `UTF8` and rejects attempts to
+change it. PostgreSQL converts both text-format and binary `text` binds from the
+session encoding before storage; routing raw bytes from any other encoding can
+disagree with the stored value and is therefore not allowed.
+
 Named prepared statements are virtualized at the pooler. Their routing plan is invalidated by relevant schema or routing epoch changes.
 
 ## Keys and constraints

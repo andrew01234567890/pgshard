@@ -12,8 +12,12 @@ database endpoint.
 
 `bigint`, UUID, and `bytea` values require PostgreSQL binary bind format. The
 crate intentionally does not approximate PostgreSQL's text input grammars.
-`text` accepts either bind format after strict UTF-8 validation because the
-catalog contract requires UTF-8 and the built-in `C` collation. Unknown
+Every route requires proof that the frontend session is pinned to canonical
+`client_encoding=UTF8`. PostgreSQL converts both text and binary `text` binds
+from the session encoding before storage, so hashing raw bytes from any other
+encoding would be incorrect. With the UTF-8 session proof, `text` accepts either
+bind format after strict UTF-8 validation because the catalog contract also
+requires UTF-8 and the built-in `C` collation. Unknown
 databases and tables, NULL keys, malformed lengths, ambiguous formats, and
 invalid text all fail closed.
 

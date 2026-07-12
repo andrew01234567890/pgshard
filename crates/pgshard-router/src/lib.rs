@@ -17,6 +17,42 @@ pub enum ParameterFormat {
     Binary,
 }
 
+/// Proof that the frontend session is pinned to `PostgreSQL`'s canonical `UTF8`
+/// client encoding.
+///
+/// The pooler must rebuild this token from authoritative session state after
+/// startup and after every accepted setting change. It must reject any attempt
+/// to select another encoding before routing or forwarding more statements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientEncoding {
+    _private: (),
+}
+
+impl ClientEncoding {
+    /// Validates `PostgreSQL`'s canonical reported client-encoding name.
+    ///
+    /// Aliases and case variants are deliberately rejected. The session layer
+    /// obtains this value from canonical PostgreSQL-compatible state, not
+    /// directly from untrusted startup bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `value` is exactly `UTF8`.
+    pub fn require_utf8(value: &str) -> Result<Self, ClientEncodingError> {
+        if value == "UTF8" {
+            Ok(Self { _private: () })
+        } else {
+            Err(ClientEncodingError)
+        }
+    }
+}
+
+/// A session selected an encoding whose `PostgreSQL` conversion semantics are
+/// not implemented by the router.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("pooler sessions must use canonical PostgreSQL client_encoding UTF8")]
+pub struct ClientEncodingError;
+
 /// Immutable result attached to a planned request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RoutePlan {
@@ -49,8 +85,9 @@ impl RoutePlan {
 ///
 /// Binary format is required for `bigint`, UUID and `bytea` keys so routing
 /// never approximates `PostgreSQL`'s input grammar. Text keys accept either
-/// format because `PostgreSQL`'s binary representation of `text` is its UTF8
-/// bytes under the catalog's required built-in `C` collation.
+/// format only after the session layer proves `client_encoding=UTF8`.
+/// `PostgreSQL` converts both text and binary `text` binds from `client_encoding`
+/// before storage, so hashing raw bytes from any other encoding is unsafe.
 ///
 /// # Errors
 ///
@@ -60,6 +97,7 @@ pub fn route_bound_parameter(
     snapshot: &CatalogSnapshot,
     database_id: DatabaseId,
     table_name: &TableName,
+    _client_encoding: ClientEncoding,
     format: ParameterFormat,
     value: Option<&[u8]>,
 ) -> Result<RoutePlan, RouteError> {
@@ -175,6 +213,10 @@ mod tests {
 
     use super::*;
 
+    fn utf8() -> ClientEncoding {
+        ClientEncoding::require_utf8("UTF8").expect("UTF8")
+    }
+
     fn ids() -> (ClusterId, DatabaseId) {
         (
             ClusterId::new(Uuid::from_u128(1)).expect("cluster ID"),
@@ -227,6 +269,7 @@ mod tests {
             &snapshot,
             database_id,
             &table,
+            utf8(),
             ParameterFormat::Binary,
             Some(&value),
         )
@@ -270,6 +313,7 @@ mod tests {
                 &snapshot,
                 database_id,
                 &table,
+                utf8(),
                 ParameterFormat::Binary,
                 Some(bytes),
             )
@@ -305,7 +349,7 @@ mod tests {
         ] {
             let (snapshot, database_id, table) = snapshot(key_type);
             assert!(
-                route_bound_parameter(&snapshot, database_id, &table, format, Some(value),)
+                route_bound_parameter(&snapshot, database_id, &table, utf8(), format, Some(value),)
                     .is_err()
             );
         }
@@ -315,10 +359,36 @@ mod tests {
                 &snapshot,
                 database_id,
                 &table,
+                utf8(),
                 ParameterFormat::Binary,
                 None,
             ),
             Err(RouteError::NullShardKey)
         );
+    }
+
+    #[test]
+    fn non_utf8_sessions_cannot_create_routing_proof_for_text_binds() {
+        for encoding in ["LATIN1", "SQL_ASCII", "utf8", "UNICODE"] {
+            assert_eq!(
+                ClientEncoding::require_utf8(encoding),
+                Err(ClientEncodingError),
+                "encoding {encoding:?}"
+            );
+        }
+
+        // C3 A9 is valid UTF-8 for é, but in a LATIN1 session PostgreSQL
+        // converts those two source bytes to UTF-8 for Ã©. A caller cannot
+        // obtain the required proof and accidentally hash the raw bytes for
+        // either wire format.
+        let latin1_source = b"\xc3\xa9";
+        assert!(std::str::from_utf8(latin1_source).is_ok());
+        for format in [ParameterFormat::Text, ParameterFormat::Binary] {
+            assert_eq!(
+                ClientEncoding::require_utf8("LATIN1"),
+                Err(ClientEncodingError),
+                "LATIN1 {format:?} bind must not obtain routing proof"
+            );
+        }
     }
 }

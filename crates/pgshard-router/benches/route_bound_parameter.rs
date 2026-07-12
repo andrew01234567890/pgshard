@@ -7,7 +7,7 @@ use pgshard_catalog::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, RegisteredTable,
     RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
 };
-use pgshard_router::{ParameterFormat, route_bound_parameter};
+use pgshard_router::{ClientEncoding, ParameterFormat, route_bound_parameter};
 use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
 use uuid::Uuid;
 
@@ -47,6 +47,7 @@ fn fixture() -> (CatalogSnapshot, DatabaseId, TableName) {
 
 fn main() {
     let (snapshot, database_id, table_name) = fixture();
+    let client_encoding = ClientEncoding::require_utf8("UTF8").expect("UTF8");
     let started = Instant::now();
     let mut digest = 0_u64;
 
@@ -58,6 +59,7 @@ fn main() {
             black_box(&snapshot),
             database_id,
             black_box(&table_name),
+            client_encoding,
             ParameterFormat::Binary,
             Some(black_box(&value)),
         )
