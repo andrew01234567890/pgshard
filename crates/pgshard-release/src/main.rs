@@ -450,7 +450,8 @@ fn semver_tag_at(sha: &str) -> Result<Option<String>> {
 }
 
 fn release_tag_version(tag: &str) -> Option<Version> {
-    tag.strip_prefix('v').and_then(|value| Version::parse(value).ok())
+    tag.strip_prefix('v')
+        .and_then(|value| Version::parse(value).ok())
 }
 
 fn tag_target(tag: &str) -> Result<Option<String>> {
