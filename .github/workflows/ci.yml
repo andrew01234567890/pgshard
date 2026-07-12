@@ -23,6 +23,7 @@ jobs:
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
       catalog: ${{ steps.detect.outputs.catalog }}
+      planner: ${{ steps.detect.outputs.planner }}
       proto: ${{ steps.detect.outputs.proto }}
       go: ${{ steps.detect.outputs.go }}
       website: ${{ steps.detect.outputs.website }}
@@ -89,6 +90,7 @@ jobs:
 
           rust_exists=false
           catalog_exists=false
+          planner_exists=false
           proto_exists=false
           go_exists=false
           website_exists=false
@@ -100,6 +102,7 @@ jobs:
 
           exists_at_head_or_base Cargo.toml && rust_exists=true
           exists_at_head_or_base crates/pgshard-catalog/Cargo.toml && catalog_exists=true
+          exists_at_head_or_base crates/pgshard-planner/Cargo.toml && planner_exists=true
           exists_at_head_or_base buf.yaml && proto_exists=true
           exists_at_head_or_base operator/go.mod && go_exists=true
           exists_at_head_or_base website/package.json && website_exists=true
@@ -111,6 +114,7 @@ jobs:
 
           emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
           emit_component catalog "$catalog_exists" '^crates/pgshard-catalog/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
+          emit_component planner "$planner_exists" '^crates/pgshard-planner/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^Makefile$|^\.github/workflows/'
           emit_component go "$go_exists" '^operator/|^proto/|^Makefile$|^\.github/workflows/'
           emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/workflows/'
@@ -257,6 +261,34 @@ jobs:
         env:
           PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/shardschema
         run: make catalog-test
+
+  planner-postgres:
+    name: Planner / PostgreSQL 18
+    needs: changes
+    if: needs.changes.outputs.planner == 'true'
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: pgshard-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Compare admitted syntax with PostgreSQL 18
+        env:
+          PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/postgres
+        run: make planner-postgres-test
 
   protobuf:
     name: Protobuf contracts
