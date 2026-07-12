@@ -92,20 +92,78 @@ jobs:
           [[ -f operator/go.mod ]] && go_exists=true
           [[ -f website/package.json ]] && website_exists=true
           [[ -f ui/package.json ]] && ui_exists=true
-          [[ -x hack/ci/integration.sh ]] && integration_exists=true
-          [[ -x hack/ci/build-images.sh ]] && images_exists=true
-          [[ -x hack/ci/kind.sh ]] && kind_exists=true
-          [[ -x hack/ci/performance.sh ]] && performance_exists=true
+          [[ -f tests/integration/Cargo.toml ]] && integration_exists=true
+          [[ -f deploy/docker-bake.hcl ]] && images_exists=true
+          [[ -f tests/e2e/Cargo.toml ]] && kind_exists=true
+          [[ -f benchmarks/Cargo.toml ]] && performance_exists=true
 
           emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^\.github/workflows/ci\.yml$'
           emit_component go "$go_exists" '^operator/|^proto/|^\.github/workflows/ci\.yml$'
           emit_component website "$website_exists" '^website/|^docs/|^\.github/workflows/ci\.yml$'
           emit_component ui "$ui_exists" '^ui/|^proto/|^\.github/workflows/ci\.yml$'
-          emit_component integration "$integration_exists" '^hack/ci/integration\.sh$|^tests/integration/|^crates/|^operator/|^proto/|^\.github/workflows/ci\.yml$'
-          emit_component images "$images_exists" '^hack/ci/build-images\.sh$|^Dockerfile|/Dockerfile$|^crates/|^operator/|^ui/|^\.github/workflows/ci\.yml$'
-          emit_component kind "$kind_exists" '^hack/ci/kind\.sh$|^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^\.github/workflows/ci\.yml$'
-          emit_component performance "$performance_exists" '^hack/ci/performance\.sh$|^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'
+          emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^\.github/workflows/ci\.yml$'
+          emit_component images "$images_exists" '^deploy/|^Dockerfile|/Dockerfile$|^crates/|^operator/|^ui/|^\.github/workflows/ci\.yml$'
+          emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^\.github/workflows/ci\.yml$'
+          emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'
           echo "website_exists=${website_exists}" >> "$GITHUB_OUTPUT"
+
+  repository-policy:
+    name: Repository policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Validate title and public content
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            cargo run --locked -p pgshard-release -- validate --subject "$PR_TITLE"
+            cargo run --locked -p pgshard-release -- audit --base "$PR_BASE_SHA" --head "$GITHUB_SHA"
+          elif [[ "$EVENT_NAME" == push && -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+            cargo run --locked -p pgshard-release -- validate
+            cargo run --locked -p pgshard-release -- audit --base "$PUSH_BEFORE_SHA" --head "$GITHUB_SHA"
+          else
+            cargo run --locked -p pgshard-release -- validate
+          fi
+
+  dependabot-automerge:
+    name: Dependabot patch auto-merge
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Read Dependabot update metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ github.token }}
+      - name: Enable checked squash auto-merge for patch updates
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_ID: ${{ github.event.pull_request.node_id }}
+          HEAD_OID: ${{ github.event.pull_request.head.sha }}
+          HEADLINE: ${{ github.event.pull_request.title }}
+          AUTHOR_EMAIL: 13841202+andrew01234567890@users.noreply.github.com
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api graphql \
+            -f query='mutation($id: ID!, $headline: String!, $authorEmail: String!, $oid: GitObjectID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH, commitHeadline: $headline, authorEmail: $authorEmail, expectedHeadOid: $oid}) { pullRequest { autoMergeRequest { enabledAt } } } }' \
+            -f id="$PR_ID" \
+            -f headline="$HEADLINE" \
+            -f authorEmail="$AUTHOR_EMAIL" \
+            -f oid="$HEAD_OID"
 
   rust-static:
     name: Rust / static checks
@@ -121,7 +179,7 @@ jobs:
           rustup show active-toolchain
           rustup component add rustfmt clippy
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -254,7 +312,7 @@ jobs:
       - name: Run integration suite
         env:
           PGSHARD_INTEGRATION_SUITE: ${{ matrix.suite }}
-        run: hack/ci/integration.sh "$PGSHARD_INTEGRATION_SUITE"
+        run: cargo run --locked -p pgshard-integration-tests -- --suite "$PGSHARD_INTEGRATION_SUITE"
 
   images:
     name: Build local test images
@@ -268,7 +326,7 @@ jobs:
         env:
           PGSHARD_IMAGE_OUTPUT: artifacts/images
           PGSHARD_IMAGE_PUSH: "false"
-        run: hack/ci/build-images.sh
+        run: docker buildx bake --file deploy/docker-bake.hcl ci
       - name: Store local OCI archives
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -308,7 +366,7 @@ jobs:
         env:
           PGSHARD_E2E_SCENARIO: ${{ matrix.scenario }}
           PGSHARD_IMAGE_PUSH: "false"
-        run: hack/ci/kind.sh "$PGSHARD_E2E_SCENARIO"
+        run: cargo run --locked -p pgshard-e2e -- --scenario "$PGSHARD_E2E_SCENARIO"
 
   performance:
     name: Performance / ${{ matrix.suite }}
@@ -328,7 +386,7 @@ jobs:
         env:
           PGSHARD_PERFORMANCE_SUITE: ${{ matrix.suite }}
           PGSHARD_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: hack/ci/performance.sh "$PGSHARD_PERFORMANCE_SUITE"
+        run: cargo run --locked -p pgshard-bench -- --suite "$PGSHARD_PERFORMANCE_SUITE"
       - name: Store performance results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -343,6 +401,8 @@ jobs:
     if: always()
     needs:
       - changes
+      - repository-policy
+      - dependabot-automerge
       - rust-static
       - rust-test
       - go-operator
@@ -358,6 +418,8 @@ jobs:
         env:
           JOB_RESULTS: >-
             changes=${{ needs.changes.result }}
+            repository-policy=${{ needs.repository-policy.result }}
+            dependabot-automerge=${{ needs.dependabot-automerge.result }}
             rust-static=${{ needs.rust-static.result }}
             rust-test=${{ needs.rust-test.result }}
             go-operator=${{ needs.go-operator.result }}

@@ -1,5 +1,41 @@
 version: 2
 updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:07"
+      timezone: Europe/London
+    open-pull-requests-limit: 5
+    groups:
+      patch-updates:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+    commit-message:
+      prefix: "build"
+      include: scope
+
+  - package-ecosystem: npm
+    directory: /website
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:12"
+      timezone: Europe/London
+    open-pull-requests-limit: 5
+    groups:
+      patch-updates:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+    commit-message:
+      prefix: "build"
+      include: scope
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -9,8 +45,11 @@ updates:
       timezone: Europe/London
     open-pull-requests-limit: 5
     groups:
-      actions:
+      patch-updates:
         patterns:
           - "*"
+        update-types:
+          - patch
     commit-message:
       prefix: "ci"
+      include: scope

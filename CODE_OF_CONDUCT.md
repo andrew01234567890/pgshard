@@ -6,4 +6,3 @@ Project maintainers are responsible for clarifying and enforcing acceptable
 behavior. Report conduct concerns privately through the repository owner's
 GitHub contact channel. Do not disclose personal or sensitive information in a
 public issue.
-

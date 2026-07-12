@@ -13,4 +13,3 @@ affected version, impact, reproduction steps, and any suggested mitigation.
 
 Do not include real credentials, private infrastructure details, production
 data, or customer information in a report or reproduction.
-

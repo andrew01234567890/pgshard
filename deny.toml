@@ -20,4 +20,3 @@ allow = [
 [sources]
 unknown-git = "deny"
 unknown-registry = "deny"
-

@@ -14,4 +14,3 @@ xxhash-rust.workspace = true
 
 [lints]
 workspace = true
-
