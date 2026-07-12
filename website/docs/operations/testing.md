@@ -8,7 +8,7 @@ description: Unit, integration, KIND, Jepsen/Elle, observability, backup, and pe
 :::info Current boundary
 Foundation unit, contract, policy and documentation checks exist. A targeted
 KIND test verifies operator PVC deletion and same-name recreation against real
-Kubernetes controllers. The broader runtime, integration, KIND, Jepsen/Elle
+Kubernetes 1.36 controllers. The broader runtime, integration, KIND, Jepsen/Elle
 and PgBouncer comparison suites below remain required Milestone 1 work; see
 [implementation status](../project/status.md).
 :::

@@ -69,7 +69,7 @@ module tidy/verification, `go vet ./...`, `go test -race ./...`,
 `go build ./...`, `go tool govulncheck ./...`, and the generation-and-diff
 sequence above. No helper shell scripts or `hack` directory are required.
 
-CI also creates a disposable KIND cluster and exercises StatefulSet/PVC
+CI also creates a digest-pinned Kubernetes 1.36 KIND cluster and exercises StatefulSet/PVC
 creation, supervised deletion, and same-name recreation against real
 Kubernetes controllers. This targeted safety test is not yet the full
 Milestone 1 KIND suite.

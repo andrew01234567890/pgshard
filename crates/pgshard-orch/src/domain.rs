@@ -156,6 +156,8 @@ pub enum LeaseOutcome {
     Acquired,
     /// The identical request already owns the shard.
     Existing,
+    /// The current operation received a later bounded expiration.
+    Renewed,
 }
 
 /// Externally reportable orchestrator status.
@@ -351,21 +353,35 @@ impl OrchState {
         }
         let now_unix_ms =
             validate_execution(operation, &request, execution, self.max_lease_ttl_ms)?;
-        if let Some(existing) = inner.leases.get(&request.shard_id) {
-            let identical = existing.owner_id == request.owner_id
+        if let Some(existing) = inner.leases.get(&request.shard_id).cloned()
+            && existing.expires_at_unix_ms > now_unix_ms
+        {
+            let same_term = existing.owner_id == request.owner_id
                 && existing.epoch == request.epoch
-                && existing.operation_id == request.operation_id
-                && existing.expires_at_unix_ms == request.expires_at_unix_ms;
-            if existing.expires_at_unix_ms > now_unix_ms {
-                return if identical {
-                    Ok(LeaseOutcome::Existing)
-                } else {
-                    Err(OrchError::LeaseHeld {
-                        shard_id: request.shard_id,
-                        epoch: existing.epoch,
-                    })
-                };
+                && existing.operation_id == request.operation_id;
+            if !same_term {
+                return Err(OrchError::LeaseHeld {
+                    shard_id: request.shard_id,
+                    epoch: existing.epoch,
+                });
             }
+            if request.expires_at_unix_ms < existing.expires_at_unix_ms {
+                return Err(OrchError::RegressiveLeaseExpiry {
+                    current: existing.expires_at_unix_ms,
+                    requested: request.expires_at_unix_ms,
+                });
+            }
+            if request.expires_at_unix_ms == existing.expires_at_unix_ms {
+                return Ok(LeaseOutcome::Existing);
+            }
+            inner.leases.insert(
+                request.shard_id,
+                ShardLease {
+                    expires_at_unix_ms: request.expires_at_unix_ms,
+                    ..existing
+                },
+            );
+            return Ok(LeaseOutcome::Renewed);
         }
         let last_epoch = inner
             .last_epochs
@@ -428,6 +444,14 @@ fn validate_execution(
             operation_id: request.operation_id.clone(),
             deadline_unix_micros: operation.spec.deadline_unix_micros,
             now_unix_micros: execution.now_unix_micros,
+        });
+    }
+    let deadline_unix_ms = operation.spec.deadline_unix_micros / 1_000;
+    if request.expires_at_unix_ms > deadline_unix_ms {
+        return Err(OrchError::LeasePastOperationDeadline {
+            operation_id: request.operation_id.clone(),
+            deadline_unix_micros: operation.spec.deadline_unix_micros,
+            requested_expiry_unix_ms: request.expires_at_unix_ms,
         });
     }
     let now_unix_ms = execution.now_unix_micros.div_ceil(1_000);
@@ -546,6 +570,26 @@ pub enum OrchError {
         requested_ms: u64,
         /// Configured maximum.
         maximum_ms: u64,
+    },
+    /// Lease expiration would outlive the immutable operation deadline.
+    #[error(
+        "operation {operation_id:?} deadline {deadline_unix_micros} is before lease expiry {requested_expiry_unix_ms} ms"
+    )]
+    LeasePastOperationDeadline {
+        /// Operation ID.
+        operation_id: OperationId,
+        /// Immutable operation deadline.
+        deadline_unix_micros: u64,
+        /// Rejected lease expiry.
+        requested_expiry_unix_ms: u64,
+    },
+    /// A live lease renewal cannot shorten the current expiration.
+    #[error("lease renewal expiry {requested} is before current expiry {current}")]
+    RegressiveLeaseExpiry {
+        /// Current expiration.
+        current: u64,
+        /// Rejected expiration.
+        requested: u64,
     },
     /// A process cannot request ownership under another orchestrator identity.
     #[error("lease owner {requested:?} does not match this orchestrator {expected:?}")]
@@ -708,8 +752,19 @@ mod tests {
                 .expect("idempotent"),
             LeaseOutcome::Existing
         );
+        assert_eq!(
+            state
+                .acquire_lease(lease("op-1", "orch-0", 11, 250), execution(11, 150),)
+                .expect("renew"),
+            LeaseOutcome::Renewed
+        );
+        assert_eq!(state.snapshot().leases[0].expires_at_unix_ms, 250);
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-1", 11, 200), execution(11, 100)),
+            state.acquire_lease(lease("op-1", "orch-0", 11, 240), execution(11, 150)),
+            Err(OrchError::RegressiveLeaseExpiry { .. })
+        ));
+        assert!(matches!(
+            state.acquire_lease(lease("op-1", "orch-1", 11, 250), execution(11, 150)),
             Err(OrchError::LeaseOwnerMismatch { .. })
         ));
 
@@ -717,7 +772,7 @@ mod tests {
             .register_operation(operation_with_fence("op-2", 1, OperationKind::Backup, 12))
             .expect("register competitor");
         assert!(matches!(
-            state.acquire_lease(lease("op-2", "orch-0", 12, 200), execution(12, 100)),
+            state.acquire_lease(lease("op-2", "orch-0", 12, 250), execution(12, 150)),
             Err(OrchError::LeaseHeld { .. })
         ));
     }
@@ -883,7 +938,11 @@ mod tests {
         );
         assert!(matches!(
             state.acquire_lease(lease("op-1", "orch-0", 11, u64::MAX), execution(11, 100)),
-            Err(OrchError::LeaseTtlExceeded { .. })
+            Err(OrchError::LeasePastOperationDeadline { .. })
+        ));
+        assert!(matches!(
+            state.acquire_lease(lease("op-1", "orch-0", 11, 1_001), execution(11, 900)),
+            Err(OrchError::LeasePastOperationDeadline { .. })
         ));
     }
 }
