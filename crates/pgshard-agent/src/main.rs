@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(reason = telemetry.reason, "OpenTelemetry export disabled");
     }
 
-    let state = AgentState::with_identity(config.identity);
+    let state = AgentState::with_identity(config.identity, config.max_lease_ttl_ms)?;
     tracing::info!(
         bind = %config.http_bind,
         version = pgshard_version::VERSION,

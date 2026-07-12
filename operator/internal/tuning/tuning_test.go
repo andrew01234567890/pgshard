@@ -35,6 +35,7 @@ func TestCalculateDeterministicSafeSettings(t *testing.T) {
 		t.Fatalf("resource basis = memory %d cpu %d", got.MemoryBytes, got.CPUMilli)
 	}
 	want := map[string]string{
+		"archive_mode":                    "off",
 		"shared_buffers":                  "1024MB",
 		"effective_cache_size":            "2867MB",
 		"maintenance_work_mem":            "204MB",

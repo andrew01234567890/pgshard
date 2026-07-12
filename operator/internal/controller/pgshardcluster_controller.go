@@ -47,9 +47,11 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=configmaps;services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
@@ -62,8 +64,12 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		if !controllerutil.ContainsFinalizer(cluster, resourceFinalizer) {
 			return ctrl.Result{}, nil
 		}
-		if err := r.prune(ctx, cluster, nil); err != nil {
+		remaining, err := r.prune(ctx, cluster, nil, true)
+		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("prune resources during cluster deletion: %w", err)
+		}
+		if remaining {
+			return ctrl.Result{RequeueAfter: retryDelay}, nil
 		}
 		controllerutil.RemoveFinalizer(cluster, resourceFinalizer)
 		if err := r.Update(ctx, cluster); err != nil {
@@ -135,7 +141,7 @@ func (r *PgShardClusterReconciler) applyPlan(ctx context.Context, cluster *pgsha
 			return fmt.Errorf("apply %T %s/%s: %w", desired, desired.GetNamespace(), desired.GetName(), err)
 		}
 	}
-	if err := r.prune(ctx, cluster, plan); err != nil {
+	if _, err := r.prune(ctx, cluster, plan, false); err != nil {
 		return fmt.Errorf("prune stale resources: %w", err)
 	}
 	return nil
@@ -252,7 +258,7 @@ func objectGVK(object client.Object) (schema.GroupVersionKind, error) {
 	}
 }
 
-func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object) error {
+func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object, includePVCs bool) (bool, error) {
 	desired := make(map[string]struct{}, len(plan))
 	for _, object := range plan {
 		desired[owned.Key(object)] = struct{}{}
@@ -269,9 +275,12 @@ func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1
 		&networkingv1.NetworkPolicyList{},
 		&policyv1.PodDisruptionBudgetList{},
 	}
+	if includePVCs {
+		lists = append(lists, &corev1.PersistentVolumeClaimList{})
+	}
 	for _, list := range lists {
 		if err := r.List(ctx, list, listOptions...); err != nil {
-			return fmt.Errorf("list %T: %w", list, err)
+			return false, fmt.Errorf("list %T: %w", list, err)
 		}
 		existing = append(existing, listObjects(list)...)
 	}
@@ -289,11 +298,19 @@ func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1
 	for _, object := range stale {
 		uid := object.GetUID()
 		resourceVersion := object.GetResourceVersion()
-		if err := r.Delete(ctx, object, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete %T %s/%s: %w", object, object.GetNamespace(), object.GetName(), err)
+		preconditions := client.Preconditions{UID: &uid}
+		deleteOptions := []client.DeleteOption{preconditions}
+		if !includePVCs {
+			preconditions.ResourceVersion = &resourceVersion
+			deleteOptions[0] = preconditions
+		} else {
+			deleteOptions = append(deleteOptions, client.PropagationPolicy(metav1.DeletePropagationForeground))
+		}
+		if err := r.Delete(ctx, object, deleteOptions...); err != nil && !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("delete %T %s/%s: %w", object, object.GetNamespace(), object.GetName(), err)
 		}
 	}
-	return nil
+	return len(stale) > 0, nil
 }
 
 func listObjects(list client.ObjectList) []client.Object {
@@ -304,6 +321,10 @@ func listObjects(list client.ObjectList) []client.Object {
 			result = append(result, &list.Items[index])
 		}
 	case *corev1.ServiceList:
+		for index := range list.Items {
+			result = append(result, &list.Items[index])
+		}
+	case *corev1.PersistentVolumeClaimList:
 		for index := range list.Items {
 			result = append(result, &list.Items[index])
 		}
@@ -537,6 +558,7 @@ func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error 
 		For(&pgshardv1alpha1.PgShardCluster{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).

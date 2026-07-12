@@ -364,18 +364,60 @@ func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 	if !contains(current.Finalizers, resourceFinalizer) {
 		t.Fatalf("finalizers = %#v", current.Finalizers)
 	}
+	controller := true
+	blockDeletion := true
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:      "data-example-etcd-0",
+		Namespace: cluster.Namespace,
+		UID:       types.UID("old-pvc-uid"),
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: pgshardv1alpha1.GroupVersion.String(), Kind: "PgShardCluster",
+			Name: cluster.Name, UID: cluster.UID, Controller: &controller, BlockOwnerDeletion: &blockDeletion,
+		}},
+	}}
+	if err := fakeClient.Create(ctx, pvc); err != nil {
+		t.Fatal(err)
+	}
 	if err := fakeClient.Delete(ctx, current); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+	result, err := reconciler.Reconcile(ctx, request)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.RequeueAfter != retryDelay {
+		t.Fatalf("deletion did not wait for observed child absence: %#v", result)
 	}
 	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: "example-etcd"}, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("owned StatefulSet survived finalization: %v", err)
 	}
+	if err := fakeClient.Get(ctx, client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned PVC survived supervised cleanup: %v", err)
+	}
+	deleting := getCluster(t, ctx, fakeClient, cluster)
+	if !contains(deleting.Finalizers, resourceFinalizer) {
+		t.Fatal("cleanup finalizer was removed before absence was observed")
+	}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
 	if err := fakeClient.Get(ctx, request.NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("cluster still exists after finalizer removal: %v", err)
 	}
+
+	replacement := validCluster()
+	replacement.UID = types.UID("replacement-uid")
+	if err := fakeClient.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(replacement)); err != nil {
+		t.Fatal(err)
+	}
+	recreated := &appsv1.StatefulSet{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: replacement.Namespace, Name: "example-etcd"}, recreated); err != nil {
+		t.Fatal(err)
+	}
+	assertControllerOwner(t, recreated, replacement)
 }
 
 func TestReconcileReportsPlanFailureWithoutAdvancingObservedGeneration(t *testing.T) {

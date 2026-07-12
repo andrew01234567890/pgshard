@@ -368,6 +368,11 @@ func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image string) *app
 	}
 	name := cluster.Name + EtcdSuffix
 	selector := componentSelector(cluster, "etcd")
+	claimMetadata := ownedMeta(cluster, "data", "etcd", nil)
+	// The namespace is assigned when the StatefulSet creates each claim. A
+	// direct CR controller reference lets our finalizer UID-safely wait for PVC
+	// deletion instead of racing a same-name cluster replacement.
+	claimMetadata.Namespace = ""
 	initialCluster := make([]string, 0, replicas)
 	for ordinal := int32(0); ordinal < replicas; ordinal++ {
 		pod := fmt.Sprintf("%s-%d", name, ordinal)
@@ -382,8 +387,8 @@ func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image string) *app
 			UpdateStrategy:      appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
 			Selector:            &metav1.LabelSelector{MatchLabels: selector},
 			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
-				WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
-				WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: selector},
@@ -419,7 +424,7 @@ func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image string) *app
 				}}),
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
-				ObjectMeta: metav1.ObjectMeta{Name: "data"},
+				ObjectMeta: claimMetadata,
 				Spec: corev1.PersistentVolumeClaimSpec{
 					AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 					StorageClassName: storageClassName,

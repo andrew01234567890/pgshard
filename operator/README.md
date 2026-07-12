@@ -22,7 +22,12 @@ also remain unimplemented. The etcd NetworkPolicy allows only selected
 same-cluster Pods, but client and peer traffic is still unauthenticated
 plaintext; the independent `TransportSecurityReady=False` condition reports
 that TLS gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
-a bounded backend quota, but automated defragmentation is not implemented.
+a bounded backend quota. Scale transitions retain those claims; cluster
+deletion keeps the CR finalizer until UID-owned StatefulSets and PVCs are
+observed absent, preventing same-name recreation from mounting stale etcd
+state. Automated defragmentation is not implemented. PostgreSQL
+`archive_mode` remains off until a real archival pipeline is reconciled and
+verified, so the generated configuration cannot silently fill `pg_wal`.
 
 The default orchestrator and pooler image values are expected development
 channel names, not a publication guarantee; the current source tree does not
@@ -63,3 +68,8 @@ The repository `make go-check` target and the Go operator CI job run formatting,
 module tidy/verification, `go vet ./...`, `go test -race ./...`,
 `go build ./...`, `go tool govulncheck ./...`, and the generation-and-diff
 sequence above. No helper shell scripts or `hack` directory are required.
+
+CI also creates a disposable KIND cluster and exercises StatefulSet/PVC
+creation, supervised deletion, and same-name recreation against real
+Kubernetes controllers. This targeted safety test is not yet the full
+Milestone 1 KIND suite.

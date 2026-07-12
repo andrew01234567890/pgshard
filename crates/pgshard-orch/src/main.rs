@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(reason = telemetry.reason, "OpenTelemetry export disabled");
     }
 
-    let state = OrchState::with_identity(config.identity);
+    let state = OrchState::with_identity(config.identity, config.lease_ttl_ms)?;
     tracing::info!(
         bind = %config.http_bind,
         lease_ttl_ms = config.lease_ttl_ms,

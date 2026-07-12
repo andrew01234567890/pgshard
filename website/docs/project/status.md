@@ -15,8 +15,8 @@ in the same pull request whenever implementation status changes.
 | Control and change-stream contracts | Buf-linted alpha protobuf definitions | Implemented in source |
 | Public-repository, CI and release policy | Parallel CI, privacy audit, source-only SemVer tooling | Implemented in source |
 | Documentation site | Typed Docusaurus build and link validation | Implemented in source |
-| Go operator API and supporting resources | Defaulting/validation, generated CRD/RBAC/webhook, deterministic ConfigMaps/Services/workloads/HPA/PDB/NetworkPolicy, pruning and fake-client tests | Implemented in source; deliberately not a database cluster |
-| Rust agent and orchestrator foundations | Linux HTTP health/readiness/status/metrics, exact integer reporting, fail-closed fencing/lease models; orchestrator persistence remains disabled | Implemented in source; deliberately not ready for control traffic |
+| Go operator API and supporting resources | Defaulting/validation, generated CRD/RBAC/webhook, deterministic ConfigMaps/Services/workloads/HPA/PDB/NetworkPolicy, semantic leader-election RBAC tests, supervised PVC deletion, and targeted KIND delete/recreate coverage | Implemented in source; deliberately not a database cluster |
+| Rust agent and orchestrator foundations | Linux HTTP health/readiness/status/metrics, exact integer reporting, bounded lease TTLs, atomic catalog/fence/deadline precondition checks; orchestrator persistence remains disabled | Implemented in source; deliberately not ready for control traffic |
 | PostgreSQL lifecycle and HA | No bootstrap, physical replication, durable lease integration, promotion or restart controller | Planned |
 | Pooling and SQL routing | No PostgreSQL wire endpoint | Planned |
 | `shardschema` catalog and cache | No catalog migrations or listener | Planned |
@@ -26,7 +26,7 @@ in the same pull request whenever implementation status changes.
 | Backup/restore and MinIO verification | Design only | Planned |
 | Online resharding | Design only | Planned |
 | Admin UI, Prometheus and OpenTelemetry | Design only | Planned |
-| KIND, Jepsen/Elle and PgBouncer comparison | Test plan only | Planned |
+| KIND, Jepsen/Elle and PgBouncer comparison | Targeted operator PVC delete/recreate KIND test; full cluster, history and performance suites remain absent | Partial |
 
 No development database cluster can be installed from the current source. The
 operator does not create PostgreSQL Pods or PVCs, the pooler has no wire

@@ -18,6 +18,8 @@ pub struct AgentConfig {
     pub http_bind: SocketAddr,
     /// Stable process identity.
     pub identity: AgentIdentity,
+    /// Maximum authenticated fencing lease duration accepted by the agent.
+    pub max_lease_ttl_ms: u64,
     /// OpenTelemetry configuration placeholder.
     pub telemetry: TelemetryConfig,
 }
@@ -36,6 +38,9 @@ struct RawConfig {
 
     #[arg(long, env = "PGSHARD_INSTANCE_ID")]
     instance_id: String,
+
+    #[arg(long, env = "PGSHARD_MAX_LEASE_TTL_MS", default_value_t = 15_000)]
+    max_lease_ttl_ms: u64,
 
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
@@ -66,6 +71,9 @@ impl AgentConfig {
         let raw = RawConfig::try_parse_from(args)?;
         validate_identifier("cluster ID", &raw.cluster_id)?;
         validate_identifier("instance ID", &raw.instance_id)?;
+        if !(1_000..=300_000).contains(&raw.max_lease_ttl_ms) {
+            return Err(ConfigError::InvalidLeaseTtl(raw.max_lease_ttl_ms));
+        }
 
         let otlp_endpoint = raw
             .otlp_endpoint
@@ -79,6 +87,7 @@ impl AgentConfig {
                 shard_id: ShardId(raw.shard_id),
                 instance_id: raw.instance_id,
             },
+            max_lease_ttl_ms: raw.max_lease_ttl_ms,
             telemetry: TelemetryConfig { otlp_endpoint },
         })
     }
@@ -137,6 +146,9 @@ pub enum ConfigError {
         /// Rejected value.
         value: String,
     },
+    /// Lease TTL is outside the bounded safety range.
+    #[error("maximum lease TTL {0} ms must be between 1000 and 300000 ms")]
+    InvalidLeaseTtl(u64),
     /// Endpoint URL parsing failed.
     #[error("invalid OTLP endpoint {value:?}: {source}")]
     InvalidOtlpEndpoint {
@@ -170,6 +182,7 @@ mod tests {
     fn accepts_required_identity() {
         let config = AgentConfig::try_parse_from(required_args()).expect("valid config");
         assert_eq!(config.identity.shard_id, ShardId(3));
+        assert_eq!(config.max_lease_ttl_ms, 15_000);
         assert!(config.telemetry.otlp_endpoint.is_none());
     }
 
@@ -191,6 +204,16 @@ mod tests {
         assert!(matches!(
             AgentConfig::try_parse_from(args),
             Err(ConfigError::InvalidIdentifier { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_unbounded_lease_ttl() {
+        let mut args = required_args();
+        args.extend(["--max-lease-ttl-ms", "300001"]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(args),
+            Err(ConfigError::InvalidLeaseTtl(300_001))
         ));
     }
 

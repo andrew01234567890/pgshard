@@ -96,6 +96,12 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != storageClass || claim.Spec.Resources.Requests.Storage().String() != "2Gi" {
 		t.Fatalf("etcd PVC = %#v", claim.Spec)
 	}
+	if claim.Namespace != "" || !metav1.IsControlledBy(&claim, cluster) {
+		t.Fatalf("etcd PVC template is not directly UID-owned by the cluster: %#v", claim.ObjectMeta)
+	}
+	if etcd.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType || etcd.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+		t.Fatalf("etcd PVC retention is destructive: %#v", etcd.Spec.PersistentVolumeClaimRetentionPolicy)
+	}
 	if etcd.Spec.Template.Spec.SecurityContext == nil || etcd.Spec.Template.Spec.SecurityContext.SeccompProfile == nil || len(etcd.Spec.Template.Spec.TopologySpreadConstraints) != 2 {
 		t.Fatalf("etcd pod hardening/spread is incomplete: %#v", etcd.Spec.Template.Spec)
 	}

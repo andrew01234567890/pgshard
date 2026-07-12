@@ -138,7 +138,10 @@ func Calculate(in Input) (Result, error) {
 	maxPrepared := max64(32, int64(in.PoolerMaxReplicas)*4) + 8
 
 	settings := map[string]string{
-		"archive_mode":                    "on",
+		// Archiving stays disabled until the operator reconciles and verifies a
+		// real archive_command/archive_library pipeline. Enabling archive_mode
+		// alone can retain WAL until pg_wal fills.
+		"archive_mode":                    "off",
 		"autovacuum_max_workers":          strconv.FormatInt(autovacuumWorkers, 10),
 		"effective_cache_size":            formatMiB(effective),
 		"fsync":                           "on",
