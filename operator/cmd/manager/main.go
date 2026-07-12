@@ -7,6 +7,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/controller"
+	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -32,10 +33,14 @@ func main() {
 	var probeAddress string
 	var leaderElection bool
 	var secureMetrics bool
+	images := owned.DefaultImages()
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":8443", "metrics endpoint bind address; set to 0 to disable")
 	flag.StringVar(&probeAddress, "health-probe-bind-address", ":8081", "health probe bind address")
 	flag.BoolVar(&leaderElection, "leader-elect", true, "enable Kubernetes leader election")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true, "serve metrics over TLS")
+	flag.StringVar(&images.Etcd, "etcd-image", images.Etcd, "etcd image reference")
+	flag.StringVar(&images.Orchestrator, "orchestrator-image", images.Orchestrator, "pgshard orchestrator image reference")
+	flag.StringVar(&images.Pooler, "pooler-image", images.Pooler, "pgshard pooler image reference")
 	zapOptions := zap.Options{Development: false}
 	zapOptions.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -66,7 +71,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.PgShardClusterReconciler{Client: manager.GetClient()}).SetupWithManager(manager); err != nil {
+	if err := (&controller.PgShardClusterReconciler{Client: manager.GetClient(), Images: images}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
 	}

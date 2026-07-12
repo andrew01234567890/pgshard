@@ -8,6 +8,10 @@ import (
 
 const (
 	PostgreSQLMajor18 = "18"
+	MaximumShards     = 128
+	// MaximumClusterNameLength leaves room for the longest generated Service
+	// suffix while keeping workload identities valid DNS labels.
+	MaximumClusterNameLength = 50
 
 	DurabilitySynchronous  DurabilityMode = "Synchronous"
 	DurabilityAsynchronous DurabilityMode = "Asynchronous"
@@ -27,6 +31,7 @@ type BackupRepositoryType string
 type PgShardClusterSpec struct {
 	// Shards is the number of logical hash ranges. The catalog remains on shard-0000.
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=128
 	// +kubebuilder:default=1
 	Shards int32 `json:"shards,omitempty"`
 
@@ -72,9 +77,11 @@ type PostgreSQLSpec struct {
 
 type StorageSpec struct {
 	// Size is the capacity of each PostgreSQL data volume.
-	// +kubebuilder:validation:XValidation:rule="self >= quantity('1Gi')",message="storage size must be at least 1Gi"
-	Size             resource.Quantity `json:"size"`
-	StorageClassName *string           `json:"storageClassName,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="quantity(self).compareTo(quantity('1Gi')) >= 0",message="storage size must be at least 1Gi"
+	Size resource.Quantity `json:"size"`
+	// StorageClassName is used for PostgreSQL data volumes and the supporting
+	// etcd quorum's independently sized volumes.
+	StorageClassName *string `json:"storageClassName,omitempty"`
 }
 
 type DatabaseTemplate struct {

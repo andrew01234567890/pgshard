@@ -3,11 +3,14 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/andrew01234567890/pgshard/operator/internal/tuning"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -78,11 +81,26 @@ func (v *PgShardClusterValidator) ValidateCreate(_ context.Context, cluster *PgS
 }
 
 func (v *PgShardClusterValidator) ValidateUpdate(_ context.Context, oldCluster, newCluster *PgShardCluster) (admission.Warnings, error) {
+	if !newCluster.DeletionTimestamp.IsZero() {
+		// A deleting object must always be able to shed finalizers, including if
+		// it predates validation that its stored spec no longer satisfies.
+		return warningsFor(newCluster), nil
+	}
 	allErrs := validateClusterFields(newCluster)
 	if oldCluster.Spec.PostgreSQL.Version != newCluster.Spec.PostgreSQL.Version {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "postgresql", "version"), newCluster.Spec.PostgreSQL.Version, "PostgreSQL major is immutable"))
 	}
+	if !equalOptionalString(oldCluster.Spec.Storage.StorageClassName, newCluster.Spec.Storage.StorageClassName) {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "storageClassName"), newCluster.Spec.Storage.StorageClassName, "storage class is immutable after cluster creation"))
+	}
 	return warningsFor(newCluster), invalidIfAny(newCluster.Name, allErrs)
+}
+
+func equalOptionalString(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func (*PgShardClusterValidator) ValidateDelete(_ context.Context, _ *PgShardCluster) (admission.Warnings, error) {
@@ -100,6 +118,13 @@ func validateCluster(cluster *PgShardCluster) error {
 	return invalidIfAny(cluster.Name, validateClusterFields(cluster))
 }
 
+// ValidateClusterForReconciliation defensively reapplies all admission safety
+// invariants before any child resource is planned. Admission configuration can
+// be temporarily absent and stored objects can predate newer validation.
+func ValidateClusterForReconciliation(cluster *PgShardCluster) error {
+	return validateCluster(cluster)
+}
+
 func invalidIfAny(name string, allErrs field.ErrorList) error {
 	if len(allErrs) == 0 {
 		return nil
@@ -110,8 +135,18 @@ func invalidIfAny(name string, allErrs field.ErrorList) error {
 func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 	specPath := field.NewPath("spec")
 	var allErrs field.ErrorList
+	namePath := field.NewPath("metadata", "name")
+	if messages := validation.IsDNS1123Label(cluster.Name); len(messages) != 0 {
+		allErrs = append(allErrs, field.Invalid(namePath, cluster.Name, "must be a DNS-1123 label because it prefixes owned Services"))
+	}
+	if len(cluster.Name) > MaximumClusterNameLength {
+		allErrs = append(allErrs, field.TooLong(namePath, cluster.Name, MaximumClusterNameLength))
+	}
 	if cluster.Spec.Shards < 1 {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("shards"), cluster.Spec.Shards, "must be at least 1"))
+	}
+	if cluster.Spec.Shards > MaximumShards {
+		allErrs = append(allErrs, field.Invalid(specPath.Child("shards"), cluster.Spec.Shards, fmt.Sprintf("must not exceed %d", MaximumShards)))
 	}
 	if cluster.Spec.MembersPerShard != 1 && cluster.Spec.MembersPerShard != 3 && cluster.Spec.MembersPerShard != 5 {
 		allErrs = append(allErrs, field.NotSupported(specPath.Child("membersPerShard"), cluster.Spec.MembersPerShard, []string{"1", "3", "5"}))
@@ -128,11 +163,17 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 	if cluster.Spec.Storage.Size.Cmp(resource.MustParse("1Gi")) < 0 {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("storage", "size"), cluster.Spec.Storage.Size.String(), "must be at least 1Gi"))
 	}
+	if storageClass := cluster.Spec.Storage.StorageClassName; storageClass != nil && *storageClass != "" {
+		if err := ValidateObjectReferenceName(*storageClass); err != nil {
+			allErrs = append(allErrs, field.Invalid(specPath.Child("storage", "storageClassName"), *storageClass, err.Error()))
+		}
+	}
 
 	poolerMax, scalingErrs := validateScaling(cluster.Spec.Pooler.Scaling, specPath.Child("pooler", "scaling"))
 	allErrs = append(allErrs, scalingErrs...)
+	settingsForOverrides := map[string]string{}
 	if poolerMax > 0 {
-		_, err := tuning.Calculate(tuning.Input{
+		result, err := tuning.Calculate(tuning.Input{
 			Resources:            cluster.Spec.PostgreSQL.Resources,
 			PoolerMaxReplicas:    poolerMax,
 			MembersPerShard:      cluster.Spec.MembersPerShard,
@@ -140,9 +181,11 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 		})
 		if err != nil {
 			allErrs = append(allErrs, field.Invalid(specPath.Child("postgresql", "resources"), cluster.Spec.PostgreSQL.Resources, err.Error()))
+		} else {
+			settingsForOverrides = result.Settings
 		}
 	}
-	if err := tuning.ApplyOverrides(map[string]string{}, cluster.Spec.PostgreSQL.Parameters); err != nil {
+	if err := tuning.ApplyOverrides(settingsForOverrides, cluster.Spec.PostgreSQL.Parameters); err != nil {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("postgresql", "parameters"), cluster.Spec.PostgreSQL.Parameters, err.Error()))
 	}
 
@@ -152,7 +195,46 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 	if cluster.Spec.Observability.ServiceMonitor && cluster.Spec.Observability.Prometheus != nil && !*cluster.Spec.Observability.Prometheus {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("observability", "serviceMonitor"), true, "requires Prometheus metrics to be enabled"))
 	}
+	if endpoint := cluster.Spec.Observability.OpenTelemetryEndpoint; endpoint != "" {
+		if err := ValidateOpenTelemetryEndpoint(endpoint); err != nil {
+			allErrs = append(allErrs, field.Invalid(specPath.Child("observability", "openTelemetryEndpoint"), endpoint, err.Error()))
+		}
+	}
 	return allErrs
+}
+
+// ValidateOpenTelemetryEndpoint rejects endpoints that cannot be passed safely
+// to the current runtime configuration or that could conceal credentials.
+func ValidateOpenTelemetryEndpoint(value string) error {
+	return ValidateCredentialFreeHTTPSEndpoint(value)
+}
+
+// ValidateCredentialFreeHTTPSEndpoint accepts only a concrete HTTP(S) origin
+// or path and rejects URL components commonly abused to embed credentials.
+func ValidateCredentialFreeHTTPSEndpoint(value string) error {
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("must not contain surrounding whitespace")
+	}
+	endpoint, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("must be a valid URL: %w", err)
+	}
+	if (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.Host == "" {
+		return fmt.Errorf("must be an HTTP(S) URL with a host")
+	}
+	if endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		return fmt.Errorf("must not contain user information, a query string, or a fragment")
+	}
+	return nil
+}
+
+// ValidateObjectReferenceName applies the Kubernetes name grammar shared by
+// namespaced Secrets and PersistentVolumeClaims.
+func ValidateObjectReferenceName(value string) error {
+	if messages := validation.IsDNS1123Subdomain(value); len(messages) != 0 {
+		return fmt.Errorf("must be a valid Kubernetes object name: %s", messages[0])
+	}
+	return nil
 }
 
 func validateScaling(scaling PoolerScaling, path *field.Path) (int32, field.ErrorList) {
@@ -226,6 +308,7 @@ func validateServices(services ServiceSet, path *field.Path) field.ErrorList {
 	}
 	for _, item := range ordered {
 		name, service := item.name, item.service
+		errs = append(errs, apivalidation.ValidateAnnotations(service.Annotations, path.Child(name, "annotations"))...)
 		switch service.Type {
 		case corev1.ServiceTypeClusterIP, corev1.ServiceTypeNodePort, corev1.ServiceTypeLoadBalancer:
 		default:
@@ -251,6 +334,13 @@ func validateBackup(backup BackupSpec, path *field.Path) field.ErrorList {
 		}
 		if repository.S3.CredentialsSecretRef.Name == "" {
 			errs = append(errs, field.Required(path.Child("repository", "s3", "credentialsSecretRef", "name"), "must not be empty"))
+		} else if err := ValidateObjectReferenceName(repository.S3.CredentialsSecretRef.Name); err != nil {
+			errs = append(errs, field.Invalid(path.Child("repository", "s3", "credentialsSecretRef", "name"), repository.S3.CredentialsSecretRef.Name, err.Error()))
+		}
+		if repository.S3.Endpoint != "" {
+			if err := ValidateCredentialFreeHTTPSEndpoint(repository.S3.Endpoint); err != nil {
+				errs = append(errs, field.Invalid(path.Child("repository", "s3", "endpoint"), repository.S3.Endpoint, err.Error()))
+			}
 		}
 		return errs
 	case RepositoryFilesystem:
@@ -263,6 +353,8 @@ func validateBackup(backup BackupSpec, path *field.Path) field.ErrorList {
 		}
 		if repository.Filesystem.PersistentVolumeClaimName == "" {
 			errs = append(errs, field.Required(path.Child("repository", "filesystem", "persistentVolumeClaimName"), "must not be empty"))
+		} else if err := ValidateObjectReferenceName(repository.Filesystem.PersistentVolumeClaimName); err != nil {
+			errs = append(errs, field.Invalid(path.Child("repository", "filesystem", "persistentVolumeClaimName"), repository.Filesystem.PersistentVolumeClaimName, err.Error()))
 		}
 		return errs
 	default:

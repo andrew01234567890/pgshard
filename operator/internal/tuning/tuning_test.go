@@ -81,6 +81,20 @@ func TestCalculateRejectsMissingAndUnsafeResources(t *testing.T) {
 	}
 }
 
+func TestCalculateRejectsQuantitiesBeforeIntegerOverflow(t *testing.T) {
+	t.Parallel()
+	absurd := "9223372036854775807"
+	_, err := Calculate(Input{
+		Resources:            resources(absurd, absurd, absurd, absurd),
+		PoolerMaxReplicas:    2,
+		MembersPerShard:      3,
+		MaximumChangeStreams: 4,
+	})
+	if err == nil {
+		t.Fatal("overflowing Kubernetes quantities were accepted")
+	}
+}
+
 func TestApplyOverridesRejectsOwnedSafetySettings(t *testing.T) {
 	t.Parallel()
 	settings := map[string]string{"fsync": "on"}
@@ -107,5 +121,64 @@ func TestApplyOverridesIsAtomicOnValidationFailure(t *testing.T) {
 	}
 	if settings["max_wal_size"] != "1GB" {
 		t.Fatalf("settings were partially mutated: %#v", settings)
+	}
+}
+
+func TestApplyOverridesRejectsConfigurationInjection(t *testing.T) {
+	t.Parallel()
+	settings := map[string]string{"fsync": "on"}
+	err := ApplyOverrides(settings, map[string]string{
+		"log_statement": "none\nfsync = off",
+	})
+	if err == nil {
+		t.Fatal("expected multiline override to fail")
+	}
+	if _, exists := settings["log_statement"]; exists || settings["fsync"] != "on" {
+		t.Fatalf("settings were mutated after injection attempt: %#v", settings)
+	}
+}
+
+func TestApplyOverridesRejectsNonViableValues(t *testing.T) {
+	t.Parallel()
+	tests := map[string]map[string]string{
+		"invalid enum":          {"log_statement": "everything"},
+		"invalid float":         {"checkpoint_completion_target": "999"},
+		"invalid integer":       {"default_statistics_target": "many"},
+		"invalid duration":      {"checkpoint_timeout": "forever"},
+		"too short duration":    {"checkpoint_timeout": "1s"},
+		"invalid size":          {"max_wal_size": "garbage"},
+		"too small size":        {"max_wal_size": "16MB"},
+		"inverted wal sizes":    {"min_wal_size": "4GB", "max_wal_size": "1GB"},
+		"min above default max": {"min_wal_size": "2GB"},
+	}
+	for name, overrides := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			settings := map[string]string{"max_worker_processes": "8", "min_wal_size": "80MB", "max_wal_size": "1GB"}
+			if err := ApplyOverrides(settings, overrides); err == nil {
+				t.Fatalf("unsafe overrides accepted: %#v", overrides)
+			}
+		})
+	}
+}
+
+func TestApplyOverridesAcceptsBoundedValues(t *testing.T) {
+	t.Parallel()
+	settings := map[string]string{"max_worker_processes": "8", "min_wal_size": "80MB", "max_wal_size": "1GB"}
+	overrides := map[string]string{
+		"autovacuum_analyze_scale_factor": "0.05",
+		"autovacuum_max_workers":          "4",
+		"checkpoint_completion_target":    "0.9",
+		"checkpoint_timeout":              "15min",
+		"default_statistics_target":       "500",
+		"effective_io_concurrency":        "200",
+		"log_min_duration_statement":      "250",
+		"log_statement":                   "ddl",
+		"max_wal_size":                    "4GB",
+		"min_wal_size":                    "1GB",
+		"random_page_cost":                "1.1",
+	}
+	if err := ApplyOverrides(settings, overrides); err != nil {
+		t.Fatalf("bounded overrides rejected: %v", err)
 	}
 }

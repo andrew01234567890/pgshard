@@ -332,6 +332,7 @@ spec:
                 description: Shards is the number of logical hash ranges. The catalog
                   remains on shard-0000.
                 format: int32
+                maximum: 128
                 minimum: 1
                 type: integer
               storage:
@@ -345,8 +346,11 @@ spec:
                     x-kubernetes-int-or-string: true
                     x-kubernetes-validations:
                     - message: storage size must be at least 1Gi
-                      rule: self >= quantity('1Gi')
+                      rule: quantity(self).compareTo(quantity('1Gi')) >= 0
                   storageClassName:
+                    description: |-
+                      StorageClassName is used for PostgreSQL data volumes and the supporting
+                      etcd quorum's independently sized volumes.
                     type: string
                 required:
                 - size
