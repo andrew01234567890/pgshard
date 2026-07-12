@@ -1,0 +1,443 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  changes:
+    name: Detect components
+    runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      go: ${{ steps.detect.outputs.go }}
+      website: ${{ steps.detect.outputs.website }}
+      website_exists: ${{ steps.detect.outputs.website_exists }}
+      ui: ${{ steps.detect.outputs.ui }}
+      integration: ${{ steps.detect.outputs.integration }}
+      images: ${{ steps.detect.outputs.images }}
+      kind: ${{ steps.detect.outputs.kind }}
+      performance: ${{ steps.detect.outputs.performance }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed and available components
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base=""
+          force_all=false
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE_SHA" ;;
+            push)
+              if [[ -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+                base="$PUSH_BEFORE_SHA"
+              fi
+              ;;
+            schedule|workflow_dispatch) force_all=true ;;
+          esac
+
+          if [[ -n "$base" ]] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            git diff --name-only "$base" "$GITHUB_SHA" > "$RUNNER_TEMP/changed-files"
+          else
+            git ls-files > "$RUNNER_TEMP/changed-files"
+          fi
+
+          changed() {
+            "$force_all" || grep -Eq "$1" "$RUNNER_TEMP/changed-files"
+          }
+
+          emit_component() {
+            local output="$1"
+            local exists="$2"
+            local pattern="$3"
+            local value=false
+            if [[ "$exists" == true ]] && changed "$pattern"; then
+              value=true
+            fi
+            echo "${output}=${value}" >> "$GITHUB_OUTPUT"
+          }
+
+          rust_exists=false
+          go_exists=false
+          website_exists=false
+          ui_exists=false
+          integration_exists=false
+          images_exists=false
+          kind_exists=false
+          performance_exists=false
+
+          [[ -f Cargo.toml ]] && rust_exists=true
+          [[ -f operator/go.mod ]] && go_exists=true
+          [[ -f website/package.json ]] && website_exists=true
+          [[ -f ui/package.json ]] && ui_exists=true
+          [[ -x hack/ci/integration.sh ]] && integration_exists=true
+          [[ -x hack/ci/build-images.sh ]] && images_exists=true
+          [[ -x hack/ci/kind.sh ]] && kind_exists=true
+          [[ -x hack/ci/performance.sh ]] && performance_exists=true
+
+          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^\.github/workflows/ci\.yml$'
+          emit_component go "$go_exists" '^operator/|^proto/|^\.github/workflows/ci\.yml$'
+          emit_component website "$website_exists" '^website/|^docs/|^\.github/workflows/ci\.yml$'
+          emit_component ui "$ui_exists" '^ui/|^proto/|^\.github/workflows/ci\.yml$'
+          emit_component integration "$integration_exists" '^hack/ci/integration\.sh$|^tests/integration/|^crates/|^operator/|^proto/|^\.github/workflows/ci\.yml$'
+          emit_component images "$images_exists" '^hack/ci/build-images\.sh$|^Dockerfile|/Dockerfile$|^crates/|^operator/|^ui/|^\.github/workflows/ci\.yml$'
+          emit_component kind "$kind_exists" '^hack/ci/kind\.sh$|^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^\.github/workflows/ci\.yml$'
+          emit_component performance "$performance_exists" '^hack/ci/performance\.sh$|^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'
+          echo "website_exists=${website_exists}" >> "$GITHUB_OUTPUT"
+
+  rust-static:
+    name: Rust / static checks
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Select repository Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  rust-test:
+    name: Rust / tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features --locked
+
+  go-operator:
+    name: Go operator
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: operator
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            printf 'Unformatted Go files:\n%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+
+  website:
+    name: Documentation website
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install dependencies
+        working-directory: website
+        run: npm ci
+      - name: Run documentation checks
+        working-directory: website
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in lint test linkcheck; do
+            if node -e "process.exit(require('./package.json').scripts?.['$script'] ? 0 : 1)"; then
+              npm run "$script"
+            fi
+          done
+          if ! node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+            echo "website/package.json must define a build script" >&2
+            exit 1
+          fi
+          npm run build
+          test -f build/index.html
+      - name: Store Pages candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pages-site
+          path: website/build
+          if-no-files-found: error
+          retention-days: 1
+
+  ui:
+    name: Admin UI
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Install dependencies
+        working-directory: ui
+        run: npm ci
+      - name: Check and build UI
+        working-directory: ui
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in lint typecheck test build; do
+            if ! node -e "process.exit(require('./package.json').scripts?.['$script'] ? 0 : 1)"; then
+              echo "ui/package.json must define the '$script' script" >&2
+              exit 1
+            fi
+            npm run "$script"
+          done
+
+  integration:
+    name: Integration / ${{ matrix.suite }}
+    needs: changes
+    if: needs.changes.outputs.integration == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [protocol, catalog, pgoutput]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run integration suite
+        env:
+          PGSHARD_INTEGRATION_SUITE: ${{ matrix.suite }}
+        run: hack/ci/integration.sh "$PGSHARD_INTEGRATION_SUITE"
+
+  images:
+    name: Build local test images
+    needs: changes
+    if: needs.changes.outputs.images == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build OCI archives without publishing
+        env:
+          PGSHARD_IMAGE_OUTPUT: artifacts/images
+          PGSHARD_IMAGE_PUSH: "false"
+        run: hack/ci/build-images.sh
+      - name: Store local OCI archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kind-images
+          path: artifacts/images/*.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  kind:
+    name: KIND / ${{ matrix.scenario }}
+    needs: [changes, images]
+    if: >-
+      always() &&
+      needs.changes.result == 'success' &&
+      needs.changes.outputs.kind == 'true' &&
+      (needs.images.result == 'success' || needs.images.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - bootstrap-routing
+          - transactions-failover
+          - backup-restore
+          - ddl-reshard
+          - observability
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download local OCI archives
+        if: needs.images.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kind-images
+          path: artifacts/images
+      - name: Run KIND scenario
+        env:
+          PGSHARD_E2E_SCENARIO: ${{ matrix.scenario }}
+          PGSHARD_IMAGE_PUSH: "false"
+        run: hack/ci/kind.sh "$PGSHARD_E2E_SCENARIO"
+
+  performance:
+    name: Performance / ${{ matrix.suite }}
+    needs: changes
+    if: needs.changes.outputs.performance == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [pooler-pgbouncer, pgoutput]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Run performance suite
+        env:
+          PGSHARD_PERFORMANCE_SUITE: ${{ matrix.suite }}
+          PGSHARD_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: hack/ci/performance.sh "$PGSHARD_PERFORMANCE_SUITE"
+      - name: Store performance results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: performance-${{ matrix.suite }}
+          path: artifacts/performance/${{ matrix.suite }}
+          if-no-files-found: error
+          retention-days: 1
+
+  aggregate:
+    name: CI aggregate
+    if: always()
+    needs:
+      - changes
+      - rust-static
+      - rust-test
+      - go-operator
+      - website
+      - ui
+      - integration
+      - images
+      - kind
+      - performance
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every applicable job
+        env:
+          JOB_RESULTS: >-
+            changes=${{ needs.changes.result }}
+            rust-static=${{ needs.rust-static.result }}
+            rust-test=${{ needs.rust-test.result }}
+            go-operator=${{ needs.go-operator.result }}
+            website=${{ needs.website.result }}
+            ui=${{ needs.ui.result }}
+            integration=${{ needs.integration.result }}
+            images=${{ needs.images.result }}
+            kind=${{ needs.kind.result }}
+            performance=${{ needs.performance.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=false
+          for result in $JOB_RESULTS; do
+            state="${result#*=}"
+            if [[ "$state" != success && "$state" != skipped ]]; then
+              echo "Required job did not pass: $result" >&2
+              failed=true
+            fi
+          done
+          "$failed" && exit 1
+          echo "All applicable CI jobs passed."
+
+  release:
+    name: Source-only SemVer release
+    needs: aggregate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.aggregate.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: pgshard-source-release
+      cancel-in-progress: false
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Configure public commit identity
+        run: |
+          git config user.name "andrew01234567890"
+          git config user.email "13841202+andrew01234567890@users.noreply.github.com"
+      - name: Publish tag and source-only GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo run --locked -p pgshard-release -- publish --sha "$GITHUB_SHA"
+
+  pages:
+    name: Deploy documentation to GitHub Pages
+    needs: [changes, website, aggregate, release]
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.website == 'true' &&
+      needs.website.result == 'success' &&
+      needs.aggregate.result == 'success' &&
+      needs.release.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - name: Download documentation site
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: pages-site
+          path: _site
+      - name: Package Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
