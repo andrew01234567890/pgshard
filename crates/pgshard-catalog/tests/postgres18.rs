@@ -640,6 +640,85 @@ async fn assert_rollback_contract(
     Ok(())
 }
 
+async fn stage_full_epoch(client: &Client, fixture: &Fixture) -> Result<i64, PgError> {
+    let routing_epoch = stage_epoch(client, &fixture.logical_database_id).await?;
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges \
+             (routing_epoch, range_start, range_end, shard_id) \
+             VALUES ($1, 0, 18446744073709551616, $2::text)",
+            &[&routing_epoch, &fixture.shard_id],
+        )
+        .await?;
+    Ok(routing_epoch)
+}
+
+async fn assert_routing_epoch_cannot_regress(
+    client: &Client,
+    listener: &CatalogListener,
+    fixture: &Fixture,
+    initial_active_epoch: i64,
+) -> TestResult {
+    let older_epoch = stage_full_epoch(client, fixture).await?;
+    let newer_epoch = stage_full_epoch(client, fixture).await?;
+    assert!(newer_epoch > older_epoch && older_epoch > initial_active_epoch);
+
+    let before_activation = catalog_epoch(client).await?;
+    let newer_catalog_epoch: i64 = client
+        .query_one(
+            "SELECT pgshard_catalog.activate_routing_epoch($1::text::uuid, $2, $3, $4)",
+            &[
+                &fixture.logical_database_id,
+                &newer_epoch,
+                &Some(initial_active_epoch),
+                &before_activation,
+            ],
+        )
+        .await?
+        .get(0);
+    wait_for_epoch(&listener.receiver, newer_catalog_epoch)?;
+
+    let error = client
+        .query_one(
+            "SELECT pgshard_catalog.activate_routing_epoch($1::text::uuid, $2, $3, $4)",
+            &[
+                &fixture.logical_database_id,
+                &older_epoch,
+                &Some(newer_epoch),
+                &newer_catalog_epoch,
+            ],
+        )
+        .await
+        .expect_err("an older staged routing epoch must never replace a newer active epoch");
+    assert_sqlstate(&error, "40001");
+    assert_no_notification(
+        &listener.receiver,
+        "rejected routing regression emitted a notification",
+    );
+    assert_eq!(catalog_epoch(client).await?, newer_catalog_epoch);
+    let active_epoch: i64 = client
+        .query_one(
+            "SELECT routing_epoch FROM pgshard_catalog.active_routing_epochs \
+             WHERE logical_database_id = $1::text::uuid",
+            &[&fixture.logical_database_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(active_epoch, newer_epoch);
+    let states = client
+        .query(
+            "SELECT routing_epoch, state FROM pgshard_catalog.routing_epochs \
+             WHERE routing_epoch IN ($1, $2) ORDER BY routing_epoch",
+            &[&older_epoch, &newer_epoch],
+        )
+        .await?;
+    assert_eq!(states[0].get::<_, i64>(0), older_epoch);
+    assert_eq!(states[0].get::<_, &str>(1), "staged");
+    assert_eq!(states[1].get::<_, i64>(0), newer_epoch);
+    assert_eq!(states[1].get::<_, &str>(1), "active");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires PGSHARD_TEST_DATABASE_URL pointing to a PostgreSQL 18 shardschema database"]
 async fn migration_and_activation_contract() -> TestResult {
@@ -659,6 +738,7 @@ async fn migration_and_activation_contract() -> TestResult {
     let activated_epoch =
         commit_valid_activation(&mut client, &listener, &fixture, &routing).await?;
     assert_rollback_contract(&mut client, &listener, &fixture, &routing, activated_epoch).await?;
+    assert_routing_epoch_cannot_regress(&client, &listener, &fixture, routing.valid_epoch).await?;
 
     listener.task.abort();
     connection_task.abort();

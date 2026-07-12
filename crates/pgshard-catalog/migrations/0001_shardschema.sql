@@ -591,6 +591,17 @@ BEGIN
             MESSAGE = 'target routing epoch is not staged for the requested logical database';
     END IF;
 
+    IF observed_active_routing_epoch IS NOT NULL
+       AND target_routing_epoch <= observed_active_routing_epoch THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001',
+            MESSAGE = format(
+                'routing epoch must advance: active %s, target %s',
+                observed_active_routing_epoch,
+                target_routing_epoch
+            );
+    END IF;
+
     PERFORM pgshard_catalog.validate_routing_epoch(target_routing_epoch);
 
     IF observed_active_routing_epoch IS NOT NULL THEN
