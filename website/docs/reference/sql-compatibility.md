@@ -9,8 +9,9 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 No pooler endpoint, SQL parser, or statement planner exists yet. The source has
 only a fail-closed core that routes an already-resolved, non-NULL shard-key bind
 parameter against one immutable catalog snapshot, plus a bounded zero-copy
-decoder for PostgreSQL 18 frontend frames. It does not yet authenticate or
-execute clients. The table below is the Milestone 1 acceptance contract; see
+decoder for PostgreSQL 18 frontend frames and selected simple/extended query
+message bodies. It does not yet authenticate, parse SQL, or execute clients. The
+table below is the Milestone 1 acceptance contract; see
 [implementation status](../project/status.md).
 :::
 

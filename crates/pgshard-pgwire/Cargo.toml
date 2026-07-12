@@ -15,5 +15,9 @@ thiserror.workspace = true
 name = "decode_frontend"
 harness = false
 
+[[bench]]
+name = "decode_bind"
+harness = false
+
 [lints]
 workspace = true
