@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::messages::ParameterTypeIter;
 use crate::{
     Decode, DecodeError, MAX_CANCEL_KEY_LENGTH, MAX_LARGE_MESSAGE_LENGTH,
-    MIN_BACKEND_CANCEL_KEY_LENGTH,
+    MIN_BACKEND_CANCEL_KEY_LENGTH, ProtocolVersion,
 };
 
 /// `PostgreSQL` libpq's maximum length word for backend tags not classified as
@@ -144,7 +144,8 @@ impl BackendTag {
         match self {
             Self::ReadyForQuery => 5,
             Self::ParameterStatus | Self::ParameterDescription => 6,
-            Self::AuthenticationRequest | Self::NegotiateProtocolVersion => 8,
+            Self::AuthenticationRequest => 8,
+            Self::NegotiateProtocolVersion => 12,
             Self::BackendKeyData => 4 + 4 + MIN_BACKEND_CANCEL_KEY_LENGTH,
             _ => 4,
         }
@@ -255,6 +256,191 @@ impl<'a> BackendKeyData<'a> {
     }
 }
 
+/// One `PostgreSQL` 18 backend authentication request or result.
+#[derive(Clone)]
+pub enum AuthenticationRequest<'a> {
+    /// Authentication completed successfully.
+    Ok,
+    /// Obsolete Kerberos V5 authentication was requested.
+    KerberosV5,
+    /// A clear-text password was requested.
+    CleartextPassword,
+    /// A deprecated MD5 password response was requested.
+    Md5Password {
+        /// Four-byte server salt. Debug output never renders these bytes.
+        salt: &'a [u8; 4],
+    },
+    /// A GSSAPI exchange must begin.
+    Gss,
+    /// More GSSAPI or SSPI exchange data was supplied.
+    GssContinue {
+        /// Opaque borrowed exchange bytes.
+        data: &'a [u8],
+    },
+    /// An SSPI exchange must begin.
+    Sspi,
+    /// A SASL exchange must begin with one of the advertised mechanisms.
+    Sasl {
+        /// Borrowed mechanisms in server preference order.
+        mechanisms: SaslMechanismIter<'a>,
+    },
+    /// More SASL challenge data was supplied.
+    SaslContinue {
+        /// Opaque borrowed challenge bytes.
+        data: &'a [u8],
+    },
+    /// SASL completed with final mechanism-specific data.
+    SaslFinal {
+        /// Opaque borrowed final bytes.
+        data: &'a [u8],
+    },
+}
+
+impl fmt::Debug for AuthenticationRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ok => formatter.write_str("AuthenticationOk"),
+            Self::KerberosV5 => formatter.write_str("AuthenticationKerberosV5"),
+            Self::CleartextPassword => formatter.write_str("AuthenticationCleartextPassword"),
+            Self::Md5Password { salt } => formatter
+                .debug_struct("AuthenticationMd5Password")
+                .field("salt_length", &salt.len())
+                .finish(),
+            Self::Gss => formatter.write_str("AuthenticationGss"),
+            Self::GssContinue { data } => formatter
+                .debug_struct("AuthenticationGssContinue")
+                .field("data_length", &data.len())
+                .finish(),
+            Self::Sspi => formatter.write_str("AuthenticationSspi"),
+            Self::Sasl { mechanisms } => formatter
+                .debug_struct("AuthenticationSasl")
+                .field("mechanism_count", &mechanisms.len())
+                .finish(),
+            Self::SaslContinue { data } => formatter
+                .debug_struct("AuthenticationSaslContinue")
+                .field("data_length", &data.len())
+                .finish(),
+            Self::SaslFinal { data } => formatter
+                .debug_struct("AuthenticationSaslFinal")
+                .field("data_length", &data.len())
+                .finish(),
+        }
+    }
+}
+
+/// Iterator over a validated zero-copy SASL mechanism list.
+#[derive(Clone)]
+pub struct SaslMechanismIter<'a> {
+    remaining: &'a [u8],
+    count: usize,
+}
+
+impl fmt::Debug for SaslMechanismIter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SaslMechanismIter")
+            .field("remaining_count", &self.count)
+            .finish()
+    }
+}
+
+impl<'a> Iterator for SaslMechanismIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        let end = self
+            .remaining
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("SASL mechanism list was validated");
+        let mechanism = &self.remaining[..end];
+        self.remaining = &self.remaining[end + 1..];
+        self.count -= 1;
+        Some(mechanism)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.count, Some(self.count))
+    }
+}
+
+impl ExactSizeIterator for SaslMechanismIter<'_> {}
+
+/// One validated backend protocol-negotiation response.
+#[derive(Clone)]
+pub struct ProtocolNegotiation<'a> {
+    selected_protocol: ProtocolVersion,
+    unsupported_options: ProtocolOptionIter<'a>,
+}
+
+impl fmt::Debug for ProtocolNegotiation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtocolNegotiation")
+            .field("selected_protocol", &self.selected_protocol)
+            .field("unsupported_option_count", &self.unsupported_options.len())
+            .finish()
+    }
+}
+
+impl<'a> ProtocolNegotiation<'a> {
+    /// Returns the protocol version selected by the backend.
+    #[must_use]
+    pub const fn selected_protocol(&self) -> ProtocolVersion {
+        self.selected_protocol
+    }
+
+    /// Iterates the unsupported reserved startup options without allocation.
+    #[must_use]
+    pub fn unsupported_options(&self) -> ProtocolOptionIter<'a> {
+        self.unsupported_options.clone()
+    }
+}
+
+/// Iterator over validated unsupported protocol-option names.
+#[derive(Clone)]
+pub struct ProtocolOptionIter<'a> {
+    remaining: &'a [u8],
+    count: usize,
+}
+
+impl fmt::Debug for ProtocolOptionIter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtocolOptionIter")
+            .field("remaining_count", &self.count)
+            .finish()
+    }
+}
+
+impl<'a> Iterator for ProtocolOptionIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        let end = self
+            .remaining
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("protocol option list was validated");
+        let option = &self.remaining[..end];
+        self.remaining = &self.remaining[end + 1..];
+        self.count -= 1;
+        Some(option)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.count, Some(self.count))
+    }
+}
+
+impl ExactSizeIterator for ProtocolOptionIter<'_> {}
+
 /// Decodes one backend frame from the beginning of `input`.
 ///
 /// Unknown tags are rejected before their length is trusted. Framing does not
@@ -312,6 +498,115 @@ pub fn decode_backend(
             body: &input[5..consumed],
         },
         consumed,
+    })
+}
+
+/// Decodes one `PostgreSQL` 18 backend authentication request or result.
+///
+/// This validates message-local layout only. Authentication method policy,
+/// exchange ordering, channel binding, credential handling, and server identity
+/// belong to the future connection state machine.
+///
+/// # Errors
+///
+/// Rejects the wrong tag, a truncated or unknown request code, malformed fixed
+/// payloads, or an unterminated SASL mechanism list.
+pub fn decode_authentication_request(
+    frame: BackendFrame<'_>,
+) -> Result<AuthenticationRequest<'_>, BackendMessageError> {
+    require_tag(frame, BackendTag::AuthenticationRequest)?;
+    let Some(code_bytes) = frame
+        .body()
+        .get(..4)
+        .and_then(|bytes| <&[u8; 4]>::try_from(bytes).ok())
+    else {
+        return Err(BackendMessageError::Truncated(
+            "authentication request code",
+        ));
+    };
+    let code = u32::from_be_bytes(*code_bytes);
+    let payload = frame.body().get(4..).ok_or(BackendMessageError::Truncated(
+        "authentication request code",
+    ))?;
+    let request = match code {
+        0 => {
+            require_exact_length(frame.body(), 4, "AuthenticationOk")?;
+            AuthenticationRequest::Ok
+        }
+        2 => {
+            require_exact_length(frame.body(), 4, "AuthenticationKerberosV5")?;
+            AuthenticationRequest::KerberosV5
+        }
+        3 => {
+            require_exact_length(frame.body(), 4, "AuthenticationCleartextPassword")?;
+            AuthenticationRequest::CleartextPassword
+        }
+        5 => {
+            require_exact_length(frame.body(), 8, "AuthenticationMD5Password")?;
+            let salt = <&[u8; 4]>::try_from(payload)
+                .map_err(|_| BackendMessageError::Truncated("AuthenticationMD5Password"))?;
+            AuthenticationRequest::Md5Password { salt }
+        }
+        7 => {
+            require_exact_length(frame.body(), 4, "AuthenticationGSS")?;
+            AuthenticationRequest::Gss
+        }
+        8 => AuthenticationRequest::GssContinue { data: payload },
+        9 => {
+            require_exact_length(frame.body(), 4, "AuthenticationSSPI")?;
+            AuthenticationRequest::Sspi
+        }
+        10 => AuthenticationRequest::Sasl {
+            mechanisms: validate_sasl_mechanisms(payload)?,
+        },
+        11 => AuthenticationRequest::SaslContinue { data: payload },
+        12 => AuthenticationRequest::SaslFinal { data: payload },
+        _ => return Err(BackendMessageError::UnknownAuthenticationRequest(code)),
+    };
+    Ok(request)
+}
+
+/// Decodes one `PostgreSQL` 18 `NegotiateProtocolVersion` body.
+///
+/// The returned version is the backend's complete major/minor protocol code,
+/// despite the protocol documentation describing the field as the newest
+/// minor version. This mirrors `PostgreSQL` 18 server and libpq source.
+///
+/// The session layer must additionally ensure that negotiation occurs at most
+/// once, is not a no-op, never upgrades the requested version, does not select
+/// nonexistent protocol 3.1 or a version below its configured minimum, and
+/// reports exactly the reserved options sent by that client.
+///
+/// # Errors
+///
+/// Rejects the wrong tag, a truncated header or option, a negative option
+/// count, a non-reserved or empty option name, or trailing bytes.
+pub fn decode_protocol_negotiation(
+    frame: BackendFrame<'_>,
+) -> Result<ProtocolNegotiation<'_>, BackendMessageError> {
+    require_tag(frame, BackendTag::NegotiateProtocolVersion)?;
+    let Some(header) = frame
+        .body()
+        .get(..8)
+        .and_then(|bytes| <&[u8; 8]>::try_from(bytes).ok())
+    else {
+        return Err(BackendMessageError::Truncated(
+            "protocol negotiation header",
+        ));
+    };
+    let option_count = i32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    let option_count = usize::try_from(option_count)
+        .map_err(|_| BackendMessageError::InvalidProtocolOptionCount(option_count))?;
+    let option_payload = frame.body().get(8..).ok_or(BackendMessageError::Truncated(
+        "protocol negotiation header",
+    ))?;
+    let unsupported_options = validate_protocol_options(option_payload, option_count)?;
+    Ok(ProtocolNegotiation {
+        selected_protocol: ProtocolVersion {
+            major: u16::from_be_bytes([header[0], header[1]]),
+            minor: u16::from_be_bytes([header[2], header[3]]),
+        },
+        unsupported_options,
     })
 }
 
@@ -484,6 +779,71 @@ fn require_tag(frame: BackendFrame<'_>, expected: BackendTag) -> Result<(), Back
     }
 }
 
+fn require_exact_length(
+    body: &[u8],
+    expected: usize,
+    field: &'static str,
+) -> Result<(), BackendMessageError> {
+    match body.len().cmp(&expected) {
+        std::cmp::Ordering::Less => Err(BackendMessageError::Truncated(field)),
+        std::cmp::Ordering::Greater => {
+            Err(BackendMessageError::TrailingData(body.len() - expected))
+        }
+        std::cmp::Ordering::Equal => Ok(()),
+    }
+}
+
+fn validate_sasl_mechanisms(payload: &[u8]) -> Result<SaslMechanismIter<'_>, BackendMessageError> {
+    let mut remaining = payload;
+    let mut validated_length = 0;
+    let mut count = 0;
+    loop {
+        let Some(end) = remaining.iter().position(|byte| *byte == 0) else {
+            return Err(BackendMessageError::Truncated("SASL mechanism list"));
+        };
+        if end == 0 {
+            let trailing = &remaining[1..];
+            if !trailing.is_empty() {
+                return Err(BackendMessageError::TrailingData(trailing.len()));
+            }
+            return Ok(SaslMechanismIter {
+                remaining: &payload[..validated_length],
+                count,
+            });
+        }
+        let consumed = end + 1;
+        validated_length += consumed;
+        remaining = &remaining[consumed..];
+        count += 1;
+    }
+}
+
+fn validate_protocol_options(
+    payload: &[u8],
+    count: usize,
+) -> Result<ProtocolOptionIter<'_>, BackendMessageError> {
+    let mut remaining = payload;
+    for index in 0..count {
+        let Some(end) = remaining.iter().position(|byte| *byte == 0) else {
+            return Err(BackendMessageError::Truncated(
+                "unsupported protocol option",
+            ));
+        };
+        let option = &remaining[..end];
+        if !option.starts_with(b"_pq_.") {
+            return Err(BackendMessageError::InvalidProtocolOptionName(index));
+        }
+        remaining = &remaining[end + 1..];
+    }
+    if !remaining.is_empty() {
+        return Err(BackendMessageError::TrailingData(remaining.len()));
+    }
+    Ok(ProtocolOptionIter {
+        remaining: payload,
+        count,
+    })
+}
+
 fn cstring_utf8<'a>(
     input: &'a [u8],
     field: &'static str,
@@ -516,6 +876,15 @@ pub enum BackendMessageError {
     /// A backend cancellation key is outside `PostgreSQL` 18's generic bounds.
     #[error("invalid PostgreSQL 18 cancellation key length {0}")]
     InvalidCancellationKeyLength(usize),
+    /// An authentication request code has no `PostgreSQL` 18 message layout.
+    #[error("unknown PostgreSQL 18 authentication request code {0}")]
+    UnknownAuthenticationRequest(u32),
+    /// A protocol negotiation declared a negative unsupported-option count.
+    #[error("invalid protocol negotiation option count {0}")]
+    InvalidProtocolOptionCount(i32),
+    /// A reported protocol option was empty or outside the reserved namespace.
+    #[error("protocol negotiation option {0} does not begin with _pq_.")]
+    InvalidProtocolOptionName(usize),
     /// A `ReadyForQuery` status is not idle `I`, transaction `T`, or failed `E`.
     #[error("invalid ReadyForQuery transaction status {0}")]
     InvalidTransactionStatus(u8),
@@ -565,6 +934,7 @@ mod tests {
                 b'1' | b'2' | b'3' | b'I' | b'n' | b's' | b'c' => b"".as_slice(),
                 b'Z' => b"I".as_slice(),
                 b'K' => b"\0\0\0\x01key!".as_slice(),
+                b'v' => b"\0\x03\0\x02\0\0\0\0".as_slice(),
                 _ => b"body".as_slice(),
             };
             let packet = backend(byte, body);
@@ -686,11 +1056,14 @@ mod tests {
             Ok(Decode::Incomplete { required: 30_002 })
         );
 
-        for tag in *b"Rv" {
-            let minimum = [tag, 0, 0, 0, 8];
+        for (tag, message_length) in [(b'R', 8_u32), (b'v', 12)] {
+            let mut minimum = vec![tag];
+            minimum.extend_from_slice(&message_length.to_be_bytes());
             assert_eq!(
                 decode_backend(&minimum, DEFAULT_LARGE_MESSAGE_LENGTH),
-                Ok(Decode::Incomplete { required: 9 })
+                Ok(Decode::Incomplete {
+                    required: message_length as usize + 1,
+                })
             );
             let maximum = [tag, 0, 0, 7, 0xd0];
             assert_eq!(
@@ -709,7 +1082,7 @@ mod tests {
             (b'S', 5, 6),
             (b't', 5, 6),
             (b'R', 7, 8),
-            (b'v', 7, 8),
+            (b'v', 11, 12),
             (
                 b'K',
                 4 + 4 + MIN_BACKEND_CANCEL_KEY_LENGTH - 1,
@@ -727,6 +1100,258 @@ mod tests {
                 Err(DecodeError::InvalidLength { actual, minimum })
             );
         }
+    }
+
+    #[test]
+    fn fixed_authentication_requests_have_exact_layouts() {
+        for code in [0_u32, 2, 3, 7, 9] {
+            let packet = backend(b'R', &code.to_be_bytes());
+            let request = decode_authentication_request(complete(&packet))
+                .expect("fixed authentication request");
+            assert!(matches!(
+                (code, request),
+                (0, AuthenticationRequest::Ok)
+                    | (2, AuthenticationRequest::KerberosV5)
+                    | (3, AuthenticationRequest::CleartextPassword)
+                    | (7, AuthenticationRequest::Gss)
+                    | (9, AuthenticationRequest::Sspi)
+            ));
+
+            let mut trailing = code.to_be_bytes().to_vec();
+            trailing.push(0xa5);
+            assert_eq!(
+                decode_authentication_request(unchecked(b'R', &trailing))
+                    .expect_err("trailing fixed authentication data must fail"),
+                BackendMessageError::TrailingData(1)
+            );
+        }
+    }
+
+    #[test]
+    fn md5_authentication_salt_is_exact_zero_copy_and_redacted() {
+        let mut body = 5_u32.to_be_bytes().to_vec();
+        body.extend_from_slice(b"sAlt");
+        let packet = backend(b'R', &body);
+        let request =
+            decode_authentication_request(complete(&packet)).expect("MD5 authentication request");
+        let rendered = format!("{request:?}");
+        let AuthenticationRequest::Md5Password { salt } = request else {
+            panic!("expected MD5 authentication request");
+        };
+        assert_eq!(salt, b"sAlt");
+        assert_eq!(salt.as_ptr(), packet[9..].as_ptr());
+        assert!(!rendered.contains("sAlt"));
+        assert!(rendered.contains("salt_length"));
+
+        assert_eq!(
+            decode_authentication_request(unchecked(b'R', &body[..7]))
+                .expect_err("truncated MD5 salt must fail"),
+            BackendMessageError::Truncated("AuthenticationMD5Password")
+        );
+        body.push(0);
+        assert_eq!(
+            decode_authentication_request(unchecked(b'R', &body))
+                .expect_err("oversized MD5 salt must fail"),
+            BackendMessageError::TrailingData(1)
+        );
+    }
+
+    #[test]
+    fn sasl_mechanisms_are_ordered_exact_zero_copy_and_redacted() {
+        let mut body = 10_u32.to_be_bytes().to_vec();
+        body.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0OAUTHBEARER\0\0");
+        let packet = backend(b'R', &body);
+        let request =
+            decode_authentication_request(complete(&packet)).expect("SASL authentication request");
+        let rendered = format!("{request:?}");
+        let AuthenticationRequest::Sasl { mechanisms } = request else {
+            panic!("expected SASL authentication request");
+        };
+        assert_eq!(mechanisms.len(), 3);
+        assert_eq!(mechanisms.remaining.as_ptr(), packet[9..].as_ptr());
+        assert_eq!(
+            mechanisms.collect::<Vec<_>>(),
+            vec![
+                b"SCRAM-SHA-256-PLUS".as_slice(),
+                b"SCRAM-SHA-256".as_slice(),
+                b"OAUTHBEARER".as_slice(),
+            ]
+        );
+        assert!(!rendered.contains("SCRAM"));
+        assert!(!rendered.contains("OAUTHBEARER"));
+        assert!(rendered.contains("mechanism_count"));
+
+        let empty_list = [10_u32.to_be_bytes().as_slice(), b"\0"].concat();
+        let AuthenticationRequest::Sasl { mechanisms } =
+            decode_authentication_request(unchecked(b'R', &empty_list))
+                .expect("empty SASL list has a valid wire layout")
+        else {
+            panic!("expected SASL authentication request");
+        };
+        assert_eq!(mechanisms.len(), 0);
+    }
+
+    #[test]
+    fn opaque_authentication_exchange_data_is_zero_copy_and_redacted() {
+        for code in [8_u32, 11, 12] {
+            let mut body = code.to_be_bytes().to_vec();
+            body.extend_from_slice(b"do-not-log-auth-data");
+            let packet = backend(b'R', &body);
+            let request = decode_authentication_request(complete(&packet))
+                .expect("opaque authentication exchange");
+            let rendered = format!("{request:?}");
+            let (AuthenticationRequest::GssContinue { data }
+            | AuthenticationRequest::SaslContinue { data }
+            | AuthenticationRequest::SaslFinal { data }) = request
+            else {
+                panic!("expected opaque authentication exchange");
+            };
+            assert_eq!(data, b"do-not-log-auth-data");
+            assert_eq!(data.as_ptr(), packet[9..].as_ptr());
+            assert!(!rendered.contains("do-not-log-auth-data"));
+            assert!(rendered.contains("data_length"));
+        }
+    }
+
+    #[test]
+    fn malformed_authentication_requests_fail_closed() {
+        let code = 0_u32.to_be_bytes();
+        for split in 0..code.len() {
+            assert_eq!(
+                decode_authentication_request(unchecked(b'R', &code[..split]))
+                    .expect_err("truncated authentication code must fail"),
+                BackendMessageError::Truncated("authentication request code")
+            );
+        }
+        for code in [1_u32, 4, 6, 13, u32::MAX] {
+            assert_eq!(
+                decode_authentication_request(unchecked(b'R', &code.to_be_bytes()))
+                    .expect_err("unknown authentication code must fail"),
+                BackendMessageError::UnknownAuthenticationRequest(code)
+            );
+        }
+        for payload in [
+            b"".as_slice(),
+            b"SCRAM-SHA-256".as_slice(),
+            b"SCRAM-SHA-256\0".as_slice(),
+        ] {
+            let body = [10_u32.to_be_bytes().as_slice(), payload].concat();
+            assert_eq!(
+                decode_authentication_request(unchecked(b'R', &body))
+                    .expect_err("unterminated SASL mechanism list must fail"),
+                BackendMessageError::Truncated("SASL mechanism list")
+            );
+        }
+        for payload in [b"\0x".as_slice(), b"SCRAM-SHA-256\0\0x".as_slice()] {
+            let body = [10_u32.to_be_bytes().as_slice(), payload].concat();
+            assert_eq!(
+                decode_authentication_request(unchecked(b'R', &body))
+                    .expect_err("SASL data after the sentinel must fail"),
+                BackendMessageError::TrailingData(1)
+            );
+        }
+        assert!(matches!(
+            decode_authentication_request(complete(&backend(b'Z', b"I"))),
+            Err(BackendMessageError::WrongTag { .. })
+        ));
+    }
+
+    #[test]
+    fn protocol_negotiation_is_exact_zero_copy_and_redacted() {
+        let mut body = [0_u8, 3, 0, 2].to_vec();
+        body.extend_from_slice(&2_i32.to_be_bytes());
+        body.extend_from_slice(b"_pq_.compression\0_pq_.pgshard_test\0");
+        let packet = backend(b'v', &body);
+        let negotiation =
+            decode_protocol_negotiation(complete(&packet)).expect("protocol negotiation");
+        assert_eq!(negotiation.selected_protocol().major(), 3);
+        assert_eq!(negotiation.selected_protocol().minor(), 2);
+        let options = negotiation.unsupported_options();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options.remaining.as_ptr(), packet[13..].as_ptr());
+        assert_eq!(
+            options.collect::<Vec<_>>(),
+            vec![
+                b"_pq_.compression".as_slice(),
+                b"_pq_.pgshard_test".as_slice(),
+            ]
+        );
+        let rendered = format!("{negotiation:?}");
+        assert!(!rendered.contains("compression"));
+        assert!(!rendered.contains("pgshard_test"));
+        assert!(rendered.contains("unsupported_option_count"));
+
+        let zero_options = backend(b'v', b"\0\x03\0\x02\0\0\0\0");
+        let decoded = decode_protocol_negotiation(complete(&zero_options))
+            .expect("zero-option protocol negotiation");
+        assert_eq!(decoded.unsupported_options().len(), 0);
+    }
+
+    #[test]
+    fn malformed_protocol_negotiation_fails_closed() {
+        let header = b"\0\x03\0\x02\0\0\0\0";
+        for split in 0..header.len() {
+            assert_eq!(
+                decode_protocol_negotiation(unchecked(b'v', &header[..split]))
+                    .expect_err("truncated protocol negotiation header must fail"),
+                BackendMessageError::Truncated("protocol negotiation header")
+            );
+        }
+
+        let negative = b"\0\x03\0\x02\xff\xff\xff\xff";
+        assert_eq!(
+            decode_protocol_negotiation(unchecked(b'v', negative))
+                .expect_err("negative protocol option count must fail"),
+            BackendMessageError::InvalidProtocolOptionCount(-1)
+        );
+        for option in [b"\0".as_slice(), b"application_name\0".as_slice()] {
+            let body = [
+                b"\0\x03\0\x02".as_slice(),
+                1_i32.to_be_bytes().as_slice(),
+                option,
+            ]
+            .concat();
+            assert_eq!(
+                decode_protocol_negotiation(unchecked(b'v', &body))
+                    .expect_err("unreserved protocol option name must fail"),
+                BackendMessageError::InvalidProtocolOptionName(0)
+            );
+        }
+        for payload in [b"_pq_.one".as_slice(), b"_pq_.one\0".as_slice()] {
+            let body = [
+                b"\0\x03\0\x02".as_slice(),
+                2_i32.to_be_bytes().as_slice(),
+                payload,
+            ]
+            .concat();
+            assert_eq!(
+                decode_protocol_negotiation(unchecked(b'v', &body))
+                    .expect_err("truncated protocol option list must fail"),
+                BackendMessageError::Truncated("unsupported protocol option")
+            );
+        }
+
+        let trailing_after_zero = [header.as_slice(), b"x"].concat();
+        assert_eq!(
+            decode_protocol_negotiation(unchecked(b'v', &trailing_after_zero))
+                .expect_err("payload after zero protocol options must fail"),
+            BackendMessageError::TrailingData(1)
+        );
+        let one_plus_trailing = [
+            b"\0\x03\0\x02".as_slice(),
+            1_i32.to_be_bytes().as_slice(),
+            b"_pq_.one\0x".as_slice(),
+        ]
+        .concat();
+        assert_eq!(
+            decode_protocol_negotiation(unchecked(b'v', &one_plus_trailing))
+                .expect_err("payload after counted protocol options must fail"),
+            BackendMessageError::TrailingData(1)
+        );
+        assert!(matches!(
+            decode_protocol_negotiation(complete(&backend(b'Z', b"I"))),
+            Err(BackendMessageError::WrongTag { .. })
+        ));
     }
 
     #[test]
