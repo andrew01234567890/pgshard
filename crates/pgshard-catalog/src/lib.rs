@@ -2,13 +2,14 @@
 //!
 //! Readers use an immutable, checksummed snapshot. [`CatalogCache`] serializes
 //! rare installs while [`arc_swap`] keeps request-path reads lock free. A
-//! A `PostgreSQL` notification is only a wake-up hint; it never supplies catalog
+//! `PostgreSQL` notification is only a wake-up hint; it never supplies catalog
 //! data and can be lost without affecting correctness because callers poll.
 
 mod cache;
 mod driver;
 mod loader;
 mod model;
+mod supervisor;
 
 pub use cache::{
     CacheError, CatalogCache, CatalogNotification, InstallOutcome, NotificationError,
@@ -26,6 +27,12 @@ pub use loader::{
 pub use model::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, IdentifierError,
     RegisteredTable, RoutingHashConfig, ShardKeyType, ShardRoute, SnapshotError, TableName,
+};
+pub use supervisor::{
+    CatalogConnectionPhase, CatalogFailureKind, CatalogReadinessReason, CatalogSupervisor,
+    CatalogSupervisorConfig, CatalogSupervisorConfigError, CatalogSupervisorSnapshot,
+    CatalogSupervisorStatus, MAX_CATALOG_INITIAL_RECONNECT_DELAY, MAX_CATALOG_RECONNECT_DELAY,
+    MAX_CATALOG_STALE_GRACE, MIN_CATALOG_RECONNECT_DELAY, MIN_CATALOG_STALE_GRACE,
 };
 
 /// Dedicated catalog database hosted on stable shard 0000 in Milestone 1.

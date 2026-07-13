@@ -18,7 +18,12 @@ LISTEN and periodic-refresh loop, observes a committed catalog change appear in
 the lock-free cache before its deliberately long polling deadline, ignores a
 malformed hint, and separately recovers a trigger-bypassed epoch through
 polling. It also interrupts a lock-blocked initial load, shuts down cleanly, and
-treats forced connection loss as terminal. A separate raw-wire PostgreSQL 18
+proves the unsupervised driver treats forced connection loss as terminal. The
+supervisor scenario then kills its live backend, deliberately blocks the next
+connection attempt, verifies readiness survives only inside the configured
+stale-cache grace, observes readiness expire at the exact age boundary,
+releases reconnection, proves a fresh authoritative load restores readiness,
+and interrupts another blocked reconnect during shutdown. A separate raw-wire PostgreSQL 18
 test validates four-byte protocol 3.0 and 32-byte protocol 3.2 server cancellation keys,
 zero-copy `BackendKeyData` and `ParameterStatus`, typed `AuthenticationOk`, and
 a real protocol 3.99 to 3.2 negotiation that returns the requested unsupported

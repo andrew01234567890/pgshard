@@ -9,8 +9,9 @@ description: How pgshard stores and distributes its authoritative topology.
 The PostgreSQL 18 migration, validated Rust snapshot model, canonical checksum,
 multi-epoch lock-free cache, repeatable-read snapshot loader,
 LISTEN-before-initial-load primitive, bounded notification and polling driver,
-and live database contract test exist in source. Pooler composition, TLS,
-readiness, metrics, and reconnect supervision are not wired yet; see
+bounded reconnect and stale-readiness supervisor, metrics-ready state, and live
+database contract test exist in source. Pooler composition, TLS, timeouts, and
+HTTP/Prometheus publication are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
@@ -64,8 +65,25 @@ range end.
    stale, and malformed hints need not trigger a read, while a burst retains
    only its latest valid epoch.
 7. The driver polls every bounded 1 to 300 seconds. Connection loss is terminal
-   so its future pooler supervisor must fail readiness and reconnect before
-   serving from a newly initialized driver.
+   to that driver instance.
+8. A single-owner supervisor creates a fresh session with bounded, jittered
+   exponential backoff. A new process is unready until its first validated
+   load. An existing process may serve its last validated snapshot during a
+   bounded 2-to-900-second grace that must be longer than its poll interval.
+9. Readiness fails exactly when cache age reaches the grace deadline, whenever
+   an epoch fence makes the current snapshot unusable, and after graceful
+   shutdown. Reconnection does not restore readiness until a new authoritative
+   load succeeds.
+
+The default policy polls every 30 seconds, allows 90 seconds of cache age, and
+backs reconnect attempts off from 100 milliseconds to five seconds. Each
+process jitters within the upper half of its current delay window so replicas
+do not reconnect in lockstep. The status handle reports connection phase,
+catalog epoch, monotonic cache age, attempts, successful connections, and
+credential-safe failure categories. The future pooler will translate that
+state into readiness and Prometheus endpoints. TLS, connection/query timeouts,
+and sanitized connection-error logging remain responsibilities of that runtime
+composition.
 
 The empty installed catalog begins at epoch zero. A reader fails closed before
 publishing metadata above the current process limits: 1,024 logical databases,
