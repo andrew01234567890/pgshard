@@ -210,11 +210,16 @@ impl ParameterRouteTemplate {
     /// Binds this syntax/catalog template to `PostgreSQL`'s authoritative
     /// parameter description after a successful Parse.
     ///
-    /// The backend session must have an empty `search_path`, which leaves only
-    /// implicit `pg_catalog` operator lookup for this explicitly
+    /// The caller must observe an empty backend `search_path` immediately
+    /// before Parse and prevent it from changing through Describe. This leaves
+    /// only implicit `pg_catalog` operator lookup for this explicitly
     /// schema-qualified statement. The selected parameter must resolve to the
     /// exact built-in type registered for the shard key; coercion-compatible
     /// and domain types fail closed.
+    ///
+    /// `PostgreSQL` can re-analyze a cached statement if `search_path` changes
+    /// later. The Bind/Execute layer must therefore keep the same backend pinned
+    /// to the empty path and validate that invariant again before execution.
     ///
     /// # Errors
     ///
@@ -261,12 +266,14 @@ impl fmt::Debug for ParameterRouteTemplate {
     }
 }
 
-/// Proof that `PostgreSQL` operator lookup is restricted to implicit
-/// `pg_catalog` for a route-template Parse.
+/// Validated observation of `PostgreSQL`'s canonical empty `search_path`.
 ///
-/// The pooler must set the backend session's `search_path` to the empty string,
-/// read the authoritative setting back, rebuild this token after every backend
-/// checkout, and reject client attempts to change it.
+/// This token validates only the value supplied by its caller; it is not tied
+/// to a backend connection and cannot enforce future session state. The pooler
+/// must derive it from an authoritative backend read immediately before Parse,
+/// keep the path empty through Describe, rebuild it before Bind/Execute, and
+/// reject every client operation that could change the setting. `PostgreSQL` may
+/// otherwise re-analyze a prepared statement using a newly visible operator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogOnlySearchPath {
     _private: (),
@@ -295,9 +302,12 @@ pub struct SearchPathError;
 
 /// A route template whose selected parameter type was resolved by `PostgreSQL`.
 ///
-/// This still is not a Bind execution proof. The session must match the
-/// prepared-statement identity, parameter count, formats, NULL state, value,
-/// catalog epoch, and retained snapshot when the Bind arrives.
+/// This still is not a Bind execution proof. The session must keep the same
+/// backend on an empty `search_path` and match the prepared-statement identity,
+/// parameter count, formats, NULL state, value, catalog epoch, and retained
+/// snapshot when the Bind arrives. `PostgreSQL` can re-analyze cached statements
+/// when the path changes, so the Parse-time observation is not durable proof of
+/// which operator will execute.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ResolvedParameterRoute {
     template: ParameterRouteTemplate,

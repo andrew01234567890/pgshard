@@ -92,10 +92,34 @@ async fn check_parameter_route(client: &tokio_postgres::Client) {
         "default PostgreSQL catalog unexpectedly resolved double equality"
     );
 
-    check_operator_search_path_injection(client, &routed_sql).await;
+    check_operator_search_path_reanalysis(client, &routed_sql).await;
 }
 
-async fn check_operator_search_path_injection(client: &tokio_postgres::Client, routed_sql: &str) {
+async fn set_search_path(client: &tokio_postgres::Client, path: &str) {
+    let path = path.to_owned();
+    let reported: String = client
+        .query_one(
+            "SELECT pg_catalog.set_config('search_path', $1, false)",
+            &[&path],
+        )
+        .await
+        .expect("set and read search path")
+        .get(0);
+    assert_eq!(reported, path, "PostgreSQL reported another search path");
+}
+
+async fn route_row_count(
+    client: &tokio_postgres::Client,
+    statement: &tokio_postgres::Statement,
+) -> usize {
+    client
+        .query(statement, &[&42_i64])
+        .await
+        .expect("execute operator route fixture")
+        .len()
+}
+
+async fn check_operator_search_path_reanalysis(client: &tokio_postgres::Client, routed_sql: &str) {
     // Keep the persistent-schema fixture inside one transaction. Any assertion
     // failure closes the test connection and PostgreSQL rolls the fixture back.
     client
@@ -124,44 +148,41 @@ async fn check_operator_search_path_injection(client: &tokio_postgres::Client, r
                  LEFTARG = bigint,
                  RIGHTARG = bigint,
                  FUNCTION = {attack_schema}.always_false
-             );
-             SELECT pg_catalog.set_config('search_path',
-                 '{attack_schema}, pg_catalog', false);"
+             );"
         ))
         .await
         .expect("install test operator");
+    set_search_path(client, &format!("{attack_schema}, pg_catalog")).await;
 
     let shadowed_statement = client
         .prepare(routed_sql)
         .await
         .expect("prepare with shadowing operator");
-    assert!(
-        client
-            .query(&shadowed_statement, &[&42_i64])
-            .await
-            .expect("execute shadowed equality")
-            .is_empty(),
+    assert_eq!(
+        route_row_count(client, &shadowed_statement).await,
+        0,
         "test operator must shadow built-in equality under an unsafe search path"
     );
 
-    client
-        .query_one(
-            "SELECT pg_catalog.set_config('search_path', '', false)",
-            &[],
-        )
-        .await
-        .expect("restore empty search path");
+    set_search_path(client, "").await;
     let builtin_statement = client
         .prepare(routed_sql)
         .await
         .expect("prepare with catalog-only operators");
+    assert_eq!(route_row_count(client, &builtin_statement).await, 1);
+
+    set_search_path(client, &format!("{attack_schema}, pg_catalog")).await;
     assert_eq!(
-        client
-            .query(&builtin_statement, &[&42_i64])
-            .await
-            .expect("execute built-in equality")
-            .len(),
-        1
+        route_row_count(client, &builtin_statement).await,
+        0,
+        "PostgreSQL must expose why search_path cannot change after Parse"
+    );
+
+    set_search_path(client, "").await;
+    assert_eq!(
+        route_row_count(client, &builtin_statement).await,
+        1,
+        "cached route statements must execute only under the empty path"
     );
     client
         .batch_execute("ROLLBACK")

@@ -38,10 +38,13 @@ noncanonical `==` operator. The template is not executable until parameter
 types, operator resolution, and the corresponding Bind value are validated.
 The next proof stage consumes PostgreSQL's authoritative parameter description,
 requires the selected parameter to have the exact built-in shard-key type OID,
-and requires a backend session pinned to an empty `search_path`. PostgreSQL 18
-integration coverage demonstrates that an attacker-schema `=` overload can
-change results under an unsafe path and cannot do so under the empty-path
-contract. Bind-value validation and execution remain absent.
+and requires a backend session pinned to an empty `search_path` from Parse
+through execution. PostgreSQL 18 integration coverage demonstrates that an
+attacker-schema `=` overload changes results under an unsafe path, including
+when PostgreSQL re-analyzes a statement originally prepared under an empty path.
+The token records one validated setting observation; the future session runtime
+must enforce the invariant continuously. Bind-value validation and execution
+remain absent.
 
 `cargo bench -p pgshard-planner --bench parse_statement` measures this parsing
 boundary in isolation. `cargo bench -p pgshard-planner --bench
