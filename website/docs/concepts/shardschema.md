@@ -13,9 +13,10 @@ bounded reconnect and stale-readiness supervisor, metrics-ready state, and live
 database contract test exist in source. A Linux control executable composes
 the supervisor with pooler HTTP/readiness/status and Prometheus publication,
 bounded runtime settings, a file-backed DSN, and coordinated shutdown. Its
-temporary plaintext connector rejects non-local endpoints. Authenticated TLS,
-remote catalog transport, operator-provisioned credentials, and the SQL data
-plane are not wired yet; see
+control HTTP resources and drain are bounded, and its temporary plaintext
+connector rejects non-local endpoints. Overall application readiness stays
+false because there is no SQL data plane. Authenticated TLS, remote catalog
+transport, and operator-provisioned credentials are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
@@ -93,10 +94,12 @@ Each process waits within the upper half of its current window so replicas do
 not reconnect in lockstep. The status handle reports connection phase, catalog
 epoch, monotonic cache age, attempts, connections completing their initial
 authoritative load, and credential-safe failure categories including separate
-connection and operation timeouts. The pooler control executable translates
-that state into fail-closed readiness, exact JSON status, and bounded-label
-Prometheus endpoints. It reads one bounded DSN file and accepts only loopback
-IP literals or Unix sockets with `sslmode=disable`, the exact `shardschema`
+connection and operation timeouts. The pooler control executable publishes
+that catalog usability independently in exact JSON status and bounded-label
+Prometheus metrics. Its overall readiness remains false with reason
+`data_plane_unavailable`, even when the catalog is ready. It opens one regular
+DSN file nonblockingly, performs a bounded read, and accepts only loopback IP
+literals or Unix sockets with `sslmode=disable`, the exact `shardschema`
 database, `target_session_attrs=read-write`, and no startup options. That
 development bridge is not a substitute for authenticated TLS or operator
 credential distribution.

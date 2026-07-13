@@ -11,8 +11,11 @@ publish = false
 [dependencies]
 axum.workspace = true
 clap = { workspace = true, features = ["env"] }
+hyper.workspace = true
+hyper-util.workspace = true
 pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
+rustix.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -22,6 +25,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3.27.0"
 tower.workspace = true
 
 [lints]

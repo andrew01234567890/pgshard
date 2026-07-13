@@ -13,6 +13,7 @@ use pgshard_catalog::{
     CatalogPollIntervalError, CatalogSupervisorConfig, CatalogSupervisorConfigError,
     SHARDSCHEMA_DATABASE,
 };
+use rustix::fs::{Mode, OFlags};
 use thiserror::Error;
 use tokio_postgres::Config;
 use tokio_postgres::config::{Host, SslMode, TargetSessionAttrs};
@@ -28,14 +29,21 @@ pub struct PoolerConfig {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "pgshard-pooler", disable_help_subcommand = true)]
+#[command(
+    name = "pgshard-pooler",
+    about = "Control-only pgshard catalog runtime (no PostgreSQL client listener)",
+    disable_help_subcommand = true
+)]
 struct RawConfig {
+    /// Control HTTP listen address for health, readiness, status, and metrics.
     #[arg(long, env = "PGSHARD_HTTP_BIND", default_value = "0.0.0.0:8080")]
     http_bind: SocketAddr,
 
+    /// File containing one local-only shardschema database DSN (maximum 16 KiB).
     #[arg(long, env = "PGSHARD_SHARDSCHEMA_DSN_FILE")]
     shardschema_dsn_file: PathBuf,
 
+    /// Authoritative catalog polling interval in milliseconds (1,000..=300,000).
     #[arg(
         long,
         env = "PGSHARD_CATALOG_POLL_INTERVAL_MS",
@@ -43,9 +51,11 @@ struct RawConfig {
     )]
     catalog_poll_interval_ms: u64,
 
+    /// Maximum usable catalog age in milliseconds (2,000..=900,000 and greater than the poll interval).
     #[arg(long, env = "PGSHARD_CATALOG_STALE_GRACE_MS", default_value_t = 90_000)]
     catalog_stale_grace_ms: u64,
 
+    /// Initial reconnect window ceiling in milliseconds (10..=5,000).
     #[arg(
         long,
         env = "PGSHARD_CATALOG_INITIAL_RECONNECT_DELAY_MS",
@@ -53,6 +63,7 @@ struct RawConfig {
     )]
     catalog_initial_reconnect_delay_ms: u64,
 
+    /// Maximum reconnect window ceiling in milliseconds (initial..=60,000).
     #[arg(
         long,
         env = "PGSHARD_CATALOG_MAX_RECONNECT_DELAY_MS",
@@ -60,6 +71,7 @@ struct RawConfig {
     )]
     catalog_max_reconnect_delay_ms: u64,
 
+    /// Deadline for one catalog connection attempt in milliseconds (100..=30,000).
     #[arg(
         long,
         env = "PGSHARD_CATALOG_CONNECT_TIMEOUT_MS",
@@ -67,6 +79,7 @@ struct RawConfig {
     )]
     catalog_connect_timeout_ms: u64,
 
+    /// Deadline for one catalog load and publication in milliseconds (100..=300,000).
     #[arg(
         long,
         env = "PGSHARD_CATALOG_OPERATION_TIMEOUT_MS",
@@ -150,7 +163,25 @@ impl PoolerConfig {
 }
 
 fn read_shardschema_dsn(path: &Path) -> Result<String, PoolerConfigError> {
-    let file = fs::File::open(path).map_err(PoolerConfigError::DsnFile)?;
+    let metadata = fs::metadata(path).map_err(PoolerConfigError::DsnFile)?;
+    if !metadata.file_type().is_file() {
+        return Err(PoolerConfigError::DsnNotRegularFile);
+    }
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .map_err(|error| PoolerConfigError::DsnFile(error.into()))?;
+    let file = fs::File::from(descriptor);
+    if !file
+        .metadata()
+        .map_err(PoolerConfigError::DsnFile)?
+        .file_type()
+        .is_file()
+    {
+        return Err(PoolerConfigError::DsnNotRegularFile);
+    }
     let mut bytes = Vec::with_capacity(MAX_SHARDSCHEMA_DSN_BYTES + 1);
     file.take((MAX_SHARDSCHEMA_DSN_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -216,6 +247,9 @@ pub enum PoolerConfigError {
     /// The DSN file could not be read.
     #[error("could not read the shardschema DSN file: {0}")]
     DsnFile(#[source] std::io::Error),
+    /// The DSN path does not resolve to a regular file.
+    #[error("shardschema DSN path must resolve to a regular file")]
+    DsnNotRegularFile,
     /// The DSN file exceeds its memory bound.
     #[error("shardschema DSN file exceeds {maximum} bytes")]
     DsnTooLarge {
@@ -273,37 +307,45 @@ pub enum CatalogDsnPolicyError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     use super::*;
+    use clap::CommandFactory;
+    use tempfile::TempDir;
 
-    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
-
-    struct TestDsnFile(PathBuf);
+    struct TestDsnFile {
+        _directory: TempDir,
+        path: PathBuf,
+    }
 
     impl TestDsnFile {
         fn new(contents: &[u8]) -> Self {
-            let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "pgshard-pooler-config-{}-{sequence}",
-                std::process::id()
-            ));
+            let directory = TempDir::new().expect("create test DSN directory");
+            let path = directory.path().join("shardschema.dsn");
             fs::write(&path, contents).expect("write test DSN");
-            Self(path)
+            Self {
+                _directory: directory,
+                path,
+            }
+        }
+
+        fn fifo() -> Self {
+            let directory = TempDir::new().expect("create test FIFO directory");
+            let path = directory.path().join("shardschema.dsn");
+            rustix::fs::mkfifoat(rustix::fs::CWD, &path, Mode::RUSR | Mode::WUSR)
+                .expect("create test FIFO");
+            Self {
+                _directory: directory,
+                path,
+            }
         }
 
         fn arguments(&self) -> Vec<OsString> {
             vec![
                 OsString::from("pgshard-pooler"),
                 OsString::from("--shardschema-dsn-file"),
-                self.0.as_os_str().to_owned(),
+                self.path.as_os_str().to_owned(),
             ]
-        }
-    }
-
-    impl Drop for TestDsnFile {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
         }
     }
 
@@ -391,6 +433,32 @@ mod tests {
         };
         assert!(!format!("{error:?}").contains(marker));
         assert!(!error.to_string().contains(marker));
+    }
+
+    #[test]
+    fn rejects_fifo_without_waiting_for_a_writer() {
+        let file = TestDsnFile::fifo();
+        let started = Instant::now();
+        assert!(matches!(
+            PoolerConfig::try_parse_from(file.arguments()),
+            Err(PoolerConfigError::DsnNotRegularFile)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn generated_help_explains_units_bounds_and_dsn_policy() {
+        let help = RawConfig::command().render_long_help().to_string();
+        for expected in [
+            "no PostgreSQL client listener",
+            "maximum 16 KiB",
+            "1,000..=300,000",
+            "2,000..=900,000",
+            "100..=30,000",
+            "100..=300,000",
+        ] {
+            assert!(help.contains(expected), "missing help text: {expected}");
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use pgshard_catalog::{CatalogCache, CatalogSupervisor};
 use thiserror::Error;
@@ -13,6 +14,8 @@ use tokio_postgres::NoTls;
 use crate::config::PoolerConfig;
 use crate::state::PoolerState;
 
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// One fail-closed pooler control runtime.
 pub struct PoolerRuntime {
     catalog: CatalogSupervisor,
@@ -21,12 +24,12 @@ pub struct PoolerRuntime {
 }
 
 impl PoolerRuntime {
-    /// Builds a runtime whose readiness is driven by one catalog supervisor.
+    /// Builds a control-only runtime that remains application-unready.
     #[must_use]
     pub fn new(config: PoolerConfig) -> Self {
         let (catalog_config, supervisor_config) = config.into_runtime_parts();
         let catalog = CatalogSupervisor::new(Arc::new(CatalogCache::new()), supervisor_config);
-        let state = PoolerState::new(catalog.status());
+        let state = PoolerState::control_only(catalog.status());
         Self {
             catalog,
             catalog_config,
@@ -49,7 +52,8 @@ impl PoolerRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error if either child task panics or the HTTP server fails.
+    /// Returns an error if either child task panics, the HTTP server fails, or
+    /// child shutdown exceeds the hard runtime deadline.
     pub async fn run<F>(self, listener: TcpListener, shutdown: F) -> Result<(), PoolerRuntimeError>
     where
         F: Future<Output = ()> + Send,
@@ -77,29 +81,67 @@ impl PoolerRuntime {
         ));
         tokio::pin!(shutdown);
 
-        let first = tokio::select! {
+        let mut catalog_result = None;
+        let mut http_result = None;
+        tokio::select! {
             biased;
-            () = shutdown.as_mut() => RuntimeExit::Shutdown,
-            result = &mut catalog_task => RuntimeExit::Catalog(result),
-            result = &mut http_task => RuntimeExit::Http(result),
-        };
+            () = shutdown.as_mut() => {}
+            result = &mut catalog_task => catalog_result = Some(result),
+            result = &mut http_task => http_result = Some(result),
+        }
         stop_guard.stop();
 
-        let (catalog_result, http_result) = match first {
-            RuntimeExit::Shutdown => (catalog_task.await, http_task.await),
-            RuntimeExit::Catalog(result) => (result, http_task.await),
-            RuntimeExit::Http(result) => (catalog_task.await, result),
-        };
+        let joined = tokio::time::timeout(RUNTIME_SHUTDOWN_TIMEOUT, async {
+            tokio::join!(
+                async {
+                    if catalog_result.is_none() {
+                        catalog_result = Some((&mut catalog_task).await);
+                    }
+                },
+                async {
+                    if http_result.is_none() {
+                        http_result = Some((&mut http_task).await);
+                    }
+                }
+            );
+        })
+        .await;
+        if joined.is_err() {
+            if catalog_result.is_none() {
+                catalog_task.abort();
+            }
+            if http_result.is_none() {
+                http_task.abort();
+            }
+            if catalog_result.is_none() {
+                catalog_result = Some(catalog_task.await);
+            }
+            if http_result.is_none() {
+                http_result = Some(http_task.await);
+            }
+            if let Some(result) = catalog_result {
+                match result {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => return Err(PoolerRuntimeError::CatalogTask(error)),
+                }
+            }
+            if let Some(result) = http_result {
+                match result {
+                    Ok(result) => result.map_err(PoolerRuntimeError::Http)?,
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => return Err(PoolerRuntimeError::HttpTask(error)),
+                }
+            }
+            return Err(shutdown_timeout_error());
+        }
+
+        let catalog_result = catalog_result.ok_or_else(shutdown_timeout_error)?;
+        let http_result = http_result.ok_or_else(shutdown_timeout_error)?;
         catalog_result.map_err(PoolerRuntimeError::CatalogTask)?;
         let http_result = http_result.map_err(PoolerRuntimeError::HttpTask)?;
         http_result.map_err(PoolerRuntimeError::Http)
     }
-}
-
-enum RuntimeExit {
-    Shutdown,
-    Catalog(Result<(), JoinError>),
-    Http(Result<std::io::Result<()>, JoinError>),
 }
 
 struct StopOnDrop(watch::Sender<bool>);
@@ -139,6 +181,18 @@ pub enum PoolerRuntimeError {
     /// The HTTP server returned an I/O failure.
     #[error("pooler HTTP server failed: {0}")]
     Http(#[source] std::io::Error),
+    /// Child tasks did not stop inside the hard runtime drain deadline.
+    #[error("pooler child tasks exceeded shutdown timeout {timeout:?}")]
+    ShutdownTimeout {
+        /// Hard drain deadline before remaining tasks are aborted.
+        timeout: Duration,
+    },
+}
+
+fn shutdown_timeout_error() -> PoolerRuntimeError {
+    PoolerRuntimeError::ShutdownTimeout {
+        timeout: RUNTIME_SHUTDOWN_TIMEOUT,
+    }
 }
 
 #[cfg(test)]

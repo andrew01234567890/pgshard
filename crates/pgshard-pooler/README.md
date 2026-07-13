@@ -5,20 +5,26 @@ future Rust pooler. It composes the live `shardschema` supervisor with four
 low-frequency HTTP endpoints:
 
 - `/healthz` reports process liveness independently of routing readiness;
-- `/readyz` returns HTTP 503 until a validated catalog is usable and whenever
-  its bounded stale-cache grace expires;
-- `/status` publishes build and catalog state, with 64-bit counters and epochs
-  encoded as decimal strings; and
+- `/readyz` reports overall application readiness and therefore remains HTTP
+  503 with reason `data_plane_unavailable` in this control-only executable,
+  even after the catalog becomes usable;
+- `/status` publishes build, overall readiness, and independent catalog state,
+  with 64-bit counters and epochs encoded as decimal strings; and
 - `/metrics` publishes Prometheus text exposition with only bounded labels.
 
-The executable reads the catalog DSN from a bounded file, applies bounded
-polling, staleness, reconnect, connection, and operation deadlines, and shuts
-the supervisor and HTTP server down together on `SIGINT` or `SIGTERM`. Its
-temporary `NoTls` connector accepts only loopback IP literals or Unix sockets,
-requires the database name `shardschema` and
-`target_session_attrs=read-write`, and rejects startup options. This prevents a
-development-only connector from silently sending credentials to a remote
-server without transport security.
+The executable opens only a regular DSN file using nonblocking Linux flags,
+reads at most 16 KiB plus one byte, applies bounded polling, staleness,
+reconnect, connection, and operation deadlines, and shuts the supervisor and
+HTTP server down together on `SIGINT` or `SIGTERM`. Its control HTTP server
+limits accepted connections, header count and bytes, header time, total
+connection lifetime, and shutdown drain time. A hard runtime deadline aborts a
+child task that still does not stop.
+
+The temporary `NoTls` connector accepts only loopback IP literals or Unix
+sockets, requires the database name `shardschema` and
+`target_session_attrs=read-write`, and rejects startup options. This prevents
+the runtime configuration from directly selecting a remote server without
+transport security.
 
 For local development, place a single DSN in a file outside the repository:
 

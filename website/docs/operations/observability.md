@@ -6,9 +6,10 @@ description: Prometheus metrics, OpenTelemetry traces, Grafana dashboards, and c
 # Observability
 
 :::info Milestone 1 design contract
-The pooler control executable now exposes catalog health, readiness, status,
-and Prometheus signals. SQL-path metrics, OpenTelemetry export, dashboards,
-scraping resources, and the Grafana/Tempo test stack remain planned; see
+The pooler control executable now exposes health, independent catalog
+readiness, status, and Prometheus signals. Overall application readiness stays
+false until a SQL data plane exists. SQL-path metrics, OpenTelemetry export,
+dashboards, scraping resources, and the Grafana/Tempo test stack remain planned; see
 [implementation status](../project/status.md).
 :::
 
@@ -29,7 +30,9 @@ readiness reason, authoritative epoch and cache age, reconnect attempts,
 successful initial loads, and safe bounded failure categories, including
 distinct `connect_timeout` and `operation_timeout` labels. Health remains live
 when catalog readiness fails so Kubernetes can distinguish a process crash from
-an unavailable or stale routing catalog.
+an unavailable or stale routing catalog. `pgshard_pooler_catalog_ready` reports
+catalog usability separately from `pgshard_pooler_ready`, which remains zero in
+the control-only executable.
 
 ## Cluster operation signals
 

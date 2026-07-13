@@ -54,7 +54,9 @@ policy uses a five-second connection deadline and 30-second operation deadline.
 Its 90-second stale grace is strictly longer than the default 30-second poll.
 The `pgshard-pooler` Linux control executable composes the supervisor with its
 HTTP and Prometheus translation, bounded runtime configuration, a file-backed
-DSN, and coordinated graceful shutdown. Its temporary `NoTls` connector
+DSN, bounded control-HTTP resources, and coordinated deadline-bounded shutdown.
+Overall application readiness remains false because no SQL listener exists,
+while status and metrics expose independent catalog usability. Its temporary `NoTls` connector
 rejects every endpoint except loopback IP literals and Unix sockets and
 requires the dedicated writer database explicitly. Authenticated TLS, remote
 catalog transport, operator-provisioned credentials, and the SQL data plane
