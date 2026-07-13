@@ -19,7 +19,7 @@ in the same pull request whenever implementation status changes.
 | Rust agent and orchestrator foundations | Linux HTTP health/readiness/status/metrics, exact integer reporting, bounded lease TTLs, atomic catalog/fence/deadline precondition checks; orchestrator persistence remains disabled | Implemented in source; deliberately not ready for control traffic |
 | PostgreSQL lifecycle and HA | No bootstrap, physical replication, durable lease integration, promotion or restart controller | Planned |
 | Pooling and SQL routing | Fail-closed bound-parameter routing core with exact canonical hashing and a standalone microbenchmark; no SQL parser, statement planner, connection pool, or PostgreSQL wire endpoint | Partial |
-| `shardschema` catalog and cache | PostgreSQL 18 idempotent migration, dual-CAS route activation, commit-only notification, live PG18 tests, repeatable-read snapshot loader, LISTEN-before-load primitive, validated checksummed snapshots and lock-free retained-epoch cache; long-running pooler refresh driver is absent | Partial |
+| `shardschema` catalog and cache | PostgreSQL 18 idempotent migration, dual-CAS route activation, commit-only notification, live PG18 tests, owned idle LISTEN-before-load reader, bounded repeatable-read snapshots, validated checksums and lock-free retained-epoch cache; long-running pooler refresh driver is absent | Partial |
 | Cross-shard 2PC and recovery | Design only; no executable coordinator | Planned |
 | Online DDL and role propagation | Design only | Planned |
 | `pgoutput` change stream | Contract only; no decoder or durable stream runtime | Planned |

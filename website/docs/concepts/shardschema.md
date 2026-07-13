@@ -51,7 +51,9 @@ range end.
 
 ## Cache protocol
 
-1. A listener commits `LISTEN pgshard_catalog_changed` before its first read.
+1. A reader takes ownership of a dedicated idle connection, clears inherited
+   session state, and commits `LISTEN pgshard_catalog_changed` before its first
+   read. An existing manual transaction fails closed.
 2. It reads a complete catalog snapshot and its epoch in one read-only,
    repeatable-read transaction.
 3. It validates range coverage, references, epochs, identities and the canonical checksum.
@@ -59,6 +61,12 @@ range end.
 5. PostgreSQL `NOTIFY` sends only the committed positive decimal epoch.
 6. A notification is a wake-up hint, never authoritative data; duplicate and stale hints are ignored.
 7. Polling and reconnect recover lost notifications by rereading a complete snapshot.
+
+The empty installed catalog begins at epoch zero. A reader fails closed before
+publishing metadata above the current process limits: 1,024 logical databases,
+4,096 ranges or 16,384 registered tables per database, and 65,536 ranges or
+tables across one snapshot. Queries fetch only the limit plus one row so a
+runaway catalog cannot force an unbounded materialization before rejection.
 
 A request retains the exact immutable snapshot with which it was planned. The
 cache retains installed snapshots across newer publications and removes old

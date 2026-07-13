@@ -149,7 +149,11 @@ impl<'a> DecodedKey<'a> {
                 Ok(Self::Uuid(bytes))
             }
             (ShardKeyType::Text, ParameterFormat::Text | ParameterFormat::Binary) => {
-                Ok(Self::Text(std::str::from_utf8(value)?))
+                let value = std::str::from_utf8(value)?;
+                if value.as_bytes().contains(&0) {
+                    return Err(RouteError::TextContainsNul);
+                }
+                Ok(Self::Text(value))
             }
             (ShardKeyType::Bytes, ParameterFormat::Binary) => Ok(Self::Bytes(value)),
             _ => Err(RouteError::UnsupportedFormat { key_type, format }),
@@ -200,6 +204,10 @@ pub enum RouteError {
     /// A text shard key is not valid UTF8.
     #[error("text shard key is not valid UTF8")]
     InvalidUtf8(#[from] std::str::Utf8Error),
+    /// `PostgreSQL` rejects the zero byte in both text and binary `text`
+    /// input before storing a value.
+    #[error("text shard key contains a NUL byte")]
+    TextContainsNul,
 }
 
 #[cfg(test)]
@@ -353,10 +361,10 @@ mod tests {
                     .is_err()
             );
         }
-        let (snapshot, database_id, table) = snapshot(ShardKeyType::Int64);
+        let (integer_snapshot, database_id, table) = snapshot(ShardKeyType::Int64);
         assert_eq!(
             route_bound_parameter(
-                &snapshot,
+                &integer_snapshot,
                 database_id,
                 &table,
                 utf8(),
@@ -365,6 +373,21 @@ mod tests {
             ),
             Err(RouteError::NullShardKey)
         );
+
+        let (snapshot, database_id, table) = snapshot(ShardKeyType::Text);
+        for format in [ParameterFormat::Text, ParameterFormat::Binary] {
+            assert_eq!(
+                route_bound_parameter(
+                    &snapshot,
+                    database_id,
+                    &table,
+                    utf8(),
+                    format,
+                    Some(b"before\0after"),
+                ),
+                Err(RouteError::TextContainsNul)
+            );
+        }
     }
 
     #[test]

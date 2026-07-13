@@ -39,7 +39,8 @@ Safe session settings are replayed when a transaction receives a backend. Tempor
 The pooler pins `client_encoding` to canonical `UTF8` and rejects attempts to
 change it. PostgreSQL converts both text-format and binary `text` binds from the
 session encoding before storage; routing raw bytes from any other encoding can
-disagree with the stored value and is therefore not allowed.
+disagree with the stored value and is therefore not allowed. Both formats also
+reject the zero byte exactly as PostgreSQL does.
 
 Named prepared statements are virtualized at the pooler. Their routing plan is invalidated by relevant schema or routing epoch changes.
 

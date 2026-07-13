@@ -18,8 +18,8 @@ from the session encoding before storage, so hashing raw bytes from any other
 encoding would be incorrect. With the UTF-8 session proof, `text` accepts either
 bind format after strict UTF-8 validation because the catalog contract also
 requires UTF-8 and the built-in `C` collation. Unknown
-databases and tables, NULL keys, malformed lengths, ambiguous formats, and
-invalid text all fail closed.
+databases and tables, NULL keys, malformed lengths, ambiguous formats, invalid
+text, and text containing PostgreSQL's forbidden zero byte all fail closed.
 
 `cargo bench -p pgshard-router --bench route_bound_parameter` measures the
 complete immutable-snapshot lookup, decode, hash, and range-routing core. It is
