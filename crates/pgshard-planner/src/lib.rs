@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeSet, fmt, num::NonZeroU16, ops::ControlFlow};
 
-use pgshard_catalog::{CatalogSnapshot, DatabaseId, ShardKeyType, TableName};
+use pgshard_catalog::{CatalogSnapshot, ClusterId, DatabaseId, ShardKeyType, TableName};
 use pgshard_types::{CatalogEpoch, ShardId};
 use sqlparser::{
     ast::{
@@ -130,7 +130,9 @@ impl ParsedStatement {
         }
 
         Ok(ParameterRouteTemplate {
+            cluster_id: snapshot.cluster_id(),
             catalog_epoch: snapshot.catalog_epoch(),
+            snapshot_checksum: snapshot.checksum(),
             database_id,
             schema_epoch: database.epochs().schema(),
             table_name,
@@ -166,12 +168,15 @@ impl fmt::Debug for ParsedStatement {
 /// table's shard key.
 ///
 /// This is deliberately not an execution proof. The session layer must still
-/// validate exact physical shard-key storage on every active shard plus
-/// Parse-time parameter types and operator resolution, then Bind-time parameter
-/// count, format, NULL state, and value bytes against this template.
+/// validate the exact permanent, non-inherited relation and shard-key storage on
+/// every active shard plus Parse-time parameter types and operator resolution,
+/// then Bind-time parameter count, format, NULL state, and value bytes against
+/// this template.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ParameterRouteTemplate {
+    cluster_id: ClusterId,
     catalog_epoch: CatalogEpoch,
+    snapshot_checksum: [u8; 32],
     database_id: DatabaseId,
     schema_epoch: u64,
     table_name: TableName,
@@ -180,10 +185,22 @@ pub struct ParameterRouteTemplate {
 }
 
 impl ParameterRouteTemplate {
+    /// Returns the immutable cluster identity used to prove the template.
+    #[must_use]
+    pub const fn cluster_id(&self) -> ClusterId {
+        self.cluster_id
+    }
+
     /// Returns the exact catalog epoch used to prove the route template.
     #[must_use]
     pub const fn catalog_epoch(&self) -> CatalogEpoch {
         self.catalog_epoch
+    }
+
+    /// Returns the checksum of the complete catalog snapshot used for proof.
+    #[must_use]
+    pub const fn snapshot_checksum(&self) -> [u8; 32] {
+        self.snapshot_checksum
     }
 
     /// Returns the logical database containing the registered table.
@@ -226,10 +243,11 @@ impl ParameterRouteTemplate {
     /// schema-qualified statement. The selected parameter must resolve to the
     /// exact built-in type registered for the shard key; coercion-compatible
     /// and domain types fail closed. The physical proof must independently
-    /// establish that the base-table shard-key column has that exact type (and,
-    /// for text, built-in `C` collation under UTF8) on every active shard at the
-    /// same catalog and managed-schema epochs. A parameter OID alone is not
-    /// sufficient because `PostgreSQL` can coerce it to another column type.
+    /// establish that the exact named database, permanent ordinary table, and
+    /// non-inherited shard-key column has that type (and, for text, built-in `C`
+    /// collation under UTF8) on every active shard. It must come from the same
+    /// cluster and complete catalog snapshot checksum. A parameter OID alone is
+    /// not sufficient because `PostgreSQL` can coerce it to another column type.
     ///
     /// `PostgreSQL` can re-analyze a cached statement if `search_path` changes
     /// later. The Bind/Execute layer must therefore keep the same backend pinned
@@ -246,7 +264,9 @@ impl ParameterRouteTemplate {
         physical_schema: &PhysicalShardKeyProof,
         parameter_type_oids: &[u32],
     ) -> Result<ResolvedParameterRoute, ParameterResolutionError> {
-        if physical_schema.catalog_epoch != self.catalog_epoch
+        if physical_schema.cluster_id != self.cluster_id
+            || physical_schema.catalog_epoch != self.catalog_epoch
+            || physical_schema.snapshot_checksum != self.snapshot_checksum
             || physical_schema.database_id != self.database_id
             || physical_schema.schema_epoch != self.schema_epoch
             || physical_schema.table_name != self.table_name
@@ -282,6 +302,7 @@ impl fmt::Debug for ParameterRouteTemplate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ParameterRouteTemplate")
+            .field("cluster_id", &self.cluster_id)
             .field("catalog_epoch", &self.catalog_epoch)
             .field("database_id", &self.database_id)
             .field("schema_epoch", &self.schema_epoch)
@@ -325,15 +346,74 @@ impl CatalogOnlySearchPath {
 #[error("routed PostgreSQL sessions must use an empty search_path")]
 pub struct SearchPathError;
 
+/// Exact catalog identity and relation classification attached to one physical
+/// shard-key observation.
+///
+/// `relation_kind` and `relation_persistence` are the raw one-byte values from
+/// `pg_class.relkind` and `pg_class.relpersistence`. The inheritance flag must
+/// come from `pg_inherits` membership in either direction, rather than the
+/// potentially conservative `pg_class.relhassubclass` hint.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PhysicalShardKeyCatalogIdentity {
+    database_id: DatabaseId,
+    database_name: String,
+    table_name: TableName,
+    column_name: String,
+    relation_kind: u8,
+    relation_persistence: u8,
+    participates_in_inheritance: bool,
+}
+
+impl PhysicalShardKeyCatalogIdentity {
+    /// Records the identity returned by one fenced shard-local catalog read.
+    #[must_use]
+    pub fn new(
+        database_id: DatabaseId,
+        database_name: impl Into<String>,
+        table_name: TableName,
+        column_name: impl Into<String>,
+        relation_kind: u8,
+        relation_persistence: u8,
+        participates_in_inheritance: bool,
+    ) -> Self {
+        Self {
+            database_id,
+            database_name: database_name.into(),
+            table_name,
+            column_name: column_name.into(),
+            relation_kind,
+            relation_persistence,
+            participates_in_inheritance,
+        }
+    }
+}
+
+impl fmt::Debug for PhysicalShardKeyCatalogIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PhysicalShardKeyCatalogIdentity")
+            .field("database_id", &self.database_id)
+            .field("relation_kind", &self.relation_kind)
+            .field("relation_persistence", &self.relation_persistence)
+            .field(
+                "participates_in_inheritance",
+                &self.participates_in_inheritance,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 /// One shard-local observation of the physical shard-key column.
 ///
-/// The schema manager must obtain these values from the named base table's
-/// `pg_catalog` rows and shard-local managed-schema marker in one fenced read.
-/// This value only validates supplied observations; it cannot make a stale or
-/// fabricated caller observation authoritative.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The schema manager must obtain the identity, classification, type,
+/// collation, database encoding, and shard-local managed-schema marker from one
+/// fenced read of the exact named column. This value only validates supplied
+/// observations; it cannot make a stale or fabricated caller observation
+/// authoritative.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalShardKeyObservation {
     shard_id: ShardId,
+    identity: PhysicalShardKeyCatalogIdentity,
     schema_epoch: u64,
     type_oid: u32,
     collation_oid: u32,
@@ -345,6 +425,7 @@ impl PhysicalShardKeyObservation {
     #[must_use]
     pub const fn new(
         shard_id: ShardId,
+        identity: PhysicalShardKeyCatalogIdentity,
         schema_epoch: u64,
         type_oid: u32,
         collation_oid: u32,
@@ -352,6 +433,7 @@ impl PhysicalShardKeyObservation {
     ) -> Self {
         Self {
             shard_id,
+            identity,
             schema_epoch,
             type_oid,
             collation_oid,
@@ -360,15 +442,55 @@ impl PhysicalShardKeyObservation {
     }
 }
 
+fn verify_physical_identity(
+    observation: &PhysicalShardKeyObservation,
+    database_id: DatabaseId,
+    database_name: &str,
+    table_name: &TableName,
+    column_name: &str,
+) -> Result<(), PhysicalSchemaError> {
+    let shard_id = observation.shard_id;
+    if observation.identity.database_id != database_id
+        || observation.identity.database_name != database_name
+    {
+        return Err(PhysicalSchemaError::DatabaseIdentityMismatch { shard_id });
+    }
+    if observation.identity.table_name != *table_name {
+        return Err(PhysicalSchemaError::RelationIdentityMismatch { shard_id });
+    }
+    if observation.identity.column_name != column_name {
+        return Err(PhysicalSchemaError::ColumnIdentityMismatch { shard_id });
+    }
+    if observation.identity.relation_kind != PG_RELKIND_RELATION {
+        return Err(PhysicalSchemaError::UnsupportedRelationKind {
+            shard_id,
+            actual: observation.identity.relation_kind,
+        });
+    }
+    if observation.identity.relation_persistence != PG_RELPERSISTENCE_PERMANENT {
+        return Err(PhysicalSchemaError::UnsupportedRelationPersistence {
+            shard_id,
+            actual: observation.identity.relation_persistence,
+        });
+    }
+    if observation.identity.participates_in_inheritance {
+        return Err(PhysicalSchemaError::UnsupportedInheritance { shard_id });
+    }
+    Ok(())
+}
+
 /// Exact physical shard-key schema verified across every active shard.
 ///
-/// This proof is bound to one immutable catalog snapshot, logical database,
-/// managed schema epoch, and registered table. The schema manager must prevent
-/// physical DDL or epoch changes while a routed statement retains the proof;
-/// the future Bind/Execute layer must reject stale catalog or schema epochs.
+/// This proof is bound to one cluster, complete immutable catalog snapshot,
+/// logical database, managed schema epoch, and registered table. The schema
+/// manager must prevent physical DDL or epoch changes while a routed statement
+/// retains the proof; the future Bind/Execute layer must reject a different
+/// snapshot checksum or stale schema epoch.
 #[derive(Clone, Eq, PartialEq)]
 pub struct PhysicalShardKeyProof {
+    cluster_id: ClusterId,
     catalog_epoch: CatalogEpoch,
+    snapshot_checksum: [u8; 32],
     database_id: DatabaseId,
     schema_epoch: u64,
     table_name: TableName,
@@ -386,9 +508,10 @@ impl PhysicalShardKeyProof {
     ///
     /// # Errors
     ///
-    /// Fails for an unknown catalog object, incomplete or duplicate shard
-    /// coverage, a stale managed-schema epoch, or any type, collation, or
-    /// encoding mismatch.
+    /// Fails for an unknown or misidentified catalog object, a relation that is
+    /// not a permanent ordinary table outside inheritance, incomplete or
+    /// duplicate shard coverage, a stale managed-schema epoch, or any type,
+    /// collation, or encoding mismatch.
     pub fn verify(
         snapshot: &CatalogSnapshot,
         database_id: DatabaseId,
@@ -420,6 +543,13 @@ impl PhysicalShardKeyProof {
                     shard_id: observation.shard_id,
                 });
             }
+            verify_physical_identity(
+                observation,
+                database_id,
+                database.name(),
+                table.name(),
+                table.shard_key_column(),
+            )?;
             if observation.schema_epoch != schema_epoch {
                 return Err(PhysicalSchemaError::SchemaEpochMismatch {
                     shard_id: observation.shard_id,
@@ -461,7 +591,9 @@ impl PhysicalShardKeyProof {
         }
 
         Ok(Self {
+            cluster_id: snapshot.cluster_id(),
             catalog_epoch: snapshot.catalog_epoch(),
+            snapshot_checksum: snapshot.checksum(),
             database_id,
             schema_epoch,
             table_name: table_name.clone(),
@@ -475,6 +607,7 @@ impl fmt::Debug for PhysicalShardKeyProof {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PhysicalShardKeyProof")
+            .field("cluster_id", &self.cluster_id)
             .field("catalog_epoch", &self.catalog_epoch)
             .field("database_id", &self.database_id)
             .field("schema_epoch", &self.schema_epoch)
@@ -503,6 +636,46 @@ pub enum PhysicalSchemaError {
     #[error("physical schema proof repeats shard {shard_id:?}")]
     DuplicateShard {
         /// Repeated shard identity.
+        shard_id: ShardId,
+    },
+    /// The shard-local database marker or exact database name differs.
+    #[error("shard {shard_id:?} physical database identity does not match the catalog")]
+    DatabaseIdentityMismatch {
+        /// Shard containing the mismatched database identity.
+        shard_id: ShardId,
+    },
+    /// The observed schema-qualified relation is not the registered table.
+    #[error("shard {shard_id:?} physical relation identity does not match the catalog")]
+    RelationIdentityMismatch {
+        /// Shard containing the mismatched relation identity.
+        shard_id: ShardId,
+    },
+    /// The observed attribute is not the registered shard-key column.
+    #[error("shard {shard_id:?} physical column identity does not match the catalog")]
+    ColumnIdentityMismatch {
+        /// Shard containing the mismatched column identity.
+        shard_id: ShardId,
+    },
+    /// Only an ordinary `pg_class` relation is currently admitted.
+    #[error("shard {shard_id:?} physical relation kind {actual} is unsupported")]
+    UnsupportedRelationKind {
+        /// Shard containing the unsupported relation kind.
+        shard_id: ShardId,
+        /// Raw `pg_class.relkind` byte.
+        actual: u8,
+    },
+    /// Temporary and unlogged relations cannot establish durable shard state.
+    #[error("shard {shard_id:?} physical relation persistence {actual} is unsupported")]
+    UnsupportedRelationPersistence {
+        /// Shard containing the unsupported persistence mode.
+        shard_id: ShardId,
+        /// Raw `pg_class.relpersistence` byte.
+        actual: u8,
+    },
+    /// Inheritance and partition membership can add rows outside one base table.
+    #[error("shard {shard_id:?} physical relation participates in inheritance")]
+    UnsupportedInheritance {
+        /// Shard containing the inherited or partitioned relation.
         shard_id: ShardId,
     },
     /// No physical observation covers one active shard.
@@ -564,10 +737,10 @@ pub enum PhysicalSchemaError {
 ///
 /// This still is not a Bind execution proof. The session must keep the same
 /// backend on an empty `search_path` and match the prepared-statement identity,
-/// parameter count, formats, NULL state, value, catalog epoch, and retained
-/// snapshot when the Bind arrives. `PostgreSQL` can re-analyze cached statements
-/// when the path changes, so the Parse-time observation is not durable proof of
-/// which operator will execute.
+/// parameter count, formats, NULL state, value, catalog epoch, and exact retained
+/// snapshot checksum when the Bind arrives. `PostgreSQL` can re-analyze cached
+/// statements when the path changes, so the Parse-time observation is not
+/// durable proof of which operator will execute.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ResolvedParameterRoute {
     template: ParameterRouteTemplate,
@@ -608,7 +781,7 @@ impl fmt::Debug for ResolvedParameterRoute {
 /// Failure to bind a route template to `PostgreSQL`'s parameter description.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ParameterResolutionError {
-    /// The all-active-shard physical proof belongs to another catalog object or epoch.
+    /// The physical proof belongs to another cluster, snapshot, object, or epoch.
     #[error("physical shard-key proof does not match the route template")]
     PhysicalSchemaMismatch,
     /// Protocol 3.0 carries at most 65,535 parameter type OIDs.
@@ -641,6 +814,9 @@ const PG_TEXT_OID: u32 = 25;
 const PG_C_COLLATION_OID: u32 = 950;
 const PG_UUID_OID: u32 = 2_950;
 const PG_UTF8_ENCODING: i32 = 6;
+// Stable pg_class one-byte codes from PostgreSQL 18's pg_class.h.
+const PG_RELKIND_RELATION: u8 = b'r';
+const PG_RELPERSISTENCE_PERMANENT: u8 = b'p';
 
 const fn postgres_type_oid(key_type: ShardKeyType) -> u32 {
     match key_type {
@@ -1173,6 +1349,14 @@ mod tests {
         shard_key_type: ShardKeyType,
         routes: Vec<ShardRoute>,
     ) -> (CatalogSnapshot, DatabaseId) {
+        route_snapshot_with_cluster(shard_key_type, routes, Uuid::from_u128(1))
+    }
+
+    fn route_snapshot_with_cluster(
+        shard_key_type: ShardKeyType,
+        routes: Vec<ShardRoute>,
+        cluster_uuid: Uuid,
+    ) -> (CatalogSnapshot, DatabaseId) {
         let database_id = DatabaseId::new(Uuid::from_u128(2)).expect("database ID");
         let table_name = TableName::new("public", "events").expect("table name");
         let table = RegisteredTable::new(
@@ -1191,13 +1375,63 @@ mod tests {
         )
         .expect("database catalog");
         let snapshot = CatalogSnapshot::new(
-            ClusterId::new(Uuid::from_u128(1)).expect("cluster ID"),
+            ClusterId::new(cluster_uuid).expect("cluster ID"),
             7,
             RoutingHashConfig::new(1, 42).expect("routing hash"),
             vec![database],
         )
         .expect("catalog snapshot");
         (snapshot, database_id)
+    }
+
+    fn physical_identity(database_id: DatabaseId) -> PhysicalShardKeyCatalogIdentity {
+        PhysicalShardKeyCatalogIdentity::new(
+            database_id,
+            "app",
+            TableName::new("public", "events").expect("table name"),
+            "tenant_id",
+            PG_RELKIND_RELATION,
+            PG_RELPERSISTENCE_PERMANENT,
+            false,
+        )
+    }
+
+    fn physical_observation(
+        database_id: DatabaseId,
+        shard_id: ShardId,
+        schema_epoch: u64,
+        type_oid: u32,
+        collation_oid: u32,
+        database_encoding: i32,
+    ) -> PhysicalShardKeyObservation {
+        PhysicalShardKeyObservation::new(
+            shard_id,
+            physical_identity(database_id),
+            schema_epoch,
+            type_oid,
+            collation_oid,
+            database_encoding,
+        )
+    }
+
+    fn verify_identity(
+        snapshot: &CatalogSnapshot,
+        database_id: DatabaseId,
+        identity: PhysicalShardKeyCatalogIdentity,
+    ) -> Result<PhysicalShardKeyProof, PhysicalSchemaError> {
+        PhysicalShardKeyProof::verify(
+            snapshot,
+            database_id,
+            &TableName::new("public", "events").expect("table name"),
+            &[PhysicalShardKeyObservation::new(
+                ShardId(0),
+                identity,
+                1,
+                PG_INT8_OID,
+                0,
+                PG_UTF8_ENCODING,
+            )],
+        )
     }
 
     fn analyze_route(sql: &str) -> Result<ParameterRouteTemplate, RouteTemplateError> {
@@ -1220,7 +1454,8 @@ mod tests {
             &snapshot,
             database_id,
             template.table_name(),
-            &[PhysicalShardKeyObservation::new(
+            &[physical_observation(
+                database_id,
                 ShardId(0),
                 template.schema_epoch(),
                 PG_INT8_OID,
@@ -1622,7 +1857,8 @@ mod tests {
             &text_snapshot,
             database_id,
             &TableName::new("public", "events").expect("table name"),
-            &[PhysicalShardKeyObservation::new(
+            &[physical_observation(
+                database_id,
                 ShardId(0),
                 1,
                 PG_TEXT_OID,
@@ -1644,17 +1880,22 @@ mod tests {
     }
 
     #[test]
-    fn physical_schema_proof_requires_every_exact_active_shard() {
+    fn physical_schema_proof_rejects_stale_mismatched_and_duplicate_rows() {
         let (snapshot, database_id) = route_snapshot();
         let table_name = TableName::new("public", "events").expect("table name");
-        let exact = PhysicalShardKeyObservation::new(ShardId(0), 1, PG_INT8_OID, 0, 6);
-        let proof = PhysicalShardKeyProof::verify(&snapshot, database_id, &table_name, &[exact])
-            .expect("exact physical schema");
+        let exact = physical_observation(database_id, ShardId(0), 1, PG_INT8_OID, 0, 6);
+        let proof = PhysicalShardKeyProof::verify(
+            &snapshot,
+            database_id,
+            &table_name,
+            std::slice::from_ref(&exact),
+        )
+        .expect("exact physical schema");
         assert!(!format!("{proof:?}").contains("events"));
 
         for (observation, expected) in [
             (
-                PhysicalShardKeyObservation::new(ShardId(0), 2, PG_INT8_OID, 0, 6),
+                physical_observation(database_id, ShardId(0), 2, PG_INT8_OID, 0, 6),
                 PhysicalSchemaError::SchemaEpochMismatch {
                     shard_id: ShardId(0),
                     expected: 1,
@@ -1662,7 +1903,7 @@ mod tests {
                 },
             ),
             (
-                PhysicalShardKeyObservation::new(ShardId(0), 1, 701, 0, 6),
+                physical_observation(database_id, ShardId(0), 1, 701, 0, 6),
                 PhysicalSchemaError::TypeMismatch {
                     shard_id: ShardId(0),
                     expected_oid: PG_INT8_OID,
@@ -1670,7 +1911,7 @@ mod tests {
                 },
             ),
             (
-                PhysicalShardKeyObservation::new(ShardId(0), 1, PG_INT8_OID, 950, 6),
+                physical_observation(database_id, ShardId(0), 1, PG_INT8_OID, 950, 6),
                 PhysicalSchemaError::CollationMismatch {
                     shard_id: ShardId(0),
                     expected_oid: 0,
@@ -1678,7 +1919,7 @@ mod tests {
                 },
             ),
             (
-                PhysicalShardKeyObservation::new(ShardId(1), 1, PG_INT8_OID, 0, 6),
+                physical_observation(database_id, ShardId(1), 1, PG_INT8_OID, 0, 6),
                 PhysicalSchemaError::UnexpectedShard {
                     shard_id: ShardId(1),
                 },
@@ -1697,12 +1938,21 @@ mod tests {
             })
         );
         assert_eq!(
-            PhysicalShardKeyProof::verify(&snapshot, database_id, &table_name, &[exact, exact],),
+            PhysicalShardKeyProof::verify(
+                &snapshot,
+                database_id,
+                &table_name,
+                &[exact.clone(), exact],
+            ),
             Err(PhysicalSchemaError::DuplicateShard {
                 shard_id: ShardId(0)
             })
         );
+    }
 
+    #[test]
+    fn physical_schema_proof_requires_every_active_shard() {
+        let table_name = TableName::new("public", "events").expect("table name");
         let midpoint = KEYSPACE_END / 2;
         let (two_shards, database_id) = route_snapshot_with(
             ShardKeyType::Int64,
@@ -1719,7 +1969,8 @@ mod tests {
                 &two_shards,
                 database_id,
                 &table_name,
-                &[PhysicalShardKeyObservation::new(
+                &[physical_observation(
+                    database_id,
                     ShardId(0),
                     1,
                     PG_INT8_OID,
@@ -1736,11 +1987,220 @@ mod tests {
             database_id,
             &table_name,
             &[
-                PhysicalShardKeyObservation::new(ShardId(0), 1, PG_INT8_OID, 0, 6),
-                PhysicalShardKeyObservation::new(ShardId(1), 1, PG_INT8_OID, 0, 6),
+                physical_observation(database_id, ShardId(0), 1, PG_INT8_OID, 0, 6),
+                physical_observation(database_id, ShardId(1), 1, PG_INT8_OID, 0, 6),
             ],
         )
         .expect("every active shard is exact");
+    }
+
+    #[test]
+    fn physical_schema_proof_binds_exact_catalog_identity() {
+        let (snapshot, database_id) = route_snapshot();
+        let table_name = TableName::new("public", "events").expect("table name");
+        let exact_identity = physical_identity(database_id);
+        let redacted = format!("{exact_identity:?}");
+        assert!(!redacted.contains("app"));
+        assert!(!redacted.contains("events"));
+        assert!(!redacted.contains("tenant_id"));
+
+        for (identity, expected) in [
+            (
+                PhysicalShardKeyCatalogIdentity::new(
+                    DatabaseId::new(Uuid::from_u128(3)).expect("other database ID"),
+                    "app",
+                    table_name.clone(),
+                    "tenant_id",
+                    PG_RELKIND_RELATION,
+                    PG_RELPERSISTENCE_PERMANENT,
+                    false,
+                ),
+                PhysicalSchemaError::DatabaseIdentityMismatch {
+                    shard_id: ShardId(0),
+                },
+            ),
+            (
+                PhysicalShardKeyCatalogIdentity::new(
+                    database_id,
+                    "other_database",
+                    table_name.clone(),
+                    "tenant_id",
+                    PG_RELKIND_RELATION,
+                    PG_RELPERSISTENCE_PERMANENT,
+                    false,
+                ),
+                PhysicalSchemaError::DatabaseIdentityMismatch {
+                    shard_id: ShardId(0),
+                },
+            ),
+            (
+                PhysicalShardKeyCatalogIdentity::new(
+                    database_id,
+                    "app",
+                    TableName::new("public", "other_events").expect("other table"),
+                    "tenant_id",
+                    PG_RELKIND_RELATION,
+                    PG_RELPERSISTENCE_PERMANENT,
+                    false,
+                ),
+                PhysicalSchemaError::RelationIdentityMismatch {
+                    shard_id: ShardId(0),
+                },
+            ),
+            (
+                PhysicalShardKeyCatalogIdentity::new(
+                    database_id,
+                    "app",
+                    table_name.clone(),
+                    "other_tenant_id",
+                    PG_RELKIND_RELATION,
+                    PG_RELPERSISTENCE_PERMANENT,
+                    false,
+                ),
+                PhysicalSchemaError::ColumnIdentityMismatch {
+                    shard_id: ShardId(0),
+                },
+            ),
+        ] {
+            assert_eq!(
+                verify_identity(&snapshot, database_id, identity),
+                Err(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn physical_schema_proof_admits_only_permanent_uninherited_tables() {
+        let (snapshot, database_id) = route_snapshot();
+        let table_name = TableName::new("public", "events").expect("table name");
+
+        let inherited = PhysicalShardKeyCatalogIdentity::new(
+            database_id,
+            "app",
+            table_name.clone(),
+            "tenant_id",
+            PG_RELKIND_RELATION,
+            PG_RELPERSISTENCE_PERMANENT,
+            true,
+        );
+        assert_eq!(
+            verify_identity(&snapshot, database_id, inherited),
+            Err(PhysicalSchemaError::UnsupportedInheritance {
+                shard_id: ShardId(0),
+            }),
+        );
+
+        for relation_kind in *b"vmfp" {
+            let identity = PhysicalShardKeyCatalogIdentity::new(
+                database_id,
+                "app",
+                table_name.clone(),
+                "tenant_id",
+                relation_kind,
+                PG_RELPERSISTENCE_PERMANENT,
+                false,
+            );
+            assert_eq!(
+                verify_identity(&snapshot, database_id, identity),
+                Err(PhysicalSchemaError::UnsupportedRelationKind {
+                    shard_id: ShardId(0),
+                    actual: relation_kind,
+                }),
+            );
+        }
+
+        for relation_persistence in *b"tu" {
+            let identity = PhysicalShardKeyCatalogIdentity::new(
+                database_id,
+                "app",
+                table_name.clone(),
+                "tenant_id",
+                PG_RELKIND_RELATION,
+                relation_persistence,
+                false,
+            );
+            assert_eq!(
+                verify_identity(&snapshot, database_id, identity),
+                Err(PhysicalSchemaError::UnsupportedRelationPersistence {
+                    shard_id: ShardId(0),
+                    actual: relation_persistence,
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_resolution_binds_exact_snapshot_and_cluster() {
+        let (snapshot, database_id) = route_snapshot();
+        let template = parse_one("select * from public.events where tenant_id = $1")
+            .expect("route SQL parses")
+            .parameter_route_template(&snapshot, database_id)
+            .expect("route template");
+        assert_eq!(template.cluster_id(), snapshot.cluster_id());
+        assert_eq!(template.snapshot_checksum(), snapshot.checksum());
+
+        let midpoint = KEYSPACE_END / 2;
+        let two_routes = vec![
+            ShardRoute::new(ShardId(0), KeyRange::new(0, midpoint).expect("lower range")),
+            ShardRoute::new(
+                ShardId(1),
+                KeyRange::new(midpoint, KEYSPACE_END).expect("upper range"),
+            ),
+        ];
+        let (resharded, resharded_database_id) =
+            route_snapshot_with(ShardKeyType::Int64, two_routes.clone());
+        assert_eq!(database_id, resharded_database_id);
+        assert_ne!(snapshot.checksum(), resharded.checksum());
+        let resharded_proof = PhysicalShardKeyProof::verify(
+            &resharded,
+            database_id,
+            template.table_name(),
+            &[
+                physical_observation(database_id, ShardId(0), 1, PG_INT8_OID, 0, 6),
+                physical_observation(database_id, ShardId(1), 1, PG_INT8_OID, 0, 6),
+            ],
+        )
+        .expect("resharded physical proof");
+        assert_eq!(
+            template.clone().resolve_parameter_types(
+                CatalogOnlySearchPath::require_empty("").expect("empty path"),
+                &resharded_proof,
+                &[PG_INT8_OID],
+            ),
+            Err(ParameterResolutionError::PhysicalSchemaMismatch),
+        );
+
+        let (other_cluster, other_database_id) = route_snapshot_with_cluster(
+            ShardKeyType::Int64,
+            vec![ShardRoute::new(
+                ShardId(0),
+                KeyRange::new(0, KEYSPACE_END).expect("complete range"),
+            )],
+            Uuid::from_u128(9),
+        );
+        assert_eq!(database_id, other_database_id);
+        let other_cluster_proof = PhysicalShardKeyProof::verify(
+            &other_cluster,
+            database_id,
+            template.table_name(),
+            &[physical_observation(
+                database_id,
+                ShardId(0),
+                1,
+                PG_INT8_OID,
+                0,
+                PG_UTF8_ENCODING,
+            )],
+        )
+        .expect("other-cluster physical proof");
+        assert_eq!(
+            template.resolve_parameter_types(
+                CatalogOnlySearchPath::require_empty("").expect("empty path"),
+                &other_cluster_proof,
+                &[PG_INT8_OID],
+            ),
+            Err(ParameterResolutionError::PhysicalSchemaMismatch),
+        );
     }
 
     #[test]
@@ -1757,7 +2217,8 @@ mod tests {
             &snapshot,
             database_id,
             &table_name,
-            &[PhysicalShardKeyObservation::new(
+            &[physical_observation(
+                database_id,
                 ShardId(0),
                 1,
                 PG_TEXT_OID,
@@ -1771,7 +2232,8 @@ mod tests {
                 &snapshot,
                 database_id,
                 &table_name,
-                &[PhysicalShardKeyObservation::new(
+                &[physical_observation(
+                    database_id,
                     ShardId(0),
                     1,
                     PG_TEXT_OID,
@@ -1790,7 +2252,8 @@ mod tests {
                 &snapshot,
                 database_id,
                 &table_name,
-                &[PhysicalShardKeyObservation::new(
+                &[physical_observation(
+                    database_id,
                     ShardId(0),
                     1,
                     PG_TEXT_OID,

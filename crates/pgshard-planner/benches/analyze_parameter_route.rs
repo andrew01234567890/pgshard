@@ -7,7 +7,8 @@ use pgshard_catalog::{
     RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
 };
 use pgshard_planner::{
-    CatalogOnlySearchPath, PhysicalShardKeyObservation, PhysicalShardKeyProof, parse_one,
+    CatalogOnlySearchPath, PhysicalShardKeyCatalogIdentity, PhysicalShardKeyObservation,
+    PhysicalShardKeyProof, parse_one,
 };
 use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
 use uuid::Uuid;
@@ -52,7 +53,22 @@ fn main() {
         &snapshot,
         database_id,
         &TableName::new("public", "events").expect("table name"),
-        &[PhysicalShardKeyObservation::new(ShardId(0), 1, 20, 0, 6)],
+        &[PhysicalShardKeyObservation::new(
+            ShardId(0),
+            PhysicalShardKeyCatalogIdentity::new(
+                database_id,
+                "app",
+                TableName::new("public", "events").expect("table name"),
+                "tenant_id",
+                b'r',
+                b'p',
+                false,
+            ),
+            1,
+            20,
+            0,
+            6,
+        )],
     )
     .expect("physical schema proof");
     let started = Instant::now();

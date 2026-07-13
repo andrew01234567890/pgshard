@@ -19,9 +19,13 @@ custom operator while the candidate parser collapses it to the same AST node as
 `=`. It is not executable until Parse parameter types/operator resolution and
 the Bind value are checked. The implemented parameter-resolution stage requires
 PostgreSQL's authoritative description to report the exact built-in shard-key
-type OID. It also requires a proof, at the retained managed-schema epoch, that
-the physical base-table shard-key column has that exact built-in type on every
-active shard, with built-in `C` collation and UTF8 encoding for text. The
+type OID. It also requires a proof that the physical shard-key column belongs to
+the exact database, schema-qualified permanent ordinary table, and column on
+every active shard, does not participate in inheritance or partitioning, and
+has that exact built-in type, with built-in `C` collation and UTF8 encoding for
+text. Template and proof carry the cluster identity, managed-schema epoch, and
+checksum of the complete retained catalog snapshot, so a proof from another
+cluster or pre/post-reshard topology cannot be reused. The
 physical proof is mandatory because a ParameterDescription reports only the
 parameter type: PostgreSQL can accept an explicitly typed `bigint` parameter
 against a `double precision` column, round distinct large integers to the same
@@ -77,11 +81,15 @@ built-in shard-key equality.
 
 Parameter OIDs and catalog registration are not substitutes for the physical
 schema proof. Before a route proof is cached, the schema manager reads the
-shard-key column's exact `pg_attribute.atttypid` and `attcollation`, database
-encoding, and shard-local managed-schema epoch from every active shard. The
-proof fails closed on missing, duplicate, stale, or unexpected shard
-observations. DDL activation and Bind/Execute must fence the retained catalog and
-schema epochs so that this proof cannot survive a physical type change.
+shard-key column's exact database/schema/table/column identity,
+`pg_class.relkind` and `relpersistence`, `pg_inherits` membership,
+`pg_attribute.atttypid` and `attcollation`, database encoding, and shard-local
+managed-schema epoch from every active shard. Only permanent ordinary tables
+outside inheritance are admitted. The proof fails closed on missing, duplicate,
+stale, unexpected, misidentified, view-like, foreign, unlogged, temporary,
+inherited, or partitioned observations. DDL activation and Bind/Execute must
+fence the exact retained snapshot checksum and schema epoch so that this proof
+cannot survive a topology or physical-schema change.
 
 The pooler pins `client_encoding` to canonical `UTF8` and rejects attempts to
 change it. PostgreSQL converts both text-format and binary `text` binds from the

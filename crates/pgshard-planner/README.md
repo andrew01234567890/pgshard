@@ -38,19 +38,23 @@ noncanonical `==` operator. The template is not executable until parameter
 types, operator resolution, and the corresponding Bind value are validated.
 The next proof stage consumes PostgreSQL's authoritative parameter description,
 requires the selected parameter to have the exact built-in shard-key type OID,
-requires a managed-schema-epoch proof that the physical shard-key column has
-that exact built-in type and storage semantics on every active shard, and
-requires a backend session pinned to an empty `search_path` from Parse through
-execution. A parameter OID alone is unsafe: PostgreSQL can coerce an explicitly
-typed `bigint` parameter to a `double precision` column, making distinct large
+and binds the result to the exact cluster and complete catalog-snapshot
+checksum. Every active shard must expose the named column on the named logical
+database and schema-qualified permanent ordinary table with the exact built-in
+type and storage semantics; inheritance is rejected. The backend session must
+remain pinned to an empty `search_path` from Parse through execution. A
+parameter OID alone is unsafe: PostgreSQL can coerce an explicitly typed
+`bigint` parameter to a `double precision` column, making distinct large
 integers compare equal after rounding even though they hash differently.
-PostgreSQL 18 integration coverage locks down that regression and demonstrates
-that an attacker-schema `=` overload changes results under an unsafe path,
-including when PostgreSQL re-analyzes a statement originally prepared under an
-empty path. The tokens record validated caller observations; the future session
-and schema runtimes must obtain them authoritatively, fence their epochs, and
-enforce the invariants continuously. Bind-value validation and execution remain
-absent.
+PostgreSQL 18 integration coverage locks down that regression; rejects catalog
+rows from another table, views, unlogged tables, inherited tables, and
+partitioned tables; and demonstrates that an attacker-schema `=` overload
+changes results under an unsafe path, including when PostgreSQL re-analyzes a
+statement originally prepared under an empty path. The tokens record validated
+caller observations; the future session and schema runtimes must obtain them
+authoritatively in fenced reads, fence the complete snapshot and schema epochs,
+and enforce the invariants continuously. Bind-value validation and execution
+remain absent.
 
 `cargo bench -p pgshard-planner --bench parse_statement` measures this parsing
 boundary in isolation. `cargo bench -p pgshard-planner --bench
