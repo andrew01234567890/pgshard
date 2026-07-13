@@ -19,13 +19,21 @@ custom operator while the candidate parser collapses it to the same AST node as
 `=`. It is not executable until Parse parameter types/operator resolution and
 the Bind value are checked. The implemented parameter-resolution stage requires
 PostgreSQL's authoritative description to report the exact built-in shard-key
-type OID and requires the backend to report an empty `search_path` immediately
-before Parse. With an empty path, PostgreSQL implicitly searches `pg_catalog`
-for operators; an attacker-schema `=` overload cannot shadow built-in equality.
+type OID. It also requires a proof, at the retained managed-schema epoch, that
+the physical base-table shard-key column has that exact built-in type on every
+active shard, with built-in `C` collation and UTF8 encoding for text. The
+physical proof is mandatory because a ParameterDescription reports only the
+parameter type: PostgreSQL can accept an explicitly typed `bigint` parameter
+against a `double precision` column, round distinct large integers to the same
+float, and still report parameter OID 20. The stage also requires the backend to
+report an empty `search_path` immediately before Parse. With an empty path,
+PostgreSQL implicitly searches `pg_catalog` for operators; an attacker-schema
+`=` overload cannot shadow built-in equality.
 This observation is not durable by itself: PostgreSQL can re-analyze a cached
 statement under a later path and select a newly visible operator. The pooler
 session runtime that keeps the path empty through Parse, Describe, Bind, and
-Execute is not yet implemented.
+Execute and the schema runtime that gathers and fences physical observations are
+not yet implemented.
 A successful syntax parse or template extraction alone is not PostgreSQL
 semantic validation or permission to route. The source does not yet
 authenticate or execute clients. The
@@ -66,6 +74,14 @@ Bind/Execute. The later check is mandatory because PostgreSQL's plan cache can
 re-analyze a prepared statement when the path changes. This prevents
 user-defined `=` overloads from changing a predicate that the pooler admitted as
 built-in shard-key equality.
+
+Parameter OIDs and catalog registration are not substitutes for the physical
+schema proof. Before a route proof is cached, the schema manager reads the
+shard-key column's exact `pg_attribute.atttypid` and `attcollation`, database
+encoding, and shard-local managed-schema epoch from every active shard. The
+proof fails closed on missing, duplicate, stale, or unexpected shard
+observations. DDL activation and Bind/Execute must fence the retained catalog and
+schema epochs so that this proof cannot survive a physical type change.
 
 The pooler pins `client_encoding` to canonical `UTF8` and rejects attempts to
 change it. PostgreSQL converts both text-format and binary `text` binds from the

@@ -4,14 +4,21 @@ use pgshard_catalog::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, RegisteredTable,
     RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
 };
-use pgshard_planner::{CatalogOnlySearchPath, RouteTemplateError, StatementKind, parse_one};
+use pgshard_planner::{
+    CatalogOnlySearchPath, PhysicalSchemaError, PhysicalShardKeyObservation, PhysicalShardKeyProof,
+    RouteTemplateError, StatementKind, parse_one,
+};
 use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
 use uuid::Uuid;
 
 fn route_snapshot(schema: &str) -> (CatalogSnapshot, DatabaseId) {
+    route_snapshot_for(schema, "planner_target")
+}
+
+fn route_snapshot_for(schema: &str, table: &str) -> (CatalogSnapshot, DatabaseId) {
     let database_id = DatabaseId::new(Uuid::from_u128(2)).expect("database ID");
     let registered_table = RegisteredTable::new(
-        TableName::new(schema, "planner_target").expect("temporary table name"),
+        TableName::new(schema, table).expect("temporary table name"),
         "tenant_id",
         ShardKeyType::Int64,
         RoutingHashV1::VERSION,
@@ -36,6 +43,34 @@ fn route_snapshot(schema: &str) -> (CatalogSnapshot, DatabaseId) {
     )
     .expect("catalog snapshot");
     (snapshot, database_id)
+}
+
+async fn physical_observation(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    table: &str,
+) -> PhysicalShardKeyObservation {
+    let row = client
+        .query_one(
+            "SELECT attributes.atttypid::bigint, attributes.attcollation::bigint, \
+                    pg_catalog.pg_char_to_encoding(pg_catalog.getdatabaseencoding()) \
+               FROM pg_catalog.pg_attribute AS attributes \
+               JOIN pg_catalog.pg_class AS relations \
+                 ON relations.oid = attributes.attrelid \
+               JOIN pg_catalog.pg_namespace AS namespaces \
+                 ON namespaces.oid = relations.relnamespace \
+              WHERE namespaces.nspname = $1 \
+                AND relations.relname = $2 \
+                AND attributes.attname = 'tenant_id' \
+                AND attributes.attnum > 0 \
+                AND NOT attributes.attisdropped",
+            &[&schema, &table],
+        )
+        .await
+        .expect("read physical shard-key catalog row");
+    let type_oid = u32::try_from(row.get::<_, i64>(0)).expect("type OID fits u32");
+    let collation_oid = u32::try_from(row.get::<_, i64>(1)).expect("collation OID fits u32");
+    PhysicalShardKeyObservation::new(ShardId(0), 1, type_oid, collation_oid, row.get(2))
 }
 
 async fn check_parameter_route(client: &tokio_postgres::Client) {
@@ -69,11 +104,19 @@ async fn check_parameter_route(client: &tokio_postgres::Client) {
         .iter()
         .map(tokio_postgres::types::Type::oid)
         .collect::<Vec<_>>();
-    let resolved = parse_one(&routed_sql)
+    let template = parse_one(&routed_sql)
         .expect("route SQL parse")
         .parameter_route_template(&snapshot, database_id)
-        .expect("route template")
-        .resolve_parameter_types(search_path, &parameter_type_oids)
+        .expect("route template");
+    let physical_schema = PhysicalShardKeyProof::verify(
+        &snapshot,
+        database_id,
+        template.table_name(),
+        &[physical_observation(client, &temporary_schema, "planner_target").await],
+    )
+    .expect("physical int8 schema on every active shard");
+    let resolved = template
+        .resolve_parameter_types(search_path, &physical_schema, &parameter_type_oids)
         .expect("PostgreSQL parameter resolution");
     assert_eq!(resolved.template().parameter_number().get(), 1);
     assert_eq!(resolved.template().shard_key_type(), ShardKeyType::Int64);
@@ -93,6 +136,58 @@ async fn check_parameter_route(client: &tokio_postgres::Client) {
     );
 
     check_operator_search_path_reanalysis(client, &routed_sql).await;
+    check_coercible_column_rejected(client, &temporary_schema).await;
+}
+
+async fn check_coercible_column_rejected(client: &tokio_postgres::Client, schema: &str) {
+    client
+        .batch_execute(
+            "CREATE TEMP TABLE planner_coercion_target (tenant_id double precision PRIMARY KEY); \
+             INSERT INTO planner_coercion_target VALUES (9007199254740992::double precision)",
+        )
+        .await
+        .expect("create coercible-column fixture");
+    let sql =
+        format!("SELECT * FROM \"{schema}\".\"planner_coercion_target\" WHERE tenant_id = $1");
+    let statement = client
+        .prepare_typed(&sql, &[tokio_postgres::types::Type::INT8])
+        .await
+        .expect("PostgreSQL accepts explicit bigint against float8 column");
+    assert_eq!(
+        statement
+            .params()
+            .iter()
+            .map(tokio_postgres::types::Type::oid)
+            .collect::<Vec<_>>(),
+        vec![20],
+        "ParameterDescription must expose only the explicit bigint parameter"
+    );
+    assert_eq!(
+        client
+            .query(&statement, &[&9_007_199_254_740_993_i64])
+            .await
+            .expect("execute coercible-column fixture")
+            .len(),
+        1,
+        "PostgreSQL must demonstrate bigint-to-float8 equality rounding"
+    );
+
+    let (snapshot, database_id) = route_snapshot_for(schema, "planner_coercion_target");
+    let table_name = TableName::new(schema, "planner_coercion_target").expect("table name");
+    assert_eq!(
+        PhysicalShardKeyProof::verify(
+            &snapshot,
+            database_id,
+            &table_name,
+            &[physical_observation(client, schema, "planner_coercion_target").await],
+        ),
+        Err(PhysicalSchemaError::TypeMismatch {
+            shard_id: ShardId(0),
+            expected_oid: 20,
+            actual_oid: 701,
+        }),
+        "a matching parameter OID must not hide a coercible physical column"
+    );
 }
 
 async fn set_search_path(client: &tokio_postgres::Client, path: &str) {
