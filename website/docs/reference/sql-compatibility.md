@@ -161,11 +161,13 @@ after validating within-sample `flush <= write` and `apply <= write` ordering.
 Apply may exceed flush as PostgreSQL's logical worker permits for locally
 written, unflushed commits. A live PostgreSQL 18 COPY-BOTH fixture proves the
 server accepts the production frame, exposes three distinct positions, and
-sends a requested keepalive after the initial catch-up keepalive is drained. Feedback
-scheduling, durable-checkpoint binding, and
-cross-sample monotonicity remain the future replication session's responsibility.
-An
-authoritative client/server UTF-8 proof and validated `pgoutput` v1-v4
+sends a requested keepalive after the initial catch-up keepalive is drained.
+A state machine scoped to one COPY-BOTH session rejects cross-sample write,
+flush, and apply regression all-or-nothing. On reconnect it starts all three
+positions from the last durable checkpoint instead of restoring volatile write
+or apply progress. Feedback scheduling and durable-checkpoint binding remain
+the future replication session's responsibility.
+An authoritative client/server UTF-8 proof and validated `pgoutput` v1-v4
 configuration gate streamed and two-phase controls, and the control decoder
 covers Begin, Commit, Origin, Stream Start/Stop/Commit/
 Abort, Begin Prepare, Prepare, Commit Prepared, Rollback Prepared, and Stream

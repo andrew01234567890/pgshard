@@ -29,7 +29,10 @@ not decide when progress is durable or safe to acknowledge. PostgreSQL permits
 apply to be ahead of flush for locally written, unflushed work, so the actual
 within-sample checks are `flush <= write` and `apply <= write`. The future
 stream owner must advance its persisted checkpoint before reporting the
-corresponding flush position and must reject any regression across samples.
+corresponding flush position. A state machine scoped to one COPY-BOTH session
+rejects any write, flush, or apply regression across samples all-or-nothing.
+After disconnect, the owner discards volatile write and apply progress and
+starts a new tracker with all positions at the last durable checkpoint.
 The live PostgreSQL 18 fixture sends the encoded frame in COPY-BOTH mode and
 proves that the server records distinct write, flush, and apply positions and
 honors its immediate-reply request after the initial catch-up keepalive is drained.

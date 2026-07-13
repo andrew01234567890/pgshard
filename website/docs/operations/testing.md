@@ -32,11 +32,13 @@ prepared-transaction GIDs, persistent slot two-phase state across a later false
 request, custom logical Message flags, prefix encoding, binary lengths,
 explicit `messages` option gating, streamed top-level-XID matching,
 zero-copy borrowing, debug redaction, and exact fixed-size Standby Status Update
-frames with ordered progress validation. The live PostgreSQL 18 fixture sends
-the production feedback frame through a real COPY-BOTH connection, drains a
-catch-up keepalive, observes three distinct positions in `pg_stat_replication`,
-receives the subsequent requested keepalive, and completes COPY cleanly. It also
-creates a two-phase logical slot and proves
+frames with ordered progress validation. All-or-nothing progress-state tests
+reject write, flush, and apply regression without mutating the last accepted
+sample.
+The live PostgreSQL 18 fixture sends the production feedback frame through a
+real COPY-BOTH connection, drains a catch-up keepalive, observes three distinct
+positions in `pg_stat_replication`, receives the subsequent requested keepalive,
+and completes COPY cleanly. It also creates a two-phase logical slot and proves
 that protocol v1 with a
 later `two_phase=false` request still emits and decodes Begin Prepare and
 Prepare plus exact Relation, Insert, Update, Delete, and Truncate metadata from
@@ -48,11 +50,12 @@ cover buffered versus streamed layouts, distinct top-level and subtransaction
 XIDs, nested/unmatched stream controls, every truncated prefix, tuple markers
 and lengths, replica identity, reserved flags, UTF-8, zero-copy iteration, and
 redaction. Complete transaction ordering, relation caching, feedback scheduling
-and persistence, replay, and cross-shard stream tests are still absent. A targeted
-KIND test verifies operator PVC deletion and same-name recreation against real
-Kubernetes 1.36 controllers. A unit regression gives the informer cache a false absence while
-the authoritative API reader still sees an owned PVC, and proves that
-finalization continues waiting. The broader runtime, integration, KIND,
+and durable-checkpoint restart integration, replay, and cross-shard stream tests
+are still absent. A targeted KIND test verifies operator PVC deletion and
+same-name recreation against real Kubernetes 1.36 controllers. A unit
+regression gives the informer cache a false absence while the authoritative API
+reader still sees an owned PVC, and proves that finalization continues waiting.
+The broader runtime, integration, KIND,
 Jepsen/Elle and PgBouncer comparison suites below remain required Milestone 1
 work; see
 [implementation status](../project/status.md).
