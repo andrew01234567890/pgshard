@@ -355,7 +355,7 @@ func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 	ctx := context.Background()
 	cluster := validCluster()
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient}
 	request := requestFor(cluster)
 	if _, err := reconciler.Reconcile(ctx, request); err != nil {
 		t.Fatal(err)
@@ -418,6 +418,52 @@ func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertControllerOwner(t, recreated, replacement)
+}
+
+func TestDeletionFinalizerUsesAuthoritativeReaderWhenCacheMissesChild(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	controller := true
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:      "data-example-etcd-0",
+		Namespace: cluster.Namespace,
+		UID:       types.UID("authoritative-pvc-uid"),
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: pgshardv1alpha1.GroupVersion.String(),
+			Kind:       "PgShardCluster",
+			Name:       cluster.Name,
+			UID:        cluster.UID,
+			Controller: &controller,
+		}},
+	}}
+
+	staleCache := newFakeClient(t, cluster)
+	authoritative := newFakeClient(t, cluster.DeepCopy(), claim)
+	reconciler := &PgShardClusterReconciler{
+		Client:    staleCache,
+		APIReader: authoritative,
+	}
+	remaining, err := reconciler.prune(ctx, cluster, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !remaining {
+		t.Fatal("finalization treated an authoritative PVC as absent because the cache missed it")
+	}
+}
+
+func TestDeletionFinalizerFailsClosedWithoutAuthoritativeReader(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	reconciler := &PgShardClusterReconciler{Client: newFakeClient(t, cluster)}
+	remaining, err := reconciler.prune(context.Background(), cluster, nil, true)
+	if err == nil {
+		t.Fatal("deletion finalization succeeded without an authoritative API reader")
+	}
+	if remaining {
+		t.Fatal("failed deletion finalization reported remaining resources")
+	}
 }
 
 func TestReconcileReportsPlanFailureWithoutAdvancingObservedGeneration(t *testing.T) {

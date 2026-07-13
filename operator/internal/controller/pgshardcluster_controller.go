@@ -41,7 +41,10 @@ const (
 // desired objects existing; supporting availability comes from workload status.
 type PgShardClusterReconciler struct {
 	client.Client
-	Images owned.Images
+	// APIReader bypasses the informer cache for deletion-finalizer absence
+	// proofs. Writes and ordinary reconciliation continue through Client.
+	APIReader client.Reader
+	Images    owned.Images
 }
 
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
@@ -265,6 +268,13 @@ func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1
 	}
 
 	var existing []client.Object
+	reader := client.Reader(r.Client)
+	if includePVCs {
+		if r.APIReader == nil {
+			return false, fmt.Errorf("authoritative API reader is required for deletion finalization")
+		}
+		reader = r.APIReader
+	}
 	listOptions := []client.ListOption{client.InNamespace(cluster.Namespace)}
 	lists := []client.ObjectList{
 		&corev1.ConfigMapList{},
@@ -279,7 +289,7 @@ func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1
 		lists = append(lists, &corev1.PersistentVolumeClaimList{})
 	}
 	for _, list := range lists {
-		if err := r.List(ctx, list, listOptions...); err != nil {
+		if err := reader.List(ctx, list, listOptions...); err != nil {
 			return false, fmt.Errorf("list %T: %w", list, err)
 		}
 		existing = append(existing, listObjects(list)...)

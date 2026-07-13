@@ -24,8 +24,9 @@ plaintext; the independent `TransportSecurityReady=False` condition reports
 that TLS gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
 a bounded backend quota. Scale transitions retain those claims; cluster
 deletion keeps the CR finalizer until UID-owned StatefulSets and PVCs are
-observed absent, preventing same-name recreation from mounting stale etcd
-state. Automated defragmentation is not implemented. PostgreSQL
+observed absent through the uncached Kubernetes API reader, preventing informer
+lag from allowing same-name recreation to mount stale etcd state. Automated
+defragmentation is not implemented. PostgreSQL
 `archive_mode` remains off until a real archival pipeline is reconciled and
 verified, so the generated configuration cannot silently fill `pg_wal`.
 

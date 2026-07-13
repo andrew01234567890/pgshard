@@ -15,7 +15,7 @@ in the same pull request whenever implementation status changes.
 | Control and change-stream contracts | Buf-linted alpha protobuf definitions | Implemented in source |
 | Public-repository, CI and release policy | Parallel CI, privacy audit, source-only SemVer tooling | Implemented in source |
 | Documentation site | Typed Docusaurus build and link validation | Implemented in source |
-| Go operator API and supporting resources | Defaulting/validation, generated CRD/RBAC/webhook, deterministic ConfigMaps/Services/workloads/HPA/PDB/NetworkPolicy, semantic leader-election RBAC tests, supervised PVC deletion, and targeted digest-pinned Kubernetes 1.36 KIND delete/recreate coverage | Implemented in source; deliberately not a database cluster |
+| Go operator API and supporting resources | Defaulting/validation, generated CRD/RBAC/webhook, deterministic ConfigMaps/Services/workloads/HPA/PDB/NetworkPolicy, semantic leader-election RBAC tests, uncached finalizer absence proofs, supervised PVC deletion, and targeted digest-pinned Kubernetes 1.36 KIND delete/recreate coverage | Implemented in source; deliberately not a database cluster |
 | Rust agent and orchestrator foundations | Linux HTTP health/readiness/status/metrics, exact integer reporting, bounded lease TTLs, atomic catalog/fence/deadline precondition checks; orchestrator persistence remains disabled | Implemented in source; deliberately not ready for control traffic |
 | PostgreSQL lifecycle and HA | No bootstrap, physical replication, durable lease integration, promotion or restart controller | Planned |
 | Pooling and SQL routing | No PostgreSQL wire endpoint | Planned |

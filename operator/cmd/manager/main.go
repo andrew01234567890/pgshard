@@ -71,7 +71,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.PgShardClusterReconciler{Client: manager.GetClient(), Images: images}).SetupWithManager(manager); err != nil {
+	if err := (&controller.PgShardClusterReconciler{
+		Client:    manager.GetClient(),
+		APIReader: manager.GetAPIReader(),
+		Images:    images,
+	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
 	}

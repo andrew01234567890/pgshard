@@ -52,7 +52,7 @@ func TestKINDDeletionWaitsForPVCBeforeSameNameRecreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}}
-	reconciler := &PgShardClusterReconciler{Client: kubeClient}
+	reconciler := &PgShardClusterReconciler{Client: kubeClient, APIReader: kubeClient}
 	if _, err := reconciler.Reconcile(ctx, request); err != nil {
 		t.Fatal(err)
 	}
