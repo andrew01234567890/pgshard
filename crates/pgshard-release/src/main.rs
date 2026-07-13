@@ -10,9 +10,9 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 const FIRST_VERSION: Version = Version::new(0, 1, 0);
-const RELEASE_MARKER: &str = "crates/pgshard-release/Cargo.toml";
-const NOREPLY_EMAIL: &str = "13841202+andrew01234567890@users.noreply.github.com";
+const RELEASE_MARKER: &str = "crates/pgshard-release/RELEASE_START";
 const RELEASE_HELPER_SOURCE: &str = "crates/pgshard-release/src/main.rs";
+const DEPENDABOT_MERGE_QUERY: &str = "query=mutation($id: ID!, $headline: String!, $oid: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, mergeMethod: SQUASH, commitHeadline: $headline, expectedHeadOid: $oid}) { pullRequest { state mergedAt mergeCommit { oid } } } }";
 
 #[derive(Debug, Parser)]
 #[command(about = "Create deterministic source-only pgshard releases")]
@@ -31,6 +31,9 @@ enum ReleaseCommand {
         /// Head revision included in the audit.
         #[arg(long, default_value = "HEAD")]
         head: String,
+        /// Permit GitHub's squash author while still requiring its noreply committer.
+        #[arg(long)]
+        allow_github_squash_author: bool,
     },
     /// Print the version that the selected commit would receive.
     Next {
@@ -50,7 +53,7 @@ enum ReleaseCommand {
         #[arg(long)]
         sha: String,
     },
-    /// Safely enable squash auto-merge after a successful CI workflow run.
+    /// Safely squash-merge a verified patch update after successful CI.
     DependabotAutomerge {
         /// Repository in owner/name form.
         #[arg(long)]
@@ -126,6 +129,24 @@ struct CommitVerification {
 }
 
 #[derive(Debug, Deserialize)]
+struct GitHubCommitDetails {
+    sha: String,
+    committer: Option<Login>,
+    commit: GitHubCommitData,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCommitData {
+    verification: GitHubCommitVerification,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCommitVerification {
+    verified: bool,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CheckRuns {
     check_runs: Vec<CheckRun>,
 }
@@ -152,7 +173,11 @@ struct ReleaseSummary<'a> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        ReleaseCommand::Audit { base, head } => audit(&base, &head)?,
+        ReleaseCommand::Audit {
+            base,
+            head,
+            allow_github_squash_author,
+        } => audit(&base, &head, allow_github_squash_author)?,
         ReleaseCommand::Next { sha } => {
             let sha = git(&["rev-parse", &format!("{sha}^{{commit}}")])?;
             if let Some(tag) = semver_tag_at(&sha)? {
@@ -185,18 +210,22 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn audit(base: &str, head: &str) -> Result<()> {
+fn audit(base: &str, head: &str, allow_github_squash_author: bool) -> Result<()> {
     let merge_base = git(&["merge-base", base, head])?;
     let range = format!("{merge_base}..{head}");
-    let identities = git(&["log", "--format=%H%x09%ae%x09%ce", &range])?;
+    let identities = git(&["log", "--format=%H%x09%ae%x09%cn%x09%ce", &range])?;
     for line in identities.lines() {
         let mut fields = line.split('\t');
         let sha = fields.next().unwrap_or_default();
         let author = fields.next().unwrap_or_default();
+        let committer_name = fields.next().unwrap_or_default();
         let committer = fields.next().unwrap_or_default();
+        let github_squash_verified = allow_github_squash_author
+            && github_squash_identity(committer_name, committer)
+            && github_commit_is_verified(sha)?;
         ensure!(
-            is_noreply(author) && is_noreply(committer),
-            "commit {sha} must use noreply author and committer addresses"
+            commit_identity_is_allowed(author, committer, github_squash_verified),
+            "commit {sha} must use noreply identities or an explicitly allowed GitHub squash author"
         );
     }
 
@@ -239,6 +268,37 @@ fn audit_repository_path(path: &str) -> Result<()> {
 
 fn is_noreply(email: &str) -> bool {
     email == "noreply@github.com" || email.ends_with("@users.noreply.github.com")
+}
+
+fn commit_identity_is_allowed(author: &str, committer: &str, github_squash_verified: bool) -> bool {
+    (is_noreply(author) && is_noreply(committer)) || github_squash_verified
+}
+
+fn github_squash_identity(committer_name: &str, committer: &str) -> bool {
+    committer_name == "GitHub" && committer == "noreply@github.com"
+}
+
+fn github_commit_is_verified(sha: &str) -> Result<bool> {
+    let repository = env::var("GITHUB_REPOSITORY")
+        .context("GITHUB_REPOSITORY is required to verify a GitHub squash commit")?;
+    let response = run(
+        "gh",
+        [
+            "api",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &format!("repos/{repository}/commits/{sha}"),
+        ],
+    )?;
+    let details: GitHubCommitDetails = serde_json::from_str(&response)?;
+    Ok(github_commit_details_are_verified(&details, sha))
+}
+
+fn github_commit_details_are_verified(details: &GitHubCommitDetails, sha: &str) -> bool {
+    details.sha == sha
+        && details.committer.as_ref().map(|login| login.login.as_str()) == Some("web-flow")
+        && details.commit.verification.verified
+        && details.commit.verification.reason == "valid"
 }
 
 fn audit_content(path: &str, content: &str) -> Result<()> {
@@ -610,9 +670,9 @@ fn dependabot_automerge(repository: &str, requested_sha: &str) -> Result<()> {
         return Ok(());
     }
 
-    enable_dependabot_automerge(&pull, requested_sha)?;
+    merge_dependabot_pull(&pull, requested_sha)?;
     println!(
-        "enabled checked squash auto-merge for Dependabot pull request #{}",
+        "squash-merged checked Dependabot pull request #{}",
         pull.number
     );
     Ok(())
@@ -719,20 +779,18 @@ fn load_dependabot_commits(
     Ok(commits)
 }
 
-fn enable_dependabot_automerge(pull: &PullRequest, requested_sha: &str) -> Result<()> {
+fn merge_dependabot_pull(pull: &PullRequest, requested_sha: &str) -> Result<()> {
     run(
         "gh",
         [
             "api",
             "graphql",
             "-f",
-            "query=mutation($id: ID!, $headline: String!, $authorEmail: String!, $oid: GitObjectID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH, commitHeadline: $headline, authorEmail: $authorEmail, expectedHeadOid: $oid}) { pullRequest { autoMergeRequest { enabledAt } } } }",
+            DEPENDABOT_MERGE_QUERY,
             "-f",
             &format!("id={}", pull.node_id),
             "-f",
             &format!("headline={}", pull.title),
-            "-f",
-            &format!("authorEmail={NOREPLY_EMAIL}"),
             "-f",
             &format!("oid={requested_sha}"),
         ],
@@ -883,6 +941,18 @@ mod tests {
         assert!(is_noreply("123+contributor@users.noreply.github.com"));
         assert!(is_noreply("noreply@github.com"));
         assert!(!is_noreply("developer@example.com"));
+        assert!(commit_identity_is_allowed(
+            "developer@example.com",
+            "noreply@github.com",
+            true,
+        ));
+        assert!(!commit_identity_is_allowed(
+            "developer@example.com",
+            "noreply@github.com",
+            false,
+        ));
+        assert!(github_squash_identity("GitHub", "noreply@github.com"));
+        assert!(!github_squash_identity("maintainer", "noreply@github.com"));
     }
 
     #[test]
@@ -909,6 +979,23 @@ mod tests {
         assert!(dependabot_patch_only([patch]));
         assert!(!dependabot_patch_only([mixed]));
         assert!(!dependabot_patch_only([incomplete]));
+        assert!(!DEPENDABOT_MERGE_QUERY.contains("authorEmail"));
+        assert!(DEPENDABOT_MERGE_QUERY.contains("mergePullRequest"));
+        assert!(!DEPENDABOT_MERGE_QUERY.contains("enablePullRequestAutoMerge"));
+        assert!(DEPENDABOT_MERGE_QUERY.contains("expectedHeadOid"));
+    }
+
+    #[test]
+    fn dependabot_version_updates_are_patch_only() {
+        let configuration = include_str!("../../../.github/dependabot.yml");
+        assert_eq!(
+            configuration.matches("version-update:semver-minor").count(),
+            4
+        );
+        assert_eq!(
+            configuration.matches("version-update:semver-major").count(),
+            4
+        );
     }
 
     #[test]
@@ -931,6 +1018,45 @@ mod tests {
             login: "maintainer".to_owned(),
         });
         assert!(!dependabot_commits_verified(&commits, &head));
+    }
+
+    #[test]
+    fn github_squash_exception_requires_verified_web_flow_commit() {
+        let mut details = GitHubCommitDetails {
+            sha: "a".repeat(40),
+            committer: Some(Login {
+                login: "web-flow".to_owned(),
+            }),
+            commit: GitHubCommitData {
+                verification: GitHubCommitVerification {
+                    verified: true,
+                    reason: "valid".to_owned(),
+                },
+            },
+        };
+        assert!(github_commit_details_are_verified(
+            &details,
+            &"a".repeat(40)
+        ));
+        details.committer = Some(Login {
+            login: "maintainer".to_owned(),
+        });
+        assert!(!github_commit_details_are_verified(
+            &details,
+            &"a".repeat(40)
+        ));
+        details.committer = Some(Login {
+            login: "web-flow".to_owned(),
+        });
+        details.commit.verification.verified = false;
+        assert!(!github_commit_details_are_verified(
+            &details,
+            &"a".repeat(40)
+        ));
+        assert!(!github_commit_details_are_verified(
+            &details,
+            &"b".repeat(40)
+        ));
     }
 
     #[test]
@@ -985,6 +1111,7 @@ mod tests {
     #[test]
     fn ci_guards_component_deletion_and_rust_policy_changes() {
         let workflow = include_str!("../../../.github/workflows/ci.yml");
+        let makefile = include_str!("../../../Makefile");
         for manifest in [
             "Cargo.toml",
             "buf.yaml",
@@ -1007,5 +1134,22 @@ mod tests {
                 "Rust CI trigger must include {policy}"
             );
         }
+        for command in [
+            "go mod tidy",
+            "go mod verify",
+            "go test -race ./...",
+            "go vet ./...",
+            "go build ./...",
+            "go tool govulncheck ./...",
+            "go tool controller-gen",
+        ] {
+            assert!(
+                makefile.contains(command),
+                "operator CI target must run {command}"
+            );
+        }
+        assert!(workflow.contains("bufbuild/buf-action@fd21066df7214747548607aaa45548ba2b9bc1ff"));
+        assert!(!workflow.contains("bufbuild/buf-setup-action"));
+        assert!(workflow.contains("run: make go-check"));
     }
 }

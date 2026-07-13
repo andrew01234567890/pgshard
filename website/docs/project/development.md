@@ -38,4 +38,8 @@ npm run check
 
 ## Git identity and history
 
-All changes use a GitHub noreply identity. Direct default-branch pushes, merge commits, and rebase merges are disabled. After squash merge, automation verifies the final commit identity before considering the change complete.
+Source-branch commits use GitHub noreply author and committer identities. Direct
+default-branch pushes, merge commits, and rebase merges are disabled. After
+squash merge, automation verifies either those noreply identities or the narrow,
+signed GitHub `web-flow` exception in the [release policy](./releases.md). That
+exception may retain public author metadata and does not hide it.
