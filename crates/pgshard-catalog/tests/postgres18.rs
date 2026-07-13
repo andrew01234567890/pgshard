@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::future::{pending, poll_fn};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,8 +15,10 @@ use tokio_postgres::{AsyncMessage, Client, Error as PgError, IsolationLevel, NoT
 use uuid::Uuid;
 
 use pgshard_catalog::{
-    CatalogCache, CatalogPollInterval, CatalogReader, CatalogRefreshError, DatabaseId,
-    InstallOutcome, LoadError, run_catalog_refresh,
+    CatalogCache, CatalogConnectionPhase, CatalogPollInterval, CatalogReader,
+    CatalogReadinessReason, CatalogRefreshError, CatalogSupervisor, CatalogSupervisorConfig,
+    CatalogSupervisorSnapshot, CatalogSupervisorStatus, DatabaseId, InstallOutcome, LoadError,
+    run_catalog_refresh,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -787,6 +790,8 @@ async fn assert_loader_contract(
     wait_for_cache_epoch(&polling_driver.cache, missed_epoch).await?;
     polling_driver.shutdown().await?;
     assert_catalog_driver_connection_loss(client, database_url, missed_epoch).await?;
+    assert_catalog_supervisor_reconnects_with_bounded_grace(client, database_url, missed_epoch)
+        .await?;
     Ok(missed_epoch)
 }
 
@@ -900,6 +905,231 @@ async fn assert_catalog_driver_connection_loss(
     assert!(
         result.is_err(),
         "catalog driver silently survived connection loss"
+    );
+    Ok(())
+}
+
+async fn wait_for_supervisor_status(
+    status: &CatalogSupervisorStatus,
+    description: &str,
+    predicate: impl Fn(CatalogSupervisorSnapshot) -> bool,
+) -> TestResult<CatalogSupervisorSnapshot> {
+    for _ in 0..250 {
+        let snapshot = status.snapshot();
+        if predicate(snapshot) {
+            return Ok(snapshot);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err(format!("catalog supervisor did not become {description} within five seconds").into())
+}
+
+async fn catalog_backend_pid(client: &Client, application_name: &str) -> TestResult<i32> {
+    Ok(client
+        .query_one(
+            "SELECT pid FROM pg_catalog.pg_stat_activity \
+             WHERE datname = current_database() AND application_name = $1",
+            &[&application_name],
+        )
+        .await?
+        .get(0))
+}
+
+async fn terminate_catalog_backend(client: &Client, application_name: &str) -> TestResult {
+    let pid = catalog_backend_pid(client, application_name).await?;
+    let terminated: bool = client
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .await?
+        .get(0);
+    if !terminated {
+        return Err(format!("catalog supervisor backend {pid} was not terminated").into());
+    }
+    Ok(())
+}
+
+fn catalog_supervisor_test_config() -> Result<CatalogSupervisorConfig, Box<dyn Error>> {
+    Ok(CatalogSupervisorConfig::new(
+        CatalogPollInterval::new(Duration::from_secs(1))?,
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+    )?)
+}
+
+async fn assert_catalog_supervisor_reconnects_with_bounded_grace(
+    client: &Client,
+    database_url: &str,
+    expected_epoch: i64,
+) -> TestResult {
+    let application_name = format!(
+        "pgshard_catalog_supervisor_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let mut connection_config: tokio_postgres::Config = database_url.parse()?;
+    connection_config.application_name(&application_name);
+    let mut unavailable_config = tokio_postgres::Config::new();
+    unavailable_config
+        .host("127.0.0.1")
+        .port(1)
+        .user("pgshard_unavailable")
+        .dbname("shardschema")
+        .connect_timeout(Duration::from_millis(100));
+    let config = catalog_supervisor_test_config()?;
+    let cache = Arc::new(CatalogCache::new());
+    let supervisor = CatalogSupervisor::new(cache, config);
+    let status = supervisor.status();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let reconnect_gate = Arc::new(tokio::sync::Notify::new());
+    let connector_attempts = Arc::clone(&attempts);
+    let connector_gate = Arc::clone(&reconnect_gate);
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(supervisor.run(
+        move || {
+            let attempt = connector_attempts.fetch_add(1, Ordering::SeqCst);
+            let reconnect_gate = Arc::clone(&connector_gate);
+            let connection_config = if attempt == 0 {
+                unavailable_config.clone()
+            } else {
+                connection_config.clone()
+            };
+            async move {
+                if attempt > 1 {
+                    reconnect_gate.notified().await;
+                }
+                connection_config.connect(NoTls).await
+            }
+        },
+        async move {
+            let _ = shutdown_receiver.await;
+        },
+    ));
+
+    assert_catalog_supervisor_lifecycle(
+        client,
+        &application_name,
+        expected_epoch,
+        &status,
+        &reconnect_gate,
+        shutdown_sender,
+        task,
+    )
+    .await?;
+    assert_catalog_supervisor_abort_cleanup(client, database_url).await
+}
+
+async fn assert_catalog_supervisor_lifecycle(
+    client: &Client,
+    application_name: &str,
+    expected_epoch: i64,
+    status: &CatalogSupervisorStatus,
+    reconnect_gate: &tokio::sync::Notify,
+    shutdown_sender: tokio::sync::oneshot::Sender<()>,
+    task: JoinHandle<()>,
+) -> TestResult {
+    let initial = wait_for_supervisor_status(status, "initially ready", |snapshot| {
+        snapshot.ready() && snapshot.phase() == CatalogConnectionPhase::Connected
+    })
+    .await?;
+    assert_eq!(initial.total_failures(), 1);
+    assert_eq!(initial.consecutive_failures(), 0);
+    assert_eq!(
+        initial.catalog_epoch().map(|epoch| epoch.0),
+        Some(u64::try_from(expected_epoch)?)
+    );
+
+    terminate_catalog_backend(client, application_name).await?;
+    let reconnecting = wait_for_supervisor_status(status, "reconnecting", |snapshot| {
+        snapshot.connect_attempts() >= 3 && snapshot.phase() == CatalogConnectionPhase::Connecting
+    })
+    .await?;
+    assert!(
+        reconnecting.ready(),
+        "a recent validated cache should survive a brief catalog outage"
+    );
+    assert_eq!(
+        reconnecting.readiness_reason(),
+        CatalogReadinessReason::ServingStale
+    );
+
+    let expired = wait_for_supervisor_status(status, "stale", |snapshot| {
+        snapshot.readiness_reason() == CatalogReadinessReason::Stale
+    })
+    .await?;
+    assert!(!expired.ready());
+    assert!(
+        expired
+            .cache_age()
+            .is_some_and(|age| age >= Duration::from_secs(2)),
+        "stale cache age did not reach its configured deadline"
+    );
+
+    reconnect_gate.notify_one();
+    let recovered = wait_for_supervisor_status(status, "recovered", |snapshot| {
+        snapshot.ready()
+            && snapshot.phase() == CatalogConnectionPhase::Connected
+            && snapshot.successful_connections() >= 2
+    })
+    .await?;
+    assert_eq!(recovered.consecutive_failures(), 0);
+    assert_eq!(recovered.last_failure(), None);
+
+    terminate_catalog_backend(client, application_name).await?;
+    wait_for_supervisor_status(status, "blocked in a second reconnect", |snapshot| {
+        snapshot.connect_attempts() >= 4 && snapshot.phase() == CatalogConnectionPhase::Connecting
+    })
+    .await?;
+    shutdown_sender
+        .send(())
+        .map_err(|()| "catalog supervisor dropped its shutdown receiver")?;
+    tokio::time::timeout(Duration::from_secs(5), task).await??;
+    assert_eq!(
+        status.snapshot().readiness_reason(),
+        CatalogReadinessReason::Stopped
+    );
+    Ok(())
+}
+
+async fn assert_catalog_supervisor_abort_cleanup(
+    client: &Client,
+    database_url: &str,
+) -> TestResult {
+    let application_name = format!(
+        "pgshard_catalog_abort_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let mut connection_config: tokio_postgres::Config = database_url.parse()?;
+    connection_config.application_name(&application_name);
+    let supervisor = CatalogSupervisor::new(
+        Arc::new(CatalogCache::new()),
+        catalog_supervisor_test_config()?,
+    );
+    let status = supervisor.status();
+    let task = tokio::spawn(supervisor.run(
+        move || {
+            let connection_config = connection_config.clone();
+            async move { connection_config.connect(NoTls).await }
+        },
+        pending(),
+    ));
+    wait_for_supervisor_status(&status, "ready before cancellation", |snapshot| {
+        snapshot.ready() && snapshot.phase() == CatalogConnectionPhase::Connected
+    })
+    .await?;
+    let backend_pid = catalog_backend_pid(client, &application_name).await?;
+
+    task.abort();
+    let cancellation = task
+        .await
+        .expect_err("aborted catalog supervisor task must not complete normally");
+    assert!(cancellation.is_cancelled());
+    let stopped = status.snapshot();
+    assert!(!stopped.ready());
+    assert_eq!(stopped.phase(), CatalogConnectionPhase::Stopped);
+    assert_eq!(stopped.readiness_reason(), CatalogReadinessReason::Stopped);
+    assert!(!stopped.phase().connection_up());
+    assert!(
+        wait_for_backend_exit(client, backend_pid).await?,
+        "catalog backend survived supervisor task cancellation"
     );
     Ok(())
 }
