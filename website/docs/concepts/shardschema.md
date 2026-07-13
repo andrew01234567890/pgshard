@@ -8,9 +8,10 @@ description: How pgshard stores and distributes its authoritative topology.
 :::info Current implementation boundary
 The PostgreSQL 18 migration, validated Rust snapshot model, canonical checksum,
 multi-epoch lock-free cache, repeatable-read snapshot loader,
-LISTEN-before-initial-load primitive, and live database contract test exist in
-source. The long-running pooler notification, reconnect, and polling task is not
-wired yet; see [implementation status](../project/status.md).
+LISTEN-before-initial-load primitive, bounded notification and polling driver,
+and live database contract test exist in source. Pooler composition, TLS,
+readiness, metrics, and reconnect supervision are not wired yet; see
+[implementation status](../project/status.md).
 :::
 
 `shardschema` is a dedicated PostgreSQL database on stable `shard-0000`.
@@ -59,8 +60,12 @@ range end.
 3. It validates range coverage, references, epochs, identities and the canonical checksum.
 4. It swaps the immutable cache state atomically.
 5. PostgreSQL `NOTIFY` sends only the committed positive decimal epoch.
-6. A notification is a wake-up hint, never authoritative data; duplicate and stale hints are ignored.
-7. Polling and reconnect recover lost notifications by rereading a complete snapshot.
+6. A notification is a wake-up hint, never authoritative data; duplicate,
+   stale, and malformed hints need not trigger a read, while a burst retains
+   only its latest valid epoch.
+7. The driver polls every bounded 1 to 300 seconds. Connection loss is terminal
+   so its future pooler supervisor must fail readiness and reconnect before
+   serving from a newly initialized driver.
 
 The empty installed catalog begins at epoch zero. A reader fails closed before
 publishing metadata above the current process limits: 1,024 logical databases,

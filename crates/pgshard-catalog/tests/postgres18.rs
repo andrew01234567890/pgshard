@@ -4,7 +4,8 @@
 //! `PGSHARD_TEST_DATABASE_URL=... cargo test -p pgshard-catalog --test postgres18 -- --ignored`
 
 use std::error::Error;
-use std::future::poll_fn;
+use std::future::{pending, poll_fn};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +13,10 @@ use tokio::task::JoinHandle;
 use tokio_postgres::{AsyncMessage, Client, Error as PgError, IsolationLevel, NoTls};
 use uuid::Uuid;
 
-use pgshard_catalog::{CatalogCache, CatalogReader, DatabaseId, InstallOutcome, LoadError};
+use pgshard_catalog::{
+    CatalogCache, CatalogPollInterval, CatalogReader, CatalogRefreshError, DatabaseId,
+    InstallOutcome, LoadError, run_catalog_refresh,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -31,6 +35,43 @@ struct CatalogListener {
     _client: Client,
     receiver: Receiver<String>,
     task: JoinHandle<Result<(), PgError>>,
+}
+
+struct CatalogDriver {
+    cache: Arc<CatalogCache>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    task: JoinHandle<Result<(), CatalogRefreshError>>,
+}
+
+impl CatalogDriver {
+    async fn start(database_url: &str, poll_interval: CatalogPollInterval) -> TestResult<Self> {
+        let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+        let cache = Arc::new(CatalogCache::new());
+        let driver_cache = Arc::clone(&cache);
+        let (shutdown, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_catalog_refresh(
+            client,
+            connection,
+            driver_cache,
+            poll_interval,
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+        ));
+        Ok(Self {
+            cache,
+            shutdown,
+            task,
+        })
+    }
+
+    async fn shutdown(self) -> TestResult {
+        self.shutdown
+            .send(())
+            .map_err(|()| "catalog refresh driver dropped its shutdown receiver")?;
+        tokio::time::timeout(Duration::from_secs(5), self.task).await???;
+        Ok(())
+    }
 }
 
 fn assert_sqlstate(error: &PgError, expected: &str) {
@@ -86,12 +127,26 @@ fn wait_for_epoch(receiver: &Receiver<String>, expected: i64) -> Result<(), Stri
     ))
 }
 
+fn wait_for_payload(receiver: &Receiver<String>, expected: &str) -> Result<(), String> {
+    for _ in 0..100 {
+        match receiver.try_recv() {
+            Ok(payload) if payload == expected => return Ok(()),
+            Ok(_) | Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(20)),
+            Err(TryRecvError::Disconnected) => return Err("LISTEN connection disconnected".into()),
+        }
+    }
+    Err(format!(
+        "did not receive catalog payload {expected:?} within two seconds"
+    ))
+}
+
 fn assert_no_notification(receiver: &Receiver<String>, context: &str) {
     std::thread::sleep(Duration::from_millis(100));
-    assert!(
-        matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
-        "{context}"
-    );
+    match receiver.try_recv() {
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => panic!("{context}: LISTEN connection disconnected"),
+        Ok(payload) => panic!("{context}: received payload {payload:?}"),
+    }
 }
 
 async fn assert_installation_contract(client: &Client) -> TestResult {
@@ -654,33 +709,20 @@ async fn commit_valid_activation(
 }
 
 async fn assert_loader_contract(
-    client: &Client,
+    client: &mut Client,
     database_url: &str,
     listener: &CatalogListener,
     fixture: &Fixture,
     routing_epoch: i64,
 ) -> TestResult<i64> {
-    let (loader_client, mut loader_connection) =
-        tokio_postgres::connect(database_url, NoTls).await?;
-    let (sender, receiver) = mpsc::channel();
-    let loader_connection_task = tokio::spawn(async move {
-        while let Some(message) = poll_fn(|context| loader_connection.poll_message(context)).await {
-            match message {
-                Ok(AsyncMessage::Notification(notification)) => {
-                    if sender.send(notification.payload().to_owned()).is_err() {
-                        return Ok(());
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    });
-    let cache = CatalogCache::new();
-    let (mut reader, outcome) = CatalogReader::subscribe(loader_client, &cache).await?;
-    assert_eq!(outcome, InstallOutcome::Installed);
-    let snapshot = cache.current_for_planning()?;
+    let initial_epoch = catalog_epoch(client).await?;
+    let notification_driver = CatalogDriver::start(
+        database_url,
+        CatalogPollInterval::new(Duration::from_secs(30))?,
+    )
+    .await?;
+    wait_for_cache_epoch(&notification_driver.cache, initial_epoch).await?;
+    let snapshot = notification_driver.cache.current_for_planning()?;
     let database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
     let database = snapshot
         .database(database_id)
@@ -692,11 +734,6 @@ async fn assert_loader_contract(
             .table(&pgshard_catalog::TableName::new("public", "events")?)
             .is_some()
     );
-    assert_eq!(
-        reader.refresh(&cache).await?,
-        InstallOutcome::AlreadyCurrent
-    );
-
     let database_name = format!("loader_notify_{}", fixture.nonce);
     client
         .execute(
@@ -705,19 +742,166 @@ async fn assert_loader_contract(
         )
         .await?;
     let notified_epoch = catalog_epoch(client).await?;
-    wait_for_epoch(&receiver, notified_epoch)?;
     wait_for_epoch(&listener.receiver, notified_epoch)?;
-    assert_eq!(reader.refresh(&cache).await?, InstallOutcome::Installed);
-    assert_eq!(
-        i64::try_from(cache.current_for_planning()?.catalog_epoch().0)?,
-        notified_epoch
+    wait_for_cache_epoch(&notification_driver.cache, notified_epoch).await?;
+
+    client
+        .execute(
+            "SELECT pg_catalog.pg_notify($1, $2)",
+            &[&pgshard_catalog::NOTIFY_CHANNEL, &"invalid"],
+        )
+        .await?;
+    wait_for_payload(&listener.receiver, "invalid")?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !notification_driver.task.is_finished(),
+        "invalid notification terminated the refresh driver"
     );
-    assert_eq!(
-        reader.refresh(&cache).await?,
-        InstallOutcome::AlreadyCurrent
+    notification_driver.shutdown().await?;
+
+    let polling_driver = CatalogDriver::start(
+        database_url,
+        CatalogPollInterval::new(Duration::from_secs(1))?,
+    )
+    .await?;
+    wait_for_cache_epoch(&polling_driver.cache, notified_epoch).await?;
+
+    let transaction = client.transaction().await?;
+    transaction
+        .batch_execute("SET LOCAL session_replication_role = replica")
+        .await?;
+    let missed_epoch: i64 = transaction
+        .query_one(
+            "UPDATE pgshard_catalog.cluster_state \
+             SET catalog_epoch = catalog_epoch + 1 \
+             WHERE singleton RETURNING catalog_epoch",
+            &[],
+        )
+        .await?
+        .get(0);
+    transaction.commit().await?;
+    assert_no_notification(
+        &listener.receiver,
+        "simulated missed catalog notification was unexpectedly delivered",
     );
-    loader_connection_task.abort();
-    Ok(notified_epoch)
+    wait_for_cache_epoch(&polling_driver.cache, missed_epoch).await?;
+    polling_driver.shutdown().await?;
+    assert_catalog_driver_connection_loss(client, database_url, missed_epoch).await?;
+    Ok(missed_epoch)
+}
+
+async fn wait_for_cache_epoch(cache: &CatalogCache, expected: i64) -> TestResult {
+    let expected = u64::try_from(expected)?;
+    for _ in 0..250 {
+        if cache
+            .current_for_planning()
+            .is_ok_and(|snapshot| snapshot.catalog_epoch().0 == expected)
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err(format!("catalog cache did not reach epoch {expected} within five seconds").into())
+}
+
+async fn assert_shutdown_interrupts_initial_load(
+    client: &mut Client,
+    database_url: &str,
+) -> TestResult {
+    let (observer, observer_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let observer_task = tokio::spawn(observer_connection);
+    let application_name = format!(
+        "pgshard_stop_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let mut driver_config: tokio_postgres::Config = database_url.parse()?;
+    driver_config.application_name(&application_name);
+    let (driver_client, driver_connection) = driver_config.connect(NoTls).await?;
+    let cache = Arc::new(CatalogCache::new());
+    let driver_cache = Arc::clone(&cache);
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+
+    let blocker = client.transaction().await?;
+    blocker
+        .batch_execute("LOCK TABLE pgshard_catalog.cluster_configuration IN ACCESS EXCLUSIVE MODE")
+        .await?;
+    let driver_task = tokio::spawn(run_catalog_refresh(
+        driver_client,
+        driver_connection,
+        driver_cache,
+        CatalogPollInterval::new(Duration::from_secs(30))?,
+        async move {
+            let _ = shutdown_receiver.await;
+        },
+    ));
+    let driver_pid = wait_for_application_backend(&observer, &application_name)
+        .await?
+        .ok_or("catalog driver backend did not connect within two seconds")?;
+    if !wait_for_backend_lock(&observer, driver_pid).await? {
+        return Err("catalog driver initial load did not block on the fixture lock".into());
+    }
+
+    shutdown_sender
+        .send(())
+        .map_err(|()| "blocked catalog driver dropped its shutdown receiver")?;
+    tokio::time::timeout(Duration::from_secs(5), driver_task).await???;
+    assert!(
+        cache.current_for_planning().is_err(),
+        "blocked initial load published a catalog snapshot"
+    );
+    blocker.rollback().await?;
+    assert!(
+        wait_for_backend_exit(&observer, driver_pid).await?,
+        "catalog driver backend survived shutdown"
+    );
+
+    observer_task.abort();
+    Ok(())
+}
+
+async fn assert_catalog_driver_connection_loss(
+    client: &Client,
+    database_url: &str,
+    expected_epoch: i64,
+) -> TestResult {
+    let application_name = format!(
+        "pgshard_catalog_loss_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let mut driver_config: tokio_postgres::Config = database_url.parse()?;
+    driver_config.application_name(&application_name);
+    let (driver_client, driver_connection) = driver_config.connect(NoTls).await?;
+    let cache = Arc::new(CatalogCache::new());
+    let driver_cache = Arc::clone(&cache);
+    let driver_task = tokio::spawn(run_catalog_refresh(
+        driver_client,
+        driver_connection,
+        driver_cache,
+        CatalogPollInterval::new(Duration::from_secs(1))?,
+        pending(),
+    ));
+    wait_for_cache_epoch(&cache, expected_epoch).await?;
+
+    let driver_pid: i32 = client
+        .query_one(
+            "SELECT pid FROM pg_catalog.pg_stat_activity \
+             WHERE datname = current_database() AND application_name = $1",
+            &[&application_name],
+        )
+        .await?
+        .get(0);
+
+    let terminated: bool = client
+        .query_one("SELECT pg_terminate_backend($1)", &[&driver_pid])
+        .await?
+        .get(0);
+    assert!(terminated, "catalog driver backend was not terminated");
+    let result = tokio::time::timeout(Duration::from_secs(5), driver_task).await??;
+    assert!(
+        result.is_err(),
+        "catalog driver silently survived connection loss"
+    );
+    Ok(())
 }
 
 async fn assert_rollback_contract(
@@ -898,6 +1082,43 @@ async fn wait_for_backend_lock(client: &Client, backend_pid: i32) -> Result<bool
     Ok(false)
 }
 
+async fn wait_for_application_backend(
+    client: &Client,
+    application_name: &str,
+) -> Result<Option<i32>, PgError> {
+    for _ in 0..100 {
+        let backend = client
+            .query_opt(
+                "SELECT pid FROM pg_catalog.pg_stat_activity \
+                 WHERE datname = current_database() AND application_name = $1",
+                &[&application_name],
+            )
+            .await?;
+        if let Some(backend) = backend {
+            return Ok(Some(backend.get(0)));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(None)
+}
+
+async fn wait_for_backend_exit(client: &Client, backend_pid: i32) -> Result<bool, PgError> {
+    for _ in 0..250 {
+        if client
+            .query_opt(
+                "SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid = $1",
+                &[&backend_pid],
+            )
+            .await?
+            .is_none()
+        {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(false)
+}
+
 async fn assert_serialization_fence_state(
     client: &Client,
     fixture: &Fixture,
@@ -1014,6 +1235,7 @@ async fn migration_and_activation_contract() -> TestResult {
     let connection_task = tokio::spawn(connection);
 
     assert_installation_contract(&client).await?;
+    assert_shutdown_interrupts_initial_load(&mut client, &database_url).await?;
     assert_initial_catalog_reader_contract(&client, &database_url).await?;
     assert_catalog_reader_rejects_existing_transaction(&client, &database_url).await?;
     assert_admin_privilege_contract(&mut client).await?;
@@ -1026,7 +1248,7 @@ async fn migration_and_activation_contract() -> TestResult {
     let listener = connect_listener(&database_url).await?;
     commit_valid_activation(&mut client, &listener, &fixture, &routing).await?;
     let activated_epoch = assert_loader_contract(
-        &client,
+        &mut client,
         &database_url,
         &listener,
         &fixture,

@@ -32,7 +32,7 @@ serde_json = "1.0.140"
 sqlparser = { version = "=0.62.0", features = ["visitor"] }
 stacker = "=0.1.24"
 thiserror = "2.0.12"
-tokio = { version = "1.46.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.46.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-postgres = "0.7.15"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }

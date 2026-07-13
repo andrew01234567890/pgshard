@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::{
     CatalogCache, CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId,
-    IdentifierError, InstallOutcome, RegisteredTable, RoutingHashConfig, ShardKeyType, ShardRoute,
-    SnapshotError, TableName,
+    IdentifierError, InstallOutcome, NOTIFY_CHANNEL, RegisteredTable, RoutingHashConfig,
+    ShardKeyType, ShardRoute, SnapshotError, TableName,
 };
 
 /// Maximum logical databases published in one process snapshot.
@@ -78,7 +78,8 @@ impl CatalogReader {
     /// and setting changes. A manually opened transaction fails closed rather
     /// than being committed or reused.
     ///
-    /// The caller must continuously drive the associated `tokio-postgres`
+    /// [`crate::run_catalog_refresh`] provides the standard long-running loop.
+    /// Direct callers must continuously drive the associated `tokio-postgres`
     /// connection, parse every notification with
     /// [`crate::CatalogNotification`], call [`Self::refresh`] for unseen
     /// epochs, and poll periodically because notifications can be lost across
@@ -94,7 +95,7 @@ impl CatalogReader {
     ) -> Result<(Self, InstallOutcome), LoadError> {
         client.batch_execute("DISCARD ALL").await?;
         client
-            .batch_execute("LISTEN pgshard_catalog_changed")
+            .batch_execute(&format!("LISTEN {NOTIFY_CHANNEL}"))
             .await?;
         let mut reader = Self { client };
         let outcome = reader.refresh(cache).await?;

@@ -13,8 +13,13 @@ deep delimiter, data-type, binary-expression, and set-operation shapes on a
 64 KiB thread stack, including destruction of both admitted and rejected trees.
 Optimized CI repeats the small-stack and parser-log redaction regressions, while
 trivia-padding tests and benchmarks verify that shallow queries do not acquire a
-large AST stack reserve. A separate raw-wire PostgreSQL 18 test validates
-four-byte protocol 3.0 and 32-byte protocol 3.2 server cancellation keys,
+large AST stack reserve. The live `shardschema` fixture drives the production
+LISTEN and periodic-refresh loop, observes a committed catalog change appear in
+the lock-free cache before its deliberately long polling deadline, ignores a
+malformed hint, and separately recovers a trigger-bypassed epoch through
+polling. It also interrupts a lock-blocked initial load, shuts down cleanly, and
+treats forced connection loss as terminal. A separate raw-wire PostgreSQL 18
+test validates four-byte protocol 3.0 and 32-byte protocol 3.2 server cancellation keys,
 zero-copy `BackendKeyData` and `ParameterStatus`, typed `AuthenticationOk`, and
 a real protocol 3.99 to 3.2 negotiation that returns the requested unsupported
 `_pq_.` option. The live connections pass through the same linear startup proof
