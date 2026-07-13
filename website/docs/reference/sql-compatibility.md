@@ -8,12 +8,19 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 :::warning Planned compatibility, not current support
 No pooler endpoint or semantic statement planner exists yet. The source has a
 byte/token/AST/stack-bounded permissive candidate parser configured with a
-PostgreSQL dialect, a fail-closed core that routes an already-resolved, non-NULL shard-key
-bind parameter against one immutable catalog snapshot, and a bounded zero-copy
-decoder for PostgreSQL 18 frontend frames and selected simple/extended query
-message bodies. A successful syntax parse is not PostgreSQL semantic validation
-or permission to route; the complete AST must be explicitly proven by future
-planning code. The source does not yet authenticate or execute clients. The
+PostgreSQL dialect, a fail-closed core that routes an already-resolved, non-NULL
+shard-key bind parameter against one immutable catalog snapshot, and a bounded
+zero-copy decoder for PostgreSQL 18 frontend frames and selected simple/extended
+query message bodies. The first catalog-bound template accepts only an explicitly
+schema-qualified `SELECT * FROM schema.table WHERE shard_key = $n` shape (or
+reversed equality), with no other clause or expression. It rejects `==` before
+AST proof because PostgreSQL resolves that spelling as a distinct, potentially
+custom operator while the candidate parser collapses it to the same AST node as
+`=`. It is not executable until Parse parameter types/operator resolution and
+the Bind value are checked.
+A successful syntax parse or template extraction alone is not PostgreSQL
+semantic validation or permission to route. The source does not yet
+authenticate or execute clients. The
 table below is the Milestone 1 acceptance contract; see
 [implementation status](../project/status.md).
 :::
