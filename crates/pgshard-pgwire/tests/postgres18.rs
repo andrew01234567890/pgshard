@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use pgshard_pgwire::{
     AuthenticationRequest, BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode,
-    ExtendedQueryObject, FrontendPhase, MAX_CANCEL_KEY_LENGTH, MIN_BACKEND_CANCEL_KEY_LENGTH,
-    TransactionStatus, decode_authentication_request, decode_backend, decode_backend_key_data,
-    decode_close, decode_describe, decode_frontend, decode_parameter_description,
-    decode_parameter_status, decode_protocol_negotiation, decode_ready_for_query,
+    ExtendedQueryObject, FrontendPhase, Postgres18StartupNegotiation, TransactionStatus,
+    decode_authentication_request, decode_backend, decode_backend_key_data, decode_close,
+    decode_describe, decode_frontend, decode_parameter_description, decode_parameter_status,
+    decode_protocol_negotiation, decode_ready_for_query, decode_startup,
     require_empty_backend_body,
 };
 
@@ -117,29 +117,24 @@ fn decoded_frontend(bytes: &[u8]) -> pgshard_pgwire::FrontendFrame<'_> {
     frame
 }
 
-fn validate_backend_key_data(frame: pgshard_pgwire::BackendFrame<'_>, expected_key_length: usize) {
-    let data = decode_backend_key_data(frame).expect("valid BackendKeyData body");
-    assert!(
-        (MIN_BACKEND_CANCEL_KEY_LENGTH..=MAX_CANCEL_KEY_LENGTH)
-            .contains(&data.cancellation_key().len()),
-        "PostgreSQL sent an invalid cancellation key length"
-    );
-    assert_ne!(data.backend_pid(), 0, "PostgreSQL sent a zero backend PID");
-    assert_eq!(
-        data.cancellation_key().len(),
-        expected_key_length,
-        "PostgreSQL 18 cancellation key length for requested protocol"
-    );
+fn startup_negotiation(bytes: &[u8]) -> Postgres18StartupNegotiation<'_> {
+    let Decode::Complete { frame, consumed } =
+        decode_startup(bytes).expect("decode the exact outbound startup packet")
+    else {
+        panic!("complete outbound startup packet decoded as incomplete");
+    };
+    assert_eq!(consumed, bytes.len());
+    Postgres18StartupNegotiation::begin(frame).expect("PostgreSQL 18 startup protocol")
 }
 
 fn finish_startup(
     stream: &mut TcpStream,
-    expected_key_length: usize,
-    expected_unsupported_options: Option<&[&[u8]]>,
+    negotiation: Postgres18StartupNegotiation<'_>,
 ) -> ClientEncoding {
+    let mut negotiation = Some(negotiation);
+    let mut protocol = None;
     let mut authenticated = false;
     let mut backend_key_data = false;
-    let mut negotiation_count = 0;
     let mut postgres18 = false;
     let mut client_encoding = None;
     loop {
@@ -147,6 +142,15 @@ fn finish_startup(
         let frame = decoded_frame(&bytes);
         match frame.tag() {
             BackendTag::AuthenticationRequest => {
+                if protocol.is_none() {
+                    protocol = Some(
+                        negotiation
+                            .take()
+                            .expect("authentication followed an earlier authentication response")
+                            .finish()
+                            .expect("PostgreSQL 18 completed required protocol negotiation"),
+                    );
+                }
                 let request = decode_authentication_request(frame)
                     .expect("valid PostgreSQL 18 authentication body");
                 assert!(
@@ -156,19 +160,15 @@ fn finish_startup(
                 authenticated = true;
             }
             BackendTag::NegotiateProtocolVersion => {
-                negotiation_count += 1;
-                assert_eq!(
-                    negotiation_count, 1,
-                    "server negotiated the protocol more than once"
-                );
-                let negotiation = decode_protocol_negotiation(frame)
+                let response = decode_protocol_negotiation(frame)
                     .expect("valid PostgreSQL 18 protocol negotiation body");
-                assert_eq!(negotiation.selected_protocol().major(), 3);
-                assert_eq!(negotiation.selected_protocol().minor(), 2);
-                assert_eq!(
-                    negotiation.unsupported_options().collect::<Vec<_>>(),
-                    expected_unsupported_options
-                        .expect("server unexpectedly negotiated the protocol")
+                let state = negotiation
+                    .take()
+                    .expect("protocol negotiation arrived after authentication");
+                negotiation = Some(
+                    state
+                        .accept(&response)
+                        .expect("response matches the exact outbound startup packet"),
                 );
             }
             BackendTag::ParameterStatus => {
@@ -184,7 +184,12 @@ fn finish_startup(
                 }
             }
             BackendTag::BackendKeyData => {
-                validate_backend_key_data(frame, expected_key_length);
+                let data = decode_backend_key_data(frame).expect("valid BackendKeyData body");
+                assert_ne!(data.backend_pid(), 0, "PostgreSQL sent a zero backend PID");
+                protocol
+                    .expect("BackendKeyData arrived before authentication")
+                    .validate_backend_key_data(data)
+                    .expect("key length matches the effective PostgreSQL 18 protocol");
                 backend_key_data = true;
             }
             BackendTag::ErrorResponse => panic!("PostgreSQL rejected startup"),
@@ -197,11 +202,7 @@ fn finish_startup(
     }
     assert!(authenticated, "server omitted AuthenticationOk");
     assert!(backend_key_data, "server omitted BackendKeyData");
-    assert_eq!(
-        negotiation_count,
-        usize::from(expected_unsupported_options.is_some()),
-        "unexpected number of protocol negotiation responses"
-    );
+    assert!(protocol.is_some(), "server omitted authentication response");
     assert!(postgres18, "test requires PostgreSQL major version 18");
     client_encoding.expect("server omitted client_encoding ParameterStatus")
 }
@@ -302,19 +303,23 @@ fn postgres18_startup_and_extended_query_controls_decode_from_real_wire_bytes() 
     let database =
         std::env::var("PGSHARD_PGWIRE_TEST_DATABASE").unwrap_or_else(|_| "postgres".into());
     let mut legacy = connect(&address);
+    let legacy_startup = startup(POSTGRES_PROTOCOL_3_0, &user, &database, &[]);
+    let legacy_negotiation = startup_negotiation(&legacy_startup);
     legacy
-        .write_all(&startup(POSTGRES_PROTOCOL_3_0, &user, &database, &[]))
+        .write_all(&legacy_startup)
         .expect("send protocol 3.0 startup packet");
-    finish_startup(&mut legacy, MIN_BACKEND_CANCEL_KEY_LENGTH, None);
+    finish_startup(&mut legacy, legacy_negotiation);
     legacy
         .write_all(&frontend(b'X', b""))
         .expect("terminate protocol 3.0 connection");
 
     let mut stream = connect(&address);
+    let native_startup = startup(POSTGRES_PROTOCOL_3_2, &user, &database, &[]);
+    let native_negotiation = startup_negotiation(&native_startup);
     stream
-        .write_all(&startup(POSTGRES_PROTOCOL_3_2, &user, &database, &[]))
+        .write_all(&native_startup)
         .expect("send protocol 3.2 startup packet");
-    let utf8 = finish_startup(&mut stream, 32, None);
+    let utf8 = finish_startup(&mut stream, native_negotiation);
     describe_statement(&mut stream, utf8);
     close_statement(&mut stream, utf8);
 
@@ -323,19 +328,17 @@ fn postgres18_startup_and_extended_query_controls_decode_from_real_wire_bytes() 
         .expect("send Terminate");
 
     let mut negotiated = connect(&address);
-    negotiated
-        .write_all(&startup(
-            POSTGRES_PROTOCOL_3_99,
-            &user,
-            &database,
-            &[("_pq_.pgshard_test", "1")],
-        ))
-        .expect("send protocol 3.99 startup packet with a reserved option");
-    finish_startup(
-        &mut negotiated,
-        32,
-        Some(&[b"_pq_.pgshard_test".as_slice()]),
+    let newer_startup = startup(
+        POSTGRES_PROTOCOL_3_99,
+        &user,
+        &database,
+        &[("_pq_.pgshard_test", "1")],
     );
+    let newer_negotiation = startup_negotiation(&newer_startup);
+    negotiated
+        .write_all(&newer_startup)
+        .expect("send protocol 3.99 startup packet with a reserved option");
+    finish_startup(&mut negotiated, newer_negotiation);
     negotiated
         .write_all(&frontend(b'X', b""))
         .expect("terminate negotiated protocol connection");

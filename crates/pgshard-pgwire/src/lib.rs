@@ -10,6 +10,7 @@ use thiserror::Error;
 
 mod backend;
 mod messages;
+mod session;
 
 pub use backend::{
     AuthenticationRequest, BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH,
@@ -25,6 +26,11 @@ pub use messages::{
     ExecuteMessage, ExtendedQueryObject, FormatCode, FormatCodeIter, MessageError,
     ParameterTypeIter, ParseMessage, QueryMessage, decode_bind, decode_close, decode_describe,
     decode_execute, decode_parse, decode_query, require_empty_body,
+};
+
+pub use session::{
+    Postgres18BackendKeyError, Postgres18Protocol, Postgres18StartupError,
+    Postgres18StartupNegotiation,
 };
 
 /// Maximum body size accepted by `PostgreSQL` 18 for a startup packet.
