@@ -60,10 +60,12 @@ An explicit replication-streaming phase admits only the CopyData, CopyDone, and
 Terminate frontend frames accepted by PostgreSQL 18's WAL sender. It does not
 yet decode `pgoutput` payloads or implement a change-stream session.
 The syntax planner applies separate limits of 16 KiB of SQL text, 4,096 lexer
-tokens, 2,048 counted AST nodes, and 50 parser-recursion levels. Larger inputs
-are rejected even though they fit inside a valid frontend frame. Tokenization
-is byte-bounded first; only one statement is parsed, and remaining input causes
-immediate multiple-statement rejection.
+tokens, 2,048 counted AST nodes, 50 lexically nested delimiters, and 50
+parser-recursion levels. The lexical guard includes angle-bracket data types and
+runs before the parser because that upstream parser path does not consume its
+recursion budget. Larger inputs are rejected even though they fit inside a valid
+frontend frame. Tokenization is byte-bounded first; only one statement is
+parsed, and remaining input causes immediate multiple-statement rejection.
 Parsing is synchronous; the future pooler must isolate it on a bounded CPU
 worker pool instead of blocking socket-processing tasks.
 

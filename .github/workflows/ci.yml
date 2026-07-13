@@ -200,6 +200,11 @@ jobs:
         run: rustup show active-toolchain
       - name: Run workspace tests
         run: make rust-test
+      - name: Run optimized planner small-stack regression
+        if: needs.changes.outputs.planner == 'true'
+        run: >-
+          cargo test --release --locked -p pgshard-planner
+          rejects_data_type_nesting_on_a_small_stack
       - name: Verify explicit identity from a source archive
         env:
           ARCHIVE_VERSION: 9.8.7-archive-test

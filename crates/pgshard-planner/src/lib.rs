@@ -10,7 +10,7 @@ use sqlparser::{
     ast::{Expr, ObjectName, Query, Select, Statement, TableFactor, ValueWithSpan, Visit, Visitor},
     dialect::PostgreSqlDialect,
     parser::{Parser, ParserError},
-    tokenizer::{Token, Tokenizer},
+    tokenizer::{Token, TokenWithSpan, Tokenizer},
 };
 use thiserror::Error;
 
@@ -27,6 +27,14 @@ pub const MAX_SQL_TOKENS: usize = 4_096;
 pub const MAX_AST_NODES: usize = 2_048;
 
 const MAX_RECURSION_DEPTH: usize = 50;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Delimiter {
+    Parenthesis,
+    Bracket,
+    Brace,
+    Angle,
+}
 
 /// Coarse top-level syntax kind.
 ///
@@ -107,6 +115,7 @@ pub fn parse_one(sql: &str) -> Result<ParsedStatement, ParseError> {
             maximum: MAX_SQL_TOKENS,
         });
     }
+    enforce_lexical_nesting_limit(&tokens)?;
 
     let mut parser = Parser::new(&dialect)
         .with_recursion_limit(MAX_RECURSION_DEPTH)
@@ -129,6 +138,46 @@ pub fn parse_one(sql: &str) -> Result<ParsedStatement, ParseError> {
     }
 
     Ok(ParsedStatement { statement })
+}
+
+fn enforce_lexical_nesting_limit(tokens: &[TokenWithSpan]) -> Result<(), ParseError> {
+    let mut delimiters = [Delimiter::Parenthesis; MAX_RECURSION_DEPTH];
+    let mut depth = 0_usize;
+
+    for token in tokens {
+        let delimiter = match token.token {
+            Token::LParen => Some(Delimiter::Parenthesis),
+            Token::LBracket => Some(Delimiter::Bracket),
+            Token::LBrace => Some(Delimiter::Brace),
+            // PostgreSQL does not use angle brackets for grouping, but the
+            // candidate parser uses them recursively for dialect-specific data
+            // types such as ARRAY<ARRAY<...>> without applying its recursion
+            // guard. Treating `<` conservatively as an opener bounds that path.
+            Token::Lt => Some(Delimiter::Angle),
+            _ => None,
+        };
+        if let Some(delimiter) = delimiter {
+            if depth == MAX_RECURSION_DEPTH {
+                return Err(ParseError::RecursionLimit);
+            }
+            delimiters[depth] = delimiter;
+            depth += 1;
+            continue;
+        }
+
+        let closing = match token.token {
+            Token::RParen => Some(Delimiter::Parenthesis),
+            Token::RBracket => Some(Delimiter::Bracket),
+            Token::RBrace => Some(Delimiter::Brace),
+            Token::Gt => Some(Delimiter::Angle),
+            _ => None,
+        };
+        if closing.is_some_and(|delimiter| depth > 0 && delimiters[depth - 1] == delimiter) {
+            depth -= 1;
+        }
+    }
+
+    Ok(())
 }
 
 struct AstBudget {
@@ -345,6 +394,25 @@ mod tests {
             ParseError::RecursionLimit
         );
     }
+
+    #[test]
+    fn rejects_data_type_nesting_on_a_small_stack() {
+        let nesting = MAX_RECURSION_DEPTH * 24;
+        let nested = format!(
+            "create table t (value {}int{})",
+            "array<".repeat(nesting),
+            ">".repeat(nesting)
+        );
+        let result = std::thread::Builder::new()
+            .name("planner-small-stack".into())
+            .stack_size(64 * 1024)
+            .spawn(move || parse_one(&nested).map(|statement| statement.kind()))
+            .expect("spawn small-stack parser")
+            .join()
+            .expect("small-stack parser must not panic");
+        assert_eq!(result, Err(ParseError::RecursionLimit));
+    }
+
     #[test]
     fn debug_and_errors_redact_sql() {
         const SECRET: &str = "never-log-this-literal";
