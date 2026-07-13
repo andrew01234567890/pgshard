@@ -452,17 +452,15 @@ impl CatalogSnapshot {
     ///
     /// # Errors
     ///
-    /// Rejects epoch zero/regression-shaped input, duplicate database IDs or
-    /// names, and table/hash-version inconsistencies.
+    /// Rejects regression-shaped input, duplicate database IDs or names, and
+    /// table/hash-version inconsistencies. Catalog epoch zero is the valid
+    /// empty genesis state created by the migration.
     pub fn new(
         cluster_id: ClusterId,
         catalog_epoch: u64,
         routing_hash: RoutingHashConfig,
         databases: Vec<DatabaseCatalog>,
     ) -> Result<Self, SnapshotError> {
-        if catalog_epoch == 0 {
-            return Err(SnapshotError::ZeroEpoch("catalog"));
-        }
         let catalog_epoch = CatalogEpoch(catalog_epoch);
         let mut database_map = HashMap::with_capacity(databases.len());
         let mut names = HashSet::with_capacity(databases.len());
@@ -807,6 +805,20 @@ mod tests {
         assert_eq!(database.route((1_u64 << 63) - 1), ShardId(0));
         assert_eq!(database.route(1_u64 << 63), ShardId(1));
         assert_eq!(database.route(u64::MAX), ShardId(1));
+    }
+
+    #[test]
+    fn empty_genesis_snapshot_accepts_catalog_epoch_zero() {
+        let snapshot = CatalogSnapshot::new(
+            cluster_id(),
+            0,
+            RoutingHashConfig::new(1, 42).expect("hash"),
+            vec![],
+        )
+        .expect("genesis snapshot");
+        assert_eq!(snapshot.catalog_epoch(), CatalogEpoch(0));
+        assert_eq!(snapshot.database_count(), 0);
+        snapshot.verify_checksum().expect("genesis checksum");
     }
 
     #[test]

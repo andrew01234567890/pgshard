@@ -895,6 +895,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgshard-router"
+version = "0.1.0"
+dependencies = [
+ "pgshard-catalog",
+ "pgshard-types",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "pgshard-types"
 version = "0.1.0"
 dependencies = [

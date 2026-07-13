@@ -10,6 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::task::JoinHandle;
 use tokio_postgres::{AsyncMessage, Client, Error as PgError, IsolationLevel, NoTls};
+use uuid::Uuid;
+
+use pgshard_catalog::{CatalogCache, CatalogReader, DatabaseId, InstallOutcome, LoadError};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -334,6 +337,62 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
     Ok(())
 }
 
+async fn assert_catalog_reader_rejects_existing_transaction(
+    client: &Client,
+    database_url: &str,
+) -> TestResult {
+    let (probe_client, probe_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let probe_connection_task = tokio::spawn(probe_connection);
+    let database_name = format!(
+        "reader_probe_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    probe_client.batch_execute("BEGIN").await?;
+    probe_client
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_databases(database_name) VALUES ($1::text)",
+            &[&database_name],
+        )
+        .await?;
+
+    let error = match CatalogReader::subscribe(probe_client, &CatalogCache::new()).await {
+        Err(LoadError::Postgres(error)) => error,
+        Err(error) => return Err(format!("unexpected catalog reader error: {error}").into()),
+        Ok(_) => return Err("catalog reader accepted a manually opened transaction".into()),
+    };
+    assert_sqlstate(&error, "25001");
+    tokio::time::timeout(Duration::from_secs(5), probe_connection_task).await???;
+
+    let committed: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pgshard_catalog.logical_databases WHERE database_name = $1",
+            &[&database_name],
+        )
+        .await?
+        .get(0);
+    assert_eq!(committed, 0, "reader startup committed caller work");
+    Ok(())
+}
+
+async fn assert_initial_catalog_reader_contract(client: &Client, database_url: &str) -> TestResult {
+    let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let reader_connection_task = tokio::spawn(reader_connection);
+    let cache = CatalogCache::new();
+    let (mut reader, outcome) = CatalogReader::subscribe(reader_client, &cache).await?;
+    assert_eq!(outcome, InstallOutcome::Installed);
+    assert_eq!(
+        i64::try_from(cache.current_for_planning()?.catalog_epoch().0)?,
+        catalog_epoch(client).await?
+    );
+    assert_eq!(
+        reader.refresh(&cache).await?,
+        InstallOutcome::AlreadyCurrent
+    );
+    drop(reader);
+    reader_connection_task.abort();
+    Ok(())
+}
+
 async fn assert_registered_table_contract(client: &Client, fixture: &Fixture) -> TestResult {
     let error = client
         .execute(
@@ -592,6 +651,73 @@ async fn commit_valid_activation(
         .expect_err("a logical database with active routing cannot be retired");
     assert_sqlstate(&error, "55000");
     Ok(activated_catalog_epoch)
+}
+
+async fn assert_loader_contract(
+    client: &Client,
+    database_url: &str,
+    listener: &CatalogListener,
+    fixture: &Fixture,
+    routing_epoch: i64,
+) -> TestResult<i64> {
+    let (loader_client, mut loader_connection) =
+        tokio_postgres::connect(database_url, NoTls).await?;
+    let (sender, receiver) = mpsc::channel();
+    let loader_connection_task = tokio::spawn(async move {
+        while let Some(message) = poll_fn(|context| loader_connection.poll_message(context)).await {
+            match message {
+                Ok(AsyncMessage::Notification(notification)) => {
+                    if sender.send(notification.payload().to_owned()).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+    let cache = CatalogCache::new();
+    let (mut reader, outcome) = CatalogReader::subscribe(loader_client, &cache).await?;
+    assert_eq!(outcome, InstallOutcome::Installed);
+    let snapshot = cache.current_for_planning()?;
+    let database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
+    let database = snapshot
+        .database(database_id)
+        .ok_or("loaded snapshot omitted active logical database")?;
+    assert_eq!(database.epochs().routing().0, u64::try_from(routing_epoch)?);
+    assert_eq!(database.routes().len(), 2);
+    assert!(
+        database
+            .table(&pgshard_catalog::TableName::new("public", "events")?)
+            .is_some()
+    );
+    assert_eq!(
+        reader.refresh(&cache).await?,
+        InstallOutcome::AlreadyCurrent
+    );
+
+    let database_name = format!("loader_notify_{}", fixture.nonce);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_databases(database_name) VALUES ($1::text)",
+            &[&database_name],
+        )
+        .await?;
+    let notified_epoch = catalog_epoch(client).await?;
+    wait_for_epoch(&receiver, notified_epoch)?;
+    wait_for_epoch(&listener.receiver, notified_epoch)?;
+    assert_eq!(reader.refresh(&cache).await?, InstallOutcome::Installed);
+    assert_eq!(
+        i64::try_from(cache.current_for_planning()?.catalog_epoch().0)?,
+        notified_epoch
+    );
+    assert_eq!(
+        reader.refresh(&cache).await?,
+        InstallOutcome::AlreadyCurrent
+    );
+    loader_connection_task.abort();
+    Ok(notified_epoch)
 }
 
 async fn assert_rollback_contract(
@@ -888,6 +1014,8 @@ async fn migration_and_activation_contract() -> TestResult {
     let connection_task = tokio::spawn(connection);
 
     assert_installation_contract(&client).await?;
+    assert_initial_catalog_reader_contract(&client, &database_url).await?;
+    assert_catalog_reader_rejects_existing_transaction(&client, &database_url).await?;
     assert_admin_privilege_contract(&mut client).await?;
     assert_admin_write_path(&mut client).await?;
     let fixture = create_fixture(&client).await?;
@@ -896,8 +1024,15 @@ async fn migration_and_activation_contract() -> TestResult {
     assert_tombstone_contract(&client, &fixture).await?;
     let routing = assert_invalid_routing_contracts(&client, &fixture).await?;
     let listener = connect_listener(&database_url).await?;
-    let activated_epoch =
-        commit_valid_activation(&mut client, &listener, &fixture, &routing).await?;
+    commit_valid_activation(&mut client, &listener, &fixture, &routing).await?;
+    let activated_epoch = assert_loader_contract(
+        &client,
+        &database_url,
+        &listener,
+        &fixture,
+        routing.valid_epoch,
+    )
+    .await?;
     assert_rollback_contract(&mut client, &listener, &fixture, &routing, activated_epoch).await?;
     assert_routing_epoch_cannot_regress(&client, &listener, &fixture, routing.valid_epoch).await?;
     assert_repeatable_read_activation_fences_concurrent_range_mutation(

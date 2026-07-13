@@ -1,7 +1,8 @@
 # pgshard catalog
 
 This non-publishable crate contains the PostgreSQL 18 `shardschema` migration,
-validated immutable Rust snapshot model, and lock-free multi-epoch cache.
+transactional snapshot loader, validated immutable Rust snapshot model, and
+lock-free multi-epoch cache.
 `shardschema` is authoritative and is hosted on stable shard 0000 in Milestone
 1. Etcd is not a topology store.
 
@@ -25,8 +26,18 @@ PGSHARD_TEST_DATABASE_URL=postgresql://postgres:password@127.0.0.1:5432/shardsch
 The cache retains the exact immutable snapshot used by an in-flight request
 until an explicit monotonic fence retires that epoch. PostgreSQL notifications
 contain only the committed decimal catalog epoch and are wake-up hints;
-periodic polling remains required. The actual pooler connection, snapshot SQL
-loader, and LISTEN/reconnect loop are not implemented in this slice.
+periodic polling remains required. `CatalogReader::subscribe` takes ownership
+of a dedicated connection, rejects a manually opened transaction, clears
+session-local state, and commits its subscription before the initial
+transactionally consistent read. The actual pooler connection driver and its
+notification, reconnect, and periodic-poll loop are not implemented in this
+slice.
+
+The empty installed catalog has genesis epoch zero. Loader queries fetch at
+most one row beyond each published safety limit and reject rather than retain
+oversized metadata: 1,024 logical databases, 4,096 ranges or 16,384 tables per
+database, and 65,536 ranges or tables across one snapshot. Future streaming can
+reduce the temporary cap-plus-one allocation without changing these bounds.
 
 Each staged routing-range mutation versions its parent routing epoch. This
 makes a concurrent activation using an older `REPEATABLE READ` snapshot fail

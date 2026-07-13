@@ -6,7 +6,9 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 # SQL compatibility
 
 :::warning Planned compatibility, not current support
-No pooler endpoint exists in the foundation release. The table below is the
+No pooler endpoint, SQL parser, or statement planner exists yet. The source has
+only a fail-closed core that routes an already-resolved, non-NULL shard-key bind
+parameter against one immutable catalog snapshot. The table below is the
 Milestone 1 acceptance contract; see [implementation status](../project/status.md).
 :::
 
@@ -33,6 +35,12 @@ can be proven to target one shard.
 ## Transaction pooling limits
 
 Safe session settings are replayed when a transaction receives a backend. Temporary objects, `LISTEN`, session advisory locks, holdable cursors, and backend-bound state are rejected because they cannot move safely between pooled connections or enter PostgreSQL prepared transactions.
+
+The pooler pins `client_encoding` to canonical `UTF8` and rejects attempts to
+change it. PostgreSQL converts both text-format and binary `text` binds from the
+session encoding before storage; routing raw bytes from any other encoding can
+disagree with the stored value and is therefore not allowed. Both formats also
+reject the zero byte exactly as PostgreSQL does.
 
 Named prepared statements are virtualized at the pooler. Their routing plan is invalidated by relevant schema or routing epoch changes.
 
