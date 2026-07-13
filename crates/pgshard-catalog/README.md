@@ -52,9 +52,15 @@ authoritative load, and credential-safe connection, connection-timeout,
 operation-timeout, load, and connection-pump failure classes. The default
 policy uses a five-second connection deadline and 30-second operation deadline.
 Its 90-second stale grace is strictly longer than the default 30-second poll.
-The future pooler executable must still compose the supervisor with TLS,
-credentials, sanitized connection-error logging, and runtime configuration;
-the HTTP and Prometheus translation exists only as a library.
+The `pgshard-pooler` Linux control executable composes the supervisor with its
+HTTP and Prometheus translation, bounded runtime configuration, a file-backed
+DSN, bounded control-HTTP resources, and coordinated deadline-bounded shutdown.
+Overall application readiness remains false because no SQL listener exists,
+while status and metrics expose independent catalog usability. Its temporary `NoTls` connector
+rejects every endpoint except loopback IP literals and Unix sockets and
+requires the dedicated writer database explicitly. Authenticated TLS, remote
+catalog transport, operator-provisioned credentials, and the SQL data plane
+remain absent.
 
 The empty installed catalog has genesis epoch zero. Loader queries fetch at
 most one row beyond each published safety limit and reject rather than retain
