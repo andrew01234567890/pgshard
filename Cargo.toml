@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/pgshard-agent",
+  "crates/pgshard-catalog",
   "crates/pgshard-orch",
   "crates/pgshard-release",
   "crates/pgshard-types",
@@ -17,16 +18,20 @@ repository = "https://github.com/andrew01234567890/pgshard"
 
 [workspace.dependencies]
 anyhow = "1.0.98"
+arc-swap = "1.7.1"
 axum = "0.8.4"
+blake3 = "1.8.2"
 clap = { version = "4.5.41", features = ["derive"] }
 semver = "1.0.26"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 thiserror = "2.0.12"
 tokio = { version = "1.46.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio-postgres = "0.7.15"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 url = "2.5.4"
+uuid = "1.18.1"
 xxhash-rust = { version = "=0.8.16", features = ["xxh3"] }
 
 [workspace.lints.rust]
