@@ -31,6 +31,11 @@ will be disabled in telemetry by default.
 
 Metrics use a `pgshard_` prefix and bounded-cardinality labels. SQL text, bind values, row values, shard keys, usernames, and unbounded transaction or stream IDs are prohibited as labels.
 
+Dependency `log` records are statically compiled out because candidate-parser
+debug messages can contain full SQL and literal-bearing AST fragments. Rust
+services use explicitly sanitized `tracing` fields for OpenTelemetry instead;
+tests install a maximal logger and verify that parsing emits no record.
+
 ## Included stack
 
 The Milestone 1 distribution will provide Prometheus recording rules and alerts,
