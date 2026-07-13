@@ -883,6 +883,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgshard-pgwire"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "pgshard-release"
 version = "0.1.0"
 dependencies = [
