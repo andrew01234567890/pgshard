@@ -60,6 +60,10 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 		}
 		assertOwned(t, service, cluster)
 	}
+	poolerControl := object[*corev1.Service](t, first, "demo-pooler")
+	if poolerControl.Spec.Type != corev1.ServiceTypeClusterIP || !poolerControl.Spec.PublishNotReadyAddresses || poolerControl.Spec.Ports[0].Port != HTTPPort || poolerControl.Spec.Ports[0].TargetPort.StrVal != "http" {
+		t.Fatalf("pooler control service = %#v", poolerControl.Spec)
+	}
 
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		service := object[*corev1.Service](t, first, shardName(cluster.Name, shard))
@@ -105,16 +109,21 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if etcd.Spec.Template.Spec.SecurityContext == nil || etcd.Spec.Template.Spec.SecurityContext.SeccompProfile == nil || len(etcd.Spec.Template.Spec.TopologySpreadConstraints) != 2 {
 		t.Fatalf("etcd pod hardening/spread is incomplete: %#v", etcd.Spec.Template.Spec)
 	}
+	etcdContainer := etcd.Spec.Template.Spec.Containers[0]
+	if etcdContainer.ReadinessProbe.FailureThreshold != 1 || etcdContainer.LivenessProbe.FailureThreshold != 3 {
+		t.Fatalf("etcd probe thresholds = readiness %d, liveness %d", etcdContainer.ReadinessProbe.FailureThreshold, etcdContainer.LivenessProbe.FailureThreshold)
+	}
 
 	orchestrator := object[*appsv1.Deployment](t, plan, "demo-orchestrator")
-	if *orchestrator.Spec.Replicas != 3 || orchestrator.Spec.Template.Spec.Containers[0].ReadinessProbe.HTTPGet.Path != "/readyz" {
+	if *orchestrator.Spec.Replicas != 3 || orchestrator.Spec.Template.Spec.Containers[0].ReadinessProbe.HTTPGet.Path != "/readyz" || orchestrator.Spec.Template.Spec.Containers[0].ReadinessProbe.FailureThreshold != 1 {
 		t.Fatalf("orchestrator spec = %#v", orchestrator.Spec)
 	}
 	if orchestrator.Spec.Template.Spec.Containers[0].Env[1].ValueFrom.FieldRef.FieldPath != "metadata.uid" {
 		t.Fatalf("orchestrator identity is not a bounded Pod UID: %#v", orchestrator.Spec.Template.Spec.Containers[0].Env[1])
 	}
 	pooler := object[*appsv1.Deployment](t, plan, "demo-pooler")
-	if pooler.Spec.Replicas != nil || len(pooler.Spec.Template.Spec.Containers[0].Ports) != 3 {
+	poolerContainer := pooler.Spec.Template.Spec.Containers[0]
+	if pooler.Spec.Replicas != nil || len(poolerContainer.Ports) != 4 || poolerContainer.ReadinessProbe.HTTPGet.Path != "/readyz" || poolerContainer.ReadinessProbe.FailureThreshold != 1 || poolerContainer.LivenessProbe.HTTPGet.Path != "/healthz" || poolerContainer.LivenessProbe.FailureThreshold != 3 {
 		t.Fatalf("pooler spec = %#v", pooler.Spec)
 	}
 	hpa := object[*autoscalingv2.HorizontalPodAutoscaler](t, plan, "demo-pooler")

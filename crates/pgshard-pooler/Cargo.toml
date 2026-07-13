@@ -1,0 +1,23 @@
+[package]
+name = "pgshard-pooler"
+description = "Fail-closed pooler runtime control-plane foundations for pgshard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
+pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
+serde.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

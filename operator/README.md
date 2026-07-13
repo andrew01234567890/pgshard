@@ -9,7 +9,10 @@ API. The controller now reconciles the safe supporting-resource slice:
 - one internal headless Service per shard;
 - etcd, orchestrator, and pooler workload specifications, topology spread,
   security contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
-  etcd ingress NetworkPolicy; and
+  etcd ingress NetworkPolicy;
+- an internal pooler HTTP Service plus fail-closed readiness and independent
+  liveness probe contracts; the control Service retains unready endpoints for
+  outage diagnostics while application Services continue filtering them; and
 - controller ownership, update pruning, and finalizer-based deletion pruning.
 
 This is not a working PostgreSQL cluster. The controller intentionally creates
@@ -31,8 +34,9 @@ defragmentation is not implemented. PostgreSQL
 verified, so the generated configuration cannot silently fill `pg_wal`.
 
 The default orchestrator and pooler image values are expected development
-channel names, not a publication guarantee; the current source tree does not
-contain a pooler runtime. Override them with `--orchestrator-image` and
+channel names, not a publication guarantee. The Rust pooler crate contains
+catalog-derived HTTP handlers but no executable, PostgreSQL listener, or
+connection pool. Override the defaults with `--orchestrator-image` and
 `--pooler-image` when concrete images exist. `--etcd-image` is also
 configurable. Image pull or runtime readiness is reported only through
 `SupportingWorkloadsAvailable`, never as database readiness.

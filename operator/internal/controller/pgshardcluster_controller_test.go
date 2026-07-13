@@ -38,20 +38,28 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 		t.Fatalf("requeue = %#v", result)
 	}
 
-	for _, name := range []string{"example-rw", "example-ro", "example-r", "example-shard-0000", "example-shard-0001", "example-etcd", "example-orchestrator"} {
+	for _, name := range []string{"example-rw", "example-ro", "example-r", "example-shard-0000", "example-shard-0001", "example-etcd", "example-orchestrator", "example-pooler"} {
 		service := &corev1.Service{}
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, service); err != nil {
 			t.Fatalf("get Service %s: %v", name, err)
 		}
 		assertControllerOwner(t, service, cluster)
 	}
-	for name, target := range map[string]string{"example-rw": "pooler-rw", "example-ro": "pooler-ro", "example-r": "pooler-r"} {
+	for name, expected := range map[string]struct {
+		port   int32
+		target string
+	}{
+		"example-rw":     {port: owned.PostgreSQLPort, target: "pooler-rw"},
+		"example-ro":     {port: owned.PostgreSQLPort, target: "pooler-ro"},
+		"example-r":      {port: owned.PostgreSQLPort, target: "pooler-r"},
+		"example-pooler": {port: owned.HTTPPort, target: "http"},
+	} {
 		service := &corev1.Service{}
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, service); err != nil {
 			t.Fatal(err)
 		}
-		if service.Spec.Ports[0].TargetPort.StrVal != target {
-			t.Fatalf("%s target port = %#v", name, service.Spec.Ports[0].TargetPort)
+		if service.Spec.Ports[0].Port != expected.port || service.Spec.Ports[0].TargetPort.StrVal != expected.target {
+			t.Fatalf("%s port = %#v", name, service.Spec.Ports[0])
 		}
 	}
 	for _, object := range []client.Object{
