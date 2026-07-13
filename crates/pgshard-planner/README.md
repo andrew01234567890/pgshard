@@ -53,8 +53,13 @@ changes results under an unsafe path, including when PostgreSQL re-analyzes a
 statement originally prepared under an empty path. The tokens record validated
 caller observations; the future session and schema runtimes must obtain them
 authoritatively in fenced reads, fence the complete snapshot and schema epochs,
-and enforce the invariants continuously. Bind-value validation and execution
-remain absent.
+and enforce the invariants continuously. The router crate now composes this
+proof with a decoded zero-copy Bind parameter collection, rechecks the exact
+snapshot, requires the caller's current empty-path token, checks the parameter
+count and selected format/NULL/value, and produces the canonical shard route.
+Prepared-statement/portal generation,
+backend identity, authoritative session enforcement, and execution remain
+absent.
 
 `cargo bench -p pgshard-planner --bench parse_statement` measures this parsing
 boundary in isolation. `cargo bench -p pgshard-planner --bench

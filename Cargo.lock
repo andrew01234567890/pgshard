@@ -940,6 +940,7 @@ version = "0.1.0"
 dependencies = [
  "pgshard-catalog",
  "pgshard-pgwire",
+ "pgshard-planner",
  "pgshard-types",
  "thiserror",
  "uuid",
