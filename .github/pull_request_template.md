@@ -20,6 +20,6 @@
 
 - [ ] PR title is a valid Conventional Commit and describes the squash commit
 - [ ] Source commits use GitHub noreply author and committer identities; any final squash-author exception follows the documented signed `web-flow` policy
-- [ ] Independent `gpt-5.6-sol high` review requested, or the nearest available high-reasoning model is disclosed
+- [ ] Independent correctness and simplification review completed
 - [ ] Material review fixes received a fresh independent review
 - [ ] This PR will be squash-merged only
