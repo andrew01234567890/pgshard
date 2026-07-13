@@ -912,11 +912,14 @@ name = "pgshard-planner"
 version = "0.1.0"
 dependencies = [
  "log",
+ "pgshard-catalog",
+ "pgshard-types",
  "sqlparser",
  "stacker",
  "thiserror",
  "tokio",
  "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]

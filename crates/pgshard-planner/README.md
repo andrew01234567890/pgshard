@@ -29,5 +29,15 @@ The API is synchronous. The future pooler session layer must execute it on a
 bounded CPU worker pool with a concurrency limit; it must not let large parses
 block asynchronous socket workers.
 
+The first catalog-bound route template accepts only an explicitly
+schema-qualified `SELECT *` from one registered table whose entire predicate is
+direct equality between its unqualified shard-key column and one canonical
+`$1` through `$65535` placeholder. It rejects aliases, joins, CTEs, subqueries,
+additional predicates, casts, modifiers, ordering, limits, locks, and the
+noncanonical `==` operator. The template is not executable until parameter
+types, operator resolution, and the corresponding Bind value are validated.
+
 `cargo bench -p pgshard-planner --bench parse_statement` measures this parsing
-boundary in isolation. It is informational and is not a pooler-throughput claim.
+boundary in isolation. `cargo bench -p pgshard-planner --bench
+analyze_parameter_route` measures parsing plus the catalog-bound template. Both
+are informational and are not pooler-throughput claims.

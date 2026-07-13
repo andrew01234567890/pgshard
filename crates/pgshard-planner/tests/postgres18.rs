@@ -1,6 +1,79 @@
 //! Live `PostgreSQL` 18 positive and known-negative candidate-parser smoke test.
 
-use pgshard_planner::{StatementKind, parse_one};
+use pgshard_catalog::{
+    CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, RegisteredTable,
+    RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
+};
+use pgshard_planner::{RouteTemplateError, StatementKind, parse_one};
+use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
+use uuid::Uuid;
+
+fn route_snapshot(schema: &str) -> (CatalogSnapshot, DatabaseId) {
+    let database_id = DatabaseId::new(Uuid::from_u128(2)).expect("database ID");
+    let registered_table = RegisteredTable::new(
+        TableName::new(schema, "planner_target").expect("temporary table name"),
+        "tenant_id",
+        ShardKeyType::Int64,
+        RoutingHashV1::VERSION,
+    )
+    .expect("registered table");
+    let database = DatabaseCatalog::new(
+        database_id,
+        "app",
+        DatabaseEpochs::new(1, 1, 1).expect("database epochs"),
+        vec![ShardRoute::new(
+            ShardId(0),
+            KeyRange::new(0, KEYSPACE_END).expect("complete range"),
+        )],
+        vec![registered_table],
+    )
+    .expect("database catalog");
+    let snapshot = CatalogSnapshot::new(
+        ClusterId::new(Uuid::from_u128(1)).expect("cluster ID"),
+        1,
+        RoutingHashConfig::new(1, 42).expect("routing hash"),
+        vec![database],
+    )
+    .expect("catalog snapshot");
+    (snapshot, database_id)
+}
+
+async fn check_parameter_route(client: &tokio_postgres::Client) {
+    let temporary_schema: String = client
+        .query_one(
+            "SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()",
+            &[],
+        )
+        .await
+        .expect("read temporary schema")
+        .get(0);
+    let (snapshot, database_id) = route_snapshot(&temporary_schema);
+    let routed_sql =
+        format!("SELECT * FROM \"{temporary_schema}\".\"planner_target\" WHERE tenant_id = $1");
+    let template = parse_one(&routed_sql)
+        .expect("route SQL parse")
+        .parameter_route_template(&snapshot, database_id)
+        .expect("route template");
+    assert_eq!(template.parameter_number().get(), 1);
+    assert_eq!(template.shard_key_type(), ShardKeyType::Int64);
+    client
+        .prepare(&routed_sql)
+        .await
+        .expect("PostgreSQL 18 routed parse");
+
+    let double_equality =
+        format!("SELECT * FROM \"{temporary_schema}\".\"planner_target\" WHERE tenant_id == $1");
+    assert_eq!(
+        parse_one(&double_equality)
+            .expect("candidate parser accepts double equality")
+            .parameter_route_template(&snapshot, database_id),
+        Err(RouteTemplateError::UnsupportedShape),
+    );
+    assert!(
+        client.prepare(&double_equality).await.is_err(),
+        "default PostgreSQL catalog unexpectedly resolved double equality"
+    );
+}
 
 #[tokio::test]
 #[ignore = "requires PGSHARD_TEST_DATABASE_URL pointing to PostgreSQL 18"]
@@ -91,6 +164,8 @@ async fn admitted_dml_parses_on_postgres18() {
             "PostgreSQL unexpectedly accepted candidate-only syntax"
         );
     }
+
+    check_parameter_route(&client).await;
 
     drop(client);
     connection_task
