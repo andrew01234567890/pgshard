@@ -13,8 +13,8 @@ use std::time::Duration;
 use pgshard_pgwire::{
     AuthenticationRequest, BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode,
     ExtendedQueryObject, FrontendPhase, PgOutputConfiguration, PgOutputControlMessage,
-    PgOutputDecoder, PgOutputEncoding, PgOutputError, PgOutputMessage, PgOutputStreaming,
-    PgOutputVersion, Postgres18StartupNegotiation, TransactionStatus,
+    PgOutputDecoder, PgOutputEncoding, PgOutputMessage, PgOutputOldTuple, PgOutputStreaming,
+    PgOutputTupleColumn, PgOutputVersion, Postgres18StartupNegotiation, TransactionStatus,
     decode_authentication_request, decode_backend, decode_backend_key_data, decode_close,
     decode_describe, decode_frontend, decode_parameter_description, decode_parameter_status,
     decode_pgoutput_control, decode_protocol_negotiation, decode_ready_for_query, decode_startup,
@@ -356,6 +356,106 @@ fn hex_nibble(value: u8) -> u8 {
     }
 }
 
+fn assert_prepared_row_changes(messages: &[Vec<u8>], table: &str, encoding: PgOutputEncoding) {
+    let configuration =
+        PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::Off, false, true)
+            .expect("protocol v1 remains decodable for a persistently enabled slot");
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message[0])
+            .collect::<Vec<_>>(),
+        b"bRIUDIRTP"
+    );
+    assert!(matches!(
+        decode_pgoutput_control(&messages[0], configuration, encoding),
+        Ok(PgOutputControlMessage::BeginPrepare(_))
+    ));
+    let mut decoder = PgOutputDecoder::new(configuration, encoding);
+    assert!(matches!(
+        decoder.decode(&messages[0]),
+        Ok(PgOutputMessage::Control(
+            PgOutputControlMessage::BeginPrepare(_)
+        ))
+    ));
+    let PgOutputMessage::Relation(relation) = decoder.decode(&messages[1]).expect("live Relation")
+    else {
+        panic!("live Relation decoded as another message");
+    };
+    assert_eq!(relation.stream_xid(), None);
+    assert_eq!(relation.namespace(), "public");
+    assert_eq!(relation.name(), table);
+    assert_eq!(relation.column_count(), 1);
+    let relation_id = relation.relation_id();
+    let column = relation.columns().next().expect("live relation column");
+    assert!(column.part_of_replica_identity());
+    assert_eq!(column.name(), "id");
+    assert_eq!(column.type_oid(), 23);
+    assert_eq!(column.type_modifier(), -1);
+    let PgOutputMessage::Insert(inserted) = decoder.decode(&messages[2]).expect("live Insert")
+    else {
+        panic!("live Insert decoded as another message");
+    };
+    assert_eq!(inserted.stream_xid(), None);
+    assert_eq!(inserted.relation_id(), relation_id);
+    assert_eq!(
+        inserted.new_tuple().columns().collect::<Vec<_>>(),
+        [PgOutputTupleColumn::Text("1")]
+    );
+    let PgOutputMessage::Update(updated) = decoder.decode(&messages[3]).expect("live Update")
+    else {
+        panic!("live Update decoded as another message");
+    };
+    assert_eq!(updated.relation_id(), relation_id);
+    let Some(PgOutputOldTuple::Key(old_key)) = updated.old_tuple() else {
+        panic!("live Update did not carry its replica-identity key");
+    };
+    assert_eq!(
+        old_key.columns().collect::<Vec<_>>(),
+        [PgOutputTupleColumn::Text("1")]
+    );
+    assert_eq!(
+        updated.new_tuple().columns().collect::<Vec<_>>(),
+        [PgOutputTupleColumn::Text("2")]
+    );
+    let PgOutputMessage::Delete(deleted) = decoder.decode(&messages[4]).expect("live Delete")
+    else {
+        panic!("live Delete decoded as another message");
+    };
+    let PgOutputOldTuple::Key(old_key) = deleted.old_tuple() else {
+        panic!("live Delete did not carry its replica-identity key");
+    };
+    assert_eq!(
+        old_key.columns().collect::<Vec<_>>(),
+        [PgOutputTupleColumn::Text("2")]
+    );
+    let PgOutputMessage::Insert(inserted) =
+        decoder.decode(&messages[5]).expect("second live Insert")
+    else {
+        panic!("second live Insert decoded as another message");
+    };
+    assert_eq!(
+        inserted.new_tuple().columns().collect::<Vec<_>>(),
+        [PgOutputTupleColumn::Text("3")]
+    );
+    assert!(matches!(
+        decoder.decode(&messages[6]),
+        Ok(PgOutputMessage::Relation(_))
+    ));
+    let PgOutputMessage::Truncate(truncated) = decoder.decode(&messages[7]).expect("live Truncate")
+    else {
+        panic!("live Truncate decoded as another message");
+    };
+    assert_eq!(truncated.relation_count(), 1);
+    assert!(!truncated.cascade());
+    assert!(!truncated.restart_identity());
+    assert_eq!(truncated.relation_ids().collect::<Vec<_>>(), [relation_id]);
+    assert!(matches!(
+        decoder.decode(&messages[8]),
+        Ok(PgOutputMessage::Control(PgOutputControlMessage::Prepare(_)))
+    ));
+}
+
 fn two_phase_slot_state_survives_a_false_start_request(
     stream: &mut TcpStream,
     encoding: PgOutputEncoding,
@@ -380,7 +480,12 @@ fn two_phase_slot_state_survives_a_false_start_request(
     let slot_creation_result = simple_query(stream, &create_slot);
     simple_query(
         stream,
-        &format!("BEGIN; INSERT INTO {table} VALUES (1); PREPARE TRANSACTION '{gid}'"),
+        &format!(
+            "BEGIN; INSERT INTO {table} VALUES (1); \
+             UPDATE {table} SET id = 2 WHERE id = 1; \
+             DELETE FROM {table} WHERE id = 2; INSERT INTO {table} VALUES (3); \
+             TRUNCATE {table}; PREPARE TRANSACTION '{gid}'"
+        ),
     );
 
     let peek = format!(
@@ -413,49 +518,7 @@ fn two_phase_slot_state_survives_a_false_start_request(
             .any(|message| message.first() == Some(&b'P')),
         "persistent slot state did not emit Prepare"
     );
-
-    let configuration =
-        PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::Off, false, true)
-            .expect("protocol v1 remains decodable for a persistently enabled slot");
-    assert_eq!(
-        messages
-            .iter()
-            .map(|message| message[0])
-            .collect::<Vec<_>>(),
-        b"bRIP"
-    );
-    assert!(matches!(
-        decode_pgoutput_control(&messages[0], configuration, encoding),
-        Ok(PgOutputControlMessage::BeginPrepare(_))
-    ));
-    let mut decoder = PgOutputDecoder::new(configuration, encoding);
-    assert!(matches!(
-        decoder.decode(&messages[0]),
-        Ok(PgOutputMessage::Control(
-            PgOutputControlMessage::BeginPrepare(_)
-        ))
-    ));
-    let PgOutputMessage::Relation(relation) = decoder.decode(&messages[1]).expect("live Relation")
-    else {
-        panic!("live Relation decoded as another message");
-    };
-    assert_eq!(relation.stream_xid(), None);
-    assert_eq!(relation.namespace(), "public");
-    assert_eq!(relation.name(), table);
-    assert_eq!(relation.column_count(), 1);
-    let column = relation.columns().next().expect("live relation column");
-    assert!(column.part_of_replica_identity());
-    assert_eq!(column.name(), "id");
-    assert_eq!(column.type_oid(), 23);
-    assert_eq!(column.type_modifier(), -1);
-    assert_eq!(
-        decoder.decode(&messages[2]),
-        Err(PgOutputError::NonControlMessage(b'I'))
-    );
-    assert!(matches!(
-        decoder.decode(&messages[3]),
-        Ok(PgOutputMessage::Control(PgOutputControlMessage::Prepare(_)))
-    ));
+    assert_prepared_row_changes(&messages, &table, encoding);
 }
 
 fn streamed_subtransaction_schema_keeps_its_own_xid(

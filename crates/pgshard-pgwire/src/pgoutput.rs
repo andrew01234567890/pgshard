@@ -1,4 +1,4 @@
-//! Bounded zero-copy decoding of `PostgreSQL` 18 logical replication controls.
+//! Bounded zero-copy decoding of `PostgreSQL` 18 logical replication messages.
 
 use std::fmt;
 
@@ -863,6 +863,316 @@ impl<'a> PgOutputType<'a> {
     }
 }
 
+/// One borrowed column value from a logical-replication tuple.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum PgOutputTupleColumn<'a> {
+    /// SQL `NULL`.
+    Null,
+    /// A toasted value that is unchanged from the previous row version.
+    UnchangedToast,
+    /// Text output under the replication connection's proven UTF-8 encoding.
+    Text(&'a str),
+    /// Type-specific binary output.
+    Binary(&'a [u8]),
+}
+
+impl fmt::Debug for PgOutputTupleColumn<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => formatter.write_str("Null"),
+            Self::UnchangedToast => formatter.write_str("UnchangedToast"),
+            Self::Text(value) => formatter
+                .debug_tuple("Text")
+                .field(&format_args!("{} bytes", value.len()))
+                .finish(),
+            Self::Binary(value) => formatter
+                .debug_tuple("Binary")
+                .field(&format_args!("{} bytes", value.len()))
+                .finish(),
+        }
+    }
+}
+
+/// Borrowed, prevalidated tuple data from a row-change message.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct PgOutputTuple<'a> {
+    column_count: u16,
+    columns: &'a [u8],
+}
+
+impl fmt::Debug for PgOutputTuple<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputTuple")
+            .field("column_count", &self.column_count)
+            .field("encoded_length", &self.columns.len())
+            .finish()
+    }
+}
+
+impl<'a> PgOutputTuple<'a> {
+    /// Returns the number of encoded tuple columns.
+    #[must_use]
+    pub const fn column_count(self) -> u16 {
+        self.column_count
+    }
+
+    /// Returns a borrowed iterator over the prevalidated tuple columns.
+    #[must_use]
+    pub fn columns(self) -> PgOutputTupleColumnIter<'a> {
+        PgOutputTupleColumnIter {
+            remaining: self.columns,
+            remaining_columns: usize::from(self.column_count),
+        }
+    }
+}
+
+/// Borrowed iterator over prevalidated tuple columns.
+#[derive(Clone)]
+pub struct PgOutputTupleColumnIter<'a> {
+    remaining: &'a [u8],
+    remaining_columns: usize,
+}
+
+impl fmt::Debug for PgOutputTupleColumnIter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputTupleColumnIter")
+            .field("remaining_bytes", &self.remaining.len())
+            .field("remaining_columns", &self.remaining_columns)
+            .finish()
+    }
+}
+
+impl<'a> Iterator for PgOutputTupleColumnIter<'a> {
+    type Item = PgOutputTupleColumn<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_columns == 0 {
+            return None;
+        }
+        let mut cursor = Cursor::new(self.remaining);
+        let column = decode_tuple_column(&mut cursor)
+            .expect("tuple columns were validated before iterator construction");
+        self.remaining = cursor.remaining();
+        self.remaining_columns -= 1;
+        Some(column)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining_columns, Some(self.remaining_columns))
+    }
+}
+
+impl ExactSizeIterator for PgOutputTupleColumnIter<'_> {}
+
+/// Replica-identity tuple carried by an Update or Delete message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PgOutputOldTuple<'a> {
+    /// Columns selected by the relation's replica-identity key.
+    Key(PgOutputTuple<'a>),
+    /// The complete old row under `REPLICA IDENTITY FULL`.
+    Full(PgOutputTuple<'a>),
+}
+
+impl<'a> PgOutputOldTuple<'a> {
+    /// Returns the borrowed tuple regardless of its identity kind.
+    #[must_use]
+    pub const fn tuple(self) -> PgOutputTuple<'a> {
+        match self {
+            Self::Key(tuple) | Self::Full(tuple) => tuple,
+        }
+    }
+}
+
+/// Borrowed Insert row change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PgOutputInsert<'a> {
+    stream_xid: Option<u32>,
+    relation_id: u32,
+    new_tuple: PgOutputTuple<'a>,
+}
+
+impl<'a> PgOutputInsert<'a> {
+    /// Returns the streamed transaction ID, or `None` for buffered output.
+    #[must_use]
+    pub const fn stream_xid(self) -> Option<u32> {
+        self.stream_xid
+    }
+
+    /// Returns the publisher relation OID.
+    #[must_use]
+    pub const fn relation_id(self) -> u32 {
+        self.relation_id
+    }
+
+    /// Returns the inserted tuple.
+    #[must_use]
+    pub const fn new_tuple(self) -> PgOutputTuple<'a> {
+        self.new_tuple
+    }
+}
+
+/// Borrowed Update row change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PgOutputUpdate<'a> {
+    stream_xid: Option<u32>,
+    relation_id: u32,
+    old_tuple: Option<PgOutputOldTuple<'a>>,
+    new_tuple: PgOutputTuple<'a>,
+}
+
+impl<'a> PgOutputUpdate<'a> {
+    /// Returns the streamed transaction ID, or `None` for buffered output.
+    #[must_use]
+    pub const fn stream_xid(self) -> Option<u32> {
+        self.stream_xid
+    }
+
+    /// Returns the publisher relation OID.
+    #[must_use]
+    pub const fn relation_id(self) -> u32 {
+        self.relation_id
+    }
+
+    /// Returns the optional key or full old tuple.
+    #[must_use]
+    pub const fn old_tuple(self) -> Option<PgOutputOldTuple<'a>> {
+        self.old_tuple
+    }
+
+    /// Returns the replacement tuple.
+    #[must_use]
+    pub const fn new_tuple(self) -> PgOutputTuple<'a> {
+        self.new_tuple
+    }
+}
+
+/// Borrowed Delete row change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PgOutputDelete<'a> {
+    stream_xid: Option<u32>,
+    relation_id: u32,
+    old_tuple: PgOutputOldTuple<'a>,
+}
+
+impl<'a> PgOutputDelete<'a> {
+    /// Returns the streamed transaction ID, or `None` for buffered output.
+    #[must_use]
+    pub const fn stream_xid(self) -> Option<u32> {
+        self.stream_xid
+    }
+
+    /// Returns the publisher relation OID.
+    #[must_use]
+    pub const fn relation_id(self) -> u32 {
+        self.relation_id
+    }
+
+    /// Returns the key or full old tuple.
+    #[must_use]
+    pub const fn old_tuple(self) -> PgOutputOldTuple<'a> {
+        self.old_tuple
+    }
+}
+
+/// Borrowed iterator over relation OIDs in a Truncate message.
+#[derive(Clone)]
+pub struct PgOutputRelationIdIter<'a> {
+    remaining: &'a [u8],
+    remaining_relations: usize,
+}
+
+impl fmt::Debug for PgOutputRelationIdIter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputRelationIdIter")
+            .field("remaining_relations", &self.remaining_relations)
+            .finish()
+    }
+}
+
+impl Iterator for PgOutputRelationIdIter<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_relations == 0 {
+            return None;
+        }
+        let bytes = self
+            .remaining
+            .get(..4)
+            .expect("Truncate relation IDs were prevalidated");
+        self.remaining = &self.remaining[4..];
+        self.remaining_relations -= 1;
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining_relations, Some(self.remaining_relations))
+    }
+}
+
+impl ExactSizeIterator for PgOutputRelationIdIter<'_> {}
+
+/// Borrowed Truncate row change.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct PgOutputTruncate<'a> {
+    stream_xid: Option<u32>,
+    relation_count: u32,
+    relation_count_usize: usize,
+    cascade: bool,
+    restart_identity: bool,
+    relation_ids: &'a [u8],
+}
+
+impl fmt::Debug for PgOutputTruncate<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputTruncate")
+            .field("stream_xid", &self.stream_xid)
+            .field("relation_count", &self.relation_count)
+            .field("cascade", &self.cascade)
+            .field("restart_identity", &self.restart_identity)
+            .finish()
+    }
+}
+
+impl<'a> PgOutputTruncate<'a> {
+    /// Returns the streamed transaction ID, or `None` for buffered output.
+    #[must_use]
+    pub const fn stream_xid(self) -> Option<u32> {
+        self.stream_xid
+    }
+
+    /// Returns the number of truncated relations.
+    #[must_use]
+    pub const fn relation_count(self) -> u32 {
+        self.relation_count
+    }
+
+    /// Returns whether the originating command requested `CASCADE`.
+    #[must_use]
+    pub const fn cascade(self) -> bool {
+        self.cascade
+    }
+
+    /// Returns whether the originating command requested `RESTART IDENTITY`.
+    #[must_use]
+    pub const fn restart_identity(self) -> bool {
+        self.restart_identity
+    }
+
+    /// Returns a borrowed iterator over the publisher relation OIDs.
+    #[must_use]
+    pub fn relation_ids(self) -> PgOutputRelationIdIter<'a> {
+        PgOutputRelationIdIter {
+            remaining: self.relation_ids,
+            remaining_relations: self.relation_count_usize,
+        }
+    }
+}
+
 /// One message decoded with stream-segment layout state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PgOutputMessage<'a> {
@@ -872,11 +1182,19 @@ pub enum PgOutputMessage<'a> {
     Relation(PgOutputRelation<'a>),
     /// User-defined type metadata.
     Type(PgOutputType<'a>),
+    /// Inserted row.
+    Insert(PgOutputInsert<'a>),
+    /// Updated row.
+    Update(PgOutputUpdate<'a>),
+    /// Deleted row.
+    Delete(PgOutputDelete<'a>),
+    /// One or more truncated relations.
+    Truncate(PgOutputTruncate<'a>),
 }
 
 /// Stateful decoder for layouts that include an XID only inside stream chunks.
 ///
-/// `PostgreSQL` does not mark the optional XID field in Relation and Type
+/// `PostgreSQL` does not mark the optional XID field in schema or row-change
 /// messages. This decoder derives its presence from successfully decoded Stream
 /// Start and Stream Stop controls, so callers cannot select an ambiguous layout
 /// per message. It deliberately does not yet prove complete transaction order.
@@ -938,6 +1256,17 @@ impl PgOutputDecoder {
             b'R' => decode_relation(body, self.active_stream_xid.is_some())
                 .map(PgOutputMessage::Relation),
             b'Y' => decode_type(body, self.active_stream_xid.is_some()).map(PgOutputMessage::Type),
+            b'I' => {
+                decode_insert(body, self.active_stream_xid.is_some()).map(PgOutputMessage::Insert)
+            }
+            b'U' => {
+                decode_update(body, self.active_stream_xid.is_some()).map(PgOutputMessage::Update)
+            }
+            b'D' => {
+                decode_delete(body, self.active_stream_xid.is_some()).map(PgOutputMessage::Delete)
+            }
+            b'T' => decode_truncate(body, self.active_stream_xid.is_some())
+                .map(PgOutputMessage::Truncate),
             _ => {
                 let message = decode_pgoutput_control(input, self.configuration, self.encoding)?;
                 let next_stream_xid = self.validate_control_transition(&message)?;
@@ -1144,6 +1473,180 @@ fn decode_type(body: &[u8], in_stream_segment: bool) -> Result<PgOutputType<'_>,
     };
     cursor.finish()?;
     Ok(value)
+}
+
+fn decode_insert(
+    body: &[u8],
+    in_stream_segment: bool,
+) -> Result<PgOutputInsert<'_>, PgOutputError> {
+    let mut cursor = Cursor::new(body);
+    let stream_xid = decode_stream_xid(&mut cursor, in_stream_segment)?;
+    let relation_id = cursor.u32("Insert relation ID")?;
+    require_tuple_marker(cursor.byte("Insert new-tuple marker")?, b'N', "Insert")?;
+    let new_tuple = decode_tuple(&mut cursor)?;
+    cursor.finish()?;
+    Ok(PgOutputInsert {
+        stream_xid,
+        relation_id,
+        new_tuple,
+    })
+}
+
+fn decode_update(
+    body: &[u8],
+    in_stream_segment: bool,
+) -> Result<PgOutputUpdate<'_>, PgOutputError> {
+    let mut cursor = Cursor::new(body);
+    let stream_xid = decode_stream_xid(&mut cursor, in_stream_segment)?;
+    let relation_id = cursor.u32("Update relation ID")?;
+    let mut marker = cursor.byte("Update tuple marker")?;
+    let old_tuple = match marker {
+        b'K' | b'O' => {
+            let tuple = decode_old_tuple(&mut cursor, marker)?;
+            marker = cursor.byte("Update new-tuple marker")?;
+            Some(tuple)
+        }
+        b'N' => None,
+        _ => {
+            return Err(PgOutputError::UnexpectedTupleMarker {
+                message: "Update",
+                marker,
+            });
+        }
+    };
+    require_tuple_marker(marker, b'N', "Update")?;
+    let new_tuple = decode_tuple(&mut cursor)?;
+    cursor.finish()?;
+    Ok(PgOutputUpdate {
+        stream_xid,
+        relation_id,
+        old_tuple,
+        new_tuple,
+    })
+}
+
+fn decode_delete(
+    body: &[u8],
+    in_stream_segment: bool,
+) -> Result<PgOutputDelete<'_>, PgOutputError> {
+    let mut cursor = Cursor::new(body);
+    let stream_xid = decode_stream_xid(&mut cursor, in_stream_segment)?;
+    let relation_id = cursor.u32("Delete relation ID")?;
+    let marker = cursor.byte("Delete old-tuple marker")?;
+    let old_tuple = match marker {
+        b'K' | b'O' => decode_old_tuple(&mut cursor, marker)?,
+        _ => {
+            return Err(PgOutputError::UnexpectedTupleMarker {
+                message: "Delete",
+                marker,
+            });
+        }
+    };
+    cursor.finish()?;
+    Ok(PgOutputDelete {
+        stream_xid,
+        relation_id,
+        old_tuple,
+    })
+}
+
+fn decode_truncate(
+    body: &[u8],
+    in_stream_segment: bool,
+) -> Result<PgOutputTruncate<'_>, PgOutputError> {
+    let mut cursor = Cursor::new(body);
+    let stream_xid = decode_stream_xid(&mut cursor, in_stream_segment)?;
+    let signed_count = cursor.i32("Truncate relation count")?;
+    let relation_count = u32::try_from(signed_count)
+        .ok()
+        .filter(|count| *count != 0)
+        .ok_or(PgOutputError::InvalidTruncateRelationCount(signed_count))?;
+    let flags = cursor.byte("Truncate flags")?;
+    if flags & !0b11 != 0 {
+        return Err(PgOutputError::InvalidTruncateFlags(flags));
+    }
+    let relation_count_usize = usize::try_from(relation_count)
+        .map_err(|_| PgOutputError::InvalidTruncateRelationCount(signed_count))?;
+    let relation_bytes = relation_count_usize
+        .checked_mul(4)
+        .ok_or(PgOutputError::InvalidTruncateRelationCount(signed_count))?;
+    let relation_ids = cursor.take(relation_bytes, "Truncate relation IDs")?;
+    cursor.finish()?;
+    Ok(PgOutputTruncate {
+        stream_xid,
+        relation_count,
+        relation_count_usize,
+        cascade: flags & 1 != 0,
+        restart_identity: flags & 2 != 0,
+        relation_ids,
+    })
+}
+
+fn require_tuple_marker(
+    marker: u8,
+    expected: u8,
+    message: &'static str,
+) -> Result<(), PgOutputError> {
+    if marker == expected {
+        Ok(())
+    } else {
+        Err(PgOutputError::UnexpectedTupleMarker { message, marker })
+    }
+}
+
+fn decode_old_tuple<'a>(
+    cursor: &mut Cursor<'a>,
+    marker: u8,
+) -> Result<PgOutputOldTuple<'a>, PgOutputError> {
+    let tuple = decode_tuple(cursor)?;
+    match marker {
+        b'K' => Ok(PgOutputOldTuple::Key(tuple)),
+        b'O' => Ok(PgOutputOldTuple::Full(tuple)),
+        _ => Err(PgOutputError::UnexpectedTupleMarker {
+            message: "old tuple",
+            marker,
+        }),
+    }
+}
+
+fn decode_tuple<'a>(cursor: &mut Cursor<'a>) -> Result<PgOutputTuple<'a>, PgOutputError> {
+    let column_count = cursor.u16("tuple column count")?;
+    let encoded_columns = cursor.remaining();
+    for _ in 0..column_count {
+        decode_tuple_column(cursor)?;
+    }
+    let consumed = encoded_columns.len() - cursor.remaining().len();
+    let columns = encoded_columns
+        .get(..consumed)
+        .ok_or(PgOutputError::Truncated("tuple columns"))?;
+    Ok(PgOutputTuple {
+        column_count,
+        columns,
+    })
+}
+
+fn decode_tuple_column<'a>(
+    cursor: &mut Cursor<'a>,
+) -> Result<PgOutputTupleColumn<'a>, PgOutputError> {
+    let kind = cursor.byte("tuple column kind")?;
+    match kind {
+        b'n' => Ok(PgOutputTupleColumn::Null),
+        b'u' => Ok(PgOutputTupleColumn::UnchangedToast),
+        b't' | b'b' => {
+            let signed_length = cursor.i32("tuple column length")?;
+            let length = usize::try_from(signed_length)
+                .map_err(|_| PgOutputError::InvalidTupleColumnLength(signed_length))?;
+            let value = cursor.take(length, "tuple column value")?;
+            if kind == b't' {
+                let text = std::str::from_utf8(value)
+                    .map_err(|_| PgOutputError::InvalidUtf8("tuple text column"))?;
+                Ok(PgOutputTupleColumn::Text(text))
+            } else {
+                Ok(PgOutputTupleColumn::Binary(value))
+            }
+        }
+        _ => Err(PgOutputError::InvalidTupleColumnKind(kind)),
+    }
 }
 
 fn decode_stream_xid(
@@ -1382,7 +1885,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Logical replication envelope or `pgoutput` control decoding failure.
+/// Logical replication envelope or `pgoutput` message decoding failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum PgOutputError {
     /// The envelope decoder was called for another backend tag.
@@ -1404,6 +1907,26 @@ pub enum PgOutputError {
     /// A Relation column set a reserved flag bit.
     #[error("unrecognized relation column flags {0}")]
     InvalidRelationColumnFlags(u8),
+    /// A row-change message carried a tuple marker that is invalid there.
+    #[error("unexpected tuple marker {marker} in {message} message")]
+    UnexpectedTupleMarker {
+        /// Row-change message family.
+        message: &'static str,
+        /// Rejected marker byte.
+        marker: u8,
+    },
+    /// A tuple column used an unknown wire representation.
+    #[error("unrecognized tuple column representation {0}")]
+    InvalidTupleColumnKind(u8),
+    /// A text or binary tuple column declared a negative length.
+    #[error("tuple column length {0} is negative")]
+    InvalidTupleColumnLength(i32),
+    /// A Truncate message declared no relations or an unrepresentable count.
+    #[error("invalid Truncate relation count {0}")]
+    InvalidTruncateRelationCount(i32),
+    /// A Truncate message set a reserved option bit.
+    #[error("unrecognized Truncate flags {0}")]
+    InvalidTruncateFlags(u8),
     /// The logical message tag is not defined by `PostgreSQL` 18 `pgoutput`.
     #[error("unknown PostgreSQL 18 pgoutput message tag {0}")]
     UnknownPgOutputMessage(u8),
@@ -1635,6 +2158,93 @@ mod tests {
         message.push(0);
         message.extend_from_slice(name);
         message.push(0);
+        message
+    }
+
+    type TestTupleColumn<'a> = (u8, &'a [u8]);
+    type TestOldTuple<'a> = (u8, &'a [TestTupleColumn<'a>]);
+
+    fn push_tuple(message: &mut Vec<u8>, columns: &[TestTupleColumn<'_>]) {
+        push_u16(
+            message,
+            u16::try_from(columns.len()).expect("tuple column count"),
+        );
+        for (kind, value) in columns {
+            message.push(*kind);
+            if matches!(kind, b't' | b'b') {
+                push_i32(
+                    message,
+                    i32::try_from(value.len()).expect("tuple column length"),
+                );
+                message.extend_from_slice(value);
+            }
+        }
+    }
+
+    fn insert(
+        stream_xid: Option<u32>,
+        relation_id: u32,
+        columns: &[TestTupleColumn<'_>],
+    ) -> Vec<u8> {
+        let mut message = vec![b'I'];
+        if let Some(xid) = stream_xid {
+            push_u32(&mut message, xid);
+        }
+        push_u32(&mut message, relation_id);
+        message.push(b'N');
+        push_tuple(&mut message, columns);
+        message
+    }
+
+    fn update(
+        stream_xid: Option<u32>,
+        relation_id: u32,
+        old_tuple: Option<TestOldTuple<'_>>,
+        new_tuple: &[TestTupleColumn<'_>],
+    ) -> Vec<u8> {
+        let mut message = vec![b'U'];
+        if let Some(xid) = stream_xid {
+            push_u32(&mut message, xid);
+        }
+        push_u32(&mut message, relation_id);
+        if let Some((marker, columns)) = old_tuple {
+            message.push(marker);
+            push_tuple(&mut message, columns);
+        }
+        message.push(b'N');
+        push_tuple(&mut message, new_tuple);
+        message
+    }
+
+    fn delete(
+        stream_xid: Option<u32>,
+        relation_id: u32,
+        marker: u8,
+        old_tuple: &[TestTupleColumn<'_>],
+    ) -> Vec<u8> {
+        let mut message = vec![b'D'];
+        if let Some(xid) = stream_xid {
+            push_u32(&mut message, xid);
+        }
+        push_u32(&mut message, relation_id);
+        message.push(marker);
+        push_tuple(&mut message, old_tuple);
+        message
+    }
+
+    fn truncate(stream_xid: Option<u32>, flags: u8, relation_ids: &[u32]) -> Vec<u8> {
+        let mut message = vec![b'T'];
+        if let Some(xid) = stream_xid {
+            push_u32(&mut message, xid);
+        }
+        push_i32(
+            &mut message,
+            i32::try_from(relation_ids.len()).expect("Truncate relation count"),
+        );
+        message.push(flags);
+        for relation_id in relation_ids {
+            push_u32(&mut message, *relation_id);
+        }
         message
     }
 
@@ -2163,6 +2773,205 @@ mod tests {
         );
 
         let mut trailing = buffered_type.clone();
+        trailing.push(0);
+        assert_eq!(
+            decoder.decode(&trailing),
+            Err(PgOutputError::TrailingData(1))
+        );
+    }
+
+    #[test]
+    fn row_messages_decode_borrowed_tuple_layouts() {
+        let config = configuration(PgOutputVersion::V2, PgOutputStreaming::On, false);
+        let mut decoder = PgOutputDecoder::new(config, utf8());
+        let columns = [
+            (b'n', b"".as_slice()),
+            (b'u', b"".as_slice()),
+            (b't', b"private-text".as_slice()),
+            (b'b', b"private-binary".as_slice()),
+        ];
+        let packet = insert(None, 4_242, &columns);
+        let PgOutputMessage::Insert(inserted) = decoder.decode(&packet).expect("buffered Insert")
+        else {
+            panic!("wrong Insert variant");
+        };
+        assert_eq!(inserted.stream_xid(), None);
+        assert_eq!(inserted.relation_id(), 4_242);
+        assert_eq!(inserted.new_tuple().column_count(), 4);
+        let mut tuple_columns = inserted.new_tuple().columns();
+        assert_eq!(tuple_columns.len(), 4);
+        assert_eq!(tuple_columns.next(), Some(PgOutputTupleColumn::Null));
+        assert_eq!(
+            tuple_columns.next(),
+            Some(PgOutputTupleColumn::UnchangedToast)
+        );
+        let Some(PgOutputTupleColumn::Text(text)) = tuple_columns.next() else {
+            panic!("text column decoded as another representation");
+        };
+        assert_eq!(text, "private-text");
+        let text_offset = packet
+            .windows(text.len())
+            .position(|window| window == text.as_bytes())
+            .expect("text column offset");
+        assert_eq!(text.as_ptr(), packet[text_offset..].as_ptr());
+        assert_eq!(
+            tuple_columns.next(),
+            Some(PgOutputTupleColumn::Binary(b"private-binary"))
+        );
+        assert_eq!(tuple_columns.next(), None);
+        assert!(!format!("{inserted:?}").contains("private"));
+
+        let key = [(b't', b"7".as_slice())];
+        let replacement = [(b't', b"replacement".as_slice())];
+        let packet = update(None, 4_242, Some((b'K', &key)), &replacement);
+        let PgOutputMessage::Update(updated) = decoder.decode(&packet).expect("buffered Update")
+        else {
+            panic!("wrong Update variant");
+        };
+        assert_eq!(updated.stream_xid(), None);
+        assert_eq!(updated.relation_id(), 4_242);
+        let Some(PgOutputOldTuple::Key(old)) = updated.old_tuple() else {
+            panic!("Update key tuple missing");
+        };
+        assert_eq!(old.columns().next(), Some(PgOutputTupleColumn::Text("7")));
+        assert_eq!(
+            updated.new_tuple().columns().next(),
+            Some(PgOutputTupleColumn::Text("replacement"))
+        );
+        let packet = update(None, 4_242, None, &replacement);
+        let PgOutputMessage::Update(without_old) =
+            decoder.decode(&packet).expect("Update without old tuple")
+        else {
+            panic!("wrong Update-without-old variant");
+        };
+        assert_eq!(without_old.old_tuple(), None);
+        assert_eq!(without_old.new_tuple().column_count(), 1);
+
+        let packet = delete(None, 4_242, b'O', &replacement);
+        let PgOutputMessage::Delete(deleted) = decoder.decode(&packet).expect("buffered Delete")
+        else {
+            panic!("wrong Delete variant");
+        };
+        assert!(matches!(deleted.old_tuple(), PgOutputOldTuple::Full(_)));
+        assert_eq!(deleted.relation_id(), 4_242);
+
+        let packet = truncate(None, 0b11, &[4_242, 4_243]);
+        let PgOutputMessage::Truncate(truncated) = decoder.decode(&packet).expect("Truncate")
+        else {
+            panic!("wrong Truncate variant");
+        };
+        assert_eq!(truncated.stream_xid(), None);
+        assert_eq!(truncated.relation_count(), 2);
+        assert!(truncated.cascade());
+        assert!(truncated.restart_identity());
+        assert_eq!(truncated.relation_ids().collect::<Vec<_>>(), [4_242, 4_243]);
+
+        decoder
+            .decode(&stream_start(7, true))
+            .expect("Stream Start");
+        let packet = insert(Some(8), 4_242, &replacement);
+        let PgOutputMessage::Insert(streamed) = decoder.decode(&packet).expect("streamed Insert")
+        else {
+            panic!("wrong streamed Insert variant");
+        };
+        assert_eq!(streamed.stream_xid(), Some(8));
+        assert_eq!(
+            decoder.decode(&insert(Some(0), 4_242, &replacement)),
+            Err(PgOutputError::InvalidTransactionId(
+                "streamed message transaction ID"
+            ))
+        );
+        assert_eq!(decoder.active_stream_xid(), Some(7));
+        decoder.decode(b"E").expect("Stream Stop");
+        assert_eq!(decoder.finish(), Ok(()));
+    }
+
+    #[test]
+    fn row_messages_fail_closed_at_every_boundary() {
+        let config = configuration(PgOutputVersion::V2, PgOutputStreaming::On, false);
+        let columns = [(b't', b"value".as_slice())];
+        let packets = [
+            insert(None, 4_242, &columns),
+            update(None, 4_242, Some((b'K', &columns)), &columns),
+            delete(None, 4_242, b'O', &columns),
+            truncate(None, 0b11, &[4_242, 4_243]),
+        ];
+        for packet in &packets {
+            for length in 0..packet.len() {
+                let mut decoder = PgOutputDecoder::new(config, utf8());
+                assert!(
+                    decoder.decode(&packet[..length]).is_err(),
+                    "row prefix {length} of tag {:?} was accepted",
+                    packet.first()
+                );
+            }
+        }
+
+        let mut decoder = PgOutputDecoder::new(config, utf8());
+        let mut wrong_insert_marker = insert(None, 4_242, &columns);
+        wrong_insert_marker[5] = b'K';
+        assert_eq!(
+            decoder.decode(&wrong_insert_marker),
+            Err(PgOutputError::UnexpectedTupleMarker {
+                message: "Insert",
+                marker: b'K',
+            })
+        );
+
+        let invalid_column = insert(None, 4_242, &[(b'x', b"".as_slice())]);
+        assert_eq!(
+            decoder.decode(&invalid_column),
+            Err(PgOutputError::InvalidTupleColumnKind(b'x'))
+        );
+
+        let mut negative_length = insert(None, 4_242, &[(b't', b"".as_slice())]);
+        negative_length[9..13].copy_from_slice(&(-1_i32).to_be_bytes());
+        assert_eq!(
+            decoder.decode(&negative_length),
+            Err(PgOutputError::InvalidTupleColumnLength(-1))
+        );
+
+        let invalid_utf8 = insert(None, 4_242, &[(b't', b"\xff".as_slice())]);
+        assert_eq!(
+            decoder.decode(&invalid_utf8),
+            Err(PgOutputError::InvalidUtf8("tuple text column"))
+        );
+
+        let mut missing_new_marker = update(None, 4_242, Some((b'K', &columns)), &columns);
+        let next_marker = 1 + 4 + 1 + 2 + 1 + 4 + b"value".len();
+        missing_new_marker[next_marker] = b'O';
+        assert_eq!(
+            decoder.decode(&missing_new_marker),
+            Err(PgOutputError::UnexpectedTupleMarker {
+                message: "Update",
+                marker: b'O',
+            })
+        );
+
+        assert_eq!(
+            decoder.decode(&delete(None, 4_242, b'N', &columns)),
+            Err(PgOutputError::UnexpectedTupleMarker {
+                message: "Delete",
+                marker: b'N',
+            })
+        );
+        assert_eq!(
+            decoder.decode(&truncate(None, 0, &[])),
+            Err(PgOutputError::InvalidTruncateRelationCount(0))
+        );
+        assert_eq!(
+            decoder.decode(&truncate(None, 4, &[4_242])),
+            Err(PgOutputError::InvalidTruncateFlags(4))
+        );
+
+        let mut negative_count = truncate(None, 0, &[4_242]);
+        negative_count[1..5].copy_from_slice(&(-1_i32).to_be_bytes());
+        assert_eq!(
+            decoder.decode(&negative_count),
+            Err(PgOutputError::InvalidTruncateRelationCount(-1))
+        );
+
+        let mut trailing = insert(None, 4_242, &columns);
         trailing.push(0);
         assert_eq!(
             decoder.decode(&trailing),

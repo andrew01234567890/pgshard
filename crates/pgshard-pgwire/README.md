@@ -81,12 +81,15 @@ proofs from the same connection, bounds prepared-transaction identifiers, and
 redacts origins, GIDs, names, and logical payloads from debug output. A
 stateful wrapper derives whether the otherwise-ambiguous XID prefix is present
 from validated Stream Start/Stop controls and decodes Relation and Type schema
-messages. A Stream Start names the top-level transaction, while each schema
-prefix may name a different nonzero subtransaction; the decoder exposes both
-without equating them. Relation columns are prevalidated once and exposed
-through a borrowed exact-size iterator. Row, truncate, and logical-message bodies remain rejected.
-Complete transaction ordering, relation cache semantics, WAL feedback, durable
-checkpoints, cross-shard merge, and the VStream-like service remain later work.
+messages plus Insert, Update, Delete, and Truncate row changes. A Stream Start
+names the top-level transaction, while each schema or row prefix may name a
+different nonzero subtransaction. Relation columns and logical tuples are
+prevalidated once and exposed through borrowed exact-size iterators. Tuple
+values distinguish null, unchanged-toast, UTF-8 text, and opaque binary without
+copying or rendering values in debug output. Logical-message bodies remain
+rejected. Complete transaction ordering, relation cache semantics, WAL
+feedback, durable checkpoints, cross-shard merge, and the VStream-like service
+remain later work.
 
 The future replication session must bind that token to the exact accepted
 `START_REPLICATION` command and the selected slot's authoritative persistent
@@ -110,5 +113,7 @@ four-parameter extended-query bind.
 `cargo bench -p pgshard-pgwire --bench decode_pgoutput_control` measures a
 borrowed transaction Begin control.
 `cargo bench -p pgshard-pgwire --bench decode_pgoutput_relation` measures
-prevalidation and iteration of a borrowed two-column Relation message. None is
-a substitute for the planned end-to-end pooler/PgBouncer comparison.
+prevalidation and iteration of a borrowed two-column Relation message.
+`cargo bench -p pgshard-pgwire --bench decode_pgoutput_insert` measures a
+borrowed two-column Insert and tuple iteration. None is a substitute for the
+planned end-to-end pooler/PgBouncer comparison.

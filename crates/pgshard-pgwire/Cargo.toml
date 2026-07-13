@@ -27,5 +27,9 @@ harness = false
 name = "decode_pgoutput_relation"
 harness = false
 
+[[bench]]
+name = "decode_pgoutput_insert"
+harness = false
+
 [lints]
 workspace = true
