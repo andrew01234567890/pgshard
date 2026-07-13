@@ -913,6 +913,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "sqlparser",
+ "stacker",
  "thiserror",
  "tokio",
  "tokio-postgres",

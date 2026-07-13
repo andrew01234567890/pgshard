@@ -27,6 +27,11 @@ pub const MAX_SQL_TOKENS: usize = 4_096;
 pub const MAX_AST_NODES: usize = 2_048;
 
 const MAX_RECURSION_DEPTH: usize = 50;
+// Flat parser trees can be much deeper than the delimiter and parser recursion
+// limits. The fixed reserve covers parser/visitor frames for small statements;
+// the per-token reserve conservatively scales every retained untrusted input.
+const MIN_AST_STACK_BYTES: usize = 256 * 1024;
+const AST_STACK_BYTES_PER_TOKEN: usize = 2 * 1024;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Delimiter {
@@ -60,21 +65,29 @@ pub enum StatementKind {
 
 /// One bounded parsed statement with its SQL-bearing syntax tree kept private.
 pub struct ParsedStatement {
-    statement: Statement,
+    statement: Option<Statement>,
+    kind: StatementKind,
+    stack_reserve: usize,
 }
 
 impl ParsedStatement {
     /// Returns the coarse top-level syntax kind.
     #[must_use]
     pub const fn kind(&self) -> StatementKind {
-        match self.statement {
-            Statement::Query(_) => StatementKind::Query,
-            Statement::Insert(_) => StatementKind::Insert,
-            Statement::Update(_) => StatementKind::Update,
-            Statement::Delete(_) => StatementKind::Delete,
-            Statement::Merge(_) => StatementKind::Merge,
-            _ => StatementKind::Other,
-        }
+        self.kind
+    }
+}
+
+impl Drop for ParsedStatement {
+    fn drop(&mut self) {
+        let Some(statement) = self.statement.take() else {
+            return;
+        };
+        // sqlparser's AST uses recursive destruction. Reuse the parse-time
+        // reserve because callers may release a valid tree on a smaller stack.
+        stacker::maybe_grow(self.stack_reserve, self.stack_reserve, move || {
+            drop(statement);
+        });
     }
 }
 
@@ -117,6 +130,19 @@ pub fn parse_one(sql: &str) -> Result<ParsedStatement, ParseError> {
     }
     enforce_lexical_nesting_limit(&tokens)?;
 
+    let stack_reserve = ast_stack_reserve(tokens.len());
+    // Keep parsing, recursive validation, and every rejected-tree drop inside
+    // the protected segment. Only an already-budgeted tree can leave it.
+    stacker::maybe_grow(stack_reserve, stack_reserve, move || {
+        parse_tokens(dialect, tokens, stack_reserve)
+    })
+}
+
+fn parse_tokens(
+    dialect: PostgreSqlDialect,
+    tokens: Vec<TokenWithSpan>,
+    stack_reserve: usize,
+) -> Result<ParsedStatement, ParseError> {
     let mut parser = Parser::new(&dialect)
         .with_recursion_limit(MAX_RECURSION_DEPTH)
         .with_tokens_with_locations(tokens);
@@ -137,7 +163,23 @@ pub fn parse_one(sql: &str) -> Result<ParsedStatement, ParseError> {
         });
     }
 
-    Ok(ParsedStatement { statement })
+    let kind = match &statement {
+        Statement::Query(_) => StatementKind::Query,
+        Statement::Insert(_) => StatementKind::Insert,
+        Statement::Update(_) => StatementKind::Update,
+        Statement::Delete(_) => StatementKind::Delete,
+        Statement::Merge(_) => StatementKind::Merge,
+        _ => StatementKind::Other,
+    };
+    Ok(ParsedStatement {
+        statement: Some(statement),
+        kind,
+        stack_reserve,
+    })
+}
+
+const fn ast_stack_reserve(token_count: usize) -> usize {
+    MIN_AST_STACK_BYTES + token_count * AST_STACK_BYTES_PER_TOKEN
 }
 
 fn enforce_lexical_nesting_limit(tokens: &[TokenWithSpan]) -> Result<(), ParseError> {
@@ -411,6 +453,32 @@ mod tests {
             .join()
             .expect("small-stack parser must not panic");
         assert_eq!(result, Err(ParseError::RecursionLimit));
+    }
+
+    #[test]
+    fn bounds_flat_trees_on_a_small_stack() {
+        let bounded_expression = format!("select {}", vec!["1"; 600].join("+"));
+        let bounded_set_operation = format!("select 1{}", " union all select 1".repeat(400));
+        let excessive_expression = format!("select {}", vec!["1"; 2_000].join("+"));
+        let result = std::thread::Builder::new()
+            .name("planner-flat-tree-small-stack".into())
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let expression = parse_one(&bounded_expression).map(|statement| statement.kind());
+                let set_operation =
+                    parse_one(&bounded_set_operation).map(|statement| statement.kind());
+                let excessive = parse_one(&excessive_expression).map(|statement| statement.kind());
+                (expression, set_operation, excessive)
+            })
+            .expect("spawn small-stack parser")
+            .join()
+            .expect("small-stack parser must not panic");
+        assert_eq!(result.0, Ok(StatementKind::Query));
+        assert_eq!(result.1, Ok(StatementKind::Query));
+        assert!(matches!(
+            result.2,
+            Err(ParseError::TooManyAstNodes { .. } | ParseError::RecursionLimit)
+        ));
     }
 
     #[test]

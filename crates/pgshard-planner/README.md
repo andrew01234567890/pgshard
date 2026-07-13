@@ -6,6 +6,11 @@ AST- and stack-bounded candidate parsing configured with a PostgreSQL dialect,
 plus an opaque statement wrapper whose debug output cannot expose SQL. A
 privacy-safe lexical nesting guard runs before the upstream parser, including
 for dialect-specific angle-bracket data types that bypass its recursion limit.
+Parsing, AST validation, and destruction reserve stack in proportion to the
+already-bounded token count. This also covers flat recursive trees, such as
+long binary expressions, which do not consume delimiter or parser-recursion
+depth. The reserve normally stays on the caller's stack; a larger stack segment
+is allocated only when the caller has insufficient space.
 
 Parsing is not PostgreSQL semantic validation and a syntactic statement kind is
 not a routing or read-only decision. Future route analysis must explicitly
