@@ -124,7 +124,10 @@ before an upstream body is buffered.
 PostgreSQL 18 separately accepts one-to-256-byte keys in incoming
 `CancelRequest` packets. The future session layer must match the complete
 opaque key to the selected backend connection and enforce the effective
-protocol version; protocol 3.0 backend keys are exactly four bytes.
+protocol version. A completed PostgreSQL 18 startup proof now requires the
+server's exact four-byte backend key before protocol 3.2 or its exact 32-byte
+key at protocol 3.2; the proof and key are not yet bound to a live pooled socket
+or exposed through cancellation routing.
 Typed zero-copy decoders expose the process identifier and opaque key without
 rendering the key in debug output, and validate `ParameterStatus` as exactly
 two terminated UTF-8 strings. A reported `client_encoding` is authoritative
@@ -135,12 +138,17 @@ request layouts, counted and terminated SASL mechanism lists, opaque exchange
 payloads, and `NegotiateProtocolVersion` responses. Authentication salts,
 mechanism names, and exchange data are omitted from debug output. Negotiation
 decoding preserves the complete major/minor protocol code and requires every
-reported option name to use the reserved `_pq_.` prefix. This is message-local
-validation only: the future session state machine must enforce exchange order,
-authentication policy, channel binding, server identity, one negotiation at
-most, no upgrade or no-op negotiation, the absence of nonexistent protocol 3.1,
-the configured minimum version, and an exact match between unsupported options
-and the options that the client actually requested.
+reported option name to use the reserved `_pq_.` prefix. A separate linear
+PostgreSQL 18 validator borrows the exact outbound startup parameters and
+requires a negotiation response exactly when the requested minor version is
+newer than 3.2 or a reserved option is present. It accepts only the server's
+exact selected version and the complete unsupported-option name sequence in
+request order, including duplicates. Missing and duplicate responses fail, and
+an invalid response consumes the validator so it cannot be retried into an
+authenticated proof. The future socket session must still enforce transport
+and authentication order, authentication policy, channel binding, server
+identity, rejection of reserved protocol 3.1 as client policy, and the
+configured minimum protocol version.
 The transport layer, which is not implemented yet, must handle PostgreSQL 18
 direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting

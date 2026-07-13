@@ -17,9 +17,14 @@ large AST stack reserve. A separate raw-wire PostgreSQL 18 test validates
 four-byte protocol 3.0 and 32-byte protocol 3.2 server cancellation keys,
 zero-copy `BackendKeyData` and `ParameterStatus`, typed `AuthenticationOk`, and
 a real protocol 3.99 to 3.2 negotiation that returns the requested unsupported
-`_pq_.` option. It also checks real `Describe`, `ParameterDescription`, empty
-completion, `ReadyForQuery`, and `Close` messages through the production framing
-and body decoders. A targeted KIND test verifies
+`_pq_.` option. The live connections pass through the same linear startup proof
+used to require the exact negotiated version, ordered option sequence, and
+protocol-specific key length. Unit tests prove that missing, duplicate,
+unexpected, version-mismatched, reordered, omitted, and added negotiation data
+fails closed, and that a rejected response consumes its validator. The live
+fixture also checks real `Describe`, `ParameterDescription`, empty completion,
+`ReadyForQuery`, and `Close` messages through the production framing and body
+decoders. A targeted KIND test verifies
 operator PVC deletion and same-name recreation against real Kubernetes 1.36
 controllers. A unit regression gives the informer cache a false absence while
 the authoritative API reader still sees an owned PVC, and proves that
