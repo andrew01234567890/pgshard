@@ -20,6 +20,7 @@ fn main() {
         PgOutputStreaming::Parallel,
         true,
         false,
+        false,
     )
     .expect("benchmark configuration");
     let encoding = PgOutputEncoding::require_utf8(

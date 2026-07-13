@@ -29,16 +29,21 @@ combinations, XLogData and keepalive envelopes, buffered, streamed, and
 two-phase transaction controls, every truncated prefix, feature mismatches,
 reserved flags, strict booleans, authoritative client/server UTF-8, maximum
 prepared-transaction GIDs, persistent slot two-phase state across a later false
-request, zero-copy borrowing, and debug redaction. The live PostgreSQL 18
+request, custom logical Message flags, prefix encoding, binary lengths,
+explicit `messages` option gating, streamed top-level-XID matching,
+zero-copy borrowing, and debug redaction. The live PostgreSQL 18
 fixture creates a two-phase logical slot and proves that protocol v1 with a
 later `two_phase=false` request still emits and decodes Begin Prepare and
 Prepare plus exact Relation, Insert, Update, Delete, and Truncate metadata from
-the live `bRIUDIRTP` sequence. Schema and row unit tests cover buffered versus
-streamed layouts, distinct top-level and subtransaction XIDs,
-nested/unmatched stream controls, every truncated prefix, tuple markers and
-lengths, replica identity, reserved flags, UTF-8, zero-copy iteration, and
-redaction. Complete transaction ordering, relation caching, logical messages,
-feedback, replay, and cross-shard stream tests are still absent. A targeted
+the live `bRIUDIRTP` sequence. A second live slot decodes nontransactional and
+streamed custom Message records with opaque binary contents. It proves that a
+Message emitted inside a savepoint retains the top-level XID while the Relation
+record carries the savepoint XID. Schema, row, and custom-message unit tests
+cover buffered versus streamed layouts, distinct top-level and subtransaction
+XIDs, nested/unmatched stream controls, every truncated prefix, tuple markers
+and lengths, replica identity, reserved flags, UTF-8, zero-copy iteration, and
+redaction. Complete transaction ordering, relation caching, feedback, replay,
+and cross-shard stream tests are still absent. A targeted
 KIND test verifies operator PVC deletion and same-name recreation against real
 Kubernetes 1.36 controllers. A unit regression gives the informer cache a false absence while
 the authoritative API reader still sees an owned PVC, and proves that
