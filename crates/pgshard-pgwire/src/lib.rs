@@ -12,11 +12,12 @@ mod backend;
 mod messages;
 
 pub use backend::{
-    BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH, BackendFrame, BackendKeyData,
-    BackendMessageError, BackendTag, MAX_BACKEND_KEY_DATA_LENGTH, MAX_PARAMETER_DESCRIPTION_LENGTH,
-    ParameterDescription, ParameterStatus, TransactionStatus, decode_backend,
-    decode_backend_key_data, decode_parameter_description, decode_parameter_status,
-    decode_ready_for_query, require_empty_backend_body,
+    AuthenticationRequest, BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH,
+    BackendFrame, BackendKeyData, BackendMessageError, BackendTag, MAX_BACKEND_KEY_DATA_LENGTH,
+    MAX_PARAMETER_DESCRIPTION_LENGTH, ParameterDescription, ParameterStatus, ProtocolNegotiation,
+    ProtocolOptionIter, SaslMechanismIter, TransactionStatus, decode_authentication_request,
+    decode_backend, decode_backend_key_data, decode_parameter_description, decode_parameter_status,
+    decode_protocol_negotiation, decode_ready_for_query, require_empty_backend_body,
 };
 
 pub use messages::{
@@ -102,7 +103,7 @@ pub enum Decode<T> {
     },
 }
 
-/// Frontend protocol version requested in a startup packet.
+/// A `PostgreSQL` frontend/backend protocol version.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolVersion {
     major: u16,
@@ -110,13 +111,13 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    /// Returns the requested major version.
+    /// Returns the major version.
     #[must_use]
     pub const fn major(self) -> u16 {
         self.major
     }
 
-    /// Returns the requested minor version.
+    /// Returns the minor version.
     #[must_use]
     pub const fn minor(self) -> u16 {
         self.minor
