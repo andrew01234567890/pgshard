@@ -31,10 +31,12 @@ pub use messages::{
 
 pub use pgoutput::{
     MAX_PGOUTPUT_MESSAGE_LENGTH, PgOutputBegin, PgOutputCommit, PgOutputConfiguration,
-    PgOutputConfigurationError, PgOutputControlMessage, PgOutputEncoding, PgOutputEncodingError,
-    PgOutputError, PgOutputOrigin, PgOutputPrepared, PgOutputRollbackPrepared, PgOutputStreamAbort,
-    PgOutputStreaming, PgOutputVersion, PrimaryKeepalive, ReplicationCopyData, XLogData,
-    decode_pgoutput_control, decode_replication_copy_data,
+    PgOutputConfigurationError, PgOutputControlMessage, PgOutputDecoder, PgOutputEncoding,
+    PgOutputEncodingError, PgOutputError, PgOutputMessage, PgOutputOrigin, PgOutputPrepared,
+    PgOutputRelation, PgOutputRelationColumn, PgOutputRelationColumnIter, PgOutputReplicaIdentity,
+    PgOutputRollbackPrepared, PgOutputStreamAbort, PgOutputStreaming, PgOutputType,
+    PgOutputVersion, PrimaryKeepalive, ReplicationCopyData, XLogData, decode_pgoutput_control,
+    decode_replication_copy_data,
 };
 
 pub use session::{
