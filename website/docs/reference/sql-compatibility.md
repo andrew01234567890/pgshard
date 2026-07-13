@@ -162,11 +162,12 @@ covers Begin, Commit, Origin, Stream Start/Stop/Commit/
 Abort, Begin Prepare, Prepare, Commit Prepared, Rollback Prepared, and Stream
 Prepare. A stateful decoder derives the optional XID layout from Stream
 Start/Stop and decodes borrowed Relation and Type names, replica identity, and
-prevalidated Relation columns. Stream Start carries the top-level transaction
-XID, while a schema prefix may carry a different nonzero subtransaction XID;
-both are exposed without a false equality check. It rejects row, truncate, and logical-message
-tags until their dedicated body decoders exist. Its state proves segment
-layout, not complete transaction order: there is no relation cache, WAL
+prevalidated Relation columns plus Insert, Update, Delete, and Truncate bodies.
+Borrowed tuple columns distinguish null, unchanged-toast, UTF-8 text, and
+opaque binary values. Stream Start carries the top-level transaction XID while
+schema and row prefixes may carry a different nonzero subtransaction XID. It
+rejects logical-message tags until their dedicated body decoder exists. Its
+state proves segment layout, not complete transaction order: there is no relation cache, WAL
 feedback, durable checkpoint, slot lifecycle, snapshot, cross-shard merge, or
 change-stream service yet.
 
