@@ -47,6 +47,11 @@ enum Delimiter {
     Brace,
 }
 
+struct LexicalFacts {
+    structural_tokens: usize,
+    contains_double_equality: bool,
+}
+
 /// Coarse top-level syntax kind.
 ///
 /// This is only a parser result. In particular, [`Self::Query`] does not mean
@@ -466,14 +471,18 @@ pub fn parse_one(sql: &str) -> Result<ParsedStatement, ParseError> {
             maximum: MAX_SQL_TOKENS,
         });
     }
-    let structural_tokens = inspect_lexical_structure(&tokens)?;
-    let contains_double_equality = tokens.iter().any(|token| token.token == Token::DoubleEq);
+    let lexical_facts = inspect_lexical_structure(&tokens)?;
 
-    let stack_reserve = ast_stack_reserve(structural_tokens);
+    let stack_reserve = ast_stack_reserve(lexical_facts.structural_tokens);
     // Keep parsing, recursive validation, and every rejected-tree drop inside
     // the protected segment. Only an already-budgeted tree can leave it.
     stacker::maybe_grow(stack_reserve, stack_reserve, move || {
-        parse_tokens(dialect, tokens, contains_double_equality, stack_reserve)
+        parse_tokens(
+            dialect,
+            tokens,
+            lexical_facts.contains_double_equality,
+            stack_reserve,
+        )
     })
 }
 
@@ -523,13 +532,14 @@ const fn ast_stack_reserve(token_count: usize) -> usize {
     MIN_AST_STACK_BYTES + token_count * AST_STACK_BYTES_PER_TOKEN
 }
 
-fn inspect_lexical_structure(tokens: &[TokenWithSpan]) -> Result<usize, ParseError> {
+fn inspect_lexical_structure(tokens: &[TokenWithSpan]) -> Result<LexicalFacts, ParseError> {
     let mut delimiters = [Delimiter::Parenthesis; MAX_RECURSION_DEPTH];
     let mut depth = 0_usize;
     let mut array_type_prefix_depth = 0_usize;
     let mut awaiting_array_angle = false;
     let mut awaiting_nested_array = false;
     let mut structural_tokens = 0_usize;
+    let mut contains_double_equality = false;
 
     for token in tokens {
         if matches!(&token.token, Token::Whitespace(_)) {
@@ -542,6 +552,7 @@ fn inspect_lexical_structure(tokens: &[TokenWithSpan]) -> Result<usize, ParseErr
             continue;
         }
         structural_tokens += 1;
+        contains_double_equality |= token.token == Token::DoubleEq;
 
         if matches!(
             &token.token,
@@ -597,7 +608,10 @@ fn inspect_lexical_structure(tokens: &[TokenWithSpan]) -> Result<usize, ParseErr
         }
     }
 
-    Ok(structural_tokens)
+    Ok(LexicalFacts {
+        structural_tokens,
+        contains_double_equality,
+    })
 }
 
 struct AstBudget {
@@ -905,11 +919,11 @@ mod tests {
 
         let plain_structure = inspect_lexical_structure(&plain).expect("plain structure");
         let padded_structure = inspect_lexical_structure(&padded).expect("padded structure");
-        assert_eq!(plain_structure, 2);
-        assert_eq!(padded_structure, 2);
+        assert_eq!(plain_structure.structural_tokens, 2);
+        assert_eq!(padded_structure.structural_tokens, 2);
         assert_eq!(
-            ast_stack_reserve(plain_structure),
-            ast_stack_reserve(padded_structure)
+            ast_stack_reserve(plain_structure.structural_tokens),
+            ast_stack_reserve(padded_structure.structural_tokens)
         );
         assert_eq!(
             parse_one(&padded_sql).expect("padded query").kind(),
