@@ -6,7 +6,7 @@ use pgshard_catalog::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, RegisteredTable,
     RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
 };
-use pgshard_planner::parse_one;
+use pgshard_planner::{CatalogOnlySearchPath, parse_one};
 use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
 use uuid::Uuid;
 
@@ -45,15 +45,18 @@ fn fixture() -> (CatalogSnapshot, DatabaseId) {
 
 fn main() {
     let (snapshot, database_id) = fixture();
+    let search_path = CatalogOnlySearchPath::require_empty("").expect("empty search path");
     let started = Instant::now();
     let mut digest = 0_u64;
 
     for _ in 0..ITERATIONS {
         let statement = parse_one(black_box(SQL)).expect("benchmark statement");
-        let template = statement
+        let resolved = statement
             .parameter_route_template(black_box(&snapshot), database_id)
-            .expect("benchmark route template");
-        digest = digest.wrapping_add(u64::from(template.parameter_number().get()));
+            .expect("benchmark route template")
+            .resolve_parameter_types(search_path, black_box(&[20]))
+            .expect("benchmark parameter resolution");
+        digest = digest.wrapping_add(u64::from(resolved.template().parameter_number().get()));
     }
 
     let elapsed = started.elapsed();

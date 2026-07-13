@@ -4,7 +4,7 @@ use pgshard_catalog::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, RegisteredTable,
     RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
 };
-use pgshard_planner::{RouteTemplateError, StatementKind, parse_one};
+use pgshard_planner::{CatalogOnlySearchPath, RouteTemplateError, StatementKind, parse_one};
 use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
 use uuid::Uuid;
 
@@ -50,16 +50,34 @@ async fn check_parameter_route(client: &tokio_postgres::Client) {
     let (snapshot, database_id) = route_snapshot(&temporary_schema);
     let routed_sql =
         format!("SELECT * FROM \"{temporary_schema}\".\"planner_target\" WHERE tenant_id = $1");
-    let template = parse_one(&routed_sql)
-        .expect("route SQL parse")
-        .parameter_route_template(&snapshot, database_id)
-        .expect("route template");
-    assert_eq!(template.parameter_number().get(), 1);
-    assert_eq!(template.shard_key_type(), ShardKeyType::Int64);
-    client
+    let reported_search_path: String = client
+        .query_one(
+            "SELECT pg_catalog.set_config('search_path', '', false)",
+            &[],
+        )
+        .await
+        .expect("pin empty search path")
+        .get(0);
+    let search_path =
+        CatalogOnlySearchPath::require_empty(&reported_search_path).expect("empty search path");
+    let statement = client
         .prepare(&routed_sql)
         .await
         .expect("PostgreSQL 18 routed parse");
+    let parameter_type_oids = statement
+        .params()
+        .iter()
+        .map(tokio_postgres::types::Type::oid)
+        .collect::<Vec<_>>();
+    let resolved = parse_one(&routed_sql)
+        .expect("route SQL parse")
+        .parameter_route_template(&snapshot, database_id)
+        .expect("route template")
+        .resolve_parameter_types(search_path, &parameter_type_oids)
+        .expect("PostgreSQL parameter resolution");
+    assert_eq!(resolved.template().parameter_number().get(), 1);
+    assert_eq!(resolved.template().shard_key_type(), ShardKeyType::Int64);
+    assert_eq!(resolved.parameter_type_oid(), 20);
 
     let double_equality =
         format!("SELECT * FROM \"{temporary_schema}\".\"planner_target\" WHERE tenant_id == $1");
@@ -73,6 +91,76 @@ async fn check_parameter_route(client: &tokio_postgres::Client) {
         client.prepare(&double_equality).await.is_err(),
         "default PostgreSQL catalog unexpectedly resolved double equality"
     );
+
+    check_operator_search_path_injection(client, &routed_sql).await;
+}
+
+async fn check_operator_search_path_injection(client: &tokio_postgres::Client, routed_sql: &str) {
+    client
+        .execute(
+            "INSERT INTO planner_target (tenant_id, value) VALUES (42, 1)",
+            &[],
+        )
+        .await
+        .expect("insert route target");
+    let backend_pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("read backend PID")
+        .get(0);
+    let attack_schema = format!("planner_operator_attack_{backend_pid}");
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {attack_schema};
+             CREATE FUNCTION {attack_schema}.always_false(bigint, bigint)
+             RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS 'SELECT false';
+             CREATE OPERATOR {attack_schema}.= (
+                 LEFTARG = bigint,
+                 RIGHTARG = bigint,
+                 FUNCTION = {attack_schema}.always_false
+             );
+             SELECT pg_catalog.set_config('search_path',
+                 '{attack_schema}, pg_catalog', false);"
+        ))
+        .await
+        .expect("install test operator");
+
+    let shadowed_statement = client
+        .prepare(routed_sql)
+        .await
+        .expect("prepare with shadowing operator");
+    assert!(
+        client
+            .query(&shadowed_statement, &[&42_i64])
+            .await
+            .expect("execute shadowed equality")
+            .is_empty(),
+        "test operator must shadow built-in equality under an unsafe search path"
+    );
+
+    client
+        .query_one(
+            "SELECT pg_catalog.set_config('search_path', '', false)",
+            &[],
+        )
+        .await
+        .expect("restore empty search path");
+    let builtin_statement = client
+        .prepare(routed_sql)
+        .await
+        .expect("prepare with catalog-only operators");
+    assert_eq!(
+        client
+            .query(&builtin_statement, &[&42_i64])
+            .await
+            .expect("execute built-in equality")
+            .len(),
+        1
+    );
+    client
+        .batch_execute(&format!("DROP SCHEMA {attack_schema} CASCADE"))
+        .await
+        .expect("remove test operator");
 }
 
 #[tokio::test]

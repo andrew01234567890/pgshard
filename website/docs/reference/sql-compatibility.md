@@ -17,7 +17,13 @@ reversed equality), with no other clause or expression. It rejects `==` before
 AST proof because PostgreSQL resolves that spelling as a distinct, potentially
 custom operator while the candidate parser collapses it to the same AST node as
 `=`. It is not executable until Parse parameter types/operator resolution and
-the Bind value are checked.
+the Bind value are checked. The implemented parameter-resolution stage requires
+PostgreSQL's authoritative description to report the exact built-in shard-key
+type OID and requires the backend to report an empty `search_path`. With an
+empty path, PostgreSQL implicitly searches `pg_catalog` for operators; an
+attacker-schema `=` overload cannot shadow built-in equality. The pooler session
+runtime that establishes and continuously enforces this invariant is not yet
+implemented.
 A successful syntax parse or template extraction alone is not PostgreSQL
 semantic validation or permission to route. The source does not yet
 authenticate or execute clients. The
@@ -48,6 +54,13 @@ can be proven to target one shard.
 ## Transaction pooling limits
 
 Safe session settings are replayed when a transaction receives a backend. Temporary objects, `LISTEN`, session advisory locks, holdable cursors, and backend-bound state are rejected because they cannot move safely between pooled connections or enter PostgreSQL prepared transactions.
+
+Backend connections used for routed statements pin `search_path` to the empty
+string. Every referenced application table must therefore be explicitly
+schema-qualified, while PostgreSQL resolves unqualified operators only from its
+implicitly searched `pg_catalog`. Client attempts to change `search_path` are
+rejected. This prevents user-defined `=` overloads from changing a predicate
+that the pooler proved as built-in shard-key equality.
 
 The pooler pins `client_encoding` to canonical `UTF8` and rejects attempts to
 change it. PostgreSQL converts both text-format and binary `text` binds from the

@@ -36,8 +36,15 @@ direct equality between its unqualified shard-key column and one canonical
 additional predicates, casts, modifiers, ordering, limits, locks, and the
 noncanonical `==` operator. The template is not executable until parameter
 types, operator resolution, and the corresponding Bind value are validated.
+The next proof stage consumes PostgreSQL's authoritative parameter description,
+requires the selected parameter to have the exact built-in shard-key type OID,
+and requires a backend session pinned to an empty `search_path`. PostgreSQL 18
+integration coverage demonstrates that an attacker-schema `=` overload can
+change results under an unsafe path and cannot do so under the empty-path
+contract. Bind-value validation and execution remain absent.
 
 `cargo bench -p pgshard-planner --bench parse_statement` measures this parsing
 boundary in isolation. `cargo bench -p pgshard-planner --bench
-analyze_parameter_route` measures parsing plus the catalog-bound template. Both
-are informational and are not pooler-throughput claims.
+analyze_parameter_route` measures parsing, the catalog-bound template, and exact
+parameter-type resolution. Both are informational and are not
+pooler-throughput claims.

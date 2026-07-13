@@ -206,6 +206,47 @@ impl ParameterRouteTemplate {
     pub const fn shard_key_type(&self) -> ShardKeyType {
         self.shard_key_type
     }
+
+    /// Binds this syntax/catalog template to `PostgreSQL`'s authoritative
+    /// parameter description after a successful Parse.
+    ///
+    /// The backend session must have an empty `search_path`, which leaves only
+    /// implicit `pg_catalog` operator lookup for this explicitly
+    /// schema-qualified statement. The selected parameter must resolve to the
+    /// exact built-in type registered for the shard key; coercion-compatible
+    /// and domain types fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the description cannot be represented by protocol 3.0, omits
+    /// the selected parameter, or reports another type OID.
+    pub fn resolve_parameter_types(
+        self,
+        _search_path: CatalogOnlySearchPath,
+        parameter_type_oids: &[u32],
+    ) -> Result<ResolvedParameterRoute, ParameterResolutionError> {
+        let parameter_count = u16::try_from(parameter_type_oids.len())
+            .map_err(|_| ParameterResolutionError::TooManyParameters)?;
+        let parameter_index = usize::from(self.parameter_number.get()) - 1;
+        let actual_oid = parameter_type_oids.get(parameter_index).copied().ok_or(
+            ParameterResolutionError::MissingParameter {
+                parameter_number: self.parameter_number,
+                parameter_count,
+            },
+        )?;
+        let expected_oid = postgres_type_oid(self.shard_key_type);
+        if actual_oid != expected_oid {
+            return Err(ParameterResolutionError::TypeMismatch {
+                expected_oid,
+                actual_oid,
+            });
+        }
+
+        Ok(ResolvedParameterRoute {
+            template: self,
+            parameter_count,
+        })
+    }
 }
 
 impl fmt::Debug for ParameterRouteTemplate {
@@ -217,6 +258,121 @@ impl fmt::Debug for ParameterRouteTemplate {
             .field("parameter_number", &self.parameter_number)
             .field("shard_key_type", &self.shard_key_type)
             .finish_non_exhaustive()
+    }
+}
+
+/// Proof that `PostgreSQL` operator lookup is restricted to implicit
+/// `pg_catalog` for a route-template Parse.
+///
+/// The pooler must set the backend session's `search_path` to the empty string,
+/// read the authoritative setting back, rebuild this token after every backend
+/// checkout, and reject client attempts to change it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CatalogOnlySearchPath {
+    _private: (),
+}
+
+impl CatalogOnlySearchPath {
+    /// Validates the canonical empty `PostgreSQL` `search_path` setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for every nonempty setting, including an explicit
+    /// `pg_catalog`, so the session contract has one unambiguous representation.
+    pub fn require_empty(value: &str) -> Result<Self, SearchPathError> {
+        if value.is_empty() {
+            Ok(Self { _private: () })
+        } else {
+            Err(SearchPathError)
+        }
+    }
+}
+
+/// A backend session did not report the canonical empty operator search path.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("routed PostgreSQL sessions must use an empty search_path")]
+pub struct SearchPathError;
+
+/// A route template whose selected parameter type was resolved by `PostgreSQL`.
+///
+/// This still is not a Bind execution proof. The session must match the
+/// prepared-statement identity, parameter count, formats, NULL state, value,
+/// catalog epoch, and retained snapshot when the Bind arrives.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResolvedParameterRoute {
+    template: ParameterRouteTemplate,
+    parameter_count: u16,
+}
+
+impl ResolvedParameterRoute {
+    /// Returns the catalog-bound syntax template.
+    #[must_use]
+    pub const fn template(&self) -> &ParameterRouteTemplate {
+        &self.template
+    }
+
+    /// Returns `PostgreSQL`'s authoritative parameter count for the statement.
+    #[must_use]
+    pub const fn parameter_count(&self) -> u16 {
+        self.parameter_count
+    }
+
+    /// Returns the exact built-in parameter type OID required by this route.
+    #[must_use]
+    pub const fn parameter_type_oid(&self) -> u32 {
+        postgres_type_oid(self.template.shard_key_type)
+    }
+}
+
+impl fmt::Debug for ResolvedParameterRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedParameterRoute")
+            .field("template", &self.template)
+            .field("parameter_count", &self.parameter_count)
+            .field("parameter_type_oid", &self.parameter_type_oid())
+            .finish()
+    }
+}
+
+/// Failure to bind a route template to `PostgreSQL`'s parameter description.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ParameterResolutionError {
+    /// Protocol 3.0 carries at most 65,535 parameter type OIDs.
+    #[error("parameter description exceeds the PostgreSQL protocol limit")]
+    TooManyParameters,
+    /// `PostgreSQL` described fewer parameters than the syntax template selects.
+    #[error(
+        "parameter ${parameter_number} is absent from a {parameter_count}-parameter description"
+    )]
+    MissingParameter {
+        /// Selected one-based parameter number.
+        parameter_number: NonZeroU16,
+        /// Number of parameters described by `PostgreSQL`.
+        parameter_count: u16,
+    },
+    /// `PostgreSQL` resolved the selected parameter to another type.
+    #[error("route parameter type OID {actual_oid} does not match required OID {expected_oid}")]
+    TypeMismatch {
+        /// Exact built-in type OID required by the registered shard key.
+        expected_oid: u32,
+        /// Type OID reported by `PostgreSQL`.
+        actual_oid: u32,
+    },
+}
+
+// Stable built-in OIDs from PostgreSQL 18's `pg_type.dat` catalog bootstrap.
+const PG_BYTEA_OID: u32 = 17;
+const PG_INT8_OID: u32 = 20;
+const PG_TEXT_OID: u32 = 25;
+const PG_UUID_OID: u32 = 2_950;
+
+const fn postgres_type_oid(key_type: ShardKeyType) -> u32 {
+    match key_type {
+        ShardKeyType::Int64 => PG_INT8_OID,
+        ShardKeyType::Uuid => PG_UUID_OID,
+        ShardKeyType::Text => PG_TEXT_OID,
+        ShardKeyType::Bytes => PG_BYTEA_OID,
     }
 }
 
@@ -1086,5 +1242,65 @@ mod tests {
             .parameter_route_template(&snapshot, database_id)
             .expect("route template");
         assert!(!format!("{template:?}").contains("events"));
+    }
+
+    #[test]
+    fn resolves_only_exact_postgres_types_under_an_empty_search_path() {
+        assert!(CatalogOnlySearchPath::require_empty("").is_ok());
+        for unsafe_path in ["pg_catalog", "public", "attacker, pg_catalog", "\"\""] {
+            assert_eq!(
+                CatalogOnlySearchPath::require_empty(unsafe_path),
+                Err(SearchPathError)
+            );
+        }
+
+        let search_path = CatalogOnlySearchPath::require_empty("").expect("empty search path");
+        let resolved = analyze_route("select * from public.events where tenant_id = $1")
+            .expect("route template")
+            .resolve_parameter_types(search_path, &[20])
+            .expect("exact int8 parameter");
+        assert_eq!(resolved.parameter_count(), 1);
+        assert_eq!(resolved.parameter_type_oid(), 20);
+        assert!(!format!("{resolved:?}").contains("events"));
+
+        let second = analyze_route("select * from public.events where tenant_id = $2")
+            .expect("route template")
+            .resolve_parameter_types(search_path, &[25, 20])
+            .expect("second exact int8 parameter");
+        assert_eq!(second.parameter_count(), 2);
+
+        assert_eq!(
+            analyze_route("select * from public.events where tenant_id = $1")
+                .expect("route template")
+                .resolve_parameter_types(search_path, &[]),
+            Err(ParameterResolutionError::MissingParameter {
+                parameter_number: NonZeroU16::new(1).expect("nonzero"),
+                parameter_count: 0,
+            })
+        );
+        assert_eq!(
+            analyze_route("select * from public.events where tenant_id = $1")
+                .expect("route template")
+                .resolve_parameter_types(search_path, &[23]),
+            Err(ParameterResolutionError::TypeMismatch {
+                expected_oid: 20,
+                actual_oid: 23,
+            })
+        );
+        let too_many_parameters = vec![20; usize::from(u16::MAX) + 1];
+        assert_eq!(
+            analyze_route("select * from public.events where tenant_id = $1")
+                .expect("route template")
+                .resolve_parameter_types(search_path, &too_many_parameters),
+            Err(ParameterResolutionError::TooManyParameters)
+        );
+    }
+
+    #[test]
+    fn builtin_shard_key_oids_are_explicit() {
+        assert_eq!(postgres_type_oid(ShardKeyType::Int64), 20);
+        assert_eq!(postgres_type_oid(ShardKeyType::Uuid), 2_950);
+        assert_eq!(postgres_type_oid(ShardKeyType::Text), 25);
+        assert_eq!(postgres_type_oid(ShardKeyType::Bytes), 17);
     }
 }
