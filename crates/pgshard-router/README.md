@@ -21,6 +21,19 @@ requires UTF-8 and the built-in `C` collation. Unknown
 databases and tables, NULL keys, malformed lengths, ambiguous formats, invalid
 text, and text containing PostgreSQL's forbidden zero byte all fail closed.
 
-`cargo bench -p pgshard-router --bench route_bound_parameter` measures the
-complete immutable-snapshot lookup, decode, hash, and range-routing core. It is
-a microbenchmark, not the planned end-to-end comparison against PgBouncer.
+The resolved-Bind composition path accepts the zero-copy parameter collection
+only after the caller supplies the exact Parse-time route proof, the retained
+catalog snapshot with the same cluster, epoch, and complete checksum, and an
+empty-`search_path` token derived from a fresh authoritative backend
+observation. It
+requires the Bind count to match PostgreSQL's `ParameterDescription` exactly
+and selects the proven parameter before applying the same routing core. It does
+not consume statement or portal names. The future session layer must map those
+names to the exact prepared generation, pin the same backend, retain the
+snapshot/schema fences, and revalidate them through Execute; this core result is
+not execution permission.
+
+`cargo bench -p pgshard-router --bench route_bound_parameter` measures both the
+direct immutable-snapshot lookup/decode/hash/range-routing core and the complete
+resolved-Bind validation path. It is a microbenchmark, not the planned
+end-to-end comparison against PgBouncer.

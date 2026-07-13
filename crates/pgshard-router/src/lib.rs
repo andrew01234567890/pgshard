@@ -5,7 +5,9 @@
 //! before invoking this hot-path core.
 
 use pgshard_catalog::{CatalogSnapshot, DatabaseId, ShardKeyType, TableName};
+use pgshard_pgwire::{BindParameters, FormatCode};
 pub use pgshard_pgwire::{ClientEncoding, ClientEncodingError};
+use pgshard_planner::{CatalogOnlySearchPath, ResolvedParameterRoute};
 use pgshard_types::{CatalogEpoch, RoutingHashV1, ShardId, ShardKey};
 use thiserror::Error;
 
@@ -81,6 +83,77 @@ pub fn route_bound_parameter(
         shard_id: database.route(hash),
         hash,
     })
+}
+
+/// Routes the selected parameter from one decoded extended-query `Bind`.
+///
+/// The resolved route must have been loaded from the exact prepared-statement
+/// entry named by the `Bind` message. This function deliberately accepts only
+/// that message's parameter collection: the future session layer remains
+/// responsible for virtualizing statement and portal names, retaining the same
+/// backend generation from Parse through Execute, and rejecting stale entries.
+/// It must rebuild `search_path` from an authoritative read on that backend
+/// immediately before this call.
+///
+/// Before inspecting parameter bytes, this function requires the complete
+/// retained catalog snapshot to match the cluster, catalog epoch, checksum,
+/// database, schema epoch, table, and shard-key type captured by the resolved
+/// route. It then requires the Bind parameter count to exactly match
+/// `PostgreSQL`'s authoritative `ParameterDescription`, selects the proven
+/// one-based parameter without copying it, and applies the canonical routing
+/// hash.
+///
+/// The returned plan is not permission to Execute. The session runtime must
+/// retain the resolved route and snapshot lease, recheck prepared-statement and
+/// backend identity, and fence the catalog/schema proof through execution.
+///
+/// # Errors
+///
+/// Fails closed for a different or stale snapshot, a parameter-count mismatch,
+/// an internally inconsistent resolved route, NULL, an unsupported parameter
+/// format, malformed bytes, invalid UTF8, or a text NUL byte.
+pub fn route_resolved_bind(
+    snapshot: &CatalogSnapshot,
+    resolved: &ResolvedParameterRoute,
+    _search_path: CatalogOnlySearchPath,
+    client_encoding: ClientEncoding,
+    parameters: BindParameters<'_>,
+) -> Result<RoutePlan, BindRouteError> {
+    let template = resolved.template();
+    if snapshot.cluster_id() != template.cluster_id()
+        || snapshot.catalog_epoch() != template.catalog_epoch()
+        || snapshot.checksum() != template.snapshot_checksum()
+    {
+        return Err(BindRouteError::SnapshotMismatch);
+    }
+
+    let actual_count = parameters.len();
+    let expected_count = resolved.parameter_count();
+    if actual_count != usize::from(expected_count) {
+        return Err(BindRouteError::ParameterCountMismatch {
+            expected: expected_count,
+            actual: actual_count,
+        });
+    }
+
+    let parameter_index = usize::from(template.parameter_number().get()) - 1;
+    let parameter = parameters
+        .iter()
+        .nth(parameter_index)
+        .ok_or(BindRouteError::ResolvedParameterMissing)?;
+    let format = match parameter.format() {
+        FormatCode::Text => ParameterFormat::Text,
+        FormatCode::Binary => ParameterFormat::Binary,
+    };
+    route_bound_parameter(
+        snapshot,
+        template.database_id(),
+        template.table_name(),
+        client_encoding,
+        format,
+        parameter.value(),
+    )
+    .map_err(BindRouteError::Route)
 }
 
 enum DecodedKey<'a> {
@@ -175,11 +248,41 @@ pub enum RouteError {
     TextContainsNul,
 }
 
+/// Failure to compose a resolved Parse-time route with one decoded Bind.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum BindRouteError {
+    /// The retained snapshot is not the exact snapshot used for route proof.
+    #[error("resolved route does not match the retained catalog snapshot")]
+    SnapshotMismatch,
+    /// The Bind does not supply `PostgreSQL`'s authoritative parameter count.
+    #[error("Bind supplies {actual} parameters but the prepared statement requires {expected}")]
+    ParameterCountMismatch {
+        /// Parameter count reported by `PostgreSQL` after Parse.
+        expected: u16,
+        /// Parameter count carried by the Bind message.
+        actual: usize,
+    },
+    /// A private resolved-route invariant was inconsistent with the Bind count.
+    #[error("resolved route parameter is absent from the validated Bind")]
+    ResolvedParameterMissing,
+    /// The selected shard-key value cannot be routed exactly.
+    #[error(transparent)]
+    Route(RouteError),
+}
+
 #[cfg(test)]
 mod tests {
     use pgshard_catalog::{
         CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, RegisteredTable,
         RoutingHashConfig, ShardRoute,
+    };
+    use pgshard_pgwire::{
+        BindParameters, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, FormatCode, FrontendPhase,
+        decode_bind, decode_frontend,
+    };
+    use pgshard_planner::{
+        CatalogOnlySearchPath, PhysicalShardKeyCatalogIdentity, PhysicalShardKeyObservation,
+        PhysicalShardKeyProof, ResolvedParameterRoute, parse_one,
     };
     use pgshard_types::{KEYSPACE_END, KeyRange};
     use uuid::Uuid;
@@ -198,6 +301,13 @@ mod tests {
     }
 
     fn snapshot(key_type: ShardKeyType) -> (CatalogSnapshot, DatabaseId, TableName) {
+        snapshot_with_seed(key_type, 42)
+    }
+
+    fn snapshot_with_seed(
+        key_type: ShardKeyType,
+        seed: u64,
+    ) -> (CatalogSnapshot, DatabaseId, TableName) {
         let (cluster_id, database_id) = ids();
         let table_name = TableName::new("public", "events").expect("table name");
         let table = RegisteredTable::new(
@@ -225,13 +335,123 @@ mod tests {
             CatalogSnapshot::new(
                 cluster_id,
                 1,
-                RoutingHashConfig::new(1, 42).expect("hash"),
+                RoutingHashConfig::new(1, seed).expect("hash"),
                 vec![database],
             )
             .expect("snapshot"),
             database_id,
             table_name,
         )
+    }
+
+    fn empty_search_path() -> CatalogOnlySearchPath {
+        CatalogOnlySearchPath::require_empty("").expect("empty search path")
+    }
+
+    fn resolved_route(
+        snapshot: &CatalogSnapshot,
+        database_id: DatabaseId,
+        table_name: &TableName,
+        sql: &str,
+        parameter_type_oids: &[u32],
+    ) -> ResolvedParameterRoute {
+        let database = snapshot.database(database_id).expect("database");
+        let table = database.table(table_name).expect("table");
+        let (type_oid, collation_oid) = match table.shard_key_type() {
+            ShardKeyType::Int64 => (20, 0),
+            ShardKeyType::Uuid => (2_950, 0),
+            ShardKeyType::Text => (25, 950),
+            ShardKeyType::Bytes => (17, 0),
+        };
+        let observations = database
+            .routes()
+            .iter()
+            .map(|route| {
+                PhysicalShardKeyObservation::new(
+                    route.shard_id(),
+                    PhysicalShardKeyCatalogIdentity::new(
+                        database_id,
+                        database.name(),
+                        table_name.clone(),
+                        table.shard_key_column(),
+                        b'r',
+                        b'p',
+                        false,
+                    ),
+                    database.epochs().schema(),
+                    type_oid,
+                    collation_oid,
+                    6,
+                )
+            })
+            .collect::<Vec<_>>();
+        let physical_schema =
+            PhysicalShardKeyProof::verify(snapshot, database_id, table_name, &observations)
+                .expect("physical schema proof");
+        parse_one(sql)
+            .expect("statement")
+            .parameter_route_template(snapshot, database_id)
+            .expect("route template")
+            .resolve_parameter_types(empty_search_path(), &physical_schema, parameter_type_oids)
+            .expect("resolved parameter route")
+    }
+
+    fn bind_frame(formats: &[FormatCode], values: &[Option<&[u8]>]) -> Vec<u8> {
+        assert!(formats.len() <= 1 || formats.len() == values.len());
+        let mut body = b"\0statement\0".to_vec();
+        body.extend_from_slice(
+            &u16::try_from(formats.len())
+                .expect("format count")
+                .to_be_bytes(),
+        );
+        for format in formats {
+            let code = match format {
+                FormatCode::Text => 0_u16,
+                FormatCode::Binary => 1_u16,
+            };
+            body.extend_from_slice(&code.to_be_bytes());
+        }
+        body.extend_from_slice(
+            &u16::try_from(values.len())
+                .expect("parameter count")
+                .to_be_bytes(),
+        );
+        for value in values {
+            match value {
+                Some(value) => {
+                    body.extend_from_slice(
+                        &i32::try_from(value.len())
+                            .expect("parameter length")
+                            .to_be_bytes(),
+                    );
+                    body.extend_from_slice(value);
+                }
+                None => body.extend_from_slice(&(-1_i32).to_be_bytes()),
+            }
+        }
+        body.extend_from_slice(&0_u16.to_be_bytes());
+
+        let mut frame = vec![b'B'];
+        frame.extend_from_slice(
+            &u32::try_from(4 + body.len())
+                .expect("frame length")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    fn bind_parameters(frame_bytes: &[u8]) -> BindParameters<'_> {
+        let Decode::Complete { frame, consumed } = decode_frontend(
+            frame_bytes,
+            FrontendPhase::Regular,
+            DEFAULT_LARGE_MESSAGE_LENGTH,
+        )
+        .expect("frontend frame") else {
+            panic!("complete Bind frame was incomplete");
+        };
+        assert_eq!(consumed, frame_bytes.len());
+        decode_bind(frame, utf8()).expect("Bind body").parameters()
     }
 
     #[test]
@@ -378,5 +598,150 @@ mod tests {
                 "LATIN1 {format:?} bind must not obtain routing proof"
             );
         }
+    }
+
+    #[test]
+    fn resolved_bind_routes_the_selected_parameter_without_copying() {
+        let (snapshot, database_id, table) = snapshot(ShardKeyType::Int64);
+        let resolved = resolved_route(
+            &snapshot,
+            database_id,
+            &table,
+            "select * from public.events where tenant_id = $2",
+            &[25, 20],
+        );
+        let key = 42_i64.to_be_bytes();
+        let values: [Option<&[u8]>; 2] = [Some(b"not-the-key"), Some(&key)];
+        let bytes = bind_frame(&[FormatCode::Text, FormatCode::Binary], &values);
+
+        let actual = route_resolved_bind(
+            &snapshot,
+            &resolved,
+            empty_search_path(),
+            utf8(),
+            bind_parameters(&bytes),
+        )
+        .expect("resolved Bind route");
+        let expected = route_bound_parameter(
+            &snapshot,
+            database_id,
+            &table,
+            utf8(),
+            ParameterFormat::Binary,
+            Some(&key),
+        )
+        .expect("direct route");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn resolved_bind_requires_the_exact_snapshot_and_parameter_count() {
+        let (snapshot, database_id, table) = snapshot(ShardKeyType::Int64);
+        let resolved = resolved_route(
+            &snapshot,
+            database_id,
+            &table,
+            "select * from public.events where tenant_id = $2",
+            &[25, 20],
+        );
+        let key = 42_i64.to_be_bytes();
+        let values: [Option<&[u8]>; 2] = [Some(b"ignored"), Some(&key)];
+        let exact = bind_frame(&[FormatCode::Text, FormatCode::Binary], &values);
+        let (changed_snapshot, _, _) = snapshot_with_seed(ShardKeyType::Int64, 43);
+        assert_eq!(
+            route_resolved_bind(
+                &changed_snapshot,
+                &resolved,
+                empty_search_path(),
+                utf8(),
+                bind_parameters(&exact),
+            ),
+            Err(BindRouteError::SnapshotMismatch)
+        );
+
+        let too_few = bind_frame(&[FormatCode::Binary], &[Some(&key)]);
+        assert_eq!(
+            route_resolved_bind(
+                &snapshot,
+                &resolved,
+                empty_search_path(),
+                utf8(),
+                bind_parameters(&too_few),
+            ),
+            Err(BindRouteError::ParameterCountMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn resolved_bind_preserves_fail_closed_value_checks() {
+        let (snapshot, database_id, table) = snapshot(ShardKeyType::Int64);
+        let resolved = resolved_route(
+            &snapshot,
+            database_id,
+            &table,
+            "select * from public.events where tenant_id = $1",
+            &[20],
+        );
+        for (format, value, expected) in [
+            (
+                FormatCode::Binary,
+                None,
+                BindRouteError::Route(RouteError::NullShardKey),
+            ),
+            (
+                FormatCode::Text,
+                Some(b"42".as_slice()),
+                BindRouteError::Route(RouteError::UnsupportedFormat {
+                    key_type: ShardKeyType::Int64,
+                    format: ParameterFormat::Text,
+                }),
+            ),
+            (
+                FormatCode::Binary,
+                Some(b"short".as_slice()),
+                BindRouteError::Route(RouteError::InvalidLength {
+                    key_type: ShardKeyType::Int64,
+                    expected: 8,
+                    actual: 5,
+                }),
+            ),
+        ] {
+            let bytes = bind_frame(&[format], &[value]);
+            assert_eq!(
+                route_resolved_bind(
+                    &snapshot,
+                    &resolved,
+                    empty_search_path(),
+                    utf8(),
+                    bind_parameters(&bytes),
+                ),
+                Err(expected)
+            );
+        }
+
+        let secret = b"bind-value-sentinel";
+        let bytes = bind_frame(&[FormatCode::Binary], &[Some(secret)]);
+        let error = route_resolved_bind(
+            &snapshot,
+            &resolved,
+            empty_search_path(),
+            utf8(),
+            bind_parameters(&bytes),
+        )
+        .expect_err("wrong-width secret must fail");
+        assert_eq!(
+            error,
+            BindRouteError::Route(RouteError::InvalidLength {
+                key_type: ShardKeyType::Int64,
+                expected: 8,
+                actual: secret.len(),
+            })
+        );
+        let secret = std::str::from_utf8(secret).expect("ASCII sentinel");
+        assert!(!format!("{error}").contains(secret));
+        assert!(!format!("{error:?}").contains(secret));
     }
 }
