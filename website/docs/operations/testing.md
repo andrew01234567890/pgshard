@@ -32,7 +32,12 @@ aborts a connected supervisor to prove readiness fails immediately and its
 backend exits. Pooler unit tests exercise the real HTTP router, keep health
 independent from fail-closed catalog readiness, preserve maximum 64-bit status
 values as decimal JSON strings, and validate bounded phase, readiness, and
-failure labels in Prometheus exposition. A separate raw-wire PostgreSQL 18
+failure labels in Prometheus exposition. Runtime tests compose the production
+supervisor with a pre-bound HTTP listener, observe a failed connection enter
+retry without becoming ready, and prove coordinated shutdown marks catalog
+state stopped. Configuration tests bound the DSN read and timing values, reject
+remote plaintext or session-policy overrides, and prove invalid DSN contents
+do not escape through errors. A separate raw-wire PostgreSQL 18
 test validates four-byte protocol 3.0 and 32-byte protocol 3.2 server cancellation keys,
 zero-copy `BackendKeyData` and `ParameterStatus`, typed `AuthenticationOk`, and
 a real protocol 3.99 to 3.2 negotiation that returns the requested unsupported

@@ -33,6 +33,19 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    serve_listener(listener, state, shutdown).await
+}
+
+/// Runs the HTTP server on an already bound listener until shutdown.
+///
+/// # Errors
+///
+/// Returns an I/O error if the server fails.
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    state: PoolerState,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
         .await

@@ -34,9 +34,12 @@ defragmentation is not implemented. PostgreSQL
 verified, so the generated configuration cannot silently fill `pg_wal`.
 
 The default orchestrator and pooler image values are expected development
-channel names, not a publication guarantee. The Rust pooler crate contains
-catalog-derived HTTP handlers but no executable, PostgreSQL listener, or
-connection pool. Override the defaults with `--orchestrator-image` and
+channel names, not a publication guarantee. The Rust pooler has a control-only
+executable that composes catalog supervision with its HTTP endpoints, but it
+has no PostgreSQL listener or connection pool. Its catalog connector is
+deliberately local-only until authenticated TLS exists, while this operator
+does not yet provision PostgreSQL, a catalog DSN Secret, or a compatible local
+catalog endpoint. Override the defaults with `--orchestrator-image` and
 `--pooler-image` when concrete images exist. `--etcd-image` is also
 configurable. Image pull or runtime readiness is reported only through
 `SupportingWorkloadsAvailable`, never as database readiness.

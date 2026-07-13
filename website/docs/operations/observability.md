@@ -6,9 +6,9 @@ description: Prometheus metrics, OpenTelemetry traces, Grafana dashboards, and c
 # Observability
 
 :::info Milestone 1 design contract
-The pooler library now exposes catalog health, readiness, status, and Prometheus
-signals. SQL-path metrics, OpenTelemetry export, dashboards, scraping resources,
-and the Grafana/Tempo test stack remain planned; see
+The pooler control executable now exposes catalog health, readiness, status,
+and Prometheus signals. SQL-path metrics, OpenTelemetry export, dashboards,
+scraping resources, and the Grafana/Tempo test stack remain planned; see
 [implementation status](../project/status.md).
 :::
 

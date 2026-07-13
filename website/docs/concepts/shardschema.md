@@ -10,10 +10,12 @@ The PostgreSQL 18 migration, validated Rust snapshot model, canonical checksum,
 multi-epoch lock-free cache, repeatable-read snapshot loader,
 LISTEN-before-initial-load primitive, bounded notification and polling driver,
 bounded reconnect and stale-readiness supervisor, metrics-ready state, and live
-database contract test exist in source. Pooler HTTP/readiness/status and
-Prometheus translation exist as a library. Bounded connection and catalog-load
-deadlines are implemented, but executable composition, TLS, credentials, and
-runtime configuration are not wired yet; see
+database contract test exist in source. A Linux control executable composes
+the supervisor with pooler HTTP/readiness/status and Prometheus publication,
+bounded runtime settings, a file-backed DSN, and coordinated shutdown. Its
+temporary plaintext connector rejects non-local endpoints. Authenticated TLS,
+remote catalog transport, operator-provisioned credentials, and the SQL data
+plane are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
@@ -91,10 +93,13 @@ Each process waits within the upper half of its current window so replicas do
 not reconnect in lockstep. The status handle reports connection phase, catalog
 epoch, monotonic cache age, attempts, connections completing their initial
 authoritative load, and credential-safe failure categories including separate
-connection and operation timeouts. The pooler library translates that state
-into fail-closed readiness, exact JSON status, and bounded-label Prometheus
-endpoints. An executable still needs to compose the supervisor with TLS,
-credentials, runtime configuration, and sanitized connection-error logging.
+connection and operation timeouts. The pooler control executable translates
+that state into fail-closed readiness, exact JSON status, and bounded-label
+Prometheus endpoints. It reads one bounded DSN file and accepts only loopback
+IP literals or Unix sockets with `sslmode=disable`, the exact `shardschema`
+database, `target_session_attrs=read-write`, and no startup options. That
+development bridge is not a substitute for authenticated TLS or operator
+credential distribution.
 
 The empty installed catalog begins at epoch zero. A reader fails closed before
 publishing metadata above the current process limits: 1,024 logical databases,

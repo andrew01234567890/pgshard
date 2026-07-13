@@ -4,5 +4,7 @@
 //! readiness. It does not yet provide a `PostgreSQL` listener, authentication,
 //! backend pooling, or query execution.
 
+pub mod config;
 pub mod http;
+pub mod runtime;
 pub mod state;
