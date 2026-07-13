@@ -1,6 +1,7 @@
 //! Bounded zero-copy decoding of `PostgreSQL` 18 logical replication messages.
 
 use std::fmt;
+use std::num::NonZeroU64;
 
 use thiserror::Error;
 
@@ -426,6 +427,154 @@ pub enum StandbyStatusUpdateError {
         write_lsn: u64,
         /// Invalid later apply position.
         apply_lsn: u64,
+    },
+}
+
+/// Session-local cross-sample ordering for Standby Status Updates.
+///
+/// One instance is authoritative for exactly one accepted slot, timeline, and
+/// COPY-BOTH session. It cannot be cloned or reset. The owner must construct it
+/// from the durable checkpoint used to start that session and advance
+/// `flush_lsn` only after the corresponding checkpoint is durably committed.
+/// After a disconnect or process restart, volatile write and apply positions
+/// must be discarded and a new instance must start from the last durable
+/// checkpoint.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StandbyFeedbackProgress {
+    write: u64,
+    flush: u64,
+    apply: u64,
+}
+
+impl StandbyFeedbackProgress {
+    /// Starts a fresh COPY-BOTH session with no durable checkpoint.
+    #[must_use]
+    pub const fn fresh() -> Self {
+        Self {
+            write: 0,
+            flush: 0,
+            apply: 0,
+        }
+    }
+
+    /// Resumes one COPY-BOTH session from its authoritative durable checkpoint.
+    ///
+    /// All three positions start at the durable point because write and apply
+    /// progress from an earlier process is intentionally not restored.
+    #[must_use]
+    pub const fn resume(durable_checkpoint_lsn: NonZeroU64) -> Self {
+        let durable_checkpoint_lsn = durable_checkpoint_lsn.get();
+        Self {
+            write: durable_checkpoint_lsn,
+            flush: durable_checkpoint_lsn,
+            apply: durable_checkpoint_lsn,
+        }
+    }
+
+    /// Advances all three positions all-or-nothing without permitting regression.
+    ///
+    /// Apply may advance ahead of flush, but neither may exceed write. State is
+    /// unchanged when validation fails.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid within-sample ordering or any position below the last
+    /// accepted value.
+    pub fn advance(
+        &mut self,
+        write_lsn: u64,
+        flush_lsn: u64,
+        apply_lsn: u64,
+    ) -> Result<(), StandbyFeedbackProgressError> {
+        StandbyStatusUpdate::new(write_lsn, flush_lsn, apply_lsn, 0, false)?;
+        if write_lsn < self.write {
+            return Err(StandbyFeedbackProgressError::WriteRegression {
+                current: self.write,
+                attempted: write_lsn,
+            });
+        }
+        if flush_lsn < self.flush {
+            return Err(StandbyFeedbackProgressError::FlushRegression {
+                current: self.flush,
+                attempted: flush_lsn,
+            });
+        }
+        if apply_lsn < self.apply {
+            return Err(StandbyFeedbackProgressError::ApplyRegression {
+                current: self.apply,
+                attempted: apply_lsn,
+            });
+        }
+        self.write = write_lsn;
+        self.flush = flush_lsn;
+        self.apply = apply_lsn;
+        Ok(())
+    }
+
+    /// Returns the last accepted write position.
+    #[must_use]
+    pub const fn write_lsn(&self) -> u64 {
+        self.write
+    }
+
+    /// Returns the last accepted flush position.
+    #[must_use]
+    pub const fn flush_lsn(&self) -> u64 {
+        self.flush
+    }
+
+    /// Returns the last accepted apply position.
+    #[must_use]
+    pub const fn apply_lsn(&self) -> u64 {
+        self.apply
+    }
+
+    /// Creates a feedback frame value from the last accepted positions.
+    #[must_use]
+    pub const fn status_update(
+        &self,
+        client_time: i64,
+        reply_requested: bool,
+    ) -> StandbyStatusUpdate {
+        StandbyStatusUpdate {
+            write_lsn: self.write,
+            flush_lsn: self.flush,
+            apply_lsn: self.apply,
+            client_time,
+            reply_requested,
+        }
+    }
+}
+
+/// Invalid or regressing cross-sample standby feedback progress.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum StandbyFeedbackProgressError {
+    /// The proposed sample is internally inconsistent.
+    #[error(transparent)]
+    InvalidSample(#[from] StandbyStatusUpdateError),
+    /// The received/write position moved backwards.
+    #[error("standby write LSN regressed from {current} to {attempted}")]
+    WriteRegression {
+        /// Last accepted write position.
+        current: u64,
+        /// Rejected earlier write position.
+        attempted: u64,
+    },
+    /// The flush position moved backwards.
+    #[error("standby flush LSN regressed from {current} to {attempted}")]
+    FlushRegression {
+        /// Last accepted flush position.
+        current: u64,
+        /// Rejected earlier flush position.
+        attempted: u64,
+    },
+    /// The apply position moved backwards.
+    #[error("standby apply LSN regressed from {current} to {attempted}")]
+    ApplyRegression {
+        /// Last accepted apply position.
+        current: u64,
+        /// Rejected earlier apply position.
+        attempted: u64,
     },
 }
 
@@ -2773,6 +2922,104 @@ mod tests {
                 apply_lsn: 13,
             })
         );
+    }
+
+    #[test]
+    fn standby_feedback_progress_is_session_scoped_and_all_or_nothing() {
+        let fresh = StandbyFeedbackProgress::fresh();
+        assert_eq!(fresh.write_lsn(), 0);
+        assert_eq!(fresh.flush_lsn(), 0);
+        assert_eq!(fresh.apply_lsn(), 0);
+
+        let mut progress = StandbyFeedbackProgress::resume(
+            NonZeroU64::new(18).expect("positive durable checkpoint"),
+        );
+        assert_eq!(progress.write_lsn(), 18);
+        assert_eq!(progress.flush_lsn(), 18);
+        assert_eq!(progress.apply_lsn(), 18);
+        progress
+            .advance(30, 20, 25)
+            .expect("session progress with apply ahead of flush");
+
+        for (write_lsn, flush_lsn, apply_lsn, expected) in [
+            (
+                29,
+                20,
+                25,
+                StandbyFeedbackProgressError::WriteRegression {
+                    current: 30,
+                    attempted: 29,
+                },
+            ),
+            (
+                31,
+                19,
+                25,
+                StandbyFeedbackProgressError::FlushRegression {
+                    current: 20,
+                    attempted: 19,
+                },
+            ),
+            (
+                31,
+                20,
+                24,
+                StandbyFeedbackProgressError::ApplyRegression {
+                    current: 25,
+                    attempted: 24,
+                },
+            ),
+            (
+                31,
+                32,
+                25,
+                StandbyFeedbackProgressError::InvalidSample(
+                    StandbyStatusUpdateError::FlushAheadOfWrite {
+                        write_lsn: 31,
+                        flush_lsn: 32,
+                    },
+                ),
+            ),
+            (
+                31,
+                20,
+                32,
+                StandbyFeedbackProgressError::InvalidSample(
+                    StandbyStatusUpdateError::ApplyAheadOfWrite {
+                        write_lsn: 31,
+                        apply_lsn: 32,
+                    },
+                ),
+            ),
+        ] {
+            let before = progress.status_update(0, false);
+            assert_eq!(
+                progress.advance(write_lsn, flush_lsn, apply_lsn),
+                Err(expected)
+            );
+            assert_eq!(
+                progress.status_update(0, false),
+                before,
+                "rejected progress mutated state"
+            );
+        }
+
+        progress
+            .advance(40, 22, 35)
+            .expect("monotonic progress with apply ahead of flush");
+        let update = progress.status_update(-44, true);
+        assert_eq!(update.write_lsn(), 40);
+        assert_eq!(update.flush_lsn(), 22);
+        assert_eq!(update.apply_lsn(), 35);
+        assert_eq!(update.client_time(), -44);
+        assert!(update.reply_requested());
+
+        let resumed = StandbyFeedbackProgress::resume(
+            NonZeroU64::new(progress.flush_lsn()).expect("positive durable checkpoint"),
+        );
+        assert_eq!(resumed.write_lsn(), 22);
+        assert_eq!(resumed.flush_lsn(), 22);
+        assert_eq!(resumed.apply_lsn(), 22);
     }
 
     #[test]

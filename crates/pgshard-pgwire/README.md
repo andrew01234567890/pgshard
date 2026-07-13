@@ -76,8 +76,11 @@ and primary-keepalive envelopes. A fixed 39-byte frontend encoder emits
 PostgreSQL 18 Standby Status Updates without allocation after validating
 `flush_lsn <= write_lsn` and `apply_lsn <= write_lsn`. Apply may be ahead of
 flush, matching PostgreSQL's logical worker while local commits are written but
-not yet durable. The feedback owner must still enforce monotonic progress
-between samples and choose positions that correspond to persisted checkpoints.
+not yet durable. A per-COPY-BOTH-session progress state machine rejects
+cross-sample write, flush, or apply regression all-or-nothing. It cannot be
+cloned or reset. The feedback owner must advance flush only for a durable
+checkpoint, discard volatile write and apply progress after disconnect, and
+start a new tracker from that durable checkpoint.
 The live PostgreSQL 18 fixture sends this production frame in COPY-BOTH mode,
 drains the initial catch-up keepalive, observes three distinct positions through
 `pg_stat_replication`, receives a subsequent requested keepalive, and completes
@@ -104,8 +107,8 @@ copying or rendering values in debug output. Custom Message prefixes require
 the connection UTF-8 proof; their binary contents remain borrowed and are
 represented only by length in debug output.
 Complete transaction ordering, relation cache semantics, feedback scheduling
-and cross-sample monotonicity, durable checkpoints, cross-shard merge, and the
-VStream-like service remain later work.
+and persistence, durable checkpoints, cross-shard merge, and the VStream-like
+service remain later work.
 
 The future replication session must bind that token to the exact accepted
 `START_REPLICATION` command and the selected slot's authoritative persistent

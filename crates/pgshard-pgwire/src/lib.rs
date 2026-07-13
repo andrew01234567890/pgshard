@@ -38,8 +38,9 @@ pub use pgoutput::{
     PgOutputReplicaIdentity, PgOutputRollbackPrepared, PgOutputStreamAbort, PgOutputStreaming,
     PgOutputTruncate, PgOutputTuple, PgOutputTupleColumn, PgOutputTupleColumnIter, PgOutputType,
     PgOutputUpdate, PgOutputVersion, PrimaryKeepalive, ReplicationCopyData,
-    STANDBY_STATUS_UPDATE_FRAME_LENGTH, StandbyStatusUpdate, StandbyStatusUpdateError, XLogData,
-    decode_pgoutput_control, decode_replication_copy_data,
+    STANDBY_STATUS_UPDATE_FRAME_LENGTH, StandbyFeedbackProgress, StandbyFeedbackProgressError,
+    StandbyStatusUpdate, StandbyStatusUpdateError, XLogData, decode_pgoutput_control,
+    decode_replication_copy_data,
 };
 
 pub use session::{
