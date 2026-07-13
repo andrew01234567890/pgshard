@@ -44,11 +44,17 @@ tags are rejected before their length is trusted. Authentication, query-cycle,
 COPY, and replication phase legality remains the future session state machine's
 responsibility. The typed backend body decoders validate
 `ParameterDescription` exactly, expose its type OIDs through a borrowed
-iterator, validate the exact empty-response family, and decode `ReadyForQuery`
-as idle, in-transaction, or failed-transaction state. The frontend body
-decoders include `Describe` and `Close` statement/portal targets. They do not
-associate a description with a Parse generation, virtualize a name, track a
-query cycle, identify a backend, or establish a catalog fence.
+iterator, validate `ParameterStatus` as exactly two UTF-8 strings, borrow the
+process identifier and secret key from `BackendKeyData`, validate the exact
+empty-response family, and decode `ReadyForQuery` as idle, in-transaction, or
+failed-transaction state. `ParameterStatus` is decoded before it establishes
+the authoritative encoding token so that a session can reject anything other
+than canonical `UTF8`. The effective session must associate backend key data
+with one exact upstream connection and require a four-byte key for protocol
+3.0. The frontend body decoders include `Describe` and `Close` statement/portal
+targets. They do not associate a description with a Parse generation,
+virtualize a name, track a query cycle, identify a backend, or establish a
+catalog fence.
 
 The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH
 loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is

@@ -125,6 +125,11 @@ PostgreSQL 18 separately accepts one-to-256-byte keys in incoming
 `CancelRequest` packets. The future session layer must match the complete
 opaque key to the selected backend connection and enforce the effective
 protocol version; protocol 3.0 backend keys are exactly four bytes.
+Typed zero-copy decoders expose the process identifier and opaque key without
+rendering the key in debug output, and validate `ParameterStatus` as exactly
+two terminated UTF-8 strings. A reported `client_encoding` is authoritative
+session state: the pooler must reject a value other than canonical `UTF8`
+before decoding more query-protocol bodies.
 The transport layer, which is not implemented yet, must handle PostgreSQL 18
 direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting
