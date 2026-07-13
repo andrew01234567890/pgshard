@@ -8,12 +8,17 @@ description: VStream-like change data capture using PostgreSQL pgoutput.
 :::info Milestone 1 design contract
 This page specifies the required behavior. Source code can decode PostgreSQL 18
 replication envelopes and the buffered, streamed, and two-phase `pgoutput`
-transaction controls, Relation and Type schema metadata, and
-Insert/Update/Delete/Truncate row bodies without allocation. A segment-layout
-state machine derives streamed schema and row XID prefixes from Stream
-Start/Stop rather than caller selection. Stream Start identifies the top-level
-transaction, while each nonzero message prefix may identify a subtransaction.
-It does not yet decode logical-message bodies or implement a complete
+transaction controls, Relation and Type schema metadata,
+Insert/Update/Delete/Truncate row bodies, and—when the accepted command
+explicitly enabled `messages`—custom logical Message records without
+allocation. A segment-layout state machine derives streamed schema,
+row, and custom-message XID prefixes from Stream Start/Stop rather than caller
+selection. Stream Start identifies the top-level transaction, while each
+schema or row prefix may identify a subtransaction. A custom Message inside a
+stream must be transactional and repeat the active top-level XID. Live
+PostgreSQL 18 coverage shows that a Message emitted inside a savepoint retains
+that top-level XID while the Relation record carries the savepoint XID. It does
+not yet implement a complete
 transaction-order machine, relation cache, slots, acknowledgements, durable
 replay, snapshots, cross-shard merge, or a stream service; see [implementation
 status](../project/status.md).

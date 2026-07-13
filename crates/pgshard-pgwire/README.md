@@ -73,7 +73,8 @@ loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is
 separate from COPY IN because CopyFail, Flush, and Sync are not valid standby
 messages. Backend replication `CopyData` now decodes exact zero-copy XLogData
 and primary-keepalive envelopes. A configuration token validates `pgoutput`
-protocol versions one through four plus streaming and two-phase feature gates;
+protocol versions one through four plus streaming, custom-message, and
+two-phase feature gates;
 the control decoder covers buffered Begin/Commit/Origin, streamed transaction
 start/stop/commit/abort, and every two-phase control including Stream Prepare.
 It requires authoritative `server_encoding=UTF8` and `client_encoding=UTF8`
@@ -81,15 +82,20 @@ proofs from the same connection, bounds prepared-transaction identifiers, and
 redacts origins, GIDs, names, and logical payloads from debug output. A
 stateful wrapper derives whether the otherwise-ambiguous XID prefix is present
 from validated Stream Start/Stop controls and decodes Relation and Type schema
-messages plus Insert, Update, Delete, and Truncate row changes. A Stream Start
-names the top-level transaction, while each schema or row prefix may name a
-different nonzero subtransaction. Relation columns and logical tuples are
+messages, Insert/Update/Delete/Truncate row changes, and custom logical Message
+records only when the exact accepted command enabled `messages`. A Stream Start
+names the top-level transaction, while schema and row prefixes may name a
+different nonzero subtransaction. A custom Message inside a stream must be
+transactional and repeat the active top-level XID; PostgreSQL 18 attributes the
+tested Message emitted inside a savepoint to that top-level transaction rather
+than the savepoint Relation XID. Relation columns and logical tuples are
 prevalidated once and exposed through borrowed exact-size iterators. Tuple
 values distinguish null, unchanged-toast, UTF-8 text, and opaque binary without
-copying or rendering values in debug output. Logical-message bodies remain
-rejected. Complete transaction ordering, relation cache semantics, WAL
-feedback, durable checkpoints, cross-shard merge, and the VStream-like service
-remain later work.
+copying or rendering values in debug output. Custom Message prefixes require
+the connection UTF-8 proof; their binary contents remain borrowed and are
+represented only by length in debug output.
+Complete transaction ordering, relation cache semantics, WAL feedback, durable
+checkpoints, cross-shard merge, and the VStream-like service remain later work.
 
 The future replication session must bind that token to the exact accepted
 `START_REPLICATION` command and the selected slot's authoritative persistent
@@ -115,5 +121,7 @@ borrowed transaction Begin control.
 `cargo bench -p pgshard-pgwire --bench decode_pgoutput_relation` measures
 prevalidation and iteration of a borrowed two-column Relation message.
 `cargo bench -p pgshard-pgwire --bench decode_pgoutput_insert` measures a
-borrowed two-column Insert and tuple iteration. None is a substitute for the
-planned end-to-end pooler/PgBouncer comparison.
+borrowed two-column Insert and tuple iteration.
+`cargo bench -p pgshard-pgwire --bench decode_pgoutput_message` measures a
+borrowed custom logical Message with an opaque binary payload. None is a
+substitute for the planned end-to-end pooler/PgBouncer comparison.
