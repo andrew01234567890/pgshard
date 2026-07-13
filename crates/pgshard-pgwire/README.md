@@ -52,17 +52,21 @@ negotiation controls. Authentication decoding covers the PostgreSQL 18 request
 codes and exact fixed payloads, borrows SASL mechanism lists and opaque exchange
 bytes, and redacts salts, mechanism names, and exchange data from debug output.
 Protocol negotiation preserves the complete backend-selected version and exact
-reserved `_pq_.` option list without allocation. `ParameterStatus` is decoded
-before it establishes the authoritative encoding token so that a session can
-reject anything other than canonical `UTF8`. The effective session must
-associate backend key data with one exact upstream connection and require a
-four-byte key for protocol 3.0. It must also enforce authentication ordering and
-policy, channel binding and server identity, and protocol-negotiation semantics
-such as a single non-upgrading response which names exactly the reserved options
-the client requested. The frontend body decoders include `Describe` and `Close`
-statement/portal targets. They do not associate a description with a Parse
-generation, virtualize a name, track a query cycle, identify a backend, or
-establish a catalog fence.
+reserved `_pq_.` option list without allocation. A linear PostgreSQL 18 startup
+validator borrows the exact outbound parameters, requires negotiation precisely
+when the server does, checks the exact selected version and ordered unsupported
+option sequence including duplicates, and cannot be reused after a rejected
+response. Finishing it before authentication yields a protocol proof that
+requires PostgreSQL 18's exact four-byte cancellation key before protocol 3.2
+or exact 32-byte key at protocol 3.2. `ParameterStatus` is decoded before it
+establishes the authoritative encoding token so that a session can reject
+anything other than canonical `UTF8`. The effective session must still bind
+the protocol proof and backend key data to one exact upstream socket and
+enforce authentication ordering and policy, channel binding, server identity,
+and configured client-protocol policy. The frontend body decoders include
+`Describe` and `Close` statement/portal targets. They do not associate a
+description with a Parse generation, virtualize a name, track a query cycle,
+identify a backend, or establish a catalog fence.
 
 The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH
 loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is
