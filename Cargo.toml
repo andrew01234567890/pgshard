@@ -3,6 +3,7 @@ members = [
   "crates/pgshard-agent",
   "crates/pgshard-catalog",
   "crates/pgshard-orch",
+  "crates/pgshard-pgwire",
   "crates/pgshard-router",
   "crates/pgshard-release",
   "crates/pgshard-types",

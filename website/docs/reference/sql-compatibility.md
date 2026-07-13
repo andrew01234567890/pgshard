@@ -8,8 +8,10 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 :::warning Planned compatibility, not current support
 No pooler endpoint, SQL parser, or statement planner exists yet. The source has
 only a fail-closed core that routes an already-resolved, non-NULL shard-key bind
-parameter against one immutable catalog snapshot. The table below is the
-Milestone 1 acceptance contract; see [implementation status](../project/status.md).
+parameter against one immutable catalog snapshot, plus a bounded zero-copy
+decoder for PostgreSQL 18 frontend frames. It does not yet authenticate or
+execute clients. The table below is the Milestone 1 acceptance contract; see
+[implementation status](../project/status.md).
 :::
 
 The planned pooler will speak PostgreSQL simple and extended query protocols and
@@ -41,6 +43,18 @@ change it. PostgreSQL converts both text-format and binary `text` binds from the
 session encoding before storage; routing raw bytes from any other encoding can
 disagree with the stored value and is therefore not allowed. Both formats also
 reject the zero byte exactly as PostgreSQL does.
+
+The decoder caps one frontend frame at 64 MiB. Startup, authentication, and
+control-message families retain PostgreSQL 18's smaller family-specific limits.
+It reports oversized frames before their bodies are buffered; the future
+session layer must then close the client connection as a protocol violation.
+The transport layer, which is not implemented yet, must handle PostgreSQL 18
+direct TLS and ALPN before startup framing. It must also preserve a pipelined
+TLS ClientHello after an SSL request for an accepted handshake, while rejecting
+buffered bytes if encryption is refused.
+An explicit replication-streaming phase admits only the CopyData, CopyDone, and
+Terminate frontend frames accepted by PostgreSQL 18's WAL sender. It does not
+yet decode `pgoutput` payloads or implement a change-stream session.
 
 Named prepared statements are virtualized at the pooler. Their routing plan is invalidated by relevant schema or routing epoch changes.
 
