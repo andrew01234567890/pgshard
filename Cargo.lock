@@ -924,6 +924,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgshard-pooler"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "pgshard-catalog",
+ "pgshard-version",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "pgshard-release"
 version = "0.1.0"
 dependencies = [

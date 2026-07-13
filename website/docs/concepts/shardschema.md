@@ -10,8 +10,9 @@ The PostgreSQL 18 migration, validated Rust snapshot model, canonical checksum,
 multi-epoch lock-free cache, repeatable-read snapshot loader,
 LISTEN-before-initial-load primitive, bounded notification and polling driver,
 bounded reconnect and stale-readiness supervisor, metrics-ready state, and live
-database contract test exist in source. Pooler composition, TLS, timeouts, and
-HTTP/Prometheus publication are not wired yet; see
+database contract test exist in source. Pooler HTTP/readiness/status and
+Prometheus translation exist as a library, but executable composition, TLS,
+and connection/query timeouts are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
@@ -80,10 +81,11 @@ uses reconnect-window ceilings from 100 milliseconds to five seconds. Each
 process waits within the upper half of its current window so replicas do not
 reconnect in lockstep. The status handle reports connection phase, catalog
 epoch, monotonic cache age, attempts, connections completing their initial
-authoritative load, and credential-safe failure categories. The future pooler
-will translate that state into readiness and Prometheus endpoints. TLS,
-connection/query timeouts, and sanitized connection-error logging remain
-responsibilities of that runtime composition.
+authoritative load, and credential-safe failure categories. The pooler library
+translates that state into fail-closed readiness, exact JSON status, and
+bounded-label Prometheus endpoints. An executable still needs to compose the
+supervisor with TLS, connection/query timeouts, and sanitized connection-error
+logging.
 
 The empty installed catalog begins at epoch zero. A reader fails closed before
 publishing metadata above the current process limits: 1,024 logical databases,

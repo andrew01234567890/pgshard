@@ -207,6 +207,19 @@ pub enum CatalogConnectionPhase {
 }
 
 impl CatalogConnectionPhase {
+    /// Returns the stable bounded label used by status and metrics endpoints.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Connecting => "connecting",
+            Self::Loading => "loading",
+            Self::Connected => "connected",
+            Self::Backoff => "backoff",
+            Self::Stopped => "stopped",
+        }
+    }
+
     /// Returns whether a catalog socket is currently owned by the driver.
     #[must_use]
     pub const fn connection_up(self) -> bool {
@@ -225,6 +238,19 @@ pub enum CatalogFailureKind {
     Connection,
     /// The spawned connection pump task failed.
     ConnectionTask,
+}
+
+impl CatalogFailureKind {
+    /// Returns the stable bounded label used by status and metrics endpoints.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Load => "load",
+            Self::Connection => "connection",
+            Self::ConnectionTask => "connection_task",
+        }
+    }
 }
 
 impl From<&CatalogRefreshError> for CatalogFailureKind {
@@ -254,6 +280,21 @@ pub enum CatalogReadinessReason {
     Stale,
     /// Supervision has stopped or its future was dropped.
     Stopped,
+}
+
+impl CatalogReadinessReason {
+    /// Returns the stable bounded label used by status and metrics endpoints.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::ServingStale => "serving_stale",
+            Self::Uninitialized => "uninitialized",
+            Self::CacheUnavailable => "cache_unavailable",
+            Self::Stale => "stale",
+            Self::Stopped => "stopped",
+        }
+    }
 }
 
 /// Point-in-time, metrics-ready catalog supervision state.

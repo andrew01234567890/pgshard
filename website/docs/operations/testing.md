@@ -25,7 +25,10 @@ stale-cache grace, observes readiness expire at the exact age boundary,
 releases reconnection, proves a fresh authoritative load restores readiness,
 interrupts another blocked reconnect during shutdown, and externally aborts a
 connected supervisor to prove readiness fails immediately and its backend
-exits. A separate raw-wire PostgreSQL 18
+exits. Pooler unit tests exercise the real HTTP router, keep health independent
+from fail-closed catalog readiness, preserve maximum 64-bit status values as
+decimal JSON strings, and validate bounded phase, readiness, and failure labels
+in Prometheus exposition. A separate raw-wire PostgreSQL 18
 test validates four-byte protocol 3.0 and 32-byte protocol 3.2 server cancellation keys,
 zero-copy `BackendKeyData` and `ParameterStatus`, typed `AuthenticationOk`, and
 a real protocol 3.99 to 3.2 negotiation that returns the requested unsupported

@@ -131,7 +131,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	topologyHash := configHash(topologyConfig)
 	poolerHash := configHash(postgresqlConfig, topologyConfig)
 
-	objects := make([]client.Object, 0, 15+cluster.Spec.Shards)
+	objects := make([]client.Object, 0, 16+cluster.Spec.Shards)
 	objects = append(objects,
 		configMap(cluster, cluster.Name+PostgreSQLConfigSuffix, map[string]string{"postgresql.conf": postgresqlConfig}),
 		configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": topologyConfig}),
@@ -140,6 +140,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		applicationService(cluster, "r", cluster.Spec.Services.Read, PoolerRPort),
 		etcdService(cluster),
 		orchestratorService(cluster),
+		poolerService(cluster),
 		etcdNetworkPolicy(cluster),
 	)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
@@ -332,6 +333,18 @@ func orchestratorService(cluster *pgshardv1alpha1.PgShardCluster) *corev1.Servic
 	}
 }
 
+func poolerService(cluster *pgshardv1alpha1.PgShardCluster) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: ownedMeta(cluster, cluster.Name+PoolerSuffix, "pooler", nil),
+		Spec: corev1.ServiceSpec{
+			Type:                     corev1.ServiceTypeClusterIP,
+			PublishNotReadyAddresses: true,
+			Selector:                 componentSelector(cluster, "pooler"),
+			Ports:                    []corev1.ServicePort{{Name: "http", Protocol: corev1.ProtocolTCP, Port: HTTPPort, TargetPort: intstr.FromString("http")}},
+		},
+	}
+}
+
 func etcdNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	clientPort := intstr.FromInt32(EtcdClientPort)
@@ -418,8 +431,8 @@ func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image string) *app
 						{Name: "peer", ContainerPort: EtcdPeerPort, Protocol: corev1.ProtocolTCP},
 					},
 					Resources:      resources("100m", "128Mi", "1", "512Mi"),
-					ReadinessProbe: httpProbe("/readyz", "client"),
-					LivenessProbe:  httpProbe("/livez", "client"),
+					ReadinessProbe: httpReadinessProbe("/readyz", "client"),
+					LivenessProbe:  httpLivenessProbe("/livez", "client"),
 					VolumeMounts:   []corev1.VolumeMount{{Name: "data", MountPath: "/var/lib/etcd"}},
 				}}),
 			},
@@ -461,8 +474,8 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 					Env:             env,
 					Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: HTTPPort, Protocol: corev1.ProtocolTCP}},
 					Resources:       resources("100m", "128Mi", "1", "512Mi"),
-					ReadinessProbe:  httpProbe("/readyz", "http"),
-					LivenessProbe:   httpProbe("/healthz", "http"),
+					ReadinessProbe:  httpReadinessProbe("/readyz", "http"),
+					LivenessProbe:   httpLivenessProbe("/healthz", "http"),
 					VolumeMounts:    []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard", ReadOnly: true}},
 				}}),
 			},
@@ -487,6 +500,7 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 	env := []corev1.EnvVar{
 		{Name: "PGSHARD_CLUSTER_ID", Value: cluster.Name},
 		{Name: "PGSHARD_TOPOLOGY_FILE", Value: "/etc/pgshard/topology/cluster.json"},
+		{Name: "PGSHARD_HTTP_BIND", Value: "0.0.0.0:8080"},
 		{Name: "PGSHARD_RW_BIND", Value: "0.0.0.0:5432"},
 		{Name: "PGSHARD_RO_BIND", Value: "0.0.0.0:5433"},
 		{Name: "PGSHARD_R_BIND", Value: "0.0.0.0:5434"},
@@ -504,10 +518,11 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 			{Name: "pooler-rw", ContainerPort: PoolerRWPort, Protocol: corev1.ProtocolTCP},
 			{Name: "pooler-ro", ContainerPort: PoolerROPort, Protocol: corev1.ProtocolTCP},
 			{Name: "pooler-r", ContainerPort: PoolerRPort, Protocol: corev1.ProtocolTCP},
+			{Name: "http", ContainerPort: HTTPPort, Protocol: corev1.ProtocolTCP},
 		},
 		Resources:      resources("250m", "256Mi", "2", "1Gi"),
-		ReadinessProbe: tcpProbe("pooler-rw"),
-		LivenessProbe:  tcpProbe("pooler-rw"),
+		ReadinessProbe: httpReadinessProbe("/readyz", "http"),
+		LivenessProbe:  httpLivenessProbe("/healthz", "http"),
 		Lifecycle:      &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{Sleep: &corev1.SleepAction{Seconds: 10}}},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true},
@@ -674,23 +689,21 @@ func resources(requestCPU, requestMemory, limitCPU, limitMemory string) corev1.R
 	}
 }
 
-func httpProbe(path, port string) *corev1.Probe {
+func httpReadinessProbe(path, port string) *corev1.Probe {
+	return httpProbe(path, port, 1)
+}
+
+func httpLivenessProbe(path, port string) *corev1.Probe {
+	return httpProbe(path, port, 3)
+}
+
+func httpProbe(path, port string, failureThreshold int32) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: path, Port: intstr.FromString(port), Scheme: corev1.URISchemeHTTP}},
 		InitialDelaySeconds: 5,
 		PeriodSeconds:       10,
 		TimeoutSeconds:      3,
-		FailureThreshold:    3,
-	}
-}
-
-func tcpProbe(port string) *corev1.Probe {
-	return &corev1.Probe{
-		ProbeHandler:        corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString(port)}},
-		InitialDelaySeconds: 5,
-		PeriodSeconds:       10,
-		TimeoutSeconds:      3,
-		FailureThreshold:    3,
+		FailureThreshold:    failureThreshold,
 	}
 }
 
