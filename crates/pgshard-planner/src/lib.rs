@@ -9,6 +9,7 @@ use std::{fmt, ops::ControlFlow};
 use sqlparser::{
     ast::{Expr, ObjectName, Query, Select, Statement, TableFactor, ValueWithSpan, Visit, Visitor},
     dialect::PostgreSqlDialect,
+    keywords::Keyword,
     parser::{Parser, ParserError},
     tokenizer::{Token, TokenWithSpan, Tokenizer},
 };
@@ -29,7 +30,7 @@ pub const MAX_AST_NODES: usize = 2_048;
 const MAX_RECURSION_DEPTH: usize = 50;
 // Flat parser trees can be much deeper than the delimiter and parser recursion
 // limits. The fixed reserve covers parser/visitor frames for small statements;
-// the per-token reserve conservatively scales every retained untrusted input.
+// the per-structural-token reserve scales syntax without rewarding trivia.
 const MIN_AST_STACK_BYTES: usize = 256 * 1024;
 const AST_STACK_BYTES_PER_TOKEN: usize = 2 * 1024;
 
@@ -38,7 +39,6 @@ enum Delimiter {
     Parenthesis,
     Bracket,
     Brace,
-    Angle,
 }
 
 /// Coarse top-level syntax kind.
@@ -128,9 +128,9 @@ pub fn parse_one(sql: &str) -> Result<ParsedStatement, ParseError> {
             maximum: MAX_SQL_TOKENS,
         });
     }
-    enforce_lexical_nesting_limit(&tokens)?;
+    let structural_tokens = inspect_lexical_structure(&tokens)?;
 
-    let stack_reserve = ast_stack_reserve(tokens.len());
+    let stack_reserve = ast_stack_reserve(structural_tokens);
     // Keep parsing, recursive validation, and every rejected-tree drop inside
     // the protected segment. Only an already-budgeted tree can leave it.
     stacker::maybe_grow(stack_reserve, stack_reserve, move || {
@@ -182,20 +182,56 @@ const fn ast_stack_reserve(token_count: usize) -> usize {
     MIN_AST_STACK_BYTES + token_count * AST_STACK_BYTES_PER_TOKEN
 }
 
-fn enforce_lexical_nesting_limit(tokens: &[TokenWithSpan]) -> Result<(), ParseError> {
+fn inspect_lexical_structure(tokens: &[TokenWithSpan]) -> Result<usize, ParseError> {
     let mut delimiters = [Delimiter::Parenthesis; MAX_RECURSION_DEPTH];
     let mut depth = 0_usize;
+    let mut array_angle_depth = 0_usize;
+    let mut saw_array_keyword = false;
+    let mut structural_tokens = 0_usize;
 
     for token in tokens {
+        if matches!(&token.token, Token::Whitespace(_)) {
+            continue;
+        }
+        if matches!(&token.token, Token::SemiColon | Token::EOF) {
+            saw_array_keyword = false;
+            continue;
+        }
+        structural_tokens += 1;
+
+        if matches!(
+            &token.token,
+            Token::Word(word) if word.keyword == Keyword::ARRAY
+        ) {
+            saw_array_keyword = true;
+            continue;
+        }
+        if token.token == Token::Lt && saw_array_keyword {
+            if array_angle_depth == MAX_RECURSION_DEPTH {
+                return Err(ParseError::RecursionLimit);
+            }
+            array_angle_depth += 1;
+            saw_array_keyword = false;
+            continue;
+        }
+        saw_array_keyword = false;
+
+        match token.token {
+            Token::Gt if array_angle_depth > 0 => {
+                array_angle_depth -= 1;
+                continue;
+            }
+            Token::ShiftRight if array_angle_depth > 0 => {
+                array_angle_depth = array_angle_depth.saturating_sub(2);
+                continue;
+            }
+            _ => {}
+        }
+
         let delimiter = match token.token {
             Token::LParen => Some(Delimiter::Parenthesis),
             Token::LBracket => Some(Delimiter::Bracket),
             Token::LBrace => Some(Delimiter::Brace),
-            // PostgreSQL does not use angle brackets for grouping, but the
-            // candidate parser uses them recursively for dialect-specific data
-            // types such as ARRAY<ARRAY<...>> without applying its recursion
-            // guard. Treating `<` conservatively as an opener bounds that path.
-            Token::Lt => Some(Delimiter::Angle),
             _ => None,
         };
         if let Some(delimiter) = delimiter {
@@ -211,7 +247,6 @@ fn enforce_lexical_nesting_limit(tokens: &[TokenWithSpan]) -> Result<(), ParseEr
             Token::RParen => Some(Delimiter::Parenthesis),
             Token::RBracket => Some(Delimiter::Bracket),
             Token::RBrace => Some(Delimiter::Brace),
-            Token::Gt => Some(Delimiter::Angle),
             _ => None,
         };
         if closing.is_some_and(|delimiter| depth > 0 && delimiters[depth - 1] == delimiter) {
@@ -219,7 +254,7 @@ fn enforce_lexical_nesting_limit(tokens: &[TokenWithSpan]) -> Result<(), ParseEr
         }
     }
 
-    Ok(())
+    Ok(structural_tokens)
 }
 
 struct AstBudget {
@@ -453,6 +488,42 @@ mod tests {
             .join()
             .expect("small-stack parser must not panic");
         assert_eq!(result, Err(ParseError::RecursionLimit));
+    }
+
+    #[test]
+    fn unrelated_comparisons_do_not_consume_array_type_depth() {
+        let comparisons = vec!["0 < 1"; MAX_RECURSION_DEPTH + 1].join(", ");
+        assert_eq!(
+            parse_one(&format!("select {comparisons}"))
+                .expect("independent comparisons")
+                .kind(),
+            StatementKind::Query
+        );
+    }
+
+    #[test]
+    fn trivia_does_not_inflate_the_ast_stack_reserve() {
+        let dialect = PostgreSqlDialect {};
+        let plain = Tokenizer::new(&dialect, "select 1")
+            .tokenize_with_location()
+            .expect("plain tokens");
+        let padded_sql = format!("{}select 1{}", ";".repeat(2_000), " ".repeat(2_000));
+        let padded = Tokenizer::new(&dialect, &padded_sql)
+            .tokenize_with_location()
+            .expect("padded tokens");
+
+        let plain_structure = inspect_lexical_structure(&plain).expect("plain structure");
+        let padded_structure = inspect_lexical_structure(&padded).expect("padded structure");
+        assert_eq!(plain_structure, 2);
+        assert_eq!(padded_structure, 2);
+        assert_eq!(
+            ast_stack_reserve(plain_structure),
+            ast_stack_reserve(padded_structure)
+        );
+        assert_eq!(
+            parse_one(&padded_sql).expect("padded query").kind(),
+            StatementKind::Query
+        );
     }
 
     #[test]

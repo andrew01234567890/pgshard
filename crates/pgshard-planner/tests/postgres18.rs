@@ -66,6 +66,19 @@ async fn admitted_dml_parses_on_postgres18() {
         client.prepare(sql).await.expect("PostgreSQL 18 parse");
     }
 
+    let comparisons = vec!["0 < 1"; 51].join(", ");
+    let comparison_sql = format!("SELECT {comparisons}");
+    assert_eq!(
+        parse_one(&comparison_sql)
+            .expect("independent comparison parse")
+            .kind(),
+        StatementKind::Query
+    );
+    client
+        .prepare(&comparison_sql)
+        .await
+        .expect("PostgreSQL 18 independent comparisons");
+
     for non_postgres_sql in [
         "SELECT TOP 1 * FROM planner_target",
         "INSERT OVERWRITE planner_target VALUES (1, 2)",

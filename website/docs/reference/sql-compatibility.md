@@ -61,14 +61,17 @@ Terminate frontend frames accepted by PostgreSQL 18's WAL sender. It does not
 yet decode `pgoutput` payloads or implement a change-stream session.
 The syntax planner applies separate limits of 16 KiB of SQL text, 4,096 lexer
 tokens, 2,048 counted AST nodes, 50 lexically nested delimiters, and 50
-parser-recursion levels. The lexical guard includes angle-bracket data types and
-runs before the parser because that upstream parser path does not consume its
-recursion budget. Flat binary expressions and set-operation trees also bypass
-delimiter depth, so parsing, AST validation, rejection, and destruction use a
-stack reserve scaled from the already-bounded token count. An accepted opaque
-tree keeps that reserve for safe destruction by a caller on a smaller stack;
-the implementation allocates a larger stack segment only when the current stack
-does not have the required space. Larger inputs are rejected even though they
+parser-recursion levels. The lexical guard includes candidate-only
+angle-bracket `ARRAY` data types because that upstream parser path does not
+consume its recursion budget; unrelated PostgreSQL comparison operators do not
+consume the array-type budget. Flat binary expressions and set-operation trees
+also bypass delimiter depth, so parsing, AST validation, rejection, and
+destruction use a stack reserve scaled from structural tokens. Whitespace,
+comments, and empty statement semicolons remain subject to the total token cap
+but cannot inflate that reserve. An accepted opaque tree keeps the same reserve
+for safe destruction by a caller on a smaller stack; the implementation
+allocates a larger stack segment only when the current stack does not have the
+required space. Larger inputs are rejected even though they
 fit inside a valid frontend frame. Tokenization is byte-bounded first; only one
 statement is parsed, and remaining input causes immediate multiple-statement
 rejection. Parsing is synchronous; the future pooler must isolate it on a

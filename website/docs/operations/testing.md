@@ -11,7 +11,9 @@ PostgreSQL 18 smoke corpus checks positive DML examples and records known syntax
 the candidate parser accepts but PostgreSQL rejects. Parser regressions exercise
 deep delimiter, data-type, binary-expression, and set-operation shapes on a
 64 KiB thread stack, including destruction of both admitted and rejected trees.
-A targeted KIND test
+Optimized CI repeats the small-stack and parser-log redaction regressions, while
+trivia-padding tests and benchmarks verify that shallow queries do not acquire a
+large AST stack reserve. A targeted KIND test
 verifies operator PVC deletion and same-name recreation against real Kubernetes
 1.36 controllers. A unit regression gives the informer cache a false absence
 while the authoritative API reader still sees an owned PVC, and proves that
