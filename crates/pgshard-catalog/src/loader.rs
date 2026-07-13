@@ -78,7 +78,8 @@ impl CatalogReader {
     /// and setting changes. A manually opened transaction fails closed rather
     /// than being committed or reused.
     ///
-    /// The caller must continuously drive the associated `tokio-postgres`
+    /// [`crate::run_catalog_refresh`] provides the standard long-running loop.
+    /// Direct callers must continuously drive the associated `tokio-postgres`
     /// connection, parse every notification with
     /// [`crate::CatalogNotification`], call [`Self::refresh`] for unseen
     /// epochs, and poll periodically because notifications can be lost across
