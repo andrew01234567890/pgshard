@@ -38,8 +38,8 @@ jittered exponential backoff. Its cloneable status handle keeps a pooler
 unready until the first validated load, permits an existing snapshot only
 within a configured 2-to-900-second stale grace, fails readiness exactly at the
 deadline or immediately after an epoch fence, and reports connection phase,
-cache age, epoch, connection attempts, established sessions, and
-credential-safe failure classes.
+cache age, epoch, connection attempts, sessions completing their initial
+authoritative load, and credential-safe failure classes.
 The default 90-second grace is strictly longer than the default 30-second poll.
 The future pooler must still configure TLS and connection/query timeouts and
 publish the status through its HTTP and Prometheus endpoints; that composition

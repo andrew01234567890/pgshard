@@ -78,12 +78,12 @@ range end.
 The default policy polls every 30 seconds, allows 90 seconds of cache age, and
 uses reconnect-window ceilings from 100 milliseconds to five seconds. Each
 process waits within the upper half of its current window so replicas do not
-reconnect in lockstep. The status handle reports connection phase,
-catalog epoch, monotonic cache age, attempts, successful connections, and
-credential-safe failure categories. The future pooler will translate that
-state into readiness and Prometheus endpoints. TLS, connection/query timeouts,
-and sanitized connection-error logging remain responsibilities of that runtime
-composition.
+reconnect in lockstep. The status handle reports connection phase, catalog
+epoch, monotonic cache age, attempts, connections completing their initial
+authoritative load, and credential-safe failure categories. The future pooler
+will translate that state into readiness and Prometheus endpoints. TLS,
+connection/query timeouts, and sanitized connection-error logging remain
+responsibilities of that runtime composition.
 
 The empty installed catalog begins at epoch zero. A reader fails closed before
 publishing metadata above the current process limits: 1,024 logical databases,

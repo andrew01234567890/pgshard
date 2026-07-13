@@ -497,17 +497,7 @@ pub struct CatalogSupervisor {
     status: CatalogSupervisorStatus,
 }
 
-struct SupervisorRunGuard {
-    status: CatalogSupervisorStatus,
-}
-
-impl SupervisorRunGuard {
-    fn new(status: CatalogSupervisorStatus) -> Self {
-        Self { status }
-    }
-}
-
-impl Drop for SupervisorRunGuard {
+impl Drop for CatalogSupervisor {
     fn drop(&mut self) {
         self.status.mark_stopped(Instant::now());
     }
@@ -553,7 +543,6 @@ impl CatalogSupervisor {
         E: Send,
         F: Future<Output = ()> + Send,
     {
-        let _run_guard = SupervisorRunGuard::new(self.status.clone());
         let random = RandomState::new();
         tokio::pin!(shutdown);
 
@@ -796,9 +785,29 @@ mod tests {
         assert_eq!(recovered.connect_attempts(), 1);
         assert_eq!(recovered.successful_connections(), 1);
 
-        drop(SupervisorRunGuard::new(status.clone()));
+        status.mark_stopped(now);
         let stopped = status.snapshot_at(now);
         assert!(!stopped.ready());
+        assert_eq!(stopped.readiness_reason(), CatalogReadinessReason::Stopped);
+    }
+
+    #[test]
+    fn dropping_an_unpolled_run_future_stops_status() {
+        let supervisor = CatalogSupervisor::new(
+            Arc::new(CatalogCache::new()),
+            CatalogSupervisorConfig::default(),
+        );
+        let status = supervisor.status();
+        let run = supervisor.run(
+            || tokio_postgres::connect("postgresql://unused", tokio_postgres::NoTls),
+            std::future::pending(),
+        );
+
+        drop(run);
+
+        let stopped = status.snapshot();
+        assert!(!stopped.ready());
+        assert_eq!(stopped.phase(), CatalogConnectionPhase::Stopped);
         assert_eq!(stopped.readiness_reason(), CatalogReadinessReason::Stopped);
     }
 }
