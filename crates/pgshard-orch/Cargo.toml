@@ -1,0 +1,27 @@
+[package]
+name = "pgshard-orch"
+description = "Conservative orchestration runtime foundations for pgshard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+clap = { workspace = true, features = ["env"] }
+pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
+pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

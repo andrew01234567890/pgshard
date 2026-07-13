@@ -9,7 +9,7 @@ permissions: {}
 
 jobs:
   enable:
-    name: Enable verified patch auto-merge
+    name: Merge verified patch update
     if: >-
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
@@ -26,7 +26,7 @@ jobs:
           ref: main
       - name: Select repository Rust toolchain
         run: rustup show active-toolchain
-      - name: Enable auto-merge after exact-head verification
+      - name: Squash merge after exact-head verification
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}

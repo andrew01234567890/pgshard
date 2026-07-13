@@ -5,11 +5,15 @@ description: SemVer rules and source-only GitHub releases.
 
 # Releases and versioning
 
-Every successful new commit on `main` receives exactly one SemVer tag and a source-only GitHub Release. Milestone 1 releases use `0.x` prerelease versions.
+Every successful new commit on `main` at or after the repository's release-start
+marker receives exactly one SemVer tag and a source-only GitHub Release.
+Milestone 1 releases use `0.x` prerelease versions. The initial foundation
+commit predates the usable post-squash identity policy and remains an untagged
+bootstrap commit rather than bypassing the exact-head CI release gate.
 
 ## Version calculation
 
-- The first foundation squash commit is `v0.1.0`.
+- The first green squash commit containing the release-start marker is `v0.1.0`.
 - Before 1.0, `feat`, `!`, or a `BREAKING CHANGE:` footer increments the minor version.
 - `fix`, `perf`, `refactor`, `revert`, `docs`, `test`, `build`, `ci`, and `chore` increment patch.
 - Promotion to 1.0 is an explicit maintainer decision and is not performed by the automated pre-1.0 calculator.
@@ -21,6 +25,13 @@ history and publishes every untagged first-parent commit oldest-first. A
 descendant job may therefore safely run before its ancestor's job. It creates no
 version-bump commit, preventing release loops. Documentation-only and CI-only
 default-branch commits still receive patch releases.
+
+Source-branch commits must use GitHub noreply author and committer addresses.
+GitHub's squash operation may retain the account's public author address when
+an author override is unavailable. The default-branch audit accepts that narrow
+exception only when GitHub's commit API reports a valid signed commit created by
+the `web-flow` committer and the local committer uses GitHub's noreply address.
+The exception does not rewrite or hide author metadata.
 
 Runtime version strings are derived from the exact release tag when building a
 tagged commit. Untagged builds report a development SemVer containing the commit

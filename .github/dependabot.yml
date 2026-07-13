@@ -14,6 +14,11 @@ updates:
           - "*"
         update-types:
           - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
     commit-message:
       prefix: "build"
       include: scope
@@ -32,6 +37,34 @@ updates:
           - "*"
         update-types:
           - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+    commit-message:
+      prefix: "build"
+      include: scope
+
+  - package-ecosystem: gomod
+    directory: /operator
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:10"
+      timezone: Europe/London
+    open-pull-requests-limit: 5
+    groups:
+      patch-updates:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
     commit-message:
       prefix: "build"
       include: scope
@@ -50,6 +83,11 @@ updates:
           - "*"
         update-types:
           - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
     commit-message:
       prefix: "ci"
       include: scope

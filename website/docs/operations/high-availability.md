@@ -6,8 +6,12 @@ description: Replication, leases, fencing, promotion, restarts, and buffering.
 # High availability
 
 :::info Milestone 1 design contract
-The HA agent, lease integration, promotion and rolling-restart controller are not
-implemented in the foundation release; see [implementation status](../project/status.md).
+The Rust agent/orchestrator health surfaces and fail-closed in-memory fencing
+models exist. They bound authenticated lease lifetimes and atomically reject an
+operation unless its catalog epoch, fencing epoch and deadline match at
+execution. PostgreSQL observation, durable lease integration, promotion,
+recovery and rolling restarts are not implemented; see
+[implementation status](../project/status.md).
 :::
 
 The target default is one primary and two physical streaming replicas per shard,
@@ -17,7 +21,7 @@ a durability downgrade and must be surfaced as such.
 
 ## Primary fencing
 
-The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Poolers route writes only to the primary identity and term currently authorized by the lease.
+The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Both the orchestrator authority and receiving agent reject expired or overlong leases; configured TTL bounds are enforced by the state machines, not merely logged. Poolers route writes only to the primary identity and term currently authorized by the lease.
 
 Promotion requires a candidate whose WAL and prepared-transaction state prove that all acknowledged commits are present. If no candidate satisfies that condition, pgshard stops writes instead of risking split brain or acknowledged-data loss.
 

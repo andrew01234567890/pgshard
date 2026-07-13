@@ -1,0 +1,31 @@
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardCluster
+metadata:
+  name: example
+spec:
+  shards: 2
+  membersPerShard: 3
+  durability: Synchronous
+  postgresql:
+    version: "18"
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+  storage:
+    size: 20Gi
+  pooler:
+    scaling:
+      mode: HPA
+      hpa:
+        minReplicas: 2
+        maxReplicas: 10
+        targetCPUUtilizationPercentage: 65
+  backup:
+    repository:
+      type: Filesystem
+      filesystem:
+        persistentVolumeClaimName: example-backups

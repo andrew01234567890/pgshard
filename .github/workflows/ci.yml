@@ -141,6 +141,7 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -149,7 +150,9 @@ jobs:
             cargo run --locked -p pgshard-release -- audit --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
           elif [[ "$EVENT_NAME" == push && -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
             cargo run --locked -p pgshard-release -- validate
-            cargo run --locked -p pgshard-release -- audit --base "$PUSH_BEFORE_SHA" --head "$GITHUB_SHA"
+            cargo run --locked -p pgshard-release -- audit \
+              --base "$PUSH_BEFORE_SHA" --head "$GITHUB_SHA" \
+              --allow-github-squash-author
           else
             cargo run --locked -p pgshard-release -- validate
           fi
@@ -234,9 +237,11 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install pinned Buf
-        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        uses: bufbuild/buf-action@fd21066df7214747548607aaa45548ba2b9bc1ff # v1.4.0
         with:
           version: 1.71.0
+          setup_only: true
+          github_token: ${{ github.token }}
       - name: Validate protobuf contracts
         run: make proto-check
       - name: Reject protobuf breaking changes
@@ -255,9 +260,6 @@ jobs:
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: operator
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -266,19 +268,39 @@ jobs:
         with:
           go-version-file: operator/go.mod
           cache-dependency-path: operator/go.sum
-      - name: Check formatting
-        shell: bash
+      - name: Validate operator
+        run: make go-check
+
+  operator-kind:
+    name: Operator KIND deletion safety
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+      - name: Create disposable Kubernetes cluster
         run: |
-          set -euo pipefail
-          unformatted="$(gofmt -l .)"
-          if [[ -n "$unformatted" ]]; then
-            printf 'Unformatted Go files:\n%s\n' "$unformatted"
-            exit 1
-          fi
-      - name: Vet
-        run: go vet ./...
-      - name: Test
-        run: go test -race ./...
+          go install sigs.k8s.io/kind@v0.32.0
+          kind create cluster \
+            --name pgshard-operator \
+            --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
+            --wait 90s
+          test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"
+          kubectl apply --server-side --field-manager=pgshard-ci -f operator/config/crd/bases/pgshard.io_pgshardclusters.yaml
+      - name: Verify UID-safe delete and same-name recreate
+        working-directory: operator
+        env:
+          PGSHARD_KIND_E2E: "true"
+        run: go test -race -count=1 -run '^TestKINDDeletionWaitsForPVCBeforeSameNameRecreate$' ./internal/controller
+      - name: Delete disposable Kubernetes cluster
+        if: always()
+        run: kind delete cluster --name pgshard-operator
 
   website:
     name: Documentation website
@@ -443,6 +465,7 @@ jobs:
       - rust-test
       - protobuf
       - go-operator
+      - operator-kind
       - website
       - ui
       - integration
@@ -460,6 +483,7 @@ jobs:
             rust-test=${{ needs.rust-test.result }}
             protobuf=${{ needs.protobuf.result }}
             go-operator=${{ needs.go-operator.result }}
+            operator-kind=${{ needs.operator-kind.result }}
             website=${{ needs.website.result }}
             ui=${{ needs.ui.result }}
             integration=${{ needs.integration.result }}
