@@ -1,8 +1,8 @@
 # pgshard PostgreSQL wire framing
 
 This non-publishable crate implements bounded, zero-copy decoding for
-PostgreSQL 18 frontend frames. Its constants and length rules follow the
-`REL_18_STABLE` PostgreSQL server source.
+PostgreSQL 18 frontend frames and selected query-protocol bodies. Its constants
+and layouts follow the `REL_18_STABLE` PostgreSQL server source.
 
 The decoder recognizes startup protocol versions, SSL and GSS negotiation,
 variable-length PostgreSQL 18 cancellation keys, and every frontend message tag
@@ -38,5 +38,11 @@ Debug output reports only frame metadata and lengths. It never renders startup
 values, cancellation authentication keys, SQL, authentication data, or other
 frontend bodies.
 
+Query-protocol C-strings require the validated UTF-8 session proof, are checked
+as UTF-8, and are exposed as `&str`. Parameter value bytes remain opaque until
+their declared PostgreSQL types and text/binary formats are resolved.
+
 `cargo bench -p pgshard-pgwire --bench decode_frontend` measures framing alone.
-It is not a substitute for the planned end-to-end pooler/PgBouncer comparison.
+`cargo bench -p pgshard-pgwire --bench decode_bind` measures framing plus a
+four-parameter extended-query bind. Neither is a substitute for the planned
+end-to-end pooler/PgBouncer comparison.
