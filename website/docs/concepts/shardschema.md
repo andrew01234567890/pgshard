@@ -67,8 +67,10 @@ range end.
    stale, and malformed hints need not trigger a read, while a burst retains
    only its latest valid epoch.
 7. The driver polls every bounded 1 to 300 seconds. Each subscription/initial
-   load and refresh has a bounded 100-millisecond-to-five-minute deadline.
-   A deadline closes that session without replacing the last validated cache;
+   load and refresh has a bounded 100-millisecond-to-five-minute deadline that
+   covers SQL, validation, and cache publication. Deadline-first selection and
+   a timed cache write lock reject publication after expiry. A deadline closes
+   that session without replacing the last validated cache;
    a slightly later PostgreSQL 18 `transaction_timeout` interrupts server-side
    lock waits and guarantees rollback. Connection loss is also terminal to that
    driver instance.

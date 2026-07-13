@@ -33,7 +33,9 @@ transactionally consistent read. `run_catalog_refresh` drives that connection,
 coalesces notification bursts through one latest-wins wakeup slot, ignores
 invalid hints, and performs authoritative repeatable-read polling every 1 to
 300 seconds. Each committed subscription/initial load and each later refresh
-has a validated 100-millisecond-to-five-minute client deadline. A deadline
+has a validated 100-millisecond-to-five-minute client deadline covering SQL,
+validation, and cache publication. Deadline-first selection and a timed cache
+write lock prevent a result from being published after expiry. A deadline
 closes the dedicated session, leaves the last validated snapshot unchanged, and
 is terminal to that driver instance. A slightly later PostgreSQL 18
 `transaction_timeout` also interrupts server-side lock waits and rolls back if

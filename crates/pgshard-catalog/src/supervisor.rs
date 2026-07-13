@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use pgshard_types::CatalogEpoch;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::{Instant as TokioInstant, sleep_until};
 use tokio_postgres::{Client, Connection};
 
 use crate::driver::run_catalog_refresh_observed;
@@ -645,18 +646,28 @@ impl CatalogSupervisor {
 
         loop {
             self.status.mark_connecting(Instant::now());
-            let connect_attempt = tokio::time::timeout(self.config.connect_timeout, connect());
-            tokio::pin!(connect_attempt);
-            let connected = tokio::select! {
-                biased;
-                () = shutdown.as_mut() => break,
-                result = connect_attempt.as_mut() => result,
+            let connected = {
+                let deadline = TokioInstant::now() + self.config.connect_timeout;
+                let connect_attempt = connect();
+                tokio::pin!(connect_attempt);
+                let deadline_timer = sleep_until(deadline);
+                tokio::pin!(deadline_timer);
+                tokio::select! {
+                    biased;
+                    () = shutdown.as_mut() => None,
+                    () = deadline_timer.as_mut() => {
+                        Some(Err(CatalogFailureKind::ConnectTimeout))
+                    }
+                    result = connect_attempt.as_mut() => {
+                        if TokioInstant::now() >= deadline {
+                            Some(Err(CatalogFailureKind::ConnectTimeout))
+                        } else {
+                            Some(result.map_err(|_| CatalogFailureKind::Connect))
+                        }
+                    }
+                }
             };
-            let connected = match connected {
-                Ok(Ok(connection)) => Ok(connection),
-                Ok(Err(_)) => Err(CatalogFailureKind::Connect),
-                Err(_) => Err(CatalogFailureKind::ConnectTimeout),
-            };
+            let Some(connected) = connected else { break };
             let (client, connection) = match connected {
                 Ok(connection) => connection,
                 Err(failure_kind) => {
@@ -969,6 +980,63 @@ mod tests {
         assert!(!timed_out.ready());
         assert!(timed_out.total_failures() >= 1);
         assert_eq!(timed_out.successful_connections(), 0);
+
+        task.abort();
+        let cancellation = task
+            .await
+            .expect_err("aborted supervisor task must not complete normally");
+        assert!(cancellation.is_cancelled());
+        assert_eq!(status.snapshot().phase(), CatalogConnectionPhase::Stopped);
+    }
+
+    #[tokio::test]
+    async fn timed_out_connector_is_dropped_before_reconnect_backoff() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let config = CatalogSupervisorConfig::new(
+            CatalogPollInterval::new(Duration::from_secs(1)).expect("poll interval"),
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .expect("supervisor config")
+        .with_timeouts(
+            MIN_CATALOG_CONNECT_TIMEOUT,
+            CatalogOperationTimeout::default(),
+        )
+        .expect("timeout policy");
+        let supervisor = CatalogSupervisor::new(Arc::new(CatalogCache::new()), config);
+        let status = supervisor.status();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let mut dropped_sender = Some(dropped_sender);
+        let task = tokio::spawn(supervisor.run(
+            move || {
+                let drop_signal = DropSignal(dropped_sender.take());
+                async move {
+                    let _drop_signal = drop_signal;
+                    std::future::pending::<()>().await;
+                    tokio_postgres::connect("postgresql://unused", tokio_postgres::NoTls).await
+                }
+            },
+            std::future::pending(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .expect("timed-out connector dropped before multi-second backoff")
+            .expect("connector retained its drop signal");
+        assert_eq!(
+            status.snapshot().last_failure(),
+            Some(CatalogFailureKind::ConnectTimeout)
+        );
 
         task.abort();
         let cancellation = task

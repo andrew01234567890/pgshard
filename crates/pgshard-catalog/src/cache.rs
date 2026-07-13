@@ -1,11 +1,12 @@
 //! Monotonic, lock-free catalog snapshot publication.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use arc_swap::ArcSwap;
 use pgshard_types::CatalogEpoch;
 use thiserror::Error;
+use tokio::time::Instant;
 
 use crate::{CatalogSnapshot, ClusterId, DatabaseId, RoutingHashConfig, SnapshotError};
 
@@ -14,6 +15,12 @@ struct CacheState {
     current: Option<Arc<CatalogSnapshot>>,
     snapshots: BTreeMap<u64, Arc<CatalogSnapshot>>,
     minimum_epoch: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum InstallBeforeError {
+    Cache(CacheError),
+    DeadlineElapsed,
 }
 
 /// Process-local cache of immutable, checksummed catalog snapshots.
@@ -136,36 +143,90 @@ impl CatalogCache {
     pub fn install(&self, candidate: CatalogSnapshot) -> Result<InstallOutcome, CacheError> {
         candidate.verify_checksum()?;
         let candidate = Arc::new(candidate);
-        let _guard = self
+        let guard = self
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.install_locked(candidate, guard, None) {
+            Ok(outcome) => Ok(outcome),
+            Err(InstallBeforeError::Cache(error)) => Err(error),
+            Err(InstallBeforeError::DeadlineElapsed) => {
+                unreachable!("an untimed cache install has no deadline")
+            }
+        }
+    }
+
+    pub(crate) async fn install_before(
+        &self,
+        candidate: CatalogSnapshot,
+        deadline: Instant,
+    ) -> Result<InstallOutcome, InstallBeforeError> {
+        let verification = candidate.verify_checksum();
+        ensure_install_deadline(Some(deadline))?;
+        verification.map_err(|error| InstallBeforeError::Cache(CacheError::Snapshot(error)))?;
+        let candidate = Arc::new(candidate);
+        let guard = self.write_lock_before(deadline).await?;
+        self.install_locked(candidate, guard, Some(deadline))
+    }
+
+    async fn write_lock_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<MutexGuard<'_, ()>, InstallBeforeError> {
+        loop {
+            ensure_install_deadline(Some(deadline))?;
+            match self.write_lock.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(TryLockError::WouldBlock) => {}
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn install_locked(
+        &self,
+        candidate: Arc<CatalogSnapshot>,
+        _guard: MutexGuard<'_, ()>,
+        deadline: Option<Instant>,
+    ) -> Result<InstallOutcome, InstallBeforeError> {
+        ensure_install_deadline(deadline)?;
         let state = self.state.load_full();
         let epoch = candidate.catalog_epoch().0;
         if epoch < state.minimum_epoch {
-            return Err(CacheError::BelowFence {
-                candidate: epoch,
-                minimum: state.minimum_epoch,
-            });
+            return reject_install(
+                deadline,
+                CacheError::BelowFence {
+                    candidate: epoch,
+                    minimum: state.minimum_epoch,
+                },
+            );
         }
 
         if let Some(current) = &state.current {
-            validate_successor(current, &candidate)?;
+            if let Err(error) = validate_successor(current, &candidate) {
+                return reject_install(deadline, error);
+            }
             let current_epoch = current.catalog_epoch().0;
             if epoch == current_epoch {
                 if candidate.checksum() == current.checksum() {
+                    ensure_install_deadline(deadline)?;
                     return Ok(InstallOutcome::AlreadyCurrent);
                 }
-                return Err(CacheError::EpochCollision {
-                    epoch,
-                    current_checksum: current.checksum(),
-                    candidate_checksum: candidate.checksum(),
-                });
+                return reject_install(
+                    deadline,
+                    CacheError::EpochCollision {
+                        epoch,
+                        current_checksum: current.checksum(),
+                        candidate_checksum: candidate.checksum(),
+                    },
+                );
             }
         }
 
         let mut snapshots = state.snapshots.clone();
         snapshots.insert(epoch, Arc::clone(&candidate));
+        ensure_install_deadline(deadline)?;
         self.state.store(Arc::new(CacheState {
             current: Some(candidate),
             snapshots,
@@ -222,6 +283,21 @@ impl CatalogCache {
             _ => RefreshDecision::Refresh,
         }
     }
+}
+
+fn ensure_install_deadline(deadline: Option<Instant>) -> Result<(), InstallBeforeError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(InstallBeforeError::DeadlineElapsed);
+    }
+    Ok(())
+}
+
+fn reject_install<T>(
+    deadline: Option<Instant>,
+    error: CacheError,
+) -> Result<T, InstallBeforeError> {
+    ensure_install_deadline(deadline)?;
+    Err(InstallBeforeError::Cache(error))
 }
 
 fn validate_successor(
@@ -559,6 +635,44 @@ mod tests {
             cache.install(snapshot(1, 1, 1)),
             Err(CacheError::EpochRegression { .. })
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_install_never_publishes_after_lock_deadline() {
+        let cache = Arc::new(CatalogCache::new());
+        cache.install(snapshot(1, 1, 1)).expect("initial install");
+        let lock_cache = Arc::clone(&cache);
+        let (locked_sender, locked_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _guard = lock_cache
+                .write_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locked_sender.send(()).expect("report held cache lock");
+            let _ = release_receiver.recv();
+        });
+        locked_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("cache lock held within one second");
+
+        let result = cache
+            .install_before(
+                snapshot(1, 2, 2),
+                Instant::now() + std::time::Duration::from_millis(50),
+            )
+            .await;
+        assert!(matches!(result, Err(InstallBeforeError::DeadlineElapsed)));
+        assert_eq!(
+            cache
+                .current_for_planning()
+                .expect("last validated snapshot")
+                .catalog_epoch(),
+            CatalogEpoch(1)
+        );
+
+        release_sender.send(()).expect("release cache lock");
+        holder.join().expect("cache lock holder");
     }
 
     #[test]

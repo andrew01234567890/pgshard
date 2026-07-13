@@ -6,6 +6,7 @@ use tokio::time::Instant;
 use tokio_postgres::{Client, IsolationLevel, Row, Transaction};
 use uuid::Uuid;
 
+use crate::cache::InstallBeforeError;
 use crate::{
     CatalogCache, CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId,
     IdentifierError, InstallOutcome, NOTIFY_CHANNEL, RegisteredTable, RoutingHashConfig,
@@ -190,7 +191,11 @@ impl CatalogReader {
         deadline: Instant,
     ) -> Result<InstallOutcome, LoadError> {
         let snapshot = self.load_snapshot_inner(Some(deadline)).await?;
-        cache.install(snapshot).map_err(LoadError::Cache)
+        match cache.install_before(snapshot, deadline).await {
+            Ok(outcome) => Ok(outcome),
+            Err(InstallBeforeError::Cache(error)) => Err(LoadError::Cache(error)),
+            Err(InstallBeforeError::DeadlineElapsed) => Err(LoadError::DeadlineElapsed),
+        }
     }
 }
 
@@ -409,6 +414,9 @@ pub enum LoadError {
     /// `PostgreSQL` query, transaction, or `LISTEN` failure.
     #[error(transparent)]
     Postgres(#[from] tokio_postgres::Error),
+    /// The configured operation deadline elapsed before cache publication.
+    #[error("catalog operation deadline elapsed before snapshot publication")]
+    DeadlineElapsed,
     /// A required singleton configuration/state row is absent.
     #[error("shardschema singleton configuration or state row is missing")]
     MissingSingleton,
@@ -454,6 +462,18 @@ pub enum LoadError {
     /// The valid snapshot cannot be monotonically published.
     #[error(transparent)]
     Cache(#[from] crate::CacheError),
+}
+
+impl LoadError {
+    pub(crate) fn is_operation_timeout(&self) -> bool {
+        match self {
+            Self::DeadlineElapsed => true,
+            Self::Postgres(error) => error
+                .code()
+                .is_some_and(|sqlstate| sqlstate.code() == "25P04"),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]

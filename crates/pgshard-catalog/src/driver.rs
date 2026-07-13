@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::{Instant, MissedTickBehavior, sleep_until};
 use tokio_postgres::{AsyncMessage, Client, Connection};
 
 use crate::{
@@ -218,23 +218,33 @@ where
     tokio::pin!(shutdown);
     let subscription = {
         let deadline = Instant::now() + operation_timeout.get();
-        let subscription = tokio::time::timeout_at(
-            deadline,
-            CatalogReader::subscribe_before(client, &cache, deadline),
-        );
+        let subscription = CatalogReader::subscribe_before(client, &cache, deadline);
         tokio::pin!(subscription);
+        let deadline_timer = sleep_until(deadline);
+        tokio::pin!(deadline_timer);
         tokio::select! {
             biased;
             () = shutdown.as_mut() => return stop_connection(connection_task).await,
-            result = subscription.as_mut() => result,
+            () = deadline_timer.as_mut() => TimedOperation::Elapsed,
+            result = subscription.as_mut() => {
+                if Instant::now() >= deadline
+                    || result
+                        .as_ref()
+                        .is_err_and(LoadError::is_operation_timeout)
+                {
+                    TimedOperation::Elapsed
+                } else {
+                    TimedOperation::Completed(result)
+                }
+            }
         }
     };
     let (reader, _) = match subscription {
-        Ok(Ok(reader)) => reader,
-        Ok(Err(source)) => {
+        TimedOperation::Completed(Ok(reader)) => reader,
+        TimedOperation::Completed(Err(source)) => {
             return Err(cleanup_after_load_error(connection_task, source).await);
         }
-        Err(_) => {
+        TimedOperation::Elapsed => {
             return Err(cleanup_after_driver_error(
                 connection_task,
                 CatalogRefreshError::OperationTimeout {
@@ -336,6 +346,11 @@ enum RefreshLoopExit {
     ConnectionClosed,
 }
 
+enum TimedOperation<T> {
+    Completed(T),
+    Elapsed,
+}
+
 enum RefreshLoopError {
     Load(LoadError),
     OperationTimeout,
@@ -382,19 +397,24 @@ where
             continue;
         }
         let deadline = Instant::now() + operation_timeout.get();
-        let refresh = tokio::time::timeout_at(deadline, reader.refresh_before(cache, deadline));
+        let refresh = reader.refresh_before(cache, deadline);
         tokio::pin!(refresh);
+        let deadline_timer = sleep_until(deadline);
+        tokio::pin!(deadline_timer);
         tokio::select! {
             biased;
             () = shutdown.as_mut() => return Ok(RefreshLoopExit::Shutdown),
+            () = deadline_timer.as_mut() => return Err(RefreshLoopError::OperationTimeout),
             result = refresh.as_mut() => {
-                match result {
-                    Ok(result) => {
-                        result?;
-                        refreshed();
-                    }
-                    Err(_) => return Err(RefreshLoopError::OperationTimeout),
+                if Instant::now() >= deadline
+                    || result
+                        .as_ref()
+                        .is_err_and(LoadError::is_operation_timeout)
+                {
+                    return Err(RefreshLoopError::OperationTimeout);
                 }
+                result?;
+                refreshed();
             }
         }
     }

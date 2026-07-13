@@ -6,7 +6,7 @@
 use std::error::Error;
 use std::future::{pending, poll_fn};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +44,35 @@ struct CatalogDriver {
     cache: Arc<CatalogCache>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     task: JoinHandle<Result<(), CatalogRefreshError>>,
+}
+
+struct ReconnectGate {
+    enabled: AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl ReconnectGate {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        if !self.enabled.load(Ordering::SeqCst) {
+            self.wake.notified().await;
+        }
+    }
+
+    fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    fn disable(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+    }
 }
 
 impl CatalogDriver {
@@ -935,6 +964,64 @@ async fn assert_operation_timeout_aborts_blocked_refresh(
     Ok(())
 }
 
+async fn assert_operation_timeout_aborts_blocked_initial_load(
+    client: &mut Client,
+    database_url: &str,
+) -> TestResult {
+    let (observer, observer_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let observer_task = tokio::spawn(observer_connection);
+    let application_name = format!(
+        "pgshard_initial_timeout_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let mut driver_config: tokio_postgres::Config = database_url.parse()?;
+    driver_config.application_name(&application_name);
+    let (driver_client, driver_connection) = driver_config.connect(NoTls).await?;
+    let cache = Arc::new(CatalogCache::new());
+    let driver_cache = Arc::clone(&cache);
+    let operation_timeout = CatalogOperationTimeout::new(Duration::from_secs(1))?;
+    let blocker = client.transaction().await?;
+    blocker
+        .batch_execute("LOCK TABLE pgshard_catalog.cluster_configuration IN ACCESS EXCLUSIVE MODE")
+        .await?;
+    let driver_task = tokio::spawn(run_catalog_refresh(
+        driver_client,
+        driver_connection,
+        driver_cache,
+        CatalogPollInterval::new(Duration::from_secs(30))?,
+        operation_timeout,
+        pending(),
+    ));
+    let driver_pid = wait_for_application_backend(&observer, &application_name)
+        .await?
+        .ok_or("catalog driver backend did not connect within two seconds")?;
+    if !wait_for_backend_lock(&observer, driver_pid).await? {
+        return Err("catalog driver initial load did not block on the fixture lock".into());
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(5), driver_task).await??;
+    let error = result.expect_err("blocked catalog initial load must exceed its deadline");
+    assert!(matches!(
+        error,
+        CatalogRefreshError::OperationTimeout {
+            operation: CatalogOperation::InitialLoad,
+            timeout,
+        } if timeout == operation_timeout.get()
+    ));
+    assert!(
+        cache.current_for_planning().is_err(),
+        "timed-out initial load published a catalog snapshot"
+    );
+    assert!(
+        wait_for_backend_exit(&observer, driver_pid).await?,
+        "catalog backend survived its initial-load timeout"
+    );
+    blocker.rollback().await?;
+
+    observer_task.abort();
+    Ok(())
+}
+
 async fn assert_catalog_driver_connection_loss(
     client: &Client,
     database_url: &str,
@@ -1055,7 +1142,7 @@ async fn assert_catalog_supervisor_reconnects_with_bounded_grace(
     let supervisor = CatalogSupervisor::new(cache, config);
     let status = supervisor.status();
     let attempts = Arc::new(AtomicUsize::new(0));
-    let reconnect_gate = Arc::new(tokio::sync::Notify::new());
+    let reconnect_gate = Arc::new(ReconnectGate::new());
     let connector_attempts = Arc::clone(&attempts);
     let connector_gate = Arc::clone(&reconnect_gate);
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
@@ -1070,7 +1157,7 @@ async fn assert_catalog_supervisor_reconnects_with_bounded_grace(
             };
             async move {
                 if attempt > 1 {
-                    reconnect_gate.notified().await;
+                    reconnect_gate.wait().await;
                 }
                 connection_config.connect(NoTls).await
             }
@@ -1098,7 +1185,7 @@ async fn assert_catalog_supervisor_lifecycle(
     application_name: &str,
     expected_epoch: i64,
     status: &CatalogSupervisorStatus,
-    reconnect_gate: &tokio::sync::Notify,
+    reconnect_gate: &ReconnectGate,
     shutdown_sender: tokio::sync::oneshot::Sender<()>,
     task: JoinHandle<()>,
 ) -> TestResult {
@@ -1146,7 +1233,7 @@ async fn assert_catalog_supervisor_lifecycle(
         "stale cache age did not reach its configured deadline"
     );
 
-    reconnect_gate.notify_one();
+    reconnect_gate.enable();
     let recovered = wait_for_supervisor_status(status, "recovered", |snapshot| {
         snapshot.ready()
             && snapshot.phase() == CatalogConnectionPhase::Connected
@@ -1156,6 +1243,7 @@ async fn assert_catalog_supervisor_lifecycle(
     assert_eq!(recovered.consecutive_failures(), 0);
     assert_eq!(recovered.last_failure(), None);
 
+    reconnect_gate.disable();
     terminate_catalog_backend(client, application_name).await?;
     wait_for_supervisor_status(status, "blocked in a second reconnect", |snapshot| {
         snapshot.connect_attempts() >= 4 && snapshot.phase() == CatalogConnectionPhase::Connecting
@@ -1549,6 +1637,7 @@ async fn migration_and_activation_contract() -> TestResult {
 
     assert_installation_contract(&client).await?;
     assert_shutdown_interrupts_initial_load(&mut client, &database_url).await?;
+    assert_operation_timeout_aborts_blocked_initial_load(&mut client, &database_url).await?;
     assert_operation_timeout_aborts_blocked_refresh(&mut client, &database_url).await?;
     assert_initial_catalog_reader_contract(&client, &database_url).await?;
     assert_catalog_reader_rejects_existing_transaction(&client, &database_url).await?;

@@ -19,9 +19,10 @@ the lock-free cache before its deliberately long polling deadline, ignores a
 malformed hint, and separately recovers a trigger-bypassed epoch through
 polling. It also interrupts a lock-blocked initial load, shuts down cleanly, and
 proves the unsupervised driver treats forced connection loss as terminal. A
-separate refresh is blocked behind a real table lock until its operation
-deadline, then proves the driver returns the safe timeout class, preserves the
-previous snapshot, and closes its PostgreSQL backend. The supervisor scenario
+second blocked initial load and a later refresh each reach their operation
+deadline and prove exact phase classification, unchanged cache state, and
+backend exit. Unit coverage separately holds the cache publication lock through
+expiry and proves no late snapshot is installed. The supervisor scenario
 then kills its live backend, deliberately blocks the next connection attempt,
 observes repeated bounded connection timeouts, verifies readiness survives only
 inside the configured stale-cache grace, observes readiness expire at the exact
