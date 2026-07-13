@@ -1,4 +1,4 @@
-//! Bounded zero-copy decoding of `PostgreSQL` 18 frontend and backend frames.
+//! Bounded `PostgreSQL` 18 wire decoding and fixed-size replication feedback encoding.
 //!
 //! Framing is deliberately separate from session state. This crate recognizes
 //! byte-level messages; a pooler must still reject messages that are invalid in
@@ -37,7 +37,8 @@ pub use pgoutput::{
     PgOutputRelationColumn, PgOutputRelationColumnIter, PgOutputRelationIdIter,
     PgOutputReplicaIdentity, PgOutputRollbackPrepared, PgOutputStreamAbort, PgOutputStreaming,
     PgOutputTruncate, PgOutputTuple, PgOutputTupleColumn, PgOutputTupleColumnIter, PgOutputType,
-    PgOutputUpdate, PgOutputVersion, PrimaryKeepalive, ReplicationCopyData, XLogData,
+    PgOutputUpdate, PgOutputVersion, PrimaryKeepalive, ReplicationCopyData,
+    STANDBY_STATUS_UPDATE_FRAME_LENGTH, StandbyStatusUpdate, StandbyStatusUpdateError, XLogData,
     decode_pgoutput_control, decode_replication_copy_data,
 };
 

@@ -1,9 +1,9 @@
 # pgshard PostgreSQL wire framing
 
 This non-publishable crate implements bounded, zero-copy decoding for
-PostgreSQL 18 frontend and backend frames and selected query-protocol bodies.
-Its constants, tags, and layouts follow the `REL_18_STABLE` PostgreSQL server
-source.
+PostgreSQL 18 frontend and backend frames and selected query-protocol bodies,
+plus fixed-size replication-feedback encoding. Its constants, tags, and layouts
+follow the `REL_18_STABLE` PostgreSQL server source.
 
 The decoder recognizes startup protocol versions, SSL and GSS negotiation,
 one-to-256-byte PostgreSQL 18 `CancelRequest` keys, and every frontend message
@@ -72,9 +72,18 @@ The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH
 loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is
 separate from COPY IN because CopyFail, Flush, and Sync are not valid standby
 messages. Backend replication `CopyData` now decodes exact zero-copy XLogData
-and primary-keepalive envelopes. A configuration token validates `pgoutput`
-protocol versions one through four plus streaming, custom-message, and
-two-phase feature gates;
+and primary-keepalive envelopes. A fixed 39-byte frontend encoder emits
+PostgreSQL 18 Standby Status Updates without allocation after validating
+`flush_lsn <= write_lsn` and `apply_lsn <= write_lsn`. Apply may be ahead of
+flush, matching PostgreSQL's logical worker while local commits are written but
+not yet durable. The feedback owner must still enforce monotonic progress
+between samples and choose positions that correspond to persisted checkpoints.
+The live PostgreSQL 18 fixture sends this production frame in COPY-BOTH mode,
+drains the initial catch-up keepalive, observes three distinct positions through
+`pg_stat_replication`, receives a subsequent requested keepalive, and completes
+the replication exchange cleanly.
+A configuration token validates `pgoutput` protocol versions one through four
+plus streaming, custom-message, and two-phase feature gates;
 the control decoder covers buffered Begin/Commit/Origin, streamed transaction
 start/stop/commit/abort, and every two-phase control including Stream Prepare.
 It requires authoritative `server_encoding=UTF8` and `client_encoding=UTF8`
@@ -94,8 +103,9 @@ values distinguish null, unchanged-toast, UTF-8 text, and opaque binary without
 copying or rendering values in debug output. Custom Message prefixes require
 the connection UTF-8 proof; their binary contents remain borrowed and are
 represented only by length in debug output.
-Complete transaction ordering, relation cache semantics, WAL feedback, durable
-checkpoints, cross-shard merge, and the VStream-like service remain later work.
+Complete transaction ordering, relation cache semantics, feedback scheduling
+and cross-sample monotonicity, durable checkpoints, cross-shard merge, and the
+VStream-like service remain later work.
 
 The future replication session must bind that token to the exact accepted
 `START_REPLICATION` command and the selected slot's authoritative persistent
