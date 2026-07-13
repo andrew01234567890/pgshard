@@ -922,7 +922,7 @@ impl PgOutputDecoder {
     /// # Errors
     ///
     /// Returns the message-local errors from [`decode_pgoutput_control`] plus
-    /// invalid stream nesting, an unmatched stop, a mismatched streamed XID,
+    /// invalid stream nesting, an unmatched stop, a zero streamed-message XID,
     /// or another control inside an active stream segment.
     pub fn decode<'input>(
         &mut self,
@@ -935,8 +935,9 @@ impl PgOutputDecoder {
             return Err(PgOutputError::Truncated("pgoutput message tag"));
         };
         match tag {
-            b'R' => decode_relation(body, self.active_stream_xid).map(PgOutputMessage::Relation),
-            b'Y' => decode_type(body, self.active_stream_xid).map(PgOutputMessage::Type),
+            b'R' => decode_relation(body, self.active_stream_xid.is_some())
+                .map(PgOutputMessage::Relation),
+            b'Y' => decode_type(body, self.active_stream_xid.is_some()).map(PgOutputMessage::Type),
             _ => {
                 let message = decode_pgoutput_control(input, self.configuration, self.encoding)?;
                 let next_stream_xid = self.validate_control_transition(&message)?;
@@ -1106,10 +1107,10 @@ pub fn decode_pgoutput_control(
 
 fn decode_relation(
     body: &[u8],
-    expected_stream_xid: Option<u32>,
+    in_stream_segment: bool,
 ) -> Result<PgOutputRelation<'_>, PgOutputError> {
     let mut cursor = Cursor::new(body);
-    let stream_xid = decode_stream_xid(&mut cursor, expected_stream_xid)?;
+    let stream_xid = decode_stream_xid(&mut cursor, in_stream_segment)?;
     let relation_id = cursor.u32("relation ID")?;
     let namespace = cursor.cstring_utf8("relation namespace")?;
     let name = cursor.cstring_utf8("relation name")?;
@@ -1132,12 +1133,9 @@ fn decode_relation(
     })
 }
 
-fn decode_type(
-    body: &[u8],
-    expected_stream_xid: Option<u32>,
-) -> Result<PgOutputType<'_>, PgOutputError> {
+fn decode_type(body: &[u8], in_stream_segment: bool) -> Result<PgOutputType<'_>, PgOutputError> {
     let mut cursor = Cursor::new(body);
-    let stream_xid = decode_stream_xid(&mut cursor, expected_stream_xid)?;
+    let stream_xid = decode_stream_xid(&mut cursor, in_stream_segment)?;
     let value = PgOutputType {
         stream_xid,
         type_oid: cursor.u32("type OID")?,
@@ -1150,17 +1148,18 @@ fn decode_type(
 
 fn decode_stream_xid(
     cursor: &mut Cursor<'_>,
-    expected_stream_xid: Option<u32>,
+    in_stream_segment: bool,
 ) -> Result<Option<u32>, PgOutputError> {
-    let Some(expected) = expected_stream_xid else {
+    if !in_stream_segment {
         return Ok(None);
-    };
-    let received = cursor.u32("stream transaction ID")?;
-    if received == expected {
-        Ok(Some(received))
-    } else {
-        Err(PgOutputError::StreamXidMismatch { expected, received })
     }
+    let received = cursor.u32("stream transaction ID")?;
+    if received == 0 {
+        return Err(PgOutputError::InvalidTransactionId(
+            "streamed message transaction ID",
+        ));
+    }
+    Ok(Some(received))
 }
 
 fn decode_relation_column<'a>(
@@ -1430,14 +1429,6 @@ pub enum PgOutputError {
     /// A control other than Origin or Stream Stop appeared inside a segment.
     #[error("pgoutput control tag {0} arrived inside an active stream segment")]
     ControlInsideStream(u8),
-    /// A schema message's XID did not identify the active stream segment.
-    #[error("pgoutput stream XID {received} does not match active XID {expected}")]
-    StreamXidMismatch {
-        /// Active Stream Start XID.
-        expected: u32,
-        /// XID carried by the schema message.
-        received: u32,
-    },
     /// The replication input ended before Stream Stop closed a segment.
     #[error("pgoutput stream segment for XID {0} did not stop")]
     UnterminatedStreamSegment(u32),
@@ -2036,31 +2027,30 @@ mod tests {
         ));
         assert_eq!(decoder.active_stream_xid(), Some(7));
 
-        let streamed = relation(Some(7), b"public", b"streamed_table", b'd', &[]);
+        let streamed = relation(Some(8), b"public", b"streamed_table", b'd', &[]);
         let PgOutputMessage::Relation(streamed_relation) =
             decoder.decode(&streamed).expect("streamed Relation")
         else {
             panic!("wrong streamed schema variant");
         };
-        assert_eq!(streamed_relation.stream_xid(), Some(7));
+        assert_eq!(streamed_relation.stream_xid(), Some(8));
         assert_eq!(streamed_relation.namespace(), "public");
         assert_eq!(streamed_relation.column_count(), 0);
 
-        let streamed_type = type_message(Some(7), 3_001, b"custom", b"streamed_type");
+        let streamed_type = type_message(Some(9), 3_001, b"custom", b"streamed_type");
         let PgOutputMessage::Type(pg_type) = decoder.decode(&streamed_type).expect("streamed Type")
         else {
             panic!("wrong streamed Type variant");
         };
-        assert_eq!(pg_type.stream_xid(), Some(7));
+        assert_eq!(pg_type.stream_xid(), Some(9));
         assert_eq!(pg_type.namespace(), "custom");
 
-        let mismatched = type_message(Some(8), 3_002, b"custom", b"wrong_xid");
+        let invalid_xid = type_message(Some(0), 3_002, b"custom", b"invalid_xid");
         assert_eq!(
-            decoder.decode(&mismatched),
-            Err(PgOutputError::StreamXidMismatch {
-                expected: 7,
-                received: 8,
-            })
+            decoder.decode(&invalid_xid),
+            Err(PgOutputError::InvalidTransactionId(
+                "streamed message transaction ID"
+            ))
         );
         assert_eq!(decoder.active_stream_xid(), Some(7));
 

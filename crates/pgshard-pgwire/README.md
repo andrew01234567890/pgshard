@@ -81,8 +81,10 @@ proofs from the same connection, bounds prepared-transaction identifiers, and
 redacts origins, GIDs, names, and logical payloads from debug output. A
 stateful wrapper derives whether the otherwise-ambiguous XID prefix is present
 from validated Stream Start/Stop controls and decodes Relation and Type schema
-messages. Relation columns are prevalidated once and exposed through a borrowed
-exact-size iterator. Row, truncate, and logical-message bodies remain rejected.
+messages. A Stream Start names the top-level transaction, while each schema
+prefix may name a different nonzero subtransaction; the decoder exposes both
+without equating them. Relation columns are prevalidated once and exposed
+through a borrowed exact-size iterator. Row, truncate, and logical-message bodies remain rejected.
 Complete transaction ordering, relation cache semantics, WAL feedback, durable
 checkpoints, cross-shard merge, and the VStream-like service remain later work.
 
