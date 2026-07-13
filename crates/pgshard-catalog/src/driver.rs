@@ -238,10 +238,8 @@ async fn cleanup_after_load_error(
 ) -> CatalogRefreshError {
     let connection_task = connection_task.into_handle();
     connection_task.abort();
-    match connection_task.await {
-        Err(source) if source.is_panic() => CatalogRefreshError::ConnectionTask(source),
-        _ => CatalogRefreshError::Load(load),
-    }
+    let _ = connection_task.await;
+    CatalogRefreshError::Load(load)
 }
 
 async fn stop_connection(connection_task: ConnectionTask) -> Result<(), CatalogRefreshError> {
@@ -319,6 +317,22 @@ mod tests {
     #[tokio::test]
     async fn load_error_precedes_clean_connection_exit() {
         let handle = tokio::spawn(async { Ok::<(), tokio_postgres::Error>(()) });
+        tokio::task::yield_now().await;
+        assert!(handle.is_finished(), "connection task did not finish");
+
+        let error =
+            cleanup_after_load_error(ConnectionTask::new(handle), LoadError::MissingSingleton)
+                .await;
+        assert!(matches!(
+            error,
+            CatalogRefreshError::Load(LoadError::MissingSingleton)
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_error_precedes_connection_task_panic() {
+        let handle: JoinHandle<Result<(), tokio_postgres::Error>> =
+            tokio::spawn(async { panic!("connection task test panic") });
         tokio::task::yield_now().await;
         assert!(handle.is_finished(), "connection task did not finish");
 
