@@ -69,7 +69,9 @@ and must run in a pre-created UTF8 database named exactly `shardschema`. It
 creates NOLOGIN reader/admin group roles, revokes public access and exposes
 activation through a dual compare-and-swap over the global catalog epoch and
 the prior active routing epoch. Activated routes and identity history are
-immutable.
+immutable. Every staged range mutation also versions its parent routing epoch,
+so an activation using an older `REPEATABLE READ` snapshot fails with a
+serialization error rather than publishing stale or incomplete coverage.
 
 ## Stable catalog host
 

@@ -144,6 +144,8 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.routing_epochs (
     routing_epoch bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     logical_database_id uuid NOT NULL
         REFERENCES pgshard_catalog.logical_databases(logical_database_id) ON DELETE RESTRICT,
+    range_revision bigint NOT NULL DEFAULT 0
+        CHECK (range_revision >= 0 AND range_revision < 9223372036854775807),
     state text NOT NULL DEFAULT 'staged'
         CHECK (state IN ('staged', 'active', 'superseded')),
     created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
@@ -269,8 +271,22 @@ BEGIN
            OR NEW.logical_database_id <> OLD.logical_database_id
            OR NEW.created_at <> OLD.created_at
            OR NEW.state NOT IN ('staged', 'active')
-           OR (NEW.state = 'staged' AND (NEW.activated_at IS NOT NULL OR NEW.superseded_at IS NOT NULL))
-           OR (NEW.state = 'active' AND (NEW.activated_at IS NULL OR NEW.superseded_at IS NOT NULL)) THEN
+           OR (
+               NEW.state = 'staged'
+               AND (
+                   NEW.activated_at IS NOT NULL
+                   OR NEW.superseded_at IS NOT NULL
+                   OR NEW.range_revision NOT IN (OLD.range_revision, OLD.range_revision + 1)
+               )
+           )
+           OR (
+               NEW.state = 'active'
+               AND (
+                   NEW.activated_at IS NULL
+                   OR NEW.superseded_at IS NOT NULL
+                   OR NEW.range_revision <> OLD.range_revision
+               )
+           ) THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid staged routing epoch transition';
         END IF;
         RETURN NEW;
@@ -280,6 +296,7 @@ BEGIN
        AND NEW.state = 'superseded'
        AND NEW.routing_epoch = OLD.routing_epoch
        AND NEW.logical_database_id = OLD.logical_database_id
+       AND NEW.range_revision = OLD.range_revision
        AND NEW.created_at = OLD.created_at
        AND NEW.activated_at = OLD.activated_at
        AND NEW.superseded_at IS NOT NULL THEN
@@ -319,6 +336,14 @@ BEGIN
     IF TG_OP = 'UPDATE' AND OLD.routing_epoch <> NEW.routing_epoch THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'a routing range cannot move between epochs';
     END IF;
+
+    -- Version the parent row in the same transaction as every child mutation.
+    -- An activation that took an older REPEATABLE READ snapshot must then fail
+    -- with a serialization error when it tries to lock the changed parent,
+    -- instead of validating stale ranges and publishing an invalid map.
+    UPDATE pgshard_catalog.routing_epochs
+       SET range_revision = range_revision + 1
+     WHERE routing_epoch = protected_epoch;
 
     RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
 END

@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::task::JoinHandle;
-use tokio_postgres::{AsyncMessage, Client, Error as PgError, NoTls};
+use tokio_postgres::{AsyncMessage, Client, Error as PgError, IsolationLevel, NoTls};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -719,6 +719,167 @@ async fn assert_routing_epoch_cannot_regress(
     Ok(())
 }
 
+async fn run_repeatable_read_activation(
+    mut client: Client,
+    logical_database_id: String,
+    target_epoch: i64,
+    active_epoch: i64,
+    expected_catalog_epoch: i64,
+) -> Result<Option<PgError>, PgError> {
+    let transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    let result = transaction
+        .query_one(
+            "SELECT pgshard_catalog.activate_routing_epoch($1::text::uuid, $2, $3, $4)",
+            &[
+                &logical_database_id,
+                &target_epoch,
+                &Some(active_epoch),
+                &expected_catalog_epoch,
+            ],
+        )
+        .await;
+    match result {
+        Ok(_) => {
+            transaction.commit().await?;
+            Ok(None)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Ok(Some(error))
+        }
+    }
+}
+
+async fn wait_for_backend_lock(client: &Client, backend_pid: i32) -> Result<bool, PgError> {
+    for _ in 0..100 {
+        let waiting = client
+            .query_opt(
+                "SELECT coalesce(wait_event_type = 'Lock', false) \
+                 FROM pg_catalog.pg_stat_activity WHERE pid = $1",
+                &[&backend_pid],
+            )
+            .await?
+            .is_some_and(|row| row.get(0));
+        if waiting {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(false)
+}
+
+async fn assert_serialization_fence_state(
+    client: &Client,
+    fixture: &Fixture,
+    target_epoch: i64,
+    active_epoch: i64,
+    expected_catalog_epoch: i64,
+) -> TestResult {
+    let staged = client
+        .query_one(
+            "SELECT epochs.state, epochs.range_revision, ranges.range_end::text \
+             FROM pgshard_catalog.routing_epochs AS epochs \
+             JOIN pgshard_catalog.routing_ranges AS ranges USING (routing_epoch) \
+             WHERE epochs.routing_epoch = $1 AND ranges.range_start = 0",
+            &[&target_epoch],
+        )
+        .await?;
+    assert_eq!(staged.get::<_, &str>(0), "staged");
+    assert!(staged.get::<_, i64>(1) > 0);
+    assert_eq!(staged.get::<_, &str>(2), "18446744073709551615");
+    let still_active: i64 = client
+        .query_one(
+            "SELECT routing_epoch FROM pgshard_catalog.active_routing_epochs \
+             WHERE logical_database_id = $1::text::uuid",
+            &[&fixture.logical_database_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(still_active, active_epoch);
+    assert_eq!(catalog_epoch(client).await?, expected_catalog_epoch);
+    Ok(())
+}
+
+async fn assert_repeatable_read_activation_fences_concurrent_range_mutation(
+    client: &Client,
+    database_url: &str,
+    listener: &CatalogListener,
+    fixture: &Fixture,
+) -> TestResult {
+    let active_epoch: i64 = client
+        .query_one(
+            "SELECT routing_epoch FROM pgshard_catalog.active_routing_epochs \
+             WHERE logical_database_id = $1::text::uuid",
+            &[&fixture.logical_database_id],
+        )
+        .await?
+        .get(0);
+    let target_epoch = stage_full_epoch(client, fixture).await?;
+    let expected_catalog_epoch = catalog_epoch(client).await?;
+
+    let (mut mutator_client, mutator_connection) =
+        tokio_postgres::connect(database_url, NoTls).await?;
+    let mutator_connection_task = tokio::spawn(mutator_connection);
+    let mutator = mutator_client.transaction().await?;
+    mutator
+        .execute(
+            "UPDATE pgshard_catalog.routing_ranges \
+             SET range_end = 18446744073709551615 \
+             WHERE routing_epoch = $1 AND range_start = 0",
+            &[&target_epoch],
+        )
+        .await?;
+
+    let (activation_client, activation_connection) =
+        tokio_postgres::connect(database_url, NoTls).await?;
+    let activation_connection_task = tokio::spawn(activation_connection);
+    let activation_pid: i32 = activation_client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    let activation = tokio::spawn(run_repeatable_read_activation(
+        activation_client,
+        fixture.logical_database_id.clone(),
+        target_epoch,
+        active_epoch,
+        expected_catalog_epoch,
+    ));
+
+    if !wait_for_backend_lock(client, activation_pid).await? {
+        activation.abort();
+        mutator.rollback().await?;
+        mutator_connection_task.abort();
+        activation_connection_task.abort();
+        return Err("activation did not wait on the concurrently versioned parent epoch".into());
+    }
+
+    mutator.commit().await?;
+    let activation_error = tokio::time::timeout(Duration::from_secs(5), activation)
+        .await???
+        .expect("stale REPEATABLE READ activation must fail");
+    assert_sqlstate(&activation_error, "40001");
+    assert_no_notification(
+        &listener.receiver,
+        "serialization failure emitted a catalog notification",
+    );
+    assert_serialization_fence_state(
+        client,
+        fixture,
+        target_epoch,
+        active_epoch,
+        expected_catalog_epoch,
+    )
+    .await?;
+
+    mutator_connection_task.abort();
+    activation_connection_task.abort();
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires PGSHARD_TEST_DATABASE_URL pointing to a PostgreSQL 18 shardschema database"]
 async fn migration_and_activation_contract() -> TestResult {
@@ -739,6 +900,13 @@ async fn migration_and_activation_contract() -> TestResult {
         commit_valid_activation(&mut client, &listener, &fixture, &routing).await?;
     assert_rollback_contract(&mut client, &listener, &fixture, &routing, activated_epoch).await?;
     assert_routing_epoch_cannot_regress(&client, &listener, &fixture, routing.valid_epoch).await?;
+    assert_repeatable_read_activation_fences_concurrent_range_mutation(
+        &client,
+        &database_url,
+        &listener,
+        &fixture,
+    )
+    .await?;
 
     listener.task.abort();
     connection_task.abort();

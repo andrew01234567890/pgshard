@@ -27,3 +27,8 @@ until an explicit monotonic fence retires that epoch. PostgreSQL notifications
 contain only the committed decimal catalog epoch and are wake-up hints;
 periodic polling remains required. The actual pooler connection, snapshot SQL
 loader, and LISTEN/reconnect loop are not implemented in this slice.
+
+Each staged routing-range mutation versions its parent routing epoch. This
+makes a concurrent activation using an older `REPEATABLE READ` snapshot fail
+with a serialization error instead of validating stale child rows and
+publishing incomplete routing coverage.
