@@ -43,7 +43,8 @@ docs-check:
 	cd website && npm audit --audit-level=high
 
 actions-check:
-	go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+	# actionlint v1.7.12 predates GitHub's official concurrency queue key.
+	go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -ignore 'unexpected key "queue" for "concurrency" section'
 
 public-check:
 	cargo run --locked -p pgshard-release -- audit --base origin/main --head HEAD
