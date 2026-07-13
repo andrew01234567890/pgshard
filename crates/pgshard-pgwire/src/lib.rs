@@ -250,10 +250,15 @@ pub enum FrontendTag {
 pub enum FrontendPhase {
     /// Authentication exchange; only the overloaded `p` response is legal.
     Authentication,
-    /// Ordinary post-authentication query protocol.
+    /// Ordinary post-authentication query protocol, including COPY messages
+    /// that `PostgreSQL` accepts and ignores while resynchronizing after a
+    /// failed COPY.
     Regular,
     /// Frontend-to-server COPY stream.
     CopyIn,
+    /// Physical or logical replication COPY-BOTH stream handled by the
+    /// `PostgreSQL` WAL sender.
+    ReplicationStreaming,
 }
 
 impl FrontendPhase {
@@ -272,6 +277,9 @@ impl FrontendPhase {
                     | FrontendTag::Query
                     | FrontendTag::Sync
                     | FrontendTag::Terminate
+                    | FrontendTag::CopyData
+                    | FrontendTag::CopyDone
+                    | FrontendTag::CopyFail
             ),
             Self::CopyIn => matches!(
                 tag,
@@ -280,6 +288,10 @@ impl FrontendPhase {
                     | FrontendTag::CopyFail
                     | FrontendTag::Flush
                     | FrontendTag::Sync
+            ),
+            Self::ReplicationStreaming => matches!(
+                tag,
+                FrontendTag::CopyData | FrontendTag::CopyDone | FrontendTag::Terminate
             ),
         }
     }
@@ -361,7 +373,8 @@ impl<'a> FrontendFrame<'a> {
 /// # Errors
 ///
 /// Returns an error for impossible or over-limit lengths, malformed startup
-/// parameter pairs, or invalid SSL, GSS, or cancellation request lengths.
+/// parameter pairs, invalid SSL, GSS, or cancellation request lengths, or
+/// buffered data after a GSS request.
 pub fn decode_startup(input: &[u8]) -> Result<Decode<StartupFrame<'_>>, DecodeError> {
     let Some(total_length) = frame_length(input, 0)? else {
         return Ok(Decode::Incomplete { required: 4 });
@@ -388,12 +401,11 @@ pub fn decode_startup(input: &[u8]) -> Result<Decode<StartupFrame<'_>>, DecodeEr
     let frame = match code {
         NEGOTIATE_SSL_CODE => {
             require_special_length("SSL", total_length, 8)?;
-            reject_buffered_negotiation_data("SSL", input.len(), total_length)?;
             StartupFrame::SslRequest
         }
         NEGOTIATE_GSS_CODE => {
             require_special_length("GSS", total_length, 8)?;
-            reject_buffered_negotiation_data("GSS", input.len(), total_length)?;
+            reject_buffered_gss_data(input.len(), total_length)?;
             StartupFrame::GssEncryptionRequest
         }
         CANCEL_REQUEST_CODE => {
@@ -523,16 +535,11 @@ fn require_special_length(
     }
 }
 
-fn reject_buffered_negotiation_data(
-    request: &'static str,
-    buffered: usize,
-    frame_length: usize,
-) -> Result<(), DecodeError> {
+fn reject_buffered_gss_data(buffered: usize, frame_length: usize) -> Result<(), DecodeError> {
     if buffered == frame_length {
         Ok(())
     } else {
-        Err(DecodeError::BufferedNegotiationData {
-            request,
+        Err(DecodeError::BufferedGssData {
             extra: buffered - frame_length,
         })
     }
@@ -601,11 +608,9 @@ pub enum DecodeError {
         /// Required total length.
         expected: usize,
     },
-    /// Plaintext bytes followed an SSL/GSS request before negotiation.
-    #[error("{request} request has {extra} buffered plaintext bytes after its frame")]
-    BufferedNegotiationData {
-        /// Request family.
-        request: &'static str,
+    /// Bytes followed a GSS request before negotiation.
+    #[error("GSS request has {extra} buffered bytes after its frame")]
+    BufferedGssData {
         /// Bytes received after the fixed request.
         extra: usize,
     },
@@ -773,13 +778,24 @@ mod tests {
                 decode_startup(&startup(code, b"x")),
                 Err(DecodeError::InvalidSpecialLength { .. })
             ));
-            let mut pipelined = packet;
-            pipelined.extend_from_slice(&startup(protocol_code(3, 2), b"\0"));
-            assert!(matches!(
-                decode_startup(&pipelined),
-                Err(DecodeError::BufferedNegotiationData { .. })
-            ));
         }
+
+        let mut ssl_with_client_hello = startup(NEGOTIATE_SSL_CODE, &[]);
+        ssl_with_client_hello.extend_from_slice(b"\x16\x03\x03\0\0");
+        assert_eq!(
+            decode_startup(&ssl_with_client_hello),
+            Ok(Decode::Complete {
+                frame: StartupFrame::SslRequest,
+                consumed: 8,
+            })
+        );
+
+        let mut pipelined_gss = startup(NEGOTIATE_GSS_CODE, &[]);
+        pipelined_gss.extend_from_slice(&startup(protocol_code(3, 2), b"\0"));
+        assert!(matches!(
+            decode_startup(&pipelined_gss),
+            Err(DecodeError::BufferedGssData { .. })
+        ));
     }
 
     #[test]
@@ -907,6 +923,46 @@ mod tests {
     }
 
     #[test]
+    fn regular_phase_accepts_copy_recovery_messages() {
+        for tag in *b"dcf" {
+            let packet = frontend(tag, b"body");
+            assert!(matches!(
+                decode_frontend(
+                    &packet,
+                    FrontendPhase::Regular,
+                    DEFAULT_LARGE_MESSAGE_LENGTH,
+                ),
+                Ok(Decode::Complete { consumed, .. }) if consumed == packet.len()
+            ));
+        }
+    }
+
+    #[test]
+    fn replication_phase_matches_postgres18_walsender() {
+        for tag in *b"dcX" {
+            let packet = frontend(tag, b"body");
+            assert!(matches!(
+                decode_frontend(
+                    &packet,
+                    FrontendPhase::ReplicationStreaming,
+                    DEFAULT_LARGE_MESSAGE_LENGTH,
+                ),
+                Ok(Decode::Complete { consumed, .. }) if consumed == packet.len()
+            ));
+        }
+        for tag in *b"fHSQ" {
+            assert!(matches!(
+                decode_frontend(
+                    &[tag],
+                    FrontendPhase::ReplicationStreaming,
+                    DEFAULT_LARGE_MESSAGE_LENGTH,
+                ),
+                Err(DecodeError::UnexpectedTagForPhase { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn unknown_tags_and_untrusted_lengths_fail_before_buffering() {
         assert_eq!(
             decode_frontend(
@@ -958,7 +1014,6 @@ mod tests {
             (b'Q', FrontendPhase::CopyIn),
             (b'B', FrontendPhase::CopyIn),
             (b'p', FrontendPhase::Regular),
-            (b'd', FrontendPhase::Regular),
         ] {
             let mut header = vec![tag];
             header.extend_from_slice(
