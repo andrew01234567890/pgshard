@@ -78,11 +78,13 @@ the control decoder covers buffered Begin/Commit/Origin, streamed transaction
 start/stop/commit/abort, and every two-phase control including Stream Prepare.
 It requires authoritative `server_encoding=UTF8` and `client_encoding=UTF8`
 proofs from the same connection, bounds prepared-transaction identifiers, and
-redacts origins, GIDs, and logical payloads from debug output.
-Row, relation, type, truncate, and logical-message bodies have distinct tags but
-are deliberately rejected until their dedicated decoders exist. Transaction
-ordering, relation state, WAL feedback, durable checkpoints, cross-shard merge,
-and the VStream-like service remain later work.
+redacts origins, GIDs, names, and logical payloads from debug output. A
+stateful wrapper derives whether the otherwise-ambiguous XID prefix is present
+from validated Stream Start/Stop controls and decodes Relation and Type schema
+messages. Relation columns are prevalidated once and exposed through a borrowed
+exact-size iterator. Row, truncate, and logical-message bodies remain rejected.
+Complete transaction ordering, relation cache semantics, WAL feedback, durable
+checkpoints, cross-shard merge, and the VStream-like service remain later work.
 
 The future replication session must bind that token to the exact accepted
 `START_REPLICATION` command and the selected slot's authoritative persistent
@@ -104,5 +106,7 @@ their declared PostgreSQL types and text/binary formats are resolved.
 four-parameter extended-query bind.
 
 `cargo bench -p pgshard-pgwire --bench decode_pgoutput_control` measures a
-borrowed transaction Begin control. None is a substitute for the planned
-end-to-end pooler/PgBouncer comparison.
+borrowed transaction Begin control.
+`cargo bench -p pgshard-pgwire --bench decode_pgoutput_relation` measures
+prevalidation and iteration of a borrowed two-column Relation message. None is
+a substitute for the planned end-to-end pooler/PgBouncer comparison.

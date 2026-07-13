@@ -13,11 +13,12 @@ use std::time::Duration;
 use pgshard_pgwire::{
     AuthenticationRequest, BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode,
     ExtendedQueryObject, FrontendPhase, PgOutputConfiguration, PgOutputControlMessage,
-    PgOutputEncoding, PgOutputStreaming, PgOutputVersion, Postgres18StartupNegotiation,
-    TransactionStatus, decode_authentication_request, decode_backend, decode_backend_key_data,
-    decode_close, decode_describe, decode_frontend, decode_parameter_description,
-    decode_parameter_status, decode_pgoutput_control, decode_protocol_negotiation,
-    decode_ready_for_query, decode_startup, require_empty_backend_body,
+    PgOutputDecoder, PgOutputEncoding, PgOutputError, PgOutputMessage, PgOutputStreaming,
+    PgOutputVersion, Postgres18StartupNegotiation, TransactionStatus,
+    decode_authentication_request, decode_backend, decode_backend_key_data, decode_close,
+    decode_describe, decode_frontend, decode_parameter_description, decode_parameter_status,
+    decode_pgoutput_control, decode_protocol_negotiation, decode_ready_for_query, decode_startup,
+    require_empty_backend_body,
 };
 
 const POSTGRES_PROTOCOL_3_0: u32 = 3 << 16;
@@ -416,15 +417,45 @@ fn two_phase_slot_state_survives_a_false_start_request(
     let configuration =
         PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::Off, false, true)
             .expect("protocol v1 remains decodable for a persistently enabled slot");
-    for message in messages
-        .iter()
-        .filter(|message| matches!(message.first(), Some(b'b' | b'P')))
-    {
-        assert!(matches!(
-            decode_pgoutput_control(message, configuration, encoding),
-            Ok(PgOutputControlMessage::BeginPrepare(_) | PgOutputControlMessage::Prepare(_))
-        ));
-    }
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message[0])
+            .collect::<Vec<_>>(),
+        b"bRIP"
+    );
+    assert!(matches!(
+        decode_pgoutput_control(&messages[0], configuration, encoding),
+        Ok(PgOutputControlMessage::BeginPrepare(_))
+    ));
+    let mut decoder = PgOutputDecoder::new(configuration, encoding);
+    assert!(matches!(
+        decoder.decode(&messages[0]),
+        Ok(PgOutputMessage::Control(
+            PgOutputControlMessage::BeginPrepare(_)
+        ))
+    ));
+    let PgOutputMessage::Relation(relation) = decoder.decode(&messages[1]).expect("live Relation")
+    else {
+        panic!("live Relation decoded as another message");
+    };
+    assert_eq!(relation.stream_xid(), None);
+    assert_eq!(relation.namespace(), "public");
+    assert_eq!(relation.name(), table);
+    assert_eq!(relation.column_count(), 1);
+    let column = relation.columns().next().expect("live relation column");
+    assert!(column.part_of_replica_identity());
+    assert_eq!(column.name(), "id");
+    assert_eq!(column.type_oid(), 23);
+    assert_eq!(column.type_modifier(), -1);
+    assert_eq!(
+        decoder.decode(&messages[2]),
+        Err(PgOutputError::NonControlMessage(b'I'))
+    );
+    assert!(matches!(
+        decoder.decode(&messages[3]),
+        Ok(PgOutputMessage::Control(PgOutputControlMessage::Prepare(_)))
+    ));
 }
 
 #[test]
