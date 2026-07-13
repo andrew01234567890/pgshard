@@ -6,11 +6,16 @@
 //! data and can be lost without affecting correctness because callers poll.
 
 mod cache;
+mod loader;
 mod model;
 
 pub use cache::{
     CacheError, CatalogCache, CatalogNotification, InstallOutcome, NotificationError,
     RefreshDecision, RequestEpochError,
+};
+pub use loader::{
+    CatalogReader, LoadError, MAX_LOGICAL_DATABASES, MAX_REGISTERED_TABLES_PER_DATABASE,
+    MAX_ROUTING_RANGES_PER_DATABASE, MAX_TOTAL_REGISTERED_TABLES, MAX_TOTAL_ROUTING_RANGES,
 };
 pub use model::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, IdentifierError,

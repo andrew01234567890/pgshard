@@ -18,8 +18,8 @@ in the same pull request whenever implementation status changes.
 | Go operator API and supporting resources | Defaulting/validation, generated CRD/RBAC/webhook, deterministic ConfigMaps/Services/workloads/HPA/PDB/NetworkPolicy, semantic leader-election RBAC tests, uncached finalizer absence proofs, supervised PVC deletion, and targeted digest-pinned Kubernetes 1.36 KIND delete/recreate coverage | Implemented in source; deliberately not a database cluster |
 | Rust agent and orchestrator foundations | Linux HTTP health/readiness/status/metrics, exact integer reporting, bounded lease TTLs, atomic catalog/fence/deadline precondition checks; orchestrator persistence remains disabled | Implemented in source; deliberately not ready for control traffic |
 | PostgreSQL lifecycle and HA | No bootstrap, physical replication, durable lease integration, promotion or restart controller | Planned |
-| Pooling and SQL routing | No PostgreSQL wire endpoint | Planned |
-| `shardschema` catalog and cache | PostgreSQL 18 idempotent migration, dual-CAS route activation, commit-only notification, live PG18 tests, validated checksummed snapshots and lock-free retained-epoch cache; pooler loader/listener is absent | Partial |
+| Pooling and SQL routing | Fail-closed bound-parameter routing core with exact canonical hashing and a standalone microbenchmark; no SQL parser, statement planner, connection pool, or PostgreSQL wire endpoint | Partial |
+| `shardschema` catalog and cache | PostgreSQL 18 idempotent migration, dual-CAS route activation, commit-only notification, live PG18 tests, owned idle LISTEN-before-load reader, bounded repeatable-read snapshots, validated checksums and lock-free retained-epoch cache; long-running pooler refresh driver is absent | Partial |
 | Cross-shard 2PC and recovery | Design only; no executable coordinator | Planned |
 | Online DDL and role propagation | Design only | Planned |
 | `pgoutput` change stream | Contract only; no decoder or durable stream runtime | Planned |
@@ -30,6 +30,6 @@ in the same pull request whenever implementation status changes.
 
 No development database cluster can be installed from the current source. The
 operator does not create PostgreSQL Pods or PVCs, the pooler has no wire
-endpoint, and supporting Services are not usable application endpoints. No
-runtime correctness, availability or performance guarantee is claimed until its
-implementation and required tests are merged and listed here.
+endpoint or connection pool, and supporting Services are not usable application
+endpoints. No runtime correctness, availability or performance guarantee is
+claimed until its implementation and required tests are merged and listed here.
