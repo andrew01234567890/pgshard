@@ -1,0 +1,543 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  changes:
+    name: Detect components
+    runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      proto: ${{ steps.detect.outputs.proto }}
+      go: ${{ steps.detect.outputs.go }}
+      website: ${{ steps.detect.outputs.website }}
+      website_exists: ${{ steps.detect.outputs.website_exists }}
+      ui: ${{ steps.detect.outputs.ui }}
+      integration: ${{ steps.detect.outputs.integration }}
+      images: ${{ steps.detect.outputs.images }}
+      kind: ${{ steps.detect.outputs.kind }}
+      performance: ${{ steps.detect.outputs.performance }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed and available components
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base=""
+          force_all=false
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE_SHA" ;;
+            push)
+              if [[ -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+                base="$PUSH_BEFORE_SHA"
+              fi
+              ;;
+            schedule|workflow_dispatch) force_all=true ;;
+          esac
+
+          if [[ -n "$base" ]] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            git diff --name-only "$base" "$GITHUB_SHA" > "$RUNNER_TEMP/changed-files"
+          else
+            git ls-files > "$RUNNER_TEMP/changed-files"
+          fi
+
+          changed() {
+            "$force_all" || grep -Eq "$1" "$RUNNER_TEMP/changed-files"
+          }
+
+          exists_at_head_or_base() {
+            [[ -e "$1" ]] || {
+              [[ -n "$base" ]] && git cat-file -e "${base}:$1" 2>/dev/null
+            }
+          }
+
+          emit_component() {
+            local output="$1"
+            local exists="$2"
+            local pattern="$3"
+            local value=false
+            if [[ "$exists" == true ]] && changed "$pattern"; then
+              value=true
+            fi
+            echo "${output}=${value}" >> "$GITHUB_OUTPUT"
+          }
+
+          rust_exists=false
+          proto_exists=false
+          go_exists=false
+          website_exists=false
+          ui_exists=false
+          integration_exists=false
+          images_exists=false
+          kind_exists=false
+          performance_exists=false
+
+          exists_at_head_or_base Cargo.toml && rust_exists=true
+          exists_at_head_or_base buf.yaml && proto_exists=true
+          exists_at_head_or_base operator/go.mod && go_exists=true
+          exists_at_head_or_base website/package.json && website_exists=true
+          exists_at_head_or_base ui/package.json && ui_exists=true
+          exists_at_head_or_base tests/integration/Cargo.toml && integration_exists=true
+          exists_at_head_or_base deploy/docker-bake.hcl && images_exists=true
+          exists_at_head_or_base tests/e2e/Cargo.toml && kind_exists=true
+          exists_at_head_or_base benchmarks/Cargo.toml && performance_exists=true
+
+          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
+          emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component go "$go_exists" '^operator/|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/workflows/'
+          emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component images "$images_exists" '^deploy/|^Dockerfile|/Dockerfile$|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
+          emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
+          emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^Makefile$|^\.github/workflows/'
+          current_website_exists=false
+          [[ -f website/package.json ]] && current_website_exists=true
+          echo "website_exists=${current_website_exists}" >> "$GITHUB_OUTPUT"
+
+  repository-policy:
+    name: Repository policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Select actionlint Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.5"
+          cache: false
+      - name: Validate workflow contracts
+        run: make actions-check
+      - name: Validate title and public content
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            cargo run --locked -p pgshard-release -- validate --subject "$PR_TITLE"
+            cargo run --locked -p pgshard-release -- audit --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
+          elif [[ "$EVENT_NAME" == push && -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+            cargo run --locked -p pgshard-release -- validate
+            cargo run --locked -p pgshard-release -- audit --base "$PUSH_BEFORE_SHA" --head "$GITHUB_SHA"
+          else
+            cargo run --locked -p pgshard-release -- validate
+          fi
+
+  rust-static:
+    name: Rust / static checks
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Select repository Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+      - name: Install pinned Rust policy tools
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+          fallback: none
+      - name: Run Rust static policy
+        run: make rust-static
+
+  rust-test:
+    name: Rust / tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Run workspace tests
+        run: make rust-test
+      - name: Verify explicit identity from a source archive
+        env:
+          ARCHIVE_VERSION: 9.8.7-archive-test
+        run: |
+          archive_dir="$RUNNER_TEMP/source-archive"
+          mkdir -p "$archive_dir"
+          git archive HEAD | tar -x -C "$archive_dir"
+          cd "$archive_dir"
+          PGSHARD_BUILD_VERSION="$ARCHIVE_VERSION" \
+          PGSHARD_GIT_SHA="$GITHUB_SHA" \
+          PGSHARD_EXPECTED_VERSION="$ARCHIVE_VERSION" \
+          PGSHARD_EXPECTED_SHA="$GITHUB_SHA" \
+            cargo test --locked -p pgshard-version
+      - name: Verify tag-only build identity invalidation
+        run: |
+          tag_dir="$RUNNER_TEMP/tag-invalidation"
+          mkdir -p "$tag_dir"
+          git archive HEAD | tar -x -C "$tag_dir"
+          cd "$tag_dir"
+          git init --quiet --initial-branch=main
+          git config user.name "pgshard CI"
+          git config user.email "noreply@github.com"
+          git add --all
+          git commit --quiet --message "test: create archive fixture"
+          fixture_sha="$(git rev-parse HEAD)"
+          development_version="0.0.0-dev+${fixture_sha:0:12}"
+          PGSHARD_EXPECTED_VERSION="$development_version" \
+          PGSHARD_EXPECTED_SHA="$fixture_sha" \
+            cargo test --locked -p pgshard-version
+          git tag v9.8.7
+          PGSHARD_EXPECTED_VERSION="9.8.7" \
+          PGSHARD_EXPECTED_SHA="$fixture_sha" \
+            cargo test --locked -p pgshard-version
+
+  protobuf:
+    name: Protobuf contracts
+    needs: changes
+    if: needs.changes.outputs.proto == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Install pinned Buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: 1.71.0
+      - name: Validate protobuf contracts
+        run: make proto-check
+      - name: Reject protobuf breaking changes
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git cat-file -e "$BASE_SHA:buf.yaml" 2>/dev/null; then
+            buf breaking --against ".git#ref=$BASE_SHA"
+          else
+            echo "No protobuf contract exists at the pull request base; skipping initial breaking comparison."
+          fi
+
+  go-operator:
+    name: Go operator
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: operator
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            printf 'Unformatted Go files:\n%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+
+  website:
+    name: Documentation website
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Run documentation checks
+        run: make docs-check
+      - name: Store Pages candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pages-site
+          path: website/build
+          if-no-files-found: error
+          retention-days: 1
+
+  ui:
+    name: Admin UI
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Install dependencies
+        working-directory: ui
+        run: npm ci
+      - name: Check and build UI
+        working-directory: ui
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in lint typecheck test build; do
+            if ! node -e "process.exit(require('./package.json').scripts?.['$script'] ? 0 : 1)"; then
+              echo "ui/package.json must define the '$script' script" >&2
+              exit 1
+            fi
+            npm run "$script"
+          done
+
+  integration:
+    name: Integration / ${{ matrix.suite }}
+    needs: changes
+    if: needs.changes.outputs.integration == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [protocol, catalog, pgoutput]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Run integration suite
+        env:
+          PGSHARD_INTEGRATION_SUITE: ${{ matrix.suite }}
+        run: cargo run --locked -p pgshard-integration-tests -- --suite "$PGSHARD_INTEGRATION_SUITE"
+
+  images:
+    name: Build local test images
+    needs: changes
+    if: needs.changes.outputs.images == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build OCI archives without publishing
+        env:
+          PGSHARD_IMAGE_OUTPUT: artifacts/images
+          PGSHARD_IMAGE_PUSH: "false"
+        run: docker buildx bake --file deploy/docker-bake.hcl ci
+      - name: Store local OCI archives
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kind-images
+          path: artifacts/images/*.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  kind:
+    name: KIND / ${{ matrix.scenario }}
+    needs: [changes, images]
+    if: >-
+      always() &&
+      needs.changes.result == 'success' &&
+      needs.changes.outputs.kind == 'true' &&
+      (needs.images.result == 'success' || needs.images.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - bootstrap-routing
+          - transactions-failover
+          - backup-restore
+          - ddl-reshard
+          - observability
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Download local OCI archives
+        if: needs.images.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kind-images
+          path: artifacts/images
+      - name: Run KIND scenario
+        env:
+          PGSHARD_E2E_SCENARIO: ${{ matrix.scenario }}
+          PGSHARD_IMAGE_PUSH: "false"
+        run: cargo run --locked -p pgshard-e2e -- --scenario "$PGSHARD_E2E_SCENARIO"
+
+  performance:
+    name: Performance / ${{ matrix.suite }}
+    needs: changes
+    if: needs.changes.outputs.performance == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [pooler-pgbouncer, pgoutput]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Run performance suite
+        env:
+          PGSHARD_PERFORMANCE_SUITE: ${{ matrix.suite }}
+          PGSHARD_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: cargo run --locked -p pgshard-bench -- --suite "$PGSHARD_PERFORMANCE_SUITE"
+      - name: Store performance results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-${{ matrix.suite }}
+          path: artifacts/performance/${{ matrix.suite }}
+          if-no-files-found: error
+          retention-days: 1
+
+  aggregate:
+    name: CI aggregate
+    if: always()
+    needs:
+      - changes
+      - repository-policy
+      - rust-static
+      - rust-test
+      - protobuf
+      - go-operator
+      - website
+      - ui
+      - integration
+      - images
+      - kind
+      - performance
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every applicable job
+        env:
+          JOB_RESULTS: >-
+            changes=${{ needs.changes.result }}
+            repository-policy=${{ needs.repository-policy.result }}
+            rust-static=${{ needs.rust-static.result }}
+            rust-test=${{ needs.rust-test.result }}
+            protobuf=${{ needs.protobuf.result }}
+            go-operator=${{ needs.go-operator.result }}
+            website=${{ needs.website.result }}
+            ui=${{ needs.ui.result }}
+            integration=${{ needs.integration.result }}
+            images=${{ needs.images.result }}
+            kind=${{ needs.kind.result }}
+            performance=${{ needs.performance.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=false
+          for result in $JOB_RESULTS; do
+            state="${result#*=}"
+            if [[ "$state" != success && "$state" != skipped ]]; then
+              echo "Required job did not pass: $result" >&2
+              failed=true
+            fi
+          done
+          "$failed" && exit 1
+          echo "All applicable CI jobs passed."
+
+  release:
+    name: Source-only SemVer release
+    needs: aggregate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.aggregate.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      checks: read
+      contents: write
+    concurrency:
+      group: pgshard-source-release
+      cancel-in-progress: false
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Configure public commit identity
+        run: |
+          git config user.name "andrew01234567890"
+          git config user.email "13841202+andrew01234567890@users.noreply.github.com"
+      - name: Publish tag and source-only GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo run --locked -p pgshard-release -- publish --sha "$GITHUB_SHA"
+
+  pages:
+    name: Deploy documentation to GitHub Pages
+    needs: [changes, website, aggregate, release]
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.website == 'true' &&
+      needs.website.result == 'success' &&
+      needs.aggregate.result == 'success' &&
+      needs.release.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Download documentation site
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pages-site
+          path: _site
+      - name: Package Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

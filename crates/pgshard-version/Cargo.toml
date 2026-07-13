@@ -1,0 +1,18 @@
+[package]
+name = "pgshard-version"
+description = "Canonical build identity for pgshard runtime components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dev-dependencies]
+semver.workspace = true
+
+[build-dependencies]
+semver.workspace = true
+
+[lints]
+workspace = true

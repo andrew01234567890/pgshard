@@ -1,0 +1,21 @@
+[package]
+name = "pgshard-types"
+description = "Core identifiers and routing primitives for pgshard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+xxhash-rust.workspace = true
+
+[[bench]]
+name = "routing_hash"
+harness = false
+
+[lints]
+workspace = true
