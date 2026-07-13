@@ -96,6 +96,12 @@ async fn check_parameter_route(client: &tokio_postgres::Client) {
 }
 
 async fn check_operator_search_path_injection(client: &tokio_postgres::Client, routed_sql: &str) {
+    // Keep the persistent-schema fixture inside one transaction. Any assertion
+    // failure closes the test connection and PostgreSQL rolls the fixture back.
+    client
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin operator fixture transaction");
     client
         .execute(
             "INSERT INTO planner_target (tenant_id, value) VALUES (42, 1)",
@@ -158,9 +164,18 @@ async fn check_operator_search_path_injection(client: &tokio_postgres::Client, r
         1
     );
     client
-        .batch_execute(&format!("DROP SCHEMA {attack_schema} CASCADE"))
+        .batch_execute("ROLLBACK")
         .await
-        .expect("remove test operator");
+        .expect("roll back operator fixture");
+    let fixture_removed: bool = client
+        .query_one(
+            "SELECT pg_catalog.to_regnamespace($1) IS NULL",
+            &[&attack_schema],
+        )
+        .await
+        .expect("verify operator fixture rollback")
+        .get(0);
+    assert!(fixture_removed, "operator fixture schema survived rollback");
 }
 
 #[tokio::test]
