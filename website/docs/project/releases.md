@@ -5,11 +5,15 @@ description: SemVer rules and source-only GitHub releases.
 
 # Releases and versioning
 
-Every successful new commit on `main` receives exactly one SemVer tag and a source-only GitHub Release. Milestone 1 releases use `0.x` prerelease versions.
+Every successful new commit on `main` at or after the repository's release-start
+marker receives exactly one SemVer tag and a source-only GitHub Release.
+Milestone 1 releases use `0.x` prerelease versions. The initial foundation
+commit predates the usable post-squash identity policy and remains an untagged
+bootstrap commit rather than bypassing the exact-head CI release gate.
 
 ## Version calculation
 
-- The first foundation squash commit is `v0.1.0`.
+- The first green squash commit containing the release-start marker is `v0.1.0`.
 - Before 1.0, `feat`, `!`, or a `BREAKING CHANGE:` footer increments the minor version.
 - `fix`, `perf`, `refactor`, `revert`, `docs`, `test`, `build`, `ci`, and `chore` increment patch.
 - Promotion to 1.0 is an explicit maintainer decision and is not performed by the automated pre-1.0 calculator.
