@@ -10,6 +10,8 @@ publish = false
 
 [dependencies]
 log.workspace = true
+pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
+pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 sqlparser.workspace = true
 stacker.workspace = true
 thiserror.workspace = true
@@ -17,9 +19,14 @@ thiserror.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 tokio-postgres.workspace = true
+uuid.workspace = true
 
 [[bench]]
 name = "parse_statement"
+harness = false
+
+[[bench]]
+name = "analyze_parameter_route"
 harness = false
 
 [lints]
