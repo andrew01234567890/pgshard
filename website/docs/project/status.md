@@ -22,7 +22,7 @@ in the same pull request whenever implementation status changes.
 | `shardschema` catalog and cache | PostgreSQL 18 idempotent migration, dual-CAS route activation, commit-only notification, live PG18 tests, owned idle LISTEN-before-load reader, bounded repeatable-read snapshots, validated checksums and lock-free retained-epoch cache; long-running pooler refresh driver is absent | Partial |
 | Cross-shard 2PC and recovery | Design only; no executable coordinator | Planned |
 | Online DDL and role propagation | Design only | Planned |
-| `pgoutput` change stream | Contract only; no decoder or durable stream runtime | Planned |
+| `pgoutput` change stream | Bounded zero-copy XLogData/keepalive envelopes, validated protocol v1-v4 streaming/two-phase configuration, and exact buffered, streamed, and prepared transaction controls with truncation, feature-gate, UTF-8, GID-bound, and redaction tests; row/schema payloads, message ordering, WAL feedback, slots, durable checkpoints, cross-shard merge, snapshots, and service runtime are absent | Partial |
 | Backup/restore and MinIO verification | Design only | Planned |
 | Online resharding | Design only | Planned |
 | Admin UI, Prometheus and OpenTelemetry | Design only | Planned |

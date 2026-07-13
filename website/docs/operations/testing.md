@@ -24,7 +24,13 @@ unexpected, version-mismatched, reordered, omitted, and added negotiation data
 fails closed, and that a rejected response consumes its validator. The live
 fixture also checks real `Describe`, `ParameterDescription`, empty completion,
 `ReadyForQuery`, and `Close` messages through the production framing and body
-decoders. A targeted KIND test verifies
+decoders. Source-aligned `pgoutput` unit tests cover protocol v1-v4 option
+combinations, XLogData and keepalive envelopes, buffered, streamed, and
+two-phase transaction controls, every truncated prefix, feature mismatches,
+reserved flags, strict booleans, UTF-8, maximum prepared-transaction GIDs,
+zero-copy borrowing, and debug redaction. A live logical-replication fixture,
+row/schema decoding, ordering, slots, feedback, replay, and cross-shard stream
+tests are still absent. A targeted KIND test verifies
 operator PVC deletion and same-name recreation against real Kubernetes 1.36
 controllers. A unit regression gives the informer cache a false absence while
 the authoritative API reader still sees an owned PVC, and proves that

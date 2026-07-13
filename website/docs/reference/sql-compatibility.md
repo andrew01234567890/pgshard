@@ -154,8 +154,20 @@ direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting
 buffered bytes if encryption is refused.
 An explicit replication-streaming phase admits only the CopyData, CopyDone, and
-Terminate frontend frames accepted by PostgreSQL 18's WAL sender. It does not
-yet decode `pgoutput` payloads or implement a change-stream session.
+Terminate frontend frames accepted by PostgreSQL 18's WAL sender. Server
+CopyData bodies decode as exact borrowed XLogData or keepalive envelopes. A
+validated `pgoutput` v1-v4 configuration gates streamed and two-phase controls,
+and the control decoder covers Begin, Commit, Origin, Stream Start/Stop/Commit/
+Abort, Begin Prepare, Prepare, Commit Prepared, Rollback Prepared, and Stream
+Prepare. It rejects row, relation, type, truncate, and logical-message tags
+until their dedicated body decoders exist. This is message-local validation:
+there is no transaction-order state machine, relation cache, WAL feedback,
+durable checkpoint, slot lifecycle, snapshot, cross-shard merge, or
+change-stream service yet.
+
+The future replication session must construct and bind that configuration only
+after the exact `START_REPLICATION` command enters COPY-BOTH mode; the decoder
+does not prove server acceptance of caller-selected options by itself.
 The syntax planner applies separate limits of 16 KiB of SQL text, 4,096 lexer
 tokens, 2,048 counted AST nodes, 50 lexically nested delimiters, and 50
 parser-recursion levels. The lexical guard includes candidate-only

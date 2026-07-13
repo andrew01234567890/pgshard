@@ -6,8 +6,12 @@ description: VStream-like change data capture using PostgreSQL pgoutput.
 # Change streams
 
 :::info Milestone 1 design contract
-This page specifies the required behavior. The `pgoutput` stream runtime is not
-implemented in the foundation release; see [implementation status](../project/status.md).
+This page specifies the required behavior. Source code can decode PostgreSQL 18
+replication envelopes and the buffered, streamed, and two-phase `pgoutput`
+transaction controls without allocation. It does not yet decode row/schema
+payloads or implement slots, ordering, acknowledgements, durable replay,
+snapshots, cross-shard merge, or a stream service; see
+[implementation status](../project/status.md).
 :::
 
 Milestone 1 will expose a cluster change stream derived from PostgreSQL 18
