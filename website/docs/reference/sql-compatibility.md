@@ -6,11 +6,14 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 # SQL compatibility
 
 :::warning Planned compatibility, not current support
-No pooler endpoint, SQL parser, or statement planner exists yet. The source has
-only a fail-closed core that routes an already-resolved, non-NULL shard-key bind
-parameter against one immutable catalog snapshot, plus a bounded zero-copy
+No pooler endpoint or semantic statement planner exists yet. The source has a
+byte/token/AST/stack-bounded permissive candidate parser configured with a
+PostgreSQL dialect, a fail-closed core that routes an already-resolved, non-NULL shard-key
+bind parameter against one immutable catalog snapshot, and a bounded zero-copy
 decoder for PostgreSQL 18 frontend frames and selected simple/extended query
-message bodies. It does not yet authenticate, parse SQL, or execute clients. The
+message bodies. A successful syntax parse is not PostgreSQL semantic validation
+or permission to route; the complete AST must be explicitly proven by future
+planning code. The source does not yet authenticate or execute clients. The
 table below is the Milestone 1 acceptance contract; see
 [implementation status](../project/status.md).
 :::
@@ -56,6 +59,23 @@ buffered bytes if encryption is refused.
 An explicit replication-streaming phase admits only the CopyData, CopyDone, and
 Terminate frontend frames accepted by PostgreSQL 18's WAL sender. It does not
 yet decode `pgoutput` payloads or implement a change-stream session.
+The syntax planner applies separate limits of 16 KiB of SQL text, 4,096 lexer
+tokens, 2,048 counted AST nodes, 50 lexically nested delimiters, and 50
+parser-recursion levels. The lexical guard includes candidate-only
+angle-bracket `ARRAY` data types because that upstream parser path does not
+consume its recursion budget; unrelated PostgreSQL comparison operators do not
+consume the array-type budget. Flat binary expressions and set-operation trees
+also bypass delimiter depth, so parsing, AST validation, rejection, and
+destruction use a stack reserve scaled from structural tokens. Whitespace,
+comments, and empty statement semicolons remain subject to the total token cap
+but cannot inflate that reserve. An accepted opaque tree keeps the same reserve
+for safe destruction by a caller on a smaller stack; the implementation
+allocates a larger stack segment only when the current stack does not have the
+required space. Larger inputs are rejected even though they
+fit inside a valid frontend frame. Tokenization is byte-bounded first; only one
+statement is parsed, and remaining input causes immediate multiple-statement
+rejection. Parsing is synchronous; the future pooler must isolate it on a
+bounded CPU worker pool instead of blocking socket-processing tasks.
 
 Named prepared statements are virtualized at the pooler. Their routing plan is invalidated by relevant schema or routing epoch changes.
 

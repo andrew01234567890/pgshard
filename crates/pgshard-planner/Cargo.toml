@@ -1,0 +1,26 @@
+[package]
+name = "pgshard-planner"
+description = "Fail-closed SQL planning foundations for pgshard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+log.workspace = true
+sqlparser.workspace = true
+stacker.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-postgres.workspace = true
+
+[[bench]]
+name = "parse_statement"
+harness = false
+
+[lints]
+workspace = true

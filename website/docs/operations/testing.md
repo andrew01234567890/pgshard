@@ -6,12 +6,20 @@ description: Unit, integration, KIND, Jepsen/Elle, observability, backup, and pe
 # Testing strategy
 
 :::info Current boundary
-Foundation unit, contract, policy and documentation checks exist. A targeted
-KIND test verifies operator PVC deletion and same-name recreation against real
-Kubernetes 1.36 controllers. A unit regression gives the informer cache a false
-absence while the authoritative API reader still sees an owned PVC, and proves
-that finalization continues waiting. The broader runtime, integration, KIND,
-Jepsen/Elle and PgBouncer comparison suites below remain required Milestone 1 work; see
+Foundation unit, contract, policy and documentation checks exist. A live
+PostgreSQL 18 smoke corpus checks positive DML examples and records known syntax
+the candidate parser accepts but PostgreSQL rejects. Parser regressions exercise
+deep delimiter, data-type, binary-expression, and set-operation shapes on a
+64 KiB thread stack, including destruction of both admitted and rejected trees.
+Optimized CI repeats the small-stack and parser-log redaction regressions, while
+trivia-padding tests and benchmarks verify that shallow queries do not acquire a
+large AST stack reserve. A targeted KIND test
+verifies operator PVC deletion and same-name recreation against real Kubernetes
+1.36 controllers. A unit regression gives the informer cache a false absence
+while the authoritative API reader still sees an owned PVC, and proves that
+finalization continues waiting. The broader runtime, integration, KIND,
+Jepsen/Elle and PgBouncer comparison suites below remain required Milestone 1
+work; see
 [implementation status](../project/status.md).
 :::
 

@@ -4,6 +4,7 @@ members = [
   "crates/pgshard-catalog",
   "crates/pgshard-orch",
   "crates/pgshard-pgwire",
+  "crates/pgshard-planner",
   "crates/pgshard-router",
   "crates/pgshard-release",
   "crates/pgshard-types",
@@ -24,9 +25,12 @@ arc-swap = "1.7.1"
 axum = "0.8.4"
 blake3 = "1.8.2"
 clap = { version = "4.5.41", features = ["derive"] }
+log = { version = "=0.4.33", features = ["max_level_off", "release_max_level_off"] }
 semver = "1.0.26"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+sqlparser = { version = "=0.62.0", features = ["visitor"] }
+stacker = "=0.1.24"
 thiserror = "2.0.12"
 tokio = { version = "1.46.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tokio-postgres = "0.7.15"
