@@ -8,14 +8,15 @@ description: VStream-like change data capture using PostgreSQL pgoutput.
 :::info Milestone 1 design contract
 This page specifies the required behavior. Source code can decode PostgreSQL 18
 replication envelopes and the buffered, streamed, and two-phase `pgoutput`
-transaction controls plus Relation and Type schema metadata without allocation.
-A segment-layout state machine derives streamed schema XID prefixes from Stream
+transaction controls, Relation and Type schema metadata, and
+Insert/Update/Delete/Truncate row bodies without allocation. A segment-layout
+state machine derives streamed schema and row XID prefixes from Stream
 Start/Stop rather than caller selection. Stream Start identifies the top-level
-transaction, while each nonzero schema prefix may identify a subtransaction.
-It does not yet decode row payloads or
-implement a complete transaction-order machine, relation cache, slots,
-acknowledgements, durable replay, snapshots, cross-shard merge, or a stream service; see
-[implementation status](../project/status.md).
+transaction, while each nonzero message prefix may identify a subtransaction.
+It does not yet decode logical-message bodies or implement a complete
+transaction-order machine, relation cache, slots, acknowledgements, durable
+replay, snapshots, cross-shard merge, or a stream service; see [implementation
+status](../project/status.md).
 :::
 
 Milestone 1 will expose a cluster change stream derived from PostgreSQL 18
