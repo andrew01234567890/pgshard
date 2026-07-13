@@ -34,10 +34,17 @@ report an empty `search_path` immediately before Parse. With an empty path,
 PostgreSQL implicitly searches `pg_catalog` for operators; an attacker-schema
 `=` overload cannot shadow built-in equality.
 This observation is not durable by itself: PostgreSQL can re-analyze a cached
-statement under a later path and select a newly visible operator. The pooler
-session runtime that keeps the path empty through Parse, Describe, Bind, and
-Execute and the schema runtime that gathers and fences physical observations are
-not yet implemented.
+statement under a later path and select a newly visible operator. The implemented
+resolved-Bind core rechecks the exact retained snapshot, accepts a validated
+empty-path token that the caller must rebuild from the current backend, and
+checks PostgreSQL's authoritative parameter count plus the selected
+format/NULL/value bytes without copying before producing a canonical shard
+route. It intentionally does not accept or trust statement and portal names.
+The pooler session runtime that maps those names to an exact prepared
+generation, pins the same backend, keeps the path empty through Parse, Describe,
+Bind, and Execute, and retains the snapshot/schema fences is not yet
+implemented. Neither is the schema runtime that gathers and fences physical
+observations.
 A successful syntax parse or template extraction alone is not PostgreSQL
 semantic validation or permission to route. The source does not yet
 authenticate or execute clients. The
