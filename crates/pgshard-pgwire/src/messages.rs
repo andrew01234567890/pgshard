@@ -29,6 +29,87 @@ impl fmt::Debug for QueryMessage<'_> {
     }
 }
 
+/// The extended-query object selected by a `Describe` or `Close` message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtendedQueryObject {
+    /// A prepared statement.
+    Statement,
+    /// A portal.
+    Portal,
+}
+
+impl ExtendedQueryObject {
+    fn decode(value: u8) -> Result<Self, MessageError> {
+        match value {
+            b'S' => Ok(Self::Statement),
+            b'P' => Ok(Self::Portal),
+            _ => Err(MessageError::InvalidExtendedQueryObject(value)),
+        }
+    }
+}
+
+/// Extended-query `Describe` message body.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct DescribeMessage<'a> {
+    object: ExtendedQueryObject,
+    name: &'a str,
+}
+
+impl<'a> DescribeMessage<'a> {
+    /// Returns whether the message describes a statement or portal.
+    #[must_use]
+    pub const fn object(self) -> ExtendedQueryObject {
+        self.object
+    }
+
+    /// Returns the object name; empty selects the unnamed object.
+    #[must_use]
+    pub const fn name(self) -> &'a str {
+        self.name
+    }
+}
+
+impl fmt::Debug for DescribeMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DescribeMessage")
+            .field("object", &self.object)
+            .field("name_length", &self.name.len())
+            .finish()
+    }
+}
+
+/// Extended-query `Close` message body.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct CloseMessage<'a> {
+    object: ExtendedQueryObject,
+    name: &'a str,
+}
+
+impl<'a> CloseMessage<'a> {
+    /// Returns whether the message closes a statement or portal.
+    #[must_use]
+    pub const fn object(self) -> ExtendedQueryObject {
+        self.object
+    }
+
+    /// Returns the object name; empty selects the unnamed object.
+    #[must_use]
+    pub const fn name(self) -> &'a str {
+        self.name
+    }
+}
+
+impl fmt::Debug for CloseMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CloseMessage")
+            .field("object", &self.object)
+            .field("name_length", &self.name.len())
+            .finish()
+    }
+}
+
 /// Extended-query `Parse` message body.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct ParseMessage<'a> {
@@ -379,6 +460,36 @@ pub fn decode_query(
     Ok(QueryMessage { query })
 }
 
+/// Decodes a complete extended-query `Describe` body.
+///
+/// # Errors
+///
+/// Rejects the wrong tag, a target other than statement `S` or portal `P`, a
+/// missing/invalid UTF-8 name, or trailing bytes.
+pub fn decode_describe(
+    frame: FrontendFrame<'_>,
+    _client_encoding: ClientEncoding,
+) -> Result<DescribeMessage<'_>, MessageError> {
+    require_tag(frame, FrontendTag::Describe)?;
+    let (object, name) = decode_extended_query_object(frame.body())?;
+    Ok(DescribeMessage { object, name })
+}
+
+/// Decodes a complete extended-query `Close` body.
+///
+/// # Errors
+///
+/// Rejects the wrong tag, a target other than statement `S` or portal `P`, a
+/// missing/invalid UTF-8 name, or trailing bytes.
+pub fn decode_close(
+    frame: FrontendFrame<'_>,
+    _client_encoding: ClientEncoding,
+) -> Result<CloseMessage<'_>, MessageError> {
+    require_tag(frame, FrontendTag::Close)?;
+    let (object, name) = decode_extended_query_object(frame.body())?;
+    Ok(CloseMessage { object, name })
+}
+
 /// Decodes a complete extended-query `Parse` body.
 ///
 /// # Errors
@@ -518,6 +629,14 @@ fn require_tag(frame: FrontendFrame<'_>, expected: FrontendTag) -> Result<(), Me
     }
 }
 
+fn decode_extended_query_object(body: &[u8]) -> Result<(ExtendedQueryObject, &str), MessageError> {
+    let mut cursor = Cursor::new(body);
+    let object = ExtendedQueryObject::decode(cursor.byte("extended-query object")?)?;
+    let name = cursor.cstring_utf8("extended-query object name")?;
+    cursor.finish()?;
+    Ok((object, name))
+}
+
 fn validate_formats(mut bytes: &[u8]) -> Result<(), MessageError> {
     while let Some(value) = bytes.get(..2) {
         FormatCode::decode(u16::from_be_bytes([value[0], value[1]]))?;
@@ -555,6 +674,10 @@ impl<'a> Cursor<'a> {
     fn u16(&mut self, field: &'static str) -> Result<u16, MessageError> {
         let bytes = self.take(2, field)?;
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn byte(&mut self, field: &'static str) -> Result<u8, MessageError> {
+        Ok(self.take(1, field)?[0])
     }
 
     fn i32(&mut self, field: &'static str) -> Result<i32, MessageError> {
@@ -601,6 +724,9 @@ pub enum MessageError {
     /// A protocol C-string is not valid under pinned `client_encoding=UTF8`.
     #[error("{0} is not valid UTF8")]
     InvalidUtf8(&'static str),
+    /// A `Describe` or `Close` target is neither statement `S` nor portal `P`.
+    #[error("invalid extended-query object code {0}")]
+    InvalidExtendedQueryObject(u8),
     /// A fixed-width or length-prefixed field extends beyond the frame body.
     #[error("{0} is truncated")]
     Truncated(&'static str),
@@ -678,6 +804,55 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn decodes_statement_and_portal_describe_and_close() {
+        let statement = decode_describe(frame(b'D', b"Slookup\0"), utf8()).expect("describe");
+        assert_eq!(statement.object(), ExtendedQueryObject::Statement);
+        assert_eq!(statement.name(), "lookup");
+
+        let unnamed_portal = decode_describe(frame(b'D', b"P\0"), utf8()).expect("describe");
+        assert_eq!(unnamed_portal.object(), ExtendedQueryObject::Portal);
+        assert_eq!(unnamed_portal.name(), "");
+
+        let portal = decode_close(frame(b'C', b"Presults\0"), utf8()).expect("close");
+        assert_eq!(portal.object(), ExtendedQueryObject::Portal);
+        assert_eq!(portal.name(), "results");
+
+        let unnamed_statement = decode_close(frame(b'C', b"S\0"), utf8()).expect("close");
+        assert_eq!(unnamed_statement.object(), ExtendedQueryObject::Statement);
+        assert_eq!(unnamed_statement.name(), "");
+    }
+
+    #[test]
+    fn malformed_describe_and_close_bodies_fail_closed() {
+        assert_eq!(
+            decode_describe(frame(b'D', b""), utf8()),
+            Err(MessageError::Truncated("extended-query object"))
+        );
+        assert_eq!(
+            decode_describe(frame(b'D', b"Xname\0"), utf8()),
+            Err(MessageError::InvalidExtendedQueryObject(b'X'))
+        );
+        assert_eq!(
+            decode_describe(frame(b'D', b"Sname"), utf8()),
+            Err(MessageError::MissingTerminator(
+                "extended-query object name"
+            ))
+        );
+        assert_eq!(
+            decode_close(frame(b'C', b"S\xff\0"), utf8()),
+            Err(MessageError::InvalidUtf8("extended-query object name"))
+        );
+        assert_eq!(
+            decode_close(frame(b'C', b"Sname\0x"), utf8()),
+            Err(MessageError::TrailingData(1))
+        );
+        assert!(matches!(
+            decode_close(frame(b'D', b"Sname\0"), utf8()),
+            Err(MessageError::WrongTag { .. })
+        ));
     }
 
     #[test]
@@ -929,5 +1104,10 @@ mod tests {
         let bind_debug = format!("{bind:?} {:?}", bind.parameters().iter().next());
         assert!(!bind_debug.contains("do-not-log-this"));
         assert!(bind_debug.contains("value_length"));
+
+        let describe =
+            decode_describe(frame(b'D', b"Sdo-not-log-this\0"), utf8()).expect("describe");
+        let close = decode_close(frame(b'C', b"Pdo-not-log-this\0"), utf8()).expect("close");
+        assert!(!format!("{describe:?} {close:?}").contains("do-not-log-this"));
     }
 }

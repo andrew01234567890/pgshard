@@ -13,12 +13,13 @@ deep delimiter, data-type, binary-expression, and set-operation shapes on a
 64 KiB thread stack, including destruction of both admitted and rejected trees.
 Optimized CI repeats the small-stack and parser-log redaction regressions, while
 trivia-padding tests and benchmarks verify that shallow queries do not acquire a
-large AST stack reserve. A separate raw-wire PostgreSQL 18 test validates every
-byte of a real backend `ParameterDescription` through the production framing
-and body decoders. A targeted KIND test
-verifies operator PVC deletion and same-name recreation against real Kubernetes
-1.36 controllers. A unit regression gives the informer cache a false absence
-while the authoritative API reader still sees an owned PVC, and proves that
+large AST stack reserve. A separate raw-wire PostgreSQL 18 test validates real
+`Describe`, `ParameterDescription`, empty completion, `ReadyForQuery`, and
+`Close` messages through the production framing and body decoders. A targeted
+KIND test verifies operator PVC deletion and same-name recreation against real
+Kubernetes 1.36 controllers. A unit regression gives the informer cache a
+false absence while the authoritative API reader still sees an owned PVC, and
+proves that
 finalization continues waiting. The broader runtime, integration, KIND,
 Jepsen/Elle and PgBouncer comparison suites below remain required Milestone 1
 work; see

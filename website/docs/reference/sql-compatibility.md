@@ -11,8 +11,9 @@ byte/token/AST/stack-bounded permissive candidate parser configured with a
 PostgreSQL dialect, a fail-closed core that routes an already-resolved, non-NULL
 shard-key bind parameter against one immutable catalog snapshot, and a bounded
 zero-copy decoder for PostgreSQL 18 frontend/backend frames, selected
-simple/extended frontend bodies, and exact backend `ParameterDescription`
-metadata. The first catalog-bound template accepts only an explicitly
+simple/extended frontend bodies including `Describe`/`Close`, exact backend
+`ParameterDescription` metadata, empty completions, and `ReadyForQuery`
+transaction status. The first catalog-bound template accepts only an explicitly
 schema-qualified `SELECT * FROM schema.table WHERE shard_key = $n` shape (or
 reversed equality), with no other clause or expression. It rejects `==` before
 AST proof because PostgreSQL resolves that spelling as a distinct, potentially
@@ -41,8 +42,10 @@ empty-path token that the caller must rebuild from the current backend, and
 checks PostgreSQL's authoritative parameter count plus the selected
 format/NULL/value bytes without copying before producing a canonical shard
 route. It intentionally does not accept or trust statement and portal names.
-The backend decoder supplies framing and borrowed type OIDs only; it does not
-prove that a description belongs to the relevant Parse, backend, or session.
+The backend decoder supplies framing, borrowed type OIDs, completion-body
+validation, and transaction-status bytes only; it does not prove that a
+description belongs to the relevant Parse, backend, or session, or track a
+query cycle.
 The pooler session runtime that maps those names to an exact prepared
 generation, pins the same backend, keeps the path empty through Parse, Describe,
 Bind, and Execute, and retains the snapshot/schema fences is not yet

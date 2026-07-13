@@ -177,6 +177,17 @@ impl<'a> BackendFrame<'a> {
     }
 }
 
+/// Transaction state carried by a backend `ReadyForQuery` message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionStatus {
+    /// Not inside a transaction block.
+    Idle,
+    /// Inside a live transaction block.
+    InTransaction,
+    /// Inside a failed transaction block.
+    FailedTransaction,
+}
+
 /// Decodes one backend frame from the beginning of `input`.
 ///
 /// Unknown tags are rejected before their length is trusted. Framing does not
@@ -297,6 +308,62 @@ pub fn decode_parameter_description(
     }
 }
 
+/// Decodes the exact transaction status in a backend `ReadyForQuery` body.
+///
+/// # Errors
+///
+/// Rejects another backend tag, a missing status byte, an unknown status, or
+/// trailing bytes.
+pub fn decode_ready_for_query(
+    frame: BackendFrame<'_>,
+) -> Result<TransactionStatus, BackendMessageError> {
+    if frame.tag() != BackendTag::ReadyForQuery {
+        return Err(BackendMessageError::WrongTag {
+            expected: BackendTag::ReadyForQuery,
+            actual: frame.tag(),
+        });
+    }
+    let status = match frame.body() {
+        b"I" => TransactionStatus::Idle,
+        b"T" => TransactionStatus::InTransaction,
+        b"E" => TransactionStatus::FailedTransaction,
+        [] => return Err(BackendMessageError::Truncated("transaction status")),
+        [actual] => return Err(BackendMessageError::InvalidTransactionStatus(*actual)),
+        body => return Err(BackendMessageError::TrailingData(body.len() - 1)),
+    };
+    Ok(status)
+}
+
+/// Validates a backend message whose `PostgreSQL` 18 body must be empty.
+///
+/// This accepts `ParseComplete`, `BindComplete`, `CloseComplete`,
+/// `EmptyQueryResponse`, `NoData`, `PortalSuspended`, and backend `CopyDone`.
+/// Other tags require their own typed decoder even when a malformed frame
+/// happens to carry no bytes.
+///
+/// # Errors
+///
+/// Rejects a tag outside that exact family or any nonempty body.
+pub fn require_empty_backend_body(frame: BackendFrame<'_>) -> Result<(), BackendMessageError> {
+    if !matches!(
+        frame.tag(),
+        BackendTag::ParseComplete
+            | BackendTag::BindComplete
+            | BackendTag::CloseComplete
+            | BackendTag::EmptyQueryResponse
+            | BackendTag::NoData
+            | BackendTag::PortalSuspended
+            | BackendTag::CopyDone
+    ) {
+        return Err(BackendMessageError::ExpectedEmptyBodyTag(frame.tag()));
+    }
+    if frame.body().is_empty() {
+        Ok(())
+    } else {
+        Err(BackendMessageError::TrailingData(frame.body().len()))
+    }
+}
+
 /// Backend message-body decoding failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum BackendMessageError {
@@ -311,6 +378,12 @@ pub enum BackendMessageError {
     /// A fixed-width or counted field extends beyond the frame body.
     #[error("{0} is truncated")]
     Truncated(&'static str),
+    /// A `ReadyForQuery` status is not idle `I`, transaction `T`, or failed `E`.
+    #[error("invalid ReadyForQuery transaction status {0}")]
+    InvalidTransactionStatus(u8),
+    /// An empty-body validator was called for a message with another layout.
+    #[error("backend message {0:?} does not belong to the empty-body family")]
+    ExpectedEmptyBodyTag(BackendTag),
     /// Valid fields did not consume the exact frame body.
     #[error("message has {0} trailing bytes")]
     TrailingData(usize),
@@ -338,6 +411,13 @@ mod tests {
         };
         assert_eq!(consumed, input.len());
         frame
+    }
+
+    fn unchecked(tag: u8, body: &[u8]) -> BackendFrame<'_> {
+        BackendFrame {
+            tag: BackendTag::from_byte(tag).expect("test backend tag"),
+            body,
+        }
     }
 
     #[test]
@@ -541,6 +621,56 @@ mod tests {
         assert_eq!(description.parameter_type_count(), usize::from(count));
         assert_eq!(description.parameter_types().next(), Some(1));
         assert_eq!(description.parameter_types().last(), Some(u32::from(count)));
+    }
+
+    #[test]
+    fn ready_for_query_reports_exact_transaction_state() {
+        for (body, expected) in [
+            (b"I".as_slice(), TransactionStatus::Idle),
+            (b"T".as_slice(), TransactionStatus::InTransaction),
+            (b"E".as_slice(), TransactionStatus::FailedTransaction),
+        ] {
+            assert_eq!(
+                decode_ready_for_query(complete(&backend(b'Z', body))),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            decode_ready_for_query(unchecked(b'Z', b"")),
+            Err(BackendMessageError::Truncated("transaction status"))
+        );
+        assert_eq!(
+            decode_ready_for_query(complete(&backend(b'Z', b"X"))),
+            Err(BackendMessageError::InvalidTransactionStatus(b'X'))
+        );
+        assert_eq!(
+            decode_ready_for_query(unchecked(b'Z', b"II")),
+            Err(BackendMessageError::TrailingData(1))
+        );
+        assert!(matches!(
+            decode_ready_for_query(complete(&backend(b'1', b""))),
+            Err(BackendMessageError::WrongTag { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_empty_backend_message_family_is_validated() {
+        for tag in *b"123Insc" {
+            assert_eq!(
+                require_empty_backend_body(complete(&backend(tag, b""))),
+                Ok(())
+            );
+            assert_eq!(
+                require_empty_backend_body(unchecked(tag, b"x")),
+                Err(BackendMessageError::TrailingData(1))
+            );
+        }
+        assert_eq!(
+            require_empty_backend_body(unchecked(b'Z', b"")),
+            Err(BackendMessageError::ExpectedEmptyBodyTag(
+                BackendTag::ReadyForQuery
+            ))
+        );
     }
 
     #[test]
