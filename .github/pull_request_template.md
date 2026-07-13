@@ -13,8 +13,6 @@
 ## Correctness review
 
 - [ ] Failure, retry, crash-recovery, and idempotency behavior considered
-- [ ] ACID guarantees and limitations remain accurate
-- [ ] Jepsen/Elle histories or checkers updated when distributed behavior changes
 - [ ] Backup, restore, DDL, resharding, and CDC safety considered where applicable
 - [ ] The change has been simplified as far as behavior permits
 
