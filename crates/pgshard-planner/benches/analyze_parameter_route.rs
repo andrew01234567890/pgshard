@@ -6,7 +6,10 @@ use pgshard_catalog::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, RegisteredTable,
     RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
 };
-use pgshard_planner::parse_one;
+use pgshard_planner::{
+    CatalogOnlySearchPath, PhysicalShardKeyCatalogIdentity, PhysicalShardKeyObservation,
+    PhysicalShardKeyProof, parse_one,
+};
 use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
 use uuid::Uuid;
 
@@ -45,15 +48,40 @@ fn fixture() -> (CatalogSnapshot, DatabaseId) {
 
 fn main() {
     let (snapshot, database_id) = fixture();
+    let search_path = CatalogOnlySearchPath::require_empty("").expect("empty search path");
+    let physical_schema = PhysicalShardKeyProof::verify(
+        &snapshot,
+        database_id,
+        &TableName::new("public", "events").expect("table name"),
+        &[PhysicalShardKeyObservation::new(
+            ShardId(0),
+            PhysicalShardKeyCatalogIdentity::new(
+                database_id,
+                "app",
+                TableName::new("public", "events").expect("table name"),
+                "tenant_id",
+                b'r',
+                b'p',
+                false,
+            ),
+            1,
+            20,
+            0,
+            6,
+        )],
+    )
+    .expect("physical schema proof");
     let started = Instant::now();
     let mut digest = 0_u64;
 
     for _ in 0..ITERATIONS {
         let statement = parse_one(black_box(SQL)).expect("benchmark statement");
-        let template = statement
+        let resolved = statement
             .parameter_route_template(black_box(&snapshot), database_id)
-            .expect("benchmark route template");
-        digest = digest.wrapping_add(u64::from(template.parameter_number().get()));
+            .expect("benchmark route template")
+            .resolve_parameter_types(search_path, &physical_schema, black_box(&[20]))
+            .expect("benchmark parameter resolution");
+        digest = digest.wrapping_add(u64::from(resolved.template().parameter_number().get()));
     }
 
     let elapsed = started.elapsed();

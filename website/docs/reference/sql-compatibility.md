@@ -17,7 +17,27 @@ reversed equality), with no other clause or expression. It rejects `==` before
 AST proof because PostgreSQL resolves that spelling as a distinct, potentially
 custom operator while the candidate parser collapses it to the same AST node as
 `=`. It is not executable until Parse parameter types/operator resolution and
-the Bind value are checked.
+the Bind value are checked. The implemented parameter-resolution stage requires
+PostgreSQL's authoritative description to report the exact built-in shard-key
+type OID. It also requires a proof that the physical shard-key column belongs to
+the exact database, schema-qualified permanent ordinary table, and column on
+every active shard, does not participate in inheritance or partitioning, and
+has that exact built-in type, with built-in `C` collation and UTF8 encoding for
+text. Template and proof carry the cluster identity, managed-schema epoch, and
+checksum of the complete retained catalog snapshot, so a proof from another
+cluster or pre/post-reshard topology cannot be reused. The
+physical proof is mandatory because a ParameterDescription reports only the
+parameter type: PostgreSQL can accept an explicitly typed `bigint` parameter
+against a `double precision` column, round distinct large integers to the same
+float, and still report parameter OID 20. The stage also requires the backend to
+report an empty `search_path` immediately before Parse. With an empty path,
+PostgreSQL implicitly searches `pg_catalog` for operators; an attacker-schema
+`=` overload cannot shadow built-in equality.
+This observation is not durable by itself: PostgreSQL can re-analyze a cached
+statement under a later path and select a newly visible operator. The pooler
+session runtime that keeps the path empty through Parse, Describe, Bind, and
+Execute and the schema runtime that gathers and fences physical observations are
+not yet implemented.
 A successful syntax parse or template extraction alone is not PostgreSQL
 semantic validation or permission to route. The source does not yet
 authenticate or execute clients. The
@@ -48,6 +68,28 @@ can be proven to target one shard.
 ## Transaction pooling limits
 
 Safe session settings are replayed when a transaction receives a backend. Temporary objects, `LISTEN`, session advisory locks, holdable cursors, and backend-bound state are rejected because they cannot move safely between pooled connections or enter PostgreSQL prepared transactions.
+
+Backend connections used for routed statements pin `search_path` to the empty
+string. Every referenced application table must therefore be explicitly
+schema-qualified, while PostgreSQL resolves unqualified operators only from its
+implicitly searched `pg_catalog`. Client attempts to change `search_path` are
+rejected, and the setting is read back before Parse and again before
+Bind/Execute. The later check is mandatory because PostgreSQL's plan cache can
+re-analyze a prepared statement when the path changes. This prevents
+user-defined `=` overloads from changing a predicate that the pooler admitted as
+built-in shard-key equality.
+
+Parameter OIDs and catalog registration are not substitutes for the physical
+schema proof. Before a route proof is cached, the schema manager reads the
+shard-key column's exact database/schema/table/column identity,
+`pg_class.relkind` and `relpersistence`, `pg_inherits` membership,
+`pg_attribute.atttypid` and `attcollation`, database encoding, and shard-local
+managed-schema epoch from every active shard. Only permanent ordinary tables
+outside inheritance are admitted. The proof fails closed on missing, duplicate,
+stale, unexpected, misidentified, view-like, foreign, unlogged, temporary,
+inherited, or partitioned observations. DDL activation and Bind/Execute must
+fence the exact retained snapshot checksum and schema epoch so that this proof
+cannot survive a topology or physical-schema change.
 
 The pooler pins `client_encoding` to canonical `UTF8` and rejects attempts to
 change it. PostgreSQL converts both text-format and binary `text` binds from the
