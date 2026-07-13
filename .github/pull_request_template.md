@@ -10,16 +10,8 @@
 - [ ] Documentation and compatibility tables updated with the implementation
 - [ ] No credentials, private paths, private email addresses, internal hostnames, or sensitive logs are included
 
-## Correctness review
-
-- [ ] Failure, retry, crash-recovery, and idempotency behavior considered
-- [ ] Backup, restore, DDL, resharding, and CDC safety considered where applicable
-- [ ] The change has been simplified as far as behavior permits
-
-## Release and review
+## Release
 
 - [ ] PR title is a valid Conventional Commit and describes the squash commit
 - [ ] Source commits use GitHub noreply author and committer identities; any final squash-author exception follows the documented signed `web-flow` policy
-- [ ] Independent correctness and simplification review completed
-- [ ] Material review fixes received a fresh independent review
 - [ ] This PR will be squash-merged only
