@@ -356,10 +356,30 @@ fn hex_nibble(value: u8) -> u8 {
     }
 }
 
+fn persistent_two_phase_configuration() -> PgOutputConfiguration {
+    PgOutputConfiguration::new(
+        PgOutputVersion::V1,
+        PgOutputStreaming::Off,
+        false,
+        true,
+        false,
+    )
+    .expect("protocol v1 remains decodable for a persistently enabled slot")
+}
+
+fn streamed_message_configuration() -> PgOutputConfiguration {
+    PgOutputConfiguration::new(
+        PgOutputVersion::V2,
+        PgOutputStreaming::On,
+        false,
+        false,
+        true,
+    )
+    .expect("protocol v2 streaming configuration")
+}
+
 fn assert_prepared_row_changes(messages: &[Vec<u8>], table: &str, encoding: PgOutputEncoding) {
-    let configuration =
-        PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::Off, false, true)
-            .expect("protocol v1 remains decodable for a persistently enabled slot");
+    let configuration = persistent_two_phase_configuration();
     assert_eq!(
         messages
             .iter()
@@ -521,7 +541,7 @@ fn two_phase_slot_state_survives_a_false_start_request(
     assert_prepared_row_changes(&messages, &table, encoding);
 }
 
-fn streamed_subtransaction_schema_keeps_its_own_xid(
+fn streamed_subtransaction_metadata_keeps_its_own_xid(
     stream: &mut TcpStream,
     encoding: PgOutputEncoding,
 ) {
@@ -543,9 +563,15 @@ fn streamed_subtransaction_schema_keeps_its_own_xid(
     let slot_creation_result = simple_query(stream, &create_slot);
     simple_query(
         stream,
+        "SELECT pg_logical_emit_message(false, 'pgshard_nontransactional', decode('00ff', 'hex'))",
+    );
+    simple_query(
+        stream,
         &format!(
             "BEGIN; SAVEPOINT child; INSERT INTO {table} \
              SELECT value, repeat('x', 512) FROM generate_series(1, 512) AS value; \
+             SELECT pg_logical_emit_message(true, 'pgshard_streamed', \
+             decode('0102ff', 'hex')); \
              RELEASE SAVEPOINT child; COMMIT"
         ),
     );
@@ -553,7 +579,7 @@ fn streamed_subtransaction_schema_keeps_its_own_xid(
     let peek = format!(
         "SELECT encode(data, 'hex') FROM pg_logical_slot_peek_binary_changes(\
          '{slot}', NULL, NULL, 'proto_version', '2', 'publication_names', \
-         '{publication}', 'streaming', 'on')"
+         '{publication}', 'streaming', 'on', 'messages', 'true')"
     );
     let messages: Vec<Vec<u8>> = simple_query(stream, &peek)
         .into_iter()
@@ -568,13 +594,17 @@ fn streamed_subtransaction_schema_keeps_its_own_xid(
     simple_query(stream, "RESET logical_decoding_work_mem");
 
     assert_eq!(slot_creation_result, [slot.as_bytes()]);
-    let configuration =
-        PgOutputConfiguration::new(PgOutputVersion::V2, PgOutputStreaming::On, false, false)
-            .expect("protocol v2 streaming configuration");
+    assert_streamed_metadata(&messages, &table, encoding);
+}
+
+fn assert_streamed_metadata(messages: &[Vec<u8>], table: &str, encoding: PgOutputEncoding) {
+    let configuration = streamed_message_configuration();
     let mut decoder = PgOutputDecoder::new(configuration, encoding);
     let mut top_level_xid = None;
     let mut schema_xid = None;
-    for message in &messages {
+    let mut logical_message_xid = None;
+    let mut nontransactional_message_seen = false;
+    for message in messages {
         match message.first() {
             Some(b'S') => {
                 let PgOutputMessage::Control(PgOutputControlMessage::StreamStart { xid, .. }) =
@@ -598,6 +628,33 @@ fn streamed_subtransaction_schema_keeps_its_own_xid(
                     );
                 }
             }
+            Some(b'M') => {
+                let PgOutputMessage::LogicalMessage(logical) = decoder
+                    .decode(message)
+                    .expect("live logical decoding Message")
+                else {
+                    panic!("live logical decoding Message decoded as another message");
+                };
+                assert_ne!(logical.lsn(), 0, "live logical Message has a zero LSN");
+                match logical.prefix() {
+                    "pgshard_nontransactional" => {
+                        assert!(!logical.transactional());
+                        assert_eq!(logical.stream_xid(), None);
+                        assert_eq!(logical.content(), [0, 0xff]);
+                        nontransactional_message_seen = true;
+                    }
+                    "pgshard_streamed" => {
+                        assert!(logical.transactional());
+                        assert_eq!(logical.content(), [1, 2, 0xff]);
+                        logical_message_xid.get_or_insert(
+                            logical
+                                .stream_xid()
+                                .expect("streamed logical Message carries a transaction ID"),
+                        );
+                    }
+                    prefix => panic!("unexpected live logical Message prefix {prefix:?}"),
+                }
+            }
             Some(b'E') => {
                 decoder.decode(message).expect("live Stream Stop");
             }
@@ -607,9 +664,23 @@ fn streamed_subtransaction_schema_keeps_its_own_xid(
     decoder.finish().expect("all live stream segments stopped");
     let top_level_xid = top_level_xid.expect("PostgreSQL emitted Stream Start");
     let schema_xid = schema_xid.expect("PostgreSQL emitted streamed Relation");
+    let logical_message_xid =
+        logical_message_xid.expect("PostgreSQL emitted streamed logical Message");
+    assert!(
+        nontransactional_message_seen,
+        "PostgreSQL omitted the nontransactional logical Message"
+    );
     assert_ne!(
         schema_xid, top_level_xid,
         "savepoint Relation must prove the subtransaction-XID layout"
+    );
+    assert_eq!(
+        logical_message_xid, top_level_xid,
+        "PostgreSQL attributes the streamed logical Message to the top-level transaction"
+    );
+    assert_ne!(
+        logical_message_xid, schema_xid,
+        "the live fixture must retain PostgreSQL's distinct Message and Relation XIDs"
     );
 }
 
@@ -642,7 +713,7 @@ fn postgres18_wire_and_persistent_slot_controls_decode_from_real_bytes() {
     describe_statement(&mut stream, utf8);
     close_statement(&mut stream, utf8);
     two_phase_slot_state_survives_a_false_start_request(&mut stream, pgoutput_encoding);
-    streamed_subtransaction_schema_keeps_its_own_xid(&mut stream, pgoutput_encoding);
+    streamed_subtransaction_metadata_keeps_its_own_xid(&mut stream, pgoutput_encoding);
 
     stream
         .write_all(&frontend(b'X', b""))

@@ -72,6 +72,7 @@ pub struct PgOutputConfiguration {
     streaming: PgOutputStreaming,
     requested_two_phase: bool,
     slot_two_phase: bool,
+    messages: bool,
 }
 
 impl PgOutputConfiguration {
@@ -81,14 +82,16 @@ impl PgOutputConfiguration {
     ///
     /// `requested_two_phase` is the accepted `START_REPLICATION` option.
     /// `slot_two_phase` must be the authoritative state of the exact selected
-    /// slot. Rejects streaming below protocol v2, parallel streaming below v4,
-    /// and a new two-phase request below v3. A previously enabled slot remains
-    /// effective even with an older requested protocol.
+    /// slot. `messages` is the accepted option whose `PostgreSQL` default is
+    /// false. Rejects streaming below protocol v2, parallel streaming below
+    /// v4, and a new two-phase request below v3. A previously enabled slot
+    /// remains effective even with an older requested protocol.
     pub fn new(
         version: PgOutputVersion,
         streaming: PgOutputStreaming,
         requested_two_phase: bool,
         slot_two_phase: bool,
+        messages: bool,
     ) -> Result<Self, PgOutputConfigurationError> {
         let minimum_streaming_version = match streaming {
             PgOutputStreaming::Off => None,
@@ -112,6 +115,7 @@ impl PgOutputConfiguration {
             streaming,
             requested_two_phase,
             slot_two_phase,
+            messages,
         })
     }
 
@@ -137,6 +141,12 @@ impl PgOutputConfiguration {
     #[must_use]
     pub const fn slot_two_phase(self) -> bool {
         self.slot_two_phase
+    }
+
+    /// Returns the accepted `messages` option from `START_REPLICATION`.
+    #[must_use]
+    pub const fn messages(self) -> bool {
+        self.messages
     }
 
     /// Returns `PostgreSQL`'s effective two-phase decoding state.
@@ -1173,6 +1183,61 @@ impl<'a> PgOutputTruncate<'a> {
     }
 }
 
+/// Borrowed custom payload from a logical decoding Message record.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct PgOutputLogicalMessage<'a> {
+    stream_xid: Option<u32>,
+    transactional: bool,
+    lsn: u64,
+    prefix: &'a str,
+    content: &'a [u8],
+}
+
+impl fmt::Debug for PgOutputLogicalMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputLogicalMessage")
+            .field("stream_xid", &self.stream_xid)
+            .field("transactional", &self.transactional)
+            .field("lsn", &self.lsn)
+            .field("prefix_length", &self.prefix.len())
+            .field("content_length", &self.content.len())
+            .finish()
+    }
+}
+
+impl<'a> PgOutputLogicalMessage<'a> {
+    /// Returns the streamed transaction ID, or `None` for buffered output.
+    #[must_use]
+    pub const fn stream_xid(self) -> Option<u32> {
+        self.stream_xid
+    }
+
+    /// Returns whether the custom record commits or rolls back with a transaction.
+    #[must_use]
+    pub const fn transactional(self) -> bool {
+        self.transactional
+    }
+
+    /// Returns the WAL position of the custom record.
+    #[must_use]
+    pub const fn lsn(self) -> u64 {
+        self.lsn
+    }
+
+    /// Returns the borrowed UTF-8 namespace chosen by the message producer.
+    #[must_use]
+    pub const fn prefix(self) -> &'a str {
+        self.prefix
+    }
+
+    /// Returns the borrowed opaque message payload.
+    #[must_use]
+    pub const fn content(self) -> &'a [u8] {
+        self.content
+    }
+}
+
 /// One message decoded with stream-segment layout state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PgOutputMessage<'a> {
@@ -1190,14 +1255,17 @@ pub enum PgOutputMessage<'a> {
     Delete(PgOutputDelete<'a>),
     /// One or more truncated relations.
     Truncate(PgOutputTruncate<'a>),
+    /// A custom logical decoding payload.
+    LogicalMessage(PgOutputLogicalMessage<'a>),
 }
 
 /// Stateful decoder for layouts that include an XID only inside stream chunks.
 ///
-/// `PostgreSQL` does not mark the optional XID field in schema or row-change
-/// messages. This decoder derives its presence from successfully decoded Stream
-/// Start and Stream Stop controls, so callers cannot select an ambiguous layout
-/// per message. It deliberately does not yet prove complete transaction order.
+/// `PostgreSQL` does not mark the optional XID field in schema, row, or logical
+/// decoding Message records. This decoder derives its presence from successfully
+/// decoded Stream Start and Stream Stop controls, so callers cannot select an
+/// ambiguous layout per message. It deliberately does not yet prove complete
+/// transaction order.
 pub struct PgOutputDecoder {
     configuration: PgOutputConfiguration,
     encoding: PgOutputEncoding,
@@ -1241,7 +1309,8 @@ impl PgOutputDecoder {
     ///
     /// Returns the message-local errors from [`decode_pgoutput_control`] plus
     /// invalid stream nesting, an unmatched stop, a zero streamed-message XID,
-    /// or another control inside an active stream segment.
+    /// another control inside an active stream segment, a custom Message while
+    /// `messages` is disabled, or invalid streamed custom-Message state.
     pub fn decode<'input>(
         &mut self,
         input: &'input [u8],
@@ -1267,6 +1336,11 @@ impl PgOutputDecoder {
             }
             b'T' => decode_truncate(body, self.active_stream_xid.is_some())
                 .map(PgOutputMessage::Truncate),
+            b'M' => {
+                require_messages(self.configuration)?;
+                decode_logical_message(body, self.active_stream_xid)
+                    .map(PgOutputMessage::LogicalMessage)
+            }
             _ => {
                 let message = decode_pgoutput_control(input, self.configuration, self.encoding)?;
                 let next_stream_xid = self.validate_control_transition(&message)?;
@@ -1582,6 +1656,50 @@ fn decode_truncate(
     })
 }
 
+fn decode_logical_message(
+    body: &[u8],
+    active_stream_xid: Option<u32>,
+) -> Result<PgOutputLogicalMessage<'_>, PgOutputError> {
+    let mut cursor = Cursor::new(body);
+    let stream_xid = decode_stream_xid(&mut cursor, active_stream_xid.is_some())?;
+    if let (Some(active_xid), Some(message_xid)) = (active_stream_xid, stream_xid)
+        && message_xid != active_xid
+    {
+        return Err(PgOutputError::LogicalMessageTransactionMismatch {
+            active_xid,
+            message_xid,
+        });
+    }
+    let flags = cursor.byte("logical decoding message flags")?;
+    if flags & !1 != 0 {
+        return Err(PgOutputError::InvalidFlags {
+            message: "logical decoding",
+            flags,
+        });
+    }
+    let transactional = flags & 1 != 0;
+    if active_stream_xid.is_some() && !transactional {
+        return Err(PgOutputError::NonTransactionalMessageInsideStream);
+    }
+    let lsn = cursor.u64("logical decoding message LSN")?;
+    if lsn == 0 {
+        return Err(PgOutputError::InvalidLsn("logical decoding message LSN"));
+    }
+    let prefix = cursor.cstring_utf8("logical decoding message prefix")?;
+    let signed_length = cursor.i32("logical decoding message content length")?;
+    let length = usize::try_from(signed_length)
+        .map_err(|_| PgOutputError::InvalidLogicalMessageLength(signed_length))?;
+    let content = cursor.take(length, "logical decoding message content")?;
+    cursor.finish()?;
+    Ok(PgOutputLogicalMessage {
+        stream_xid,
+        transactional,
+        lsn,
+        prefix,
+        content,
+    })
+}
+
 fn require_tuple_marker(
     marker: u8,
     expected: u8,
@@ -1794,6 +1912,14 @@ fn require_two_phase(configuration: PgOutputConfiguration, tag: u8) -> Result<()
     }
 }
 
+fn require_messages(configuration: PgOutputConfiguration) -> Result<(), PgOutputError> {
+    if configuration.messages() {
+        Ok(())
+    } else {
+        Err(PgOutputError::LogicalMessagesDisabled)
+    }
+}
+
 struct Cursor<'a> {
     remaining: &'a [u8],
 }
@@ -1927,6 +2053,25 @@ pub enum PgOutputError {
     /// A Truncate message set a reserved option bit.
     #[error("unrecognized Truncate flags {0}")]
     InvalidTruncateFlags(u8),
+    /// A logical decoding Message record declared a negative content length.
+    #[error("logical decoding message content length {0} is negative")]
+    InvalidLogicalMessageLength(i32),
+    /// A custom logical Message arrived without `messages=true`.
+    #[error("pgoutput logical Message arrived while messages were disabled")]
+    LogicalMessagesDisabled,
+    /// A nontransactional custom Message appeared inside a streamed segment.
+    #[error("nontransactional pgoutput logical Message arrived inside a stream segment")]
+    NonTransactionalMessageInsideStream,
+    /// A streamed custom Message named another transaction.
+    #[error(
+        "pgoutput logical Message XID {message_xid} does not match active stream XID {active_xid}"
+    )]
+    LogicalMessageTransactionMismatch {
+        /// Transaction whose stream segment is open.
+        active_xid: u32,
+        /// Different XID encoded by the custom Message.
+        message_xid: u32,
+    },
     /// The logical message tag is not defined by `PostgreSQL` 18 `pgoutput`.
     #[error("unknown PostgreSQL 18 pgoutput message tag {0}")]
     UnknownPgOutputMessage(u8),
@@ -2012,8 +2157,16 @@ mod tests {
         streaming: PgOutputStreaming,
         two_phase: bool,
     ) -> PgOutputConfiguration {
-        PgOutputConfiguration::new(version, streaming, two_phase, false)
+        PgOutputConfiguration::new(version, streaming, two_phase, false, false)
             .expect("valid pgoutput test configuration")
+    }
+
+    fn message_configuration(
+        version: PgOutputVersion,
+        streaming: PgOutputStreaming,
+    ) -> PgOutputConfiguration {
+        PgOutputConfiguration::new(version, streaming, false, false, true)
+            .expect("valid pgoutput message test configuration")
     }
 
     fn copy_data(body: &[u8]) -> Vec<u8> {
@@ -2248,6 +2401,29 @@ mod tests {
         message
     }
 
+    fn logical_message(
+        stream_xid: Option<u32>,
+        transactional: bool,
+        lsn: u64,
+        prefix: &[u8],
+        content: &[u8],
+    ) -> Vec<u8> {
+        let mut message = vec![b'M'];
+        if let Some(xid) = stream_xid {
+            push_u32(&mut message, xid);
+        }
+        message.push(u8::from(transactional));
+        push_u64(&mut message, lsn);
+        message.extend_from_slice(prefix);
+        message.push(0);
+        push_i32(
+            &mut message,
+            i32::try_from(content.len()).expect("logical message content length"),
+        );
+        message.extend_from_slice(content);
+        message
+    }
+
     #[test]
     fn configuration_enforces_postgres18_feature_versions() {
         for (raw, expected) in [
@@ -2278,10 +2454,17 @@ mod tests {
             assert_eq!(config.requested_two_phase(), two_phase);
             assert!(!config.slot_two_phase());
             assert_eq!(config.two_phase(), two_phase);
+            assert!(!config.messages());
         }
 
         assert!(matches!(
-            PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::On, false, false),
+            PgOutputConfiguration::new(
+                PgOutputVersion::V1,
+                PgOutputStreaming::On,
+                false,
+                false,
+                false,
+            ),
             Err(PgOutputConfigurationError::StreamingRequiresVersion {
                 minimum: PgOutputVersion::V2,
                 actual: PgOutputVersion::V1,
@@ -2293,7 +2476,8 @@ mod tests {
                 PgOutputVersion::V3,
                 PgOutputStreaming::Parallel,
                 false,
-                false
+                false,
+                false,
             ),
             Err(PgOutputConfigurationError::StreamingRequiresVersion {
                 minimum: PgOutputVersion::V4,
@@ -2302,20 +2486,36 @@ mod tests {
             })
         ));
         assert_eq!(
-            PgOutputConfiguration::new(PgOutputVersion::V2, PgOutputStreaming::Off, true, false),
+            PgOutputConfiguration::new(
+                PgOutputVersion::V2,
+                PgOutputStreaming::Off,
+                true,
+                false,
+                false,
+            ),
             Err(PgOutputConfigurationError::RequestedTwoPhaseRequiresVersion(PgOutputVersion::V2))
         );
 
-        let first_start =
-            PgOutputConfiguration::new(PgOutputVersion::V3, PgOutputStreaming::Off, true, false)
-                .expect("first two-phase request");
+        let first_start = PgOutputConfiguration::new(
+            PgOutputVersion::V3,
+            PgOutputStreaming::Off,
+            true,
+            false,
+            false,
+        )
+        .expect("first two-phase request");
         assert!(first_start.requested_two_phase());
         assert!(!first_start.slot_two_phase());
         assert!(first_start.two_phase());
 
-        let restarted =
-            PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::Off, false, true)
-                .expect("persistently enabled slot under a later false request");
+        let restarted = PgOutputConfiguration::new(
+            PgOutputVersion::V1,
+            PgOutputStreaming::Off,
+            false,
+            true,
+            false,
+        )
+        .expect("persistently enabled slot under a later false request");
         assert!(!restarted.requested_two_phase());
         assert!(restarted.slot_two_phase());
         assert!(restarted.two_phase());
@@ -2323,7 +2523,23 @@ mod tests {
             decode_pgoutput_control(&prepared(b'P', true, b"gid"), restarted, utf8()),
             Ok(PgOutputControlMessage::Prepare(_))
         ));
+    }
 
+    #[test]
+    fn configuration_tracks_the_messages_option() {
+        let messages = PgOutputConfiguration::new(
+            PgOutputVersion::V1,
+            PgOutputStreaming::Off,
+            false,
+            false,
+            true,
+        )
+        .expect("logical Messages enabled");
+        assert!(messages.messages());
+    }
+
+    #[test]
+    fn encoding_requires_canonical_server_utf8() {
         let client = ClientEncoding::require_utf8("UTF8").expect("client UTF8");
         assert_eq!(
             PgOutputEncoding::require_utf8(client, "LATIN1"),
@@ -2975,6 +3191,188 @@ mod tests {
         trailing.push(0);
         assert_eq!(
             decoder.decode(&trailing),
+            Err(PgOutputError::TrailingData(1))
+        );
+    }
+
+    #[test]
+    fn logical_messages_decode_borrowed_binary_content() {
+        let packet = logical_message(
+            None,
+            false,
+            4_242,
+            b"private-prefix",
+            b"private-content\0\xff",
+        );
+        let disabled = configuration(PgOutputVersion::V2, PgOutputStreaming::On, false);
+        assert_eq!(
+            PgOutputDecoder::new(disabled, utf8()).decode(&packet),
+            Err(PgOutputError::LogicalMessagesDisabled)
+        );
+
+        let config = message_configuration(PgOutputVersion::V2, PgOutputStreaming::On);
+        let mut decoder = PgOutputDecoder::new(config, utf8());
+        let PgOutputMessage::LogicalMessage(message) =
+            decoder.decode(&packet).expect("buffered logical message")
+        else {
+            panic!("wrong logical message variant");
+        };
+        assert_eq!(message.stream_xid(), None);
+        assert!(!message.transactional());
+        assert_eq!(message.lsn(), 4_242);
+        assert_eq!(message.prefix(), "private-prefix");
+        assert_eq!(message.content(), b"private-content\0\xff");
+        let prefix_offset = packet
+            .windows(message.prefix().len())
+            .position(|window| window == message.prefix().as_bytes())
+            .expect("logical message prefix offset");
+        assert_eq!(message.prefix().as_ptr(), packet[prefix_offset..].as_ptr());
+        let content_offset = packet
+            .windows(message.content().len())
+            .position(|window| window == message.content())
+            .expect("logical message content offset");
+        assert_eq!(
+            message.content().as_ptr(),
+            packet[content_offset..].as_ptr()
+        );
+        assert!(!format!("{message:?}").contains("private"));
+
+        let transactional = logical_message(None, true, 4_243, b"tx", b"");
+        let PgOutputMessage::LogicalMessage(message) = decoder
+            .decode(&transactional)
+            .expect("transactional logical message")
+        else {
+            panic!("wrong transactional logical message variant");
+        };
+        assert!(message.transactional());
+        assert!(message.content().is_empty());
+
+        decoder
+            .decode(&stream_start(7, true))
+            .expect("Stream Start");
+        let streamed = logical_message(Some(7), true, 4_244, b"stream", b"payload");
+        let PgOutputMessage::LogicalMessage(message) =
+            decoder.decode(&streamed).expect("streamed logical message")
+        else {
+            panic!("wrong streamed logical message variant");
+        };
+        assert_eq!(message.stream_xid(), Some(7));
+        assert!(message.transactional());
+        assert_eq!(decoder.active_stream_xid(), Some(7));
+        assert_eq!(
+            decoder.decode(&logical_message(
+                Some(8),
+                true,
+                4_245,
+                b"stream",
+                b"payload"
+            )),
+            Err(PgOutputError::LogicalMessageTransactionMismatch {
+                active_xid: 7,
+                message_xid: 8,
+            })
+        );
+        assert_eq!(decoder.active_stream_xid(), Some(7));
+        assert_eq!(
+            decoder.decode(&logical_message(
+                Some(7),
+                false,
+                4_246,
+                b"stream",
+                b"payload"
+            )),
+            Err(PgOutputError::NonTransactionalMessageInsideStream)
+        );
+        assert_eq!(decoder.active_stream_xid(), Some(7));
+        assert_eq!(
+            decoder.decode(&logical_message(
+                Some(0),
+                true,
+                4_247,
+                b"stream",
+                b"payload"
+            )),
+            Err(PgOutputError::InvalidTransactionId(
+                "streamed message transaction ID"
+            ))
+        );
+        assert_eq!(decoder.active_stream_xid(), Some(7));
+        decoder.decode(b"E").expect("Stream Stop");
+        assert_eq!(decoder.finish(), Ok(()));
+    }
+
+    #[test]
+    fn logical_messages_fail_closed_at_every_boundary() {
+        let config = message_configuration(PgOutputVersion::V2, PgOutputStreaming::On);
+        let buffered = logical_message(None, true, 4_242, b"prefix", b"content");
+        for length in 0..buffered.len() {
+            let mut decoder = PgOutputDecoder::new(config, utf8());
+            assert!(
+                decoder.decode(&buffered[..length]).is_err(),
+                "buffered logical message prefix {length} was accepted"
+            );
+        }
+
+        let streamed = logical_message(Some(7), true, 4_242, b"prefix", b"content");
+        let mut decoder = PgOutputDecoder::new(config, utf8());
+        decoder
+            .decode(&stream_start(7, true))
+            .expect("stream layout context");
+        for length in 0..streamed.len() {
+            assert!(
+                decoder.decode(&streamed[..length]).is_err(),
+                "streamed logical message prefix {length} was accepted"
+            );
+            assert_eq!(decoder.active_stream_xid(), Some(7));
+        }
+
+        let mut invalid_flags = buffered.clone();
+        invalid_flags[1] = 2;
+        assert_eq!(
+            PgOutputDecoder::new(config, utf8()).decode(&invalid_flags),
+            Err(PgOutputError::InvalidFlags {
+                message: "logical decoding",
+                flags: 2,
+            })
+        );
+
+        let mut invalid_utf8 = buffered.clone();
+        let prefix_offset = 1 + 1 + 8;
+        invalid_utf8[prefix_offset] = 0xff;
+        assert_eq!(
+            PgOutputDecoder::new(config, utf8()).decode(&invalid_utf8),
+            Err(PgOutputError::InvalidUtf8(
+                "logical decoding message prefix"
+            ))
+        );
+
+        let zero_lsn = logical_message(None, true, 0, b"prefix", b"content");
+        assert_eq!(
+            PgOutputDecoder::new(config, utf8()).decode(&zero_lsn),
+            Err(PgOutputError::InvalidLsn("logical decoding message LSN"))
+        );
+
+        let content_length_offset = 1 + 1 + 8 + b"prefix".len() + 1;
+        let mut negative_length = buffered.clone();
+        negative_length[content_length_offset..content_length_offset + 4]
+            .copy_from_slice(&(-1_i32).to_be_bytes());
+        assert_eq!(
+            PgOutputDecoder::new(config, utf8()).decode(&negative_length),
+            Err(PgOutputError::InvalidLogicalMessageLength(-1))
+        );
+
+        let mut oversized_content = buffered.clone();
+        oversized_content[content_length_offset..content_length_offset + 4]
+            .copy_from_slice(&100_i32.to_be_bytes());
+        assert_eq!(
+            PgOutputDecoder::new(config, utf8()).decode(&oversized_content),
+            Err(PgOutputError::Truncated("logical decoding message content"))
+        );
+
+        let mut trailing = buffered;
+        trailing.push(0);
+        assert_eq!(
+            PgOutputDecoder::new(config, utf8()).decode(&trailing),
             Err(PgOutputError::TrailingData(1))
         );
     }

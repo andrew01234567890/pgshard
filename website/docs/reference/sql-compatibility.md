@@ -164,11 +164,16 @@ Prepare. A stateful decoder derives the optional XID layout from Stream
 Start/Stop and decodes borrowed Relation and Type names, replica identity, and
 prevalidated Relation columns plus Insert, Update, Delete, and Truncate bodies.
 Borrowed tuple columns distinguish null, unchanged-toast, UTF-8 text, and
-opaque binary values. Stream Start carries the top-level transaction XID while
-schema and row prefixes may carry a different nonzero subtransaction XID. It
-rejects logical-message tags until their dedicated body decoder exists. Its
-state proves segment layout, not complete transaction order: there is no relation cache, WAL
-feedback, durable checkpoint, slot lifecycle, snapshot, cross-shard merge, or
+opaque binary values. Custom logical Message records expose a validated UTF-8
+prefix and borrowed opaque contents without rendering either in debug output,
+but only when the exact accepted command enabled `messages`. Stream Start
+carries the top-level transaction XID while schema and row records may carry a
+subtransaction XID. A custom Message inside the segment must be transactional
+and repeat the active top-level XID. In the live PostgreSQL 18 fixture, a
+Message emitted inside a savepoint retains that top-level XID while the
+Relation record carries the savepoint XID. Decoder state proves segment layout,
+not complete transaction order: there is no relation cache, WAL feedback,
+durable checkpoint, slot lifecycle, snapshot, cross-shard merge, or
 change-stream service yet.
 
 The future replication session must construct and bind that configuration only

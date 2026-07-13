@@ -22,9 +22,14 @@ fn main() {
     message.extend_from_slice(&4_i32.to_be_bytes());
     message.extend_from_slice(&[0, 1, 2, 3]);
 
-    let configuration =
-        PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::Off, false, false)
-            .expect("benchmark configuration");
+    let configuration = PgOutputConfiguration::new(
+        PgOutputVersion::V1,
+        PgOutputStreaming::Off,
+        false,
+        false,
+        false,
+    )
+    .expect("benchmark configuration");
     let encoding = PgOutputEncoding::require_utf8(
         ClientEncoding::require_utf8("UTF8").expect("client UTF8"),
         "UTF8",

@@ -31,5 +31,9 @@ harness = false
 name = "decode_pgoutput_insert"
 harness = false
 
+[[bench]]
+name = "decode_pgoutput_message"
+harness = false
+
 [lints]
 workspace = true
