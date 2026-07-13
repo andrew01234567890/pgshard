@@ -22,9 +22,42 @@ bootstrap commit rather than bypassing the exact-head CI release gate.
 The release job is serialized and idempotent. Queue order is not trusted: each
 invocation finds the nearest SemVer tag on the selected commit's first-parent
 history and publishes every untagged first-parent commit oldest-first. A
-descendant job may therefore safely run before its ancestor's job. It creates no
-version-bump commit, preventing release loops. Documentation-only and CI-only
-default-branch commits still receive patch releases.
+descendant job may therefore safely run before its ancestor's job. Before
+publishing, it waits for every planned ancestor's exact aggregate check to
+succeed and fails immediately if a completed aggregate failed; this covers
+GitHub's explicitly unordered concurrency scheduling without releasing an
+unchecked gap. It creates no version-bump commit, preventing release loops.
+Documentation-only and CI-only default-branch commits still receive patch
+releases.
+
+Verified Dependabot patch updates are squash-merged by the trusted default-branch
+workflow only after their exact pull-request head passes the aggregate CI gate
+and every reported check is terminal without a failure. A default-setup CodeQL
+summary must be present even when GitHub marks that summary neutral; every
+reported analyzer check must still finish without failure. The pull request must
+also be based on the current `main` commit. Merge attempts are
+[queued and serialized](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency#using-concurrency-in-different-scenarios)
+so concurrent green updates recheck that base after the preceding squash instead
+of racing it.
+[GitHub suppresses ordinary `push` workflow runs](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs)
+for merges authenticated with the repository `GITHUB_TOKEN`, so that workflow
+creates a temporary tag at the exact squash commit and dispatches this same CI
+workflow on the immutable tag. A dispatch runs every component, records an
+aggregate result on the exact squash commit, and may publish releases under the
+same serialized, idempotent release job. The tag is deleted only after both the
+aggregate and publication succeed; a failure retains it for an exact rerun.
+The publisher independently requires that the requested commit is reachable
+from the live `main` ref, so a lookalike tag cannot authorize an unmerged
+release. This uses GitHub's documented `workflow_dispatch` exception rather
+than a personal access token or repository secret.
+
+Unattended merging is limited to modified Go module files under `operator/`.
+npm updates still require a normal reviewed squash so their `main` push can pass
+the branch-restricted GitHub Pages deployment gate. Cargo and GitHub Actions
+updates also require manual review because the source-release job executes the
+Rust publisher and pinned actions with a write token after merge. All still
+receive Dependabot pull requests and CI. The allowlist also rejects renamed
+files and any unexpected bot-authored source or workflow change.
 
 Source-branch commits must use GitHub noreply author and committer addresses.
 GitHub's squash operation may retain the account's public author address when
