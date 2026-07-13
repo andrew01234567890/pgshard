@@ -1,4 +1,4 @@
-//! Live `PostgreSQL` 18 startup-control, metadata, and query decoder contract.
+//! Live `PostgreSQL` 18 startup, query, decoding, and replication-feedback contract.
 //!
 //! The fixture must allow TCP trust authentication because this deliberately
 //! small raw protocol client does not implement password or SASL exchange. It
@@ -14,11 +14,12 @@ use pgshard_pgwire::{
     AuthenticationRequest, BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode,
     ExtendedQueryObject, FrontendPhase, PgOutputConfiguration, PgOutputControlMessage,
     PgOutputDecoder, PgOutputEncoding, PgOutputMessage, PgOutputOldTuple, PgOutputStreaming,
-    PgOutputTupleColumn, PgOutputVersion, Postgres18StartupNegotiation, TransactionStatus,
-    decode_authentication_request, decode_backend, decode_backend_key_data, decode_close,
-    decode_describe, decode_frontend, decode_parameter_description, decode_parameter_status,
-    decode_pgoutput_control, decode_protocol_negotiation, decode_ready_for_query, decode_startup,
-    require_empty_backend_body,
+    PgOutputTupleColumn, PgOutputVersion, Postgres18StartupNegotiation, ReplicationCopyData,
+    StandbyStatusUpdate, TransactionStatus, decode_authentication_request, decode_backend,
+    decode_backend_key_data, decode_close, decode_describe, decode_frontend,
+    decode_parameter_description, decode_parameter_status, decode_pgoutput_control,
+    decode_protocol_negotiation, decode_ready_for_query, decode_replication_copy_data,
+    decode_startup, require_empty_backend_body,
 };
 
 const POSTGRES_PROTOCOL_3_0: u32 = 3 << 16;
@@ -227,6 +228,17 @@ fn connect(address: &str) -> TcpStream {
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .expect("set write timeout");
+    stream
+}
+
+fn connect_regular(address: &str, user: &str, database: &str) -> TcpStream {
+    let mut stream = connect(address);
+    let packet = startup(POSTGRES_PROTOCOL_3_2, user, database, &[]);
+    let negotiation = startup_negotiation(&packet);
+    stream
+        .write_all(&packet)
+        .expect("send regular cleanup startup packet");
+    let _ = finish_startup(&mut stream, negotiation);
     stream
 }
 
@@ -597,6 +609,252 @@ fn streamed_subtransaction_metadata_keeps_its_own_xid(
     assert_streamed_metadata(&messages, &table, encoding);
 }
 
+fn start_live_logical_replication(
+    address: &str,
+    user: &str,
+    database: &str,
+    application_name: &str,
+    slot: &str,
+    publication: &str,
+) -> TcpStream {
+    let mut replication = connect(address);
+    let replication_startup = startup(
+        POSTGRES_PROTOCOL_3_2,
+        user,
+        database,
+        &[
+            ("replication", "database"),
+            ("application_name", application_name),
+        ],
+    );
+    let negotiation = startup_negotiation(&replication_startup);
+    replication
+        .write_all(&replication_startup)
+        .expect("send logical-replication startup packet");
+    let _ = finish_startup(&mut replication, negotiation);
+
+    let mut start_replication = format!(
+        "START_REPLICATION SLOT {slot} LOGICAL 0/0 (proto_version '1', publication_names '{publication}')"
+    )
+    .into_bytes();
+    start_replication.push(0);
+    replication
+        .write_all(&frontend(b'Q', &start_replication))
+        .expect("start logical replication");
+    loop {
+        let bytes = read_backend(&mut replication);
+        let frame = decoded_frame(&bytes);
+        match frame.tag() {
+            BackendTag::CopyBothResponse => break,
+            BackendTag::ErrorResponse => panic!("PostgreSQL rejected START_REPLICATION"),
+            _ => {}
+        }
+    }
+    replication
+}
+
+fn feedback_positions_are_visible(control: &mut TcpStream, application_name: &str) -> bool {
+    let stats_query = format!(
+        "SELECT count(*) FROM pg_stat_replication WHERE application_name = '{application_name}' \
+         AND write_lsn = '0/3'::pg_lsn AND flush_lsn = '0/1'::pg_lsn \
+         AND replay_lsn = '0/2'::pg_lsn"
+    );
+    for _ in 0..100 {
+        if simple_query(control, &stats_query) == [b"1".to_vec()] {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+fn wait_for_primary_keepalive(replication: &mut TcpStream) {
+    loop {
+        let bytes = read_backend(replication);
+        let frame = decoded_frame(&bytes);
+        match frame.tag() {
+            BackendTag::CopyData => {
+                if let ReplicationCopyData::PrimaryKeepalive(keepalive) =
+                    decode_replication_copy_data(frame).expect("live replication CopyData")
+                {
+                    assert!(
+                        !keepalive.reply_requested(),
+                        "feedback reply unexpectedly requested another immediate reply"
+                    );
+                    return;
+                }
+            }
+            BackendTag::ErrorResponse => panic!("PostgreSQL rejected standby feedback"),
+            _ => {}
+        }
+    }
+}
+
+struct FeedbackFixtureNames {
+    table: String,
+    publication: String,
+    slot: String,
+    application_name: String,
+}
+
+impl FeedbackFixtureNames {
+    fn new(suffix: u32) -> Self {
+        Self {
+            table: format!("pgshard_feedback_table_{suffix}"),
+            publication: format!("pgshard_feedback_publication_{suffix}"),
+            slot: format!("pgshard_feedback_slot_{suffix}"),
+            application_name: format!("pgshard_feedback_{suffix}"),
+        }
+    }
+}
+
+fn finish_live_logical_replication(mut replication: TcpStream) {
+    replication
+        .write_all(&frontend(b'c', b""))
+        .expect("finish logical replication");
+    let mut server_copy_done = false;
+    loop {
+        let bytes = read_backend(&mut replication);
+        let frame = decoded_frame(&bytes);
+        match frame.tag() {
+            BackendTag::CopyDone => {
+                require_empty_backend_body(frame).expect("empty replication CopyDone");
+                server_copy_done = true;
+            }
+            BackendTag::ErrorResponse => panic!("PostgreSQL rejected replication CopyDone"),
+            BackendTag::ReadyForQuery => {
+                assert!(server_copy_done, "PostgreSQL omitted replication CopyDone");
+                assert_eq!(decode_ready_for_query(frame), Ok(TransactionStatus::Idle));
+                break;
+            }
+            _ => {}
+        }
+    }
+    replication
+        .write_all(&frontend(b'X', b""))
+        .expect("terminate logical-replication connection");
+}
+
+fn run_standby_status_update_fixture(
+    address: &str,
+    user: &str,
+    database: &str,
+    control: &mut TcpStream,
+    names: &FeedbackFixtureNames,
+) {
+    simple_query(
+        control,
+        &format!("CREATE TABLE {} (id integer PRIMARY KEY)", names.table),
+    );
+    simple_query(
+        control,
+        &format!(
+            "CREATE PUBLICATION {} FOR TABLE {}",
+            names.publication, names.table
+        ),
+    );
+    simple_query(
+        control,
+        &format!(
+            "SELECT slot_name FROM pg_create_logical_replication_slot('{}', 'pgoutput')",
+            names.slot
+        ),
+    );
+    simple_query(control, &format!("INSERT INTO {} VALUES (1)", names.table));
+
+    let mut replication = start_live_logical_replication(
+        address,
+        user,
+        database,
+        &names.application_name,
+        &names.slot,
+        &names.publication,
+    );
+    // The new slot has unsent WAL, so PostgreSQL emits a catch-up keepalive.
+    // Drain it before sending the feedback whose requested reply is asserted.
+    wait_for_primary_keepalive(&mut replication);
+
+    let update =
+        StandbyStatusUpdate::new(3, 1, 2, 0, true).expect("ordered live Standby Status Update");
+    replication
+        .write_all(&update.encode_frame())
+        .expect("send Standby Status Update");
+    assert!(
+        feedback_positions_are_visible(control, &names.application_name),
+        "PostgreSQL did not expose the encoded feedback positions"
+    );
+    wait_for_primary_keepalive(&mut replication);
+    finish_live_logical_replication(replication);
+}
+
+fn cleanup_feedback_fixture(
+    address: &str,
+    user: &str,
+    database: &str,
+    names: &FeedbackFixtureNames,
+) {
+    let mut cleanup = connect_regular(address, user, database);
+    let active_query = format!(
+        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{}' AND active",
+        names.slot
+    );
+    let mut slot_inactive = false;
+    for _ in 0..500 {
+        if simple_query(&mut cleanup, &active_query) == [b"0".to_vec()] {
+            slot_inactive = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        slot_inactive,
+        "feedback fixture replication slot stayed active"
+    );
+    simple_query(
+        &mut cleanup,
+        &format!(
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+             WHERE slot_name = '{}'",
+            names.slot
+        ),
+    );
+    simple_query(
+        &mut cleanup,
+        &format!("DROP PUBLICATION IF EXISTS {}", names.publication),
+    );
+    simple_query(
+        &mut cleanup,
+        &format!("DROP TABLE IF EXISTS {}", names.table),
+    );
+    cleanup
+        .write_all(&frontend(b'X', b""))
+        .expect("terminate feedback cleanup connection");
+}
+
+fn standby_status_update_is_accepted_by_postgres18(
+    address: &str,
+    user: &str,
+    database: &str,
+    control: &mut TcpStream,
+) {
+    let names = FeedbackFixtureNames::new(std::process::id());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_standby_status_update_fixture(address, user, database, control, &names);
+    }));
+    let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cleanup_feedback_fixture(address, user, database, &names);
+    }));
+    if let Err(original) = outcome {
+        if cleanup.is_err() {
+            eprintln!("feedback fixture cleanup also failed; preserving the original failure");
+        }
+        std::panic::resume_unwind(original);
+    }
+    if let Err(cleanup_failure) = cleanup {
+        std::panic::resume_unwind(cleanup_failure);
+    }
+}
+
 fn assert_streamed_metadata(messages: &[Vec<u8>], table: &str, encoding: PgOutputEncoding) {
     let configuration = streamed_message_configuration();
     let mut decoder = PgOutputDecoder::new(configuration, encoding);
@@ -714,6 +972,7 @@ fn postgres18_wire_and_persistent_slot_controls_decode_from_real_bytes() {
     close_statement(&mut stream, utf8);
     two_phase_slot_state_survives_a_false_start_request(&mut stream, pgoutput_encoding);
     streamed_subtransaction_metadata_keeps_its_own_xid(&mut stream, pgoutput_encoding);
+    standby_status_update_is_accepted_by_postgres18(&address, &user, &database, &mut stream);
 
     stream
         .write_all(&frontend(b'X', b""))

@@ -155,7 +155,16 @@ TLS ClientHello after an SSL request for an accepted handshake, while rejecting
 buffered bytes if encryption is refused.
 An explicit replication-streaming phase admits only the CopyData, CopyDone, and
 Terminate frontend frames accepted by PostgreSQL 18's WAL sender. Server
-CopyData bodies decode as exact borrowed XLogData or keepalive envelopes. An
+CopyData bodies decode as exact borrowed XLogData or keepalive envelopes. A
+fixed-size frontend encoder emits exact Standby Status Update CopyData frames
+after validating within-sample `flush <= write` and `apply <= write` ordering.
+Apply may exceed flush as PostgreSQL's logical worker permits for locally
+written, unflushed commits. A live PostgreSQL 18 COPY-BOTH fixture proves the
+server accepts the production frame, exposes three distinct positions, and
+sends a requested keepalive after the initial catch-up keepalive is drained. Feedback
+scheduling, durable-checkpoint binding, and
+cross-sample monotonicity remain the future replication session's responsibility.
+An
 authoritative client/server UTF-8 proof and validated `pgoutput` v1-v4
 configuration gate streamed and two-phase controls, and the control decoder
 covers Begin, Commit, Origin, Stream Start/Stop/Commit/
@@ -172,8 +181,8 @@ subtransaction XID. A custom Message inside the segment must be transactional
 and repeat the active top-level XID. In the live PostgreSQL 18 fixture, a
 Message emitted inside a savepoint retains that top-level XID while the
 Relation record carries the savepoint XID. Decoder state proves segment layout,
-not complete transaction order: there is no relation cache, WAL feedback,
-durable checkpoint, slot lifecycle, snapshot, cross-shard merge, or
+not complete transaction order: there is no relation cache, feedback runtime or
+scheduler, durable checkpoint, slot lifecycle, snapshot, cross-shard merge, or
 change-stream service yet.
 
 The future replication session must construct and bind that configuration only

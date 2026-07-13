@@ -22,6 +22,17 @@ not yet implement a complete
 transaction-order machine, relation cache, slots, acknowledgements, durable
 replay, snapshots, cross-shard merge, or a stream service; see [implementation
 status](../project/status.md).
+
+The source also contains a fixed-size PostgreSQL 18 Standby Status Update
+encoder. It validates that neither flush nor apply is ahead of write but does
+not decide when progress is durable or safe to acknowledge. PostgreSQL permits
+apply to be ahead of flush for locally written, unflushed work, so the actual
+within-sample checks are `flush <= write` and `apply <= write`. The future
+stream owner must advance its persisted checkpoint before reporting the
+corresponding flush position and must reject any regression across samples.
+The live PostgreSQL 18 fixture sends the encoded frame in COPY-BOTH mode and
+proves that the server records distinct write, flush, and apply positions and
+honors its immediate-reply request after the initial catch-up keepalive is drained.
 :::
 
 Milestone 1 will expose a cluster change stream derived from PostgreSQL 18

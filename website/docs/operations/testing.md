@@ -31,8 +31,13 @@ reserved flags, strict booleans, authoritative client/server UTF-8, maximum
 prepared-transaction GIDs, persistent slot two-phase state across a later false
 request, custom logical Message flags, prefix encoding, binary lengths,
 explicit `messages` option gating, streamed top-level-XID matching,
-zero-copy borrowing, and debug redaction. The live PostgreSQL 18
-fixture creates a two-phase logical slot and proves that protocol v1 with a
+zero-copy borrowing, debug redaction, and exact fixed-size Standby Status Update
+frames with ordered progress validation. The live PostgreSQL 18 fixture sends
+the production feedback frame through a real COPY-BOTH connection, drains a
+catch-up keepalive, observes three distinct positions in `pg_stat_replication`,
+receives the subsequent requested keepalive, and completes COPY cleanly. It also
+creates a two-phase logical slot and proves
+that protocol v1 with a
 later `two_phase=false` request still emits and decodes Begin Prepare and
 Prepare plus exact Relation, Insert, Update, Delete, and Truncate metadata from
 the live `bRIUDIRTP` sequence. A second live slot decodes nontransactional and
@@ -42,8 +47,8 @@ record carries the savepoint XID. Schema, row, and custom-message unit tests
 cover buffered versus streamed layouts, distinct top-level and subtransaction
 XIDs, nested/unmatched stream controls, every truncated prefix, tuple markers
 and lengths, replica identity, reserved flags, UTF-8, zero-copy iteration, and
-redaction. Complete transaction ordering, relation caching, feedback, replay,
-and cross-shard stream tests are still absent. A targeted
+redaction. Complete transaction ordering, relation caching, feedback scheduling
+and persistence, replay, and cross-shard stream tests are still absent. A targeted
 KIND test verifies operator PVC deletion and same-name recreation against real
 Kubernetes 1.36 controllers. A unit regression gives the informer cache a false absence while
 the authoritative API reader still sees an owned PVC, and proves that
