@@ -2,6 +2,7 @@
 
 use pgshard_types::{KeyRange, KeyRangeError, ShardId};
 use thiserror::Error;
+use tokio::time::Instant;
 use tokio_postgres::{Client, IsolationLevel, Row, Transaction};
 use uuid::Uuid;
 
@@ -25,6 +26,14 @@ pub const MAX_TOTAL_REGISTERED_TABLES: usize = 65_536;
 const DATABASE_QUERY_LIMIT: i64 = 1_025;
 const ROUTE_QUERY_LIMIT: i64 = 4_097;
 const TABLE_QUERY_LIMIT: i64 = 16_385;
+// The client deadline remains authoritative. This slightly later PostgreSQL 18
+// transaction timeout interrupts lock waits and rolls back even if a backend
+// does not notice that the client socket was dropped while it is blocked.
+const SERVER_TRANSACTION_TIMEOUT_GRACE: std::time::Duration = std::time::Duration::from_millis(101);
+const SET_SESSION_TRANSACTION_TIMEOUT_SQL: &str =
+    "SELECT pg_catalog.set_config('transaction_timeout', $1, false)";
+const SET_LOCAL_TRANSACTION_TIMEOUT_SQL: &str =
+    "SELECT pg_catalog.set_config('transaction_timeout', $1, true)";
 
 const CONFIGURATION_SQL: &str = "\
     SELECT configuration.cluster_id::text, configuration.hash_version, \
@@ -93,12 +102,40 @@ impl CatalogReader {
         client: Client,
         cache: &CatalogCache,
     ) -> Result<(Self, InstallOutcome), LoadError> {
+        Self::subscribe_inner(client, cache, None).await
+    }
+
+    pub(crate) async fn subscribe_before(
+        client: Client,
+        cache: &CatalogCache,
+        deadline: Instant,
+    ) -> Result<(Self, InstallOutcome), LoadError> {
+        Self::subscribe_inner(client, cache, Some(deadline)).await
+    }
+
+    async fn subscribe_inner(
+        client: Client,
+        cache: &CatalogCache,
+        deadline: Option<Instant>,
+    ) -> Result<(Self, InstallOutcome), LoadError> {
         client.batch_execute("DISCARD ALL").await?;
+        if let Some(deadline) = deadline {
+            let setting = server_transaction_timeout_setting(deadline);
+            client
+                .query_one(SET_SESSION_TRANSACTION_TIMEOUT_SQL, &[&setting])
+                .await?;
+        }
         client
             .batch_execute(&format!("LISTEN {NOTIFY_CHANNEL}"))
             .await?;
+        if deadline.is_some() {
+            client.batch_execute("SET transaction_timeout = 0").await?;
+        }
         let mut reader = Self { client };
-        let outcome = reader.refresh(cache).await?;
+        let outcome = match deadline {
+            Some(deadline) => reader.refresh_before(cache, deadline).await?,
+            None => reader.refresh(cache).await?,
+        };
         Ok((reader, outcome))
     }
 
@@ -114,6 +151,13 @@ impl CatalogReader {
     /// Fails closed on SQL errors, missing singleton state, unsupported catalog
     /// values, integer conversion errors, or any snapshot invariant violation.
     pub async fn load_snapshot(&mut self) -> Result<CatalogSnapshot, LoadError> {
+        self.load_snapshot_inner(None).await
+    }
+
+    async fn load_snapshot_inner(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<CatalogSnapshot, LoadError> {
         let transaction = self
             .client
             .build_transaction()
@@ -121,6 +165,9 @@ impl CatalogReader {
             .read_only(true)
             .start()
             .await?;
+        if let Some(deadline) = deadline {
+            set_server_transaction_timeout(&transaction, deadline).await?;
+        }
         let snapshot = load_in_transaction(&transaction).await?;
         transaction.commit().await?;
         Ok(snapshot)
@@ -136,6 +183,34 @@ impl CatalogReader {
         let snapshot = self.load_snapshot().await?;
         cache.install(snapshot).map_err(LoadError::Cache)
     }
+
+    pub(crate) async fn refresh_before(
+        &mut self,
+        cache: &CatalogCache,
+        deadline: Instant,
+    ) -> Result<InstallOutcome, LoadError> {
+        let snapshot = self.load_snapshot_inner(Some(deadline)).await?;
+        cache.install(snapshot).map_err(LoadError::Cache)
+    }
+}
+
+async fn set_server_transaction_timeout(
+    transaction: &Transaction<'_>,
+    deadline: Instant,
+) -> Result<(), tokio_postgres::Error> {
+    let setting = server_transaction_timeout_setting(deadline);
+    transaction
+        .query_one(SET_LOCAL_TRANSACTION_TIMEOUT_SQL, &[&setting])
+        .await?;
+    Ok(())
+}
+
+fn server_transaction_timeout_setting(deadline: Instant) -> String {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout = remaining.saturating_add(SERVER_TRANSACTION_TIMEOUT_GRACE);
+    let milliseconds = u64::try_from(timeout.as_millis())
+        .expect("bounded catalog operation timeout fits PostgreSQL milliseconds");
+    format!("{milliseconds}ms")
 }
 
 async fn load_in_transaction(transaction: &Transaction<'_>) -> Result<CatalogSnapshot, LoadError> {

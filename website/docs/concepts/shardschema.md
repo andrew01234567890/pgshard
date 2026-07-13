@@ -11,8 +11,9 @@ multi-epoch lock-free cache, repeatable-read snapshot loader,
 LISTEN-before-initial-load primitive, bounded notification and polling driver,
 bounded reconnect and stale-readiness supervisor, metrics-ready state, and live
 database contract test exist in source. Pooler HTTP/readiness/status and
-Prometheus translation exist as a library, but executable composition, TLS,
-and connection/query timeouts are not wired yet; see
+Prometheus translation exist as a library. Bounded connection and catalog-load
+deadlines are implemented, but executable composition, TLS, credentials, and
+runtime configuration are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
@@ -65,27 +66,33 @@ range end.
 6. A notification is a wake-up hint, never authoritative data; duplicate,
    stale, and malformed hints need not trigger a read, while a burst retains
    only its latest valid epoch.
-7. The driver polls every bounded 1 to 300 seconds. Connection loss is terminal
-   to that driver instance.
+7. The driver polls every bounded 1 to 300 seconds. Each subscription/initial
+   load and refresh has a bounded 100-millisecond-to-five-minute deadline.
+   A deadline closes that session without replacing the last validated cache;
+   a slightly later PostgreSQL 18 `transaction_timeout` interrupts server-side
+   lock waits and guarantees rollback. Connection loss is also terminal to that
+   driver instance.
 8. A single-owner supervisor creates a fresh session with bounded, jittered
-   exponential backoff. A new process is unready until its first validated
-   load. An existing process may serve its last validated snapshot during a
-   bounded 2-to-900-second grace that must be longer than its poll interval.
+   exponential backoff and a 100-millisecond-to-30-second connection deadline.
+   A new process is unready until its first validated load. An existing process
+   may serve its last validated snapshot during a bounded 2-to-900-second grace
+   that must be longer than its poll interval.
 9. Readiness fails exactly when cache age reaches the grace deadline, whenever
    an epoch fence makes the current snapshot unusable, and after graceful
    shutdown. Reconnection does not restore readiness until a new authoritative
    load succeeds.
 
-The default policy polls every 30 seconds, allows 90 seconds of cache age, and
-uses reconnect-window ceilings from 100 milliseconds to five seconds. Each
-process waits within the upper half of its current window so replicas do not
-reconnect in lockstep. The status handle reports connection phase, catalog
+The default policy polls every 30 seconds, allows 90 seconds of cache age, uses
+a five-second connection deadline and a 30-second catalog-operation deadline,
+and grows reconnect-window ceilings from 100 milliseconds to five seconds.
+Each process waits within the upper half of its current window so replicas do
+not reconnect in lockstep. The status handle reports connection phase, catalog
 epoch, monotonic cache age, attempts, connections completing their initial
-authoritative load, and credential-safe failure categories. The pooler library
-translates that state into fail-closed readiness, exact JSON status, and
-bounded-label Prometheus endpoints. An executable still needs to compose the
-supervisor with TLS, connection/query timeouts, and sanitized connection-error
-logging.
+authoritative load, and credential-safe failure categories including separate
+connection and operation timeouts. The pooler library translates that state
+into fail-closed readiness, exact JSON status, and bounded-label Prometheus
+endpoints. An executable still needs to compose the supervisor with TLS,
+credentials, runtime configuration, and sanitized connection-error logging.
 
 The empty installed catalog begins at epoch zero. A reader fails closed before
 publishing metadata above the current process limits: 1,024 logical databases,
