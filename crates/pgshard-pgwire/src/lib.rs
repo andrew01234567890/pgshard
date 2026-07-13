@@ -12,9 +12,10 @@ mod backend;
 mod messages;
 
 pub use backend::{
-    BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH, BackendFrame,
+    BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH, BackendFrame, BackendKeyData,
     BackendMessageError, BackendTag, MAX_BACKEND_KEY_DATA_LENGTH, MAX_PARAMETER_DESCRIPTION_LENGTH,
-    ParameterDescription, TransactionStatus, decode_backend, decode_parameter_description,
+    ParameterDescription, ParameterStatus, TransactionStatus, decode_backend,
+    decode_backend_key_data, decode_parameter_description, decode_parameter_status,
     decode_ready_for_query, require_empty_backend_body,
 };
 

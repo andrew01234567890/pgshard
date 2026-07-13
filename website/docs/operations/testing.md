@@ -13,8 +13,9 @@ deep delimiter, data-type, binary-expression, and set-operation shapes on a
 64 KiB thread stack, including destruction of both admitted and rejected trees.
 Optimized CI repeats the small-stack and parser-log redaction regressions, while
 trivia-padding tests and benchmarks verify that shallow queries do not acquire a
-large AST stack reserve. A separate protocol 3.2 raw-wire PostgreSQL 18 test
-validates the 32-byte server cancellation-key boundary plus real `Describe`,
+large AST stack reserve. A separate raw-wire PostgreSQL 18 test validates
+four-byte protocol 3.0 and 32-byte protocol 3.2 server cancellation keys,
+zero-copy `BackendKeyData` and `ParameterStatus`, plus real `Describe`,
 `ParameterDescription`, empty completion, `ReadyForQuery`, and `Close` messages
 through the production framing and body decoders. A targeted KIND test verifies
 operator PVC deletion and same-name recreation against real Kubernetes 1.36

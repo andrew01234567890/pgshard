@@ -1,4 +1,4 @@
-//! Live `PostgreSQL` 18 extended-query framing and body-decoder contract test.
+//! Live `PostgreSQL` 18 backend-metadata and extended-query decoder contract.
 //!
 //! The fixture must allow TCP trust authentication because this deliberately
 //! small raw protocol client does not implement password or SASL exchange.
@@ -12,13 +12,15 @@ use std::time::Duration;
 use pgshard_pgwire::{
     BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, ExtendedQueryObject,
     FrontendPhase, MAX_CANCEL_KEY_LENGTH, MIN_BACKEND_CANCEL_KEY_LENGTH, TransactionStatus,
-    decode_backend, decode_close, decode_describe, decode_frontend, decode_parameter_description,
-    decode_ready_for_query, require_empty_backend_body,
+    decode_backend, decode_backend_key_data, decode_close, decode_describe, decode_frontend,
+    decode_parameter_description, decode_parameter_status, decode_ready_for_query,
+    require_empty_backend_body,
 };
 
+const POSTGRES_PROTOCOL_3_0: u32 = 3 << 16;
 const POSTGRES_PROTOCOL_3_2: u32 = (3 << 16) | 2;
 
-fn startup(user: &str, database: &str) -> Vec<u8> {
+fn startup(protocol: u32, user: &str, database: &str) -> Vec<u8> {
     assert!(
         !user.as_bytes().contains(&0),
         "test user contains zero byte"
@@ -27,7 +29,7 @@ fn startup(user: &str, database: &str) -> Vec<u8> {
         !database.as_bytes().contains(&0),
         "test database contains zero byte"
     );
-    let mut body = POSTGRES_PROTOCOL_3_2.to_be_bytes().to_vec();
+    let mut body = protocol.to_be_bytes().to_vec();
     for (name, value) in [
         ("user", user),
         ("database", database),
@@ -97,31 +99,22 @@ fn decoded_frontend(bytes: &[u8]) -> pgshard_pgwire::FrontendFrame<'_> {
     frame
 }
 
-fn parameter_status(body: &[u8]) -> Option<(&str, &str)> {
-    let name_end = body.iter().position(|byte| *byte == 0)?;
-    let after_name = body.get(name_end + 1..)?;
-    let value_end = after_name.iter().position(|byte| *byte == 0)?;
-    if value_end + 1 != after_name.len() {
-        return None;
-    }
-    Some((
-        std::str::from_utf8(&body[..name_end]).ok()?,
-        std::str::from_utf8(&after_name[..value_end]).ok()?,
-    ))
-}
-
-fn validate_backend_key_data(body: &[u8]) {
-    let key = body
-        .get(4..)
-        .expect("BackendKeyData contains a process identifier");
+fn validate_backend_key_data(frame: pgshard_pgwire::BackendFrame<'_>, expected_key_length: usize) {
+    let data = decode_backend_key_data(frame).expect("valid BackendKeyData body");
     assert!(
-        (MIN_BACKEND_CANCEL_KEY_LENGTH..=MAX_CANCEL_KEY_LENGTH).contains(&key.len()),
+        (MIN_BACKEND_CANCEL_KEY_LENGTH..=MAX_CANCEL_KEY_LENGTH)
+            .contains(&data.cancellation_key().len()),
         "PostgreSQL sent an invalid cancellation key length"
     );
-    assert_eq!(key.len(), 32, "PostgreSQL 18 protocol 3.2 key length");
+    assert_ne!(data.backend_pid(), 0, "PostgreSQL sent a zero backend PID");
+    assert_eq!(
+        data.cancellation_key().len(),
+        expected_key_length,
+        "PostgreSQL 18 cancellation key length for requested protocol"
+    );
 }
 
-fn finish_startup(stream: &mut TcpStream) -> ClientEncoding {
+fn finish_startup(stream: &mut TcpStream, expected_key_length: usize) -> ClientEncoding {
     let mut authenticated = false;
     let mut backend_key_data = false;
     let mut postgres18 = false;
@@ -139,19 +132,19 @@ fn finish_startup(stream: &mut TcpStream) -> ClientEncoding {
                 authenticated = true;
             }
             BackendTag::ParameterStatus => {
-                let (name, value) =
-                    parameter_status(frame.body()).expect("valid ParameterStatus body");
-                if name == "server_version" {
-                    postgres18 = value == "18" || value.starts_with("18.");
-                } else if name == "client_encoding" {
+                let status =
+                    decode_parameter_status(frame).expect("valid UTF-8 ParameterStatus body");
+                if status.name() == "server_version" {
+                    postgres18 = status.value() == "18" || status.value().starts_with("18.");
+                } else if status.name() == "client_encoding" {
                     client_encoding = Some(
-                        ClientEncoding::require_utf8(value)
+                        ClientEncoding::require_utf8(status.value())
                             .expect("PostgreSQL honored client_encoding=UTF8"),
                     );
                 }
             }
             BackendTag::BackendKeyData => {
-                validate_backend_key_data(frame.body());
+                validate_backend_key_data(frame, expected_key_length);
                 backend_key_data = true;
             }
             BackendTag::ErrorResponse => panic!("PostgreSQL rejected startup"),
@@ -166,6 +159,17 @@ fn finish_startup(stream: &mut TcpStream) -> ClientEncoding {
     assert!(backend_key_data, "server omitted BackendKeyData");
     assert!(postgres18, "test requires PostgreSQL major version 18");
     client_encoding.expect("server omitted client_encoding ParameterStatus")
+}
+
+fn connect(address: &str) -> TcpStream {
+    let stream = TcpStream::connect(address).expect("connect to PostgreSQL 18");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+    stream
 }
 
 fn describe_statement(stream: &mut TcpStream, utf8: ClientEncoding) {
@@ -252,17 +256,20 @@ fn postgres18_extended_query_controls_decode_from_real_wire_bytes() {
     let user = std::env::var("PGSHARD_PGWIRE_TEST_USER").unwrap_or_else(|_| "postgres".into());
     let database =
         std::env::var("PGSHARD_PGWIRE_TEST_DATABASE").unwrap_or_else(|_| "postgres".into());
-    let mut stream = TcpStream::connect(&address).expect("connect to PostgreSQL 18");
+    let mut legacy = connect(&address);
+    legacy
+        .write_all(&startup(POSTGRES_PROTOCOL_3_0, &user, &database))
+        .expect("send protocol 3.0 startup packet");
+    finish_startup(&mut legacy, MIN_BACKEND_CANCEL_KEY_LENGTH);
+    legacy
+        .write_all(&frontend(b'X', b""))
+        .expect("terminate protocol 3.0 connection");
+
+    let mut stream = connect(&address);
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set read timeout");
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .expect("set write timeout");
-    stream
-        .write_all(&startup(&user, &database))
-        .expect("send startup packet");
-    let utf8 = finish_startup(&mut stream);
+        .write_all(&startup(POSTGRES_PROTOCOL_3_2, &user, &database))
+        .expect("send protocol 3.2 startup packet");
+    let utf8 = finish_startup(&mut stream, 32);
     describe_statement(&mut stream, utf8);
     close_statement(&mut stream, utf8);
 
