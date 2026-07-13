@@ -37,6 +37,10 @@ pub const AUTHENTICATION_MESSAGE_LENGTH: usize = 65_535;
 pub const DEFAULT_LARGE_MESSAGE_LENGTH: usize = 16 * 1024 * 1024;
 /// Hard pooler bound for one typed protocol message, regardless of caller policy.
 pub const MAX_LARGE_MESSAGE_LENGTH: usize = 64 * 1024 * 1024;
+/// Minimum key size accepted by a `PostgreSQL` 18 `CancelRequest`.
+pub const MIN_CANCEL_REQUEST_KEY_LENGTH: usize = 1;
+/// Minimum key size accepted from `PostgreSQL` 18 `BackendKeyData`.
+pub const MIN_BACKEND_CANCEL_KEY_LENGTH: usize = 4;
 /// Maximum `PostgreSQL` 18 cancellation authentication key size.
 pub const MAX_CANCEL_KEY_LENGTH: usize = 256;
 
@@ -439,28 +443,35 @@ pub fn decode_startup(input: &[u8]) -> Result<Decode<StartupFrame<'_>>, DecodeEr
             maximum: MAX_STARTUP_FRAME_LENGTH,
         });
     }
+    if input.len() < 8 {
+        return Ok(Decode::Incomplete { required: 8 });
+    }
+
+    let code = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
+    match code {
+        NEGOTIATE_SSL_CODE => require_special_length("SSL", total_length, 8)?,
+        NEGOTIATE_GSS_CODE => require_special_length("GSS", total_length, 8)?,
+        CANCEL_REQUEST_CODE => {
+            let key_length = total_length.saturating_sub(12);
+            if !(MIN_CANCEL_REQUEST_KEY_LENGTH..=MAX_CANCEL_KEY_LENGTH).contains(&key_length) {
+                return Err(DecodeError::InvalidCancelKeyLength(key_length));
+            }
+        }
+        _ => {}
+    }
     if input.len() < total_length {
         return Ok(Decode::Incomplete {
             required: total_length,
         });
     }
 
-    let code = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
     let frame = match code {
-        NEGOTIATE_SSL_CODE => {
-            require_special_length("SSL", total_length, 8)?;
-            StartupFrame::SslRequest
-        }
+        NEGOTIATE_SSL_CODE => StartupFrame::SslRequest,
         NEGOTIATE_GSS_CODE => {
-            require_special_length("GSS", total_length, 8)?;
             reject_buffered_gss_data(input.len(), total_length)?;
             StartupFrame::GssEncryptionRequest
         }
         CANCEL_REQUEST_CODE => {
-            let key_length = total_length.saturating_sub(12);
-            if !(1..=MAX_CANCEL_KEY_LENGTH).contains(&key_length) {
-                return Err(DecodeError::InvalidCancelKeyLength(key_length));
-            }
             let backend_pid = u32::from_be_bytes([input[8], input[9], input[10], input[11]]);
             StartupFrame::CancelRequest {
                 backend_pid,
@@ -662,7 +673,7 @@ pub enum DecodeError {
         /// Bytes received after the fixed request.
         extra: usize,
     },
-    /// A `PostgreSQL` 18 cancel key is empty or over 256 bytes.
+    /// A `PostgreSQL` 18 `CancelRequest` key is empty or over 256 bytes.
     #[error("invalid PostgreSQL 18 cancellation key length {0}")]
     InvalidCancelKeyLength(usize),
     /// Startup name/value pairs are missing a value or final terminator.
@@ -851,7 +862,7 @@ mod tests {
 
     #[test]
     fn cancellation_keys_cover_postgres18_boundaries() {
-        for key_length in [1, 4, MAX_CANCEL_KEY_LENGTH] {
+        for key_length in [MIN_CANCEL_REQUEST_KEY_LENGTH, 4, 32, MAX_CANCEL_KEY_LENGTH] {
             let key = vec![7; key_length];
             let mut body = 42_u32.to_be_bytes().to_vec();
             body.extend_from_slice(&key);
@@ -878,6 +889,60 @@ mod tests {
                 Err(DecodeError::InvalidCancelKeyLength(actual)) if actual == key_length
             ));
         }
+    }
+
+    #[test]
+    fn special_startup_bounds_fail_from_the_eight_byte_header() {
+        for (code, total_length, expected) in [
+            (
+                NEGOTIATE_SSL_CODE,
+                9,
+                DecodeError::InvalidSpecialLength {
+                    request: "SSL",
+                    actual: 9,
+                    expected: 8,
+                },
+            ),
+            (
+                NEGOTIATE_GSS_CODE,
+                9,
+                DecodeError::InvalidSpecialLength {
+                    request: "GSS",
+                    actual: 9,
+                    expected: 8,
+                },
+            ),
+            (
+                CANCEL_REQUEST_CODE,
+                12 + MIN_CANCEL_REQUEST_KEY_LENGTH - 1,
+                DecodeError::InvalidCancelKeyLength(MIN_CANCEL_REQUEST_KEY_LENGTH - 1),
+            ),
+            (
+                CANCEL_REQUEST_CODE,
+                12 + MAX_CANCEL_KEY_LENGTH + 1,
+                DecodeError::InvalidCancelKeyLength(MAX_CANCEL_KEY_LENGTH + 1),
+            ),
+        ] {
+            let mut header = u32::try_from(total_length)
+                .expect("test startup length fits u32")
+                .to_be_bytes()
+                .to_vec();
+            header.extend_from_slice(&code.to_be_bytes());
+            assert_eq!(decode_startup(&header), Err(expected));
+        }
+
+        let valid_cancel_length = 12 + MIN_CANCEL_REQUEST_KEY_LENGTH;
+        let mut valid_cancel = u32::try_from(valid_cancel_length)
+            .expect("test startup length fits u32")
+            .to_be_bytes()
+            .to_vec();
+        valid_cancel.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
+        assert_eq!(
+            decode_startup(&valid_cancel),
+            Ok(Decode::Incomplete {
+                required: valid_cancel_length,
+            })
+        );
     }
 
     #[test]

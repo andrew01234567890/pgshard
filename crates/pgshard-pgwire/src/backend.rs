@@ -5,7 +5,10 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::messages::ParameterTypeIter;
-use crate::{Decode, DecodeError, MAX_CANCEL_KEY_LENGTH, MAX_LARGE_MESSAGE_LENGTH};
+use crate::{
+    Decode, DecodeError, MAX_CANCEL_KEY_LENGTH, MAX_LARGE_MESSAGE_LENGTH,
+    MIN_BACKEND_CANCEL_KEY_LENGTH,
+};
 
 /// `PostgreSQL` libpq's maximum length word for backend tags not classified as
 /// long messages.
@@ -141,6 +144,7 @@ impl BackendTag {
         match self {
             Self::ReadyForQuery => 5,
             Self::AuthenticationRequest | Self::NegotiateProtocolVersion => 8,
+            Self::BackendKeyData => 4 + 4 + MIN_BACKEND_CANCEL_KEY_LENGTH,
             _ => 4,
         }
     }
@@ -426,6 +430,7 @@ mod tests {
             let body = match byte {
                 b'1' | b'2' | b'3' | b'I' | b'n' | b's' | b'c' => b"".as_slice(),
                 b'Z' => b"I".as_slice(),
+                b'K' => b"\0\0\0\x01key!".as_slice(),
                 _ => b"body".as_slice(),
             };
             let packet = backend(byte, body);
@@ -565,7 +570,16 @@ mod tests {
 
     #[test]
     fn backend_family_minimums_fail_closed_from_the_header() {
-        for (tag, actual, minimum) in [(b'Z', 4, 5), (b'R', 7, 8), (b'v', 7, 8)] {
+        for (tag, actual, minimum) in [
+            (b'Z', 4, 5),
+            (b'R', 7, 8),
+            (b'v', 7, 8),
+            (
+                b'K',
+                4 + 4 + MIN_BACKEND_CANCEL_KEY_LENGTH - 1,
+                4 + 4 + MIN_BACKEND_CANCEL_KEY_LENGTH,
+            ),
+        ] {
             let mut header = vec![tag];
             header.extend_from_slice(
                 &u32::try_from(actual)
