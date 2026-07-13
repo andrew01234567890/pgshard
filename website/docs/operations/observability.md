@@ -6,8 +6,10 @@ description: Prometheus metrics, OpenTelemetry traces, Grafana dashboards, and c
 # Observability
 
 :::info Milestone 1 design contract
-These signals and the Grafana/Tempo test stack are planned. No runtime telemetry
-is shipped by the foundation release; see [implementation status](../project/status.md).
+The pooler library now exposes catalog health, readiness, status, and Prometheus
+signals. SQL-path metrics, OpenTelemetry export, dashboards, scraping resources,
+and the Grafana/Tempo test stack remain planned; see
+[implementation status](../project/status.md).
 :::
 
 Every Milestone 1 Rust service will expose health, readiness, Prometheus metrics,
@@ -21,6 +23,12 @@ will be disabled in telemetry by default.
 - Routing/catalog epoch and stale-cache rejection.
 - Buffer requests, bytes, age, resume, and rejection reason.
 - Distributed transaction phase, prepared age, and recovery backlog.
+
+The implemented catalog subset reports connection phase and availability,
+readiness reason, authoritative epoch and cache age, reconnect attempts,
+successful initial loads, and safe failure categories. Health remains live
+when catalog readiness fails so Kubernetes can distinguish a process crash from
+an unavailable or stale routing catalog.
 
 ## Cluster operation signals
 

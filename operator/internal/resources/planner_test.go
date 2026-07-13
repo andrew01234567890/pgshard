@@ -60,6 +60,10 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 		}
 		assertOwned(t, service, cluster)
 	}
+	poolerControl := object[*corev1.Service](t, first, "demo-pooler")
+	if poolerControl.Spec.Type != corev1.ServiceTypeClusterIP || poolerControl.Spec.Ports[0].Port != HTTPPort || poolerControl.Spec.Ports[0].TargetPort.StrVal != "http" {
+		t.Fatalf("pooler control service = %#v", poolerControl.Spec)
+	}
 
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		service := object[*corev1.Service](t, first, shardName(cluster.Name, shard))
@@ -114,7 +118,8 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		t.Fatalf("orchestrator identity is not a bounded Pod UID: %#v", orchestrator.Spec.Template.Spec.Containers[0].Env[1])
 	}
 	pooler := object[*appsv1.Deployment](t, plan, "demo-pooler")
-	if pooler.Spec.Replicas != nil || len(pooler.Spec.Template.Spec.Containers[0].Ports) != 3 {
+	poolerContainer := pooler.Spec.Template.Spec.Containers[0]
+	if pooler.Spec.Replicas != nil || len(poolerContainer.Ports) != 4 || poolerContainer.ReadinessProbe.HTTPGet.Path != "/readyz" || poolerContainer.LivenessProbe.HTTPGet.Path != "/healthz" {
 		t.Fatalf("pooler spec = %#v", pooler.Spec)
 	}
 	hpa := object[*autoscalingv2.HorizontalPodAutoscaler](t, plan, "demo-pooler")

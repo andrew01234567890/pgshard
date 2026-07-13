@@ -3,6 +3,7 @@ members = [
   "crates/pgshard-agent",
   "crates/pgshard-catalog",
   "crates/pgshard-orch",
+  "crates/pgshard-pooler",
   "crates/pgshard-pgwire",
   "crates/pgshard-planner",
   "crates/pgshard-router",
@@ -34,6 +35,7 @@ stacker = "=0.1.24"
 thiserror = "2.0.12"
 tokio = { version = "1.46.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-postgres = "0.7.15"
+tower = { version = "0.5.2", features = ["util"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 url = "2.5.4"
