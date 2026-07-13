@@ -32,8 +32,13 @@ prepared-transaction GIDs, persistent slot two-phase state across a later false
 request, zero-copy borrowing, and debug redaction. The live PostgreSQL 18
 fixture creates a two-phase logical slot and proves that protocol v1 with a
 later `two_phase=false` request still emits and decodes Begin Prepare and
-Prepare. Live row/schema decoding, ordering, feedback, replay, and cross-shard
-stream tests are still absent. A targeted KIND test verifies
+Prepare plus exact Relation metadata. Schema unit tests cover buffered versus
+streamed XID layouts, distinct nonzero top-level and subtransaction XIDs,
+nested/unmatched stream controls, every truncated prefix, replica identity,
+reserved column flags, UTF-8, zero-copy column iteration, and redaction. Live
+row decoding, complete transaction
+ordering, relation caching, feedback, replay, and cross-shard stream tests are
+still absent. A targeted KIND test verifies
 operator PVC deletion and same-name recreation against real Kubernetes 1.36
 controllers. A unit regression gives the informer cache a false absence while
 the authoritative API reader still sees an owned PVC, and proves that

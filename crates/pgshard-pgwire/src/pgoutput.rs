@@ -622,6 +622,387 @@ pub enum PgOutputControlMessage<'a> {
     StreamPrepare(PgOutputPrepared<'a>),
 }
 
+/// Replica identity advertised by a Relation message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PgOutputReplicaIdentity {
+    /// Use the primary key when one exists.
+    Default,
+    /// Publish no old-row identity.
+    Nothing,
+    /// Publish the complete old row.
+    Full,
+    /// Use a selected unique index.
+    Index,
+}
+
+impl TryFrom<u8> for PgOutputReplicaIdentity {
+    type Error = PgOutputError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            b'd' => Ok(Self::Default),
+            b'n' => Ok(Self::Nothing),
+            b'f' => Ok(Self::Full),
+            b'i' => Ok(Self::Index),
+            _ => Err(PgOutputError::InvalidReplicaIdentity(value)),
+        }
+    }
+}
+
+/// One column advertised by a Relation message.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct PgOutputRelationColumn<'a> {
+    part_of_replica_identity: bool,
+    name: &'a str,
+    type_oid: u32,
+    type_modifier: i32,
+}
+
+impl fmt::Debug for PgOutputRelationColumn<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputRelationColumn")
+            .field("part_of_replica_identity", &self.part_of_replica_identity)
+            .field("name_length", &self.name.len())
+            .field("type_oid", &self.type_oid)
+            .field("type_modifier", &self.type_modifier)
+            .finish()
+    }
+}
+
+impl<'a> PgOutputRelationColumn<'a> {
+    /// Returns whether this column participates in replica identity.
+    #[must_use]
+    pub const fn part_of_replica_identity(self) -> bool {
+        self.part_of_replica_identity
+    }
+
+    /// Returns the borrowed UTF-8 column name.
+    #[must_use]
+    pub const fn name(self) -> &'a str {
+        self.name
+    }
+
+    /// Returns the publisher type OID.
+    #[must_use]
+    pub const fn type_oid(self) -> u32 {
+        self.type_oid
+    }
+
+    /// Returns the publisher type modifier, including negative sentinel values.
+    #[must_use]
+    pub const fn type_modifier(self) -> i32 {
+        self.type_modifier
+    }
+}
+
+/// Borrowed iterator over prevalidated Relation columns.
+#[derive(Clone)]
+pub struct PgOutputRelationColumnIter<'a> {
+    remaining: &'a [u8],
+    remaining_columns: usize,
+}
+
+impl fmt::Debug for PgOutputRelationColumnIter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputRelationColumnIter")
+            .field("remaining_bytes", &self.remaining.len())
+            .field("remaining_columns", &self.remaining_columns)
+            .finish()
+    }
+}
+
+impl<'a> Iterator for PgOutputRelationColumnIter<'a> {
+    type Item = PgOutputRelationColumn<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_columns == 0 {
+            return None;
+        }
+        let mut cursor = Cursor::new(self.remaining);
+        let column = decode_relation_column(&mut cursor)
+            .expect("Relation columns were validated before iterator construction");
+        self.remaining = cursor.remaining();
+        self.remaining_columns -= 1;
+        Some(column)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining_columns, Some(self.remaining_columns))
+    }
+}
+
+impl ExactSizeIterator for PgOutputRelationColumnIter<'_> {}
+
+/// Borrowed schema metadata from a Relation message.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct PgOutputRelation<'a> {
+    stream_xid: Option<u32>,
+    relation_id: u32,
+    namespace: &'a str,
+    name: &'a str,
+    replica_identity: PgOutputReplicaIdentity,
+    column_count: u16,
+    columns: &'a [u8],
+}
+
+impl fmt::Debug for PgOutputRelation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputRelation")
+            .field("stream_xid", &self.stream_xid)
+            .field("relation_id", &self.relation_id)
+            .field("namespace_length", &self.namespace.len())
+            .field("name_length", &self.name.len())
+            .field("replica_identity", &self.replica_identity)
+            .field("column_count", &self.column_count)
+            .finish()
+    }
+}
+
+impl<'a> PgOutputRelation<'a> {
+    /// Returns the streamed transaction ID, or `None` for buffered output.
+    #[must_use]
+    pub const fn stream_xid(self) -> Option<u32> {
+        self.stream_xid
+    }
+
+    /// Returns the publisher relation OID.
+    #[must_use]
+    pub const fn relation_id(self) -> u32 {
+        self.relation_id
+    }
+
+    /// Returns the publisher namespace, expanding the empty wire sentinel.
+    #[must_use]
+    pub fn namespace(self) -> &'a str {
+        if self.namespace.is_empty() {
+            "pg_catalog"
+        } else {
+            self.namespace
+        }
+    }
+
+    /// Returns the borrowed UTF-8 relation name.
+    #[must_use]
+    pub const fn name(self) -> &'a str {
+        self.name
+    }
+
+    /// Returns the advertised replica identity mode.
+    #[must_use]
+    pub const fn replica_identity(self) -> PgOutputReplicaIdentity {
+        self.replica_identity
+    }
+
+    /// Returns the number of advertised columns.
+    #[must_use]
+    pub const fn column_count(self) -> u16 {
+        self.column_count
+    }
+
+    /// Returns a borrowed iterator over the prevalidated columns.
+    #[must_use]
+    pub fn columns(self) -> PgOutputRelationColumnIter<'a> {
+        PgOutputRelationColumnIter {
+            remaining: self.columns,
+            remaining_columns: usize::from(self.column_count),
+        }
+    }
+}
+
+/// Borrowed metadata from a Type message.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct PgOutputType<'a> {
+    stream_xid: Option<u32>,
+    type_oid: u32,
+    namespace: &'a str,
+    name: &'a str,
+}
+
+impl fmt::Debug for PgOutputType<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputType")
+            .field("stream_xid", &self.stream_xid)
+            .field("type_oid", &self.type_oid)
+            .field("namespace_length", &self.namespace.len())
+            .field("name_length", &self.name.len())
+            .finish()
+    }
+}
+
+impl<'a> PgOutputType<'a> {
+    /// Returns the streamed transaction ID, or `None` for buffered output.
+    #[must_use]
+    pub const fn stream_xid(self) -> Option<u32> {
+        self.stream_xid
+    }
+
+    /// Returns the publisher type OID.
+    #[must_use]
+    pub const fn type_oid(self) -> u32 {
+        self.type_oid
+    }
+
+    /// Returns the publisher namespace, expanding the empty wire sentinel.
+    #[must_use]
+    pub fn namespace(self) -> &'a str {
+        if self.namespace.is_empty() {
+            "pg_catalog"
+        } else {
+            self.namespace
+        }
+    }
+
+    /// Returns the borrowed UTF-8 type name.
+    #[must_use]
+    pub const fn name(self) -> &'a str {
+        self.name
+    }
+}
+
+/// One message decoded with stream-segment layout state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PgOutputMessage<'a> {
+    /// A transaction or stream control.
+    Control(PgOutputControlMessage<'a>),
+    /// Relation schema metadata.
+    Relation(PgOutputRelation<'a>),
+    /// User-defined type metadata.
+    Type(PgOutputType<'a>),
+}
+
+/// Stateful decoder for layouts that include an XID only inside stream chunks.
+///
+/// `PostgreSQL` does not mark the optional XID field in Relation and Type
+/// messages. This decoder derives its presence from successfully decoded Stream
+/// Start and Stream Stop controls, so callers cannot select an ambiguous layout
+/// per message. It deliberately does not yet prove complete transaction order.
+pub struct PgOutputDecoder {
+    configuration: PgOutputConfiguration,
+    encoding: PgOutputEncoding,
+    active_stream_xid: Option<u32>,
+}
+
+impl fmt::Debug for PgOutputDecoder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgOutputDecoder")
+            .field("configuration", &self.configuration)
+            .field("encoding", &self.encoding)
+            .field("active_stream_xid", &self.active_stream_xid)
+            .finish()
+    }
+}
+
+impl PgOutputDecoder {
+    /// Creates one decoder for an accepted replication stream.
+    #[must_use]
+    pub const fn new(configuration: PgOutputConfiguration, encoding: PgOutputEncoding) -> Self {
+        Self {
+            configuration,
+            encoding,
+            active_stream_xid: None,
+        }
+    }
+
+    /// Returns the transaction whose stream segment is currently open.
+    #[must_use]
+    pub const fn active_stream_xid(&self) -> Option<u32> {
+        self.active_stream_xid
+    }
+
+    /// Decodes one complete message and advances stream-segment layout state.
+    ///
+    /// State changes only after the entire message and its current-state rules
+    /// validate successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message-local errors from [`decode_pgoutput_control`] plus
+    /// invalid stream nesting, an unmatched stop, a zero streamed-message XID,
+    /// or another control inside an active stream segment.
+    pub fn decode<'input>(
+        &mut self,
+        input: &'input [u8],
+    ) -> Result<PgOutputMessage<'input>, PgOutputError> {
+        if input.len() > MAX_PGOUTPUT_MESSAGE_LENGTH {
+            return Err(PgOutputError::MessageTooLarge(input.len()));
+        }
+        let Some((&tag, body)) = input.split_first() else {
+            return Err(PgOutputError::Truncated("pgoutput message tag"));
+        };
+        match tag {
+            b'R' => decode_relation(body, self.active_stream_xid.is_some())
+                .map(PgOutputMessage::Relation),
+            b'Y' => decode_type(body, self.active_stream_xid.is_some()).map(PgOutputMessage::Type),
+            _ => {
+                let message = decode_pgoutput_control(input, self.configuration, self.encoding)?;
+                let next_stream_xid = self.validate_control_transition(&message)?;
+                self.active_stream_xid = next_stream_xid;
+                Ok(PgOutputMessage::Control(message))
+            }
+        }
+    }
+
+    /// Verifies that the input ended outside a stream segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a Stream Start was not matched by Stream Stop.
+    pub fn finish(self) -> Result<(), PgOutputError> {
+        match self.active_stream_xid {
+            Some(xid) => Err(PgOutputError::UnterminatedStreamSegment(xid)),
+            None => Ok(()),
+        }
+    }
+
+    fn validate_control_transition(
+        &self,
+        message: &PgOutputControlMessage<'_>,
+    ) -> Result<Option<u32>, PgOutputError> {
+        match (self.active_stream_xid, message) {
+            (None, PgOutputControlMessage::StreamStart { xid: 0, .. }) => {
+                Err(PgOutputError::InvalidTransactionId("stream transaction ID"))
+            }
+            (None, PgOutputControlMessage::StreamStart { xid, .. }) => Ok(Some(*xid)),
+            (None, PgOutputControlMessage::StreamStop) => {
+                Err(PgOutputError::StreamStopWithoutStart)
+            }
+            (None, _) | (Some(_), PgOutputControlMessage::StreamStop) => Ok(None),
+            (Some(xid), PgOutputControlMessage::Origin(_)) => Ok(Some(xid)),
+            (Some(active_xid), PgOutputControlMessage::StreamStart { xid, .. }) => {
+                Err(PgOutputError::NestedStreamSegment {
+                    active_xid,
+                    received_xid: *xid,
+                })
+            }
+            (Some(_), _) => Err(PgOutputError::ControlInsideStream(message.tag())),
+        }
+    }
+}
+
+impl PgOutputControlMessage<'_> {
+    const fn tag(&self) -> u8 {
+        match self {
+            Self::Begin(_) => b'B',
+            Self::Commit(_) => b'C',
+            Self::Origin(_) => b'O',
+            Self::StreamStart { .. } => b'S',
+            Self::StreamStop => b'E',
+            Self::StreamCommit { .. } => b'c',
+            Self::StreamAbort(_) => b'A',
+            Self::BeginPrepare(_) => b'b',
+            Self::Prepare(_) => b'P',
+            Self::CommitPrepared(_) => b'K',
+            Self::RollbackPrepared(_) => b'r',
+            Self::StreamPrepare(_) => b'p',
+        }
+    }
+}
+
 /// Decodes one complete `pgoutput` transaction/control message.
 ///
 /// The message must be the complete logical payload from one replication
@@ -722,6 +1103,78 @@ pub fn decode_pgoutput_control(
     };
     cursor.finish()?;
     Ok(message)
+}
+
+fn decode_relation(
+    body: &[u8],
+    in_stream_segment: bool,
+) -> Result<PgOutputRelation<'_>, PgOutputError> {
+    let mut cursor = Cursor::new(body);
+    let stream_xid = decode_stream_xid(&mut cursor, in_stream_segment)?;
+    let relation_id = cursor.u32("relation ID")?;
+    let namespace = cursor.cstring_utf8("relation namespace")?;
+    let name = cursor.cstring_utf8("relation name")?;
+    let replica_identity =
+        PgOutputReplicaIdentity::try_from(cursor.byte("relation replica identity")?)?;
+    let column_count = cursor.u16("relation column count")?;
+    let columns = cursor.remaining();
+    for _ in 0..column_count {
+        decode_relation_column(&mut cursor)?;
+    }
+    cursor.finish()?;
+    Ok(PgOutputRelation {
+        stream_xid,
+        relation_id,
+        namespace,
+        name,
+        replica_identity,
+        column_count,
+        columns,
+    })
+}
+
+fn decode_type(body: &[u8], in_stream_segment: bool) -> Result<PgOutputType<'_>, PgOutputError> {
+    let mut cursor = Cursor::new(body);
+    let stream_xid = decode_stream_xid(&mut cursor, in_stream_segment)?;
+    let value = PgOutputType {
+        stream_xid,
+        type_oid: cursor.u32("type OID")?,
+        namespace: cursor.cstring_utf8("type namespace")?,
+        name: cursor.cstring_utf8("type name")?,
+    };
+    cursor.finish()?;
+    Ok(value)
+}
+
+fn decode_stream_xid(
+    cursor: &mut Cursor<'_>,
+    in_stream_segment: bool,
+) -> Result<Option<u32>, PgOutputError> {
+    if !in_stream_segment {
+        return Ok(None);
+    }
+    let received = cursor.u32("stream transaction ID")?;
+    if received == 0 {
+        return Err(PgOutputError::InvalidTransactionId(
+            "streamed message transaction ID",
+        ));
+    }
+    Ok(Some(received))
+}
+
+fn decode_relation_column<'a>(
+    cursor: &mut Cursor<'a>,
+) -> Result<PgOutputRelationColumn<'a>, PgOutputError> {
+    let flags = cursor.byte("relation column flags")?;
+    if flags & !1 != 0 {
+        return Err(PgOutputError::InvalidRelationColumnFlags(flags));
+    }
+    Ok(PgOutputRelationColumn {
+        part_of_replica_identity: flags & 1 == 1,
+        name: cursor.cstring_utf8("relation column name")?,
+        type_oid: cursor.u32("relation column type OID")?,
+        type_modifier: cursor.i32("relation column type modifier")?,
+    })
 }
 
 fn decode_begin(cursor: &mut Cursor<'_>) -> Result<PgOutputBegin, PgOutputError> {
@@ -864,9 +1317,19 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    fn u16(&mut self, field: &'static str) -> Result<u16, PgOutputError> {
+        let bytes = self.take(2, field)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
     fn u32(&mut self, field: &'static str) -> Result<u32, PgOutputError> {
         let bytes = self.take(4, field)?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn i32(&mut self, field: &'static str) -> Result<i32, PgOutputError> {
+        let bytes = self.take(4, field)?;
+        Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn u64(&mut self, field: &'static str) -> Result<u64, PgOutputError> {
@@ -935,6 +1398,12 @@ pub enum PgOutputError {
     /// dedicated decoder.
     #[error("pgoutput message tag {0} is not a transaction/control message")]
     NonControlMessage(u8),
+    /// A Relation message advertised an unknown replica identity mode.
+    #[error("unrecognized relation replica identity {0}")]
+    InvalidReplicaIdentity(u8),
+    /// A Relation column set a reserved flag bit.
+    #[error("unrecognized relation column flags {0}")]
+    InvalidRelationColumnFlags(u8),
     /// The logical message tag is not defined by `PostgreSQL` 18 `pgoutput`.
     #[error("unknown PostgreSQL 18 pgoutput message tag {0}")]
     UnknownPgOutputMessage(u8),
@@ -944,6 +1413,25 @@ pub enum PgOutputError {
     /// A prepared-transaction message arrived although two-phase was disabled.
     #[error("pgoutput two-phase message tag {0} arrived while two-phase was disabled")]
     TwoPhaseMessageDisabled(u8),
+    /// A Stream Stop arrived without an active stream segment.
+    #[error("pgoutput Stream Stop arrived without an active stream segment")]
+    StreamStopWithoutStart,
+    /// A second Stream Start arrived before the active segment stopped.
+    #[error(
+        "pgoutput Stream Start for XID {received_xid} arrived while XID {active_xid} was active"
+    )]
+    NestedStreamSegment {
+        /// XID whose segment is already active.
+        active_xid: u32,
+        /// XID carried by the rejected Stream Start.
+        received_xid: u32,
+    },
+    /// A control other than Origin or Stream Stop appeared inside a segment.
+    #[error("pgoutput control tag {0} arrived inside an active stream segment")]
+    ControlInsideStream(u8),
+    /// The replication input ended before Stream Stop closed a segment.
+    #[error("pgoutput stream segment for XID {0} did not stop")]
+    UnterminatedStreamSegment(u32),
     /// A fixed-width field is missing bytes.
     #[error("{0} is truncated")]
     Truncated(&'static str),
@@ -1032,6 +1520,14 @@ mod tests {
         bytes.extend_from_slice(&value.to_be_bytes());
     }
 
+    fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn push_i32(bytes: &mut Vec<u8>, value: i32) {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
     fn push_u64(bytes: &mut Vec<u8>, value: u64) {
         bytes.extend_from_slice(&value.to_be_bytes());
     }
@@ -1082,6 +1578,62 @@ mod tests {
         push_i64(&mut message, -124);
         push_u32(&mut message, 125);
         message.extend_from_slice(gid);
+        message.push(0);
+        message
+    }
+
+    fn stream_start(xid: u32, first_segment: bool) -> Vec<u8> {
+        let mut message = vec![b'S'];
+        push_u32(&mut message, xid);
+        message.push(u8::from(first_segment));
+        message
+    }
+
+    fn relation(
+        stream_xid: Option<u32>,
+        namespace: &[u8],
+        name: &[u8],
+        replica_identity: u8,
+        columns: &[(bool, &[u8], u32, i32)],
+    ) -> Vec<u8> {
+        let mut message = vec![b'R'];
+        if let Some(xid) = stream_xid {
+            push_u32(&mut message, xid);
+        }
+        push_u32(&mut message, 4_242);
+        message.extend_from_slice(namespace);
+        message.push(0);
+        message.extend_from_slice(name);
+        message.push(0);
+        message.push(replica_identity);
+        push_u16(
+            &mut message,
+            u16::try_from(columns.len()).expect("relation column count"),
+        );
+        for (identity, column_name, type_oid, type_modifier) in columns {
+            message.push(u8::from(*identity));
+            message.extend_from_slice(column_name);
+            message.push(0);
+            push_u32(&mut message, *type_oid);
+            push_i32(&mut message, *type_modifier);
+        }
+        message
+    }
+
+    fn type_message(
+        stream_xid: Option<u32>,
+        type_oid: u32,
+        namespace: &[u8],
+        name: &[u8],
+    ) -> Vec<u8> {
+        let mut message = vec![b'Y'];
+        if let Some(xid) = stream_xid {
+            push_u32(&mut message, xid);
+        }
+        push_u32(&mut message, type_oid);
+        message.extend_from_slice(namespace);
+        message.push(0);
+        message.extend_from_slice(name);
         message.push(0);
         message
     }
@@ -1408,6 +1960,214 @@ mod tests {
         assert_eq!(rollback.xid(), 125);
         assert_eq!(rollback.gid(), "private-rollback-gid");
         assert!(!format!("{rollback:?}").contains("private"));
+    }
+
+    #[test]
+    fn stateful_decoder_selects_schema_layout_from_stream_controls() {
+        let config = configuration(PgOutputVersion::V2, PgOutputStreaming::On, false);
+        let mut decoder = PgOutputDecoder::new(config, utf8());
+        let columns = [
+            (true, b"private-key".as_slice(), 23, -1),
+            (false, b"private-value".as_slice(), 25, 42),
+        ];
+        let buffered = relation(None, b"private-schema", b"private-table", b'i', &columns);
+        let PgOutputMessage::Relation(decoded_relation) =
+            decoder.decode(&buffered).expect("buffered Relation")
+        else {
+            panic!("wrong buffered schema variant");
+        };
+        assert_eq!(decoded_relation.stream_xid(), None);
+        assert_eq!(decoded_relation.relation_id(), 4_242);
+        assert_eq!(decoded_relation.namespace(), "private-schema");
+        assert_eq!(decoded_relation.name(), "private-table");
+        assert_eq!(
+            decoded_relation.replica_identity(),
+            PgOutputReplicaIdentity::Index
+        );
+        assert_eq!(decoded_relation.column_count(), 2);
+        let mut decoded_columns = decoded_relation.columns();
+        assert_eq!(decoded_columns.len(), 2);
+        let key = decoded_columns.next().expect("identity column");
+        assert!(key.part_of_replica_identity());
+        assert_eq!(key.name(), "private-key");
+        assert_eq!(key.type_oid(), 23);
+        assert_eq!(key.type_modifier(), -1);
+        let value = decoded_columns.next().expect("value column");
+        assert!(!value.part_of_replica_identity());
+        assert_eq!(value.name(), "private-value");
+        assert_eq!(value.type_oid(), 25);
+        assert_eq!(value.type_modifier(), 42);
+        assert_eq!(decoded_columns.next(), None);
+        let key_offset = buffered
+            .windows(b"private-key".len())
+            .position(|window| window == b"private-key")
+            .expect("key name offset");
+        assert_eq!(key.name().as_ptr(), buffered[key_offset..].as_ptr());
+        assert!(!format!("{decoded_relation:?} {key:?}").contains("private"));
+
+        let builtin_type = type_message(None, 3_000, b"", b"private-type");
+        let PgOutputMessage::Type(pg_type) = decoder.decode(&builtin_type).expect("buffered Type")
+        else {
+            panic!("wrong Type variant");
+        };
+        assert_eq!(pg_type.stream_xid(), None);
+        assert_eq!(pg_type.type_oid(), 3_000);
+        assert_eq!(pg_type.namespace(), "pg_catalog");
+        assert_eq!(pg_type.name(), "private-type");
+        assert!(!format!("{pg_type:?}").contains("private"));
+
+        assert!(matches!(
+            decoder.decode(&stream_start(7, true)),
+            Ok(PgOutputMessage::Control(
+                PgOutputControlMessage::StreamStart {
+                    xid: 7,
+                    first_segment: true
+                }
+            ))
+        ));
+        assert_eq!(decoder.active_stream_xid(), Some(7));
+
+        let streamed = relation(Some(8), b"public", b"streamed_table", b'd', &[]);
+        let PgOutputMessage::Relation(streamed_relation) =
+            decoder.decode(&streamed).expect("streamed Relation")
+        else {
+            panic!("wrong streamed schema variant");
+        };
+        assert_eq!(streamed_relation.stream_xid(), Some(8));
+        assert_eq!(streamed_relation.namespace(), "public");
+        assert_eq!(streamed_relation.column_count(), 0);
+
+        let streamed_type = type_message(Some(9), 3_001, b"custom", b"streamed_type");
+        let PgOutputMessage::Type(pg_type) = decoder.decode(&streamed_type).expect("streamed Type")
+        else {
+            panic!("wrong streamed Type variant");
+        };
+        assert_eq!(pg_type.stream_xid(), Some(9));
+        assert_eq!(pg_type.namespace(), "custom");
+
+        let invalid_xid = type_message(Some(0), 3_002, b"custom", b"invalid_xid");
+        assert_eq!(
+            decoder.decode(&invalid_xid),
+            Err(PgOutputError::InvalidTransactionId(
+                "streamed message transaction ID"
+            ))
+        );
+        assert_eq!(decoder.active_stream_xid(), Some(7));
+
+        assert_eq!(
+            decoder.decode(b"E"),
+            Ok(PgOutputMessage::Control(PgOutputControlMessage::StreamStop))
+        );
+        assert_eq!(decoder.active_stream_xid(), None);
+        assert_eq!(decoder.finish(), Ok(()));
+    }
+
+    #[test]
+    fn stream_segment_state_changes_only_after_valid_controls() {
+        let config = configuration(PgOutputVersion::V2, PgOutputStreaming::On, false);
+        let mut decoder = PgOutputDecoder::new(config, utf8());
+        assert_eq!(
+            decoder.decode(b"E"),
+            Err(PgOutputError::StreamStopWithoutStart)
+        );
+        assert_eq!(decoder.active_stream_xid(), None);
+
+        assert_eq!(
+            decoder.decode(&stream_start(0, true)),
+            Err(PgOutputError::InvalidTransactionId("stream transaction ID"))
+        );
+        assert_eq!(decoder.active_stream_xid(), None);
+
+        decoder
+            .decode(&stream_start(7, true))
+            .expect("valid Stream Start");
+        assert_eq!(
+            decoder.decode(&stream_start(8, false)),
+            Err(PgOutputError::NestedStreamSegment {
+                active_xid: 7,
+                received_xid: 8,
+            })
+        );
+        assert_eq!(decoder.active_stream_xid(), Some(7));
+
+        assert_eq!(
+            decoder.decode(&begin()),
+            Err(PgOutputError::ControlInsideStream(b'B'))
+        );
+        assert_eq!(decoder.active_stream_xid(), Some(7));
+        assert_eq!(
+            decoder.finish(),
+            Err(PgOutputError::UnterminatedStreamSegment(7))
+        );
+    }
+
+    #[test]
+    fn schema_messages_fail_closed_at_every_boundary() {
+        let config = configuration(PgOutputVersion::V2, PgOutputStreaming::On, false);
+        let columns = [
+            (true, b"key".as_slice(), 23, -1),
+            (false, b"value".as_slice(), 25, 7),
+        ];
+        let buffered_relation = relation(None, b"public", b"items", b'd', &columns);
+        let buffered_type = type_message(None, 3_000, b"public", b"item_type");
+        for packet in [&buffered_relation, &buffered_type] {
+            for length in 0..packet.len() {
+                let mut decoder = PgOutputDecoder::new(config, utf8());
+                assert!(
+                    decoder.decode(&packet[..length]).is_err(),
+                    "buffered schema prefix {length} of tag {:?} was accepted",
+                    packet.first()
+                );
+            }
+        }
+
+        let streamed_relation = relation(Some(7), b"public", b"items", b'd', &columns);
+        let streamed_type = type_message(Some(7), 3_000, b"public", b"item_type");
+        for packet in [&streamed_relation, &streamed_type] {
+            let mut decoder = PgOutputDecoder::new(config, utf8());
+            decoder
+                .decode(&stream_start(7, true))
+                .expect("stream layout context");
+            for length in 0..packet.len() {
+                assert!(
+                    decoder.decode(&packet[..length]).is_err(),
+                    "streamed schema prefix {length} of tag {:?} was accepted",
+                    packet.first()
+                );
+                assert_eq!(decoder.active_stream_xid(), Some(7));
+            }
+        }
+
+        let mut bad_identity = relation(None, b"public", b"items", b'd', &[]);
+        let identity_offset = 1 + 4 + b"public".len() + 1 + b"items".len() + 1;
+        bad_identity[identity_offset] = b'x';
+        let mut decoder = PgOutputDecoder::new(config, utf8());
+        assert_eq!(
+            decoder.decode(&bad_identity),
+            Err(PgOutputError::InvalidReplicaIdentity(b'x'))
+        );
+
+        let mut bad_flags = buffered_relation.clone();
+        let first_column_flags = identity_offset + 1 + 2;
+        bad_flags[first_column_flags] = 2;
+        assert_eq!(
+            decoder.decode(&bad_flags),
+            Err(PgOutputError::InvalidRelationColumnFlags(2))
+        );
+
+        let mut invalid_utf8 = type_message(None, 3_000, b"public", b"item_type");
+        invalid_utf8[1 + 4] = 0xff;
+        assert_eq!(
+            decoder.decode(&invalid_utf8),
+            Err(PgOutputError::InvalidUtf8("type namespace"))
+        );
+
+        let mut trailing = buffered_type.clone();
+        trailing.push(0);
+        assert_eq!(
+            decoder.decode(&trailing),
+            Err(PgOutputError::TrailingData(1))
+        );
     }
 
     #[test]
