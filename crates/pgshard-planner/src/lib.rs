@@ -185,8 +185,9 @@ const fn ast_stack_reserve(token_count: usize) -> usize {
 fn inspect_lexical_structure(tokens: &[TokenWithSpan]) -> Result<usize, ParseError> {
     let mut delimiters = [Delimiter::Parenthesis; MAX_RECURSION_DEPTH];
     let mut depth = 0_usize;
-    let mut array_angle_depth = 0_usize;
-    let mut saw_array_keyword = false;
+    let mut array_type_prefix_depth = 0_usize;
+    let mut awaiting_array_angle = false;
+    let mut awaiting_nested_array = false;
     let mut structural_tokens = 0_usize;
 
     for token in tokens {
@@ -194,7 +195,9 @@ fn inspect_lexical_structure(tokens: &[TokenWithSpan]) -> Result<usize, ParseErr
             continue;
         }
         if matches!(&token.token, Token::SemiColon | Token::EOF) {
-            saw_array_keyword = false;
+            array_type_prefix_depth = 0;
+            awaiting_array_angle = false;
+            awaiting_nested_array = false;
             continue;
         }
         structural_tokens += 1;
@@ -203,30 +206,29 @@ fn inspect_lexical_structure(tokens: &[TokenWithSpan]) -> Result<usize, ParseErr
             &token.token,
             Token::Word(word) if word.keyword == Keyword::ARRAY
         ) {
-            saw_array_keyword = true;
+            if !awaiting_nested_array {
+                array_type_prefix_depth = 0;
+            }
+            awaiting_array_angle = true;
+            awaiting_nested_array = false;
             continue;
         }
-        if token.token == Token::Lt && saw_array_keyword {
-            if array_angle_depth == MAX_RECURSION_DEPTH {
+        if token.token == Token::Lt && awaiting_array_angle {
+            if array_type_prefix_depth == MAX_RECURSION_DEPTH {
                 return Err(ParseError::RecursionLimit);
             }
-            array_angle_depth += 1;
-            saw_array_keyword = false;
+            array_type_prefix_depth += 1;
+            awaiting_array_angle = false;
+            awaiting_nested_array = true;
             continue;
         }
-        saw_array_keyword = false;
-
-        match token.token {
-            Token::Gt if array_angle_depth > 0 => {
-                array_angle_depth -= 1;
-                continue;
-            }
-            Token::ShiftRight if array_angle_depth > 0 => {
-                array_angle_depth = array_angle_depth.saturating_sub(2);
-                continue;
-            }
-            _ => {}
-        }
+        // sqlparser recursively parses a directly nested ARRAY<ARRAY<...>>
+        // prefix without consulting its recursion counter. Reset the lexical
+        // guard at any other structural token so qualified attributes such as
+        // `t.array < 1` remain ordinary PostgreSQL comparisons.
+        array_type_prefix_depth = 0;
+        awaiting_array_angle = false;
+        awaiting_nested_array = false;
 
         let delimiter = match token.token {
             Token::LParen => Some(Delimiter::Parenthesis),
@@ -460,16 +462,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_excessive_recursion_without_panicking() {
+    fn rejects_excessive_delimiter_nesting_on_a_small_stack() {
         let nested = format!(
             "select {}1{}",
             "(".repeat(MAX_RECURSION_DEPTH * 4),
             ")".repeat(MAX_RECURSION_DEPTH * 4)
         );
-        assert_eq!(
-            parse_one(&nested).expect_err("excessive recursion"),
-            ParseError::RecursionLimit
-        );
+        let result = std::thread::Builder::new()
+            .name("planner-delimiter-small-stack".into())
+            .stack_size(64 * 1024)
+            .spawn(move || parse_one(&nested).map(|statement| statement.kind()))
+            .expect("spawn small-stack parser")
+            .join()
+            .expect("small-stack parser must not panic");
+        assert_eq!(result, Err(ParseError::RecursionLimit));
     }
 
     #[test]
@@ -491,10 +497,10 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_comparisons_do_not_consume_array_type_depth() {
-        let comparisons = vec!["0 < 1"; MAX_RECURSION_DEPTH + 1].join(", ");
+    fn qualified_array_comparisons_do_not_consume_type_prefix_depth() {
+        let comparisons = vec!["t.array < 1"; MAX_RECURSION_DEPTH + 1].join(", ");
         assert_eq!(
-            parse_one(&format!("select {comparisons}"))
+            parse_one(&format!("select {comparisons} from t"))
                 .expect("independent comparisons")
                 .kind(),
             StatementKind::Query

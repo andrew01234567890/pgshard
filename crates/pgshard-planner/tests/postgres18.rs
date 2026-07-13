@@ -28,7 +28,8 @@ async fn admitted_dml_parses_on_postgres18() {
         .batch_execute(
             "CREATE TEMP TABLE planner_target (
                 tenant_id bigint PRIMARY KEY,
-                value bigint NOT NULL
+                value bigint NOT NULL,
+                \"array\" bigint NOT NULL DEFAULT 0
             )",
         )
         .await
@@ -66,8 +67,8 @@ async fn admitted_dml_parses_on_postgres18() {
         client.prepare(sql).await.expect("PostgreSQL 18 parse");
     }
 
-    let comparisons = vec!["0 < 1"; 51].join(", ");
-    let comparison_sql = format!("SELECT {comparisons}");
+    let comparisons = vec!["target.array < 1"; 51].join(", ");
+    let comparison_sql = format!("SELECT {comparisons} FROM planner_target AS target");
     assert_eq!(
         parse_one(&comparison_sql)
             .expect("independent comparison parse")
