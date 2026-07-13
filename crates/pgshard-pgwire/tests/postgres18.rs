@@ -376,7 +376,7 @@ fn two_phase_slot_state_survives_a_false_start_request(
     let create_slot = format!(
         "SELECT slot_name FROM pg_create_logical_replication_slot('{slot}', 'pgoutput', false, true)"
     );
-    assert_eq!(simple_query(stream, &create_slot), [slot.as_bytes()]);
+    let slot_creation_result = simple_query(stream, &create_slot);
     simple_query(
         stream,
         &format!("BEGIN; INSERT INTO {table} VALUES (1); PREPARE TRANSACTION '{gid}'"),
@@ -391,6 +391,15 @@ fn two_phase_slot_state_survives_a_false_start_request(
         .into_iter()
         .map(|row| decode_hex(&row))
         .collect();
+    simple_query(stream, &format!("ROLLBACK PREPARED '{gid}'"));
+    simple_query(
+        stream,
+        &format!("SELECT pg_drop_replication_slot('{slot}')"),
+    );
+    simple_query(stream, &format!("DROP PUBLICATION {publication}"));
+    simple_query(stream, &format!("DROP TABLE {table}"));
+
+    assert_eq!(slot_creation_result, [slot.as_bytes()]);
     assert!(
         messages
             .iter()
@@ -416,14 +425,6 @@ fn two_phase_slot_state_survives_a_false_start_request(
             Ok(PgOutputControlMessage::BeginPrepare(_) | PgOutputControlMessage::Prepare(_))
         ));
     }
-
-    simple_query(stream, &format!("ROLLBACK PREPARED '{gid}'"));
-    simple_query(
-        stream,
-        &format!("SELECT pg_drop_replication_slot('{slot}')"),
-    );
-    simple_query(stream, &format!("DROP PUBLICATION {publication}"));
-    simple_query(stream, &format!("DROP TABLE {table}"));
 }
 
 #[test]
