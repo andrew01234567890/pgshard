@@ -1,8 +1,9 @@
 # pgshard PostgreSQL wire framing
 
 This non-publishable crate implements bounded, zero-copy decoding for
-PostgreSQL 18 frontend frames and selected query-protocol bodies. Its constants
-and layouts follow the `REL_18_STABLE` PostgreSQL server source.
+PostgreSQL 18 frontend and backend frames and selected query-protocol bodies.
+Its constants, tags, and layouts follow the `REL_18_STABLE` PostgreSQL server
+source.
 
 The decoder recognizes startup protocol versions, SSL and GSS negotiation,
 variable-length PostgreSQL 18 cancellation keys, and every frontend message tag
@@ -28,6 +29,22 @@ the eventual session state machine. In the regular phase, COPY data, done, and
 failure messages are admitted because PostgreSQL accepts and ignores them to
 resynchronize after COPY has failed.
 
+The backend decoder recognizes every PostgreSQL 18 server-to-client tag and
+applies the stricter of a caller-selected ceiling and the tag's protocol
+family bound before buffering its body. Fixed empty responses and
+`ReadyForQuery` use their exact lengths, `BackendKeyData` includes at most the
+PostgreSQL 18 256-byte cancellation key, `ParameterDescription` includes at
+most 65,535 OIDs, startup authentication and protocol-negotiation messages use
+libpq's 2,000-byte ceiling, other tags not classified as long retain libpq's
+30,000-byte defensive ceiling, and long row/COPY/error/notice families remain
+subject to the caller ceiling no larger than 64 MiB. Unknown tags are rejected
+before their length is trusted. Authentication, query-cycle, COPY, and
+replication phase legality remains the future session state machine's
+responsibility. The first typed backend body decoder validates
+`ParameterDescription` exactly and exposes its type OIDs through a borrowed
+iterator. It does not associate that description with a Parse generation,
+statement name, backend identity, or catalog fence.
+
 The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH
 loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is
 separate from COPY IN because CopyFail, Flush, and Sync are not valid standby
@@ -35,8 +52,8 @@ messages. This is only a framing contract; logical-replication message decoding
 and durable stream state remain later work.
 
 Debug output reports only frame metadata and lengths. It never renders startup
-values, cancellation authentication keys, SQL, authentication data, or other
-frontend bodies.
+values, cancellation authentication keys, SQL, authentication data, error
+fields, rows, or other frontend/backend bodies.
 
 Query-protocol C-strings require the validated UTF-8 session proof, are checked
 as UTF-8, and are exposed as `&str`. Parameter value bytes remain opaque until

@@ -53,9 +53,7 @@ impl<'a> ParseMessage<'a> {
     /// Iterates declared parameter type OIDs in wire order.
     #[must_use]
     pub const fn parameter_types(self) -> ParameterTypeIter<'a> {
-        ParameterTypeIter {
-            remaining: self.parameter_type_bytes,
-        }
+        ParameterTypeIter::from_validated_bytes(self.parameter_type_bytes)
     }
 
     /// Returns the number of declared parameter types.
@@ -80,6 +78,12 @@ impl fmt::Debug for ParseMessage<'_> {
 #[derive(Clone)]
 pub struct ParameterTypeIter<'a> {
     remaining: &'a [u8],
+}
+
+impl<'a> ParameterTypeIter<'a> {
+    pub(crate) const fn from_validated_bytes(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
 }
 
 impl Iterator for ParameterTypeIter<'_> {

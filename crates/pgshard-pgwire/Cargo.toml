@@ -1,6 +1,6 @@
 [package]
 name = "pgshard-pgwire"
-description = "Bounded zero-copy PostgreSQL 18 frontend frame decoder for pgshard"
+description = "Bounded zero-copy PostgreSQL 18 frontend/backend frame decoder for pgshard"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
