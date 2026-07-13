@@ -1,7 +1,8 @@
 //! Live `PostgreSQL` 18 startup-control, metadata, and query decoder contract.
 //!
 //! The fixture must allow TCP trust authentication because this deliberately
-//! small raw protocol client does not implement password or SASL exchange.
+//! small raw protocol client does not implement password or SASL exchange. It
+//! must use `wal_level=logical` and a positive `max_prepared_transactions`.
 //! Run with:
 //! `PGSHARD_PGWIRE_TEST_ADDRESS=127.0.0.1:5432 cargo test -p pgshard-pgwire --test postgres18 -- --ignored`
 
@@ -11,11 +12,12 @@ use std::time::Duration;
 
 use pgshard_pgwire::{
     AuthenticationRequest, BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode,
-    ExtendedQueryObject, FrontendPhase, Postgres18StartupNegotiation, TransactionStatus,
-    decode_authentication_request, decode_backend, decode_backend_key_data, decode_close,
-    decode_describe, decode_frontend, decode_parameter_description, decode_parameter_status,
-    decode_protocol_negotiation, decode_ready_for_query, decode_startup,
-    require_empty_backend_body,
+    ExtendedQueryObject, FrontendPhase, PgOutputConfiguration, PgOutputControlMessage,
+    PgOutputEncoding, PgOutputStreaming, PgOutputVersion, Postgres18StartupNegotiation,
+    TransactionStatus, decode_authentication_request, decode_backend, decode_backend_key_data,
+    decode_close, decode_describe, decode_frontend, decode_parameter_description,
+    decode_parameter_status, decode_pgoutput_control, decode_protocol_negotiation,
+    decode_ready_for_query, decode_startup, require_empty_backend_body,
 };
 
 const POSTGRES_PROTOCOL_3_0: u32 = 3 << 16;
@@ -130,13 +132,14 @@ fn startup_negotiation(bytes: &[u8]) -> Postgres18StartupNegotiation<'_> {
 fn finish_startup(
     stream: &mut TcpStream,
     negotiation: Postgres18StartupNegotiation<'_>,
-) -> ClientEncoding {
+) -> (ClientEncoding, PgOutputEncoding) {
     let mut negotiation = Some(negotiation);
     let mut protocol = None;
     let mut authenticated = false;
     let mut backend_key_data = false;
     let mut postgres18 = false;
     let mut client_encoding = None;
+    let mut server_encoding = None;
     loop {
         let bytes = read_backend(stream);
         let frame = decoded_frame(&bytes);
@@ -181,6 +184,8 @@ fn finish_startup(
                         ClientEncoding::require_utf8(status.value())
                             .expect("PostgreSQL honored client_encoding=UTF8"),
                     );
+                } else if status.name() == "server_encoding" {
+                    server_encoding = Some(status.value().to_owned());
                 }
             }
             BackendTag::BackendKeyData => {
@@ -204,7 +209,13 @@ fn finish_startup(
     assert!(backend_key_data, "server omitted BackendKeyData");
     assert!(protocol.is_some(), "server omitted authentication response");
     assert!(postgres18, "test requires PostgreSQL major version 18");
-    client_encoding.expect("server omitted client_encoding ParameterStatus")
+    let client_encoding = client_encoding.expect("server omitted client_encoding ParameterStatus");
+    let pgoutput_encoding = PgOutputEncoding::require_utf8(
+        client_encoding,
+        &server_encoding.expect("server omitted server_encoding ParameterStatus"),
+    )
+    .expect("fixture database uses canonical server_encoding=UTF8");
+    (client_encoding, pgoutput_encoding)
 }
 
 fn connect(address: &str) -> TcpStream {
@@ -294,9 +305,131 @@ fn close_statement(stream: &mut TcpStream, utf8: ClientEncoding) {
     assert!(close_complete, "server omitted CloseComplete");
 }
 
+fn simple_query(stream: &mut TcpStream, sql: &str) -> Vec<Vec<u8>> {
+    assert!(!sql.as_bytes().contains(&0), "test SQL contains zero byte");
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    stream
+        .write_all(&frontend(b'Q', &body))
+        .expect("send simple Query");
+
+    let mut rows = Vec::new();
+    loop {
+        let bytes = read_backend(stream);
+        let frame = decoded_frame(&bytes);
+        match frame.tag() {
+            BackendTag::DataRow => rows.push(single_data_row(frame.body())),
+            BackendTag::ErrorResponse => panic!("PostgreSQL rejected fixed logical fixture SQL"),
+            BackendTag::ReadyForQuery => {
+                assert_eq!(decode_ready_for_query(frame), Ok(TransactionStatus::Idle));
+                return rows;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn single_data_row(body: &[u8]) -> Vec<u8> {
+    assert!(body.len() >= 6, "DataRow is missing one-column metadata");
+    assert_eq!(u16::from_be_bytes([body[0], body[1]]), 1);
+    let length = i32::from_be_bytes([body[2], body[3], body[4], body[5]]);
+    assert!(length >= 0, "logical fixture returned NULL");
+    let length = usize::try_from(length).expect("nonnegative DataRow length");
+    assert_eq!(body.len(), 6 + length, "DataRow has trailing bytes");
+    body[6..].to_vec()
+}
+
+fn decode_hex(input: &[u8]) -> Vec<u8> {
+    assert!(input.len().is_multiple_of(2), "hex output has odd length");
+    input
+        .chunks_exact(2)
+        .map(|pair| hex_nibble(pair[0]) << 4 | hex_nibble(pair[1]))
+        .collect()
+}
+
+fn hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        _ => panic!("PostgreSQL returned non-hex output"),
+    }
+}
+
+fn two_phase_slot_state_survives_a_false_start_request(
+    stream: &mut TcpStream,
+    encoding: PgOutputEncoding,
+) {
+    let suffix = std::process::id();
+    let table = format!("pgshard_pgoutput_table_{suffix}");
+    let publication = format!("pgshard_pgoutput_publication_{suffix}");
+    let slot = format!("pgshard_pgoutput_slot_{suffix}");
+    let gid = format!("pgshard_pgoutput_gid_{suffix}");
+
+    simple_query(
+        stream,
+        &format!("CREATE TABLE {table} (id integer PRIMARY KEY)"),
+    );
+    simple_query(
+        stream,
+        &format!("CREATE PUBLICATION {publication} FOR TABLE {table}"),
+    );
+    let create_slot = format!(
+        "SELECT slot_name FROM pg_create_logical_replication_slot('{slot}', 'pgoutput', false, true)"
+    );
+    let slot_creation_result = simple_query(stream, &create_slot);
+    simple_query(
+        stream,
+        &format!("BEGIN; INSERT INTO {table} VALUES (1); PREPARE TRANSACTION '{gid}'"),
+    );
+
+    let peek = format!(
+        "SELECT encode(data, 'hex') FROM pg_logical_slot_peek_binary_changes(\
+         '{slot}', NULL, NULL, 'proto_version', '1', 'publication_names', \
+         '{publication}', 'streaming', 'off', 'two_phase', 'false')"
+    );
+    let messages: Vec<Vec<u8>> = simple_query(stream, &peek)
+        .into_iter()
+        .map(|row| decode_hex(&row))
+        .collect();
+    simple_query(stream, &format!("ROLLBACK PREPARED '{gid}'"));
+    simple_query(
+        stream,
+        &format!("SELECT pg_drop_replication_slot('{slot}')"),
+    );
+    simple_query(stream, &format!("DROP PUBLICATION {publication}"));
+    simple_query(stream, &format!("DROP TABLE {table}"));
+
+    assert_eq!(slot_creation_result, [slot.as_bytes()]);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.first() == Some(&b'b')),
+        "persistent slot state did not emit Begin Prepare"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.first() == Some(&b'P')),
+        "persistent slot state did not emit Prepare"
+    );
+
+    let configuration =
+        PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::Off, false, true)
+            .expect("protocol v1 remains decodable for a persistently enabled slot");
+    for message in messages
+        .iter()
+        .filter(|message| matches!(message.first(), Some(b'b' | b'P')))
+    {
+        assert!(matches!(
+            decode_pgoutput_control(message, configuration, encoding),
+            Ok(PgOutputControlMessage::BeginPrepare(_) | PgOutputControlMessage::Prepare(_))
+        ));
+    }
+}
+
 #[test]
 #[ignore = "requires a trust-authenticated PostgreSQL 18 TCP fixture"]
-fn postgres18_startup_and_extended_query_controls_decode_from_real_wire_bytes() {
+fn postgres18_wire_and_persistent_slot_controls_decode_from_real_bytes() {
     let address = std::env::var("PGSHARD_PGWIRE_TEST_ADDRESS")
         .expect("PGSHARD_PGWIRE_TEST_ADDRESS is required");
     let user = std::env::var("PGSHARD_PGWIRE_TEST_USER").unwrap_or_else(|_| "postgres".into());
@@ -308,7 +441,7 @@ fn postgres18_startup_and_extended_query_controls_decode_from_real_wire_bytes() 
     legacy
         .write_all(&legacy_startup)
         .expect("send protocol 3.0 startup packet");
-    finish_startup(&mut legacy, legacy_negotiation);
+    let _ = finish_startup(&mut legacy, legacy_negotiation);
     legacy
         .write_all(&frontend(b'X', b""))
         .expect("terminate protocol 3.0 connection");
@@ -319,9 +452,10 @@ fn postgres18_startup_and_extended_query_controls_decode_from_real_wire_bytes() 
     stream
         .write_all(&native_startup)
         .expect("send protocol 3.2 startup packet");
-    let utf8 = finish_startup(&mut stream, native_negotiation);
+    let (utf8, pgoutput_encoding) = finish_startup(&mut stream, native_negotiation);
     describe_statement(&mut stream, utf8);
     close_statement(&mut stream, utf8);
+    two_phase_slot_state_survives_a_false_start_request(&mut stream, pgoutput_encoding);
 
     stream
         .write_all(&frontend(b'X', b""))
@@ -338,7 +472,7 @@ fn postgres18_startup_and_extended_query_controls_decode_from_real_wire_bytes() 
     negotiated
         .write_all(&newer_startup)
         .expect("send protocol 3.99 startup packet with a reserved option");
-    finish_startup(&mut negotiated, newer_negotiation);
+    let _ = finish_startup(&mut negotiated, newer_negotiation);
     negotiated
         .write_all(&frontend(b'X', b""))
         .expect("terminate negotiated protocol connection");

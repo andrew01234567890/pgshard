@@ -71,8 +71,25 @@ identify a backend, or establish a catalog fence.
 The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH
 loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is
 separate from COPY IN because CopyFail, Flush, and Sync are not valid standby
-messages. This is only a framing contract; logical-replication message decoding
-and durable stream state remain later work.
+messages. Backend replication `CopyData` now decodes exact zero-copy XLogData
+and primary-keepalive envelopes. A configuration token validates `pgoutput`
+protocol versions one through four plus streaming and two-phase feature gates;
+the control decoder covers buffered Begin/Commit/Origin, streamed transaction
+start/stop/commit/abort, and every two-phase control including Stream Prepare.
+It requires authoritative `server_encoding=UTF8` and `client_encoding=UTF8`
+proofs from the same connection, bounds prepared-transaction identifiers, and
+redacts origins, GIDs, and logical payloads from debug output.
+Row, relation, type, truncate, and logical-message bodies have distinct tags but
+are deliberately rejected until their dedicated decoders exist. Transaction
+ordering, relation state, WAL feedback, durable checkpoints, cross-shard merge,
+and the VStream-like service remain later work.
+
+The future replication session must bind that token to the exact accepted
+`START_REPLICATION` command and the selected slot's authoritative persistent
+`two_phase` state rather than trusting caller-selected options. PostgreSQL keeps
+two-phase decoding enabled after a later `two_phase=false` start unless the
+slot itself is explicitly disabled, so the effective decoder gate is the
+logical OR of the request and slot states.
 
 Debug output reports only frame metadata and lengths. It never renders startup
 values, cancellation authentication keys, SQL, authentication data, error
@@ -84,5 +101,8 @@ their declared PostgreSQL types and text/binary formats are resolved.
 
 `cargo bench -p pgshard-pgwire --bench decode_frontend` measures framing alone.
 `cargo bench -p pgshard-pgwire --bench decode_bind` measures framing plus a
-four-parameter extended-query bind. Neither is a substitute for the planned
+four-parameter extended-query bind.
+
+`cargo bench -p pgshard-pgwire --bench decode_pgoutput_control` measures a
+borrowed transaction Begin control. None is a substitute for the planned
 end-to-end pooler/PgBouncer comparison.

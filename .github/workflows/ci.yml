@@ -309,6 +309,7 @@ jobs:
         image: postgres:18
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: --set wal_level=logical --set max_prepared_transactions=10
         ports:
           - 5432:5432
         options: >-
@@ -321,7 +322,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Select repository Rust toolchain
         run: rustup show active-toolchain
-      - name: Decode real PostgreSQL 18 extended-query controls
+      - name: Decode real PostgreSQL 18 wire and persistent-slot controls
         env:
           PGSHARD_PGWIRE_TEST_ADDRESS: 127.0.0.1:5432
         run: make pgwire-postgres-test
