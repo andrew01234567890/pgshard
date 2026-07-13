@@ -4,14 +4,26 @@ use pgshard_catalog::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, RegisteredTable,
     RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
 };
-use pgshard_planner::{RouteTemplateError, StatementKind, parse_one};
+use pgshard_planner::{
+    CatalogOnlySearchPath, PhysicalSchemaError, PhysicalShardKeyCatalogIdentity,
+    PhysicalShardKeyObservation, PhysicalShardKeyProof, RouteTemplateError, StatementKind,
+    parse_one,
+};
 use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
 use uuid::Uuid;
 
-fn route_snapshot(schema: &str) -> (CatalogSnapshot, DatabaseId) {
+fn route_snapshot(schema: &str, database_name: &str) -> (CatalogSnapshot, DatabaseId) {
+    route_snapshot_for(schema, "planner_target", database_name)
+}
+
+fn route_snapshot_for(
+    schema: &str,
+    table: &str,
+    database_name: &str,
+) -> (CatalogSnapshot, DatabaseId) {
     let database_id = DatabaseId::new(Uuid::from_u128(2)).expect("database ID");
     let registered_table = RegisteredTable::new(
-        TableName::new(schema, "planner_target").expect("temporary table name"),
+        TableName::new(schema, table).expect("temporary table name"),
         "tenant_id",
         ShardKeyType::Int64,
         RoutingHashV1::VERSION,
@@ -19,7 +31,7 @@ fn route_snapshot(schema: &str) -> (CatalogSnapshot, DatabaseId) {
     .expect("registered table");
     let database = DatabaseCatalog::new(
         database_id,
-        "app",
+        database_name,
         DatabaseEpochs::new(1, 1, 1).expect("database epochs"),
         vec![ShardRoute::new(
             ShardId(0),
@@ -38,40 +50,386 @@ fn route_snapshot(schema: &str) -> (CatalogSnapshot, DatabaseId) {
     (snapshot, database_id)
 }
 
-async fn check_parameter_route(client: &tokio_postgres::Client) {
-    let temporary_schema: String = client
+async fn physical_observation(
+    client: &tokio_postgres::Client,
+    database_id: DatabaseId,
+    schema: &str,
+    table: &str,
+) -> PhysicalShardKeyObservation {
+    let row = client
         .query_one(
-            "SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()",
+            "SELECT pg_catalog.current_database(), namespaces.nspname, relations.relname, \
+                    attributes.attname, relations.relkind::text, \
+                    relations.relpersistence::text, \
+                    EXISTS ( \
+                        SELECT FROM pg_catalog.pg_inherits AS inheritance \
+                         WHERE inheritance.inhrelid = relations.oid \
+                            OR inheritance.inhparent = relations.oid \
+                    ), attributes.atttypid::bigint, attributes.attcollation::bigint, \
+                    pg_catalog.pg_char_to_encoding(pg_catalog.getdatabaseencoding()) \
+               FROM pg_catalog.pg_attribute AS attributes \
+               JOIN pg_catalog.pg_class AS relations \
+                 ON relations.oid = attributes.attrelid \
+               JOIN pg_catalog.pg_namespace AS namespaces \
+                 ON namespaces.oid = relations.relnamespace \
+              WHERE namespaces.nspname = $1 \
+                AND relations.relname = $2 \
+                AND attributes.attname = 'tenant_id' \
+                AND attributes.attnum > 0 \
+                AND NOT attributes.attisdropped",
+            &[&schema, &table],
+        )
+        .await
+        .expect("read physical shard-key catalog row");
+    let catalog_code = |index| {
+        let value: String = row.get(index);
+        let [code] = value.as_bytes() else {
+            panic!("PostgreSQL catalog code must contain exactly one byte")
+        };
+        *code
+    };
+    let identity = PhysicalShardKeyCatalogIdentity::new(
+        database_id,
+        row.get::<_, String>(0),
+        TableName::new(row.get::<_, String>(1), row.get::<_, String>(2))
+            .expect("catalog table name"),
+        row.get::<_, String>(3),
+        catalog_code(4),
+        catalog_code(5),
+        row.get(6),
+    );
+    let type_oid = u32::try_from(row.get::<_, i64>(7)).expect("type OID fits u32");
+    let collation_oid = u32::try_from(row.get::<_, i64>(8)).expect("collation OID fits u32");
+    PhysicalShardKeyObservation::new(ShardId(0), identity, 1, type_oid, collation_oid, row.get(9))
+}
+
+async fn check_parameter_route(client: &tokio_postgres::Client) {
+    let identity_row = client
+        .query_one("SELECT pg_backend_pid(), current_database()", &[])
+        .await
+        .expect("read backend and database identity");
+    let backend_pid: i32 = identity_row.get(0);
+    let database_name: String = identity_row.get(1);
+    let proof_schema = format!("planner_route_{backend_pid}");
+    client
+        .batch_execute(&format!(
+            "BEGIN; \
+             CREATE SCHEMA \"{proof_schema}\"; \
+             CREATE TABLE \"{proof_schema}\".planner_target ( \
+                 tenant_id bigint PRIMARY KEY, \
+                 value bigint NOT NULL \
+             )"
+        ))
+        .await
+        .expect("create permanent-table proof fixture");
+    let (snapshot, database_id) = route_snapshot(&proof_schema, &database_name);
+    let routed_sql =
+        format!("SELECT * FROM \"{proof_schema}\".\"planner_target\" WHERE tenant_id = $1");
+    let reported_search_path: String = client
+        .query_one(
+            "SELECT pg_catalog.set_config('search_path', '', false)",
             &[],
         )
         .await
-        .expect("read temporary schema")
+        .expect("pin empty search path")
         .get(0);
-    let (snapshot, database_id) = route_snapshot(&temporary_schema);
-    let routed_sql =
-        format!("SELECT * FROM \"{temporary_schema}\".\"planner_target\" WHERE tenant_id = $1");
+    let search_path =
+        CatalogOnlySearchPath::require_empty(&reported_search_path).expect("empty search path");
+    let statement = client
+        .prepare(&routed_sql)
+        .await
+        .expect("PostgreSQL 18 routed parse");
+    let parameter_type_oids = statement
+        .params()
+        .iter()
+        .map(tokio_postgres::types::Type::oid)
+        .collect::<Vec<_>>();
     let template = parse_one(&routed_sql)
         .expect("route SQL parse")
         .parameter_route_template(&snapshot, database_id)
         .expect("route template");
-    assert_eq!(template.parameter_number().get(), 1);
-    assert_eq!(template.shard_key_type(), ShardKeyType::Int64);
-    client
-        .prepare(&routed_sql)
-        .await
-        .expect("PostgreSQL 18 routed parse");
+    let physical_schema = PhysicalShardKeyProof::verify(
+        &snapshot,
+        database_id,
+        template.table_name(),
+        &[physical_observation(client, database_id, &proof_schema, "planner_target").await],
+    )
+    .expect("physical int8 schema on every active shard");
+    let resolved = template
+        .resolve_parameter_types(search_path, &physical_schema, &parameter_type_oids)
+        .expect("PostgreSQL parameter resolution");
+    assert_eq!(resolved.template().parameter_number().get(), 1);
+    assert_eq!(resolved.template().shard_key_type(), ShardKeyType::Int64);
+    assert_eq!(resolved.parameter_type_oid(), 20);
 
     let double_equality =
-        format!("SELECT * FROM \"{temporary_schema}\".\"planner_target\" WHERE tenant_id == $1");
+        format!("SELECT * FROM \"{proof_schema}\".\"planner_target\" WHERE tenant_id == $1");
     assert_eq!(
         parse_one(&double_equality)
             .expect("candidate parser accepts double equality")
             .parameter_route_template(&snapshot, database_id),
         Err(RouteTemplateError::UnsupportedShape),
     );
+    client
+        .batch_execute("SAVEPOINT invalid_double_equality")
+        .await
+        .expect("savepoint expected parse error");
     assert!(
         client.prepare(&double_equality).await.is_err(),
         "default PostgreSQL catalog unexpectedly resolved double equality"
+    );
+    client
+        .batch_execute(
+            "ROLLBACK TO SAVEPOINT invalid_double_equality; \
+             RELEASE SAVEPOINT invalid_double_equality",
+        )
+        .await
+        .expect("recover expected parse error");
+
+    check_operator_search_path_reanalysis(client, &routed_sql, &proof_schema).await;
+    check_coercible_column_rejected(client, &proof_schema, &database_name).await;
+    check_relation_identity_rejected(client, &proof_schema, &database_name).await;
+
+    client
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("roll back permanent-table proof fixtures");
+    let fixture_removed: bool = client
+        .query_one(
+            "SELECT pg_catalog.to_regnamespace($1) IS NULL",
+            &[&proof_schema],
+        )
+        .await
+        .expect("verify proof fixture rollback")
+        .get(0);
+    assert!(fixture_removed, "planner proof schema survived rollback");
+}
+
+async fn check_coercible_column_rejected(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    database_name: &str,
+) {
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{schema}\".planner_coercion_target ( \
+                 tenant_id double precision PRIMARY KEY \
+             ); \
+             INSERT INTO \"{schema}\".planner_coercion_target \
+             VALUES (9007199254740992::double precision)"
+        ))
+        .await
+        .expect("create coercible-column fixture");
+    let sql =
+        format!("SELECT * FROM \"{schema}\".\"planner_coercion_target\" WHERE tenant_id = $1");
+    let statement = client
+        .prepare_typed(&sql, &[tokio_postgres::types::Type::INT8])
+        .await
+        .expect("PostgreSQL accepts explicit bigint against float8 column");
+    assert_eq!(
+        statement
+            .params()
+            .iter()
+            .map(tokio_postgres::types::Type::oid)
+            .collect::<Vec<_>>(),
+        vec![20],
+        "ParameterDescription must expose only the explicit bigint parameter"
+    );
+    assert_eq!(
+        client
+            .query(&statement, &[&9_007_199_254_740_993_i64])
+            .await
+            .expect("execute coercible-column fixture")
+            .len(),
+        1,
+        "PostgreSQL must demonstrate bigint-to-float8 equality rounding"
+    );
+
+    let (snapshot, database_id) =
+        route_snapshot_for(schema, "planner_coercion_target", database_name);
+    let table_name = TableName::new(schema, "planner_coercion_target").expect("table name");
+    assert_eq!(
+        PhysicalShardKeyProof::verify(
+            &snapshot,
+            database_id,
+            &table_name,
+            &[physical_observation(client, database_id, schema, "planner_coercion_target").await],
+        ),
+        Err(PhysicalSchemaError::TypeMismatch {
+            shard_id: ShardId(0),
+            expected_oid: 20,
+            actual_oid: 701,
+        }),
+        "a matching parameter OID must not hide a coercible physical column"
+    );
+}
+
+async fn check_relation_identity_rejected(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    database_name: &str,
+) {
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{schema}\".planner_other_target (tenant_id bigint); \
+             CREATE VIEW \"{schema}\".planner_view_target AS \
+                 SELECT tenant_id FROM \"{schema}\".planner_target; \
+             CREATE UNLOGGED TABLE \"{schema}\".planner_unlogged_target (tenant_id bigint); \
+             CREATE TABLE \"{schema}\".planner_inherited_target (tenant_id bigint); \
+             CREATE TABLE \"{schema}\".planner_inherited_child () \
+                 INHERITS (\"{schema}\".planner_inherited_target); \
+             CREATE TABLE \"{schema}\".planner_partitioned_target (tenant_id bigint) \
+                 PARTITION BY HASH (tenant_id)"
+        ))
+        .await
+        .expect("create relation-identity fixtures");
+
+    let (target_snapshot, database_id) = route_snapshot(schema, database_name);
+    let target_name = TableName::new(schema, "planner_target").expect("target table name");
+    assert_eq!(
+        PhysicalShardKeyProof::verify(
+            &target_snapshot,
+            database_id,
+            &target_name,
+            &[physical_observation(client, database_id, schema, "planner_other_target").await],
+        ),
+        Err(PhysicalSchemaError::RelationIdentityMismatch {
+            shard_id: ShardId(0),
+        }),
+        "a catalog row from another physical table must not prove the route target"
+    );
+
+    for (table, expected) in [
+        (
+            "planner_view_target",
+            PhysicalSchemaError::UnsupportedRelationKind {
+                shard_id: ShardId(0),
+                actual: b'v',
+            },
+        ),
+        (
+            "planner_unlogged_target",
+            PhysicalSchemaError::UnsupportedRelationPersistence {
+                shard_id: ShardId(0),
+                actual: b'u',
+            },
+        ),
+        (
+            "planner_inherited_target",
+            PhysicalSchemaError::UnsupportedInheritance {
+                shard_id: ShardId(0),
+            },
+        ),
+        (
+            "planner_partitioned_target",
+            PhysicalSchemaError::UnsupportedRelationKind {
+                shard_id: ShardId(0),
+                actual: b'p',
+            },
+        ),
+    ] {
+        let (snapshot, database_id) = route_snapshot_for(schema, table, database_name);
+        let table_name = TableName::new(schema, table).expect("fixture table name");
+        assert_eq!(
+            PhysicalShardKeyProof::verify(
+                &snapshot,
+                database_id,
+                &table_name,
+                &[physical_observation(client, database_id, schema, table).await],
+            ),
+            Err(expected),
+        );
+    }
+}
+
+async fn set_search_path(client: &tokio_postgres::Client, path: &str) {
+    let path = path.to_owned();
+    let reported: String = client
+        .query_one(
+            "SELECT pg_catalog.set_config('search_path', $1, false)",
+            &[&path],
+        )
+        .await
+        .expect("set and read search path")
+        .get(0);
+    assert_eq!(reported, path, "PostgreSQL reported another search path");
+}
+
+async fn route_row_count(
+    client: &tokio_postgres::Client,
+    statement: &tokio_postgres::Statement,
+) -> usize {
+    client
+        .query(statement, &[&42_i64])
+        .await
+        .expect("execute operator route fixture")
+        .len()
+}
+
+async fn check_operator_search_path_reanalysis(
+    client: &tokio_postgres::Client,
+    routed_sql: &str,
+    schema: &str,
+) {
+    // The caller keeps every persistent-schema fixture inside one transaction.
+    // Any assertion failure closes the connection and PostgreSQL rolls it back.
+    client
+        .execute(
+            &format!("INSERT INTO \"{schema}\".planner_target (tenant_id, value) VALUES (42, 1)"),
+            &[],
+        )
+        .await
+        .expect("insert route target");
+    let backend_pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("read backend PID")
+        .get(0);
+    let attack_schema = format!("planner_operator_attack_{backend_pid}");
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {attack_schema};
+             CREATE FUNCTION {attack_schema}.always_false(bigint, bigint)
+             RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS 'SELECT false';
+             CREATE OPERATOR {attack_schema}.= (
+                 LEFTARG = bigint,
+                 RIGHTARG = bigint,
+                 FUNCTION = {attack_schema}.always_false
+             );"
+        ))
+        .await
+        .expect("install test operator");
+    set_search_path(client, &format!("{attack_schema}, pg_catalog")).await;
+
+    let shadowed_statement = client
+        .prepare(routed_sql)
+        .await
+        .expect("prepare with shadowing operator");
+    assert_eq!(
+        route_row_count(client, &shadowed_statement).await,
+        0,
+        "test operator must shadow built-in equality under an unsafe search path"
+    );
+
+    set_search_path(client, "").await;
+    let builtin_statement = client
+        .prepare(routed_sql)
+        .await
+        .expect("prepare with catalog-only operators");
+    assert_eq!(route_row_count(client, &builtin_statement).await, 1);
+
+    set_search_path(client, &format!("{attack_schema}, pg_catalog")).await;
+    assert_eq!(
+        route_row_count(client, &builtin_statement).await,
+        0,
+        "PostgreSQL must expose why search_path cannot change after Parse"
+    );
+
+    set_search_path(client, "").await;
+    assert_eq!(
+        route_row_count(client, &builtin_statement).await,
+        1,
+        "cached route statements must execute only under the empty path"
     );
 }
 
