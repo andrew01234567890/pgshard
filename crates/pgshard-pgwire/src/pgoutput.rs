@@ -7,9 +7,13 @@ use thiserror::Error;
 use crate::{BackendFrame, BackendTag, ClientEncoding, MAX_LARGE_MESSAGE_LENGTH};
 
 const PGOUTPUT_GID_MAX_LENGTH: usize = 199;
+const STANDBY_STATUS_UPDATE_MESSAGE_LENGTH: u32 = 38;
 
 /// Maximum complete `pgoutput` message accepted by this decoder.
 pub const MAX_PGOUTPUT_MESSAGE_LENGTH: usize = MAX_LARGE_MESSAGE_LENGTH;
+
+/// Exact frontend `CopyData` frame length of a Standby Status Update.
+pub const STANDBY_STATUS_UPDATE_FRAME_LENGTH: usize = 39;
 
 /// A `PostgreSQL` 18 `pgoutput` protocol version.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -307,6 +311,122 @@ pub enum ReplicationCopyData<'a> {
     XLogData(XLogData<'a>),
     /// Sender keepalive and optional immediate-reply request.
     PrimaryKeepalive(PrimaryKeepalive),
+}
+
+/// Validated WAL progress for one `PostgreSQL` Standby Status Update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandbyStatusUpdate {
+    write_lsn: u64,
+    flush_lsn: u64,
+    apply_lsn: u64,
+    client_time: i64,
+    reply_requested: bool,
+}
+
+impl StandbyStatusUpdate {
+    /// Validates one progress sample before it can be encoded.
+    ///
+    /// Zero is accepted as `PostgreSQL`'s not-yet-known LSN sentinel. Flush and
+    /// apply must not exceed write, but apply can be ahead of flush exactly as
+    /// `PostgreSQL`'s logical worker reports locally written, unflushed commits.
+    /// Monotonicity between samples belongs to the durable feedback owner.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a flush or apply position ahead of the write position.
+    pub const fn new(
+        write_lsn: u64,
+        flush_lsn: u64,
+        apply_lsn: u64,
+        client_time: i64,
+        reply_requested: bool,
+    ) -> Result<Self, StandbyStatusUpdateError> {
+        if flush_lsn > write_lsn {
+            return Err(StandbyStatusUpdateError::FlushAheadOfWrite {
+                write_lsn,
+                flush_lsn,
+            });
+        }
+        if apply_lsn > write_lsn {
+            return Err(StandbyStatusUpdateError::ApplyAheadOfWrite {
+                write_lsn,
+                apply_lsn,
+            });
+        }
+        Ok(Self {
+            write_lsn,
+            flush_lsn,
+            apply_lsn,
+            client_time,
+            reply_requested,
+        })
+    }
+
+    /// Returns the first position after WAL received and written by the client.
+    #[must_use]
+    pub const fn write_lsn(self) -> u64 {
+        self.write_lsn
+    }
+
+    /// Returns the first position after WAL durably flushed by the client.
+    #[must_use]
+    pub const fn flush_lsn(self) -> u64 {
+        self.flush_lsn
+    }
+
+    /// Returns the first position after WAL applied by the client.
+    #[must_use]
+    pub const fn apply_lsn(self) -> u64 {
+        self.apply_lsn
+    }
+
+    /// Returns the client time in microseconds since `PostgreSQL`'s epoch.
+    #[must_use]
+    pub const fn client_time(self) -> i64 {
+        self.client_time
+    }
+
+    /// Returns whether this update asks the WAL sender for an immediate reply.
+    #[must_use]
+    pub const fn reply_requested(self) -> bool {
+        self.reply_requested
+    }
+
+    /// Encodes the exact fixed-size frontend `CopyData` frame accepted by `PostgreSQL` 18.
+    #[must_use]
+    pub fn encode_frame(self) -> [u8; STANDBY_STATUS_UPDATE_FRAME_LENGTH] {
+        let mut frame = [0_u8; STANDBY_STATUS_UPDATE_FRAME_LENGTH];
+        frame[0] = b'd';
+        frame[1..5].copy_from_slice(&STANDBY_STATUS_UPDATE_MESSAGE_LENGTH.to_be_bytes());
+        frame[5] = b'r';
+        frame[6..14].copy_from_slice(&self.write_lsn.to_be_bytes());
+        frame[14..22].copy_from_slice(&self.flush_lsn.to_be_bytes());
+        frame[22..30].copy_from_slice(&self.apply_lsn.to_be_bytes());
+        frame[30..38].copy_from_slice(&self.client_time.to_be_bytes());
+        frame[38] = u8::from(self.reply_requested);
+        frame
+    }
+}
+
+/// Invalid within-sample ordering in a Standby Status Update.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum StandbyStatusUpdateError {
+    /// The durable flush position exceeds bytes reported written.
+    #[error("standby flush LSN {flush_lsn} exceeds write LSN {write_lsn}")]
+    FlushAheadOfWrite {
+        /// Last position reported written.
+        write_lsn: u64,
+        /// Invalid later flush position.
+        flush_lsn: u64,
+    },
+    /// The apply position exceeds bytes reported written.
+    #[error("standby apply LSN {apply_lsn} exceeds write LSN {write_lsn}")]
+    ApplyAheadOfWrite {
+        /// Last position reported written.
+        write_lsn: u64,
+        /// Invalid later apply position.
+        apply_lsn: u64,
+    },
 }
 
 /// Decodes one replication payload from a backend `CopyData` frame.
@@ -2142,7 +2262,10 @@ pub enum PgOutputError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_LARGE_MESSAGE_LENGTH, Decode, decode_backend};
+    use crate::{
+        DEFAULT_LARGE_MESSAGE_LENGTH, Decode, FrontendPhase, FrontendTag, decode_backend,
+        decode_frontend,
+    };
 
     fn utf8() -> PgOutputEncoding {
         PgOutputEncoding::require_utf8(
@@ -2187,6 +2310,19 @@ mod tests {
             decode_backend(input, DEFAULT_LARGE_MESSAGE_LENGTH).expect("backend frame")
         else {
             panic!("complete backend packet was incomplete");
+        };
+        assert_eq!(consumed, input.len());
+        frame
+    }
+
+    fn frontend_frame(input: &[u8]) -> crate::FrontendFrame<'_> {
+        let Decode::Complete { frame, consumed } = decode_frontend(
+            input,
+            FrontendPhase::ReplicationStreaming,
+            DEFAULT_LARGE_MESSAGE_LENGTH,
+        )
+        .expect("frontend frame") else {
+            panic!("complete frontend packet was incomplete");
         };
         assert_eq!(consumed, input.len());
         frame
@@ -2586,6 +2722,57 @@ mod tests {
             assert_eq!(keepalive.server_time(), -505);
             assert_eq!(keepalive.reply_requested(), expected);
         }
+    }
+
+    #[test]
+    fn standby_status_update_is_an_exact_fixed_copy_data_frame() {
+        for reply_requested in [false, true] {
+            let update = StandbyStatusUpdate::new(303, 101, 202, -404, reply_requested)
+                .expect("ordered standby status");
+            assert_eq!(update.write_lsn(), 303);
+            assert_eq!(update.flush_lsn(), 101);
+            assert_eq!(update.apply_lsn(), 202);
+            assert_eq!(update.client_time(), -404);
+            assert_eq!(update.reply_requested(), reply_requested);
+
+            let encoded = update.encode_frame();
+            assert_eq!(STANDBY_STATUS_UPDATE_FRAME_LENGTH, 39);
+            assert_eq!(encoded.len(), STANDBY_STATUS_UPDATE_FRAME_LENGTH);
+            assert_eq!(encoded[0], b'd');
+            assert_eq!(
+                u32::from_be_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]),
+                38
+            );
+            let frame = frontend_frame(&encoded);
+            assert_eq!(frame.tag(), FrontendTag::CopyData);
+            assert_eq!(frame.body().len(), 34);
+            assert_eq!(frame.body()[0], b'r');
+            assert_eq!(&frame.body()[1..9], &303_u64.to_be_bytes());
+            assert_eq!(&frame.body()[9..17], &101_u64.to_be_bytes());
+            assert_eq!(&frame.body()[17..25], &202_u64.to_be_bytes());
+            assert_eq!(&frame.body()[25..33], &(-404_i64).to_be_bytes());
+            assert_eq!(frame.body()[33], u8::from(reply_requested));
+        }
+    }
+
+    #[test]
+    fn standby_status_update_rejects_impossible_within_sample_progress() {
+        assert!(StandbyStatusUpdate::new(0, 0, 0, i64::MIN, false).is_ok());
+        assert!(StandbyStatusUpdate::new(u64::MAX, u64::MAX, u64::MAX, i64::MAX, true).is_ok());
+        assert_eq!(
+            StandbyStatusUpdate::new(10, 11, 9, 0, false),
+            Err(StandbyStatusUpdateError::FlushAheadOfWrite {
+                write_lsn: 10,
+                flush_lsn: 11,
+            })
+        );
+        assert_eq!(
+            StandbyStatusUpdate::new(12, 10, 13, 0, false),
+            Err(StandbyStatusUpdateError::ApplyAheadOfWrite {
+                write_lsn: 12,
+                apply_lsn: 13,
+            })
+        );
     }
 
     #[test]
