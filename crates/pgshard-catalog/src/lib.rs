@@ -6,12 +6,18 @@
 //! data and can be lost without affecting correctness because callers poll.
 
 mod cache;
+mod driver;
 mod loader;
 mod model;
 
 pub use cache::{
     CacheError, CatalogCache, CatalogNotification, InstallOutcome, NotificationError,
     RefreshDecision, RequestEpochError,
+};
+pub use driver::{
+    CatalogPollInterval, CatalogPollIntervalError, CatalogRefreshError,
+    DEFAULT_CATALOG_POLL_INTERVAL, MAX_CATALOG_POLL_INTERVAL, MIN_CATALOG_POLL_INTERVAL,
+    run_catalog_refresh,
 };
 pub use loader::{
     CatalogReader, LoadError, MAX_LOGICAL_DATABASES, MAX_REGISTERED_TABLES_PER_DATABASE,
