@@ -6,17 +6,19 @@ Its constants, tags, and layouts follow the `REL_18_STABLE` PostgreSQL server
 source.
 
 The decoder recognizes startup protocol versions, SSL and GSS negotiation,
-variable-length PostgreSQL 18 cancellation keys, and every frontend message tag
-accepted by PostgreSQL 18. Startup packets retain PostgreSQL's 10,004-byte total
-limit. Ordinary messages use the stricter of PostgreSQL's small-message limit
-or authentication limit and a caller-supplied large-message limit, with a hard
-64 MiB pooler ceiling. Bytes already present after an SSL request remain
-unconsumed so an accepted TLS handshake can consume an immediately pipelined
-ClientHello, as PostgreSQL 18 does. The eventual transport must reject those
-bytes if it refuses TLS and, when it accepts TLS, feed them through the TLS
-stack and reject any raw bytes left unconsumed after the handshake. Buffered
-data after a GSS request is rejected because PostgreSQL 18 does not pass its
-receive buffer into the GSS handshake.
+one-to-256-byte PostgreSQL 18 `CancelRequest` keys, and every frontend message
+tag accepted by PostgreSQL 18. Startup packets retain PostgreSQL's 10,004-byte
+total limit; fixed negotiation and cancellation-key bounds are enforced from
+their eight-byte header before buffering the rest. Ordinary messages use the
+stricter of PostgreSQL's small-message limit or authentication limit and a
+caller-supplied large-message limit, with a hard 64 MiB pooler ceiling. Bytes
+already present after an SSL request remain unconsumed so an accepted TLS
+handshake can consume an immediately pipelined ClientHello, as PostgreSQL 18
+does. The eventual transport must reject those bytes if it refuses TLS and,
+when it accepts TLS, feed them through the TLS stack and reject any raw bytes
+left unconsumed after the handshake. Buffered data after a GSS request is
+rejected because PostgreSQL 18 does not pass its receive buffer into the GSS
+handshake.
 PostgreSQL 18 direct TLS begins with a TLS record rather than a PostgreSQL
 startup frame; the future transport must detect it before calling this decoder
 and require the `postgresql` ALPN protocol during the handshake.
@@ -32,14 +34,14 @@ resynchronize after COPY has failed.
 The backend decoder recognizes every PostgreSQL 18 server-to-client tag and
 applies the stricter of a caller-selected ceiling and the tag's protocol
 family bound before buffering its body. Fixed empty responses and
-`ReadyForQuery` use their exact lengths, `BackendKeyData` includes at most the
-PostgreSQL 18 256-byte cancellation key, `ParameterDescription` includes at
-most 65,535 OIDs, startup authentication and protocol-negotiation messages use
-libpq's 2,000-byte ceiling, other tags not classified as long retain libpq's
-30,000-byte defensive ceiling, and long row/COPY/error/notice families remain
-subject to the caller ceiling no larger than 64 MiB. Unknown tags are rejected
-before their length is trusted. Authentication, query-cycle, COPY, and
-replication phase legality remains the future session state machine's
+`ReadyForQuery` use their exact lengths, `BackendKeyData` includes a
+four-to-256-byte PostgreSQL 18 cancellation key, `ParameterDescription`
+includes at most 65,535 OIDs, startup authentication and protocol-negotiation
+messages use libpq's 2,000-byte ceiling, other tags not classified as long
+retain libpq's 30,000-byte defensive ceiling, and long row/COPY/error/notice
+families remain subject to the caller ceiling no larger than 64 MiB. Unknown
+tags are rejected before their length is trusted. Authentication, query-cycle,
+COPY, and replication phase legality remains the future session state machine's
 responsibility. The typed backend body decoders validate
 `ParameterDescription` exactly, expose its type OIDs through a borrowed
 iterator, validate the exact empty-response family, and decode `ReadyForQuery`
