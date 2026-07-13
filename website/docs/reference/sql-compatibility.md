@@ -10,8 +10,9 @@ No pooler endpoint or semantic statement planner exists yet. The source has a
 byte/token/AST/stack-bounded permissive candidate parser configured with a
 PostgreSQL dialect, a fail-closed core that routes an already-resolved, non-NULL
 shard-key bind parameter against one immutable catalog snapshot, and a bounded
-zero-copy decoder for PostgreSQL 18 frontend frames and selected simple/extended
-query message bodies. The first catalog-bound template accepts only an explicitly
+zero-copy decoder for PostgreSQL 18 frontend/backend frames, selected
+simple/extended frontend bodies, and exact backend `ParameterDescription`
+metadata. The first catalog-bound template accepts only an explicitly
 schema-qualified `SELECT * FROM schema.table WHERE shard_key = $n` shape (or
 reversed equality), with no other clause or expression. It rejects `==` before
 AST proof because PostgreSQL resolves that spelling as a distinct, potentially
@@ -40,6 +41,8 @@ empty-path token that the caller must rebuild from the current backend, and
 checks PostgreSQL's authoritative parameter count plus the selected
 format/NULL/value bytes without copying before producing a canonical shard
 route. It intentionally does not accept or trust statement and portal names.
+The backend decoder supplies framing and borrowed type OIDs only; it does not
+prove that a description belongs to the relevant Parse, backend, or session.
 The pooler session runtime that maps those names to an exact prepared
 generation, pins the same backend, keeps the path empty through Parse, Describe,
 Bind, and Execute, and retains the snapshot/schema fences is not yet
@@ -108,6 +111,12 @@ The decoder caps one frontend frame at 64 MiB. Startup, authentication, and
 control-message families retain PostgreSQL 18's smaller family-specific limits.
 It reports oversized frames before their bodies are buffered; the future
 session layer must then close the client connection as a protocol violation.
+Backend framing likewise applies exact fixed-message and
+`ParameterDescription`/`BackendKeyData` maxima, libpq's 2,000-byte ceiling to
+startup authentication and protocol-negotiation responses, its 30,000-byte
+ceiling to the remaining tags it does not classify as long, and the configured
+ceiling only to long row/COPY/error/notice families. These checks happen from
+the backend header before an upstream body is buffered.
 The transport layer, which is not implemented yet, must handle PostgreSQL 18
 direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting

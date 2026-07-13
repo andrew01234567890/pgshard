@@ -23,6 +23,7 @@ jobs:
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
       catalog: ${{ steps.detect.outputs.catalog }}
+      pgwire: ${{ steps.detect.outputs.pgwire }}
       planner: ${{ steps.detect.outputs.planner }}
       proto: ${{ steps.detect.outputs.proto }}
       go: ${{ steps.detect.outputs.go }}
@@ -90,6 +91,7 @@ jobs:
 
           rust_exists=false
           catalog_exists=false
+          pgwire_exists=false
           planner_exists=false
           proto_exists=false
           go_exists=false
@@ -102,6 +104,7 @@ jobs:
 
           exists_at_head_or_base Cargo.toml && rust_exists=true
           exists_at_head_or_base crates/pgshard-catalog/Cargo.toml && catalog_exists=true
+          exists_at_head_or_base crates/pgshard-pgwire/Cargo.toml && pgwire_exists=true
           exists_at_head_or_base crates/pgshard-planner/Cargo.toml && planner_exists=true
           exists_at_head_or_base buf.yaml && proto_exists=true
           exists_at_head_or_base operator/go.mod && go_exists=true
@@ -114,6 +117,7 @@ jobs:
 
           emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
           emit_component catalog "$catalog_exists" '^crates/pgshard-catalog/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
+          emit_component pgwire "$pgwire_exists" '^crates/pgshard-pgwire/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component planner "$planner_exists" '^crates/pgshard-planner/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^Makefile$|^\.github/workflows/'
           emit_component go "$go_exists" '^operator/|^proto/|^Makefile$|^\.github/workflows/'
@@ -294,6 +298,33 @@ jobs:
         env:
           PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/postgres
         run: make planner-postgres-test
+
+  pgwire-postgres:
+    name: Pgwire / PostgreSQL 18
+    needs: changes
+    if: needs.changes.outputs.pgwire == 'true'
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Decode a real PostgreSQL 18 parameter description
+        env:
+          PGSHARD_PGWIRE_TEST_ADDRESS: 127.0.0.1:5432
+        run: make pgwire-postgres-test
 
   protobuf:
     name: Protobuf contracts
@@ -533,6 +564,7 @@ jobs:
       - rust-static
       - rust-test
       - catalog-postgres
+      - pgwire-postgres
       - planner-postgres
       - protobuf
       - go-operator
@@ -553,6 +585,7 @@ jobs:
             rust-static=${{ needs.rust-static.result }}
             rust-test=${{ needs.rust-test.result }}
             catalog-postgres=${{ needs.catalog-postgres.result }}
+            pgwire-postgres=${{ needs.pgwire-postgres.result }}
             planner-postgres=${{ needs.planner-postgres.result }}
             protobuf=${{ needs.protobuf.result }}
             go-operator=${{ needs.go-operator.result }}

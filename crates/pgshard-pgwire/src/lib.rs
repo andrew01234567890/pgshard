@@ -1,4 +1,4 @@
-//! Bounded zero-copy decoding of `PostgreSQL` 18 frontend frames.
+//! Bounded zero-copy decoding of `PostgreSQL` 18 frontend and backend frames.
 //!
 //! Framing is deliberately separate from session state. This crate recognizes
 //! byte-level messages; a pooler must still reject messages that are invalid in
@@ -8,7 +8,14 @@ use std::fmt;
 
 use thiserror::Error;
 
+mod backend;
 mod messages;
+
+pub use backend::{
+    BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH, BackendFrame,
+    BackendMessageError, BackendTag, MAX_BACKEND_KEY_DATA_LENGTH, MAX_PARAMETER_DESCRIPTION_LENGTH,
+    ParameterDescription, decode_backend, decode_parameter_description,
+};
 
 pub use messages::{
     BindMessage, BindParameter, BindParameterIter, BindParameters, ExecuteMessage, FormatCode,
@@ -24,9 +31,9 @@ pub const MAX_STARTUP_FRAME_LENGTH: usize = MAX_STARTUP_BODY_LENGTH + 4;
 pub const SMALL_MESSAGE_LENGTH: usize = 10_000;
 /// `PostgreSQL` 18 authentication-message bound, including the length word.
 pub const AUTHENTICATION_MESSAGE_LENGTH: usize = 65_535;
-/// Default bound for frontend messages that `PostgreSQL` classifies as large.
+/// Default bound for typed protocol messages that may carry large payloads.
 pub const DEFAULT_LARGE_MESSAGE_LENGTH: usize = 16 * 1024 * 1024;
-/// Hard pooler bound for one frontend message, regardless of caller policy.
+/// Hard pooler bound for one typed protocol message, regardless of caller policy.
 pub const MAX_LARGE_MESSAGE_LENGTH: usize = 64 * 1024 * 1024;
 /// Maximum `PostgreSQL` 18 cancellation authentication key size.
 pub const MAX_CANCEL_KEY_LENGTH: usize = 256;
@@ -605,7 +612,7 @@ fn validate_startup_layout(mut bytes: &[u8]) -> Result<(), DecodeError> {
     }
 }
 
-/// Frontend frame decoding failure.
+/// `PostgreSQL` frame decoding failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum DecodeError {
     /// A length is smaller than the protocol header it describes.
@@ -662,6 +669,9 @@ pub enum DecodeError {
     /// The byte is not a `PostgreSQL` 18 frontend message tag.
     #[error("unknown PostgreSQL 18 frontend message tag {0}")]
     UnknownFrontendTag(u8),
+    /// The byte is not a `PostgreSQL` 18 backend message tag.
+    #[error("unknown PostgreSQL 18 backend message tag {0}")]
+    UnknownBackendTag(u8),
     /// A known tag is illegal in the current session phase.
     #[error("frontend message {tag:?} is not allowed during {phase:?}")]
     UnexpectedTagForPhase {
