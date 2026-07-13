@@ -18,7 +18,7 @@ pgshard is developed in public. Never commit credentials, private infrastructure
 7. Require the aggregate CI result.
 8. Squash-merge and delete the branch.
 
-Reviews cover ordinary code quality plus ACID claims, crash recovery, split brain, durability, Jepsen/Elle histories, backup consistency, CDC gaps/replays, security, silent failures, and documentation honesty.
+Reviews cover ordinary code quality plus transactional correctness, crash recovery, split brain, durability, backup consistency, CDC gaps/replays, security, silent failures, and documentation honesty.
 
 ## Documentation locally
 

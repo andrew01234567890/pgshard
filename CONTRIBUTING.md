@@ -10,7 +10,7 @@ tests, and documentation are part of every change.
 3. Add regression tests and update affected documentation.
 4. Open a draft pull request and wait for all required GitHub checks.
 5. Complete an independent adversarial review covering simplification,
-   correctness, ACID, Jepsen/Elle histories, crash recovery and durability.
+   correctness, failure handling, crash recovery and durability.
 6. Squash-merge only after every required check passes.
 
 All source-branch commits must use GitHub noreply author and committer addresses.
@@ -36,5 +36,5 @@ actionlint and public-history policy used by CI. It requires Rust 1.97,
 cargo-deny 0.20.2, cargo-audit 0.22.2, Buf 1.71, Go 1.26, and Node.js 22. The Go
 checks include module consistency, race tests, vet, build, vulnerability
 analysis, and reproducible controller-generated manifests. UI, integration,
-KIND, performance, and Jepsen/Elle targets join this command when their
+KIND, fault-injection, and performance targets join this command when their
 workspaces land.
