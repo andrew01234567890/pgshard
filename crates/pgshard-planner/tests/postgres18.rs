@@ -1,4 +1,4 @@
-//! Live `PostgreSQL` 18 syntax differential for the admitted planner subset.
+//! Live `PostgreSQL` 18 positive and known-negative candidate-parser smoke test.
 
 use pgshard_planner::{StatementKind, parse_one};
 
@@ -64,6 +64,18 @@ async fn admitted_dml_parses_on_postgres18() {
     ] {
         assert_eq!(parse_one(sql).expect("planner parse").kind(), expected);
         client.prepare(sql).await.expect("PostgreSQL 18 parse");
+    }
+
+    for non_postgres_sql in [
+        "SELECT TOP 1 * FROM planner_target",
+        "INSERT OVERWRITE planner_target VALUES (1, 2)",
+        "DELETE FROM planner_target ORDER BY tenant_id LIMIT 1",
+    ] {
+        parse_one(non_postgres_sql).expect("candidate parser acceptance");
+        assert!(
+            client.prepare(non_postgres_sql).await.is_err(),
+            "PostgreSQL unexpectedly accepted candidate-only syntax"
+        );
     }
 
     drop(client);

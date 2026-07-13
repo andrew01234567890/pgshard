@@ -528,6 +528,7 @@ jobs:
       - rust-static
       - rust-test
       - catalog-postgres
+      - planner-postgres
       - protobuf
       - go-operator
       - operator-kind
@@ -547,6 +548,7 @@ jobs:
             rust-static=${{ needs.rust-static.result }}
             rust-test=${{ needs.rust-test.result }}
             catalog-postgres=${{ needs.catalog-postgres.result }}
+            planner-postgres=${{ needs.planner-postgres.result }}
             protobuf=${{ needs.protobuf.result }}
             go-operator=${{ needs.go-operator.result }}
             operator-kind=${{ needs.operator-kind.result }}

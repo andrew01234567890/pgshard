@@ -7,8 +7,8 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 
 :::warning Planned compatibility, not current support
 No pooler endpoint or semantic statement planner exists yet. The source has a
-bounded, stack-protected parser for a conservative PostgreSQL-dialect syntax
-subset, a fail-closed core that routes an already-resolved, non-NULL shard-key
+byte/token/AST/stack-bounded permissive candidate parser configured with a
+PostgreSQL dialect, a fail-closed core that routes an already-resolved, non-NULL shard-key
 bind parameter against one immutable catalog snapshot, and a bounded zero-copy
 decoder for PostgreSQL 18 frontend frames and selected simple/extended query
 message bodies. A successful syntax parse is not PostgreSQL semantic validation
@@ -59,9 +59,11 @@ buffered bytes if encryption is refused.
 An explicit replication-streaming phase admits only the CopyData, CopyDone, and
 Terminate frontend frames accepted by PostgreSQL 18's WAL sender. It does not
 yet decode `pgoutput` payloads or implement a change-stream session.
-The syntax planner applies a separate 1 MiB SQL-text limit before tokenization
-or AST allocation. Larger statements are rejected even though they fit inside a
-valid frontend frame.
+The syntax planner applies separate limits of 16 KiB of SQL text, 4,096 lexer
+tokens, 2,048 counted AST nodes, and 50 parser-recursion levels. Larger inputs
+are rejected even though they fit inside a valid frontend frame. Tokenization
+is byte-bounded first; only one statement is parsed, and remaining input causes
+immediate multiple-statement rejection.
 Parsing is synchronous; the future pooler must isolate it on a bounded CPU
 worker pool instead of blocking socket-processing tasks.
 

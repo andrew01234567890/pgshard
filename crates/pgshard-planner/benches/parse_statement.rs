@@ -1,4 +1,4 @@
-//! Standalone conservative PostgreSQL-dialect parser microbenchmark.
+//! Standalone bounded candidate-parser microbenchmark.
 
 use std::{hint::black_box, time::Instant};
 

@@ -1743,6 +1743,7 @@ mod tests {
         let makefile = include_str!("../../../Makefile");
         for manifest in [
             "Cargo.toml",
+            "crates/pgshard-planner/Cargo.toml",
             "buf.yaml",
             "operator/go.mod",
             "website/package.json",
@@ -1782,5 +1783,7 @@ mod tests {
         assert!(workflow.contains("run: make go-check"));
         assert!(makefile.contains("actionlint@v1.7.12 -ignore"));
         assert!(makefile.contains("concurrency queue key"));
+        assert!(workflow.contains("      - planner-postgres"));
+        assert!(workflow.contains("planner-postgres=${{ needs.planner-postgres.result }}"));
     }
 }

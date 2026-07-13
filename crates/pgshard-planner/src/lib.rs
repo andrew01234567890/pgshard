@@ -1,15 +1,16 @@
 //! Fail-closed parsing foundations for future `PostgreSQL` 18 route analysis.
 //!
-//! This parser deliberately accepts only a conservative PostgreSQL-dialect
-//! subset. A successful parse is not `PostgreSQL` semantic validation and never
-//! authorizes routing by itself.
+//! The candidate parser is configured with its `PostgreSQL` dialect but is
+//! intentionally treated as permissive. A successful parse is not
+//! `PostgreSQL` semantic validation and never authorizes routing by itself.
 
-use std::fmt;
+use std::{fmt, ops::ControlFlow};
 
 use sqlparser::{
-    ast::Statement,
+    ast::{Expr, ObjectName, Query, Select, Statement, TableFactor, ValueWithSpan, Visit, Visitor},
     dialect::PostgreSqlDialect,
     parser::{Parser, ParserError},
+    tokenizer::{Token, Tokenizer},
 };
 use thiserror::Error;
 
@@ -17,7 +18,13 @@ use thiserror::Error;
 ///
 /// `PostgreSQL`'s wire protocol permits larger frames, but planning an unbounded
 /// syntax tree would let one client consume disproportionate pooler memory.
-pub const MAX_SQL_BYTES: usize = 1_048_576;
+pub const MAX_SQL_BYTES: usize = 16_384;
+
+/// Maximum lexer tokens retained for one statement, including whitespace.
+pub const MAX_SQL_TOKENS: usize = 4_096;
+
+/// Maximum counted syntax nodes retained for one parsed statement.
+pub const MAX_AST_NODES: usize = 2_048;
 
 const MAX_RECURSION_DEPTH: usize = 50;
 
@@ -72,7 +79,7 @@ impl fmt::Debug for ParsedStatement {
     }
 }
 
-/// Parses exactly one bounded PostgreSQL-dialect statement.
+/// Parses exactly one bounded candidate statement using a `PostgreSQL` dialect.
 ///
 /// # Errors
 ///
@@ -91,23 +98,88 @@ pub fn parse_one(sql: &str) -> Result<ParsedStatement, ParseError> {
     }
 
     let dialect = PostgreSqlDialect {};
-    let statements = Parser::new(&dialect)
-        .with_recursion_limit(MAX_RECURSION_DEPTH)
-        .try_with_sql(sql)
-        .map_err(|error| ParseError::from_upstream(&error))?
-        .parse_statements()
-        .map_err(|error| ParseError::from_upstream(&error))?;
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|_| ParseError::InvalidSyntax)?;
+    if tokens.len() > MAX_SQL_TOKENS {
+        return Err(ParseError::TooManyTokens {
+            actual: tokens.len(),
+            maximum: MAX_SQL_TOKENS,
+        });
+    }
 
-    let actual = statements.len();
-    let mut statements = statements.into_iter();
-    let Some(statement) = statements.next() else {
-        return Err(ParseError::StatementCount { actual });
-    };
-    if statements.next().is_some() {
-        return Err(ParseError::StatementCount { actual });
+    let mut parser = Parser::new(&dialect)
+        .with_recursion_limit(MAX_RECURSION_DEPTH)
+        .with_tokens_with_locations(tokens);
+    while parser.consume_token(&Token::SemiColon) {}
+    if parser.peek_token_ref().token == Token::EOF {
+        return Err(ParseError::NoStatement);
+    }
+    let statement = parser
+        .parse_statement()
+        .map_err(|error| ParseError::from_upstream(&error))?;
+    while parser.consume_token(&Token::SemiColon) {}
+    if parser.peek_token_ref().token != Token::EOF {
+        return Err(ParseError::MultipleStatements);
+    }
+    if statement.visit(&mut AstBudget::new()).is_break() {
+        return Err(ParseError::TooManyAstNodes {
+            maximum: MAX_AST_NODES,
+        });
     }
 
     Ok(ParsedStatement { statement })
+}
+
+struct AstBudget {
+    visited: usize,
+}
+
+impl AstBudget {
+    const fn new() -> Self {
+        Self { visited: 0 }
+    }
+
+    fn count(&mut self) -> ControlFlow<()> {
+        self.visited += 1;
+        if self.visited > MAX_AST_NODES {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+impl Visitor for AstBudget {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.count()
+    }
+
+    fn pre_visit_select(&mut self, _select: &Select) -> ControlFlow<Self::Break> {
+        self.count()
+    }
+
+    fn pre_visit_relation(&mut self, _relation: &ObjectName) -> ControlFlow<Self::Break> {
+        self.count()
+    }
+
+    fn pre_visit_table_factor(&mut self, _table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        self.count()
+    }
+
+    fn pre_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<Self::Break> {
+        self.count()
+    }
+
+    fn pre_visit_statement(&mut self, _statement: &Statement) -> ControlFlow<Self::Break> {
+        self.count()
+    }
+
+    fn pre_visit_value(&mut self, _value: &ValueWithSpan) -> ControlFlow<Self::Break> {
+        self.count()
+    }
 }
 
 /// Fail-closed SQL parsing failure with no query fragments.
@@ -121,21 +193,35 @@ pub enum ParseError {
         /// Configured hard maximum.
         maximum_bytes: usize,
     },
+    /// Lexing produced too many retained tokens.
+    #[error("SQL contains {actual} tokens; planner maximum is {maximum}")]
+    TooManyTokens {
+        /// Actual token count, including whitespace.
+        actual: usize,
+        /// Configured hard maximum.
+        maximum: usize,
+    },
+    /// Parsed syntax contains too many retained AST nodes.
+    #[error("SQL syntax exceeds the planner AST-node limit of {maximum}")]
+    TooManyAstNodes {
+        /// Configured hard maximum.
+        maximum: usize,
+    },
     /// `PostgreSQL` protocol strings cannot contain embedded zero bytes.
     #[error("SQL contains an embedded zero byte")]
     EmbeddedZero,
-    /// The conservative PostgreSQL-dialect parser rejected the syntax.
+    /// The candidate parser rejected the syntax.
     #[error("SQL syntax is not supported")]
     InvalidSyntax,
     /// The syntax tree exceeds the bounded recursion depth.
     #[error("SQL syntax exceeds the planner recursion limit")]
     RecursionLimit,
-    /// Planning accepts exactly one statement at a time.
-    #[error("expected exactly one SQL statement, received {actual}")]
-    StatementCount {
-        /// Parsed top-level statement count.
-        actual: usize,
-    },
+    /// No nonempty statement was supplied.
+    #[error("expected one SQL statement, received none")]
+    NoStatement,
+    /// Input remains after the first statement.
+    #[error("expected one SQL statement, received multiple")]
+    MultipleStatements,
 }
 
 impl ParseError {
@@ -173,12 +259,17 @@ mod tests {
     fn requires_exactly_one_statement() {
         assert_eq!(
             parse_one("").expect_err("empty input"),
-            ParseError::StatementCount { actual: 0 }
+            ParseError::NoStatement
         );
         assert_eq!(
             parse_one("select 1; select 2").expect_err("two statements"),
-            ParseError::StatementCount { actual: 2 }
+            ParseError::MultipleStatements
         );
+        assert_eq!(
+            parse_one("select 1; select (((").expect_err("second invalid statement"),
+            ParseError::MultipleStatements
+        );
+        assert!(parse_one(";;; select 1;;;").is_ok());
     }
 
     #[test]
@@ -198,6 +289,51 @@ mod tests {
     }
 
     #[test]
+    fn enforces_token_and_ast_budgets() {
+        let token_heavy = format!("select {}", vec!["1"; MAX_SQL_TOKENS].join(","));
+        assert!(matches!(
+            parse_one(&token_heavy),
+            Err(ParseError::TooManyTokens {
+                actual,
+                maximum: MAX_SQL_TOKENS,
+            }) if actual > MAX_SQL_TOKENS
+        ));
+
+        let ast_heavy = format!("select {}", vec!["1"; 1_100].join(","));
+        assert_eq!(
+            parse_one(&ast_heavy).expect_err("AST budget"),
+            ParseError::TooManyAstNodes {
+                maximum: MAX_AST_NODES,
+            }
+        );
+
+        let many_statements = "select 1;".repeat(1_000);
+        assert_eq!(
+            parse_one(&many_statements).expect_err("many statements"),
+            ParseError::MultipleStatements
+        );
+
+        let payload = "x".repeat(MAX_SQL_BYTES - "select ''".len());
+        let exact_limit = format!("select '{payload}'");
+        assert_eq!(exact_limit.len(), MAX_SQL_BYTES);
+        assert!(parse_one(&exact_limit).is_ok());
+    }
+
+    #[test]
+    fn candidate_parser_is_not_postgres_validation() {
+        for non_postgres_sql in [
+            "select top 1 * from planner_target",
+            "insert overwrite planner_target values (1, 2)",
+            "delete from planner_target order by tenant_id limit 1",
+        ] {
+            assert!(
+                parse_one(non_postgres_sql).is_ok(),
+                "candidate parser changed for {non_postgres_sql}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_excessive_recursion_without_panicking() {
         let nested = format!(
             "select {}1{}",
@@ -209,7 +345,6 @@ mod tests {
             ParseError::RecursionLimit
         );
     }
-
     #[test]
     fn debug_and_errors_redact_sql() {
         const SECRET: &str = "never-log-this-literal";
