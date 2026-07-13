@@ -1,0 +1,451 @@
+syntax = "proto3";
+
+package pgshard.stream.v1;
+
+// ChangeStream exposes a durable, cluster-wide change feed backed by PostgreSQL
+// pgoutput. Delivery is at least once from the last acknowledged checkpoint.
+// Events retain transaction order within a shard, but no global ordering across
+// shards is promised.
+service ChangeStream {
+  // StreamChanges opens one logical stream and exchanges flow-control and
+  // checkpoint acknowledgements while events are delivered.
+  rpc StreamChanges(stream StreamChangesRequest) returns (stream StreamChangesResponse);
+}
+
+// StreamChangesRequest is a client-to-server stream control message. Open must
+// be the first message and may occur only once.
+message StreamChangesRequest {
+  oneof request {
+    OpenRequest open = 1;
+    AcknowledgeRequest acknowledge = 2;
+    FlowControlRequest flow_control = 3;
+    CloseRequest close = 4;
+  }
+}
+
+// OpenRequest selects a preconfigured stream and its initial position.
+message OpenRequest {
+  // stream_id is authoritative. Its durable configuration selects exactly one
+  // database; clients cannot override that database at open time.
+  string stream_id = 1;
+  StartMode start_mode = 2;
+  bytes resume_token = 3;
+  FlowControlRequest initial_flow_control = 4;
+}
+
+// StartMode selects how an OpenRequest begins delivery.
+enum StartMode {
+  START_MODE_UNSPECIFIED = 0;
+  // Begin with changes committed after the stream is opened.
+  START_MODE_LATEST = 1;
+  // Emit a coordinated snapshot and then changes without an unreported gap.
+  START_MODE_SNAPSHOT = 2;
+  // Resume after the checkpoint encoded by OpenRequest.resume_token.
+  START_MODE_RESUME = 3;
+}
+
+// AcknowledgeRequest confirms that the client durably processed a checkpoint.
+// resume_token must be an authenticated, versioned token issued by this server
+// for a Checkpoint delivered on the current RPC. It binds the stream, semantic
+// configuration, position, checkpoint generation and ordinal. Bit-flipped,
+// cross-stream, cross-configuration, or not-yet-delivered tokens are rejected.
+// A valid acknowledgement advances durable state monotonically; a duplicate or
+// older authenticated token is an idempotent no-op and never regresses slot
+// feedback. The server may advance replication-slot feedback no further than
+// the highest durably acknowledged token.
+message AcknowledgeRequest {
+  bytes resume_token = 1;
+}
+
+// FlowControlRequest bounds flow-controlled data events sent but not covered by
+// an acknowledgement. Those events are SnapshotBegin, Relation, SnapshotRow,
+// SnapshotComplete, Begin, row changes, Truncate, prepared-transaction outcomes,
+// Commit, Schema, and ReshardJournal. Opened, Heartbeat, Checkpoint,
+// ResnapshotRequired, and StreamError are bounded control events and do not
+// consume the window, so a full window cannot prevent its Checkpoint from being
+// delivered. Zero values request configured defaults. A nonzero event window
+// below Opened.max_transaction_events is rejected. A nonzero byte window below
+// either Opened.max_transaction_bytes or Opened.max_event_payload_bytes is
+// rejected. Byte counts use the stable canonical event-payload encoding defined
+// by Opened, not the per-RPC StreamChangesResponse envelope or transport bytes.
+message FlowControlRequest {
+  uint64 max_unacknowledged_events = 1;
+  uint64 max_unacknowledged_bytes = 2;
+}
+
+// CloseRequest asks the server to finish the RPC without deleting durable stream
+// state or its last acknowledged checkpoint.
+message CloseRequest {
+  string reason = 1;
+}
+
+// StreamChangesResponse contains exactly one stream lifecycle or data event.
+message StreamChangesResponse {
+  // Monotonically increases for this RPC only and resets after reconnect.
+  uint64 sequence = 1;
+  uint64 emitted_at_unix_micros = 2;
+
+  oneof event {
+    Opened opened = 10;
+    SnapshotBegin snapshot_begin = 11;
+    Relation relation = 12;
+    SnapshotRow snapshot_row = 13;
+    SnapshotComplete snapshot_complete = 14;
+    Begin begin = 15;
+    Insert insert = 16;
+    Update update = 17;
+    Delete delete = 18;
+    Truncate truncate = 19;
+    Prepare prepare = 20;
+    CommitPrepared commit_prepared = 21;
+    RollbackPrepared rollback_prepared = 22;
+    Commit commit = 23;
+    Schema schema = 24;
+    Heartbeat heartbeat = 25;
+    ReshardJournal reshard_journal = 26;
+    Checkpoint checkpoint = 27;
+    ResnapshotRequired resnapshot_required = 28;
+    StreamError error = 29;
+  }
+}
+
+// Opened confirms the resolved stream identity and delivery guarantees.
+enum DeliverySemantics {
+  DELIVERY_SEMANTICS_UNSPECIFIED = 0;
+  DELIVERY_SEMANTICS_AT_LEAST_ONCE = 1;
+}
+
+message Opened {
+  string stream_id = 1;
+  string cluster_id = 2;
+  string database_id = 3;
+  VectorPosition start_position = 4;
+  DeliverySemantics delivery_semantics = 5;
+  // Durable stream limits enforced while buffering pgoutput transactions. The
+  // event count covers Begin, all row/Truncate events, any Relation response
+  // required to decode them, and Commit or Prepare plus CommitPrepared. Byte
+  // limits sum the deterministic protobuf encoding of each selected oneof event
+  // message only. They exclude StreamChangesResponse.sequence,
+  // emitted_at_unix_micros, wrapper field tags, gRPC framing, compression, and
+  // transport overhead, so replay cannot change whether an event fits.
+  uint64 max_transaction_events = 6;
+  uint64 max_transaction_bytes = 7;
+  // Maximum canonical payload bytes for any one flow-controlled event,
+  // including SnapshotRow, Relation, Schema, and ReshardJournal. An event above
+  // this limit is not partially emitted; the stream terminates at the last
+  // acknowledged checkpoint with STREAM_ERROR_CODE_EVENT_TOO_LARGE.
+  uint64 max_event_payload_bytes = 8;
+  // Server-enforced maximum canonical payload bytes for every excluded control
+  // event. Control text is truncated to stay within this bound. A stream whose
+  // Opened or Checkpoint metadata cannot fit is rejected before data delivery.
+  uint64 max_control_payload_bytes = 9;
+}
+
+// ShardPosition is one shard's durable logical-WAL coordinate.
+message ShardPosition {
+  string shard_id = 1;
+  uint32 timeline = 2;
+  uint64 lsn = 3;
+}
+
+// VectorPosition identifies cluster-wide progress. shard_positions are ordered
+// by shard_id for canonical encoding. stream_configuration_hash covers semantic
+// data selection and transformation only; compatible delivery settings such as
+// flow and buffering limits are excluded so they may be raised before resuming.
+// A VectorPosition is never itself acknowledgeable: only an authenticated token
+// from Checkpoint.resume_token can be acknowledged.
+message VectorPosition {
+  string cluster_id = 1;
+  string database_id = 2;
+  bytes stream_configuration_hash = 3;
+  uint64 routing_epoch = 4;
+  uint64 schema_epoch = 5;
+  uint64 reshard_journal_generation = 6;
+  repeated ShardPosition shard_positions = 7;
+}
+
+// SnapshotBegin marks the position from which concurrent changes are retained.
+// Before the initialization barrier is released, retained per-shard snapshot
+// transactions acquire ACCESS SHARE locks on every selected relation in
+// deterministic OID order. They hold those locks through SnapshotComplete so
+// DDL cannot replace or drop storage during a later copy chunk; DML may proceed.
+message SnapshotBegin {
+  VectorPosition position = 1;
+}
+
+// ReplicaIdentity describes which old tuple data pgoutput can provide.
+enum ReplicaIdentity {
+  REPLICA_IDENTITY_UNSPECIFIED = 0;
+  REPLICA_IDENTITY_DEFAULT = 1;
+  REPLICA_IDENTITY_NOTHING = 2;
+  REPLICA_IDENTITY_FULL = 3;
+  REPLICA_IDENTITY_INDEX = 4;
+}
+
+// Relation describes a table version used by subsequent tuple events.
+message Relation {
+  string shard_id = 1;
+  uint32 relation_id = 2;
+  string namespace = 3;
+  string name = 4;
+  ReplicaIdentity replica_identity = 5;
+  repeated RelationField fields = 6;
+  uint64 schema_epoch = 7;
+}
+
+// RelationField is a PostgreSQL column in relation order.
+message RelationField {
+  uint32 index = 1;
+  string name = 2;
+  uint32 type_oid = 3;
+  int32 type_modifier = 4;
+  bool is_replica_identity = 5;
+}
+
+// ColumnValue is a PostgreSQL text-format tuple value. OID and type_modifier are
+// repeated here so an event remains unambiguous if relation metadata is cached
+// independently. unchanged_toast means the prior toasted value was not sent;
+// it is not SQL NULL or an empty value.
+message ColumnValue {
+  uint32 column_index = 1;
+  uint32 type_oid = 2;
+  int32 type_modifier = 3;
+
+  oneof content {
+    bytes value = 10;
+    NullValue null = 11;
+    UnchangedToastValue unchanged_toast = 12;
+  }
+}
+
+// NullValue explicitly represents SQL NULL.
+message NullValue {}
+
+// UnchangedToastValue explicitly represents pgoutput's unchanged-TOAST marker.
+message UnchangedToastValue {}
+
+// Tuple is one complete or replica-identity PostgreSQL tuple image.
+message Tuple {
+  repeated ColumnValue columns = 1;
+}
+
+// SnapshotRow is a row copied from a shard's exported snapshot.
+message SnapshotRow {
+  string shard_id = 1;
+  uint32 relation_id = 2;
+  Tuple row = 3;
+}
+
+// SnapshotComplete transitions the stream from copied rows to retained changes.
+// Before releasing snapshot transactions and relation locks, the service
+// durably spools every snapshot event not yet covered by an acknowledged
+// checkpoint. The spool survives gateway/client reconnect and is retained until
+// the checkpoint covering SnapshotComplete is durably acknowledged.
+message SnapshotComplete {
+  VectorPosition change_start_position = 1;
+}
+
+// Transaction identifies a transaction within one PostgreSQL shard.
+message Transaction {
+  string shard_id = 1;
+  uint32 xid = 2;
+  // Set for participants of a pgshard distributed transaction.
+  string distributed_transaction_id = 3;
+}
+
+// Begin starts one shard-local transaction. Milestone 1 buffers or spills all
+// pgoutput transaction-stream chunks until the terminal outcome is known.
+// Aborted transactions emit no Begin or row events. For a committed transaction
+// the Begin, row events, and Commit (or Prepare and CommitPrepared) are emitted
+// contiguously in source order only after commit is known. If buffered events or
+// bytes exceed the stream's advertised transaction limit, no part is emitted;
+// the RPC terminates with STREAM_ERROR_CODE_TRANSACTION_TOO_LARGE at the last
+// acknowledged checkpoint. Raising the durable limit and resuming that token
+// re-decodes the transaction without a gap.
+message Begin {
+  Transaction transaction = 1;
+  uint64 final_lsn = 2;
+  uint64 commit_time_unix_micros = 3;
+}
+
+// Insert carries a new tuple image.
+message Insert {
+  Transaction transaction = 1;
+  uint32 relation_id = 2;
+  Tuple new_row = 3;
+}
+
+// Update carries the available old identity and the new tuple image.
+message Update {
+  Transaction transaction = 1;
+  uint32 relation_id = 2;
+  Tuple old_key = 3;
+  Tuple new_row = 4;
+}
+
+// Delete carries the old replica-identity tuple.
+message Delete {
+  Transaction transaction = 1;
+  uint32 relation_id = 2;
+  Tuple old_key = 3;
+}
+
+// Truncate carries all relations affected by one pgoutput truncate event.
+message Truncate {
+  Transaction transaction = 1;
+  repeated uint32 relation_ids = 2;
+  bool cascade = 3;
+  bool restart_identity = 4;
+}
+
+// Prepare marks a PostgreSQL prepared transaction whose final commit is already
+// known to the stream implementation. Participant events preserve shard order
+// but do not imply a globally ordered distributed commit.
+message Prepare {
+  Transaction transaction = 1;
+  string gid = 2;
+  uint64 prepare_lsn = 3;
+  uint64 end_lsn = 4;
+  uint64 prepare_time_unix_micros = 5;
+}
+
+// CommitPrepared commits a previously prepared shard transaction.
+message CommitPrepared {
+  Transaction transaction = 1;
+  string gid = 2;
+  uint64 commit_lsn = 3;
+  uint64 end_lsn = 4;
+  uint64 commit_time_unix_micros = 5;
+}
+
+// RollbackPrepared reports a prepared rollback without exposing its discarded
+// row images.
+message RollbackPrepared {
+  Transaction transaction = 1;
+  string gid = 2;
+  uint64 end_lsn = 3;
+  uint64 rollback_time_unix_micros = 4;
+}
+
+// Commit completes a non-prepared shard transaction.
+message Commit {
+  Transaction transaction = 1;
+  uint64 commit_lsn = 2;
+  uint64 end_lsn = 3;
+  uint64 commit_time_unix_micros = 4;
+}
+
+// Schema announces a managed schema activation after every shard acknowledges it.
+message Schema {
+  uint64 previous_schema_epoch = 1;
+  uint64 schema_epoch = 2;
+  string operation_id = 3;
+  bytes schema_fingerprint = 4;
+}
+
+// SourceProgress is diagnostic, non-acknowledgeable WAL progress. source_position
+// may be ahead of fully_delivered_position while a transaction is buffered.
+message SourceProgress {
+  repeated ShardPosition source_positions = 1;
+  VectorPosition fully_delivered_position = 2;
+}
+
+// Heartbeat reports diagnostic source progress even when no rows change. It
+// intentionally contains no resume token.
+message Heartbeat {
+  SourceProgress progress = 1;
+  uint64 source_time_unix_micros = 2;
+}
+
+// KeyRange is a half-open unsigned 64-bit hash interval. An empty end encodes
+// 2^64 so the final interval does not wrap.
+message KeyRange {
+  fixed64 start = 1;
+  optional fixed64 end = 2;
+}
+
+// ReshardMapping allows old resume positions to cross one topology activation.
+message ReshardMapping {
+  string source_shard_id = 1;
+  KeyRange key_range = 2;
+  ShardPosition source_fence_position = 3;
+  string target_shard_id = 4;
+  ShardPosition target_start_position = 5;
+}
+
+// ReshardJournal is durably emitted before a stream changes shard topology.
+message ReshardJournal {
+  string operation_id = 1;
+  uint64 generation = 2;
+  uint64 previous_routing_epoch = 3;
+  uint64 routing_epoch = 4;
+  repeated ReshardMapping mappings = 5;
+}
+
+// Checkpoint is the only acknowledgement boundary. It is emitted only after all
+// transactions covered by position have emitted a terminal Commit,
+// CommitPrepared, or RollbackPrepared event. resume_token is an opaque,
+// authenticated and versioned server token bound to this durable stream,
+// semantic configuration, position, checkpoint generation and monotonic
+// ordinal. During initial copy it also binds the retained snapshot-session ID,
+// snapshot phase, and each shard's relation and deterministic chunk cursor. It
+// is excluded from the flow-control window but bounded by
+// Opened.max_control_payload_bytes. Delivery after this checkpoint is at least
+// once until resume_token is durably acknowledged.
+message Checkpoint {
+  VectorPosition position = 1;
+  bytes resume_token = 2;
+  // Counts flow-controlled events since the prior checkpoint using the same
+  // event set as FlowControlRequest.
+  uint64 events_since_previous = 3;
+  // Sums their canonical event-payload bytes using the same stable encoding as
+  // FlowControlRequest; this is not a serialized-response or wire-byte count.
+  uint64 bytes_since_previous = 4;
+}
+
+// ResnapshotReason explains why a prior token can no longer resume safely.
+enum ResnapshotReason {
+  RESNAPSHOT_REASON_UNSPECIFIED = 0;
+  RESNAPSHOT_REASON_WAL_REMOVED = 1;
+  RESNAPSHOT_REASON_INACTIVE_TTL = 2;
+  RESNAPSHOT_REASON_RESTORED_TIMELINE = 3;
+  RESNAPSHOT_REASON_CONFIGURATION_CHANGED = 4;
+  RESNAPSHOT_REASON_JOURNAL_UNAVAILABLE = 5;
+  RESNAPSHOT_REASON_SLOT_LOST = 6;
+}
+
+// ResnapshotRequired is the final in-band response. The server then closes the
+// RPC with a failed-precondition status. The client must start a new snapshot;
+// last_available_position is diagnostic and is not acknowledgeable.
+message ResnapshotRequired {
+  ResnapshotReason reason = 1;
+  string message = 2;
+  VectorPosition last_available_position = 3;
+}
+
+enum StreamErrorCode {
+  STREAM_ERROR_CODE_UNSPECIFIED = 0;
+  STREAM_ERROR_CODE_INTERNAL = 1;
+  STREAM_ERROR_CODE_INVALID_FLOW_CONTROL = 2;
+  STREAM_ERROR_CODE_TRANSACTION_TOO_LARGE = 3;
+  STREAM_ERROR_CODE_RESOURCE_EXHAUSTED = 4;
+  STREAM_ERROR_CODE_EVENT_TOO_LARGE = 5;
+}
+
+enum StreamRetryAction {
+  STREAM_RETRY_ACTION_UNSPECIFIED = 0;
+  STREAM_RETRY_ACTION_RESUME_LAST_ACKNOWLEDGED = 1;
+  STREAM_RETRY_ACTION_CHANGE_CONFIGURATION = 2;
+  STREAM_RETRY_ACTION_DO_NOT_RETRY = 3;
+}
+
+// StreamError is always the final in-band response. The server immediately
+// closes the RPC with a matching non-OK gRPC status and never sends later data.
+// A retry resumes only last_acknowledged_resume_token; no diagnostic source
+// position in an error can advance acknowledgement state.
+message StreamError {
+  StreamErrorCode code = 1;
+  string message = 2;
+  StreamRetryAction retry_action = 3;
+  bytes last_acknowledged_resume_token = 4;
+}
