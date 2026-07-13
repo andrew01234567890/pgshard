@@ -374,18 +374,13 @@ fn prove_equality(expression: &Expr) -> Result<(String, NonZeroU16), RouteTempla
         return Err(RouteTemplateError::NotShardKeyEquality);
     }
 
-    prove_column_and_placeholder(left, right).or_else(|_| prove_column_and_placeholder(right, left))
-}
-
-fn prove_column_and_placeholder(
-    column: &Expr,
-    placeholder: &Expr,
-) -> Result<(String, NonZeroU16), RouteTemplateError> {
-    let Expr::Identifier(column) = peel_nested(column) else {
+    let ((Expr::Identifier(column), placeholder) | (placeholder, Expr::Identifier(column))) =
+        (peel_nested(left), peel_nested(right))
+    else {
         return Err(RouteTemplateError::NotShardKeyEquality);
     };
     let column = normalize_identifier(column)?;
-    let Expr::Value(value) = peel_nested(placeholder) else {
+    let Expr::Value(value) = placeholder else {
         return Err(RouteTemplateError::InvalidPlaceholder);
     };
     let Value::Placeholder(placeholder) = &value.value else {
@@ -1052,6 +1047,21 @@ mod tests {
                     .is_err()
             });
             assert!(rejected, "unexpected route template for {sql}");
+        }
+    }
+
+    #[test]
+    fn preserves_invalid_placeholder_errors_in_both_orientations() {
+        for sql in [
+            "select * from public.events where tenant_id = $0",
+            "select * from public.events where $01 = tenant_id",
+            "select * from public.events where tenant_id = $65536",
+        ] {
+            assert_eq!(
+                analyze_route(sql),
+                Err(RouteTemplateError::InvalidPlaceholder),
+                "unexpected error for {sql}"
+            );
         }
     }
 
