@@ -143,6 +143,7 @@ impl BackendTag {
     const fn minimum_message_length(self) -> usize {
         match self {
             Self::ReadyForQuery => 5,
+            Self::ParameterStatus | Self::ParameterDescription => 6,
             Self::AuthenticationRequest | Self::NegotiateProtocolVersion => 8,
             Self::BackendKeyData => 4 + 4 + MIN_BACKEND_CANCEL_KEY_LENGTH,
             _ => 4,
@@ -190,6 +191,68 @@ pub enum TransactionStatus {
     InTransaction,
     /// Inside a failed transaction block.
     FailedTransaction,
+}
+
+/// One validated backend run-time parameter report.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ParameterStatus<'a> {
+    name: &'a str,
+    value: &'a str,
+}
+
+impl fmt::Debug for ParameterStatus<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParameterStatus")
+            .field("name_length", &self.name.len())
+            .field("value_length", &self.value.len())
+            .finish()
+    }
+}
+
+impl<'a> ParameterStatus<'a> {
+    /// Returns the UTF-8 run-time parameter name without its wire terminator.
+    #[must_use]
+    pub const fn name(self) -> &'a str {
+        self.name
+    }
+
+    /// Returns the UTF-8 run-time parameter value without its wire terminator.
+    #[must_use]
+    pub const fn value(self) -> &'a str {
+        self.value
+    }
+}
+
+/// Borrowed process and secret-key metadata needed to cancel a backend query.
+#[derive(Clone, Copy)]
+pub struct BackendKeyData<'a> {
+    backend_pid: u32,
+    cancellation_key: &'a [u8],
+}
+
+impl fmt::Debug for BackendKeyData<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackendKeyData")
+            .field("backend_pid", &self.backend_pid)
+            .field("cancellation_key_length", &self.cancellation_key.len())
+            .finish()
+    }
+}
+
+impl<'a> BackendKeyData<'a> {
+    /// Returns the backend process identifier in host byte order.
+    #[must_use]
+    pub const fn backend_pid(self) -> u32 {
+        self.backend_pid
+    }
+
+    /// Returns the opaque borrowed cancellation authentication key.
+    #[must_use]
+    pub const fn cancellation_key(self) -> &'a [u8] {
+        self.cancellation_key
+    }
 }
 
 /// Decodes one backend frame from the beginning of `input`.
@@ -252,6 +315,58 @@ pub fn decode_backend(
     })
 }
 
+/// Decodes an exact backend `ParameterStatus` body without allocating.
+///
+/// This decoder validates UTF-8 directly because `ParameterStatus` is how the
+/// session establishes and refreshes its authoritative `client_encoding`
+/// proof. The session must reject a reported encoding other than canonical
+/// `UTF8` before decoding any more query-protocol bodies.
+///
+/// # Errors
+///
+/// Rejects the wrong tag, missing string terminators, invalid UTF-8, or bytes
+/// after the two protocol strings.
+pub fn decode_parameter_status(
+    frame: BackendFrame<'_>,
+) -> Result<ParameterStatus<'_>, BackendMessageError> {
+    require_tag(frame, BackendTag::ParameterStatus)?;
+    let (name, remaining) = cstring_utf8(frame.body(), "parameter name")?;
+    let (value, remaining) = cstring_utf8(remaining, "parameter value")?;
+    if !remaining.is_empty() {
+        return Err(BackendMessageError::TrailingData(remaining.len()));
+    }
+    Ok(ParameterStatus { name, value })
+}
+
+/// Decodes a backend `BackendKeyData` body without copying its secret key.
+///
+/// The generic `PostgreSQL` 18 boundary is four to 256 key bytes. The session
+/// layer must bind this data to the exact upstream connection and negotiated
+/// protocol version; protocol 3.0 additionally requires exactly four bytes.
+///
+/// # Errors
+///
+/// Rejects the wrong tag, a truncated process identifier, or a cancellation
+/// key outside `PostgreSQL` 18's generic length boundary.
+pub fn decode_backend_key_data(
+    frame: BackendFrame<'_>,
+) -> Result<BackendKeyData<'_>, BackendMessageError> {
+    require_tag(frame, BackendTag::BackendKeyData)?;
+    let Some(pid_bytes) = frame.body().get(..4) else {
+        return Err(BackendMessageError::Truncated("backend process identifier"));
+    };
+    let cancellation_key = &frame.body()[4..];
+    if !(MIN_BACKEND_CANCEL_KEY_LENGTH..=MAX_CANCEL_KEY_LENGTH).contains(&cancellation_key.len()) {
+        return Err(BackendMessageError::InvalidCancellationKeyLength(
+            cancellation_key.len(),
+        ));
+    }
+    Ok(BackendKeyData {
+        backend_pid: u32::from_be_bytes([pid_bytes[0], pid_bytes[1], pid_bytes[2], pid_bytes[3]]),
+        cancellation_key,
+    })
+}
+
 /// A validated backend `ParameterDescription` body.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct ParameterDescription<'a> {
@@ -290,12 +405,7 @@ impl<'a> ParameterDescription<'a> {
 pub fn decode_parameter_description(
     frame: BackendFrame<'_>,
 ) -> Result<ParameterDescription<'_>, BackendMessageError> {
-    if frame.tag() != BackendTag::ParameterDescription {
-        return Err(BackendMessageError::WrongTag {
-            expected: BackendTag::ParameterDescription,
-            actual: frame.tag(),
-        });
-    }
+    require_tag(frame, BackendTag::ParameterDescription)?;
     let Some(count_bytes) = frame.body().get(..2) else {
         return Err(BackendMessageError::Truncated("parameter count"));
     };
@@ -321,12 +431,7 @@ pub fn decode_parameter_description(
 pub fn decode_ready_for_query(
     frame: BackendFrame<'_>,
 ) -> Result<TransactionStatus, BackendMessageError> {
-    if frame.tag() != BackendTag::ReadyForQuery {
-        return Err(BackendMessageError::WrongTag {
-            expected: BackendTag::ReadyForQuery,
-            actual: frame.tag(),
-        });
-    }
+    require_tag(frame, BackendTag::ReadyForQuery)?;
     let status = match frame.body() {
         b"I" => TransactionStatus::Idle,
         b"T" => TransactionStatus::InTransaction,
@@ -368,6 +473,29 @@ pub fn require_empty_backend_body(frame: BackendFrame<'_>) -> Result<(), Backend
     }
 }
 
+fn require_tag(frame: BackendFrame<'_>, expected: BackendTag) -> Result<(), BackendMessageError> {
+    if frame.tag() == expected {
+        Ok(())
+    } else {
+        Err(BackendMessageError::WrongTag {
+            expected,
+            actual: frame.tag(),
+        })
+    }
+}
+
+fn cstring_utf8<'a>(
+    input: &'a [u8],
+    field: &'static str,
+) -> Result<(&'a str, &'a [u8]), BackendMessageError> {
+    let Some(end) = input.iter().position(|byte| *byte == 0) else {
+        return Err(BackendMessageError::Truncated(field));
+    };
+    let value =
+        std::str::from_utf8(&input[..end]).map_err(|_| BackendMessageError::InvalidUtf8(field))?;
+    Ok((value, &input[end + 1..]))
+}
+
 /// Backend message-body decoding failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum BackendMessageError {
@@ -382,6 +510,12 @@ pub enum BackendMessageError {
     /// A fixed-width or counted field extends beyond the frame body.
     #[error("{0} is truncated")]
     Truncated(&'static str),
+    /// A backend protocol string is not valid UTF-8.
+    #[error("{0} is not valid UTF-8")]
+    InvalidUtf8(&'static str),
+    /// A backend cancellation key is outside `PostgreSQL` 18's generic bounds.
+    #[error("invalid PostgreSQL 18 cancellation key length {0}")]
+    InvalidCancellationKeyLength(usize),
     /// A `ReadyForQuery` status is not idle `I`, transaction `T`, or failed `E`.
     #[error("invalid ReadyForQuery transaction status {0}")]
     InvalidTransactionStatus(u8),
@@ -572,6 +706,8 @@ mod tests {
     fn backend_family_minimums_fail_closed_from_the_header() {
         for (tag, actual, minimum) in [
             (b'Z', 4, 5),
+            (b'S', 5, 6),
+            (b't', 5, 6),
             (b'R', 7, 8),
             (b'v', 7, 8),
             (
@@ -591,6 +727,123 @@ mod tests {
                 Err(DecodeError::InvalidLength { actual, minimum })
             );
         }
+    }
+
+    #[test]
+    fn parameter_status_is_exact_zero_copy_metadata() {
+        let packet = backend(b'S', b"client_encoding\0UTF8\0");
+        let status = decode_parameter_status(complete(&packet)).expect("parameter status");
+        assert_eq!(status.name(), "client_encoding");
+        assert_eq!(status.value(), "UTF8");
+        assert_eq!(status.name.as_ptr(), packet[5..].as_ptr());
+        assert_eq!(
+            status.value.as_ptr(),
+            packet[5 + b"client_encoding\0".len()..].as_ptr()
+        );
+
+        let rendered = format!("{status:?}");
+        assert!(!rendered.contains("client_encoding"));
+        assert!(!rendered.contains("UTF8"));
+        assert!(rendered.contains("name_length"));
+        assert!(rendered.contains("value_length"));
+    }
+
+    #[test]
+    fn malformed_parameter_statuses_fail_closed() {
+        let complete_body = b"client_encoding\0UTF8\0";
+        for split in 0..complete_body.len() {
+            assert!(decode_parameter_status(unchecked(b'S', &complete_body[..split])).is_err());
+        }
+        for (body, expected) in [
+            (
+                b"".as_slice(),
+                BackendMessageError::Truncated("parameter name"),
+            ),
+            (
+                b"client_encoding".as_slice(),
+                BackendMessageError::Truncated("parameter name"),
+            ),
+            (
+                b"client_encoding\0UTF8".as_slice(),
+                BackendMessageError::Truncated("parameter value"),
+            ),
+            (
+                b"\xff\0UTF8\0".as_slice(),
+                BackendMessageError::InvalidUtf8("parameter name"),
+            ),
+            (
+                b"client_encoding\0\xff\0".as_slice(),
+                BackendMessageError::InvalidUtf8("parameter value"),
+            ),
+            (
+                b"client_encoding\0UTF8\0x".as_slice(),
+                BackendMessageError::TrailingData(1),
+            ),
+        ] {
+            assert_eq!(
+                decode_parameter_status(unchecked(b'S', body)),
+                Err(expected)
+            );
+        }
+        assert!(matches!(
+            decode_parameter_status(complete(&backend(b't', b"\0\0"))),
+            Err(BackendMessageError::WrongTag { .. })
+        ));
+        let empty_value_packet = backend(b'S', b"application_name\0\0");
+        let empty_value =
+            decode_parameter_status(complete(&empty_value_packet)).expect("empty parameter value");
+        assert_eq!(empty_value.name(), "application_name");
+        assert_eq!(empty_value.value(), "");
+    }
+
+    #[test]
+    fn backend_key_data_is_bounded_zero_copy_secret_metadata() {
+        for key_length in [MIN_BACKEND_CANCEL_KEY_LENGTH, 32, MAX_CANCEL_KEY_LENGTH] {
+            let key = vec![0xa5; key_length];
+            let mut body = 0x0102_0304_u32.to_be_bytes().to_vec();
+            body.extend_from_slice(&key);
+            let packet = backend(b'K', &body);
+            let data = decode_backend_key_data(complete(&packet)).expect("backend key data");
+            assert_eq!(data.backend_pid(), 0x0102_0304);
+            assert_eq!(data.cancellation_key(), key);
+            assert_eq!(data.cancellation_key.as_ptr(), packet[9..].as_ptr());
+        }
+
+        let packet = backend(b'K', b"\0\0\0\x07do-not-log");
+        let data = decode_backend_key_data(complete(&packet)).expect("backend key data");
+        let rendered = format!("{data:?}");
+        assert!(!rendered.contains("do-not-log"));
+        assert!(rendered.contains("cancellation_key_length"));
+    }
+
+    #[test]
+    fn malformed_backend_key_data_fails_closed() {
+        for pid_length in 0..4 {
+            assert!(matches!(
+                decode_backend_key_data(unchecked(b'K', &0_u32.to_be_bytes()[..pid_length])),
+                Err(BackendMessageError::Truncated("backend process identifier"))
+            ));
+        }
+        for key_length in 0..MIN_BACKEND_CANCEL_KEY_LENGTH {
+            let mut body = 7_u32.to_be_bytes().to_vec();
+            body.resize(4 + key_length, 0xa5);
+            assert!(matches!(
+                decode_backend_key_data(unchecked(b'K', &body)),
+                Err(BackendMessageError::InvalidCancellationKeyLength(actual))
+                    if actual == key_length
+            ));
+        }
+        let mut oversized = 7_u32.to_be_bytes().to_vec();
+        oversized.resize(4 + MAX_CANCEL_KEY_LENGTH + 1, 0xa5);
+        assert!(matches!(
+            decode_backend_key_data(unchecked(b'K', &oversized)),
+            Err(BackendMessageError::InvalidCancellationKeyLength(actual))
+                if actual == MAX_CANCEL_KEY_LENGTH + 1
+        ));
+        assert!(matches!(
+            decode_backend_key_data(complete(&backend(b'S', b"name\0value\0"))),
+            Err(BackendMessageError::WrongTag { .. })
+        ));
     }
 
     #[test]
@@ -693,8 +946,7 @@ mod tests {
         body.extend_from_slice(&20_u32.to_be_bytes());
         body.extend_from_slice(&2950_u32.to_be_bytes());
         for split in 0..body.len() {
-            let packet = backend(b't', &body[..split]);
-            assert!(decode_parameter_description(complete(&packet)).is_err());
+            assert!(decode_parameter_description(unchecked(b't', &body[..split])).is_err());
         }
 
         let mut trailing = body.clone();
