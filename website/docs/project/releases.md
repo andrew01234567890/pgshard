@@ -26,6 +26,13 @@ descendant job may therefore safely run before its ancestor's job. It creates no
 version-bump commit, preventing release loops. Documentation-only and CI-only
 default-branch commits still receive patch releases.
 
+Source-branch commits must use GitHub noreply author and committer addresses.
+GitHub's squash operation may retain the account's public author address when
+an author override is unavailable. The default-branch audit accepts that narrow
+exception only when GitHub's commit API reports a valid signed commit created by
+the `web-flow` committer and the local committer uses GitHub's noreply address.
+The exception does not rewrite or hide author metadata.
+
 Runtime version strings are derived from the exact release tag when building a
 tagged commit. Untagged builds report a development SemVer containing the commit
 SHA; workspace package metadata is not presented as the running release version.

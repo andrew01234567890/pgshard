@@ -129,6 +129,24 @@ struct CommitVerification {
 }
 
 #[derive(Debug, Deserialize)]
+struct GitHubCommitDetails {
+    sha: String,
+    committer: Option<Login>,
+    commit: GitHubCommitData,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCommitData {
+    verification: GitHubCommitVerification,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCommitVerification {
+    verified: bool,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CheckRuns {
     check_runs: Vec<CheckRun>,
 }
@@ -202,13 +220,11 @@ fn audit(base: &str, head: &str, allow_github_squash_author: bool) -> Result<()>
         let author = fields.next().unwrap_or_default();
         let committer_name = fields.next().unwrap_or_default();
         let committer = fields.next().unwrap_or_default();
+        let github_squash_verified = allow_github_squash_author
+            && github_squash_identity(committer_name, committer)
+            && github_commit_is_verified(sha)?;
         ensure!(
-            commit_identity_is_allowed(
-                author,
-                committer_name,
-                committer,
-                allow_github_squash_author,
-            ),
+            commit_identity_is_allowed(author, committer, github_squash_verified),
             "commit {sha} must use noreply identities or an explicitly allowed GitHub squash author"
         );
     }
@@ -254,16 +270,35 @@ fn is_noreply(email: &str) -> bool {
     email == "noreply@github.com" || email.ends_with("@users.noreply.github.com")
 }
 
-fn commit_identity_is_allowed(
-    author: &str,
-    committer_name: &str,
-    committer: &str,
-    allow_github_squash_author: bool,
-) -> bool {
-    (is_noreply(author) && is_noreply(committer))
-        || (allow_github_squash_author
-            && committer_name == "GitHub"
-            && committer == "noreply@github.com")
+fn commit_identity_is_allowed(author: &str, committer: &str, github_squash_verified: bool) -> bool {
+    (is_noreply(author) && is_noreply(committer)) || github_squash_verified
+}
+
+fn github_squash_identity(committer_name: &str, committer: &str) -> bool {
+    committer_name == "GitHub" && committer == "noreply@github.com"
+}
+
+fn github_commit_is_verified(sha: &str) -> Result<bool> {
+    let repository = env::var("GITHUB_REPOSITORY")
+        .context("GITHUB_REPOSITORY is required to verify a GitHub squash commit")?;
+    let response = run(
+        "gh",
+        [
+            "api",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &format!("repos/{repository}/commits/{sha}"),
+        ],
+    )?;
+    let details: GitHubCommitDetails = serde_json::from_str(&response)?;
+    Ok(github_commit_details_are_verified(&details, sha))
+}
+
+fn github_commit_details_are_verified(details: &GitHubCommitDetails, sha: &str) -> bool {
+    details.sha == sha
+        && details.committer.as_ref().map(|login| login.login.as_str()) == Some("web-flow")
+        && details.commit.verification.verified
+        && details.commit.verification.reason == "valid"
 }
 
 fn audit_content(path: &str, content: &str) -> Result<()> {
@@ -908,22 +943,16 @@ mod tests {
         assert!(!is_noreply("developer@example.com"));
         assert!(commit_identity_is_allowed(
             "developer@example.com",
-            "GitHub",
             "noreply@github.com",
             true,
         ));
         assert!(!commit_identity_is_allowed(
             "developer@example.com",
-            "GitHub",
             "noreply@github.com",
             false,
         ));
-        assert!(!commit_identity_is_allowed(
-            "developer@example.com",
-            "maintainer",
-            "noreply@github.com",
-            true,
-        ));
+        assert!(github_squash_identity("GitHub", "noreply@github.com"));
+        assert!(!github_squash_identity("maintainer", "noreply@github.com"));
     }
 
     #[test]
@@ -989,6 +1018,45 @@ mod tests {
             login: "maintainer".to_owned(),
         });
         assert!(!dependabot_commits_verified(&commits, &head));
+    }
+
+    #[test]
+    fn github_squash_exception_requires_verified_web_flow_commit() {
+        let mut details = GitHubCommitDetails {
+            sha: "a".repeat(40),
+            committer: Some(Login {
+                login: "web-flow".to_owned(),
+            }),
+            commit: GitHubCommitData {
+                verification: GitHubCommitVerification {
+                    verified: true,
+                    reason: "valid".to_owned(),
+                },
+            },
+        };
+        assert!(github_commit_details_are_verified(
+            &details,
+            &"a".repeat(40)
+        ));
+        details.committer = Some(Login {
+            login: "maintainer".to_owned(),
+        });
+        assert!(!github_commit_details_are_verified(
+            &details,
+            &"a".repeat(40)
+        ));
+        details.committer = Some(Login {
+            login: "web-flow".to_owned(),
+        });
+        details.commit.verification.verified = false;
+        assert!(!github_commit_details_are_verified(
+            &details,
+            &"a".repeat(40)
+        ));
+        assert!(!github_commit_details_are_verified(
+            &details,
+            &"b".repeat(40)
+        ));
     }
 
     #[test]

@@ -13,9 +13,12 @@ tests, and documentation are part of every change.
    correctness, ACID, Jepsen/Elle histories, crash recovery and durability.
 6. Squash-merge only after every required check passes.
 
-All commits must use a GitHub noreply address. Do not add secrets, credentials,
-private hostnames, personal paths, internal-only information, production data,
-or row values captured from a change stream.
+All source-branch commits must use GitHub noreply author and committer addresses.
+GitHub's final squash commit may retain the pull-request author's public address
+only under the signed `web-flow` exception documented in the release policy; it
+does not hide that metadata. Do not add secrets, credentials, private hostnames,
+personal paths, internal-only information, production data, or row values
+captured from a change stream.
 
 ## Supported development environment
 
