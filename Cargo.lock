@@ -928,12 +928,21 @@ name = "pgshard-pooler"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "clap",
+ "hyper",
+ "hyper-util",
  "pgshard-catalog",
  "pgshard-version",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
+ "tokio-postgres",
  "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

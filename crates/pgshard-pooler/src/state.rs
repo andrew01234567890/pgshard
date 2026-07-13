@@ -1,4 +1,4 @@
-//! Read-only pooler state derived from catalog supervision.
+//! Read-only pooler state derived from catalog and data-plane availability.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +7,7 @@ use pgshard_catalog::{CatalogFailureKind, CatalogSupervisorSnapshot, CatalogSupe
 use serde::{Serialize, Serializer};
 
 type CatalogSnapshotSource = dyn Fn() -> PoolerCatalogSnapshot + Send + Sync;
+const DATA_PLANE_UNAVAILABLE: &str = "data_plane_unavailable";
 
 /// Externally reportable catalog state for one pooler process.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -88,14 +89,19 @@ pub struct PoolerReadiness {
 #[derive(Clone)]
 pub struct PoolerState {
     catalog_snapshot: Arc<CatalogSnapshotSource>,
+    data_plane_ready: bool,
 }
 
 impl PoolerState {
-    /// Creates state backed by the live catalog supervisor.
+    /// Creates control-only state backed by the live catalog supervisor.
+    ///
+    /// Application readiness remains false even after the catalog becomes
+    /// usable because the current executable has no SQL data plane.
     #[must_use]
-    pub fn new(catalog: CatalogSupervisorStatus) -> Self {
+    pub fn control_only(catalog: CatalogSupervisorStatus) -> Self {
         Self {
             catalog_snapshot: Arc::new(move || catalog.snapshot().into()),
+            data_plane_ready: false,
         }
     }
 
@@ -104,7 +110,7 @@ impl PoolerState {
     pub fn snapshot(&self) -> PoolerSnapshot {
         let catalog = (self.catalog_snapshot)();
         PoolerSnapshot {
-            ready: catalog.ready,
+            ready: catalog.ready && self.data_plane_ready,
             version: pgshard_version::VERSION,
             git_sha: pgshard_version::GIT_SHA,
             catalog,
@@ -115,16 +121,27 @@ impl PoolerState {
     #[must_use]
     pub fn readiness(&self) -> PoolerReadiness {
         let catalog = (self.catalog_snapshot)();
+        if !catalog.ready {
+            return PoolerReadiness {
+                ready: false,
+                reason: catalog.readiness_reason,
+            };
+        }
         PoolerReadiness {
-            ready: catalog.ready,
-            reason: catalog.readiness_reason,
+            ready: self.data_plane_ready,
+            reason: if self.data_plane_ready {
+                catalog.readiness_reason
+            } else {
+                DATA_PLANE_UNAVAILABLE
+            },
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn from_catalog(catalog: PoolerCatalogSnapshot) -> Self {
+    pub(crate) fn from_catalog(catalog: PoolerCatalogSnapshot, data_plane_ready: bool) -> Self {
         Self {
             catalog_snapshot: Arc::new(move || catalog.clone()),
+            data_plane_ready,
         }
     }
 }
@@ -176,7 +193,7 @@ mod tests {
             Arc::new(CatalogCache::new()),
             CatalogSupervisorConfig::default(),
         );
-        let state = PoolerState::new(supervisor.status());
+        let state = PoolerState::control_only(supervisor.status());
 
         let starting = state.snapshot();
         assert!(!starting.ready);
@@ -193,19 +210,22 @@ mod tests {
 
     #[test]
     fn status_json_preserves_exact_integer_values() {
-        let state = PoolerState::from_catalog(PoolerCatalogSnapshot {
-            phase: "backoff",
-            connection_up: false,
-            ready: true,
-            readiness_reason: "serving_stale",
-            catalog_epoch: Some(u64::MAX),
-            cache_age: Some(Duration::from_millis(1_234)),
-            consecutive_failures: u64::MAX,
-            total_failures: u64::MAX - 1,
-            connect_attempts: u64::MAX - 2,
-            successful_connections: u64::MAX - 3,
-            last_failure: Some("connection"),
-        });
+        let state = PoolerState::from_catalog(
+            PoolerCatalogSnapshot {
+                phase: "backoff",
+                connection_up: false,
+                ready: true,
+                readiness_reason: "serving_stale",
+                catalog_epoch: Some(u64::MAX),
+                cache_age: Some(Duration::from_millis(1_234)),
+                consecutive_failures: u64::MAX,
+                total_failures: u64::MAX - 1,
+                connect_attempts: u64::MAX - 2,
+                successful_connections: u64::MAX - 3,
+                last_failure: Some("connection"),
+            },
+            true,
+        );
 
         let value = serde_json::to_value(state.snapshot()).expect("serialize pooler status");
         let catalog = &value["catalog"];
@@ -219,5 +239,36 @@ mod tests {
             (u64::MAX - 3).to_string()
         );
         assert_eq!(state.readiness().reason, "serving_stale");
+    }
+
+    #[test]
+    fn control_only_state_never_claims_application_readiness() {
+        let state = PoolerState::from_catalog(
+            PoolerCatalogSnapshot {
+                phase: "connected",
+                connection_up: true,
+                ready: true,
+                readiness_reason: "ready",
+                catalog_epoch: Some(1),
+                cache_age: Some(Duration::ZERO),
+                consecutive_failures: 0,
+                total_failures: 0,
+                connect_attempts: 1,
+                successful_connections: 1,
+                last_failure: None,
+            },
+            false,
+        );
+
+        let snapshot = state.snapshot();
+        assert!(!snapshot.ready);
+        assert!(snapshot.catalog.ready);
+        assert_eq!(
+            state.readiness(),
+            PoolerReadiness {
+                ready: false,
+                reason: DATA_PLANE_UNAVAILABLE,
+            }
+        );
     }
 }
