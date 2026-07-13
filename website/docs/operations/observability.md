@@ -26,7 +26,8 @@ will be disabled in telemetry by default.
 
 The implemented catalog subset reports connection phase and availability,
 readiness reason, authoritative epoch and cache age, reconnect attempts,
-successful initial loads, and safe failure categories. Health remains live
+successful initial loads, and safe bounded failure categories, including
+distinct `connect_timeout` and `operation_timeout` labels. Health remains live
 when catalog readiness fails so Kubernetes can distinguish a process crash from
 an unavailable or stale routing catalog.
 

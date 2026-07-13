@@ -1,5 +1,6 @@
 //! Long-running notification and polling driver for the catalog cache.
 
+use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::{Instant, MissedTickBehavior, sleep_until};
 use tokio_postgres::{AsyncMessage, Client, Connection};
 
 use crate::{
@@ -22,6 +23,12 @@ pub const MIN_CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const MAX_CATALOG_POLL_INTERVAL: Duration = Duration::from_mins(5);
 /// Default authoritative polling interval.
 pub const DEFAULT_CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Shortest accepted deadline for one subscription or authoritative load.
+pub const MIN_CATALOG_OPERATION_TIMEOUT: Duration = Duration::from_millis(100);
+/// Longest accepted deadline for one subscription or authoritative load.
+pub const MAX_CATALOG_OPERATION_TIMEOUT: Duration = Duration::from_mins(5);
+/// Default deadline for one subscription or authoritative load.
+pub const DEFAULT_CATALOG_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounded interval between authoritative catalog reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +60,79 @@ impl Default for CatalogPollInterval {
     }
 }
 
+/// Bounded deadline for one catalog subscription or authoritative load.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CatalogOperationTimeout(Duration);
+
+impl CatalogOperationTimeout {
+    /// Validates an operation timeout between 100 milliseconds and five minutes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a timeout outside the bounded range.
+    pub fn new(timeout: Duration) -> Result<Self, CatalogOperationTimeoutError> {
+        if !(MIN_CATALOG_OPERATION_TIMEOUT..=MAX_CATALOG_OPERATION_TIMEOUT).contains(&timeout) {
+            return Err(CatalogOperationTimeoutError { timeout });
+        }
+        Ok(Self(timeout))
+    }
+
+    /// Returns the validated duration.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for CatalogOperationTimeout {
+    fn default() -> Self {
+        Self(DEFAULT_CATALOG_OPERATION_TIMEOUT)
+    }
+}
+
+/// Invalid catalog operation timeout.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error(
+    "catalog operation timeout {timeout:?} must be between {MIN_CATALOG_OPERATION_TIMEOUT:?} and {MAX_CATALOG_OPERATION_TIMEOUT:?}"
+)]
+pub struct CatalogOperationTimeoutError {
+    timeout: Duration,
+}
+
+impl CatalogOperationTimeoutError {
+    /// Returns the rejected timeout.
+    #[must_use]
+    pub const fn timeout(self) -> Duration {
+        self.timeout
+    }
+}
+
+/// Authoritative catalog operation protected by a deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogOperation {
+    /// Session reset, committed `LISTEN`, and the initial authoritative load.
+    InitialLoad,
+    /// A periodic or notification-triggered authoritative refresh.
+    Refresh,
+}
+
+impl CatalogOperation {
+    /// Returns the stable bounded label used in errors and telemetry.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialLoad => "initial_load",
+            Self::Refresh => "refresh",
+        }
+    }
+}
+
+impl fmt::Display for CatalogOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Invalid authoritative catalog polling interval.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[error(
@@ -79,8 +159,9 @@ impl CatalogPollIntervalError {
 /// Connection closure is terminal so the owner can fail readiness and create a
 /// fresh connection rather than silently running on polling alone.
 ///
-/// Direct callers remain responsible for TLS, authentication, connect and
-/// query timeouts, retry backoff, and supervising this future.
+/// Direct callers remain responsible for TLS, authentication, connection
+/// timeouts, retry backoff, and supervising this future. `operation_timeout`
+/// bounds the committed subscription plus initial load and every later load.
 /// [`crate::CatalogSupervisor`] provides the standard reconnect and readiness
 /// policy. `shutdown` is observed during subscription, between refreshes, and
 /// while a refresh query is pending. Dropping this future aborts its connection
@@ -96,6 +177,7 @@ pub async fn run_catalog_refresh<S, T, F>(
     connection: Connection<S, T>,
     cache: Arc<CatalogCache>,
     poll_interval: CatalogPollInterval,
+    operation_timeout: CatalogOperationTimeout,
     shutdown: F,
 ) -> Result<(), CatalogRefreshError>
 where
@@ -103,7 +185,16 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: Future<Output = ()>,
 {
-    run_catalog_refresh_observed(client, connection, cache, poll_interval, || {}, shutdown).await
+    run_catalog_refresh_observed(
+        client,
+        connection,
+        cache,
+        poll_interval,
+        operation_timeout,
+        || {},
+        shutdown,
+    )
+    .await
 }
 
 pub(crate) async fn run_catalog_refresh_observed<S, T, F, R>(
@@ -111,6 +202,7 @@ pub(crate) async fn run_catalog_refresh_observed<S, T, F, R>(
     connection: Connection<S, T>,
     cache: Arc<CatalogCache>,
     poll_interval: CatalogPollInterval,
+    operation_timeout: CatalogOperationTimeout,
     refreshed: R,
     shutdown: F,
 ) -> Result<(), CatalogRefreshError>
@@ -125,18 +217,42 @@ where
         ConnectionTask::new(tokio::spawn(forward_notifications(connection, sender)));
     tokio::pin!(shutdown);
     let subscription = {
-        let subscription = CatalogReader::subscribe(client, &cache);
+        let deadline = Instant::now() + operation_timeout.get();
+        let subscription = CatalogReader::subscribe_before(client, &cache, deadline);
         tokio::pin!(subscription);
+        let deadline_timer = sleep_until(deadline);
+        tokio::pin!(deadline_timer);
         tokio::select! {
             biased;
             () = shutdown.as_mut() => return stop_connection(connection_task).await,
-            result = subscription.as_mut() => result,
+            () = deadline_timer.as_mut() => TimedOperation::Elapsed,
+            result = subscription.as_mut() => {
+                if Instant::now() >= deadline
+                    || result
+                        .as_ref()
+                        .is_err_and(LoadError::is_operation_timeout)
+                {
+                    TimedOperation::Elapsed
+                } else {
+                    TimedOperation::Completed(result)
+                }
+            }
         }
     };
     let (reader, _) = match subscription {
-        Ok(reader) => reader,
-        Err(source) => {
+        TimedOperation::Completed(Ok(reader)) => reader,
+        TimedOperation::Completed(Err(source)) => {
             return Err(cleanup_after_load_error(connection_task, source).await);
+        }
+        TimedOperation::Elapsed => {
+            return Err(cleanup_after_driver_error(
+                connection_task,
+                CatalogRefreshError::OperationTimeout {
+                    operation: CatalogOperation::InitialLoad,
+                    timeout: operation_timeout.get(),
+                },
+            )
+            .await);
         }
     };
     refreshed();
@@ -146,6 +262,7 @@ where
         receiver,
         &cache,
         poll_interval,
+        operation_timeout,
         &refreshed,
         shutdown.as_mut(),
     )
@@ -153,7 +270,17 @@ where
     {
         Ok(RefreshLoopExit::Shutdown) => stop_connection(connection_task).await,
         Ok(RefreshLoopExit::ConnectionClosed) => finish_connection(connection_task).await,
-        Err(source) => Err(cleanup_after_load_error(connection_task, source).await),
+        Err(RefreshLoopError::Load(source)) => {
+            Err(cleanup_after_load_error(connection_task, source).await)
+        }
+        Err(RefreshLoopError::OperationTimeout) => Err(cleanup_after_driver_error(
+            connection_task,
+            CatalogRefreshError::OperationTimeout {
+                operation: CatalogOperation::Refresh,
+                timeout: operation_timeout.get(),
+            },
+        )
+        .await),
     }
 }
 
@@ -219,14 +346,31 @@ enum RefreshLoopExit {
     ConnectionClosed,
 }
 
+enum TimedOperation<T> {
+    Completed(T),
+    Elapsed,
+}
+
+enum RefreshLoopError {
+    Load(LoadError),
+    OperationTimeout,
+}
+
+impl From<LoadError> for RefreshLoopError {
+    fn from(error: LoadError) -> Self {
+        Self::Load(error)
+    }
+}
+
 async fn refresh_loop<F, R>(
     mut reader: CatalogReader,
     mut notifications: watch::Receiver<Option<CatalogNotification>>,
     cache: &CatalogCache,
     poll_interval: CatalogPollInterval,
+    operation_timeout: CatalogOperationTimeout,
     refreshed: &R,
     mut shutdown: Pin<&mut F>,
-) -> Result<RefreshLoopExit, LoadError>
+) -> Result<RefreshLoopExit, RefreshLoopError>
 where
     F: Future<Output = ()>,
     R: Fn(),
@@ -252,10 +396,23 @@ where
         if !should_refresh {
             continue;
         }
+        let deadline = Instant::now() + operation_timeout.get();
+        let refresh = reader.refresh_before(cache, deadline);
+        tokio::pin!(refresh);
+        let deadline_timer = sleep_until(deadline);
+        tokio::pin!(deadline_timer);
         tokio::select! {
             biased;
             () = shutdown.as_mut() => return Ok(RefreshLoopExit::Shutdown),
-            result = reader.refresh(cache) => {
+            () = deadline_timer.as_mut() => return Err(RefreshLoopError::OperationTimeout),
+            result = refresh.as_mut() => {
+                if Instant::now() >= deadline
+                    || result
+                        .as_ref()
+                        .is_err_and(LoadError::is_operation_timeout)
+                {
+                    return Err(RefreshLoopError::OperationTimeout);
+                }
                 result?;
                 refreshed();
             }
@@ -267,10 +424,17 @@ async fn cleanup_after_load_error(
     connection_task: ConnectionTask,
     load: LoadError,
 ) -> CatalogRefreshError {
+    cleanup_after_driver_error(connection_task, CatalogRefreshError::Load(load)).await
+}
+
+async fn cleanup_after_driver_error(
+    connection_task: ConnectionTask,
+    error: CatalogRefreshError,
+) -> CatalogRefreshError {
     let connection_task = connection_task.into_handle();
     connection_task.abort();
     let _ = connection_task.await;
-    CatalogRefreshError::Load(load)
+    error
 }
 
 async fn stop_connection(connection_task: ConnectionTask) -> Result<(), CatalogRefreshError> {
@@ -298,6 +462,14 @@ pub enum CatalogRefreshError {
     /// Subscription, authoritative loading, or cache publication failed.
     #[error(transparent)]
     Load(#[from] LoadError),
+    /// A subscription, initial load, or refresh exceeded its configured deadline.
+    #[error("catalog {operation} exceeded configured operation timeout {timeout:?}")]
+    OperationTimeout {
+        /// Operation that exceeded its deadline.
+        operation: CatalogOperation,
+        /// Configured deadline.
+        timeout: Duration,
+    },
     /// The dedicated connection closed without an error before shutdown.
     #[error("catalog notification connection closed before shutdown")]
     ConnectionClosed,
@@ -342,6 +514,35 @@ mod tests {
         ] {
             let error = CatalogPollInterval::new(rejected).expect_err("invalid interval");
             assert_eq!(error.interval(), rejected);
+        }
+    }
+
+    #[test]
+    fn operation_timeout_is_bounded() {
+        assert_eq!(
+            CatalogOperationTimeout::default().get(),
+            DEFAULT_CATALOG_OPERATION_TIMEOUT
+        );
+        assert_eq!(
+            CatalogOperationTimeout::new(MIN_CATALOG_OPERATION_TIMEOUT)
+                .expect("minimum operation timeout")
+                .get(),
+            MIN_CATALOG_OPERATION_TIMEOUT
+        );
+        assert_eq!(
+            CatalogOperationTimeout::new(MAX_CATALOG_OPERATION_TIMEOUT)
+                .expect("maximum operation timeout")
+                .get(),
+            MAX_CATALOG_OPERATION_TIMEOUT
+        );
+        for rejected in [
+            MIN_CATALOG_OPERATION_TIMEOUT
+                .checked_sub(Duration::from_nanos(1))
+                .expect("minimum timeout exceeds one nanosecond"),
+            MAX_CATALOG_OPERATION_TIMEOUT + Duration::from_nanos(1),
+        ] {
+            let error = CatalogOperationTimeout::new(rejected).expect_err("invalid timeout");
+            assert_eq!(error.timeout(), rejected);
         }
     }
 

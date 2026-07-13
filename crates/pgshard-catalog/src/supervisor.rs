@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 use pgshard_types::CatalogEpoch;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::{Instant as TokioInstant, sleep_until};
 use tokio_postgres::{Client, Connection};
 
 use crate::driver::run_catalog_refresh_observed;
-use crate::{CatalogCache, CatalogPollInterval, CatalogRefreshError};
+use crate::{CatalogCache, CatalogOperationTimeout, CatalogPollInterval, CatalogRefreshError};
 
 /// Shortest accepted interval for serving from the last validated snapshot.
 pub const MIN_CATALOG_STALE_GRACE: Duration = Duration::from_secs(2);
@@ -24,10 +25,15 @@ pub const MIN_CATALOG_RECONNECT_DELAY: Duration = Duration::from_millis(10);
 pub const MAX_CATALOG_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Longest accepted reconnect-delay ceiling.
 pub const MAX_CATALOG_RECONNECT_DELAY: Duration = Duration::from_mins(1);
+/// Shortest accepted deadline for establishing one catalog connection.
+pub const MIN_CATALOG_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+/// Longest accepted deadline for establishing one catalog connection.
+pub const MAX_CATALOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_CATALOG_STALE_GRACE: Duration = Duration::from_secs(90);
 const DEFAULT_CATALOG_INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const DEFAULT_CATALOG_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const DEFAULT_CATALOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Validated refresh, staleness, and reconnect policy for one pooler process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +42,8 @@ pub struct CatalogSupervisorConfig {
     stale_grace: Duration,
     initial_reconnect_delay: Duration,
     maximum_reconnect_delay: Duration,
+    connect_timeout: Duration,
+    operation_timeout: CatalogOperationTimeout,
 }
 
 impl CatalogSupervisorConfig {
@@ -90,7 +98,29 @@ impl CatalogSupervisorConfig {
             stale_grace,
             initial_reconnect_delay,
             maximum_reconnect_delay,
+            connect_timeout: DEFAULT_CATALOG_CONNECT_TIMEOUT,
+            operation_timeout: CatalogOperationTimeout::default(),
         })
+    }
+
+    /// Overrides the connection and catalog-operation deadlines.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a connection deadline outside 100 milliseconds to 30 seconds.
+    pub fn with_timeouts(
+        mut self,
+        connect_timeout: Duration,
+        operation_timeout: CatalogOperationTimeout,
+    ) -> Result<Self, CatalogSupervisorConfigError> {
+        if !(MIN_CATALOG_CONNECT_TIMEOUT..=MAX_CATALOG_CONNECT_TIMEOUT).contains(&connect_timeout) {
+            return Err(CatalogSupervisorConfigError::ConnectTimeoutOutOfRange {
+                timeout: connect_timeout,
+            });
+        }
+        self.connect_timeout = connect_timeout;
+        self.operation_timeout = operation_timeout;
+        Ok(self)
     }
 
     /// Returns the authoritative polling interval.
@@ -115,6 +145,18 @@ impl CatalogSupervisorConfig {
     #[must_use]
     pub const fn maximum_reconnect_delay(self) -> Duration {
         self.maximum_reconnect_delay
+    }
+
+    /// Returns the deadline for establishing one catalog connection.
+    #[must_use]
+    pub const fn connect_timeout(self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Returns the deadline for one subscription or authoritative load.
+    #[must_use]
+    pub const fn operation_timeout(self) -> CatalogOperationTimeout {
+        self.operation_timeout
     }
 
     fn retry_delay(self, consecutive_failures: u64, entropy: u64) -> Duration {
@@ -187,6 +229,14 @@ pub enum CatalogSupervisorConfigError {
         /// Validated initial delay.
         initial: Duration,
     },
+    /// Connection deadline is outside the global safety bounds.
+    #[error(
+        "catalog connection timeout {timeout:?} must be between {MIN_CATALOG_CONNECT_TIMEOUT:?} and {MAX_CATALOG_CONNECT_TIMEOUT:?}"
+    )]
+    ConnectTimeoutOutOfRange {
+        /// Rejected connection deadline.
+        timeout: Duration,
+    },
 }
 
 /// Lifecycle phase of the dedicated catalog connection.
@@ -232,8 +282,12 @@ impl CatalogConnectionPhase {
 pub enum CatalogFailureKind {
     /// Establishing a fresh `PostgreSQL` connection failed.
     Connect,
+    /// Establishing a fresh `PostgreSQL` connection exceeded its deadline.
+    ConnectTimeout,
     /// Subscription, snapshot loading, or cache validation failed.
     Load,
+    /// Subscription or an authoritative load exceeded its deadline.
+    OperationTimeout,
     /// The established `PostgreSQL` connection failed or closed.
     Connection,
     /// The spawned connection pump task failed.
@@ -246,7 +300,9 @@ impl CatalogFailureKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Connect => "connect",
+            Self::ConnectTimeout => "connect_timeout",
             Self::Load => "load",
+            Self::OperationTimeout => "operation_timeout",
             Self::Connection => "connection",
             Self::ConnectionTask => "connection_task",
         }
@@ -257,6 +313,7 @@ impl From<&CatalogRefreshError> for CatalogFailureKind {
     fn from(error: &CatalogRefreshError) -> Self {
         match error {
             CatalogRefreshError::Load(_) => Self::Load,
+            CatalogRefreshError::OperationTimeout { .. } => Self::OperationTimeout,
             CatalogRefreshError::ConnectionClosed | CatalogRefreshError::Connection(_) => {
                 Self::Connection
             }
@@ -589,29 +646,48 @@ impl CatalogSupervisor {
 
         loop {
             self.status.mark_connecting(Instant::now());
-            let connected = tokio::select! {
-                biased;
-                () = shutdown.as_mut() => break,
-                result = connect() => result,
-            };
-            let Ok((client, connection)) = connected else {
-                let (consecutive, total) = self
-                    .status
-                    .mark_failure(CatalogFailureKind::Connect, Instant::now());
-                let delay = self
-                    .config
-                    .retry_delay(consecutive, retry_entropy(&random, consecutive, total));
-                tracing::warn!(
-                    failure_kind = ?CatalogFailureKind::Connect,
-                    consecutive_failures = consecutive,
-                    total_failures = total,
-                    retry_delay = ?delay,
-                    "catalog connection failed; retrying"
-                );
-                if wait_for_retry(delay, shutdown.as_mut()).await {
-                    break;
+            let connected = {
+                let deadline = TokioInstant::now() + self.config.connect_timeout;
+                let connect_attempt = connect();
+                tokio::pin!(connect_attempt);
+                let deadline_timer = sleep_until(deadline);
+                tokio::pin!(deadline_timer);
+                tokio::select! {
+                    biased;
+                    () = shutdown.as_mut() => None,
+                    () = deadline_timer.as_mut() => {
+                        Some(Err(CatalogFailureKind::ConnectTimeout))
+                    }
+                    result = connect_attempt.as_mut() => {
+                        if TokioInstant::now() >= deadline {
+                            Some(Err(CatalogFailureKind::ConnectTimeout))
+                        } else {
+                            Some(result.map_err(|_| CatalogFailureKind::Connect))
+                        }
+                    }
                 }
-                continue;
+            };
+            let Some(connected) = connected else { break };
+            let (client, connection) = match connected {
+                Ok(connection) => connection,
+                Err(failure_kind) => {
+                    let (consecutive, total) =
+                        self.status.mark_failure(failure_kind, Instant::now());
+                    let delay = self
+                        .config
+                        .retry_delay(consecutive, retry_entropy(&random, consecutive, total));
+                    tracing::warn!(
+                        failure_kind = ?failure_kind,
+                        consecutive_failures = consecutive,
+                        total_failures = total,
+                        retry_delay = ?delay,
+                        "catalog connection failed; retrying"
+                    );
+                    if wait_for_retry(delay, shutdown.as_mut()).await {
+                        break;
+                    }
+                    continue;
+                }
             };
 
             self.status.mark_loading(Instant::now());
@@ -621,6 +697,7 @@ impl CatalogSupervisor {
                 connection,
                 Arc::clone(&self.cache),
                 self.config.poll_interval,
+                self.config.operation_timeout,
                 move || refresh_status.mark_refreshed(Instant::now()),
                 shutdown.as_mut(),
             )
@@ -695,9 +772,12 @@ mod tests {
 
     #[test]
     fn configuration_enforces_staleness_and_retry_bounds() {
+        let defaults = CatalogSupervisorConfig::default();
+        assert_eq!(defaults.stale_grace(), Duration::from_secs(90));
+        assert_eq!(defaults.connect_timeout(), DEFAULT_CATALOG_CONNECT_TIMEOUT);
         assert_eq!(
-            CatalogSupervisorConfig::default().stale_grace(),
-            Duration::from_secs(90)
+            defaults.operation_timeout(),
+            CatalogOperationTimeout::default()
         );
         let poll = CatalogPollInterval::new(Duration::from_secs(2)).expect("poll interval");
         assert!(matches!(
@@ -729,6 +809,42 @@ mod tests {
             ),
             Err(CatalogSupervisorConfigError::MaximumReconnectDelayOutOfRange { .. })
         ));
+        for accepted in [MIN_CATALOG_CONNECT_TIMEOUT, MAX_CATALOG_CONNECT_TIMEOUT] {
+            assert_eq!(
+                config()
+                    .with_timeouts(accepted, CatalogOperationTimeout::default())
+                    .expect("bounded connect timeout")
+                    .connect_timeout(),
+                accepted
+            );
+        }
+        for rejected in [
+            MIN_CATALOG_CONNECT_TIMEOUT
+                .checked_sub(Duration::from_nanos(1))
+                .expect("minimum timeout exceeds one nanosecond"),
+            MAX_CATALOG_CONNECT_TIMEOUT + Duration::from_nanos(1),
+        ] {
+            assert!(matches!(
+                config().with_timeouts(rejected, CatalogOperationTimeout::default()),
+                Err(CatalogSupervisorConfigError::ConnectTimeoutOutOfRange { timeout })
+                    if timeout == rejected
+            ));
+        }
+        assert_eq!(
+            CatalogFailureKind::from(&CatalogRefreshError::OperationTimeout {
+                operation: crate::CatalogOperation::Refresh,
+                timeout: Duration::from_secs(1),
+            }),
+            CatalogFailureKind::OperationTimeout
+        );
+        assert_eq!(
+            CatalogFailureKind::ConnectTimeout.as_str(),
+            "connect_timeout"
+        );
+        assert_eq!(
+            CatalogFailureKind::OperationTimeout.as_str(),
+            "operation_timeout"
+        );
     }
 
     #[test]
@@ -830,6 +946,104 @@ mod tests {
         let stopped = status.snapshot_at(now);
         assert!(!stopped.ready());
         assert_eq!(stopped.readiness_reason(), CatalogReadinessReason::Stopped);
+    }
+
+    #[tokio::test]
+    async fn pending_connector_hits_deadline_and_reports_safe_failure() {
+        let config = config()
+            .with_timeouts(
+                MIN_CATALOG_CONNECT_TIMEOUT,
+                CatalogOperationTimeout::default(),
+            )
+            .expect("timeout policy");
+        let supervisor = CatalogSupervisor::new(Arc::new(CatalogCache::new()), config);
+        let status = supervisor.status();
+        let task = tokio::spawn(supervisor.run(
+            || async {
+                std::future::pending::<()>().await;
+                tokio_postgres::connect("postgresql://unused", tokio_postgres::NoTls).await
+            },
+            std::future::pending(),
+        ));
+
+        let timed_out = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = status.snapshot();
+                if snapshot.last_failure() == Some(CatalogFailureKind::ConnectTimeout) {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pending connector must hit its configured deadline");
+        assert!(!timed_out.ready());
+        assert!(timed_out.total_failures() >= 1);
+        assert_eq!(timed_out.successful_connections(), 0);
+
+        task.abort();
+        let cancellation = task
+            .await
+            .expect_err("aborted supervisor task must not complete normally");
+        assert!(cancellation.is_cancelled());
+        assert_eq!(status.snapshot().phase(), CatalogConnectionPhase::Stopped);
+    }
+
+    #[tokio::test]
+    async fn timed_out_connector_is_dropped_before_reconnect_backoff() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let config = CatalogSupervisorConfig::new(
+            CatalogPollInterval::new(Duration::from_secs(1)).expect("poll interval"),
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .expect("supervisor config")
+        .with_timeouts(
+            MIN_CATALOG_CONNECT_TIMEOUT,
+            CatalogOperationTimeout::default(),
+        )
+        .expect("timeout policy");
+        let supervisor = CatalogSupervisor::new(Arc::new(CatalogCache::new()), config);
+        let status = supervisor.status();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let mut dropped_sender = Some(dropped_sender);
+        let task = tokio::spawn(supervisor.run(
+            move || {
+                let drop_signal = DropSignal(dropped_sender.take());
+                async move {
+                    let _drop_signal = drop_signal;
+                    std::future::pending::<()>().await;
+                    tokio_postgres::connect("postgresql://unused", tokio_postgres::NoTls).await
+                }
+            },
+            std::future::pending(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .expect("timed-out connector dropped before multi-second backoff")
+            .expect("connector retained its drop signal");
+        assert_eq!(
+            status.snapshot().last_failure(),
+            Some(CatalogFailureKind::ConnectTimeout)
+        );
+
+        task.abort();
+        let cancellation = task
+            .await
+            .expect_err("aborted supervisor task must not complete normally");
+        assert!(cancellation.is_cancelled());
+        assert_eq!(status.snapshot().phase(), CatalogConnectionPhase::Stopped);
     }
 
     #[test]
