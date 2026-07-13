@@ -4,8 +4,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use pgshard_pgwire::{
-    ClientEncoding, PgOutputConfiguration, PgOutputControlMessage, PgOutputStreaming,
-    PgOutputVersion, decode_pgoutput_control,
+    ClientEncoding, PgOutputConfiguration, PgOutputControlMessage, PgOutputEncoding,
+    PgOutputStreaming, PgOutputVersion, decode_pgoutput_control,
 };
 
 const ITERATIONS: u64 = 5_000_000;
@@ -15,17 +15,24 @@ fn main() {
     message.extend_from_slice(&11_u64.to_be_bytes());
     message.extend_from_slice(&22_i64.to_be_bytes());
     message.extend_from_slice(&33_u32.to_be_bytes());
-    let configuration =
-        PgOutputConfiguration::new(PgOutputVersion::V4, PgOutputStreaming::Parallel, true)
-            .expect("benchmark configuration");
-    let client_encoding = ClientEncoding::require_utf8("UTF8").expect("UTF8");
+    let configuration = PgOutputConfiguration::new(
+        PgOutputVersion::V4,
+        PgOutputStreaming::Parallel,
+        true,
+        false,
+    )
+    .expect("benchmark configuration");
+    let encoding = PgOutputEncoding::require_utf8(
+        ClientEncoding::require_utf8("UTF8").expect("client UTF8"),
+        "UTF8",
+    )
+    .expect("server UTF8");
 
     let started = Instant::now();
     let mut digest = 0_u64;
     for _ in 0..ITERATIONS {
         let PgOutputControlMessage::Begin(begin) =
-            decode_pgoutput_control(black_box(&message), configuration, client_encoding)
-                .expect("decode")
+            decode_pgoutput_control(black_box(&message), configuration, encoding).expect("decode")
         else {
             panic!("benchmark message decoded as another control");
         };

@@ -76,15 +76,20 @@ and primary-keepalive envelopes. A configuration token validates `pgoutput`
 protocol versions one through four plus streaming and two-phase feature gates;
 the control decoder covers buffered Begin/Commit/Origin, streamed transaction
 start/stop/commit/abort, and every two-phase control including Stream Prepare.
-It requires the authoritative UTF-8 session proof, bounds prepared-transaction
-identifiers, and redacts origins, GIDs, and logical payloads from debug output.
+It requires authoritative `server_encoding=UTF8` and `client_encoding=UTF8`
+proofs from the same connection, bounds prepared-transaction identifiers, and
+redacts origins, GIDs, and logical payloads from debug output.
 Row, relation, type, truncate, and logical-message bodies have distinct tags but
 are deliberately rejected until their dedicated decoders exist. Transaction
 ordering, relation state, WAL feedback, durable checkpoints, cross-shard merge,
 and the VStream-like service remain later work.
 
 The future replication session must bind that token to the exact accepted
-`START_REPLICATION` command rather than trusting caller-selected options.
+`START_REPLICATION` command and the selected slot's authoritative persistent
+`two_phase` state rather than trusting caller-selected options. PostgreSQL keeps
+two-phase decoding enabled after a later `two_phase=false` start unless the
+slot itself is explicitly disabled, so the effective decoder gate is the
+logical OR of the request and slot states.
 
 Debug output reports only frame metadata and lengths. It never renders startup
 values, cancellation authentication keys, SQL, authentication data, error

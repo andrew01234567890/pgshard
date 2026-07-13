@@ -62,12 +62,16 @@ pub enum PgOutputStreaming {
 ///
 /// This proves only that the option combination is supported. The connection
 /// owner must bind it to the exact `START_REPLICATION` command that requested
-/// those options and use it only after that command enters COPY-BOTH mode.
+/// those options, the authoritative persistent `two_phase` state of that
+/// command's replication slot, and use it only after the command enters
+/// COPY-BOTH mode. `PostgreSQL` uses the logical OR of the requested and
+/// persistent slot states; requesting `false` does not disable an enabled slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PgOutputConfiguration {
     version: PgOutputVersion,
     streaming: PgOutputStreaming,
-    two_phase: bool,
+    requested_two_phase: bool,
+    slot_two_phase: bool,
 }
 
 impl PgOutputConfiguration {
@@ -75,12 +79,16 @@ impl PgOutputConfiguration {
     ///
     /// # Errors
     ///
-    /// Rejects streaming below protocol v2, parallel streaming below v4, and
-    /// two-phase decoding below v3.
+    /// `requested_two_phase` is the accepted `START_REPLICATION` option.
+    /// `slot_two_phase` must be the authoritative state of the exact selected
+    /// slot. Rejects streaming below protocol v2, parallel streaming below v4,
+    /// and a new two-phase request below v3. A previously enabled slot remains
+    /// effective even with an older requested protocol.
     pub fn new(
         version: PgOutputVersion,
         streaming: PgOutputStreaming,
-        two_phase: bool,
+        requested_two_phase: bool,
+        slot_two_phase: bool,
     ) -> Result<Self, PgOutputConfigurationError> {
         let minimum_streaming_version = match streaming {
             PgOutputStreaming::Off => None,
@@ -96,13 +104,14 @@ impl PgOutputConfiguration {
                 actual: version,
             });
         }
-        if two_phase && version < PgOutputVersion::V3 {
-            return Err(PgOutputConfigurationError::TwoPhaseRequiresVersion(version));
+        if requested_two_phase && version < PgOutputVersion::V3 {
+            return Err(PgOutputConfigurationError::RequestedTwoPhaseRequiresVersion(version));
         }
         Ok(Self {
             version,
             streaming,
-            two_phase,
+            requested_two_phase,
+            slot_two_phase,
         })
     }
 
@@ -118,10 +127,25 @@ impl PgOutputConfiguration {
         self.streaming
     }
 
-    /// Returns whether two-phase messages were enabled.
+    /// Returns whether the accepted command requested two-phase decoding.
+    #[must_use]
+    pub const fn requested_two_phase(self) -> bool {
+        self.requested_two_phase
+    }
+
+    /// Returns the authoritative persistent two-phase state of the slot.
+    #[must_use]
+    pub const fn slot_two_phase(self) -> bool {
+        self.slot_two_phase
+    }
+
+    /// Returns `PostgreSQL`'s effective two-phase decoding state.
+    ///
+    /// A slot remains enabled across later starts that request `two_phase`
+    /// false, until an explicit slot alteration disables it.
     #[must_use]
     pub const fn two_phase(self) -> bool {
-        self.two_phase
+        self.requested_two_phase || self.slot_two_phase
     }
 
     const fn streaming_enabled(self) -> bool {
@@ -149,10 +173,47 @@ pub enum PgOutputConfigurationError {
         /// Requested protocol version.
         actual: PgOutputVersion,
     },
-    /// Two-phase decoding was enabled below protocol v3.
-    #[error("pgoutput two-phase decoding requires protocol v3; received {0:?}")]
-    TwoPhaseRequiresVersion(PgOutputVersion),
+    /// A command requested two-phase decoding below protocol v3.
+    #[error("requesting pgoutput two-phase decoding requires protocol v3; received {0:?}")]
+    RequestedTwoPhaseRequiresVersion(PgOutputVersion),
 }
+
+/// Proof that both sides of a replication connection use canonical `UTF8`.
+///
+/// `PostgreSQL` bounds prepared-transaction identifiers before converting from
+/// `server_encoding` to `client_encoding`. Requiring both authoritative
+/// `ParameterStatus` values to be `UTF8` makes that server-side 199-byte bound
+/// valid on the wire as well as matching pgshard's database-encoding contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PgOutputEncoding {
+    _private: (),
+}
+
+impl PgOutputEncoding {
+    /// Combines the existing client-encoding proof with server state.
+    ///
+    /// `server_encoding` must be the authoritative `ParameterStatus` value from
+    /// the same replication connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the server reports canonical `UTF8`.
+    pub fn require_utf8(
+        _client_encoding: ClientEncoding,
+        server_encoding: &str,
+    ) -> Result<Self, PgOutputEncodingError> {
+        if server_encoding == "UTF8" {
+            Ok(Self { _private: () })
+        } else {
+            Err(PgOutputEncodingError)
+        }
+    }
+}
+
+/// A replication connection does not satisfy pgshard's UTF-8 contract.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("pgoutput decoding requires canonical server_encoding and client_encoding UTF8")]
+pub struct PgOutputEncodingError;
 
 /// One WAL-data envelope carried by backend `CopyData`.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -569,9 +630,10 @@ pub enum PgOutputControlMessage<'a> {
 /// durable acknowledgements, and replay belong to the future stream state
 /// machine.
 ///
-/// The encoding proof must come from the same replication connection before
-/// any protocol string is interpreted as UTF-8. The configuration must likewise
-/// be the one bound to that connection's accepted `START_REPLICATION` command.
+/// The combined client/server encoding proof must come from the same
+/// replication connection before any protocol string is interpreted as UTF-8.
+/// The configuration must likewise be bound to that connection's accepted
+/// `START_REPLICATION` command and authoritative persistent slot state.
 ///
 /// # Errors
 ///
@@ -580,7 +642,7 @@ pub enum PgOutputControlMessage<'a> {
 pub fn decode_pgoutput_control(
     input: &[u8],
     configuration: PgOutputConfiguration,
-    _client_encoding: ClientEncoding,
+    _encoding: PgOutputEncoding,
 ) -> Result<PgOutputControlMessage<'_>, PgOutputError> {
     if input.len() > MAX_PGOUTPUT_MESSAGE_LENGTH {
         return Err(PgOutputError::MessageTooLarge(input.len()));
@@ -910,7 +972,7 @@ pub enum PgOutputError {
     /// A protocol string is missing its zero terminator.
     #[error("{0} is missing its zero terminator")]
     MissingTerminator(&'static str),
-    /// A protocol string is not valid under `client_encoding=UTF8`.
+    /// A protocol string is not valid under the proven UTF-8 connection encodings.
     #[error("{0} is not valid UTF-8")]
     InvalidUtf8(&'static str),
     /// A prepared-transaction identifier exceeds `PostgreSQL`'s 199-byte bound.
@@ -926,8 +988,12 @@ mod tests {
     use super::*;
     use crate::{DEFAULT_LARGE_MESSAGE_LENGTH, Decode, decode_backend};
 
-    fn utf8() -> ClientEncoding {
-        ClientEncoding::require_utf8("UTF8").expect("canonical UTF8")
+    fn utf8() -> PgOutputEncoding {
+        PgOutputEncoding::require_utf8(
+            ClientEncoding::require_utf8("UTF8").expect("canonical client UTF8"),
+            "UTF8",
+        )
+        .expect("canonical server UTF8")
     }
 
     fn configuration(
@@ -935,7 +1001,7 @@ mod tests {
         streaming: PgOutputStreaming,
         two_phase: bool,
     ) -> PgOutputConfiguration {
-        PgOutputConfiguration::new(version, streaming, two_phase)
+        PgOutputConfiguration::new(version, streaming, two_phase, false)
             .expect("valid pgoutput test configuration")
     }
 
@@ -1047,11 +1113,13 @@ mod tests {
             let config = configuration(version, streaming, two_phase);
             assert_eq!(config.version(), version);
             assert_eq!(config.streaming(), streaming);
+            assert_eq!(config.requested_two_phase(), two_phase);
+            assert!(!config.slot_two_phase());
             assert_eq!(config.two_phase(), two_phase);
         }
 
         assert!(matches!(
-            PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::On, false),
+            PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::On, false, false),
             Err(PgOutputConfigurationError::StreamingRequiresVersion {
                 minimum: PgOutputVersion::V2,
                 actual: PgOutputVersion::V1,
@@ -1059,7 +1127,12 @@ mod tests {
             })
         ));
         assert!(matches!(
-            PgOutputConfiguration::new(PgOutputVersion::V3, PgOutputStreaming::Parallel, false),
+            PgOutputConfiguration::new(
+                PgOutputVersion::V3,
+                PgOutputStreaming::Parallel,
+                false,
+                false
+            ),
             Err(PgOutputConfigurationError::StreamingRequiresVersion {
                 minimum: PgOutputVersion::V4,
                 actual: PgOutputVersion::V3,
@@ -1067,10 +1140,36 @@ mod tests {
             })
         ));
         assert_eq!(
-            PgOutputConfiguration::new(PgOutputVersion::V2, PgOutputStreaming::Off, true),
-            Err(PgOutputConfigurationError::TwoPhaseRequiresVersion(
-                PgOutputVersion::V2
-            ))
+            PgOutputConfiguration::new(PgOutputVersion::V2, PgOutputStreaming::Off, true, false),
+            Err(PgOutputConfigurationError::RequestedTwoPhaseRequiresVersion(PgOutputVersion::V2))
+        );
+
+        let first_start =
+            PgOutputConfiguration::new(PgOutputVersion::V3, PgOutputStreaming::Off, true, false)
+                .expect("first two-phase request");
+        assert!(first_start.requested_two_phase());
+        assert!(!first_start.slot_two_phase());
+        assert!(first_start.two_phase());
+
+        let restarted =
+            PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::Off, false, true)
+                .expect("persistently enabled slot under a later false request");
+        assert!(!restarted.requested_two_phase());
+        assert!(restarted.slot_two_phase());
+        assert!(restarted.two_phase());
+        assert!(matches!(
+            decode_pgoutput_control(&prepared(b'P', true, b"gid"), restarted, utf8()),
+            Ok(PgOutputControlMessage::Prepare(_))
+        ));
+
+        let client = ClientEncoding::require_utf8("UTF8").expect("client UTF8");
+        assert_eq!(
+            PgOutputEncoding::require_utf8(client, "LATIN1"),
+            Err(PgOutputEncodingError)
+        );
+        assert_eq!(
+            PgOutputEncoding::require_utf8(client, "UTF8"),
+            Ok(PgOutputEncoding { _private: () })
         );
     }
 
