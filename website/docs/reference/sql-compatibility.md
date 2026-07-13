@@ -115,11 +115,16 @@ control-message families retain PostgreSQL 18's smaller family-specific limits.
 It reports oversized frames before their bodies are buffered; the future
 session layer must then close the client connection as a protocol violation.
 Backend framing likewise applies exact fixed-message and
-`ParameterDescription`/`BackendKeyData` maxima, libpq's 2,000-byte ceiling to
-startup authentication and protocol-negotiation responses, its 30,000-byte
-ceiling to the remaining tags it does not classify as long, and the configured
-ceiling only to long row/COPY/error/notice families. These checks happen from
-the backend header before an upstream body is buffered.
+`ParameterDescription` maxima, PostgreSQL 18's four-to-256-byte cancellation-key
+bound to `BackendKeyData`, libpq's 2,000-byte ceiling to startup authentication
+and protocol-negotiation responses, its 30,000-byte ceiling to the remaining
+tags it does not classify as long, and the configured ceiling only to long
+row/COPY/error/notice families. These checks happen from the backend header
+before an upstream body is buffered.
+PostgreSQL 18 separately accepts one-to-256-byte keys in incoming
+`CancelRequest` packets. The future session layer must match the complete
+opaque key to the selected backend connection and enforce the effective
+protocol version; protocol 3.0 backend keys are exactly four bytes.
 The transport layer, which is not implemented yet, must handle PostgreSQL 18
 direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting

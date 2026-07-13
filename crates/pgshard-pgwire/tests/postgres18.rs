@@ -11,10 +11,12 @@ use std::time::Duration;
 
 use pgshard_pgwire::{
     BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, ExtendedQueryObject,
-    FrontendPhase, TransactionStatus, decode_backend, decode_close, decode_describe,
-    decode_frontend, decode_parameter_description, decode_ready_for_query,
-    require_empty_backend_body,
+    FrontendPhase, MAX_CANCEL_KEY_LENGTH, MIN_BACKEND_CANCEL_KEY_LENGTH, TransactionStatus,
+    decode_backend, decode_close, decode_describe, decode_frontend, decode_parameter_description,
+    decode_ready_for_query, require_empty_backend_body,
 };
+
+const POSTGRES_PROTOCOL_3_2: u32 = (3 << 16) | 2;
 
 fn startup(user: &str, database: &str) -> Vec<u8> {
     assert!(
@@ -25,7 +27,7 @@ fn startup(user: &str, database: &str) -> Vec<u8> {
         !database.as_bytes().contains(&0),
         "test database contains zero byte"
     );
-    let mut body = 196_608_u32.to_be_bytes().to_vec();
+    let mut body = POSTGRES_PROTOCOL_3_2.to_be_bytes().to_vec();
     for (name, value) in [
         ("user", user),
         ("database", database),
@@ -108,8 +110,20 @@ fn parameter_status(body: &[u8]) -> Option<(&str, &str)> {
     ))
 }
 
+fn validate_backend_key_data(body: &[u8]) {
+    let key = body
+        .get(4..)
+        .expect("BackendKeyData contains a process identifier");
+    assert!(
+        (MIN_BACKEND_CANCEL_KEY_LENGTH..=MAX_CANCEL_KEY_LENGTH).contains(&key.len()),
+        "PostgreSQL sent an invalid cancellation key length"
+    );
+    assert_eq!(key.len(), 32, "PostgreSQL 18 protocol 3.2 key length");
+}
+
 fn finish_startup(stream: &mut TcpStream) -> ClientEncoding {
     let mut authenticated = false;
+    let mut backend_key_data = false;
     let mut postgres18 = false;
     let mut client_encoding = None;
     loop {
@@ -136,6 +150,10 @@ fn finish_startup(stream: &mut TcpStream) -> ClientEncoding {
                     );
                 }
             }
+            BackendTag::BackendKeyData => {
+                validate_backend_key_data(frame.body());
+                backend_key_data = true;
+            }
             BackendTag::ErrorResponse => panic!("PostgreSQL rejected startup"),
             BackendTag::ReadyForQuery => {
                 assert_eq!(decode_ready_for_query(frame), Ok(TransactionStatus::Idle));
@@ -145,6 +163,7 @@ fn finish_startup(stream: &mut TcpStream) -> ClientEncoding {
         }
     }
     assert!(authenticated, "server omitted AuthenticationOk");
+    assert!(backend_key_data, "server omitted BackendKeyData");
     assert!(postgres18, "test requires PostgreSQL major version 18");
     client_encoding.expect("server omitted client_encoding ParameterStatus")
 }
