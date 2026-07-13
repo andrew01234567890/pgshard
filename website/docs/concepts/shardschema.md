@@ -76,9 +76,9 @@ range end.
    load succeeds.
 
 The default policy polls every 30 seconds, allows 90 seconds of cache age, and
-backs reconnect attempts off from 100 milliseconds to five seconds. Each
-process jitters within the upper half of its current delay window so replicas
-do not reconnect in lockstep. The status handle reports connection phase,
+uses reconnect-window ceilings from 100 milliseconds to five seconds. Each
+process waits within the upper half of its current window so replicas do not
+reconnect in lockstep. The status handle reports connection phase,
 catalog epoch, monotonic cache age, attempts, successful connections, and
 credential-safe failure categories. The future pooler will translate that
 state into readiness and Prometheus endpoints. TLS, connection/query timeouts,

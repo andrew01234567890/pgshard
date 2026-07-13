@@ -947,6 +947,15 @@ async fn terminate_catalog_backend(client: &Client, application_name: &str) -> T
     Ok(())
 }
 
+fn catalog_supervisor_test_config() -> Result<CatalogSupervisorConfig, Box<dyn Error>> {
+    Ok(CatalogSupervisorConfig::new(
+        CatalogPollInterval::new(Duration::from_secs(1))?,
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+    )?)
+}
+
 async fn assert_catalog_supervisor_reconnects_with_bounded_grace(
     client: &Client,
     database_url: &str,
@@ -965,12 +974,7 @@ async fn assert_catalog_supervisor_reconnects_with_bounded_grace(
         .user("pgshard_unavailable")
         .dbname("shardschema")
         .connect_timeout(Duration::from_millis(100));
-    let config = CatalogSupervisorConfig::new(
-        CatalogPollInterval::new(Duration::from_secs(1))?,
-        Duration::from_secs(2),
-        Duration::from_millis(10),
-        Duration::from_millis(20),
-    )?;
+    let config = catalog_supervisor_test_config()?;
     let cache = Arc::new(CatalogCache::new());
     let supervisor = CatalogSupervisor::new(cache, config);
     let status = supervisor.status();
@@ -1009,7 +1013,8 @@ async fn assert_catalog_supervisor_reconnects_with_bounded_grace(
         shutdown_sender,
         task,
     )
-    .await
+    .await?;
+    assert_catalog_supervisor_abort_cleanup(client, database_url).await
 }
 
 async fn assert_catalog_supervisor_lifecycle(
@@ -1080,6 +1085,51 @@ async fn assert_catalog_supervisor_lifecycle(
     assert_eq!(
         status.snapshot().readiness_reason(),
         CatalogReadinessReason::Stopped
+    );
+    Ok(())
+}
+
+async fn assert_catalog_supervisor_abort_cleanup(
+    client: &Client,
+    database_url: &str,
+) -> TestResult {
+    let application_name = format!(
+        "pgshard_catalog_abort_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let mut connection_config: tokio_postgres::Config = database_url.parse()?;
+    connection_config.application_name(&application_name);
+    let supervisor = CatalogSupervisor::new(
+        Arc::new(CatalogCache::new()),
+        catalog_supervisor_test_config()?,
+    );
+    let status = supervisor.status();
+    let task = tokio::spawn(supervisor.run(
+        move || {
+            let connection_config = connection_config.clone();
+            async move { connection_config.connect(NoTls).await }
+        },
+        pending(),
+    ));
+    wait_for_supervisor_status(&status, "ready before cancellation", |snapshot| {
+        snapshot.ready() && snapshot.phase() == CatalogConnectionPhase::Connected
+    })
+    .await?;
+    let backend_pid = catalog_backend_pid(client, &application_name).await?;
+
+    task.abort();
+    let cancellation = task
+        .await
+        .expect_err("aborted catalog supervisor task must not complete normally");
+    assert!(cancellation.is_cancelled());
+    let stopped = status.snapshot();
+    assert!(!stopped.ready());
+    assert_eq!(stopped.phase(), CatalogConnectionPhase::Stopped);
+    assert_eq!(stopped.readiness_reason(), CatalogReadinessReason::Stopped);
+    assert!(!stopped.phase().connection_up());
+    assert!(
+        wait_for_backend_exit(client, backend_pid).await?,
+        "catalog backend survived supervisor task cancellation"
     );
     Ok(())
 }

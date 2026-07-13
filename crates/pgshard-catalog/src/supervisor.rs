@@ -18,9 +18,9 @@ use crate::{CatalogCache, CatalogPollInterval, CatalogRefreshError};
 pub const MIN_CATALOG_STALE_GRACE: Duration = Duration::from_secs(2);
 /// Longest accepted interval for serving from the last validated snapshot.
 pub const MAX_CATALOG_STALE_GRACE: Duration = Duration::from_mins(15);
-/// Shortest accepted initial reconnect delay.
+/// Smallest accepted ceiling for the initial reconnect window.
 pub const MIN_CATALOG_RECONNECT_DELAY: Duration = Duration::from_millis(10);
-/// Longest accepted initial reconnect delay.
+/// Largest accepted ceiling for the initial reconnect window.
 pub const MAX_CATALOG_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Longest accepted reconnect-delay ceiling.
 pub const MAX_CATALOG_RECONNECT_DELAY: Duration = Duration::from_mins(1);
@@ -105,7 +105,7 @@ impl CatalogSupervisorConfig {
         self.stale_grace
     }
 
-    /// Returns the lower bound for the first reconnect delay.
+    /// Returns the configured ceiling of the first jittered reconnect window.
     #[must_use]
     pub const fn initial_reconnect_delay(self) -> Duration {
         self.initial_reconnect_delay
@@ -202,7 +202,7 @@ pub enum CatalogConnectionPhase {
     Connected,
     /// The last connection or driver attempt failed and retry is delayed.
     Backoff,
-    /// Graceful shutdown has stopped the runner.
+    /// The runner has stopped or its future was dropped.
     Stopped,
 }
 
@@ -252,7 +252,7 @@ pub enum CatalogReadinessReason {
     CacheUnavailable,
     /// The last authoritative refresh has reached its staleness deadline.
     Stale,
-    /// Graceful shutdown has stopped supervision.
+    /// Supervision has stopped or its future was dropped.
     Stopped,
 }
 
@@ -320,7 +320,7 @@ impl CatalogSupervisorSnapshot {
         self.connect_attempts
     }
 
-    /// Returns connections that reached the initial catalog load phase.
+    /// Returns connections that completed their initial authoritative load.
     #[must_use]
     pub const fn successful_connections(self) -> u64 {
         self.successful_connections
@@ -426,7 +426,6 @@ impl CatalogSupervisorStatus {
     fn mark_loading(&self, now: Instant) {
         self.mutate(now, |state, _| {
             state.phase = CatalogConnectionPhase::Loading;
-            state.successful_connections = state.successful_connections.saturating_add(1);
         });
     }
 
@@ -436,6 +435,9 @@ impl CatalogSupervisorStatus {
         };
         let epoch = snapshot.catalog_epoch();
         self.mutate(now, |state, now| {
+            if state.phase == CatalogConnectionPhase::Loading {
+                state.successful_connections = state.successful_connections.saturating_add(1);
+            }
             state.phase = CatalogConnectionPhase::Connected;
             state.catalog_epoch = Some(epoch);
             state.last_refresh = Some(now);
@@ -495,6 +497,22 @@ pub struct CatalogSupervisor {
     status: CatalogSupervisorStatus,
 }
 
+struct SupervisorRunGuard {
+    status: CatalogSupervisorStatus,
+}
+
+impl SupervisorRunGuard {
+    fn new(status: CatalogSupervisorStatus) -> Self {
+        Self { status }
+    }
+}
+
+impl Drop for SupervisorRunGuard {
+    fn drop(&mut self) {
+        self.status.mark_stopped(Instant::now());
+    }
+}
+
 impl CatalogSupervisor {
     /// Creates one runner over an empty or already populated process cache.
     #[must_use]
@@ -524,7 +542,8 @@ impl CatalogSupervisor {
     ///
     /// `shutdown` interrupts connection attempts, reconnect delay, initial
     /// loads, and refresh queries. Consuming `self` enforces one active runner
-    /// per status handle.
+    /// per status handle. Dropping this future immediately marks the status
+    /// stopped; the inner driver's drop guard aborts its connection pump.
     pub async fn run<C, CF, S, T, E, F>(self, mut connect: C, shutdown: F)
     where
         C: FnMut() -> CF + Send,
@@ -534,6 +553,7 @@ impl CatalogSupervisor {
         E: Send,
         F: Future<Output = ()> + Send,
     {
+        let _run_guard = SupervisorRunGuard::new(self.status.clone());
         let random = RandomState::new();
         tokio::pin!(shutdown);
 
@@ -595,8 +615,6 @@ impl CatalogSupervisor {
                 break;
             }
         }
-
-        self.status.mark_stopped(Instant::now());
     }
 }
 
@@ -778,7 +796,7 @@ mod tests {
         assert_eq!(recovered.connect_attempts(), 1);
         assert_eq!(recovered.successful_connections(), 1);
 
-        status.mark_stopped(now);
+        drop(SupervisorRunGuard::new(status.clone()));
         let stopped = status.snapshot_at(now);
         assert!(!stopped.ready());
         assert_eq!(stopped.readiness_reason(), CatalogReadinessReason::Stopped);
