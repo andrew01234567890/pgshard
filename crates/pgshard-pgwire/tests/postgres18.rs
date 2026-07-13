@@ -13,11 +13,12 @@ use std::time::Duration;
 use pgshard_pgwire::{
     AuthenticationRequest, BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode,
     ExtendedQueryObject, FrontendPhase, PgOutputConfiguration, PgOutputControlMessage,
-    PgOutputEncoding, PgOutputStreaming, PgOutputVersion, Postgres18StartupNegotiation,
-    TransactionStatus, decode_authentication_request, decode_backend, decode_backend_key_data,
-    decode_close, decode_describe, decode_frontend, decode_parameter_description,
-    decode_parameter_status, decode_pgoutput_control, decode_protocol_negotiation,
-    decode_ready_for_query, decode_startup, require_empty_backend_body,
+    PgOutputDecoder, PgOutputEncoding, PgOutputError, PgOutputMessage, PgOutputStreaming,
+    PgOutputVersion, Postgres18StartupNegotiation, TransactionStatus,
+    decode_authentication_request, decode_backend, decode_backend_key_data, decode_close,
+    decode_describe, decode_frontend, decode_parameter_description, decode_parameter_status,
+    decode_pgoutput_control, decode_protocol_negotiation, decode_ready_for_query, decode_startup,
+    require_empty_backend_body,
 };
 
 const POSTGRES_PROTOCOL_3_0: u32 = 3 << 16;
@@ -416,15 +417,137 @@ fn two_phase_slot_state_survives_a_false_start_request(
     let configuration =
         PgOutputConfiguration::new(PgOutputVersion::V1, PgOutputStreaming::Off, false, true)
             .expect("protocol v1 remains decodable for a persistently enabled slot");
-    for message in messages
-        .iter()
-        .filter(|message| matches!(message.first(), Some(b'b' | b'P')))
-    {
-        assert!(matches!(
-            decode_pgoutput_control(message, configuration, encoding),
-            Ok(PgOutputControlMessage::BeginPrepare(_) | PgOutputControlMessage::Prepare(_))
-        ));
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message[0])
+            .collect::<Vec<_>>(),
+        b"bRIP"
+    );
+    assert!(matches!(
+        decode_pgoutput_control(&messages[0], configuration, encoding),
+        Ok(PgOutputControlMessage::BeginPrepare(_))
+    ));
+    let mut decoder = PgOutputDecoder::new(configuration, encoding);
+    assert!(matches!(
+        decoder.decode(&messages[0]),
+        Ok(PgOutputMessage::Control(
+            PgOutputControlMessage::BeginPrepare(_)
+        ))
+    ));
+    let PgOutputMessage::Relation(relation) = decoder.decode(&messages[1]).expect("live Relation")
+    else {
+        panic!("live Relation decoded as another message");
+    };
+    assert_eq!(relation.stream_xid(), None);
+    assert_eq!(relation.namespace(), "public");
+    assert_eq!(relation.name(), table);
+    assert_eq!(relation.column_count(), 1);
+    let column = relation.columns().next().expect("live relation column");
+    assert!(column.part_of_replica_identity());
+    assert_eq!(column.name(), "id");
+    assert_eq!(column.type_oid(), 23);
+    assert_eq!(column.type_modifier(), -1);
+    assert_eq!(
+        decoder.decode(&messages[2]),
+        Err(PgOutputError::NonControlMessage(b'I'))
+    );
+    assert!(matches!(
+        decoder.decode(&messages[3]),
+        Ok(PgOutputMessage::Control(PgOutputControlMessage::Prepare(_)))
+    ));
+}
+
+fn streamed_subtransaction_schema_keeps_its_own_xid(
+    stream: &mut TcpStream,
+    encoding: PgOutputEncoding,
+) {
+    let suffix = std::process::id();
+    let table = format!("pgshard_pgoutput_stream_table_{suffix}");
+    let publication = format!("pgshard_pgoutput_stream_publication_{suffix}");
+    let slot = format!("pgshard_pgoutput_stream_slot_{suffix}");
+
+    simple_query(
+        stream,
+        &format!("CREATE TABLE {table} (id integer PRIMARY KEY, payload text NOT NULL)"),
+    );
+    simple_query(
+        stream,
+        &format!("CREATE PUBLICATION {publication} FOR TABLE {table}"),
+    );
+    let create_slot =
+        format!("SELECT slot_name FROM pg_create_logical_replication_slot('{slot}', 'pgoutput')");
+    let slot_creation_result = simple_query(stream, &create_slot);
+    simple_query(
+        stream,
+        &format!(
+            "BEGIN; SAVEPOINT child; INSERT INTO {table} \
+             SELECT value, repeat('x', 512) FROM generate_series(1, 512) AS value; \
+             RELEASE SAVEPOINT child; COMMIT"
+        ),
+    );
+    simple_query(stream, "SET logical_decoding_work_mem = '64kB'");
+    let peek = format!(
+        "SELECT encode(data, 'hex') FROM pg_logical_slot_peek_binary_changes(\
+         '{slot}', NULL, NULL, 'proto_version', '2', 'publication_names', \
+         '{publication}', 'streaming', 'on')"
+    );
+    let messages: Vec<Vec<u8>> = simple_query(stream, &peek)
+        .into_iter()
+        .map(|row| decode_hex(&row))
+        .collect();
+    simple_query(
+        stream,
+        &format!("SELECT pg_drop_replication_slot('{slot}')"),
+    );
+    simple_query(stream, &format!("DROP PUBLICATION {publication}"));
+    simple_query(stream, &format!("DROP TABLE {table}"));
+    simple_query(stream, "RESET logical_decoding_work_mem");
+
+    assert_eq!(slot_creation_result, [slot.as_bytes()]);
+    let configuration =
+        PgOutputConfiguration::new(PgOutputVersion::V2, PgOutputStreaming::On, false, false)
+            .expect("protocol v2 streaming configuration");
+    let mut decoder = PgOutputDecoder::new(configuration, encoding);
+    let mut top_level_xid = None;
+    let mut schema_xid = None;
+    for message in &messages {
+        match message.first() {
+            Some(b'S') => {
+                let PgOutputMessage::Control(PgOutputControlMessage::StreamStart { xid, .. }) =
+                    decoder.decode(message).expect("live Stream Start")
+                else {
+                    panic!("live Stream Start decoded as another message");
+                };
+                top_level_xid.get_or_insert(xid);
+            }
+            Some(b'R') => {
+                let PgOutputMessage::Relation(relation) =
+                    decoder.decode(message).expect("live streamed Relation")
+                else {
+                    panic!("live Relation decoded as another message");
+                };
+                if relation.name() == table {
+                    schema_xid.get_or_insert(
+                        relation
+                            .stream_xid()
+                            .expect("streamed Relation carries a transaction ID"),
+                    );
+                }
+            }
+            Some(b'E') => {
+                decoder.decode(message).expect("live Stream Stop");
+            }
+            _ => {}
+        }
     }
+    decoder.finish().expect("all live stream segments stopped");
+    let top_level_xid = top_level_xid.expect("PostgreSQL emitted Stream Start");
+    let schema_xid = schema_xid.expect("PostgreSQL emitted streamed Relation");
+    assert_ne!(
+        schema_xid, top_level_xid,
+        "savepoint Relation must prove the subtransaction-XID layout"
+    );
 }
 
 #[test]
@@ -456,6 +579,7 @@ fn postgres18_wire_and_persistent_slot_controls_decode_from_real_bytes() {
     describe_statement(&mut stream, utf8);
     close_statement(&mut stream, utf8);
     two_phase_slot_state_survives_a_false_start_request(&mut stream, pgoutput_encoding);
+    streamed_subtransaction_schema_keeps_its_own_xid(&mut stream, pgoutput_encoding);
 
     stream
         .write_all(&frontend(b'X', b""))
