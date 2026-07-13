@@ -61,7 +61,8 @@ range end.
 4. It swaps the immutable cache state atomically.
 5. PostgreSQL `NOTIFY` sends only the committed positive decimal epoch.
 6. A notification is a wake-up hint, never authoritative data; duplicate,
-   stale, malformed, and burst-coalesced hints need not trigger a read.
+   stale, and malformed hints need not trigger a read, while a burst retains
+   only its latest valid epoch.
 7. The driver polls every bounded 1 to 300 seconds. Connection loss is terminal
    so its future pooler supervisor must fail readiness and reconnect before
    serving from a newly initialized driver.

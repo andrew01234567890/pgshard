@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::{
     CatalogCache, CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId,
-    IdentifierError, InstallOutcome, RegisteredTable, RoutingHashConfig, ShardKeyType, ShardRoute,
-    SnapshotError, TableName,
+    IdentifierError, InstallOutcome, NOTIFY_CHANNEL, RegisteredTable, RoutingHashConfig,
+    ShardKeyType, ShardRoute, SnapshotError, TableName,
 };
 
 /// Maximum logical databases published in one process snapshot.
@@ -95,7 +95,7 @@ impl CatalogReader {
     ) -> Result<(Self, InstallOutcome), LoadError> {
         client.batch_execute("DISCARD ALL").await?;
         client
-            .batch_execute("LISTEN pgshard_catalog_changed")
+            .batch_execute(&format!("LISTEN {NOTIFY_CHANNEL}"))
             .await?;
         let mut reader = Self { client };
         let outcome = reader.refresh(cache).await?;

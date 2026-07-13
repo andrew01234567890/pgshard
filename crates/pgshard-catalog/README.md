@@ -30,9 +30,9 @@ periodic polling remains required. `CatalogReader::subscribe` takes ownership
 of a dedicated connection, rejects a manually opened transaction, clears
 session-local state, and commits its subscription before the initial
 transactionally consistent read. `run_catalog_refresh` drives that connection,
-coalesces notification bursts through one bounded wakeup slot, ignores invalid
-hints, and performs authoritative repeatable-read polling every 1 to 300
-seconds. Connection loss is terminal rather than a silent polling-only mode.
+coalesces notification bursts through one latest-wins wakeup slot, ignores
+invalid hints, and performs authoritative repeatable-read polling every 1 to
+300 seconds. Connection loss is terminal rather than a silent polling-only mode.
 The future pooler must configure TLS and timeouts, supervise reconnect with
 backoff, and expose readiness and refresh metrics; that composition is not yet
 implemented.

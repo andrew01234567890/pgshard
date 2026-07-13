@@ -1,12 +1,13 @@
 //! Long-running notification and polling driver for the catalog cache.
 
 use std::future::{Future, poll_fn};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_postgres::{AsyncMessage, Client, Connection};
@@ -21,8 +22,6 @@ pub const MIN_CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const MAX_CATALOG_POLL_INTERVAL: Duration = Duration::from_mins(5);
 /// Default authoritative polling interval.
 pub const DEFAULT_CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(30);
-
-const NOTIFICATION_QUEUE_CAPACITY: usize = 1;
 
 /// Bounded interval between authoritative catalog reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,15 +73,17 @@ impl CatalogPollIntervalError {
 /// Runs one dedicated catalog connection until shutdown or failure.
 ///
 /// Construction commits `LISTEN` before publishing the initial snapshot. A
-/// one-item wakeup queue deliberately coalesces bursts and may drop notification
-/// hints; the periodic repeatable-read refresh remains authoritative. Invalid
-/// payloads and notifications from other channels are ignored for the same
-/// reason. Connection closure is terminal so the owner can fail readiness and
-/// create a fresh connection rather than silently running on polling alone.
+/// single latest-wins wakeup slot deliberately coalesces bursts; the periodic
+/// repeatable-read refresh remains authoritative. Invalid payloads and
+/// notifications from other channels are ignored for the same reason.
+/// Connection closure is terminal so the owner can fail readiness and create a
+/// fresh connection rather than silently running on polling alone.
 ///
 /// The caller remains responsible for TLS, authentication, connect and query
 /// timeouts, retry backoff, and supervising this future. `shutdown` is observed
-/// between refreshes and while a refresh query is pending.
+/// during subscription, between refreshes, and while a refresh query is
+/// pending. Dropping this future aborts its connection pump rather than
+/// detaching the socket task.
 ///
 /// # Errors
 ///
@@ -101,29 +102,62 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: Future<Output = ()>,
 {
-    let (sender, receiver) = mpsc::channel(NOTIFICATION_QUEUE_CAPACITY);
-    let connection_task = tokio::spawn(forward_notifications(connection, sender));
-    let (reader, _) = match CatalogReader::subscribe(client, &cache).await {
+    let (sender, receiver) = watch::channel(None);
+    let connection_task =
+        ConnectionTask::new(tokio::spawn(forward_notifications(connection, sender)));
+    tokio::pin!(shutdown);
+    let subscription = {
+        let subscription = CatalogReader::subscribe(client, &cache);
+        tokio::pin!(subscription);
+        tokio::select! {
+            biased;
+            () = shutdown.as_mut() => return stop_connection(connection_task).await,
+            result = subscription.as_mut() => result,
+        }
+    };
+    let (reader, _) = match subscription {
         Ok(reader) => reader,
         Err(source) => {
             return Err(cleanup_after_load_error(connection_task, source).await);
         }
     };
 
-    match refresh_loop(reader, receiver, &cache, poll_interval, shutdown).await {
+    match refresh_loop(reader, receiver, &cache, poll_interval, shutdown.as_mut()).await {
         Ok(RefreshLoopExit::Shutdown) => stop_connection(connection_task).await,
-        Ok(RefreshLoopExit::ConnectionClosed) => match connection_task.await {
-            Ok(Ok(())) => Err(CatalogRefreshError::ConnectionClosed),
-            Ok(Err(source)) => Err(CatalogRefreshError::Connection(source)),
-            Err(source) => Err(CatalogRefreshError::ConnectionTask(source)),
-        },
+        Ok(RefreshLoopExit::ConnectionClosed) => finish_connection(connection_task).await,
         Err(source) => Err(cleanup_after_load_error(connection_task, source).await),
+    }
+}
+
+struct ConnectionTask {
+    handle: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
+}
+
+impl ConnectionTask {
+    fn new(handle: JoinHandle<Result<(), tokio_postgres::Error>>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn into_handle(mut self) -> JoinHandle<Result<(), tokio_postgres::Error>> {
+        self.handle
+            .take()
+            .expect("connection task handle is consumed exactly once")
+    }
+}
+
+impl Drop for ConnectionTask {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
     }
 }
 
 async fn forward_notifications<S, T>(
     mut connection: Connection<S, T>,
-    sender: mpsc::Sender<CatalogNotification>,
+    sender: watch::Sender<Option<CatalogNotification>>,
 ) -> Result<(), tokio_postgres::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -140,12 +174,16 @@ where
         let Ok(notification) = CatalogNotification::parse(notification.payload()) else {
             continue;
         };
-        match sender.try_send(notification) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-            Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
-        }
+        publish_notification(&sender, notification);
     }
     Ok(())
+}
+
+fn publish_notification(
+    sender: &watch::Sender<Option<CatalogNotification>>,
+    notification: CatalogNotification,
+) {
+    let _ = sender.send_replace(Some(notification));
 }
 
 enum RefreshLoopExit {
@@ -155,10 +193,10 @@ enum RefreshLoopExit {
 
 async fn refresh_loop<F>(
     mut reader: CatalogReader,
-    mut notifications: mpsc::Receiver<CatalogNotification>,
+    mut notifications: watch::Receiver<Option<CatalogNotification>>,
     cache: &CatalogCache,
     poll_interval: CatalogPollInterval,
-    shutdown: F,
+    mut shutdown: Pin<&mut F>,
 ) -> Result<RefreshLoopExit, LoadError>
 where
     F: Future<Output = ()>,
@@ -166,17 +204,18 @@ where
     let interval = poll_interval.get();
     let mut poll = tokio::time::interval_at(Instant::now() + interval, interval);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    tokio::pin!(shutdown);
 
     loop {
         let should_refresh = tokio::select! {
             biased;
-            () = &mut shutdown => return Ok(RefreshLoopExit::Shutdown),
+            () = shutdown.as_mut() => return Ok(RefreshLoopExit::Shutdown),
             _ = poll.tick() => true,
-            notification = notifications.recv() => {
-                let Some(notification) = notification else {
+            notification = notifications.changed() => {
+                if notification.is_err() {
                     return Ok(RefreshLoopExit::ConnectionClosed);
-                };
+                }
+                let notification = (*notifications.borrow_and_update())
+                    .expect("a notification change always publishes an epoch");
                 cache.refresh_decision(notification) == RefreshDecision::Refresh
             }
         };
@@ -185,7 +224,7 @@ where
         }
         tokio::select! {
             biased;
-            () = &mut shutdown => return Ok(RefreshLoopExit::Shutdown),
+            () = shutdown.as_mut() => return Ok(RefreshLoopExit::Shutdown),
             result = reader.refresh(cache) => {
                 result?;
             }
@@ -194,26 +233,32 @@ where
 }
 
 async fn cleanup_after_load_error(
-    connection_task: JoinHandle<Result<(), tokio_postgres::Error>>,
+    connection_task: ConnectionTask,
     load: LoadError,
 ) -> CatalogRefreshError {
+    let connection_task = connection_task.into_handle();
     connection_task.abort();
     match connection_task.await {
-        Ok(Ok(())) => CatalogRefreshError::ConnectionClosed,
-        Ok(Err(source)) => CatalogRefreshError::Connection(source),
         Err(source) if source.is_panic() => CatalogRefreshError::ConnectionTask(source),
         _ => CatalogRefreshError::Load(load),
     }
 }
 
-async fn stop_connection(
-    connection_task: JoinHandle<Result<(), tokio_postgres::Error>>,
-) -> Result<(), CatalogRefreshError> {
+async fn stop_connection(connection_task: ConnectionTask) -> Result<(), CatalogRefreshError> {
+    let connection_task = connection_task.into_handle();
     connection_task.abort();
     match connection_task.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(source)) => Err(CatalogRefreshError::Connection(source)),
         Err(source) if source.is_cancelled() => Ok(()),
+        Err(source) => Err(CatalogRefreshError::ConnectionTask(source)),
+    }
+}
+
+async fn finish_connection(connection_task: ConnectionTask) -> Result<(), CatalogRefreshError> {
+    match connection_task.into_handle().await {
+        Ok(Ok(())) => Err(CatalogRefreshError::ConnectionClosed),
+        Ok(Err(source)) => Err(CatalogRefreshError::Connection(source)),
         Err(source) => Err(CatalogRefreshError::ConnectionTask(source)),
     }
 }
@@ -237,6 +282,8 @@ pub enum CatalogRefreshError {
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
+
     use super::*;
 
     #[test]
@@ -267,5 +314,61 @@ mod tests {
             let error = CatalogPollInterval::new(rejected).expect_err("invalid interval");
             assert_eq!(error.interval(), rejected);
         }
+    }
+
+    #[tokio::test]
+    async fn load_error_precedes_clean_connection_exit() {
+        let handle = tokio::spawn(async { Ok::<(), tokio_postgres::Error>(()) });
+        tokio::task::yield_now().await;
+        assert!(handle.is_finished(), "connection task did not finish");
+
+        let error =
+            cleanup_after_load_error(ConnectionTask::new(handle), LoadError::MissingSingleton)
+                .await;
+        assert!(matches!(
+            error,
+            CatalogRefreshError::Load(LoadError::MissingSingleton)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_connection_task_aborts_the_child() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_sender));
+            let _ = started_sender.send(());
+            pending::<Result<(), tokio_postgres::Error>>().await
+        });
+        started_receiver.await.expect("child task started");
+
+        drop(ConnectionTask::new(handle));
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .expect("aborted child dropped within one second")
+            .expect("child retained its drop signal");
+    }
+
+    #[tokio::test]
+    async fn notification_slot_retains_the_latest_epoch() {
+        let (sender, mut receiver) = watch::channel(None);
+        let older = CatalogNotification::parse("2").expect("older epoch");
+        let newer = CatalogNotification::parse("3").expect("newer epoch");
+
+        publish_notification(&sender, older);
+        publish_notification(&sender, newer);
+        receiver.changed().await.expect("notification published");
+
+        assert_eq!(*receiver.borrow_and_update(), Some(newer));
     }
 }
