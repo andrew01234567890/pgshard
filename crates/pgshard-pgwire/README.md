@@ -40,10 +40,13 @@ libpq's 2,000-byte ceiling, other tags not classified as long retain libpq's
 subject to the caller ceiling no larger than 64 MiB. Unknown tags are rejected
 before their length is trusted. Authentication, query-cycle, COPY, and
 replication phase legality remains the future session state machine's
-responsibility. The first typed backend body decoder validates
-`ParameterDescription` exactly and exposes its type OIDs through a borrowed
-iterator. It does not associate that description with a Parse generation,
-statement name, backend identity, or catalog fence.
+responsibility. The typed backend body decoders validate
+`ParameterDescription` exactly, expose its type OIDs through a borrowed
+iterator, validate the exact empty-response family, and decode `ReadyForQuery`
+as idle, in-transaction, or failed-transaction state. The frontend body
+decoders include `Describe` and `Close` statement/portal targets. They do not
+associate a description with a Parse generation, virtualize a name, track a
+query cycle, identify a backend, or establish a catalog fence.
 
 The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH
 loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is

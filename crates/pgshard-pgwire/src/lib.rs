@@ -14,12 +14,14 @@ mod messages;
 pub use backend::{
     BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH, BackendFrame,
     BackendMessageError, BackendTag, MAX_BACKEND_KEY_DATA_LENGTH, MAX_PARAMETER_DESCRIPTION_LENGTH,
-    ParameterDescription, decode_backend, decode_parameter_description,
+    ParameterDescription, TransactionStatus, decode_backend, decode_parameter_description,
+    decode_ready_for_query, require_empty_backend_body,
 };
 
 pub use messages::{
-    BindMessage, BindParameter, BindParameterIter, BindParameters, ExecuteMessage, FormatCode,
-    FormatCodeIter, MessageError, ParameterTypeIter, ParseMessage, QueryMessage, decode_bind,
+    BindMessage, BindParameter, BindParameterIter, BindParameters, CloseMessage, DescribeMessage,
+    ExecuteMessage, ExtendedQueryObject, FormatCode, FormatCodeIter, MessageError,
+    ParameterTypeIter, ParseMessage, QueryMessage, decode_bind, decode_close, decode_describe,
     decode_execute, decode_parse, decode_query, require_empty_body,
 };
 

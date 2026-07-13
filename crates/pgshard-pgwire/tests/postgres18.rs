@@ -1,4 +1,4 @@
-//! Live `PostgreSQL` 18 backend-framing and parameter-description contract test.
+//! Live `PostgreSQL` 18 extended-query framing and body-decoder contract test.
 //!
 //! The fixture must allow TCP trust authentication because this deliberately
 //! small raw protocol client does not implement password or SASL exchange.
@@ -10,7 +10,10 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use pgshard_pgwire::{
-    BackendTag, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, decode_backend, decode_parameter_description,
+    BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, ExtendedQueryObject,
+    FrontendPhase, TransactionStatus, decode_backend, decode_close, decode_describe,
+    decode_frontend, decode_parameter_description, decode_ready_for_query,
+    require_empty_backend_body,
 };
 
 fn startup(user: &str, database: &str) -> Vec<u8> {
@@ -81,6 +84,17 @@ fn decoded_frame(bytes: &[u8]) -> pgshard_pgwire::BackendFrame<'_> {
     frame
 }
 
+fn decoded_frontend(bytes: &[u8]) -> pgshard_pgwire::FrontendFrame<'_> {
+    let Decode::Complete { frame, consumed } =
+        decode_frontend(bytes, FrontendPhase::Regular, DEFAULT_LARGE_MESSAGE_LENGTH)
+            .expect("decode frontend frame")
+    else {
+        panic!("complete frontend frame decoded as incomplete");
+    };
+    assert_eq!(consumed, bytes.len());
+    frame
+}
+
 fn parameter_status(body: &[u8]) -> Option<(&str, &str)> {
     let name_end = body.iter().position(|byte| *byte == 0)?;
     let after_name = body.get(name_end + 1..)?;
@@ -94,29 +108,12 @@ fn parameter_status(body: &[u8]) -> Option<(&str, &str)> {
     ))
 }
 
-#[test]
-#[ignore = "requires a trust-authenticated PostgreSQL 18 TCP fixture"]
-fn postgres18_parameter_description_decodes_from_real_wire_bytes() {
-    let address = std::env::var("PGSHARD_PGWIRE_TEST_ADDRESS")
-        .expect("PGSHARD_PGWIRE_TEST_ADDRESS is required");
-    let user = std::env::var("PGSHARD_PGWIRE_TEST_USER").unwrap_or_else(|_| "postgres".into());
-    let database =
-        std::env::var("PGSHARD_PGWIRE_TEST_DATABASE").unwrap_or_else(|_| "postgres".into());
-    let mut stream = TcpStream::connect(&address).expect("connect to PostgreSQL 18");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set read timeout");
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .expect("set write timeout");
-    stream
-        .write_all(&startup(&user, &database))
-        .expect("send startup packet");
-
+fn finish_startup(stream: &mut TcpStream) -> ClientEncoding {
     let mut authenticated = false;
     let mut postgres18 = false;
+    let mut client_encoding = None;
     loop {
-        let bytes = read_backend(&mut stream);
+        let bytes = read_backend(stream);
         let frame = decoded_frame(&bytes);
         match frame.tag() {
             BackendTag::AuthenticationRequest => {
@@ -132,11 +129,16 @@ fn postgres18_parameter_description_decodes_from_real_wire_bytes() {
                     parameter_status(frame.body()).expect("valid ParameterStatus body");
                 if name == "server_version" {
                     postgres18 = value == "18" || value.starts_with("18.");
+                } else if name == "client_encoding" {
+                    client_encoding = Some(
+                        ClientEncoding::require_utf8(value)
+                            .expect("PostgreSQL honored client_encoding=UTF8"),
+                    );
                 }
             }
             BackendTag::ErrorResponse => panic!("PostgreSQL rejected startup"),
             BackendTag::ReadyForQuery => {
-                assert_eq!(frame.body(), b"I");
+                assert_eq!(decode_ready_for_query(frame), Ok(TransactionStatus::Idle));
                 break;
             }
             _ => {}
@@ -144,12 +146,18 @@ fn postgres18_parameter_description_decodes_from_real_wire_bytes() {
     }
     assert!(authenticated, "server omitted AuthenticationOk");
     assert!(postgres18, "test requires PostgreSQL major version 18");
+    client_encoding.expect("server omitted client_encoding ParameterStatus")
+}
 
+fn describe_statement(stream: &mut TcpStream, utf8: ClientEncoding) {
     let mut parse_body = b"pgshard_types\0SELECT $1::bigint, $2::uuid, $3::bytea\0".to_vec();
     parse_body.extend_from_slice(&0_u16.to_be_bytes());
     let parse = frontend(b'P', &parse_body);
     let describe = frontend(b'D', b"Spgshard_types\0");
     let sync = frontend(b'S', b"");
+    let decoded_describe = decode_describe(decoded_frontend(&describe), utf8).expect("Describe");
+    assert_eq!(decoded_describe.object(), ExtendedQueryObject::Statement);
+    assert_eq!(decoded_describe.name(), "pgshard_types");
     stream.write_all(&parse).expect("send Parse");
     stream.write_all(&describe).expect("send Describe");
     stream.write_all(&sync).expect("send Sync");
@@ -158,11 +166,11 @@ fn postgres18_parameter_description_decodes_from_real_wire_bytes() {
     let mut row_description = false;
     let mut parameter_description_count = 0;
     loop {
-        let bytes = read_backend(&mut stream);
+        let bytes = read_backend(stream);
         let frame = decoded_frame(&bytes);
         match frame.tag() {
             BackendTag::ParseComplete => {
-                assert!(frame.body().is_empty());
+                require_empty_backend_body(frame).expect("empty ParseComplete");
                 parse_complete = true;
             }
             BackendTag::ParameterDescription => {
@@ -177,7 +185,7 @@ fn postgres18_parameter_description_decodes_from_real_wire_bytes() {
             BackendTag::RowDescription => row_description = true,
             BackendTag::ErrorResponse => panic!("PostgreSQL rejected Parse or Describe"),
             BackendTag::ReadyForQuery => {
-                assert_eq!(frame.body(), b"I");
+                assert_eq!(decode_ready_for_query(frame), Ok(TransactionStatus::Idle));
                 break;
             }
             _ => {}
@@ -186,6 +194,58 @@ fn postgres18_parameter_description_decodes_from_real_wire_bytes() {
     assert!(parse_complete, "server omitted ParseComplete");
     assert!(row_description, "server omitted RowDescription");
     assert_eq!(parameter_description_count, 1);
+}
+
+fn close_statement(stream: &mut TcpStream, utf8: ClientEncoding) {
+    let close = frontend(b'C', b"Spgshard_types\0");
+    let decoded_close = decode_close(decoded_frontend(&close), utf8).expect("Close");
+    assert_eq!(decoded_close.object(), ExtendedQueryObject::Statement);
+    assert_eq!(decoded_close.name(), "pgshard_types");
+    stream.write_all(&close).expect("send Close");
+    stream
+        .write_all(&frontend(b'S', b""))
+        .expect("send Sync after Close");
+    let mut close_complete = false;
+    loop {
+        let bytes = read_backend(stream);
+        let frame = decoded_frame(&bytes);
+        match frame.tag() {
+            BackendTag::CloseComplete => {
+                require_empty_backend_body(frame).expect("empty CloseComplete");
+                close_complete = true;
+            }
+            BackendTag::ErrorResponse => panic!("PostgreSQL rejected Close"),
+            BackendTag::ReadyForQuery => {
+                assert_eq!(decode_ready_for_query(frame), Ok(TransactionStatus::Idle));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(close_complete, "server omitted CloseComplete");
+}
+
+#[test]
+#[ignore = "requires a trust-authenticated PostgreSQL 18 TCP fixture"]
+fn postgres18_extended_query_controls_decode_from_real_wire_bytes() {
+    let address = std::env::var("PGSHARD_PGWIRE_TEST_ADDRESS")
+        .expect("PGSHARD_PGWIRE_TEST_ADDRESS is required");
+    let user = std::env::var("PGSHARD_PGWIRE_TEST_USER").unwrap_or_else(|_| "postgres".into());
+    let database =
+        std::env::var("PGSHARD_PGWIRE_TEST_DATABASE").unwrap_or_else(|_| "postgres".into());
+    let mut stream = TcpStream::connect(&address).expect("connect to PostgreSQL 18");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+    stream
+        .write_all(&startup(&user, &database))
+        .expect("send startup packet");
+    let utf8 = finish_startup(&mut stream);
+    describe_statement(&mut stream, utf8);
+    close_statement(&mut stream, utf8);
 
     stream
         .write_all(&frontend(b'X', b""))
