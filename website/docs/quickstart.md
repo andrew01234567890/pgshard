@@ -25,3 +25,9 @@ This validates contracts, core and runtime foundations, generated Kubernetes
 resources, release policy and documentation; it does not start PostgreSQL or
 prove a sharding runtime. Follow [implementation status](./project/status.md)
 for the first version with a real cluster quickstart.
+
+The catalog migration has a separate opt-in live contract test against a
+disposable PostgreSQL 18 `shardschema` database. See the
+[`pgshard-catalog` README](https://github.com/andrew01234567890/pgshard/tree/main/crates/pgshard-catalog)
+for its preconditions. CI runs that test with an ephemeral service database;
+the operator does not bootstrap it yet.
