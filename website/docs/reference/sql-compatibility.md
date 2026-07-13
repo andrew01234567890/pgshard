@@ -130,6 +130,17 @@ rendering the key in debug output, and validate `ParameterStatus` as exactly
 two terminated UTF-8 strings. A reported `client_encoding` is authoritative
 session state: the pooler must reject a value other than canonical `UTF8`
 before decoding more query-protocol bodies.
+Typed startup-control decoders also validate PostgreSQL 18 authentication
+request layouts, counted and terminated SASL mechanism lists, opaque exchange
+payloads, and `NegotiateProtocolVersion` responses. Authentication salts,
+mechanism names, and exchange data are omitted from debug output. Negotiation
+decoding preserves the complete major/minor protocol code and requires every
+reported option name to use the reserved `_pq_.` prefix. This is message-local
+validation only: the future session state machine must enforce exchange order,
+authentication policy, channel binding, server identity, one negotiation at
+most, no upgrade or no-op negotiation, the absence of nonexistent protocol 3.1,
+the configured minimum version, and an exact match between unsupported options
+and the options that the client actually requested.
 The transport layer, which is not implemented yet, must handle PostgreSQL 18
 direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting

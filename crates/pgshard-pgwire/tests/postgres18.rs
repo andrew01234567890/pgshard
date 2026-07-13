@@ -1,4 +1,4 @@
-//! Live `PostgreSQL` 18 backend-metadata and extended-query decoder contract.
+//! Live `PostgreSQL` 18 startup-control, metadata, and query decoder contract.
 //!
 //! The fixture must allow TCP trust authentication because this deliberately
 //! small raw protocol client does not implement password or SASL exchange.
@@ -10,17 +10,24 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use pgshard_pgwire::{
-    BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, ExtendedQueryObject,
-    FrontendPhase, MAX_CANCEL_KEY_LENGTH, MIN_BACKEND_CANCEL_KEY_LENGTH, TransactionStatus,
-    decode_backend, decode_backend_key_data, decode_close, decode_describe, decode_frontend,
-    decode_parameter_description, decode_parameter_status, decode_ready_for_query,
+    AuthenticationRequest, BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode,
+    ExtendedQueryObject, FrontendPhase, MAX_CANCEL_KEY_LENGTH, MIN_BACKEND_CANCEL_KEY_LENGTH,
+    TransactionStatus, decode_authentication_request, decode_backend, decode_backend_key_data,
+    decode_close, decode_describe, decode_frontend, decode_parameter_description,
+    decode_parameter_status, decode_protocol_negotiation, decode_ready_for_query,
     require_empty_backend_body,
 };
 
 const POSTGRES_PROTOCOL_3_0: u32 = 3 << 16;
 const POSTGRES_PROTOCOL_3_2: u32 = (3 << 16) | 2;
+const POSTGRES_PROTOCOL_3_99: u32 = (3 << 16) | 0x0063;
 
-fn startup(protocol: u32, user: &str, database: &str) -> Vec<u8> {
+fn startup(
+    protocol: u32,
+    user: &str,
+    database: &str,
+    extra_parameters: &[(&str, &str)],
+) -> Vec<u8> {
     assert!(
         !user.as_bytes().contains(&0),
         "test user contains zero byte"
@@ -34,7 +41,18 @@ fn startup(protocol: u32, user: &str, database: &str) -> Vec<u8> {
         ("user", user),
         ("database", database),
         ("client_encoding", "UTF8"),
-    ] {
+    ]
+    .into_iter()
+    .chain(extra_parameters.iter().copied())
+    {
+        assert!(
+            !name.as_bytes().contains(&0),
+            "test parameter name contains zero byte"
+        );
+        assert!(
+            !value.as_bytes().contains(&0),
+            "test parameter value contains zero byte"
+        );
         body.extend_from_slice(name.as_bytes());
         body.push(0);
         body.extend_from_slice(value.as_bytes());
@@ -114,9 +132,14 @@ fn validate_backend_key_data(frame: pgshard_pgwire::BackendFrame<'_>, expected_k
     );
 }
 
-fn finish_startup(stream: &mut TcpStream, expected_key_length: usize) -> ClientEncoding {
+fn finish_startup(
+    stream: &mut TcpStream,
+    expected_key_length: usize,
+    expected_unsupported_options: Option<&[&[u8]]>,
+) -> ClientEncoding {
     let mut authenticated = false;
     let mut backend_key_data = false;
+    let mut negotiation_count = 0;
     let mut postgres18 = false;
     let mut client_encoding = None;
     loop {
@@ -124,12 +147,29 @@ fn finish_startup(stream: &mut TcpStream, expected_key_length: usize) -> ClientE
         let frame = decoded_frame(&bytes);
         match frame.tag() {
             BackendTag::AuthenticationRequest => {
-                assert_eq!(
-                    frame.body(),
-                    0_u32.to_be_bytes(),
-                    "fixture must use trust authentication"
+                let request = decode_authentication_request(frame)
+                    .expect("valid PostgreSQL 18 authentication body");
+                assert!(
+                    matches!(request, AuthenticationRequest::Ok),
+                    "fixture must use trust authentication; received {request:?}"
                 );
                 authenticated = true;
+            }
+            BackendTag::NegotiateProtocolVersion => {
+                negotiation_count += 1;
+                assert_eq!(
+                    negotiation_count, 1,
+                    "server negotiated the protocol more than once"
+                );
+                let negotiation = decode_protocol_negotiation(frame)
+                    .expect("valid PostgreSQL 18 protocol negotiation body");
+                assert_eq!(negotiation.selected_protocol().major(), 3);
+                assert_eq!(negotiation.selected_protocol().minor(), 2);
+                assert_eq!(
+                    negotiation.unsupported_options().collect::<Vec<_>>(),
+                    expected_unsupported_options
+                        .expect("server unexpectedly negotiated the protocol")
+                );
             }
             BackendTag::ParameterStatus => {
                 let status =
@@ -157,6 +197,11 @@ fn finish_startup(stream: &mut TcpStream, expected_key_length: usize) -> ClientE
     }
     assert!(authenticated, "server omitted AuthenticationOk");
     assert!(backend_key_data, "server omitted BackendKeyData");
+    assert_eq!(
+        negotiation_count,
+        usize::from(expected_unsupported_options.is_some()),
+        "unexpected number of protocol negotiation responses"
+    );
     assert!(postgres18, "test requires PostgreSQL major version 18");
     client_encoding.expect("server omitted client_encoding ParameterStatus")
 }
@@ -250,7 +295,7 @@ fn close_statement(stream: &mut TcpStream, utf8: ClientEncoding) {
 
 #[test]
 #[ignore = "requires a trust-authenticated PostgreSQL 18 TCP fixture"]
-fn postgres18_extended_query_controls_decode_from_real_wire_bytes() {
+fn postgres18_startup_and_extended_query_controls_decode_from_real_wire_bytes() {
     let address = std::env::var("PGSHARD_PGWIRE_TEST_ADDRESS")
         .expect("PGSHARD_PGWIRE_TEST_ADDRESS is required");
     let user = std::env::var("PGSHARD_PGWIRE_TEST_USER").unwrap_or_else(|_| "postgres".into());
@@ -258,22 +303,40 @@ fn postgres18_extended_query_controls_decode_from_real_wire_bytes() {
         std::env::var("PGSHARD_PGWIRE_TEST_DATABASE").unwrap_or_else(|_| "postgres".into());
     let mut legacy = connect(&address);
     legacy
-        .write_all(&startup(POSTGRES_PROTOCOL_3_0, &user, &database))
+        .write_all(&startup(POSTGRES_PROTOCOL_3_0, &user, &database, &[]))
         .expect("send protocol 3.0 startup packet");
-    finish_startup(&mut legacy, MIN_BACKEND_CANCEL_KEY_LENGTH);
+    finish_startup(&mut legacy, MIN_BACKEND_CANCEL_KEY_LENGTH, None);
     legacy
         .write_all(&frontend(b'X', b""))
         .expect("terminate protocol 3.0 connection");
 
     let mut stream = connect(&address);
     stream
-        .write_all(&startup(POSTGRES_PROTOCOL_3_2, &user, &database))
+        .write_all(&startup(POSTGRES_PROTOCOL_3_2, &user, &database, &[]))
         .expect("send protocol 3.2 startup packet");
-    let utf8 = finish_startup(&mut stream, 32);
+    let utf8 = finish_startup(&mut stream, 32, None);
     describe_statement(&mut stream, utf8);
     close_statement(&mut stream, utf8);
 
     stream
         .write_all(&frontend(b'X', b""))
         .expect("send Terminate");
+
+    let mut negotiated = connect(&address);
+    negotiated
+        .write_all(&startup(
+            POSTGRES_PROTOCOL_3_99,
+            &user,
+            &database,
+            &[("_pq_.pgshard_test", "1")],
+        ))
+        .expect("send protocol 3.99 startup packet with a reserved option");
+    finish_startup(
+        &mut negotiated,
+        32,
+        Some(&[b"_pq_.pgshard_test".as_slice()]),
+    );
+    negotiated
+        .write_all(&frontend(b'X', b""))
+        .expect("terminate negotiated protocol connection");
 }
