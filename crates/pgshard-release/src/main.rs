@@ -784,7 +784,7 @@ fn dependabot_automerge(repository: &str, requested_sha: &str) -> Result<()> {
     } else {
         if !dependabot_checks_passed(repository, requested_sha)? {
             println!(
-                "Dependabot pull request #{} is waiting for every check to finish without failure",
+                "Dependabot pull request #{} is waiting for successful CI and CodeQL with every check terminal",
                 pull.number
             );
             return Ok(());
@@ -841,16 +841,23 @@ fn dependabot_checks_passed(repository: &str, requested_sha: &str) -> Result<boo
         checks.check_runs.len() < 100,
         "Dependabot check-run lookup reached its page limit and is ambiguous"
     );
-    Ok(ci_passed(&checks)
-        && codeql_reported(&checks)
-        && all_checks_terminal_without_failure(&checks))
+    Ok(
+        ci_passed(&checks)
+            && codeql_passed(&checks)
+            && all_checks_terminal_without_failure(&checks),
+    )
 }
 
-fn codeql_reported(checks: &CheckRuns) -> bool {
-    checks
+fn codeql_passed(checks: &CheckRuns) -> bool {
+    let mut summaries = checks
         .check_runs
         .iter()
-        .any(|check| check.name == "CodeQL" && check.app.slug == "github-advanced-security")
+        .filter(|check| check.name == "CodeQL" && check.app.slug == "github-advanced-security")
+        .peekable();
+    summaries.peek().is_some()
+        && summaries.all(|check| {
+            check.status == "completed" && check.conclusion.as_deref() == Some("success")
+        })
 }
 
 fn all_checks_terminal_without_failure(checks: &CheckRuns) -> bool {
@@ -1526,7 +1533,7 @@ mod tests {
     }
 
     #[test]
-    fn dependabot_requires_every_check_to_finish_without_failure() {
+    fn dependabot_requires_successful_codeql_and_terminal_checks() {
         let mut checks: CheckRuns = serde_json::from_value(serde_json::json!({
             "check_runs": [
                 {
@@ -1551,19 +1558,35 @@ mod tests {
         }))
         .expect("valid check runs");
         assert!(ci_passed(&checks));
-        assert!(codeql_reported(&checks));
+        assert!(!codeql_passed(&checks));
         assert!(all_checks_terminal_without_failure(&checks));
+
+        checks.check_runs[1].conclusion = Some("success".to_owned());
+        assert!(codeql_passed(&checks));
+
+        let duplicate_neutral: CheckRun = serde_json::from_value(serde_json::json!({
+            "name": "CodeQL",
+            "status": "completed",
+            "conclusion": "neutral",
+            "app": { "slug": "github-advanced-security" }
+        }))
+        .expect("valid duplicate CodeQL check");
+        checks.check_runs.push(duplicate_neutral);
+        assert!(!codeql_passed(&checks));
+        checks.check_runs.pop();
 
         checks.check_runs[1].status = "in_progress".to_owned();
         checks.check_runs[1].conclusion = None;
+        assert!(!codeql_passed(&checks));
         assert!(!all_checks_terminal_without_failure(&checks));
 
         checks.check_runs[1].status = "completed".to_owned();
         checks.check_runs[1].conclusion = Some("failure".to_owned());
+        assert!(!codeql_passed(&checks));
         assert!(!all_checks_terminal_without_failure(&checks));
 
         checks.check_runs.remove(1);
-        assert!(!codeql_reported(&checks));
+        assert!(!codeql_passed(&checks));
     }
 
     #[test]

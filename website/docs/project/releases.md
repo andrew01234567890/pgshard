@@ -32,10 +32,11 @@ releases.
 
 Verified Dependabot patch updates are squash-merged by the trusted default-branch
 workflow only after their exact pull-request head passes the aggregate CI gate
-and every reported check is terminal without a failure. A default-setup CodeQL
-summary must be present even when GitHub marks that summary neutral; every
-reported analyzer check must still finish without failure. The pull request must
-also be based on the current `main` commit. Merge attempts are
+and every reported check is terminal without a failure. The GitHub Advanced
+Security CodeQL aggregate must be completed successfully; a neutral summary,
+including "configurations not found", fails closed instead of authorizing an
+unattended merge. The pull request must also be based on the current `main`
+commit. Merge attempts are
 [queued and serialized](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency#using-concurrency-in-different-scenarios)
 so concurrent green updates recheck that base after the preceding squash instead
 of racing it.
