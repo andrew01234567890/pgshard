@@ -6,7 +6,7 @@
 use std::error::Error;
 use std::future::{pending, poll_fn};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -47,31 +47,31 @@ struct CatalogDriver {
 }
 
 struct ReconnectGate {
-    enabled: AtomicBool,
-    wake: tokio::sync::Notify,
+    enabled: tokio::sync::watch::Sender<bool>,
 }
 
 impl ReconnectGate {
     fn new() -> Self {
-        Self {
-            enabled: AtomicBool::new(false),
-            wake: tokio::sync::Notify::new(),
-        }
+        let (enabled, _) = tokio::sync::watch::channel(false);
+        Self { enabled }
     }
 
     async fn wait(&self) {
-        if !self.enabled.load(Ordering::SeqCst) {
-            self.wake.notified().await;
+        let mut enabled = self.enabled.subscribe();
+        while !*enabled.borrow_and_update() {
+            enabled
+                .changed()
+                .await
+                .expect("reconnect gate retains its sender");
         }
     }
 
     fn enable(&self) {
-        self.enabled.store(true, Ordering::SeqCst);
-        self.wake.notify_one();
+        self.enabled.send_replace(true);
     }
 
     fn disable(&self) {
-        self.enabled.store(false, Ordering::SeqCst);
+        self.enabled.send_replace(false);
     }
 }
 
@@ -1626,6 +1626,25 @@ async fn assert_repeatable_read_activation_fences_concurrent_range_mutation(
     mutator_connection_task.abort();
     activation_connection_task.abort();
     Ok(())
+}
+
+#[tokio::test]
+async fn reconnect_gate_preserves_current_state_across_subscribers() {
+    let gate = ReconnectGate::new();
+    gate.enable();
+    gate.disable();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), gate.wait())
+            .await
+            .is_err(),
+        "an earlier enabled period bypassed the disabled gate"
+    );
+
+    gate.enable();
+    tokio::time::timeout(Duration::from_millis(50), gate.wait())
+        .await
+        .expect("an enabled reconnect gate should release immediately");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
