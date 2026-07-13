@@ -79,11 +79,12 @@ impl CatalogPollIntervalError {
 /// Connection closure is terminal so the owner can fail readiness and create a
 /// fresh connection rather than silently running on polling alone.
 ///
-/// The caller remains responsible for TLS, authentication, connect and query
-/// timeouts, retry backoff, and supervising this future. `shutdown` is observed
-/// during subscription, between refreshes, and while a refresh query is
-/// pending. Dropping this future aborts its connection pump rather than
-/// detaching the socket task.
+/// Direct callers remain responsible for TLS, authentication, connect and
+/// query timeouts, retry backoff, and supervising this future.
+/// [`crate::CatalogSupervisor`] provides the standard reconnect and readiness
+/// policy. `shutdown` is observed during subscription, between refreshes, and
+/// while a refresh query is pending. Dropping this future aborts its connection
+/// pump rather than detaching the socket task.
 ///
 /// # Errors
 ///
@@ -101,6 +102,23 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: Future<Output = ()>,
+{
+    run_catalog_refresh_observed(client, connection, cache, poll_interval, || {}, shutdown).await
+}
+
+pub(crate) async fn run_catalog_refresh_observed<S, T, F, R>(
+    client: Client,
+    connection: Connection<S, T>,
+    cache: Arc<CatalogCache>,
+    poll_interval: CatalogPollInterval,
+    refreshed: R,
+    shutdown: F,
+) -> Result<(), CatalogRefreshError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: Future<Output = ()>,
+    R: Fn() + Send + Sync,
 {
     let (sender, receiver) = watch::channel(None);
     let connection_task =
@@ -121,8 +139,18 @@ where
             return Err(cleanup_after_load_error(connection_task, source).await);
         }
     };
+    refreshed();
 
-    match refresh_loop(reader, receiver, &cache, poll_interval, shutdown.as_mut()).await {
+    match refresh_loop(
+        reader,
+        receiver,
+        &cache,
+        poll_interval,
+        &refreshed,
+        shutdown.as_mut(),
+    )
+    .await
+    {
         Ok(RefreshLoopExit::Shutdown) => stop_connection(connection_task).await,
         Ok(RefreshLoopExit::ConnectionClosed) => finish_connection(connection_task).await,
         Err(source) => Err(cleanup_after_load_error(connection_task, source).await),
@@ -191,15 +219,17 @@ enum RefreshLoopExit {
     ConnectionClosed,
 }
 
-async fn refresh_loop<F>(
+async fn refresh_loop<F, R>(
     mut reader: CatalogReader,
     mut notifications: watch::Receiver<Option<CatalogNotification>>,
     cache: &CatalogCache,
     poll_interval: CatalogPollInterval,
+    refreshed: &R,
     mut shutdown: Pin<&mut F>,
 ) -> Result<RefreshLoopExit, LoadError>
 where
     F: Future<Output = ()>,
+    R: Fn(),
 {
     let interval = poll_interval.get();
     let mut poll = tokio::time::interval_at(Instant::now() + interval, interval);
@@ -227,6 +257,7 @@ where
             () = shutdown.as_mut() => return Ok(RefreshLoopExit::Shutdown),
             result = reader.refresh(cache) => {
                 result?;
+                refreshed();
             }
         }
     }

@@ -33,9 +33,17 @@ transactionally consistent read. `run_catalog_refresh` drives that connection,
 coalesces notification bursts through one latest-wins wakeup slot, ignores
 invalid hints, and performs authoritative repeatable-read polling every 1 to
 300 seconds. Connection loss is terminal rather than a silent polling-only mode.
-The future pooler must configure TLS and timeouts, supervise reconnect with
-backoff, and expose readiness and refresh metrics; that composition is not yet
-implemented.
+`CatalogSupervisor` creates a fresh session after failure with bounded,
+jittered exponential backoff. Its cloneable status handle keeps a pooler
+unready until the first validated load, permits an existing snapshot only
+within a configured 2-to-900-second stale grace, fails readiness exactly at the
+deadline or immediately after an epoch fence, and reports connection phase,
+cache age, epoch, connection attempts, sessions completing their initial
+authoritative load, and credential-safe failure classes.
+The default 90-second grace is strictly longer than the default 30-second poll.
+The future pooler must still configure TLS and connection/query timeouts and
+publish the status through its HTTP and Prometheus endpoints; that composition
+is not yet implemented.
 
 The empty installed catalog has genesis epoch zero. Loader queries fetch at
 most one row beyond each published safety limit and reject rather than retain
