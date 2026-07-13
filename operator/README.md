@@ -11,7 +11,8 @@ API. The controller now reconciles the safe supporting-resource slice:
   security contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
   etcd ingress NetworkPolicy;
 - an internal pooler HTTP Service plus fail-closed readiness and independent
-  liveness probe contracts; and
+  liveness probe contracts; the control Service retains unready endpoints for
+  outage diagnostics while application Services continue filtering them; and
 - controller ownership, update pruning, and finalizer-based deletion pruning.
 
 This is not a working PostgreSQL cluster. The controller intentionally creates
