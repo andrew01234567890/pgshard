@@ -24,6 +24,8 @@ use crate::state::{PoolerSnapshot, PoolerState};
 const MAX_HTTP_CONNECTIONS: usize = 128;
 const MAX_HTTP_HEADERS: usize = 32;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+const HTTP_ACCEPT_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
+const HTTP_ACCEPT_MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -33,6 +35,8 @@ struct HttpServerPolicy {
     maximum_connections: usize,
     maximum_headers: usize,
     maximum_header_bytes: usize,
+    accept_initial_retry_delay: Duration,
+    accept_max_retry_delay: Duration,
     header_timeout: Duration,
     connection_timeout: Duration,
     shutdown_timeout: Duration,
@@ -44,12 +48,24 @@ const DEFAULT_HTTP_SERVER_POLICY: HttpServerPolicy = HttpServerPolicy {
     maximum_connections: MAX_HTTP_CONNECTIONS,
     maximum_headers: MAX_HTTP_HEADERS,
     maximum_header_bytes: MAX_HTTP_HEADER_BYTES,
+    accept_initial_retry_delay: HTTP_ACCEPT_INITIAL_RETRY_DELAY,
+    accept_max_retry_delay: HTTP_ACCEPT_MAX_RETRY_DELAY,
     header_timeout: HTTP_HEADER_TIMEOUT,
     connection_timeout: HTTP_CONNECTION_TIMEOUT,
     shutdown_timeout: HTTP_SHUTDOWN_TIMEOUT,
     #[cfg(test)]
     accepted_connections: None,
 };
+
+trait HttpAcceptor: Send {
+    async fn accept(&mut self) -> io::Result<TcpStream>;
+}
+
+impl HttpAcceptor for TcpListener {
+    async fn accept(&mut self) -> io::Result<TcpStream> {
+        TcpListener::accept(self).await.map(|(stream, _)| stream)
+    }
+}
 
 /// Builds the pooler's low-frequency control-plane routes.
 pub fn router(state: PoolerState) -> Router {
@@ -94,6 +110,18 @@ async fn serve_listener_with_policy(
     shutdown: impl Future<Output = ()> + Send + 'static,
     policy: HttpServerPolicy,
 ) -> io::Result<()> {
+    serve_acceptor_with_policy(listener, state, shutdown, policy).await
+}
+
+async fn serve_acceptor_with_policy<A>(
+    mut acceptor: A,
+    state: PoolerState,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    policy: HttpServerPolicy,
+) -> io::Result<()>
+where
+    A: HttpAcceptor,
+{
     let routes = router(state);
     let permits = Arc::new(Semaphore::new(policy.maximum_connections));
     let mut connections = JoinSet::new();
@@ -108,7 +136,12 @@ async fn serve_listener_with_policy(
                     connection_task_result(result)?;
                 }
             }
-            accepted = accept_bounded(&listener, Arc::clone(&permits)) => {
+            accepted = accept_bounded(
+                &mut acceptor,
+                Arc::clone(&permits),
+                policy.accept_initial_retry_delay,
+                policy.accept_max_retry_delay,
+            ) => {
                 let (stream, permit) = accepted?;
                 #[cfg(test)]
                 if let Some(accepted) = &policy.accepted_connections {
@@ -127,13 +160,48 @@ async fn serve_listener_with_policy(
     drain_connections(&mut connections, policy.shutdown_timeout).await
 }
 
-async fn accept_bounded(
-    listener: &TcpListener,
+async fn accept_bounded<A>(
+    acceptor: &mut A,
     permits: Arc<Semaphore>,
-) -> io::Result<(TcpStream, OwnedSemaphorePermit)> {
+    initial_retry_delay: Duration,
+    maximum_retry_delay: Duration,
+) -> io::Result<(TcpStream, OwnedSemaphorePermit)>
+where
+    A: HttpAcceptor,
+{
     let permit = permits.acquire_owned().await.map_err(io::Error::other)?;
-    let (stream, _) = listener.accept().await?;
-    Ok((stream, permit))
+    let mut retry_delay = initial_retry_delay.min(maximum_retry_delay);
+    loop {
+        match acceptor.accept().await {
+            Ok(stream) => return Ok((stream, permit)),
+            Err(error) if is_connection_accept_error(&error) => {
+                tracing::debug!(%error, "transient pooler HTTP accept error");
+                tokio::task::yield_now().await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    retry_delay_milliseconds = retry_delay.as_millis(),
+                    "pooler HTTP accept failed; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = next_accept_retry_delay(retry_delay, maximum_retry_delay);
+            }
+        }
+    }
+}
+
+fn is_connection_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
+}
+
+fn next_accept_retry_delay(current: Duration, maximum: Duration) -> Duration {
+    current.saturating_mul(2).min(maximum)
 }
 
 async fn serve_connection(
@@ -306,6 +374,32 @@ mod tests {
     use super::*;
     use crate::state::PoolerCatalogSnapshot;
 
+    struct ErrorOnceAcceptor {
+        listener: TcpListener,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl HttpAcceptor for ErrorOnceAcceptor {
+        async fn accept(&mut self) -> io::Result<TcpStream> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(io::Error::other("injected accept failure"))
+            } else {
+                self.listener.accept().await.map(|(stream, _)| stream)
+            }
+        }
+    }
+
+    struct AlwaysFailAcceptor {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl HttpAcceptor for AlwaysFailAcceptor {
+        async fn accept(&mut self) -> io::Result<TcpStream> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("injected persistent accept failure"))
+        }
+    }
+
     fn state(ready: bool) -> PoolerState {
         state_with_data_plane(ready, ready)
     }
@@ -350,6 +444,20 @@ mod tests {
             .await
             .expect("bounded response body");
         String::from_utf8(bytes.to_vec()).expect("UTF-8 response")
+    }
+
+    fn test_policy(accepted_connections: Option<Arc<AtomicUsize>>) -> HttpServerPolicy {
+        HttpServerPolicy {
+            maximum_connections: 1,
+            maximum_headers: MAX_HTTP_HEADERS,
+            maximum_header_bytes: MAX_HTTP_HEADER_BYTES,
+            accept_initial_retry_delay: Duration::from_millis(1),
+            accept_max_retry_delay: Duration::from_millis(2),
+            header_timeout: Duration::from_secs(30),
+            connection_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_millis(25),
+            accepted_connections,
+        }
     }
 
     #[tokio::test]
@@ -404,6 +512,101 @@ mod tests {
         assert!(metrics.contains("pgshard_pooler_catalog_ready 1\n"));
     }
 
+    #[test]
+    fn accept_retry_delay_grows_to_but_not_past_its_bound() {
+        let maximum = Duration::from_millis(25);
+        assert_eq!(
+            next_accept_retry_delay(Duration::from_millis(10), maximum),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            next_accept_retry_delay(Duration::from_millis(20), maximum),
+            maximum
+        );
+        assert_eq!(next_accept_retry_delay(maximum, maximum), maximum);
+    }
+
+    #[tokio::test]
+    async fn retries_an_accept_error_then_serves_a_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind retry test listener");
+        let address = listener.local_addr().expect("retry test listener address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let acceptor = ErrorOnceAcceptor {
+            listener,
+            attempts: Arc::clone(&attempts),
+        };
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_acceptor_with_policy(
+            acceptor,
+            state(false),
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            test_policy(Some(Arc::clone(&accepted))),
+        ));
+
+        let connection = TcpStream::connect(address)
+            .await
+            .expect("connect after injected accept failure");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accepted.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server retries and accepts a connection");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        shutdown_sender
+            .send(())
+            .expect("server retains retry-test shutdown receiver");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("retry-test server stops")
+            .expect("retry-test server task")
+            .expect("clean retry-test shutdown");
+        drop(connection);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_accept_error_backoff() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let acceptor = AlwaysFailAcceptor {
+            attempts: Arc::clone(&attempts),
+        };
+        let mut policy = test_policy(None);
+        policy.accept_initial_retry_delay = Duration::from_secs(30);
+        policy.accept_max_retry_delay = Duration::from_secs(30);
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_acceptor_with_policy(
+            acceptor,
+            state(false),
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            policy,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server reaches injected accept failure");
+
+        shutdown_sender
+            .send(())
+            .expect("server retains backoff-test shutdown receiver");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("shutdown interrupts accept backoff")
+            .expect("backoff-test server task")
+            .expect("clean backoff-test shutdown");
+    }
+
     #[tokio::test]
     async fn shutdown_aborts_a_held_partial_request_after_bounded_drain() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -411,15 +614,7 @@ mod tests {
             .expect("bind test listener");
         let address = listener.local_addr().expect("test listener address");
         let accepted = Arc::new(AtomicUsize::new(0));
-        let policy = HttpServerPolicy {
-            maximum_connections: 1,
-            maximum_headers: MAX_HTTP_HEADERS,
-            maximum_header_bytes: MAX_HTTP_HEADER_BYTES,
-            header_timeout: Duration::from_secs(30),
-            connection_timeout: Duration::from_secs(30),
-            shutdown_timeout: Duration::from_millis(25),
-            accepted_connections: Some(Arc::clone(&accepted)),
-        };
+        let policy = test_policy(Some(Arc::clone(&accepted)));
         let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve_listener_with_policy(
             listener,

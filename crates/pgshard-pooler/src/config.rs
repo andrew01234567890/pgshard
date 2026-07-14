@@ -341,10 +341,23 @@ mod tests {
         }
 
         fn arguments(&self) -> Vec<OsString> {
+            self.arguments_with_poll_interval(30_000)
+        }
+
+        fn arguments_with_poll_interval(&self, poll_interval_milliseconds: u64) -> Vec<OsString> {
             vec![
                 OsString::from("pgshard-pooler"),
+                OsString::from("--http-bind=0.0.0.0:8080"),
                 OsString::from("--shardschema-dsn-file"),
                 self.path.as_os_str().to_owned(),
+                OsString::from(format!(
+                    "--catalog-poll-interval-ms={poll_interval_milliseconds}"
+                )),
+                OsString::from("--catalog-stale-grace-ms=90000"),
+                OsString::from("--catalog-initial-reconnect-delay-ms=100"),
+                OsString::from("--catalog-max-reconnect-delay-ms=5000"),
+                OsString::from("--catalog-connect-timeout-ms=5000"),
+                OsString::from("--catalog-operation-timeout-ms=30000"),
             ]
         }
     }
@@ -464,13 +477,8 @@ mod tests {
     #[test]
     fn rejects_out_of_range_runtime_timing() {
         let file = TestDsnFile::new(VALID_DSN.as_bytes());
-        let mut arguments = file.arguments();
-        arguments.extend([
-            OsString::from("--catalog-poll-interval-ms"),
-            OsString::from("999"),
-        ]);
         assert!(matches!(
-            PoolerConfig::try_parse_from(arguments),
+            PoolerConfig::try_parse_from(file.arguments_with_poll_interval(999)),
             Err(PoolerConfigError::PollInterval(_))
         ));
     }

@@ -17,8 +17,9 @@ reads at most 16 KiB plus one byte, applies bounded polling, staleness,
 reconnect, connection, and operation deadlines, and shuts the supervisor and
 HTTP server down together on `SIGINT` or `SIGTERM`. Its control HTTP server
 limits accepted connections, header count and bytes, header time, total
-connection lifetime, and shutdown drain time. A hard runtime deadline aborts a
-child task that still does not stop.
+connection lifetime, and shutdown drain time. Transient accept errors retry,
+with capped exponential backoff for resource and system failures. A hard
+runtime deadline aborts a child task that still does not stop.
 
 The temporary `NoTls` connector accepts only loopback IP literals or Unix
 sockets, requires the database name `shardschema` and

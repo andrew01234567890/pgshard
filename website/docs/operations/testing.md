@@ -38,9 +38,11 @@ retry without becoming ready, and prove coordinated shutdown marks catalog
 state stopped. They also prove a catalog-ready control process stays
 application-unready. An HTTP regression holds a partial request under a
 one-connection test policy and proves shutdown force-closes it after a bounded
-drain; the production policy also bounds headers and connection lifetime. A
-Linux subprocess test loads real environment, CLI override, and file
-configuration, serves health, receives `SIGTERM`, and exits successfully.
+drain; the production policy also bounds headers and connection lifetime.
+Injected acceptor tests prove an accept error can recover and shutdown can
+interrupt the capped retry backoff. A Linux subprocess test loads real
+environment variables, a CLI override, and file configuration, serves health,
+receives `SIGTERM`, and exits successfully.
 Configuration tests open only regular DSN files nonblockingly, reject a FIFO
 without waiting for a writer, bound the read and timing values, reject remote
 plaintext or session-policy overrides, and prove invalid DSN contents do not
