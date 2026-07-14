@@ -17,8 +17,11 @@ use hyper_util::service::TowerToHyperService;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::JoinSet;
 
+use crate::server::{
+    AcceptBackoff, TcpAcceptor, accept_bounded, connection_task_result, drain_connections,
+};
 use crate::state::{PoolerSnapshot, PoolerState};
 
 const MAX_HTTP_CONNECTIONS: usize = 128;
@@ -56,16 +59,6 @@ const DEFAULT_HTTP_SERVER_POLICY: HttpServerPolicy = HttpServerPolicy {
     #[cfg(test)]
     accepted_connections: None,
 };
-
-trait HttpAcceptor: Send {
-    async fn accept(&mut self) -> io::Result<TcpStream>;
-}
-
-impl HttpAcceptor for TcpListener {
-    async fn accept(&mut self) -> io::Result<TcpStream> {
-        TcpListener::accept(self).await.map(|(stream, _)| stream)
-    }
-}
 
 /// Builds the pooler's low-frequency control-plane routes.
 pub fn router(state: PoolerState) -> Router {
@@ -120,10 +113,14 @@ async fn serve_acceptor_with_policy<A>(
     policy: HttpServerPolicy,
 ) -> io::Result<()>
 where
-    A: HttpAcceptor,
+    A: TcpAcceptor,
 {
     let routes = router(state);
     let permits = Arc::new(Semaphore::new(policy.maximum_connections));
+    let mut accept_backoff = AcceptBackoff::new(
+        policy.accept_initial_retry_delay,
+        policy.accept_max_retry_delay,
+    );
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
 
@@ -139,8 +136,8 @@ where
             accepted = accept_bounded(
                 &mut acceptor,
                 Arc::clone(&permits),
-                policy.accept_initial_retry_delay,
-                policy.accept_max_retry_delay,
+                &mut accept_backoff,
+                "HTTP",
             ) => {
                 let (stream, permit) = accepted?;
                 #[cfg(test)]
@@ -158,50 +155,6 @@ where
     }
 
     drain_connections(&mut connections, policy.shutdown_timeout).await
-}
-
-async fn accept_bounded<A>(
-    acceptor: &mut A,
-    permits: Arc<Semaphore>,
-    initial_retry_delay: Duration,
-    maximum_retry_delay: Duration,
-) -> io::Result<(TcpStream, OwnedSemaphorePermit)>
-where
-    A: HttpAcceptor,
-{
-    let permit = permits.acquire_owned().await.map_err(io::Error::other)?;
-    let mut retry_delay = initial_retry_delay.min(maximum_retry_delay);
-    loop {
-        match acceptor.accept().await {
-            Ok(stream) => return Ok((stream, permit)),
-            Err(error) if is_connection_accept_error(&error) => {
-                tracing::debug!(%error, "transient pooler HTTP accept error");
-                tokio::task::yield_now().await;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    retry_delay_milliseconds = retry_delay.as_millis(),
-                    "pooler HTTP accept failed; retrying"
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = next_accept_retry_delay(retry_delay, maximum_retry_delay);
-            }
-        }
-    }
-}
-
-fn is_connection_accept_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionReset
-    )
-}
-
-fn next_accept_retry_delay(current: Duration, maximum: Duration) -> Duration {
-    current.saturating_mul(2).min(maximum)
 }
 
 async fn serve_connection(
@@ -228,35 +181,6 @@ async fn serve_connection(
             tracing::debug!("pooler HTTP connection exceeded its lifetime");
         }
     }
-}
-
-async fn drain_connections(
-    connections: &mut JoinSet<()>,
-    shutdown_timeout: Duration,
-) -> io::Result<()> {
-    let drained = tokio::time::timeout(shutdown_timeout, async {
-        while let Some(result) = connections.join_next().await {
-            connection_task_result(result)?;
-        }
-        Ok(())
-    })
-    .await;
-    if let Ok(result) = drained {
-        result
-    } else {
-        connections.abort_all();
-        while let Some(result) = connections.join_next().await {
-            match result {
-                Err(error) if error.is_cancelled() => {}
-                result => connection_task_result(result)?,
-            }
-        }
-        Ok(())
-    }
-}
-
-fn connection_task_result(result: Result<(), JoinError>) -> io::Result<()> {
-    result.map_err(io::Error::other)
 }
 
 #[derive(Serialize)]
@@ -379,7 +303,7 @@ mod tests {
         attempts: Arc<AtomicUsize>,
     }
 
-    impl HttpAcceptor for ErrorOnceAcceptor {
+    impl TcpAcceptor for ErrorOnceAcceptor {
         async fn accept(&mut self) -> io::Result<TcpStream> {
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err(io::Error::other("injected accept failure"))
@@ -393,7 +317,7 @@ mod tests {
         attempts: Arc<AtomicUsize>,
     }
 
-    impl HttpAcceptor for AlwaysFailAcceptor {
+    impl TcpAcceptor for AlwaysFailAcceptor {
         async fn accept(&mut self) -> io::Result<TcpStream> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(io::Error::other("injected persistent accept failure"))
@@ -510,20 +434,6 @@ mod tests {
         let metrics = body(request("/metrics", control_only).await).await;
         assert!(metrics.contains("pgshard_pooler_ready 0\n"));
         assert!(metrics.contains("pgshard_pooler_catalog_ready 1\n"));
-    }
-
-    #[test]
-    fn accept_retry_delay_grows_to_but_not_past_its_bound() {
-        let maximum = Duration::from_millis(25);
-        assert_eq!(
-            next_accept_retry_delay(Duration::from_millis(10), maximum),
-            Duration::from_millis(20)
-        );
-        assert_eq!(
-            next_accept_retry_delay(Duration::from_millis(20), maximum),
-            maximum
-        );
-        assert_eq!(next_accept_retry_delay(maximum, maximum), maximum);
     }
 
     #[tokio::test]

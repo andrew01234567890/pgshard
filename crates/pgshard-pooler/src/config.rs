@@ -21,9 +21,10 @@ use tokio_postgres::config::{Host, SslMode, TargetSessionAttrs};
 const MAX_SHARDSCHEMA_DSN_BYTES: usize = 16 * 1024;
 const CATALOG_APPLICATION_NAME: &str = "pgshard-pooler-catalog";
 
-/// Validated configuration for the pooler control runtime.
+/// Validated configuration for the fail-closed pooler runtime.
 pub struct PoolerConfig {
     http_bind: SocketAddr,
+    read_write_bind: SocketAddr,
     catalog: Config,
     supervisor: CatalogSupervisorConfig,
 }
@@ -31,13 +32,17 @@ pub struct PoolerConfig {
 #[derive(Debug, Parser)]
 #[command(
     name = "pgshard-pooler",
-    about = "Control-only pgshard catalog runtime (no PostgreSQL client listener)",
+    about = "Fail-closed pgshard catalog runtime and PostgreSQL handshake boundary",
     disable_help_subcommand = true
 )]
 struct RawConfig {
     /// Control HTTP listen address for health, readiness, status, and metrics.
     #[arg(long, env = "PGSHARD_HTTP_BIND", default_value = "0.0.0.0:8080")]
     http_bind: SocketAddr,
+
+    /// Read-write `PostgreSQL` listen address; connections are rejected until the data plane exists.
+    #[arg(long, env = "PGSHARD_RW_BIND", default_value = "0.0.0.0:5432")]
+    read_write_bind: SocketAddr,
 
     /// File containing one local-only shardschema database DSN (maximum 16 KiB).
     #[arg(long, env = "PGSHARD_SHARDSCHEMA_DSN_FILE")]
@@ -133,6 +138,7 @@ impl PoolerConfig {
 
         Ok(Self {
             http_bind: raw.http_bind,
+            read_write_bind: raw.read_write_bind,
             catalog,
             supervisor,
         })
@@ -144,6 +150,12 @@ impl PoolerConfig {
         self.http_bind
     }
 
+    /// Returns the `PostgreSQL` read-write bind address.
+    #[must_use]
+    pub const fn read_write_bind(&self) -> SocketAddr {
+        self.read_write_bind
+    }
+
     pub(crate) fn into_runtime_parts(self) -> (Config, CatalogSupervisorConfig) {
         (self.catalog, self.supervisor)
     }
@@ -151,11 +163,13 @@ impl PoolerConfig {
     #[cfg(test)]
     pub(crate) fn from_runtime_parts(
         http_bind: SocketAddr,
+        read_write_bind: SocketAddr,
         catalog: Config,
         supervisor: CatalogSupervisorConfig,
     ) -> Self {
         Self {
             http_bind,
+            read_write_bind,
             catalog,
             supervisor,
         }
@@ -348,6 +362,7 @@ mod tests {
             vec![
                 OsString::from("pgshard-pooler"),
                 OsString::from("--http-bind=0.0.0.0:8080"),
+                OsString::from("--read-write-bind=0.0.0.0:5432"),
                 OsString::from("--shardschema-dsn-file"),
                 self.path.as_os_str().to_owned(),
                 OsString::from(format!(
@@ -375,6 +390,10 @@ mod tests {
         assert_eq!(
             config.http_bind(),
             "0.0.0.0:8080".parse().expect("default HTTP bind")
+        );
+        assert_eq!(
+            config.read_write_bind(),
+            "0.0.0.0:5432".parse().expect("default read-write bind")
         );
         assert_eq!(config.catalog.get_dbname(), Some(SHARDSCHEMA_DATABASE));
         assert_eq!(
@@ -463,7 +482,8 @@ mod tests {
     fn generated_help_explains_units_bounds_and_dsn_policy() {
         let help = RawConfig::command().render_long_help().to_string();
         for expected in [
-            "no PostgreSQL client listener",
+            "PostgreSQL handshake boundary",
+            "connections are rejected until the data plane exists",
             "maximum 16 KiB",
             "1,000..=300,000",
             "2,000..=900,000",

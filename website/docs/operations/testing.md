@@ -33,16 +33,20 @@ backend exits. Pooler unit tests exercise the real HTTP router, keep health
 independent from fail-closed catalog readiness, preserve maximum 64-bit status
 values as decimal JSON strings, and validate bounded phase, readiness, and
 failure labels in Prometheus exposition. Runtime tests compose the production
-supervisor with a pre-bound HTTP listener, observe a failed connection enter
-retry without becoming ready, and prove coordinated shutdown marks catalog
-state stopped. They also prove a catalog-ready control process stays
-application-unready. An HTTP regression holds a partial request under a
+supervisor with pre-bound HTTP and PostgreSQL listeners, observe a failed
+catalog connection enter retry without becoming ready, and prove coordinated
+shutdown marks catalog state stopped. They also prove a catalog-ready process
+stays application-unready. An HTTP regression holds a partial request under a
 one-connection test policy and proves shutdown force-closes it after a bounded
 drain; the production policy also bounds headers and connection lifetime.
-Injected acceptor tests prove an accept error can recover and shutdown can
-interrupt the capped retry backoff. A Linux subprocess test loads real
+Injected acceptor tests prove an accept error can recover, cancellation of an
+in-flight wait retains its deadline and exponential retry state, and shutdown
+can interrupt the capped retry backoff. A Linux subprocess test loads real
 environment variables, a CLI override, and file configuration, serves health,
-receives `SIGTERM`, and exits successfully.
+returns an exact PostgreSQL `FATAL`/`57P03` startup rejection, receives
+`SIGTERM`, and exits successfully. PostgreSQL listener tests refuse sequential
+GSS and SSL requests, decode the bounded rejection, close cancellation without
+a response, time out an incomplete startup, and drain on shutdown.
 Configuration tests open only regular DSN files nonblockingly, reject a FIFO
 without waiting for a writer, bound the read and timing values, reject remote
 plaintext or session-policy overrides, and prove invalid DSN contents do not

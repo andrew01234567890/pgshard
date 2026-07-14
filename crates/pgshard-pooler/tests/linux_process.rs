@@ -1,4 +1,4 @@
-//! Linux process-level control-runtime regression tests.
+//! Linux process-level runtime regression tests.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use pgshard_pgwire::{ProtocolVersion, encode_startup};
 use rustix::process::{Pid, Signal, kill_process};
 use tempfile::TempDir;
 
@@ -24,7 +25,7 @@ impl Drop for ChildGuard {
 }
 
 #[test]
-fn env_file_http_and_sigterm_form_one_clean_process_contract() {
+fn env_file_http_postgresql_rejection_and_sigterm_form_one_process_contract() {
     let temporary = TempDir::new().expect("create process-test directory");
     let dsn_path = temporary.path().join("shardschema.dsn");
     fs::write(
@@ -32,13 +33,13 @@ fn env_file_http_and_sigterm_form_one_clean_process_contract() {
         b"postgresql://postgres@127.0.0.1:1/shardschema?sslmode=disable&target_session_attrs=read-write\n",
     )
     .expect("write process-test DSN");
-    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve HTTP address");
-    let address = reservation.local_addr().expect("reserved HTTP address");
-    drop(reservation);
+    let http_address = reserve_address("HTTP");
+    let read_write_address = reserve_address("PostgreSQL read-write");
 
     let child = Command::new(env!("CARGO_BIN_EXE_pgshard-pooler"))
         .env_clear()
-        .env("PGSHARD_HTTP_BIND", address.to_string())
+        .env("PGSHARD_HTTP_BIND", http_address.to_string())
+        .env("PGSHARD_RW_BIND", read_write_address.to_string())
         .env("PGSHARD_SHARDSCHEMA_DSN_FILE", &dsn_path)
         .env("PGSHARD_CATALOG_POLL_INTERVAL_MS", "999")
         .arg("--catalog-poll-interval-ms=1000")
@@ -51,7 +52,7 @@ fn env_file_http_and_sigterm_form_one_clean_process_contract() {
 
     let started = Instant::now();
     let response = loop {
-        if let Ok(response) = request_health(address) {
+        if let Ok(response) = request_health(http_address) {
             break response;
         }
         if let Some(status) = child.0.try_wait().expect("inspect pooler process") {
@@ -65,6 +66,11 @@ fn env_file_http_and_sigterm_form_one_clean_process_contract() {
     };
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(response.contains(r#"{"status":"alive""#));
+
+    let rejection = request_postgresql(read_write_address)
+        .expect("PostgreSQL handshake boundary rejects a regular startup");
+    assert_eq!(rejection.first(), Some(&b'E'));
+    assert!(rejection.windows(6).any(|bytes| bytes == b"C57P03"));
 
     kill_process(Pid::from_child(&child.0), Signal::TERM).expect("send SIGTERM");
     let signalled = Instant::now();
@@ -81,11 +87,37 @@ fn env_file_http_and_sigterm_form_one_clean_process_contract() {
     assert!(status.success(), "pooler SIGTERM exit was {status}");
 }
 
+fn reserve_address(description: &str) -> SocketAddr {
+    let reservation = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|error| panic!("reserve {description} address: {error}"));
+    let address = reservation
+        .local_addr()
+        .unwrap_or_else(|error| panic!("read reserved {description} address: {error}"));
+    drop(reservation);
+    address
+}
+
 fn request_health(address: SocketAddr) -> std::io::Result<String> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(100))?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn request_postgresql(address: SocketAddr) -> std::io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1))?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    let mut request = [0_u8; 128];
+    let length = encode_startup(
+        ProtocolVersion::new(3, 2),
+        &[(b"user".as_slice(), b"postgres".as_slice())],
+        &mut request,
+    )
+    .expect("bounded process-test startup");
+    stream.write_all(&request[..length])?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
     Ok(response)
 }

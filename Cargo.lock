@@ -932,6 +932,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "pgshard-catalog",
+ "pgshard-pgwire",
  "pgshard-version",
  "rustix",
  "serde",
