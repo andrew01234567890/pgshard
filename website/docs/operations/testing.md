@@ -60,7 +60,11 @@ unexpected, version-mismatched, reordered, omitted, and added negotiation data
 fails closed, and that a rejected response consumes its validator. The live
 fixture also checks real `Describe`, `ParameterDescription`, empty completion,
 `ReadyForQuery`, and `Close` messages through the production framing and body
-decoders. Source-aligned `pgoutput` unit tests cover protocol v1-v4 option
+decoders. Separate unit tests enforce PostgreSQL 18's tighter SCRAM frame bound,
+decode absent, empty, truncated, negative, and trailing initial responses,
+redact all mechanism and exchange bytes, and round-trip the closed SCRAM
+advertisement plus continue/final encoders. Source-aligned `pgoutput` unit tests
+cover protocol v1-v4 option
 combinations, XLogData and keepalive envelopes, buffered, streamed, and
 two-phase transaction controls, every truncated prefix, feature mismatches,
 reserved flags, strict booleans, authoritative client/server UTF-8, maximum

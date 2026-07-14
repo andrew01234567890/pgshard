@@ -25,15 +25,17 @@ pub use backend::{
 
 pub use encode::{
     AUTHENTICATION_OK_FRAME_LENGTH, BackendEncodeError, READY_FOR_QUERY_FRAME_LENGTH,
-    encode_authentication_ok, encode_backend_key_data, encode_parameter_status,
-    encode_protocol_negotiation, encode_ready_for_query,
+    ScramMechanisms, encode_authentication_ok, encode_authentication_sasl,
+    encode_authentication_sasl_continue, encode_authentication_sasl_final, encode_backend_key_data,
+    encode_parameter_status, encode_protocol_negotiation, encode_ready_for_query,
 };
 
 pub use messages::{
     BindMessage, BindParameter, BindParameterIter, BindParameters, CloseMessage, DescribeMessage,
     ExecuteMessage, ExtendedQueryObject, FormatCode, FormatCodeIter, MessageError,
-    ParameterTypeIter, ParseMessage, QueryMessage, decode_bind, decode_close, decode_describe,
-    decode_execute, decode_parse, decode_query, require_empty_body,
+    ParameterTypeIter, ParseMessage, QueryMessage, SaslInitialResponse, SaslResponse, decode_bind,
+    decode_close, decode_describe, decode_execute, decode_parse, decode_query,
+    decode_sasl_initial_response, decode_sasl_response, require_empty_body,
 };
 
 pub use pgoutput::{
@@ -63,6 +65,8 @@ pub const MAX_STARTUP_FRAME_LENGTH: usize = MAX_STARTUP_BODY_LENGTH + 4;
 pub const SMALL_MESSAGE_LENGTH: usize = 10_000;
 /// `PostgreSQL` 18 authentication-message bound, including the length word.
 pub const AUTHENTICATION_MESSAGE_LENGTH: usize = 65_535;
+/// `PostgreSQL` 18's maximum length word for one frontend SCRAM message.
+pub const SCRAM_MESSAGE_LENGTH: usize = 1_024;
 /// Default bound for typed protocol messages that may carry large payloads.
 pub const DEFAULT_LARGE_MESSAGE_LENGTH: usize = 16 * 1024 * 1024;
 /// Hard pooler bound for one typed protocol message, regardless of caller policy.
@@ -352,6 +356,9 @@ pub enum FrontendTag {
 pub enum FrontendPhase {
     /// Authentication exchange; only the overloaded `p` response is legal.
     Authentication,
+    /// SCRAM authentication exchange with `PostgreSQL` 18's tighter 1,024-byte
+    /// mechanism bound; only the overloaded `p` response is legal.
+    ScramAuthentication,
     /// Ordinary post-authentication query protocol, including COPY messages
     /// that `PostgreSQL` accepts and ignores while resynchronizing after a
     /// failed COPY.
@@ -366,7 +373,9 @@ pub enum FrontendPhase {
 impl FrontendPhase {
     const fn allows(self, tag: FrontendTag) -> bool {
         match self {
-            Self::Authentication => matches!(tag, FrontendTag::AuthenticationResponse),
+            Self::Authentication | Self::ScramAuthentication => {
+                matches!(tag, FrontendTag::AuthenticationResponse)
+            }
             Self::Regular => matches!(
                 tag,
                 FrontendTag::Bind
@@ -589,9 +598,14 @@ pub fn decode_frontend(
             minimum: 4,
         });
     }
-    let maximum = match tag {
-        _ if tag.uses_small_limit() => SMALL_MESSAGE_LENGTH.min(maximum_large_message_length),
-        FrontendTag::AuthenticationResponse => {
+    let maximum = match (tag, phase) {
+        (FrontendTag::AuthenticationResponse, FrontendPhase::ScramAuthentication) => {
+            SCRAM_MESSAGE_LENGTH.min(maximum_large_message_length)
+        }
+        (tag, _) if tag.uses_small_limit() => {
+            SMALL_MESSAGE_LENGTH.min(maximum_large_message_length)
+        }
+        (FrontendTag::AuthenticationResponse, _) => {
             AUTHENTICATION_MESSAGE_LENGTH.min(maximum_large_message_length)
         }
         _ => maximum_large_message_length,
@@ -1043,6 +1057,7 @@ mod tests {
             (b'S', FrontendPhase::Regular),
             (b'X', FrontendPhase::Regular),
             (b'p', FrontendPhase::Authentication),
+            (b'p', FrontendPhase::ScramAuthentication),
             (b'd', FrontendPhase::CopyIn),
             (b'c', FrontendPhase::CopyIn),
             (b'f', FrontendPhase::CopyIn),
@@ -1177,6 +1192,7 @@ mod tests {
     fn phase_illegal_tags_fail_before_their_lengths_are_trusted() {
         for (tag, phase) in [
             (b'Q', FrontendPhase::Authentication),
+            (b'Q', FrontendPhase::ScramAuthentication),
             (b'Q', FrontendPhase::CopyIn),
             (b'B', FrontendPhase::CopyIn),
             (b'p', FrontendPhase::Regular),
@@ -1244,6 +1260,28 @@ mod tests {
             ),
             Err(DecodeError::FrameTooLarge {
                 maximum: AUTHENTICATION_MESSAGE_LENGTH,
+                ..
+            })
+        ));
+
+        let exact_scram = frontend(b'p', &vec![0; SCRAM_MESSAGE_LENGTH.saturating_sub(4)]);
+        assert!(
+            decode_frontend(
+                &exact_scram,
+                FrontendPhase::ScramAuthentication,
+                DEFAULT_LARGE_MESSAGE_LENGTH,
+            )
+            .is_ok()
+        );
+        let oversized_scram = frontend(b'p', &vec![0; SCRAM_MESSAGE_LENGTH.saturating_sub(3)]);
+        assert!(matches!(
+            decode_frontend(
+                &oversized_scram,
+                FrontendPhase::ScramAuthentication,
+                DEFAULT_LARGE_MESSAGE_LENGTH,
+            ),
+            Err(DecodeError::FrameTooLarge {
+                maximum: SCRAM_MESSAGE_LENGTH,
                 ..
             })
         ));
