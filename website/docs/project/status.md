@@ -16,7 +16,7 @@ in the same pull request whenever implementation status changes.
 | Public-repository, CI and release policy | Parallel CI, privacy audit, source-only SemVer tooling | Implemented in source |
 | Documentation site | Typed Docusaurus build and link validation | Implemented in source |
 | Local container images | Digest-pinned Linux/amd64 Rust runtime and Go operator Docker-compatible image archives, non-root entrypoint smoke tests, no registry output | Implemented in source; test artifacts only |
-| Go operator API and supporting resources | Defaulting/validation, generated CRD/RBAC/webhook, deterministic ConfigMaps/Services/workloads/HPA/PDB/NetworkPolicy, internal pooler HTTP Service and probe contract, semantic leader-election RBAC tests, uncached finalizer absence proofs, supervised PVC deletion, and targeted digest-pinned Kubernetes 1.36 KIND delete/recreate coverage | Implemented in source; deliberately not a database cluster |
+| Go operator API and supporting resources | Defaulting/validation, generated CRD/RBAC/webhook, deterministic ConfigMaps/Services/workloads/HPA/PDB/NetworkPolicy, internal pooler HTTP Service and probe contract, semantic leader-election RBAC tests, uncached finalizer absence proofs, supervised PVC deletion, a restricted local-image development manager Kustomization, and targeted digest-pinned Kubernetes 1.36 delete/recreate plus real-manager fail-closed coverage | Implemented in source; deliberately not a database cluster |
 | Rust agent and orchestrator foundations | Linux HTTP health/readiness/status/metrics, exact integer reporting, bounded lease TTLs, atomic catalog/fence/deadline precondition checks; orchestrator persistence remains disabled | Implemented in source; deliberately not ready for control traffic |
 | PostgreSQL lifecycle and HA | No bootstrap, physical replication, durable lease integration, promotion or restart controller | Planned |
 | Pooling and SQL routing | A Linux runtime composing catalog supervision; bounded HTTP health/readiness/status and Prometheus publication; and a connection-, packet-, time-, and drain-bounded read-write PostgreSQL handshake listener that refuses GSS/SSL, closes cancellation silently, and returns `FATAL`/`57P03` to regular startup. Regular-file and timing bounds, capped accept retry, hard child-task shutdown, and process-level `SIGTERM` coverage are implemented; overall readiness deliberately remains false without a SQL data plane. Also implemented: bounded zero-copy PostgreSQL 18 frontend/backend framing, fixed SSL/GSS startup requests, caller-buffered regular startup packets, protocol-proof-bound cancellation request encoding, selected frontend bodies including statement/portal `Describe` and `Close`, exact borrowed backend `ParameterDescription`, UTF-8 `ParameterStatus`, opaque `BackendKeyData`, typed redacted authentication requests, frontend SCRAM initial/follow-up responses under PostgreSQL 18's 1,024-byte bound, closed ordered SCRAM advertisements and opaque continue/final encoders, minimal client-facing `ErrorResponse` encoding with required canonical fields, exact protocol-negotiation responses, a linear validator bound to the outbound startup parameters, exact PostgreSQL 18 protocol-specific cancellation-key lengths, empty completion validation, `ReadyForQuery` transaction status, allocation-free fixed startup-control encoders, caller-buffered variable startup-control encoders with all-or-nothing validation, byte/token/AST/stack-bounded permissive candidate parsing with a live PostgreSQL 18 positive/known-negative smoke corpus, a catalog-bound template for one deliberately narrow parameterized `SELECT` shape, exact PostgreSQL parameter-type resolution gated by cluster/snapshot-bound all-active-shard proof of exact permanent non-inherited relation identity, type, collation, encoding, and schema epoch, live wrong-relation/view/unlogged/inheritance/partition/coercion, empty-path, and cached-plan re-analysis boundary tests, fail-closed composition of the exact resolved proof with zero-copy Bind count/format/NULL/value validation and canonical hashing, and standalone microbenchmarks; no accepted PostgreSQL session, TLS/authentication policy or cryptographic exchange, optional diagnostic fields, complete backend phase/session state, socket-bound cancellation routing, query-cycle tracking, statement/portal virtualization, backend pinning, Execute integration, authoritative schema-observation runtime, complete semantic planner, or connection pool | Partial |
@@ -27,7 +27,7 @@ in the same pull request whenever implementation status changes.
 | Backup/restore and MinIO verification | Design only | Planned |
 | Online resharding | Design only | Planned |
 | Admin UI, Prometheus and OpenTelemetry | The pooler control executable serves catalog Prometheus exposition; scraping resources, SQL-path metrics, OpenTelemetry export, dashboards, UI, and Grafana/Tempo validation are absent | Partial |
-| KIND, Jepsen/Elle and PgBouncer comparison | Targeted operator PVC delete/recreate KIND test; full cluster, history and performance suites remain absent | Partial |
+| KIND, Jepsen/Elle and PgBouncer comparison | Targeted operator PVC delete/recreate and real development-manager fail-closed KIND tests; full database cluster, history and performance suites remain absent | Partial |
 
 The current operator plan starts poolers only in explicit
 `bootstrap-unavailable` catalog mode. This proves a credential-free process can
@@ -37,7 +37,10 @@ fail-closed, and no connection attempt is made. It is not evidence of a usable
 pooler or database endpoint.
 
 No development database cluster can be installed from the current source. The
-operator does not create PostgreSQL Pods or PVCs, the pooler accepts no wire
-session and has no connection pool, and supporting Services are not usable
-application endpoints. No runtime correctness, availability or performance guarantee is
-claimed until its implementation and required tests are merged and listed here.
+local Kustomization installs only a certificate-free development manager and
+its CRD; it intentionally omits admission webhook configurations until serving
+certificate lifecycle exists. The operator does not create PostgreSQL Pods or
+PVCs, the pooler accepts no wire session and has no connection pool, and
+supporting Services are not usable application endpoints. No runtime
+correctness, availability or performance guarantee is claimed until its
+implementation and required tests are merged and listed here.

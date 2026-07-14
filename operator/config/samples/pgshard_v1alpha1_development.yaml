@@ -1,0 +1,38 @@
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardCluster
+metadata:
+  name: development
+spec:
+  shards: 1
+  membersPerShard: 3
+  durability: Synchronous
+  postgresql:
+    version: "18"
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+  storage:
+    size: 2Gi
+  pooler:
+    scaling:
+      mode: Fixed
+      fixed:
+        replicas: 1
+  services:
+    rw:
+      type: ClusterIP
+    ro:
+      type: ClusterIP
+    r:
+      type: ClusterIP
+  backup:
+    repository:
+      type: Filesystem
+      filesystem:
+        persistentVolumeClaimName: development-backups
+  observability:
+    prometheus: true

@@ -25,8 +25,11 @@ also remain unimplemented. The etcd NetworkPolicy allows only selected
 same-cluster Pods, but client and peer traffic is still unauthenticated
 plaintext; the independent `TransportSecurityReady=False` condition reports
 that TLS gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
-a bounded backend quota. Scale transitions retain those claims; cluster
-deletion keeps the CR finalizer until UID-owned StatefulSets and PVCs are
+a bounded backend quota. Its default image is digest-pinned and the Pod command
+selects that image contract's `/usr/local/bin/etcd` executable explicitly;
+custom `--etcd-image` values must provide the same path. Scale transitions
+retain those claims; cluster deletion keeps the CR finalizer until UID-owned
+StatefulSets and PVCs are
 observed absent through the uncached Kubernetes API reader, preventing informer
 lag from allowing same-name recreation to mount stale etcd state. Automated
 defragmentation is not implemented. PostgreSQL
@@ -51,6 +54,38 @@ configurable. Image pull or runtime readiness is reported only through
 
 The module is pinned to Go 1.26.5, controller-runtime 0.24.1, and Kubernetes
 libraries 0.36.0. Only the Linux container deployment is supported.
+
+## Certificate-free development manager
+
+`config/development` installs the CRD, a least-privilege manager identity, and
+the real operator Deployment from local `pgshard/*:dev` images. The manager
+runs as a numeric non-root user with a read-only root filesystem, namespace-
+scoped leader-election Lease access, bounded probes, zero-unavailable rollouts,
+and no metrics listener.
+The command defaults to admission webhooks enabled, but this development
+overlay passes `--webhook-enabled=false` because certificate provisioning is
+not implemented. It deliberately does not install the generated webhook
+configurations. OpenAPI validation still applies, and the reconciler repeats
+all semantic safety validation before creating children, but this is not a
+production admission setup.
+
+After building and loading the operator, orchestrator, and pooler `:dev` images
+into a local KIND cluster:
+
+```console
+kubectl apply -k operator/config/development
+kubectl rollout status --namespace pgshard-system deployment/pgshard-controller-manager
+kubectl create namespace pgshard-development
+kubectl apply --namespace pgshard-development -f operator/config/samples/pgshard_v1alpha1_development.yaml
+kubectl get --namespace pgshard-development pgshardcluster development
+```
+
+The sample proves only real manager reconciliation and fail-closed supporting
+processes. Its pooler and orchestrator Pods run but remain unready, application
+Services have no ready endpoints, no PostgreSQL workload is created, and the
+cluster reports `Ready=False` with `PostgreSQLLifecycleUnavailable`. The named
+backup PVC is only validated configuration; no backup job or repository is
+created.
 
 Run the local checks from this directory:
 
@@ -82,7 +117,9 @@ module tidy/verification, `go vet ./...`, `go test -race ./...`,
 `go build ./...`, `go tool govulncheck ./...`, and the generation-and-diff
 sequence above. No helper shell scripts or `hack` directory are required.
 
-CI also creates a digest-pinned Kubernetes 1.36 KIND cluster and exercises StatefulSet/PVC
-creation, supervised deletion, and same-name recreation against real
-Kubernetes controllers. This targeted safety test is not yet the full
-Milestone 1 KIND suite.
+CI creates separate digest-pinned Kubernetes 1.36 KIND clusters. One exercises
+StatefulSet/PVC creation, supervised deletion, and same-name recreation against
+real Kubernetes controllers. Another builds and loads local images, installs
+the real manager, waits for its rollout, and proves the exact fail-closed
+development boundary above remains stable without container restarts. These
+targeted tests are not yet the full Milestone 1 KIND suite.

@@ -12,6 +12,10 @@ Build all four archives from the repository root:
 make images
 ```
 
+Set `PGSHARD_IMAGE_TARGETS` to a space-separated Bake target list when a local
+test needs only a subset. For example, the manager KIND smoke builds
+`operator orchestrator pooler`; the default remains the complete `ci` group.
+
 The selected Buildx builder must support the Docker exporter. Docker's default
 `docker` driver does not support this archive exporter; use a
 `docker-container`, Kubernetes, or remote builder. CI creates an isolated
@@ -30,3 +34,7 @@ ephemeral runner. CI does not upload or publish the archives.
 
 These images contain the current incomplete runtimes. They do not create a
 PostgreSQL cluster, and no image is published by the Milestone 1 release job.
+The certificate-free development Kustomization under
+`operator/config/development` consumes local `:dev` images after they are
+loaded into KIND. It is a tested manager/reconciliation boundary, not a
+deployable database or production admission configuration.

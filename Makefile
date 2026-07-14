@@ -4,6 +4,7 @@ PGSHARD_GIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
 PGSHARD_BUILD_VERSION ?= 0.0.0-dev+local.$(shell printf '%.12s' "$(PGSHARD_GIT_SHA)")$(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" || printf '.dirty')
 PGSHARD_IMAGE_OUTPUT ?= artifacts/images
 PGSHARD_IMAGE_TAG ?= dev
+PGSHARD_IMAGE_TARGETS ?= ci
 
 check: rust-check proto-check go-check docs-check actions-check public-check
 
@@ -73,7 +74,7 @@ images:
 	PGSHARD_GIT_SHA="$(PGSHARD_GIT_SHA)" \
 	PGSHARD_IMAGE_OUTPUT="$(PGSHARD_IMAGE_OUTPUT)" \
 	PGSHARD_IMAGE_TAG="$(PGSHARD_IMAGE_TAG)" \
-	docker buildx bake --file deploy/docker-bake.hcl ci
+	docker buildx bake --file deploy/docker-bake.hcl $(PGSHARD_IMAGE_TARGETS)
 
 release-build:
 	@test -n "$(VERSION)" || (echo "VERSION is required" >&2; exit 1)
