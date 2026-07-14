@@ -10,8 +10,8 @@ There is no installable pgshard database cluster yet. The source includes the Go
 custom-resource API and safe supporting-resource reconciler plus fail-closed
 Rust agent/orchestrator foundations and a local-only pooler catalog control
 executable plus local-only test image builds, but no PostgreSQL lifecycle,
-executable SQL pooler, chart, or full KIND environment. A certificate-free
-development manager manifest now exercises the real operator and fail-closed
+executable SQL pooler, chart, or full KIND environment. A self-managed admission
+manager manifest now exercises the real operator, fail-closed webhooks, and
 supporting processes in KIND, but it creates no PostgreSQL workload and is not
 a database installation. A cluster quickstart will appear only after those
 end-to-end tests pass.
@@ -52,16 +52,16 @@ kind create cluster --name pgshard-development \
   --wait 90s
 kind load docker-image pgshard/operator:dev pgshard/orchestrator:dev \
   pgshard/pooler:dev --name pgshard-development
-kubectl apply -k operator/config/development
+kubectl apply -k operator/config/admission
 kubectl rollout status --namespace pgshard-system deployment/pgshard-controller-manager
 kubectl create namespace pgshard-development
 kubectl apply --namespace pgshard-development -f operator/config/samples/pgshard_v1alpha1_development.yaml
 ```
 
-The development overlay disables admission-webhook registration because no
-serving-certificate lifecycle exists. The binary default remains enabled;
-OpenAPI validation and defensive reconciliation still fail closed. Expect the
-sample to remain `Ready=False`, its pooler and orchestrator Pods to remain
-unready, and its application Services to have no ready endpoints. This path is
-for source validation only. Delete the disposable cluster with
+The admission overlay provisions an ECDSA serving chain into exact-name
+operator-managed Secrets, injects the CA bundle, and keeps semantic validation
+fail closed. Its leaf certificate renews without a Pod restart; automatic CA
+rotation is not yet implemented. Expect the sample to remain `Ready=False`, its
+pooler and orchestrator Pods to remain unready, and its application Services to
+have no ready endpoints. This path is for source validation only. Delete the disposable cluster with
 `kind delete cluster --name pgshard-development`.

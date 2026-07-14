@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-service
+  namespace: system
+  labels:
+    app.kubernetes.io/name: pgshard-operator
+    app.kubernetes.io/component: admission
+    app.kubernetes.io/part-of: pgshard
+spec:
+  selector:
+    app.kubernetes.io/name: pgshard-operator
+    app.kubernetes.io/component: controller-manager
+  ports:
+    - name: webhook
+      protocol: TCP
+      port: 443
+      targetPort: webhook

@@ -7,11 +7,13 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/controller"
+	"github.com/andrew01234567890/pgshard/operator/internal/pki"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -34,7 +36,18 @@ type commandOptions struct {
 	leaderElection bool
 	secureMetrics  bool
 	webhookEnabled bool
+	webhook        webhookCommandOptions
 	images         owned.Images
+}
+
+type webhookCommandOptions struct {
+	namespace                   string
+	serviceName                 string
+	caSecretName                string
+	servingSecretName           string
+	mutatingConfigurationName   string
+	validatingConfigurationName string
+	certificateDirectory        string
 }
 
 func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
@@ -44,6 +57,13 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.BoolVar(&options.leaderElection, "leader-elect", true, "enable Kubernetes leader election")
 	flags.BoolVar(&options.secureMetrics, "metrics-secure", true, "serve metrics over TLS")
 	flags.BoolVar(&options.webhookEnabled, "webhook-enabled", true, "register admission webhooks; serving certificates are required")
+	flags.StringVar(&options.webhook.namespace, "webhook-namespace", "pgshard-system", "namespace containing the webhook Service and certificate Secrets")
+	flags.StringVar(&options.webhook.serviceName, "webhook-service-name", "pgshard-webhook-service", "webhook Service name")
+	flags.StringVar(&options.webhook.caSecretName, "webhook-ca-secret-name", "pgshard-webhook-ca", "pre-created webhook CA Secret name")
+	flags.StringVar(&options.webhook.servingSecretName, "webhook-serving-secret-name", "pgshard-webhook-certificate", "pre-created webhook serving Secret name")
+	flags.StringVar(&options.webhook.mutatingConfigurationName, "webhook-mutating-configuration-name", "pgshard-mutating-webhook-configuration", "mutating webhook configuration name")
+	flags.StringVar(&options.webhook.validatingConfigurationName, "webhook-validating-configuration-name", "pgshard-validating-webhook-configuration", "validating webhook configuration name")
+	flags.StringVar(&options.webhook.certificateDirectory, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "private directory for generated webhook certificate files")
 	flags.StringVar(&options.images.Etcd, "etcd-image", options.images.Etcd, "etcd image reference")
 	flags.StringVar(&options.images.Orchestrator, "orchestrator-image", options.images.Orchestrator, "pgshard orchestrator image reference")
 	flags.StringVar(&options.images.Pooler, "pooler-image", options.images.Pooler, "pgshard pooler image reference")
@@ -57,6 +77,7 @@ func main() {
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOptions)))
 
+	restConfig := ctrl.GetConfigOrDie()
 	managerOptions := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -71,14 +92,17 @@ func main() {
 		LeaderElectionID:              "operator.pgshard.io",
 		LeaderElectionReleaseOnCancel: true,
 	}
+	var webhookServer webhook.Server
 	if options.webhookEnabled {
-		managerOptions.WebhookServer = webhook.NewServer(webhook.Options{
+		webhookServer = webhook.NewServer(webhook.Options{
+			CertDir: options.webhook.certificateDirectory,
 			TLSOpts: []func(*tls.Config){func(config *tls.Config) {
 				config.MinVersion = tls.VersionTLS13
 			}},
 		})
+		managerOptions.WebhookServer = webhookServer
 	}
-	manager, err := ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions)
+	manager, err := ctrl.NewManager(restConfig, managerOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to create manager")
 		os.Exit(1)
@@ -110,8 +134,48 @@ func main() {
 		os.Exit(1)
 	}
 
+	managerContext := ctrl.SetupSignalHandler()
+	if options.webhookEnabled {
+		directClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+		if err != nil {
+			setupLog.Error(err, "unable to create direct webhook certificate client")
+			os.Exit(1)
+		}
+		certificateProvisioner, err := pki.New(pki.Config{
+			Client:                      directClient,
+			Namespace:                   options.webhook.namespace,
+			ServiceName:                 options.webhook.serviceName,
+			CASecretName:                options.webhook.caSecretName,
+			ServingSecretName:           options.webhook.servingSecretName,
+			MutatingConfigurationName:   options.webhook.mutatingConfigurationName,
+			ValidatingConfigurationName: options.webhook.validatingConfigurationName,
+			CertificateDirectory:        options.webhook.certificateDirectory,
+			Logger:                      setupLog.WithName("webhook-pki"),
+		})
+		if err != nil {
+			setupLog.Error(err, "invalid webhook certificate configuration")
+			os.Exit(1)
+		}
+		if err := certificateProvisioner.Bootstrap(managerContext); err != nil {
+			setupLog.Error(err, "unable to bootstrap webhook certificates")
+			os.Exit(1)
+		}
+		if err := manager.Add(certificateProvisioner); err != nil {
+			setupLog.Error(err, "unable to schedule webhook certificate maintenance")
+			os.Exit(1)
+		}
+		if err := manager.AddReadyzCheck("webhook-certificate", certificateProvisioner.Checker); err != nil {
+			setupLog.Error(err, "unable to add webhook certificate readiness check")
+			os.Exit(1)
+		}
+		if err := manager.AddReadyzCheck("webhook-server", webhookServer.StartedChecker()); err != nil {
+			setupLog.Error(err, "unable to add webhook server readiness check")
+			os.Exit(1)
+		}
+	}
+
 	setupLog.Info("starting manager", "postgresqlMajor", pgshardv1alpha1.PostgreSQLMajor18, "serviceModes", []string{"rw", "ro", "r"}, "webhookEnabled", options.webhookEnabled)
-	if err := manager.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := manager.Start(managerContext); err != nil {
 		setupLog.Error(err, "manager stopped with an error")
 		os.Exit(1)
 	}

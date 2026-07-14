@@ -67,13 +67,13 @@ func TestDevelopmentKustomizationBindsOnlyTheManagerRuntime(t *testing.T) {
 		t.Fatalf("development names = %#v", config)
 	}
 	resources := slices.Clone(config.Resources)
-	wantedResources := []string{"namespace.yaml", "../crd", "../rbac", "../manager"}
+	wantedResources := []string{"../namespace", "../crd", "../rbac", "../manager"}
 	slices.Sort(resources)
 	slices.Sort(wantedResources)
 	if !slices.Equal(resources, wantedResources) {
 		t.Fatalf("development resources = %q", config.Resources)
 	}
-	namespace := readManifest[corev1.Namespace](t, "../../config/development/namespace.yaml")
+	namespace := readManifest[corev1.Namespace](t, "../../config/namespace/namespace.yaml")
 	for _, key := range []string{
 		"pod-security.kubernetes.io/audit",
 		"pod-security.kubernetes.io/enforce",

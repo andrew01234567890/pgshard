@@ -450,18 +450,21 @@ jobs:
             pgshard/orchestrator:dev \
             pgshard/pooler:dev \
             --name pgshard-manager
-      - name: Install the certificate-free development manager
+      - name: Install the self-managed admission manager
         run: |
-          kubectl apply --server-side --field-manager=pgshard-ci -k operator/config/development
+          kubectl apply --server-side --field-manager=pgshard-ci -k operator/config/admission
           kubectl rollout status \
             --namespace pgshard-system \
             deployment/pgshard-controller-manager \
-            --timeout=120s
-      - name: Verify real manager reconciliation stays fail closed
+            --timeout=180s
+      - name: Verify admission and real reconciliation stay fail closed
         working-directory: operator
         env:
           PGSHARD_KIND_MANAGER_E2E: "true"
-        run: go test -race -count=1 -run '^TestKINDManagerReconcilesFailClosedDevelopmentCluster$' ./internal/controller
+        run: >-
+          go test -race -count=1
+          -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|ManagerReconcilesFailClosedDevelopmentCluster)$'
+          ./internal/controller
       - name: Capture manager diagnostics
         if: failure()
         run: |

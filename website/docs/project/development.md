@@ -56,10 +56,11 @@ identity is rejected.
 
 `PGSHARD_IMAGE_TARGETS="operator orchestrator pooler" make images` builds the
 subset used by the real-manager KIND smoke. After loading those `:dev` images
-into KIND, `kubectl apply -k operator/config/development` installs the restricted
-certificate-free manager. It is expected to reconcile only fail-closed
-supporting workloads; it is not a database quickstart or production admission
-configuration.
+into KIND, `kubectl apply -k operator/config/admission` installs the restricted
+self-managed admission manager. `operator/config/development` retains a
+certificate-free path for controller debugging. Both reconcile only
+fail-closed supporting workloads; neither is a database quickstart or
+production distribution.
 
 ## Git identity and history
 
