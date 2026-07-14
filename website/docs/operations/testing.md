@@ -171,7 +171,27 @@ exercise that fallback. The observer preserves exact request order and typed
 built-in state, records the non-atomic collection interval, treats every
 non-temporary public-view row's persistence as unproven, and reports ownership
 as unknown; this is local catalog observation, not a multi-server eligibility
-proof or creation attestation.
+proof or creation attestation. The same consumed connection also brackets a
+preceding PostgreSQL 18 prerequisite query. The live primary fixture verifies
+its control-file system identifier and checkpoint timeline, writable role,
+logical WAL level, enabled feedback and slot-sync settings, exact one-second
+receiver interval, configured test physical-slot name, absent replay position,
+and absent WAL receiver; settings on that writable server are not behavioral
+evidence. The job takes a physical base backup through a dedicated replication
+role, creates a primary failover anchor after that backup but before starting its
+standby, and therefore keeps both the anchor's required WAL and catalog horizon
+available for synchronization. The standby starts on a separate port and must
+report recovery, replay, a streaming receiver using the managed physical slot,
+mandatory feedback, and continuous slot synchronization. The test waits past
+PostgreSQL's temporary synchronized-slot state for a
+non-temporary synchronized copy. A standby login without `pg_read_all_stats`
+sees only the receiver PID, and the observer must return its typed
+details-unavailable error instead of reporting an absent receiver. Exact
+primary/walsender identity correlation, feedback freshness, new-anchor
+reconciliation on already-running standbys, and a timestamped successful
+slot-sync cycle remain part of the later multi-server runtime suite.
+The same job runs the observer against PostgreSQL 17 and requires the typed
+minimum-version rejection before any PostgreSQL 18-only setting is queried.
 Agent unit tests reject unsafe, incompatible, symlinked, structurally incomplete,
 or role-aware recovery state, including base-backup markers and CRC-backed
 `shut down in recovery` or `in archive recovery` control states with both signal
