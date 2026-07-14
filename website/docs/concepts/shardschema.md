@@ -44,12 +44,18 @@ logical-consumer registry keys each per-shard record by consumer,
 shard restore-incarnation UUID, PostgreSQL system identifier, and database OID;
 the database name remains metadata. It records a bounded purpose, ownership
 fence, primary anchor, selected source identity and timeline, standby-local slot
-and consistent point, durable checkpoint and generation, and whether a new
-snapshot is required. Public streams and reshard materializers receive separate
-records and slots. Bootstrap and every coordinated restore install fresh shard
-restore-incarnation UUIDs and atomically advance affected checkpoint generations
-before slot reconciliation or serving; restoring the catalog's old incarnation
-value never authorizes attachment to restored WAL or an old resume token.
+and consistent point, each never-reused slot generation and
+generation-encoded name, the exact two-phase activation boundary, durable
+checkpoint and checkpoint generation, and whether a new snapshot is required.
+The planned live-health record also binds slot-sync success to the current
+direct-primary connection generation; it does not mistake that worker's SQL
+connection database for the database OID of every slot it synchronizes. Public
+streams and reshard materializers receive separate records and slots. Bootstrap
+and every coordinated restore install fresh shard restore-incarnation UUIDs and
+atomically advance affected checkpoint generations before slot reconciliation
+or serving; restoring the catalog's old incarnation value never authorizes
+attachment to restored WAL or an old resume token. Retired managed slot names
+and generations are permanent tombstones and are never allocated again.
 
 Password material is never stored in `shardschema`.
 
