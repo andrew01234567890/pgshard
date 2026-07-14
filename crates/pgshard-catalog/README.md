@@ -6,6 +6,28 @@ lock-free multi-epoch cache.
 `shardschema` is authoritative and is hosted on stable shard 0000 in Milestone
 1. Etcd is not a topology store.
 
+The migration also stores permanent shard restore-incarnation history,
+logical-consumer identities, per-shard ownership fences, never-reused
+checkpoint and source-attachment generations, source-bound checkpoint
+identities, and generation-encoded primary-anchor and standby-decoder slot
+allocations.
+Primary anchors are cluster-scoped failover identities whose synchronized
+copies follow PostgreSQL promotion; standby decoders are bound to one canonical
+member ordinal.
+Database triggers serialize mutations through the catalog epoch, reject
+checkpoint seeding and regression, require every progress change to advance its
+ordinal, require every new generation to begin at a snapshot boundary, bind it
+to one restore/system/database/timeline lineage, reject identity rebinding,
+require active matching selected-source and primary-anchor slots for every
+checkpoint advance, require both activation boundaries before snapshot
+completion, and retain immutable retired names and generations as tombstones.
+The restricted catalog role cannot update checkpoint progress directly. Its
+checkpoint CAS requires the caller's expected ownership fence and checkpoint
+ordinal, so a fence that wins the catalog lock makes an in-flight stale advance
+fail before it can reinterpret durable WAL progress.
+The Rust routing snapshot intentionally does not load this registry yet;
+catalog records do not authorize a live replication session.
+
 The migration expects a pre-created UTF8 database and a trusted migration
 principal able to create the two NOLOGIN group roles:
 

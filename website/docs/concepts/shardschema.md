@@ -18,7 +18,11 @@ connector rejects non-local endpoints. An explicit credential-free bootstrap
 mode exposes liveness while reporting the catalog unconfigured and making no
 connection attempt. The operator selects that mode until it can provision a
 safe catalog transport. Overall application readiness stays false because
-there is no SQL data plane. Authenticated TLS, remote catalog transport, and
+there is no SQL data plane. The migration now also contains the permanent
+logical-consumer, checkpoint-generation, source-attachment, and managed-slot
+allocation registry described below. Its live PostgreSQL 18 test exercises the
+fenced lifecycle and tombstones, but no Rust reconciler loads or mutates those
+records yet. Authenticated TLS, remote catalog transport, and
 operator-provisioned credentials are not wired yet; see
 [implementation status](../project/status.md).
 :::
@@ -33,29 +37,55 @@ leases and fencing.
 The current internal `pgshard_catalog` migration records:
 
 - Databases, registered tables, shard-key types and hash versions.
-- Shard identities and non-overlapping half-open key ranges.
+- Shard identities, permanent restore-incarnation history, and non-overlapping
+  half-open key ranges.
 - Routing, schema, authorization, and catalog epochs.
+- Permanent logical-consumer identities and per-shard ownership fences.
+- Never-reused checkpoint, source-attachment, and managed-slot generations.
 - Permanent fixed-size operation tombstones for idempotency.
 
-Durable DDL, reshard, backup/restore and change-stream journals remain planned
-extensions; the current schema does not claim to store them. The planned
-logical-consumer registry keys each per-shard record by consumer,
+Durable DDL, reshard, backup/restore and delivered-change journals remain
+planned extensions; the current schema does not claim to store them. The
+logical-consumer registry keys each stable per-shard fence by consumer,
 `logical_database_id`, and shard. Its source-attachment key adds an immutable
 shard restore-incarnation UUID, PostgreSQL system identifier, and database OID;
 the database name remains metadata. It records a bounded purpose, ownership
-fence, primary anchor, selected source identity and timeline, standby-local slot
-and consistent point, each never-reused slot generation and
-generation-encoded name, the exact two-phase activation boundary, durable
-checkpoint and checkpoint generation, and whether a new snapshot is required.
-The planned live-health record also binds slot-sync success to the current
+fence, cluster-scoped primary anchor, explicit selected source role, source
+identity and timeline, member-ordinal-bound standby-local slot and consistent
+point, each never-reused slot generation and generation-encoded name, the exact
+two-phase activation boundary, durable checkpoint and checkpoint generation,
+and whether a new snapshot is required. A checkpoint generation is immutably
+bound to its restore incarnation, system identifier, database OID, and source
+timeline; a different lineage cannot reinterpret its LSN.
+Only `active`, `draining`, and then `retired` consumer transitions are accepted.
+A per-shard record starts provisioning, cannot become ready until a current
+non-snapshot checkpoint and complete active attachment exist, and must advance
+its ownership fence when a ready owner is fenced. Every checkpoint generation
+starts at LSN and ordinal zero with `snapshot_required`; its LSN and ordinal
+cannot regress, every progress change must advance the ordinal, and progress
+cannot advance in the statement that retires it or without an active
+exact-lineage attachment and its selected-source and primary-anchor slots.
+Clearing `snapshot_required` requires the durable checkpoint to cover both
+slots' recorded consistent points and two-phase boundaries. Activated
+source identity, slot names, generations, consistent points, and two-phase
+boundaries are immutable. Source and slot retirement is ordered, and retired
+rows cannot be changed, deleted, or reused. A selected source may be a
+member-bound standby-local decoder or the cluster-scoped primary failover
+anchor, preserving the fail-closed primary fallback. Synchronized anchor copies
+remain observed PostgreSQL state rather than separate catalog allocations.
+
+The future live-health record will also bind slot-sync success to the current
 direct-primary connection generation; it does not mistake that worker's SQL
 connection database for the database OID of every slot it synchronizes. Public
 streams and reshard materializers receive separate records and slots. Bootstrap
-and every coordinated restore install fresh shard restore-incarnation UUIDs and
-atomically advance affected checkpoint generations before slot reconciliation
-or serving; restoring the catalog's old incarnation value never authorizes
-attachment to restored WAL or an old resume token. Retired managed slot names
-and generations are permanent tombstones and are never allocated again.
+and every coordinated restore must install fresh shard restore-incarnation
+UUIDs and atomically advance affected checkpoint generations before slot
+reconciliation or serving; restoring the catalog's old incarnation value never
+authorizes attachment to restored WAL or an old resume token. Retired managed slot names
+and generations are already permanent tombstones and are never allocated
+again. The controlled restore rotation and its CAS API, live observation,
+PostgreSQL slot creation/drop, and connection-bound stream ownership remain
+unimplemented; table rows alone do not authorize `START_REPLICATION`.
 
 Password material is never stored in `shardschema`.
 
@@ -146,7 +176,10 @@ The migration is transactional and idempotent, requires PostgreSQL 18 or newer,
 and must run in a pre-created UTF8 database named exactly `shardschema`. It
 creates NOLOGIN reader/admin group roles, revokes public access and exposes
 activation through a dual compare-and-swap over the global catalog epoch and
-the prior active routing epoch. Activated routes and identity history are
+the prior active routing epoch. The administrator cannot update checkpoint
+progress directly; a dedicated function compares both the caller's ownership
+fence and checkpoint ordinal while holding the global catalog lock. Activated
+routes and identity history are
 immutable. Every staged range mutation also versions its parent routing epoch,
 so an activation using an older `REPEATABLE READ` snapshot fails with a
 serialization error rather than publishing stale or incomplete coverage.
