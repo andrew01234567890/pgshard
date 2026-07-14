@@ -151,18 +151,22 @@ authenticated proof. The future socket session must still enforce transport
 and authentication order, authentication policy, channel binding, server
 identity, rejection of reserved protocol 3.1 as client policy, and the
 configured minimum protocol version.
-Exact startup-control encoders cover `AuthenticationOk`, `ParameterStatus`,
-`BackendKeyData`, `NegotiateProtocolVersion`, and every `ReadyForQuery`
-transaction state. They also cover PostgreSQL 18's ordered SCRAM-SHA-256
-advertisement and opaque SASL continue/final frames. Frontend typed decoders
-borrow the selected SASL mechanism, preserve absent versus empty initial data,
-and borrow follow-up response bytes without rendering them. Caller-buffered
-encoders validate the complete bounded
+Exact control encoders cover `AuthenticationOk`, minimal `ErrorResponse`,
+`ParameterStatus`, `BackendKeyData`, `NegotiateProtocolVersion`, and every
+`ReadyForQuery` transaction state. They also cover PostgreSQL 18's ordered
+SCRAM-SHA-256 advertisement and opaque SASL continue/final frames. Frontend
+typed decoders borrow the selected SASL mechanism, preserve absent versus empty
+initial data, and borrow follow-up response bytes without rendering them.
+Minimal errors contain canonical localized and nonlocalized severity, SQLSTATE,
+and primary-message fields; optional diagnostic fields are not encoded yet.
+The caller supplies the phase-appropriate error limit: 30,000 bytes before
+authentication or a bounded authenticated-session policy no greater than the
+64 MiB pooler ceiling. Caller-buffered encoders validate the complete bounded
 frame before changing output and redact payloads from errors. The PostgreSQL 18
-fixture requires the non-SASL startup-control output to equal live server bytes;
-the SCRAM primitives currently have source-aligned unit coverage only. No
-ordered session writer, SCRAM cryptographic state machine, or client-facing
-startup exchange exists yet.
+fixture requires non-SASL startup-control output other than `ErrorResponse` to
+equal live server bytes; the SCRAM and error primitives currently have
+source-aligned unit coverage only. No ordered session writer, SCRAM
+cryptographic state machine, or client-facing startup exchange exists yet.
 The transport layer, which is not implemented yet, must handle PostgreSQL 18
 direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting

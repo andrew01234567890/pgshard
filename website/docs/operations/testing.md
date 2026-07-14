@@ -63,8 +63,14 @@ fixture also checks real `Describe`, `ParameterDescription`, empty completion,
 decoders. Separate unit tests enforce PostgreSQL 18's tighter SCRAM frame bound,
 decode absent, empty, truncated, negative, and trailing initial responses,
 redact all mechanism and exchange bytes, and round-trip the closed SCRAM
-advertisement plus continue/final encoders. Source-aligned `pgoutput` unit tests
-cover protocol v1-v4 option
+advertisement plus continue/final encoders. Separate unit tests require minimal
+client-facing `ErrorResponse` encoding to preserve PostgreSQL 18's `S`, `V`,
+`C`, `M`, and terminal-field order; accept the exact 30,000-byte startup
+ceiling and an explicit larger authenticated-session bound; reject excessive
+caller limits, every invalid SQLSTATE position, empty or zero-containing
+messages, oversizing, and short output without mutation; keep rejected payloads
+out of errors. Source-aligned `pgoutput` unit tests cover protocol
+v1-v4 option
 combinations, XLogData and keepalive envelopes, buffered, streamed, and
 two-phase transaction controls, every truncated prefix, feature mismatches,
 reserved flags, strict booleans, authoritative client/server UTF-8, maximum
