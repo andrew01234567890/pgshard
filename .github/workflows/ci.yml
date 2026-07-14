@@ -361,7 +361,7 @@ jobs:
             --volume pgshard-ci-standby:/var/lib/postgresql \
             postgres:18 \
             postgres -D /var/lib/postgresql/18/docker -p 5434 \
-              -c "primary_conninfo=host=host.docker.internal port=5432 user=pgshard_replicator password=pgshard-ci-only dbname=shardschema application_name=pgshard_ci_standby sslmode=disable" \
+              -c "primary_conninfo=host=host.docker.internal port=5432 user=pgshard_replicator password=pgshard-ci-only dbname=shardschema application_name=pgshard_member_0001 sslmode=disable" \
               -c primary_slot_name=pgshard_member_0001 \
               -c hot_standby_feedback=on \
               -c wal_receiver_status_interval=1s \
