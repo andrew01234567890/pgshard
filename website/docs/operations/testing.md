@@ -137,6 +137,25 @@ tests cover observations only; the catalog allocation lifecycle is tested
 separately, while the live probe, controlled PostgreSQL slot lifecycle,
 connection-bound command proof, quarantined COPY-BOTH attachment, and stream
 owner are not implemented.
+The `Orchestrator catalog / PostgreSQL 18` CI job applies the real migration,
+constructs a ready reshard-materializer fixture, and loads its exact
+restore-bound checkpoint, ownership fence, anchor, and member-local decoder in
+one repeatable-read transaction. It also proves another member cannot inherit
+the allocation, a committed ownership fence removes the policy from subsequent
+reads, exact singleton values are retained, and corrupt ready rows with an
+unfinished snapshot, seed ordinal, or missing attachment/slot fail closed. A
+delayed singleton lock followed by a still-held owner lock proves the remaining
+server timeout is recomputed against one absolute client deadline before each
+PostgreSQL statement. The test
+observes the reader backend idle with no transaction while the owner lock is
+still held, then proves the same connection can retry after that statement
+cancellation and rollback. A unit test classifies an elapsed absolute client
+deadline as terminal and a completed statement cancellation as retryable; it
+does not simulate PostgreSQL's transaction-timeout error or a closed socket. A
+shared golden contract keeps the Rust reader and Go operator's
+member physical-slot names identical. This covers
+catalog-to-validator loading only; it does not
+observe, create, consume, synchronize, or drop a live replication slot.
 Agent unit tests reject unsafe, incompatible, symlinked, structurally incomplete,
 or role-aware recovery state, including base-backup markers and CRC-backed
 `shut down in recovery` or `in archive recovery` control states with both signal

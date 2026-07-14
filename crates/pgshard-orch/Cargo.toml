@@ -11,11 +11,13 @@ publish = false
 [dependencies]
 axum.workspace = true
 clap = { workspace = true, features = ["env"] }
+pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-postgres.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
