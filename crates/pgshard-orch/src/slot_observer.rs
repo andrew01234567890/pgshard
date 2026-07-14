@@ -9,7 +9,10 @@
 //! every observation remains [`SlotOwnership::Unknown`] until a future
 //! mutation-history attestor supplies stronger evidence.
 
-use std::{num::NonZeroU32, time::Duration};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    time::Duration,
+};
 
 use pgshard_catalog::CatalogOperationTimeout;
 use pgshard_types::PgLsn;
@@ -55,11 +58,27 @@ const OBSERVE_PREREQUISITES_SQL: &str = "\
            pg_catalog.pg_last_wal_replay_lsn()::pg_catalog.text AS replay_lsn, \
            receiver.pid::pg_catalog.int4, \
            receiver.status::pg_catalog.text, \
-           receiver.slot_name::pg_catalog.text \
+           receiver.slot_name::pg_catalog.text, \
+           pg_catalog.pg_has_role( \
+               current_user, 'pg_read_all_stats', 'USAGE' \
+           ) AS has_read_all_stats, \
+           slotsync.pid::pg_catalog.int4 AS slotsync_pid, \
+           pg_catalog.floor( \
+               pg_catalog.date_part('epoch', slotsync.backend_start) * 1000000 \
+           )::pg_catalog.int8 AS slotsync_backend_start_epoch_micros, \
+           slotsync.wait_event_type::pg_catalog.text AS slotsync_wait_event_type, \
+           slotsync.wait_event::pg_catalog.text AS slotsync_wait_event \
       FROM pg_catalog.pg_control_system() AS control \
      CROSS JOIN pg_catalog.pg_control_checkpoint() AS checkpoint_control \
       LEFT JOIN pg_catalog.pg_stat_get_wal_receiver() AS receiver \
-        ON receiver.pid IS NOT NULL";
+        ON receiver.pid IS NOT NULL \
+      LEFT JOIN LATERAL ( \
+            SELECT activity.pid, activity.backend_start, \
+                   activity.wait_event_type, activity.wait_event \
+              FROM pg_catalog.pg_stat_get_activity(NULL) AS activity \
+             WHERE activity.backend_type OPERATOR(pg_catalog.=) 'slotsync worker' \
+             LIMIT 2 \
+      ) AS slotsync ON true";
 const OBSERVE_SLOTS_SQL: &str = "\
     SELECT slot_name::pg_catalog.text AS slot_name, \
            plugin::pg_catalog.text AS plugin, slot_type, \
@@ -171,6 +190,62 @@ pub enum LocalWalReceiverActivity {
     Stopping,
 }
 
+/// Stable identity of one local `PostgreSQL` backend process.
+///
+/// The start timestamp comes from the server's wall clock and is used only for
+/// equality across observations. It is never treated as a freshness clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalPostgresBackendIdentity {
+    pid: NonZeroU32,
+    start_epoch_micros: NonZeroU64,
+}
+
+impl LocalPostgresBackendIdentity {
+    /// Returns the local process identifier.
+    #[must_use]
+    pub const fn pid(self) -> NonZeroU32 {
+        self.pid
+    }
+
+    /// Returns the positive server-wall-clock start value in Unix microseconds.
+    #[must_use]
+    pub const fn start_epoch_micros(self) -> NonZeroU64 {
+        self.start_epoch_micros
+    }
+}
+
+/// Raw local state of `PostgreSQL` 18's continuous slot-sync worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalSlotSyncWorkerActivity {
+    /// The worker is executing or is not currently waiting on a named event.
+    Running,
+    /// The worker completed a cycle and is in `ReplicationSlotsyncMain` wait.
+    WaitingAfterCycle,
+    /// The worker is blocked on another coherent `PostgreSQL` wait event.
+    OtherWait,
+}
+
+/// One local slot-sync worker observation before upstream correlation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalSlotSyncWorkerObservation {
+    identity: LocalPostgresBackendIdentity,
+    activity: LocalSlotSyncWorkerActivity,
+}
+
+impl LocalSlotSyncWorkerObservation {
+    /// Returns the PID plus backend-start identity of this worker generation.
+    #[must_use]
+    pub const fn identity(self) -> LocalPostgresBackendIdentity {
+        self.identity
+    }
+
+    /// Returns the raw local worker activity.
+    #[must_use]
+    pub const fn activity(self) -> LocalSlotSyncWorkerActivity {
+        self.activity
+    }
+}
+
 /// One local server's `PostgreSQL` 18 state needed by standby-first decoding.
 ///
 /// This is observation only. In particular, an enabled slot-sync setting is
@@ -191,6 +266,7 @@ pub struct LocalStandbyPrerequisiteObservation {
     wal_receiver_pid: Option<NonZeroU32>,
     wal_receiver_activity: LocalWalReceiverActivity,
     wal_receiver_slot_name: Option<ReplicationSlotName>,
+    slot_sync_worker: Option<LocalSlotSyncWorkerObservation>,
 }
 
 impl LocalStandbyPrerequisiteObservation {
@@ -264,6 +340,16 @@ impl LocalStandbyPrerequisiteObservation {
     #[must_use]
     pub const fn wal_receiver_slot_name(&self) -> Option<&ReplicationSlotName> {
         self.wal_receiver_slot_name.as_ref()
+    }
+
+    /// Returns the local continuous slot-sync worker, if one is observable.
+    ///
+    /// A waiting worker proves only that one local cycle returned. Upstream
+    /// connection identity and exact synchronized slot state still require a
+    /// later multi-server correlation step.
+    #[must_use]
+    pub const fn slot_sync_worker(&self) -> Option<LocalSlotSyncWorkerObservation> {
+        self.slot_sync_worker
     }
 }
 
@@ -541,6 +627,15 @@ fn parse_prerequisites(
     let receiver_slot_name = row.try_get(12)?;
     let (wal_receiver_pid, wal_receiver_activity, wal_receiver_slot_name) =
         parse_wal_receiver(receiver_pid, receiver_status.as_deref(), receiver_slot_name)?;
+    if !row.try_get::<_, bool>(13)? {
+        return Err(LocalSlotObservationError::StatisticsPrivilegeRequired);
+    }
+    let slot_sync_worker = parse_slot_sync_worker(
+        row.try_get(14)?,
+        row.try_get(15)?,
+        row.try_get::<_, Option<String>>(16)?.as_deref(),
+        row.try_get::<_, Option<String>>(17)?.as_deref(),
+    )?;
 
     Ok(LocalStandbyPrerequisiteObservation {
         system_identifier,
@@ -555,6 +650,7 @@ fn parse_prerequisites(
         wal_receiver_pid,
         wal_receiver_activity,
         wal_receiver_slot_name,
+        slot_sync_worker,
     })
 }
 
@@ -621,6 +717,48 @@ fn parse_wal_receiver(
         }
     };
     Ok((Some(pid), activity, optional_slot_name(slot_name)?))
+}
+
+fn parse_slot_sync_worker(
+    pid: Option<i32>,
+    backend_start_epoch_micros: Option<i64>,
+    wait_event_type: Option<&str>,
+    wait_event: Option<&str>,
+) -> Result<Option<LocalSlotSyncWorkerObservation>, LocalSlotObservationError> {
+    let Some(pid) = pid else {
+        if backend_start_epoch_micros.is_some() || wait_event_type.is_some() || wait_event.is_some()
+        {
+            return Err(LocalSlotObservationError::InconsistentSlotSyncWorker);
+        }
+        return Ok(None);
+    };
+    let pid = u32::try_from(pid)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or(LocalSlotObservationError::InvalidSlotSyncWorkerPid(pid))?;
+    let start_value =
+        backend_start_epoch_micros.ok_or(LocalSlotObservationError::InconsistentSlotSyncWorker)?;
+    let start_epoch_micros = u64::try_from(start_value)
+        .ok()
+        .and_then(NonZeroU64::new)
+        .ok_or(LocalSlotObservationError::InvalidSlotSyncWorkerStart(
+            start_value,
+        ))?;
+    let activity = match (wait_event_type, wait_event) {
+        (None, None) => LocalSlotSyncWorkerActivity::Running,
+        (Some("Activity"), Some("ReplicationSlotsyncMain")) => {
+            LocalSlotSyncWorkerActivity::WaitingAfterCycle
+        }
+        (Some(_), Some(_)) => LocalSlotSyncWorkerActivity::OtherWait,
+        _ => return Err(LocalSlotObservationError::InconsistentSlotSyncWorker),
+    };
+    Ok(Some(LocalSlotSyncWorkerObservation {
+        identity: LocalPostgresBackendIdentity {
+            pid,
+            start_epoch_micros,
+        },
+        activity,
+    }))
 }
 
 const fn setting_state(enabled: bool) -> SettingState {
@@ -861,12 +999,24 @@ pub enum LocalSlotObservationError {
         /// Visible PID of the receiver whose remaining fields were redacted.
         pid: NonZeroU32,
     },
+    /// The observer role cannot distinguish redacted auxiliary-process rows.
+    #[error("local slot observation requires effective pg_read_all_stats privileges")]
+    StatisticsPrivilegeRequired,
     /// `PostgreSQL` returned receiver details without a receiver PID.
     #[error("PostgreSQL WAL receiver details are inconsistent with its PID")]
     InconsistentWalReceiver,
     /// `PostgreSQL` returned a receiver status outside the `PostgreSQL` 18 closed set.
     #[error("unsupported PostgreSQL 18 WAL receiver status {0:?}")]
     UnsupportedWalReceiverStatus(String),
+    /// A local slot-sync worker PID was zero or outside the supported range.
+    #[error("PostgreSQL slot-sync worker PID is invalid: {0}")]
+    InvalidSlotSyncWorkerPid(i32),
+    /// A slot-sync worker backend-start timestamp was not a positive Unix value.
+    #[error("PostgreSQL slot-sync worker backend start is invalid: {0}")]
+    InvalidSlotSyncWorkerStart(i64),
+    /// `PostgreSQL` returned a partial slot-sync worker identity or wait event.
+    #[error("PostgreSQL slot-sync worker details are internally inconsistent")]
+    InconsistentSlotSyncWorker,
     /// A nonnegative `PostgreSQL` setting did not fit the Rust model.
     #[error("PostgreSQL observation field {field} must be a nonnegative integer; observed {value}")]
     InvalidNonnegativeInteger {
@@ -1100,6 +1250,81 @@ mod tests {
             Err(LocalSlotObservationError::UnsupportedWalReceiverStatus(status))
                 if status == "future"
         ));
+    }
+
+    #[test]
+    fn parses_slot_sync_worker_identity_and_cycle_boundary() {
+        assert_eq!(
+            parse_slot_sync_worker(None, None, None, None).expect("absent worker"),
+            None
+        );
+        let worker = parse_slot_sync_worker(
+            Some(42),
+            Some(1_700_000_000_123_456),
+            Some("Activity"),
+            Some("ReplicationSlotsyncMain"),
+        )
+        .expect("waiting worker")
+        .expect("worker row");
+        assert_eq!(worker.identity().pid().get(), 42);
+        assert_eq!(
+            worker.identity().start_epoch_micros().get(),
+            1_700_000_000_123_456
+        );
+        assert_eq!(
+            worker.activity(),
+            LocalSlotSyncWorkerActivity::WaitingAfterCycle
+        );
+
+        for (wait_type, wait_event, expected) in [
+            (None, None, LocalSlotSyncWorkerActivity::Running),
+            (
+                Some("Client"),
+                Some("ClientRead"),
+                LocalSlotSyncWorkerActivity::OtherWait,
+            ),
+        ] {
+            assert_eq!(
+                parse_slot_sync_worker(
+                    Some(43),
+                    Some(1_700_000_000_123_457),
+                    wait_type,
+                    wait_event,
+                )
+                .expect("coherent worker")
+                .expect("worker row")
+                .activity(),
+                expected
+            );
+        }
+
+        assert!(matches!(
+            parse_slot_sync_worker(Some(0), Some(1), None, None),
+            Err(LocalSlotObservationError::InvalidSlotSyncWorkerPid(0))
+        ));
+        assert!(matches!(
+            parse_slot_sync_worker(Some(42), None, None, None),
+            Err(LocalSlotObservationError::InconsistentSlotSyncWorker)
+        ));
+        assert!(matches!(
+            parse_slot_sync_worker(Some(42), Some(0), None, None),
+            Err(LocalSlotObservationError::InvalidSlotSyncWorkerStart(0))
+        ));
+        for inconsistent in [
+            (None, Some(1), None, None),
+            (Some(42), Some(1), Some("Activity"), None),
+            (Some(42), Some(1), None, Some("ReplicationSlotsyncMain")),
+        ] {
+            assert!(matches!(
+                parse_slot_sync_worker(
+                    inconsistent.0,
+                    inconsistent.1,
+                    inconsistent.2,
+                    inconsistent.3,
+                ),
+                Err(LocalSlotObservationError::InconsistentSlotSyncWorker)
+            ));
+        }
     }
 
     #[test]

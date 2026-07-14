@@ -335,6 +335,9 @@ jobs:
           docker exec "$primary_container" psql \
             --username postgres --dbname shardschema --set ON_ERROR_STOP=1 \
             --command "CREATE ROLE pgshard_observer_restricted LOGIN PASSWORD 'pgshard-test-only'"
+          docker exec "$primary_container" psql \
+            --username postgres --dbname shardschema --set ON_ERROR_STOP=1 \
+            --command "GRANT pg_read_all_stats TO pgshard_observer_restricted WITH INHERIT FALSE"
           docker exec --user postgres "$primary_container" sh -ceu \
             'printf "%s\n" "host replication pgshard_replicator all scram-sha-256" >> "$PGDATA/pg_hba.conf"; pg_ctl reload --pgdata "$PGDATA"'
           docker volume create pgshard-ci-standby >/dev/null

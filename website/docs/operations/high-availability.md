@@ -27,8 +27,10 @@ The operator renders inactive common plus per-member primary and standby
 PostgreSQL 18 configuration profiles, including promotion-safe slot capacity, `ANY 1`, and
 mandatory standby feedback and slot synchronization. A bounded local observer
 reads PostgreSQL 18 recovery, receiver, replay, slot-sync configuration, and
-logical-slot state, with a real primary/standby CI fixture. Secure upstream
-connection material, multi-server identity correlation, role activation,
+logical-slot state plus the local continuous worker's process generation and
+post-cycle wait boundary, with a real primary/standby CI fixture. Secure
+upstream connection material, multi-server identity and worker-connection
+correlation, role activation,
 operator-managed replication, durable lease integration, promotion, automated
 recovery, and rolling restarts are not implemented; see
 [implementation status](../project/status.md).
