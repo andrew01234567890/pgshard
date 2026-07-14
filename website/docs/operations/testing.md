@@ -169,6 +169,12 @@ without restarts while they remain unready, proves application Services have no
 ready endpoints, and verifies no PostgreSQL workload exists. A unit
 regression gives the informer cache a false absence while the authoritative API
 reader still sees an owned PVC, and proves that finalization continues waiting.
+Operator unit tests also prove deterministic common, primary, and per-standby
+configuration rendering; self-excluding primary candidate sets; `ANY 1` versus
+asynchronous role selection; mandatory
+standby feedback and slot synchronization; and slot-capacity bounds for steady
+primary, steady standby, and promotion-overlap states on one-, three-, and
+five-member shards.
 The broader runtime, integration, KIND,
 Jepsen/Elle and PgBouncer comparison suites below remain required Milestone 1
 work; see
@@ -217,6 +223,11 @@ Jepsen/Elle check the guarantees actually offered: atomic final cross-shard outc
   across source loss and promotion, with no consumption of a synchronized slot
   before promotion and no cross-consumer or cross-database checkpoint or slot
   ownership.
+- Switchover and former-primary rejoin while same-named primary anchors remain:
+  synchronization and promotion eligibility stay fenced until checkpoint-safe
+  managed-slot cleanup or a rebuild, managed cleanup leaves unrelated user slots
+  untouched, unknown collisions fail closed, and the recovered stream has no
+  gaps.
 - Source attachment rejects a same-name and same-OID database from another
   PostgreSQL system identifier, and rejects a physical restore that reuses the
   system identifier and OID without a fresh shard restore-incarnation UUID.

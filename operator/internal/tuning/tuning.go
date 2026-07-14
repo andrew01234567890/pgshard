@@ -42,6 +42,8 @@ var (
 const (
 	maximumPostgreSQLCPUText    = "1024"
 	maximumPostgreSQLMemoryText = "16Ti"
+	maximumMembersPerShard      = int32(5)
+	maximumChangeStreams        = int32(1024)
 )
 
 type Input struct {
@@ -49,6 +51,28 @@ type Input struct {
 	PoolerMaxReplicas    int32
 	MembersPerShard      int32
 	MaximumChangeStreams int32
+	SynchronousStandbys  int32
+}
+
+// Standby describes the immutable per-member settings needed before a direct
+// physical replica can become eligible for logical decoding or promotion-slot
+// synchronization. primary_conninfo remains an orchestration-owned secret and
+// is deliberately not rendered here. A former primary must also reconcile or
+// remove obsolete primary-owned slots before this profile is activated because
+// PostgreSQL will not replace a same-named non-synchronized local slot.
+type Standby struct {
+	Ordinal          int32
+	ApplicationName  string
+	PhysicalSlotName string
+	Settings         map[string]string
+}
+
+// Primary describes the per-member candidate set used when that member owns
+// the writable role. Every member gets a profile because ordinal zero is not a
+// permanent primary after failover.
+type Primary struct {
+	Ordinal  int32
+	Settings map[string]string
 }
 
 type Result struct {
@@ -59,7 +83,13 @@ type Result struct {
 	MaxPreparedTransactions int32
 	MaxWALSenders           int32
 	MaxReplicationSlots     int32
+	ManagedLogicalConsumers int32
+	PrimarySlotDemand       int32
+	StandbySlotDemand       int32
+	PromotionSlotDemand     int32
 	Settings                map[string]string
+	Primaries               []Primary
+	Standbys                []Standby
 }
 
 func Calculate(in Input) (Result, error) {
@@ -106,8 +136,20 @@ func Calculate(in Input) (Result, error) {
 	if in.MembersPerShard < 1 {
 		return Result{}, fmt.Errorf("members per shard must be positive")
 	}
+	if in.MembersPerShard > maximumMembersPerShard {
+		return Result{}, fmt.Errorf("members per shard must not exceed %d", maximumMembersPerShard)
+	}
 	if in.MaximumChangeStreams < 0 {
 		return Result{}, fmt.Errorf("maximum change streams cannot be negative")
+	}
+	if in.MaximumChangeStreams > maximumChangeStreams {
+		return Result{}, fmt.Errorf("maximum change streams must not exceed %d", maximumChangeStreams)
+	}
+	if in.SynchronousStandbys < 0 || in.SynchronousStandbys > 1 {
+		return Result{}, fmt.Errorf("synchronous standbys must be zero or one")
+	}
+	if in.SynchronousStandbys > in.MembersPerShard-1 {
+		return Result{}, fmt.Errorf("synchronous standby count exceeds physical replicas")
 	}
 
 	shared := memory / 4
@@ -130,10 +172,26 @@ func Calculate(in Input) (Result, error) {
 	parallelWorkersPerGather := clamp64((cores+1)/2, 1, 4)
 	autovacuumWorkers := clamp64(cores+1, 3, 10)
 
-	operationSlots := int64(4) // one each for backup, DDL, reshard, and recovery
+	operationSlots := int64(4) // reshard, schema, repair, and recovery consumers
 	physicalSlots := int64(in.MembersPerShard - 1)
-	logicalSlots := int64(in.MaximumChangeStreams) + operationSlots
-	maxSlots := physicalSlots + logicalSlots + 2
+	managedLogicalConsumers := int64(in.MaximumChangeStreams) + operationSlots
+	// A primary holds one physical slot per direct standby plus one failover
+	// anchor per managed logical consumer. An eligible standby needs both the
+	// synchronized copy of every anchor and a separate standby-local decoding
+	// slot because PostgreSQL cannot consume a synchronized slot in recovery.
+	// A promoted decoding standby can temporarily retain both logical slot
+	// classes while it creates physical slots for the remaining replicas. Size
+	// every member for that transition so promotion never requires a restart
+	// merely to raise max_replication_slots. Two additional slots remain
+	// reserved for bounded repair/migration overlap.
+	primarySlotDemand := physicalSlots + managedLogicalConsumers
+	standbySlotDemand := int64(0)
+	promotionSlotDemand := int64(0)
+	if physicalSlots > 0 {
+		standbySlotDemand = managedLogicalConsumers * 2
+		promotionSlotDemand = standbySlotDemand + physicalSlots
+	}
+	maxSlots := max64(primarySlotDemand, promotionSlotDemand) + 2
 	maxSenders := maxSlots + 2
 	maxPrepared := max64(32, int64(in.PoolerMaxReplicas)*4) + 8
 
@@ -146,6 +204,8 @@ func Calculate(in Input) (Result, error) {
 		"effective_cache_size":            formatMiB(effective),
 		"fsync":                           "on",
 		"full_page_writes":                "on",
+		"hot_standby":                     "on",
+		"idle_replication_slot_timeout":   "0",
 		"maintenance_work_mem":            formatMiB(maintenance),
 		"max_connections":                 strconv.FormatInt(maxConnections, 10),
 		"max_parallel_workers":            strconv.FormatInt(parallelWorkers, 10),
@@ -163,6 +223,48 @@ func Calculate(in Input) (Result, error) {
 		"work_mem":                        formatMiB(workMem),
 	}
 
+	standbys := make([]Standby, 0, in.MembersPerShard)
+	for ordinal := int32(0); ordinal < in.MembersPerShard; ordinal++ {
+		name := memberReplicationName(ordinal)
+		standbys = append(standbys, Standby{
+			Ordinal:          ordinal,
+			ApplicationName:  name,
+			PhysicalSlotName: name,
+			Settings: map[string]string{
+				"hot_standby":                  "on",
+				"hot_standby_feedback":         "on",
+				"primary_slot_name":            postgresqlString(name),
+				"sync_replication_slots":       "on",
+				"wal_receiver_status_interval": "1s",
+			},
+		})
+	}
+
+	primaries := make([]Primary, 0, in.MembersPerShard)
+	for primaryOrdinal := int32(0); primaryOrdinal < in.MembersPerShard; primaryOrdinal++ {
+		physicalSlotNames := make([]string, 0, physicalSlots)
+		applicationNames := make([]string, 0, physicalSlots)
+		for candidateOrdinal := int32(0); candidateOrdinal < in.MembersPerShard; candidateOrdinal++ {
+			if candidateOrdinal == primaryOrdinal {
+				continue
+			}
+			name := memberReplicationName(candidateOrdinal)
+			physicalSlotNames = append(physicalSlotNames, name)
+			applicationNames = append(applicationNames, name)
+		}
+		synchronousStandbyNames := ""
+		if in.SynchronousStandbys == 1 {
+			synchronousStandbyNames = fmt.Sprintf("ANY 1 (%s)", strings.Join(applicationNames, ","))
+		}
+		primaries = append(primaries, Primary{
+			Ordinal: primaryOrdinal,
+			Settings: map[string]string{
+				"synchronized_standby_slots": postgresqlString(strings.Join(physicalSlotNames, ",")),
+				"synchronous_standby_names":  postgresqlString(synchronousStandbyNames),
+			},
+		})
+	}
+
 	return Result{
 		MemoryBytes:             memory,
 		CPUMilli:                cpu,
@@ -171,8 +273,25 @@ func Calculate(in Input) (Result, error) {
 		MaxPreparedTransactions: int32(maxPrepared),
 		MaxWALSenders:           int32(maxSenders),
 		MaxReplicationSlots:     int32(maxSlots),
+		ManagedLogicalConsumers: int32(managedLogicalConsumers),
+		PrimarySlotDemand:       int32(primarySlotDemand),
+		StandbySlotDemand:       int32(standbySlotDemand),
+		PromotionSlotDemand:     int32(promotionSlotDemand),
 		Settings:                settings,
+		Primaries:               primaries,
+		Standbys:                standbys,
 	}, nil
+}
+
+func memberReplicationName(ordinal int32) string {
+	return fmt.Sprintf("pgshard_member_%04d", ordinal)
+}
+
+func postgresqlString(value string) string {
+	// All current callers construct values exclusively from fixed ASCII tokens
+	// and decimal ordinals. Keep the escaping correct if a future controlled
+	// value contains a quote rather than teaching renderers to special-case it.
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func ApplyOverrides(settings map[string]string, overrides map[string]string) error {

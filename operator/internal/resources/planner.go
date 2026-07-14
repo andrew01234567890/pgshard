@@ -122,21 +122,21 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		}
 	}
 
-	settings, err := cluster.ResolvedPostgreSQLSettings()
+	postgresql, err := cluster.ResolvedPostgreSQLConfiguration()
 	if err != nil {
 		return nil, fmt.Errorf("resolve PostgreSQL settings: %w", err)
 	}
-	postgresqlConfig := renderPostgreSQLConfig(settings)
+	postgresqlConfig := renderPostgreSQLConfiguration(postgresql)
 	topologyConfig, err := renderTopology(cluster)
 	if err != nil {
 		return nil, err
 	}
 	topologyHash := configHash(topologyConfig)
-	poolerHash := configHash(postgresqlConfig, topologyConfig)
+	poolerHash := configHash(configMapDataHash(postgresqlConfig), topologyConfig)
 
 	objects := make([]client.Object, 0, 16+cluster.Spec.Shards)
 	objects = append(objects,
-		configMap(cluster, cluster.Name+PostgreSQLConfigSuffix, map[string]string{"postgresql.conf": postgresqlConfig}),
+		configMap(cluster, cluster.Name+PostgreSQLConfigSuffix, postgresqlConfig),
 		configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": topologyConfig}),
 		applicationService(cluster, "rw", cluster.Spec.Services.ReadWrite, PoolerRWPort),
 		applicationService(cluster, "ro", cluster.Spec.Services.ReadOnly, PoolerROPort),
@@ -162,6 +162,18 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		objects = append(objects, poolerHPA(cluster))
 	}
 	return objects, nil
+}
+
+func renderPostgreSQLConfiguration(configuration pgshardv1alpha1.ResolvedPostgreSQLConfiguration) map[string]string {
+	data := make(map[string]string, 1+len(configuration.Primaries)+len(configuration.Standbys))
+	data["postgresql.conf"] = renderPostgreSQLConfig(configuration.Common)
+	for _, primary := range configuration.Primaries {
+		data[fmt.Sprintf("primary-%04d.conf", primary.Ordinal)] = renderPostgreSQLConfig(primary.Settings)
+	}
+	for _, standby := range configuration.Standbys {
+		data[fmt.Sprintf("standby-%04d.conf", standby.Ordinal)] = renderPostgreSQLConfig(standby.Settings)
+	}
+	return data
 }
 
 func renderPostgreSQLConfig(settings map[string]string) string {
@@ -264,6 +276,22 @@ func configHash(configs ...string) string {
 	hash := sha256.New()
 	for _, config := range configs {
 		hash.Write([]byte(config))
+		hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func configMapDataHash(data map[string]string) string {
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	hash := sha256.New()
+	for _, key := range keys {
+		hash.Write([]byte(key))
+		hash.Write([]byte{0})
+		hash.Write([]byte(data[key]))
 		hash.Write([]byte{0})
 	}
 	return hex.EncodeToString(hash.Sum(nil))

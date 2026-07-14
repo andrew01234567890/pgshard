@@ -27,6 +27,7 @@ func TestCalculateDeterministicSafeSettings(t *testing.T) {
 		PoolerMaxReplicas:    10,
 		MembersPerShard:      3,
 		MaximumChangeStreams: 4,
+		SynchronousStandbys:  1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -42,8 +43,8 @@ func TestCalculateDeterministicSafeSettings(t *testing.T) {
 		"work_mem":                        "5MB",
 		"max_connections":                 "100",
 		"max_prepared_transactions":       "48",
-		"max_replication_slots":           "12",
-		"max_wal_senders":                 "14",
+		"max_replication_slots":           "20",
+		"max_wal_senders":                 "22",
 		"max_worker_processes":            "12",
 		"max_parallel_workers":            "2",
 		"max_parallel_workers_per_gather": "1",
@@ -51,11 +52,108 @@ func TestCalculateDeterministicSafeSettings(t *testing.T) {
 		"wal_level":                       "logical",
 		"fsync":                           "on",
 		"full_page_writes":                "on",
+		"hot_standby":                     "on",
+		"idle_replication_slot_timeout":   "0",
 		"synchronous_commit":              "on",
 	}
 	for key, value := range want {
 		if got.Settings[key] != value {
 			t.Errorf("%s = %q, want %q", key, got.Settings[key], value)
+		}
+	}
+	if got.ManagedLogicalConsumers != 8 || got.PrimarySlotDemand != 10 || got.StandbySlotDemand != 16 || got.PromotionSlotDemand != 18 {
+		t.Fatalf("slot demand = consumers %d primary %d standby %d promotion %d", got.ManagedLogicalConsumers, got.PrimarySlotDemand, got.StandbySlotDemand, got.PromotionSlotDemand)
+	}
+	if len(got.Primaries) != 3 {
+		t.Fatalf("primary profiles = %#v", got.Primaries)
+	}
+	wantCandidates := []string{
+		"pgshard_member_0001,pgshard_member_0002",
+		"pgshard_member_0000,pgshard_member_0002",
+		"pgshard_member_0000,pgshard_member_0001",
+	}
+	for ordinal, primary := range got.Primaries {
+		candidates := wantCandidates[ordinal]
+		if primary.Ordinal != int32(ordinal) ||
+			primary.Settings["synchronized_standby_slots"] != postgresqlString(candidates) ||
+			primary.Settings["synchronous_standby_names"] != postgresqlString("ANY 1 ("+candidates+")") {
+			t.Fatalf("primary profile %d = %#v", ordinal, primary)
+		}
+	}
+	if len(got.Standbys) != 3 {
+		t.Fatalf("standby profiles = %#v", got.Standbys)
+	}
+	for ordinal, standby := range got.Standbys {
+		name := memberReplicationName(int32(ordinal))
+		if standby.Ordinal != int32(ordinal) ||
+			standby.ApplicationName != name ||
+			standby.PhysicalSlotName != name ||
+			standby.Settings["primary_slot_name"] != postgresqlString(name) ||
+			standby.Settings["hot_standby"] != "on" ||
+			standby.Settings["hot_standby_feedback"] != "on" ||
+			standby.Settings["sync_replication_slots"] != "on" ||
+			standby.Settings["wal_receiver_status_interval"] != "1s" {
+			t.Fatalf("standby profile %d = %#v", ordinal, standby)
+		}
+	}
+}
+
+func TestCalculateSeparatesPrimaryAnchorsFromStandbyDecoders(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name                string
+		members             int32
+		synchronousStandbys int32
+		primaryDemand       int32
+		standbyDemand       int32
+		promotionDemand     int32
+		maxSlots            int32
+	}{
+		{name: "single asynchronous member", members: 1, primaryDemand: 8, maxSlots: 10},
+		{name: "three synchronous members", members: 3, synchronousStandbys: 1, primaryDemand: 10, standbyDemand: 16, promotionDemand: 18, maxSlots: 20},
+		{name: "five synchronous members", members: 5, synchronousStandbys: 1, primaryDemand: 12, standbyDemand: 16, promotionDemand: 20, maxSlots: 22},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Calculate(Input{
+				Resources:            resources("2", "4", "4Gi", "8Gi"),
+				PoolerMaxReplicas:    10,
+				MembersPerShard:      test.members,
+				MaximumChangeStreams: 4,
+				SynchronousStandbys:  test.synchronousStandbys,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.PrimarySlotDemand != test.primaryDemand || got.StandbySlotDemand != test.standbyDemand || got.PromotionSlotDemand != test.promotionDemand || got.MaxReplicationSlots != test.maxSlots {
+				t.Fatalf("slot demand = primary %d standby %d promotion %d max %d", got.PrimarySlotDemand, got.StandbySlotDemand, got.PromotionSlotDemand, got.MaxReplicationSlots)
+			}
+		})
+	}
+}
+
+func TestCalculateRejectsImpossibleSynchronousStandbyCount(t *testing.T) {
+	t.Parallel()
+	for _, input := range []Input{
+		{Resources: resources("1", "1", "2Gi", "2Gi"), PoolerMaxReplicas: 2, MembersPerShard: 1, SynchronousStandbys: 1},
+		{Resources: resources("1", "1", "2Gi", "2Gi"), PoolerMaxReplicas: 2, MembersPerShard: 3, SynchronousStandbys: 2},
+	} {
+		if _, err := Calculate(input); err == nil {
+			t.Fatalf("invalid synchronous standby count accepted: %#v", input)
+		}
+	}
+}
+
+func TestCalculateBoundsSlotCardinalityBeforeNarrowing(t *testing.T) {
+	t.Parallel()
+	for _, input := range []Input{
+		{Resources: resources("1", "1", "2Gi", "2Gi"), PoolerMaxReplicas: 2, MembersPerShard: maximumMembersPerShard + 1},
+		{Resources: resources("1", "1", "2Gi", "2Gi"), PoolerMaxReplicas: 2, MembersPerShard: 3, MaximumChangeStreams: maximumChangeStreams + 1},
+	} {
+		if _, err := Calculate(input); err == nil {
+			t.Fatalf("unbounded slot cardinality accepted: %#v", input)
 		}
 	}
 }
