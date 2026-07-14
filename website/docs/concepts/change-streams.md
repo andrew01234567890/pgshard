@@ -69,8 +69,9 @@ retains the connection for retry. A hard client deadline or transaction timeout
 makes the reader terminal and requires a fresh connection. It does not
 select a member, observe or mutate PostgreSQL slots, or authorize a connection.
 No PostgreSQL Pod consumes the profiles, and secure `primary_conninfo`,
-multi-server observation, slot creation or mutation, role activation,
-quarantined attachment, and stream ownership remain unimplemented.
+connection-owned multi-server collection and post-acquisition rechecks, slot
+creation or mutation, role activation, quarantined attachment, and stream
+ownership remain unimplemented.
 
 The source also contains a fixed-size PostgreSQL 18 Standby Status Update
 encoder. It validates that neither flush nor apply is ahead of write but does
@@ -210,9 +211,25 @@ ephemeral-slot directory rename can clear the active PID before the shared slot
 row disappears. Only mutation history or stronger evidence may classify the
 slot as persistent. Primary-side `catalog_xmin`, reply timestamps, and
 32-bit transaction IDs remain raw values rather than freshness or horizon
-coverage proofs. Multi-server source correlation, slot-sync-cycle evidence, mutation-history attestation,
-and every create, advance, acquire, or drop action remain future reconciliation
-work.
+coverage proofs. A pure correlator now combines one standby batch and one
+primary batch inside the catalog-selected monotonic age bound. It fails closed
+unless their database, observable system/timeline/database identity, roles, WAL
+levels, mandatory feedback and continuous synchronization settings, receiver
+slot, gated physical slot, active PID, retained WAL,
+walsender generation, `application_name`, and streaming state agree. Its result
+is a non-authorizing endpoint-compatibility and change-token carrier, not proof
+that the two endpoints were connected and not permission to attach. PostgreSQL
+18's SQL API returns the replay LSN without its atomically sampled replay
+timeline, so the correlator deliberately neither compares nor carries that raw
+LSN. The separate attachment contract accepts only an opaque source-bound
+replay position. The raw local observer cannot construct it, and no production
+constructor exists until an exact replay-lineage observer is implemented. The
+restore incarnation and catalog epoch come from the fenced policy rather than
+PostgreSQL observation. Exact replay lineage, upstream identity and network
+adjacency, feedback freshness, catalog-horizon coverage,
+physical-slot lifecycle persistence, source-bound slot-sync-cycle evidence,
+logical-slot ownership, mutation-history attestation, and every create,
+advance, acquire, or drop action remain future reconciliation work.
 
 Each checkpoint generation is immutably bound to its shard restore incarnation,
 PostgreSQL system identifier, database OID, and source timeline. Physical
@@ -303,8 +320,9 @@ The current Rust observer reads the local PostgreSQL 18 control-file system
 identifier and checkpoint timeline, recovery role, WAL level,
 `hot_standby_feedback`, exact `wal_receiver_status_interval`,
 `sync_replication_slots`, `primary_slot_name`, replay position, and live WAL
-receiver PID, raw activity, and physical-slot name immediately before it reads
-the requested local slots. It also records the local slot-sync worker's PID,
+receiver PID, raw activity, physical-slot name, and last received timeline
+immediately before it reads the requested local slots. It also records the
+local slot-sync worker's PID,
 backend-start identity, and whether the worker is in PostgreSQL's
 `ReplicationSlotsyncMain` wait after returning from a cycle. The server-wall-clock
 start value is only an equality key across observations; it is not a freshness
@@ -322,7 +340,9 @@ upstream, physical-slot ownership, feedback freshness, or a source-bound recent
 slot-sync cycle.
 
 The primary-side sample uses the same consumed-connection and privilege
-boundary. It bounds `synchronized_standby_slots` before returning it and accepts
+boundary. It records both the latest control-file checkpoint timeline and the
+writable server's current WAL insertion timeline, bounds
+`synchronized_standby_slots` before returning it, and accepts
 only a plain, unique list of replication-slot-shaped identifiers. That syntax
 check and one-name membership result do not prove equality with the complete
 catalog-managed set. For one requested physical slot it records conservative persistence, active PID, raw
@@ -335,6 +355,28 @@ reject process transition or PID reuse. The reply timestamp does not identify a
 hot-standby feedback message or primary receive time, and neither it nor
 `catalog_xmin` proves feedback freshness or coverage of a standby-local decoder
 horizon.
+The pure cross-server correlator binds these two separately sampled batches to
+the catalog policy only while their complete local monotonic window remains
+within its age limit. It accepts only compatible standby/primary endpoint
+reports with the same database and observable source components, mandatory
+`hot_standby_feedback`, a safe positive feedback interval,
+`sync_replication_slots`, exact receiver and physical-slot names, both recorded
+checkpoints plus the live receiver and writable primary on the catalog timeline,
+primary gating, retained non-temporary slot state, the active slot PID's
+streaming walsender, and the expected `application_name`. Requiring both live
+timeline signals as well as both checkpoints prevents a lagging control-file
+checkpoint, a receiver that has already switched timelines, or a newly promoted
+primary from masquerading as the selected endpoint lineage. It does not bind
+`pg_last_wal_replay_lsn()` to that lineage because PostgreSQL does not expose the
+atomically paired replay timeline through SQL. A future exact replay-lineage
+observation must supply that proof before any checkpoint comparison. The
+physical slot's public-view persistence remains `Unproven`; its raw
+`catalog_xmin` and peer
+reply timestamp are carried without being promoted to horizon or freshness
+proof. The result can become stale immediately and cannot authorize
+`START_REPLICATION`. Matching these endpoint reports does not prove they were
+connected to each other or exclude a cascading upstream; the connection owner
+must establish that separately.
 Runtime code does not call `pg_sync_replication_slots()`. PostgreSQL 18 describes
 that one-shot function as primarily for testing and debugging and recommends the
 continuous slot-sync worker for high availability; pgshard will observe the

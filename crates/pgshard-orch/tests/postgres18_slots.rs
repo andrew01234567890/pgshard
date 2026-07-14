@@ -13,15 +13,18 @@ use pgshard_orch::{
         LocalLogicalSlotObservationBatch, LocalPrimaryReplicationObservationBatch,
         LocalSlotObservationError, LocalSlotSyncWorkerActivity, LocalWalReceiverActivity,
         LocalWalSenderActivity, LogicalSlotObservationRequest,
-        PrimaryReplicationObservationRequest, observe_local_logical_slots,
-        observe_local_primary_replication,
+        PrimaryReplicationObservationRequest, correlate_standby_replication_path,
+        observe_local_logical_slots, observe_local_primary_replication,
     },
     standby_slots::{
         FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotPlugin, LogicalWalLevel,
-        ManagedSlotTarget, RecoveryState, ReplicationSlotName, SettingState, SlotActivity,
-        SlotGeneration, SlotOwnership, SlotPersistence, SlotWalRetention,
+        ManagedSlotTarget, ManagedTwoPhasePolicy, RecoveryState, ReplicationSlotName,
+        ReplicationSourceIdentity, SettingState, SlotActivity, SlotGeneration, SlotOwnership,
+        SlotPersistence, SlotWalRetention, StandbyDecoderEvidenceLimits, StandbyDecoderPolicy,
+        StandbyDecoderTarget,
     },
 };
+use pgshard_types::CatalogEpoch;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     task::JoinHandle,
@@ -244,6 +247,7 @@ async fn run_observation_fixture(
 }
 
 async fn run_standby_observation_fixture(
+    primary_database_url: String,
     standby_database_url: String,
     expected_system_identifier: u64,
 ) -> TestResult {
@@ -266,6 +270,13 @@ async fn run_standby_observation_fixture(
     };
 
     assert_standby_observation(&batch, &target, expected_system_identifier);
+    assert_correlated_replication_path(
+        &primary_database_url,
+        &standby_database_url,
+        &request,
+        &target,
+    )
+    .await?;
 
     let (role_check_client, role_check_connection) =
         tokio_postgres::connect(&standby_database_url, NoTls).await?;
@@ -302,6 +313,60 @@ async fn run_standby_observation_fixture(
         error,
         LocalSlotObservationError::WalReceiverDetailsUnavailable { .. }
     ));
+    Ok(())
+}
+
+async fn assert_correlated_replication_path(
+    primary_database_url: &str,
+    standby_database_url: &str,
+    standby_request: &LogicalSlotObservationRequest,
+    anchor: &ManagedSlotTarget,
+) -> TestResult {
+    let physical_slot = ReplicationSlotName::new(EXPECTED_PRIMARY_SLOT_NAME)?;
+    let primary_request = PrimaryReplicationObservationRequest::new(physical_slot.clone());
+    let primary = wait_for_managed_primary_path(primary_database_url, &primary_request).await?;
+    let standby = observe(standby_database_url, standby_request).await?;
+    let prerequisites = standby.prerequisites();
+    // The raw SQL replay LSN only seeds a nonzero catalog-policy fixture. The
+    // endpoint correlator deliberately does not certify it without a future
+    // exact replay-lineage observation.
+    let catalog_checkpoint_fixture = prerequisites
+        .replay_lsn()
+        .filter(|lsn| lsn.0 != 0)
+        .ok_or_else(|| io::Error::other("standby replay position is absent"))?;
+    let source = ReplicationSourceIdentity::new(
+        prerequisites.system_identifier(),
+        prerequisites.checkpoint_timeline(),
+        standby.database_oid(),
+        Uuid::from_u128(0xc1),
+        CatalogEpoch(1),
+    )?;
+    let policy = StandbyDecoderPolicy::new(
+        source,
+        StandbyDecoderTarget::new(
+            1,
+            physical_slot.clone(),
+            anchor.clone(),
+            target("pgshard_ci_local")?,
+        )?,
+        ManagedTwoPhasePolicy {
+            failover_anchor_at: catalog_checkpoint_fixture,
+            local_decoder_at: catalog_checkpoint_fixture,
+        },
+        catalog_checkpoint_fixture,
+        StandbyDecoderEvidenceLimits::new(
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        )?,
+    )?;
+
+    let proof = correlate_standby_replication_path(&policy, &standby, &primary)?;
+    assert_eq!(proof.source_identity(), source);
+    assert_eq!(proof.physical_slot(), &physical_slot);
+    assert_eq!(proof.physical_slot_persistence(), SlotPersistence::Unproven);
+    assert_ne!(proof.physical_catalog_xmin().get().get(), 0);
+    assert_ne!(proof.peer_reply_epoch_micros().get(), 0);
     Ok(())
 }
 
@@ -358,6 +423,10 @@ fn assert_standby_observation(
             .wal_receiver_slot_name()
             .map(ReplicationSlotName::as_str),
         Some(EXPECTED_PRIMARY_SLOT_NAME)
+    );
+    assert_eq!(
+        prerequisites.wal_receiver_received_timeline(),
+        Some(prerequisites.checkpoint_timeline())
     );
     let slot_sync_worker = prerequisites
         .slot_sync_worker()
@@ -450,6 +519,7 @@ async fn assert_primary_prerequisites(
         LocalWalReceiverActivity::Absent
     );
     assert_eq!(prerequisites.wal_receiver_slot_name(), None);
+    assert_eq!(prerequisites.wal_receiver_received_timeline(), None);
     assert_eq!(prerequisites.slot_sync_worker(), None);
     Ok(())
 }
@@ -677,6 +747,7 @@ fn assert_managed_primary_path(
     assert!(batch.collection_started_at() <= batch.collection_finished_at());
     assert_ne!(batch.system_identifier(), 0);
     assert_ne!(batch.checkpoint_timeline(), 0);
+    assert_eq!(batch.current_timeline(), Some(batch.checkpoint_timeline()));
     assert_eq!(batch.recovery(), RecoveryState::Writable);
     assert_eq!(batch.wal_level(), LogicalWalLevel::Logical);
     assert_eq!(
@@ -879,7 +950,12 @@ async fn observes_streaming_standby_slot_sync_and_rejects_redacted_receiver() ->
     drop(primary);
     finish_connection(primary_task).await?;
 
-    run_standby_observation_fixture(standby_database_url, expected_system_identifier).await
+    run_standby_observation_fixture(
+        primary_database_url,
+        standby_database_url,
+        expected_system_identifier,
+    )
+    .await
 }
 
 #[tokio::test]
