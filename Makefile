@@ -1,4 +1,4 @@
-.PHONY: check rust-check rust-static rust-test catalog-test orch-catalog-test pgwire-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check actions-check public-check images release-build
+.PHONY: check rust-check rust-static rust-test catalog-test orch-catalog-test orch-slot-observer-test pgwire-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check actions-check public-check images release-build
 
 PGSHARD_GIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
 PGSHARD_BUILD_VERSION ?= 0.0.0-dev+local.$(shell printf '%.12s' "$(PGSHARD_GIT_SHA)")$(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" || printf '.dirty')
@@ -26,6 +26,10 @@ catalog-test:
 orch-catalog-test:
 	@test -n "$(PGSHARD_TEST_DATABASE_URL)" || (echo "PGSHARD_TEST_DATABASE_URL is required" >&2; exit 1)
 	cargo test --locked -p pgshard-orch --test postgres18_catalog -- --ignored --test-threads=1
+
+orch-slot-observer-test:
+	@test -n "$(PGSHARD_TEST_DATABASE_URL)" || (echo "PGSHARD_TEST_DATABASE_URL is required" >&2; exit 1)
+	cargo test --locked -p pgshard-orch --test postgres18_slots -- --ignored --test-threads=1
 
 pgwire-postgres-test:
 	@test -n "$(PGSHARD_PGWIRE_TEST_ADDRESS)" || (echo "PGSHARD_PGWIRE_TEST_ADDRESS is required" >&2; exit 1)

@@ -155,7 +155,23 @@ does not simulate PostgreSQL's transaction-timeout error or a closed socket. A
 shared golden contract keeps the Rust reader and Go operator's
 member physical-slot names identical. This covers
 catalog-to-validator loading only; it does not
-observe, create, consume, synchronize, or drop a live replication slot.
+create, consume, synchronize, or drop a live replication slot.
+The same PostgreSQL 18 job initializes logical WAL and prepared transactions,
+then exercises the separate local slot observer against persistent failover
+anchors, persistent non-failover decoders, a session-temporary slot, a missing
+target, and a physical slot occupying a requested logical name. A hostile
+startup `search_path` cannot replace the observer's built-ins because it pins an
+empty path before the first catalog read. A separately held `pg_database` lock
+proves that the operation remains bounded, aborts its owned connection driver,
+and removes the backend while the blocker remains held. The fixture attempts
+final cleanup of every persistent slot and hostile schema after the fixture
+task completes, and reports cleanup failures alongside fixture failures. The
+current live case does not deliberately inject a fixture error or panic to
+exercise that fallback. The observer preserves exact request order and typed
+built-in state, records the non-atomic collection interval, treats every
+non-temporary public-view row's persistence as unproven, and reports ownership
+as unknown; this is local catalog observation, not a multi-server eligibility
+proof or creation attestation.
 Agent unit tests reject unsafe, incompatible, symlinked, structurally incomplete,
 or role-aware recovery state, including base-backup markers and CRC-backed
 `shut down in recovery` or `in archive recovery` control states with both signal

@@ -332,13 +332,16 @@ pub enum LogicalSlotKind {
     Other,
 }
 
-/// Persistent or temporary logical-slot state.
+/// Persistence evidence for one logical slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlotPersistence {
-    /// Slot survives session exit and restart.
+    /// Mutation history or stronger evidence proves the slot is persistent.
     Persistent,
-    /// Slot is temporary, ephemeral, or otherwise not durable.
+    /// `PostgreSQL` reports the slot as temporary and therefore not durable.
     NonPersistent,
+    /// A non-temporary public-view row may be persistent or in `RS_EPHEMERAL`
+    /// state; `temporary = false` and inactivity cannot distinguish them.
+    Unproven,
 }
 
 /// Whether a backend currently owns a slot.
@@ -2464,7 +2467,7 @@ mod tests {
             })
         );
 
-        let cases: [(MutateSlot, ManagedSlotProblem); 6] = [
+        let cases: [(MutateSlot, ManagedSlotProblem); 7] = [
             (
                 |slot| slot.name = self::slot("wrong_local"),
                 ManagedSlotProblem::NameMismatch,
@@ -2479,6 +2482,10 @@ mod tests {
             ),
             (
                 |slot| slot.persistence = SlotPersistence::NonPersistent,
+                ManagedSlotProblem::NotPersistent,
+            ),
+            (
+                |slot| slot.persistence = SlotPersistence::Unproven,
                 ManagedSlotProblem::NotPersistent,
             ),
             (
