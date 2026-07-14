@@ -1,11 +1,15 @@
 //! `pgshard-agent` Linux container entry point.
 
-use pgshard_agent::config::AgentConfig;
+use pgshard_agent::config::{AgentConfig, ConfigError};
 use pgshard_agent::domain::AgentState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = AgentConfig::from_env()?;
+    let config = match AgentConfig::from_env() {
+        Ok(config) => config,
+        Err(ConfigError::Arguments(error)) => error.exit(),
+        Err(error) => return Err(error.into()),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

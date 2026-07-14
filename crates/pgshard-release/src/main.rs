@@ -1787,6 +1787,21 @@ mod tests {
                 "Rust CI trigger must include {policy}"
             );
         }
+        let image_trigger = workflow
+            .lines()
+            .find(|line| line.contains("emit_component images"))
+            .expect("image CI trigger");
+        for input in [
+            "^\\.dockerignore$",
+            "^Cargo\\.(toml|lock)$",
+            "^rust-toolchain\\.toml$",
+            "^rustfmt\\.toml$",
+        ] {
+            assert!(
+                image_trigger.contains(input),
+                "image CI trigger must include {input}"
+            );
+        }
         for command in [
             "go mod tidy",
             "go mod verify",

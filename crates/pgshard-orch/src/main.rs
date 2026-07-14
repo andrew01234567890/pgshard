@@ -1,11 +1,15 @@
 //! `pgshard-orch` Linux container entry point.
 
-use pgshard_orch::config::OrchConfig;
+use pgshard_orch::config::{ConfigError, OrchConfig};
 use pgshard_orch::domain::OrchState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = OrchConfig::from_env()?;
+    let config = match OrchConfig::from_env() {
+        Ok(config) => config,
+        Err(ConfigError::Arguments(error)) => error.exit(),
+        Err(error) => return Err(error.into()),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

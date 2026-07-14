@@ -1,4 +1,9 @@
-.PHONY: check rust-check rust-static rust-test catalog-test pgwire-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check actions-check public-check release-build
+.PHONY: check rust-check rust-static rust-test catalog-test pgwire-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check actions-check public-check images release-build
+
+PGSHARD_GIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
+PGSHARD_BUILD_VERSION ?= 0.0.0-dev+local.$(shell printf '%.12s' "$(PGSHARD_GIT_SHA)")$(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" || printf '.dirty')
+PGSHARD_IMAGE_OUTPUT ?= artifacts/images
+PGSHARD_IMAGE_TAG ?= dev
 
 check: rust-check proto-check go-check docs-check actions-check public-check
 
@@ -60,6 +65,15 @@ actions-check:
 
 public-check:
 	cargo run --locked -p pgshard-release -- audit --base origin/main --head HEAD
+
+images:
+	@test -n "$(PGSHARD_GIT_SHA)" || (echo "PGSHARD_GIT_SHA is required outside a Git checkout" >&2; exit 1)
+	@mkdir -p "$(PGSHARD_IMAGE_OUTPUT)"
+	PGSHARD_BUILD_VERSION="$(PGSHARD_BUILD_VERSION)" \
+	PGSHARD_GIT_SHA="$(PGSHARD_GIT_SHA)" \
+	PGSHARD_IMAGE_OUTPUT="$(PGSHARD_IMAGE_OUTPUT)" \
+	PGSHARD_IMAGE_TAG="$(PGSHARD_IMAGE_TAG)" \
+	docker buildx bake --file deploy/docker-bake.hcl ci
 
 release-build:
 	@test -n "$(VERSION)" || (echo "VERSION is required" >&2; exit 1)

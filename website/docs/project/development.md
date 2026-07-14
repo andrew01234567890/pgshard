@@ -36,6 +36,24 @@ npm run check
 
 `check` type-checks the site and performs a production build with broken internal links treated as errors. Search indexing happens during the build and requires no hosted search service.
 
+## Local container images
+
+```bash
+make images
+```
+
+This builds digest-pinned Linux/amd64 Docker-compatible image archives for the
+Rust agent, orchestrator and pooler plus the Go operator under
+`artifacts/images/`. The bake definition has no registry output or push target.
+The current images are test inputs, not an installable database cluster. The
+selected Buildx builder must support the Docker exporter. Docker's default
+`docker` driver does not support this archive exporter; use a
+`docker-container`, Kubernetes, or remote builder. The command derives the full
+revision from `HEAD` and marks its development version `dirty` when the worktree
+differs. Source archives must provide `PGSHARD_GIT_SHA` explicitly. Direct Bake
+invocations must provide both build identity variables; missing and all-zero
+identity is rejected.
+
 ## Git identity and history
 
 Source-branch commits use GitHub noreply author and committer identities. Direct
