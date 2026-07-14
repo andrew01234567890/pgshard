@@ -2,8 +2,9 @@
 
 This non-publishable crate implements bounded, zero-copy decoding for
 PostgreSQL 18 frontend and backend frames, frontend SASL responses, and selected
-query-protocol bodies, plus bounded backend startup-control and fixed-size
-replication-feedback encoding. Its constants, tags, and layouts follow the `REL_18_STABLE`
+query-protocol bodies, plus bounded backend-control, minimal-error, and
+fixed-size replication-feedback encoding. Its constants, tags, and layouts
+follow the `REL_18_STABLE`
 PostgreSQL server source.
 
 The decoder recognizes startup protocol versions, SSL and GSS negotiation,
@@ -77,12 +78,18 @@ and configured client-protocol policy. The frontend body decoders include
 description with a Parse generation, virtualize a name, track a query cycle,
 identify a backend, or establish a catalog fence.
 
-Backend startup-control encoders emit exact `AuthenticationOk` and
-`ReadyForQuery` arrays plus caller-buffered SCRAM `AuthenticationSASL`,
-`AuthenticationSASLContinue`, `AuthenticationSASLFinal`, `BackendKeyData`,
-`ParameterStatus`, and `NegotiateProtocolVersion` frames. SCRAM advertisements
-are closed to PostgreSQL 18's SHA-256 mechanisms and put the channel-binding
-variant first. Variable frames are completely sized
+Backend control encoders emit exact `AuthenticationOk` and `ReadyForQuery`
+arrays plus caller-buffered minimal `ErrorResponse`, SCRAM
+`AuthenticationSASL`, `AuthenticationSASLContinue`,
+`AuthenticationSASLFinal`, `BackendKeyData`, `ParameterStatus`, and
+`NegotiateProtocolVersion` frames. SCRAM advertisements are closed to
+PostgreSQL 18's SHA-256 mechanisms and put the channel-binding variant first.
+`ErrorResponse` encoding emits canonical `S`, `V`, `C`, and `M` fields,
+validates the five-byte SQLSTATE and nonempty UTF-8 message, and deliberately
+omits optional diagnostics. Its explicit caller limit uses libpq's 30,000-byte
+pre-authentication ceiling during startup while allowing bounded authenticated
+session policy up to the pooler's 64 MiB hard limit. Variable frames are
+completely sized
 and validated before the output is touched, retain PostgreSQL 18's family
 bounds, and never include values or cancellation keys in errors. Unsupported
 protocol options are supplied as borrowed byte slices so validation and writing
@@ -90,9 +97,10 @@ need no internal allocation or replayable iterator contract. A decoded
 protocol-three request can derive PostgreSQL 18's selected version directly,
 including the 3.2 response to a future minor version. The live
 PostgreSQL 18 trust-authentication fixture decodes and re-encodes the non-SASL
-startup frames and requires byte-for-byte equality. The SCRAM primitives have
-source-aligned unit coverage but no live exchange yet. These primitives do not
-yet provide a client listener, authentication policy, or ordered session writer.
+startup frames other than `ErrorResponse` and requires byte-for-byte equality.
+The SCRAM and `ErrorResponse` primitives have source-aligned unit coverage but
+no live exchange yet. These primitives do not yet provide a client listener,
+authentication policy, or ordered session writer.
 
 The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH
 loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is

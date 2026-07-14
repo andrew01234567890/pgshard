@@ -13,6 +13,8 @@ use crate::{
 /// `PostgreSQL` libpq's maximum length word for backend tags not classified as
 /// long messages.
 pub const BACKEND_SHORT_MESSAGE_LENGTH: usize = 30_000;
+/// `PostgreSQL` libpq's pre-authentication `ErrorResponse` length-word ceiling.
+pub const BACKEND_STARTUP_ERROR_MESSAGE_LENGTH: usize = BACKEND_SHORT_MESSAGE_LENGTH;
 /// `PostgreSQL` libpq's startup-phase ceiling for authentication and protocol
 /// negotiation backend messages.
 pub const BACKEND_STARTUP_MESSAGE_LENGTH: usize = 2_000;

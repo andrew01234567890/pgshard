@@ -15,18 +15,20 @@ mod pgoutput;
 mod session;
 
 pub use backend::{
-    AuthenticationRequest, BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH,
-    BackendFrame, BackendKeyData, BackendMessageError, BackendTag, MAX_BACKEND_KEY_DATA_LENGTH,
-    MAX_PARAMETER_DESCRIPTION_LENGTH, ParameterDescription, ParameterStatus, ProtocolNegotiation,
-    ProtocolOptionIter, SaslMechanismIter, TransactionStatus, decode_authentication_request,
-    decode_backend, decode_backend_key_data, decode_parameter_description, decode_parameter_status,
-    decode_protocol_negotiation, decode_ready_for_query, require_empty_backend_body,
+    AuthenticationRequest, BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+    BACKEND_STARTUP_MESSAGE_LENGTH, BackendFrame, BackendKeyData, BackendMessageError, BackendTag,
+    MAX_BACKEND_KEY_DATA_LENGTH, MAX_PARAMETER_DESCRIPTION_LENGTH, ParameterDescription,
+    ParameterStatus, ProtocolNegotiation, ProtocolOptionIter, SaslMechanismIter, TransactionStatus,
+    decode_authentication_request, decode_backend, decode_backend_key_data,
+    decode_parameter_description, decode_parameter_status, decode_protocol_negotiation,
+    decode_ready_for_query, require_empty_backend_body,
 };
 
 pub use encode::{
-    AUTHENTICATION_OK_FRAME_LENGTH, BackendEncodeError, READY_FOR_QUERY_FRAME_LENGTH,
-    ScramMechanisms, encode_authentication_ok, encode_authentication_sasl,
-    encode_authentication_sasl_continue, encode_authentication_sasl_final, encode_backend_key_data,
+    AUTHENTICATION_OK_FRAME_LENGTH, BackendEncodeError, ErrorResponseSeverity,
+    READY_FOR_QUERY_FRAME_LENGTH, ScramMechanisms, encode_authentication_ok,
+    encode_authentication_sasl, encode_authentication_sasl_continue,
+    encode_authentication_sasl_final, encode_backend_key_data, encode_error_response,
     encode_parameter_status, encode_protocol_negotiation, encode_ready_for_query,
 };
 

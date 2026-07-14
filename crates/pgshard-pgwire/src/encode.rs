@@ -1,10 +1,11 @@
-//! Allocation-free encoding of `PostgreSQL` 18 backend startup controls.
+//! Allocation-free encoding of `PostgreSQL` 18 backend controls and minimal errors.
 
 use thiserror::Error;
 
 use crate::{
     BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH, MAX_BACKEND_KEY_DATA_LENGTH,
-    MAX_CANCEL_KEY_LENGTH, MIN_BACKEND_CANCEL_KEY_LENGTH, ProtocolVersion, TransactionStatus,
+    MAX_CANCEL_KEY_LENGTH, MAX_LARGE_MESSAGE_LENGTH, MIN_BACKEND_CANCEL_KEY_LENGTH,
+    ProtocolVersion, TransactionStatus,
 };
 
 /// Exact wire length of an `AuthenticationOk` frame.
@@ -16,6 +17,25 @@ const SCRAM_SHA_256: &[u8] = b"SCRAM-SHA-256";
 const SCRAM_SHA_256_PLUS: &[u8] = b"SCRAM-SHA-256-PLUS";
 const SCRAM_SHA_256_MECHANISMS: [&[u8]; 1] = [SCRAM_SHA_256];
 const SCRAM_SHA_256_PLUS_MECHANISMS: [&[u8]; 2] = [SCRAM_SHA_256_PLUS, SCRAM_SHA_256];
+
+/// Severity supported by a minimal client-facing `ErrorResponse`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorResponseSeverity {
+    /// Recoverable statement or transaction error.
+    Error,
+    /// Session-ending startup or connection error.
+    Fatal,
+}
+
+impl ErrorResponseSeverity {
+    const fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Error => b"ERROR",
+            Self::Fatal => b"FATAL",
+        }
+    }
+}
+
 const PROTOCOL_NEGOTIATION_FIXED_MESSAGE_LENGTH: usize = 12;
 const MIN_PROTOCOL_OPTION_MESSAGE_LENGTH: usize = b"_pq_.".len() + 1;
 const MAX_PROTOCOL_NEGOTIATION_OPTIONS: usize = (BACKEND_STARTUP_MESSAGE_LENGTH
@@ -84,6 +104,82 @@ pub fn encode_authentication_sasl(
         offset += mechanism.len();
         output[offset] = 0;
         offset += 1;
+    }
+    output[offset] = 0;
+    offset += 1;
+    debug_assert_eq!(offset, frame_length);
+    Ok(frame_length)
+}
+
+/// Encodes a minimal `PostgreSQL` 18 `ErrorResponse` into caller-owned storage.
+///
+/// The canonical field order is localized severity (`S`), nonlocalized
+/// severity (`V`), five-byte SQLSTATE (`C`), primary UTF-8 message (`M`), and
+/// the final zero byte. pgshard does not localize severity names. Optional
+/// diagnostic fields remain a future extension. `maximum_message_length`
+/// includes the four-byte length word. Pre-authentication callers must use
+/// [`crate::BACKEND_STARTUP_ERROR_MESSAGE_LENGTH`]; authenticated session
+/// policy may choose a larger bound no greater than
+/// [`MAX_LARGE_MESSAGE_LENGTH`].
+///
+/// The output is not modified on error.
+///
+/// # Errors
+///
+/// Rejects an invalid caller limit, an empty message, an embedded zero byte, a
+/// SQLSTATE byte outside uppercase ASCII letters and digits, a complete
+/// message above the caller limit, arithmetic overflow, or caller-owned storage
+/// smaller than the complete frame.
+pub fn encode_error_response(
+    severity: ErrorResponseSeverity,
+    sqlstate: [u8; 5],
+    message: &str,
+    maximum_message_length: usize,
+    output: &mut [u8],
+) -> Result<usize, BackendEncodeError> {
+    if maximum_message_length > MAX_LARGE_MESSAGE_LENGTH {
+        return Err(BackendEncodeError::MessageLimitTooLarge {
+            actual: maximum_message_length,
+            maximum: MAX_LARGE_MESSAGE_LENGTH,
+        });
+    }
+    if message.is_empty() {
+        return Err(BackendEncodeError::EmptyDiagnosticMessage);
+    }
+
+    let severity = severity.as_bytes();
+    let fields = [
+        (b'S', severity),
+        (b'V', severity),
+        (b'C', sqlstate.as_slice()),
+        (b'M', message.as_bytes()),
+    ];
+    let body_length = fields.iter().try_fold(
+        1_usize,
+        |body_length, (_, field)| -> Result<usize, BackendEncodeError> {
+            body_length
+                .checked_add(1)
+                .and_then(|length| length.checked_add(field.len()))
+                .and_then(|length| length.checked_add(1))
+                .ok_or(BackendEncodeError::LengthOverflow)
+        },
+    )?;
+    let (message_length, frame_length) = checked_frame_length(body_length, maximum_message_length)?;
+
+    for (index, byte) in sqlstate.iter().copied().enumerate() {
+        if !(byte.is_ascii_uppercase() || byte.is_ascii_digit()) {
+            return Err(BackendEncodeError::InvalidSqlStateByte(index));
+        }
+    }
+    if message.as_bytes().contains(&0) {
+        return Err(BackendEncodeError::EmbeddedNull("diagnostic message"));
+    }
+    require_output(output, frame_length)?;
+
+    write_header(output, b'E', message_length);
+    let mut offset = 5;
+    for (tag, field) in fields {
+        offset = write_cstring_field(output, offset, tag, field);
     }
     output[offset] = 0;
     offset += 1;
@@ -339,9 +435,32 @@ fn write_header(output: &mut [u8], tag: u8, message_length: u32) {
     output[1..5].copy_from_slice(&message_length.to_be_bytes());
 }
 
+fn write_cstring_field(output: &mut [u8], offset: usize, tag: u8, value: &[u8]) -> usize {
+    output[offset] = tag;
+    let value_start = offset + 1;
+    let value_end = value_start + value.len();
+    output[value_start..value_end].copy_from_slice(value);
+    output[value_end] = 0;
+    value_end + 1
+}
+
 /// Backend startup/control encoding failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum BackendEncodeError {
+    /// A caller-selected message limit exceeds the pooler's hard ceiling.
+    #[error("backend message limit {actual} exceeds maximum {maximum}")]
+    MessageLimitTooLarge {
+        /// Rejected caller limit.
+        actual: usize,
+        /// Pooler-wide maximum message length.
+        maximum: usize,
+    },
+    /// A required diagnostic primary message is empty.
+    #[error("diagnostic primary message is empty")]
+    EmptyDiagnosticMessage,
+    /// One SQLSTATE byte is outside the protocol's uppercase alphanumeric set.
+    #[error("invalid SQLSTATE byte at index {0}")]
+    InvalidSqlStateByte(usize),
     /// A cancellation key is outside `PostgreSQL` 18's generic bounds.
     #[error("invalid PostgreSQL 18 cancellation key length {0}")]
     InvalidCancellationKeyLength(usize),
@@ -390,9 +509,9 @@ pub enum BackendEncodeError {
 mod tests {
     use super::*;
     use crate::{
-        AuthenticationRequest, Decode, decode_authentication_request, decode_backend,
-        decode_backend_key_data, decode_parameter_status, decode_protocol_negotiation,
-        decode_ready_for_query,
+        AuthenticationRequest, BACKEND_STARTUP_ERROR_MESSAGE_LENGTH, Decode,
+        decode_authentication_request, decode_backend, decode_backend_key_data,
+        decode_parameter_status, decode_protocol_negotiation, decode_ready_for_query,
     };
 
     fn protocol(major: u16, minor: u16) -> ProtocolVersion {
@@ -470,6 +589,41 @@ mod tests {
     }
 
     #[test]
+    fn error_responses_use_postgres18_required_fields_and_order() {
+        for (severity, severity_bytes) in [
+            (ErrorResponseSeverity::Error, b"ERROR".as_slice()),
+            (ErrorResponseSeverity::Fatal, b"FATAL".as_slice()),
+        ] {
+            let body = [
+                [b"S".as_slice(), severity_bytes, b"\0"].concat(),
+                [b"V".as_slice(), severity_bytes, b"\0"].concat(),
+                b"C28P01\0".to_vec(),
+                b"Mpassword authentication failed\0".to_vec(),
+                b"\0".to_vec(),
+            ]
+            .concat();
+            let mut expected = vec![b'E'];
+            expected.extend_from_slice(
+                &u32::try_from(4 + body.len())
+                    .expect("bounded diagnostic length")
+                    .to_be_bytes(),
+            );
+            expected.extend_from_slice(&body);
+
+            let mut output = [0; 128];
+            let length = encode_error_response(
+                severity,
+                *b"28P01",
+                "password authentication failed",
+                BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+                &mut output,
+            )
+            .expect("bounded ErrorResponse");
+            assert_eq!(&output[..length], expected);
+        }
+    }
+
+    #[test]
     fn backend_key_data_round_trips_exact_bounds() {
         for key_length in [MIN_BACKEND_CANCEL_KEY_LENGTH, 32, MAX_CANCEL_KEY_LENGTH] {
             let key = vec![0xa5; key_length];
@@ -532,6 +686,67 @@ mod tests {
         let error = action(&mut output).expect_err("invalid input");
         assert_eq!(output, original);
         error
+    }
+
+    #[test]
+    fn diagnostic_encoder_rejects_invalid_input_without_modification() {
+        assert_eq!(
+            assert_error_does_not_modify(|output| encode_error_response(
+                ErrorResponseSeverity::Fatal,
+                *b"28P01",
+                "failure",
+                MAX_LARGE_MESSAGE_LENGTH + 1,
+                output,
+            )),
+            BackendEncodeError::MessageLimitTooLarge {
+                actual: MAX_LARGE_MESSAGE_LENGTH + 1,
+                maximum: MAX_LARGE_MESSAGE_LENGTH,
+            }
+        );
+        assert_eq!(
+            assert_error_does_not_modify(|output| encode_error_response(
+                ErrorResponseSeverity::Fatal,
+                *b"28P01",
+                "",
+                BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+                output,
+            )),
+            BackendEncodeError::EmptyDiagnosticMessage
+        );
+        for index in 0..5 {
+            let mut sqlstate = *b"28P01";
+            sqlstate[index] = b'_';
+            assert_eq!(
+                assert_error_does_not_modify(|output| encode_error_response(
+                    ErrorResponseSeverity::Fatal,
+                    sqlstate,
+                    "failure",
+                    BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+                    output,
+                )),
+                BackendEncodeError::InvalidSqlStateByte(index)
+            );
+        }
+        assert_eq!(
+            assert_error_does_not_modify(|output| encode_error_response(
+                ErrorResponseSeverity::Fatal,
+                *b"28P01",
+                "hidden\0suffix",
+                BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+                output,
+            )),
+            BackendEncodeError::EmbeddedNull("diagnostic message")
+        );
+        assert!(matches!(
+            assert_error_does_not_modify(|output| encode_error_response(
+                ErrorResponseSeverity::Fatal,
+                *b"28P01",
+                "failure",
+                BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+                &mut output[..8],
+            )),
+            BackendEncodeError::OutputTooSmall { .. }
+        ));
     }
 
     #[test]
@@ -644,6 +859,26 @@ mod tests {
         };
         assert_eq!(data.len(), maximum_sasl_data_length);
 
+        let maximum_diagnostic_message_length = BACKEND_STARTUP_ERROR_MESSAGE_LENGTH - 28;
+        let message = "x".repeat(maximum_diagnostic_message_length);
+        let mut diagnostic_output = vec![0; BACKEND_STARTUP_ERROR_MESSAGE_LENGTH + 1];
+        let length = encode_error_response(
+            ErrorResponseSeverity::Fatal,
+            *b"08006",
+            &message,
+            BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+            &mut diagnostic_output,
+        )
+        .expect("maximum ErrorResponse");
+        assert_eq!(length, BACKEND_STARTUP_ERROR_MESSAGE_LENGTH + 1);
+        assert_eq!(diagnostic_output[0], b'E');
+        assert_eq!(
+            u32::from_be_bytes(diagnostic_output[1..5].try_into().expect("length word")),
+            u32::try_from(BACKEND_STARTUP_ERROR_MESSAGE_LENGTH).expect("protocol bound fits")
+        );
+        assert_eq!(diagnostic_output[length - 2], 0);
+        assert_eq!(diagnostic_output[length - 1], 0);
+
         let maximum_value_length = BACKEND_SHORT_MESSAGE_LENGTH - 7;
         let value = "x".repeat(maximum_value_length);
         let mut parameter_output = vec![0; BACKEND_SHORT_MESSAGE_LENGTH + 1];
@@ -688,6 +923,34 @@ mod tests {
         );
         assert_eq!(output, original);
 
+        let oversized_diagnostic = "x".repeat(BACKEND_STARTUP_ERROR_MESSAGE_LENGTH - 27);
+        assert_eq!(
+            encode_error_response(
+                ErrorResponseSeverity::Error,
+                *b"XX000",
+                &oversized_diagnostic,
+                BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+                &mut output,
+            ),
+            Err(BackendEncodeError::MessageTooLarge {
+                actual: BACKEND_STARTUP_ERROR_MESSAGE_LENGTH + 1,
+                maximum: BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+            })
+        );
+        assert_eq!(output, original);
+
+        let authenticated_limit = BACKEND_STARTUP_ERROR_MESSAGE_LENGTH + 1;
+        let mut authenticated_output = vec![0; authenticated_limit + 1];
+        let length = encode_error_response(
+            ErrorResponseSeverity::Error,
+            *b"XX000",
+            &oversized_diagnostic,
+            authenticated_limit,
+            &mut authenticated_output,
+        )
+        .expect("authenticated caller-selected error bound");
+        assert_eq!(length, authenticated_limit + 1);
+
         let oversized = "x".repeat(BACKEND_SHORT_MESSAGE_LENGTH);
         assert!(matches!(
             encode_parameter_status("name", &oversized, &mut output),
@@ -709,6 +972,20 @@ mod tests {
     fn size_bounds_precede_payload_scans() {
         let mut output = [0x5a; 32];
         let original = output;
+
+        let mut oversized_diagnostic = "x".repeat(BACKEND_STARTUP_ERROR_MESSAGE_LENGTH);
+        oversized_diagnostic.push('\0');
+        assert!(matches!(
+            encode_error_response(
+                ErrorResponseSeverity::Error,
+                *b"inval",
+                &oversized_diagnostic,
+                BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+                &mut output,
+            ),
+            Err(BackendEncodeError::MessageTooLarge { .. })
+        ));
+        assert_eq!(output, original);
 
         let mut oversized_value = "x".repeat(BACKEND_SHORT_MESSAGE_LENGTH);
         oversized_value.push('\0');
@@ -766,6 +1043,14 @@ mod tests {
     fn encoding_errors_never_render_payloads() {
         let mut output = [0; 64];
         let errors = [
+            encode_error_response(
+                ErrorResponseSeverity::Fatal,
+                *b"28P01",
+                "do-not-render-this",
+                BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
+                &mut output[..8],
+            )
+            .expect_err("short diagnostic output"),
             encode_backend_key_data(1, b"s3k", &mut output).expect_err("short secret key"),
             encode_authentication_sasl_continue(b"server-nonce-secret", &mut output[..8])
                 .expect_err("short SASL output"),
@@ -777,6 +1062,7 @@ mod tests {
         for error in errors {
             let rendered = format!("{error:?} {error}");
             for marker in [
+                "do-not-render-this",
                 "s3k",
                 "server-nonce-secret",
                 "topsecret",
