@@ -128,8 +128,9 @@ PostgreSQL 18 separately accepts one-to-256-byte keys in incoming
 opaque key to the selected backend connection and enforce the effective
 protocol version. A completed PostgreSQL 18 startup proof now requires the
 server's exact four-byte backend key before protocol 3.2 or its exact 32-byte
-key at protocol 3.2; the proof and key are not yet bound to a live pooled socket
-or exposed through cancellation routing.
+key at protocol 3.2. The cancellation encoder requires that proof and decoded
+`BackendKeyData` before producing a request, but the proof and key are not yet
+bound to a live pooled socket or exposed through cancellation routing.
 Typed zero-copy decoders expose the process identifier and opaque key without
 rendering the key in debug output, and validate `ParameterStatus` as exactly
 two terminated UTF-8 strings. A reported `client_encoding` is authoritative
@@ -151,6 +152,12 @@ authenticated proof. The future socket session must still enforce transport
 and authentication order, authentication policy, channel binding, server
 identity, rejection of reserved protocol 3.1 as client policy, and the
 configured minimum protocol version.
+Fixed frontend encoders cover SSL and GSS negotiation requests. A
+caller-buffered regular-startup encoder accepts protocol major three, preserves
+ordered and duplicate byte-string parameters including empty values, and
+enforces PostgreSQL 18's 10,004-byte total bound before changing output. The
+live PostgreSQL 18 fixture uses it for protocol 3.0, 3.2, and negotiated 3.99
+connections. Transport policy and direct-TLS ALPN remain outside this encoder.
 Exact control encoders cover `AuthenticationOk`, minimal `ErrorResponse`,
 `ParameterStatus`, `BackendKeyData`, `NegotiateProtocolVersion`, and every
 `ReadyForQuery` transaction state. They also cover PostgreSQL 18's ordered

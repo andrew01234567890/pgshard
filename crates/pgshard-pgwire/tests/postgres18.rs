@@ -13,62 +13,46 @@ use std::time::Duration;
 use pgshard_pgwire::{
     AuthenticationRequest, BackendEncodeError, BackendTag, ClientEncoding,
     DEFAULT_LARGE_MESSAGE_LENGTH, Decode, ExtendedQueryObject, FrontendPhase,
-    PgOutputConfiguration, PgOutputControlMessage, PgOutputDecoder, PgOutputEncoding,
-    PgOutputMessage, PgOutputOldTuple, PgOutputStreaming, PgOutputTupleColumn, PgOutputVersion,
-    Postgres18StartupNegotiation, ReplicationCopyData, StandbyStatusUpdate, TransactionStatus,
-    decode_authentication_request, decode_backend, decode_backend_key_data, decode_close,
-    decode_describe, decode_frontend, decode_parameter_description, decode_parameter_status,
-    decode_pgoutput_control, decode_protocol_negotiation, decode_ready_for_query,
-    decode_replication_copy_data, decode_startup, encode_authentication_ok,
-    encode_backend_key_data, encode_parameter_status, encode_protocol_negotiation,
-    encode_ready_for_query, require_empty_backend_body,
+    MAX_STARTUP_FRAME_LENGTH, PgOutputConfiguration, PgOutputControlMessage, PgOutputDecoder,
+    PgOutputEncoding, PgOutputMessage, PgOutputOldTuple, PgOutputStreaming, PgOutputTupleColumn,
+    PgOutputVersion, Postgres18StartupNegotiation, ProtocolVersion, ReplicationCopyData,
+    StandbyStatusUpdate, TransactionStatus, decode_authentication_request, decode_backend,
+    decode_backend_key_data, decode_close, decode_describe, decode_frontend,
+    decode_parameter_description, decode_parameter_status, decode_pgoutput_control,
+    decode_protocol_negotiation, decode_ready_for_query, decode_replication_copy_data,
+    decode_startup, encode_authentication_ok, encode_backend_key_data, encode_parameter_status,
+    encode_protocol_negotiation, encode_ready_for_query, encode_startup,
+    require_empty_backend_body,
 };
 
-const POSTGRES_PROTOCOL_3_0: u32 = 3 << 16;
-const POSTGRES_PROTOCOL_3_2: u32 = (3 << 16) | 2;
-const POSTGRES_PROTOCOL_3_99: u32 = (3 << 16) | 0x0063;
+const POSTGRES_PROTOCOL_3_0: ProtocolVersion = ProtocolVersion::new(3, 0);
+const POSTGRES_PROTOCOL_3_2: ProtocolVersion = ProtocolVersion::new(3, 2);
+const POSTGRES_PROTOCOL_3_99: ProtocolVersion = ProtocolVersion::new(3, 99);
 
 fn startup(
-    protocol: u32,
+    protocol: ProtocolVersion,
     user: &str,
     database: &str,
     extra_parameters: &[(&str, &str)],
 ) -> Vec<u8> {
-    assert!(
-        !user.as_bytes().contains(&0),
-        "test user contains zero byte"
-    );
-    assert!(
-        !database.as_bytes().contains(&0),
-        "test database contains zero byte"
-    );
-    let mut body = protocol.to_be_bytes().to_vec();
+    let mut parameters = Vec::with_capacity(3 + extra_parameters.len());
     for (name, value) in [
         ("user", user),
         ("database", database),
         ("client_encoding", "UTF8"),
-    ]
-    .into_iter()
-    .chain(extra_parameters.iter().copied())
-    {
-        assert!(
-            !name.as_bytes().contains(&0),
-            "test parameter name contains zero byte"
-        );
-        assert!(
-            !value.as_bytes().contains(&0),
-            "test parameter value contains zero byte"
-        );
-        body.extend_from_slice(name.as_bytes());
-        body.push(0);
-        body.extend_from_slice(value.as_bytes());
-        body.push(0);
+    ] {
+        parameters.push((name.as_bytes(), value.as_bytes()));
     }
-    body.push(0);
+    parameters.extend(
+        extra_parameters
+            .iter()
+            .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
+    );
 
-    let length = u32::try_from(4 + body.len()).expect("startup length");
-    let mut packet = length.to_be_bytes().to_vec();
-    packet.extend_from_slice(&body);
+    let mut packet = vec![0; MAX_STARTUP_FRAME_LENGTH];
+    let length = encode_startup(protocol, &parameters, &mut packet)
+        .expect("bounded production startup packet");
+    packet.truncate(length);
     packet
 }
 

@@ -47,10 +47,12 @@ Configuration tests open only regular DSN files nonblockingly, reject a FIFO
 without waiting for a writer, bound the read and timing values, reject remote
 plaintext or session-policy overrides, and prove invalid DSN contents do not
 escape through errors. A separate raw-wire PostgreSQL 18
-test validates four-byte protocol 3.0 and 32-byte protocol 3.2 server cancellation keys,
-zero-copy `BackendKeyData` and `ParameterStatus`, typed `AuthenticationOk`, and
-a real protocol 3.99 to 3.2 negotiation that returns the requested unsupported
-`_pq_.` option. It also reconstructs each live startup-phase `AuthenticationOk`,
+test creates every protocol 3.0, 3.2, and negotiated 3.99 outbound packet with
+the production startup encoder. It validates four-byte protocol 3.0 and
+32-byte protocol 3.2 server cancellation keys, zero-copy `BackendKeyData` and
+`ParameterStatus`, typed `AuthenticationOk`, and a real protocol 3.99 to 3.2
+negotiation that returns the requested unsupported `_pq_.` option. It also
+reconstructs each live startup-phase `AuthenticationOk`,
 `ParameterStatus`, `BackendKeyData`, `NegotiateProtocolVersion`, and
 `ReadyForQuery` frame through the production encoders and requires exact byte
 equality. The live connections pass through the same linear startup proof
@@ -60,7 +62,11 @@ unexpected, version-mismatched, reordered, omitted, and added negotiation data
 fails closed, and that a rejected response consumes its validator. The live
 fixture also checks real `Describe`, `ParameterDescription`, empty completion,
 `ReadyForQuery`, and `Close` messages through the production framing and body
-decoders. Separate unit tests enforce PostgreSQL 18's tighter SCRAM frame bound,
+decoders. Unit and public-API tests round-trip fixed SSL/GSS requests, maximum
+regular startup packets, ordered duplicate and empty parameters, and
+protocol-proof-bound four- and 32-byte cancellation requests; reject invalid or
+oversized input without mutation; and redact parameter values and keys from
+errors. Separate unit tests enforce PostgreSQL 18's tighter SCRAM frame bound,
 decode absent, empty, truncated, negative, and trailing initial responses,
 redact all mechanism and exchange bytes, and round-trip the closed SCRAM
 advertisement plus continue/final encoders. Separate unit tests require minimal
