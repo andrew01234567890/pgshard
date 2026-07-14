@@ -1,4 +1,4 @@
-//! Bounded `PostgreSQL` 18 wire decoding and fixed-size replication feedback encoding.
+//! Bounded `PostgreSQL` 18 wire decoding and control-message encoding.
 //!
 //! Framing is deliberately separate from session state. This crate recognizes
 //! byte-level messages; a pooler must still reject messages that are invalid in
@@ -9,6 +9,7 @@ use std::fmt;
 use thiserror::Error;
 
 mod backend;
+mod encode;
 mod messages;
 mod pgoutput;
 mod session;
@@ -20,6 +21,12 @@ pub use backend::{
     ProtocolOptionIter, SaslMechanismIter, TransactionStatus, decode_authentication_request,
     decode_backend, decode_backend_key_data, decode_parameter_description, decode_parameter_status,
     decode_protocol_negotiation, decode_ready_for_query, require_empty_backend_body,
+};
+
+pub use encode::{
+    AUTHENTICATION_OK_FRAME_LENGTH, BackendEncodeError, READY_FOR_QUERY_FRAME_LENGTH,
+    encode_authentication_ok, encode_backend_key_data, encode_parameter_status,
+    encode_protocol_negotiation, encode_ready_for_query,
 };
 
 pub use messages::{
@@ -132,6 +139,26 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
+    /// Returns the version `PostgreSQL` 18 selects for this startup request.
+    ///
+    /// Protocol-three minor versions above the server's latest minor version
+    /// select that latest version. Other major versions are unsupported.
+    #[must_use]
+    pub const fn postgres18_selected_version(self) -> Option<Self> {
+        if self.major == 3 {
+            Some(Self {
+                major: self.major,
+                minor: if self.minor > LATEST_PROTOCOL_MINOR {
+                    LATEST_PROTOCOL_MINOR
+                } else {
+                    self.minor
+                },
+            })
+        } else {
+            None
+        }
+    }
+
     /// Returns the major version.
     #[must_use]
     pub const fn major(self) -> u16 {

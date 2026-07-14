@@ -11,15 +11,17 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use pgshard_pgwire::{
-    AuthenticationRequest, BackendTag, ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode,
-    ExtendedQueryObject, FrontendPhase, PgOutputConfiguration, PgOutputControlMessage,
-    PgOutputDecoder, PgOutputEncoding, PgOutputMessage, PgOutputOldTuple, PgOutputStreaming,
-    PgOutputTupleColumn, PgOutputVersion, Postgres18StartupNegotiation, ReplicationCopyData,
-    StandbyStatusUpdate, TransactionStatus, decode_authentication_request, decode_backend,
-    decode_backend_key_data, decode_close, decode_describe, decode_frontend,
-    decode_parameter_description, decode_parameter_status, decode_pgoutput_control,
-    decode_protocol_negotiation, decode_ready_for_query, decode_replication_copy_data,
-    decode_startup, require_empty_backend_body,
+    AuthenticationRequest, BackendEncodeError, BackendTag, ClientEncoding,
+    DEFAULT_LARGE_MESSAGE_LENGTH, Decode, ExtendedQueryObject, FrontendPhase,
+    PgOutputConfiguration, PgOutputControlMessage, PgOutputDecoder, PgOutputEncoding,
+    PgOutputMessage, PgOutputOldTuple, PgOutputStreaming, PgOutputTupleColumn, PgOutputVersion,
+    Postgres18StartupNegotiation, ReplicationCopyData, StandbyStatusUpdate, TransactionStatus,
+    decode_authentication_request, decode_backend, decode_backend_key_data, decode_close,
+    decode_describe, decode_frontend, decode_parameter_description, decode_parameter_status,
+    decode_pgoutput_control, decode_protocol_negotiation, decode_ready_for_query,
+    decode_replication_copy_data, decode_startup, encode_authentication_ok,
+    encode_backend_key_data, encode_parameter_status, encode_protocol_negotiation,
+    encode_ready_for_query, require_empty_backend_body,
 };
 
 const POSTGRES_PROTOCOL_3_0: u32 = 3 << 16;
@@ -110,6 +112,67 @@ fn decoded_frame(bytes: &[u8]) -> pgshard_pgwire::BackendFrame<'_> {
     frame
 }
 
+fn assert_variable_backend_encoding(
+    server_bytes: &[u8],
+    encode: impl FnOnce(&mut [u8]) -> Result<usize, BackendEncodeError>,
+) {
+    let mut encoded = vec![0; server_bytes.len()];
+    let length = encode(&mut encoded).expect("encode live PostgreSQL 18 frame");
+    assert_eq!(length, server_bytes.len());
+    assert!(
+        encoded == server_bytes,
+        "encoder disagrees with live PostgreSQL 18 frame"
+    );
+}
+
+fn assert_backend_control_encoding(server_bytes: &[u8], frame: pgshard_pgwire::BackendFrame<'_>) {
+    match frame.tag() {
+        BackendTag::AuthenticationRequest
+            if matches!(
+                decode_authentication_request(frame),
+                Ok(AuthenticationRequest::Ok)
+            ) =>
+        {
+            assert!(
+                server_bytes == encode_authentication_ok(),
+                "AuthenticationOk encoder disagrees with PostgreSQL 18"
+            );
+        }
+        BackendTag::NegotiateProtocolVersion => {
+            let response = decode_protocol_negotiation(frame).expect("protocol negotiation");
+            let mut options = response.unsupported_options();
+            let option = options.next();
+            assert!(
+                options.next().is_none(),
+                "live fixture requested at most one protocol option"
+            );
+            assert_variable_backend_encoding(server_bytes, |output| {
+                encode_protocol_negotiation(response.selected_protocol(), option.as_slice(), output)
+            });
+        }
+        BackendTag::ParameterStatus => {
+            let status = decode_parameter_status(frame).expect("ParameterStatus");
+            assert_variable_backend_encoding(server_bytes, |output| {
+                encode_parameter_status(status.name(), status.value(), output)
+            });
+        }
+        BackendTag::BackendKeyData => {
+            let data = decode_backend_key_data(frame).expect("BackendKeyData");
+            assert_variable_backend_encoding(server_bytes, |output| {
+                encode_backend_key_data(data.backend_pid(), data.cancellation_key(), output)
+            });
+        }
+        BackendTag::ReadyForQuery => {
+            let status = decode_ready_for_query(frame).expect("ReadyForQuery");
+            assert!(
+                server_bytes == encode_ready_for_query(status),
+                "ReadyForQuery encoder disagrees with PostgreSQL 18"
+            );
+        }
+        _ => {}
+    }
+}
+
 fn decoded_frontend(bytes: &[u8]) -> pgshard_pgwire::FrontendFrame<'_> {
     let Decode::Complete { frame, consumed } =
         decode_frontend(bytes, FrontendPhase::Regular, DEFAULT_LARGE_MESSAGE_LENGTH)
@@ -145,6 +208,7 @@ fn finish_startup(
     loop {
         let bytes = read_backend(stream);
         let frame = decoded_frame(&bytes);
+        assert_backend_control_encoding(&bytes, frame);
         match frame.tag() {
             BackendTag::AuthenticationRequest => {
                 if protocol.is_none() {
