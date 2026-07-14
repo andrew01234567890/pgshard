@@ -1,11 +1,40 @@
 package tuning
 
 import (
+	"encoding/json"
+	"os"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+type replicationSlotNameContract struct {
+	MemberPhysicalSlots []struct {
+		MemberOrdinal int32  `json:"member_ordinal"`
+		SlotName      string `json:"slot_name"`
+	} `json:"member_physical_slots"`
+}
+
+func TestMemberReplicationNameMatchesSharedContract(t *testing.T) {
+	t.Parallel()
+	contents, err := os.ReadFile("../../../contracts/replication-slot-names.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract replicationSlotNameContract
+	if err := json.Unmarshal(contents, &contract); err != nil {
+		t.Fatal(err)
+	}
+	if len(contract.MemberPhysicalSlots) == 0 {
+		t.Fatal("shared replication-slot naming contract has no cases")
+	}
+	for _, test := range contract.MemberPhysicalSlots {
+		if got := memberReplicationName(test.MemberOrdinal); got != test.SlotName {
+			t.Errorf("member %d slot name = %q, want %q", test.MemberOrdinal, got, test.SlotName)
+		}
+	}
+}
 
 func resources(cpuRequest, cpuLimit, memoryRequest, memoryLimit string) corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{

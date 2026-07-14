@@ -53,10 +53,24 @@ are checked but never selected while the server is in recovery, and transient
 ownership of the synchronized copy by PostgreSQL's slot-sync worker is
 accepted. `shardschema` now stores permanent consumer, checkpoint, attachment,
 and managed-slot generations with fenced lifecycle constraints and PostgreSQL
-18 contract coverage. That registry has no Rust loader or reconciler yet. No
-PostgreSQL Pod consumes the profiles, and secure `primary_conninfo`, live
-observation, slot creation or mutation, role activation, quarantined
-attachment, and stream ownership remain unimplemented.
+18 contract coverage. A bounded Rust reader now loads one exact ready
+consumer/database/shard/member policy in a read-only repeatable-read transaction,
+including its cluster and restore identity, ownership fence, checkpoint ordinal,
+primary anchor, and standby-local slot generation. It returns no attachable
+policy for a fenced owner, another member, or primary fallback, and fails closed
+when a required singleton or ready-policy component is absent, a snapshot is
+incomplete, the checkpoint ordinal is zero, or an active slot boundary is ahead
+of the durable checkpoint. Every construction and load has one validated
+absolute client deadline. Inside a load, the remaining PostgreSQL statement
+timeout is recomputed before every catalog query, leaving time for an observed
+rollback, and a PostgreSQL 18 transaction timeout backs up the whole transaction
+through commit. Only a statement cancellation followed by completed rollback
+retains the connection for retry. A hard client deadline or transaction timeout
+makes the reader terminal and requires a fresh connection. It does not
+select a member, observe or mutate PostgreSQL slots, or authorize a connection.
+No PostgreSQL Pod consumes the profiles, and secure `primary_conninfo`, live
+observation, slot creation or mutation, role activation, quarantined attachment,
+and stream ownership remain unimplemented.
 
 The source also contains a fixed-size PostgreSQL 18 Standby Status Update
 encoder. It validates that neither flush nor apply is ahead of write but does
@@ -173,10 +187,9 @@ rebinding, checkpoint progress without active exact-lineage source and anchor
 slots, activation without a primary anchor and selected source slot, snapshot
 completion behind either slot's consistent point or two-phase boundary,
 readiness without a resumable checkpoint, and retirement out of order. A
-consumer cannot attach to a slot
-until a future catalog reader and connection-owning runtime prove those fields
-match its current catalog epoch and lease. Catalog presence by itself is
-non-authorizing.
+consumer cannot attach to a slot until the future connection-owning runtime
+proves the loaded fields match its current catalog epoch and lease. Catalog
+presence by itself is non-authorizing.
 
 Each checkpoint generation is immutably bound to its shard restore incarnation,
 PostgreSQL system identifier, database OID, and source timeline. Physical

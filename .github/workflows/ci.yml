@@ -24,6 +24,7 @@ jobs:
       rust: ${{ steps.detect.outputs.rust }}
       postgres_agent: ${{ steps.detect.outputs.postgres_agent }}
       catalog: ${{ steps.detect.outputs.catalog }}
+      orch_catalog: ${{ steps.detect.outputs.orch_catalog }}
       pgwire: ${{ steps.detect.outputs.pgwire }}
       planner: ${{ steps.detect.outputs.planner }}
       proto: ${{ steps.detect.outputs.proto }}
@@ -93,6 +94,7 @@ jobs:
           rust_exists=false
           postgres_agent_exists=false
           catalog_exists=false
+          orch_catalog_exists=false
           pgwire_exists=false
           planner_exists=false
           proto_exists=false
@@ -107,6 +109,7 @@ jobs:
           exists_at_head_or_base Cargo.toml && rust_exists=true
           exists_at_head_or_base crates/pgshard-agent/Cargo.toml && postgres_agent_exists=true
           exists_at_head_or_base crates/pgshard-catalog/Cargo.toml && catalog_exists=true
+          exists_at_head_or_base crates/pgshard-orch/Cargo.toml && orch_catalog_exists=true
           exists_at_head_or_base crates/pgshard-pgwire/Cargo.toml && pgwire_exists=true
           exists_at_head_or_base crates/pgshard-planner/Cargo.toml && planner_exists=true
           exists_at_head_or_base buf.yaml && proto_exists=true
@@ -118,13 +121,14 @@ jobs:
           exists_at_head_or_base tests/e2e/Cargo.toml && kind_exists=true
           exists_at_head_or_base benchmarks/Cargo.toml && performance_exists=true
 
-          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
+          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^contracts/replication-slot-names\.json$|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
           emit_component postgres_agent "$postgres_agent_exists" '^crates/(pgshard-agent|pgshard-types|pgshard-version)/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^\.cargo/|^\.dockerignore$|^deploy/(docker-bake\.hcl|images/rust\.Dockerfile|images/quarantine\.pg_hba\.conf)$|^Makefile$|^\.github/workflows/ci\.yml$'
           emit_component catalog "$catalog_exists" '^crates/pgshard-catalog/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
+          emit_component orch_catalog "$orch_catalog_exists" '^crates/(pgshard-orch|pgshard-catalog|pgshard-types)/|^operator/internal/tuning/|^contracts/replication-slot-names\.json$|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component pgwire "$pgwire_exists" '^crates/pgshard-pgwire/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component planner "$planner_exists" '^crates/pgshard-planner/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^Makefile$|^\.github/workflows/'
-          emit_component go "$go_exists" '^operator/|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component go "$go_exists" '^operator/|^proto/|^contracts/replication-slot-names\.json$|^Makefile$|^\.github/workflows/'
           emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/workflows/'
           emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/workflows/'
           emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^Makefile$|^\.github/workflows/'
@@ -275,6 +279,34 @@ jobs:
         env:
           PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/shardschema
         run: make catalog-test
+
+  orch-catalog-postgres:
+    name: Orchestrator catalog / PostgreSQL 18
+    needs: changes
+    if: needs.changes.outputs.orch_catalog == 'true'
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: shardschema
+          POSTGRES_PASSWORD: pgshard-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d shardschema"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Load one fenced standby attachment policy
+        env:
+          PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/shardschema
+        run: make orch-catalog-test
 
   planner-postgres:
     name: Planner / PostgreSQL 18
@@ -1137,6 +1169,7 @@ jobs:
       - rust-static
       - rust-test
       - catalog-postgres
+      - orch-catalog-postgres
       - pgwire-postgres
       - planner-postgres
       - protobuf
@@ -1160,6 +1193,7 @@ jobs:
             rust-static=${{ needs.rust-static.result }}
             rust-test=${{ needs.rust-test.result }}
             catalog-postgres=${{ needs.catalog-postgres.result }}
+            orch-catalog-postgres=${{ needs.orch-catalog-postgres.result }}
             pgwire-postgres=${{ needs.pgwire-postgres.result }}
             planner-postgres=${{ needs.planner-postgres.result }}
             protobuf=${{ needs.protobuf.result }}

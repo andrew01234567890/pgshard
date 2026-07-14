@@ -664,6 +664,48 @@ impl StandbyDecoderPolicy {
             evidence_limits,
         })
     }
+
+    /// Returns the exact source identity authorized by the catalog snapshot.
+    #[must_use]
+    pub const fn expected_source(&self) -> ReplicationSourceIdentity {
+        self.expected_source
+    }
+
+    /// Returns the selected standby member ordinal.
+    #[must_use]
+    pub const fn member_ordinal(&self) -> u16 {
+        self.target.member_ordinal
+    }
+
+    /// Returns the physical slot protecting this standby's WAL and catalog horizon.
+    #[must_use]
+    pub fn physical_slot(&self) -> &ReplicationSlotName {
+        &self.target.physical_slot
+    }
+
+    /// Returns the cluster-scoped failover-anchor allocation.
+    #[must_use]
+    pub fn failover_anchor(&self) -> &ManagedSlotTarget {
+        &self.target.failover_anchor
+    }
+
+    /// Returns the selected member's independent standby-local decoder allocation.
+    #[must_use]
+    pub fn local_decoder(&self) -> &ManagedSlotTarget {
+        &self.target.local_decoder
+    }
+
+    /// Returns the catalog-bound prepared-transaction activation boundaries.
+    #[must_use]
+    pub const fn two_phase_policy(&self) -> ManagedTwoPhasePolicy {
+        self.two_phase
+    }
+
+    /// Returns the durable checkpoint from which attachment must resume.
+    #[must_use]
+    pub const fn durable_checkpoint_lsn(&self) -> PgLsn {
+        self.durable_checkpoint_lsn
+    }
 }
 
 /// Invalid catalog-derived attachment policy.

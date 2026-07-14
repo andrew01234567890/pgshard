@@ -1,0 +1,10 @@
+{
+  "member_physical_slots": [
+    { "member_ordinal": 0, "slot_name": "pgshard_member_0000" },
+    { "member_ordinal": 1, "slot_name": "pgshard_member_0001" },
+    { "member_ordinal": 42, "slot_name": "pgshard_member_0042" },
+    { "member_ordinal": 9999, "slot_name": "pgshard_member_9999" },
+    { "member_ordinal": 10000, "slot_name": "pgshard_member_10000" },
+    { "member_ordinal": 65535, "slot_name": "pgshard_member_65535" }
+  ]
+}
