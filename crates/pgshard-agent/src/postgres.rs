@@ -46,6 +46,40 @@ const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const QUARANTINE_HBA_CONTENT: &[u8] = b"local all all reject\nlocal replication all reject\n";
 
+// A process forked while a test owns a writable fixture descriptor inherits
+// that descriptor until exec, even with O_CLOEXEC. Serialize test fixture
+// writes with every child-process creation in this unit-test binary.
+#[cfg(test)]
+static TEST_EXEC_HANDOFF: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_EXEC_HANDOFF_OBSERVER:
+        std::cell::RefCell<Option<std::sync::mpsc::SyncSender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_exec_handoff_guard() -> std::sync::MutexGuard<'static, ()> {
+    let observer = TEST_EXEC_HANDOFF_OBSERVER.with(|observer| observer.borrow_mut().take());
+    if let Some(observer) = observer {
+        let _ = observer.send(());
+    }
+    TEST_EXEC_HANDOFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+fn observe_next_test_exec_handoff(observer: std::sync::mpsc::SyncSender<()>) {
+    TEST_EXEC_HANDOFF_OBSERVER.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(observer).is_none(),
+            "test thread already has an exec-handoff observer"
+        );
+    });
+}
+
 /// Configuration for an opt-in postmaster that is isolated from network clients.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostgresConfig {
@@ -467,7 +501,12 @@ impl PreparedPostgres {
         self,
         state: &AgentState,
     ) -> Result<(PostgresProcessFence, AsyncFd<OwnedFd>, Pid), PostgresError> {
-        let child = match self.command().spawn() {
+        let spawn_result = {
+            #[cfg(test)]
+            let _exec_handoff = test_exec_handoff_guard();
+            self.command().spawn()
+        };
+        let child = match spawn_result {
             Ok(child) => child,
             Err(source) => {
                 state.set_postgres_process(PostgresProcessState::Failed);
@@ -1777,6 +1816,8 @@ fn validate_control_data(
     expected_executable: FileSnapshot,
     expected_uid: u32,
 ) -> Result<ControlDataState, PostgresError> {
+    #[cfg(test)]
+    let _exec_handoff = test_exec_handoff_guard();
     let output = std::process::Command::new(&config.controldata_executable)
         .arg(&config.data_dir)
         .env_clear()
@@ -2872,6 +2913,76 @@ mod tests {
     }
 
     #[test]
+    fn executable_fixture_rewrites_replace_the_inode() {
+        let root = TempDir::new().expect("create executable fixture");
+        let executable = root.path().join("fixture");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let original = File::open(&executable).expect("open original executable fixture");
+
+        write_executable(&executable, "#!/bin/sh\nexit 42\n");
+
+        assert_ne!(
+            original.metadata().expect("inspect original fixture").ino(),
+            fs::metadata(&executable)
+                .expect("inspect replacement fixture")
+                .ino(),
+            "fixture rewrites must not open the executable inode for writing"
+        );
+        let status = {
+            let _exec_handoff = test_exec_handoff_guard();
+            std::process::Command::new(&executable)
+                .status()
+                .expect("execute replacement fixture")
+        };
+        assert_eq!(status.code(), Some(42));
+    }
+
+    #[test]
+    fn exec_handoff_blocks_control_data_while_its_fixture_is_writable() {
+        let root = TempDir::new().expect("create exec-handoff fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let executable = root.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let config = test_config(data_dir, executable.clone(), root.path().join("socket"));
+
+        let handoff = test_exec_handoff_guard();
+        let control_data = executable.with_file_name("pg_controldata");
+        fs::set_permissions(&control_data, fs::Permissions::from_mode(0o700))
+            .expect("make control-data fixture writable");
+        let writer = OpenOptions::new()
+            .write(true)
+            .open(&control_data)
+            .expect("hold control-data writer");
+        fs::set_permissions(&control_data, fs::Permissions::from_mode(0o500))
+            .expect("restore trusted control-data mode");
+
+        let (attempt_tx, attempt_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let prepare = std::thread::spawn(move || {
+            observe_next_test_exec_handoff(attempt_tx);
+            result_tx
+                .send(prepare_fixture(config).is_ok())
+                .expect("publish preparation result");
+        });
+        attempt_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observe control-data exec handoff attempt");
+        assert_eq!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        drop(writer);
+        drop(handoff);
+
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("preparation completed after writer release"),
+            "preparation failed after the executable writer closed"
+        );
+        prepare.join().expect("join fixture preparation");
+    }
+
+    #[test]
     fn rejects_untrusted_or_incomplete_control_data_reports() {
         let root = TempDir::new().expect("create control-data fixture");
         let data_dir = root.path().join("data");
@@ -3179,12 +3290,15 @@ mod tests {
         );
         drop(parent);
 
-        let unrelated = ProcessGuard(
-            std::process::Command::new("/bin/sleep")
-                .arg("30")
-                .spawn()
-                .expect("spawn unrelated live process"),
-        );
+        let unrelated = {
+            let _exec_handoff = test_exec_handoff_guard();
+            ProcessGuard(
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("spawn unrelated live process"),
+            )
+        };
         fs::write(&lock, format!("{}\n", unrelated.0.id())).expect("replace crash lock PID");
         let unrelated_prepared = prepare_fixture(config).expect("prepare unrelated PID lock");
         rewrite_agent_thread_lock(&lock, unrelated_prepared.validated.data.postmaster_lock)
@@ -3585,7 +3699,10 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg("exit 42").kill_on_drop(true);
         command.as_std_mut().process_group(0);
-        let mut child = command.spawn().expect("spawn exit fixture");
+        let mut child = {
+            let _exec_handoff = test_exec_handoff_guard();
+            command.spawn().expect("spawn exit fixture")
+        };
         let child_id = child.id().expect("fixture exposes child PID");
         let process_group = Pid::from_raw(i32::try_from(child_id).expect("child PID fits i32"))
             .expect("positive child PID");
@@ -4014,9 +4131,7 @@ mod tests {
     }
 
     fn write_executable(path: &Path, contents: &str) {
-        fs::write(path, contents).expect("write executable fixture");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o500))
-            .expect("make fixture executable");
+        replace_executable_fixture(path, contents);
         if path.file_name() == Some(OsStr::new("postgres")) {
             let controldata = path.with_file_name("pg_controldata");
             if !controldata.exists() {
@@ -4027,19 +4142,33 @@ mod tests {
 
     fn write_control_data_state(postgres: &Path, state: &str, stderr: &str) {
         let controldata = postgres.with_file_name("pg_controldata");
-        if controldata.exists() {
-            fs::set_permissions(&controldata, fs::Permissions::from_mode(0o700))
-                .expect("make control-data fixture replaceable");
-        }
-        fs::write(
+        replace_executable_fixture(
             &controldata,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' 'pg_control version number:            1800' 'Database cluster state:               {state}'\nprintf '%s' '{stderr}' >&2\n"
             ),
-        )
-        .expect("write control-data fixture");
-        fs::set_permissions(&controldata, fs::Permissions::from_mode(0o500))
-            .expect("protect control-data fixture");
+        );
+    }
+
+    fn replace_executable_fixture(path: &Path, contents: &str) {
+        let _exec_handoff = test_exec_handoff_guard();
+        let parent = path.parent().expect("executable fixture has a parent");
+        let mut temporary = NamedTempFile::new_in(parent).expect("create executable fixture");
+        temporary
+            .write_all(contents.as_bytes())
+            .expect("write executable fixture");
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o500))
+            .expect("make fixture executable");
+
+        // Close the writable descriptor before the inode becomes executable by
+        // name. In-place rewrites can otherwise race a parallel fork/exec and
+        // make Linux return ETXTBSY from an unrelated test.
+        temporary
+            .into_temp_path()
+            .persist(path)
+            .expect("replace executable fixture");
     }
 
     fn write_hba(path: &Path) {
