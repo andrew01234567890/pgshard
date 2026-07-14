@@ -1,4 +1,5 @@
-//! Read-only observation of local `PostgreSQL` 18 logical replication slots.
+//! Read-only observation of local `PostgreSQL` 18 logical replication slots
+//! and standby-decoder prerequisites.
 //!
 //! The observer consumes a dedicated database client and its connection driver,
 //! then returns one bounded, non-atomic observation batch for an exact, small
@@ -21,9 +22,9 @@ use tokio::{
 use tokio_postgres::{Client, Connection, Row};
 
 use crate::standby_slots::{
-    LogicalSlotKind, LogicalSlotObservation, LogicalSlotPlugin, ManagedSlotTarget,
-    ReplicationSlotName, SettingState, SlotActivity, SlotInvalidation, SlotNameError,
-    SlotOwnership, SlotPersistence, SlotWalRetention,
+    LogicalSlotKind, LogicalSlotObservation, LogicalSlotPlugin, LogicalWalLevel, ManagedSlotTarget,
+    RecoveryState, ReplicationSlotName, SettingState, SlotActivity, SlotInvalidation,
+    SlotNameError, SlotOwnership, SlotPersistence, SlotWalRetention,
 };
 
 const MIN_POSTGRES_VERSION_NUM: i32 = 180_000;
@@ -39,6 +40,26 @@ const REQUIREMENTS_SQL: &str = "\
            (SELECT oid::pg_catalog.int8 FROM pg_catalog.pg_database \
              WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()), \
            pg_catalog.getdatabaseencoding()";
+const OBSERVE_PREREQUISITES_SQL: &str = "\
+    SELECT control.system_identifier::pg_catalog.int8, \
+           checkpoint_control.timeline_id, \
+           pg_catalog.pg_is_in_recovery(), \
+           pg_catalog.current_setting('wal_level'), \
+           pg_catalog.current_setting('hot_standby_feedback')::pg_catalog.bool, \
+           (SELECT setting::pg_catalog.int8 FROM pg_catalog.pg_settings \
+             WHERE name OPERATOR(pg_catalog.=) 'wal_receiver_status_interval'), \
+           (SELECT unit::pg_catalog.text FROM pg_catalog.pg_settings \
+             WHERE name OPERATOR(pg_catalog.=) 'wal_receiver_status_interval'), \
+           pg_catalog.current_setting('sync_replication_slots')::pg_catalog.bool, \
+           NULLIF(pg_catalog.current_setting('primary_slot_name'), ''), \
+           pg_catalog.pg_last_wal_replay_lsn()::pg_catalog.text AS replay_lsn, \
+           receiver.pid::pg_catalog.int4, \
+           receiver.status::pg_catalog.text, \
+           receiver.slot_name::pg_catalog.text \
+      FROM pg_catalog.pg_control_system() AS control \
+     CROSS JOIN pg_catalog.pg_control_checkpoint() AS checkpoint_control \
+      LEFT JOIN pg_catalog.pg_stat_get_wal_receiver() AS receiver \
+        ON receiver.pid IS NOT NULL";
 const OBSERVE_SLOTS_SQL: &str = "\
     SELECT slot_name::pg_catalog.text AS slot_name, \
            plugin::pg_catalog.text AS plugin, slot_type, \
@@ -125,6 +146,127 @@ pub struct LogicalSlotSnapshotEntry {
     observation: Option<LogicalSlotObservation>,
 }
 
+/// Raw local WAL-receiver activity, before any upstream identity correlation.
+///
+/// `Streaming` here means only that `PostgreSQL`'s local receiver reports that
+/// state. It does not prove that the receiver is connected to the catalog's
+/// expected primary; the later multi-server observer must establish that
+/// separately before constructing an eligibility
+/// [`WalReceiverState`](crate::standby_slots::WalReceiverState).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalWalReceiverActivity {
+    /// No displayable local WAL receiver exists.
+    Absent,
+    /// `PostgreSQL` reports the receiver stopped.
+    Stopped,
+    /// `PostgreSQL` reports the receiver starting.
+    Starting,
+    /// `PostgreSQL` reports the receiver actively streaming from an uncorrelated source.
+    Streaming,
+    /// `PostgreSQL` reports the receiver waiting for more WAL.
+    Waiting,
+    /// `PostgreSQL` reports the receiver restarting its connection.
+    Restarting,
+    /// `PostgreSQL` reports the receiver stopping.
+    Stopping,
+}
+
+/// One local server's `PostgreSQL` 18 state needed by standby-first decoding.
+///
+/// This is observation only. In particular, an enabled slot-sync setting is
+/// not evidence that the background worker completed a cycle, and the latest
+/// checkpoint timeline can conservatively lag a recovery timeline change until
+/// `PostgreSQL` records a later restartpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalStandbyPrerequisiteObservation {
+    system_identifier: u64,
+    checkpoint_timeline: u32,
+    recovery: RecoveryState,
+    wal_level: LogicalWalLevel,
+    hot_standby_feedback: SettingState,
+    wal_receiver_status_interval: Duration,
+    sync_replication_slots: SettingState,
+    primary_slot_name: Option<ReplicationSlotName>,
+    replay_lsn: Option<PgLsn>,
+    wal_receiver_pid: Option<NonZeroU32>,
+    wal_receiver_activity: LocalWalReceiverActivity,
+    wal_receiver_slot_name: Option<ReplicationSlotName>,
+}
+
+impl LocalStandbyPrerequisiteObservation {
+    /// Returns the unsigned `PostgreSQL` cluster system identifier.
+    #[must_use]
+    pub const fn system_identifier(&self) -> u64 {
+        self.system_identifier
+    }
+
+    /// Returns the timeline stored in `PostgreSQL`'s latest control-file checkpoint.
+    #[must_use]
+    pub const fn checkpoint_timeline(&self) -> u32 {
+        self.checkpoint_timeline
+    }
+
+    /// Returns whether the observed server is in recovery.
+    #[must_use]
+    pub const fn recovery(&self) -> RecoveryState {
+        self.recovery
+    }
+
+    /// Returns the effective logical-decoding WAL level.
+    #[must_use]
+    pub const fn wal_level(&self) -> LogicalWalLevel {
+        self.wal_level
+    }
+
+    /// Returns the effective hot-standby-feedback setting.
+    #[must_use]
+    pub const fn hot_standby_feedback(&self) -> SettingState {
+        self.hot_standby_feedback
+    }
+
+    /// Returns `PostgreSQL`'s effective WAL-receiver feedback interval.
+    #[must_use]
+    pub const fn wal_receiver_status_interval(&self) -> Duration {
+        self.wal_receiver_status_interval
+    }
+
+    /// Returns whether continuous logical failover-slot synchronization is enabled.
+    #[must_use]
+    pub const fn sync_replication_slots(&self) -> SettingState {
+        self.sync_replication_slots
+    }
+
+    /// Returns the configured physical upstream slot, if any.
+    #[must_use]
+    pub const fn primary_slot_name(&self) -> Option<&ReplicationSlotName> {
+        self.primary_slot_name.as_ref()
+    }
+
+    /// Returns the last replayed WAL location, if `PostgreSQL` exposes one.
+    #[must_use]
+    pub const fn replay_lsn(&self) -> Option<PgLsn> {
+        self.replay_lsn
+    }
+
+    /// Returns the displayable local WAL receiver's process identifier, if any.
+    #[must_use]
+    pub const fn wal_receiver_pid(&self) -> Option<NonZeroU32> {
+        self.wal_receiver_pid
+    }
+
+    /// Returns raw local receiver activity without claiming upstream identity.
+    #[must_use]
+    pub const fn wal_receiver_activity(&self) -> LocalWalReceiverActivity {
+        self.wal_receiver_activity
+    }
+
+    /// Returns the live WAL receiver's physical slot, if reported.
+    #[must_use]
+    pub const fn wal_receiver_slot_name(&self) -> Option<&ReplicationSlotName> {
+        self.wal_receiver_slot_name.as_ref()
+    }
+}
+
 impl LogicalSlotSnapshotEntry {
     /// Returns the exact catalog target requested by the caller.
     #[must_use]
@@ -150,6 +292,9 @@ impl LogicalSlotSnapshotEntry {
 pub struct LocalLogicalSlotObservationBatch {
     database_name: String,
     database_oid: u32,
+    prerequisite_collection_started_at: Instant,
+    prerequisite_collection_finished_at: Instant,
+    prerequisites: LocalStandbyPrerequisiteObservation,
     slot_collection_started_at: Instant,
     slot_collection_finished_at: Instant,
     entries: Vec<LogicalSlotSnapshotEntry>,
@@ -166,6 +311,24 @@ impl LocalLogicalSlotObservationBatch {
     #[must_use]
     pub const fn database_oid(&self) -> u32 {
         self.database_oid
+    }
+
+    /// Returns the local monotonic instant before prerequisite collection.
+    #[must_use]
+    pub const fn prerequisite_collection_started_at(&self) -> Instant {
+        self.prerequisite_collection_started_at
+    }
+
+    /// Returns the local monotonic instant after prerequisite collection.
+    #[must_use]
+    pub const fn prerequisite_collection_finished_at(&self) -> Instant {
+        self.prerequisite_collection_finished_at
+    }
+
+    /// Returns the local standby-decoder prerequisites observed before the slots.
+    #[must_use]
+    pub const fn prerequisites(&self) -> &LocalStandbyPrerequisiteObservation {
+        &self.prerequisites
     }
 
     /// Returns the local monotonic instant immediately before the slot query.
@@ -287,6 +450,7 @@ async fn observe_before(
     client.batch_execute("DISCARD ALL").await?;
     client.query_one(PIN_SEARCH_PATH_SQL, &[]).await?;
     set_statement_timeout(&client, deadline).await?;
+    let prerequisite_collection_started_at = Instant::now();
     let requirements = client.query_one(REQUIREMENTS_SQL, &[]).await?;
     let version: i32 = requirements.try_get(0)?;
     let database_name: String = requirements.try_get(1)?;
@@ -300,6 +464,10 @@ async fn observe_before(
     if encoding != "UTF8" {
         return Err(LocalSlotObservationError::WrongEncoding(encoding));
     }
+    set_statement_timeout(&client, deadline).await?;
+    let prerequisite_row = client.query_one(OBSERVE_PREREQUISITES_SQL, &[]).await?;
+    let prerequisite_collection_finished_at = Instant::now();
+    let prerequisites = parse_prerequisites(&prerequisite_row)?;
 
     let names: Vec<String> = request
         .targets
@@ -339,10 +507,155 @@ async fn observe_before(
     Ok(LocalLogicalSlotObservationBatch {
         database_name,
         database_oid,
+        prerequisite_collection_started_at,
+        prerequisite_collection_finished_at,
+        prerequisites,
         slot_collection_started_at,
         slot_collection_finished_at,
         entries,
     })
+}
+
+fn parse_prerequisites(
+    row: &Row,
+) -> Result<LocalStandbyPrerequisiteObservation, LocalSlotObservationError> {
+    let system_identifier = parse_system_identifier(row.try_get(0)?)?;
+    let checkpoint_timeline = parse_timeline_id(row.try_get(1)?)?;
+    let recovery = if row.try_get(2)? {
+        RecoveryState::Standby
+    } else {
+        RecoveryState::Writable
+    };
+    let wal_level = match row.try_get::<_, String>(3)?.as_str() {
+        "logical" => LogicalWalLevel::Logical,
+        _ => LogicalWalLevel::Insufficient,
+    };
+    let hot_standby_feedback = setting_state(row.try_get(4)?);
+    let wal_receiver_status_interval =
+        parse_wal_receiver_interval(row.try_get(5)?, &row.try_get::<_, String>(6)?)?;
+    let sync_replication_slots = setting_state(row.try_get(7)?);
+    let primary_slot_name = optional_slot_name(row.try_get(8)?)?;
+    let replay_lsn = optional_lsn(row, "replay_lsn")?;
+    let receiver_pid = row.try_get(10)?;
+    let receiver_status: Option<String> = row.try_get(11)?;
+    let receiver_slot_name = row.try_get(12)?;
+    let (wal_receiver_pid, wal_receiver_activity, wal_receiver_slot_name) =
+        parse_wal_receiver(receiver_pid, receiver_status.as_deref(), receiver_slot_name)?;
+
+    Ok(LocalStandbyPrerequisiteObservation {
+        system_identifier,
+        checkpoint_timeline,
+        recovery,
+        wal_level,
+        hot_standby_feedback,
+        wal_receiver_status_interval,
+        sync_replication_slots,
+        primary_slot_name,
+        replay_lsn,
+        wal_receiver_pid,
+        wal_receiver_activity,
+        wal_receiver_slot_name,
+    })
+}
+
+fn parse_system_identifier(value: i64) -> Result<u64, LocalSlotObservationError> {
+    // PostgreSQL stores this as uint64 but exposes the control-file field as
+    // int8. Preserve the bit pattern so clusters initialized after the signed
+    // boundary do not acquire a different identity.
+    let value = value.cast_unsigned();
+    if value == 0 {
+        return Err(LocalSlotObservationError::InvalidSystemIdentifier);
+    }
+    Ok(value)
+}
+
+fn parse_timeline_id(value: i32) -> Result<u32, LocalSlotObservationError> {
+    // PostgreSQL stores TimeLineID as uint32 but exposes the control-file field
+    // as int4. Preserve the signed SQL value's complete bit pattern.
+    let value = value.cast_unsigned();
+    if value == 0 {
+        return Err(LocalSlotObservationError::InvalidTimelineId);
+    }
+    Ok(value)
+}
+
+fn parse_wal_receiver(
+    pid: Option<i32>,
+    status: Option<&str>,
+    slot_name: Option<String>,
+) -> Result<
+    (
+        Option<NonZeroU32>,
+        LocalWalReceiverActivity,
+        Option<ReplicationSlotName>,
+    ),
+    LocalSlotObservationError,
+> {
+    let Some(pid) = pid else {
+        if status.is_some() || slot_name.is_some() {
+            return Err(LocalSlotObservationError::InconsistentWalReceiver);
+        }
+        return Ok((None, LocalWalReceiverActivity::Absent, None));
+    };
+    let pid = u32::try_from(pid)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or(LocalSlotObservationError::InvalidWalReceiverPid(pid))?;
+    let Some(status) = status else {
+        // PostgreSQL deliberately leaves the PID visible while redacting every
+        // other field from roles without pg_read_all_stats. An observer must
+        // not turn that live-but-unobservable receiver into an absent one.
+        return Err(LocalSlotObservationError::WalReceiverDetailsUnavailable { pid });
+    };
+    let activity = match status {
+        "stopped" => LocalWalReceiverActivity::Stopped,
+        "starting" => LocalWalReceiverActivity::Starting,
+        "streaming" => LocalWalReceiverActivity::Streaming,
+        "waiting" => LocalWalReceiverActivity::Waiting,
+        "restarting" => LocalWalReceiverActivity::Restarting,
+        "stopping" => LocalWalReceiverActivity::Stopping,
+        _ => {
+            return Err(LocalSlotObservationError::UnsupportedWalReceiverStatus(
+                status.to_owned(),
+            ));
+        }
+    };
+    Ok((Some(pid), activity, optional_slot_name(slot_name)?))
+}
+
+const fn setting_state(enabled: bool) -> SettingState {
+    if enabled {
+        SettingState::Enabled
+    } else {
+        SettingState::Disabled
+    }
+}
+
+fn parse_wal_receiver_interval(
+    value: i64,
+    unit: &str,
+) -> Result<Duration, LocalSlotObservationError> {
+    if unit != "s" {
+        return Err(LocalSlotObservationError::UnsupportedSettingUnit {
+            setting: "wal_receiver_status_interval",
+            unit: unit.to_owned(),
+        });
+    }
+    let seconds =
+        u64::try_from(value).map_err(|_| LocalSlotObservationError::InvalidNonnegativeInteger {
+            field: "wal_receiver_status_interval",
+            value,
+        })?;
+    Ok(Duration::from_secs(seconds))
+}
+
+fn optional_slot_name(
+    value: Option<String>,
+) -> Result<Option<ReplicationSlotName>, LocalSlotObservationError> {
+    value
+        .map(ReplicationSlotName::new)
+        .transpose()
+        .map_err(Into::into)
 }
 
 async fn set_statement_timeout(
@@ -522,12 +835,53 @@ pub enum LocalSlotObservationError {
     #[error("logical slot observation requires UTF8; observed {0:?}")]
     WrongEncoding(String),
     /// A positive `PostgreSQL` numeric identity did not fit the Rust model.
-    #[error("logical slot field {field} must be a positive 32-bit integer; observed {value}")]
+    #[error(
+        "PostgreSQL observation field {field} must be a positive 32-bit integer; observed {value}"
+    )]
     InvalidPositiveInteger {
         /// Rejected field.
         field: &'static str,
         /// Rejected `PostgreSQL` value.
         value: i64,
+    },
+    /// `PostgreSQL` reported a zero cluster system identifier.
+    #[error("PostgreSQL system identifier must be nonzero")]
+    InvalidSystemIdentifier,
+    /// `PostgreSQL` reported a zero checkpoint timeline identifier.
+    #[error("PostgreSQL checkpoint timeline identifier must be nonzero")]
+    InvalidTimelineId,
+    /// A live WAL receiver's backend PID was zero or outside the supported range.
+    #[error("PostgreSQL WAL receiver PID is invalid: {0}")]
+    InvalidWalReceiverPid(i32),
+    /// A live WAL receiver exists, but `PostgreSQL` redacted its details.
+    #[error(
+        "PostgreSQL WAL receiver {pid} details are unavailable; the observer role requires pg_read_all_stats"
+    )]
+    WalReceiverDetailsUnavailable {
+        /// Visible PID of the receiver whose remaining fields were redacted.
+        pid: NonZeroU32,
+    },
+    /// `PostgreSQL` returned receiver details without a receiver PID.
+    #[error("PostgreSQL WAL receiver details are inconsistent with its PID")]
+    InconsistentWalReceiver,
+    /// `PostgreSQL` returned a receiver status outside the `PostgreSQL` 18 closed set.
+    #[error("unsupported PostgreSQL 18 WAL receiver status {0:?}")]
+    UnsupportedWalReceiverStatus(String),
+    /// A nonnegative `PostgreSQL` setting did not fit the Rust model.
+    #[error("PostgreSQL observation field {field} must be a nonnegative integer; observed {value}")]
+    InvalidNonnegativeInteger {
+        /// Rejected field.
+        field: &'static str,
+        /// Rejected `PostgreSQL` value.
+        value: i64,
+    },
+    /// `PostgreSQL` 18 exposed an unexpected canonical setting unit.
+    #[error("PostgreSQL setting {setting} has unsupported unit {unit:?}")]
+    UnsupportedSettingUnit {
+        /// Setting whose unit was rejected.
+        setting: &'static str,
+        /// Unit returned by `pg_settings`.
+        unit: String,
     },
     /// An expected logical slot had no owning database OID.
     #[error("requested logical slot {0:?} has no database OID")]
@@ -652,6 +1006,100 @@ mod tests {
 
         assert_eq!(classify_persistence(false), SlotPersistence::Unproven);
         assert_eq!(classify_persistence(true), SlotPersistence::NonPersistent);
+    }
+
+    #[test]
+    fn parses_unsigned_system_identity_and_exact_feedback_unit() {
+        assert_eq!(parse_system_identifier(1).expect("identity"), 1);
+        assert_eq!(
+            parse_system_identifier(i64::MIN).expect("unsigned identity"),
+            1_u64 << 63
+        );
+        assert_eq!(
+            parse_system_identifier(-1).expect("maximum unsigned identity"),
+            u64::MAX
+        );
+        assert!(matches!(
+            parse_system_identifier(0),
+            Err(LocalSlotObservationError::InvalidSystemIdentifier)
+        ));
+        assert_eq!(parse_timeline_id(1).expect("timeline"), 1);
+        assert_eq!(
+            parse_timeline_id(i32::MIN).expect("high-bit timeline"),
+            1_u32 << 31
+        );
+        assert_eq!(parse_timeline_id(-1).expect("maximum timeline"), u32::MAX);
+        assert!(matches!(
+            parse_timeline_id(0),
+            Err(LocalSlotObservationError::InvalidTimelineId)
+        ));
+        assert_eq!(
+            parse_wal_receiver_interval(0, "s").expect("disabled interval"),
+            Duration::ZERO
+        );
+        assert_eq!(
+            parse_wal_receiver_interval(10, "s").expect("feedback interval"),
+            Duration::from_secs(10)
+        );
+        assert!(matches!(
+            parse_wal_receiver_interval(-1, "s"),
+            Err(LocalSlotObservationError::InvalidNonnegativeInteger { .. })
+        ));
+        assert!(matches!(
+            parse_wal_receiver_interval(10, "ms"),
+            Err(LocalSlotObservationError::UnsupportedSettingUnit { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_closed_receiver_activity_and_fails_on_redaction() {
+        assert_eq!(
+            parse_wal_receiver(None, None, None).expect("absent receiver"),
+            (None, LocalWalReceiverActivity::Absent, None)
+        );
+        for (status, expected) in [
+            ("stopped", LocalWalReceiverActivity::Stopped),
+            ("starting", LocalWalReceiverActivity::Starting),
+            ("streaming", LocalWalReceiverActivity::Streaming),
+            ("waiting", LocalWalReceiverActivity::Waiting),
+            ("restarting", LocalWalReceiverActivity::Restarting),
+            ("stopping", LocalWalReceiverActivity::Stopping),
+        ] {
+            let (pid, activity, slot_name) = parse_wal_receiver(
+                Some(42),
+                Some(status),
+                Some("pgshard_member_0001".to_owned()),
+            )
+            .expect("known receiver state");
+            assert_eq!(pid.map(NonZeroU32::get), Some(42));
+            assert_eq!(activity, expected);
+            assert_eq!(
+                slot_name.as_ref().map(ReplicationSlotName::as_str),
+                Some("pgshard_member_0001")
+            );
+        }
+        assert!(matches!(
+            parse_wal_receiver(Some(42), None, None),
+            Err(LocalSlotObservationError::WalReceiverDetailsUnavailable { pid })
+                if pid.get() == 42
+        ));
+        assert!(matches!(
+            parse_wal_receiver(Some(0), Some("streaming"), None),
+            Err(LocalSlotObservationError::InvalidWalReceiverPid(0))
+        ));
+        assert!(matches!(
+            parse_wal_receiver(None, Some("streaming"), None),
+            Err(LocalSlotObservationError::InconsistentWalReceiver)
+        ));
+        assert!(matches!(
+            parse_wal_receiver(None, None, Some("pgshard_member_0001".to_owned())),
+            Err(LocalSlotObservationError::InconsistentWalReceiver)
+        ));
+        assert!(matches!(
+            parse_wal_receiver(Some(42), Some("future"), None),
+            Err(LocalSlotObservationError::UnsupportedWalReceiverStatus(status))
+                if status == "future"
+        ));
     }
 
     #[test]

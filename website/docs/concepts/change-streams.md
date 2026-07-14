@@ -258,6 +258,17 @@ boundaries, and the durable checkpoint. A safe source change starts from that
 checkpoint and can replay already acknowledged WAL, so the public contract
 remains at-least-once.
 
+A newly introduced failover anchor also cannot assume that every already-running
+standby can synchronize it. The reconciler must prove the anchor's required WAL
+and catalog horizons are still available there. A row with `synced = true` and
+`temporary = true` is only the slot-sync worker's transitional copy and is never
+promotion evidence. If PostgreSQL reports that synchronization would require an
+already-passed catalog horizon, pgshard fences that member and rebuilds it from
+a safe base backup or creates a new snapshot/checkpoint generation; it does not
+advance, persist, or relabel the temporary copy. The focused CI fixture creates
+its anchor after taking the base backup but before starting the standby, then
+requires the continuous worker to expose the non-temporary synchronized copy.
+
 For every shard that can host a decoder or receive a synchronized anchor, the
 operator enforces the PostgreSQL 18 prerequisites as one configuration unit:
 
@@ -284,6 +295,25 @@ catalog database OID. The setting and continued existence of an old
 synchronized slot are not accepted as worker health: a missing
 `primary_conninfo` `dbname`, connection failure, a success from an earlier or
 different connection, or a stale cycle fences the member.
+
+The current Rust observer reads the local PostgreSQL 18 control-file system
+identifier and checkpoint timeline, recovery role, WAL level,
+`hot_standby_feedback`, exact `wal_receiver_status_interval`,
+`sync_replication_slots`, `primary_slot_name`, replay position, and live WAL
+receiver PID, raw activity, and physical-slot name immediately before it reads
+the requested local slots. Raw `streaming` activity does not claim that the
+receiver is connected to the expected primary. If PostgreSQL exposes a live PID
+but redacts the remaining receiver fields, the observer fails with a typed
+`pg_read_all_stats` prerequisite instead of treating the receiver as absent.
+Both query intervals are recorded on one consumed, deadline-bounded connection.
+This is still local, non-atomic observation: it does not prove the configured
+upstream, physical-slot ownership, feedback freshness, or a completed slot-sync
+cycle.
+Runtime code does not call `pg_sync_replication_slots()`. PostgreSQL 18 describes
+that one-shot function as primarily for testing and debugging and recommends the
+continuous slot-sync worker for high availability; pgshard will observe the
+worker and synchronized slot progress instead of substituting an occasional
+manual call for continuous protection.
 
 The candidate's live `pg_stat_wal_receiver.slot_name` must equal the managed
 physical slot. On the primary, the matching `pg_stat_replication` walsender PID

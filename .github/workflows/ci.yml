@@ -291,9 +291,21 @@ jobs:
         env:
           POSTGRES_DB: shardschema
           POSTGRES_PASSWORD: pgshard-ci-only
-          POSTGRES_INITDB_ARGS: --set wal_level=logical --set max_prepared_transactions=10
+          POSTGRES_INITDB_ARGS: --set wal_level=logical --set max_prepared_transactions=10 --set hot_standby_feedback=on --set wal_receiver_status_interval=1s --set sync_replication_slots=on --set primary_slot_name=pgshard_member_0001 --set synchronized_standby_slots=pgshard_member_0001
         ports:
           - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d shardschema"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      postgres17:
+        image: postgres:17
+        env:
+          POSTGRES_DB: shardschema
+          POSTGRES_PASSWORD: pgshard-ci-only
+        ports:
+          - 5433:5432
         options: >-
           --health-cmd "pg_isready -U postgres -d shardschema"
           --health-interval 5s
@@ -308,10 +320,91 @@ jobs:
         env:
           PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/shardschema
         run: make orch-catalog-test
-      - name: Observe exact local logical slots
+      - name: Start a PostgreSQL 18 streaming standby
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t primary_containers < <(
+            docker ps --filter publish=5432 --format '{{.ID}}'
+          )
+          test "${#primary_containers[@]}" -eq 1
+          primary_container="${primary_containers[0]}"
+          docker exec "$primary_container" psql \
+            --username postgres --dbname shardschema --set ON_ERROR_STOP=1 \
+            --command "CREATE ROLE pgshard_replicator WITH REPLICATION LOGIN PASSWORD 'pgshard-ci-only'"
+          docker exec "$primary_container" psql \
+            --username postgres --dbname shardschema --set ON_ERROR_STOP=1 \
+            --command "CREATE ROLE pgshard_observer_restricted LOGIN PASSWORD 'pgshard-test-only'"
+          docker exec --user postgres "$primary_container" sh -ceu \
+            'printf "%s\n" "host replication pgshard_replicator all scram-sha-256" >> "$PGDATA/pg_hba.conf"; pg_ctl reload --pgdata "$PGDATA"'
+          docker volume create pgshard-ci-standby >/dev/null
+          docker run --rm --user postgres \
+            --add-host host.docker.internal:host-gateway \
+            --env PGPASSWORD=pgshard-ci-only \
+            --volume pgshard-ci-standby:/var/lib/postgresql \
+            postgres:18 \
+            pg_basebackup --host host.docker.internal --port 5432 \
+              --username pgshard_replicator \
+              --pgdata /var/lib/postgresql/18/docker \
+              --write-recovery-conf --wal-method stream --create-slot \
+              --slot pgshard_member_0001 --checkpoint fast
+          docker exec "$primary_container" psql \
+            --username postgres --dbname shardschema --set ON_ERROR_STOP=1 \
+            --command "SELECT slot_name, lsn FROM pg_catalog.pg_create_logical_replication_slot('pgshard_ci_anchor_00000000000000000000000000000001', 'pgoutput', false, true, true)"
+          docker run --detach --name pgshard-ci-standby \
+            --add-host host.docker.internal:host-gateway \
+            --publish 5434:5434 \
+            --user postgres \
+            --volume pgshard-ci-standby:/var/lib/postgresql \
+            postgres:18 \
+            postgres -D /var/lib/postgresql/18/docker -p 5434 \
+              -c "primary_conninfo=host=host.docker.internal port=5432 user=pgshard_replicator password=pgshard-ci-only dbname=shardschema application_name=pgshard_ci_standby sslmode=disable" \
+              -c primary_slot_name=pgshard_member_0001 \
+              -c hot_standby_feedback=on \
+              -c wal_receiver_status_interval=1s \
+              -c sync_replication_slots=on
+          ready=false
+          for _ in {1..30}; do
+            if docker exec pgshard-ci-standby \
+              pg_isready --username postgres --dbname shardschema --port 5434 >/dev/null
+            then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs pgshard-ci-standby
+            exit 1
+          fi
+          receiver_count="$(docker exec pgshard-ci-standby psql \
+            --username postgres --dbname shardschema --port 5434 \
+            --tuples-only --no-align \
+            --command "SELECT count(*) FROM pg_catalog.pg_stat_wal_receiver WHERE status = 'streaming' AND slot_name = 'pgshard_member_0001'")"
+          test "$receiver_count" = 1
+      - name: Observe local logical slots and prerequisites
         env:
           PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/shardschema
+          PGSHARD_TEST_LEGACY_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5433/shardschema
+          PGSHARD_TEST_STANDBY_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5434/shardschema
         run: make orch-slot-observer-test
+      - name: Remove the PostgreSQL 18 streaming standby
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          docker rm --force pgshard-ci-standby 2>/dev/null || true
+          mapfile -t primary_containers < <(
+            docker ps --filter publish=5432 --format '{{.ID}}'
+          )
+          if [[ "${#primary_containers[@]}" -eq 1 ]]; then
+            docker exec "${primary_containers[0]}" psql \
+              --username postgres --dbname shardschema \
+              --command "SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'pgshard_ci_anchor_00000000000000000000000000000001'" \
+              --command "SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'pgshard_member_0001'" \
+              >/dev/null || true
+          fi
+          docker volume rm pgshard-ci-standby 2>/dev/null || true
 
   planner-postgres:
     name: Planner / PostgreSQL 18

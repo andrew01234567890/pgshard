@@ -29,6 +29,8 @@ orch-catalog-test:
 
 orch-slot-observer-test:
 	@test -n "$(PGSHARD_TEST_DATABASE_URL)" || (echo "PGSHARD_TEST_DATABASE_URL is required" >&2; exit 1)
+	@test -n "$(PGSHARD_TEST_LEGACY_DATABASE_URL)" || (echo "PGSHARD_TEST_LEGACY_DATABASE_URL is required" >&2; exit 1)
+	@test -n "$(PGSHARD_TEST_STANDBY_DATABASE_URL)" || (echo "PGSHARD_TEST_STANDBY_DATABASE_URL is required" >&2; exit 1)
 	cargo test --locked -p pgshard-orch --test postgres18_slots -- --ignored --test-threads=1
 
 pgwire-postgres-test:

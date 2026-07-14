@@ -10,12 +10,13 @@ use std::{
 use pgshard_catalog::CatalogOperationTimeout;
 use pgshard_orch::{
     slot_observer::{
-        LocalLogicalSlotObservationBatch, LocalSlotObservationError, LogicalSlotObservationRequest,
-        observe_local_logical_slots,
+        LocalLogicalSlotObservationBatch, LocalSlotObservationError, LocalWalReceiverActivity,
+        LogicalSlotObservationRequest, observe_local_logical_slots,
     },
     standby_slots::{
-        LogicalSlotKind, LogicalSlotPlugin, ManagedSlotTarget, ReplicationSlotName, SettingState,
-        SlotActivity, SlotGeneration, SlotOwnership, SlotPersistence, SlotWalRetention,
+        LogicalSlotKind, LogicalSlotPlugin, LogicalWalLevel, ManagedSlotTarget, RecoveryState,
+        ReplicationSlotName, SettingState, SlotActivity, SlotGeneration, SlotOwnership,
+        SlotPersistence, SlotWalRetention,
     },
 };
 use tokio::{
@@ -34,6 +35,12 @@ const CREATE_LOGICAL_SLOT_SQL: &str = "\
 const CONNECTION_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const EXPECTED_PRIMARY_SLOT_NAME: &str = "pgshard_member_0001";
+const EXPECTED_SYNCED_ANCHOR_NAME: &str = "pgshard_ci_anchor_00000000000000000000000000000001";
+const STANDBY_CATCHUP_TIMEOUT: Duration = Duration::from_mins(1);
+const STANDBY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const STANDBY_RESTRICTED_ROLE: &str = "pgshard_observer_restricted";
+const STANDBY_RESTRICTED_PASSWORD: &str = "pgshard-test-only";
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 type TestError = Box<dyn Error + Send + Sync>;
@@ -76,6 +83,14 @@ fn target(prefix: &str) -> TestResult<ManagedSlotTarget> {
         SlotGeneration::new(Uuid::from_u128(elapsed.as_nanos() ^ (pid << 64) ^ sequence))?;
     Ok(ManagedSlotTarget::new(
         ReplicationSlotName::new(format!("{prefix}_{}", generation.as_uuid().simple()))?,
+        generation,
+    )?)
+}
+
+fn expected_synced_anchor() -> TestResult<ManagedSlotTarget> {
+    let generation = SlotGeneration::new(Uuid::from_u128(1))?;
+    Ok(ManagedSlotTarget::new(
+        ReplicationSlotName::new(EXPECTED_SYNCED_ANCHOR_NAME)?,
         generation,
     )?)
 }
@@ -225,6 +240,172 @@ async fn run_observation_fixture(
     connection_result
 }
 
+async fn run_standby_observation_fixture(
+    standby_database_url: String,
+    expected_system_identifier: u64,
+) -> TestResult {
+    let target = expected_synced_anchor()?;
+    let request = LogicalSlotObservationRequest::new(vec![target.clone()])?;
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    let batch = loop {
+        let batch = observe(&standby_database_url, &request).await?;
+        let synchronized = batch.entries()[0].observation().is_some_and(|slot| {
+            slot.kind == LogicalSlotKind::SynchronizedFailoverAnchor
+                && slot.persistence == SlotPersistence::Unproven
+                && slot.activity == SlotActivity::Inactive
+                && slot.invalidation.is_none()
+        });
+        if synchronized {
+            break batch;
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "standby did not synchronize failover slot {:?} within {STANDBY_CATCHUP_TIMEOUT:?}",
+                target.name().as_str()
+            ))
+            .into());
+        }
+        sleep(STANDBY_POLL_INTERVAL).await;
+    };
+
+    let prerequisites = batch.prerequisites();
+    assert_eq!(
+        prerequisites.system_identifier(),
+        expected_system_identifier
+    );
+    assert_ne!(prerequisites.checkpoint_timeline(), 0);
+    assert_eq!(prerequisites.recovery(), RecoveryState::Standby);
+    assert_eq!(prerequisites.wal_level(), LogicalWalLevel::Logical);
+    assert_eq!(prerequisites.hot_standby_feedback(), SettingState::Enabled);
+    assert_eq!(
+        prerequisites.wal_receiver_status_interval(),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        prerequisites.sync_replication_slots(),
+        SettingState::Enabled
+    );
+    assert_eq!(
+        prerequisites
+            .primary_slot_name()
+            .map(ReplicationSlotName::as_str),
+        Some(EXPECTED_PRIMARY_SLOT_NAME)
+    );
+    assert!(prerequisites.replay_lsn().is_some());
+    assert!(prerequisites.wal_receiver_pid().is_some());
+    assert_eq!(
+        prerequisites.wal_receiver_activity(),
+        LocalWalReceiverActivity::Streaming
+    );
+    assert_eq!(
+        prerequisites
+            .wal_receiver_slot_name()
+            .map(ReplicationSlotName::as_str),
+        Some(EXPECTED_PRIMARY_SLOT_NAME)
+    );
+
+    let observation = batch.entries()[0]
+        .observation()
+        .expect("synchronized standby slot");
+    assert_eq!(batch.entries()[0].target(), &target);
+    assert_eq!(observation.name, *target.name());
+    assert_eq!(observation.plugin, LogicalSlotPlugin::PgOutput);
+    assert_eq!(
+        observation.kind,
+        LogicalSlotKind::SynchronizedFailoverAnchor
+    );
+    assert_eq!(observation.persistence, SlotPersistence::Unproven);
+    assert_eq!(observation.two_phase, SettingState::Enabled);
+    assert_eq!(observation.activity, SlotActivity::Inactive);
+    assert_eq!(observation.ownership, SlotOwnership::Unknown);
+    assert_eq!(observation.invalidation, None);
+
+    let mut restricted_config: Config = standby_database_url.parse()?;
+    restricted_config.user(STANDBY_RESTRICTED_ROLE);
+    restricted_config.password(STANDBY_RESTRICTED_PASSWORD);
+    let (restricted_client, restricted_connection) = restricted_config.connect(NoTls).await?;
+    let error = observe_local_logical_slots(
+        restricted_client,
+        restricted_connection,
+        CatalogOperationTimeout::default(),
+        &request,
+    )
+    .await
+    .expect_err("a live receiver redacted from the observer role must fail closed");
+    assert!(matches!(
+        error,
+        LocalSlotObservationError::WalReceiverDetailsUnavailable { .. }
+    ));
+    Ok(())
+}
+
+async fn assert_primary_prerequisites(
+    setup: &Client,
+    batch: &LocalLogicalSlotObservationBatch,
+) -> TestResult {
+    let expected_database_oid: i64 = setup
+        .query_one(
+            "SELECT oid::pg_catalog.int8 FROM pg_catalog.pg_database \
+              WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    let expected_control = setup
+        .query_one(
+            "SELECT control.system_identifier::pg_catalog.int8, \
+                    checkpoint_control.timeline_id \
+               FROM pg_catalog.pg_control_system() AS control \
+              CROSS JOIN pg_catalog.pg_control_checkpoint() AS checkpoint_control",
+            &[],
+        )
+        .await?;
+    let expected_system_identifier = expected_control.try_get::<_, i64>(0)?.cast_unsigned();
+    let expected_checkpoint_timeline = expected_control.try_get::<_, i32>(1)?.cast_unsigned();
+
+    assert_eq!(batch.database_name(), "shardschema");
+    assert_eq!(u32::try_from(expected_database_oid)?, batch.database_oid());
+    assert!(
+        batch.prerequisite_collection_started_at() <= batch.prerequisite_collection_finished_at()
+    );
+    assert!(batch.prerequisite_collection_finished_at() <= batch.slot_collection_started_at());
+    assert!(batch.slot_collection_started_at() <= batch.slot_collection_finished_at());
+    let prerequisites = batch.prerequisites();
+    assert_eq!(
+        prerequisites.system_identifier(),
+        expected_system_identifier
+    );
+    assert_eq!(
+        prerequisites.checkpoint_timeline(),
+        expected_checkpoint_timeline
+    );
+    assert_eq!(prerequisites.recovery(), RecoveryState::Writable);
+    assert_eq!(prerequisites.wal_level(), LogicalWalLevel::Logical);
+    assert_eq!(prerequisites.hot_standby_feedback(), SettingState::Enabled);
+    assert_eq!(
+        prerequisites.wal_receiver_status_interval(),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        prerequisites.sync_replication_slots(),
+        SettingState::Enabled
+    );
+    assert_eq!(
+        prerequisites
+            .primary_slot_name()
+            .map(ReplicationSlotName::as_str),
+        Some(EXPECTED_PRIMARY_SLOT_NAME)
+    );
+    assert_eq!(prerequisites.replay_lsn(), None);
+    assert_eq!(prerequisites.wal_receiver_pid(), None);
+    assert_eq!(
+        prerequisites.wal_receiver_activity(),
+        LocalWalReceiverActivity::Absent
+    );
+    assert_eq!(prerequisites.wal_receiver_slot_name(), None);
+    Ok(())
+}
+
 async fn run_observation_assertions(
     database_url: &str,
     setup: &Client,
@@ -257,17 +438,7 @@ async fn run_observation_assertions(
     hostile_config.options(format!("-csearch_path={hostile_schema},pg_catalog"));
     assert_hostile_path_is_effective(&hostile_config).await?;
     let batch = observe_with_config(&hostile_config, &request).await?;
-    let expected_database_oid: i64 = setup
-        .query_one(
-            "SELECT oid::pg_catalog.int8 FROM pg_catalog.pg_database \
-              WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()",
-            &[],
-        )
-        .await?
-        .try_get(0)?;
-    assert_eq!(batch.database_name(), "shardschema");
-    assert_eq!(u32::try_from(expected_database_oid)?, batch.database_oid());
-    assert!(batch.slot_collection_started_at() <= batch.slot_collection_finished_at());
+    assert_primary_prerequisites(setup, &batch).await?;
     assert_observed_slot_states(&batch, anchor, decoder, temporary);
 
     drop_slot(setup, decoder).await?;
@@ -355,7 +526,7 @@ fn assert_observed_slot_states(
 }
 
 #[tokio::test]
-#[ignore = "requires PGSHARD_TEST_DATABASE_URL pointing at PostgreSQL 18 with wal_level=logical"]
+#[ignore = "requires the CI PostgreSQL 18 logical-slot and standby-prerequisite settings"]
 async fn observes_exact_slot_states_with_pinned_search_path_and_final_cleanup() -> TestResult {
     let database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
     let (cleanup, cleanup_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
@@ -383,6 +554,50 @@ async fn observes_exact_slot_states_with_pinned_search_path_and_final_cleanup() 
     let cleanup_connection_result = finish_connection(cleanup_task).await;
 
     combine_fixture_results(fixture_result, cleanup_result, cleanup_connection_result)
+}
+
+#[tokio::test]
+#[ignore = "requires a streaming PostgreSQL 18 standby with continuous slot synchronization"]
+async fn observes_streaming_standby_slot_sync_and_rejects_redacted_receiver() -> TestResult {
+    let primary_database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
+    let standby_database_url = std::env::var("PGSHARD_TEST_STANDBY_DATABASE_URL")?;
+    let (primary, primary_connection) =
+        tokio_postgres::connect(&primary_database_url, NoTls).await?;
+    let primary_task = tokio::spawn(primary_connection);
+    let expected_system_identifier = primary
+        .query_one(
+            "SELECT system_identifier::pg_catalog.int8 \
+               FROM pg_catalog.pg_control_system()",
+            &[],
+        )
+        .await?
+        .try_get::<_, i64>(0)?
+        .cast_unsigned();
+    drop(primary);
+    finish_connection(primary_task).await?;
+
+    run_standby_observation_fixture(standby_database_url, expected_system_identifier).await
+}
+
+#[tokio::test]
+#[ignore = "requires PGSHARD_TEST_LEGACY_DATABASE_URL pointing at PostgreSQL 17"]
+async fn rejects_legacy_server_before_postgres18_prerequisites() -> TestResult {
+    let database_url = std::env::var("PGSHARD_TEST_LEGACY_DATABASE_URL")?;
+    let request = LogicalSlotObservationRequest::new(vec![target("pgshard_test_legacy")?])?;
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let error = observe_local_logical_slots(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        &request,
+    )
+    .await
+    .expect_err("PostgreSQL 17 must fail before PostgreSQL 18-only settings are read");
+    assert!(matches!(
+        error,
+        LocalSlotObservationError::UnsupportedPostgresVersion(version) if version < 180_000
+    ));
+    Ok(())
 }
 
 async fn backend_exists(client: &Client, backend_pid: i32) -> TestResult<bool> {
