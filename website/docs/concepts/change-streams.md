@@ -193,8 +193,10 @@ presence by itself is non-authorizing.
 
 The current Rust foundation can load one ready standby-selected policy from
 `shardschema` and take a bounded, read-only observation batch of an exact small
-set of local PostgreSQL 18 replication slots. PostgreSQL copies each slot under
-its own mutex, so the batch is not a point-in-time cross-slot snapshot. It
+set of local PostgreSQL 18 replication slots. A companion primary-side sample
+observes one exact physical slot, plain-list synchronization-policy membership,
+and only the walsender whose PID owns that slot. PostgreSQL copies each slot under
+its own mutex, so neither batch is a point-in-time cross-slot snapshot. It
 records the local monotonic interval that brackets the server query; a future
 mutating reconciler must take a fresh post-acquisition batch and recheck every
 invariant. The observer consumes and owns both its dedicated client and
@@ -206,8 +208,9 @@ persistence because PostgreSQL 18's public view cannot distinguish a durable
 slot from `RS_EPHEMERAL` state. Even inactivity is insufficient: a failed
 ephemeral-slot directory rename can clear the active PID before the shared slot
 row disappears. Only mutation history or stronger evidence may classify the
-slot as persistent. Multi-server
-source correlation, slot-sync-cycle evidence, mutation-history attestation,
+slot as persistent. Primary-side `catalog_xmin`, reply timestamps, and
+32-bit transaction IDs remain raw values rather than freshness or horizon
+coverage proofs. Multi-server source correlation, slot-sync-cycle evidence, mutation-history attestation,
 and every create, advance, acquire, or drop action remain future reconciliation
 work.
 
@@ -317,6 +320,21 @@ Both query intervals are recorded on one consumed, deadline-bounded connection.
 This is still local, non-atomic observation: it does not prove the configured
 upstream, physical-slot ownership, feedback freshness, or a source-bound recent
 slot-sync cycle.
+
+The primary-side sample uses the same consumed-connection and privilege
+boundary. It bounds `synchronized_standby_slots` before returning it and accepts
+only a plain, unique list of replication-slot-shaped identifiers. That syntax
+check and one-name membership result do not prove equality with the complete
+catalog-managed set. For one requested physical slot it records conservative persistence, active PID, raw
+`catalog_xmin`, restart LSN, WAL-retention state, and invalidation. It joins
+that active PID directly to `pg_stat_get_wal_senders()` and records the
+walsender's backend generation, slot-name-shaped `application_name`, raw
+activity, and latest peer-supplied reply timestamp. The join proves that both local rows
+reported the same PID during that non-atomic sample; a later recheck must still
+reject process transition or PID reuse. The reply timestamp does not identify a
+hot-standby feedback message or primary receive time, and neither it nor
+`catalog_xmin` proves feedback freshness or coverage of a standby-local decoder
+horizon.
 Runtime code does not call `pg_sync_replication_slots()`. PostgreSQL 18 describes
 that one-shot function as primarily for testing and debugging and recommends the
 continuous slot-sync worker for high availability; pgshard will observe the

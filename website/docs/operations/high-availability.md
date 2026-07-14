@@ -28,7 +28,11 @@ PostgreSQL 18 configuration profiles, including promotion-safe slot capacity, `A
 mandatory standby feedback and slot synchronization. A bounded local observer
 reads PostgreSQL 18 recovery, receiver, replay, slot-sync configuration, and
 logical-slot state plus the local continuous worker's process generation and
-post-cycle wait boundary, with a real primary/standby CI fixture. Secure
+post-cycle wait boundary. A primary-side sample bounds the plain unique
+synchronized-slot list and joins one managed physical slot's active PID to its
+exact walsender while keeping peer-supplied reply time and `catalog_xmin`
+non-authorizing.
+Both paths run in a real primary/standby CI fixture. Secure
 upstream connection material, multi-server identity and worker-connection
 correlation, role activation,
 operator-managed replication, durable lease integration, promotion, automated

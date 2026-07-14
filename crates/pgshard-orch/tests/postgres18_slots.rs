@@ -10,19 +10,22 @@ use std::{
 use pgshard_catalog::CatalogOperationTimeout;
 use pgshard_orch::{
     slot_observer::{
-        LocalLogicalSlotObservationBatch, LocalSlotObservationError, LocalSlotSyncWorkerActivity,
-        LocalWalReceiverActivity, LogicalSlotObservationRequest, observe_local_logical_slots,
+        LocalLogicalSlotObservationBatch, LocalPrimaryReplicationObservationBatch,
+        LocalSlotObservationError, LocalSlotSyncWorkerActivity, LocalWalReceiverActivity,
+        LocalWalSenderActivity, LogicalSlotObservationRequest,
+        PrimaryReplicationObservationRequest, observe_local_logical_slots,
+        observe_local_primary_replication,
     },
     standby_slots::{
-        LogicalSlotKind, LogicalSlotPlugin, LogicalWalLevel, ManagedSlotTarget, RecoveryState,
-        ReplicationSlotName, SettingState, SlotActivity, SlotGeneration, SlotOwnership,
-        SlotPersistence, SlotWalRetention,
+        FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotPlugin, LogicalWalLevel,
+        ManagedSlotTarget, RecoveryState, ReplicationSlotName, SettingState, SlotActivity,
+        SlotGeneration, SlotOwnership, SlotPersistence, SlotWalRetention,
     },
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     task::JoinHandle,
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 use tokio_postgres::{Client, Config, Connection, NoTls, error::SqlState};
 use uuid::Uuid;
@@ -620,6 +623,242 @@ async fn observes_exact_slot_states_with_pinned_search_path_and_final_cleanup() 
     combine_fixture_results(fixture_result, cleanup_result, cleanup_connection_result)
 }
 
+async fn observe_primary_path(
+    database_url: &str,
+    request: &PrimaryReplicationObservationRequest,
+) -> TestResult<LocalPrimaryReplicationObservationBatch> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    Ok(observe_local_primary_replication(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        request,
+    )
+    .await?)
+}
+
+async fn wait_for_managed_primary_path(
+    database_url: &str,
+    request: &PrimaryReplicationObservationRequest,
+) -> TestResult<LocalPrimaryReplicationObservationBatch> {
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    loop {
+        let batch = observe_primary_path(database_url, request).await?;
+        let ready = batch.physical_slot().is_some_and(|slot| {
+            slot.catalog_xmin().is_some()
+                && slot.restart_lsn().is_some()
+                && matches!(
+                    slot.wal_retention(),
+                    Some(SlotWalRetention::Reserved | SlotWalRetention::Extended)
+                )
+        }) && batch.wal_sender().is_some_and(|sender| {
+            sender.activity() == LocalWalSenderActivity::Streaming
+                && sender.reply_epoch_micros().is_some()
+        });
+        if ready {
+            return Ok(batch);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "primary physical slot did not expose required streaming evidence within the bound",
+            )
+            .into());
+        }
+        sleep(STANDBY_POLL_INTERVAL).await;
+    }
+}
+
+fn assert_managed_primary_path(
+    batch: &LocalPrimaryReplicationObservationBatch,
+    physical_slot: &ReplicationSlotName,
+) {
+    assert_eq!(batch.database_name(), "shardschema");
+    assert_ne!(batch.database_oid(), 0);
+    assert!(batch.collection_started_at() <= batch.collection_finished_at());
+    assert_ne!(batch.system_identifier(), 0);
+    assert_ne!(batch.checkpoint_timeline(), 0);
+    assert_eq!(batch.recovery(), RecoveryState::Writable);
+    assert_eq!(batch.wal_level(), LogicalWalLevel::Logical);
+    assert_eq!(
+        batch.failover_slot_synchronization(),
+        FailoverSlotSynchronization::GatedOnPhysicalSlot
+    );
+    let observed_slot = batch.physical_slot().expect("managed physical slot");
+    assert_eq!(observed_slot.name(), physical_slot);
+    assert_eq!(observed_slot.persistence(), SlotPersistence::Unproven);
+    assert!(observed_slot.catalog_xmin().is_some());
+    assert!(observed_slot.restart_lsn().is_some());
+    assert_eq!(observed_slot.invalidation(), None);
+    let active_pid = match observed_slot.activity() {
+        SlotActivity::Active(pid) => pid,
+        SlotActivity::Inactive => panic!("managed physical slot is inactive"),
+    };
+    let sender = batch.wal_sender().expect("physical slot walsender");
+    assert_eq!(sender.identity().pid(), active_pid);
+    assert_ne!(sender.identity().start_epoch_micros().get(), 0);
+    assert_eq!(sender.application_name(), physical_slot);
+    assert_eq!(sender.activity(), LocalWalSenderActivity::Streaming);
+    assert!(sender.reply_epoch_micros().is_some());
+}
+
+async fn wait_for_missing_primary_path(
+    database_url: &str,
+    request: &PrimaryReplicationObservationRequest,
+) -> TestResult {
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        let observation = timeout_at(deadline, observe_primary_path(database_url, request))
+            .await
+            .map_err(|_| {
+                io::Error::other(format!(
+                    "replication slot {:?} remained after its owning backend exited",
+                    request.physical_slot().as_str()
+                ))
+            })?;
+        match observation {
+            Ok(missing) if missing.physical_slot().is_none() => {
+                assert_eq!(
+                    missing.failover_slot_synchronization(),
+                    FailoverSlotSynchronization::NotGated
+                );
+                assert_eq!(missing.wal_sender(), None);
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let expected_collision = matches!(
+                    error.downcast_ref::<LocalSlotObservationError>(),
+                    Some(LocalSlotObservationError::PhysicalSlotNameCollision(name))
+                        if name == request.physical_slot().as_str()
+                );
+                if !expected_collision {
+                    return Err(error);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "replication slot {:?} remained after its owning backend exited",
+                request.physical_slot().as_str()
+            ))
+            .into());
+        }
+        sleep(CLEANUP_RETRY_INTERVAL).await;
+    }
+}
+
+async fn exercise_temporary_physical_slot(database_url: &str) -> TestResult {
+    let temporary_target = target("pgshard_test_physical")?;
+    let temporary_name = temporary_target.name().clone();
+    let (temporary_owner, temporary_connection) =
+        tokio_postgres::connect(database_url, NoTls).await?;
+    let temporary_task = tokio::spawn(temporary_connection);
+    let temporary_request = PrimaryReplicationObservationRequest::new(temporary_name.clone());
+    let fixture_result: TestResult = async {
+        temporary_owner
+            .query_one(
+                "SELECT slot_name::pg_catalog.text, lsn::pg_catalog.text \
+                   FROM pg_catalog.pg_create_physical_replication_slot( \
+                        $1::pg_catalog.name, true, true)",
+                &[&temporary_name.as_str()],
+            )
+            .await?;
+        let owner_pid: i32 = temporary_owner
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .await?
+            .try_get(0)?;
+        let temporary = observe_primary_path(database_url, &temporary_request).await?;
+        assert_eq!(
+            temporary.failover_slot_synchronization(),
+            FailoverSlotSynchronization::NotGated
+        );
+        let slot = temporary.physical_slot().expect("temporary physical slot");
+        assert_eq!(slot.name(), &temporary_name);
+        assert_eq!(slot.persistence(), SlotPersistence::NonPersistent);
+        match slot.activity() {
+            SlotActivity::Active(pid) => assert_eq!(pid.get(), u32::try_from(owner_pid)?),
+            SlotActivity::Inactive => panic!("temporary slot lost its creating backend"),
+        }
+        assert!(slot.restart_lsn().is_some());
+        assert_eq!(slot.catalog_xmin(), None);
+        assert_eq!(temporary.wal_sender(), None);
+        Ok(())
+    }
+    .await;
+    drop(temporary_owner);
+    let connection_result = finish_connection(temporary_task).await;
+    fixture_result?;
+    connection_result?;
+    wait_for_missing_primary_path(database_url, &temporary_request).await
+}
+
+async fn exercise_logical_physical_name_collision(database_url: &str) -> TestResult {
+    let collision_target = target("pgshard_test_collision")?;
+    let collision_name = collision_target.name().clone();
+    let (collision_owner, collision_connection) =
+        tokio_postgres::connect(database_url, NoTls).await?;
+    let collision_task = tokio::spawn(collision_connection);
+    let collision_request = PrimaryReplicationObservationRequest::new(collision_name.clone());
+    let fixture_result: TestResult = async {
+        create_logical_slot(&collision_owner, &collision_target, true, false, false).await?;
+        let error = observe_primary_path(database_url, &collision_request)
+            .await
+            .expect_err("a logical slot occupying the physical member name must fail closed");
+        assert!(matches!(
+            error.downcast_ref::<LocalSlotObservationError>(),
+            Some(LocalSlotObservationError::PhysicalSlotNameCollision(name))
+                if name == collision_name.as_str()
+        ));
+        Ok(())
+    }
+    .await;
+    drop(collision_owner);
+    let connection_result = finish_connection(collision_task).await;
+    fixture_result?;
+    connection_result?;
+    wait_for_missing_primary_path(database_url, &collision_request).await
+}
+
+async fn assert_primary_observation_requires_effective_stats(
+    database_url: &str,
+    request: &PrimaryReplicationObservationRequest,
+) -> TestResult {
+    let mut restricted_config: Config = database_url.parse()?;
+    restricted_config.user(RESTRICTED_OBSERVER_ROLE);
+    restricted_config.password(RESTRICTED_OBSERVER_PASSWORD);
+    let (restricted_client, restricted_connection) = restricted_config.connect(NoTls).await?;
+    let error = observe_local_primary_replication(
+        restricted_client,
+        restricted_connection,
+        CatalogOperationTimeout::default(),
+        request,
+    )
+    .await
+    .expect_err("non-inherited statistics membership must not expose walsender state");
+    assert!(matches!(
+        error,
+        LocalSlotObservationError::StatisticsPrivilegeRequired
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL 18 primary serving the managed physical standby slot"]
+async fn observes_primary_physical_slot_and_exact_walsender() -> TestResult {
+    let database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
+    let physical_slot = ReplicationSlotName::new(EXPECTED_PRIMARY_SLOT_NAME)?;
+    let request = PrimaryReplicationObservationRequest::new(physical_slot.clone());
+    let batch = wait_for_managed_primary_path(&database_url, &request).await?;
+    assert_managed_primary_path(&batch, &physical_slot);
+
+    let missing_request =
+        PrimaryReplicationObservationRequest::new(ReplicationSlotName::new("pgshard_member_9999")?);
+    wait_for_missing_primary_path(&database_url, &missing_request).await?;
+    exercise_temporary_physical_slot(&database_url).await?;
+    exercise_logical_physical_name_collision(&database_url).await?;
+    assert_primary_observation_requires_effective_stats(&database_url, &request).await
+}
+
 #[tokio::test]
 #[ignore = "requires a streaming PostgreSQL 18 standby with continuous slot synchronization"]
 async fn observes_streaming_standby_slot_sync_and_rejects_redacted_receiver() -> TestResult {
@@ -657,6 +896,24 @@ async fn rejects_legacy_server_before_postgres18_prerequisites() -> TestResult {
     )
     .await
     .expect_err("PostgreSQL 17 must fail before PostgreSQL 18-only settings are read");
+    assert!(matches!(
+        error,
+        LocalSlotObservationError::UnsupportedPostgresVersion(version) if version < 180_000
+    ));
+
+    let primary_request = PrimaryReplicationObservationRequest::new(ReplicationSlotName::new(
+        EXPECTED_PRIMARY_SLOT_NAME,
+    )?);
+    let (primary_client, primary_connection) =
+        tokio_postgres::connect(&database_url, NoTls).await?;
+    let error = observe_local_primary_replication(
+        primary_client,
+        primary_connection,
+        CatalogOperationTimeout::default(),
+        &primary_request,
+    )
+    .await
+    .expect_err("PostgreSQL 17 must fail before the primary-only PostgreSQL 18 reads");
     assert!(matches!(
         error,
         LocalSlotObservationError::UnsupportedPostgresVersion(version) if version < 180_000

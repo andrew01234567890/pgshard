@@ -25,13 +25,15 @@ use tokio::{
 use tokio_postgres::{Client, Connection, Row};
 
 use crate::standby_slots::{
-    LogicalSlotKind, LogicalSlotObservation, LogicalSlotPlugin, LogicalWalLevel, ManagedSlotTarget,
-    RecoveryState, ReplicationSlotName, SettingState, SlotActivity, SlotInvalidation,
-    SlotNameError, SlotOwnership, SlotPersistence, SlotWalRetention,
+    FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotObservation, LogicalSlotPlugin,
+    LogicalWalLevel, ManagedSlotTarget, RecoveryState, ReplicationSlotName, SettingState,
+    SlotActivity, SlotInvalidation, SlotNameError, SlotOwnership, SlotPersistence,
+    SlotWalRetention, StandbyDecoderPolicy,
 };
 
 const MIN_POSTGRES_VERSION_NUM: i32 = 180_000;
 const MAX_OBSERVATION_TARGETS: usize = 3;
+const MAX_SYNCHRONIZED_STANDBY_SLOTS_BYTES: i32 = 4096;
 const SERVER_STATEMENT_TIMEOUT_HEADROOM: Duration = Duration::from_millis(25);
 const CONNECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const PIN_SEARCH_PATH_SQL: &str = "SELECT pg_catalog.set_config('search_path', '', false)";
@@ -90,6 +92,62 @@ const OBSERVE_SLOTS_SQL: &str = "\
      WHERE slot_name::pg_catalog.text OPERATOR(pg_catalog.=) \
            ANY($1::pg_catalog.text[]) \
      ORDER BY slot_name";
+const OBSERVE_PRIMARY_REPLICATION_SQL: &str = "\
+    SELECT control.system_identifier::pg_catalog.int8, \
+           checkpoint_control.timeline_id, \
+           pg_catalog.pg_is_in_recovery(), \
+           pg_catalog.current_setting('wal_level'), \
+           pg_catalog.pg_has_role( \
+               current_user, 'pg_read_all_stats', 'USAGE' \
+           ) AS has_read_all_stats, \
+           sync_policy.octets, sync_policy.value, \
+           physical.slot_name::pg_catalog.text, \
+           physical.plugin::pg_catalog.text, physical.slot_type, \
+           physical.datoid::pg_catalog.int8 AS database_oid, \
+           physical.temporary, physical.active, \
+           physical.active_pid::pg_catalog.int8, \
+           physical.catalog_xmin::pg_catalog.text, \
+           physical.restart_lsn::pg_catalog.text, physical.wal_status, \
+           physical.invalidation_reason, \
+           sender.pid::pg_catalog.int4 AS sender_pid, \
+           sender.application_name::pg_catalog.text AS sender_application_name, \
+           pg_catalog.floor( \
+               pg_catalog.date_part('epoch', sender.backend_start) * 1000000 \
+           )::pg_catalog.int8 AS sender_backend_start_epoch_micros, \
+           sender.state::pg_catalog.text AS sender_state, \
+           pg_catalog.floor( \
+               pg_catalog.date_part('epoch', sender.reply_time) * 1000000 \
+           )::pg_catalog.int8 AS sender_reply_epoch_micros \
+      FROM pg_catalog.pg_control_system() AS control \
+     CROSS JOIN pg_catalog.pg_control_checkpoint() AS checkpoint_control \
+     CROSS JOIN LATERAL ( \
+           SELECT pg_catalog.octet_length(setting)::pg_catalog.int8 AS octets, \
+                  CASE WHEN pg_catalog.octet_length(setting) \
+                                  OPERATOR(pg_catalog.<=) $2::pg_catalog.int4 \
+                       THEN setting END AS value \
+             FROM ( \
+                   SELECT pg_catalog.current_setting( \
+                              'synchronized_standby_slots') AS setting \
+             ) AS raw_policy \
+     ) AS sync_policy \
+      LEFT JOIN LATERAL ( \
+            SELECT slot_name, plugin, slot_type, datoid, temporary, active, \
+                   active_pid, catalog_xmin, restart_lsn, wal_status, \
+                   invalidation_reason \
+              FROM pg_catalog.pg_replication_slots \
+             WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name \
+             LIMIT 2 \
+      ) AS physical ON true \
+      LEFT JOIN LATERAL ( \
+            SELECT activity.pid, activity.application_name, \
+                   activity.backend_start, walsender.state, walsender.reply_time \
+              FROM pg_catalog.pg_stat_get_activity( \
+                       NULL::pg_catalog.int4) AS activity \
+              JOIN pg_catalog.pg_stat_get_wal_senders() AS walsender \
+                ON walsender.pid OPERATOR(pg_catalog.=) activity.pid \
+             WHERE activity.pid OPERATOR(pg_catalog.=) physical.active_pid \
+             LIMIT 2 \
+      ) AS sender ON true";
 
 /// Validated, bounded set of managed slot targets to observe on one server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +216,32 @@ pub enum SlotObservationRequestError {
     DuplicateGeneration,
 }
 
+/// Exact primary-side physical replication path to observe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimaryReplicationObservationRequest {
+    physical_slot: ReplicationSlotName,
+}
+
+impl PrimaryReplicationObservationRequest {
+    /// Creates a request for one exact physical replication-slot name.
+    #[must_use]
+    pub fn new(physical_slot: ReplicationSlotName) -> Self {
+        Self { physical_slot }
+    }
+
+    /// Derives the physical path from a catalog-fenced decoder policy.
+    #[must_use]
+    pub fn from_policy(policy: &StandbyDecoderPolicy) -> Self {
+        Self::new(policy.physical_slot().clone())
+    }
+
+    /// Returns the exact physical slot expected to own the walsender.
+    #[must_use]
+    pub const fn physical_slot(&self) -> &ReplicationSlotName {
+        &self.physical_slot
+    }
+}
+
 /// One requested target and its optional server-side observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalSlotSnapshotEntry {
@@ -198,6 +282,131 @@ pub enum LocalWalReceiverActivity {
 pub struct LocalPostgresBackendIdentity {
     pid: NonZeroU32,
     start_epoch_micros: NonZeroU64,
+}
+
+/// Raw `PostgreSQL` transaction ID without cross-server ordering semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalPostgresTransactionId(NonZeroU32);
+
+impl LocalPostgresTransactionId {
+    /// Returns the server's 32-bit transaction ID.
+    ///
+    /// This value cannot be ordered across wraparound or across independently
+    /// sampled servers without additional epoch evidence.
+    #[must_use]
+    pub const fn get(self) -> NonZeroU32 {
+        self.0
+    }
+}
+
+/// Raw activity state of the physical walsender owning a managed slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalWalSenderActivity {
+    /// Walsender is starting up.
+    Startup,
+    /// Walsender is sending retained WAL to catch the standby up.
+    Catchup,
+    /// Walsender reports active streaming.
+    Streaming,
+    /// Walsender is serving a base backup.
+    Backup,
+    /// Walsender is stopping.
+    Stopping,
+}
+
+/// One local primary-side physical slot observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalPhysicalReplicationSlotObservation {
+    name: ReplicationSlotName,
+    persistence: SlotPersistence,
+    activity: SlotActivity,
+    catalog_xmin: Option<LocalPostgresTransactionId>,
+    restart_lsn: Option<PgLsn>,
+    wal_retention: Option<SlotWalRetention>,
+    invalidation: Option<SlotInvalidation>,
+}
+
+impl LocalPhysicalReplicationSlotObservation {
+    /// Returns the exact server-side physical slot name.
+    #[must_use]
+    pub const fn name(&self) -> &ReplicationSlotName {
+        &self.name
+    }
+
+    /// Returns conservative persistence evidence from `PostgreSQL`'s public view.
+    #[must_use]
+    pub const fn persistence(&self) -> SlotPersistence {
+        self.persistence
+    }
+
+    /// Returns whether a backend currently owns the slot.
+    #[must_use]
+    pub const fn activity(&self) -> SlotActivity {
+        self.activity
+    }
+
+    /// Returns the raw catalog horizon carried by hot-standby feedback.
+    #[must_use]
+    pub const fn catalog_xmin(&self) -> Option<LocalPostgresTransactionId> {
+        self.catalog_xmin
+    }
+
+    /// Returns the oldest retained WAL position reported for the slot.
+    #[must_use]
+    pub const fn restart_lsn(&self) -> Option<PgLsn> {
+        self.restart_lsn
+    }
+
+    /// Returns `PostgreSQL`'s current WAL-retention classification.
+    #[must_use]
+    pub const fn wal_retention(&self) -> Option<SlotWalRetention> {
+        self.wal_retention
+    }
+
+    /// Returns `PostgreSQL`'s invalidation reason, if any.
+    #[must_use]
+    pub const fn invalidation(&self) -> Option<SlotInvalidation> {
+        self.invalidation
+    }
+}
+
+/// One primary-side walsender joined to a physical slot's active PID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalWalSenderObservation {
+    identity: LocalPostgresBackendIdentity,
+    application_name: ReplicationSlotName,
+    activity: LocalWalSenderActivity,
+    reply_epoch_micros: Option<NonZeroU64>,
+}
+
+impl LocalWalSenderObservation {
+    /// Returns the primary-local backend identity for equality checks.
+    #[must_use]
+    pub const fn identity(&self) -> LocalPostgresBackendIdentity {
+        self.identity
+    }
+
+    /// Returns the bounded, replication-slot-shaped application name.
+    #[must_use]
+    pub const fn application_name(&self) -> &ReplicationSlotName {
+        &self.application_name
+    }
+
+    /// Returns the raw physical walsender activity.
+    #[must_use]
+    pub const fn activity(&self) -> LocalWalSenderActivity {
+        self.activity
+    }
+
+    /// Returns the timestamp the standby embedded in its latest reply.
+    ///
+    /// The value comes from the peer's wall clock and is an equality/change
+    /// token only. It is not a primary receive time or monotonic age proof and
+    /// does not distinguish a status reply from hot-standby feedback.
+    #[must_use]
+    pub const fn reply_epoch_micros(&self) -> Option<NonZeroU64> {
+        self.reply_epoch_micros
+    }
 }
 
 impl LocalPostgresBackendIdentity {
@@ -386,6 +595,96 @@ pub struct LocalLogicalSlotObservationBatch {
     entries: Vec<LogicalSlotSnapshotEntry>,
 }
 
+/// One bounded, non-authorizing primary-side physical replication sample.
+///
+/// `PostgreSQL` does not expose a monotonic timestamp for hot-standby feedback,
+/// and this query is not atomic with a standby-side sample. The returned data
+/// can prove local PID joins and configuration membership, but a later
+/// multi-server correlator must establish source identity, freshness, catalog
+/// horizon coverage, and lifecycle ownership before decoder attachment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalPrimaryReplicationObservationBatch {
+    database_name: String,
+    database_oid: u32,
+    collection_started_at: Instant,
+    collection_finished_at: Instant,
+    system_identifier: u64,
+    checkpoint_timeline: u32,
+    recovery: RecoveryState,
+    wal_level: LogicalWalLevel,
+    failover_slot_synchronization: FailoverSlotSynchronization,
+    physical_slot: Option<LocalPhysicalReplicationSlotObservation>,
+    wal_sender: Option<LocalWalSenderObservation>,
+}
+
+impl LocalPrimaryReplicationObservationBatch {
+    /// Returns the database used for this primary-local sample.
+    #[must_use]
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    /// Returns that database's live `PostgreSQL` OID.
+    #[must_use]
+    pub const fn database_oid(&self) -> u32 {
+        self.database_oid
+    }
+
+    /// Returns the local monotonic instant immediately before collection.
+    #[must_use]
+    pub const fn collection_started_at(&self) -> Instant {
+        self.collection_started_at
+    }
+
+    /// Returns the local monotonic instant immediately after collection.
+    #[must_use]
+    pub const fn collection_finished_at(&self) -> Instant {
+        self.collection_finished_at
+    }
+
+    /// Returns the unsigned `PostgreSQL` cluster system identifier.
+    #[must_use]
+    pub const fn system_identifier(&self) -> u64 {
+        self.system_identifier
+    }
+
+    /// Returns the timeline stored in `PostgreSQL`'s latest control checkpoint.
+    #[must_use]
+    pub const fn checkpoint_timeline(&self) -> u32 {
+        self.checkpoint_timeline
+    }
+
+    /// Returns whether the sampled upstream is writable or in recovery.
+    #[must_use]
+    pub const fn recovery(&self) -> RecoveryState {
+        self.recovery
+    }
+
+    /// Returns the upstream's effective WAL level.
+    #[must_use]
+    pub const fn wal_level(&self) -> LogicalWalLevel {
+        self.wal_level
+    }
+
+    /// Returns whether the bounded plain configured list contains the slot.
+    #[must_use]
+    pub const fn failover_slot_synchronization(&self) -> FailoverSlotSynchronization {
+        self.failover_slot_synchronization
+    }
+
+    /// Returns the exact primary-local physical slot row, if present.
+    #[must_use]
+    pub const fn physical_slot(&self) -> Option<&LocalPhysicalReplicationSlotObservation> {
+        self.physical_slot.as_ref()
+    }
+
+    /// Returns a walsender joined to the slot's active PID, if present.
+    #[must_use]
+    pub const fn wal_sender(&self) -> Option<&LocalWalSenderObservation> {
+        self.wal_sender.as_ref()
+    }
+}
+
 impl LocalLogicalSlotObservationBatch {
     /// Returns the database on the consumed observation connection.
     #[must_use]
@@ -528,6 +827,114 @@ where
     }
 }
 
+/// Observes one primary-local physical slot and its exact active walsender.
+///
+/// The matching client and connection driver are consumed together under one
+/// absolute deadline. The query pins built-in names, bounds the configured
+/// synchronized-slot policy before returning it, and joins the physical slot's
+/// `active_pid` directly to `pg_stat_get_wal_senders()`. It never creates,
+/// advances, acquires, or drops a slot.
+///
+/// # Errors
+///
+/// Returns an error on timeout, connection failure, `PostgreSQL` older than 18,
+/// non-UTF8 encoding, missing effective statistics privilege, unsupported or
+/// overlong synchronized-slot policy, or internally inconsistent server state.
+pub async fn observe_local_primary_replication<S, T>(
+    client: Client,
+    connection: Connection<S, T>,
+    operation_timeout: CatalogOperationTimeout,
+    request: &PrimaryReplicationObservationRequest,
+) -> Result<LocalPrimaryReplicationObservationBatch, LocalSlotObservationError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let duration = operation_timeout.get();
+    let deadline = Instant::now() + duration;
+    let connection_task = ConnectionTask::new(tokio::spawn(connection));
+    match timeout_at(deadline, observe_primary_before(client, request, deadline)).await {
+        Ok(Ok(batch)) => connection_task.finish(batch).await,
+        Ok(Err(error)) => {
+            connection_task.abort_and_wait().await;
+            Err(error)
+        }
+        Err(_) => {
+            connection_task.abort_and_wait().await;
+            Err(LocalSlotObservationError::OperationTimeout { duration })
+        }
+    }
+}
+
+async fn observe_primary_before(
+    client: Client,
+    request: &PrimaryReplicationObservationRequest,
+    deadline: Instant,
+) -> Result<LocalPrimaryReplicationObservationBatch, LocalSlotObservationError> {
+    client.batch_execute("DISCARD ALL").await?;
+    client.query_one(PIN_SEARCH_PATH_SQL, &[]).await?;
+    set_statement_timeout(&client, deadline).await?;
+    let requirements = client.query_one(REQUIREMENTS_SQL, &[]).await?;
+    let version: i32 = requirements.try_get(0)?;
+    let database_name: String = requirements.try_get(1)?;
+    let database_oid = positive_u32(requirements.try_get::<_, i64>(2)?, "database_oid")?;
+    let encoding: String = requirements.try_get(3)?;
+    if version < MIN_POSTGRES_VERSION_NUM {
+        return Err(LocalSlotObservationError::UnsupportedPostgresVersion(
+            version,
+        ));
+    }
+    if encoding != "UTF8" {
+        return Err(LocalSlotObservationError::WrongEncoding(encoding));
+    }
+
+    set_statement_timeout(&client, deadline).await?;
+    let collection_started_at = Instant::now();
+    let row = client
+        .query_one(
+            OBSERVE_PRIMARY_REPLICATION_SQL,
+            &[
+                &request.physical_slot().as_str(),
+                &MAX_SYNCHRONIZED_STANDBY_SLOTS_BYTES,
+            ],
+        )
+        .await?;
+    let collection_finished_at = Instant::now();
+
+    let system_identifier = parse_system_identifier(row.try_get(0)?)?;
+    let checkpoint_timeline = parse_timeline_id(row.try_get(1)?)?;
+    let recovery = if row.try_get(2)? {
+        RecoveryState::Standby
+    } else {
+        RecoveryState::Writable
+    };
+    let wal_level = match row.try_get::<_, String>(3)?.as_str() {
+        "logical" => LogicalWalLevel::Logical,
+        _ => LogicalWalLevel::Insufficient,
+    };
+    if !row.try_get::<_, bool>(4)? {
+        return Err(LocalSlotObservationError::StatisticsPrivilegeRequired);
+    }
+    let failover_slot_synchronization =
+        parse_synchronized_slot_policy(row.try_get(5)?, row.try_get(6)?, request.physical_slot())?;
+    let physical_slot = parse_physical_slot(&row, request.physical_slot())?;
+    let wal_sender = parse_wal_sender(&row, physical_slot.as_ref())?;
+
+    Ok(LocalPrimaryReplicationObservationBatch {
+        database_name,
+        database_oid,
+        collection_started_at,
+        collection_finished_at,
+        system_identifier,
+        checkpoint_timeline,
+        recovery,
+        wal_level,
+        failover_slot_synchronization,
+        physical_slot,
+        wal_sender,
+    })
+}
+
 async fn observe_before(
     client: Client,
     request: &LogicalSlotObservationRequest,
@@ -600,6 +1007,194 @@ async fn observe_before(
         slot_collection_finished_at,
         entries,
     })
+}
+
+fn parse_synchronized_slot_policy(
+    octets: i64,
+    value: Option<String>,
+    target: &ReplicationSlotName,
+) -> Result<FailoverSlotSynchronization, LocalSlotObservationError> {
+    let maximum = i64::from(MAX_SYNCHRONIZED_STANDBY_SLOTS_BYTES);
+    if octets < 0 {
+        return Err(LocalSlotObservationError::InvalidNonnegativeInteger {
+            field: "synchronized_standby_slots_octets",
+            value: octets,
+        });
+    }
+    if octets > maximum {
+        return Err(LocalSlotObservationError::SynchronizedStandbySlotsTooLong {
+            observed: octets,
+            maximum,
+        });
+    }
+    let value = value.ok_or(LocalSlotObservationError::InconsistentSynchronizedStandbySlots)?;
+    if i64::try_from(value.len()).ok() != Some(octets) {
+        return Err(LocalSlotObservationError::InconsistentSynchronizedStandbySlots);
+    }
+    if value.is_empty() {
+        return Ok(FailoverSlotSynchronization::NotGated);
+    }
+
+    let mut parsed = Vec::new();
+    for raw_name in value.split(',') {
+        let name = ReplicationSlotName::new(raw_name)
+            .map_err(|_| LocalSlotObservationError::UnsupportedSynchronizedStandbySlotsList)?;
+        if parsed.contains(&name) {
+            return Err(LocalSlotObservationError::UnsupportedSynchronizedStandbySlotsList);
+        }
+        parsed.push(name);
+    }
+    if parsed.contains(target) {
+        Ok(FailoverSlotSynchronization::GatedOnPhysicalSlot)
+    } else {
+        Ok(FailoverSlotSynchronization::NotGated)
+    }
+}
+
+fn parse_physical_slot(
+    row: &Row,
+    target: &ReplicationSlotName,
+) -> Result<Option<LocalPhysicalReplicationSlotObservation>, LocalSlotObservationError> {
+    let name: Option<String> = row.try_get(7)?;
+    let plugin: Option<String> = row.try_get(8)?;
+    let slot_type: Option<String> = row.try_get(9)?;
+    let database_oid: Option<i64> = row.try_get(10)?;
+    let temporary: Option<bool> = row.try_get(11)?;
+    let active: Option<bool> = row.try_get(12)?;
+    let active_pid: Option<i64> = row.try_get(13)?;
+    let catalog_xmin: Option<String> = row.try_get(14)?;
+    let restart_lsn: Option<String> = row.try_get(15)?;
+    let wal_status: Option<String> = row.try_get(16)?;
+    let invalidation_reason: Option<String> = row.try_get(17)?;
+
+    let Some(name) = name else {
+        if plugin.is_some()
+            || slot_type.is_some()
+            || database_oid.is_some()
+            || temporary.is_some()
+            || active.is_some()
+            || active_pid.is_some()
+            || catalog_xmin.is_some()
+            || restart_lsn.is_some()
+            || wal_status.is_some()
+            || invalidation_reason.is_some()
+        {
+            return Err(LocalSlotObservationError::InconsistentPhysicalSlot);
+        }
+        return Ok(None);
+    };
+    let parsed_name = ReplicationSlotName::new(name.clone())?;
+    if parsed_name != *target {
+        return Err(LocalSlotObservationError::UnexpectedSlot(name));
+    }
+    if slot_type.as_deref() != Some("physical") || plugin.is_some() || database_oid.is_some() {
+        return Err(LocalSlotObservationError::PhysicalSlotNameCollision(name));
+    }
+    let temporary = temporary.ok_or(LocalSlotObservationError::InconsistentPhysicalSlot)?;
+    let active = active.ok_or(LocalSlotObservationError::InconsistentPhysicalSlot)?;
+    let activity = parse_slot_activity(&name, active, active_pid)?;
+
+    Ok(Some(LocalPhysicalReplicationSlotObservation {
+        name: parsed_name,
+        persistence: classify_persistence(temporary),
+        activity,
+        catalog_xmin: catalog_xmin
+            .map(|value| parse_transaction_id(&value))
+            .transpose()?,
+        restart_lsn: restart_lsn
+            .map(|value| {
+                parse_lsn(&value).ok_or(LocalSlotObservationError::InvalidLsn {
+                    field: "physical_restart_lsn",
+                    value,
+                })
+            })
+            .transpose()?,
+        wal_retention: parse_wal_retention(wal_status)?,
+        invalidation: parse_invalidation(invalidation_reason)?,
+    }))
+}
+
+fn parse_wal_sender(
+    row: &Row,
+    physical_slot: Option<&LocalPhysicalReplicationSlotObservation>,
+) -> Result<Option<LocalWalSenderObservation>, LocalSlotObservationError> {
+    let pid: Option<i32> = row.try_get(18)?;
+    let application_name: Option<String> = row.try_get(19)?;
+    let backend_start_epoch_micros: Option<i64> = row.try_get(20)?;
+    let state: Option<String> = row.try_get(21)?;
+    let reply_epoch_micros: Option<i64> = row.try_get(22)?;
+    if pid.is_none()
+        && application_name.is_none()
+        && backend_start_epoch_micros.is_none()
+        && state.is_none()
+        && reply_epoch_micros.is_none()
+    {
+        return Ok(None);
+    }
+    let (Some(pid), Some(application_name), Some(start), Some(state)) =
+        (pid, application_name, backend_start_epoch_micros, state)
+    else {
+        return Err(LocalSlotObservationError::InconsistentWalSender);
+    };
+    let pid = u32::try_from(pid)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or(LocalSlotObservationError::InvalidWalSenderPid(pid))?;
+    let start_epoch_micros = u64::try_from(start)
+        .ok()
+        .and_then(NonZeroU64::new)
+        .ok_or(LocalSlotObservationError::InvalidWalSenderStart(start))?;
+    let activity = parse_wal_sender_activity(state)?;
+    let application_name = ReplicationSlotName::new(application_name)
+        .map_err(|_| LocalSlotObservationError::InvalidWalSenderApplicationName)?;
+    let reply_epoch_micros = reply_epoch_micros
+        .map(|value| {
+            u64::try_from(value)
+                .ok()
+                .and_then(NonZeroU64::new)
+                .ok_or(LocalSlotObservationError::InvalidWalSenderReply(value))
+        })
+        .transpose()?;
+    let Some(physical_slot) = physical_slot else {
+        return Err(LocalSlotObservationError::InconsistentWalSender);
+    };
+    if physical_slot.activity() != SlotActivity::Active(pid) {
+        return Err(LocalSlotObservationError::InconsistentWalSender);
+    }
+
+    Ok(Some(LocalWalSenderObservation {
+        identity: LocalPostgresBackendIdentity {
+            pid,
+            start_epoch_micros,
+        },
+        application_name,
+        activity,
+        reply_epoch_micros,
+    }))
+}
+
+fn parse_wal_sender_activity(
+    state: String,
+) -> Result<LocalWalSenderActivity, LocalSlotObservationError> {
+    match state.as_str() {
+        "startup" => Ok(LocalWalSenderActivity::Startup),
+        "catchup" => Ok(LocalWalSenderActivity::Catchup),
+        "streaming" => Ok(LocalWalSenderActivity::Streaming),
+        "backup" => Ok(LocalWalSenderActivity::Backup),
+        "stopping" => Ok(LocalWalSenderActivity::Stopping),
+        _ => Err(LocalSlotObservationError::UnsupportedWalSenderState(state)),
+    }
+}
+
+fn parse_transaction_id(
+    value: &str,
+) -> Result<LocalPostgresTransactionId, LocalSlotObservationError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .and_then(NonZeroU32::new)
+        .map(LocalPostgresTransactionId)
+        .ok_or(LocalSlotObservationError::InvalidTransactionId)
 }
 
 fn parse_prerequisites(
@@ -844,17 +1439,7 @@ fn parse_logical_slot(row: &Row) -> Result<LogicalSlotObservation, LocalSlotObse
     };
     let active: bool = row.try_get("active")?;
     let active_pid: Option<i64> = row.try_get("active_pid")?;
-    let activity = match (active, active_pid) {
-        (false, None) => SlotActivity::Inactive,
-        (true, Some(pid)) => {
-            let pid = u32::try_from(pid)
-                .ok()
-                .and_then(NonZeroU32::new)
-                .ok_or(LocalSlotObservationError::InvalidActivePid(pid))?;
-            SlotActivity::Active(pid)
-        }
-        _ => return Err(LocalSlotObservationError::InconsistentActivity(name_text)),
-    };
+    let activity = parse_slot_activity(&name_text, active, active_pid)?;
     let persistence = classify_persistence(temporary);
 
     Ok(LogicalSlotObservation {
@@ -870,6 +1455,28 @@ fn parse_logical_slot(row: &Row) -> Result<LogicalSlotObservation, LocalSlotObse
         invalidation: parse_invalidation(row.try_get("invalidation_reason")?)?,
         wal_retention: parse_wal_retention(row.try_get("wal_status")?)?,
         confirmed_flush_lsn: optional_lsn(row, "confirmed_flush_lsn")?,
+    })
+}
+
+fn parse_slot_activity(
+    name: &str,
+    active: bool,
+    active_pid: Option<i64>,
+) -> Result<SlotActivity, LocalSlotObservationError> {
+    Ok(match (active, active_pid) {
+        (false, None) => SlotActivity::Inactive,
+        (true, Some(pid)) => {
+            let pid = u32::try_from(pid)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .ok_or(LocalSlotObservationError::InvalidActivePid(pid))?;
+            SlotActivity::Active(pid)
+        }
+        _ => {
+            return Err(LocalSlotObservationError::InconsistentActivity(
+                name.to_owned(),
+            ));
+        }
     })
 }
 
@@ -1002,6 +1609,20 @@ pub enum LocalSlotObservationError {
     /// The observer role cannot distinguish redacted auxiliary-process rows.
     #[error("local slot observation requires effective pg_read_all_stats privileges")]
     StatisticsPrivilegeRequired,
+    /// The primary's synchronized-slot policy exceeded the observation bound.
+    #[error("synchronized_standby_slots length {observed} exceeds the observation bound {maximum}")]
+    SynchronizedStandbySlotsTooLong {
+        /// Server-reported policy length in bytes.
+        observed: i64,
+        /// Maximum policy length accepted by the observer.
+        maximum: i64,
+    },
+    /// The bounded synchronized-slot value disagreed with its reported length.
+    #[error("PostgreSQL returned inconsistent synchronized_standby_slots details")]
+    InconsistentSynchronizedStandbySlots,
+    /// The synchronized-slot value is not a plain unique replication-slot list.
+    #[error("synchronized_standby_slots must be a plain unique replication-slot-name list")]
+    UnsupportedSynchronizedStandbySlotsList,
     /// `PostgreSQL` returned receiver details without a receiver PID.
     #[error("PostgreSQL WAL receiver details are inconsistent with its PID")]
     InconsistentWalReceiver,
@@ -1017,6 +1638,33 @@ pub enum LocalSlotObservationError {
     /// `PostgreSQL` returned a partial slot-sync worker identity or wait event.
     #[error("PostgreSQL slot-sync worker details are internally inconsistent")]
     InconsistentSlotSyncWorker,
+    /// The requested physical slot name is occupied by another slot kind.
+    #[error("requested physical replication slot name {0:?} is occupied by a non-physical slot")]
+    PhysicalSlotNameCollision(String),
+    /// `PostgreSQL` returned a partial or impossible physical-slot row.
+    #[error("PostgreSQL physical replication slot details are internally inconsistent")]
+    InconsistentPhysicalSlot,
+    /// A physical-slot catalog horizon was not a valid nonzero transaction ID.
+    #[error("PostgreSQL physical slot catalog_xmin is invalid")]
+    InvalidTransactionId,
+    /// A physical walsender PID was zero or outside the supported range.
+    #[error("PostgreSQL physical walsender PID is invalid: {0}")]
+    InvalidWalSenderPid(i32),
+    /// A physical walsender backend-start timestamp was not a positive Unix value.
+    #[error("PostgreSQL physical walsender backend start is invalid: {0}")]
+    InvalidWalSenderStart(i64),
+    /// A physical walsender reply timestamp was not a positive Unix value.
+    #[error("PostgreSQL physical walsender reply timestamp is invalid: {0}")]
+    InvalidWalSenderReply(i64),
+    /// A physical walsender application name violates the replication-slot-name contract.
+    #[error("PostgreSQL physical walsender application_name is not replication-slot-shaped")]
+    InvalidWalSenderApplicationName,
+    /// `PostgreSQL` returned a walsender state outside its version 18 closed set.
+    #[error("unsupported PostgreSQL 18 physical walsender state {0:?}")]
+    UnsupportedWalSenderState(String),
+    /// `PostgreSQL` returned a partial or PID-inconsistent walsender row.
+    #[error("PostgreSQL physical walsender details are internally inconsistent")]
+    InconsistentWalSender,
     /// A nonnegative `PostgreSQL` setting did not fit the Rust model.
     #[error("PostgreSQL observation field {field} must be a nonnegative integer; observed {value}")]
     InvalidNonnegativeInteger {
@@ -1127,6 +1775,109 @@ mod tests {
                 received: 4,
                 maximum: MAX_OBSERVATION_TARGETS
             })
+        ));
+    }
+
+    #[test]
+    fn primary_policy_membership_is_exact_bounded_and_plain() {
+        let target = ReplicationSlotName::new("pgshard_member_0001").expect("slot");
+        let request = PrimaryReplicationObservationRequest::new(target.clone());
+        assert_eq!(request.physical_slot(), &target);
+        let configured = "pgshard_member_0000,pgshard_member_0001";
+        assert_eq!(
+            parse_synchronized_slot_policy(
+                i64::try_from(configured.len()).expect("length"),
+                Some(configured.to_owned()),
+                &target,
+            )
+            .expect("plain unique policy"),
+            FailoverSlotSynchronization::GatedOnPhysicalSlot
+        );
+        assert_eq!(
+            parse_synchronized_slot_policy(0, Some(String::new()), &target).expect("empty policy"),
+            FailoverSlotSynchronization::NotGated
+        );
+        assert_eq!(
+            parse_synchronized_slot_policy(19, Some("pgshard_member_0002".to_owned()), &target,)
+                .expect("other member"),
+            FailoverSlotSynchronization::NotGated
+        );
+        for unsupported in [
+            " pgshard_member_0001",
+            "pgshard_member_0001 ",
+            "\"pgshard_member_0001\"",
+            "pgshard_member_0001,,pgshard_member_0002",
+            "pgshard_member_0001,pgshard_member_0001",
+        ] {
+            assert!(matches!(
+                parse_synchronized_slot_policy(
+                    i64::try_from(unsupported.len()).expect("length"),
+                    Some(unsupported.to_owned()),
+                    &target,
+                ),
+                Err(LocalSlotObservationError::UnsupportedSynchronizedStandbySlotsList)
+            ));
+        }
+        assert!(matches!(
+            parse_synchronized_slot_policy(
+                i64::from(MAX_SYNCHRONIZED_STANDBY_SLOTS_BYTES) + 1,
+                None,
+                &target,
+            ),
+            Err(LocalSlotObservationError::SynchronizedStandbySlotsTooLong { .. })
+        ));
+        assert!(matches!(
+            parse_synchronized_slot_policy(1, Some(String::new()), &target),
+            Err(LocalSlotObservationError::InconsistentSynchronizedStandbySlots)
+        ));
+    }
+
+    #[test]
+    fn primary_raw_identifiers_are_nonzero_and_unordered() {
+        assert_eq!(
+            parse_transaction_id("4294967295")
+                .expect("maximum xid")
+                .get()
+                .get(),
+            u32::MAX
+        );
+        for invalid in ["", "0", "-1", "4294967296", "future"] {
+            assert!(matches!(
+                parse_transaction_id(invalid),
+                Err(LocalSlotObservationError::InvalidTransactionId)
+            ));
+        }
+        let pid = NonZeroU32::new(42).expect("PID");
+        assert_eq!(
+            parse_slot_activity("member", true, Some(42)).expect("active"),
+            SlotActivity::Active(pid)
+        );
+        assert_eq!(
+            parse_slot_activity("member", false, None).expect("inactive"),
+            SlotActivity::Inactive
+        );
+        for inconsistent in [(true, None), (false, Some(42))] {
+            assert!(matches!(
+                parse_slot_activity("member", inconsistent.0, inconsistent.1),
+                Err(LocalSlotObservationError::InconsistentActivity(_))
+            ));
+        }
+        for (state, expected) in [
+            ("startup", LocalWalSenderActivity::Startup),
+            ("catchup", LocalWalSenderActivity::Catchup),
+            ("streaming", LocalWalSenderActivity::Streaming),
+            ("backup", LocalWalSenderActivity::Backup),
+            ("stopping", LocalWalSenderActivity::Stopping),
+        ] {
+            assert_eq!(
+                parse_wal_sender_activity(state.to_owned()).expect("known state"),
+                expected
+            );
+        }
+        assert!(matches!(
+            parse_wal_sender_activity("future".to_owned()),
+            Err(LocalSlotObservationError::UnsupportedWalSenderState(state))
+                if state == "future"
         ));
     }
 

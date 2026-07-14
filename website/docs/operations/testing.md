@@ -193,9 +193,19 @@ auxiliary-worker rows can be classified as absent. The fixture grants that role
 with `INHERIT FALSE`, proving that membership alone is insufficient. On the
 standby, the same restricted login sees only the receiver PID, and the observer
 returns its PID-specific details-unavailable error. Exact
-primary/walsender identity correlation, feedback freshness, new-anchor
-reconciliation on already-running standbys, and a timestamped successful
-source-bound slot-sync cycle remain part of the later multi-server runtime suite.
+primary-side coverage also requires the bounded plain synchronized-slot list to
+contain the managed physical slot, observes its nonzero `catalog_xmin`, retained
+restart LSN and active PID, and joins that PID to a streaming walsender with the
+expected managed `application_name`, nonzero backend generation, and a
+peer-supplied reply timestamp. An absent ungated slot returns no synthetic rows.
+The reply timestamp and 32-bit transaction ID are equality-only raw values; direct
+multi-server source identity, feedback freshness and horizon coverage,
+new-anchor reconciliation on already-running standbys, and a timestamped
+successful source-bound slot-sync cycle remain part of the later runtime suite.
+The same fixture proves that a session-owned temporary physical slot is active
+without inventing a walsender row, that it disappears within a bounded cleanup
+window after its backend exits, and that a temporary logical slot occupying the
+physical name produces a typed collision before bounded cleanup.
 The same job runs the observer against PostgreSQL 17 and requires the typed
 minimum-version rejection before any PostgreSQL 18-only setting is queried.
 Agent unit tests reject unsafe, incompatible, symlinked, structurally incomplete,
