@@ -140,10 +140,9 @@ impl<'a> Postgres18StartupNegotiation<'a> {
     }
 
     fn expected_selected_protocol(&self) -> ProtocolVersion {
-        ProtocolVersion {
-            major: self.requested_protocol.major(),
-            minor: self.requested_protocol.minor().min(LATEST_PROTOCOL_MINOR),
-        }
+        self.requested_protocol
+            .postgres18_selected_version()
+            .expect("startup negotiation accepts only PostgreSQL protocol major three")
     }
 
     fn protocol_option_count(&self) -> usize {

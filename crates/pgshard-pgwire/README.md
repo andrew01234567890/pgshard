@@ -2,8 +2,9 @@
 
 This non-publishable crate implements bounded, zero-copy decoding for
 PostgreSQL 18 frontend and backend frames and selected query-protocol bodies,
-plus fixed-size replication-feedback encoding. Its constants, tags, and layouts
-follow the `REL_18_STABLE` PostgreSQL server source.
+plus bounded backend startup-control and fixed-size replication-feedback
+encoding. Its constants, tags, and layouts follow the `REL_18_STABLE`
+PostgreSQL server source.
 
 The decoder recognizes startup protocol versions, SSL and GSS negotiation,
 one-to-256-byte PostgreSQL 18 `CancelRequest` keys, and every frontend message
@@ -67,6 +68,19 @@ and configured client-protocol policy. The frontend body decoders include
 `Describe` and `Close` statement/portal targets. They do not associate a
 description with a Parse generation, virtualize a name, track a query cycle,
 identify a backend, or establish a catalog fence.
+
+Backend startup-control encoders emit exact `AuthenticationOk` and
+`ReadyForQuery` arrays plus caller-buffered `BackendKeyData`, `ParameterStatus`,
+and `NegotiateProtocolVersion` frames. Variable frames are completely sized
+and validated before the output is touched, retain PostgreSQL 18's family
+bounds, and never include values or cancellation keys in errors. Unsupported
+protocol options are supplied as borrowed byte slices so validation and writing
+need no internal allocation or replayable iterator contract. A decoded
+protocol-three request can derive PostgreSQL 18's selected version directly,
+including the 3.2 response to a future minor version. The live
+PostgreSQL 18 fixture decodes and re-encodes every corresponding startup frame
+and requires byte-for-byte equality. These primitives do not yet provide a
+client listener, authentication policy, or ordered session writer.
 
 The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH
 loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is

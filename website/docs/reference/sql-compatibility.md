@@ -42,10 +42,10 @@ empty-path token that the caller must rebuild from the current backend, and
 checks PostgreSQL's authoritative parameter count plus the selected
 format/NULL/value bytes without copying before producing a canonical shard
 route. It intentionally does not accept or trust statement and portal names.
-The backend decoder supplies framing, borrowed type OIDs, completion-body
-validation, and transaction-status bytes only; it does not prove that a
-description belongs to the relevant Parse, backend, or session, or track a
-query cycle.
+The backend codec supplies framing, borrowed type OIDs, completion-body
+validation, transaction-status bytes, and bounded startup-control encoders
+only; it does not prove that a description belongs to the relevant Parse,
+backend, or session, or track a query cycle.
 The pooler session runtime that maps those names to an exact prepared
 generation, pins the same backend, keeps the path empty through Parse, Describe,
 Bind, and Execute, and retains the snapshot/schema fences is not yet
@@ -149,6 +149,12 @@ authenticated proof. The future socket session must still enforce transport
 and authentication order, authentication policy, channel binding, server
 identity, rejection of reserved protocol 3.1 as client policy, and the
 configured minimum protocol version.
+Exact startup-control encoders cover `AuthenticationOk`, `ParameterStatus`,
+`BackendKeyData`, `NegotiateProtocolVersion`, and every `ReadyForQuery`
+transaction state. Caller-buffered encoders validate the complete bounded
+frame before changing output and redact payloads from errors. The PostgreSQL 18
+fixture requires their output to equal live server bytes. No ordered session
+writer or client-facing startup exchange exists yet.
 The transport layer, which is not implemented yet, must handle PostgreSQL 18
 direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting
