@@ -1766,6 +1766,7 @@ mod tests {
         let makefile = include_str!("../../../Makefile");
         for manifest in [
             "Cargo.toml",
+            "crates/pgshard-agent/Cargo.toml",
             "crates/pgshard-planner/Cargo.toml",
             "buf.yaml",
             "operator/go.mod",
@@ -1802,6 +1803,21 @@ mod tests {
                 "image CI trigger must include {input}"
             );
         }
+        let postgres_agent_trigger = workflow
+            .lines()
+            .find(|line| line.contains("emit_component postgres_agent"))
+            .expect("PostgreSQL agent lifecycle trigger");
+        for input in [
+            "^crates/(pgshard-agent|pgshard-types|pgshard-version)/",
+            "images/rust\\.Dockerfile",
+            "images/quarantine\\.pg_hba\\.conf",
+        ] {
+            assert!(
+                postgres_agent_trigger.contains(input),
+                "PostgreSQL agent trigger must include {input}"
+            );
+        }
+        assert!(workflow.contains("if: needs.changes.outputs.postgres_agent == 'true'"));
         for command in [
             "go mod tidy",
             "go mod verify",

@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1.97.0-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS build
+FROM docker.io/library/rust:1.97.0-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS build-base
 
 ARG PGSHARD_BUILD_VERSION
 ARG PGSHARD_GIT_SHA
@@ -6,6 +6,8 @@ ARG PGSHARD_GIT_SHA
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
+
+FROM build-base AS build
 
 RUN PGSHARD_BUILD_VERSION="${PGSHARD_BUILD_VERSION}" \
     PGSHARD_GIT_SHA="${PGSHARD_GIT_SHA}" \
@@ -16,6 +18,13 @@ RUN PGSHARD_BUILD_VERSION="${PGSHARD_BUILD_VERSION}" \
     install -D -m 0755 target/release/pgshard-agent /out/pgshard-agent && \
     install -D -m 0755 target/release/pgshard-orch /out/pgshard-orch && \
     install -D -m 0755 target/release/pgshard-pooler /out/pgshard-pooler
+
+FROM build-base AS postgres-agent-build
+
+RUN PGSHARD_BUILD_VERSION="${PGSHARD_BUILD_VERSION}" \
+    PGSHARD_GIT_SHA="${PGSHARD_GIT_SHA}" \
+    cargo build --locked --release --package pgshard-agent && \
+    install -D -m 0755 target/release/pgshard-agent /out/pgshard-agent
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:ce0d66bc0f64aae46e6a03add867b07f42cc7b8799c949c2e898057b7f75a151 AS runtime
 
@@ -40,3 +49,20 @@ ENTRYPOINT ["/usr/local/bin/pgshard-orch"]
 FROM runtime AS pooler
 COPY --from=build /out/pgshard-pooler /usr/local/bin/pgshard-pooler
 ENTRYPOINT ["/usr/local/bin/pgshard-pooler"]
+
+FROM docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7 AS postgres-agent
+
+ARG PGSHARD_BUILD_VERSION
+ARG PGSHARD_GIT_SHA
+
+LABEL org.opencontainers.image.source="https://github.com/andrew01234567890/pgshard" \
+      org.opencontainers.image.version="${PGSHARD_BUILD_VERSION}" \
+      org.opencontainers.image.revision="${PGSHARD_GIT_SHA}"
+
+COPY --from=postgres-agent-build --chown=0:0 /out/pgshard-agent /usr/local/bin/pgshard-agent
+RUN install -d -o 0 -g 0 -m 0755 /etc/pgshard
+COPY --chown=0:0 --chmod=0444 deploy/images/quarantine.pg_hba.conf /etc/pgshard/quarantine.pg_hba.conf
+
+USER 999:999
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/pgshard-agent"]

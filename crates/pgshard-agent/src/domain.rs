@@ -35,6 +35,25 @@ pub enum PostgresRole {
     Replica,
 }
 
+/// Locally supervised postmaster process state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresProcessState {
+    /// Process supervision was not requested.
+    #[default]
+    Disabled,
+    /// Required `PostgreSQL` 18 files passed structural offline preflight.
+    Validated,
+    /// The postmaster is starting without a network listener.
+    StartingQuarantined,
+    /// The postmaster process exists without a TCP listener; SQL readiness is not implied.
+    RunningQuarantined,
+    /// A bounded postmaster shutdown is in progress.
+    Stopping,
+    /// Startup, supervision, or shutdown failed terminally.
+    Failed,
+}
+
 /// Last locally verified `PostgreSQL` state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PostgresObservation {
@@ -97,6 +116,8 @@ pub struct AgentSnapshot {
     pub identity: Option<AgentIdentity>,
     /// Last `PostgreSQL` observation.
     pub postgres: Option<PostgresObservation>,
+    /// Current local postmaster process state.
+    pub postgres_process: PostgresProcessState,
     /// Current fencing lease.
     pub lease: Option<FencingLease>,
 }
@@ -150,6 +171,14 @@ impl AgentState {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .postgres = Some(observation);
+    }
+
+    /// Replaces the locally supervised postmaster process state.
+    pub fn set_postgres_process(&self, process: PostgresProcessState) {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .postgres_process = process;
     }
 
     /// Installs or renews a lease already authenticated by the orchestrator
@@ -310,6 +339,10 @@ pub enum ReadinessReason {
     IdentityMissing,
     /// No fencing lease is installed.
     LeaseMissing,
+    /// The local postmaster is intentionally unavailable to routed traffic.
+    PostgresQuarantined,
+    /// Local postmaster validation, startup, supervision, or shutdown failed.
+    PostgresFailed,
     /// The lease belongs to another instance.
     LeaseOwnerMismatch,
     /// Epoch zero can never authorize an instance.
@@ -342,35 +375,50 @@ pub struct Readiness {
 }
 
 fn evaluate_readiness(snapshot: &AgentSnapshot, now_unix_ms: u64) -> Readiness {
-    let reason = match (&snapshot.identity, &snapshot.lease, &snapshot.postgres) {
-        (None, _, _) => ReadinessReason::IdentityMissing,
-        (Some(_), None, _) => ReadinessReason::LeaseMissing,
-        (Some(identity), Some(lease), _) if identity.instance_id != lease.owner_instance => {
+    let reason = match (
+        &snapshot.identity,
+        snapshot.postgres_process,
+        &snapshot.lease,
+        &snapshot.postgres,
+    ) {
+        (_, PostgresProcessState::Failed, _, _) => ReadinessReason::PostgresFailed,
+        (
+            Some(_),
+            PostgresProcessState::Validated
+            | PostgresProcessState::StartingQuarantined
+            | PostgresProcessState::RunningQuarantined
+            | PostgresProcessState::Stopping,
+            _,
+            _,
+        ) => ReadinessReason::PostgresQuarantined,
+        (None, _, _, _) => ReadinessReason::IdentityMissing,
+        (Some(_), _, None, _) => ReadinessReason::LeaseMissing,
+        (Some(identity), _, Some(lease), _) if identity.instance_id != lease.owner_instance => {
             ReadinessReason::LeaseOwnerMismatch
         }
-        (_, Some(lease), _) if lease.epoch == 0 => ReadinessReason::LeaseEpochInvalid,
-        (_, Some(lease), _) if lease.valid_until_unix_ms <= now_unix_ms => {
+        (_, _, Some(lease), _) if lease.epoch == 0 => ReadinessReason::LeaseEpochInvalid,
+        (_, _, Some(lease), _) if lease.valid_until_unix_ms <= now_unix_ms => {
             ReadinessReason::LeaseExpired
         }
-        (_, _, None) => ReadinessReason::PostgresUnobserved,
-        (_, _, Some(postgres))
+        (_, _, _, None) => ReadinessReason::PostgresUnobserved,
+        (_, _, _, Some(postgres))
             if postgres.observed_at_unix_ms == 0 || postgres.observed_at_unix_ms > now_unix_ms =>
         {
             ReadinessReason::PostgresObservationTimeInvalid
         }
-        (_, _, Some(postgres))
+        (_, _, _, Some(postgres))
             if now_unix_ms - postgres.observed_at_unix_ms > POSTGRES_OBSERVATION_MAX_AGE_MS =>
         {
             ReadinessReason::PostgresObservationStale
         }
-        (_, _, Some(postgres)) if postgres.role == PostgresRole::Unknown => {
+        (_, _, _, Some(postgres)) if postgres.role == PostgresRole::Unknown => {
             ReadinessReason::PostgresRoleUnknown
         }
-        (_, _, Some(postgres)) if postgres.timeline == 0 => ReadinessReason::TimelineInvalid,
-        (_, Some(lease), Some(postgres)) if postgres.fencing_epoch != lease.epoch => {
+        (_, _, _, Some(postgres)) if postgres.timeline == 0 => ReadinessReason::TimelineInvalid,
+        (_, _, Some(lease), Some(postgres)) if postgres.fencing_epoch != lease.epoch => {
             ReadinessReason::FencingEpochMismatch
         }
-        (_, _, Some(postgres))
+        (_, _, _, Some(postgres))
             if (postgres.role == PostgresRole::Primary && postgres.flush_lsn.is_none())
                 || (postgres.role == PostgresRole::Replica && postgres.replay_lsn.is_none()) =>
         {
@@ -511,6 +559,36 @@ mod tests {
                 ready: true,
                 reason: ReadinessReason::Ready,
             }
+        );
+    }
+
+    #[test]
+    fn quarantine_process_state_overrides_valid_authority() {
+        let state = state();
+        state.set_postgres(primary());
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "instance-1".to_owned(),
+                    epoch: 3,
+                    valid_until_unix_ms: 200,
+                },
+                100,
+            )
+            .expect("install matching lease");
+        state.set_postgres_process(PostgresProcessState::RunningQuarantined);
+
+        assert_eq!(
+            state.readiness_at(100).reason,
+            ReadinessReason::PostgresQuarantined
+        );
+        state.set_postgres_process(PostgresProcessState::Disabled);
+        assert_eq!(state.readiness_at(100).reason, ReadinessReason::Ready);
+
+        state.set_postgres_process(PostgresProcessState::Failed);
+        assert_eq!(
+            state.readiness_at(100).reason,
+            ReadinessReason::PostgresFailed
         );
     }
 

@@ -49,7 +49,10 @@ invented global WAL order.
 - Deliver at least once from the last acknowledged vector checkpoint.
 - Never claim strict order between independent shards.
 - Carry distributed-transaction identifiers without pretending participant events are one globally ordered batch.
-- Protect resume tokens with authenticated versioning plus stream, cluster, database, semantic configuration, epoch, timeline, per-shard LSN, checkpoint generation and ordinal, and reshard-journal generation.
+- Protect resume tokens with authenticated versioning plus stream, cluster,
+  database, semantic configuration, epoch, each per-shard source-attachment
+  identity, timeline and LSN, checkpoint generation and ordinal, and
+  reshard-journal generation.
 
 Only a `Checkpoint` carries an acknowledgeable resume token. Tokens are opaque,
 server-issued, and authenticated. The server rejects altered, cross-stream,
@@ -59,6 +62,16 @@ idempotent no-ops, so durable acknowledgement and slot feedback never regress.
 Heartbeats expose non-acknowledgeable source progress and the last fully
 delivered position, so a consumer cannot acknowledge past buffered WAL it has
 never received.
+
+The token contains a canonical authenticated hash of every shard's restore
+incarnation, PostgreSQL system identifier, and database OID independently of the
+stream's semantic-configuration hash. Resume and acknowledgement validate that
+attachment vector before reading or advancing any checkpoint or replication
+slot. During restore, one non-serving `shardschema` transaction installs the new
+shard incarnations, advances the affected checkpoint generations, and marks the
+streams as requiring a snapshot. A token from the restored history therefore
+returns `SOURCE_INCARNATION_CHANGED` without changing durable checkpoint or slot
+state, even if its cluster, database, timeline, and LSN fields still match.
 
 Milestone 1 buffers or spills PostgreSQL streaming-transaction chunks until the
 terminal outcome is known. Aborted transactions expose no row events. A committed
@@ -96,6 +109,113 @@ so a gateway or client reconnect can continue the same exported snapshots with
 at-least-once replay after the last acknowledgement. If a holder, slot, or
 exported snapshot is lost before copy completes, the service returns
 `ResnapshotRequired` instead of combining a new snapshot with the old WAL vector.
+
+## Standby-first slot topology
+
+All pgshard-managed `pgoutput` consumers use one placement policy. This includes
+public change streams, online-reshard catch-up and its target materializers, and
+future internal materializations. Normal decoding runs on an eligible direct
+physical standby to keep logical decoding work off the shard primary. This is a
+placement preference, not permission to lose or skip data: if no standby can
+prove that it retains the durable per-shard checkpoint, pgshard either uses the
+primary's anchor slot or fences the consumer and requires a new snapshot.
+
+`shardschema` is the authority for every managed logical consumer. Each
+per-shard record is keyed by consumer, `logical_database_id`, and shard. Its
+source-attachment key adds the shard restore incarnation, PostgreSQL system
+identifier from `pg_control_system()`, and database OID; the database name is
+descriptive metadata, not identity. It also records the bounded purpose,
+primary anchor, selected source server and timeline, standby-local slot and
+consistent point, durable checkpoint and generation, and ownership fence. A
+consumer cannot attach to a slot until those fields match its current catalog
+epoch and lease.
+Physical replicas share the system identifier and database OID, so an ordinary
+promotion can retain the attachment after its timeline checks. A reinitialized
+shard has a different system identifier. A restore can reuse both the system
+identifier and database OID, so every initial bootstrap and coordinated restore
+installs a fresh immutable shard restore-incarnation UUID before slot
+reconciliation or application service. Any mismatch is fenced and requires a
+compatible snapshot instead of rebinding the record. This prevents workers,
+databases, restored histories, or different uses such as a public stream and a
+reshard materializer from sharing a slot or advancing each other's checkpoint.
+
+PostgreSQL's synchronized logical slots and standby-local decoding slots have
+different jobs. A synchronized slot copied from the primary cannot be consumed
+on a hot standby before that standby is promoted, and a logical slot created
+locally on a standby cannot be marked as a failover slot and synchronized to
+its peers. Milestone 1 therefore keeps two explicit classes of slot per logical
+consumer and shard:
+
+- a persistent `failover = true` anchor on the current primary, advanced no
+  further than the durable checkpoint stored in `shardschema`; and
+- persistent, non-failover decoding slots created locally on eligible standbys,
+  from which the active stream worker consumes `pgoutput`.
+
+The operator automatically synchronizes each primary anchor to eligible direct
+standbys for promotion safety. Standby-local slots are independent and
+reconciled separately; pgshard never describes them as synchronized and never
+treats a PostgreSQL-synchronized slot as usable on a server that is still in
+recovery. `shardschema` records each local slot's consistent point.
+A new local slot is ineligible while that point is ahead of the durable
+checkpoint because PostgreSQL cannot decode the missing older WAL through that
+slot. The old source or primary anchor remains active until the checkpoint
+reaches the new consistent point; if neither retains the gap, the stream
+requires a new snapshot. Source selection is fenced by shard term, restore
+incarnation, system identifier, database OID, timeline, catalog epoch, slot
+identity, consistent point, and the durable checkpoint. A safe source change
+starts from that checkpoint and can replay already acknowledged WAL, so the
+public contract remains at-least-once.
+
+For every shard that can host a decoder or receive a synchronized anchor, the
+operator enforces the PostgreSQL 18 prerequisites as one configuration unit:
+
+- `wal_level = logical`, sufficient `max_replication_slots`, and sufficient
+  `max_wal_senders` on the primary and every eligible standby;
+- `hot_standby = on`, `hot_standby_feedback = on`, a bounded positive
+  `wal_receiver_status_interval`, and `sync_replication_slots = on` on eligible
+  standbys;
+- one durable physical slot per standby, named by its `primary_slot_name`, plus
+  a valid database name in `primary_conninfo`; and
+- a primary `synchronized_standby_slots` policy containing the physical slots
+  whose receipt must gate failover-anchor progress.
+
+`hot_standby_feedback` is mandatory for these managed standbys, not merely a
+tuning default. It carries the standby logical slots' catalog horizon upstream;
+turning it off, setting its reporting interval to zero, or accepting stale
+feedback can let primary vacuum invalidate standby decoding or synchronized
+slots. Decoder eligibility therefore requires recently observed upstream
+feedback, not configuration alone. Operator reconciliation rejects an override
+that disables feedback and fences an assigned decoder if the observed setting
+or feedback becomes unhealthy. The physical slot is also mandatory because
+feedback alone disappears across a standby disconnect or restart. Replicas that
+are explicitly excluded from both decoding and promotion-slot synchronization
+need not enable feedback; with the default topology, every managed promotion
+candidate is eligible and therefore has it enabled.
+
+Since both facilities can retain WAL and dead catalog tuples, the operator
+exposes retained-byte, retained-age, `catalog_xmin`, synchronization-lag,
+invalidation, and feedback-health metrics. Retention caps continue to prefer
+database availability. The operator first durably fences the stream and records
+that a new snapshot is required, then stops and drops or safely advances the
+offending logical slots. It verifies that every upstream physical slot's
+`catalog_xmin` and retained WAL clear or advance. If a disconnected standby
+cannot send clearing feedback within the bound, the operator removes it from
+eligibility, drops its primary-side physical slot, and requires a full standby
+rebuild before recreating that slot. Merely fencing a consumer is never treated
+as proof that retained storage was released.
+
+Milestone 1 KIND and Docker Desktop end-to-end suites must cover public streams
+and reshard materializers under steady standby decoding, primary write-load
+offload, slot synchronization, standby restart, consumer restart, promotion,
+decoder-source replacement, lag and invalidation, feedback loss, timeline
+change, and resumption from the last durable checkpoint without gaps. They must
+also prove that independent consumers cannot share or advance each other's
+slots, a consumer cannot attach to a slot for another logical or source
+database, same-name and same-OID databases with a different system identifier
+are rejected, and restoring the same system identifier requires a new restore
+incarnation. A synchronized slot is never consumed while its server is still a
+standby, and loss of every safe source fails closed. These suites are planned
+and not yet present.
 
 ## Snapshot plus changes
 

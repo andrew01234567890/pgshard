@@ -2,13 +2,16 @@
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pgshard_types::ShardId;
 use thiserror::Error;
 use url::Url;
 
 use crate::domain::AgentIdentity;
+use crate::postgres::{PostgresConfig, PostgresConfigError};
 use crate::telemetry::TelemetryConfig;
 
 /// Validated process configuration.
@@ -22,6 +25,15 @@ pub struct AgentConfig {
     pub max_lease_ttl_ms: u64,
     /// OpenTelemetry configuration placeholder.
     pub telemetry: TelemetryConfig,
+    /// Optional client-TCP-quarantined `PostgreSQL` process supervision.
+    pub postgres: Option<PostgresConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum PostgresMode {
+    #[default]
+    Disabled,
+    Quarantine,
 }
 
 #[derive(Debug, Parser)]
@@ -44,6 +56,59 @@ struct RawConfig {
 
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
+
+    #[arg(
+        long,
+        env = "PGSHARD_POSTGRES_MODE",
+        value_enum,
+        default_value_t = PostgresMode::Disabled
+    )]
+    postgres_mode: PostgresMode,
+
+    #[arg(long, env = "PGDATA")]
+    postgres_data_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "PGSHARD_POSTGRES_BIN",
+        default_value = "/usr/lib/postgresql/18/bin/postgres"
+    )]
+    postgres_bin: PathBuf,
+
+    #[arg(
+        long,
+        env = "PGSHARD_POSTGRES_SOCKET_DIR",
+        default_value = "/run/pgshard/postgres"
+    )]
+    postgres_socket_dir: PathBuf,
+
+    #[arg(
+        long,
+        env = "PGSHARD_POSTGRES_HBA_FILE",
+        default_value = "/etc/pgshard/quarantine.pg_hba.conf"
+    )]
+    postgres_hba_file: PathBuf,
+
+    #[arg(
+        long,
+        env = "PGSHARD_POSTGRES_SMART_SHUTDOWN_MS",
+        default_value_t = 5_000
+    )]
+    postgres_smart_shutdown_ms: u64,
+
+    #[arg(
+        long,
+        env = "PGSHARD_POSTGRES_FAST_SHUTDOWN_MS",
+        default_value_t = 44_000
+    )]
+    postgres_fast_shutdown_ms: u64,
+
+    #[arg(
+        long,
+        env = "PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS",
+        default_value_t = 5_000
+    )]
+    postgres_immediate_shutdown_ms: u64,
 }
 
 impl AgentConfig {
@@ -79,6 +144,23 @@ impl AgentConfig {
             .otlp_endpoint
             .map(|value| validate_otlp_endpoint(&value))
             .transpose()?;
+        let postgres = match raw.postgres_mode {
+            PostgresMode::Disabled => None,
+            PostgresMode::Quarantine => {
+                let data_dir = raw
+                    .postgres_data_dir
+                    .ok_or(ConfigError::PostgresDataDirectoryMissing)?;
+                Some(PostgresConfig::new(
+                    data_dir,
+                    raw.postgres_bin,
+                    raw.postgres_socket_dir,
+                    raw.postgres_hba_file,
+                    Duration::from_millis(raw.postgres_smart_shutdown_ms),
+                    Duration::from_millis(raw.postgres_fast_shutdown_ms),
+                    Duration::from_millis(raw.postgres_immediate_shutdown_ms),
+                )?)
+            }
+        };
 
         Ok(Self {
             http_bind: raw.http_bind,
@@ -89,6 +171,7 @@ impl AgentConfig {
             },
             max_lease_ttl_ms: raw.max_lease_ttl_ms,
             telemetry: TelemetryConfig { otlp_endpoint },
+            postgres,
         })
     }
 }
@@ -160,6 +243,12 @@ pub enum ConfigError {
     /// Endpoint is not an unauthenticated HTTP(S) URL.
     #[error("OTLP endpoint {0:?} must be an HTTP(S) URL without embedded credentials")]
     UnsafeOtlpEndpoint(String),
+    /// Quarantine mode requires an explicit durable data directory.
+    #[error("PGDATA is required when PostgreSQL quarantine supervision is enabled")]
+    PostgresDataDirectoryMissing,
+    /// `PostgreSQL` process configuration is unsafe or unbounded.
+    #[error(transparent)]
+    Postgres(#[from] PostgresConfigError),
 }
 
 #[cfg(test)]
@@ -184,6 +273,7 @@ mod tests {
         assert_eq!(config.identity.shard_id, ShardId(3));
         assert_eq!(config.max_lease_ttl_ms, 15_000);
         assert!(config.telemetry.otlp_endpoint.is_none());
+        assert!(config.postgres.is_none());
     }
 
     #[test]
@@ -244,5 +334,54 @@ mod tests {
                 Err(ConfigError::UnsafeOtlpEndpoint(_))
             ));
         }
+    }
+
+    #[test]
+    fn quarantine_mode_requires_pgdata_and_bounded_shutdown() {
+        let mut missing = required_args();
+        missing.extend(["--postgres-mode", "quarantine"]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(missing),
+            Err(ConfigError::PostgresDataDirectoryMissing)
+        ));
+
+        let mut configured = required_args();
+        configured.extend([
+            "--postgres-mode",
+            "quarantine",
+            "--postgres-data-dir",
+            "/var/lib/postgresql/data",
+            "--postgres-smart-shutdown-ms",
+            "5000",
+            "--postgres-fast-shutdown-ms",
+            "40000",
+            "--postgres-immediate-shutdown-ms",
+            "5000",
+        ]);
+        let parsed = AgentConfig::try_parse_from(configured).expect("bounded quarantine config");
+        assert_eq!(
+            parsed.postgres.as_ref().map(PostgresConfig::data_dir),
+            Some(std::path::Path::new("/var/lib/postgresql/data"))
+        );
+
+        let mut excessive = required_args();
+        excessive.extend([
+            "--postgres-mode",
+            "quarantine",
+            "--postgres-data-dir",
+            "/var/lib/postgresql/data",
+            "--postgres-smart-shutdown-ms",
+            "10000",
+            "--postgres-fast-shutdown-ms",
+            "40000",
+            "--postgres-immediate-shutdown-ms",
+            "10000",
+        ]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(excessive),
+            Err(ConfigError::Postgres(
+                PostgresConfigError::ShutdownBudgetExceeded { .. }
+            ))
+        ));
     }
 }
