@@ -1,4 +1,4 @@
-//! `pgshard-pooler` Linux control-runtime entry point.
+//! `pgshard-pooler` Linux runtime entry point.
 
 use pgshard_pooler::config::{PoolerConfig, PoolerConfigError};
 use pgshard_pooler::runtime::PoolerRuntime;
@@ -11,6 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(error.into()),
     };
     let http_bind = config.http_bind();
+    let read_write_bind = config.read_write_bind();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -18,18 +19,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let listener = tokio::net::TcpListener::bind(http_bind).await?;
+    let http_listener = tokio::net::TcpListener::bind(http_bind).await?;
+    let read_write_listener = tokio::net::TcpListener::bind(read_write_bind).await?;
     let runtime = PoolerRuntime::new(config);
     tracing::warn!(
-        "PostgreSQL client listeners, remote catalog transport, and OpenTelemetry export remain disabled"
+        "PostgreSQL sessions are rejected; authentication, backend pooling, remote catalog transport, and OpenTelemetry export remain disabled"
     );
     tracing::info!(
-        bind = %http_bind,
+        http_bind = %http_bind,
+        read_write_bind = %read_write_bind,
         version = pgshard_version::VERSION,
         git_sha = pgshard_version::GIT_SHA,
         "starting pooler control runtime"
     );
-    runtime.run(listener, shutdown_signal()).await?;
+    runtime
+        .run(http_listener, read_write_listener, shutdown_signal())
+        .await?;
     tracing::info!("pooler control runtime stopped");
     Ok(())
 }

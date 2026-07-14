@@ -6,7 +6,10 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 # SQL compatibility
 
 :::warning Planned compatibility, not current support
-No pooler endpoint or semantic statement planner exists yet. The source has a
+No usable pooler endpoint or complete semantic statement planner exists yet.
+The read-write socket currently terminates only a bounded startup handshake and
+rejects every regular session with `FATAL`/`57P03`; it does not authenticate or
+route queries. The source has a
 byte/token/AST/stack-bounded permissive candidate parser configured with a
 PostgreSQL dialect, a fail-closed core that routes an already-resolved, non-NULL
 shard-key bind parameter against one immutable catalog snapshot, and a bounded
