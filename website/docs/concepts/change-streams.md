@@ -68,9 +68,9 @@ through commit. Only a statement cancellation followed by completed rollback
 retains the connection for retry. A hard client deadline or transaction timeout
 makes the reader terminal and requires a fresh connection. It does not
 select a member, observe or mutate PostgreSQL slots, or authorize a connection.
-No PostgreSQL Pod consumes the profiles, and secure `primary_conninfo`, live
-observation, slot creation or mutation, role activation, quarantined attachment,
-and stream ownership remain unimplemented.
+No PostgreSQL Pod consumes the profiles, and secure `primary_conninfo`,
+multi-server observation, slot creation or mutation, role activation,
+quarantined attachment, and stream ownership remain unimplemented.
 
 The source also contains a fixed-size PostgreSQL 18 Standby Status Update
 encoder. It validates that neither flush nor apply is ahead of write but does
@@ -190,6 +190,26 @@ readiness without a resumable checkpoint, and retirement out of order. A
 consumer cannot attach to a slot until the future connection-owning runtime
 proves the loaded fields match its current catalog epoch and lease. Catalog
 presence by itself is non-authorizing.
+
+The current Rust foundation can load one ready standby-selected policy from
+`shardschema` and take a bounded, read-only observation batch of an exact small
+set of local PostgreSQL 18 replication slots. PostgreSQL copies each slot under
+its own mutex, so the batch is not a point-in-time cross-slot snapshot. It
+records the local monotonic interval that brackets the server query; a future
+mutating reconciler must take a fresh post-acquisition batch and recheck every
+invariant. The observer consumes and owns both its dedicated client and
+connection driver, pins an empty `search_path`, and aborts the driver on any
+terminal path. It returns missing slots and typed server state but deliberately
+marks ownership unknown: matching a generation-encoded name does not prove
+which process created it. Every row reported as non-temporary has unproven
+persistence because PostgreSQL 18's public view cannot distinguish a durable
+slot from `RS_EPHEMERAL` state. Even inactivity is insufficient: a failed
+ephemeral-slot directory rename can clear the active PID before the shared slot
+row disappears. Only mutation history or stronger evidence may classify the
+slot as persistent. Multi-server
+source correlation, slot-sync-cycle evidence, mutation-history attestation,
+and every create, advance, acquire, or drop action remain future reconciliation
+work.
 
 Each checkpoint generation is immutably bound to its shard restore incarnation,
 PostgreSQL system identifier, database OID, and source timeline. Physical
