@@ -27,9 +27,33 @@ The operator's generated configuration plan now reserves separate capacity for
 primary failover anchors, synchronized copies, standby-local decoding slots,
 and the temporary physical slots needed when a decoder is promoted. It renders
 primary and standby PostgreSQL 18 role profiles for every member, with the
-mandatory feedback and slot-synchronization settings described below. No PostgreSQL Pod consumes
-those profiles yet, and secure `primary_conninfo`, slot creation, eligibility
-observation, role activation, and stream ownership remain unimplemented.
+mandatory feedback and slot-synchronization settings described below. The Rust
+orchestrator source also has a pure two-stage attachment validation model. Its
+preflight rejects a changed standby member or direct-primary source identity, a stale
+multi-server observation, a cascading upstream, insufficient WAL level,
+disabled feedback, a reporting interval without a fixed freshness margin,
+stale feedback, an absent, wrong-source, stale, or connection-generation-mixed
+slot-sync worker observation, a replay position behind the durable checkpoint,
+a live receiver slot or primary walsender that cannot be tied to the exact
+physical-slot owner, unsafe physical or logical slot WAL retention, an active
+or unowned primary anchor or standby-local decoder, a physical slot omitted
+from the primary's failover-slot gate, an absent or unsafe
+primary/synchronized anchor pair, the wrong anchor/local role, a slot
+generation that differs from its active catalog allocation, a currently wrong
+two-phase mode or activation boundary, or a slot whose
+confirmed-flush LSN is ahead of the durable checkpoint. After a quarantined
+attachment reportedly acquires the local slot, a fresh full observation checks
+that slot's active PID and the caller-reported start checkpoint. The result is
+explicitly non-authorizing: pure values cannot prove the PID and LSN came from
+the actual `BackendKeyData` and encoded `START_REPLICATION` command. The future
+connection-owning runtime must bind those facts in one linear session state;
+no record may be emitted, delivered, or acknowledged before it does. Both
+copies of the failover anchor
+are checked but never selected while the server is in recovery, and transient
+ownership of the synchronized copy by PostgreSQL's slot-sync worker is
+accepted. No PostgreSQL Pod consumes the profiles yet, and secure
+`primary_conninfo`, live observation, slot creation or mutation, role
+activation, quarantined attachment, and stream ownership remain unimplemented.
 
 The source also contains a fixed-size PostgreSQL 18 Standby Status Update
 encoder. It validates that neither flush nor apply is ahead of write but does
@@ -134,9 +158,12 @@ source-attachment key adds the shard restore incarnation, PostgreSQL system
 identifier from `pg_control_system()`, and database OID; the database name is
 descriptive metadata, not identity. It also records the bounded purpose,
 primary anchor, selected source server and timeline, standby-local slot and
-consistent point, durable checkpoint and generation, and ownership fence. A
-consumer cannot attach to a slot until those fields match its current catalog
-epoch and lease.
+consistent point, each active slot's catalog generation and
+generation-encoded name, durable checkpoint and checkpoint generation, and
+ownership fence. The planned registry permanently tombstones retired names and
+generations; the pure attachment validator only matches the active catalog
+values. A consumer cannot attach to a slot until those fields match its current
+catalog epoch and lease.
 Physical replicas share the system identifier and database OID, so an ordinary
 promotion can retain the attachment after its timeline checks. A reinitialized
 shard has a different system identifier. A restore can reuse both the system
@@ -180,13 +207,32 @@ operator enforces the PostgreSQL 18 prerequisites as one configuration unit:
 - `wal_level = logical`, sufficient `max_replication_slots`, and sufficient
   `max_wal_senders` on the primary and every eligible standby;
 - `hot_standby = on`, `hot_standby_feedback = on`, a bounded positive
-  `wal_receiver_status_interval`, and `sync_replication_slots = on` on eligible
+  `wal_receiver_status_interval` at least one second below the
+  feedback-health bound, and `sync_replication_slots = on` on eligible
   standbys;
 - one durable physical slot per standby, named by its `primary_slot_name`, plus
   a valid database name and the member profile's exact `application_name` in
   `primary_conninfo`; and
 - a primary `synchronized_standby_slots` policy containing the physical slots
   whose receipt must gate failover-anchor progress.
+
+PostgreSQL 18's slot-sync worker uses one SQL-capable `primary_conninfo`
+database connection to query failover slots across the direct primary; that
+connection database does not have to be each logical slot's database. Decoder
+and promotion eligibility instead bind the current worker connection to the
+exact primary server and a non-nil connection generation, then require a
+bounded, recent completely successful synchronization cycle recorded for that
+same connection generation. Each logical slot is still checked against its own
+catalog database OID. The setting and continued existence of an old
+synchronized slot are not accepted as worker health: a missing
+`primary_conninfo` `dbname`, connection failure, a success from an earlier or
+different connection, or a stale cycle fences the member.
+
+The candidate's live `pg_stat_wal_receiver.slot_name` must equal the managed
+physical slot. On the primary, the matching `pg_stat_replication` walsender PID
+and configured member `application_name` must identify the same backend as that
+physical slot's `active_pid`. `primary_slot_name` configuration alone is not
+proof of the active connection.
 
 A demoted primary cannot immediately enable its standby profile. It can retain
 primary failover anchors whose names now belong to synchronized copies from the
@@ -203,12 +249,35 @@ operator intervention and is never deleted automatically. The member remains
 ineligible for decoding and promotion until a fresh synchronized copy has been
 observed healthy.
 
+Milestone 1 creates every managed logical slot with two-phase decoding enabled.
+`shardschema` records each never-reused slot generation, a name ending in that
+generation's full UUID, and the exact PostgreSQL `two_phase_at` boundary. The
+primary failover anchor and its synchronized copy must match the same recorded
+boundary; each standby-local decoder matches its own recorded activation
+boundary. Enabling or disabling two-phase decoding in place is never a managed
+transition because PostgreSQL hides `two_phase_at` while the current mode is
+disabled, and a true-to-false-to-true sequence can reveal the older boundary
+again without proving safe history.
+
+The operator therefore owns the managed replication-slot lifecycle through its
+restricted internal role and never issues `ALTER_REPLICATION_SLOT` for these
+slots. The pure validator checks only current visible state; it cannot discover
+a privileged external true-to-false-to-true mutation that restores that state.
+If catalog ownership, lifecycle continuity, or the exclusive-role assumption
+is unproven, the probe must report the slot as unowned and reconciliation must
+fence and recreate it under a new name and generation from a safe checkpoint or
+snapshot. A retired name is never allocated again. Direct superuser mutation
+of managed slots is outside the supported trust boundary and may require
+operator intervention or a new snapshot.
+
 `hot_standby_feedback` is mandatory for these managed standbys, not merely a
 tuning default. It carries the standby logical slots' catalog horizon upstream;
 turning it off, setting its reporting interval to zero, or accepting stale
 feedback can let primary vacuum invalidate standby decoding or synchronized
 slots. Decoder eligibility therefore requires recently observed upstream
-feedback, not configuration alone. Operator reconciliation rejects an override
+feedback, not configuration alone. The reporting interval must remain at least
+one second below the accepted feedback age so scheduling jitter cannot erase
+the health margin. Operator reconciliation rejects an override
 that disables feedback and fences an assigned decoder if the observed setting
 or feedback becomes unhealthy. The physical slot is also mandatory because
 feedback alone disappears across a standby disconnect or restart. Replicas that
@@ -239,7 +308,20 @@ until verified cleanup or rebuild; managed cleanup leaves unrelated user slots
 untouched; unknown collisions fail closed; independent consumers cannot share
 or advance each other's slots; a consumer cannot attach to a slot for another
 logical or source database; same-name and same-OID databases with a different
-system identifier are rejected; and restoring the same system identifier
+system identifier are rejected; a zero or marginless feedback interval, missing
+slot-sync `dbname`, wrong-primary worker connection, success evidence from a
+different worker connection generation, and stale synchronization cycle fence
+decoding and promotion; a valid SQL-capable connection database different from
+the logical slot database remains eligible; the live receiver slot,
+walsender/member identity, and physical-slot owner PID must agree; every
+operator-requested two-phase mode change, lost lifecycle attestation, changed
+visible `two_phase_at` boundary, reused name, or reused generation forces a new
+fenced slot generation, while tests explicitly document that visible state
+alone cannot detect a privileged true-to-false-to-true restoration; a
+concurrent slot-progress race between preflight and `START_REPLICATION`, a
+wrong active backend PID, a mismatch between the actual encoded start/PID and
+the pure report, or any record emitted or acknowledged before the future
+connection-bound authorization fails the test; and restoring the same system identifier
 requires a new restore incarnation. A synchronized slot is never consumed while
 its server is still a standby, and loss of every safe source fails closed. These
 suites are planned and not yet present.

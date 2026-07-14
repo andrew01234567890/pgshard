@@ -6,4 +6,5 @@
 pub mod config;
 pub mod domain;
 pub mod http;
+pub mod standby_slots;
 pub mod telemetry;

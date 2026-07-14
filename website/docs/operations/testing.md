@@ -96,6 +96,21 @@ zero-copy borrowing, debug redaction, and exact fixed-size Standby Status Update
 frames with ordered progress validation. All-or-nothing progress-state tests
 reject write, flush, and apply regression without mutating the last accepted
 sample.
+Pure orchestrator tests exercise the standby-decoder attachment contract. They
+require non-nil catalog generations encoded in slot names and matched exactly,
+the current enabled two-phase mode and activation boundaries; a bounded
+hot-standby-feedback interval
+with a fixed scheduling margin; a slot-sync success from the current
+direct-primary connection generation; exact live receiver, primary walsender,
+and physical-slot-owner correlation; and a second complete invariant check
+after the caller reports that a replication backend acquired the local slot.
+The second check rejects a changed source or current mode, slot progress racing beyond the
+durable checkpoint, a different reported active backend PID, and a reported
+start other than that checkpoint before producing a non-authorizing report.
+Pure values cannot prove which PID and start LSN an actual socket used. These
+tests cover observations only; the live probe, controlled slot lifecycle,
+connection-bound command proof, quarantined COPY-BOTH attachment, and stream
+owner are not implemented.
 Agent unit tests reject unsafe, incompatible, symlinked, structurally incomplete,
 or role-aware recovery state, including base-backup markers and CRC-backed
 `shut down in recovery` or `in archive recovery` control states with both signal
@@ -218,11 +233,34 @@ Jepsen/Elle check the guarantees actually offered: atomic final cross-shard outc
 - Standby-first public streams and reshard materializers, including operator
   configuration of physical and logical slots, `sync_replication_slots`,
   `synchronized_standby_slots`, `primary_slot_name`, and mandatory
-  `hot_standby_feedback`; disabling or stalling feedback must fence the decoder.
+  `hot_standby_feedback`; disabling feedback, setting its report interval to
+  zero or inside the fixed scheduling margin, or stalling feedback must fence
+  the decoder.
 - Independent standby-local slots plus synchronized primary failover anchors
   across source loss and promotion, with no consumption of a synchronized slot
   before promotion and no cross-consumer or cross-database checkpoint or slot
   ownership.
+- Slot-sync health from one SQL-capable connection database on the exact direct
+  primary, including acceptance when that database differs from a logical
+  slot's database and rejection of a missing `dbname`, wrong primary, nil or
+  changed worker connection generation, success attributed to another
+  connection generation, and a stale or absent successful cycle.
+- Exact correlation of the standby's live WAL-receiver slot with the primary's
+  member walsender and physical-slot `active_pid`; configured names without
+  matching live ownership, a wrong application name, and an inactive or
+  differently owned physical slot all fail closed.
+- A quarantined `START_REPLICATION` race suite that advances slot progress
+  after preflight, substitutes another active backend PID, changes every
+  preflight invariant in turn, mismatches the actual `BackendKeyData` PID or
+  encoded start LSN from the pure report, and proves no decoded record or
+  acknowledgement escapes before the future connection-owned authorization.
+- Managed slot lifecycle tests that prove the restricted operator path never
+  uses `ALTER_REPLICATION_SLOT`, recreate on an operator-requested mode change
+  or lost lifecycle attestation, and reject a changed visible `two_phase_at` or
+  attempted reuse of a retired name or generation. A direct privileged
+  true-to-false-to-true round trip documents the trust boundary: restored
+  visible state alone is indistinguishable, so external superuser mutation is
+  unsupported rather than falsely claimed as detectable.
 - Switchover and former-primary rejoin while same-named primary anchors remain:
   synchronization and promotion eligibility stay fenced until checkpoint-safe
   managed-slot cleanup or a rebuild, managed cleanup leaves unrelated user slots
