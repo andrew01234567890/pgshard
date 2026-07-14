@@ -39,11 +39,33 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 
 	postgresConfig := object[*corev1.ConfigMap](t, first, "demo-postgresql-config")
 	contents := postgresConfig.Data["postgresql.conf"]
-	if !strings.Contains(contents, "shared_buffers = 512MB\n") || !strings.Contains(contents, "fsync = on\n") {
+	if !strings.Contains(contents, "shared_buffers = 512MB\n") || !strings.Contains(contents, "fsync = on\n") || !strings.Contains(contents, "max_replication_slots = 20\n") {
 		t.Fatalf("resource-derived settings were not rendered:\n%s", contents)
 	}
 	if strings.Index(contents, "default_statistics_target") > strings.Index(contents, "log_statement") {
 		t.Fatal("PostgreSQL parameters are not sorted")
+	}
+	if len(postgresConfig.Data) != 7 {
+		t.Fatalf("PostgreSQL configuration documents = %#v", postgresConfig.Data)
+	}
+	primary := postgresConfig.Data["primary-0000.conf"]
+	if !strings.Contains(primary, "synchronized_standby_slots = 'pgshard_member_0001,pgshard_member_0002'\n") || !strings.Contains(primary, "synchronous_standby_names = 'ANY 1 (pgshard_member_0001,pgshard_member_0002)'\n") {
+		t.Fatalf("primary role settings were not rendered:\n%s", primary)
+	}
+	promotedPrimary := postgresConfig.Data["primary-0001.conf"]
+	if !strings.Contains(promotedPrimary, "synchronized_standby_slots = 'pgshard_member_0000,pgshard_member_0002'\n") || strings.Contains(promotedPrimary, "pgshard_member_0001") {
+		t.Fatalf("promoted primary did not exclude itself:\n%s", promotedPrimary)
+	}
+	standby := postgresConfig.Data["standby-0001.conf"]
+	for _, expected := range []string{
+		"hot_standby_feedback = on\n",
+		"primary_slot_name = 'pgshard_member_0001'\n",
+		"sync_replication_slots = on\n",
+		"wal_receiver_status_interval = 1s\n",
+	} {
+		if !strings.Contains(standby, expected) {
+			t.Fatalf("standby role setting %q was not rendered:\n%s", expected, standby)
+		}
 	}
 
 	pooler := object[*appsv1.Deployment](t, first, "demo-pooler")
@@ -76,6 +98,30 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 			t.Fatal("planner must not create PostgreSQL Pods before safe lifecycle and HA exist")
 		}
 		assertOwned(t, item, cluster)
+	}
+}
+
+func TestConfigMapDataHashCoversNamesAndContentsDeterministically(t *testing.T) {
+	t.Parallel()
+	first := map[string]string{
+		"postgresql.conf":   "wal_level = logical\n",
+		"standby-0001.conf": "hot_standby_feedback = on\n",
+	}
+	second := map[string]string{
+		"standby-0001.conf": "hot_standby_feedback = on\n",
+		"postgresql.conf":   "wal_level = logical\n",
+	}
+	if configMapDataHash(first) != configMapDataHash(second) {
+		t.Fatal("configuration hash depends on map insertion order")
+	}
+	second["standby-0001.conf"] = "hot_standby_feedback = off\n"
+	if configMapDataHash(first) == configMapDataHash(second) {
+		t.Fatal("configuration hash ignored role-profile content")
+	}
+	delete(second, "standby-0001.conf")
+	second["standby-0002.conf"] = "hot_standby_feedback = on\n"
+	if configMapDataHash(first) == configMapDataHash(second) {
+		t.Fatal("configuration hash ignored role-profile name")
 	}
 }
 

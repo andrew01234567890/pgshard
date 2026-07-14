@@ -84,6 +84,16 @@ func TestValidationAcceptsSafeClusterAndResolvesTuning(t *testing.T) {
 			t.Errorf("%s = %q, want %q", key, settings[key], want)
 		}
 	}
+	configuration, err := cluster.ResolvedPostgreSQLConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.ManagedLogicalConsumers != 8 || configuration.PrimarySlotDemand != 10 || configuration.StandbySlotDemand != 16 || configuration.PromotionSlotDemand != 18 || configuration.Common["max_replication_slots"] != "20" {
+		t.Fatalf("resolved slot configuration = %#v", configuration)
+	}
+	if len(configuration.Primaries) != 3 || configuration.Primaries[0].Settings["synchronous_standby_names"] != "'ANY 1 (pgshard_member_0001,pgshard_member_0002)'" || len(configuration.Standbys) != 3 {
+		t.Fatalf("resolved role profiles = %#v", configuration)
+	}
 }
 
 func TestValidationRejectsPostgreSQL17AndUnsafeOverride(t *testing.T) {
@@ -129,6 +139,13 @@ func TestAsynchronousModeWarnsWithoutDisablingLocalDurability(t *testing.T) {
 	}
 	if settings["synchronous_commit"] != "on" || settings["fsync"] != "on" {
 		t.Fatalf("local durability was weakened: %#v", settings)
+	}
+	configuration, err := cluster.ResolvedPostgreSQLConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.Primaries[0].Settings["synchronous_standby_names"] != "''" || configuration.Primaries[0].Settings["synchronized_standby_slots"] == "''" {
+		t.Fatalf("asynchronous role settings = %#v", configuration.Primaries)
 	}
 }
 

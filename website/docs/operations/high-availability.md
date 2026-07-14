@@ -23,8 +23,11 @@ signal files and also runs the immutable PostgreSQL 18 `pg_controldata` sibling
 to verify its CRC-backed report. Recovery control states are rejected even if a
 signal file was lost, rather than silently turning former standby storage into
 a writable primary. It does not bootstrap or activate a server.
-PostgreSQL observation, replication, durable lease integration, promotion,
-automated recovery and rolling restarts are not implemented; see
+The operator renders inactive common plus per-member primary and standby
+PostgreSQL 18 configuration profiles, including promotion-safe slot capacity, `ANY 1`, and
+mandatory standby feedback and slot synchronization. PostgreSQL observation,
+secure upstream connection material, role activation, replication, durable
+lease integration, promotion, automated recovery, and rolling restarts are not implemented; see
 [implementation status](../project/status.md).
 :::
 
@@ -49,6 +52,27 @@ slot. Promotion and source changes are catalog-fenced and may replay events,
 but they must never skip an event. See
 [change streams](../concepts/change-streams.md#standby-first-slot-topology) for
 the slot roles, required settings, retention bounds, and failure tests.
+
+Capacity includes the failover transition itself. A promoted decoder can still
+hold synchronized anchor copies and standby-local decoder slots while it creates
+physical slots for the remaining replicas. `max_replication_slots` is derived
+from that combined footprint plus bounded repair headroom, so promotion does not
+depend on a configuration restart. This is capacity only: the future
+orchestrator must still prove candidate eligibility and remove an unavailable
+physical slot from `synchronized_standby_slots` before a clean primary shutdown,
+which PostgreSQL otherwise waits to complete.
+
+Demotion has an additional slot-ownership gate. A former primary can retain
+same-named failover anchors that PostgreSQL's slot-sync worker will not replace
+with synchronized copies. Before activating its standby profile, the
+orchestrator fences the member and slot users, verifies durable checkpoint
+handoff, then removes only obsolete catalog-owned primary slots before an
+orderly role change. After an unplanned failover, the old member is never
+restarted writable for cleanup; it is reinitialized from the new primary and
+its slot state is verified. The member cannot decode or become a promotion
+candidate until synchronization from the new primary is observed healthy; an
+unknown or user-owned collision requires operator intervention instead of
+automatic deletion.
 
 ## Planned maintenance
 
