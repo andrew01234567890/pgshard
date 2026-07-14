@@ -119,6 +119,12 @@ work; see
 
 One GitHub Actions workflow fans out into independent jobs and ends in one required aggregate result. Pull requests run focused checks; scheduled invocations expand Kubernetes versions, fault duration, fuzzing, and performance samples.
 
+The image job builds four Linux/amd64 Docker-compatible image archives without
+a registry output, loads each archive locally, and verifies its platform, build
+labels, numeric non-root identity, and binary entrypoint under a read-only root
+filesystem. The archives are discarded with the runner; CI does not upload or
+publish them.
+
 ## Test layers
 
 | Layer | Focus |

@@ -85,4 +85,4 @@ compiled identity matches both values.
 
 ## Publishing boundary
 
-Milestone 1 does **not** publish container images, Helm charts, operator bundles, binaries, crates, npm packages, SBOMs, or provenance to a registry or GitHub Release. Releases contain generated notes and GitHub's source archives only. Short-lived CI artifacts are used internally for KIND jobs.
+Milestone 1 does **not** publish container images, Helm charts, operator bundles, binaries, crates, npm packages, SBOMs, or provenance to a registry or GitHub Release. Releases contain generated notes and GitHub's source archives only. Image archives remain local to the CI job that builds and inspects them; they are not uploaded as workflow artifacts.

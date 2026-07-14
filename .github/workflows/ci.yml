@@ -124,7 +124,7 @@ jobs:
           emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/workflows/'
           emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/workflows/'
           emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^Makefile$|^\.github/workflows/'
-          emit_component images "$images_exists" '^deploy/|^Dockerfile|/Dockerfile$|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
+          emit_component images "$images_exists" '^deploy/|^Dockerfile|/Dockerfile$|^\.dockerignore$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
           emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
           emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^Makefile$|^\.github/workflows/'
           current_website_exists=false
@@ -482,27 +482,41 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Build OCI archives without publishing
-        env:
-          PGSHARD_IMAGE_OUTPUT: artifacts/images
-          PGSHARD_IMAGE_PUSH: "false"
-        run: docker buildx bake --file deploy/docker-bake.hcl ci
-      - name: Store local OCI archives
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Set up archive-capable Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
-          name: kind-images
-          path: artifacts/images/*.tar
-          if-no-files-found: error
-          retention-days: 1
+          cache-binary: false
+      - name: Build local image archives without publishing
+        env:
+          PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
+          PGSHARD_GIT_SHA: ${{ github.sha }}
+          PGSHARD_IMAGE_OUTPUT: artifacts/images
+          PGSHARD_IMAGE_TAG: ci
+        run: make images
+      - name: Verify non-root image entrypoints
+        env:
+          PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
+          PGSHARD_GIT_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for component in agent operator orchestrator pooler; do
+            docker load --input "artifacts/images/pgshard-${component}.tar"
+            image="pgshard/${component}:ci"
+            test "$(docker inspect --format '{{.Config.User}}' "$image")" = "10001:10001"
+            test "$(docker inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = "linux/amd64"
+            test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$PGSHARD_BUILD_VERSION"
+            test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$PGSHARD_GIT_SHA"
+            docker run --rm --platform linux/amd64 --network none --read-only \
+              --cap-drop ALL --security-opt no-new-privileges \
+              "$image" --help >/dev/null
+          done
 
   kind:
     name: KIND / ${{ matrix.scenario }}
-    needs: [changes, images]
+    needs: changes
     if: >-
-      always() &&
-      needs.changes.result == 'success' &&
-      needs.changes.outputs.kind == 'true' &&
-      (needs.images.result == 'success' || needs.images.result == 'skipped')
+      needs.changes.outputs.kind == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -516,12 +530,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Download local OCI archives
-        if: needs.images.result == 'success'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: kind-images
-          path: artifacts/images
       - name: Run KIND scenario
         env:
           PGSHARD_E2E_SCENARIO: ${{ matrix.scenario }}

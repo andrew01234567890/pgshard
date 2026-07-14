@@ -1,0 +1,14 @@
+.git
+.github
+artifacts
+target
+website/.docusaurus
+website/build
+website/node_modules
+**/node_modules
+**/coverage
+**/dist
+*.log
+.env
+.env.*
+!.env.example

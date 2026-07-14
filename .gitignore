@@ -1,4 +1,5 @@
 /target/
+/artifacts/images/
 **/node_modules/
 **/.docusaurus/
 **/build/
