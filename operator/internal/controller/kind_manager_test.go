@@ -20,7 +20,6 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/yaml"
 )
 
 // This exceeds the 5-second initial delay plus three 10-second liveness
@@ -51,14 +50,7 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = kubeClient.Delete(context.Background(), namespace) })
 
-	contents, err := os.ReadFile("../../config/samples/pgshard_v1alpha1_development.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cluster := &pgshardv1alpha1.PgShardCluster{}
-	if err := yaml.UnmarshalStrict(contents, cluster); err != nil {
-		t.Fatal(err)
-	}
+	cluster := readDevelopmentSample(t)
 	cluster.Namespace = namespace.Name
 	if err := kubeClient.Create(ctx, cluster); err != nil {
 		t.Fatal(err)

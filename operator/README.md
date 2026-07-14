@@ -62,12 +62,12 @@ the real operator Deployment from local `pgshard/*:dev` images. The manager
 runs as a numeric non-root user with a read-only root filesystem, namespace-
 scoped leader-election Lease access, bounded probes, zero-unavailable rollouts,
 and no metrics listener.
-The command defaults to admission webhooks enabled, but this development
-overlay passes `--webhook-enabled=false` because certificate provisioning is
-not implemented. It deliberately does not install the generated webhook
-configurations. OpenAPI validation still applies, and the reconciler repeats
-all semantic safety validation before creating children, but this is not a
-production admission setup.
+The command defaults to admission webhooks enabled, but this focused debugging
+overlay passes `--webhook-enabled=false` and deliberately omits the generated
+webhook configurations. Use `config/admission` to exercise self-managed
+certificates and admission. OpenAPI validation still applies here, and the
+reconciler repeats all semantic safety validation before creating children,
+but this is not a production admission setup.
 
 After building and loading the operator, orchestrator, and pooler `:dev` images
 into a local KIND cluster:
@@ -86,6 +86,44 @@ Services have no ready endpoints, no PostgreSQL workload is created, and the
 cluster reports `Ready=False` with `PostgreSQLLifecycleUnavailable`. The named
 backup PVC is only validated configuration; no backup job or repository is
 created.
+
+## Self-managed admission manager
+
+`config/admission` extends the same local-image install with the generated
+mutating and validating webhook configurations. It pre-creates empty,
+operator-labeled Secrets and grants the manager exact-name `get` and `update`
+access only in `pgshard-system`; the manager cannot list Secrets or read
+arbitrary Secret names. A separate ClusterRole permits `get` and `patch` only
+on pgshard's two exact webhook-configuration names. Kubernetes RBAC cannot
+restrict a patch to individual fields, so the provisioner validates the full
+Service target and existing trust state before changing only CA bundles.
+
+Before the webhook listener starts, each manager Pod creates an ECDSA P-256 CA
+and TLS 1.3 serving key pair in those Secrets, validates the Service references,
+injects the CA bundle, and writes the serving files into a private memory-backed
+`emptyDir`. The 90-day serving certificate is checked hourly and renewed 30
+days before expiry. Controller-runtime reloads a renewed key pair without a Pod
+restart, and readiness fails if the local certificate becomes untrusted,
+incorrectly named, or expires. Existing non-empty malformed Secrets,
+foreign CA bundles, and incorrectly targeted webhook configurations stop
+startup instead of being overwritten.
+
+Automatic CA rotation is not implemented. The generated CA is valid for about
+ten years, and startup fails once it can no longer safely issue a full 90-day
+leaf certificate. This explicit boundary avoids an unsafe one-step CA swap;
+overlapping trust and rollout proof are required before automated CA rotation
+is added.
+
+After loading the three local images, install the admission path with:
+
+```console
+kubectl apply -k operator/config/admission
+kubectl rollout status --namespace pgshard-system deployment/pgshard-controller-manager
+```
+
+This remains a development/source-validation install. It proves fail-closed
+admission and manager reconciliation, but still creates no PostgreSQL workload
+or usable application endpoint.
 
 Run the local checks from this directory:
 
@@ -120,6 +158,7 @@ sequence above. No helper shell scripts or `hack` directory are required.
 CI creates separate digest-pinned Kubernetes 1.36 KIND clusters. One exercises
 StatefulSet/PVC creation, supervised deletion, and same-name recreation against
 real Kubernetes controllers. Another builds and loads local images, installs
-the real manager, waits for its rollout, and proves the exact fail-closed
-development boundary above remains stable without container restarts. These
-targeted tests are not yet the full Milestone 1 KIND suite.
+the self-managed admission manager, proves semantic admission rejection and
+certificate trust, waits for real reconciliation, and proves the fail-closed
+supporting boundary remains stable without container restarts. These targeted
+tests are not yet the full Milestone 1 KIND suite.

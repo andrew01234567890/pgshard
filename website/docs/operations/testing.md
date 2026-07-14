@@ -114,12 +114,13 @@ redaction. Complete transaction ordering, relation caching, feedback scheduling
 and durable-checkpoint restart integration, replay, and cross-shard stream tests
 are still absent. A targeted KIND test verifies operator PVC deletion and
 same-name recreation against real Kubernetes 1.36 controllers. A separate KIND
-job builds local images, installs the real certificate-free development
-manager, waits for leader-elected reconciliation, observes a restart-free etcd
-quorum, keeps rejection-only pooler and persistence-free orchestrator
-containers running without restarts while they remain unready, proves
-application Services have no ready endpoints, and verifies no PostgreSQL
-workload exists. A unit
+job builds local images, installs the real manager with self-managed admission
+certificates, proves the generated serving chain and injected CA bundles,
+observes semantic validation reject an unsafe synchronous singleton, waits for
+leader-elected reconciliation, observes a restart-free etcd quorum, keeps
+rejection-only pooler and persistence-free orchestrator containers running
+without restarts while they remain unready, proves application Services have no
+ready endpoints, and verifies no PostgreSQL workload exists. A unit
 regression gives the informer cache a false absence while the authoritative API
 reader still sees an owned PVC, and proves that finalization continues waiting.
 The broader runtime, integration, KIND,

@@ -1,0 +1,16 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: webhook-certificate-role
+  namespace: system
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    resourceNames:
+      - pgshard-webhook-ca
+      - pgshard-webhook-certificate
+    verbs:
+      - get
+      - update

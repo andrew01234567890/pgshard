@@ -34,7 +34,8 @@ ephemeral runner. CI does not upload or publish the archives.
 
 These images contain the current incomplete runtimes. They do not create a
 PostgreSQL cluster, and no image is published by the Milestone 1 release job.
-The certificate-free development Kustomization under
-`operator/config/development` consumes local `:dev` images after they are
-loaded into KIND. It is a tested manager/reconciliation boundary, not a
-deployable database or production admission configuration.
+The Kustomizations under `operator/config/development` and
+`operator/config/admission` consume local `:dev` images after they are loaded
+into KIND. The latter adds self-managed webhook certificates and fail-closed
+admission. Both are tested source-validation boundaries, not deployable
+databases or production distributions.
