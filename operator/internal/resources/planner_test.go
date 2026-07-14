@@ -126,6 +126,21 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if pooler.Spec.Replicas != nil || len(poolerContainer.Ports) != 4 || poolerContainer.ReadinessProbe.HTTPGet.Path != "/readyz" || poolerContainer.ReadinessProbe.FailureThreshold != 1 || poolerContainer.LivenessProbe.HTTPGet.Path != "/healthz" || poolerContainer.LivenessProbe.FailureThreshold != 3 {
 		t.Fatalf("pooler spec = %#v", pooler.Spec)
 	}
+	catalogModeCount := 0
+	for _, variable := range poolerContainer.Env {
+		switch variable.Name {
+		case "PGSHARD_CATALOG_MODE":
+			catalogModeCount++
+			if variable.Value != "bootstrap-unavailable" {
+				t.Fatalf("pooler catalog mode = %q, want bootstrap-unavailable", variable.Value)
+			}
+		case "PGSHARD_SHARDSCHEMA_DSN_FILE":
+			t.Fatal("pooler unexpectedly has a shardschema DSN file")
+		}
+	}
+	if catalogModeCount != 1 {
+		t.Fatalf("pooler catalog mode count = %d, want 1", catalogModeCount)
+	}
 	hpa := object[*autoscalingv2.HorizontalPodAutoscaler](t, plan, "demo-pooler")
 	if *hpa.Spec.MinReplicas != 2 || hpa.Spec.MaxReplicas != 6 || *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization != 70 {
 		t.Fatalf("HPA spec = %#v", hpa.Spec)

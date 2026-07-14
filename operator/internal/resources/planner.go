@@ -504,6 +504,7 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 		{Name: "PGSHARD_RW_BIND", Value: "0.0.0.0:5432"},
 		{Name: "PGSHARD_RO_BIND", Value: "0.0.0.0:5433"},
 		{Name: "PGSHARD_R_BIND", Value: "0.0.0.0:5434"},
+		{Name: "PGSHARD_CATALOG_MODE", Value: "bootstrap-unavailable"},
 		{Name: "PGSHARD_ETCD_ENDPOINTS", Value: etcdEndpoints(cluster)},
 	}
 	if cluster.Spec.Observability.OpenTelemetryEndpoint != "" {

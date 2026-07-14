@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pgshard_catalog::{
     CatalogOperationTimeout, CatalogOperationTimeoutError, CatalogPollInterval,
     CatalogPollIntervalError, CatalogSupervisorConfig, CatalogSupervisorConfigError,
@@ -25,8 +25,18 @@ const CATALOG_APPLICATION_NAME: &str = "pgshard-pooler-catalog";
 pub struct PoolerConfig {
     http_bind: SocketAddr,
     read_write_bind: SocketAddr,
-    catalog: Config,
-    supervisor: CatalogSupervisorConfig,
+    catalog: Option<SupervisedCatalogConfig>,
+}
+
+pub(crate) struct SupervisedCatalogConfig {
+    pub(crate) catalog: Config,
+    pub(crate) supervisor: CatalogSupervisorConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CatalogMode {
+    Local,
+    BootstrapUnavailable,
 }
 
 #[derive(Debug, Parser)]
@@ -44,9 +54,18 @@ struct RawConfig {
     #[arg(long, env = "PGSHARD_RW_BIND", default_value = "0.0.0.0:5432")]
     read_write_bind: SocketAddr,
 
+    /// Catalog runtime: local DSN supervision or explicit unavailable bootstrap.
+    #[arg(
+        long,
+        env = "PGSHARD_CATALOG_MODE",
+        value_enum,
+        default_value_t = CatalogMode::Local
+    )]
+    catalog_mode: CatalogMode,
+
     /// File containing one local-only shardschema database DSN (maximum 16 KiB).
     #[arg(long, env = "PGSHARD_SHARDSCHEMA_DSN_FILE")]
-    shardschema_dsn_file: PathBuf,
+    shardschema_dsn_file: Option<PathBuf>,
 
     /// Authoritative catalog polling interval in milliseconds (1,000..=300,000).
     #[arg(
@@ -116,31 +135,20 @@ impl PoolerConfig {
         T: Into<OsString> + Clone,
     {
         let raw = RawConfig::try_parse_from(arguments)?;
-        let dsn = read_shardschema_dsn(&raw.shardschema_dsn_file)?;
-        let mut catalog: Config = dsn.parse().map_err(|_| PoolerConfigError::InvalidDsn)?;
-        validate_catalog_transport(&catalog)?;
-        catalog.application_name(CATALOG_APPLICATION_NAME);
-
-        let poll_interval =
-            CatalogPollInterval::new(Duration::from_millis(raw.catalog_poll_interval_ms))?;
-        let operation_timeout =
-            CatalogOperationTimeout::new(Duration::from_millis(raw.catalog_operation_timeout_ms))?;
-        let supervisor = CatalogSupervisorConfig::new(
-            poll_interval,
-            Duration::from_millis(raw.catalog_stale_grace_ms),
-            Duration::from_millis(raw.catalog_initial_reconnect_delay_ms),
-            Duration::from_millis(raw.catalog_max_reconnect_delay_ms),
-        )?
-        .with_timeouts(
-            Duration::from_millis(raw.catalog_connect_timeout_ms),
-            operation_timeout,
-        )?;
+        let supervisor = catalog_supervisor(&raw)?;
+        let catalog = match (raw.catalog_mode, raw.shardschema_dsn_file.as_deref()) {
+            (CatalogMode::Local, Some(path)) => Some(supervised_catalog(path, supervisor)?),
+            (CatalogMode::Local, None) => return Err(PoolerConfigError::CatalogDsnRequired),
+            (CatalogMode::BootstrapUnavailable, None) => None,
+            (CatalogMode::BootstrapUnavailable, Some(_)) => {
+                return Err(PoolerConfigError::CatalogDsnForbiddenInBootstrapMode);
+            }
+        };
 
         Ok(Self {
             http_bind: raw.http_bind,
             read_write_bind: raw.read_write_bind,
             catalog,
-            supervisor,
         })
     }
 
@@ -156,8 +164,8 @@ impl PoolerConfig {
         self.read_write_bind
     }
 
-    pub(crate) fn into_runtime_parts(self) -> (Config, CatalogSupervisorConfig) {
-        (self.catalog, self.supervisor)
+    pub(crate) fn into_runtime_parts(self) -> Option<SupervisedCatalogConfig> {
+        self.catalog
     }
 
     #[cfg(test)]
@@ -170,10 +178,56 @@ impl PoolerConfig {
         Self {
             http_bind,
             read_write_bind,
-            catalog,
-            supervisor,
+            catalog: Some(SupervisedCatalogConfig {
+                catalog,
+                supervisor,
+            }),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn bootstrap_unavailable(
+        http_bind: SocketAddr,
+        read_write_bind: SocketAddr,
+    ) -> Self {
+        Self {
+            http_bind,
+            read_write_bind,
+            catalog: None,
+        }
+    }
+}
+
+fn supervised_catalog(
+    dsn_path: &Path,
+    supervisor: CatalogSupervisorConfig,
+) -> Result<SupervisedCatalogConfig, PoolerConfigError> {
+    let dsn = read_shardschema_dsn(dsn_path)?;
+    let mut catalog: Config = dsn.parse().map_err(|_| PoolerConfigError::InvalidDsn)?;
+    validate_catalog_transport(&catalog)?;
+    catalog.application_name(CATALOG_APPLICATION_NAME);
+
+    Ok(SupervisedCatalogConfig {
+        catalog,
+        supervisor,
+    })
+}
+
+fn catalog_supervisor(raw: &RawConfig) -> Result<CatalogSupervisorConfig, PoolerConfigError> {
+    let poll_interval =
+        CatalogPollInterval::new(Duration::from_millis(raw.catalog_poll_interval_ms))?;
+    let operation_timeout =
+        CatalogOperationTimeout::new(Duration::from_millis(raw.catalog_operation_timeout_ms))?;
+    Ok(CatalogSupervisorConfig::new(
+        poll_interval,
+        Duration::from_millis(raw.catalog_stale_grace_ms),
+        Duration::from_millis(raw.catalog_initial_reconnect_delay_ms),
+        Duration::from_millis(raw.catalog_max_reconnect_delay_ms),
+    )?
+    .with_timeouts(
+        Duration::from_millis(raw.catalog_connect_timeout_ms),
+        operation_timeout,
+    )?)
 }
 
 fn read_shardschema_dsn(path: &Path) -> Result<String, PoolerConfigError> {
@@ -261,6 +315,12 @@ pub enum PoolerConfigError {
     /// The DSN file could not be read.
     #[error("could not read the shardschema DSN file: {0}")]
     DsnFile(#[source] std::io::Error),
+    /// Local supervision has no DSN file.
+    #[error("shardschema DSN file is required in local catalog mode")]
+    CatalogDsnRequired,
+    /// Bootstrap mode must not silently retain catalog credentials.
+    #[error("shardschema DSN file must be absent in bootstrap-unavailable catalog mode")]
+    CatalogDsnForbiddenInBootstrapMode,
     /// The DSN path does not resolve to a regular file.
     #[error("shardschema DSN path must resolve to a regular file")]
     DsnNotRegularFile,
@@ -384,6 +444,15 @@ mod tests {
         PoolerConfig::try_parse_from(file.arguments())
     }
 
+    fn bootstrap_arguments() -> Vec<OsString> {
+        vec![
+            OsString::from("pgshard-pooler"),
+            OsString::from("--http-bind=0.0.0.0:8080"),
+            OsString::from("--read-write-bind=0.0.0.0:5432"),
+            OsString::from("--catalog-mode=bootstrap-unavailable"),
+        ]
+    }
+
     #[test]
     fn accepts_bounded_local_catalog_configuration() {
         let config = parse(format!("{VALID_DSN}\n").as_bytes()).expect("valid pooler config");
@@ -395,15 +464,50 @@ mod tests {
             config.read_write_bind(),
             "0.0.0.0:5432".parse().expect("default read-write bind")
         );
-        assert_eq!(config.catalog.get_dbname(), Some(SHARDSCHEMA_DATABASE));
+        let Some(SupervisedCatalogConfig {
+            catalog,
+            supervisor,
+        }) = &config.catalog
+        else {
+            panic!("local catalog configuration did not enable supervision");
+        };
+        assert_eq!(catalog.get_dbname(), Some(SHARDSCHEMA_DATABASE));
         assert_eq!(
-            config.catalog.get_application_name(),
+            catalog.get_application_name(),
             Some(CATALOG_APPLICATION_NAME)
         );
         assert_eq!(
-            config.supervisor.operation_timeout().get(),
+            supervisor.operation_timeout().get(),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn accepts_only_explicit_credential_free_bootstrap_mode() {
+        let config = PoolerConfig::try_parse_from(bootstrap_arguments())
+            .expect("explicit bootstrap-unavailable mode");
+        assert!(config.catalog.is_none());
+
+        assert!(matches!(
+            PoolerConfig::try_parse_from(["pgshard-pooler"]),
+            Err(PoolerConfigError::CatalogDsnRequired)
+        ));
+
+        let file = TestDsnFile::new(VALID_DSN.as_bytes());
+        let mut arguments = bootstrap_arguments();
+        arguments.push(OsString::from("--shardschema-dsn-file"));
+        arguments.push(file.path.as_os_str().to_owned());
+        assert!(matches!(
+            PoolerConfig::try_parse_from(arguments),
+            Err(PoolerConfigError::CatalogDsnForbiddenInBootstrapMode)
+        ));
+
+        let mut arguments = bootstrap_arguments();
+        arguments.push(OsString::from("--catalog-poll-interval-ms=999"));
+        assert!(matches!(
+            PoolerConfig::try_parse_from(arguments),
+            Err(PoolerConfigError::PollInterval(_))
+        ));
     }
 
     #[test]
@@ -484,6 +588,8 @@ mod tests {
         for expected in [
             "PostgreSQL handshake boundary",
             "connections are rejected until the data plane exists",
+            "explicit unavailable bootstrap",
+            "bootstrap-unavailable",
             "maximum 16 KiB",
             "1,000..=300,000",
             "2,000..=900,000",

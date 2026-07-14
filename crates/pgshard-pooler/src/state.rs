@@ -8,6 +8,7 @@ use serde::{Serialize, Serializer};
 
 type CatalogSnapshotSource = dyn Fn() -> PoolerCatalogSnapshot + Send + Sync;
 const DATA_PLANE_UNAVAILABLE: &str = "data_plane_unavailable";
+const CATALOG_NOT_CONFIGURED: &str = "catalog_not_configured";
 
 /// Externally reportable catalog state for one pooler process.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -101,6 +102,28 @@ impl PoolerState {
     pub fn control_only(catalog: CatalogSupervisorStatus) -> Self {
         Self {
             catalog_snapshot: Arc::new(move || catalog.snapshot().into()),
+            data_plane_ready: false,
+        }
+    }
+
+    /// Creates a healthy but unready process state for installation before a
+    /// catalog transport has been provisioned.
+    #[must_use]
+    pub(crate) fn bootstrap_unavailable() -> Self {
+        Self {
+            catalog_snapshot: Arc::new(|| PoolerCatalogSnapshot {
+                phase: "not_configured",
+                connection_up: false,
+                ready: false,
+                readiness_reason: CATALOG_NOT_CONFIGURED,
+                catalog_epoch: None,
+                cache_age: None,
+                consecutive_failures: 0,
+                total_failures: 0,
+                connect_attempts: 0,
+                successful_connections: 0,
+                last_failure: None,
+            }),
             data_plane_ready: false,
         }
     }
@@ -206,6 +229,19 @@ mod tests {
         assert!(!stopped.ready);
         assert_eq!(stopped.catalog.phase, "stopped");
         assert_eq!(stopped.catalog.readiness_reason, "stopped");
+    }
+
+    #[test]
+    fn bootstrap_without_catalog_is_observable_and_unready() {
+        let state = PoolerState::bootstrap_unavailable();
+        let snapshot = state.snapshot();
+        assert!(!snapshot.ready);
+        assert_eq!(snapshot.catalog.phase, "not_configured");
+        assert_eq!(snapshot.catalog.readiness_reason, CATALOG_NOT_CONFIGURED);
+        assert!(!snapshot.catalog.connection_up);
+        assert_eq!(snapshot.catalog.connect_attempts, 0);
+        assert_eq!(snapshot.catalog.last_failure, None);
+        assert_eq!(state.readiness().reason, CATALOG_NOT_CONFIGURED);
     }
 
     #[test]

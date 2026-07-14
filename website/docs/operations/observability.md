@@ -32,7 +32,9 @@ distinct `connect_timeout` and `operation_timeout` labels. Health remains live
 when catalog readiness fails so Kubernetes can distinguish a process crash from
 an unavailable or stale routing catalog. `pgshard_pooler_catalog_ready` reports
 catalog usability separately from `pgshard_pooler_ready`, which remains zero in
-the control-only executable.
+the control-only executable. Before the operator can provision catalog
+transport, its explicit bootstrap mode reports phase `not_configured`, reason
+`catalog_not_configured`, zero connection attempts, and failure label `none`.
 
 ## Cluster operation signals
 

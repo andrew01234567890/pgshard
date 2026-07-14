@@ -437,6 +437,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_mode_publishes_bounded_unconfigured_signals() {
+        let bootstrap = PoolerState::bootstrap_unavailable();
+        let readiness = request("/readyz", bootstrap.clone()).await;
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body(readiness).await,
+            r#"{"ready":false,"reason":"catalog_not_configured"}"#
+        );
+
+        let metrics = body(request("/metrics", bootstrap).await).await;
+        assert!(metrics.contains("pgshard_pooler_catalog_ready 0\n"));
+        assert!(
+            metrics.contains("pgshard_pooler_catalog_phase_info{phase=\"not_configured\"} 1\n")
+        );
+        assert!(metrics.contains(
+            "pgshard_pooler_catalog_readiness_info{reason=\"catalog_not_configured\"} 1\n"
+        ));
+        assert!(metrics.contains("pgshard_pooler_catalog_connect_attempts_total 0\n"));
+        assert!(metrics.contains("pgshard_pooler_catalog_last_failure_info{kind=\"none\"} 1\n"));
+    }
+
+    #[tokio::test]
     async fn retries_an_accept_error_then_serves_a_connection() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

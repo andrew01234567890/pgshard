@@ -11,29 +11,45 @@ use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_postgres::NoTls;
 
-use crate::config::PoolerConfig;
+use crate::config::{PoolerConfig, SupervisedCatalogConfig};
 use crate::state::PoolerState;
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One fail-closed pooler runtime.
 pub struct PoolerRuntime {
-    catalog: CatalogSupervisor,
-    catalog_config: tokio_postgres::Config,
+    catalog: Option<SupervisedCatalog>,
     state: PoolerState,
+}
+
+struct SupervisedCatalog {
+    supervisor: CatalogSupervisor,
+    config: tokio_postgres::Config,
 }
 
 impl PoolerRuntime {
     /// Builds a fail-closed runtime that remains application-unready.
     #[must_use]
     pub fn new(config: PoolerConfig) -> Self {
-        let (catalog_config, supervisor_config) = config.into_runtime_parts();
-        let catalog = CatalogSupervisor::new(Arc::new(CatalogCache::new()), supervisor_config);
-        let state = PoolerState::control_only(catalog.status());
-        Self {
-            catalog,
-            catalog_config,
-            state,
+        match config.into_runtime_parts() {
+            Some(SupervisedCatalogConfig {
+                catalog,
+                supervisor,
+            }) => {
+                let supervisor = CatalogSupervisor::new(Arc::new(CatalogCache::new()), supervisor);
+                let state = PoolerState::control_only(supervisor.status());
+                Self {
+                    catalog: Some(SupervisedCatalog {
+                        supervisor,
+                        config: catalog,
+                    }),
+                    state,
+                }
+            }
+            None => Self {
+                catalog: None,
+                state: PoolerState::bootstrap_unavailable(),
+            },
         }
     }
 
@@ -43,12 +59,12 @@ impl PoolerRuntime {
         self.state.clone()
     }
 
-    /// Runs catalog supervision, HTTP control, and the `PostgreSQL` handshake
-    /// boundary until shutdown.
+    /// Runs optional catalog supervision, HTTP control, and the `PostgreSQL`
+    /// handshake boundary until shutdown.
     ///
-    /// The current connector is intentionally restricted by [`PoolerConfig`]
-    /// to loopback IP literals or Unix sockets with `sslmode=disable`. It is a
-    /// development bridge, not the future authenticated cluster transport.
+    /// In local mode the connector is intentionally restricted by
+    /// [`PoolerConfig`] to loopback IP literals or Unix sockets with
+    /// `sslmode=disable`. Bootstrap-unavailable mode starts no connector.
     /// Dropping this future broadcasts shutdown to all child tasks.
     ///
     /// # Errors
@@ -64,22 +80,21 @@ impl PoolerRuntime {
     where
         F: Future<Output = ()> + Send,
     {
-        let Self {
-            catalog,
-            catalog_config,
-            state,
-        } = self;
+        let Self { catalog, state } = self;
         let (stop_sender, stop_receiver) = watch::channel(false);
         let stop_guard = StopOnDrop(stop_sender);
 
         let catalog_shutdown = wait_for_stop(stop_receiver.clone());
-        let mut catalog_task = tokio::spawn(catalog.run(
-            move || {
-                let config = catalog_config.clone();
-                async move { config.connect(NoTls).await }
-            },
-            catalog_shutdown,
-        ));
+        let mut catalog_task = match catalog {
+            Some(SupervisedCatalog { supervisor, config }) => tokio::spawn(supervisor.run(
+                move || {
+                    let config = config.clone();
+                    async move { config.connect(NoTls).await }
+                },
+                catalog_shutdown,
+            )),
+            None => tokio::spawn(catalog_shutdown),
+        };
         let mut http_task = tokio::spawn(crate::http::serve_listener(
             http_listener,
             state,
@@ -341,5 +356,46 @@ mod tests {
             state.snapshot().catalog.phase,
             CatalogConnectionPhase::Stopped.as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_without_catalog_serves_control_and_stops_cleanly() {
+        let http_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bootstrap HTTP listener");
+        let http_address = http_listener.local_addr().expect("bootstrap HTTP address");
+        let frontend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bootstrap PostgreSQL listener");
+        let frontend_address = frontend_listener
+            .local_addr()
+            .expect("bootstrap PostgreSQL address");
+        let runtime = PoolerRuntime::new(PoolerConfig::bootstrap_unavailable(
+            http_address,
+            frontend_address,
+        ));
+        let state = runtime.state();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(runtime.run(http_listener, frontend_listener, async move {
+            let _ = shutdown_receiver.await;
+        }));
+
+        assert_eq!(state.readiness().reason, "catalog_not_configured");
+        TcpStream::connect(http_address)
+            .await
+            .expect("bootstrap HTTP listener accepts a connection");
+        TcpStream::connect(frontend_address)
+            .await
+            .expect("bootstrap PostgreSQL listener accepts a connection");
+
+        shutdown_sender
+            .send(())
+            .expect("runtime retains bootstrap shutdown receiver");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("bootstrap runtime stops within one second")
+            .expect("bootstrap runtime task")
+            .expect("clean bootstrap runtime shutdown");
+        assert_eq!(state.snapshot().catalog.phase, "not_configured");
     }
 }
