@@ -21,7 +21,32 @@ polling. It also interrupts a lock-blocked initial load, shuts down cleanly, and
 proves the unsupervised driver treats forced connection loss as terminal. A
 second blocked initial load and a later refresh each reach their operation
 deadline and prove exact phase classification, unchanged cache state, and
-backend exit. Unit coverage separately holds the cache publication lock through
+backend exit. The same PostgreSQL 18 fixture exercises the logical-consumer
+registry's core trigger and ownership-fenced checkpoint CAS paths through its
+migration principal; a separate rollback-only smoke path creates the registry
+allocation set through
+the restricted catalog-admin role. It also verifies that privileged functions
+place the temporary schema last in their fixed search paths and that replaying
+the migration cannot resurrect a retired restore incarnation or advance the
+catalog epoch. The trigger suite rejects slot names that
+do not encode their complete UUID generation, activation without both the
+primary anchor and selected source, an attachment that invents a restore
+incarnation, snapshot completion behind either slot's consistent point or
+two-phase boundary, a checkpoint source-lineage mismatch, readiness with a
+snapshot-required checkpoint, checkpoint regression or progress without an
+ordinal advance, progress before source activation or after source retirement,
+each selected-source and anchor activation boundary in isolation,
+two-phase-boundary mutation, generation-incompatible name reuse and retired
+generation rebinding, restore rotation while a checkpoint or non-retired source
+attachment exists, retirement before dependent slots, and a stale checkpoint
+advance waiting behind a concurrently committed owner fence. It also rejects
+fencing a ready owner without advancing its ownership fence and consumer
+creation under draining and retired logical databases, cleans up an activated
+slot after attachment
+activation fails, completes the ordered fence, slot, attachment, checkpoint,
+consumer, and restore-incarnation rotation path, and proves the retired records
+remain
+immutable. Unit coverage separately holds the cache publication lock through
 expiry and proves no late snapshot is installed. The supervisor scenario
 then kills its live backend, deliberately blocks the next connection attempt,
 observes repeated bounded connection timeouts, verifies readiness survives only
@@ -108,7 +133,8 @@ The second check rejects a changed source or current mode, slot progress racing 
 durable checkpoint, a different reported active backend PID, and a reported
 start other than that checkpoint before producing a non-authorizing report.
 Pure values cannot prove which PID and start LSN an actual socket used. These
-tests cover observations only; the live probe, controlled slot lifecycle,
+tests cover observations only; the catalog allocation lifecycle is tested
+separately, while the live probe, controlled PostgreSQL slot lifecycle,
 connection-bound command proof, quarantined COPY-BOTH attachment, and stream
 owner are not implemented.
 Agent unit tests reject unsafe, incompatible, symlinked, structurally incomplete,

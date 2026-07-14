@@ -51,9 +51,12 @@ no record may be emitted, delivered, or acknowledged before it does. Both
 copies of the failover anchor
 are checked but never selected while the server is in recovery, and transient
 ownership of the synchronized copy by PostgreSQL's slot-sync worker is
-accepted. No PostgreSQL Pod consumes the profiles yet, and secure
-`primary_conninfo`, live observation, slot creation or mutation, role
-activation, quarantined attachment, and stream ownership remain unimplemented.
+accepted. `shardschema` now stores permanent consumer, checkpoint, attachment,
+and managed-slot generations with fenced lifecycle constraints and PostgreSQL
+18 contract coverage. That registry has no Rust loader or reconciler yet. No
+PostgreSQL Pod consumes the profiles, and secure `primary_conninfo`, live
+observation, slot creation or mutation, role activation, quarantined
+attachment, and stream ownership remain unimplemented.
 
 The source also contains a fixed-size PostgreSQL 18 Standby Status Update
 encoder. It validates that neither flush nor apply is ahead of write but does
@@ -157,18 +160,35 @@ per-shard record is keyed by consumer, `logical_database_id`, and shard. Its
 source-attachment key adds the shard restore incarnation, PostgreSQL system
 identifier from `pg_control_system()`, and database OID; the database name is
 descriptive metadata, not identity. It also records the bounded purpose,
-primary anchor, selected source server and timeline, standby-local slot and
-consistent point, each active slot's catalog generation and
-generation-encoded name, durable checkpoint and checkpoint generation, and
-ownership fence. The planned registry permanently tombstones retired names and
-generations; the pure attachment validator only matches the active catalog
-values. A consumer cannot attach to a slot until those fields match its current
-catalog epoch and lease.
-Physical replicas share the system identifier and database OID, so an ordinary
-promotion can retain the attachment after its timeline checks. A reinitialized
-shard has a different system identifier. A restore can reuse both the system
+cluster-scoped primary anchor, explicit selected source role, source server and
+timeline, member-ordinal-bound standby-local slot and consistent point, each
+active slot's catalog generation and generation-encoded name, durable
+source-bound checkpoint and checkpoint generation, and ownership fence. The
+migration implements those records and permanently tombstones retired names and
+generations, while the pure attachment validator
+only accepts caller-supplied active catalog values. The catalog rejects
+checkpoint seeding or regression, progress changes during retirement,
+generation-incompatible slot names or generation rebinding, source-identity
+rebinding, checkpoint progress without active exact-lineage source and anchor
+slots, activation without a primary anchor and selected source slot, snapshot
+completion behind either slot's consistent point or two-phase boundary,
+readiness without a resumable checkpoint, and retirement out of order. A
+consumer cannot attach to a slot
+until a future catalog reader and connection-owning runtime prove those fields
+match its current catalog epoch and lease. Catalog presence by itself is
+non-authorizing.
+
+Each checkpoint generation is immutably bound to its shard restore incarnation,
+PostgreSQL system identifier, database OID, and source timeline. Physical
+replicas share the system identifier and database OID, so a source move on the
+same timeline can retain the checkpoint. A timeline change must rotate the
+source attachment and, until a future ancestry proof exists, allocate a
+snapshot-required checkpoint generation; bare LSNs are never compared across
+catalog lineages. The synchronized anchor still preserves PostgreSQL failover
+state, but does not by itself authorize checkpoint reuse. A reinitialized shard
+has a different system identifier. A restore can reuse both the system
 identifier and database OID, so every initial bootstrap and coordinated restore
-installs a fresh immutable shard restore-incarnation UUID before slot
+must install a fresh immutable shard restore-incarnation UUID before slot
 reconciliation or application service. Any mismatch is fenced and requires a
 compatible snapshot instead of rebinding the record. This prevents workers,
 databases, restored histories, or different uses such as a public stream and a
@@ -190,16 +210,20 @@ The operator automatically synchronizes each primary anchor to eligible direct
 standbys for promotion safety. Standby-local slots are independent and
 reconciled separately; pgshard never describes them as synchronized and never
 treats a PostgreSQL-synchronized slot as usable on a server that is still in
-recovery. `shardschema` records each local slot's consistent point.
-A new local slot is ineligible while that point is ahead of the durable
-checkpoint because PostgreSQL cannot decode the missing older WAL through that
-slot. The old source or primary anchor remains active until the checkpoint
-reaches the new consistent point; if neither retains the gap, the stream
-requires a new snapshot. Source selection is fenced by shard term, restore
-incarnation, system identifier, database OID, timeline, catalog epoch, slot
-identity, consistent point, and the durable checkpoint. A safe source change
-starts from that checkpoint and can replay already acknowledged WAL, so the
-public contract remains at-least-once.
+recovery. The anchor allocation is cluster-scoped and has no member identity;
+its synchronized physical copies and current primary placement are observed
+runtime state. Each standby decoder allocation is member-bound. `shardschema`
+records its canonical member ordinal, the attachment's selected role, and each
+local slot's consistent point and two-phase boundary. A new local slot is
+ineligible while either boundary is ahead of the durable checkpoint because
+PostgreSQL cannot decode the missing older WAL through that slot. The old source
+or primary anchor remains active until the checkpoint reaches both boundaries;
+if neither retains the gap, the stream requires a new snapshot. Source
+selection is fenced by shard term, restore incarnation, system identifier,
+database OID, timeline, catalog epoch, slot identity, both activation
+boundaries, and the durable checkpoint. A safe source change starts from that
+checkpoint and can replay already acknowledged WAL, so the public contract
+remains at-least-once.
 
 For every shard that can host a decoder or receive a synchronized anchor, the
 operator enforces the PostgreSQL 18 prerequisites as one configuration unit:

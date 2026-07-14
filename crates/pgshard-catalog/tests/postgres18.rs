@@ -26,6 +26,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 struct Fixture {
     logical_database_id: String,
     nonce: u128,
+    restore_incarnation: String,
     shard_id: String,
 }
 
@@ -118,6 +119,44 @@ fn assert_sqlstate(error: &PgError, expected: &str) {
     );
 }
 
+fn assert_database_message(error: &PgError, expected: &str) {
+    let actual = error
+        .as_db_error()
+        .map(tokio_postgres::error::DbError::message);
+    assert_eq!(
+        actual,
+        Some(expected),
+        "unexpected PostgreSQL error: {error}"
+    );
+}
+
+async fn advance_checkpoint(
+    client: &Client,
+    checkpoint_generation: &str,
+    expected_ownership_fence: i64,
+    expected_checkpoint_ordinal: i64,
+    checkpoint_lsn: &str,
+    checkpoint_ordinal: i64,
+    snapshot_required: bool,
+) -> Result<i64, PgError> {
+    Ok(client
+        .query_one(
+            "SELECT pgshard_catalog.advance_logical_consumer_checkpoint( \
+                 $1::text::uuid, $2, $3, $4::text::pg_lsn, $5, $6 \
+             )",
+            &[
+                &checkpoint_generation,
+                &expected_ownership_fence,
+                &expected_checkpoint_ordinal,
+                &checkpoint_lsn,
+                &checkpoint_ordinal,
+                &snapshot_required,
+            ],
+        )
+        .await?
+        .get(0))
+}
+
 async fn catalog_epoch(client: &Client) -> Result<i64, PgError> {
     Ok(client
         .query_one(
@@ -203,6 +242,28 @@ async fn assert_installation_contract(client: &Client) -> TestResult {
         .get(0);
     assert!(server_version >= 180_000);
 
+    let unsafe_security_definers: i64 = client
+        .query_one(
+            "SELECT count(*) \
+             FROM pg_catalog.pg_proc AS procedures \
+             JOIN pg_catalog.pg_namespace AS namespaces \
+               ON namespaces.oid = procedures.pronamespace \
+             WHERE namespaces.nspname = 'pgshard_catalog' \
+               AND procedures.prosecdef \
+               AND NOT coalesce( \
+                   procedures.proconfig @> \
+                       ARRAY['search_path=pg_catalog, pgshard_catalog, pg_temp'], \
+                   false \
+               )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        unsafe_security_definers, 0,
+        "security-definer functions must place pg_temp last"
+    );
+
     let unsafe_column_count: i64 = client
         .query_one(
             "SELECT count(*) FROM information_schema.columns \
@@ -261,11 +322,86 @@ async fn create_fixture(client: &Client) -> TestResult<Fixture> {
             &[&shard_id, &shard_number],
         )
         .await?;
+    let restore_incarnation: String = client
+        .query_one(
+            "SELECT restore_incarnation::text \
+             FROM pgshard_catalog.shard_restore_incarnations \
+             WHERE shard_id = $1::text AND state = 'active'",
+            &[&shard_id],
+        )
+        .await?
+        .get(0);
     Ok(Fixture {
         logical_database_id,
         nonce,
+        restore_incarnation,
         shard_id,
     })
+}
+
+async fn assert_migration_does_not_resurrect_retired_restore(
+    client: &Client,
+    nonce: u128,
+) -> TestResult {
+    let shard_id = format!("replay-{nonce}");
+    let shard_number: i64 = client
+        .query_one(
+            "SELECT coalesce(max(shard_number), 0) + 1 FROM pgshard_catalog.shards",
+            &[],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.shards(shard_id, shard_number) \
+             VALUES ($1::text, $2)",
+            &[&shard_id, &shard_number],
+        )
+        .await?;
+    let restore_incarnation: String = client
+        .query_one(
+            "SELECT restore_incarnation::text \
+             FROM pgshard_catalog.shard_restore_incarnations \
+             WHERE shard_id = $1::text AND state = 'active'",
+            &[&shard_id],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "UPDATE pgshard_catalog.shard_restore_incarnations \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE restore_incarnation = $1::text::uuid",
+            &[&restore_incarnation],
+        )
+        .await?;
+    let epoch_before_replay = catalog_epoch(client).await?;
+    client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
+    assert_eq!(
+        catalog_epoch(client).await?,
+        epoch_before_replay,
+        "migration replay mutated catalog state after restore retirement"
+    );
+    let row = client
+        .query_one(
+            "SELECT \
+                 count(*) FILTER (WHERE state = 'active'), \
+                 count(*) FILTER ( \
+                     WHERE restore_incarnation = $2::text::uuid AND state = 'retired' \
+                 ) \
+             FROM pgshard_catalog.shard_restore_incarnations \
+             WHERE shard_id = $1::text",
+            &[&shard_id, &restore_incarnation],
+        )
+        .await?;
+    let active_count: i64 = row.get(0);
+    let retired_count: i64 = row.get(1);
+    assert_eq!(
+        active_count, 0,
+        "migration replay resurrected retired WAL history"
+    );
+    assert_eq!(retired_count, 1, "migration replay rewrote restore history");
+    Ok(())
 }
 
 async fn assert_identity_history_contract(client: &Client, fixture: &Fixture) -> TestResult {
@@ -371,6 +507,15 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
             &[&shard_id, &shard_number],
         )
         .await?;
+    let restore_incarnation: String = transaction
+        .query_one(
+            "SELECT restore_incarnation::text \
+             FROM pgshard_catalog.shard_restore_incarnations \
+             WHERE shard_id = $1::text AND state = 'active'",
+            &[&shard_id],
+        )
+        .await?
+        .get(0);
     transaction
         .execute(
             "INSERT INTO pgshard_catalog.registered_tables( \
@@ -379,6 +524,14 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
             &[&logical_database_id],
         )
         .await?;
+    assert_admin_consumer_write_path(
+        &transaction,
+        nonce,
+        &logical_database_id,
+        &shard_id,
+        &restore_incarnation,
+    )
+    .await?;
     let routing_epoch: i64 = transaction
         .query_one(
             "INSERT INTO pgshard_catalog.routing_epochs(logical_database_id) \
@@ -422,6 +575,154 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
         )
         .await?;
     transaction.rollback().await?;
+    Ok(())
+}
+
+async fn assert_admin_consumer_write_path(
+    transaction: &tokio_postgres::Transaction<'_>,
+    nonce: u128,
+    logical_database_id: &str,
+    shard_id: &str,
+    restore_incarnation: &str,
+) -> TestResult {
+    let checkpoint_generation = fixture_uuid(nonce, 101).to_string();
+    let consumer_id: String = transaction
+        .query_one(
+            "INSERT INTO pgshard_catalog.logical_consumers( \
+                 logical_database_id, consumer_name, purpose \
+             ) VALUES ($1::text::uuid, $2::text, 'change-stream') \
+             RETURNING consumer_id::text",
+            &[&logical_database_id, &format!("admin-stream-{nonce}")],
+        )
+        .await?
+        .get(0);
+    transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_shards( \
+                 consumer_id, logical_database_id, shard_id \
+             ) VALUES ($1::text::uuid, $2::text::uuid, $3::text)",
+            &[&consumer_id, &logical_database_id, &shard_id],
+        )
+        .await?;
+    transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_checkpoints( \
+                 checkpoint_generation, consumer_id, logical_database_id, shard_id, \
+                 restore_incarnation, system_identifier, database_oid, source_timeline \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text, \
+                 $5::text::uuid, 1, 1, 1 \
+             )",
+            &[
+                &checkpoint_generation,
+                &consumer_id,
+                &logical_database_id,
+                &shard_id,
+                &restore_incarnation,
+            ],
+        )
+        .await?;
+    let attachment_generation = fixture_uuid(nonce, 102).to_string();
+    transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_attachments( \
+                 attachment_generation, consumer_id, logical_database_id, shard_id, \
+                 restore_incarnation, system_identifier, database_oid, database_name, \
+                 selected_source_member_ordinal, selected_source_role, selected_source_timeline \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text, \
+                 $5::text::uuid, 1, 1, 'admin_database', 0, 'primary-anchor', 1 \
+             )",
+            &[
+                &attachment_generation,
+                &consumer_id,
+                &logical_database_id,
+                &shard_id,
+                &restore_incarnation,
+            ],
+        )
+        .await?;
+    let slot_generation = fixture_uuid(nonce, 104);
+    transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                 slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                 shard_id, slot_role, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                 $5::text, 'primary-anchor', $6::text \
+             )",
+            &[
+                &slot_generation.to_string(),
+                &attachment_generation,
+                &consumer_id,
+                &logical_database_id,
+                &shard_id,
+                &format!("anchor_{}", slot_generation.simple()),
+            ],
+        )
+        .await?;
+    assert_admin_checkpoint_write_path(
+        transaction,
+        &checkpoint_generation,
+        &attachment_generation,
+        slot_generation,
+    )
+    .await
+}
+
+async fn assert_admin_checkpoint_write_path(
+    transaction: &tokio_postgres::Transaction<'_>,
+    checkpoint_generation: &str,
+    attachment_generation: &str,
+    slot_generation: Uuid,
+) -> TestResult {
+    transaction
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET state = 'active', consistent_point = '0/1', two_phase_at = '0/1', \
+                 activated_at = statement_timestamp() \
+             WHERE slot_generation = $1::text::uuid",
+            &[&slot_generation.to_string()],
+        )
+        .await?;
+    transaction
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'active', activated_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&attachment_generation],
+        )
+        .await?;
+    transaction
+        .batch_execute("SAVEPOINT direct_checkpoint_progress")
+        .await?;
+    let error = transaction
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_checkpoints \
+             SET checkpoint_lsn = '0/1', checkpoint_ordinal = 1 \
+             WHERE checkpoint_generation = $1::text::uuid",
+            &[&checkpoint_generation],
+        )
+        .await
+        .expect_err("catalog admin must use the ownership-fenced checkpoint CAS");
+    assert_sqlstate(&error, "42501");
+    transaction
+        .batch_execute(
+            "ROLLBACK TO SAVEPOINT direct_checkpoint_progress; \
+             RELEASE SAVEPOINT direct_checkpoint_progress",
+        )
+        .await?;
+    let checkpoint_ordinal: i64 = transaction
+        .query_one(
+            "SELECT pgshard_catalog.advance_logical_consumer_checkpoint( \
+                 $1::text::uuid, 1, 0, '0/1', 1, false \
+             )",
+            &[&checkpoint_generation],
+        )
+        .await?
+        .get(0);
+    assert_eq!(checkpoint_ordinal, 1);
     Ok(())
 }
 
@@ -536,6 +837,1402 @@ async fn assert_tombstone_contract(client: &Client, fixture: &Fixture) -> TestRe
         .expect_err("operation tombstones must be permanent");
     assert_sqlstate(&error, "55000");
     Ok(())
+}
+
+fn fixture_uuid(nonce: u128, discriminator: u128) -> Uuid {
+    Uuid::from_u128(nonce.wrapping_add(discriminator) | (1_u128 << 127))
+}
+
+struct ConsumerRegistryFixture {
+    consumer_id: String,
+    checkpoint_generation: String,
+    attachment_generation: String,
+    selected_member_ordinal: i32,
+    anchor_generation: Uuid,
+    decoder_generation: Uuid,
+    decoder_name: String,
+}
+
+#[derive(Clone, Copy)]
+enum SelectedSource {
+    Primary(i32),
+    Standby(i32),
+}
+
+impl SelectedSource {
+    const fn member_ordinal(self) -> i32 {
+        match self {
+            Self::Primary(member_ordinal) | Self::Standby(member_ordinal) => member_ordinal,
+        }
+    }
+
+    const fn role(self) -> &'static str {
+        match self {
+            Self::Primary(_) => "primary-anchor",
+            Self::Standby(_) => "standby-decoder",
+        }
+    }
+}
+
+async fn assert_checkpoint_progress_requires_active_source(
+    client: &Client,
+    checkpoint_generation: &str,
+    context: &str,
+) -> TestResult {
+    let error = advance_checkpoint(client, checkpoint_generation, 1, 0, "0/10", 1, true)
+        .await
+        .expect_err(context);
+    assert_sqlstate(&error, "55000");
+    Ok(())
+}
+
+async fn create_initial_consumer_checkpoint(
+    client: &Client,
+    shard: &Fixture,
+    consumer_id: &str,
+) -> TestResult<String> {
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_checkpoints( \
+                 checkpoint_generation, consumer_id, logical_database_id, shard_id, \
+                 restore_incarnation, system_identifier, database_oid, source_timeline, \
+                 checkpoint_lsn, checkpoint_ordinal, snapshot_required \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text, \
+                 $5::text::uuid, 18446744073709551615, 4294967295, 1, \
+                 '0/10', 1, false \
+             )",
+            &[
+                &fixture_uuid(shard.nonce, 12).to_string(),
+                &consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &shard.restore_incarnation,
+            ],
+        )
+        .await
+        .expect_err("a new checkpoint generation cannot bypass its snapshot boundary");
+    assert_sqlstate(&error, "55000");
+    let checkpoint_generation = fixture_uuid(shard.nonce, 1).to_string();
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_checkpoints( \
+                 checkpoint_generation, consumer_id, logical_database_id, shard_id, \
+                 restore_incarnation, system_identifier, database_oid, source_timeline \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text, \
+                 $5::text::uuid, 18446744073709551615, 4294967295, 1 \
+             )",
+            &[
+                &checkpoint_generation,
+                &consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &shard.restore_incarnation,
+            ],
+        )
+        .await?;
+    assert_checkpoint_progress_requires_active_source(
+        client,
+        &checkpoint_generation,
+        "checkpoint progress requires an active source attachment",
+    )
+    .await?;
+    Ok(checkpoint_generation)
+}
+
+async fn create_consumer_registry_fixture(
+    client: &Client,
+    shard: &Fixture,
+) -> TestResult<ConsumerRegistryFixture> {
+    let consumer_id: String = client
+        .query_one(
+            "INSERT INTO pgshard_catalog.logical_consumers( \
+                 logical_database_id, consumer_name, purpose \
+             ) VALUES ($1::text::uuid, $2::text, 'change-stream') \
+             RETURNING consumer_id::text",
+            &[
+                &shard.logical_database_id,
+                &format!("stream-{}", shard.nonce),
+            ],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_shards( \
+                 consumer_id, logical_database_id, shard_id \
+             ) VALUES ($1::text::uuid, $2::text::uuid, $3::text)",
+            &[&consumer_id, &shard.logical_database_id, &shard.shard_id],
+        )
+        .await?;
+    let checkpoint_generation =
+        create_initial_consumer_checkpoint(client, shard, &consumer_id).await?;
+    let attachment_generation = fixture_uuid(shard.nonce, 2).to_string();
+    let selected_member_ordinal = 1;
+    let error = insert_consumer_attachment(
+        client,
+        shard,
+        &consumer_id,
+        &fixture_uuid(shard.nonce, 3).to_string(),
+        &fixture_uuid(shard.nonce, 10).to_string(),
+        SelectedSource::Standby(selected_member_ordinal),
+        1,
+    )
+    .await
+    .expect_err("an attachment cannot invent a shard restore incarnation");
+    assert_sqlstate(&error, "55000");
+    insert_consumer_attachment(
+        client,
+        shard,
+        &consumer_id,
+        &attachment_generation,
+        &shard.restore_incarnation,
+        SelectedSource::Standby(selected_member_ordinal),
+        1,
+    )
+    .await?;
+    let anchor_generation = fixture_uuid(shard.nonce, 4);
+    let decoder_generation = fixture_uuid(shard.nonce, 5);
+    Ok(ConsumerRegistryFixture {
+        consumer_id,
+        checkpoint_generation,
+        attachment_generation,
+        selected_member_ordinal,
+        anchor_generation,
+        decoder_generation,
+        decoder_name: format!("decoder_{}", decoder_generation.simple()),
+    })
+}
+
+async fn insert_consumer_attachment(
+    client: &Client,
+    shard: &Fixture,
+    consumer_id: &str,
+    attachment_generation: &str,
+    restore_incarnation: &str,
+    selected_source: SelectedSource,
+    timeline: i64,
+) -> Result<u64, PgError> {
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_attachments( \
+                 attachment_generation, consumer_id, logical_database_id, shard_id, \
+                 restore_incarnation, system_identifier, database_oid, database_name, \
+                 selected_source_member_ordinal, selected_source_role, selected_source_timeline \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text, \
+                 $5::text::uuid, 18446744073709551615, 4294967295, $6::text, \
+                 $7, $8::text, $9 \
+             )",
+            &[
+                &attachment_generation,
+                &consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &restore_incarnation,
+                &format!("database_{}", shard.nonce),
+                &selected_source.member_ordinal(),
+                &selected_source.role(),
+                &timeline,
+            ],
+        )
+        .await
+}
+
+async fn assert_invalid_managed_slot_allocations(
+    client: &Client,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let wrong_name = format!("decoder_{}", fixture_uuid(shard.nonce, 6).simple());
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                 slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                 shard_id, slot_role, member_ordinal, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                 $5::text, 'standby-decoder', $6, $7::text \
+             )",
+            &[
+                &consumer.decoder_generation.to_string(),
+                &consumer.attachment_generation,
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &consumer.selected_member_ordinal,
+                &wrong_name,
+            ],
+        )
+        .await
+        .expect_err("a managed slot name must encode its complete catalog generation");
+    assert_sqlstate(&error, "23514");
+
+    let invalid_anchor_generation = fixture_uuid(shard.nonce, 13);
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                 slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                 shard_id, slot_role, member_ordinal, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                 $5::text, 'primary-anchor', $6, $7::text \
+             )",
+            &[
+                &invalid_anchor_generation.to_string(),
+                &consumer.attachment_generation,
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &consumer.selected_member_ordinal,
+                &format!("anchor_{}", invalid_anchor_generation.simple()),
+            ],
+        )
+        .await
+        .expect_err("a failover anchor is cluster-scoped rather than member-bound");
+    assert_sqlstate(&error, "23514");
+
+    let invalid_decoder_generation = fixture_uuid(shard.nonce, 14);
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                 slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                 shard_id, slot_role, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                 $5::text, 'standby-decoder', $6::text \
+             )",
+            &[
+                &invalid_decoder_generation.to_string(),
+                &consumer.attachment_generation,
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &format!("decoder_{}", invalid_decoder_generation.simple()),
+            ],
+        )
+        .await
+        .expect_err("a standby decoder must identify its member");
+    assert_sqlstate(&error, "23514");
+    Ok(())
+}
+
+async fn allocate_managed_slots(
+    client: &Client,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let anchor_name = format!("anchor_{}", consumer.anchor_generation.simple());
+    for (generation, role, member, name) in [
+        (
+            consumer.anchor_generation.to_string(),
+            "primary-anchor",
+            None,
+            anchor_name.as_str(),
+        ),
+        (
+            consumer.decoder_generation.to_string(),
+            "standby-decoder",
+            Some(consumer.selected_member_ordinal),
+            consumer.decoder_name.as_str(),
+        ),
+    ] {
+        client
+            .execute(
+                "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                     slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                     shard_id, slot_role, member_ordinal, slot_name \
+                 ) VALUES ( \
+                     $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                     $5::text, $6::text, $7, $8::text \
+                 )",
+                &[
+                    &generation,
+                    &consumer.attachment_generation,
+                    &consumer.consumer_id,
+                    &shard.logical_database_id,
+                    &shard.shard_id,
+                    &role,
+                    &member,
+                    &name,
+                ],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn assert_managed_slot_allocation(
+    client: &Client,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    assert_invalid_managed_slot_allocations(client, shard, consumer).await?;
+    allocate_managed_slots(client, shard, consumer).await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET state = 'retired', consistent_point = '0/10', two_phase_at = '0/10', \
+                 activated_at = statement_timestamp(), retired_at = statement_timestamp() \
+             WHERE slot_generation = $1::text::uuid",
+            &[&consumer.anchor_generation.to_string()],
+        )
+        .await
+        .expect_err("abandoning an allocated slot cannot fabricate activation history");
+    assert_sqlstate(&error, "55000");
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'active', activated_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&consumer.attachment_generation],
+        )
+        .await
+        .expect_err("an attachment cannot activate before both managed slots");
+    assert_sqlstate(&error, "55000");
+    Ok(())
+}
+
+async fn activate_consumer_registry_fixture(
+    client: &Client,
+    database_url: &str,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET state = 'active', consistent_point = '0/30', two_phase_at = '0/30', \
+                 activated_at = statement_timestamp() \
+             WHERE slot_generation = $1::text::uuid",
+            &[&consumer.anchor_generation.to_string()],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET state = 'active', consistent_point = '0/20', two_phase_at = '0/40', \
+                 activated_at = statement_timestamp() \
+             WHERE slot_generation = $1::text::uuid",
+            &[&consumer.decoder_generation.to_string()],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'active', activated_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&consumer.attachment_generation],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_shards SET state = 'fenced' \
+             WHERE consumer_id = $1::text::uuid \
+               AND logical_database_id = $2::text::uuid AND shard_id = $3::text",
+            &[
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+            ],
+        )
+        .await?;
+    assert_snapshot_activation_boundaries(client, database_url, shard, consumer).await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_shards SET state = 'ready' \
+             WHERE consumer_id = $1::text::uuid \
+               AND logical_database_id = $2::text::uuid AND shard_id = $3::text",
+            &[
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+            ],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.shard_restore_incarnations \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE restore_incarnation = $1::text::uuid",
+            &[&shard.restore_incarnation],
+        )
+        .await
+        .expect_err("an active consumer must fence before restore-incarnation rotation");
+    assert_sqlstate(&error, "55000");
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotBoundaryCase {
+    context: &'static str,
+    anchor_consistent: &'static str,
+    anchor_two_phase: &'static str,
+    decoder_consistent: &'static str,
+    decoder_two_phase: &'static str,
+}
+
+struct SnapshotBoundaryFixture {
+    consumer_id: String,
+    checkpoint_generation: String,
+    attachment_generation: String,
+    anchor_generation: Uuid,
+    decoder_generation: Uuid,
+}
+
+async fn create_snapshot_boundary_fixture(
+    transaction: &tokio_postgres::Transaction<'_>,
+    shard: &Fixture,
+    index: u128,
+) -> TestResult<SnapshotBoundaryFixture> {
+    let consumer_id: String = transaction
+        .query_one(
+            "INSERT INTO pgshard_catalog.logical_consumers( \
+                 logical_database_id, consumer_name, purpose \
+             ) VALUES ($1::text::uuid, $2::text, 'change-stream') \
+             RETURNING consumer_id::text",
+            &[
+                &shard.logical_database_id,
+                &format!("boundary-{index}-{}", shard.nonce),
+            ],
+        )
+        .await?
+        .get(0);
+    transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_shards( \
+                 consumer_id, logical_database_id, shard_id \
+             ) VALUES ($1::text::uuid, $2::text::uuid, $3::text)",
+            &[&consumer_id, &shard.logical_database_id, &shard.shard_id],
+        )
+        .await?;
+    let discriminator = 1_000 + index * 10;
+    let checkpoint_generation = fixture_uuid(shard.nonce, discriminator + 1).to_string();
+    transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_checkpoints( \
+                 checkpoint_generation, consumer_id, logical_database_id, shard_id, \
+                 restore_incarnation, system_identifier, database_oid, source_timeline \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text, \
+                 $5::text::uuid, 18446744073709551615, 4294967295, 1 \
+             )",
+            &[
+                &checkpoint_generation,
+                &consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &shard.restore_incarnation,
+            ],
+        )
+        .await?;
+    let attachment_generation = fixture_uuid(shard.nonce, discriminator + 2).to_string();
+    transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumer_attachments( \
+                 attachment_generation, consumer_id, logical_database_id, shard_id, \
+                 restore_incarnation, system_identifier, database_oid, database_name, \
+                 selected_source_member_ordinal, selected_source_role, \
+                 selected_source_timeline \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text, \
+                 $5::text::uuid, 18446744073709551615, 4294967295, $6::text, \
+                 1, 'standby-decoder', 1 \
+             )",
+            &[
+                &attachment_generation,
+                &consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &shard.restore_incarnation,
+                &format!("boundary_database_{index}"),
+            ],
+        )
+        .await?;
+    let fixture = SnapshotBoundaryFixture {
+        consumer_id,
+        checkpoint_generation,
+        attachment_generation,
+        anchor_generation: fixture_uuid(shard.nonce, discriminator + 3),
+        decoder_generation: fixture_uuid(shard.nonce, discriminator + 4),
+    };
+    allocate_snapshot_boundary_slots(transaction, shard, &fixture).await?;
+    Ok(fixture)
+}
+
+async fn allocate_snapshot_boundary_slots(
+    transaction: &tokio_postgres::Transaction<'_>,
+    shard: &Fixture,
+    fixture: &SnapshotBoundaryFixture,
+) -> TestResult {
+    for (generation, role, member_ordinal) in [
+        (fixture.anchor_generation, "primary-anchor", None),
+        (fixture.decoder_generation, "standby-decoder", Some(1_i32)),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                     slot_generation, attachment_generation, consumer_id, \
+                     logical_database_id, shard_id, slot_role, member_ordinal, slot_name \
+                 ) VALUES ( \
+                     $1::text::uuid, $2::text::uuid, $3::text::uuid, \
+                     $4::text::uuid, $5::text, $6::text, $7, $8::text \
+                 )",
+                &[
+                    &generation.to_string(),
+                    &fixture.attachment_generation,
+                    &fixture.consumer_id,
+                    &shard.logical_database_id,
+                    &shard.shard_id,
+                    &role,
+                    &member_ordinal,
+                    &format!("boundary_{}", generation.simple()),
+                ],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn activate_snapshot_boundary_fixture(
+    transaction: &tokio_postgres::Transaction<'_>,
+    fixture: &SnapshotBoundaryFixture,
+    boundary: SnapshotBoundaryCase,
+) -> TestResult {
+    for (generation, consistent_point, two_phase_at) in [
+        (
+            fixture.anchor_generation,
+            boundary.anchor_consistent,
+            boundary.anchor_two_phase,
+        ),
+        (
+            fixture.decoder_generation,
+            boundary.decoder_consistent,
+            boundary.decoder_two_phase,
+        ),
+    ] {
+        transaction
+            .execute(
+                "UPDATE pgshard_catalog.managed_replication_slots \
+                 SET state = 'active', consistent_point = $2::text::pg_lsn, \
+                     two_phase_at = $3::text::pg_lsn, \
+                     activated_at = statement_timestamp() \
+                 WHERE slot_generation = $1::text::uuid",
+                &[&generation.to_string(), &consistent_point, &two_phase_at],
+            )
+            .await?;
+    }
+    transaction
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'active', activated_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&fixture.attachment_generation],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn assert_snapshot_boundary_case(
+    client: &mut Client,
+    shard: &Fixture,
+    index: u128,
+    boundary: SnapshotBoundaryCase,
+) -> TestResult {
+    let transaction = client.transaction().await?;
+    let fixture = create_snapshot_boundary_fixture(&transaction, shard, index).await?;
+    activate_snapshot_boundary_fixture(&transaction, &fixture, boundary).await?;
+    let Err(error) = transaction
+        .query_one(
+            "SELECT pgshard_catalog.advance_logical_consumer_checkpoint( \
+                 $1::text::uuid, 1, 0, '0/18', 1, false \
+             )",
+            &[&fixture.checkpoint_generation],
+        )
+        .await
+    else {
+        panic!("{} was not enforced", boundary.context);
+    };
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "snapshot completion is behind a managed slot activation boundary",
+    );
+    transaction.rollback().await?;
+    Ok(())
+}
+
+async fn assert_isolated_snapshot_boundaries(database_url: &str, shard: &Fixture) -> TestResult {
+    let (mut client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let boundaries = [
+        SnapshotBoundaryCase {
+            context: "primary-anchor consistent point",
+            anchor_consistent: "0/20",
+            anchor_two_phase: "0/10",
+            decoder_consistent: "0/10",
+            decoder_two_phase: "0/10",
+        },
+        SnapshotBoundaryCase {
+            context: "primary-anchor two-phase boundary",
+            anchor_consistent: "0/10",
+            anchor_two_phase: "0/20",
+            decoder_consistent: "0/10",
+            decoder_two_phase: "0/10",
+        },
+        SnapshotBoundaryCase {
+            context: "standby-decoder consistent point",
+            anchor_consistent: "0/10",
+            anchor_two_phase: "0/10",
+            decoder_consistent: "0/20",
+            decoder_two_phase: "0/10",
+        },
+        SnapshotBoundaryCase {
+            context: "standby-decoder two-phase boundary",
+            anchor_consistent: "0/10",
+            anchor_two_phase: "0/10",
+            decoder_consistent: "0/10",
+            decoder_two_phase: "0/20",
+        },
+    ];
+    let result: TestResult = async {
+        for (index, boundary) in boundaries.into_iter().enumerate() {
+            assert_snapshot_boundary_case(&mut client, shard, index as u128, boundary).await?;
+        }
+        Ok(())
+    }
+    .await;
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), connection_task).await???;
+    result
+}
+
+async fn assert_snapshot_activation_boundaries(
+    client: &Client,
+    database_url: &str,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_shards SET state = 'ready' \
+             WHERE consumer_id = $1::text::uuid \
+               AND logical_database_id = $2::text::uuid AND shard_id = $3::text",
+            &[
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+            ],
+        )
+        .await
+        .expect_err("a snapshot-required checkpoint cannot become ready");
+    assert_sqlstate(&error, "55000");
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_checkpoints \
+             SET checkpoint_lsn = '0/10' \
+             WHERE checkpoint_generation = $1::text::uuid",
+            &[&consumer.checkpoint_generation],
+        )
+        .await
+        .expect_err("checkpoint LSN changes must advance the checkpoint ordinal");
+    assert_sqlstate(&error, "55000");
+    assert_isolated_snapshot_boundaries(database_url, shard).await?;
+    assert_eq!(
+        advance_checkpoint(
+            client,
+            &consumer.checkpoint_generation,
+            1,
+            0,
+            "0/40",
+            1,
+            false,
+        )
+        .await?,
+        1
+    );
+    Ok(())
+}
+
+async fn assert_consumer_registry_history_guards(
+    client: &Client,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let error = advance_checkpoint(
+        client,
+        &consumer.checkpoint_generation,
+        1,
+        1,
+        "0/10",
+        2,
+        false,
+    )
+    .await
+    .expect_err("durable checkpoint LSN must not regress");
+    assert_sqlstate(&error, "55000");
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots SET two_phase_at = '0/30' \
+             WHERE slot_generation = $1::text::uuid",
+            &[&consumer.decoder_generation.to_string()],
+        )
+        .await
+        .expect_err("an activated two-phase boundary must be immutable");
+    assert_sqlstate(&error, "55000");
+    let error = client
+        .execute(
+            "DELETE FROM pgshard_catalog.managed_replication_slots \
+             WHERE slot_generation = $1::text::uuid",
+            &[&consumer.decoder_generation.to_string()],
+        )
+        .await
+        .expect_err("managed slot generations must be permanent");
+    assert_sqlstate(&error, "55000");
+
+    let replacement = fixture_uuid(shard.nonce, 7).to_string();
+    insert_consumer_attachment(
+        client,
+        shard,
+        &consumer.consumer_id,
+        &replacement,
+        &shard.restore_incarnation,
+        SelectedSource::Standby(consumer.selected_member_ordinal),
+        2,
+    )
+    .await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'retired', activated_at = statement_timestamp(), \
+                 retired_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&replacement],
+        )
+        .await
+        .expect_err("abandoning a staged attachment cannot fabricate activation history");
+    assert_sqlstate(&error, "55000");
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&replacement],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn assert_retired_source_guards(
+    client: &Client,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET retired_at = retired_at + interval '1 second' \
+             WHERE slot_generation = $1::text::uuid",
+            &[&consumer.decoder_generation.to_string()],
+        )
+        .await
+        .expect_err("retired managed slot tombstones must be immutable");
+    assert_sqlstate(&error, "55000");
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET retired_at = retired_at + interval '1 second' \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&consumer.attachment_generation],
+        )
+        .await
+        .expect_err("retired source attachment tombstones must be immutable");
+    assert_sqlstate(&error, "55000");
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_checkpoints \
+             SET checkpoint_lsn = '0/50', checkpoint_ordinal = 2 \
+             WHERE checkpoint_generation = $1::text::uuid",
+            &[&consumer.checkpoint_generation],
+        )
+        .await
+        .expect_err("checkpoint progress cannot outlive its active source attachment");
+    assert_sqlstate(&error, "55000");
+    Ok(())
+}
+
+async fn observe_backend_blocked_by(
+    observer: &Client,
+    waiting_pid: i32,
+    holding_pid: i32,
+) -> Result<bool, PgError> {
+    for _ in 0..200 {
+        let blocked: bool = observer
+            .query_one(
+                "SELECT EXISTS ( \
+                     SELECT FROM pg_catalog.pg_stat_activity \
+                     WHERE pid = $1 AND wait_event_type = 'Lock' \
+                       AND $2 = ANY(pg_catalog.pg_blocking_pids(pid)) \
+                 )",
+                &[&waiting_pid, &holding_pid],
+            )
+            .await?
+            .get(0);
+        if blocked {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(false)
+}
+
+async fn assert_fence_wins_checkpoint_race(
+    observer: &Client,
+    database_url: &str,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let (mut fencer, fencer_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let fencer_connection_task = tokio::spawn(fencer_connection);
+    let (advancer, advancer_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let advancer_connection_task = tokio::spawn(advancer_connection);
+    let fencer_pid: i32 = fencer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    let advancer_pid: i32 = advancer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    advancer
+        .batch_execute("SET ROLE pgshard_catalog_admin")
+        .await?;
+
+    let transaction = fencer.transaction().await?;
+    transaction
+        .batch_execute("SET LOCAL ROLE pgshard_catalog_admin")
+        .await?;
+    transaction
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_shards \
+             SET state = 'fenced', ownership_fence = ownership_fence + 1 \
+             WHERE consumer_id = $1::text::uuid \
+               AND logical_database_id = $2::text::uuid AND shard_id = $3::text",
+            &[
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+            ],
+        )
+        .await?;
+
+    let checkpoint_generation = consumer.checkpoint_generation.clone();
+    let advance_task = tokio::spawn(async move {
+        advance_checkpoint(&advancer, &checkpoint_generation, 1, 1, "0/50", 2, false).await
+    });
+    if !observe_backend_blocked_by(observer, advancer_pid, fencer_pid).await? {
+        transaction.rollback().await?;
+        advance_task.abort();
+        let _ = advance_task.await;
+        fencer_connection_task.abort();
+        advancer_connection_task.abort();
+        return Err("checkpoint CAS did not block behind the in-flight ownership fence".into());
+    }
+
+    transaction.commit().await?;
+    let error = advance_task
+        .await?
+        .expect_err("a stale owner advanced a checkpoint after its fence committed");
+    assert_sqlstate(&error, "40001");
+    assert_database_message(
+        &error,
+        "logical consumer ownership fence compare-and-swap failed: expected 1, observed 2",
+    );
+    drop(fencer);
+    fencer_connection_task.abort();
+    advancer_connection_task.abort();
+    Ok(())
+}
+
+async fn assert_restore_waits_for_retiring_attachment(
+    database_url: &str,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let (mut client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let transaction = client.transaction().await?;
+    transaction
+        .batch_execute("SET LOCAL ROLE pgshard_catalog_admin")
+        .await?;
+    transaction
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_checkpoints \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE checkpoint_generation = $1::text::uuid",
+            &[&consumer.checkpoint_generation],
+        )
+        .await?;
+    let error = transaction
+        .execute(
+            "UPDATE pgshard_catalog.shard_restore_incarnations \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE restore_incarnation = $1::text::uuid",
+            &[&shard.restore_incarnation],
+        )
+        .await
+        .expect_err("restore retirement skipped a retiring source attachment");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "restore incarnation retains non-retired logical consumer attachment",
+    );
+    transaction.rollback().await?;
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), connection_task).await???;
+    Ok(())
+}
+
+async fn fence_and_retire_consumer_attachment(
+    client: &Client,
+    database_url: &str,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_shards SET state = 'fenced' \
+             WHERE consumer_id = $1::text::uuid \
+               AND logical_database_id = $2::text::uuid AND shard_id = $3::text",
+            &[
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+            ],
+        )
+        .await
+        .expect_err("fencing a ready owner must advance its ownership fence");
+    assert_sqlstate(&error, "55000");
+    assert_fence_wins_checkpoint_race(client, database_url, shard, consumer).await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments SET state = 'retiring' \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&consumer.attachment_generation],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&consumer.attachment_generation],
+        )
+        .await
+        .expect_err("an attachment cannot retire while it retains live slots");
+    assert_sqlstate(&error, "55000");
+    assert_restore_waits_for_retiring_attachment(database_url, shard, consumer).await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots SET state = 'retiring' \
+             WHERE attachment_generation = $1::text::uuid AND state = 'active'",
+            &[&consumer.attachment_generation],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid AND state = 'retiring'",
+            &[&consumer.attachment_generation],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&consumer.attachment_generation],
+        )
+        .await?;
+    assert_retired_source_guards(client, consumer).await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.shard_restore_incarnations \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE restore_incarnation = $1::text::uuid",
+            &[&shard.restore_incarnation],
+        )
+        .await
+        .expect_err("a restore incarnation cannot retire with a current checkpoint");
+    assert_sqlstate(&error, "55000");
+    Ok(())
+}
+
+async fn assert_primary_fallback_attachment(
+    client: &Client,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let attachment_generation = fixture_uuid(shard.nonce, 20).to_string();
+    insert_consumer_attachment(
+        client,
+        shard,
+        &consumer.consumer_id,
+        &attachment_generation,
+        &shard.restore_incarnation,
+        SelectedSource::Primary(0),
+        1,
+    )
+    .await?;
+    assert_retired_slot_identity_cannot_be_reused(client, shard, consumer, &attachment_generation)
+        .await?;
+
+    let slot_generation = fixture_uuid(shard.nonce, 21);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                 slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                 shard_id, slot_role, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                 $5::text, 'primary-anchor', $6::text \
+             )",
+            &[
+                &slot_generation.to_string(),
+                &attachment_generation,
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &format!("anchor_{}", slot_generation.simple()),
+            ],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET state = 'active', consistent_point = '0/20', two_phase_at = '0/20', \
+                 activated_at = statement_timestamp() \
+             WHERE slot_generation = $1::text::uuid",
+            &[&slot_generation.to_string()],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'active', activated_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&attachment_generation],
+        )
+        .await?;
+
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments SET state = 'retiring' \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&attachment_generation],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots SET state = 'retiring' \
+             WHERE slot_generation = $1::text::uuid",
+            &[&slot_generation.to_string()],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE slot_generation = $1::text::uuid",
+            &[&slot_generation.to_string()],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&attachment_generation],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn assert_retired_slot_identity_cannot_be_reused(
+    client: &Client,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+    attachment_generation: &str,
+) -> TestResult {
+    let new_generation = fixture_uuid(shard.nonce, 22);
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                 slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                 shard_id, slot_role, member_ordinal, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                 $5::text, 'standby-decoder', $6, $7::text \
+             )",
+            &[
+                &new_generation.to_string(),
+                &attachment_generation,
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &consumer.selected_member_ordinal,
+                &consumer.decoder_name,
+            ],
+        )
+        .await
+        .expect_err("a new generation cannot reuse a retired slot name");
+    assert_sqlstate(&error, "23514");
+
+    let replacement_name = format!("replacement_{}", consumer.decoder_generation.simple());
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                 slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                 shard_id, slot_role, member_ordinal, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                 $5::text, 'standby-decoder', $6, $7::text \
+             )",
+            &[
+                &consumer.decoder_generation.to_string(),
+                &attachment_generation,
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &consumer.selected_member_ordinal,
+                &replacement_name,
+            ],
+        )
+        .await
+        .expect_err("a retired generation cannot be rebound to a replacement name");
+    assert_sqlstate(&error, "23505");
+    Ok(())
+}
+
+async fn assert_mismatched_source_requires_snapshot(
+    client: &Client,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let attachment_generation = fixture_uuid(shard.nonce, 30).to_string();
+    insert_consumer_attachment(
+        client,
+        shard,
+        &consumer.consumer_id,
+        &attachment_generation,
+        &shard.restore_incarnation,
+        SelectedSource::Primary(0),
+        2,
+    )
+    .await?;
+    let slot_generation = fixture_uuid(shard.nonce, 31);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                 slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                 shard_id, slot_role, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                 $5::text, 'primary-anchor', $6::text \
+             )",
+            &[
+                &slot_generation.to_string(),
+                &attachment_generation,
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &format!("anchor_{}", slot_generation.simple()),
+            ],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET state = 'active', consistent_point = '0/20', two_phase_at = '0/20', \
+                 activated_at = statement_timestamp() \
+             WHERE slot_generation = $1::text::uuid",
+            &[&slot_generation.to_string()],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'active', activated_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&attachment_generation],
+        )
+        .await
+        .expect_err("a checkpoint cannot resume on a different source timeline");
+    assert_sqlstate(&error, "55000");
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE slot_generation = $1::text::uuid",
+            &[&slot_generation.to_string()],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE attachment_generation = $1::text::uuid",
+            &[&attachment_generation],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn retire_consumer_registry_fixture(
+    client: &Client,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_checkpoints \
+             SET checkpoint_ordinal = checkpoint_ordinal + 1, state = 'retired', \
+                 retired_at = statement_timestamp() \
+             WHERE checkpoint_generation = $1::text::uuid",
+            &[&consumer.checkpoint_generation],
+        )
+        .await
+        .expect_err("checkpoint retirement cannot advance progress in the same statement");
+    assert_sqlstate(&error, "55000");
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_checkpoints \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE checkpoint_generation = $1::text::uuid",
+            &[&consumer.checkpoint_generation],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_shards SET state = 'retired' \
+             WHERE consumer_id = $1::text::uuid \
+               AND logical_database_id = $2::text::uuid AND shard_id = $3::text",
+            &[
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+            ],
+        )
+        .await?;
+    for state in ["draining", "retired"] {
+        client
+            .execute(
+                "UPDATE pgshard_catalog.logical_consumers SET state = $2::text \
+                 WHERE consumer_id = $1::text::uuid",
+                &[&consumer.consumer_id, &state],
+            )
+            .await?;
+    }
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_checkpoints \
+             SET checkpoint_ordinal = checkpoint_ordinal + 1 \
+             WHERE checkpoint_generation = $1::text::uuid",
+            &[&consumer.checkpoint_generation],
+        )
+        .await
+        .expect_err("retired checkpoint generations must remain immutable tombstones");
+    assert_sqlstate(&error, "55000");
+
+    client
+        .execute(
+            "UPDATE pgshard_catalog.shard_restore_incarnations \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE restore_incarnation = $1::text::uuid",
+            &[&shard.restore_incarnation],
+        )
+        .await?;
+    let replacement_restore = fixture_uuid(shard.nonce, 11).to_string();
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.shard_restore_incarnations( \
+                 restore_incarnation, shard_id \
+             ) VALUES ($1::text::uuid, $2::text)",
+            &[&replacement_restore, &shard.shard_id],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.shard_restore_incarnations SET state = 'active' \
+             WHERE restore_incarnation = $1::text::uuid",
+            &[&shard.restore_incarnation],
+        )
+        .await
+        .expect_err("retired restore incarnations must remain permanent tombstones");
+    assert_sqlstate(&error, "55000");
+    Ok(())
+}
+
+async fn assert_consumer_requires_active_database(client: &Client, nonce: u128) -> TestResult {
+    let logical_database_id: String = client
+        .query_one(
+            "INSERT INTO pgshard_catalog.logical_databases(database_name) \
+             VALUES ($1::text) RETURNING logical_database_id::text",
+            &[&format!("consumer_lifecycle_{nonce}")],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_databases SET state = 'draining' \
+             WHERE logical_database_id = $1::text::uuid",
+            &[&logical_database_id],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumers( \
+                 logical_database_id, consumer_name, purpose \
+             ) VALUES ($1::text::uuid, $2::text, 'change-stream')",
+            &[&logical_database_id, &format!("draining-{nonce}")],
+        )
+        .await
+        .expect_err("a draining database cannot gain a logical consumer");
+    assert_sqlstate(&error, "55000");
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_databases SET state = 'retired' \
+             WHERE logical_database_id = $1::text::uuid",
+            &[&logical_database_id],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_consumers( \
+                 logical_database_id, consumer_name, purpose \
+             ) VALUES ($1::text::uuid, $2::text, 'change-stream')",
+            &[&logical_database_id, &format!("retired-{nonce}")],
+        )
+        .await
+        .expect_err("a retired database cannot gain a logical consumer");
+    assert_sqlstate(&error, "55000");
+    Ok(())
+}
+
+async fn assert_logical_consumer_registry_contract(
+    client: &Client,
+    database_url: &str,
+    fixture: &Fixture,
+) -> TestResult {
+    let consumer = create_consumer_registry_fixture(client, fixture).await?;
+    assert_managed_slot_allocation(client, fixture, &consumer).await?;
+    activate_consumer_registry_fixture(client, database_url, fixture, &consumer).await?;
+    assert_consumer_registry_history_guards(client, fixture, &consumer).await?;
+    fence_and_retire_consumer_attachment(client, database_url, fixture, &consumer).await?;
+    assert_mismatched_source_requires_snapshot(client, fixture, &consumer).await?;
+    assert_primary_fallback_attachment(client, fixture, &consumer).await?;
+    retire_consumer_registry_fixture(client, fixture, &consumer).await
 }
 
 async fn assert_invalid_routing_contracts(
@@ -1663,9 +3360,12 @@ async fn migration_and_activation_contract() -> TestResult {
     assert_admin_privilege_contract(&mut client).await?;
     assert_admin_write_path(&mut client).await?;
     let fixture = create_fixture(&client).await?;
+    assert_migration_does_not_resurrect_retired_restore(&client, fixture.nonce).await?;
     assert_identity_history_contract(&client, &fixture).await?;
     assert_registered_table_contract(&client, &fixture).await?;
     assert_tombstone_contract(&client, &fixture).await?;
+    assert_consumer_requires_active_database(&client, fixture.nonce).await?;
+    assert_logical_consumer_registry_contract(&client, &database_url, &fixture).await?;
     let routing = assert_invalid_routing_contracts(&client, &fixture).await?;
     let listener = connect_listener(&database_url).await?;
     commit_valid_activation(&mut client, &listener, &fixture, &routing).await?;
