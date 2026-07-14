@@ -10,8 +10,8 @@ use std::{
 use pgshard_catalog::CatalogOperationTimeout;
 use pgshard_orch::{
     slot_observer::{
-        LocalLogicalSlotObservationBatch, LocalSlotObservationError, LocalWalReceiverActivity,
-        LogicalSlotObservationRequest, observe_local_logical_slots,
+        LocalLogicalSlotObservationBatch, LocalSlotObservationError, LocalSlotSyncWorkerActivity,
+        LocalWalReceiverActivity, LogicalSlotObservationRequest, observe_local_logical_slots,
     },
     standby_slots::{
         LogicalSlotKind, LogicalSlotPlugin, LogicalWalLevel, ManagedSlotTarget, RecoveryState,
@@ -39,8 +39,8 @@ const EXPECTED_PRIMARY_SLOT_NAME: &str = "pgshard_member_0001";
 const EXPECTED_SYNCED_ANCHOR_NAME: &str = "pgshard_ci_anchor_00000000000000000000000000000001";
 const STANDBY_CATCHUP_TIMEOUT: Duration = Duration::from_mins(1);
 const STANDBY_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const STANDBY_RESTRICTED_ROLE: &str = "pgshard_observer_restricted";
-const STANDBY_RESTRICTED_PASSWORD: &str = "pgshard-test-only";
+const RESTRICTED_OBSERVER_ROLE: &str = "pgshard_observer_restricted";
+const RESTRICTED_OBSERVER_PASSWORD: &str = "pgshard-test-only";
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 type TestError = Box<dyn Error + Send + Sync>;
@@ -249,13 +249,7 @@ async fn run_standby_observation_fixture(
     let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
     let batch = loop {
         let batch = observe(&standby_database_url, &request).await?;
-        let synchronized = batch.entries()[0].observation().is_some_and(|slot| {
-            slot.kind == LogicalSlotKind::SynchronizedFailoverAnchor
-                && slot.persistence == SlotPersistence::Unproven
-                && slot.activity == SlotActivity::Inactive
-                && slot.invalidation.is_none()
-        });
-        if synchronized {
+        if synchronized_anchor_waiting(&batch) {
             break batch;
         }
         if Instant::now() >= deadline {
@@ -268,6 +262,65 @@ async fn run_standby_observation_fixture(
         sleep(STANDBY_POLL_INTERVAL).await;
     };
 
+    assert_standby_observation(&batch, &target, expected_system_identifier);
+
+    let (role_check_client, role_check_connection) =
+        tokio_postgres::connect(&standby_database_url, NoTls).await?;
+    let role_check_task = tokio::spawn(role_check_connection);
+    let role_options = role_check_client
+        .query_one(
+            "SELECT pg_catalog.pg_has_role( \
+                        $1::pg_catalog.name, 'pg_read_all_stats', 'MEMBER' \
+                    ), \
+                    pg_catalog.pg_has_role( \
+                        $1::pg_catalog.name, 'pg_read_all_stats', 'USAGE' \
+                    )",
+            &[&RESTRICTED_OBSERVER_ROLE],
+        )
+        .await?;
+    assert!(role_options.try_get::<_, bool>(0)?);
+    assert!(!role_options.try_get::<_, bool>(1)?);
+    drop(role_check_client);
+    finish_connection(role_check_task).await?;
+
+    let mut restricted_config: Config = standby_database_url.parse()?;
+    restricted_config.user(RESTRICTED_OBSERVER_ROLE);
+    restricted_config.password(RESTRICTED_OBSERVER_PASSWORD);
+    let (restricted_client, restricted_connection) = restricted_config.connect(NoTls).await?;
+    let error = observe_local_logical_slots(
+        restricted_client,
+        restricted_connection,
+        CatalogOperationTimeout::default(),
+        &request,
+    )
+    .await
+    .expect_err("a live receiver redacted from the observer role must fail closed");
+    assert!(matches!(
+        error,
+        LocalSlotObservationError::WalReceiverDetailsUnavailable { .. }
+    ));
+    Ok(())
+}
+
+fn synchronized_anchor_waiting(batch: &LocalLogicalSlotObservationBatch) -> bool {
+    let anchor_ready = batch.entries()[0].observation().is_some_and(|slot| {
+        slot.kind == LogicalSlotKind::SynchronizedFailoverAnchor
+            && slot.persistence == SlotPersistence::Unproven
+            && slot.activity == SlotActivity::Inactive
+            && slot.invalidation.is_none()
+    });
+    let worker_waiting = batch
+        .prerequisites()
+        .slot_sync_worker()
+        .is_some_and(|worker| worker.activity() == LocalSlotSyncWorkerActivity::WaitingAfterCycle);
+    anchor_ready && worker_waiting
+}
+
+fn assert_standby_observation(
+    batch: &LocalLogicalSlotObservationBatch,
+    target: &ManagedSlotTarget,
+    expected_system_identifier: u64,
+) {
     let prerequisites = batch.prerequisites();
     assert_eq!(
         prerequisites.system_identifier(),
@@ -303,11 +356,20 @@ async fn run_standby_observation_fixture(
             .map(ReplicationSlotName::as_str),
         Some(EXPECTED_PRIMARY_SLOT_NAME)
     );
+    let slot_sync_worker = prerequisites
+        .slot_sync_worker()
+        .expect("continuous slot-sync worker");
+    assert_ne!(slot_sync_worker.identity().pid().get(), 0);
+    assert_ne!(slot_sync_worker.identity().start_epoch_micros().get(), 0);
+    assert_eq!(
+        slot_sync_worker.activity(),
+        LocalSlotSyncWorkerActivity::WaitingAfterCycle
+    );
 
     let observation = batch.entries()[0]
         .observation()
         .expect("synchronized standby slot");
-    assert_eq!(batch.entries()[0].target(), &target);
+    assert_eq!(batch.entries()[0].target(), target);
     assert_eq!(observation.name, *target.name());
     assert_eq!(observation.plugin, LogicalSlotPlugin::PgOutput);
     assert_eq!(
@@ -319,24 +381,6 @@ async fn run_standby_observation_fixture(
     assert_eq!(observation.activity, SlotActivity::Inactive);
     assert_eq!(observation.ownership, SlotOwnership::Unknown);
     assert_eq!(observation.invalidation, None);
-
-    let mut restricted_config: Config = standby_database_url.parse()?;
-    restricted_config.user(STANDBY_RESTRICTED_ROLE);
-    restricted_config.password(STANDBY_RESTRICTED_PASSWORD);
-    let (restricted_client, restricted_connection) = restricted_config.connect(NoTls).await?;
-    let error = observe_local_logical_slots(
-        restricted_client,
-        restricted_connection,
-        CatalogOperationTimeout::default(),
-        &request,
-    )
-    .await
-    .expect_err("a live receiver redacted from the observer role must fail closed");
-    assert!(matches!(
-        error,
-        LocalSlotObservationError::WalReceiverDetailsUnavailable { .. }
-    ));
-    Ok(())
 }
 
 async fn assert_primary_prerequisites(
@@ -403,6 +447,7 @@ async fn assert_primary_prerequisites(
         LocalWalReceiverActivity::Absent
     );
     assert_eq!(prerequisites.wal_receiver_slot_name(), None);
+    assert_eq!(prerequisites.slot_sync_worker(), None);
     Ok(())
 }
 
@@ -440,6 +485,25 @@ async fn run_observation_assertions(
     let batch = observe_with_config(&hostile_config, &request).await?;
     assert_primary_prerequisites(setup, &batch).await?;
     assert_observed_slot_states(&batch, anchor, decoder, temporary);
+
+    let mut restricted_config: Config = database_url.parse()?;
+    restricted_config.user(RESTRICTED_OBSERVER_ROLE);
+    restricted_config.password(RESTRICTED_OBSERVER_PASSWORD);
+    let (restricted_client, restricted_connection) = restricted_config.connect(NoTls).await?;
+    let error = observe_local_logical_slots(
+        restricted_client,
+        restricted_connection,
+        CatalogOperationTimeout::default(),
+        &request,
+    )
+    .await
+    .expect_err(
+        "non-inherited pg_read_all_stats membership must not classify workers as observable",
+    );
+    assert!(matches!(
+        error,
+        LocalSlotObservationError::StatisticsPrivilegeRequired
+    ));
 
     drop_slot(setup, decoder).await?;
     let missing_request =

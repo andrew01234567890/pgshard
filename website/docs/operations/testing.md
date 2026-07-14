@@ -184,12 +184,18 @@ available for synchronization. The standby starts on a separate port and must
 report recovery, replay, a streaming receiver using the managed physical slot,
 mandatory feedback, and continuous slot synchronization. The test waits past
 PostgreSQL's temporary synchronized-slot state for a
-non-temporary synchronized copy. A standby login without `pg_read_all_stats`
-sees only the receiver PID, and the observer must return its typed
-details-unavailable error instead of reporting an absent receiver. Exact
+non-temporary synchronized copy and observes the local slot-sync worker at its
+post-cycle `ReplicationSlotsyncMain` wait boundary with a nonzero PID and
+backend-start identity. That identity is compared only for equality; it does
+not turn the server wall clock into a freshness source. A primary login without
+effective `pg_read_all_stats` privileges is rejected before redacted
+auxiliary-worker rows can be classified as absent. The fixture grants that role
+with `INHERIT FALSE`, proving that membership alone is insufficient. On the
+standby, the same restricted login sees only the receiver PID, and the observer
+returns its PID-specific details-unavailable error. Exact
 primary/walsender identity correlation, feedback freshness, new-anchor
 reconciliation on already-running standbys, and a timestamped successful
-slot-sync cycle remain part of the later multi-server runtime suite.
+source-bound slot-sync cycle remain part of the later multi-server runtime suite.
 The same job runs the observer against PostgreSQL 17 and requires the typed
 minimum-version rejection before any PostgreSQL 18-only setting is queried.
 Agent unit tests reject unsafe, incompatible, symlinked, structurally incomplete,

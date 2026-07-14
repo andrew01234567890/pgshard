@@ -301,14 +301,22 @@ identifier and checkpoint timeline, recovery role, WAL level,
 `hot_standby_feedback`, exact `wal_receiver_status_interval`,
 `sync_replication_slots`, `primary_slot_name`, replay position, and live WAL
 receiver PID, raw activity, and physical-slot name immediately before it reads
-the requested local slots. Raw `streaming` activity does not claim that the
-receiver is connected to the expected primary. If PostgreSQL exposes a live PID
-but redacts the remaining receiver fields, the observer fails with a typed
-`pg_read_all_stats` prerequisite instead of treating the receiver as absent.
+the requested local slots. It also records the local slot-sync worker's PID,
+backend-start identity, and whether the worker is in PostgreSQL's
+`ReplicationSlotsyncMain` wait after returning from a cycle. The server-wall-clock
+start value is only an equality key across observations; it is not a freshness
+clock. Raw `streaming` activity does not claim that the receiver is connected to
+the expected primary, and a waiting local worker does not identify its upstream
+connection or prove that a particular anchor was synchronized. If PostgreSQL
+exposes a live receiver PID but redacts its details, the observer returns that
+PID in a typed error. It also requires effective inherited
+`pg_read_all_stats` privileges on every observation because PostgreSQL otherwise
+redacts the auxiliary worker's type and can make a running slot-sync worker
+indistinguishable from absence. Mere non-inherited role membership is rejected.
 Both query intervals are recorded on one consumed, deadline-bounded connection.
 This is still local, non-atomic observation: it does not prove the configured
-upstream, physical-slot ownership, feedback freshness, or a completed slot-sync
-cycle.
+upstream, physical-slot ownership, feedback freshness, or a source-bound recent
+slot-sync cycle.
 Runtime code does not call `pg_sync_replication_slots()`. PostgreSQL 18 describes
 that one-shot function as primarily for testing and debugging and recommends the
 continuous slot-sync worker for high availability; pgshard will observe the
