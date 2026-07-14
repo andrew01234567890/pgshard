@@ -178,6 +178,7 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 			PoolerMaxReplicas:    poolerMax,
 			MembersPerShard:      cluster.Spec.MembersPerShard,
 			MaximumChangeStreams: maximumChangeStreams,
+			SynchronousStandbys:  synchronousStandbys(cluster.Spec.Durability),
 		})
 		if err != nil {
 			allErrs = append(allErrs, field.Invalid(specPath.Child("postgresql", "resources"), cluster.Spec.PostgreSQL.Resources, err.Error()))
@@ -362,24 +363,103 @@ func validateBackup(backup BackupSpec, path *field.Path) field.ErrorList {
 	}
 }
 
+// ResolvedPostgreSQLStandby is one deterministic direct-standby role profile.
+// PrimaryConninfo is intentionally absent because it will be written only by
+// authenticated orchestration after the upstream identity and TLS material are
+// known. Activation also requires collision-free reconciliation of managed
+// slots retained from any earlier primary role.
+// +kubebuilder:object:generate=false
+type ResolvedPostgreSQLStandby struct {
+	Ordinal          int32
+	ApplicationName  string
+	PhysicalSlotName string
+	Settings         map[string]string
+}
+
+// ResolvedPostgreSQLPrimary is the role profile for one possible primary
+// member. Its candidate list excludes that member's own ordinal.
+// +kubebuilder:object:generate=false
+type ResolvedPostgreSQLPrimary struct {
+	Ordinal  int32
+	Settings map[string]string
+}
+
+// ResolvedPostgreSQLConfiguration is the resource-derived PostgreSQL 18
+// configuration plan. Common settings are safe on every member; exactly one
+// role profile is activated by future bootstrap/orchestration code.
+// +kubebuilder:object:generate=false
+type ResolvedPostgreSQLConfiguration struct {
+	Common                  map[string]string
+	Primaries               []ResolvedPostgreSQLPrimary
+	Standbys                []ResolvedPostgreSQLStandby
+	ManagedLogicalConsumers int32
+	PrimarySlotDemand       int32
+	StandbySlotDemand       int32
+	PromotionSlotDemand     int32
+}
+
+// ResolvedPostgreSQLSettings retains the original common-settings API for
+// callers that do not need role-specific replication configuration.
 func (cluster *PgShardCluster) ResolvedPostgreSQLSettings() (map[string]string, error) {
+	configuration, err := cluster.ResolvedPostgreSQLConfiguration()
+	if err != nil {
+		return nil, err
+	}
+	return configuration.Common, nil
+}
+
+// ResolvedPostgreSQLConfiguration derives common, primary, and per-standby
+// settings from the same validated resource budget.
+func (cluster *PgShardCluster) ResolvedPostgreSQLConfiguration() (ResolvedPostgreSQLConfiguration, error) {
 	poolerMax, errs := validateScaling(cluster.Spec.Pooler.Scaling, field.NewPath("spec", "pooler", "scaling"))
 	if len(errs) != 0 {
-		return nil, fmt.Errorf("invalid pooler scaling: %s", errs.ToAggregate())
+		return ResolvedPostgreSQLConfiguration{}, fmt.Errorf("invalid pooler scaling: %s", errs.ToAggregate())
 	}
 	result, err := tuning.Calculate(tuning.Input{
 		Resources:            cluster.Spec.PostgreSQL.Resources,
 		PoolerMaxReplicas:    poolerMax,
 		MembersPerShard:      cluster.Spec.MembersPerShard,
 		MaximumChangeStreams: maximumChangeStreams,
+		SynchronousStandbys:  synchronousStandbys(cluster.Spec.Durability),
 	})
 	if err != nil {
-		return nil, err
+		return ResolvedPostgreSQLConfiguration{}, err
 	}
 	if err := tuning.ApplyOverrides(result.Settings, cluster.Spec.PostgreSQL.Parameters); err != nil {
-		return nil, err
+		return ResolvedPostgreSQLConfiguration{}, err
 	}
-	return result.Settings, nil
+	primaries := make([]ResolvedPostgreSQLPrimary, 0, len(result.Primaries))
+	for _, primary := range result.Primaries {
+		primaries = append(primaries, ResolvedPostgreSQLPrimary{
+			Ordinal:  primary.Ordinal,
+			Settings: primary.Settings,
+		})
+	}
+	standbys := make([]ResolvedPostgreSQLStandby, 0, len(result.Standbys))
+	for _, standby := range result.Standbys {
+		standbys = append(standbys, ResolvedPostgreSQLStandby{
+			Ordinal:          standby.Ordinal,
+			ApplicationName:  standby.ApplicationName,
+			PhysicalSlotName: standby.PhysicalSlotName,
+			Settings:         standby.Settings,
+		})
+	}
+	return ResolvedPostgreSQLConfiguration{
+		Common:                  result.Settings,
+		Primaries:               primaries,
+		Standbys:                standbys,
+		ManagedLogicalConsumers: result.ManagedLogicalConsumers,
+		PrimarySlotDemand:       result.PrimarySlotDemand,
+		StandbySlotDemand:       result.StandbySlotDemand,
+		PromotionSlotDemand:     result.PromotionSlotDemand,
+	}, nil
+}
+
+func synchronousStandbys(durability DurabilityMode) int32 {
+	if durability == DurabilitySynchronous {
+		return 1
+	}
+	return 0
 }
 
 // +kubebuilder:webhook:path=/mutate-pgshard-io-v1alpha1-pgshardcluster,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=create;update,versions=v1alpha1,name=mpgshardcluster.kb.io,admissionReviewVersions=v1

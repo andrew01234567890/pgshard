@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,6 +65,7 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	assertCondition(t, current, supportingAvailableCondition, metav1.ConditionFalse, "SupportingWorkloadsProgressing")
 	assertCondition(t, current, readyCondition, metav1.ConditionFalse, "PostgreSQLLifecycleUnavailable")
 	assertCondition(t, current, transportSecurityCondition, metav1.ConditionFalse, "EtcdTLSUnavailable")
+	assertPostgreSQLRoleProfiles(t, ctx, kubeClient, current)
 
 	waitForEtcdQuorum(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "etcd", 3, true)
@@ -72,6 +74,65 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	waitForStableManagerPod(t, ctx, kubeClient)
 	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertNoPostgreSQLWorkload(t, ctx, kubeClient, namespace.Name, cluster.Name)
+}
+
+func assertPostgreSQLRoleProfiles(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	configuration := &corev1.ConfigMap{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLConfigSuffix}
+	if err := kubeClient.Get(ctx, key, configuration); err != nil {
+		t.Fatal(err)
+	}
+	wantDocuments := 1 + int(cluster.Spec.MembersPerShard)*2
+	if len(configuration.Data) != wantDocuments {
+		t.Fatalf("PostgreSQL configuration documents = %#v", configuration.Data)
+	}
+	common := configuration.Data["postgresql.conf"]
+	for _, setting := range []string{
+		"hot_standby = on\n",
+		"idle_replication_slot_timeout = 0\n",
+		"wal_level = logical\n",
+	} {
+		if !strings.Contains(common, setting) {
+			t.Fatalf("common PostgreSQL configuration is missing %q:\n%s", setting, common)
+		}
+	}
+	for ordinal := int32(0); ordinal < cluster.Spec.MembersPerShard; ordinal++ {
+		memberName := fmt.Sprintf("pgshard_member_%04d", ordinal)
+		standby := configuration.Data[fmt.Sprintf("standby-%04d.conf", ordinal)]
+		for _, setting := range []string{
+			"hot_standby_feedback = on\n",
+			"primary_slot_name = '" + memberName + "'\n",
+			"sync_replication_slots = on\n",
+			"wal_receiver_status_interval = 1s\n",
+		} {
+			if !strings.Contains(standby, setting) {
+				t.Fatalf("standby %d configuration is missing %q:\n%s", ordinal, setting, standby)
+			}
+		}
+		primary := configuration.Data[fmt.Sprintf("primary-%04d.conf", ordinal)]
+		candidates := make([]string, 0, cluster.Spec.MembersPerShard-1)
+		for candidate := int32(0); candidate < cluster.Spec.MembersPerShard; candidate++ {
+			if candidate == ordinal {
+				continue
+			}
+			candidates = append(candidates, fmt.Sprintf("pgshard_member_%04d", candidate))
+		}
+		joinedCandidates := strings.Join(candidates, ",")
+		wantPrimarySettings := []string{
+			"synchronized_standby_slots = '" + joinedCandidates + "'\n",
+		}
+		if cluster.Spec.Durability == pgshardv1alpha1.DurabilitySynchronous {
+			wantPrimarySettings = append(wantPrimarySettings, "synchronous_standby_names = 'ANY 1 ("+joinedCandidates+")'\n")
+		} else {
+			wantPrimarySettings = append(wantPrimarySettings, "synchronous_standby_names = ''\n")
+		}
+		for _, setting := range wantPrimarySettings {
+			if !strings.Contains(primary, setting) {
+				t.Fatalf("primary %d configuration is missing %q:\n%s", ordinal, setting, primary)
+			}
+		}
+	}
 }
 
 func waitForStableManagerPod(t *testing.T, ctx context.Context, kubeClient client.Client) {

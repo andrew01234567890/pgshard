@@ -23,6 +23,14 @@ transaction-order machine, relation cache, slots, acknowledgements, durable
 replay, snapshots, cross-shard merge, or a stream service; see [implementation
 status](../project/status.md).
 
+The operator's generated configuration plan now reserves separate capacity for
+primary failover anchors, synchronized copies, standby-local decoding slots,
+and the temporary physical slots needed when a decoder is promoted. It renders
+primary and standby PostgreSQL 18 role profiles for every member, with the
+mandatory feedback and slot-synchronization settings described below. No PostgreSQL Pod consumes
+those profiles yet, and secure `primary_conninfo`, slot creation, eligibility
+observation, role activation, and stream ownership remain unimplemented.
+
 The source also contains a fixed-size PostgreSQL 18 Standby Status Update
 encoder. It validates that neither flush nor apply is ahead of write but does
 not decide when progress is durable or safe to acknowledge. PostgreSQL permits
@@ -175,9 +183,25 @@ operator enforces the PostgreSQL 18 prerequisites as one configuration unit:
   `wal_receiver_status_interval`, and `sync_replication_slots = on` on eligible
   standbys;
 - one durable physical slot per standby, named by its `primary_slot_name`, plus
-  a valid database name in `primary_conninfo`; and
+  a valid database name and the member profile's exact `application_name` in
+  `primary_conninfo`; and
 - a primary `synchronized_standby_slots` policy containing the physical slots
   whose receipt must gate failover-anchor progress.
+
+A demoted primary cannot immediately enable its standby profile. It can retain
+primary failover anchors whose names now belong to synchronized copies from the
+new primary, and PostgreSQL 18's slot-sync worker rejects a same-named local
+slot that is not already marked as synchronized. Rejoin therefore fences the
+member and every slot user, transfers and verifies durable consumer checkpoints,
+and reconciles only catalog-owned slots. Obsolete primary anchors and physical
+slots are dropped before `sync_replication_slots` is enabled. An orderly
+switchover performs that cleanup while the old primary remains fenced and before
+its role changes. After an unplanned failover, the old member is never restarted
+writable merely to clean slots; it is reinitialized from the new primary and
+its slot state is verified clean. An unknown or user-owned collision requires
+operator intervention and is never deleted automatically. The member remains
+ineligible for decoding and promotion until a fresh synchronized copy has been
+observed healthy.
 
 `hot_standby_feedback` is mandatory for these managed standbys, not merely a
 tuning default. It carries the standby logical slots' catalog horizon upstream;
@@ -207,15 +231,18 @@ as proof that retained storage was released.
 Milestone 1 KIND and Docker Desktop end-to-end suites must cover public streams
 and reshard materializers under steady standby decoding, primary write-load
 offload, slot synchronization, standby restart, consumer restart, promotion,
-decoder-source replacement, lag and invalidation, feedback loss, timeline
-change, and resumption from the last durable checkpoint without gaps. They must
-also prove that independent consumers cannot share or advance each other's
-slots, a consumer cannot attach to a slot for another logical or source
-database, same-name and same-OID databases with a different system identifier
-are rejected, and restoring the same system identifier requires a new restore
-incarnation. A synchronized slot is never consumed while its server is still a
-standby, and loss of every safe source fails closed. These suites are planned
-and not yet present.
+decoder-source replacement, former-primary rejoin with retained same-named
+slots, lag and invalidation, feedback loss, timeline change, and resumption from
+the last durable checkpoint without gaps. They must also prove that a colliding
+former-primary slot keeps synchronization and promotion eligibility fenced
+until verified cleanup or rebuild; managed cleanup leaves unrelated user slots
+untouched; unknown collisions fail closed; independent consumers cannot share
+or advance each other's slots; a consumer cannot attach to a slot for another
+logical or source database; same-name and same-OID databases with a different
+system identifier are rejected; and restoring the same system identifier
+requires a new restore incarnation. A synchronized slot is never consumed while
+its server is still a standby, and loss of every safe source fails closed. These
+suites are planned and not yet present.
 
 ## Snapshot plus changes
 

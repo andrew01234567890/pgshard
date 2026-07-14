@@ -3,7 +3,8 @@
 This module contains the Go control plane for the namespaced `PgShardCluster`
 API. The controller now reconciles the safe supporting-resource slice:
 
-- generated topology and resource-derived PostgreSQL configuration ConfigMaps;
+- generated topology and resource-derived PostgreSQL configuration ConfigMaps,
+  including common plus primary and standby role profiles for every member;
 - CNPG-style `<cluster>-rw`, `<cluster>-ro`, and `<cluster>-r` application
   Services, each targeting its own pooler listener;
 - one internal headless Service per shard;
@@ -35,6 +36,36 @@ lag from allowing same-name recreation to mount stale etcd state. Automated
 defragmentation is not implemented. PostgreSQL
 `archive_mode` remains off until a real archival pipeline is reconciled and
 verified, so the generated configuration cannot silently fill `pg_wal`.
+
+The PostgreSQL ConfigMap sizes every member for the largest slot footprint it
+can carry during promotion: primary physical slots and failover anchors,
+standby-synchronized anchor copies and independent standby-local decoding
+slots, plus the physical slots a promoted decoder must create before old local
+slots can be retired. Each member's primary profile excludes itself, names the
+other members' managed physical slots, and selects `ANY 1` for synchronous
+durability. Each standby profile fixes that member's own `primary_slot_name` and
+requires `hot_standby_feedback = on`, a positive
+one-second feedback interval, and `sync_replication_slots = on`. These are
+configuration plans, not evidence that replication is running. Authenticated
+orchestration must still write a `primary_conninfo` containing a valid database
+name and the profile's exact `application_name`, create the physical slots,
+observe feedback health, activate exactly one role profile, and remove unhealthy
+candidates from the synchronized set before logical consumers or clean primary
+shutdown are allowed.
+
+Rejoining a former primary is a separate fenced transition, not a direct switch
+to its standby profile. PostgreSQL 18 refuses slot synchronization when a
+same-named local slot exists but is not already a synchronized copy. The
+orchestrator must stop slot users, durably transfer and verify every managed
+consumer checkpoint, classify slots by their catalog ownership, and remove
+obsolete primary-owned anchors and physical slots before it enables
+`sync_replication_slots`. An orderly switchover performs that cleanup while the
+old primary is fenced and before its role changes. After an unplanned failover,
+the old member is never restarted writable merely to clean slots; it is
+reinitialized from the new primary and verified free of stale slot state. An
+unknown or user-owned collision requires operator intervention and is never
+deleted automatically. Only a collision-free member can regain decoder or
+promotion eligibility.
 
 The default orchestrator and pooler image values are expected development
 channel names, not a publication guarantee. The Rust pooler has a control-only
