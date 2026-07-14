@@ -41,7 +41,9 @@ transport, its explicit bootstrap mode reports phase `not_configured`, reason
 - Primary term, replica replay lag, fencing, promotion, and restart state.
 - Backup source role, per-shard completion, WAL readiness, and restore validation.
 - DDL/reshard copy, catch-up, validation, barrier, and activation stages.
-- CDC snapshot progress, event rate, acknowledgement age, LSN lag, retained WAL, and resnapshot requirements.
+- CDC and reshard-materializer source role, slot purpose, snapshot progress,
+  event rate, acknowledgement age, LSN lag, synchronized-anchor lag,
+  feedback health, retained WAL, and resnapshot requirements.
 
 Metrics use a `pgshard_` prefix and bounded-cardinality labels. SQL text, bind values, row values, shard keys, usernames, and unbounded transaction or stream IDs are prohibited as labels.
 

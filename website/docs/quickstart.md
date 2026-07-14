@@ -9,12 +9,16 @@ description: Validate the current pgshard foundation source.
 There is no installable pgshard database cluster yet. The source includes the Go
 custom-resource API and safe supporting-resource reconciler plus fail-closed
 Rust agent/orchestrator foundations and a local-only pooler catalog control
-executable plus local-only test image builds, but no PostgreSQL lifecycle,
-executable SQL pooler, chart, or full KIND environment. A self-managed admission
-manager manifest now exercises the real operator, fail-closed webhooks, and
-supporting processes in KIND, but it creates no PostgreSQL workload and is not
-a database installation. A cluster quickstart will appear only after those
-end-to-end tests pass.
+executable plus local-only test image builds. The agent can structurally
+preflight PostgreSQL 18 state and supervise its postmaster with client TCP and
+replication ingress disabled and all local SQL rejected for lifecycle testing,
+but there is no bootstrap,
+role-aware recovery, replication, client activation,
+operator-managed PostgreSQL workload, executable SQL pooler, chart, or full
+database KIND environment. A self-managed admission manager manifest exercises
+the real operator, fail-closed webhooks, and supporting processes in KIND, but
+it creates no PostgreSQL workload and is not a database installation. A cluster
+quickstart will appear only after those end-to-end tests pass.
 
 ## Validate the current source
 
@@ -26,9 +30,11 @@ make check
 ```
 
 This validates contracts, core and runtime foundations, generated Kubernetes
-resources, release policy and documentation; it does not start PostgreSQL or
-prove a sharding runtime. Follow [implementation status](./project/status.md)
-for the first version with a real cluster quickstart.
+resources, release policy and documentation. CI separately exercises the
+local-only lifecycle image with a disposable PostgreSQL 18 data directory; the
+quickstart does not start PostgreSQL or prove a sharding runtime. Follow
+[implementation status](./project/status.md) for the first version with a real
+cluster quickstart.
 
 The catalog migration has a separate opt-in live contract test against a
 disposable PostgreSQL 18 `shardschema` database. See the

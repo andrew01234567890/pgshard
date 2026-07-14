@@ -40,9 +40,10 @@ shard's restore LSN and timeline. Those epoch values and the complete mutation
 barrier identity are part of the immutable manifest.
 
 The manifest also identifies the cluster, PostgreSQL major, source topology,
-every pgBackRest backup ID, checksums, and backup source role. A backup is usable
-only when every shard backup, required WAL object, and the final manifest exist.
-Retention treats the complete set as one unit.
+every shard's source restore incarnation and PostgreSQL system identifier,
+database OIDs, every pgBackRest backup ID, checksums, and backup source role. A
+backup is usable only when every shard backup, required WAL object, and the final
+manifest exist. Retention treats the complete set as one unit.
 
 :::caution Recovery point boundary
 Milestone 1 restores coordinated backup-set points. Arbitrary wall-clock cross-shard PITR is not supported because a distributed commit can straddle a timestamp.
@@ -55,9 +56,17 @@ Restore accepts an empty target only:
 1. Validate the manifest, PostgreSQL 18 compatibility, backup objects, checksums, and required WAL before changing the target.
 2. Restore the original source topology to the recorded per-shard positions.
 3. Restore `shard-0000`, including `shardschema`, before validating the catalog.
-4. Keep application Services non-serving until all shards, roles, grants, and epochs validate.
-5. If the requested shard count differs, provision non-serving targets and run the normal reshard workflow.
-6. Publish services only after validation succeeds.
+4. While every workload remains non-serving, use one `shardschema` transaction
+   to install a fresh restore-incarnation UUID for each restored shard, advance
+   every affected logical-consumer checkpoint generation, and require a new
+   snapshot. Never reuse the incarnation copied from the backup, even when
+   system identifier and database OID are unchanged; an old resume token must
+   fail before it can advance checkpoint or slot state.
+5. Keep application Services non-serving until all shards, roles, grants,
+   identities, and epochs validate.
+6. If the requested shard count differs, provision non-serving targets and run
+   the normal reshard workflow.
+7. Publish services only after validation succeeds.
 
 The required KIND suite will use an S3-compatible MinIO deployment and cover
 standby selection, primary fallback, interrupted uploads, missing objects, and

@@ -38,7 +38,18 @@ The current internal `pgshard_catalog` migration records:
 - Permanent fixed-size operation tombstones for idempotency.
 
 Durable DDL, reshard, backup/restore and change-stream journals remain planned
-extensions; the current schema does not claim to store them.
+extensions; the current schema does not claim to store them. The planned
+logical-consumer registry keys each per-shard record by consumer,
+`logical_database_id`, and shard. Its source-attachment key adds an immutable
+shard restore-incarnation UUID, PostgreSQL system identifier, and database OID;
+the database name remains metadata. It records a bounded purpose, ownership
+fence, primary anchor, selected source identity and timeline, standby-local slot
+and consistent point, durable checkpoint and generation, and whether a new
+snapshot is required. Public streams and reshard materializers receive separate
+records and slots. Bootstrap and every coordinated restore install fresh shard
+restore-incarnation UUIDs and atomically advance affected checkpoint generations
+before slot reconciliation or serving; restoring the catalog's old incarnation
+value never authorizes attachment to restored WAL or an old resume token.
 
 Password material is never stored in `shardschema`.
 

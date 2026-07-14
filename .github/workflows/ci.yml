@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
+      postgres_agent: ${{ steps.detect.outputs.postgres_agent }}
       catalog: ${{ steps.detect.outputs.catalog }}
       pgwire: ${{ steps.detect.outputs.pgwire }}
       planner: ${{ steps.detect.outputs.planner }}
@@ -90,6 +91,7 @@ jobs:
           }
 
           rust_exists=false
+          postgres_agent_exists=false
           catalog_exists=false
           pgwire_exists=false
           planner_exists=false
@@ -103,6 +105,7 @@ jobs:
           performance_exists=false
 
           exists_at_head_or_base Cargo.toml && rust_exists=true
+          exists_at_head_or_base crates/pgshard-agent/Cargo.toml && postgres_agent_exists=true
           exists_at_head_or_base crates/pgshard-catalog/Cargo.toml && catalog_exists=true
           exists_at_head_or_base crates/pgshard-pgwire/Cargo.toml && pgwire_exists=true
           exists_at_head_or_base crates/pgshard-planner/Cargo.toml && planner_exists=true
@@ -116,6 +119,7 @@ jobs:
           exists_at_head_or_base benchmarks/Cargo.toml && performance_exists=true
 
           emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
+          emit_component postgres_agent "$postgres_agent_exists" '^crates/(pgshard-agent|pgshard-types|pgshard-version)/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^\.cargo/|^\.dockerignore$|^deploy/(docker-bake\.hcl|images/rust\.Dockerfile|images/quarantine\.pg_hba\.conf)$|^Makefile$|^\.github/workflows/ci\.yml$'
           emit_component catalog "$catalog_exists" '^crates/pgshard-catalog/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component pgwire "$pgwire_exists" '^crates/pgshard-pgwire/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component planner "$planner_exists" '^crates/pgshard-planner/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
@@ -195,6 +199,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -583,6 +588,494 @@ jobs:
               "$image" --help >/dev/null
           done
 
+  agent-postgres:
+    name: Agent / PostgreSQL 18 lifecycle
+    needs: changes
+    if: needs.changes.outputs.postgres_agent == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up local-image Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          cache-binary: false
+      - name: Build the local PostgreSQL agent without publishing
+        env:
+          PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
+          PGSHARD_GIT_SHA: ${{ github.sha }}
+          PGSHARD_IMAGE_OUTPUT: artifacts/images
+          PGSHARD_IMAGE_TAG: ci
+          PGSHARD_IMAGE_TARGETS: postgres-agent
+        run: make images
+      - name: Verify the PostgreSQL agent image
+        env:
+          PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
+          PGSHARD_GIT_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker load --input artifacts/images/pgshard-postgres-agent.tar
+          image="pgshard/postgres-agent:ci"
+          test "$(docker inspect --format '{{.Config.User}}' "$image")" = "999:999"
+          test "$(docker inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = "linux/amd64"
+          test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$PGSHARD_BUILD_VERSION"
+          test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$PGSHARD_GIT_SHA"
+          test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" | sed -n 's/^PG_MAJOR=//p')" = "18"
+          docker run --rm --platform linux/amd64 --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            "$image" --help >/dev/null
+      - name: Exercise real PostgreSQL 18 quarantine and recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="pgshard/postgres-agent:ci"
+          volume="pgshard-pgdata-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          runtime_volume="pgshard-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          external_wal_volume="pgshard-external-wal-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          standby_volume="pgshard-standby-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          container="pgshard-agent-postgres-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          regular_mount_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/pgshard-regular-mount.XXXXXX")"
+          regular_mount_file="$regular_mount_dir/PG_VERSION"
+          : > "$regular_mount_file"
+          cleanup() {
+            docker rm --force "$container" >/dev/null 2>&1 || true
+            docker rm --force "${container}-marker" >/dev/null 2>&1 || true
+            docker rm --force "${container}-mount" >/dev/null 2>&1 || true
+            docker rm --force "${container}-external-pid" >/dev/null 2>&1 || true
+            docker rm --force "${container}-control" >/dev/null 2>&1 || true
+            docker rm --force "${container}-second" >/dev/null 2>&1 || true
+            docker volume rm --force "$volume" >/dev/null 2>&1 || true
+            docker volume rm --force "$runtime_volume" >/dev/null 2>&1 || true
+            docker volume rm --force "$external_wal_volume" >/dev/null 2>&1 || true
+            docker volume rm --force "$standby_volume" >/dev/null 2>&1 || true
+            rm -f "$regular_mount_file"
+            rmdir "$regular_mount_dir" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          docker volume create "$volume" >/dev/null
+          docker volume create "$runtime_volume" >/dev/null
+          docker volume create "$external_wal_volume" >/dev/null
+          docker volume create "$standby_volume" >/dev/null
+          docker run --rm --user 0:0 --entrypoint /bin/chown \
+            --volume "$volume:/var/lib/postgresql/18/docker" \
+            "$image" 999:999 /var/lib/postgresql/18/docker
+          docker run --rm --user 0:0 --entrypoint /bin/chown \
+            --volume "$standby_volume:/standby" \
+            "$image" 999:999 /standby
+          docker run --rm --user 0:0 --entrypoint /bin/sh \
+            --volume "$runtime_volume:/run/pgshard" \
+            --volume "$external_wal_volume:/external-wal" \
+            "$image" -ceu \
+            'chown 999:999 /run/pgshard /external-wal; chmod 0700 /run/pgshard /external-wal; printf "%s\n" external-pid-sentinel > /run/pgshard/deployment.pid; chown 999:999 /run/pgshard/deployment.pid; chmod 0600 /run/pgshard/deployment.pid'
+          docker run --rm --user 999:999 \
+            --entrypoint /usr/lib/postgresql/18/bin/initdb \
+            --volume "$volume:/var/lib/postgresql/18/docker" \
+            "$image" \
+            -D /var/lib/postgresql/18/docker \
+            --auth-local=trust --auth-host=reject --encoding=UTF8 --locale=C \
+            --set wal_level=logical
+
+          docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$volume:/var/lib/postgresql/18/docker" \
+            --tmpfs /run/slot-init:rw,uid=999,gid=999,mode=0700 \
+            "$image" -ceu '
+              pg_ctl -D "$PGDATA" -o "-c listen_addresses= -c unix_socket_directories=/run/slot-init -c external_pid_file=/run/slot-init/postmaster.external.pid" -l /tmp/slot-init.log -w start >/dev/null || { cat /tmp/slot-init.log >&2; exit 1; }
+              trap '\''pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true'\'' EXIT
+              psql -h /run/slot-init -d postgres -v ON_ERROR_STOP=1 -c "SELECT pg_create_physical_replication_slot('\''physical_keep'\'', true)" >/dev/null
+              psql -h /run/slot-init -d postgres -v ON_ERROR_STOP=1 -c "SELECT pg_create_logical_replication_slot('\''logical_keep'\'', '\''pgoutput'\'')" >/dev/null
+              psql -h /run/slot-init -d postgres -v ON_ERROR_STOP=1 -c "SELECT pg_switch_wal(); SELECT pg_switch_wal()" >/dev/null
+              pg_ctl -D "$PGDATA" -m fast -w stop >/dev/null
+              trap - EXIT
+            '
+
+          docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$volume:/primary" \
+            --volume "$standby_volume:/standby" \
+            --tmpfs /run/control:rw,uid=999,gid=999,mode=0700 \
+            "$image" -ceu '
+              mkdir -m 0700 /run/control/primary /run/control/standby
+              primary_options="-c data_directory=/primary -c listen_addresses= -c unix_socket_directories=/run/control/primary -c external_pid_file=/run/control/primary/postmaster.external.pid"
+              standby_options="-c data_directory=/standby -c listen_addresses= -c unix_socket_directories=/run/control/standby -c external_pid_file=/run/control/standby/postmaster.external.pid"
+              pg_ctl -D /primary -o "$primary_options" -l /tmp/control-primary.log -w start >/dev/null || { cat /tmp/control-primary.log >&2; exit 1; }
+              trap "pg_ctl -D /standby -m immediate -w stop >/dev/null 2>&1 || true; pg_ctl -D /primary -m immediate -w stop >/dev/null 2>&1 || true" EXIT
+              pg_basebackup -h /run/control/primary -D /standby -X stream -R -c fast
+              chmod 0700 /standby
+              pg_ctl -D /standby -o "$standby_options" -l /tmp/control-standby.log -w start >/dev/null || { cat /tmp/control-standby.log >&2; exit 1; }
+              pg_isready -q -h /run/control/standby -p 5432
+              pg_ctl -D /standby -m fast -w stop >/dev/null
+              pg_ctl -D /primary -m fast -w stop >/dev/null
+              trap - EXIT
+            '
+
+          test "$(docker run --rm --user 999:999 \
+            --entrypoint /usr/lib/postgresql/18/bin/pg_controldata \
+            --volume "$standby_volume:/standby" \
+            "$image" /standby \
+            | sed -n 's/^Database cluster state: *//p')" = "shut down in recovery"
+          docker run --rm --user 999:999 --entrypoint /bin/rm \
+            --volume "$standby_volume:/standby" \
+            "$image" /standby/standby.signal
+          for recovery_state in "shut down in recovery" "in archive recovery"; do
+            set +e
+            control_output="$(timeout --signal=TERM --kill-after=1s 5s \
+              docker run --rm --name "${container}-control" --user 999:999 \
+                --network none --read-only --cap-drop ALL \
+                --security-opt no-new-privileges \
+                --tmpfs /run/pgshard:rw,uid=999,gid=999,mode=0700 \
+                --volume "$standby_volume:/var/lib/postgresql/18/docker" \
+                --env PGSHARD_HTTP_BIND=127.0.0.1:8080 \
+                --env PGSHARD_CLUSTER_ID=cluster-1 \
+                --env PGSHARD_SHARD_ID=0 \
+                --env PGSHARD_INSTANCE_ID=cluster-1-shard-0-0 \
+                --env PGSHARD_POSTGRES_MODE=quarantine \
+                "$image" 2>&1)"
+            control_status=$?
+            set -e
+            docker rm --force "${container}-control" >/dev/null 2>&1 || true
+            test "$control_status" = 1
+            grep --quiet --fixed-strings 'RecoveryControlState' <<<"$control_output"
+            grep --quiet --fixed-strings "$recovery_state" <<<"$control_output"
+            if [[ "$recovery_state" = "shut down in recovery" ]]; then
+              docker run --rm --user 999:999 --entrypoint /usr/bin/touch \
+                --volume "$standby_volume:/standby" \
+                "$image" /standby/standby.signal
+              docker run --rm --user 999:999 --entrypoint /bin/sh \
+                --volume "$volume:/primary" \
+                --volume "$standby_volume:/standby" \
+                --tmpfs /run/control:rw,uid=999,gid=999,mode=0700 \
+                "$image" -ceu '
+                  mkdir -m 0700 /run/control/primary /run/control/standby
+                  primary_options="-c data_directory=/primary -c listen_addresses= -c unix_socket_directories=/run/control/primary -c external_pid_file=/run/control/primary/postmaster.external.pid"
+                  standby_options="-c data_directory=/standby -c listen_addresses= -c unix_socket_directories=/run/control/standby -c external_pid_file=/run/control/standby/postmaster.external.pid"
+                  pg_ctl -D /primary -o "$primary_options" -l /tmp/control-primary.log -w start >/dev/null || { cat /tmp/control-primary.log >&2; exit 1; }
+                  trap "pg_ctl -D /standby -m immediate -w stop >/dev/null 2>&1 || true; pg_ctl -D /primary -m immediate -w stop >/dev/null 2>&1 || true" EXIT
+                  pg_ctl -D /standby -o "$standby_options" -l /tmp/control-standby.log -w start >/dev/null || { cat /tmp/control-standby.log >&2; exit 1; }
+                  pg_isready -q -h /run/control/standby -p 5432
+                  pg_ctl -D /standby -m immediate -w stop >/dev/null
+                  pg_ctl -D /primary -m fast -w stop >/dev/null
+                  trap - EXIT
+                '
+              test "$(docker run --rm --user 999:999 \
+                --entrypoint /usr/lib/postgresql/18/bin/pg_controldata \
+                --volume "$standby_volume:/standby" \
+                "$image" /standby \
+                | sed -n 's/^Database cluster state: *//p')" = "in archive recovery"
+              docker run --rm --user 999:999 --entrypoint /bin/rm \
+                --volume "$standby_volume:/standby" \
+                "$image" /standby/standby.signal
+            fi
+          done
+
+          for mount_path in pg_wal base/1; do
+            set +e
+            mount_output="$(timeout --signal=TERM --kill-after=1s 5s \
+              docker run --rm --name "${container}-mount" --user 999:999 \
+                --network none --read-only --cap-drop ALL \
+                --security-opt no-new-privileges \
+                --tmpfs /run/pgshard:rw,uid=999,gid=999,mode=0700 \
+                --volume "$volume:/var/lib/postgresql/18/docker" \
+                --volume "$external_wal_volume:/var/lib/postgresql/18/docker/$mount_path" \
+                --env PGSHARD_HTTP_BIND=127.0.0.1:8080 \
+                --env PGSHARD_CLUSTER_ID=cluster-1 \
+                --env PGSHARD_SHARD_ID=0 \
+                --env PGSHARD_INSTANCE_ID=cluster-1-shard-0-0 \
+                --env PGSHARD_POSTGRES_MODE=quarantine \
+                "$image" 2>&1)"
+            mount_status=$?
+            set -e
+            docker rm --force "${container}-mount" >/dev/null 2>&1 || true
+            test "$mount_status" = 1
+            grep --quiet --fixed-strings 'ExternalMount' <<<"$mount_output"
+            grep --quiet --fixed-strings "$mount_path" <<<"$mount_output"
+          done
+
+          docker run --rm --user 0:0 --entrypoint /bin/sh \
+            --volume "$regular_mount_file:/mount-probe" \
+            "$image" -ceu \
+            'printf "18\n" > /mount-probe; chown 999:999 /mount-probe; chmod 0600 /mount-probe'
+          set +e
+          mount_output="$(timeout --signal=TERM --kill-after=1s 5s \
+            docker run --rm --name "${container}-mount" --user 999:999 \
+              --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --tmpfs /run/pgshard:rw,uid=999,gid=999,mode=0700 \
+              --volume "$volume:/var/lib/postgresql/18/docker" \
+              --mount "type=bind,source=$regular_mount_file,target=/var/lib/postgresql/18/docker/PG_VERSION,readonly" \
+              --env PGSHARD_HTTP_BIND=127.0.0.1:8080 \
+              --env PGSHARD_CLUSTER_ID=cluster-1 \
+              --env PGSHARD_SHARD_ID=0 \
+              --env PGSHARD_INSTANCE_ID=cluster-1-shard-0-0 \
+              --env PGSHARD_POSTGRES_MODE=quarantine \
+              "$image" 2>&1)"
+          mount_status=$?
+          set -e
+          docker rm --force "${container}-mount" >/dev/null 2>&1 || true
+          test "$mount_status" = 1
+          grep --quiet --fixed-strings 'ExternalMount' <<<"$mount_output"
+          grep --quiet --fixed-strings 'PG_VERSION' <<<"$mount_output"
+
+          for marker in standby.signal recovery.signal backup_label tablespace_map; do
+            docker run --rm --user 999:999 --entrypoint /bin/sh \
+              --volume "$volume:/var/lib/postgresql/18/docker" \
+              "$image" -ceu ': > "$PGDATA/$1"' -- "$marker"
+            set +e
+            marker_output="$(timeout --signal=TERM --kill-after=1s 5s \
+              docker run --rm --name "${container}-marker" --user 999:999 \
+                --network none --read-only --cap-drop ALL \
+                --security-opt no-new-privileges \
+                --tmpfs /run/pgshard:rw,uid=999,gid=999,mode=0700 \
+                --volume "$volume:/var/lib/postgresql/18/docker" \
+                --env PGSHARD_HTTP_BIND=127.0.0.1:8080 \
+                --env PGSHARD_CLUSTER_ID=cluster-1 \
+                --env PGSHARD_SHARD_ID=0 \
+                --env PGSHARD_INSTANCE_ID=cluster-1-shard-0-0 \
+                --env PGSHARD_POSTGRES_MODE=quarantine \
+                "$image" 2>&1)"
+            marker_status=$?
+            set -e
+            docker rm --force "${container}-marker" >/dev/null 2>&1 || true
+            test "$marker_status" = 1
+            grep --quiet --fixed-strings 'RecoveryStatePresent' <<<"$marker_output"
+            grep --quiet --fixed-strings "$marker" <<<"$marker_output"
+            docker run --rm --user 999:999 --entrypoint /usr/bin/test \
+              --volume "$volume:/var/lib/postgresql/18/docker" \
+              "$image" ! -e /var/lib/postgresql/18/docker/postmaster.pid
+            docker run --rm --user 999:999 --entrypoint /bin/rm \
+              --volume "$volume:/var/lib/postgresql/18/docker" \
+              "$image" "/var/lib/postgresql/18/docker/$marker"
+          done
+
+          docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$volume:/var/lib/postgresql/18/docker" \
+            "$image" -ceu \
+            'printf "%s\n" \
+              "primary_conninfo = '\''host=198.51.100.1 port=5432'\''" \
+              "data_directory = '\''/var/lib/postgresql/redirected'\''" \
+              "external_pid_file = '\''/run/pgshard/deployment.pid'\''" \
+              "idle_replication_slot_timeout = '\''1s'\''" \
+              "max_slot_wal_keep_size = 0" \
+              "ignore_invalid_pages = on" \
+              "data_sync_retry = on" \
+              "ignore_checksum_failure = on" \
+              "zero_damaged_pages = on" \
+              >> "$PGDATA/postgresql.conf"'
+          pending_wal=000000010000000000000000
+          docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$volume:/var/lib/postgresql/18/docker" \
+            "$image" -ceu \
+            'truncate -s 16777216 "$PGDATA/pg_wal/$1"; : > "$PGDATA/pg_wal/archive_status/$1.ready"' \
+            -- "$pending_wal"
+
+          docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$runtime_volume:/run/pgshard" \
+            "$image" -ceu '
+              mkdir -p /run/pgshard/postgres
+              chmod 0700 /run/pgshard/postgres
+              ln -s ../deployment.pid /run/pgshard/postgres/postmaster.external.pid
+            '
+          set +e
+          external_pid_output="$(timeout --signal=TERM --kill-after=1s 5s \
+            docker run --rm --name "${container}-external-pid" --user 999:999 \
+              --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --volume "$runtime_volume:/run/pgshard" \
+              --volume "$volume:/var/lib/postgresql/18/docker" \
+              --env PGSHARD_HTTP_BIND=127.0.0.1:8080 \
+              --env PGSHARD_CLUSTER_ID=cluster-1 \
+              --env PGSHARD_SHARD_ID=0 \
+              --env PGSHARD_INSTANCE_ID=cluster-1-shard-0-0 \
+              --env PGSHARD_POSTGRES_MODE=quarantine \
+              "$image" 2>&1)"
+          external_pid_status=$?
+          set -e
+          docker rm --force "${container}-external-pid" >/dev/null 2>&1 || true
+          test "$external_pid_status" = 1
+          grep --quiet --fixed-strings 'Symlink' <<<"$external_pid_output"
+          grep --quiet --fixed-strings 'postmaster.external.pid' <<<"$external_pid_output"
+          test "$(docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$runtime_volume:/run/pgshard" \
+            "$image" -ceu 'cat /run/pgshard/deployment.pid')" = external-pid-sentinel
+          docker run --rm --user 999:999 --entrypoint /bin/rm \
+            --volume "$runtime_volume:/run/pgshard" \
+            "$image" /run/pgshard/postgres/postmaster.external.pid
+
+          start_agent() {
+            docker run --detach --name "$container" --user 999:999 \
+              --read-only --cap-drop ALL --security-opt no-new-privileges \
+              --publish 127.0.0.1::8080 \
+              --volume "$runtime_volume:/run/pgshard" \
+              --volume "$volume:/var/lib/postgresql/18/docker" \
+              --env PGSHARD_HTTP_BIND=0.0.0.0:8080 \
+              --env PGSHARD_CLUSTER_ID=cluster-1 \
+              --env PGSHARD_SHARD_ID=0 \
+              --env PGSHARD_INSTANCE_ID=cluster-1-shard-0-0 \
+              --env PGSHARD_POSTGRES_MODE=quarantine \
+              --env PGSHARD_POSTGRES_SMART_SHUTDOWN_MS=1000 \
+              --env PGSHARD_POSTGRES_FAST_SHUTDOWN_MS=5000 \
+              --env PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS=1000 \
+              "$image" >/dev/null
+          }
+          wait_ready() {
+            local port=""
+            for _ in $(seq 1 100); do
+              if [[ -z "$port" ]]; then
+                port="$(docker port "$container" 8080/tcp 2>/dev/null \
+                  | sed -n 's/.*://p' || true)"
+              fi
+              if [[ "$(docker inspect --format '{{.State.Running}}' "$container")" != true ]]; then
+                docker logs "$container" >&2
+                return 1
+              fi
+              if [[ -n "$port" ]] && curl --fail --silent --show-error \
+                --connect-timeout 1 --max-time 2 \
+                "http://127.0.0.1:${port}/status" \
+                | jq --exit-status '.postgres_process == "running_quarantined"' >/dev/null \
+                && docker exec "$container" /usr/lib/postgresql/18/bin/pg_isready \
+                  -q -h /run/pgshard/postgres -p 5432; then
+                test "$(curl --silent --show-error --connect-timeout 1 --max-time 2 \
+                  --output /dev/null \
+                  --write-out '%{http_code}' \
+                  "http://127.0.0.1:${port}/readyz")" = 503
+                test "$(curl --silent --show-error --connect-timeout 1 --max-time 2 \
+                  "http://127.0.0.1:${port}/readyz" \
+                  | jq --raw-output '.reason')" = postgres_quarantined
+                if docker exec "$container" /usr/lib/postgresql/18/bin/pg_isready \
+                  -q -h 127.0.0.1 -p 5432; then
+                  echo "quarantined PostgreSQL unexpectedly accepted TCP" >&2
+                  exit 1
+                fi
+                postmaster_arguments="$(docker exec "$container" /bin/sh -ceu \
+                  'pid="$(head -n 1 "$PGDATA/postmaster.pid")"; tr "\000" "\n" < "/proc/$pid/cmdline"')"
+                for expected in \
+                  data_directory=/var/lib/postgresql/18/docker \
+                  hba_file=/etc/pgshard/quarantine.pg_hba.conf \
+                  external_pid_file=/run/pgshard/postgres/postmaster.external.pid \
+                  listen_addresses= unix_socket_group= primary_conninfo= primary_slot_name= \
+                  restore_command= archive_mode=on archive_command= archive_library= \
+                  max_wal_senders=0 \
+                  max_logical_replication_workers=0 \
+                  idle_replication_slot_timeout=0 max_slot_wal_keep_size=-1 \
+                  fsync=on full_page_writes=on ignore_invalid_pages=off \
+                  data_sync_retry=off ignore_checksum_failure=off zero_damaged_pages=off; do
+                  grep --quiet --fixed-strings --line-regexp -- "$expected" \
+                    <<<"$postmaster_arguments"
+                done
+                docker exec "$container" /usr/bin/test \
+                  -e /var/lib/postgresql/18/docker/postmaster.pid
+                docker exec "$container" /usr/bin/test \
+                  ! -e /var/lib/postgresql/redirected/postmaster.pid
+                test "$(docker exec "$container" /bin/sh -ceu \
+                  'cat /run/pgshard/deployment.pid')" = external-pid-sentinel
+                set +e
+                sql_output="$(docker exec "$container" \
+                  /usr/lib/postgresql/18/bin/psql -h /run/pgshard/postgres \
+                  -d postgres -Atqc 'CREATE TABLE quarantine_must_reject(i int)' 2>&1)"
+                sql_status=$?
+                set -e
+                test "$sql_status" -ne 0
+                grep --quiet --fixed-strings 'pg_hba.conf rejects connection' <<<"$sql_output"
+                return
+              fi
+              sleep 0.1
+            done
+            docker logs "$container" >&2
+            return 1
+          }
+
+          start_agent
+          wait_ready
+          first_postmaster_pid="$(docker exec "$container" /bin/sh -ceu \
+            'head -n 1 "$PGDATA/postmaster.pid"')"
+          first_external_pid="$(docker exec "$container" /bin/sh -ceu \
+            'cat /run/pgshard/postgres/postmaster.external.pid')"
+          test "$first_external_pid" = "$first_postmaster_pid"
+          set +e
+          second_output="$(timeout --signal=TERM --kill-after=1s 5s \
+            docker run --rm --name "${container}-second" --user 999:999 \
+              --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --tmpfs /run/pgshard:rw,uid=999,gid=999,mode=0700 \
+              --volume "$volume:/var/lib/postgresql/18/docker" \
+              --env PGSHARD_HTTP_BIND=127.0.0.1:8080 \
+              --env PGSHARD_CLUSTER_ID=cluster-1 \
+              --env PGSHARD_SHARD_ID=0 \
+              --env PGSHARD_INSTANCE_ID=cluster-1-shard-0-1 \
+              --env PGSHARD_POSTGRES_MODE=quarantine \
+              "$image" 2>&1)"
+          second_status=$?
+          set -e
+          docker rm --force "${container}-second" >/dev/null 2>&1 || true
+          test "$second_status" = 1
+          grep --quiet --fixed-strings 'SupervisorLockHeld' <<<"$second_output"
+          test "$(docker inspect --format '{{.State.Running}}' "$container")" = true
+          test "$(docker exec "$container" /bin/sh -ceu \
+            'head -n 1 "$PGDATA/postmaster.pid"')" = "$first_postmaster_pid"
+
+          docker exec "$container" /bin/sh -ceu \
+            'kill -KILL "$(head -n 1 "$PGDATA/postmaster.pid")"'
+          for _ in $(seq 1 100); do
+            test "$(docker inspect --format '{{.State.Running}}' "$container")" = false && break
+            sleep 0.1
+          done
+          test "$(docker inspect --format '{{.State.Running}}' "$container")" = false
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" -ne 0
+          docker rm "$container" >/dev/null
+          test "$(docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$runtime_volume:/run/pgshard" \
+            "$image" -ceu 'cat /run/pgshard/postgres/postmaster.external.pid')" \
+            = "$first_external_pid"
+
+          replacement_external_pid=2147483647
+          test "$replacement_external_pid" != "$first_external_pid"
+          docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$runtime_volume:/run/pgshard" \
+            "$image" -ceu '
+              printf "%s\n" "$1" > /run/pgshard/postgres/postmaster.external.pid
+              chmod 0644 /run/pgshard/postgres/postmaster.external.pid
+              test "$(cat /run/pgshard/postgres/postmaster.external.pid)" = "$1"
+            ' -- "$replacement_external_pid"
+
+          start_agent
+          wait_ready
+          second_postmaster_pid="$(docker exec "$container" /bin/sh -ceu \
+            'head -n 1 "$PGDATA/postmaster.pid"')"
+          second_external_pid="$(docker exec "$container" /bin/sh -ceu \
+            'cat /run/pgshard/postgres/postmaster.external.pid')"
+          test "$second_external_pid" = "$second_postmaster_pid"
+          test "$second_external_pid" != "$replacement_external_pid"
+          docker stop --time 10 "$container" >/dev/null
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = 0
+          docker run --rm --user 999:999 --entrypoint /usr/bin/test \
+            --volume "$volume:/var/lib/postgresql/18/docker" \
+            "$image" ! -e /var/lib/postgresql/18/docker/postmaster.pid
+          docker run --rm --user 999:999 --entrypoint /usr/bin/test \
+            --volume "$runtime_volume:/run/pgshard" \
+            "$image" ! -e /run/pgshard/postgres/postmaster.external.pid
+          docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$volume:/var/lib/postgresql/18/docker" \
+            "$image" -ceu \
+            'test -f "$PGDATA/pg_wal/$1"; test -f "$PGDATA/pg_wal/archive_status/$1.ready"' \
+            -- "$pending_wal"
+          test "$(docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$runtime_volume:/run/pgshard" \
+            "$image" -ceu 'cat /run/pgshard/deployment.pid')" = external-pid-sentinel
+
+          slot_state="$(docker run --rm --user 999:999 --entrypoint /bin/sh \
+            --volume "$volume:/var/lib/postgresql/18/docker" \
+            --tmpfs /run/slot-check:rw,uid=999,gid=999,mode=0700 \
+            "$image" -ceu '
+              options="-c data_directory=$PGDATA -c listen_addresses= -c unix_socket_directories=/run/slot-check -c external_pid_file=/run/slot-check/postmaster.external.pid -c idle_replication_slot_timeout=0 -c max_slot_wal_keep_size=-1 -c ignore_invalid_pages=off -c data_sync_retry=off -c ignore_checksum_failure=off -c zero_damaged_pages=off"
+              pg_ctl -D "$PGDATA" -o "$options" -l /tmp/slot-check.log -w start >/dev/null
+              trap '\''pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true'\'' EXIT
+              psql -h /run/slot-check -d postgres -At -v ON_ERROR_STOP=1 -c "SELECT slot_name || '\''|'\'' || COALESCE(invalidation_reason, '\'''\'') FROM pg_replication_slots WHERE slot_name IN ('\''logical_keep'\'', '\''physical_keep'\'') ORDER BY slot_name"
+              pg_ctl -D "$PGDATA" -m fast -w stop >/dev/null
+              trap - EXIT
+            ')"
+          test "$slot_state" = $'logical_keep|\nphysical_keep|'
+
   kind:
     name: KIND / ${{ matrix.scenario }}
     needs: changes
@@ -654,6 +1147,7 @@ jobs:
       - ui
       - integration
       - images
+      - agent-postgres
       - kind
       - performance
     runs-on: ubuntu-24.04
@@ -676,6 +1170,7 @@ jobs:
             ui=${{ needs.ui.result }}
             integration=${{ needs.integration.result }}
             images=${{ needs.images.result }}
+            agent-postgres=${{ needs.agent-postgres.result }}
             kind=${{ needs.kind.result }}
             performance=${{ needs.performance.result }}
         shell: bash
