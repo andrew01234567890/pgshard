@@ -29,6 +29,13 @@ in the same pull request whenever implementation status changes.
 | Admin UI, Prometheus and OpenTelemetry | The pooler control executable serves catalog Prometheus exposition; scraping resources, SQL-path metrics, OpenTelemetry export, dashboards, UI, and Grafana/Tempo validation are absent | Partial |
 | KIND, Jepsen/Elle and PgBouncer comparison | Targeted operator PVC delete/recreate KIND test; full cluster, history and performance suites remain absent | Partial |
 
+The current operator plan starts poolers only in explicit
+`bootstrap-unavailable` catalog mode. This proves a credential-free process can
+remain alive and observable before catalog transport exists; phase
+`not_configured` and readiness reason `catalog_not_configured` remain
+fail-closed, and no connection attempt is made. It is not evidence of a usable
+pooler or database endpoint.
+
 No development database cluster can be installed from the current source. The
 operator does not create PostgreSQL Pods or PVCs, the pooler accepts no wire
 session and has no connection pool, and supporting Services are not usable

@@ -44,15 +44,20 @@ in-flight wait retains its deadline and exponential retry state, and shutdown
 can interrupt the capped retry backoff. A Linux subprocess test loads real
 environment variables, a CLI override, and file configuration, serves health,
 returns an exact PostgreSQL `FATAL`/`57P03` startup rejection, receives
-`SIGTERM`, and exits successfully. PostgreSQL listener tests refuse sequential
-GSS and SSL requests, decode the bounded rejection, close cancellation without
-a response, time out an incomplete startup, and drain on shutdown.
-Configuration tests open only regular DSN files nonblockingly, reject a FIFO
-without waiting for a writer, bound the read and timing values, reject remote
-plaintext or session-policy overrides, and prove invalid DSN contents do not
-escape through errors. A separate raw-wire PostgreSQL 18
-test creates every protocol 3.0, 3.2, and negotiated 3.99 outbound packet with
-the production startup encoder. It validates four-byte protocol 3.0 and
+`SIGTERM`, and exits successfully. A second subprocess starts with no DSN in
+explicit bootstrap mode, proves liveness stays independent while readiness and
+status report `catalog_not_configured`, observes no connection attempt, rejects
+PostgreSQL startup, and exits cleanly on `SIGTERM`. PostgreSQL listener tests
+refuse sequential GSS and SSL requests, decode the bounded rejection, close
+cancellation without a response, time out an incomplete startup, and drain on
+shutdown. Configuration tests require exactly one explicit catalog path: local
+mode with a regular DSN file, or credential-free `bootstrap-unavailable` mode.
+They open DSN files nonblockingly, reject a FIFO without waiting for a writer,
+bound the read and timing values, reject remote plaintext or session-policy
+overrides, and prove invalid DSN contents do not escape through errors. A
+separate raw-wire PostgreSQL 18 test creates every protocol 3.0, 3.2, and
+negotiated 3.99 outbound packet with the production startup encoder. It
+validates four-byte protocol 3.0 and
 32-byte protocol 3.2 server cancellation keys, zero-copy `BackendKeyData` and
 `ParameterStatus`, typed `AuthenticationOk`, and a real protocol 3.99 to 3.2
 negotiation that returns the requested unsupported `_pq_.` option. It also

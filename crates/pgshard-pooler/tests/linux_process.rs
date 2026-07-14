@@ -52,7 +52,7 @@ fn env_file_http_postgresql_rejection_and_sigterm_form_one_process_contract() {
 
     let started = Instant::now();
     let response = loop {
-        if let Ok(response) = request_health(http_address) {
+        if let Ok(response) = request_http(http_address, "/healthz") {
             break response;
         }
         if let Some(status) = child.0.try_wait().expect("inspect pooler process") {
@@ -87,6 +87,70 @@ fn env_file_http_postgresql_rejection_and_sigterm_form_one_process_contract() {
     assert!(status.success(), "pooler SIGTERM exit was {status}");
 }
 
+#[test]
+fn explicit_bootstrap_mode_is_healthy_unready_and_credential_free() {
+    let http_address = reserve_address("bootstrap HTTP");
+    let read_write_address = reserve_address("bootstrap PostgreSQL read-write");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_pgshard-pooler"))
+        .env_clear()
+        .env("PGSHARD_HTTP_BIND", http_address.to_string())
+        .env("PGSHARD_RW_BIND", read_write_address.to_string())
+        .env("PGSHARD_CATALOG_MODE", "bootstrap-unavailable")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn bootstrap pooler process");
+    let mut child = ChildGuard(child);
+
+    let started = Instant::now();
+    let health = loop {
+        if let Ok(response) = request_http(http_address, "/healthz") {
+            break response;
+        }
+        if let Some(status) = child.0.try_wait().expect("inspect bootstrap process") {
+            panic!("bootstrap pooler exited before HTTP became ready: {status}");
+        }
+        assert!(
+            started.elapsed() < PROCESS_TIMEOUT,
+            "bootstrap HTTP startup timed out"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    let readiness = request_http(http_address, "/readyz").expect("request readiness");
+    assert!(readiness.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+    assert!(readiness.contains(r#"{"ready":false,"reason":"catalog_not_configured"}"#));
+
+    let status = request_http(http_address, "/status").expect("request status");
+    assert!(status.contains(r#""phase":"not_configured""#));
+    assert!(status.contains(r#""connect_attempts":"0""#));
+
+    let rejection = request_postgresql(read_write_address)
+        .expect("bootstrap PostgreSQL boundary rejects startup");
+    assert_eq!(rejection.first(), Some(&b'E'));
+    assert!(rejection.windows(6).any(|bytes| bytes == b"C57P03"));
+
+    kill_process(Pid::from_child(&child.0), Signal::TERM).expect("send bootstrap SIGTERM");
+    let signalled = Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("wait for bootstrap process") {
+            break status;
+        }
+        assert!(
+            signalled.elapsed() < PROCESS_TIMEOUT,
+            "bootstrap SIGTERM shutdown timed out"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "bootstrap pooler SIGTERM exit was {status}"
+    );
+}
+
 fn reserve_address(description: &str) -> SocketAddr {
     let reservation = TcpListener::bind("127.0.0.1:0")
         .unwrap_or_else(|error| panic!("reserve {description} address: {error}"));
@@ -97,10 +161,12 @@ fn reserve_address(description: &str) -> SocketAddr {
     address
 }
 
-fn request_health(address: SocketAddr) -> std::io::Result<String> {
+fn request_http(address: SocketAddr, path: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(100))?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-    stream.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    stream.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
+    )?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)

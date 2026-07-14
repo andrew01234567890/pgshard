@@ -35,12 +35,16 @@ verified, so the generated configuration cannot silently fill `pg_wal`.
 
 The default orchestrator and pooler image values are expected development
 channel names, not a publication guarantee. The Rust pooler has a control-only
-executable that composes catalog supervision with its HTTP endpoints, but it
-has no PostgreSQL listener or connection pool and deliberately remains
-application-unready even when its catalog is usable. Its catalog connector is
+executable that composes catalog state with its HTTP endpoints and a
+rejection-only PostgreSQL read-write handshake listener. It accepts no SQL
+session, has no connection pool, and deliberately remains application-unready
+even when its catalog is usable. Its catalog connector is
 deliberately local-only until authenticated TLS exists, while this operator
 does not yet provision PostgreSQL, a catalog DSN Secret, or a compatible local
-catalog endpoint. Override the defaults with `--orchestrator-image` and
+catalog endpoint. The operator therefore selects the pooler's explicit
+`bootstrap-unavailable` mode: the process exposes liveness and bounded status
+without a credential or connection attempt, while catalog and application
+readiness fail closed. Override the defaults with `--orchestrator-image` and
 `--pooler-image` when concrete images exist. `--etcd-image` is also
 configurable. Image pull or runtime readiness is reported only through
 `SupportingWorkloadsAvailable`, never as database readiness.

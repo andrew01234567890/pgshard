@@ -14,9 +14,12 @@ database contract test exist in source. A Linux control executable composes
 the supervisor with pooler HTTP/readiness/status and Prometheus publication,
 bounded runtime settings, a file-backed DSN, and coordinated shutdown. Its
 control HTTP resources and drain are bounded, and its temporary plaintext
-connector rejects non-local endpoints. Overall application readiness stays
-false because there is no SQL data plane. Authenticated TLS, remote catalog
-transport, and operator-provisioned credentials are not wired yet; see
+connector rejects non-local endpoints. An explicit credential-free bootstrap
+mode exposes liveness while reporting the catalog unconfigured and making no
+connection attempt. The operator selects that mode until it can provision a
+safe catalog transport. Overall application readiness stays false because
+there is no SQL data plane. Authenticated TLS, remote catalog transport, and
+operator-provisioned credentials are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
@@ -103,6 +106,12 @@ literals or Unix sockets with `sslmode=disable`, the exact `shardschema`
 database, `target_session_attrs=read-write`, and no startup options. That
 development bridge is not a substitute for authenticated TLS or operator
 credential distribution.
+
+`bootstrap-unavailable` is a separate fail-closed installation state, not an
+empty catalog or a stale-cache policy. It accepts no DSN, reports phase
+`not_configured` and readiness reason `catalog_not_configured`, keeps all
+connection counters at zero, and requires a process rollout to enter supervised
+catalog mode.
 
 The empty installed catalog begins at epoch zero. A reader fails closed before
 publishing metadata above the current process limits: 1,024 logical databases,

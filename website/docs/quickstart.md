@@ -9,9 +9,10 @@ description: Validate the current pgshard foundation source.
 There is no installable pgshard database cluster yet. The source includes the Go
 custom-resource API and safe supporting-resource reconciler plus fail-closed
 Rust agent/orchestrator foundations and a local-only pooler catalog control
-executable, but no PostgreSQL lifecycle, executable SQL pooler, chart, container
-build, or KIND environment. A cluster quickstart will appear only after those
-end-to-end tests pass.
+executable plus local-only test image builds, but no PostgreSQL lifecycle,
+executable SQL pooler, operator installation manifest, chart, or full KIND
+environment. A cluster quickstart will appear only after those end-to-end tests
+pass.
 
 ## Validate the current source
 
