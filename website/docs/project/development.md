@@ -43,16 +43,18 @@ make images
 ```
 
 This builds digest-pinned Linux/amd64 Docker-compatible image archives for the
-Rust agent, orchestrator and pooler plus the Go operator under
-`artifacts/images/`. The bake definition has no registry output or push target.
-The current images are test inputs, not an installable database cluster. The
-selected Buildx builder must support the Docker exporter. Docker's default
-`docker` driver does not support this archive exporter; use a
-`docker-container`, Kubernetes, or remote builder. The command derives the full
-revision from `HEAD` and marks its development version `dirty` when the worktree
-differs. Source archives must provide `PGSHARD_GIT_SHA` explicitly. Direct Bake
-invocations must provide both build identity variables; missing and all-zero
-identity is rejected.
+Rust agent, orchestrator and pooler and the Go operator under
+`artifacts/images/`. The separate
+`PGSHARD_IMAGE_TARGETS=postgres-agent make images` target builds the heavier
+PostgreSQL 18 lifecycle-test archive once where needed. The bake definition has no
+registry output or push target. The current images are test inputs, not an
+installable database cluster. The selected Buildx builder must support the
+Docker exporter. Docker's default `docker` driver does not support this archive
+exporter; use a `docker-container`, Kubernetes, or remote builder. The command
+derives the full revision from `HEAD` and marks its development version `dirty`
+when the worktree differs. Source archives must provide `PGSHARD_GIT_SHA`
+explicitly. Direct Bake invocations must provide both build identity variables;
+missing and all-zero identity is rejected.
 
 `PGSHARD_IMAGE_TARGETS="operator orchestrator pooler" make images` builds the
 subset used by the real-manager KIND smoke. After loading those `:dev` images

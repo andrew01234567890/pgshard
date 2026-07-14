@@ -47,8 +47,11 @@ enum StartMode {
 // AcknowledgeRequest confirms that the client durably processed a checkpoint.
 // resume_token must be an authenticated, versioned token issued by this server
 // for a Checkpoint delivered on the current RPC. It binds the stream, semantic
-// configuration, position, checkpoint generation and ordinal. Bit-flipped,
-// cross-stream, cross-configuration, or not-yet-delivered tokens are rejected.
+// configuration, position, checkpoint generation and ordinal, plus every
+// shard's source attachment: restore-incarnation UUID, PostgreSQL system
+// identifier and database OID. Bit-flipped, cross-stream,
+// cross-configuration, source-incarnation-changed, or not-yet-delivered tokens
+// are rejected before checkpoint state or replication-slot feedback advances.
 // A valid acknowledgement advances durable state monotonically; a duplicate or
 // older authenticated token is an idempotent no-op and never regresses slot
 // feedback. The server may advance replication-slot feedback no further than
@@ -386,10 +389,11 @@ message ReshardJournal {
 // transactions covered by position have emitted a terminal Commit,
 // CommitPrepared, or RollbackPrepared event. resume_token is an opaque,
 // authenticated and versioned server token bound to this durable stream,
-// semantic configuration, position, checkpoint generation and monotonic
-// ordinal. During initial copy it also binds the retained snapshot-session ID,
-// snapshot phase, and each shard's relation and deterministic chunk cursor. It
-// is excluded from the flow-control window but bounded by
+// semantic configuration, position, each shard's source attachment (restore
+// incarnation, PostgreSQL system identifier, and database OID), checkpoint
+// generation, and monotonic ordinal. During initial copy it also binds the
+// retained snapshot-session ID, snapshot phase, and each shard's relation and
+// deterministic chunk cursor. It is excluded from the flow-control window but bounded by
 // Opened.max_control_payload_bytes. Delivery after this checkpoint is at least
 // once until resume_token is durably acknowledged.
 message Checkpoint {
@@ -412,6 +416,7 @@ enum ResnapshotReason {
   RESNAPSHOT_REASON_CONFIGURATION_CHANGED = 4;
   RESNAPSHOT_REASON_JOURNAL_UNAVAILABLE = 5;
   RESNAPSHOT_REASON_SLOT_LOST = 6;
+  RESNAPSHOT_REASON_SOURCE_INCARNATION_CHANGED = 7;
 }
 
 // ResnapshotRequired is the final in-band response. The server then closes the

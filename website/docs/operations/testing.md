@@ -96,6 +96,52 @@ zero-copy borrowing, debug redaction, and exact fixed-size Standby Status Update
 frames with ordered progress validation. All-or-nothing progress-state tests
 reject write, flush, and apply regression without mutating the last accepted
 sample.
+Agent unit tests reject unsafe, incompatible, symlinked, structurally incomplete,
+or role-aware recovery state, including base-backup markers and CRC-backed
+`shut down in recovery` or `in archive recovery` control states with both signal
+files deliberately absent; require a shutdown signal budget that includes its
+bounded initial reap; reject external WAL directories and user
+tablespaces; enforce directory owner and mode policy; recursively reject unsafe
+directories, symlinks, and special-file entries throughout PGDATA; bound
+fixed-policy file reads; revalidate path identities immediately before spawn;
+and abandon a genuinely
+blocked preparation or revalidation worker when shutdown wins before process
+creation. They hold one cross-process supervisor lock per PGDATA, reject a
+symlinked external PID file without modifying its target, preserve an exact
+validated regular PID file or bounded PostgreSQL-created `0600`/`0640` startup
+transient through final pre-spawn revalidation, and atomically replace a stale
+agent-thread lock only after durably writing its new PID line plus the preserved
+shared-memory/orphan fields. Separately, the PostgreSQL 18 source ordering
+establishes its data and socket locks before overwriting the external PID file.
+Shutdown tests exercise smart-to-fast escalation, forced reaping, a
+signal-ignoring postmaster descendant, nested PID-namespace group identifiers,
+a leader that exits before its
+descendant, unreaped pidfd observation, non-UTF-8 Linux process names, and
+cancellation of the supervision future; cancellation also reaps the direct
+child before the PGDATA fence can be reacquired, and the complete PostgreSQL
+process group must be dead.
+Linux subprocess coverage proves the control listener binds before child
+creation, reports the quarantined process state and metrics, remains unready
+without a lease, bounds HTTP drain even when a client holds partial headers,
+propagates postmaster crash and `SIGTERM`, and leaves no child behind. A separate
+local-image CI job initializes a real PostgreSQL 18 data directory, rejects
+standby, archive, incomplete base-backup, and missing-signal recovery control
+state before process creation,
+rejects directory mounts at both `pg_wal` and `base/1` plus a bind-mounted
+regular `PG_VERSION` file, and proves a configuration-file data-directory
+redirect cannot escape the validated path.
+It also proves a second container cannot supervise the same PGDATA and that an
+external PID symlink is rejected while its target remains byte-identical.
+Destructive recovery settings are overridden, TCP is closed, and the private
+Unix listener rejects all SQL through an immutable HBA policy. The test kills
+the postmaster and requires the agent to fail terminally,
+restarts through crash recovery with the same data and socket volumes, then
+verifies clean shutdown removes `postmaster.pid` while a pending archive WAL
+segment and its `.ready` marker remain retained. Persistent physical and logical
+slots must remain valid across the idle timeout, WAL growth, recovery, and clean
+shutdown. PostgreSQL's own CRC-checking control-data tool remains the authority
+for interpreting control-file contents. Test
+images and volumes remain runner-local and are not published.
 The live PostgreSQL 18 fixture sends the production feedback frame through a
 real COPY-BOTH connection, drains a catch-up keepalive, observes three distinct
 positions in `pg_stat_replication`, receives the subsequent requested keepalive,
@@ -131,11 +177,12 @@ work; see
 
 One GitHub Actions workflow fans out into independent jobs and ends in one required aggregate result. Pull requests run focused checks; scheduled invocations expand Kubernetes versions, fault duration, fuzzing, and performance samples.
 
-The image job builds four Linux/amd64 Docker-compatible image archives without
-a registry output, loads each archive locally, and verifies its platform, build
-labels, numeric non-root identity, and binary entrypoint under a read-only root
-filesystem. The archives are discarded with the runner; CI does not upload or
-publish them.
+The standard image job builds four Linux/amd64 Docker-compatible image archives
+without a registry output, loads each archive locally, and verifies its
+platform, build labels, numeric non-root identity, and binary entrypoint under
+a read-only root filesystem. A separate change-filtered lifecycle job builds
+only the agent and combines it with PostgreSQL 18 for the real lifecycle test.
+The archives are discarded with the runner; CI does not upload or publish them.
 
 ## Test layers
 
@@ -162,12 +209,26 @@ Jepsen/Elle check the guarantees actually offered: atomic final cross-shard outc
   plus stable conflict for same ID with each individual field changed and a
   delayed replay after terminal-state retention boundaries.
 - Active DDL, reshard, and CDC streams during failover.
+- Standby-first public streams and reshard materializers, including operator
+  configuration of physical and logical slots, `sync_replication_slots`,
+  `synchronized_standby_slots`, `primary_slot_name`, and mandatory
+  `hot_standby_feedback`; disabling or stalling feedback must fence the decoder.
+- Independent standby-local slots plus synchronized primary failover anchors
+  across source loss and promotion, with no consumption of a synchronized slot
+  before promotion and no cross-consumer or cross-database checkpoint or slot
+  ownership.
+- Source attachment rejects a same-name and same-OID database from another
+  PostgreSQL system identifier, and rejects a physical restore that reuses the
+  system identifier and OID without a fresh shard restore-incarnation UUID.
 - CDC reconnect/replay before every chunk and terminal event, including a
   transaction exactly at and one byte/event above configured flow limits, a
   checkpoint emitted while the data window is exactly full, and individual
   snapshot/relation/reshard events at and above their byte limit.
 - CDC token tampering, future-token acknowledgement, cross-stream/configuration
   replay, duplicate and stale acknowledgements, and signing-key rotation.
+- Replay of an old resume token after a different-system reinitialization and
+  after a same-system physical restore with a new shard incarnation; both must
+  return `SOURCE_INCARNATION_CHANGED` without advancing checkpoint or slot state.
 - CDC snapshot initialization with failures and delayed DDL, 2PC recovery,
   reshard activation, topology publication, and semantic configuration mutation
   at every barrier boundary.

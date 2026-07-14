@@ -60,6 +60,13 @@ target "pooler" {
   output   = ["type=docker,dest=${PGSHARD_IMAGE_OUTPUT}/pgshard-pooler.tar"]
 }
 
+target "postgres-agent" {
+  inherits = ["rust-runtime"]
+  target   = "postgres-agent"
+  tags     = ["pgshard/postgres-agent:${PGSHARD_IMAGE_TAG}"]
+  output   = ["type=docker,dest=${PGSHARD_IMAGE_OUTPUT}/pgshard-postgres-agent.tar"]
+}
+
 target "operator" {
   context    = "."
   dockerfile = "deploy/images/operator.Dockerfile"
