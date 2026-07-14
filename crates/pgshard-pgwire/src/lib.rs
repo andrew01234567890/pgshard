@@ -13,6 +13,7 @@ mod encode;
 mod messages;
 mod pgoutput;
 mod session;
+mod startup_encode;
 
 pub use backend::{
     AuthenticationRequest, BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_ERROR_MESSAGE_LENGTH,
@@ -59,6 +60,12 @@ pub use session::{
     Postgres18StartupNegotiation,
 };
 
+pub use startup_encode::{
+    ENCRYPTION_REQUEST_FRAME_LENGTH, MAX_STARTUP_PARAMETERS, StartupEncodeError,
+    encode_gss_encryption_request, encode_postgres18_cancel_request, encode_ssl_request,
+    encode_startup,
+};
+
 /// Maximum body size accepted by `PostgreSQL` 18 for a startup packet.
 pub const MAX_STARTUP_BODY_LENGTH: usize = 10_000;
 /// Maximum total startup frame size, including its four-byte length word.
@@ -84,6 +91,8 @@ const CANCEL_REQUEST_CODE: u32 = protocol_code(1234, 5678);
 const NEGOTIATE_SSL_CODE: u32 = protocol_code(1234, 5679);
 const NEGOTIATE_GSS_CODE: u32 = protocol_code(1234, 5680);
 const LATEST_PROTOCOL_MINOR: u16 = 2;
+const STARTUP_HEADER_LENGTH_WORD: u32 = 8;
+const STARTUP_HEADER_LENGTH: usize = STARTUP_HEADER_LENGTH_WORD as usize;
 
 const fn protocol_code(major: u16, minor: u16) -> u32 {
     (major as u32) << 16 | minor as u32
@@ -145,6 +154,16 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
+    /// Creates a frontend/backend protocol version from its wire components.
+    #[must_use]
+    pub const fn new(major: u16, minor: u16) -> Self {
+        Self { major, minor }
+    }
+
+    const fn wire_code(self) -> u32 {
+        protocol_code(self.major, self.minor)
+    }
+
     /// Returns the version `PostgreSQL` 18 selects for this startup request.
     ///
     /// Protocol-three minor versions above the server's latest minor version
@@ -492,10 +511,10 @@ pub fn decode_startup(input: &[u8]) -> Result<Decode<StartupFrame<'_>>, DecodeEr
     let Some(total_length) = frame_length(input, 0)? else {
         return Ok(Decode::Incomplete { required: 4 });
     };
-    if total_length < 8 {
+    if total_length < STARTUP_HEADER_LENGTH {
         return Err(DecodeError::InvalidLength {
             actual: total_length,
-            minimum: 8,
+            minimum: STARTUP_HEADER_LENGTH,
         });
     }
     if total_length > MAX_STARTUP_FRAME_LENGTH {
@@ -504,14 +523,20 @@ pub fn decode_startup(input: &[u8]) -> Result<Decode<StartupFrame<'_>>, DecodeEr
             maximum: MAX_STARTUP_FRAME_LENGTH,
         });
     }
-    if input.len() < 8 {
-        return Ok(Decode::Incomplete { required: 8 });
+    if input.len() < STARTUP_HEADER_LENGTH {
+        return Ok(Decode::Incomplete {
+            required: STARTUP_HEADER_LENGTH,
+        });
     }
 
     let code = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
     match code {
-        NEGOTIATE_SSL_CODE => require_special_length("SSL", total_length, 8)?,
-        NEGOTIATE_GSS_CODE => require_special_length("GSS", total_length, 8)?,
+        NEGOTIATE_SSL_CODE => {
+            require_special_length("SSL", total_length, STARTUP_HEADER_LENGTH)?;
+        }
+        NEGOTIATE_GSS_CODE => {
+            require_special_length("GSS", total_length, STARTUP_HEADER_LENGTH)?;
+        }
         CANCEL_REQUEST_CODE => {
             let key_length = total_length.saturating_sub(12);
             if !(MIN_CANCEL_REQUEST_KEY_LENGTH..=MAX_CANCEL_KEY_LENGTH).contains(&key_length) {

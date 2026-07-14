@@ -2,9 +2,9 @@
 
 This non-publishable crate implements bounded, zero-copy decoding for
 PostgreSQL 18 frontend and backend frames, frontend SASL responses, and selected
-query-protocol bodies, plus bounded backend-control, minimal-error, and
-fixed-size replication-feedback encoding. Its constants, tags, and layouts
-follow the `REL_18_STABLE`
+query-protocol bodies, plus bounded frontend startup-request, backend-control,
+minimal-error, and fixed-size replication-feedback encoding. Its constants,
+tags, and layouts follow the `REL_18_STABLE`
 PostgreSQL server source.
 
 The decoder recognizes startup protocol versions, SSL and GSS negotiation,
@@ -25,6 +25,15 @@ handshake.
 PostgreSQL 18 direct TLS begins with a TLS record rather than a PostgreSQL
 startup frame; the future transport must detect it before calling this decoder
 and require the `postgresql` ALPN protocol during the handshake.
+
+Frontend startup encoders emit exact fixed SSL and GSS negotiation requests,
+preserve ordered and duplicate byte-string parameters in caller-buffered
+protocol-three startup packets, and validate every variable packet before
+touching output. PostgreSQL 18 cancellation encoding accepts only a completed
+startup-protocol proof and decoded `BackendKeyData`, enforcing the server's
+exact four-byte key before protocol 3.2 or 32-byte key at protocol 3.2. The
+connection owner must still bind that proof and key to the exact upstream
+socket; the encoders do not implement transport or cancellation routing.
 
 This crate does not open a socket, terminate TLS, authenticate users, parse SQL,
 pool connections, or proxy a message. A caller must supply the current protocol
@@ -89,17 +98,19 @@ validates the five-byte SQLSTATE and nonempty UTF-8 message, and deliberately
 omits optional diagnostics. Its explicit caller limit uses libpq's 30,000-byte
 pre-authentication ceiling during startup while allowing bounded authenticated
 session policy up to the pooler's 64 MiB hard limit. Variable frames are
-completely sized
-and validated before the output is touched, retain PostgreSQL 18's family
-bounds, and never include values or cancellation keys in errors. Unsupported
+completely sized and validated before the output is touched. They retain
+PostgreSQL 18's family bounds and never include values or cancellation keys in
+errors. Unsupported
 protocol options are supplied as borrowed byte slices so validation and writing
 need no internal allocation or replayable iterator contract. A decoded
 protocol-three request can derive PostgreSQL 18's selected version directly,
 including the 3.2 response to a future minor version. The live
-PostgreSQL 18 trust-authentication fixture decodes and re-encodes the non-SASL
-startup frames other than `ErrorResponse` and requires byte-for-byte equality.
-The SCRAM and `ErrorResponse` primitives have source-aligned unit coverage but
-no live exchange yet. These primitives do not yet provide a client listener,
+PostgreSQL 18 trust-authentication fixture creates its protocol 3.0, 3.2, and
+negotiated 3.99 outbound packets through the production startup encoder, then
+decodes and re-encodes the non-SASL backend startup frames other than
+`ErrorResponse` with byte-for-byte equality. The SSL, GSS, cancellation, SCRAM,
+and `ErrorResponse` primitives have source-aligned unit coverage but no live
+exchange yet. These primitives do not yet provide a client listener,
 authentication policy, or ordered session writer.
 
 The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH

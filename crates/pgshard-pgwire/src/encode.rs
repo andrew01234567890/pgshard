@@ -365,9 +365,7 @@ pub fn encode_protocol_negotiation(
     require_output(output, frame_length)?;
 
     write_header(output, b'v', message_length);
-    let protocol =
-        u32::from(selected_protocol.major()) << 16 | u32::from(selected_protocol.minor());
-    output[5..9].copy_from_slice(&protocol.to_be_bytes());
+    output[5..9].copy_from_slice(&selected_protocol.wire_code().to_be_bytes());
     output[9..13].copy_from_slice(&option_count.to_be_bytes());
     let mut offset = 13;
     for option in unsupported_options.iter().copied() {
