@@ -112,6 +112,8 @@ reject the zero byte exactly as PostgreSQL does.
 
 The decoder caps one frontend frame at 64 MiB. Startup, authentication, and
 control-message families retain PostgreSQL 18's smaller family-specific limits.
+SCRAM responses use a dedicated authentication phase that applies PostgreSQL
+18's 1,024-byte limit from the length word before buffering.
 It reports oversized frames before their bodies are buffered; the future
 session layer must then close the client connection as a protocol violation.
 Backend framing likewise applies exact fixed-message and
@@ -151,10 +153,16 @@ identity, rejection of reserved protocol 3.1 as client policy, and the
 configured minimum protocol version.
 Exact startup-control encoders cover `AuthenticationOk`, `ParameterStatus`,
 `BackendKeyData`, `NegotiateProtocolVersion`, and every `ReadyForQuery`
-transaction state. Caller-buffered encoders validate the complete bounded
+transaction state. They also cover PostgreSQL 18's ordered SCRAM-SHA-256
+advertisement and opaque SASL continue/final frames. Frontend typed decoders
+borrow the selected SASL mechanism, preserve absent versus empty initial data,
+and borrow follow-up response bytes without rendering them. Caller-buffered
+encoders validate the complete bounded
 frame before changing output and redact payloads from errors. The PostgreSQL 18
-fixture requires their output to equal live server bytes. No ordered session
-writer or client-facing startup exchange exists yet.
+fixture requires the non-SASL startup-control output to equal live server bytes;
+the SCRAM primitives currently have source-aligned unit coverage only. No
+ordered session writer, SCRAM cryptographic state machine, or client-facing
+startup exchange exists yet.
 The transport layer, which is not implemented yet, must handle PostgreSQL 18
 direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting

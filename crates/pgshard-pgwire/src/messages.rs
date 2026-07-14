@@ -6,6 +6,66 @@ use thiserror::Error;
 
 use crate::{ClientEncoding, FrontendFrame, FrontendTag};
 
+/// First frontend response to an advertised SASL mechanism list.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct SaslInitialResponse<'a> {
+    mechanism: &'a [u8],
+    initial_response: Option<&'a [u8]>,
+}
+
+impl<'a> SaslInitialResponse<'a> {
+    /// Returns the selected mechanism name as uninterpreted protocol bytes.
+    #[must_use]
+    pub const fn mechanism(self) -> &'a [u8] {
+        self.mechanism
+    }
+
+    /// Returns the optional initial client response.
+    ///
+    /// `None` is `PostgreSQL`'s `-1` sentinel. `Some(&[])` is a present,
+    /// zero-length response and remains distinct.
+    #[must_use]
+    pub const fn initial_response(self) -> Option<&'a [u8]> {
+        self.initial_response
+    }
+}
+
+impl fmt::Debug for SaslInitialResponse<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SaslInitialResponse")
+            .field("mechanism_length", &self.mechanism.len())
+            .field(
+                "initial_response_length",
+                &self.initial_response.map(<[u8]>::len),
+            )
+            .finish()
+    }
+}
+
+/// Subsequent opaque frontend SASL response bytes.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct SaslResponse<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> SaslResponse<'a> {
+    /// Returns the complete borrowed response bytes.
+    #[must_use]
+    pub const fn data(self) -> &'a [u8] {
+        self.data
+    }
+}
+
+impl fmt::Debug for SaslResponse<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SaslResponse")
+            .field("data_length", &self.data.len())
+            .finish()
+    }
+}
+
 /// Simple-query message body.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct QueryMessage<'a> {
@@ -444,6 +504,57 @@ impl fmt::Debug for ExecuteMessage<'_> {
     }
 }
 
+/// Decodes a complete frontend `SASLInitialResponse` body.
+///
+/// The caller must first frame this message under
+/// [`crate::FrontendPhase::ScramAuthentication`] so `PostgreSQL` 18's
+/// 1,024-byte SCRAM limit is enforced before buffering the body. Mechanism policy and
+/// comparison with the advertised list belong to the authentication state
+/// machine.
+///
+/// # Errors
+///
+/// Rejects the wrong frame tag, a missing mechanism terminator or response
+/// length, a negative length other than `PostgreSQL`'s `-1` sentinel, a response
+/// outside the frame, or trailing bytes.
+pub fn decode_sasl_initial_response(
+    frame: FrontendFrame<'_>,
+) -> Result<SaslInitialResponse<'_>, MessageError> {
+    require_tag(frame, FrontendTag::AuthenticationResponse)?;
+    let mut cursor = Cursor::new(frame.body());
+    let mechanism = cursor.cstring_bytes("SASL mechanism")?;
+    let response_length = cursor.i32("SASL initial response length")?;
+    let initial_response = match response_length {
+        -1 => None,
+        0.. => {
+            let response_length =
+                usize::try_from(response_length).map_err(|_| MessageError::LengthOverflow)?;
+            Some(cursor.take(response_length, "SASL initial response")?)
+        }
+        _ => return Err(MessageError::InvalidSaslResponseLength(response_length)),
+    };
+    cursor.finish()?;
+    Ok(SaslInitialResponse {
+        mechanism,
+        initial_response,
+    })
+}
+
+/// Borrows the complete body of a subsequent frontend `SASLResponse`.
+///
+/// The caller must first frame this message under
+/// [`crate::FrontendPhase::ScramAuthentication`] and ensure it follows a valid
+/// initial response in the same authentication exchange.
+///
+/// # Errors
+///
+/// Rejects a frame with any tag other than the overloaded authentication
+/// response tag `p`.
+pub fn decode_sasl_response(frame: FrontendFrame<'_>) -> Result<SaslResponse<'_>, MessageError> {
+    require_tag(frame, FrontendTag::AuthenticationResponse)?;
+    Ok(SaslResponse { data: frame.body() })
+}
+
 /// Decodes a complete simple-query body.
 ///
 /// # Errors
@@ -661,6 +772,11 @@ impl<'a> Cursor<'a> {
     }
 
     fn cstring_utf8(&mut self, field: &'static str) -> Result<&'a str, MessageError> {
+        let value = self.cstring_bytes(field)?;
+        std::str::from_utf8(value).map_err(|_| MessageError::InvalidUtf8(field))
+    }
+
+    fn cstring_bytes(&mut self, field: &'static str) -> Result<&'a [u8], MessageError> {
         let remaining = &self.bytes[self.position..];
         let end = remaining
             .iter()
@@ -668,7 +784,7 @@ impl<'a> Cursor<'a> {
             .ok_or(MessageError::MissingTerminator(field))?;
         let value = &remaining[..end];
         self.position += end + 1;
-        std::str::from_utf8(value).map_err(|_| MessageError::InvalidUtf8(field))
+        Ok(value)
     }
 
     fn u16(&mut self, field: &'static str) -> Result<u16, MessageError> {
@@ -747,6 +863,9 @@ pub enum MessageError {
     /// A parameter length is negative but not the NULL sentinel `-1`.
     #[error("invalid bind parameter length {0}")]
     InvalidParameterLength(i32),
+    /// A SASL initial-response length is negative but not the `-1` sentinel.
+    #[error("invalid SASL initial response length {0}")]
+    InvalidSaslResponseLength(i32),
     /// Valid fields did not consume the exact frame body.
     #[error("message has {0} trailing bytes")]
     TrailingData(usize),
@@ -773,6 +892,112 @@ mod tests {
 
     fn push_i32(bytes: &mut Vec<u8>, value: i32) {
         bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    #[test]
+    fn sasl_initial_and_followup_responses_are_exact_zero_copy_and_redacted() {
+        let initial_bytes = b"n,,n=user,r=nonce";
+        let mut body = b"SCRAM-SHA-256\0".to_vec();
+        push_i32(
+            &mut body,
+            i32::try_from(initial_bytes.len()).expect("test response length"),
+        );
+        body.extend_from_slice(initial_bytes);
+        let initial = decode_sasl_initial_response(frame(b'p', &body)).expect("SASL initial");
+        assert_eq!(initial.mechanism(), b"SCRAM-SHA-256");
+        assert_eq!(initial.initial_response(), Some(initial_bytes.as_slice()));
+        assert!(std::ptr::eq(
+            initial
+                .initial_response()
+                .expect("present response")
+                .as_ptr(),
+            body[body.len() - initial_bytes.len()..].as_ptr(),
+        ));
+
+        let rendered = format!("{initial:?}");
+        for secret in ["SCRAM", "user", "nonce"] {
+            assert!(!rendered.contains(secret));
+        }
+
+        let response_bytes = b"c=biws,r=nonce,p=proof";
+        let response = decode_sasl_response(frame(b'p', response_bytes)).expect("SASL response");
+        assert_eq!(response.data(), response_bytes);
+        let rendered = format!("{response:?}");
+        for secret in ["nonce", "proof"] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn sasl_initial_response_preserves_absent_and_empty() {
+        for (length, expected) in [(-1, None), (0, Some(b"".as_slice()))] {
+            let mut body = b"SCRAM-SHA-256\0".to_vec();
+            push_i32(&mut body, length);
+            let response =
+                decode_sasl_initial_response(frame(b'p', &body)).expect("bounded SASL initial");
+            assert_eq!(response.initial_response(), expected);
+        }
+    }
+
+    #[test]
+    fn malformed_sasl_initial_responses_fail_closed() {
+        assert_eq!(
+            decode_sasl_initial_response(frame(b'p', b"SCRAM-SHA-256")),
+            Err(MessageError::MissingTerminator("SASL mechanism"))
+        );
+        assert_eq!(
+            decode_sasl_initial_response(frame(b'p', b"SCRAM-SHA-256\0")),
+            Err(MessageError::Truncated("SASL initial response length"))
+        );
+
+        let mut invalid_negative = b"SCRAM-SHA-256\0".to_vec();
+        push_i32(&mut invalid_negative, -2);
+        assert_eq!(
+            decode_sasl_initial_response(frame(b'p', &invalid_negative)),
+            Err(MessageError::InvalidSaslResponseLength(-2))
+        );
+
+        let mut truncated = b"SCRAM-SHA-256\0".to_vec();
+        push_i32(&mut truncated, 3);
+        truncated.extend_from_slice(b"ab");
+        assert_eq!(
+            decode_sasl_initial_response(frame(b'p', &truncated)),
+            Err(MessageError::Truncated("SASL initial response"))
+        );
+
+        for length in [-1, 1] {
+            let mut trailing = b"SCRAM-SHA-256\0".to_vec();
+            push_i32(&mut trailing, length);
+            trailing.extend_from_slice(b"xy");
+            assert_eq!(
+                decode_sasl_initial_response(frame(b'p', &trailing)),
+                Err(MessageError::TrailingData(if length == -1 { 2 } else { 1 }))
+            );
+        }
+
+        assert!(matches!(
+            decode_sasl_initial_response(frame(b'Q', b"")),
+            Err(MessageError::WrongTag { .. })
+        ));
+        assert!(matches!(
+            decode_sasl_response(frame(b'Q', b"")),
+            Err(MessageError::WrongTag { .. })
+        ));
+    }
+
+    #[test]
+    fn every_truncated_sasl_initial_response_prefix_fails() {
+        let mut body = b"SCRAM-SHA-256\0".to_vec();
+        push_i32(&mut body, 4);
+        body.extend_from_slice(b"n,,,");
+
+        for length in 0..body.len() {
+            assert!(
+                decode_sasl_initial_response(frame(b'p', &body[..length])).is_err(),
+                "accepted truncated prefix of {length} bytes"
+            );
+        }
+        assert!(decode_sasl_initial_response(frame(b'p', &body)).is_ok());
     }
 
     #[test]

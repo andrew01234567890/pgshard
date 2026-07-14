@@ -1,9 +1,9 @@
 # pgshard PostgreSQL wire framing
 
 This non-publishable crate implements bounded, zero-copy decoding for
-PostgreSQL 18 frontend and backend frames and selected query-protocol bodies,
-plus bounded backend startup-control and fixed-size replication-feedback
-encoding. Its constants, tags, and layouts follow the `REL_18_STABLE`
+PostgreSQL 18 frontend and backend frames, frontend SASL responses, and selected
+query-protocol bodies, plus bounded backend startup-control and fixed-size
+replication-feedback encoding. Its constants, tags, and layouts follow the `REL_18_STABLE`
 PostgreSQL server source.
 
 The decoder recognizes startup protocol versions, SSL and GSS negotiation,
@@ -11,8 +11,9 @@ one-to-256-byte PostgreSQL 18 `CancelRequest` keys, and every frontend message
 tag accepted by PostgreSQL 18. Startup packets retain PostgreSQL's 10,004-byte
 total limit; fixed negotiation and cancellation-key bounds are enforced from
 their eight-byte header before buffering the rest. Ordinary messages use the
-stricter of PostgreSQL's small-message limit or authentication limit and a
-caller-supplied large-message limit, with a hard 64 MiB pooler ceiling. Bytes
+stricter of PostgreSQL's small-message limit, general authentication limit, or
+1,024-byte SCRAM limit and a caller-supplied large-message limit, with a hard
+64 MiB pooler ceiling. Bytes
 already present after an SSL request remain unconsumed so an accepted TLS
 handshake can consume an immediately pipelined ClientHello, as PostgreSQL 18
 does. The eventual transport must reject those bytes if it refuses TLS and,
@@ -52,6 +53,13 @@ failed-transaction state, and decode startup authentication and protocol
 negotiation controls. Authentication decoding covers the PostgreSQL 18 request
 codes and exact fixed payloads, borrows SASL mechanism lists and opaque exchange
 bytes, and redacts salts, mechanism names, and exchange data from debug output.
+Frontend SCRAM framing uses a distinct authentication phase so PostgreSQL 18's
+1,024-byte limit is enforced from the length word. Typed zero-copy decoders
+preserve the selected mechanism and distinguish an absent initial response
+from a present empty response, then borrow subsequent opaque response bytes;
+their debug output reports lengths only. The future authentication state
+machine must match the selected mechanism to the exact advertisement and
+enforce exchange ordering.
 Protocol negotiation preserves the complete backend-selected version and exact
 reserved `_pq_.` option list without allocation. A linear PostgreSQL 18 startup
 validator borrows the exact outbound parameters, requires negotiation precisely
@@ -70,17 +78,21 @@ description with a Parse generation, virtualize a name, track a query cycle,
 identify a backend, or establish a catalog fence.
 
 Backend startup-control encoders emit exact `AuthenticationOk` and
-`ReadyForQuery` arrays plus caller-buffered `BackendKeyData`, `ParameterStatus`,
-and `NegotiateProtocolVersion` frames. Variable frames are completely sized
+`ReadyForQuery` arrays plus caller-buffered SCRAM `AuthenticationSASL`,
+`AuthenticationSASLContinue`, `AuthenticationSASLFinal`, `BackendKeyData`,
+`ParameterStatus`, and `NegotiateProtocolVersion` frames. SCRAM advertisements
+are closed to PostgreSQL 18's SHA-256 mechanisms and put the channel-binding
+variant first. Variable frames are completely sized
 and validated before the output is touched, retain PostgreSQL 18's family
 bounds, and never include values or cancellation keys in errors. Unsupported
 protocol options are supplied as borrowed byte slices so validation and writing
 need no internal allocation or replayable iterator contract. A decoded
 protocol-three request can derive PostgreSQL 18's selected version directly,
 including the 3.2 response to a future minor version. The live
-PostgreSQL 18 fixture decodes and re-encodes every corresponding startup frame
-and requires byte-for-byte equality. These primitives do not yet provide a
-client listener, authentication policy, or ordered session writer.
+PostgreSQL 18 trust-authentication fixture decodes and re-encodes the non-SASL
+startup frames and requires byte-for-byte equality. The SCRAM primitives have
+source-aligned unit coverage but no live exchange yet. These primitives do not
+yet provide a client listener, authentication policy, or ordered session writer.
 
 The replication-streaming phase follows PostgreSQL 18's WAL sender COPY-BOTH
 loop and accepts only frontend CopyData, CopyDone, and Terminate messages. It is
