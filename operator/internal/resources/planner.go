@@ -47,6 +47,9 @@ const (
 	EtcdPeerPort   int32 = 2380
 	HTTPPort       int32 = 8080
 
+	etcdExecutable   = "/usr/local/bin/etcd"
+	defaultEtcdImage = "registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534"
+
 	configHashAnnotation = "pgshard.io/config-hash"
 	ScaleOwnerAnnotation = "pgshard.io/hpa-scale-handed-off"
 )
@@ -64,7 +67,7 @@ type Images struct {
 // their availability as evidence that PostgreSQL lifecycle or HA is complete.
 func DefaultImages() Images {
 	return Images{
-		Etcd:         "registry.k8s.io/etcd:3.6.5-0",
+		Etcd:         defaultEtcdImage,
 		Orchestrator: "ghcr.io/andrew01234567890/pgshard-orch:main",
 		Pooler:       "ghcr.io/andrew01234567890/pgshard-pooler:main",
 	}
@@ -409,6 +412,7 @@ func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image string) *app
 					Name:            "etcd",
 					Image:           image,
 					ImagePullPolicy: imagePullPolicy(image),
+					Command:         []string{etcdExecutable},
 					Args: []string{
 						"--name=$(POD_NAME)",
 						"--data-dir=/var/lib/etcd",

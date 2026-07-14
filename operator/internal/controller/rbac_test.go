@@ -24,7 +24,6 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		resource string
 		verbs    []string
 	}{
-		{group: "coordination.k8s.io", resource: "leases", verbs: []string{"create", "get", "list", "patch", "update", "watch"}},
 		{group: "", resource: "events", verbs: []string{"create", "patch"}},
 		{group: "", resource: "persistentvolumeclaims", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 	} {
@@ -32,10 +31,35 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 			t.Errorf("manager role does not authorize %q %q with verbs %v", required.group, required.resource, required.verbs)
 		}
 	}
+	if roleAllows(role, "coordination.k8s.io", "leases", []string{"get"}) {
+		t.Fatal("cluster-wide manager role must not grant leader-election Lease access")
+	}
+}
+
+func TestLeaderElectionRoleIsNamespaced(t *testing.T) {
+	t.Parallel()
+	contents, err := os.ReadFile("../../config/rbac/leader_election_role.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	role := &rbacv1.Role{}
+	if err := yaml.UnmarshalStrict(contents, role); err != nil {
+		t.Fatal(err)
+	}
+	if role.Namespace != "system" {
+		t.Fatalf("leader-election Role namespace = %q", role.Namespace)
+	}
+	if !rulesAllow(role.Rules, "coordination.k8s.io", "leases", []string{"create", "delete", "get", "list", "patch", "update", "watch"}) {
+		t.Fatalf("leader-election Role rules = %#v", role.Rules)
+	}
 }
 
 func roleAllows(role *rbacv1.ClusterRole, group, resource string, verbs []string) bool {
-	for _, rule := range role.Rules {
+	return rulesAllow(role.Rules, group, resource, verbs)
+}
+
+func rulesAllow(rules []rbacv1.PolicyRule, group, resource string, verbs []string) bool {
+	for _, rule := range rules {
 		if !slices.Contains(rule.APIGroups, group) || !slices.Contains(rule.Resources, resource) {
 			continue
 		}

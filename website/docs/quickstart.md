@@ -10,9 +10,11 @@ There is no installable pgshard database cluster yet. The source includes the Go
 custom-resource API and safe supporting-resource reconciler plus fail-closed
 Rust agent/orchestrator foundations and a local-only pooler catalog control
 executable plus local-only test image builds, but no PostgreSQL lifecycle,
-executable SQL pooler, operator installation manifest, chart, or full KIND
-environment. A cluster quickstart will appear only after those end-to-end tests
-pass.
+executable SQL pooler, chart, or full KIND environment. A certificate-free
+development manager manifest now exercises the real operator and fail-closed
+supporting processes in KIND, but it creates no PostgreSQL workload and is not
+a database installation. A cluster quickstart will appear only after those
+end-to-end tests pass.
 
 ## Validate the current source
 
@@ -33,3 +35,33 @@ disposable PostgreSQL 18 `shardschema` database. See the
 [`pgshard-catalog` README](https://github.com/andrew01234567890/pgshard/tree/main/crates/pgshard-catalog)
 for its preconditions. CI runs that test with an ephemeral service database;
 the operator does not bootstrap it yet.
+
+## Exercise the development manager
+
+Build the local-only images with an archive-capable Buildx builder, load the
+operator, orchestrator, and pooler `:dev` images into a disposable KIND cluster,
+then install the manager:
+
+```console
+PGSHARD_IMAGE_TARGETS="operator orchestrator pooler" make images
+docker load --input artifacts/images/pgshard-operator.tar
+docker load --input artifacts/images/pgshard-orchestrator.tar
+docker load --input artifacts/images/pgshard-pooler.tar
+kind create cluster --name pgshard-development \
+  --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
+  --wait 90s
+kind load docker-image pgshard/operator:dev pgshard/orchestrator:dev \
+  pgshard/pooler:dev --name pgshard-development
+kubectl apply -k operator/config/development
+kubectl rollout status --namespace pgshard-system deployment/pgshard-controller-manager
+kubectl create namespace pgshard-development
+kubectl apply --namespace pgshard-development -f operator/config/samples/pgshard_v1alpha1_development.yaml
+```
+
+The development overlay disables admission-webhook registration because no
+serving-certificate lifecycle exists. The binary default remains enabled;
+OpenAPI validation and defensive reconciliation still fail closed. Expect the
+sample to remain `Ready=False`, its pooler and orchestrator Pods to remain
+unready, and its application Services to have no ready endpoints. This path is
+for source validation only. Delete the disposable cluster with
+`kind delete cluster --name pgshard-development`.

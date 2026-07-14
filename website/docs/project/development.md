@@ -54,6 +54,13 @@ differs. Source archives must provide `PGSHARD_GIT_SHA` explicitly. Direct Bake
 invocations must provide both build identity variables; missing and all-zero
 identity is rejected.
 
+`PGSHARD_IMAGE_TARGETS="operator orchestrator pooler" make images` builds the
+subset used by the real-manager KIND smoke. After loading those `:dev` images
+into KIND, `kubectl apply -k operator/config/development` installs the restricted
+certificate-free manager. It is expected to reconcile only fail-closed
+supporting workloads; it is not a database quickstart or production admission
+configuration.
+
 ## Git identity and history
 
 Source-branch commits use GitHub noreply author and committer identities. Direct

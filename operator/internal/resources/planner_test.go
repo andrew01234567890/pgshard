@@ -110,6 +110,9 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		t.Fatalf("etcd pod hardening/spread is incomplete: %#v", etcd.Spec.Template.Spec)
 	}
 	etcdContainer := etcd.Spec.Template.Spec.Containers[0]
+	if len(etcdContainer.Command) != 1 || etcdContainer.Command[0] != etcdExecutable || etcdContainer.Image != defaultEtcdImage || etcdContainer.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Fatalf("etcd executable/image contract = %#v", etcdContainer)
+	}
 	if etcdContainer.ReadinessProbe.FailureThreshold != 1 || etcdContainer.LivenessProbe.FailureThreshold != 3 {
 		t.Fatalf("etcd probe thresholds = readiness %d, liveness %d", etcdContainer.ReadinessProbe.FailureThreshold, etcdContainer.LivenessProbe.FailureThreshold)
 	}
