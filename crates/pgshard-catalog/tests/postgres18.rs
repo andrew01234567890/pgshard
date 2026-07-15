@@ -771,7 +771,7 @@ async fn assert_squatted_catalog_role_is_rejected(client: &Client) -> TestResult
     Ok(())
 }
 
-async fn assert_installation_contract(client: &Client) -> TestResult {
+async fn assert_installation_contract(client: &Client, database_url: &str) -> TestResult {
     assert_pre_receipt_probe_upgrade(client).await?;
     assert_pre_creation_attempt_consumer_upgrade(client).await?;
     let epoch_after_first_migration = catalog_epoch(client).await?;
@@ -781,7 +781,7 @@ async fn assert_installation_contract(client: &Client) -> TestResult {
         epoch_after_first_migration,
         "reapplying the migration must not mutate catalog state"
     );
-    assert_legacy_catalog_owner_upgrade(client).await?;
+    assert_legacy_catalog_owner_upgrade(client, database_url).await?;
     assert_catalog_role_bootstrap_rejections(client).await?;
 
     let database_name: String = client
@@ -849,7 +849,7 @@ async fn assert_installation_contract(client: &Client) -> TestResult {
     Ok(())
 }
 
-async fn assert_legacy_catalog_owner_upgrade(client: &Client) -> TestResult {
+async fn assert_legacy_catalog_owner_upgrade(client: &Client, database_url: &str) -> TestResult {
     client
         .batch_execute("DROP SCHEMA pgshard_catalog CASCADE")
         .await?;
@@ -860,10 +860,13 @@ async fn assert_legacy_catalog_owner_upgrade(client: &Client) -> TestResult {
         .batch_execute("DROP SCHEMA pgshard_catalog CASCADE")
         .await?;
     drop_catalog_roles(client).await?;
-    assert_distinct_superuser_v049_owner_upgrade(client).await
+    assert_distinct_superuser_v049_owner_upgrade(client, database_url).await
 }
 
-async fn assert_distinct_superuser_v049_owner_upgrade(client: &Client) -> TestResult {
+async fn assert_distinct_superuser_v049_owner_upgrade(
+    client: &Client,
+    database_url: &str,
+) -> TestResult {
     let legacy_owner = format!("pgshard_legacy_owner_{}", Uuid::new_v4().simple());
     let runtime_reader = format!("pgshard_runtime_reader_{}", Uuid::new_v4().simple());
     let runtime_admin = format!("pgshard_runtime_admin_{}", Uuid::new_v4().simple());
@@ -903,7 +906,7 @@ async fn assert_distinct_superuser_v049_owner_upgrade(client: &Client) -> TestRe
 
     let mut upgrade_committed = false;
     let upgrade_result: TestResult = async {
-        assert_external_catalog_trigger_rejections(client).await?;
+        assert_external_catalog_trigger_rejections(client, database_url).await?;
         client
             .batch_execute(&format!(
                 "GRANT pgshard_catalog_reader TO {legacy_owner} WITH ADMIN OPTION; \
@@ -965,9 +968,36 @@ async fn assert_distinct_superuser_v049_owner_upgrade(client: &Client) -> TestRe
     Ok(())
 }
 
-async fn assert_external_catalog_trigger_rejections(client: &Client) -> TestResult {
+async fn assert_external_catalog_trigger_rejections(
+    client: &Client,
+    database_url: &str,
+) -> TestResult {
+    assert_same_identity_altered_trigger_is_rejected(client).await?;
     assert_external_executable_trigger_is_rejected(client).await?;
-    assert_external_reference_trigger_is_rejected(client).await
+    assert_external_reference_trigger_is_rejected(client).await?;
+    assert_concurrent_external_trigger_is_rejected(client, database_url).await
+}
+
+async fn assert_same_identity_altered_trigger_is_rejected(client: &Client) -> TestResult {
+    let role = format!("pgshard_trigger_replace_role_{}", Uuid::new_v4().simple());
+    assert_catalog_migration_rejection(
+        client,
+        &format!(
+            "CREATE ROLE {role} NOLOGIN; \
+             GRANT USAGE ON SCHEMA pgshard_catalog TO {role}; \
+             GRANT TRIGGER ON pgshard_catalog.cluster_state TO {role}; \
+             GRANT EXECUTE ON FUNCTION pgshard_catalog.notify_catalog_state() TO {role}; \
+             SET ROLE {role}; \
+             CREATE OR REPLACE TRIGGER cluster_state_notify \
+                 AFTER UPDATE ON pgshard_catalog.cluster_state \
+                 FOR EACH ROW WHEN (false) \
+                 EXECUTE FUNCTION pgshard_catalog.notify_catalog_state('unexpected'); \
+             RESET ROLE"
+        ),
+        "pre-existing pgshard_catalog contains an unsupported attached trigger",
+        &[&role],
+    )
+    .await
 }
 
 async fn assert_external_executable_trigger_is_rejected(client: &Client) -> TestResult {
@@ -1016,6 +1046,144 @@ async fn assert_external_reference_trigger_is_rejected(client: &Client) -> TestR
         &[&role],
     )
     .await
+}
+
+async fn assert_concurrent_external_trigger_is_rejected(
+    client: &Client,
+    database_url: &str,
+) -> TestResult {
+    let role = format!("pgshard_trigger_race_role_{}", Uuid::new_v4().simple());
+    let schema = format!("pgshard_trigger_race_schema_{}", Uuid::new_v4().simple());
+    client
+        .batch_execute(&format!(
+            "CREATE ROLE {role} NOLOGIN; \
+             CREATE SCHEMA {schema} AUTHORIZATION {role}; \
+             GRANT USAGE ON SCHEMA pgshard_catalog TO {role}; \
+             GRANT TRIGGER ON pgshard_catalog.cluster_state TO {role}; \
+             SET ROLE {role}; \
+             CREATE FUNCTION {schema}.observe_catalog_write() RETURNS trigger \
+                 LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; \
+             RESET ROLE"
+        ))
+        .await?;
+
+    let concurrent_result =
+        run_concurrent_external_trigger_rejection(client, database_url, &role, &schema).await;
+
+    let cleanup_result = client
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; \
+             DROP OWNED BY {role}; \
+             DROP ROLE IF EXISTS {role}"
+        ))
+        .await;
+    concurrent_result?;
+    cleanup_result?;
+    Ok(())
+}
+
+async fn run_concurrent_external_trigger_rejection(
+    observer: &Client,
+    database_url: &str,
+    role: &str,
+    schema: &str,
+) -> TestResult {
+    let (attacker, attacker_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let attacker_connection_task = tokio::spawn(attacker_connection);
+    let (migration_client, migration_connection) =
+        tokio_postgres::connect(database_url, NoTls).await?;
+    let migration_connection_task = tokio::spawn(migration_connection);
+
+    let test_result: TestResult = async {
+        attacker
+            .batch_execute(&format!(
+                "BEGIN; \
+                 SET LOCAL ROLE {role}; \
+                 CREATE TRIGGER concurrent_catalog_write \
+                     BEFORE UPDATE ON pgshard_catalog.cluster_state \
+                     FOR EACH ROW EXECUTE FUNCTION {schema}.observe_catalog_write()"
+            ))
+            .await?;
+        let attacker_pid: i32 = attacker
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let migration_pid: i32 = migration_client
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let mut migration = tokio::spawn(async move {
+            let result = migration_client
+                .batch_execute(pgshard_catalog::MIGRATION_SQL)
+                .await;
+            (migration_client, result)
+        });
+
+        let migration_blocked =
+            match observe_backend_blocked_by(observer, migration_pid, attacker_pid).await {
+                Ok(blocked) => blocked,
+                Err(error) => {
+                    let _ = attacker.batch_execute("ROLLBACK").await;
+                    migration.abort();
+                    let _ = migration.await;
+                    return Err(error.into());
+                }
+            };
+        if !migration_blocked {
+            let _ = attacker.batch_execute("ROLLBACK").await;
+            migration.abort();
+            let _ = migration.await;
+            return Err(
+                "catalog migration did not wait for the concurrent trigger transaction".into(),
+            );
+        }
+
+        if let Err(error) = attacker.batch_execute("COMMIT").await {
+            migration.abort();
+            let _ = migration.await;
+            return Err(error.into());
+        }
+        let Ok(joined) = tokio::time::timeout(Duration::from_secs(10), &mut migration).await else {
+            migration.abort();
+            let _ = migration.await;
+            return Err(
+                "catalog migration did not finish after the trigger transaction committed".into(),
+            );
+        };
+        let (migration_client, migration_result) = joined?;
+        let rollback_result = migration_client.batch_execute("ROLLBACK").await;
+        let migration_error = match migration_result {
+            Ok(()) => {
+                rollback_result?;
+                return Err(
+                    "migration accepted a trigger committed while relation locking waited".into(),
+                );
+            }
+            Err(error) => error,
+        };
+        rollback_result?;
+        let actual_sqlstate = migration_error
+            .as_db_error()
+            .map(|database_error| database_error.code().code());
+        let actual_message = migration_error
+            .as_db_error()
+            .map(tokio_postgres::error::DbError::message);
+        if actual_sqlstate != Some("42501")
+            || actual_message
+                != Some("pre-existing pgshard_catalog contains an unsupported attached trigger")
+        {
+            return Err(
+                format!("unexpected concurrent-trigger rejection: {migration_error}").into(),
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    drop(attacker);
+    attacker_connection_task.abort();
+    migration_connection_task.abort();
+    test_result
 }
 
 async fn assert_bootstrap_superuser_v049_owner_upgrade(client: &Client) -> TestResult {
@@ -6784,7 +6952,7 @@ async fn run_migration_and_activation_contract(
 ) -> TestResult {
     assert_squatted_catalog_role_is_rejected(client).await?;
     assert_restricted_catalog_migration_is_rejected(client).await?;
-    assert_installation_contract(client).await?;
+    assert_installation_contract(client, database_url).await?;
     assert_shutdown_interrupts_initial_load(client, database_url).await?;
     assert_operation_timeout_aborts_blocked_initial_load(client, database_url).await?;
     assert_operation_timeout_aborts_blocked_refresh(client, database_url).await?;

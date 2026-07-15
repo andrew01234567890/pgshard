@@ -41,8 +41,13 @@ standalone composite type proves complete ownership transfer. Rollback-only
 cases cover unsafe fixed-role attributes, delegable memberships, unexpected
 reader/admin/owner inheritance, owner members, fixed-role schema ownership,
 missing released roles, mixed object ownership, unsupported schema object
-classes, external executable or referential triggers, and unexpected default
-privileges without advancing the catalog epoch or retaining fixture roles. A
+classes, external executable or referential triggers, a same-identity released
+trigger with altered predicate and arguments, and unexpected default privileges
+without advancing the catalog epoch or retaining fixture roles. A concurrent
+case commits an external trigger while the migration waits for the target
+relation, proves the lock wait through `pg_blocking_pids`, and requires the next
+statement's fresh snapshot to reject that trigger. Relation locks remain held
+through ownership transfer, ACL reset, and trigger recreation. A
 separate rollback-only smoke path creates the registry allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying

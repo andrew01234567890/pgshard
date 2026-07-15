@@ -33,6 +33,34 @@ BEGIN
 END
 $pgshard_requirements$;
 
+-- Freeze every pre-existing catalog relation before inspecting attached
+-- triggers or foreign keys.  CREATE TRIGGER and referential-constraint DDL
+-- require a conflicting relation lock.  This is a separate statement so a
+-- transaction that committed while this block waited is visible to the fresh
+-- snapshot used by the takeover checks below.  The locks remain held through
+-- ownership transfer, ACL reset, and trigger recreation.
+DO $pgshard_lock_existing_catalog_relations$
+DECLARE
+    catalog_relation record;
+BEGIN
+    FOR catalog_relation IN
+        SELECT namespaces.nspname, relations.relname
+          FROM pg_catalog.pg_class AS relations
+          JOIN pg_catalog.pg_namespace AS namespaces
+            ON namespaces.oid = relations.relnamespace
+         WHERE namespaces.nspname = 'pgshard_catalog'
+           AND relations.relkind IN ('r', 'p', 'v', 'm', 'f')
+         ORDER BY relations.oid
+    LOOP
+        EXECUTE pg_catalog.format(
+            'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+            catalog_relation.nspname,
+            catalog_relation.relname
+        );
+    END LOOP;
+END
+$pgshard_lock_existing_catalog_relations$;
+
 DO $pgshard_role_bootstrap$
 DECLARE
     bootstrap_superuser_oid CONSTANT pg_catalog.oid := 10;
@@ -153,43 +181,68 @@ BEGIN
                AND (
                    routine_namespaces.nspname <> 'pgshard_catalog'
                    OR routines.pronargs <> 0
-                   OR (relations.relname, triggers.tgname, routines.proname) NOT IN (
-                       ('cluster_configuration', 'cluster_configuration_immutable', 'reject_all_changes'),
-                       ('cluster_state', 'cluster_state_notify', 'notify_catalog_state'),
-                       ('logical_consumer_attachments', 'logical_consumer_attachments_lock_catalog', 'lock_catalog_state'),
-                       ('logical_consumer_attachments', 'logical_consumer_attachments_protect_history', 'protect_logical_consumer_attachment'),
-                       ('logical_consumer_attachments', 'logical_consumer_attachments_touch_catalog', 'touch_catalog_state'),
-                       ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_lock_catalog', 'lock_catalog_state'),
-                       ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_protect_history', 'protect_logical_consumer_checkpoint'),
-                       ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_touch_catalog', 'touch_catalog_state'),
-                       ('logical_consumer_shards', 'logical_consumer_shards_lock_catalog', 'lock_catalog_state'),
-                       ('logical_consumer_shards', 'logical_consumer_shards_protect_lifecycle', 'protect_logical_consumer_shard_lifecycle'),
-                       ('logical_consumer_shards', 'logical_consumer_shards_touch_catalog', 'touch_catalog_state'),
-                       ('logical_consumers', 'logical_consumers_lock_catalog', 'lock_catalog_state'),
-                       ('logical_consumers', 'logical_consumers_protect_lifecycle', 'protect_logical_consumer_lifecycle'),
-                       ('logical_consumers', 'logical_consumers_touch_catalog', 'touch_catalog_state'),
-                       ('logical_databases', 'logical_databases_lock_catalog', 'lock_catalog_state'),
-                       ('logical_databases', 'logical_databases_protect_active_routing', 'protect_database_lifecycle'),
-                       ('logical_databases', 'logical_databases_touch_catalog', 'touch_catalog_state'),
-                       ('managed_replication_slots', 'managed_replication_slots_lock_catalog', 'lock_catalog_state'),
-                       ('managed_replication_slots', 'managed_replication_slots_protect_history', 'protect_managed_replication_slot'),
-                       ('managed_replication_slots', 'managed_replication_slots_touch_catalog', 'touch_catalog_state'),
-                       ('managed_slot_creation_attempts', 'managed_slot_creation_attempts_protect_history', 'protect_managed_slot_creation_attempt'),
-                       ('operation_tombstones', 'operation_tombstone_immutable', 'reject_all_changes'),
-                       ('registered_tables', 'registered_tables_lock_catalog', 'lock_catalog_state'),
-                       ('registered_tables', 'registered_tables_touch_catalog', 'touch_catalog_state'),
-                       ('routing_epochs', 'routing_epoch_history_immutable', 'protect_routing_epoch_history'),
-                       ('routing_ranges', 'routing_range_history_immutable', 'protect_routing_range_history'),
-                       ('shard_restore_incarnations', 'shard_restore_incarnations_lock_catalog', 'lock_catalog_state'),
-                       ('shard_restore_incarnations', 'shard_restore_incarnations_protect_history', 'protect_shard_restore_incarnation'),
-                       ('shard_restore_incarnations', 'shard_restore_incarnations_touch_catalog', 'touch_catalog_state'),
-                       ('shards', 'shards_install_restore_incarnation', 'install_initial_shard_restore_incarnation'),
-                       ('shards', 'shards_lock_catalog', 'lock_catalog_state'),
-                       ('shards', 'shards_protect_active_routing', 'protect_shard_lifecycle'),
-                       ('shards', 'shards_touch_catalog', 'touch_catalog_state'),
-                       ('slot_sync_probes', 'slot_sync_probes_lock_catalog', 'lock_catalog_state'),
-                       ('slot_sync_probes', 'slot_sync_probes_protect_history', 'protect_slot_sync_probe'),
-                       ('slot_sync_probes', 'slot_sync_probes_touch_catalog', 'touch_catalog_state')
+                   OR triggers.tgenabled <> 'O'
+                   OR triggers.tgconstraint <> 0
+                   OR triggers.tgconstrrelid <> 0
+                   OR triggers.tgconstrindid <> 0
+                   OR triggers.tgdeferrable
+                   OR triggers.tginitdeferred
+                   OR triggers.tgparentid <> 0
+                   OR triggers.tgnargs <> 0
+                   OR pg_catalog.octet_length(triggers.tgargs) <> 0
+                   OR triggers.tgattr <> ''::pg_catalog.int2vector
+                   OR triggers.tgqual IS NOT NULL
+                   OR triggers.tgoldtable IS NOT NULL
+                   OR triggers.tgnewtable IS NOT NULL
+                   OR NOT EXISTS (
+                       SELECT
+                         FROM (VALUES
+                             ('cluster_configuration', 'cluster_configuration_immutable', 'reject_all_changes', 27),
+                             ('cluster_state', 'cluster_state_notify', 'notify_catalog_state', 17),
+                             ('logical_consumer_attachments', 'logical_consumer_attachments_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_consumer_attachments', 'logical_consumer_attachments_protect_history', 'protect_logical_consumer_attachment', 31),
+                             ('logical_consumer_attachments', 'logical_consumer_attachments_touch_catalog', 'touch_catalog_state', 28),
+                             ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_protect_history', 'protect_logical_consumer_checkpoint', 31),
+                             ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_touch_catalog', 'touch_catalog_state', 28),
+                             ('logical_consumer_shards', 'logical_consumer_shards_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_consumer_shards', 'logical_consumer_shards_protect_lifecycle', 'protect_logical_consumer_shard_lifecycle', 31),
+                             ('logical_consumer_shards', 'logical_consumer_shards_touch_catalog', 'touch_catalog_state', 28),
+                             ('logical_consumers', 'logical_consumers_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_consumers', 'logical_consumers_protect_lifecycle', 'protect_logical_consumer_lifecycle', 31),
+                             ('logical_consumers', 'logical_consumers_touch_catalog', 'touch_catalog_state', 28),
+                             ('logical_databases', 'logical_databases_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_databases', 'logical_databases_protect_active_routing', 'protect_database_lifecycle', 27),
+                             ('logical_databases', 'logical_databases_touch_catalog', 'touch_catalog_state', 28),
+                             ('managed_replication_slots', 'managed_replication_slots_lock_catalog', 'lock_catalog_state', 30),
+                             ('managed_replication_slots', 'managed_replication_slots_protect_history', 'protect_managed_replication_slot', 31),
+                             ('managed_replication_slots', 'managed_replication_slots_touch_catalog', 'touch_catalog_state', 28),
+                             ('managed_slot_creation_attempts', 'managed_slot_creation_attempts_protect_history', 'protect_managed_slot_creation_attempt', 31),
+                             ('operation_tombstones', 'operation_tombstone_immutable', 'reject_all_changes', 27),
+                             ('registered_tables', 'registered_tables_lock_catalog', 'lock_catalog_state', 30),
+                             ('registered_tables', 'registered_tables_touch_catalog', 'touch_catalog_state', 28),
+                             ('routing_epochs', 'routing_epoch_history_immutable', 'protect_routing_epoch_history', 27),
+                             ('routing_ranges', 'routing_range_history_immutable', 'protect_routing_range_history', 31),
+                             ('shard_restore_incarnations', 'shard_restore_incarnations_lock_catalog', 'lock_catalog_state', 30),
+                             ('shard_restore_incarnations', 'shard_restore_incarnations_protect_history', 'protect_shard_restore_incarnation', 31),
+                             ('shard_restore_incarnations', 'shard_restore_incarnations_touch_catalog', 'touch_catalog_state', 28),
+                             ('shards', 'shards_install_restore_incarnation', 'install_initial_shard_restore_incarnation', 5),
+                             ('shards', 'shards_lock_catalog', 'lock_catalog_state', 30),
+                             ('shards', 'shards_protect_active_routing', 'protect_shard_lifecycle', 27),
+                             ('shards', 'shards_touch_catalog', 'touch_catalog_state', 28),
+                             ('slot_sync_probes', 'slot_sync_probes_lock_catalog', 'lock_catalog_state', 30),
+                             ('slot_sync_probes', 'slot_sync_probes_protect_history', 'protect_slot_sync_probe', 31),
+                             ('slot_sync_probes', 'slot_sync_probes_touch_catalog', 'touch_catalog_state', 28)
+                         ) AS allowed_triggers(
+                             relation_name,
+                             trigger_name,
+                             routine_name,
+                             trigger_type
+                         )
+                        WHERE allowed_triggers.relation_name = relations.relname
+                          AND allowed_triggers.trigger_name = triggers.tgname
+                          AND allowed_triggers.routine_name = routines.proname
+                          AND allowed_triggers.trigger_type = triggers.tgtype
                    )
                )
            )

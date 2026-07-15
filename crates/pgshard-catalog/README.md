@@ -75,11 +75,16 @@ reader-only boundary. Rejecting a non-superuser legacy owner prevents arbitrary
 triggers or security-definer routines from being promoted into the trusted
 dedicated owner. It also rejects independently owned schema object classes that
 the released layout did not contain rather than leaving them behind during a
-partial transfer. Existing non-internal triggers must match the released
-relation/name/function inventory, and internal referential triggers must belong
-to foreign keys wholly inside the catalog; external executable triggers and
-cross-schema references are rejected before ownership changes. For an eligible
-upgrade, the migration preserves
+partial transfer. Before inspecting attachments, the migration locks every
+pre-existing catalog relation through transaction end; a trigger or foreign-key
+transaction that commits while lock acquisition waits is therefore visible to
+the next statement's fresh snapshot. Existing non-internal triggers must match
+the released relation, name, function, event, timing, level, enabled mode,
+predicate, argument, transition-table, parent, and constraint shape. Internal
+referential triggers must belong to foreign keys wholly inside the catalog.
+External executable triggers, altered released triggers, and cross-schema
+references are rejected before ownership changes. For an eligible upgrade, the
+migration preserves
 non-delegable runtime grants already rooted at PostgreSQL's bootstrap
 superuser, otherwise re-homes the legacy owner's grants there, and removes
 explicit fixed-role memberships held by the legacy owner with `CASCADE`. It
