@@ -31,10 +31,21 @@ logical-slot state plus the local continuous worker's process generation and
 post-cycle wait boundary. A primary-side sample bounds the plain unique
 synchronized-slot list and joins one managed physical slot's active PID to its
 exact walsender while keeping peer-supplied reply time and `catalog_xmin`
-non-authorizing.
-Both paths run in a real primary/standby CI fixture. Secure
-upstream connection material, multi-server identity and worker-connection
-correlation, role activation,
+non-authorizing. A pure bounded correlator now requires the separately sampled
+standby and primary paths to match the catalog's observable source components,
+database, roles, mandatory feedback and slot-sync configuration, matching
+standby and primary checkpoint timelines plus live receiver and
+writable-primary timelines, receiver slot, gated
+active physical slot, retained WAL, and exact streaming walsender identity. It
+remains a preflight endpoint-compatibility and
+change token rather than proof of network adjacency or decoder authorization.
+PostgreSQL's SQL API does not expose the replay LSN with its atomically sampled
+replay timeline, so this correlator neither compares nor carries the raw replay
+LSN. Both paths run in a real primary/standby CI fixture. Secure upstream
+connection material, exact replay-lineage, upstream and network-adjacency proof,
+restore-incarnation observation,
+worker-connection and successful-cycle correlation, feedback freshness and
+catalog-horizon proof, physical-slot lifecycle attestation, role activation,
 operator-managed replication, durable lease integration, promotion, automated
 recovery, and rolling restarts are not implemented; see
 [implementation status](../project/status.md).

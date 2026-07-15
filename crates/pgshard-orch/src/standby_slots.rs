@@ -395,6 +395,40 @@ pub struct LogicalSlotObservation {
     pub confirmed_flush_lsn: Option<PgLsn>,
 }
 
+/// One replay position coherently bound to its observed source lineage.
+///
+/// The fields are deliberately opaque. No production constructor exists until
+/// a connection-owned observer can sample the replay LSN and replay timeline as
+/// one coherent value. In particular, a bare `pg_last_wal_replay_lsn()` result
+/// cannot create this proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceBoundReplayPosition {
+    source_identity: ReplicationSourceIdentity,
+    lsn: PgLsn,
+}
+
+impl SourceBoundReplayPosition {
+    /// Returns the exact source lineage observed with the replay position.
+    #[must_use]
+    pub const fn source_identity(self) -> ReplicationSourceIdentity {
+        self.source_identity
+    }
+
+    /// Returns the replay position after its lineage has been bound.
+    #[must_use]
+    pub const fn lsn(self) -> PgLsn {
+        self.lsn
+    }
+
+    #[cfg(test)]
+    const fn for_test(source_identity: ReplicationSourceIdentity, lsn: PgLsn) -> Self {
+        Self {
+            source_identity,
+            lsn,
+        }
+    }
+}
+
 /// One bounded standby and upstream observation set.
 ///
 /// `PostgreSQL` cannot provide a transaction spanning two servers. The future
@@ -426,8 +460,8 @@ pub struct StandbyDecoderObservation {
     pub slot_sync_worker: Option<SlotSyncWorkerObservation>,
     /// Effective WAL level on the candidate.
     pub wal_level: LogicalWalLevel,
-    /// Last WAL location replayed by the candidate, if observable.
-    pub replay_lsn: Option<PgLsn>,
+    /// Exact replay position bound to its atomically observed source lineage.
+    pub replay_position: Option<SourceBoundReplayPosition>,
     /// WAL receiver state for the expected primary.
     pub wal_receiver: WalReceiverState,
     /// Live `pg_stat_wal_receiver.slot_name`, if observed.
@@ -491,6 +525,24 @@ impl StandbyDecoderEvidenceLimits {
             feedback: maximum_feedback_age,
             slot_sync: maximum_slot_sync_age,
         })
+    }
+
+    /// Returns the maximum age of a complete multi-server observation set.
+    #[must_use]
+    pub const fn maximum_observation_age(self) -> Duration {
+        self.observation
+    }
+
+    /// Returns the maximum accepted age of physical feedback evidence.
+    #[must_use]
+    pub const fn maximum_feedback_age(self) -> Duration {
+        self.feedback
+    }
+
+    /// Returns the maximum accepted age of slot-sync success evidence.
+    #[must_use]
+    pub const fn maximum_slot_sync_age(self) -> Duration {
+        self.slot_sync
     }
 }
 
@@ -709,6 +761,12 @@ impl StandbyDecoderPolicy {
     pub const fn durable_checkpoint_lsn(&self) -> PgLsn {
         self.durable_checkpoint_lsn
     }
+
+    /// Returns the catalog-selected evidence freshness limits.
+    #[must_use]
+    pub const fn evidence_limits(&self) -> StandbyDecoderEvidenceLimits {
+        self.evidence_limits
+    }
 }
 
 /// Invalid catalog-derived attachment policy.
@@ -906,6 +964,9 @@ pub enum StandbyDecoderIneligible {
     /// Candidate replay position is unavailable.
     #[error("standby replay LSN is unavailable")]
     ReplayPositionMissing,
+    /// Replay position was observed on another source lineage.
+    #[error("standby replay position source does not match the candidate source")]
+    ReplaySourceIdentityMismatch,
     /// Candidate has not replayed the durable checkpoint.
     #[error("standby replay LSN is behind the durable checkpoint")]
     ReplayBehind {
@@ -1130,11 +1191,13 @@ fn validate_standby_observation(
     if observation.wal_level != LogicalWalLevel::Logical {
         return Err(StandbyDecoderIneligible::WalLevelInsufficient);
     }
-    let replay_lsn = observation
-        .replay_lsn
+    let replay_position = observation
+        .replay_position
         .ok_or(StandbyDecoderIneligible::ReplayPositionMissing)?;
-    // Bare PostgreSQL LSNs are ordered only after both endpoints have passed
-    // the exact source/timeline identity gates above.
+    if replay_position.source_identity() != observation.source_identity {
+        return Err(StandbyDecoderIneligible::ReplaySourceIdentityMismatch);
+    }
+    let replay_lsn = replay_position.lsn();
     if lsn_follows_on_same_source(policy.durable_checkpoint_lsn, replay_lsn) {
         return Err(StandbyDecoderIneligible::ReplayBehind {
             observed: replay_lsn,
@@ -1473,6 +1536,13 @@ mod tests {
         .expect("valid test source")
     }
 
+    fn replay_position(
+        source_identity: ReplicationSourceIdentity,
+        lsn: PgLsn,
+    ) -> SourceBoundReplayPosition {
+        SourceBoundReplayPosition::for_test(source_identity, lsn)
+    }
+
     fn generation(value: u128) -> SlotGeneration {
         SlotGeneration::new(Uuid::from_u128(value)).expect("valid test slot generation")
     }
@@ -1579,7 +1649,7 @@ mod tests {
                 }),
             }),
             wal_level: LogicalWalLevel::Logical,
-            replay_lsn: Some(CHECKPOINT),
+            replay_position: Some(replay_position(source(7), CHECKPOINT)),
             wal_receiver: WalReceiverState::Streaming,
             wal_receiver_slot_name: Some(slot("pgshard_member_0001")),
             upstream_walsender_pid: Some(pid(701)),
@@ -2003,14 +2073,21 @@ mod tests {
     #[test]
     fn requires_replay_through_checkpoint_and_primary_sync_gating() {
         let mut candidate = observation();
-        candidate.replay_lsn = None;
+        candidate.replay_position = None;
         assert_eq!(
             validate_standby_decoder_attachment(&policy(), &candidate),
             Err(StandbyDecoderIneligible::ReplayPositionMissing)
         );
 
         let mut candidate = observation();
-        candidate.replay_lsn = Some(BEFORE_CHECKPOINT);
+        candidate.replay_position = Some(replay_position(source(8), CHECKPOINT));
+        assert_eq!(
+            validate_standby_decoder_attachment(&policy(), &candidate),
+            Err(StandbyDecoderIneligible::ReplaySourceIdentityMismatch)
+        );
+
+        let mut candidate = observation();
+        candidate.replay_position = Some(replay_position(source(7), BEFORE_CHECKPOINT));
         assert_eq!(
             validate_standby_decoder_attachment(&policy(), &candidate),
             Err(StandbyDecoderIneligible::ReplayBehind {

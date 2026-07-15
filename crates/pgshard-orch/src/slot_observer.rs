@@ -9,6 +9,13 @@
 //! every observation remains [`SlotOwnership::Unknown`] until a future
 //! mutation-history attestor supplies stronger evidence.
 
+mod correlation;
+
+pub use correlation::{
+    CorrelatedStandbyReplicationPath, StandbyReplicationPathCorrelationError,
+    correlate_standby_replication_path,
+};
+
 use std::{
     num::{NonZeroU32, NonZeroU64},
     time::Duration,
@@ -61,6 +68,7 @@ const OBSERVE_PREREQUISITES_SQL: &str = "\
            receiver.pid::pg_catalog.int4, \
            receiver.status::pg_catalog.text, \
            receiver.slot_name::pg_catalog.text, \
+           NULLIF(receiver.received_tli, 0)::pg_catalog.int4, \
            pg_catalog.pg_has_role( \
                current_user, 'pg_read_all_stats', 'USAGE' \
            ) AS has_read_all_stats, \
@@ -96,6 +104,11 @@ const OBSERVE_PRIMARY_REPLICATION_SQL: &str = "\
     SELECT control.system_identifier::pg_catalog.int8, \
            checkpoint_control.timeline_id, \
            pg_catalog.pg_is_in_recovery(), \
+           CASE WHEN NOT pg_catalog.pg_is_in_recovery() \
+                THEN pg_catalog.substring( \
+                         pg_catalog.pg_walfile_name( \
+                             pg_catalog.pg_current_wal_lsn()), 1, 8) \
+           END AS current_timeline_hex, \
            pg_catalog.current_setting('wal_level'), \
            pg_catalog.pg_has_role( \
                current_user, 'pg_read_all_stats', 'USAGE' \
@@ -475,6 +488,7 @@ pub struct LocalStandbyPrerequisiteObservation {
     wal_receiver_pid: Option<NonZeroU32>,
     wal_receiver_activity: LocalWalReceiverActivity,
     wal_receiver_slot_name: Option<ReplicationSlotName>,
+    wal_receiver_received_timeline: Option<u32>,
     slot_sync_worker: Option<LocalSlotSyncWorkerObservation>,
 }
 
@@ -527,7 +541,10 @@ impl LocalStandbyPrerequisiteObservation {
         self.primary_slot_name.as_ref()
     }
 
-    /// Returns the last replayed WAL location, if `PostgreSQL` exposes one.
+    /// Returns the raw last replayed WAL location, if `PostgreSQL` exposes one.
+    ///
+    /// SQL does not return its replay timeline atomically, so this value cannot
+    /// construct a `SourceBoundReplayPosition` or authorize LSN ordering.
     #[must_use]
     pub const fn replay_lsn(&self) -> Option<PgLsn> {
         self.replay_lsn
@@ -549,6 +566,16 @@ impl LocalStandbyPrerequisiteObservation {
     #[must_use]
     pub const fn wal_receiver_slot_name(&self) -> Option<&ReplicationSlotName> {
         self.wal_receiver_slot_name.as_ref()
+    }
+
+    /// Returns the live receiver's last received timeline, if available.
+    ///
+    /// Neither this value nor the control-file checkpoint timeline binds the
+    /// raw replay LSN to a lineage. Ordering replay requires an atomically
+    /// paired replay timeline and the opaque source-bound replay contract.
+    #[must_use]
+    pub const fn wal_receiver_received_timeline(&self) -> Option<u32> {
+        self.wal_receiver_received_timeline
     }
 
     /// Returns the local continuous slot-sync worker, if one is observable.
@@ -610,6 +637,7 @@ pub struct LocalPrimaryReplicationObservationBatch {
     collection_finished_at: Instant,
     system_identifier: u64,
     checkpoint_timeline: u32,
+    current_timeline: Option<u32>,
     recovery: RecoveryState,
     wal_level: LogicalWalLevel,
     failover_slot_synchronization: FailoverSlotSynchronization,
@@ -652,6 +680,15 @@ impl LocalPrimaryReplicationObservationBatch {
     #[must_use]
     pub const fn checkpoint_timeline(&self) -> u32 {
         self.checkpoint_timeline
+    }
+
+    /// Returns the writable server's current WAL insertion timeline.
+    ///
+    /// This is `None` only when the observed server is in recovery. A writable
+    /// observation fails closed instead of returning without this value.
+    #[must_use]
+    pub const fn current_timeline(&self) -> Option<u32> {
+        self.current_timeline
     }
 
     /// Returns whether the sampled upstream is writable or in recovery.
@@ -908,15 +945,16 @@ async fn observe_primary_before(
     } else {
         RecoveryState::Writable
     };
-    let wal_level = match row.try_get::<_, String>(3)?.as_str() {
+    let current_timeline = parse_primary_current_timeline(row.try_get(3)?, recovery)?;
+    let wal_level = match row.try_get::<_, String>(4)?.as_str() {
         "logical" => LogicalWalLevel::Logical,
         _ => LogicalWalLevel::Insufficient,
     };
-    if !row.try_get::<_, bool>(4)? {
+    if !row.try_get::<_, bool>(5)? {
         return Err(LocalSlotObservationError::StatisticsPrivilegeRequired);
     }
     let failover_slot_synchronization =
-        parse_synchronized_slot_policy(row.try_get(5)?, row.try_get(6)?, request.physical_slot())?;
+        parse_synchronized_slot_policy(row.try_get(6)?, row.try_get(7)?, request.physical_slot())?;
     let physical_slot = parse_physical_slot(&row, request.physical_slot())?;
     let wal_sender = parse_wal_sender(&row, physical_slot.as_ref())?;
 
@@ -927,6 +965,7 @@ async fn observe_primary_before(
         collection_finished_at,
         system_identifier,
         checkpoint_timeline,
+        current_timeline,
         recovery,
         wal_level,
         failover_slot_synchronization,
@@ -1055,17 +1094,17 @@ fn parse_physical_slot(
     row: &Row,
     target: &ReplicationSlotName,
 ) -> Result<Option<LocalPhysicalReplicationSlotObservation>, LocalSlotObservationError> {
-    let name: Option<String> = row.try_get(7)?;
-    let plugin: Option<String> = row.try_get(8)?;
-    let slot_type: Option<String> = row.try_get(9)?;
-    let database_oid: Option<i64> = row.try_get(10)?;
-    let temporary: Option<bool> = row.try_get(11)?;
-    let active: Option<bool> = row.try_get(12)?;
-    let active_pid: Option<i64> = row.try_get(13)?;
-    let catalog_xmin: Option<String> = row.try_get(14)?;
-    let restart_lsn: Option<String> = row.try_get(15)?;
-    let wal_status: Option<String> = row.try_get(16)?;
-    let invalidation_reason: Option<String> = row.try_get(17)?;
+    let name: Option<String> = row.try_get(8)?;
+    let plugin: Option<String> = row.try_get(9)?;
+    let slot_type: Option<String> = row.try_get(10)?;
+    let database_oid: Option<i64> = row.try_get(11)?;
+    let temporary: Option<bool> = row.try_get(12)?;
+    let active: Option<bool> = row.try_get(13)?;
+    let active_pid: Option<i64> = row.try_get(14)?;
+    let catalog_xmin: Option<String> = row.try_get(15)?;
+    let restart_lsn: Option<String> = row.try_get(16)?;
+    let wal_status: Option<String> = row.try_get(17)?;
+    let invalidation_reason: Option<String> = row.try_get(18)?;
 
     let Some(name) = name else {
         if plugin.is_some()
@@ -1118,11 +1157,11 @@ fn parse_wal_sender(
     row: &Row,
     physical_slot: Option<&LocalPhysicalReplicationSlotObservation>,
 ) -> Result<Option<LocalWalSenderObservation>, LocalSlotObservationError> {
-    let pid: Option<i32> = row.try_get(18)?;
-    let application_name: Option<String> = row.try_get(19)?;
-    let backend_start_epoch_micros: Option<i64> = row.try_get(20)?;
-    let state: Option<String> = row.try_get(21)?;
-    let reply_epoch_micros: Option<i64> = row.try_get(22)?;
+    let pid: Option<i32> = row.try_get(19)?;
+    let application_name: Option<String> = row.try_get(20)?;
+    let backend_start_epoch_micros: Option<i64> = row.try_get(21)?;
+    let state: Option<String> = row.try_get(22)?;
+    let reply_epoch_micros: Option<i64> = row.try_get(23)?;
     if pid.is_none()
         && application_name.is_none()
         && backend_start_epoch_micros.is_none()
@@ -1220,16 +1259,26 @@ fn parse_prerequisites(
     let receiver_pid = row.try_get(10)?;
     let receiver_status: Option<String> = row.try_get(11)?;
     let receiver_slot_name = row.try_get(12)?;
-    let (wal_receiver_pid, wal_receiver_activity, wal_receiver_slot_name) =
-        parse_wal_receiver(receiver_pid, receiver_status.as_deref(), receiver_slot_name)?;
-    if !row.try_get::<_, bool>(13)? {
+    let receiver_timeline = row.try_get(13)?;
+    let ParsedWalReceiver {
+        pid: wal_receiver_pid,
+        activity: wal_receiver_activity,
+        slot_name: wal_receiver_slot_name,
+        received_timeline: wal_receiver_received_timeline,
+    } = parse_wal_receiver(
+        receiver_pid,
+        receiver_status.as_deref(),
+        receiver_slot_name,
+        receiver_timeline,
+    )?;
+    if !row.try_get::<_, bool>(14)? {
         return Err(LocalSlotObservationError::StatisticsPrivilegeRequired);
     }
     let slot_sync_worker = parse_slot_sync_worker(
-        row.try_get(14)?,
         row.try_get(15)?,
-        row.try_get::<_, Option<String>>(16)?.as_deref(),
+        row.try_get(16)?,
         row.try_get::<_, Option<String>>(17)?.as_deref(),
+        row.try_get::<_, Option<String>>(18)?.as_deref(),
     )?;
 
     Ok(LocalStandbyPrerequisiteObservation {
@@ -1245,6 +1294,7 @@ fn parse_prerequisites(
         wal_receiver_pid,
         wal_receiver_activity,
         wal_receiver_slot_name,
+        wal_receiver_received_timeline,
         slot_sync_worker,
     })
 }
@@ -1270,23 +1320,55 @@ fn parse_timeline_id(value: i32) -> Result<u32, LocalSlotObservationError> {
     Ok(value)
 }
 
+fn parse_primary_current_timeline(
+    value: Option<String>,
+    recovery: RecoveryState,
+) -> Result<Option<u32>, LocalSlotObservationError> {
+    match (recovery, value) {
+        (RecoveryState::Standby, None) => Ok(None),
+        (RecoveryState::Writable, Some(value))
+            if value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            let Some(timeline) = u32::from_str_radix(&value, 16)
+                .ok()
+                .and_then(NonZeroU32::new)
+            else {
+                return Err(LocalSlotObservationError::InvalidPrimaryCurrentTimeline(
+                    Some(value),
+                ));
+            };
+            Ok(Some(timeline.get()))
+        }
+        (_, value) => Err(LocalSlotObservationError::InvalidPrimaryCurrentTimeline(
+            value,
+        )),
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedWalReceiver {
+    pid: Option<NonZeroU32>,
+    activity: LocalWalReceiverActivity,
+    slot_name: Option<ReplicationSlotName>,
+    received_timeline: Option<u32>,
+}
+
 fn parse_wal_receiver(
     pid: Option<i32>,
     status: Option<&str>,
     slot_name: Option<String>,
-) -> Result<
-    (
-        Option<NonZeroU32>,
-        LocalWalReceiverActivity,
-        Option<ReplicationSlotName>,
-    ),
-    LocalSlotObservationError,
-> {
+    received_timeline: Option<i32>,
+) -> Result<ParsedWalReceiver, LocalSlotObservationError> {
     let Some(pid) = pid else {
-        if status.is_some() || slot_name.is_some() {
+        if status.is_some() || slot_name.is_some() || received_timeline.is_some() {
             return Err(LocalSlotObservationError::InconsistentWalReceiver);
         }
-        return Ok((None, LocalWalReceiverActivity::Absent, None));
+        return Ok(ParsedWalReceiver {
+            pid: None,
+            activity: LocalWalReceiverActivity::Absent,
+            slot_name: None,
+            received_timeline: None,
+        });
     };
     let pid = u32::try_from(pid)
         .ok()
@@ -1311,7 +1393,13 @@ fn parse_wal_receiver(
             ));
         }
     };
-    Ok((Some(pid), activity, optional_slot_name(slot_name)?))
+    let received_timeline = received_timeline.map(parse_timeline_id).transpose()?;
+    Ok(ParsedWalReceiver {
+        pid: Some(pid),
+        activity,
+        slot_name: optional_slot_name(slot_name)?,
+        received_timeline,
+    })
 }
 
 fn parse_slot_sync_worker(
@@ -1592,9 +1680,12 @@ pub enum LocalSlotObservationError {
     /// `PostgreSQL` reported a zero cluster system identifier.
     #[error("PostgreSQL system identifier must be nonzero")]
     InvalidSystemIdentifier,
-    /// `PostgreSQL` reported a zero checkpoint timeline identifier.
-    #[error("PostgreSQL checkpoint timeline identifier must be nonzero")]
+    /// `PostgreSQL` reported a zero timeline identifier.
+    #[error("PostgreSQL timeline identifier must be nonzero")]
     InvalidTimelineId,
+    /// A writable primary did not expose one exact nonzero current timeline.
+    #[error("PostgreSQL primary current timeline is unavailable or invalid: {0:?}")]
+    InvalidPrimaryCurrentTimeline(Option<String>),
     /// A live WAL receiver's backend PID was zero or outside the supported range.
     #[error("PostgreSQL WAL receiver PID is invalid: {0}")]
     InvalidWalReceiverPid(i32),
@@ -1835,6 +1926,31 @@ mod tests {
     #[test]
     fn primary_raw_identifiers_are_nonzero_and_unordered() {
         assert_eq!(
+            parse_primary_current_timeline(Some("00000001".to_owned()), RecoveryState::Writable,)
+                .expect("current timeline"),
+            Some(1)
+        );
+        assert_eq!(
+            parse_primary_current_timeline(Some("FFFFFFFF".to_owned()), RecoveryState::Writable,)
+                .expect("maximum current timeline"),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            parse_primary_current_timeline(None, RecoveryState::Standby)
+                .expect("standby has no insertion timeline"),
+            None
+        );
+        for invalid in [None, Some("00000000"), Some("0000001"), Some("0000000g")] {
+            assert!(matches!(
+                parse_primary_current_timeline(invalid.map(str::to_owned), RecoveryState::Writable,),
+                Err(LocalSlotObservationError::InvalidPrimaryCurrentTimeline(_))
+            ));
+        }
+        assert!(matches!(
+            parse_primary_current_timeline(Some("00000001".to_owned()), RecoveryState::Standby,),
+            Err(LocalSlotObservationError::InvalidPrimaryCurrentTimeline(_))
+        ));
+        assert_eq!(
             parse_transaction_id("4294967295")
                 .expect("maximum xid")
                 .get()
@@ -1955,8 +2071,13 @@ mod tests {
     #[test]
     fn parses_closed_receiver_activity_and_fails_on_redaction() {
         assert_eq!(
-            parse_wal_receiver(None, None, None).expect("absent receiver"),
-            (None, LocalWalReceiverActivity::Absent, None)
+            parse_wal_receiver(None, None, None, None).expect("absent receiver"),
+            ParsedWalReceiver {
+                pid: None,
+                activity: LocalWalReceiverActivity::Absent,
+                slot_name: None,
+                received_timeline: None,
+            }
         );
         for (status, expected) in [
             ("stopped", LocalWalReceiverActivity::Stopped),
@@ -1966,38 +2087,44 @@ mod tests {
             ("restarting", LocalWalReceiverActivity::Restarting),
             ("stopping", LocalWalReceiverActivity::Stopping),
         ] {
-            let (pid, activity, slot_name) = parse_wal_receiver(
+            let receiver = parse_wal_receiver(
                 Some(42),
                 Some(status),
                 Some("pgshard_member_0001".to_owned()),
+                Some(-1),
             )
             .expect("known receiver state");
-            assert_eq!(pid.map(NonZeroU32::get), Some(42));
-            assert_eq!(activity, expected);
+            assert_eq!(receiver.pid.map(NonZeroU32::get), Some(42));
+            assert_eq!(receiver.activity, expected);
             assert_eq!(
-                slot_name.as_ref().map(ReplicationSlotName::as_str),
+                receiver.slot_name.as_ref().map(ReplicationSlotName::as_str),
                 Some("pgshard_member_0001")
             );
+            assert_eq!(receiver.received_timeline, Some(u32::MAX));
         }
         assert!(matches!(
-            parse_wal_receiver(Some(42), None, None),
+            parse_wal_receiver(Some(42), None, None, Some(7)),
             Err(LocalSlotObservationError::WalReceiverDetailsUnavailable { pid })
                 if pid.get() == 42
         ));
         assert!(matches!(
-            parse_wal_receiver(Some(0), Some("streaming"), None),
+            parse_wal_receiver(Some(0), Some("streaming"), None, Some(7)),
             Err(LocalSlotObservationError::InvalidWalReceiverPid(0))
         ));
         assert!(matches!(
-            parse_wal_receiver(None, Some("streaming"), None),
+            parse_wal_receiver(None, Some("streaming"), None, None),
             Err(LocalSlotObservationError::InconsistentWalReceiver)
         ));
         assert!(matches!(
-            parse_wal_receiver(None, None, Some("pgshard_member_0001".to_owned())),
+            parse_wal_receiver(None, None, Some("pgshard_member_0001".to_owned()), None,),
             Err(LocalSlotObservationError::InconsistentWalReceiver)
         ));
         assert!(matches!(
-            parse_wal_receiver(Some(42), Some("future"), None),
+            parse_wal_receiver(None, None, None, Some(7)),
+            Err(LocalSlotObservationError::InconsistentWalReceiver)
+        ));
+        assert!(matches!(
+            parse_wal_receiver(Some(42), Some("future"), None, Some(7)),
             Err(LocalSlotObservationError::UnsupportedWalReceiverStatus(status))
                 if status == "future"
         ));

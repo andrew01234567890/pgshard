@@ -123,7 +123,8 @@ reject write, flush, and apply regression without mutating the last accepted
 sample.
 Pure orchestrator tests exercise the standby-decoder attachment contract. They
 require non-nil catalog generations encoded in slot names and matched exactly,
-the current enabled two-phase mode and activation boundaries; a bounded
+an opaque test-only replay position bound to the exact source identity, the
+current enabled two-phase mode and activation boundaries; a bounded
 hot-standby-feedback interval
 with a fixed scheduling margin; a slot-sync success from the current
 direct-primary connection generation; exact live receiver, primary walsender,
@@ -133,10 +134,18 @@ The second check rejects a changed source or current mode, slot progress racing 
 durable checkpoint, a different reported active backend PID, and a reported
 start other than that checkpoint before producing a non-authorizing report.
 Pure values cannot prove which PID and start LSN an actual socket used. These
-tests cover observations only; the catalog allocation lifecycle is tested
-separately, while the live probe, controlled PostgreSQL slot lifecycle,
+tests cover observation contracts only; the catalog allocation lifecycle is
+tested separately, while controlled PostgreSQL slot mutation,
 connection-bound command proof, quarantined COPY-BOTH attachment, and stream
-owner are not implemented.
+ownership remain future work.
+A lower-level correlation suite independently mutates every sampled path class.
+It accepts an unproven non-temporary physical slot only as raw evidence and
+rejects reversed or stale collection windows; database, source, role, WAL-level,
+feedback, slot-sync, receiver, gate, physical-slot, retention,
+invalidation, PID, application-name, activity, and peer-reply mismatches. It
+also proves that the output preserves raw `catalog_xmin`, restart LSN,
+persistence classification, backend generation, and peer reply only as
+non-authorizing tokens.
 The `Orchestrator catalog / PostgreSQL 18` CI job applies the real migration,
 constructs a ready reshard-materializer fixture, and loads its exact
 restore-bound checkpoint, ownership fence, anchor, and member-local decoder in
@@ -197,9 +206,18 @@ primary-side coverage also requires the bounded plain synchronized-slot list to
 contain the managed physical slot, observes its nonzero `catalog_xmin`, retained
 restart LSN and active PID, and joins that PID to a streaming walsender with the
 expected managed `application_name`, nonzero backend generation, and a
-peer-supplied reply timestamp. An absent ungated slot returns no synthetic rows.
-The reply timestamp and 32-bit transaction ID are equality-only raw values; direct
-multi-server source identity, feedback freshness and horizon coverage,
+peer-supplied reply timestamp. The live topology then samples both endpoints
+again and runs the source-bound endpoint correlator. The raw standby replay
+position only seeds a nonzero catalog-policy fixture; the correlator does not
+compare or carry it because SQL does not expose its atomically paired replay
+timeline. The test verifies the same database and source components, both
+control-file checkpoints, the live receiver, and the primary's current WAL
+insertion timeline all agree, followed by the exact physical path and raw
+horizon, unproven persistence, and peer token without
+claiming that the sampled endpoints were directly connected or granting
+attachment authority. An absent ungated slot returns no synthetic rows.
+The reply timestamp and 32-bit transaction ID are equality-only raw values;
+feedback freshness and horizon coverage,
 new-anchor reconciliation on already-running standbys, and a timestamped
 successful source-bound slot-sync cycle remain part of the later runtime suite.
 The same fixture proves that a session-owned temporary physical slot is active
