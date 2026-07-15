@@ -73,12 +73,16 @@ a superuser, the schema and every relation, routine, type, and collation share
 that owner, and its schema-local default privileges match the released
 reader-only boundary. Rejecting a non-superuser legacy owner prevents arbitrary
 triggers or security-definer routines from being promoted into the trusted
-dedicated owner. For an eligible upgrade, the migration re-homes the legacy
-owner's non-delegable reader and administrator grants under the bootstrap
-principal, removes PostgreSQL 18's automatic creator memberships with
-`CASCADE`, transfers standalone composite types with the rest of the catalog,
-and clears all existing fixed-role ACLs and grant options before rebuilding the
-exact runtime boundary. It then runs catalog DDL as the dedicated owner:
+dedicated owner. It also rejects independently owned schema object classes that
+the released layout did not contain rather than leaving them behind during a
+partial transfer. For an eligible upgrade, the migration preserves
+non-delegable runtime grants already rooted at PostgreSQL's bootstrap
+superuser, otherwise re-homes the legacy owner's grants there, and removes
+explicit fixed-role memberships held by the legacy owner with `CASCADE`. It
+transfers standalone composite types with the rest of the catalog and clears
+all existing fixed-role schema, relation, column, routine and type ACLs plus
+grant options before rebuilding the exact runtime boundary. It then runs
+catalog DDL as the dedicated owner:
 
 ```sql
 CREATE DATABASE shardschema TEMPLATE template0 ENCODING 'UTF8';

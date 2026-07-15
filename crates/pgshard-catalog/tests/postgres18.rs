@@ -850,6 +850,20 @@ async fn assert_installation_contract(client: &Client) -> TestResult {
 }
 
 async fn assert_legacy_catalog_owner_upgrade(client: &Client) -> TestResult {
+    client
+        .batch_execute("DROP SCHEMA pgshard_catalog CASCADE")
+        .await?;
+    drop_catalog_roles(client).await?;
+    assert_non_superuser_v049_owner_is_rejected(client).await?;
+    assert_bootstrap_superuser_v049_owner_upgrade(client).await?;
+    client
+        .batch_execute("DROP SCHEMA pgshard_catalog CASCADE")
+        .await?;
+    drop_catalog_roles(client).await?;
+    assert_distinct_superuser_v049_owner_upgrade(client).await
+}
+
+async fn assert_distinct_superuser_v049_owner_upgrade(client: &Client) -> TestResult {
     let legacy_owner = format!("pgshard_legacy_owner_{}", Uuid::new_v4().simple());
     let runtime_reader = format!("pgshard_runtime_reader_{}", Uuid::new_v4().simple());
     let runtime_admin = format!("pgshard_runtime_admin_{}", Uuid::new_v4().simple());
@@ -860,12 +874,6 @@ async fn assert_legacy_catalog_owner_upgrade(client: &Client) -> TestResult {
         &legacy_grantee,
         &legacy_owner,
     ];
-
-    client
-        .batch_execute("DROP SCHEMA pgshard_catalog CASCADE")
-        .await?;
-    drop_catalog_roles(client).await?;
-    assert_non_superuser_v049_owner_is_rejected(client).await?;
     let role_setup = client
         .batch_execute(&format!(
             "CREATE ROLE {legacy_owner} NOLOGIN SUPERUSER; \
@@ -881,15 +889,17 @@ async fn assert_legacy_catalog_owner_upgrade(client: &Client) -> TestResult {
         cleanup?;
         return Err(error.into());
     }
-    let fixture_install = client.batch_execute(V0_49_0_MIGRATION_SQL).await;
-    let reset_after_install = client.batch_execute("RESET ROLE").await;
+    let fixture_install: TestResult = async {
+        client.batch_execute(V0_49_0_MIGRATION_SQL).await?;
+        client.batch_execute("RESET ROLE").await?;
+        Ok(())
+    }
+    .await;
     if let Err(error) = fixture_install {
         let cleanup = cleanup_legacy_upgrade_fixture(client, &fixture_roles, true).await;
-        reset_after_install?;
         cleanup?;
-        return Err(error.into());
+        return Err(error);
     }
-    reset_after_install?;
 
     let mut upgrade_committed = false;
     let upgrade_result: TestResult = async {
@@ -907,6 +917,11 @@ async fn assert_legacy_catalog_owner_upgrade(client: &Client) -> TestResult {
                      GRANTED BY {legacy_owner}; \
                  SET ROLE {legacy_owner}; \
                  CREATE TYPE pgshard_catalog.legacy_composite AS (value integer); \
+                 CREATE PROCEDURE pgshard_catalog.legacy_procedure() \
+                     LANGUAGE plpgsql \
+                     SECURITY DEFINER \
+                     SET search_path = pg_catalog, pgshard_catalog, pg_temp \
+                     AS 'BEGIN NULL; END'; \
                  GRANT ALL PRIVILEGES ON SCHEMA pgshard_catalog \
                      TO pgshard_catalog_reader WITH GRANT OPTION; \
                  GRANT UPDATE, TRUNCATE ON pgshard_catalog.cluster_state \
@@ -914,6 +929,8 @@ async fn assert_legacy_catalog_owner_upgrade(client: &Client) -> TestResult {
                  GRANT UPDATE (catalog_epoch) ON pgshard_catalog.cluster_state \
                      TO pgshard_catalog_admin WITH GRANT OPTION; \
                  GRANT EXECUTE ON FUNCTION pgshard_catalog.notify_catalog_state() \
+                     TO pgshard_catalog_reader WITH GRANT OPTION; \
+                 GRANT EXECUTE ON PROCEDURE pgshard_catalog.legacy_procedure() \
                      TO pgshard_catalog_reader WITH GRANT OPTION; \
                  GRANT USAGE ON TYPE pgshard_catalog.legacy_composite \
                      TO pgshard_catalog_admin WITH GRANT OPTION; \
@@ -947,6 +964,117 @@ async fn assert_legacy_catalog_owner_upgrade(client: &Client) -> TestResult {
     Ok(())
 }
 
+async fn assert_bootstrap_superuser_v049_owner_upgrade(client: &Client) -> TestResult {
+    let runtime_reader = format!("pgshard_bootstrap_reader_{}", Uuid::new_v4().simple());
+    let runtime_admin = format!("pgshard_bootstrap_admin_{}", Uuid::new_v4().simple());
+    let fixture_roles = [&runtime_reader, &runtime_admin];
+    let bootstrap_role: String = client
+        .query_one(
+            "SELECT pg_catalog.quote_ident(rolname) \
+               FROM pg_catalog.pg_roles \
+              WHERE oid = 10 AND rolsuper",
+            &[],
+        )
+        .await?
+        .get(0);
+
+    let fixture_setup: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE ROLE {runtime_reader} NOLOGIN; \
+                 CREATE ROLE {runtime_admin} NOLOGIN; \
+                 SET ROLE {bootstrap_role}"
+            ))
+            .await?;
+        client.batch_execute(V0_49_0_MIGRATION_SQL).await?;
+        client
+            .batch_execute(&format!(
+                "GRANT pgshard_catalog_reader TO {runtime_reader} \
+                     WITH ADMIN FALSE, INHERIT TRUE, SET FALSE; \
+                 GRANT pgshard_catalog_admin TO {runtime_admin} \
+                     WITH ADMIN FALSE, INHERIT FALSE, SET TRUE; \
+                 RESET ROLE"
+            ))
+            .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = fixture_setup {
+        let cleanup = cleanup_legacy_upgrade_fixture(client, &fixture_roles, true).await;
+        cleanup?;
+        return Err(error);
+    }
+
+    let mut upgrade_committed = false;
+    let upgrade_result: TestResult = async {
+        assert_bootstrap_memberships_preserved(client, &runtime_reader, &runtime_admin).await?;
+        let epoch_before_upgrade = catalog_epoch(client).await?;
+        client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
+        upgrade_committed = true;
+        if catalog_epoch(client).await? != epoch_before_upgrade {
+            return Err("bootstrap-owner takeover mutated catalog state".into());
+        }
+        assert_catalog_owned_by_dedicated_role(client).await?;
+        assert_bootstrap_memberships_preserved(client, &runtime_reader, &runtime_admin).await?;
+        Ok(())
+    }
+    .await;
+    let cleanup_result =
+        cleanup_legacy_upgrade_fixture(client, &fixture_roles, !upgrade_committed).await;
+    upgrade_result?;
+    cleanup_result?;
+    Ok(())
+}
+
+async fn assert_bootstrap_memberships_preserved(
+    client: &Client,
+    runtime_reader: &str,
+    runtime_admin: &str,
+) -> TestResult {
+    let rows = client
+        .query(
+            "SELECT granted.rolname, members.rolname, memberships.grantor, \
+                    memberships.admin_option, memberships.inherit_option, \
+                    memberships.set_option \
+               FROM pg_catalog.pg_auth_members AS memberships \
+               JOIN pg_catalog.pg_roles AS granted \
+                 ON granted.oid = memberships.roleid \
+               JOIN pg_catalog.pg_roles AS members \
+                 ON members.oid = memberships.member \
+              WHERE granted.rolname IN ( \
+                        'pgshard_catalog_reader', 'pgshard_catalog_admin' \
+                    ) \
+                AND members.rolname = ANY($1::text[]) \
+              ORDER BY granted.rolname, members.rolname",
+            &[&vec![runtime_reader, runtime_admin]],
+        )
+        .await?;
+    if rows.len() != 2 {
+        return Err("bootstrap-owned runtime memberships were not preserved".into());
+    }
+    let admin_row = &rows[0];
+    let admin_matches = admin_row.get::<_, &str>(0) == "pgshard_catalog_admin"
+        && admin_row.get::<_, &str>(1) == runtime_admin
+        && admin_row.get::<_, u32>(2) == 10
+        && !admin_row.get::<_, bool>(3)
+        && !admin_row.get::<_, bool>(4)
+        && admin_row.get::<_, bool>(5);
+    if !admin_matches {
+        return Err("bootstrap-owned administrator membership changed".into());
+    }
+    let reader_row = &rows[1];
+    let reader_matches = reader_row.get::<_, &str>(0) == "pgshard_catalog_reader"
+        && reader_row.get::<_, &str>(1) == runtime_reader
+        && reader_row.get::<_, u32>(2) == 10
+        && !reader_row.get::<_, bool>(3)
+        && reader_row.get::<_, bool>(4)
+        && !reader_row.get::<_, bool>(5);
+    if !reader_matches {
+        return Err("bootstrap-owned reader membership changed".into());
+    }
+    Ok(())
+}
+
 async fn assert_non_superuser_v049_owner_is_rejected(client: &Client) -> TestResult {
     let legacy_owner = format!("pgshard_untrusted_owner_{}", Uuid::new_v4().simple());
     let fixture_roles = [&legacy_owner];
@@ -962,15 +1090,17 @@ async fn assert_non_superuser_v049_owner_is_rejected(client: &Client) -> TestRes
         cleanup?;
         return Err(error.into());
     }
-    let fixture_install = client.batch_execute(V0_49_0_MIGRATION_SQL).await;
-    let reset_after_install = client.batch_execute("RESET ROLE").await;
+    let fixture_install: TestResult = async {
+        client.batch_execute(V0_49_0_MIGRATION_SQL).await?;
+        client.batch_execute("RESET ROLE").await?;
+        Ok(())
+    }
+    .await;
     if let Err(error) = fixture_install {
         let cleanup = cleanup_legacy_upgrade_fixture(client, &fixture_roles, true).await;
-        reset_after_install?;
         cleanup?;
-        return Err(error.into());
+        return Err(error);
     }
-    reset_after_install?;
 
     let rejection_result: TestResult = async {
         let released_memberships: i64 = client
@@ -1257,6 +1387,11 @@ async fn assert_legacy_fixed_role_acls_removed(client: &Client) -> TestResult {
                         'pgshard_catalog.notify_catalog_state()', \
                         'EXECUTE' \
                     ) \
+                 OR pg_catalog.has_function_privilege( \
+                        'pgshard_catalog_reader', \
+                        'pgshard_catalog.legacy_procedure()', \
+                        'EXECUTE' \
+                    ) \
                  OR EXISTS ( \
                         SELECT \
                           FROM pg_catalog.pg_type AS types \
@@ -1298,6 +1433,8 @@ async fn assert_catalog_role_bootstrap_rejections(client: &Client) -> TestResult
         &[],
     )
     .await?;
+
+    assert_unsupported_schema_object_is_rejected(client).await?;
 
     let delegable_member = format!("pgshard_delegable_{}", Uuid::new_v4().simple());
     assert_catalog_migration_rejection(
@@ -1378,6 +1515,30 @@ async fn assert_catalog_role_bootstrap_rejections(client: &Client) -> TestResult
     )
     .await?;
     Ok(())
+}
+
+async fn assert_unsupported_schema_object_is_rejected(client: &Client) -> TestResult {
+    let unsupported_routine = format!("legacy_operator_eq_{}", Uuid::new_v4().simple());
+    assert_catalog_migration_rejection(
+        client,
+        &format!(
+            "SET ROLE pgshard_catalog_owner; \
+             CREATE FUNCTION pgshard_catalog.{unsupported_routine}( \
+                 left_value integer, right_value integer \
+             ) RETURNS boolean \
+                 LANGUAGE SQL IMMUTABLE \
+                 AS 'SELECT left_value = right_value'; \
+             CREATE OPERATOR pgshard_catalog.=== ( \
+                 LEFTARG = integer, \
+                 RIGHTARG = integer, \
+                 FUNCTION = pgshard_catalog.{unsupported_routine} \
+             ); \
+             RESET ROLE"
+        ),
+        "pre-existing pgshard_catalog contains an unsupported schema object",
+        &[],
+    )
+    .await
 }
 
 async fn assert_catalog_inheritance_rejections(client: &Client) -> TestResult {

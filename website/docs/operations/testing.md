@@ -27,18 +27,22 @@ migration principal. A negative bootstrap test first proves that a non-superuser
 principal is rejected before object creation. Upgrade coverage embeds the exact
 v0.49 migration bytes and installs them through `SET ROLE`, first proving that a
 non-superuser `CREATEROLE` owner and its real PostgreSQL 18 grantor chain are
-rejected rather than elevated. The eligible superuser-owned fixture then moves
-the released catalog to the dedicated NOLOGIN owner, re-homes non-delegable
-runtime memberships with their exact `INHERIT` and `SET` options, removes the
-old creator memberships, preserves the epoch, and proves the deprivileged old
-owner has no residual catalog access and can be dropped. Hostile reader/admin
-schema, table, column, routine, type, and grant-option ACLs are cleared before
-the documented boundary is rebuilt, and a standalone composite type proves
-complete ownership transfer. Rollback-only cases cover unsafe fixed-role
-attributes, delegable memberships, unexpected reader/admin/owner inheritance,
-owner members, fixed-role schema ownership, missing released roles, mixed
-object ownership, and unexpected default privileges without advancing the
-catalog epoch or retaining fixture roles. A separate
+rejected rather than elevated. An exact fixture installed as PostgreSQL's
+bootstrap superuser proves its non-delegable runtime memberships and their
+`INHERIT` and `SET` options survive takeover without a same-grantor revoke. A
+second eligible superuser-owned fixture moves the released catalog to the
+dedicated NOLOGIN owner, re-homes those memberships under the bootstrap
+grantor, removes explicit fixed-role memberships held by the old owner,
+preserves the epoch, and proves the deprivileged old owner has no residual
+catalog access and can be dropped. Hostile reader/admin schema, table, column,
+function, procedure, type, and grant-option ACLs, including PUBLIC procedure
+execution, are cleared before the documented boundary is rebuilt, and a
+standalone composite type proves complete ownership transfer. Rollback-only
+cases cover unsafe fixed-role attributes, delegable memberships, unexpected
+reader/admin/owner inheritance, owner members, fixed-role schema ownership,
+missing released roles, mixed object ownership, unsupported schema object
+classes, and unexpected default privileges without advancing the catalog epoch
+or retaining fixture roles. A separate
 rollback-only smoke path creates the registry allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying
