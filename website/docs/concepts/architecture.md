@@ -14,33 +14,45 @@ The target architecture separates the latency-sensitive data path from
 declarative Kubernetes reconciliation. Rust components will route queries,
 manage PostgreSQL instances, decode WAL, and recover distributed operations. The
 Go operator will translate custom resources into cluster resources and
-configuration.
+configuration. Change-stream serving is an internal `pgshard-pooler` subsystem,
+not a separate deployment.
 
 ```mermaid
 flowchart LR
-  app[PostgreSQL client] --> svc[Cluster rw/ro/r Service]
-  svc --> pool[pgshard-pooler]
-  pool --> p0[(Shard 0000 primary)]
-  pool --> p1[(Shard 0001 primary)]
-  p0 --> r00[(Replica)]
-  p1 --> r10[(Replica)]
+  app[PostgreSQL client] --> svc[Cluster writer/readwrite/readonly Services]
+  subgraph pool[pgshard-pooler Pods]
+    direction TB
+    query[query/router container]
+    stream[stream-worker sidecar]
+    query <-->|bounded UID-authenticated IPC| stream
+  end
+  svc --> query
+  cdc[Change-stream client] -->|ChangeStream API| stream
+  query -->|SQL queries| p0[(Shard 0000 primary)]
+  query -->|SQL queries| p1[(Shard 0001 primary)]
+  p0 -->|physical WAL + anchor sync| r00[(Shard 0000 standby)]
+  p1 -->|physical WAL + anchor sync| r10[(Shard 0001 standby)]
+  query -->|read-only SQL| r00
+  query -->|read-only SQL| r10
+  r00 -.->|pgoutput change data| stream
+  r10 -.->|pgoutput change data| stream
   p0 --- schema[(shardschema)]
   orch[pgshard-orch] --> p0
   orch --> p1
+  orch --> r00
+  orch --> r10
+  orch --> stream
   orch <--> etcd[(etcd leases)]
   operator[Go operator] --> orch
-  stream[pgshard-stream] --> p0
-  stream --> p1
 ```
 
 ## Component responsibilities
 
 | Component | Responsibility | Durable authority |
 |---|---|---|
-| Pooler | PostgreSQL protocol, pooling, routing, scatter reads, 2PC driving, bounded failover buffering | None; caches validated epochs |
-| Agent | PostgreSQL lifecycle, pgBackRest, role and LSN reporting, native logical-replication connection | PostgreSQL and local volume state |
+| Pooler Pod | Separately credentialed query/router and stream-worker modes of the same Rust binary: PostgreSQL protocol, pooling, routing, scatter reads, 2PC driving, bounded failover buffering, stream API, snapshots, per-shard `pgoutput` workers, cross-shard merge and resume vectors | None locally; validated routing epochs and acknowledged stream positions live in `shardschema` |
+| Agent | PostgreSQL lifecycle, pgBackRest, role, LSN and slot-health reporting, quarantine and local mutation hooks | PostgreSQL and local volume state |
 | Orchestrator | Fencing, promotion, operation state machines, abandoned 2PC recovery | PostgreSQL operation records |
-| Stream | Merges per-shard `pgoutput`, snapshots, resume vectors, reshard journals | Acknowledged stream position in `shardschema` |
 | Operator | Kubernetes resources, defaults, resource-derived tuning, status | Kubernetes API desired state |
 | etcd | Short-lived leadership and fencing leases | No durable topology |
 
@@ -48,10 +60,71 @@ flowchart LR
 
 The pooler hashes a registered table's shard-key value into a versioned unsigned 64-bit keyspace and routes it using a cached catalog epoch. Single-shard transactions stay on one backend. A transaction that enlists more than one shard uses [two-phase commit](./distributed-transactions.md).
 
+## Embedded stream runtime
+
+Every pooler Pod runs separately supervised query/router and stream-worker modes
+of the same Rust `pgshard-pooler` binary in containers named `query-router` and
+`stream-worker`. The query container parses untrusted application SQL but
+receives no replication or checkpoint-mutation credentials. The sidecar never
+accepts PostgreSQL client sessions and is the only container mounting those
+credentials. A bounded
+Unix-domain control socket on a shared memory volume checks the query
+container's distinct Linux UID and admits only typed coordination requests; it
+does not proxy arbitrary SQL or replication commands.
+
+Change-stream RPCs, per-shard replication sessions, snapshot holders, merge
+queues and acknowledgements therefore scale with the same fixed replica count
+or HPA-managed `pgshard-pooler` Deployment. The HPA uses query-container CPU,
+external query-admission pressure, and per-Pod stream queue fill described in
+the [test contract](../operations/testing.md#required-end-to-end-environments).
+Scale-down sends a selected Pod through a bounded pre-stop drain and grants it
+no new stream ownership. Durable ownership and checkpoints remain external to
+either container, so a drained or failed worker can hand off without inventing
+progress.
+
+Selectorless query and stream Kubernetes Services may expose different named
+protocol ports through operator-owned EndpointSlices, but every endpoint still
+belongs to a pooler Pod and owns no separate compute or scaling policy.
+
+Replication sessions use dedicated native replication connections from the
+sidecar; they never borrow a transaction-pooled SQL backend. Separate container
+limits, bounded queues, memory budgets, concurrency limits and readiness signals
+keep a slow stream consumer from exhausting query routing. Before termination,
+a worker stops accepting new stream ownership and drains each fenced session,
+while query connections use the normal bounded drain path. Lease expiry alone
+never authorizes takeover: pgshard must rotate the durable owner fence, make
+stale checkpoint writes fail, use agent-held pidfds to terminate and prove
+inactivity of every exact old PostgreSQL replication and snapshot-holder
+backend, and only then authorize a successor.
+
+Live WAL delivery can resume from the last durable checkpoint after that
+takeover proof. An exported snapshot cannot move between PostgreSQL sessions.
+If forced termination loses a holder before `SnapshotComplete` is durably
+spooled, pgshard marks that snapshot generation `ResnapshotRequired`; it never
+continues a mid-copy cursor against a new snapshot.
+
+The steady-state `pgoutput` path terminates on an eligible physical standby's
+independent standby-local decoder. The primary keeps the failover anchor, whose
+synchronized standby copy protects promotion, and serves application writes;
+the pooler does not consume that anchor during normal operation. If no standby
+proves checkpoint coverage and feedback health, the default policy fences the
+stream instead of silently moving decoding load to the primary. Any emergency
+primary fallback must be an explicit operator policy and remains visible in
+`shardschema`.
+
 ## Control-plane availability
 
 Poolers may continue serving routes from a previously validated epoch while `shardschema` is temporarily unavailable. New poolers, topology changes, DDL activation, authorization changes, and reshard activation fail closed until the authoritative catalog returns.
 
 ## Network boundary
 
-Application Services select poolers only. PostgreSQL, etcd, agents, orchestration RPCs, metrics, and native replication endpoints are protected by dedicated Services, TLS identities, RBAC, and NetworkPolicies.
+Kubernetes Services select Pods, not containers, and kubelet makes ordinary Pod
+readiness depend on every regular or restartable container. The query and
+stream Services are therefore selectorless. The operator owns separate
+EndpointSlices containing, respectively, only healthy named query ports and
+only healthy named stream ports from non-terminating pooler Pods. Sidecar
+failure can remove a stream endpoint without removing a healthy SQL endpoint;
+query failure still removes SQL before it can receive a new connection.
+PostgreSQL, etcd, agents, orchestration RPCs, metrics, and native replication
+endpoints are protected by dedicated Services, container-specific credentials,
+TLS identities, RBAC, and NetworkPolicies.

@@ -19,7 +19,8 @@ rewrites into online shadow-table migrations.
 1. Parse and classify the statement before any shard changes.
 2. Create a shadow table on every shard.
 3. Take exported snapshots and bulk-copy primary-key chunks.
-4. Apply concurrent writes through the shared PostgreSQL `pgoutput` decoder.
+4. Apply concurrent writes through the `pgshard-pooler` stream-worker sidecar
+   consuming the selected standby-local PostgreSQL `pgoutput` decoder.
 5. Validate schema, row counts, and chunk checksums.
 6. Enter `ReadyForActivation`, automatically or awaiting an explicit command.
 7. Gate the affected table and drain old-epoch transactions.

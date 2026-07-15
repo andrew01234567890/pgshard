@@ -264,7 +264,7 @@ Injected post-dispatch slot-mutation socket loss and cancellation races are not
 yet exercised. A complete post-dispatch slot-outcome ledger, automatic
 reconciliation after an unknown outcome, connection-bound command proof,
 quarantined COPY-BOTH
-attachment, and stream ownership remain future work.
+attachment, and connection-bound pooler stream ownership remain future work.
 A lower-level correlation suite independently mutates every sampled path class.
 It accepts an unproven non-temporary physical slot only as raw evidence and
 rejects reversed or stale collection windows; database, source, role, WAL-level,
@@ -507,6 +507,56 @@ Jepsen/Elle check the guarantees actually offered: atomic final cross-shard outc
   `hot_standby_feedback`; disabling feedback, setting its report interval to
   zero or inside the fixed scheduling margin, or stalling feedback must fence
   the decoder.
+- Embedded stream runtime topology: the operator creates no standalone stream
+  Deployment or Pod. Selectorless query and stream Services resolve only their
+  respective healthy named ports through operator-owned EndpointSlice entries
+  on non-terminating pooler Pods; an
+  owning `pgshard-pooler` stream-worker sidecar holds each dedicated native
+  replication connection to the catalog-selected standby-local decoder, and no
+  steady-state consumer walsender decodes from the primary anchor. The query
+  container cannot read replication or checkpoint-mutation credentials, the
+  sidecar accepts no PostgreSQL client sessions, and their UID-authenticated IPC
+  rejects untyped and over-budget requests. Independently failing or stopping
+  either container removes only its matching EndpointSlice entry; sidecar
+  failure leaves a healthy SQL endpoint available even when kubelet marks the
+  aggregate Pod unready. Kill the active operator before and after query/stream
+  endpoint add, health removal, Pod UID/IP replacement, and Pod deletion. After
+  leader recovery, each slice must idempotently converge, remove every stale
+  address before advertising its replacement, and use the standard Service-name
+  plus `endpointslice.kubernetes.io/managed-by=pgshard-operator` ownership labels.
+- Fixed-size reconciliation and real HPA behavior are tested separately. The
+  rendered `query-router` container has `resources.requests.cpu: 250m`. The
+  `autoscaling/v2` HPA uses its `ContainerResource` CPU metric with
+  `averageUtilization: 70`, a `Pods` metric named
+  `pgshard_stream_queue_fill_percent` with `averageValue: 70`, and an `External`
+  `pgshard_query_admission_pressure_percent` metric scoped by cluster with
+  `value: 70`. KIND installs metrics-server and Prometheus Adapter; the adapter
+  derives both Prometheus metrics from the pooler endpoints. Before load, the
+  test requires `AbleToScale=True`, `ScalingActive=True`, and all three current
+  metrics in HPA status. Query CPU, stream queue fill, and external query
+  pressure must each independently drive an HPA scale-up. During sidecar
+  failure, sustained SQL load must remain routed through the query EndpointSlice
+  and the external metric must still cause bounded scale-up even though kubelet
+  marks that Pod unready. After all metrics fall below threshold, an
+  HPA-selected scale-down Pod transfers fenced stream ownership only after its
+  bounded pre-stop drain. The test may not substitute a direct Deployment
+  resize. Durable-checkpoint replay must remain at least once, while stream
+  backpressure and memory limits leave SQL routing ready.
+- Ownership-takeover faults partition or stop the old worker before and after
+  each durable-intent, quarantined-connect, pidfd-registration,
+  generation-revalidation and activation transition for COPY-BOTH and
+  independent exported-snapshot holders. No PostgreSQL side effect may precede
+  registration. Its local lease deadline must stop emission and close all
+  sessions; a successor must rotate the durable fence, reject stale checkpoint
+  CAS, mark incomplete snapshots for resnapshot, resolve every intent, signal
+  each exact process through an agent-held pidfd, prove all are absent and the
+  slot inactive, and only then resume. Exit and PID-reuse races are injected
+  around pidfd open and identity revalidation. Failure to prove any intent or
+  step remains fenced.
+- HPA termination during snapshot copy either completes and durably spools
+  `SnapshotComplete` inside the drain bound or marks the generation
+  `ResnapshotRequired`. A replacement Pod must never resume a mid-copy cursor
+  against a different exported snapshot.
 - Independent standby-local slots plus synchronized primary failover anchors
   across source loss and promotion, with no consumption of a synchronized slot
   before promotion and no cross-consumer or cross-database checkpoint or slot
