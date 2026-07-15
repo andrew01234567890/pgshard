@@ -46,12 +46,15 @@ registry are hidden from catalog reader and administrator roles. Every fence
 acquisition stores an opaque fence ID bound to the exact PostgreSQL backend PID,
 backend start, and postmaster start. PID reuse, a public slot name, or a guessed
 advisory-lock key therefore cannot manufacture lifecycle authority. PostgreSQL
-advisory locks are not part of this protocol. Registry writers instead take one
-fail-fast, self-conflicting table lock that remains compatible with ordinary
-lifecycle DML, then lock the exact target row. Built-in advisory-lock ACLs remain
-at PostgreSQL defaults: defending a shared postmaster against deliberately
-hostile or resource-exhausting SQL requires a future all-database operator
-policy and is not claimed by this database-local migration.
+advisory locks are not target-registry authority; mutation sessions preserve
+bounded caller-held advisory locks. Registry writers first lock an existing
+target row. Only first insertion of a target takes a fail-fast,
+self-conflicting table lock, so unrelated established targets remain
+independent while same-name first insertion cannot hide a unique-index wait.
+Built-in advisory-lock ACLs remain at PostgreSQL defaults: defending a shared
+postmaster against deliberately hostile or resource-exhausting SQL requires a
+future all-database operator policy and is not claimed by this database-local
+migration.
 The restricted catalog role cannot update checkpoint progress directly. Its
 checkpoint CAS requires the caller's expected ownership fence and checkpoint
 ordinal, so a fence that wins the catalog lock makes an in-flight stale advance
@@ -60,10 +63,17 @@ The Rust routing snapshot intentionally does not load this registry yet;
 catalog records do not authorize a live replication session.
 
 The migration expects a pre-created UTF8 database and a short-lived superuser
-bootstrap principal. Superuser authority is required to create two fixed
+bootstrap principal. Superuser authority is required to create a dedicated
+`pgshard_catalog_owner` NOLOGIN role plus the fixed reader and administrator
 NOLOGIN group roles, reject unsafe pre-existing attributes or delegable role
-memberships, and leave the security-definer fence owner able to read exact
-backend generations:
+memberships, and grant only the owner `pg_read_all_stats` so security-definer
+fence functions can read exact backend generations. An upgrade from the
+released shared-owner layout is accepted only when the schema, every relation,
+routine, type, and collation share one legacy owner and its schema-local default
+privileges match the released reader-only boundary. The migration then removes
+PostgreSQL 18's automatic creator
+memberships, transfers the complete catalog and strips direct legacy grants
+before running catalog DDL as the dedicated owner:
 
 ```sql
 CREATE DATABASE shardschema TEMPLATE template0 ENCODING 'UTF8';

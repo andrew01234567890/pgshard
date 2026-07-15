@@ -78,13 +78,16 @@ database-enforced target fence fails fast so no writer retains global catalog
 state while queued; the Rust create path retries acquisition within its bounded
 preflight window. Each acquisition records a fresh opaque fence ID bound to the
 exact backend start time, backend PID, and postmaster generation in a hidden
-per-target registry in the authoritative writable `shardschema` database. The
-registry does not acquire a PostgreSQL advisory lock. Its writers take a
-fail-fast, self-conflicting table lock compatible with ordinary lifecycle DML,
-then lock the exact target row. This database-local migration deliberately does
-not alter built-in advisory-lock ACLs because doing so in `shardschema` alone
-cannot protect the postmaster-wide lock table. Hostile SQL resource isolation
-remains an operator/bootstrap responsibility across every database. A stale row is
+per-target registry in the authoritative writable `shardschema` database.
+PostgreSQL advisory locks are not target-registry authority, and a mutation
+session may retain its bounded caller-held advisory locks. A registry writer
+first locks an established target row. Only first insertion of a target takes
+the fail-fast, self-conflicting table lock, keeping established unrelated
+targets independent while preventing a same-name unique-index wait. This
+database-local migration deliberately does not alter built-in advisory-lock
+ACLs because doing so in `shardschema` alone cannot protect the postmaster-wide
+lock table. Hostile SQL resource isolation remains an operator/bootstrap
+responsibility across every database. A stale row is
 reclaimable only after that exact backend generation is no longer live, so PID
 reuse after a backend or Pod restart is not fence authority. A successful create
 returns the matching process-local cleanup receipt; source, role, the bounded

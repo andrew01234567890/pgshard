@@ -520,6 +520,14 @@ async fn install_pre_receipt_probe_schema(client: &Client) -> TestResult {
     client
         .batch_execute("DROP SCHEMA IF EXISTS pgshard_catalog CASCADE")
         .await?;
+    drop_catalog_roles(client).await?;
+    client
+        .batch_execute(
+            "CREATE ROLE pgshard_catalog_reader NOLOGIN; \
+             CREATE ROLE pgshard_catalog_admin NOLOGIN; \
+             GRANT pgshard_catalog_reader TO pgshard_catalog_admin",
+        )
+        .await?;
     client.batch_execute(PRE_RECEIPT_PROBE_SCHEMA_SQL).await?;
     Ok(())
 }
@@ -707,10 +715,15 @@ async fn drop_catalog_roles(client: &Client) -> TestResult {
                     AND pg_catalog.to_regrole('pgshard_catalog_admin') IS NOT NULL THEN \
                      REVOKE pgshard_catalog_reader FROM pgshard_catalog_admin; \
                  END IF; \
+                 IF pg_catalog.to_regrole('pgshard_catalog_owner') IS NOT NULL THEN \
+                     REVOKE pg_read_all_stats FROM pgshard_catalog_owner; \
+                     DROP OWNED BY pgshard_catalog_owner; \
+                 END IF; \
              END \
              $cleanup$; \
              DROP ROLE IF EXISTS pgshard_catalog_admin; \
-             DROP ROLE IF EXISTS pgshard_catalog_reader",
+             DROP ROLE IF EXISTS pgshard_catalog_reader; \
+             DROP ROLE IF EXISTS pgshard_catalog_owner",
         )
         .await?;
     Ok(())
@@ -764,6 +777,8 @@ async fn assert_installation_contract(client: &Client) -> TestResult {
         epoch_after_first_migration,
         "reapplying the migration must not mutate catalog state"
     );
+    assert_legacy_catalog_owner_upgrade(client).await?;
+    assert_catalog_role_bootstrap_rejections(client).await?;
 
     let database_name: String = client
         .query_one("SELECT current_database()", &[])
@@ -827,6 +842,206 @@ async fn assert_installation_contract(client: &Client) -> TestResult {
         .await
         .expect_err("64-byte identifiers must be rejected");
     assert_sqlstate(&error, "23514");
+    Ok(())
+}
+
+async fn assert_legacy_catalog_owner_upgrade(client: &Client) -> TestResult {
+    let legacy_owner = format!("pgshard_legacy_owner_{}", Uuid::new_v4().simple());
+    let legacy_grantee = format!("pgshard_legacy_grantee_{}", Uuid::new_v4().simple());
+    let epoch_before_upgrade = catalog_epoch(client).await?;
+    client
+        .batch_execute(&format!(
+            "BEGIN; \
+             ALTER DEFAULT PRIVILEGES FOR ROLE pgshard_catalog_owner \
+                 IN SCHEMA pgshard_catalog \
+                 REVOKE SELECT ON TABLES FROM pgshard_catalog_reader; \
+             CREATE ROLE {legacy_owner} NOLOGIN CREATEROLE; \
+             CREATE ROLE {legacy_grantee} NOLOGIN; \
+             REASSIGN OWNED BY pgshard_catalog_owner TO {legacy_owner}; \
+             ALTER DEFAULT PRIVILEGES FOR ROLE {legacy_owner} \
+                 IN SCHEMA pgshard_catalog \
+                 GRANT SELECT ON TABLES TO pgshard_catalog_reader; \
+             GRANT pgshard_catalog_reader TO {legacy_owner} WITH ADMIN OPTION; \
+             GRANT pgshard_catalog_admin TO {legacy_owner} WITH ADMIN OPTION; \
+             GRANT USAGE ON SCHEMA pgshard_catalog TO {legacy_grantee}; \
+             GRANT SELECT (singleton) ON pgshard_catalog.cluster_state \
+                 TO {legacy_grantee}"
+        ))
+        .await?;
+    if let Err(error) = client.batch_execute(pgshard_catalog::MIGRATION_SQL).await {
+        client.batch_execute("ROLLBACK").await?;
+        return Err(error.into());
+    }
+
+    let assertions: TestResult = async {
+        assert_eq!(
+            catalog_epoch(client).await?,
+            epoch_before_upgrade,
+            "owner takeover mutated catalog state"
+        );
+        assert_catalog_owned_by_dedicated_role(client).await?;
+        assert_legacy_catalog_access_removed(client, &legacy_owner, &legacy_grantee).await?;
+        Ok(())
+    }
+    .await;
+    let drop_result = client
+        .batch_execute(&format!(
+            "DROP ROLE {legacy_grantee}; DROP ROLE {legacy_owner}"
+        ))
+        .await;
+    assertions?;
+    drop_result?;
+    Ok(())
+}
+
+async fn assert_catalog_owned_by_dedicated_role(client: &Client) -> TestResult {
+    let mismatched_owners: i64 = client
+        .query_one(
+            "WITH catalog_schema AS ( \
+                 SELECT oid FROM pg_catalog.pg_namespace \
+                  WHERE nspname = 'pgshard_catalog' \
+             ), object_owners AS ( \
+                 SELECT relowner AS owner FROM pg_catalog.pg_class, catalog_schema \
+                  WHERE relnamespace = catalog_schema.oid \
+                 UNION ALL \
+                 SELECT proowner FROM pg_catalog.pg_proc, catalog_schema \
+                  WHERE pronamespace = catalog_schema.oid \
+                 UNION ALL \
+                 SELECT typowner FROM pg_catalog.pg_type, catalog_schema \
+                  WHERE typnamespace = catalog_schema.oid \
+                 UNION ALL \
+                 SELECT collowner FROM pg_catalog.pg_collation, catalog_schema \
+                  WHERE collnamespace = catalog_schema.oid \
+             ) \
+             SELECT count(*) \
+               FROM object_owners, pg_catalog.pg_roles AS owners \
+              WHERE owners.oid = object_owners.owner \
+                AND owners.rolname <> 'pgshard_catalog_owner'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        mismatched_owners, 0,
+        "catalog objects did not transfer to the dedicated owner"
+    );
+    let schema_owner: String = client
+        .query_one(
+            "SELECT owners.rolname \
+               FROM pg_catalog.pg_namespace AS namespaces \
+               JOIN pg_catalog.pg_roles AS owners ON owners.oid = namespaces.nspowner \
+              WHERE namespaces.nspname = 'pgshard_catalog'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(schema_owner, "pgshard_catalog_owner");
+    Ok(())
+}
+
+async fn assert_legacy_catalog_access_removed(
+    client: &Client,
+    legacy_owner: &str,
+    legacy_grantee: &str,
+) -> TestResult {
+    let legacy_memberships: i64 = client
+        .query_one(
+            "SELECT count(*) \
+               FROM pg_catalog.pg_auth_members AS memberships \
+               JOIN pg_catalog.pg_roles AS members ON members.oid = memberships.member \
+               JOIN pg_catalog.pg_roles AS granted ON granted.oid = memberships.roleid \
+              WHERE members.rolname = $1 \
+                AND granted.rolname IN ( \
+                    'pgshard_catalog_reader', 'pgshard_catalog_admin' \
+                )",
+            &[&legacy_owner],
+        )
+        .await?
+        .get(0);
+    assert_eq!(legacy_memberships, 0);
+    let legacy_access: bool = client
+        .query_one(
+            "SELECT pg_catalog.has_schema_privilege($1, 'pgshard_catalog', 'USAGE') \
+                 OR pg_catalog.has_schema_privilege($2, 'pgshard_catalog', 'USAGE') \
+                 OR pg_catalog.has_column_privilege( \
+                     $2, 'pgshard_catalog.cluster_state', 'singleton', 'SELECT' \
+                 )",
+            &[&legacy_owner, &legacy_grantee],
+        )
+        .await?
+        .get(0);
+    assert!(!legacy_access, "legacy principal retained catalog access");
+    let owner_can_see_backend_generation: bool = client
+        .query_one(
+            "SELECT pgshard_catalog.managed_slot_backend_identity_live( \
+                 pg_catalog.pg_backend_pid(), \
+                 (SELECT backend_start FROM pg_catalog.pg_stat_activity \
+                   WHERE pid = pg_catalog.pg_backend_pid()), \
+                 pg_catalog.pg_postmaster_start_time() \
+             )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        owner_can_see_backend_generation,
+        "catalog owner cannot validate exact backend generations"
+    );
+    Ok(())
+}
+
+async fn assert_catalog_role_bootstrap_rejections(client: &Client) -> TestResult {
+    client
+        .batch_execute("BEGIN; ALTER ROLE pgshard_catalog_reader LOGIN")
+        .await?;
+    let unsafe_role = client.batch_execute(pgshard_catalog::MIGRATION_SQL).await;
+    client.batch_execute("ROLLBACK").await?;
+    let unsafe_role = unsafe_role.expect_err("an unsafe fixed-role attribute must block migration");
+    assert_sqlstate(&unsafe_role, "42501");
+    assert_database_message(
+        &unsafe_role,
+        "pre-existing pgshard_catalog_reader role has unsafe attributes",
+    );
+
+    let mixed_owner = format!("pgshard_mixed_owner_{}", Uuid::new_v4().simple());
+    let mixed_table = format!("owner_mismatch_{}", Uuid::new_v4().simple());
+    client
+        .batch_execute(&format!(
+            "BEGIN; \
+             CREATE ROLE {mixed_owner} NOLOGIN; \
+             CREATE TABLE pgshard_catalog.{mixed_table}(value integer); \
+             ALTER TABLE pgshard_catalog.{mixed_table} OWNER TO {mixed_owner}"
+        ))
+        .await?;
+    let mixed_ownership = client.batch_execute(pgshard_catalog::MIGRATION_SQL).await;
+    client.batch_execute("ROLLBACK").await?;
+    let mixed_ownership =
+        mixed_ownership.expect_err("mixed catalog ownership must block migration");
+    assert_sqlstate(&mixed_ownership, "42501");
+    assert_database_message(
+        &mixed_ownership,
+        "pre-existing pgshard_catalog objects must share the schema owner",
+    );
+
+    let default_grantee = format!("pgshard_default_grantee_{}", Uuid::new_v4().simple());
+    client
+        .batch_execute(&format!(
+            "BEGIN; \
+             CREATE ROLE {default_grantee} NOLOGIN; \
+             ALTER DEFAULT PRIVILEGES FOR ROLE pgshard_catalog_owner \
+                 IN SCHEMA pgshard_catalog \
+                 GRANT INSERT ON TABLES TO {default_grantee}"
+        ))
+        .await?;
+    let unsafe_defaults = client.batch_execute(pgshard_catalog::MIGRATION_SQL).await;
+    client.batch_execute("ROLLBACK").await?;
+    let unsafe_defaults =
+        unsafe_defaults.expect_err("unexpected legacy default privileges must block migration");
+    assert_sqlstate(&unsafe_defaults, "42501");
+    assert_database_message(
+        &unsafe_defaults,
+        "pre-existing pgshard_catalog default privileges do not match the released boundary",
+    );
     Ok(())
 }
 
@@ -1517,14 +1732,7 @@ async fn assert_identity_history_contract(client: &Client, fixture: &Fixture) ->
 }
 
 async fn assert_admin_privilege_contract(client: &mut Client) -> TestResult {
-    let login_roles: i64 = client
-        .query_one(
-            "SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname IN ('pgshard_catalog_reader', 'pgshard_catalog_admin') AND rolcanlogin",
-            &[],
-        )
-        .await?
-        .get(0);
-    assert_eq!(login_roles, 0, "catalog group roles must remain NOLOGIN");
+    assert_catalog_role_boundary(client).await?;
 
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let transaction = client.transaction().await?;
@@ -1560,6 +1768,66 @@ async fn assert_admin_privilege_contract(client: &mut Client) -> TestResult {
     transaction
         .batch_execute("ROLLBACK TO SAVEPOINT hidden_probe_receipts")
         .await?;
+    assert_hidden_target_registry(&transaction).await?;
+    let unknown_receipt_state: Option<String> = transaction
+        .query_one(
+            "SELECT pgshard_catalog.managed_slot_creation_attempt_state( \
+                        $1::text::uuid, 'unknown_slot', $2::text::uuid \
+                    )",
+            &[&Uuid::new_v4().to_string(), &Uuid::new_v4().to_string()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(unknown_receipt_state, None);
+    transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_databases(database_name) VALUES ($1::text)",
+            &[&format!("admin_test_{nonce}")],
+        )
+        .await?;
+    let error = transaction
+        .execute(
+            "UPDATE pgshard_catalog.cluster_configuration SET hash_seed = hash_seed + 1",
+            &[],
+        )
+        .await
+        .expect_err("catalog admin must not mutate immutable configuration directly");
+    assert_sqlstate(&error, "42501");
+    transaction.rollback().await?;
+    Ok(())
+}
+
+async fn assert_catalog_role_boundary(client: &Client) -> TestResult {
+    let login_roles: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_roles \
+              WHERE rolname IN ( \
+                  'pgshard_catalog_owner', \
+                  'pgshard_catalog_reader', \
+                  'pgshard_catalog_admin' \
+              ) AND rolcanlogin",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(login_roles, 0, "catalog group roles must remain NOLOGIN");
+    let owner_members: i64 = client
+        .query_one(
+            "SELECT count(*) \
+               FROM pg_catalog.pg_auth_members AS memberships \
+               JOIN pg_catalog.pg_roles AS granted ON granted.oid = memberships.roleid \
+              WHERE granted.rolname = 'pgshard_catalog_owner'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(owner_members, 0, "catalog owner must not be assumable");
+    Ok(())
+}
+
+async fn assert_hidden_target_registry(
+    transaction: &tokio_postgres::Transaction<'_>,
+) -> TestResult {
     transaction
         .batch_execute("SAVEPOINT hidden_target_fences")
         .await?;
@@ -1588,31 +1856,6 @@ async fn assert_admin_privilege_contract(client: &mut Client) -> TestResult {
     transaction
         .batch_execute("ROLLBACK TO SAVEPOINT raw_probe_lifecycle")
         .await?;
-    let unknown_receipt_state: Option<String> = transaction
-        .query_one(
-            "SELECT pgshard_catalog.managed_slot_creation_attempt_state( \
-                        $1::text::uuid, 'unknown_slot', $2::text::uuid \
-                    )",
-            &[&Uuid::new_v4().to_string(), &Uuid::new_v4().to_string()],
-        )
-        .await?
-        .get(0);
-    assert_eq!(unknown_receipt_state, None);
-    transaction
-        .execute(
-            "INSERT INTO pgshard_catalog.logical_databases(database_name) VALUES ($1::text)",
-            &[&format!("admin_test_{nonce}")],
-        )
-        .await?;
-    let error = transaction
-        .execute(
-            "UPDATE pgshard_catalog.cluster_configuration SET hash_seed = hash_seed + 1",
-            &[],
-        )
-        .await
-        .expect_err("catalog admin must not mutate immutable configuration directly");
-    assert_sqlstate(&error, "42501");
-    transaction.rollback().await?;
     Ok(())
 }
 
@@ -2709,35 +2952,42 @@ async fn assert_target_registry_lock_is_fail_fast(
         .await?
         .get(0);
 
-    holder.batch_execute("BEGIN").await?;
-    acquire_target_fence(&holder, &target_name).await?;
-    contender
-        .batch_execute(
-            "BEGIN; \
-             SELECT 1 FROM pgshard_catalog.cluster_state \
-              WHERE singleton FOR UPDATE",
+    let mut contender_force_terminate = false;
+    let probe_result: TestResult<_> = async {
+        holder.batch_execute("BEGIN").await?;
+        acquire_target_fence(&holder, &target_name).await?;
+        contender
+            .batch_execute(
+                "BEGIN; \
+                 SELECT 1 FROM pgshard_catalog.cluster_state \
+                  WHERE singleton FOR UPDATE",
+            )
+            .await?;
+        let lock_outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            contender.query_one(
+                "SELECT pgshard_catalog.lock_managed_slot_target($1::text)",
+                &[&target_name],
+            ),
         )
-        .await?;
-    let lock_outcome = tokio::time::timeout(
-        Duration::from_secs(1),
-        contender.query_one(
-            "SELECT pgshard_catalog.lock_managed_slot_target($1::text)",
-            &[&target_name],
-        ),
-    )
+        .await;
+        contender_force_terminate = lock_outcome.is_err();
+        Ok(lock_outcome)
+    }
     .await;
     let contender_cleanup = cleanup_lock_test_connection(
         observer,
         contender,
         contender_task,
         contender_pid,
-        lock_outcome.is_err(),
+        contender_force_terminate,
     )
     .await;
     let holder_cleanup =
         cleanup_lock_test_connection(observer, holder, holder_task, holder_pid, false).await;
     contender_cleanup?;
     holder_cleanup?;
+    let lock_outcome = probe_result?;
     let error = lock_outcome
         .map_err(|_| "target registry lock waited while cluster state was retained")?
         .expect_err("a retained target row must fail fast");
@@ -2755,11 +3005,11 @@ async fn assert_target_registry_lock_is_fail_fast(
         .get(0);
     assert_eq!(rows, 0, "rolled-back first acquisition left a registry row");
 
-    assert_cross_target_registry_lock_is_fail_fast(observer, database_url).await?;
+    assert_cross_target_registry_lock_remains_independent(observer, database_url).await?;
     Ok(())
 }
 
-async fn assert_cross_target_registry_lock_is_fail_fast(
+async fn assert_cross_target_registry_lock_remains_independent(
     observer: &Client,
     database_url: &str,
 ) -> TestResult {
@@ -2777,59 +3027,125 @@ async fn assert_cross_target_registry_lock_is_fail_fast(
         .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
         .await?
         .get(0);
-    let fence_id = acquire_target_fence(&lifecycle, &existing_target).await?;
-
-    lifecycle
-        .batch_execute(
-            "BEGIN; \
-             SELECT 1 FROM pgshard_catalog.cluster_state \
-              WHERE singleton FOR UPDATE",
+    let (probe_result, lifecycle_force_terminate, creator_force_terminate) =
+        run_cross_target_registry_lock_probe(
+            observer,
+            &lifecycle,
+            &creator,
+            creator_pid,
+            &existing_target,
+            &missing_target,
         )
-        .await?;
-    creator.batch_execute("BEGIN").await?;
-    creator
-        .query_one(
-            "SELECT pgshard_catalog.lock_managed_slot_target($1::text)",
-            &[&missing_target],
-        )
-        .await?;
-
-    let release_outcome = tokio::time::timeout(
-        Duration::from_secs(1),
-        lifecycle.query_one(
-            "SELECT pgshard_catalog.release_managed_slot_target_fence( \
-                        $1::text, $2::text::uuid \
-                    )",
-            &[&existing_target, &fence_id],
-        ),
-    )
-    .await;
+        .await;
     let lifecycle_cleanup = cleanup_lock_test_connection(
         observer,
         lifecycle,
         lifecycle_task,
         lifecycle_pid,
-        release_outcome.is_err(),
+        lifecycle_force_terminate,
     )
     .await;
-    let creator_cleanup =
-        cleanup_lock_test_connection(observer, creator, creator_task, creator_pid, false).await;
-    lifecycle_cleanup?;
-    creator_cleanup?;
-    observer
+    let creator_cleanup = cleanup_lock_test_connection(
+        observer,
+        creator,
+        creator_task,
+        creator_pid,
+        creator_force_terminate,
+    )
+    .await;
+    let registry_cleanup = observer
         .execute(
             "DELETE FROM pgshard_catalog.managed_slot_target_fences \
               WHERE target_name::text = ANY($1::text[])",
-            &[&vec![existing_target.clone(), missing_target.clone()]],
+            &[&vec![existing_target, missing_target]],
         )
-        .await?;
+        .await;
+    lifecycle_cleanup?;
+    creator_cleanup?;
+    registry_cleanup?;
+    probe_result
+}
 
-    let error = release_outcome
-        .map_err(|_| "cross-target registry lock waited while cluster state was retained")?
-        .expect_err("cross-target registry serialization must fail fast");
-    assert_sqlstate(&error, "55P03");
-    assert_database_message(&error, "managed slot target fence is busy");
-    Ok(())
+async fn run_cross_target_registry_lock_probe(
+    observer: &Client,
+    lifecycle: &Client,
+    creator: &Client,
+    creator_pid: i32,
+    existing_target: &str,
+    missing_target: &str,
+) -> (TestResult, bool, bool) {
+    let mut lifecycle_force_terminate = false;
+    let mut creator_force_terminate = false;
+    let probe_result: TestResult = async {
+        acquire_target_fence(lifecycle, existing_target).await?;
+        lifecycle
+            .batch_execute(
+                "BEGIN; \
+                 SELECT 1 FROM pgshard_catalog.cluster_state \
+                  WHERE singleton FOR UPDATE",
+            )
+            .await?;
+        creator.batch_execute("BEGIN").await?;
+        creator
+            .query_one(
+                "SELECT pgshard_catalog.lock_managed_slot_target($1::text)",
+                &[&missing_target],
+            )
+            .await?;
+
+        let creator_cluster_state = creator.query_one(
+            "SELECT 1 FROM pgshard_catalog.cluster_state \
+              WHERE singleton FOR UPDATE",
+            &[],
+        );
+        tokio::pin!(creator_cluster_state);
+        let wait_observed = tokio::select! {
+            result = &mut creator_cluster_state => {
+                result?;
+                return Err("different-target creator bypassed retained cluster state".into());
+            }
+            result = wait_for_backend_lock(observer, creator_pid) => result?,
+        };
+        if !wait_observed {
+            creator_force_terminate = true;
+            return Err("different-target creator did not form the reverse lock waiter".into());
+        }
+
+        let existing_target_outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            lifecycle.query_one(
+                "SELECT pgshard_catalog.lock_managed_slot_target($1::text)",
+                &[&existing_target],
+            ),
+        )
+        .await;
+        let existing_target_row = if let Ok(result) = existing_target_outcome {
+            result?
+        } else {
+            lifecycle_force_terminate = true;
+            return Err(
+                "existing-target registry lock waited behind a different-target insertion".into(),
+            );
+        };
+        drop(existing_target_row);
+
+        lifecycle.batch_execute("ROLLBACK").await?;
+        if let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(2), &mut creator_cluster_state).await
+        {
+            result?;
+        } else {
+            creator_force_terminate = true;
+            return Err("different-target creator remained blocked after rollback".into());
+        }
+        Ok(())
+    }
+    .await;
+    (
+        probe_result,
+        lifecycle_force_terminate,
+        creator_force_terminate,
+    )
 }
 
 async fn cleanup_lock_test_connection(

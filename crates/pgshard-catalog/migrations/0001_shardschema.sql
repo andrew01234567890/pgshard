@@ -35,36 +35,137 @@ $pgshard_requirements$;
 
 DO $pgshard_role_bootstrap$
 DECLARE
-    catalog_schema_owner_is_superuser boolean;
+    catalog_schema_oid oid;
+    catalog_schema_owner oid;
+    catalog_schema_owner_name name;
+    mismatched_object text;
 BEGIN
-    SELECT owners.rolsuper
-      INTO catalog_schema_owner_is_superuser
+    SELECT namespaces.oid, owners.oid, owners.rolname
+      INTO catalog_schema_oid, catalog_schema_owner, catalog_schema_owner_name
       FROM pg_catalog.pg_namespace AS namespaces
       JOIN pg_catalog.pg_roles AS owners ON owners.oid = namespaces.nspowner
      WHERE namespaces.nspname = 'pgshard_catalog';
 
-    IF NOT FOUND AND EXISTS (
+    IF NOT FOUND THEN
+        IF EXISTS (
+            SELECT
+              FROM pg_catalog.pg_roles AS roles
+             WHERE roles.rolname IN (
+                       'pgshard_catalog_owner',
+                       'pgshard_catalog_reader',
+                       'pgshard_catalog_admin'
+                   )
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = 'pgshard catalog roles exist before catalog bootstrap';
+        END IF;
+        RETURN;
+    END IF;
+
+    SELECT objects.object_identity
+      INTO mismatched_object
+      FROM (
+          SELECT pg_catalog.format('relation %I', relations.relname) AS object_identity,
+                 relations.relowner AS object_owner
+            FROM pg_catalog.pg_class AS relations
+           WHERE relations.relnamespace = catalog_schema_oid
+          UNION ALL
+          SELECT pg_catalog.format('routine %I', routines.proname), routines.proowner
+            FROM pg_catalog.pg_proc AS routines
+           WHERE routines.pronamespace = catalog_schema_oid
+          UNION ALL
+          SELECT pg_catalog.format('type %I', types.typname), types.typowner
+            FROM pg_catalog.pg_type AS types
+           WHERE types.typnamespace = catalog_schema_oid
+          UNION ALL
+          SELECT pg_catalog.format('collation %I', collations.collname), collations.collowner
+            FROM pg_catalog.pg_collation AS collations
+           WHERE collations.collnamespace = catalog_schema_oid
+      ) AS objects
+     WHERE objects.object_owner <> catalog_schema_owner
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog objects must share the schema owner',
+            DETAIL = mismatched_object;
+    END IF;
+
+    IF EXISTS (
         SELECT
-          FROM pg_catalog.pg_roles AS roles
-         WHERE roles.rolname IN (
-                   'pgshard_catalog_reader',
-                   'pgshard_catalog_admin'
+          FROM pg_catalog.pg_default_acl AS defaults
+         WHERE defaults.defaclnamespace = catalog_schema_oid
+           AND (
+               defaults.defaclrole <> catalog_schema_owner
+               OR defaults.defaclobjtype <> 'r'
+               OR EXISTS (
+                   SELECT
+                     FROM pg_catalog.aclexplode(defaults.defaclacl) AS acl
+                     LEFT JOIN pg_catalog.pg_roles AS grantees
+                       ON grantees.oid = acl.grantee
+                    WHERE grantees.rolname IS DISTINCT FROM 'pgshard_catalog_reader'
+                       OR acl.privilege_type <> 'SELECT'
+                       OR acl.is_grantable
                )
+           )
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '42501',
-            MESSAGE = 'pgshard catalog roles exist before catalog bootstrap';
+            MESSAGE = 'pre-existing pgshard_catalog default privileges do not match the released boundary';
     END IF;
-    IF FOUND AND NOT catalog_schema_owner_is_superuser THEN
+
+    IF catalog_schema_owner_name IN (
+        'pgshard_catalog_reader',
+        'pgshard_catalog_admin'
+    ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '42501',
-            MESSAGE = 'pre-existing pgshard_catalog schema must be owned by a superuser';
+            MESSAGE = 'pre-existing pgshard_catalog schema has an unsafe fixed-role owner';
+    END IF;
+
+    -- PostgreSQL 18 automatically gives a non-superuser CREATEROLE principal
+    -- ADMIN OPTION on roles that it creates. The released catalog migration
+    -- allowed that principal to own the whole schema, so remove only those two
+    -- legacy creator memberships after proving the schema has one owner.
+    IF catalog_schema_owner_name <> 'pgshard_catalog_owner' THEN
+        IF (
+            SELECT pg_catalog.count(*)
+              FROM pg_catalog.pg_roles AS roles
+             WHERE roles.rolname IN (
+                       'pgshard_catalog_reader',
+                       'pgshard_catalog_admin'
+                   )
+        ) <> 2 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = 'legacy pgshard_catalog schema requires both released fixed roles';
+        END IF;
+        IF EXISTS (
+            SELECT
+              FROM pg_catalog.pg_auth_members AS memberships
+             WHERE memberships.member = catalog_schema_owner
+               AND memberships.roleid = 'pgshard_catalog_reader'::pg_catalog.regrole
+        ) THEN
+            EXECUTE pg_catalog.format(
+                'REVOKE pgshard_catalog_reader FROM %I',
+                catalog_schema_owner_name
+            );
+        END IF;
+        IF EXISTS (
+            SELECT
+              FROM pg_catalog.pg_auth_members AS memberships
+             WHERE memberships.member = catalog_schema_owner
+               AND memberships.roleid = 'pgshard_catalog_admin'::pg_catalog.regrole
+        ) THEN
+            EXECUTE pg_catalog.format(
+                'REVOKE pgshard_catalog_admin FROM %I',
+                catalog_schema_owner_name
+            );
+        END IF;
     END IF;
 END
 $pgshard_role_bootstrap$;
-
-CREATE SCHEMA IF NOT EXISTS pgshard_catalog;
-REVOKE ALL ON SCHEMA pgshard_catalog FROM PUBLIC;
 
 DO $pgshard_roles$
 DECLARE
@@ -72,6 +173,7 @@ DECLARE
     role_attributes record;
 BEGIN
     FOREACH role_name IN ARRAY ARRAY[
+        'pgshard_catalog_owner',
         'pgshard_catalog_reader',
         'pgshard_catalog_admin'
     ]
@@ -125,6 +227,7 @@ BEGIN
           JOIN pg_catalog.pg_roles AS granted_roles
             ON granted_roles.oid = memberships.roleid
          WHERE granted_roles.rolname IN (
+                   'pgshard_catalog_owner',
                    'pgshard_catalog_reader',
                    'pgshard_catalog_admin'
                )
@@ -147,15 +250,273 @@ BEGIN
                 member_roles.rolname = 'pgshard_catalog_admin'
                 AND granted_roles.rolname <> 'pgshard_catalog_reader'
             )
+            OR (
+                member_roles.rolname = 'pgshard_catalog_owner'
+                AND granted_roles.rolname <> 'pg_read_all_stats'
+            )
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '42501',
             MESSAGE = 'pre-existing pgshard catalog role inherits an unexpected role';
     END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.pg_auth_members AS memberships
+          JOIN pg_catalog.pg_roles AS granted_roles
+            ON granted_roles.oid = memberships.roleid
+         WHERE granted_roles.rolname = 'pgshard_catalog_owner'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog_owner role has a member';
+    END IF;
 END
 $pgshard_roles$;
 
+GRANT pg_read_all_stats TO pgshard_catalog_owner;
 GRANT pgshard_catalog_reader TO pgshard_catalog_admin;
+CREATE SCHEMA IF NOT EXISTS pgshard_catalog AUTHORIZATION pgshard_catalog_owner;
+REVOKE ALL ON SCHEMA pgshard_catalog FROM PUBLIC;
+
+DO $pgshard_owner_takeover$
+DECLARE
+    catalog_schema_oid oid;
+    legacy_owner oid;
+    legacy_owner_name name;
+    object record;
+    grantee record;
+BEGIN
+    SELECT namespaces.oid, owners.oid, owners.rolname
+      INTO STRICT catalog_schema_oid, legacy_owner, legacy_owner_name
+      FROM pg_catalog.pg_namespace AS namespaces
+      JOIN pg_catalog.pg_roles AS owners ON owners.oid = namespaces.nspowner
+     WHERE namespaces.nspname = 'pgshard_catalog';
+    IF legacy_owner_name = 'pgshard_catalog_owner' THEN
+        RETURN;
+    END IF;
+
+    FOR object IN
+        SELECT relations.relkind, relations.relname
+         FROM pg_catalog.pg_class AS relations
+         WHERE relations.relnamespace = catalog_schema_oid
+           AND relations.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+           AND NOT (
+               relations.relkind = 'S'
+               AND EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_depend AS dependencies
+                    WHERE dependencies.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                      AND dependencies.objid = relations.oid
+                      AND dependencies.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                      AND dependencies.deptype IN ('a', 'i')
+               )
+           )
+         ORDER BY relations.oid
+    LOOP
+        EXECUTE CASE object.relkind
+            WHEN 'S' THEN pg_catalog.format(
+                'ALTER SEQUENCE pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+            WHEN 'v' THEN pg_catalog.format(
+                'ALTER VIEW pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+            WHEN 'm' THEN pg_catalog.format(
+                'ALTER MATERIALIZED VIEW pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+            WHEN 'f' THEN pg_catalog.format(
+                'ALTER FOREIGN TABLE pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+            ELSE pg_catalog.format(
+                'ALTER TABLE pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+        END;
+    END LOOP;
+
+    FOR object IN
+        SELECT routines.prokind,
+               routines.proname,
+               pg_catalog.pg_get_function_identity_arguments(routines.oid) AS identity_arguments
+          FROM pg_catalog.pg_proc AS routines
+         WHERE routines.pronamespace = catalog_schema_oid
+         ORDER BY routines.oid
+    LOOP
+        EXECUTE CASE object.prokind
+            WHEN 'p' THEN pg_catalog.format(
+                'ALTER PROCEDURE pgshard_catalog.%I(%s) OWNER TO pgshard_catalog_owner',
+                object.proname,
+                object.identity_arguments
+            )
+            WHEN 'a' THEN pg_catalog.format(
+                'ALTER AGGREGATE pgshard_catalog.%I(%s) OWNER TO pgshard_catalog_owner',
+                object.proname,
+                object.identity_arguments
+            )
+            ELSE pg_catalog.format(
+                'ALTER FUNCTION pgshard_catalog.%I(%s) OWNER TO pgshard_catalog_owner',
+                object.proname,
+                object.identity_arguments
+            )
+        END;
+    END LOOP;
+
+    FOR object IN
+        SELECT types.typtype, types.typname
+          FROM pg_catalog.pg_type AS types
+         WHERE types.typnamespace = catalog_schema_oid
+           AND types.typrelid = 0
+           AND NOT EXISTS (
+               SELECT
+                 FROM pg_catalog.pg_type AS element_types
+                WHERE element_types.typarray = types.oid
+           )
+         ORDER BY types.oid
+    LOOP
+        EXECUTE CASE object.typtype
+            WHEN 'd' THEN pg_catalog.format(
+                'ALTER DOMAIN pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.typname
+            )
+            ELSE pg_catalog.format(
+                'ALTER TYPE pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.typname
+            )
+        END;
+    END LOOP;
+
+    FOR object IN
+        SELECT collations.collname
+          FROM pg_catalog.pg_collation AS collations
+         WHERE collations.collnamespace = catalog_schema_oid
+         ORDER BY collations.oid
+    LOOP
+        EXECUTE pg_catalog.format(
+            'ALTER COLLATION pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+            object.collname
+        );
+    END LOOP;
+
+    ALTER SCHEMA pgshard_catalog OWNER TO pgshard_catalog_owner;
+
+    -- Ownership changes do not remove explicit grants. Strip every direct
+    -- grant outside the two runtime groups; the migration recreates the exact
+    -- reader/admin boundary below.
+    FOR grantee IN
+        SELECT DISTINCT roles.rolname
+          FROM (
+              SELECT acl.grantee
+                FROM pg_catalog.pg_namespace AS namespaces
+                CROSS JOIN LATERAL pg_catalog.aclexplode(namespaces.nspacl) AS acl
+               WHERE namespaces.oid = catalog_schema_oid
+              UNION
+              SELECT acl.grantee
+                FROM pg_catalog.pg_class AS relations
+                CROSS JOIN LATERAL pg_catalog.aclexplode(relations.relacl) AS acl
+               WHERE relations.relnamespace = catalog_schema_oid
+              UNION
+              SELECT acl.grantee
+                FROM pg_catalog.pg_proc AS routines
+                CROSS JOIN LATERAL pg_catalog.aclexplode(routines.proacl) AS acl
+               WHERE routines.pronamespace = catalog_schema_oid
+              UNION
+              SELECT acl.grantee
+                FROM pg_catalog.pg_type AS types
+                CROSS JOIN LATERAL pg_catalog.aclexplode(types.typacl) AS acl
+               WHERE types.typnamespace = catalog_schema_oid
+              UNION
+              SELECT acl.grantee
+                FROM pg_catalog.pg_attribute AS attributes
+                JOIN pg_catalog.pg_class AS relations
+                  ON relations.oid = attributes.attrelid
+                CROSS JOIN LATERAL pg_catalog.aclexplode(attributes.attacl) AS acl
+               WHERE relations.relnamespace = catalog_schema_oid
+          ) AS grants
+          JOIN pg_catalog.pg_roles AS roles ON roles.oid = grants.grantee
+         WHERE roles.rolname NOT IN (
+                   'pgshard_catalog_owner',
+                   'pgshard_catalog_reader',
+                   'pgshard_catalog_admin'
+               )
+    LOOP
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON SCHEMA pgshard_catalog FROM %I',
+            grantee.rolname
+        );
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA pgshard_catalog FROM %I',
+            grantee.rolname
+        );
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA pgshard_catalog FROM %I',
+            grantee.rolname
+        );
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA pgshard_catalog FROM %I',
+            grantee.rolname
+        );
+        FOR object IN
+            SELECT types.typname
+              FROM pg_catalog.pg_type AS types
+             WHERE types.typnamespace = catalog_schema_oid
+               AND types.typrelid = 0
+               AND NOT EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_type AS element_types
+                    WHERE element_types.typarray = types.oid
+               )
+        LOOP
+            EXECUTE pg_catalog.format(
+                'REVOKE ALL PRIVILEGES ON TYPE pgshard_catalog.%I FROM %I',
+                object.typname,
+                grantee.rolname
+            );
+        END LOOP;
+        FOR object IN
+            SELECT relations.relname, attributes.attname
+              FROM pg_catalog.pg_attribute AS attributes
+              JOIN pg_catalog.pg_class AS relations
+                ON relations.oid = attributes.attrelid
+             WHERE relations.relnamespace = catalog_schema_oid
+               AND attributes.attnum > 0
+               AND NOT attributes.attisdropped
+               AND attributes.attacl IS NOT NULL
+        LOOP
+            EXECUTE pg_catalog.format(
+                'REVOKE ALL PRIVILEGES (%I) ON TABLE pgshard_catalog.%I FROM %I',
+                object.attname,
+                object.relname,
+                grantee.rolname
+            );
+        END LOOP;
+    END LOOP;
+
+    -- Reset the released owner's schema-local default privileges so the old
+    -- bootstrap role has no remaining catalog dependency and can be dropped.
+    EXECUTE pg_catalog.format(
+        'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA pgshard_catalog '
+        'REVOKE ALL PRIVILEGES ON TABLES FROM pgshard_catalog_reader',
+        legacy_owner_name
+    );
+    EXECUTE pg_catalog.format(
+        'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA pgshard_catalog '
+        'REVOKE ALL PRIVILEGES ON TABLES FROM pgshard_catalog_admin',
+        legacy_owner_name
+    );
+    EXECUTE pg_catalog.format(
+        'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA pgshard_catalog '
+        'REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC',
+        legacy_owner_name
+    );
+END
+$pgshard_owner_takeover$;
+
+SET LOCAL ROLE pgshard_catalog_owner;
+
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_admin;
 
@@ -1090,13 +1451,6 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pgshard_catalog, pg_temp
 AS $function$
 BEGIN
-    -- SHARE UPDATE EXCLUSIVE is self-conflicting, so it serializes both
-    -- missing-row creation and every registry writer. Unlike SHARE ROW
-    -- EXCLUSIVE, it is compatible with the ROW EXCLUSIVE lock already held by
-    -- a lifecycle UPDATE whose row trigger reaches this function. NOWAIT turns
-    -- reversed catalog/registry lock order into a retry instead of a deadlock.
-    LOCK TABLE pgshard_catalog.managed_slot_target_fences
-        IN SHARE UPDATE EXCLUSIVE MODE NOWAIT;
     PERFORM 1
       FROM pgshard_catalog.managed_slot_target_fences AS fences
      WHERE fences.target_name::text = $1
@@ -1105,6 +1459,13 @@ BEGIN
         RETURN;
     END IF;
 
+    -- A missing unique-key row cannot be protected with FOR UPDATE. SHARE
+    -- UPDATE EXCLUSIVE serializes first insertion with itself but remains
+    -- compatible with ROW EXCLUSIVE updates and ROW SHARE row locking on
+    -- unrelated targets. NOWAIT prevents same-name speculative insertion from
+    -- becoming a hidden wait edge.
+    LOCK TABLE pgshard_catalog.managed_slot_target_fences
+        IN SHARE UPDATE EXCLUSIVE MODE NOWAIT;
     INSERT INTO pgshard_catalog.managed_slot_target_fences(target_name)
     VALUES ($1)
     ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
@@ -1364,10 +1725,6 @@ DECLARE
     existing_backend_start timestamptz;
     existing_postmaster_start timestamptz;
 BEGIN
-    -- Release participates in the same fail-fast registry serialization as
-    -- acquisition, including when the target row does not exist.
-    LOCK TABLE pgshard_catalog.managed_slot_target_fences
-        IN SHARE UPDATE EXCLUSIVE MODE NOWAIT;
     SELECT fences.fence_id,
            fences.owner_pid,
            fences.owner_backend_start,
@@ -4041,7 +4398,7 @@ GRANT EXECUTE ON FUNCTION pgshard_catalog.advance_logical_consumer_checkpoint(
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog REVOKE ALL ON TABLES FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog REVOKE ALL ON SEQUENCES FROM PUBLIC;
-ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog GRANT SELECT ON TABLES TO pgshard_catalog_reader;
 
 COMMIT;

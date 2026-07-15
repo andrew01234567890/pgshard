@@ -24,8 +24,12 @@ deadline and prove exact phase classification, unchanged cache state, and
 backend exit. The same PostgreSQL 18 fixture exercises the logical-consumer
 registry's core trigger and ownership-fenced checkpoint CAS paths through its
 migration principal. A negative bootstrap test first proves that a non-superuser
-owner is rejected before object creation; a separate rollback-only smoke path
-creates the registry allocation set through
+principal is rejected before object creation. Upgrade coverage moves a
+realistic single-owner released catalog to the dedicated NOLOGIN owner, removes
+its PostgreSQL 18 automatic fixed-role memberships, preserves the epoch, proves
+the old owner has no catalog access and can be dropped, and rejects both unsafe
+fixed-role attributes and mixed legacy object ownership. A separate
+rollback-only smoke path creates the registry allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying
 the migration cannot resurrect a retired restore incarnation or advance the
@@ -214,10 +218,11 @@ advisory lock, deny the untrusted catalog reader access to fence acquisition and
 state, and row-lock the hidden registry through release. PID reuse and
 transaction locks must not restore authority; release must remain bounded, its
 backend must exit, and the stale row must then be reclaimable. A two-session
-test retains `cluster_state` opposite both same-target ownership and an
-uncommitted different-target creation, and requires `55P03` within one second
-instead of a lock-order deadlock. Every timeout/error branch reaps both test
-sessions before it reports the assertion.
+test retains `cluster_state` opposite same-target first insertion and requires
+`55P03` within one second. A reverse-wait test then holds an uncommitted
+different-target insertion behind `cluster_state` and proves an established
+target still locks within one second. Every setup, timeout, and error branch
+reaps both test sessions before it reports the assertion.
 Always-run
 bounded cleanup retires the catalog row only
 after both primary-slot removal and synchronized standby-copy disappearance
