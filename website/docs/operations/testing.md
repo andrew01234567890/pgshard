@@ -123,7 +123,7 @@ reject write, flush, and apply regression without mutating the last accepted
 sample.
 Pure orchestrator tests exercise the standby-decoder attachment contract. They
 require non-nil catalog generations encoded in slot names and matched exactly,
-an opaque test-only replay position bound to the exact source identity, the
+an opaque test-only replay floor bound to the exact source identity, the
 current enabled two-phase mode and activation boundaries; a bounded
 hot-standby-feedback interval
 with a fixed scheduling margin; a slot-sync success from the current
@@ -141,11 +141,12 @@ ownership remain future work.
 A lower-level correlation suite independently mutates every sampled path class.
 It accepts an unproven non-temporary physical slot only as raw evidence and
 rejects reversed or stale collection windows; database, source, role, WAL-level,
-feedback, slot-sync, receiver, gate, physical-slot, retention,
-invalidation, PID, application-name, activity, and peer-reply mismatches. It
-also proves that the output preserves raw `catalog_xmin`, restart LSN,
-persistence classification, backend generation, and peer reply only as
-non-authorizing tokens.
+feedback, slot-sync, replay-floor coverage, receiver, gate, physical-slot,
+retention, invalidation, PID, application-name, activity, and peer-reply
+mismatches. It also proves that the output carries the coherent standby
+control-file checkpoint as an opaque source-bound replay floor while preserving
+raw `catalog_xmin`, physical restart LSN, persistence classification, backend
+generation, and peer reply only as non-authorizing tokens.
 The `Orchestrator catalog / PostgreSQL 18` CI job applies the real migration,
 constructs a ready reshard-materializer fixture, and loads its exact
 restore-bound checkpoint, ownership fence, anchor, and member-local decoder in
@@ -206,13 +207,22 @@ primary-side coverage also requires the bounded plain synchronized-slot list to
 contain the managed physical slot, observes its nonzero `catalog_xmin`, retained
 restart LSN and active PID, and joins that PID to a streaming walsender with the
 expected managed `application_name`, nonzero backend generation, and a
-peer-supplied reply timestamp. The live topology then samples both endpoints
-again and runs the source-bound endpoint correlator. The raw standby replay
-position only seeds a nonzero catalog-policy fixture; the correlator does not
-compare or carry it because SQL does not expose its atomically paired replay
-timeline. The test verifies the same database and source components, both
-control-file checkpoints, the live receiver, and the primary's current WAL
-insertion timeline all agree, followed by the exact physical path and raw
+peer-supplied reply timestamp. The live topology confirms that WAL replay is
+paused, issues a new primary checkpoint, records the standby control-file floor,
+and uses the new checkpoint record as the catalog requirement. The snapshot
+taken while replay remains paused fails correlation because its floor is behind
+that requirement. A bounded cleanup path always attempts to resume replay and
+fails the test if it cannot. The test waits for the raw replay end pointer to
+move strictly past the checkpoint record's start,
+requests a bounded standby checkpoint, and then waits for the coherent
+control-file floor to advance. The same catalog checkpoint passes, and the
+returned opaque replay floor matches the advanced checkpoint LSN and timeline.
+The raw standby replay position is used only to synchronize this test transition;
+it remains unpaired and cannot
+supply product evidence. The test also verifies the same database and source
+components, both control-file checkpoint timelines, the live receiver, and the
+primary's current WAL insertion timeline all agree, followed by the
+exact physical path and raw
 horizon, unproven persistence, and peer token without
 claiming that the sampled endpoints were directly connected or granting
 attachment authority. An absent ungated slot returns no synthetic rows.

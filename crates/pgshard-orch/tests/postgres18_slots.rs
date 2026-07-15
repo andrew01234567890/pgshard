@@ -13,8 +13,9 @@ use pgshard_orch::{
         LocalLogicalSlotObservationBatch, LocalPrimaryReplicationObservationBatch,
         LocalSlotObservationError, LocalSlotSyncWorkerActivity, LocalWalReceiverActivity,
         LocalWalSenderActivity, LogicalSlotObservationRequest,
-        PrimaryReplicationObservationRequest, correlate_standby_replication_path,
-        observe_local_logical_slots, observe_local_primary_replication,
+        PrimaryReplicationObservationRequest, StandbyReplicationPathCorrelationError,
+        correlate_standby_replication_path, observe_local_logical_slots,
+        observe_local_primary_replication,
     },
     standby_slots::{
         FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotPlugin, LogicalWalLevel,
@@ -24,13 +25,15 @@ use pgshard_orch::{
         StandbyDecoderTarget,
     },
 };
-use pgshard_types::CatalogEpoch;
+use pgshard_types::{CatalogEpoch, PgLsn};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     task::JoinHandle,
     time::{Instant, sleep, timeout, timeout_at},
 };
-use tokio_postgres::{Client, Config, Connection, NoTls, error::SqlState};
+use tokio_postgres::{
+    Client, Config, Connection, NoTls, error::SqlState, types::PgLsn as WirePgLsn,
+};
 use uuid::Uuid;
 
 const CREATE_LOGICAL_SLOT_SQL: &str = "\
@@ -91,6 +94,10 @@ fn target(prefix: &str) -> TestResult<ManagedSlotTarget> {
         ReplicationSlotName::new(format!("{prefix}_{}", generation.as_uuid().simple()))?,
         generation,
     )?)
+}
+
+fn pg_lsn_text(lsn: PgLsn) -> String {
+    format!("{:X}/{:X}", lsn.0 >> 32, lsn.0 & u64::from(u32::MAX))
 }
 
 fn expected_synced_anchor() -> TestResult<ManagedSlotTarget> {
@@ -324,16 +331,97 @@ async fn assert_correlated_replication_path(
 ) -> TestResult {
     let physical_slot = ReplicationSlotName::new(EXPECTED_PRIMARY_SLOT_NAME)?;
     let primary_request = PrimaryReplicationObservationRequest::new(physical_slot.clone());
+    let (replay_control, replay_control_connection) =
+        tokio_postgres::connect(standby_database_url, NoTls).await?;
+    let replay_control_task = tokio::spawn(replay_control_connection);
+    let paused_phase: TestResult<_> = async {
+        pause_standby_replay(&replay_control).await?;
+        let required_checkpoint = create_primary_checkpoint(primary_database_url).await?;
+        let initial_primary =
+            wait_for_managed_primary_path(primary_database_url, &primary_request).await?;
+        let initial_standby = observe(standby_database_url, standby_request).await?;
+        let prerequisites = initial_standby.prerequisites();
+        let pre_restartpoint_floor = prerequisites.checkpoint_lsn();
+        if pre_restartpoint_floor.0 >= required_checkpoint.0 {
+            return Err(
+                io::Error::other("standby replay floor advanced while replay was paused").into(),
+            );
+        }
+        let (source, policy) = test_decoder_policy(
+            &initial_standby,
+            &physical_slot,
+            anchor,
+            pre_restartpoint_floor,
+            required_checkpoint,
+        )?;
+        Ok((
+            required_checkpoint,
+            initial_primary,
+            initial_standby,
+            pre_restartpoint_floor,
+            source,
+            policy,
+        ))
+    }
+    .await;
+    let resume_result = resume_standby_replay(&replay_control).await;
+    drop(replay_control);
+    let replay_control_connection_result = finish_connection(replay_control_task).await;
+    let mut paused_phase_output = None;
+    let paused_phase_result = paused_phase.map(|output| paused_phase_output = Some(output));
+    combine_fixture_results(
+        paused_phase_result,
+        resume_result,
+        replay_control_connection_result,
+    )?;
+    let (
+        required_checkpoint,
+        initial_primary,
+        initial_standby,
+        pre_restartpoint_floor,
+        source,
+        policy,
+    ) = paused_phase_output.expect("successful paused phase has output");
+
+    assert_eq!(
+        correlate_standby_replication_path(&policy, &initial_standby, &initial_primary),
+        Err(
+            StandbyReplicationPathCorrelationError::StandbyReplayFloorBehind {
+                observed: pre_restartpoint_floor,
+                required: required_checkpoint,
+            }
+        )
+    );
+
+    wait_for_standby_replay_past_checkpoint(standby_database_url, required_checkpoint).await?;
+    let standby =
+        advance_standby_replay_floor(standby_database_url, standby_request, required_checkpoint)
+            .await?;
     let primary = wait_for_managed_primary_path(primary_database_url, &primary_request).await?;
-    let standby = observe(standby_database_url, standby_request).await?;
+    let proof = correlate_standby_replication_path(&policy, &standby, &primary)?;
+    assert_eq!(proof.source_identity(), source);
+    assert!(proof.standby_replay_floor_lsn().0 > pre_restartpoint_floor.0);
+    assert!(proof.standby_replay_floor_lsn().0 >= required_checkpoint.0);
+    assert_eq!(proof.source_bound_replay_floor().source_identity(), source);
+    assert_eq!(
+        proof.source_bound_replay_floor().lsn(),
+        proof.standby_replay_floor_lsn()
+    );
+    assert_eq!(proof.physical_slot(), &physical_slot);
+    assert_eq!(proof.physical_slot_persistence(), SlotPersistence::Unproven);
+    assert_ne!(proof.physical_catalog_xmin().get().get(), 0);
+    assert_ne!(proof.peer_reply_epoch_micros().get(), 0);
+    Ok(())
+}
+
+fn test_decoder_policy(
+    standby: &LocalLogicalSlotObservationBatch,
+    physical_slot: &ReplicationSlotName,
+    anchor: &ManagedSlotTarget,
+    replay_floor: PgLsn,
+    required_checkpoint: PgLsn,
+) -> TestResult<(ReplicationSourceIdentity, StandbyDecoderPolicy)> {
     let prerequisites = standby.prerequisites();
-    // The raw SQL replay LSN only seeds a nonzero catalog-policy fixture. The
-    // endpoint correlator deliberately does not certify it without a future
-    // exact replay-lineage observation.
-    let catalog_checkpoint_fixture = prerequisites
-        .replay_lsn()
-        .filter(|lsn| lsn.0 != 0)
-        .ok_or_else(|| io::Error::other("standby replay position is absent"))?;
     let source = ReplicationSourceIdentity::new(
         prerequisites.system_identifier(),
         prerequisites.checkpoint_timeline(),
@@ -341,33 +429,169 @@ async fn assert_correlated_replication_path(
         Uuid::from_u128(0xc1),
         CatalogEpoch(1),
     )?;
+    let decoder_target = StandbyDecoderTarget::new(
+        1,
+        physical_slot.clone(),
+        anchor.clone(),
+        target("pgshard_ci_local")?,
+    )?;
     let policy = StandbyDecoderPolicy::new(
         source,
-        StandbyDecoderTarget::new(
-            1,
-            physical_slot.clone(),
-            anchor.clone(),
-            target("pgshard_ci_local")?,
-        )?,
+        decoder_target,
         ManagedTwoPhasePolicy {
-            failover_anchor_at: catalog_checkpoint_fixture,
-            local_decoder_at: catalog_checkpoint_fixture,
+            failover_anchor_at: replay_floor,
+            local_decoder_at: replay_floor,
         },
-        catalog_checkpoint_fixture,
+        required_checkpoint,
         StandbyDecoderEvidenceLimits::new(
             Duration::from_secs(30),
             Duration::from_secs(3),
             Duration::from_secs(3),
         )?,
     )?;
+    Ok((source, policy))
+}
 
-    let proof = correlate_standby_replication_path(&policy, &standby, &primary)?;
-    assert_eq!(proof.source_identity(), source);
-    assert_eq!(proof.physical_slot(), &physical_slot);
-    assert_eq!(proof.physical_slot_persistence(), SlotPersistence::Unproven);
-    assert_ne!(proof.physical_catalog_xmin().get().get(), 0);
-    assert_ne!(proof.peer_reply_epoch_micros().get(), 0);
+async fn pause_standby_replay(client: &Client) -> TestResult {
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    timeout_at(
+        deadline,
+        client.batch_execute("SELECT pg_catalog.pg_wal_replay_pause()"),
+    )
+    .await
+    .map_err(|_| io::Error::other("standby replay pause request exceeded the bound"))??;
+    loop {
+        let state: String = timeout_at(
+            deadline,
+            client.query_one(
+                "SELECT pg_catalog.pg_get_wal_replay_pause_state()::pg_catalog.text",
+                &[],
+            ),
+        )
+        .await
+        .map_err(|_| io::Error::other("standby replay did not pause within the bound"))??
+        .try_get(0)?;
+        if state == "paused" {
+            return Ok(());
+        }
+        sleep(STANDBY_POLL_INTERVAL).await;
+    }
+}
+
+async fn resume_standby_replay(client: &Client) -> TestResult {
+    timeout(
+        STANDBY_CATCHUP_TIMEOUT,
+        client.batch_execute("SELECT pg_catalog.pg_wal_replay_resume()"),
+    )
+    .await
+    .map_err(|_| io::Error::other("standby replay resume request exceeded the bound"))??;
     Ok(())
+}
+
+async fn create_primary_checkpoint(primary_database_url: &str) -> TestResult<PgLsn> {
+    let (primary, primary_connection) =
+        tokio_postgres::connect(primary_database_url, NoTls).await?;
+    let primary_task = tokio::spawn(primary_connection);
+
+    let checkpoint_result: TestResult<PgLsn> = match timeout(STANDBY_CATCHUP_TIMEOUT, async {
+        primary.batch_execute("CHECKPOINT").await?;
+        let checkpoint_lsn: WirePgLsn = primary
+            .query_one(
+                "SELECT checkpoint_lsn \
+                   FROM pg_catalog.pg_control_checkpoint()",
+                &[],
+            )
+            .await?
+            .try_get(0)?;
+        Ok(PgLsn(checkpoint_lsn.into()))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other("primary checkpoint exceeded the bound").into()),
+    };
+
+    drop(primary);
+    let primary_connection_result = finish_connection(primary_task).await;
+    let checkpoint_lsn = checkpoint_result?;
+    primary_connection_result?;
+    Ok(checkpoint_lsn)
+}
+
+async fn wait_for_standby_replay_past_checkpoint(
+    standby_database_url: &str,
+    required_checkpoint: PgLsn,
+) -> TestResult {
+    let (standby, standby_connection) =
+        tokio_postgres::connect(standby_database_url, NoTls).await?;
+    let standby_task = tokio::spawn(standby_connection);
+    let checkpoint_lsn = WirePgLsn::from(required_checkpoint.0);
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    let replay_result: TestResult = async {
+        loop {
+            let replayed: bool = timeout_at(
+                deadline,
+                standby.query_one(
+                    "SELECT COALESCE( \
+                                pg_catalog.pg_last_wal_replay_lsn() \
+                                    OPERATOR(pg_catalog.>) $1, \
+                                false)",
+                    &[&checkpoint_lsn],
+                ),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::other("standby did not replay the primary checkpoint within the bound")
+            })??
+            .try_get(0)?;
+            if replayed {
+                return Ok(());
+            }
+            sleep(STANDBY_POLL_INTERVAL).await;
+        }
+    }
+    .await;
+    drop(standby);
+    let standby_connection_result = finish_connection(standby_task).await;
+    replay_result?;
+    standby_connection_result?;
+    Ok(())
+}
+
+async fn advance_standby_replay_floor(
+    standby_database_url: &str,
+    standby_request: &LogicalSlotObservationRequest,
+    required_checkpoint: PgLsn,
+) -> TestResult<LocalLogicalSlotObservationBatch> {
+    let (standby, standby_connection) =
+        tokio_postgres::connect(standby_database_url, NoTls).await?;
+    let standby_task = tokio::spawn(standby_connection);
+    let checkpoint_result: TestResult =
+        match timeout(STANDBY_CATCHUP_TIMEOUT, standby.batch_execute("CHECKPOINT")).await {
+            Ok(result) => result.map_err(Into::into),
+            Err(_) => {
+                Err(io::Error::other("standby restartpoint request exceeded the bound").into())
+            }
+        };
+    drop(standby);
+    let standby_connection_result = finish_connection(standby_task).await;
+    checkpoint_result?;
+    standby_connection_result?;
+
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    loop {
+        let batch = observe(standby_database_url, standby_request).await?;
+        if batch.prerequisites().checkpoint_lsn().0 >= required_checkpoint.0 {
+            return Ok(batch);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "standby control-file replay floor did not advance within the bound",
+            )
+            .into());
+        }
+        sleep(STANDBY_POLL_INTERVAL).await;
+    }
 }
 
 fn synchronized_anchor_waiting(batch: &LocalLogicalSlotObservationBatch) -> bool {
@@ -394,6 +618,7 @@ fn assert_standby_observation(
         prerequisites.system_identifier(),
         expected_system_identifier
     );
+    assert_ne!(prerequisites.checkpoint_lsn().0, 0);
     assert_ne!(prerequisites.checkpoint_timeline(), 0);
     assert_eq!(prerequisites.recovery(), RecoveryState::Standby);
     assert_eq!(prerequisites.wal_level(), LogicalWalLevel::Logical);
@@ -470,7 +695,8 @@ async fn assert_primary_prerequisites(
     let expected_control = setup
         .query_one(
             "SELECT control.system_identifier::pg_catalog.int8, \
-                    checkpoint_control.timeline_id \
+                    checkpoint_control.timeline_id, \
+                    checkpoint_control.checkpoint_lsn::pg_catalog.text \
                FROM pg_catalog.pg_control_system() AS control \
               CROSS JOIN pg_catalog.pg_control_checkpoint() AS checkpoint_control",
             &[],
@@ -478,6 +704,7 @@ async fn assert_primary_prerequisites(
         .await?;
     let expected_system_identifier = expected_control.try_get::<_, i64>(0)?.cast_unsigned();
     let expected_checkpoint_timeline = expected_control.try_get::<_, i32>(1)?.cast_unsigned();
+    let expected_checkpoint_lsn: String = expected_control.try_get(2)?;
 
     assert_eq!(batch.database_name(), "shardschema");
     assert_eq!(u32::try_from(expected_database_oid)?, batch.database_oid());
@@ -490,6 +717,10 @@ async fn assert_primary_prerequisites(
     assert_eq!(
         prerequisites.system_identifier(),
         expected_system_identifier
+    );
+    assert_eq!(
+        pg_lsn_text(prerequisites.checkpoint_lsn()),
+        expected_checkpoint_lsn
     );
     assert_eq!(
         prerequisites.checkpoint_timeline(),

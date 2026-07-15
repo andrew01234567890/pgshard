@@ -395,26 +395,37 @@ pub struct LogicalSlotObservation {
     pub confirmed_flush_lsn: Option<PgLsn>,
 }
 
-/// One replay position coherently bound to its observed source lineage.
+/// One conservative replay floor coherently bound to its observed source lineage.
 ///
-/// The fields are deliberately opaque. No production constructor exists until
-/// a connection-owned observer can sample the replay LSN and replay timeline as
-/// one coherent value. In particular, a bare `pg_last_wal_replay_lsn()` result
-/// cannot create this proof.
+/// The fields are deliberately opaque. Only crate-owned source correlation may
+/// construct production evidence. In particular, a bare
+/// `pg_last_wal_replay_lsn()` result cannot create this proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SourceBoundReplayPosition {
+pub struct SourceBoundReplayFloor {
     source_identity: ReplicationSourceIdentity,
     lsn: PgLsn,
 }
 
-impl SourceBoundReplayPosition {
-    /// Returns the exact source lineage observed with the replay position.
+impl SourceBoundReplayFloor {
+    // The path's fields and constructor are private to the correlator, so no
+    // other crate module can supply arbitrary source or LSN evidence here.
+    pub(crate) const fn from_correlated_path(
+        path: &crate::slot_observer::CorrelatedStandbyReplicationPath,
+    ) -> Self {
+        Self {
+            source_identity: path.source_identity(),
+            lsn: path.standby_replay_floor_lsn(),
+        }
+    }
+
+    /// Returns the catalog-selected source identity whose observable
+    /// `PostgreSQL` components were correlated with the replay floor.
     #[must_use]
     pub const fn source_identity(self) -> ReplicationSourceIdentity {
         self.source_identity
     }
 
-    /// Returns the replay position after its lineage has been bound.
+    /// Returns the conservative replay floor after its lineage has been bound.
     #[must_use]
     pub const fn lsn(self) -> PgLsn {
         self.lsn
@@ -460,8 +471,8 @@ pub struct StandbyDecoderObservation {
     pub slot_sync_worker: Option<SlotSyncWorkerObservation>,
     /// Effective WAL level on the candidate.
     pub wal_level: LogicalWalLevel,
-    /// Exact replay position bound to its atomically observed source lineage.
-    pub replay_position: Option<SourceBoundReplayPosition>,
+    /// Conservative replay floor bound to its coherently observed source lineage.
+    pub replay_floor: Option<SourceBoundReplayFloor>,
     /// WAL receiver state for the expected primary.
     pub wal_receiver: WalReceiverState,
     /// Live `pg_stat_wal_receiver.slot_name`, if observed.
@@ -961,16 +972,16 @@ pub enum StandbyDecoderIneligible {
     /// Effective WAL level cannot support logical decoding.
     #[error("wal_level is insufficient for logical decoding")]
     WalLevelInsufficient,
-    /// Candidate replay position is unavailable.
-    #[error("standby replay LSN is unavailable")]
-    ReplayPositionMissing,
-    /// Replay position was observed on another source lineage.
-    #[error("standby replay position source does not match the candidate source")]
-    ReplaySourceIdentityMismatch,
-    /// Candidate has not replayed the durable checkpoint.
-    #[error("standby replay LSN is behind the durable checkpoint")]
-    ReplayBehind {
-        /// Last replayed LSN.
+    /// Candidate replay floor is unavailable.
+    #[error("standby replay floor is unavailable")]
+    ReplayFloorMissing,
+    /// Replay floor was observed on another source lineage.
+    #[error("standby replay floor source does not match the candidate source")]
+    ReplayFloorSourceIdentityMismatch,
+    /// Candidate's replay floor does not cover the durable checkpoint.
+    #[error("standby replay floor is behind the durable checkpoint")]
+    ReplayFloorBehind {
+        /// Conservative replay floor.
         observed: PgLsn,
         /// Durable consumer checkpoint.
         required: PgLsn,
@@ -1191,16 +1202,16 @@ fn validate_standby_observation(
     if observation.wal_level != LogicalWalLevel::Logical {
         return Err(StandbyDecoderIneligible::WalLevelInsufficient);
     }
-    let replay_position = observation
-        .replay_position
-        .ok_or(StandbyDecoderIneligible::ReplayPositionMissing)?;
-    if replay_position.source_identity() != observation.source_identity {
-        return Err(StandbyDecoderIneligible::ReplaySourceIdentityMismatch);
+    let replay_floor = observation
+        .replay_floor
+        .ok_or(StandbyDecoderIneligible::ReplayFloorMissing)?;
+    if replay_floor.source_identity() != observation.source_identity {
+        return Err(StandbyDecoderIneligible::ReplayFloorSourceIdentityMismatch);
     }
-    let replay_lsn = replay_position.lsn();
-    if lsn_follows_on_same_source(policy.durable_checkpoint_lsn, replay_lsn) {
-        return Err(StandbyDecoderIneligible::ReplayBehind {
-            observed: replay_lsn,
+    let replay_floor_lsn = replay_floor.lsn();
+    if lsn_follows_on_same_source(policy.durable_checkpoint_lsn, replay_floor_lsn) {
+        return Err(StandbyDecoderIneligible::ReplayFloorBehind {
+            observed: replay_floor_lsn,
             required: policy.durable_checkpoint_lsn,
         });
     }
@@ -1536,11 +1547,11 @@ mod tests {
         .expect("valid test source")
     }
 
-    fn replay_position(
+    fn replay_floor(
         source_identity: ReplicationSourceIdentity,
         lsn: PgLsn,
-    ) -> SourceBoundReplayPosition {
-        SourceBoundReplayPosition::for_test(source_identity, lsn)
+    ) -> SourceBoundReplayFloor {
+        SourceBoundReplayFloor::for_test(source_identity, lsn)
     }
 
     fn generation(value: u128) -> SlotGeneration {
@@ -1649,7 +1660,7 @@ mod tests {
                 }),
             }),
             wal_level: LogicalWalLevel::Logical,
-            replay_position: Some(replay_position(source(7), CHECKPOINT)),
+            replay_floor: Some(replay_floor(source(7), CHECKPOINT)),
             wal_receiver: WalReceiverState::Streaming,
             wal_receiver_slot_name: Some(slot("pgshard_member_0001")),
             upstream_walsender_pid: Some(pid(701)),
@@ -2073,24 +2084,24 @@ mod tests {
     #[test]
     fn requires_replay_through_checkpoint_and_primary_sync_gating() {
         let mut candidate = observation();
-        candidate.replay_position = None;
+        candidate.replay_floor = None;
         assert_eq!(
             validate_standby_decoder_attachment(&policy(), &candidate),
-            Err(StandbyDecoderIneligible::ReplayPositionMissing)
+            Err(StandbyDecoderIneligible::ReplayFloorMissing)
         );
 
         let mut candidate = observation();
-        candidate.replay_position = Some(replay_position(source(8), CHECKPOINT));
+        candidate.replay_floor = Some(replay_floor(source(8), CHECKPOINT));
         assert_eq!(
             validate_standby_decoder_attachment(&policy(), &candidate),
-            Err(StandbyDecoderIneligible::ReplaySourceIdentityMismatch)
+            Err(StandbyDecoderIneligible::ReplayFloorSourceIdentityMismatch)
         );
 
         let mut candidate = observation();
-        candidate.replay_position = Some(replay_position(source(7), BEFORE_CHECKPOINT));
+        candidate.replay_floor = Some(replay_floor(source(7), BEFORE_CHECKPOINT));
         assert_eq!(
             validate_standby_decoder_attachment(&policy(), &candidate),
-            Err(StandbyDecoderIneligible::ReplayBehind {
+            Err(StandbyDecoderIneligible::ReplayFloorBehind {
                 observed: BEFORE_CHECKPOINT,
                 required: CHECKPOINT,
             })
