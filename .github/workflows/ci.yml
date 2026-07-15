@@ -511,10 +511,11 @@ jobs:
         run: make go-check
 
   operator-kind:
-    name: Operator KIND deletion safety
+    name: Operator KIND API safety
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -532,11 +533,14 @@ jobs:
             --wait 90s
           test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"
           kubectl apply --server-side --field-manager=pgshard-ci -f operator/config/crd/bases/pgshard.io_pgshardclusters.yaml
-      - name: Verify UID-safe delete and same-name recreate
+      - name: Verify API ownership and deletion safety
         working-directory: operator
         env:
           PGSHARD_KIND_E2E: "true"
-        run: go test -race -count=1 -run '^TestKINDDeletionWaitsForPVCBeforeSameNameRecreate$' ./internal/controller
+        run: >-
+          go test -race -count=1
+          -run '^(TestKINDDeletionWaitsForPVCBeforeSameNameRecreate|TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership)$'
+          ./internal/controller
       - name: Delete disposable Kubernetes cluster
         if: always()
         run: kind delete cluster --name pgshard-operator

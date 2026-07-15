@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
@@ -15,12 +17,15 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
@@ -254,6 +259,981 @@ func TestFixedToHPAHandoffPreservesCurrentCapacity(t *testing.T) {
 	}
 	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: "example-pooler"}, &autoscalingv2.HorizontalPodAutoscaler{}); err != nil {
 		t.Fatalf("HPA was not created after scale ownership handoff: %v", err)
+	}
+}
+
+func TestHPAHandoffUsesAuthoritativeReplicas(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	desired := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      cluster.Name + owned.PoolerSuffix,
+		Namespace: cluster.Namespace,
+	}}
+	currentReplicas := int32(7)
+	latestReplicas := int32(9)
+	authoritativePooler := desired.DeepCopy()
+	authoritativePooler.UID = types.UID("pooler-uid")
+	authoritativePooler.ResourceVersion = "42"
+	authoritativePooler.Spec.Replicas = &currentReplicas
+	reads := 0
+	authoritative := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+			reads++
+			source := authoritativePooler.DeepCopy()
+			if reads > 1 {
+				source.ResourceVersion = "43"
+				source.Spec.Replicas = &latestReplicas
+			}
+			target, ok := object.(*appsv1.Deployment)
+			if !ok {
+				t.Fatalf("authoritative destination type = %T", object)
+			}
+			*target = *source
+			return nil
+		},
+	})
+
+	var applied *unstructured.Unstructured
+	var options client.PatchOptions
+	patches := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Patch: func(_ context.Context, _ client.WithWatch, object client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patches++
+			if patch.Type() != types.ApplyPatchType {
+				t.Fatalf("patch type = %q, want apply", patch.Type())
+			}
+			if patches == 1 {
+				return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("injected conflict"))
+			}
+			var ok bool
+			applied, ok = object.DeepCopyObject().(*unstructured.Unstructured)
+			if !ok {
+				t.Fatalf("handoff object type = %T", object)
+			}
+			options.ApplyOptions(opts)
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	if err := reconciler.handoffPoolerReplicas(
+		ctx,
+		cluster,
+		desired,
+		authoritativePooler.UID,
+		appsv1.SchemeGroupVersion.WithKind("Deployment"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if applied == nil {
+		t.Fatal("HPA handoff did not apply replicas")
+	}
+	replicas, found, err := unstructured.NestedInt64(applied.Object, "spec", "replicas")
+	if err != nil || !found || replicas != int64(latestReplicas) {
+		t.Fatalf("applied replicas = %d, found %t, error %v", replicas, found, err)
+	}
+	if applied.GetUID() != authoritativePooler.UID || applied.GetResourceVersion() != "43" {
+		t.Fatalf("handoff preconditions = UID %q RV %q", applied.GetUID(), applied.GetResourceVersion())
+	}
+	if reads != 2 || patches != 2 {
+		t.Fatalf("handoff attempts = %d reads, %d patches; want 2 each", reads, patches)
+	}
+	if options.FieldManager != hpaScaleFieldManager || options.Force == nil || !*options.Force {
+		t.Fatalf("handoff patch options = %#v", options)
+	}
+}
+
+func TestHPAHandoffCanonicalizesLegacyWholeDeploymentOwnership(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	desired := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      cluster.Name + owned.PoolerSuffix,
+		Namespace: cluster.Namespace,
+	}}
+	replicas := int32(7)
+	current := desired.DeepCopy()
+	current.UID = types.UID("pooler-uid")
+	current.ResourceVersion = "42"
+	current.Spec.Replicas = &replicas
+	current.ManagedFields = []metav1.ManagedFieldsEntry{{
+		Manager:    hpaScaleFieldManager,
+		Operation:  metav1.ManagedFieldsOperationApply,
+		APIVersion: "apps/v1",
+		FieldsType: "FieldsV1",
+		FieldsV1:   &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:labels":{"f:pgshard.io/cluster":{}}},"f:spec":{"f:replicas":{},"f:template":{"f:spec":{"f:containers":{}}}}}`)},
+	}}
+	if hasExactReplicaApplyOwnership(current, hpaScaleFieldManager) {
+		t.Fatal("legacy whole-Deployment field set was classified as replicas-only")
+	}
+
+	patches := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Patch: func(_ context.Context, _ client.WithWatch, object client.Object, patch client.Patch, _ ...client.PatchOption) error {
+			patches++
+			if patch.Type() != types.ApplyPatchType {
+				t.Fatalf("patch type = %q, want apply", patch.Type())
+			}
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: newFakeClient(t, current)}
+	if err := reconciler.handoffPoolerReplicas(
+		context.Background(),
+		cluster,
+		desired,
+		current.UID,
+		appsv1.SchemeGroupVersion.WithKind("Deployment"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if patches != 1 {
+		t.Fatalf("canonicalization patches = %d, want 1", patches)
+	}
+}
+
+func TestExactReplicaApplyOwnership(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		entries []metav1.ManagedFieldsEntry
+		want    bool
+	}{
+		{
+			name: "exact",
+			entries: []metav1.ManagedFieldsEntry{{
+				Manager: hpaScaleFieldManager, Operation: metav1.ManagedFieldsOperationApply, FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)},
+			}},
+			want: true,
+		},
+		{
+			name: "extra root field",
+			entries: []metav1.ManagedFieldsEntry{{
+				Manager: hpaScaleFieldManager, Operation: metav1.ManagedFieldsOperationApply, FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{},"f:spec":{"f:replicas":{}}}`)},
+			}},
+		},
+		{
+			name: "extra spec field",
+			entries: []metav1.ManagedFieldsEntry{{
+				Manager: hpaScaleFieldManager, Operation: metav1.ManagedFieldsOperationApply, FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{},"f:template":{}}}`)},
+			}},
+		},
+		{
+			name: "null leaf",
+			entries: []metav1.ManagedFieldsEntry{{
+				Manager: hpaScaleFieldManager, Operation: metav1.ManagedFieldsOperationApply, FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":null}}`)},
+			}},
+		},
+		{
+			name: "malformed",
+			entries: []metav1.ManagedFieldsEntry{{
+				Manager: hpaScaleFieldManager, Operation: metav1.ManagedFieldsOperationApply, FieldsV1: &metav1.FieldsV1{Raw: []byte(`{`)},
+			}},
+		},
+		{
+			name: "duplicate manager entries",
+			entries: []metav1.ManagedFieldsEntry{
+				{Manager: hpaScaleFieldManager, Operation: metav1.ManagedFieldsOperationApply, FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)}},
+				{Manager: hpaScaleFieldManager, Operation: metav1.ManagedFieldsOperationApply, FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)}},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			object := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{ManagedFields: test.entries}}
+			if got := hasExactReplicaApplyOwnership(object, hpaScaleFieldManager); got != test.want {
+				t.Fatalf("hasExactReplicaApplyOwnership() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestHPAHandoffRejectsReplacedDeployment(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	desired := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      cluster.Name + owned.PoolerSuffix,
+		Namespace: cluster.Namespace,
+	}}
+	replacement := desired.DeepCopy()
+	replacement.UID = types.UID("replacement-uid")
+	authoritative := newFakeClient(t, replacement)
+	reconciler := &PgShardClusterReconciler{Client: newFakeClient(t), APIReader: authoritative}
+	err := reconciler.handoffPoolerReplicas(
+		context.Background(),
+		cluster,
+		desired,
+		types.UID("expected-uid"),
+		appsv1.SchemeGroupVersion.WithKind("Deployment"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("replacement error = %v", err)
+	}
+}
+
+func TestHPAHandoffBoundsConflicts(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	desired := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      cluster.Name + owned.PoolerSuffix,
+		Namespace: cluster.Namespace,
+	}}
+	current := desired.DeepCopy()
+	current.UID = types.UID("pooler-uid")
+	current.ResourceVersion = "42"
+	authoritative := newFakeClient(t, current)
+	patches := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Patch: func(_ context.Context, _ client.WithWatch, object client.Object, _ client.Patch, _ ...client.PatchOption) error {
+			patches++
+			return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("injected conflict"))
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	err := reconciler.handoffPoolerReplicas(
+		context.Background(),
+		cluster,
+		desired,
+		current.UID,
+		appsv1.SchemeGroupVersion.WithKind("Deployment"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "after 4 conflicts") {
+		t.Fatalf("conflict exhaustion error = %v", err)
+	}
+	if patches != 4 {
+		t.Fatalf("patch attempts = %d, want 4", patches)
+	}
+}
+
+func TestFixedScaleHandoffRelinquishesAuthoritativeHPAOwnership(t *testing.T) {
+	t.Parallel()
+	replicas := int32(7)
+	desired := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-pooler", Namespace: "default"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+	}
+	current := desired.DeepCopy()
+	current.UID = types.UID("pooler-uid")
+	current.ResourceVersion = "42"
+	current.ManagedFields = []metav1.ManagedFieldsEntry{
+		replicaApplyOwner(owned.ManagedByValue),
+		legacyHPAApplyOwner(),
+	}
+	reads := 0
+	authoritative := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+			reads++
+			source := current.DeepCopy()
+			if reads > 1 {
+				source.ResourceVersion = "43"
+			}
+			*object.(*appsv1.Deployment) = *source
+			return nil
+		},
+	})
+	patches := 0
+	var relinquished *unstructured.Unstructured
+	var options client.PatchOptions
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Patch: func(_ context.Context, _ client.WithWatch, object client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patches++
+			if patch.Type() != types.ApplyPatchType {
+				t.Fatalf("patch type = %q, want apply", patch.Type())
+			}
+			if patches == 1 {
+				return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("injected conflict"))
+			}
+			relinquished = object.DeepCopyObject().(*unstructured.Unstructured)
+			options.ApplyOptions(opts)
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	if err := reconciler.relinquishPoolerScaleOwnership(
+		context.Background(), desired, current.UID, appsv1.SchemeGroupVersion.WithKind("Deployment"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if reads != 2 || patches != 2 {
+		t.Fatalf("fixed-scale handoff attempts = %d reads, %d patches; want 2 each", reads, patches)
+	}
+	if relinquished == nil || relinquished.GetUID() != current.UID || relinquished.GetResourceVersion() != "43" {
+		t.Fatalf("relinquish preconditions = %#v", relinquished)
+	}
+	if _, exists := relinquished.Object["spec"]; exists {
+		t.Fatalf("relinquish Apply still claims spec: %#v", relinquished.Object)
+	}
+	if options.FieldManager != hpaScaleFieldManager || options.Force == nil || !*options.Force {
+		t.Fatalf("relinquish patch options = %#v", options)
+	}
+}
+
+func TestFixedScaleHandoffReclaimsLateScaleWriteBeforeRelinquishing(t *testing.T) {
+	t.Parallel()
+	desiredReplicas := int32(7)
+	lateReplicas := int32(1)
+	desired := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-pooler", Namespace: "default"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &desiredReplicas},
+	}
+	late := desired.DeepCopy()
+	late.UID = types.UID("pooler-uid")
+	late.ResourceVersion = "42"
+	late.Spec.Replicas = &lateReplicas
+	late.ManagedFields = []metav1.ManagedFieldsEntry{
+		{
+			Manager: owned.ManagedByValue, Operation: metav1.ManagedFieldsOperationApply,
+			APIVersion: "apps/v1", FieldsType: "FieldsV1",
+			FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:labels":{}}}`)},
+		},
+		legacyHPAApplyOwner(),
+	}
+	corrected := desired.DeepCopy()
+	corrected.UID = late.UID
+	corrected.ResourceVersion = "43"
+	corrected.ManagedFields = []metav1.ManagedFieldsEntry{
+		replicaApplyOwner(owned.ManagedByValue),
+		legacyHPAApplyOwner(),
+	}
+	reads := 0
+	authoritative := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+			reads++
+			source := late
+			if reads > 1 {
+				source = corrected
+			}
+			*object.(*appsv1.Deployment) = *source.DeepCopy()
+			return nil
+		},
+	})
+	patches := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Patch: func(_ context.Context, _ client.WithWatch, object client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patches++
+			if patch.Type() != types.ApplyPatchType {
+				t.Fatalf("patch type = %q, want apply", patch.Type())
+			}
+			var options client.PatchOptions
+			options.ApplyOptions(opts)
+			switch patches {
+			case 1:
+				reclaim, ok := object.(*appsv1.Deployment)
+				if !ok || reclaim.Spec.Replicas == nil || *reclaim.Spec.Replicas != desiredReplicas || reclaim.UID != late.UID || reclaim.ResourceVersion != "42" {
+					t.Fatalf("fixed replica reclaim = %#v", object)
+				}
+				if options.FieldManager != owned.ManagedByValue || options.Force == nil || !*options.Force {
+					t.Fatalf("fixed replica reclaim options = %#v", options)
+				}
+			case 2:
+				relinquish, ok := object.(*unstructured.Unstructured)
+				if !ok || relinquish.GetUID() != late.UID || relinquish.GetResourceVersion() != "43" {
+					t.Fatalf("HPA relinquishment = %#v", object)
+				}
+				if _, exists := relinquish.Object["spec"]; exists {
+					t.Fatalf("HPA relinquishment still claims spec: %#v", relinquish.Object)
+				}
+				if options.FieldManager != hpaScaleFieldManager || options.Force == nil || !*options.Force {
+					t.Fatalf("HPA relinquishment options = %#v", options)
+				}
+			default:
+				t.Fatalf("unexpected patch %d: %#v", patches, object)
+			}
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	if err := reconciler.relinquishPoolerScaleOwnership(context.Background(), desired, late.UID, appsv1.SchemeGroupVersion.WithKind("Deployment")); err != nil {
+		t.Fatal(err)
+	}
+	if reads != 2 || patches != 2 {
+		t.Fatalf("late-write recovery = %d reads, %d patches; want 2 each", reads, patches)
+	}
+}
+
+func TestFixedScaleHandoffReclaimsScaleWriteAfterRelinquishConflict(t *testing.T) {
+	t.Parallel()
+	desiredReplicas := int32(7)
+	lateReplicas := int32(1)
+	desired := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-pooler", Namespace: "default"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &desiredReplicas},
+	}
+	stable := desired.DeepCopy()
+	stable.UID = types.UID("pooler-uid")
+	stable.ResourceVersion = "42"
+	stable.ManagedFields = []metav1.ManagedFieldsEntry{
+		replicaApplyOwner(owned.ManagedByValue),
+		legacyHPAApplyOwner(),
+	}
+	raced := stable.DeepCopy()
+	raced.ResourceVersion = "43"
+	raced.Spec.Replicas = &lateReplicas
+	raced.ManagedFields = []metav1.ManagedFieldsEntry{
+		{
+			Manager: owned.ManagedByValue, Operation: metav1.ManagedFieldsOperationApply,
+			APIVersion: "apps/v1", FieldsType: "FieldsV1",
+			FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:labels":{}}}`)},
+		},
+		legacyHPAApplyOwner(),
+	}
+	corrected := stable.DeepCopy()
+	corrected.ResourceVersion = "44"
+	reads := 0
+	authoritative := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+			reads++
+			source := stable
+			if reads == 2 {
+				source = raced
+			} else if reads > 2 {
+				source = corrected
+			}
+			*object.(*appsv1.Deployment) = *source.DeepCopy()
+			return nil
+		},
+	})
+	patches := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Patch: func(_ context.Context, _ client.WithWatch, object client.Object, _ client.Patch, opts ...client.PatchOption) error {
+			patches++
+			var options client.PatchOptions
+			options.ApplyOptions(opts)
+			switch patches {
+			case 1:
+				if options.FieldManager != hpaScaleFieldManager || object.GetResourceVersion() != "42" {
+					t.Fatalf("first relinquishment = manager %q object %#v", options.FieldManager, object)
+				}
+				return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("injected scale race"))
+			case 2:
+				reclaim, ok := object.(*appsv1.Deployment)
+				if !ok || options.FieldManager != owned.ManagedByValue || reclaim.ResourceVersion != "43" || reclaim.Spec.Replicas == nil || *reclaim.Spec.Replicas != desiredReplicas {
+					t.Fatalf("retry replica reclaim = manager %q object %#v", options.FieldManager, object)
+				}
+				return nil
+			case 3:
+				if options.FieldManager != hpaScaleFieldManager || object.GetResourceVersion() != "44" {
+					t.Fatalf("final relinquishment = manager %q object %#v", options.FieldManager, object)
+				}
+				return nil
+			default:
+				t.Fatalf("unexpected patch %d: %#v", patches, object)
+				return nil
+			}
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	if err := reconciler.relinquishPoolerScaleOwnership(context.Background(), desired, stable.UID, appsv1.SchemeGroupVersion.WithKind("Deployment")); err != nil {
+		t.Fatal(err)
+	}
+	if reads != 3 || patches != 3 {
+		t.Fatalf("conflict-race recovery = %d reads, %d patches; want 3 each", reads, patches)
+	}
+}
+
+func TestFixedScaleHandoffRejectsReplacementAndBoundsConflicts(t *testing.T) {
+	t.Parallel()
+	replicas := int32(7)
+	desired := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-pooler", Namespace: "default"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+	}
+	current := desired.DeepCopy()
+	current.UID = types.UID("pooler-uid")
+	current.ManagedFields = []metav1.ManagedFieldsEntry{
+		replicaApplyOwner(owned.ManagedByValue),
+		legacyHPAApplyOwner(),
+	}
+
+	replacement := current.DeepCopy()
+	replacement.UID = types.UID("replacement-uid")
+	reconciler := &PgShardClusterReconciler{Client: newFakeClient(t), APIReader: newFakeClient(t, replacement)}
+	if err := reconciler.relinquishPoolerScaleOwnership(context.Background(), desired, current.UID, appsv1.SchemeGroupVersion.WithKind("Deployment")); err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("replacement error = %v", err)
+	}
+
+	patches := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Patch: func(_ context.Context, _ client.WithWatch, object client.Object, _ client.Patch, _ ...client.PatchOption) error {
+			patches++
+			return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("injected conflict"))
+		},
+	})
+	reconciler = &PgShardClusterReconciler{Client: writeClient, APIReader: newFakeClient(t, current)}
+	err := reconciler.relinquishPoolerScaleOwnership(context.Background(), desired, current.UID, appsv1.SchemeGroupVersion.WithKind("Deployment"))
+	if err == nil || !strings.Contains(err.Error(), "after 4 attempts") {
+		t.Fatalf("conflict exhaustion error = %v", err)
+	}
+	if patches != 4 {
+		t.Fatalf("relinquish attempts = %d, want 4", patches)
+	}
+}
+
+func replicaApplyOwner(manager string) metav1.ManagedFieldsEntry {
+	return metav1.ManagedFieldsEntry{
+		Manager: manager, Operation: metav1.ManagedFieldsOperationApply,
+		APIVersion: "apps/v1", FieldsType: "FieldsV1",
+		FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)},
+	}
+}
+
+func legacyHPAApplyOwner() metav1.ManagedFieldsEntry {
+	return metav1.ManagedFieldsEntry{
+		Manager: hpaScaleFieldManager, Operation: metav1.ManagedFieldsOperationApply,
+		APIVersion: "apps/v1", FieldsType: "FieldsV1",
+		FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:annotations":{"f:pgshard.io/hpa-scale-handed-off":{}}},"f:spec":{"f:replicas":{}}}`)},
+	}
+}
+
+func TestLegacyAlignmentUsesAuthoritativeReplicas(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	staleReplicas := int32(2)
+	currentReplicas := int32(7)
+	latestReplicas := int32(9)
+	stale := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-pooler", Namespace: "default", UID: types.UID("pooler-uid"), ResourceVersion: "40"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &staleReplicas},
+	}
+	authoritativePooler := stale.DeepCopy()
+	authoritativePooler.ResourceVersion = "42"
+	authoritativePooler.Spec.Replicas = &currentReplicas
+	reads := 0
+	authoritative := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+			reads++
+			source := authoritativePooler.DeepCopy()
+			if reads > 1 {
+				source.ResourceVersion = "43"
+				source.Spec.Replicas = &latestReplicas
+			}
+			target, ok := object.(*appsv1.Deployment)
+			if !ok {
+				t.Fatalf("authoritative destination type = %T", object)
+			}
+			*target = *source
+			return nil
+		},
+	})
+	desired := stale.DeepCopy()
+	desired.ResourceVersion = ""
+	desired.Spec.Replicas = nil
+
+	var updated *appsv1.Deployment
+	updates := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+			updates++
+			if updates == 1 {
+				return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("injected conflict"))
+			}
+			var ok bool
+			updated, ok = object.DeepCopyObject().(*appsv1.Deployment)
+			if !ok {
+				t.Fatalf("alignment object type = %T", object)
+			}
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	aligned, err := reconciler.alignLegacyOwnedFields(ctx, stale, desired, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated == nil || updated.Spec.Replicas == nil || *updated.Spec.Replicas != latestReplicas {
+		t.Fatalf("legacy alignment replayed cached replicas: %#v", updated)
+	}
+	if aligned.GetResourceVersion() != "43" {
+		t.Fatalf("aligned resource version = %q, want 43", aligned.GetResourceVersion())
+	}
+	if reads != 2 || updates != 2 {
+		t.Fatalf("alignment attempts = %d reads, %d updates; want 2 each", reads, updates)
+	}
+}
+
+func TestLegacyAlignmentReclassifiesAuthoritativeApplyOwnershipAfterConflict(t *testing.T) {
+	t.Parallel()
+	replicas := int32(7)
+	stale := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-pooler", Namespace: "default", UID: types.UID("pooler-uid"), ResourceVersion: "40"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+	}
+	legacyHPAOwner := metav1.ManagedFieldsEntry{
+		Manager:    hpaScaleFieldManager,
+		Operation:  metav1.ManagedFieldsOperationApply,
+		APIVersion: "apps/v1",
+		FieldsType: "FieldsV1",
+		FieldsV1:   &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:labels":{}},"f:spec":{"f:replicas":{}}}`)},
+	}
+	authoritativePooler := stale.DeepCopy()
+	authoritativePooler.ResourceVersion = "42"
+	authoritativePooler.ManagedFields = []metav1.ManagedFieldsEntry{legacyHPAOwner}
+	reads := 0
+	authoritative := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+			reads++
+			source := authoritativePooler.DeepCopy()
+			if reads > 1 {
+				source.ResourceVersion = "43"
+				source.Annotations = map[string]string{owned.ApplyOwnershipAnnotation: owned.ApplyOwnershipVersion}
+				source.ManagedFields = append(source.ManagedFields,
+					metav1.ManagedFieldsEntry{
+						Manager: owned.ManagedByValue, Operation: metav1.ManagedFieldsOperationApply,
+						FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:annotations":{"f:pgshard.io/apply-ownership":{}}}}`)},
+					},
+					metav1.ManagedFieldsEntry{Manager: "external-manager", Operation: metav1.ManagedFieldsOperationApply},
+				)
+			}
+			target := object.(*appsv1.Deployment)
+			*target = *source
+			return nil
+		},
+	})
+	updates := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+			updates++
+			if updates > 1 {
+				t.Fatal("authoritative Apply ownership was not reclassified before Update")
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("injected conflict"))
+		},
+	})
+	desired := stale.DeepCopy()
+	desired.ResourceVersion = ""
+	desired.Spec.Replicas = nil
+	desired.ManagedFields = nil
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	aligned, err := reconciler.alignLegacyOwnedFields(context.Background(), stale, desired, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reads != 2 || updates != 1 {
+		t.Fatalf("alignment attempts = %d reads, %d updates; want 2 reads, 1 update", reads, updates)
+	}
+	if aligned.GetResourceVersion() != "43" || !applyOwnershipMigrationComplete(aligned) {
+		t.Fatalf("alignment did not return authoritative Apply-owned object: %#v", aligned.GetManagedFields())
+	}
+}
+
+func TestApplyOwnershipMigrationCompleteRequiresOperatorOwnedMarker(t *testing.T) {
+	t.Parallel()
+	object := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{owned.ApplyOwnershipAnnotation: owned.ApplyOwnershipVersion},
+		ManagedFields: []metav1.ManagedFieldsEntry{{
+			Manager: owned.ManagedByValue, Operation: metav1.ManagedFieldsOperationApply,
+			FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:data":{"f:current":{}}}`)},
+		}},
+	}}
+	if applyOwnershipMigrationComplete(object) {
+		t.Fatal("operator Apply ownership without marker-field ownership completed migration")
+	}
+	object.ManagedFields = append(object.ManagedFields, metav1.ManagedFieldsEntry{
+		Manager: "external-manager", Operation: metav1.ManagedFieldsOperationApply,
+		FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:annotations":{"f:pgshard.io/apply-ownership":{}}}}`)},
+	})
+	if applyOwnershipMigrationComplete(object) {
+		t.Fatal("external marker-field ownership completed operator migration")
+	}
+	object.ManagedFields[0].FieldsV1 = &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:annotations":{".":{},"f:pgshard.io/apply-ownership":{}}}}`)}
+	if !applyOwnershipMigrationComplete(object) {
+		t.Fatal("operator-owned marker was not recognized as completed migration")
+	}
+}
+
+func TestLegacyAlignmentDoesNotTrustApplyOwnershipWithoutMarker(t *testing.T) {
+	t.Parallel()
+	current := legacyManagedConfigMap(types.UID("legacy-uid"))
+	current.Data = map[string]string{"current": "value", "stale": "value"}
+	current.ManagedFields = append(current.ManagedFields, metav1.ManagedFieldsEntry{
+		Manager: owned.ManagedByValue, Operation: metav1.ManagedFieldsOperationApply,
+		APIVersion: "v1", FieldsType: "FieldsV1", FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:data":{"f:current":{}}}`)},
+	})
+	desired := current.DeepCopy()
+	desired.Data = map[string]string{"current": "value"}
+	desired.ManagedFields = nil
+	updates := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+			updates++
+			updated := object.(*corev1.ConfigMap)
+			if _, exists := updated.Data["stale"]; exists {
+				t.Fatalf("legacy alignment retained stale data: %#v", updated.Data)
+			}
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: newFakeClient(t, current)}
+	if _, err := reconciler.alignLegacyOwnedFields(context.Background(), current, desired, false); err != nil {
+		t.Fatal(err)
+	}
+	if updates != 1 {
+		t.Fatalf("legacy alignment updates = %d, want 1", updates)
+	}
+}
+
+func TestLegacyAlignmentAllowsOnlyInternalHPAOwnerForPooler(t *testing.T) {
+	t.Parallel()
+	replicas := int32(7)
+	current := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-pooler", Namespace: "default", UID: types.UID("pooler-uid"),
+			ManagedFields: []metav1.ManagedFieldsEntry{{
+				Manager: hpaScaleFieldManager, Operation: metav1.ManagedFieldsOperationApply,
+				APIVersion: "apps/v1", FieldsType: "FieldsV1",
+				FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)},
+			}},
+		},
+		Spec: appsv1.DeploymentSpec{Replicas: &replicas},
+	}
+	if !hasUnrelatedTopLevelApplyOwnership(current, false) {
+		t.Fatal("legacy HPA manager was accepted outside the pooler Deployment")
+	}
+	if hasUnrelatedTopLevelApplyOwnership(current, true) {
+		t.Fatal("legacy HPA manager was rejected for the pooler Deployment")
+	}
+	withExternal := current.DeepCopy()
+	withExternal.ManagedFields = append(withExternal.ManagedFields, metav1.ManagedFieldsEntry{
+		Manager: "external-manager", Operation: metav1.ManagedFieldsOperationApply,
+	})
+	if !hasUnrelatedTopLevelApplyOwnership(withExternal, true) {
+		t.Fatal("external Apply manager was accepted alongside the legacy HPA manager")
+	}
+
+	desired := current.DeepCopy()
+	desired.ManagedFields = nil
+	updates := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.UpdateOption) error {
+			updates++
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: newFakeClient(t, current)}
+	if _, err := reconciler.alignLegacyOwnedFields(context.Background(), current, desired, true); err != nil {
+		t.Fatal(err)
+	}
+	if updates != 1 {
+		t.Fatalf("legacy alignment updates = %d, want 1", updates)
+	}
+}
+
+func TestLegacyAlignmentBoundsConflicts(t *testing.T) {
+	t.Parallel()
+	current := legacyManagedConfigMap(types.UID("legacy-uid"))
+	desired := current.DeepCopy()
+	desired.Data = map[string]string{"current": "value"}
+	authoritative := newFakeClient(t, current.DeepCopy())
+	updates := 0
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+			updates++
+			return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, object.GetName(), errors.New("injected conflict"))
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	_, err := reconciler.alignLegacyOwnedFields(context.Background(), current, desired, false)
+	if err == nil || !strings.Contains(err.Error(), "after 4 conflicts") {
+		t.Fatalf("conflict exhaustion error = %v", err)
+	}
+	if updates != 4 {
+		t.Fatalf("update attempts = %d, want 4", updates)
+	}
+}
+
+func TestLegacyAlignmentRejectsReplacementAfterConflict(t *testing.T) {
+	t.Parallel()
+	current := legacyManagedConfigMap(types.UID("legacy-uid"))
+	desired := current.DeepCopy()
+	reads := 0
+	authoritative := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+			reads++
+			source := current.DeepCopy()
+			if reads > 1 {
+				source.UID = types.UID("replacement-uid")
+			}
+			target := object.(*corev1.ConfigMap)
+			*target = *source
+			return nil
+		},
+	})
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+			return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, object.GetName(), errors.New("injected conflict"))
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	_, err := reconciler.alignLegacyOwnedFields(context.Background(), current, desired, false)
+	if err == nil || !strings.Contains(err.Error(), "replaced during") {
+		t.Fatalf("replacement error = %v", err)
+	}
+}
+
+func TestLegacyAlignmentRejectsUnrelatedApplyOwner(t *testing.T) {
+	t.Parallel()
+	current := legacyManagedConfigMap(types.UID("legacy-uid"))
+	current.ManagedFields = append(current.ManagedFields, metav1.ManagedFieldsEntry{
+		Manager:    "external-manager",
+		Operation:  metav1.ManagedFieldsOperationApply,
+		APIVersion: "v1",
+		FieldsType: "FieldsV1",
+		FieldsV1:   &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:annotations":{"f:example.com/external":{}}}}`)},
+	})
+	authoritative := newFakeClient(t, current.DeepCopy())
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.UpdateOption) error {
+			t.Fatal("unsafe legacy alignment reached Update")
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	_, err := reconciler.alignLegacyOwnedFields(context.Background(), current, current.DeepCopy(), false)
+	if err == nil || !strings.Contains(err.Error(), "another top-level Apply manager") {
+		t.Fatalf("unrelated owner error = %v", err)
+	}
+}
+
+func TestLegacyServiceAlignmentPreservesAllocations(t *testing.T) {
+	t.Parallel()
+	singleStack := corev1.IPFamilyPolicySingleStack
+	current := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "example-rw",
+			Namespace:   "default",
+			Annotations: map[string]string{"example.com/remove-me": "true"},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:                  corev1.ServiceTypeLoadBalancer,
+			ClusterIP:             "10.96.0.42",
+			ClusterIPs:            []string{"10.96.0.42"},
+			IPFamilies:            []corev1.IPFamily{corev1.IPv4Protocol},
+			IPFamilyPolicy:        &singleStack,
+			HealthCheckNodePort:   32042,
+			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
+			Ports: []corev1.ServicePort{{
+				Name: "postgresql", Protocol: corev1.ProtocolTCP, Port: 5432, NodePort: 30432,
+			}},
+		},
+	}
+	desired := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: current.Name, Namespace: current.Namespace},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{Name: "postgresql", Protocol: corev1.ProtocolTCP, Port: 5432}},
+		},
+	}
+	alignedObject, err := legacyAlignedObject(current, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aligned := alignedObject.(*corev1.Service)
+	if aligned.Spec.ClusterIP != current.Spec.ClusterIP ||
+		len(aligned.Spec.ClusterIPs) != 1 || aligned.Spec.ClusterIPs[0] != current.Spec.ClusterIPs[0] ||
+		len(aligned.Spec.IPFamilies) != 1 || aligned.Spec.IPFamilies[0] != current.Spec.IPFamilies[0] ||
+		aligned.Spec.IPFamilyPolicy == nil || *aligned.Spec.IPFamilyPolicy != *current.Spec.IPFamilyPolicy ||
+		aligned.Spec.HealthCheckNodePort != current.Spec.HealthCheckNodePort ||
+		aligned.Spec.ExternalTrafficPolicy != current.Spec.ExternalTrafficPolicy ||
+		len(aligned.Spec.Ports) != 1 || aligned.Spec.Ports[0].NodePort != current.Spec.Ports[0].NodePort {
+		t.Fatalf("legacy alignment changed Service allocations or API defaults: %#v", aligned.Spec)
+	}
+	if len(aligned.Annotations) != 0 {
+		t.Fatalf("legacy operator annotation survived alignment: %#v", aligned.Annotations)
+	}
+}
+
+func TestMigrateApplyOwnershipRetriesConflict(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	legacy := legacyManagedConfigMap(types.UID("legacy-uid"))
+	base := newFakeClient(t, legacy.DeepCopy())
+	updates := 0
+	writeClient := interceptedClient(t, base, interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+			updates++
+			if updates == 1 {
+				return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, object.GetName(), errors.New("injected conflict"))
+			}
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+	migrated, err := reconciler.migrateApplyOwnership(ctx, legacy.DeepCopy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updates != 2 {
+		t.Fatalf("update attempts = %d, want 2", updates)
+	}
+	for _, entry := range migrated.GetManagedFields() {
+		if entry.Manager == "unknown" && entry.Operation == metav1.ManagedFieldsOperationUpdate {
+			t.Fatalf("legacy manager survived migration: %#v", migrated.GetManagedFields())
+		}
+	}
+}
+
+func TestMigrateApplyOwnershipBoundsConflicts(t *testing.T) {
+	t.Parallel()
+	legacy := legacyManagedConfigMap(types.UID("legacy-uid"))
+	base := newFakeClient(t, legacy.DeepCopy())
+	updates := 0
+	writeClient := interceptedClient(t, base, interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+			updates++
+			return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, object.GetName(), errors.New("injected conflict"))
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+	_, err := reconciler.migrateApplyOwnership(context.Background(), legacy.DeepCopy())
+	if err == nil || !strings.Contains(err.Error(), "after 4 conflicts") {
+		t.Fatalf("conflict exhaustion error = %v", err)
+	}
+	if updates != 4 {
+		t.Fatalf("update attempts = %d, want 4", updates)
+	}
+}
+
+func TestMigrateApplyOwnershipRejectsReplacementAfterConflict(t *testing.T) {
+	t.Parallel()
+	legacy := legacyManagedConfigMap(types.UID("legacy-uid"))
+	replacement := legacyManagedConfigMap(types.UID("replacement-uid"))
+	base := newFakeClient(t, replacement)
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+			return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, object.GetName(), errors.New("injected conflict"))
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+	_, err := reconciler.migrateApplyOwnership(context.Background(), legacy)
+	if err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("replacement error = %v", err)
+	}
+}
+
+func TestMigrateApplyOwnershipPreservesLaterUpdateManager(t *testing.T) {
+	t.Parallel()
+	current := legacyManagedConfigMap(types.UID("managed-uid"))
+	current.Annotations = map[string]string{owned.ApplyOwnershipAnnotation: owned.ApplyOwnershipVersion}
+	current.ManagedFields = append(current.ManagedFields, metav1.ManagedFieldsEntry{
+		Manager:    owned.ManagedByValue,
+		Operation:  metav1.ManagedFieldsOperationApply,
+		APIVersion: "v1",
+		FieldsType: "FieldsV1",
+		FieldsV1:   &metav1.FieldsV1{Raw: []byte(`{"f:data":{".":{},"f:stale":{}},"f:metadata":{"f:annotations":{"f:pgshard.io/apply-ownership":{}}}}`)},
+	})
+	writeClient := interceptedClient(t, newFakeClient(t), interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.UpdateOption) error {
+			t.Fatal("completed ownership migration attempted to erase a later Update manager")
+			return nil
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient}
+	migrated, err := reconciler.migrateApplyOwnership(context.Background(), current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrated.GetManagedFields()) != 2 || migrated.GetManagedFields()[0].Manager != "unknown" {
+		t.Fatalf("later Update manager was not preserved: %#v", migrated.GetManagedFields())
 	}
 }
 
@@ -543,6 +1523,34 @@ func newFakeClient(t *testing.T, objects ...client.Object) client.Client {
 		WithStatusSubresource(&pgshardv1alpha1.PgShardCluster{}, &appsv1.Deployment{}, &appsv1.StatefulSet{}, &autoscalingv2.HorizontalPodAutoscaler{}, &policyv1.PodDisruptionBudget{}).
 		WithObjects(objects...).
 		Build()
+}
+
+func interceptedClient(t *testing.T, base client.Client, funcs interceptor.Funcs) client.Client {
+	t.Helper()
+	withWatch, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatalf("client %T does not implement client.WithWatch", base)
+	}
+	return interceptor.NewClient(withWatch, funcs)
+}
+
+func legacyManagedConfigMap(uid types.UID) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "legacy-config",
+			Namespace:       "default",
+			UID:             uid,
+			ResourceVersion: "1",
+			ManagedFields: []metav1.ManagedFieldsEntry{{
+				Manager:    "unknown",
+				Operation:  metav1.ManagedFieldsOperationUpdate,
+				APIVersion: "v1",
+				FieldsType: "FieldsV1",
+				FieldsV1:   &metav1.FieldsV1{Raw: []byte(`{"f:data":{".":{},"f:stale":{}}}`)},
+			}},
+		},
+		Data: map[string]string{"stale": "value"},
+	}
 }
 
 func requestFor(cluster *pgshardv1alpha1.PgShardCluster) ctrl.Request {
