@@ -83,11 +83,7 @@ can be proven to target one shard.
 
 ## Transaction pooling limits
 
-Safe session settings are replayed when a transaction receives a backend. Temporary objects, `LISTEN`, session advisory locks, holdable cursors, and backend-bound state are rejected because they cannot move safely between pooled connections or enter PostgreSQL prepared transactions.
-
-The dedicated PostgreSQL cluster also revokes every advisory-lock acquisition
-function from `PUBLIC`. Only the operator's trusted source-mutation identity may
-inherit `pgshard_slot_mutator`; application identities must not receive it.
+Safe session settings are replayed when a transaction receives a backend. Temporary objects, `LISTEN`, session advisory locks, holdable cursors, and backend-bound state are rejected because they cannot move safely between pooled connections or enter PostgreSQL prepared transactions. Built-in advisory-lock ACLs currently remain at PostgreSQL defaults; the pooler rejection is a pooling-safety rule, not a cluster-wide hostile-SQL resource boundary.
 
 Backend connections used for routed statements pin `search_path` to the empty
 string. Every referenced application table must therefore be explicitly

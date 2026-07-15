@@ -33,50 +33,129 @@ BEGIN
 END
 $pgshard_requirements$;
 
+DO $pgshard_role_bootstrap$
+DECLARE
+    catalog_schema_owner_is_superuser boolean;
+BEGIN
+    SELECT owners.rolsuper
+      INTO catalog_schema_owner_is_superuser
+      FROM pg_catalog.pg_namespace AS namespaces
+      JOIN pg_catalog.pg_roles AS owners ON owners.oid = namespaces.nspowner
+     WHERE namespaces.nspname = 'pgshard_catalog';
+
+    IF NOT FOUND AND EXISTS (
+        SELECT
+          FROM pg_catalog.pg_roles AS roles
+         WHERE roles.rolname IN (
+                   'pgshard_catalog_reader',
+                   'pgshard_catalog_admin'
+               )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pgshard catalog roles exist before catalog bootstrap';
+    END IF;
+    IF FOUND AND NOT catalog_schema_owner_is_superuser THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog schema must be owned by a superuser';
+    END IF;
+END
+$pgshard_role_bootstrap$;
+
 CREATE SCHEMA IF NOT EXISTS pgshard_catalog;
 REVOKE ALL ON SCHEMA pgshard_catalog FROM PUBLIC;
 
 DO $pgshard_roles$
 DECLARE
-    role_can_login boolean;
+    role_name text;
+    role_attributes record;
 BEGIN
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_catalog_reader') THEN
-        CREATE ROLE pgshard_catalog_reader NOLOGIN;
-    ELSE
-        SELECT rolcanlogin INTO role_can_login
-          FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_catalog_reader';
-        IF role_can_login THEN
-            RAISE EXCEPTION USING ERRCODE = '42501',
-                MESSAGE = 'pre-existing pgshard_catalog_reader role must be NOLOGIN';
+    FOREACH role_name IN ARRAY ARRAY[
+        'pgshard_catalog_reader',
+        'pgshard_catalog_admin'
+    ]
+    LOOP
+        SELECT roles.rolsuper,
+               roles.rolinherit,
+               roles.rolcreaterole,
+               roles.rolcreatedb,
+               roles.rolcanlogin,
+               roles.rolreplication,
+               roles.rolbypassrls,
+               roles.rolconnlimit,
+               roles.rolpassword,
+               roles.rolvaliduntil,
+               EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_db_role_setting AS settings
+                    WHERE settings.setrole = roles.oid
+               ) AS has_role_settings
+          INTO role_attributes
+          FROM pg_catalog.pg_authid AS roles
+         WHERE roles.rolname = role_name;
+        IF NOT FOUND THEN
+            EXECUTE pg_catalog.format('CREATE ROLE %I NOLOGIN', role_name);
+        ELSIF role_attributes.rolsuper
+           OR NOT role_attributes.rolinherit
+           OR role_attributes.rolcreaterole
+           OR role_attributes.rolcreatedb
+           OR role_attributes.rolcanlogin
+           OR role_attributes.rolreplication
+           OR role_attributes.rolbypassrls
+           OR role_attributes.rolconnlimit <> -1
+           OR role_attributes.rolpassword IS NOT NULL
+           OR role_attributes.rolvaliduntil IS NOT NULL
+           OR role_attributes.has_role_settings THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = pg_catalog.format(
+                    'pre-existing %s role has unsafe attributes',
+                    role_name
+                );
         END IF;
+    END LOOP;
+
+    -- PostgreSQL 18 gives a CREATEROLE principal ADMIN OPTION on every role it
+    -- creates. Reject that and every other delegable membership before these
+    -- fixed roles receive catalog privileges.
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.pg_auth_members AS memberships
+          JOIN pg_catalog.pg_roles AS granted_roles
+            ON granted_roles.oid = memberships.roleid
+         WHERE granted_roles.rolname IN (
+                   'pgshard_catalog_reader',
+                   'pgshard_catalog_admin'
+               )
+           AND memberships.admin_option
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard catalog role has a delegable membership';
     END IF;
 
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_catalog_admin') THEN
-        CREATE ROLE pgshard_catalog_admin NOLOGIN;
-    ELSE
-        SELECT rolcanlogin INTO role_can_login
-          FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_catalog_admin';
-        IF role_can_login THEN
-            RAISE EXCEPTION USING ERRCODE = '42501',
-                MESSAGE = 'pre-existing pgshard_catalog_admin role must be NOLOGIN';
-        END IF;
-    END IF;
-
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_slot_mutator') THEN
-        CREATE ROLE pgshard_slot_mutator NOLOGIN;
-    ELSE
-        SELECT rolcanlogin INTO role_can_login
-          FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_slot_mutator';
-        IF role_can_login THEN
-            RAISE EXCEPTION USING ERRCODE = '42501',
-                MESSAGE = 'pre-existing pgshard_slot_mutator role must be NOLOGIN';
-        END IF;
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.pg_auth_members AS memberships
+          JOIN pg_catalog.pg_roles AS member_roles
+            ON member_roles.oid = memberships.member
+          JOIN pg_catalog.pg_roles AS granted_roles
+            ON granted_roles.oid = memberships.roleid
+         WHERE member_roles.rolname = 'pgshard_catalog_reader'
+            OR (
+                member_roles.rolname = 'pgshard_catalog_admin'
+                AND granted_roles.rolname <> 'pgshard_catalog_reader'
+            )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard catalog role inherits an unexpected role';
     END IF;
 END
 $pgshard_roles$;
 
 GRANT pgshard_catalog_reader TO pgshard_catalog_admin;
-GRANT pgshard_slot_mutator TO pgshard_catalog_admin;
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_admin;
 
@@ -1011,6 +1090,13 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pgshard_catalog, pg_temp
 AS $function$
 BEGIN
+    -- SHARE UPDATE EXCLUSIVE is self-conflicting, so it serializes both
+    -- missing-row creation and every registry writer. Unlike SHARE ROW
+    -- EXCLUSIVE, it is compatible with the ROW EXCLUSIVE lock already held by
+    -- a lifecycle UPDATE whose row trigger reaches this function. NOWAIT turns
+    -- reversed catalog/registry lock order into a retry instead of a deadlock.
+    LOCK TABLE pgshard_catalog.managed_slot_target_fences
+        IN SHARE UPDATE EXCLUSIVE MODE NOWAIT;
     PERFORM 1
       FROM pgshard_catalog.managed_slot_target_fences AS fences
      WHERE fences.target_name::text = $1
@@ -1019,11 +1105,6 @@ BEGIN
         RETURN;
     END IF;
 
-    -- A missing unique-key row cannot be protected with FOR UPDATE. Serialize
-    -- only first-row creation, without waiting for an uncommitted competing
-    -- insert anywhere in this registry, then lock the now-canonical row.
-    LOCK TABLE pgshard_catalog.managed_slot_target_fences
-        IN SHARE ROW EXCLUSIVE MODE NOWAIT;
     INSERT INTO pgshard_catalog.managed_slot_target_fences(target_name)
     VALUES ($1)
     ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
@@ -1283,6 +1364,10 @@ DECLARE
     existing_backend_start timestamptz;
     existing_postmaster_start timestamptz;
 BEGIN
+    -- Release participates in the same fail-fast registry serialization as
+    -- acquisition, including when the target row does not exist.
+    LOCK TABLE pgshard_catalog.managed_slot_target_fences
+        IN SHARE UPDATE EXCLUSIVE MODE NOWAIT;
     SELECT fences.fence_id,
            fences.owner_pid,
            fences.owner_backend_start,
@@ -3801,48 +3886,6 @@ FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_managed_slot_creation_atte
 REVOKE ALL ON ALL TABLES IN SCHEMA pgshard_catalog FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA pgshard_catalog FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pgshard_catalog FROM PUBLIC;
-
--- PostgreSQL advisory locks share the heavyweight-lock table with ordinary
--- catalog locks. The dedicated pgshard cluster therefore denies every
--- acquisition variant to PUBLIC and gives the operator-managed mutation role
--- the narrow opt-in capability used to fence a trusted source session.
-REVOKE EXECUTE ON FUNCTION
-    pg_catalog.pg_advisory_lock(bigint),
-    pg_catalog.pg_advisory_lock(integer, integer),
-    pg_catalog.pg_advisory_lock_shared(bigint),
-    pg_catalog.pg_advisory_lock_shared(integer, integer),
-    pg_catalog.pg_advisory_xact_lock(bigint),
-    pg_catalog.pg_advisory_xact_lock(integer, integer),
-    pg_catalog.pg_advisory_xact_lock_shared(bigint),
-    pg_catalog.pg_advisory_xact_lock_shared(integer, integer),
-    pg_catalog.pg_try_advisory_lock(bigint),
-    pg_catalog.pg_try_advisory_lock(integer, integer),
-    pg_catalog.pg_try_advisory_lock_shared(bigint),
-    pg_catalog.pg_try_advisory_lock_shared(integer, integer),
-    pg_catalog.pg_try_advisory_xact_lock(bigint),
-    pg_catalog.pg_try_advisory_xact_lock(integer, integer),
-    pg_catalog.pg_try_advisory_xact_lock_shared(bigint),
-    pg_catalog.pg_try_advisory_xact_lock_shared(integer, integer)
-FROM PUBLIC;
-
-GRANT EXECUTE ON FUNCTION
-    pg_catalog.pg_advisory_lock(bigint),
-    pg_catalog.pg_advisory_lock(integer, integer),
-    pg_catalog.pg_advisory_lock_shared(bigint),
-    pg_catalog.pg_advisory_lock_shared(integer, integer),
-    pg_catalog.pg_advisory_xact_lock(bigint),
-    pg_catalog.pg_advisory_xact_lock(integer, integer),
-    pg_catalog.pg_advisory_xact_lock_shared(bigint),
-    pg_catalog.pg_advisory_xact_lock_shared(integer, integer),
-    pg_catalog.pg_try_advisory_lock(bigint),
-    pg_catalog.pg_try_advisory_lock(integer, integer),
-    pg_catalog.pg_try_advisory_lock_shared(bigint),
-    pg_catalog.pg_try_advisory_lock_shared(integer, integer),
-    pg_catalog.pg_try_advisory_xact_lock(bigint),
-    pg_catalog.pg_try_advisory_xact_lock(integer, integer),
-    pg_catalog.pg_try_advisory_xact_lock_shared(bigint),
-    pg_catalog.pg_try_advisory_xact_lock_shared(integer, integer)
-TO pgshard_slot_mutator;
 
 GRANT SELECT ON ALL TABLES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;

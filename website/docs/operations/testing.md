@@ -210,12 +210,14 @@ always drops the login. Its complete consumer hierarchy is inserted in one
 transaction so setup failure cannot strand undiscoverable parent rows. Fence
 tests also replace a dead owner PID with a live PID while retaining the stale
 backend generation, release a real fence before acquiring a transaction
-advisory lock, deny every advisory-lock acquisition overload to the untrusted
-catalog reader, and row-lock the hidden registry through release. PID reuse and
+advisory lock, deny the untrusted catalog reader access to fence acquisition and
+state, and row-lock the hidden registry through release. PID reuse and
 transaction locks must not restore authority; release must remain bounded, its
 backend must exit, and the stale row must then be reclaimable. A two-session
-test retains `cluster_state` opposite an uncommitted first target-row creation
-and requires `55P03` within one second instead of a lock-order deadlock.
+test retains `cluster_state` opposite both same-target ownership and an
+uncommitted different-target creation, and requires `55P03` within one second
+instead of a lock-order deadlock. Every timeout/error branch reaps both test
+sessions before it reports the assertion.
 Always-run
 bounded cleanup retires the catalog row only
 after both primary-slot removal and synchronized standby-copy disappearance

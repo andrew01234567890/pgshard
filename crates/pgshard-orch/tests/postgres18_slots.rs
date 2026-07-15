@@ -2271,7 +2271,6 @@ async fn setup_primary_mutation_role(
             .batch_execute(&format!(
                 "CREATE ROLE {mutation_role} WITH REPLICATION; \
                  GRANT pg_monitor TO {mutation_role}; \
-                 GRANT pgshard_slot_mutator TO {mutation_role}; \
                  CREATE SCHEMA {hostile_schema}; \
                  CREATE FUNCTION {hostile_schema}.current_database() \
                  RETURNS pg_catalog.name LANGUAGE SQL IMMUTABLE \

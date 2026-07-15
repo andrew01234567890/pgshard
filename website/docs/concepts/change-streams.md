@@ -76,11 +76,10 @@ catalog fence and then reloads the exact durable generation, lifecycle, restore
 incarnation, source, role, target database, and current catalog epoch. Each
 acquisition uses a fresh opaque fence ID bound to the exact live backend and
 postmaster generation; pgshard does not acquire an advisory lock for this fence
-or derive authority from the visible slot name. Because PostgreSQL advisory and
-ordinary locks share the heavyweight-lock table, the dedicated-cluster
-migration revokes advisory-lock acquisition from `PUBLIC`. Only the trusted
-source-mutation identity should inherit the NOLOGIN `pgshard_slot_mutator`
-capability. The second connection performs
+or derive authority from the visible slot name. The registry uses fail-fast
+database table and row locks, independent of PostgreSQL advisory-lock ACLs.
+Those built-in ACLs remain at PostgreSQL defaults until the operator can enforce
+one policy across every database sharing a postmaster. The second connection performs
 the slot mutation in that allocated database. This split retains one canonical
 cluster-wide target registry while the physical mutation runs in the allocated
 database. The mutator requires an absent
@@ -380,9 +379,9 @@ serializes through a hidden per-target registry in the writable `shardschema`
 database, then revalidates the exact catalog row after acquisition. The registry
 binds an opaque fence ID to the exact backend start time, PID, and postmaster
 generation. Public advisory locks, target names, PID reuse, and name-derived
-hashes are not authority. Untrusted roles cannot acquire advisory locks at all;
-the trusted mutation credential remains a denial-of-service boundary because
-it can consume shared lock memory. Allocation, activation,
+hashes are not authority. The catalog migration does not claim to prevent a
+PostgreSQL login from exhausting postmaster-wide resources through hostile SQL;
+that requires a future cluster-wide operator policy. Allocation, activation,
 cleanup-start, and related parent lifecycle writes, including direct
 administrative writes to managed catalog tables, use that same canonical
 registry. They fail fast on a busy target rather than retaining the catalog-state

@@ -46,11 +46,12 @@ registry are hidden from catalog reader and administrator roles. Every fence
 acquisition stores an opaque fence ID bound to the exact PostgreSQL backend PID,
 backend start, and postmaster start. PID reuse, a public slot name, or a guessed
 advisory-lock key therefore cannot manufacture lifecycle authority. PostgreSQL
-advisory and ordinary locks share one heavyweight-lock table, so the migration
-also revokes every advisory-lock acquisition function from `PUBLIC` and grants
-that capability only through the NOLOGIN `pgshard_slot_mutator` role. The
-operator must grant that role only to its trusted source-mutation identity; a
-compromised trusted identity can still deny service by exhausting shared locks.
+advisory locks are not part of this protocol. Registry writers instead take one
+fail-fast, self-conflicting table lock that remains compatible with ordinary
+lifecycle DML, then lock the exact target row. Built-in advisory-lock ACLs remain
+at PostgreSQL defaults: defending a shared postmaster against deliberately
+hostile or resource-exhausting SQL requires a future all-database operator
+policy and is not claimed by this database-local migration.
 The restricted catalog role cannot update checkpoint progress directly. Its
 checkpoint CAS requires the caller's expected ownership fence and checkpoint
 ordinal, so a fence that wins the catalog lock makes an in-flight stale advance
@@ -59,9 +60,10 @@ The Rust routing snapshot intentionally does not load this registry yet;
 catalog records do not authorize a live replication session.
 
 The migration expects a pre-created UTF8 database and a short-lived superuser
-bootstrap principal. Superuser authority is required to create three NOLOGIN
-group roles, harden built-in advisory-lock ACLs, and leave the
-security-definer fence owner able to read exact backend generations:
+bootstrap principal. Superuser authority is required to create two fixed
+NOLOGIN group roles, reject unsafe pre-existing attributes or delegable role
+memberships, and leave the security-definer fence owner able to read exact
+backend generations:
 
 ```sql
 CREATE DATABASE shardschema TEMPLATE template0 ENCODING 'UTF8';
