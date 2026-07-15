@@ -1,12 +1,19 @@
 BEGIN;
 
 -- Takeover validation uses statement snapshots.  Override a non-default
--- session characteristic before the transaction takes its first snapshot; an
--- already-active outer snapshot makes this statement fail closed instead.
+-- session characteristic before the transaction takes its first snapshot.  An
+-- already-active stronger-isolation snapshot fails closed; an enclosing READ
+-- COMMITTED transaction continues to receive a fresh snapshot per statement.
 SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 
 DO $pgshard_requirements$
 BEGIN
+    IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '25000',
+            MESSAGE = 'the shardschema migration requires READ COMMITTED isolation';
+    END IF;
+
     IF NOT EXISTS (
         SELECT
           FROM pg_catalog.pg_roles AS roles

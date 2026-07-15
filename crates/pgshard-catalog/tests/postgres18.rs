@@ -1109,12 +1109,12 @@ async fn run_concurrent_external_trigger_rejection(
                      FOR EACH ROW EXECUTE FUNCTION {schema}.observe_catalog_write()"
             ))
             .await?;
-        let lock_result = tokio::time::timeout(
+        let lock_result = run_bounded_concurrent_migration(
+            &migration_client,
             Duration::from_secs(2),
-            migration_client.batch_execute(pgshard_catalog::MIGRATION_SQL),
+            "catalog migration waited for a concurrent catalog relation lock",
         )
-        .await
-        .map_err(|_| "catalog migration waited for a concurrent catalog relation lock")?;
+        .await?;
         let rollback_result = migration_client.batch_execute("ROLLBACK").await;
         let lock_error = match lock_result {
             Ok(()) => {
@@ -1134,9 +1134,12 @@ async fn run_concurrent_external_trigger_rejection(
         }
 
         attacker.batch_execute("COMMIT").await?;
-        let migration_result = migration_client
-            .batch_execute(pgshard_catalog::MIGRATION_SQL)
-            .await;
+        let migration_result = run_bounded_concurrent_migration(
+            &migration_client,
+            Duration::from_secs(10),
+            "catalog migration retry did not finish after catalog traffic quiesced",
+        )
+        .await?;
         let rollback_result = migration_client.batch_execute("ROLLBACK").await;
         let migration_error = match migration_result {
             Ok(()) => {
@@ -1174,10 +1177,49 @@ async fn run_concurrent_external_trigger_rejection(
     }
     .await;
 
+    let attacker_cleanup = rollback_concurrent_migration_connection(&attacker, "attacker").await;
+    let migration_cleanup =
+        rollback_concurrent_migration_connection(&migration_client, "migration").await;
     drop(attacker);
+    drop(migration_client);
     attacker_connection_task.abort();
     migration_connection_task.abort();
-    test_result
+    test_result?;
+    attacker_cleanup?;
+    migration_cleanup
+}
+
+async fn run_bounded_concurrent_migration(
+    client: &Client,
+    query_timeout: Duration,
+    timeout_message: &str,
+) -> TestResult<Result<(), PgError>> {
+    let result = tokio::time::timeout(
+        query_timeout,
+        client.batch_execute(pgshard_catalog::MIGRATION_SQL),
+    )
+    .await;
+    let Ok(result) = result else {
+        let cancellation = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.cancel_token().cancel_query(NoTls),
+        )
+        .await
+        .map_err(|_| format!("{timeout_message}; query cancellation timed out"))?;
+        cancellation.map_err(|error| format!("{timeout_message}; cancellation failed: {error}"))?;
+        return Err(timeout_message.to_owned().into());
+    };
+    Ok(result)
+}
+
+async fn rollback_concurrent_migration_connection(
+    client: &Client,
+    connection_name: &str,
+) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(5), client.batch_execute("ROLLBACK"))
+        .await
+        .map_err(|_| format!("{connection_name} connection rollback timed out"))??;
+    Ok(())
 }
 
 async fn assert_bootstrap_superuser_v049_owner_upgrade(client: &Client) -> TestResult {

@@ -78,6 +78,8 @@ the released layout did not contain rather than leaving them behind during a
 partial transfer. Before inspecting attachments, the migration locks every
 pre-existing trigger/FK-capable catalog relation through transaction end. It
 explicitly uses `READ COMMITTED` even when the session default is stronger.
+The requirements pass verifies the live transaction setting before takeover,
+so removing or bypassing that override fails closed.
 Every relation lock uses `NOWAIT`: concurrent catalog activity returns `55P03`
 and the caller must retry the complete migration after catalog traffic is
 quiesced instead of waiting with a partial lock set that can deadlock normal

@@ -48,9 +48,12 @@ case holds an uncommitted external trigger on a target relation and requires the
 migration's `NOWAIT` lock pass to fail promptly with `55P03`. After that DDL
 commits, a complete migration retry must reject the trigger. The migration
 client starts with a `REPEATABLE READ` session default, proving the migration
-explicitly selects `READ COMMITTED` before its first snapshot. A successful
-lock pass retains every trigger/FK-capable relation lock through ownership
-transfer, ACL reset, and trigger recreation. A
+explicitly selects `READ COMMITTED` before its first snapshot; the migration's
+requirements pass checks the live transaction setting, so removing the override
+makes this regression fail before its expected lock result. Both migration
+attempts and both connection rollbacks are bounded. A successful lock pass
+retains every trigger/FK-capable relation lock through ownership transfer, ACL
+reset, and trigger recreation. A
 separate rollback-only smoke path creates the registry allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying
