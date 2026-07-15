@@ -43,9 +43,14 @@ generation before retry. This composes the clean same-process lifecycle but is
 not yet a long-running controller or crash/external-mutation reconciler.
 Creation-attempt rows, raw probe receipt columns, and the per-target fence
 registry are hidden from catalog reader and administrator roles. Every fence
-acquisition stores a fresh random session advisory-lock key and opaque fence ID,
-so a public slot name or name-derived advisory lock cannot manufacture lifecycle
-authority or monopolize the control-plane fence.
+acquisition stores an opaque fence ID bound to the exact PostgreSQL backend PID,
+backend start, and postmaster start. PID reuse, a public slot name, or a guessed
+advisory-lock key therefore cannot manufacture lifecycle authority. PostgreSQL
+advisory and ordinary locks share one heavyweight-lock table, so the migration
+also revokes every advisory-lock acquisition function from `PUBLIC` and grants
+that capability only through the NOLOGIN `pgshard_slot_mutator` role. The
+operator must grant that role only to its trusted source-mutation identity; a
+compromised trusted identity can still deny service by exhausting shared locks.
 The restricted catalog role cannot update checkpoint progress directly. Its
 checkpoint CAS requires the caller's expected ownership fence and checkpoint
 ordinal, so a fence that wins the catalog lock makes an in-flight stale advance
@@ -53,16 +58,20 @@ fail before it can reinterpret durable WAL progress.
 The Rust routing snapshot intentionally does not load this registry yet;
 catalog records do not authorize a live replication session.
 
-The migration expects a pre-created UTF8 database and a trusted migration
-principal able to create the two NOLOGIN group roles:
+The migration expects a pre-created UTF8 database and a short-lived superuser
+bootstrap principal. Superuser authority is required to create three NOLOGIN
+group roles, harden built-in advisory-lock ACLs, and leave the
+security-definer fence owner able to read exact backend generations:
 
 ```sql
 CREATE DATABASE shardschema TEMPLATE template0 ENCODING 'UTF8';
 ```
 
 Apply `migrations/0001_shardschema.sql` while connected to that database. It is
-transactional and idempotent. Application credentials, passwords, connection
-strings, and other secret material do not belong in the catalog.
+transactional, idempotent, and rejects a non-superuser owner before creating
+objects. Runtime catalog and mutation credentials are not superusers.
+Application credentials, passwords, connection strings, and other secret
+material do not belong in the catalog.
 
 The checked-in live test requires a disposable PostgreSQL 18 database:
 

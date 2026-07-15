@@ -773,6 +773,32 @@ async fn assert_installation_contract(client: &Client) -> TestResult {
     Ok(())
 }
 
+async fn assert_restricted_catalog_migration_is_rejected(client: &Client) -> TestResult {
+    let role_name = format!("pgshard_migration_test_{}", Uuid::new_v4().simple());
+    client
+        .batch_execute(&format!(
+            "CREATE ROLE {role_name} NOLOGIN CREATEROLE; SET ROLE {role_name}"
+        ))
+        .await?;
+    let migration = client.batch_execute(pgshard_catalog::MIGRATION_SQL).await;
+    let rollback_result = client.batch_execute("ROLLBACK").await;
+    let reset_result = client.batch_execute("RESET ROLE").await;
+    let drop_result = client
+        .batch_execute(&format!("DROP ROLE IF EXISTS {role_name}"))
+        .await;
+
+    let error = migration.expect_err("catalog bootstrap must reject a non-superuser owner");
+    assert_sqlstate(&error, "42501");
+    assert_database_message(
+        &error,
+        "pgshard catalog migration requires a superuser bootstrap principal",
+    );
+    rollback_result?;
+    reset_result?;
+    drop_result?;
+    Ok(())
+}
+
 async fn create_fixture(client: &Client) -> TestResult<Fixture> {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let logical_name = format!("db_{nonce}");
@@ -1436,9 +1462,7 @@ async fn assert_identity_history_contract(client: &Client, fixture: &Fixture) ->
 async fn assert_admin_privilege_contract(client: &mut Client) -> TestResult {
     let login_roles: i64 = client
         .query_one(
-            "SELECT count(*) FROM pg_catalog.pg_roles \
-             WHERE rolname IN ('pgshard_catalog_reader', 'pgshard_catalog_admin') \
-               AND rolcanlogin",
+            "SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname IN ('pgshard_catalog_reader', 'pgshard_catalog_admin', 'pgshard_slot_mutator') AND rolcanlogin",
             &[],
         )
         .await?
@@ -1542,14 +1566,44 @@ async fn assert_catalog_reader_cannot_seize_target_fence(database_url: &str) -> 
     reader
         .batch_execute("SET ROLE pgshard_catalog_reader")
         .await?;
-    reader
+    let advisory_acquisition_privileges: i64 = reader
         .query_one(
-            "SELECT pg_catalog.pg_advisory_lock( \
+            "SELECT pg_catalog.count(*) \
+               FROM pg_catalog.pg_proc AS procedures \
+               JOIN pg_catalog.pg_namespace AS namespaces \
+                 ON namespaces.oid OPERATOR(pg_catalog.=) procedures.pronamespace \
+              WHERE namespaces.nspname OPERATOR(pg_catalog.=) 'pg_catalog' \
+                AND procedures.proname OPERATOR(pg_catalog.=) ANY (ARRAY[ \
+                        'pg_advisory_lock', \
+                        'pg_advisory_lock_shared', \
+                        'pg_advisory_xact_lock', \
+                        'pg_advisory_xact_lock_shared', \
+                        'pg_try_advisory_lock', \
+                        'pg_try_advisory_lock_shared', \
+                        'pg_try_advisory_xact_lock', \
+                        'pg_try_advisory_xact_lock_shared' \
+                    ]::pg_catalog.name[]) \
+                AND pg_catalog.has_function_privilege( \
+                        current_user, procedures.oid, 'EXECUTE' \
+                    )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        advisory_acquisition_privileges, 0,
+        "catalog readers must not consume the shared heavyweight-lock table with advisory locks"
+    );
+    let denied_advisory_lock = reader
+        .query_one(
+            "SELECT pg_catalog.pg_try_advisory_lock( \
                         pg_catalog.hashtextextended($1::text, 1346851656::bigint) \
                     )",
             &[&target_name],
         )
-        .await?;
+        .await
+        .expect_err("catalog readers must not acquire public advisory locks");
+    assert_sqlstate(&denied_advisory_lock, "42501");
     let denied = reader
         .query_one(
             "SELECT * FROM pgshard_catalog.acquire_managed_slot_target_fence($1::text)",
@@ -1585,16 +1639,6 @@ async fn assert_catalog_reader_cannot_seize_target_fence(database_url: &str) -> 
     drop(controller);
     tokio::time::timeout(Duration::from_secs(5), controller_task).await???;
 
-    let public_released: bool = reader
-        .query_one(
-            "SELECT pg_catalog.pg_advisory_unlock( \
-                        pg_catalog.hashtextextended($1::text, 1346851656::bigint) \
-                    )",
-            &[&target_name],
-        )
-        .await?
-        .get(0);
-    assert!(public_released);
     drop(reader);
     tokio::time::timeout(Duration::from_secs(5), reader_task).await???;
     Ok(())
@@ -2625,6 +2669,57 @@ async fn assert_target_fence_blocks_catalog_writes(
         .await?
         .get(0);
     assert_eq!(state_while_fenced, "allocated");
+    Ok(())
+}
+
+async fn assert_target_registry_lock_is_fail_fast(
+    observer: &Client,
+    database_url: &str,
+) -> TestResult {
+    let target_name = format!("lock_order_{}", Uuid::new_v4().simple());
+    let (holder, holder_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let holder_task = tokio::spawn(holder_connection);
+    let (contender, contender_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let contender_task = tokio::spawn(contender_connection);
+
+    holder.batch_execute("BEGIN").await?;
+    acquire_target_fence(&holder, &target_name).await?;
+    contender
+        .batch_execute(
+            "BEGIN; \
+             SELECT 1 FROM pgshard_catalog.cluster_state \
+              WHERE singleton FOR UPDATE",
+        )
+        .await?;
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        contender.query_one(
+            "SELECT pgshard_catalog.lock_managed_slot_target($1::text)",
+            &[&target_name],
+        ),
+    )
+    .await
+    .map_err(|_| "target registry lock waited while cluster state was retained")?
+    .expect_err("a retained target row must fail fast");
+    assert_sqlstate(&error, "55P03");
+    assert_database_message(&error, "managed slot target fence is busy");
+
+    contender.batch_execute("ROLLBACK").await?;
+    holder.batch_execute("ROLLBACK").await?;
+    drop(contender);
+    drop(holder);
+    tokio::time::timeout(Duration::from_secs(5), contender_task).await???;
+    tokio::time::timeout(Duration::from_secs(5), holder_task).await???;
+    let rows: i64 = observer
+        .query_one(
+            "SELECT pg_catalog.count(*) \
+               FROM pgshard_catalog.managed_slot_target_fences \
+              WHERE target_name::pg_catalog.text = $1::pg_catalog.text",
+            &[&target_name],
+        )
+        .await?
+        .get(0);
+    assert_eq!(rows, 0, "rolled-back first acquisition left a registry row");
     Ok(())
 }
 
@@ -5502,6 +5597,7 @@ async fn run_migration_and_activation_contract(
     client: &mut Client,
     database_url: &str,
 ) -> TestResult {
+    assert_restricted_catalog_migration_is_rejected(client).await?;
     assert_installation_contract(client).await?;
     assert_shutdown_interrupts_initial_load(client, database_url).await?;
     assert_operation_timeout_aborts_blocked_initial_load(client, database_url).await?;
@@ -5511,6 +5607,7 @@ async fn run_migration_and_activation_contract(
     assert_admin_privilege_contract(client).await?;
     assert_catalog_reader_cannot_seize_target_fence(database_url).await?;
     assert_stale_target_fence_backend_generation_is_reclaimed(database_url).await?;
+    assert_target_registry_lock_is_fail_fast(client, database_url).await?;
     assert_admin_write_path(client).await?;
     let fixture = create_fixture(client).await?;
     assert_migration_does_not_resurrect_retired_restore(client, fixture.nonce).await?;

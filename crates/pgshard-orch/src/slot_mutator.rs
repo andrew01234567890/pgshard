@@ -1494,7 +1494,7 @@ where
     );
     // Persist capability identity before the target endpoint can observe a
     // mutation. The durable pending attempt survives loss of this process or
-    // its advisory-lock backend and prevents the allocation from retiring
+    // its catalog-fence backend and prevents the allocation from retiring
     // beneath an in-flight create.
     let receipt_id = ManagedLogicalSlotReceiptId::new();
     let catalog_connection_task = ConnectionTask::new(tokio::spawn(catalog_connection));

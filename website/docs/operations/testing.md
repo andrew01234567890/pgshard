@@ -23,8 +23,9 @@ second blocked initial load and a later refresh each reach their operation
 deadline and prove exact phase classification, unchanged cache state, and
 backend exit. The same PostgreSQL 18 fixture exercises the logical-consumer
 registry's core trigger and ownership-fenced checkpoint CAS paths through its
-migration principal; a separate rollback-only smoke path creates the registry
-allocation set through
+migration principal. A negative bootstrap test first proves that a non-superuser
+owner is rejected before object creation; a separate rollback-only smoke path
+creates the registry allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying
 the migration cannot resurrect a retired restore incarnation or advance the
@@ -209,9 +210,14 @@ always drops the login. Its complete consumer hierarchy is inserted in one
 transaction so setup failure cannot strand undiscoverable parent rows. Fence
 tests also replace a dead owner PID with a live PID while retaining the stale
 backend generation, release a real fence before acquiring a transaction
-advisory lock, and row-lock the hidden registry through release. PID reuse and
-transaction locks must not restore authority; release must remain bounded and
-the stale row must then be reclaimable. Always-run bounded cleanup retires the catalog row only
+advisory lock, deny every advisory-lock acquisition overload to the untrusted
+catalog reader, and row-lock the hidden registry through release. PID reuse and
+transaction locks must not restore authority; release must remain bounded, its
+backend must exit, and the stale row must then be reclaimable. A two-session
+test retains `cluster_state` opposite an uncommitted first target-row creation
+and requires `55P03` within one second instead of a lock-order deadlock.
+Always-run
+bounded cleanup retires the catalog row only
 after both primary-slot removal and synchronized standby-copy disappearance
 succeed; cleanup owns a separately deadline-bounded connection with PostgreSQL
 statement, lock, and transaction timeouts. It then retires the attachment,

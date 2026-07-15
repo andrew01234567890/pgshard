@@ -2,6 +2,17 @@ BEGIN;
 
 DO $pgshard_requirements$
 BEGIN
+    IF NOT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_roles AS roles
+         WHERE roles.rolname = current_user
+           AND roles.rolsuper
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pgshard catalog migration requires a superuser bootstrap principal';
+    END IF;
+
     IF current_setting('server_version_num')::integer < 180000 THEN
         RAISE EXCEPTION USING
             ERRCODE = '0A000',
@@ -50,10 +61,22 @@ BEGIN
                 MESSAGE = 'pre-existing pgshard_catalog_admin role must be NOLOGIN';
         END IF;
     END IF;
+
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_slot_mutator') THEN
+        CREATE ROLE pgshard_slot_mutator NOLOGIN;
+    ELSE
+        SELECT rolcanlogin INTO role_can_login
+          FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_slot_mutator';
+        IF role_can_login THEN
+            RAISE EXCEPTION USING ERRCODE = '42501',
+                MESSAGE = 'pre-existing pgshard_slot_mutator role must be NOLOGIN';
+        END IF;
+    END IF;
 END
 $pgshard_roles$;
 
 GRANT pgshard_catalog_reader TO pgshard_catalog_admin;
+GRANT pgshard_slot_mutator TO pgshard_catalog_admin;
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_admin;
 
@@ -749,7 +772,7 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.managed_slot_target_fences (
 );
 
 COMMENT ON TABLE pgshard_catalog.managed_slot_target_fences IS
-    'Hidden per-target session fences. A random capability is bound to the exact live PostgreSQL backend and postmaster generation without consuming the public advisory-lock pool.';
+    'Hidden per-target session fences. A random capability is bound to the exact live PostgreSQL backend and postmaster generation without acquiring an advisory lock.';
 
 CREATE TABLE IF NOT EXISTS pgshard_catalog.operation_tombstones (
     operation_kind pgshard_catalog.sql_identifier NOT NULL,
@@ -981,6 +1004,41 @@ AS $function$
     )
 $function$;
 
+CREATE OR REPLACE FUNCTION pgshard_catalog.lock_managed_slot_target_row(target_name text)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+    PERFORM 1
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1
+     FOR UPDATE NOWAIT;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    -- A missing unique-key row cannot be protected with FOR UPDATE. Serialize
+    -- only first-row creation, without waiting for an uncommitted competing
+    -- insert anywhere in this registry, then lock the now-canonical row.
+    LOCK TABLE pgshard_catalog.managed_slot_target_fences
+        IN SHARE ROW EXCLUSIVE MODE NOWAIT;
+    INSERT INTO pgshard_catalog.managed_slot_target_fences(target_name)
+    VALUES ($1)
+    ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
+    PERFORM 1
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1
+     FOR UPDATE NOWAIT;
+EXCEPTION
+    WHEN lock_not_available THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55P03',
+            MESSAGE = 'managed slot target fence is busy';
+END
+$function$;
+
 CREATE OR REPLACE FUNCTION pgshard_catalog.lock_managed_slot_target(target_name text)
 RETURNS void
 LANGUAGE plpgsql
@@ -997,9 +1055,7 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot target is required';
     END IF;
 
-    INSERT INTO pgshard_catalog.managed_slot_target_fences(target_name)
-    VALUES ($1)
-    ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
+    PERFORM pgshard_catalog.lock_managed_slot_target_row($1);
 
     SELECT fences.fence_id,
            fences.owner_pid,
@@ -1010,8 +1066,7 @@ BEGIN
            existing_backend_start,
            existing_postmaster_start
       FROM pgshard_catalog.managed_slot_target_fences AS fences
-     WHERE fences.target_name::text = $1
-     FOR UPDATE;
+     WHERE fences.target_name::text = $1;
 
     IF existing_fence_id IS NOT NULL THEN
         IF pgshard_catalog.managed_slot_backend_identity_live(
@@ -1077,9 +1132,7 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot target is required';
     END IF;
 
-    INSERT INTO pgshard_catalog.managed_slot_target_fences(target_name)
-    VALUES ($1)
-    ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
+    PERFORM pgshard_catalog.lock_managed_slot_target_row($1);
 
     SELECT fences.fence_id,
            fences.owner_pid,
@@ -1090,8 +1143,7 @@ BEGIN
            existing_backend_start,
            existing_postmaster_start
       FROM pgshard_catalog.managed_slot_target_fences AS fences
-     WHERE fences.target_name::text = $1
-     FOR UPDATE;
+     WHERE fences.target_name::text = $1;
 
     IF existing_fence_id IS NOT NULL
        AND pgshard_catalog.managed_slot_backend_identity_live(
@@ -1241,7 +1293,7 @@ BEGIN
            existing_postmaster_start
       FROM pgshard_catalog.managed_slot_target_fences AS fences
      WHERE fences.target_name::text = $1
-     FOR UPDATE;
+     FOR UPDATE NOWAIT;
     IF NOT FOUND OR existing_fence_id IS NULL THEN
         RETURN false;
     END IF;
@@ -1272,6 +1324,11 @@ BEGIN
            acquired_at = NULL
      WHERE fences.target_name::text = $1;
     RETURN true;
+EXCEPTION
+    WHEN lock_not_available THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55P03',
+            MESSAGE = 'managed slot target fence is busy';
 END
 $function$;
 
@@ -1319,7 +1376,7 @@ BEGIN
 
     -- This fails fast rather than retaining the cluster-state row while
     -- waiting. The Rust caller waits at session scope, then invokes this
-    -- function again while owning the same target key.
+    -- function again while owning the same target fence.
     PERFORM pgshard_catalog.lock_managed_slot_target(expected_slot_name);
 
     SELECT 'probe'
@@ -3744,6 +3801,48 @@ FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_managed_slot_creation_atte
 REVOKE ALL ON ALL TABLES IN SCHEMA pgshard_catalog FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA pgshard_catalog FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pgshard_catalog FROM PUBLIC;
+
+-- PostgreSQL advisory locks share the heavyweight-lock table with ordinary
+-- catalog locks. The dedicated pgshard cluster therefore denies every
+-- acquisition variant to PUBLIC and gives the operator-managed mutation role
+-- the narrow opt-in capability used to fence a trusted source session.
+REVOKE EXECUTE ON FUNCTION
+    pg_catalog.pg_advisory_lock(bigint),
+    pg_catalog.pg_advisory_lock(integer, integer),
+    pg_catalog.pg_advisory_lock_shared(bigint),
+    pg_catalog.pg_advisory_lock_shared(integer, integer),
+    pg_catalog.pg_advisory_xact_lock(bigint),
+    pg_catalog.pg_advisory_xact_lock(integer, integer),
+    pg_catalog.pg_advisory_xact_lock_shared(bigint),
+    pg_catalog.pg_advisory_xact_lock_shared(integer, integer),
+    pg_catalog.pg_try_advisory_lock(bigint),
+    pg_catalog.pg_try_advisory_lock(integer, integer),
+    pg_catalog.pg_try_advisory_lock_shared(bigint),
+    pg_catalog.pg_try_advisory_lock_shared(integer, integer),
+    pg_catalog.pg_try_advisory_xact_lock(bigint),
+    pg_catalog.pg_try_advisory_xact_lock(integer, integer),
+    pg_catalog.pg_try_advisory_xact_lock_shared(bigint),
+    pg_catalog.pg_try_advisory_xact_lock_shared(integer, integer)
+FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION
+    pg_catalog.pg_advisory_lock(bigint),
+    pg_catalog.pg_advisory_lock(integer, integer),
+    pg_catalog.pg_advisory_lock_shared(bigint),
+    pg_catalog.pg_advisory_lock_shared(integer, integer),
+    pg_catalog.pg_advisory_xact_lock(bigint),
+    pg_catalog.pg_advisory_xact_lock(integer, integer),
+    pg_catalog.pg_advisory_xact_lock_shared(bigint),
+    pg_catalog.pg_advisory_xact_lock_shared(integer, integer),
+    pg_catalog.pg_try_advisory_lock(bigint),
+    pg_catalog.pg_try_advisory_lock(integer, integer),
+    pg_catalog.pg_try_advisory_lock_shared(bigint),
+    pg_catalog.pg_try_advisory_lock_shared(integer, integer),
+    pg_catalog.pg_try_advisory_xact_lock(bigint),
+    pg_catalog.pg_try_advisory_xact_lock(integer, integer),
+    pg_catalog.pg_try_advisory_xact_lock_shared(bigint),
+    pg_catalog.pg_try_advisory_xact_lock_shared(integer, integer)
+TO pgshard_slot_mutator;
 
 GRANT SELECT ON ALL TABLES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;

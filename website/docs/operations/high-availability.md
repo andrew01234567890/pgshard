@@ -79,7 +79,11 @@ state while queued; the Rust create path retries acquisition within its bounded
 preflight window. Each acquisition records a fresh opaque fence ID bound to the
 exact backend start time, backend PID, and postmaster generation in a hidden
 per-target registry in the authoritative writable `shardschema` database. The
-registry does not consume PostgreSQL's public advisory-lock pool. A stale row is
+registry does not acquire a PostgreSQL advisory lock. Advisory and ordinary
+locks still share PostgreSQL's heavyweight-lock table, so the dedicated-cluster
+migration revokes advisory-lock acquisition from `PUBLIC` and exposes it only
+through the trusted NOLOGIN `pgshard_slot_mutator` capability. The operator must
+grant that role only to the source-mutation identity. A stale row is
 reclaimable only after that exact backend generation is no longer live, so PID
 reuse after a backend or Pod restart is not fence authority. A successful create
 returns the matching process-local cleanup receipt; source, role, the bounded

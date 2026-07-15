@@ -84,6 +84,7 @@ static NEXT_ADVISORY_FENCE: AtomicU64 = AtomicU64::new(1);
 type TestError = Box<dyn Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
 
+#[derive(Clone)]
 struct CatalogAdminTestPrincipal {
     role_name: String,
     password: String,
@@ -129,12 +130,16 @@ fn combine_fixture_results(
     cleanup: TestResult,
     cleanup_connection: TestResult,
 ) -> TestResult {
-    let mut errors = Vec::new();
-    for (phase, result) in [
+    combine_named_results([
         ("fixture", fixture),
         ("fixture cleanup", cleanup),
         ("cleanup connection", cleanup_connection),
-    ] {
+    ])
+}
+
+fn combine_named_results<const N: usize>(results: [(&'static str, TestResult); N]) -> TestResult {
+    let mut errors = Vec::new();
+    for (phase, result) in results {
         if let Err(error) = result {
             errors.push((phase, error));
         }
@@ -1683,6 +1688,7 @@ async fn release_known_drop_while_registry_row_is_blocked(
     );
     let target_name = fence.receipt().target().name().as_str().to_owned();
     let expected_receipt_id = fence.receipt().receipt_id();
+    let fence_backend_pid = i32::try_from(fence.catalog_fence_backend_pid().get())?;
     let (blocker, blocker_connection) = tokio_postgres::connect(database_url, NoTls).await?;
     let blocker_task = tokio::spawn(blocker_connection);
     blocker.batch_execute("BEGIN").await?;
@@ -1701,6 +1707,7 @@ async fn release_known_drop_while_registry_row_is_blocked(
         .map_err(|_| io::Error::other("blocked target-fence release exceeded its hard bound"))?;
     assert_eq!(released.receipt_id(), expected_receipt_id);
     blocker.batch_execute("ROLLBACK").await?;
+    wait_for_backend_exit(&blocker, fence_backend_pid).await?;
     drop(blocker);
     finish_connection(blocker_task).await?;
 
@@ -2264,6 +2271,7 @@ async fn setup_primary_mutation_role(
             .batch_execute(&format!(
                 "CREATE ROLE {mutation_role} WITH REPLICATION; \
                  GRANT pg_monitor TO {mutation_role}; \
+                 GRANT pgshard_slot_mutator TO {mutation_role}; \
                  CREATE SCHEMA {hostile_schema}; \
                  CREATE FUNCTION {hostile_schema}.current_database() \
                  RETURNS pg_catalog.name LANGUAGE SQL IMMUTABLE \
@@ -2528,28 +2536,9 @@ async fn activate_standby_decoder(
     catalog_database_url: &str,
     target: &ManagedSlotTarget,
     receipt: &ManagedLogicalSlotReceipt,
-) -> TestResult {
-    assert_eq!(receipt.target(), target);
-    let principal = CatalogAdminTestPrincipal::new();
-    let (admin, admin_connection) = tokio_postgres::connect(catalog_database_url, NoTls).await?;
-    let admin_task = tokio::spawn(admin_connection);
-    let result: TestResult = async {
-        principal.create(&admin).await?;
-        exercise_standby_decoder_activation(catalog_database_url, target, receipt, &principal).await
-    }
-    .await;
-    let cleanup = principal.drop_if_exists(&admin).await;
-    drop(admin);
-    let connection_result = finish_connection(admin_task).await;
-    combine_fixture_results(result, cleanup, connection_result)
-}
-
-async fn exercise_standby_decoder_activation(
-    catalog_database_url: &str,
-    target: &ManagedSlotTarget,
-    receipt: &ManagedLogicalSlotReceipt,
     principal: &CatalogAdminTestPrincipal,
 ) -> TestResult {
+    assert_eq!(receipt.target(), target);
     let config = principal.config(catalog_database_url)?;
     let (wrong_client, wrong_connection) = config.connect(NoTls).await?;
     let wrong_task = AbortOnDropConnectionTask::new(tokio::spawn(wrong_connection));
@@ -3198,6 +3187,7 @@ async fn run_standby_mutation_fixture(
     standby_database_url: String,
     target: ManagedSlotTarget,
     backend_pid: Arc<AtomicU32>,
+    principal: CatalogAdminTestPrincipal,
 ) -> TestResult {
     ensure_nonzero_catalog_epoch(&primary_database_url).await?;
     let provisional = correlated_standby_mutation_path(
@@ -3236,7 +3226,7 @@ async fn run_standby_mutation_fixture(
         receipt.observation().kind,
         LogicalSlotKind::StandbyLocalDecoder
     );
-    activate_standby_decoder(&primary_database_url, &target, &receipt).await?;
+    activate_standby_decoder(&primary_database_url, &target, &receipt, &principal).await?;
 
     let observed = observe(
         &standby_database_url,
@@ -4179,17 +4169,26 @@ async fn creates_verifies_and_drops_standby_local_decoder() -> TestResult {
     let (cleanup, cleanup_connection) =
         tokio_postgres::connect(&standby_database_url, NoTls).await?;
     let cleanup_task = tokio::spawn(cleanup_connection);
+    let (catalog_admin, catalog_admin_connection) =
+        tokio_postgres::connect(&primary_database_url, NoTls).await?;
+    let catalog_admin_task = tokio::spawn(catalog_admin_connection);
     let target = target("pgshard_mutation_decoder")?;
     let mutation_backend_pid = Arc::new(AtomicU32::new(0));
-    let fixture_result = finish_bounded_fixture(
-        tokio::spawn(run_standby_mutation_fixture(
-            primary_database_url.clone(),
-            standby_database_url,
-            target.clone(),
-            Arc::clone(&mutation_backend_pid),
-        )),
-        "standby slot-mutation fixture",
-    )
+    let principal = CatalogAdminTestPrincipal::new();
+    let fixture_result: TestResult = async {
+        principal.create(&catalog_admin).await?;
+        finish_bounded_fixture(
+            tokio::spawn(run_standby_mutation_fixture(
+                primary_database_url.clone(),
+                standby_database_url,
+                target.clone(),
+                Arc::clone(&mutation_backend_pid),
+                principal.clone(),
+            )),
+            "standby slot-mutation fixture",
+        )
+        .await
+    }
     .await;
     let cleanup_result = cleanup_standby_mutation_fixture(
         &cleanup,
@@ -4198,9 +4197,21 @@ async fn creates_verifies_and_drops_standby_local_decoder() -> TestResult {
         &mutation_backend_pid,
     )
     .await;
+    let principal_cleanup_result = principal.drop_if_exists(&catalog_admin).await;
     drop(cleanup);
+    drop(catalog_admin);
     let cleanup_connection_result = finish_connection(cleanup_task).await;
-    combine_fixture_results(fixture_result, cleanup_result, cleanup_connection_result)
+    let catalog_admin_connection_result = finish_connection(catalog_admin_task).await;
+    combine_named_results([
+        ("fixture", fixture_result),
+        ("slot cleanup", cleanup_result),
+        ("catalog principal cleanup", principal_cleanup_result),
+        ("slot cleanup connection", cleanup_connection_result),
+        (
+            "catalog principal connection",
+            catalog_admin_connection_result,
+        ),
+    ])
 }
 
 async fn observe_primary_path(
