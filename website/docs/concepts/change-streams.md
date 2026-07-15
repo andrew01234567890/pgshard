@@ -219,7 +219,10 @@ unless their database, observable system/timeline/database identity, roles, WAL
 levels, mandatory feedback and continuous synchronization settings, a standby
 control-file replay floor at or after the durable checkpoint, receiver slot,
 gated physical slot, active PID, retained WAL,
-walsender generation, `application_name`, and streaming state agree. It also
+walsender generation, `application_name`, and streaming state agree. The
+standby batch must bracket its logical-slot query with the same slot-sync worker
+PID and backend-start identity, and the post-query sample must find that worker
+in PostgreSQL's completed-cycle wait. It also
 requires the primary anchor and its continuously synchronized standby copy to
 match the catalog-selected name and database, use `pgoutput`, expose the exact
 failover-enabled primary and synchronized-standby roles, be non-temporary,
@@ -343,20 +346,27 @@ identifier plus checkpoint LSN and timeline, recovery role, WAL level,
 `hot_standby_feedback`, exact `wal_receiver_status_interval`,
 `sync_replication_slots`, `primary_slot_name`, raw replay position, and live WAL
 receiver PID, raw activity, physical-slot name, and last received timeline
-immediately before it reads the requested local slots. It also records the
-local slot-sync worker's PID,
-backend-start identity, and whether the worker is in PostgreSQL's
-`ReplicationSlotsyncMain` wait after returning from a cycle. The server-wall-clock
-start value is only an equality key across observations; it is not a freshness
-clock. Raw `streaming` activity does not claim that the receiver is connected to
-the expected primary, and a waiting local worker does not identify its upstream
-connection or prove that a particular anchor was synchronized. If PostgreSQL
+immediately before it reads the requested local slots. That prerequisite query
+also samples the local slot-sync worker's PID, backend-start identity, and raw
+activity. A dedicated query immediately after the slot read samples the worker
+again. The observer rejects appearance, disappearance, or a changed process
+generation across the slot query. The correlator additionally requires the
+post-query worker to be in PostgreSQL's `ReplicationSlotsyncMain` wait after
+returning from a cycle. PostgreSQL 18 keeps one upstream connection for that
+worker process and exits the process on connection or relevant configuration
+errors, so an unchanged PID plus backend start excludes an observed reconnect
+or restart inside this local window. The server-wall-clock start value is only
+an equality key across observations; it is not a freshness clock. Raw
+`streaming` activity does not claim that the receiver is connected to the
+expected primary, and a post-query waiting worker does not identify its upstream
+connection, date the completed cycle, or prove that a particular anchor was
+synchronized. If PostgreSQL
 exposes a live receiver PID but redacts its details, the observer returns that
 PID in a typed error. It also requires effective inherited
 `pg_read_all_stats` privileges on every observation because PostgreSQL otherwise
 redacts the auxiliary worker's type and can make a running slot-sync worker
 indistinguishable from absence. Mere non-inherited role membership is rejected.
-Both query intervals are recorded on one consumed, deadline-bounded connection.
+All three query intervals are recorded on one consumed, deadline-bounded connection.
 This is still local, non-atomic observation: it does not prove the configured
 upstream, physical-slot ownership, feedback freshness, or a source-bound recent
 slot-sync cycle.
@@ -385,7 +395,8 @@ reports with the same database and observable source components, mandatory
 `sync_replication_slots`, exact receiver and physical-slot names, both recorded
 checkpoint timelines plus the live receiver and writable primary on the catalog timeline,
 and the standby checkpoint record at or after the durable consumer checkpoint,
-primary gating, retained non-temporary slot state, the active slot PID's
+one stable slot-sync worker generation around the local slot query, its
+post-query completed-cycle wait state, primary gating, retained non-temporary slot state, the active slot PID's
 streaming walsender, and the expected `application_name`. Requiring both live
 timeline signals as well as both checkpoint timelines prevents a lagging control-file
 checkpoint, a receiver that has already switched timelines, or a newly promoted

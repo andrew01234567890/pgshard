@@ -409,6 +409,13 @@ async fn assert_correlated_replication_path(
         proof.standby_replay_floor_lsn()
     );
     assert_eq!(proof.physical_slot(), &physical_slot);
+    let observed_worker = standby
+        .post_slot_sync_worker()
+        .expect("eligible standby has a post-slot worker");
+    assert_eq!(
+        proof.slot_sync_worker_identity(),
+        observed_worker.identity()
+    );
     assert_eq!(proof.physical_slot_persistence(), SlotPersistence::Unproven);
     assert_ne!(proof.physical_catalog_xmin().get().get(), 0);
     assert_ne!(proof.peer_reply_epoch_micros().get(), 0);
@@ -623,7 +630,11 @@ fn synchronized_anchor_waiting(batch: &LocalLogicalSlotObservationBatch) -> bool
     let worker_waiting = batch
         .prerequisites()
         .slot_sync_worker()
-        .is_some_and(|worker| worker.activity() == LocalSlotSyncWorkerActivity::WaitingAfterCycle);
+        .zip(batch.post_slot_sync_worker())
+        .is_some_and(|(before, after)| {
+            before.identity() == after.identity()
+                && after.activity() == LocalSlotSyncWorkerActivity::WaitingAfterCycle
+        });
     anchor_ready && worker_waiting
 }
 
@@ -677,9 +688,20 @@ fn assert_standby_observation(
         .expect("continuous slot-sync worker");
     assert_ne!(slot_sync_worker.identity().pid().get(), 0);
     assert_ne!(slot_sync_worker.identity().start_epoch_micros().get(), 0);
+    let post_slot_sync_worker = batch
+        .post_slot_sync_worker()
+        .expect("same continuous slot-sync worker after slot collection");
     assert_eq!(
-        slot_sync_worker.activity(),
+        post_slot_sync_worker.identity(),
+        slot_sync_worker.identity()
+    );
+    assert_eq!(
+        post_slot_sync_worker.activity(),
         LocalSlotSyncWorkerActivity::WaitingAfterCycle
+    );
+    assert!(batch.slot_collection_finished_at() <= batch.post_worker_collection_started_at());
+    assert!(
+        batch.post_worker_collection_started_at() <= batch.post_worker_collection_finished_at()
     );
 
     let observation = batch.entries()[0]
@@ -732,6 +754,10 @@ async fn assert_primary_prerequisites(
     );
     assert!(batch.prerequisite_collection_finished_at() <= batch.slot_collection_started_at());
     assert!(batch.slot_collection_started_at() <= batch.slot_collection_finished_at());
+    assert!(batch.slot_collection_finished_at() <= batch.post_worker_collection_started_at());
+    assert!(
+        batch.post_worker_collection_started_at() <= batch.post_worker_collection_finished_at()
+    );
     let prerequisites = batch.prerequisites();
     assert_eq!(
         prerequisites.system_identifier(),
@@ -771,6 +797,7 @@ async fn assert_primary_prerequisites(
     assert_eq!(prerequisites.wal_receiver_slot_name(), None);
     assert_eq!(prerequisites.wal_receiver_received_timeline(), None);
     assert_eq!(prerequisites.slot_sync_worker(), None);
+    assert_eq!(batch.post_slot_sync_worker(), None);
     Ok(())
 }
 
