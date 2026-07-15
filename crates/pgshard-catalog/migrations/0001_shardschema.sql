@@ -172,6 +172,78 @@ CREATE UNIQUE INDEX IF NOT EXISTS shard_restore_incarnations_one_active
 COMMENT ON TABLE pgshard_catalog.shard_restore_incarnations IS
     'Permanent shard history. Bootstrap and each coordinated restore allocate a fresh active UUID.';
 
+CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
+    probe_generation uuid PRIMARY KEY
+        CHECK (probe_generation <> '00000000-0000-0000-0000-000000000000'::uuid),
+    shard_id pgshard_catalog.resource_name NOT NULL
+        REFERENCES pgshard_catalog.shards(shard_id) ON DELETE RESTRICT,
+    restore_incarnation uuid NOT NULL
+        CHECK (restore_incarnation <> '00000000-0000-0000-0000-000000000000'::uuid),
+    system_identifier numeric(20, 0) NOT NULL
+        CHECK (system_identifier BETWEEN 1 AND 18446744073709551615),
+    database_oid bigint NOT NULL CHECK (database_oid BETWEEN 1 AND 4294967295),
+    database_name pgshard_catalog.sql_identifier NOT NULL,
+    source_timeline bigint NOT NULL CHECK (source_timeline BETWEEN 1 AND 4294967295),
+    slot_name pgshard_catalog.replication_slot_name NOT NULL,
+    consistent_point pg_lsn,
+    state text NOT NULL DEFAULT 'allocated'
+        CHECK (state IN ('allocated', 'active', 'retiring', 'retired')),
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    activated_at timestamptz,
+    retiring_at timestamptz,
+    retired_at timestamptz,
+    UNIQUE (shard_id, slot_name),
+    FOREIGN KEY (restore_incarnation, shard_id)
+        REFERENCES pgshard_catalog.shard_restore_incarnations(restore_incarnation, shard_id)
+        ON DELETE RESTRICT,
+    CHECK (right(slot_name::text, 32) = replace(probe_generation::text, '-', '')),
+    CHECK (consistent_point IS NULL OR consistent_point > '0/0'),
+    CHECK (
+        (
+            state = 'allocated'
+            AND consistent_point IS NULL
+            AND activated_at IS NULL
+            AND retiring_at IS NULL
+            AND retired_at IS NULL
+        )
+        OR
+        (
+            state = 'active'
+            AND consistent_point IS NOT NULL
+            AND activated_at IS NOT NULL
+            AND retiring_at IS NULL
+            AND retired_at IS NULL
+        )
+        OR
+        (
+            state = 'retiring'
+            AND retiring_at IS NOT NULL
+            AND retired_at IS NULL
+            AND (
+                (consistent_point IS NULL AND activated_at IS NULL)
+                OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
+            )
+        )
+        OR
+        (
+            state = 'retired'
+            AND retiring_at IS NOT NULL
+            AND retired_at IS NOT NULL
+            AND (
+                (consistent_point IS NULL AND activated_at IS NULL)
+                OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
+            )
+        )
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS slot_sync_probes_one_live_per_shard
+    ON pgshard_catalog.slot_sync_probes(shard_id)
+    WHERE state IN ('allocated', 'active', 'retiring');
+
+COMMENT ON TABLE pgshard_catalog.slot_sync_probes IS
+    'Permanent per-shard failover-slot probe allocations used only to attest continuous slot synchronization. Consumer checkpoints never depend on probe progress.';
+
 CREATE TABLE IF NOT EXISTS pgshard_catalog.routing_epochs (
     routing_epoch bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     logical_database_id uuid NOT NULL
@@ -728,6 +800,17 @@ BEGIN
             MESSAGE = format('shard %s still has non-retired logical consumers', OLD.shard_id);
     END IF;
 
+    IF NEW.state = 'retired' AND EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.shard_id = OLD.shard_id
+           AND probes.state <> 'retired'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = format('shard %s still has a non-retired slot-sync probe', OLD.shard_id);
+    END IF;
+
     RETURN NEW;
 END
 $function$;
@@ -814,6 +897,124 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
             MESSAGE = 'restore incarnation retains non-retired logical consumer attachment';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.shard_id = NEW.shard_id
+           AND probes.restore_incarnation = NEW.restore_incarnation
+           AND probes.state <> 'retired'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'restore incarnation retains a non-retired slot-sync probe';
+    END IF;
+
+    RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.protect_slot_sync_probe()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    restore_state text;
+    shard_state text;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe generations are permanent';
+    END IF;
+
+    SELECT incarnations.state, shards.state
+      INTO restore_state, shard_state
+      FROM pgshard_catalog.shard_restore_incarnations AS incarnations
+      JOIN pgshard_catalog.shards AS shards
+        ON shards.shard_id = incarnations.shard_id
+     WHERE incarnations.restore_incarnation = NEW.restore_incarnation
+       AND incarnations.shard_id = NEW.shard_id
+     FOR KEY SHARE OF incarnations, shards;
+
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.state <> 'allocated'
+           OR NEW.consistent_point IS NOT NULL
+           OR NEW.activated_at IS NOT NULL
+           OR NEW.retiring_at IS NOT NULL
+           OR NEW.retired_at IS NOT NULL THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'a slot-sync probe must start allocated';
+        END IF;
+        IF restore_state IS DISTINCT FROM 'active'
+           OR shard_state IS NULL
+           OR shard_state NOT IN ('provisioning', 'active') THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probes require an active shard restore';
+        END IF;
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.managed_replication_slots AS slots
+             WHERE slots.slot_generation = NEW.probe_generation
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'replication-slot generations cannot be reused across managed roles';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.probe_generation IS DISTINCT FROM OLD.probe_generation
+       OR NEW.shard_id IS DISTINCT FROM OLD.shard_id
+       OR NEW.restore_incarnation IS DISTINCT FROM OLD.restore_incarnation
+       OR NEW.system_identifier IS DISTINCT FROM OLD.system_identifier
+       OR NEW.database_oid IS DISTINCT FROM OLD.database_oid
+       OR NEW.database_name IS DISTINCT FROM OLD.database_name
+       OR NEW.source_timeline IS DISTINCT FROM OLD.source_timeline
+       OR NEW.slot_name IS DISTINCT FROM OLD.slot_name
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe allocation identity is immutable';
+    END IF;
+
+    IF OLD.state = 'retired' THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'retired slot-sync probes are immutable';
+    END IF;
+
+    IF NEW.state = OLD.state THEN
+        IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+           OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
+           OR NEW.retiring_at IS DISTINCT FROM OLD.retiring_at
+           OR NEW.retired_at IS DISTINCT FROM OLD.retired_at THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe lifecycle history is immutable';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.state = 'allocated' AND NEW.state = 'active' THEN
+        IF restore_state IS DISTINCT FROM 'active'
+           OR shard_state IS NULL
+           OR shard_state NOT IN ('provisioning', 'active')
+           OR NEW.consistent_point IS NULL
+           OR NEW.activated_at IS NULL
+           OR NEW.retiring_at IS NOT NULL
+           OR NEW.retired_at IS NOT NULL THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe activation is incomplete or misplaced';
+        END IF;
+    ELSIF OLD.state IN ('allocated', 'active') AND NEW.state = 'retiring' THEN
+        IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+           OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
+           OR NEW.retiring_at IS NULL
+           OR NEW.retired_at IS NOT NULL THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe retirement must preserve activation history';
+        END IF;
+    ELSIF OLD.state = 'retiring' AND NEW.state = 'retired' THEN
+        IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+           OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
+           OR NEW.retiring_at IS DISTINCT FROM OLD.retiring_at
+           OR NEW.retired_at IS NULL THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe retirement is incomplete';
+        END IF;
+    ELSE
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid slot-sync probe transition';
     END IF;
 
     RETURN NEW;
@@ -1457,6 +1658,15 @@ BEGIN
         IF attachment_state <> 'staged' THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slots can only be allocated to staged attachments';
         END IF;
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.slot_sync_probes AS probes
+             WHERE probes.probe_generation = NEW.slot_generation
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'replication-slot generations cannot be reused across managed roles';
+        END IF;
         RETURN NEW;
     END IF;
 
@@ -1848,6 +2058,24 @@ CREATE TRIGGER shard_restore_incarnations_protect_history
 BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.shard_restore_incarnations
 FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_shard_restore_incarnation();
 
+DROP TRIGGER IF EXISTS slot_sync_probes_touch_catalog
+    ON pgshard_catalog.slot_sync_probes;
+CREATE TRIGGER slot_sync_probes_touch_catalog
+AFTER INSERT OR UPDATE OR DELETE ON pgshard_catalog.slot_sync_probes
+FOR EACH STATEMENT EXECUTE FUNCTION pgshard_catalog.touch_catalog_state();
+
+DROP TRIGGER IF EXISTS slot_sync_probes_lock_catalog
+    ON pgshard_catalog.slot_sync_probes;
+CREATE TRIGGER slot_sync_probes_lock_catalog
+BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.slot_sync_probes
+FOR EACH STATEMENT EXECUTE FUNCTION pgshard_catalog.lock_catalog_state();
+
+DROP TRIGGER IF EXISTS slot_sync_probes_protect_history
+    ON pgshard_catalog.slot_sync_probes;
+CREATE TRIGGER slot_sync_probes_protect_history
+BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.slot_sync_probes
+FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_slot_sync_probe();
+
 DROP TRIGGER IF EXISTS registered_tables_touch_catalog ON pgshard_catalog.registered_tables;
 CREATE TRIGGER registered_tables_touch_catalog
 AFTER INSERT OR UPDATE OR DELETE ON pgshard_catalog.registered_tables
@@ -1957,6 +2185,17 @@ GRANT INSERT (shard_id, shard_number, state), UPDATE (state)
     ON pgshard_catalog.shards TO pgshard_catalog_admin;
 GRANT INSERT (restore_incarnation, shard_id), UPDATE (state, retired_at)
     ON pgshard_catalog.shard_restore_incarnations TO pgshard_catalog_admin;
+GRANT INSERT (
+    probe_generation,
+    shard_id,
+    restore_incarnation,
+    system_identifier,
+    database_oid,
+    database_name,
+    source_timeline,
+    slot_name
+), UPDATE (consistent_point, state, activated_at, retiring_at, retired_at)
+    ON pgshard_catalog.slot_sync_probes TO pgshard_catalog_admin;
 GRANT INSERT (logical_database_id) ON pgshard_catalog.routing_epochs TO pgshard_catalog_admin;
 GRANT INSERT, UPDATE, DELETE ON pgshard_catalog.routing_ranges TO pgshard_catalog_admin;
 GRANT INSERT (

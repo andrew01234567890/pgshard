@@ -10,17 +10,29 @@ The migration also stores permanent shard restore-incarnation history,
 logical-consumer identities, per-shard ownership fences, never-reused
 checkpoint and source-attachment generations, source-bound checkpoint
 identities, and generation-encoded primary-anchor and standby-decoder slot
-allocations.
+allocations. It also keeps one never-reused, generation-encoded slot-sync probe
+allocation per live shard restore. A probe is a dedicated failover slot for
+worker-health challenges; it is never a consumer resume point and its progress
+cannot advance a consumer checkpoint. Probe and consumer-slot tombstones share
+one never-reused generation namespace even though their lifecycle records have
+different owners.
 Primary anchors are cluster-scoped failover identities whose synchronized
 copies follow PostgreSQL promotion; standby decoders are bound to one canonical
 member ordinal.
-Database triggers serialize mutations through the catalog epoch, reject
-checkpoint seeding and regression, require every progress change to advance its
+Database triggers serialize mutations through the catalog epoch. A concurrent
+`REPEATABLE READ` writer whose snapshot predates a committed mutation fails with
+`40001` when it reaches the versioned epoch gate; a current writer then performs
+the cross-table generation checks. The same triggers reject checkpoint seeding
+and regression, require every progress change to advance its
 ordinal, require every new generation to begin at a snapshot boundary, bind it
 to one restore/system/database/timeline lineage, reject identity rebinding,
 require active matching selected-source and primary-anchor slots for every
 checkpoint advance, require both activation boundaries before snapshot
 completion, and retain immutable retired names and generations as tombstones.
+Probe allocation, activation, cleanup, and retirement are similarly ordered:
+an active or possibly-created probe must enter `retiring` and be proven absent
+by future reconciliation before its permanent tombstone permits a replacement
+or restore retirement.
 The restricted catalog role cannot update checkpoint progress directly. Its
 checkpoint CAS requires the caller's expected ownership fence and checkpoint
 ordinal, so a fence that wins the catalog lock makes an in-flight stale advance

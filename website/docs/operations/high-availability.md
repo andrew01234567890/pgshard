@@ -69,6 +69,12 @@ logical-slot ownership and server-attested generation,
 operator-managed replication, durable lease integration, promotion, automated
 recovery, and rolling restarts are not implemented; see
 [implementation status](../project/status.md).
+
+`shardschema` now reserves one permanent generation/name history for a
+dedicated slot-sync probe per live shard restore. The probe is explicitly
+separate from consumer anchors, so a future freshness challenge cannot skip
+unconsumed data by advancing a consumer resume slot. Only its catalog lifecycle
+is implemented: no current runtime creates, advances, or drops that probe.
 :::
 
 The target default is one primary and two physical streaming replicas per shard,
