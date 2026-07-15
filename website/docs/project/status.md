@@ -13,7 +13,7 @@ in the same pull request whenever implementation status changes.
 |---|---|---|
 | Core key ranges and routing hash | Rust types, no-allocation hash, golden vectors, microbenchmark | Implemented in source |
 | Control and change-stream contracts | Buf-linted alpha protobuf definitions | Implemented in source |
-| Public-repository, CI and release policy | Parallel CI, privacy audit, source-only SemVer tooling | Implemented in source |
+| Public-repository, CI and release policy | Parallel CI, binary-safe audited-range history privacy audit, source-only SemVer tooling | Implemented in source |
 | Documentation site | Typed Docusaurus build and link validation | Implemented in source |
 | Local container images | Digest-pinned Linux/amd64 Rust runtime, Go operator, and PostgreSQL 18 agent Docker-compatible image archives, non-root entrypoint smoke tests, no registry output | Implemented in source; test artifacts only |
 | Go operator API and supporting resources | Defaulting/validation, generated CRD/RBAC/webhook, deterministic common and per-member primary/standby PostgreSQL 18 role ConfigMaps with steady and promotion-overlap slot budgeting, Services/workloads/HPA/PDB/NetworkPolicy, internal pooler HTTP Service and probe contract, namespace-scoped leader election, uncached finalizer absence proofs, supervised PVC deletion, restricted certificate-free and self-managed-admission local-image Kustomizations, exact-name certificate RBAC, renewable leaf certificates, and targeted digest-pinned Kubernetes 1.36 delete/recreate plus admission/real-manager fail-closed coverage | Implemented in source; deliberately not a database cluster |
