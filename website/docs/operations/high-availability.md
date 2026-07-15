@@ -28,7 +28,9 @@ PostgreSQL 18 configuration profiles, including promotion-safe slot capacity, `A
 mandatory standby feedback and slot synchronization. A bounded local observer
 reads PostgreSQL 18 recovery, receiver, replay, slot-sync configuration, and
 logical-slot state plus the local continuous worker's process generation and
-post-cycle wait boundary. A primary-side sample bounds the plain unique
+activity before and after the slot query. The worker generation must stay
+unchanged, and its post-slot sample must expose PostgreSQL's completed-cycle wait
+state. A primary-side sample bounds the plain unique
 synchronized-slot list and joins one managed physical slot's active PID to its
 exact walsender while keeping peer-supplied reply time and `catalog_xmin`
 non-authorizing. The same bounded primary statement also reads the exact
@@ -37,7 +39,8 @@ separately sampled standby and primary paths to match the catalog's observable
 source components, database, roles, mandatory feedback and slot-sync configuration, matching
 standby and primary checkpoint timelines plus live receiver and
 writable-primary timelines, a standby control-file replay floor covering the
-durable checkpoint, receiver slot, gated
+durable checkpoint, one stable local slot-sync worker generation around the slot
+query, its post-query completed-cycle wait, receiver slot, gated
 active physical slot, retained WAL, and exact streaming walsender identity. It
 compares the primary anchor with the continuously synchronized standby copy,
 requiring their name, database, plugin, failover-enabled primary and
@@ -60,7 +63,7 @@ when PostgreSQL installs the safe checkpoint pair.
 Both paths run in a real primary/standby CI fixture. Secure upstream connection
 material, exact live-replay, upstream and network-adjacency proof,
 restore-incarnation observation,
-worker-connection and successful-cycle correlation, feedback freshness and
+worker-connection and recent successful-cycle correlation, feedback freshness and
 catalog-horizon proof, physical-slot lifecycle attestation, role activation,
 logical-slot ownership and server-attested generation,
 operator-managed replication, durable lease integration, promotion, automated

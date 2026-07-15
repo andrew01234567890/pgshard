@@ -5,7 +5,7 @@
 //! compatible endpoints for one catalog-selected path. It does not prove that
 //! those endpoints were connected to each other and deliberately does not
 //! manufacture exact replay-lineage, feedback freshness, catalog-horizon
-//! coverage, lifecycle ownership, or slot-sync success.
+//! coverage, lifecycle ownership, or source-bound recent slot-sync success.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -18,7 +18,8 @@ use tokio::time::Instant;
 
 use super::{
     LocalLogicalSlotObservationBatch, LocalPostgresBackendIdentity, LocalPostgresTransactionId,
-    LocalPrimaryReplicationObservationBatch, LocalWalReceiverActivity, LocalWalSenderActivity,
+    LocalPrimaryReplicationObservationBatch, LocalSlotSyncWorkerActivity, LocalWalReceiverActivity,
+    LocalWalSenderActivity,
 };
 use crate::standby_slots::{
     FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotObservation, LogicalSlotPlugin,
@@ -51,6 +52,7 @@ pub struct CorrelatedStandbyReplicationPath {
     standby_replay_floor_lsn: PgLsn,
     physical_slot: ReplicationSlotName,
     wal_receiver_pid: NonZeroU32,
+    slot_sync_worker_identity: LocalPostgresBackendIdentity,
     walsender_identity: LocalPostgresBackendIdentity,
     physical_slot_persistence: SlotPersistence,
     physical_catalog_xmin: LocalPostgresTransactionId,
@@ -109,6 +111,16 @@ impl CorrelatedStandbyReplicationPath {
     #[must_use]
     pub const fn wal_receiver_pid(&self) -> NonZeroU32 {
         self.wal_receiver_pid
+    }
+
+    /// Returns the stable local slot-sync worker generation around the slot snapshot.
+    ///
+    /// This identity proves only that the two local worker samples surrounded
+    /// the slot query without an observed restart. It does not identify the
+    /// worker's upstream connection or date its last successful cycle.
+    #[must_use]
+    pub const fn slot_sync_worker_identity(&self) -> LocalPostgresBackendIdentity {
+        self.slot_sync_worker_identity
     }
 
     /// Returns the primary-local walsender PID plus backend generation.
@@ -201,7 +213,7 @@ fn correlate_standby_replication_path_at(
 ) -> Result<CorrelatedStandbyReplicationPath, StandbyReplicationPathCorrelationError> {
     let oldest_observation_age = observation_age(policy, standby, primary, evaluated_at)?;
     validate_sources_and_roles(policy, standby, primary)?;
-    let (standby_replay_floor_lsn, wal_receiver_pid) = validate_standby_path(policy, standby)?;
+    let standby_path = validate_standby_path(policy, standby)?;
     let primary_path = validate_primary_path(policy, primary)?;
     let failover_anchor = validate_failover_anchors(policy, standby, primary)?;
 
@@ -209,9 +221,10 @@ fn correlate_standby_replication_path_at(
         source_identity: policy.expected_source(),
         member_ordinal: policy.member_ordinal(),
         oldest_observation_age,
-        standby_replay_floor_lsn,
+        standby_replay_floor_lsn: standby_path.replay_floor_lsn,
         physical_slot: policy.physical_slot().clone(),
-        wal_receiver_pid,
+        wal_receiver_pid: standby_path.wal_receiver_pid,
+        slot_sync_worker_identity: standby_path.slot_sync_worker_identity,
         walsender_identity: primary_path.walsender_identity,
         physical_slot_persistence: primary_path.persistence,
         physical_catalog_xmin: primary_path.catalog_xmin,
@@ -271,7 +284,7 @@ fn validate_sources_and_roles(
 fn validate_standby_path(
     policy: &StandbyDecoderPolicy,
     standby: &LocalLogicalSlotObservationBatch,
-) -> Result<(PgLsn, NonZeroU32), StandbyReplicationPathCorrelationError> {
+) -> Result<StandbyPathEvidence, StandbyReplicationPathCorrelationError> {
     let prerequisites = standby.prerequisites();
     let standby_replay_floor_lsn = prerequisites.checkpoint_lsn();
     if standby_replay_floor_lsn.0 < policy.durable_checkpoint_lsn().0 {
@@ -304,6 +317,22 @@ fn validate_standby_path(
     if prerequisites.primary_slot_name() != Some(policy.physical_slot()) {
         return Err(StandbyReplicationPathCorrelationError::PrimarySlotNameMismatch);
     }
+    let slot_sync_worker = prerequisites
+        .slot_sync_worker()
+        .ok_or(StandbyReplicationPathCorrelationError::SlotSyncWorkerMissingBeforeSnapshot)?;
+    let post_slot_sync_worker = standby
+        .post_slot_sync_worker()
+        .ok_or(StandbyReplicationPathCorrelationError::SlotSyncWorkerMissingAfterSnapshot)?;
+    if slot_sync_worker.identity() != post_slot_sync_worker.identity() {
+        return Err(StandbyReplicationPathCorrelationError::SlotSyncWorkerChangedDuringSnapshot);
+    }
+    if post_slot_sync_worker.activity() != LocalSlotSyncWorkerActivity::WaitingAfterCycle {
+        return Err(
+            StandbyReplicationPathCorrelationError::SlotSyncWorkerNotWaitingAfterSnapshot {
+                observed: post_slot_sync_worker.activity(),
+            },
+        );
+    }
     let wal_receiver_pid = prerequisites
         .wal_receiver_pid()
         .ok_or(StandbyReplicationPathCorrelationError::WalReceiverMissing)?;
@@ -316,7 +345,17 @@ fn validate_standby_path(
     if prerequisites.wal_receiver_received_timeline() != Some(policy.expected_source().timeline()) {
         return Err(StandbyReplicationPathCorrelationError::WalReceiverTimelineMismatch);
     }
-    Ok((standby_replay_floor_lsn, wal_receiver_pid))
+    Ok(StandbyPathEvidence {
+        replay_floor_lsn: standby_replay_floor_lsn,
+        wal_receiver_pid,
+        slot_sync_worker_identity: slot_sync_worker.identity(),
+    })
+}
+
+struct StandbyPathEvidence {
+    replay_floor_lsn: PgLsn,
+    wal_receiver_pid: NonZeroU32,
+    slot_sync_worker_identity: LocalPostgresBackendIdentity,
 }
 
 struct PrimaryPathEvidence {
@@ -529,12 +568,16 @@ fn observation_age(
     let standby_started = standby.prerequisite_collection_started_at();
     let standby_prerequisites_finished = standby.prerequisite_collection_finished_at();
     let standby_slots_started = standby.slot_collection_started_at();
-    let standby_finished = standby.slot_collection_finished_at();
+    let standby_slots_finished = standby.slot_collection_finished_at();
+    let standby_post_worker_started = standby.post_worker_collection_started_at();
+    let standby_finished = standby.post_worker_collection_finished_at();
     let primary_started = primary.collection_started_at();
     let primary_finished = primary.collection_finished_at();
     if standby_started > standby_prerequisites_finished
         || standby_prerequisites_finished > standby_slots_started
-        || standby_slots_started > standby_finished
+        || standby_slots_started > standby_slots_finished
+        || standby_slots_finished > standby_post_worker_started
+        || standby_post_worker_started > standby_finished
         || primary_started > primary_finished
     {
         return Err(StandbyReplicationPathCorrelationError::ObservationWindowInconsistent);
@@ -696,6 +739,21 @@ pub enum StandbyReplicationPathCorrelationError {
     /// Standby configuration names another or no physical slot.
     #[error("primary_slot_name does not match the catalog-selected physical slot")]
     PrimarySlotNameMismatch,
+    /// No slot-sync worker was visible before the logical-slot snapshot.
+    #[error("standby slot-sync worker is absent before the logical-slot snapshot")]
+    SlotSyncWorkerMissingBeforeSnapshot,
+    /// No slot-sync worker was visible after the logical-slot snapshot.
+    #[error("standby slot-sync worker is absent after the logical-slot snapshot")]
+    SlotSyncWorkerMissingAfterSnapshot,
+    /// The local slot-sync worker generation changed across the snapshot.
+    #[error("standby slot-sync worker changed during the logical-slot snapshot")]
+    SlotSyncWorkerChangedDuringSnapshot,
+    /// The post-snapshot worker sample did not expose its completed-cycle wait.
+    #[error("standby slot-sync worker is not waiting after a completed cycle")]
+    SlotSyncWorkerNotWaitingAfterSnapshot {
+        /// Raw activity observed after the logical-slot query.
+        observed: LocalSlotSyncWorkerActivity,
+    },
     /// Standby's conservative control-file replay floor precedes the checkpoint.
     #[error("standby control-file replay floor {observed:?} is behind checkpoint {required:?}")]
     StandbyReplayFloorBehind {
@@ -789,8 +847,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::{
-        LocalPhysicalReplicationSlotObservation, LocalStandbyPrerequisiteObservation,
-        LocalWalSenderObservation, LogicalSlotSnapshotEntry,
+        LocalPhysicalReplicationSlotObservation, LocalSlotSyncWorkerObservation,
+        LocalStandbyPrerequisiteObservation, LocalWalSenderObservation, LogicalSlotSnapshotEntry,
     };
     use super::*;
     use crate::standby_slots::{
@@ -820,6 +878,20 @@ mod tests {
 
     fn nonzero_u64(value: u64) -> NonZeroU64 {
         NonZeroU64::new(value).expect("nonzero test value")
+    }
+
+    fn slot_sync_worker(
+        pid: u32,
+        start_epoch_micros: u64,
+        activity: LocalSlotSyncWorkerActivity,
+    ) -> LocalSlotSyncWorkerObservation {
+        LocalSlotSyncWorkerObservation {
+            identity: LocalPostgresBackendIdentity {
+                pid: nonzero_u32(pid),
+                start_epoch_micros: nonzero_u64(start_epoch_micros),
+            },
+            activity,
+        }
     }
 
     fn slot(name: &str) -> ReplicationSlotName {
@@ -876,6 +948,11 @@ mod tests {
         base: Instant,
     ) -> LocalLogicalSlotObservationBatch {
         let physical_slot = policy.physical_slot().clone();
+        let worker = slot_sync_worker(
+            301,
+            1_700_000_000_123_456,
+            LocalSlotSyncWorkerActivity::Running,
+        );
         LocalLogicalSlotObservationBatch {
             database_name: "shardschema".to_owned(),
             database_oid: DATABASE_OID,
@@ -896,10 +973,16 @@ mod tests {
                 wal_receiver_activity: LocalWalReceiverActivity::Streaming,
                 wal_receiver_slot_name: Some(physical_slot),
                 wal_receiver_received_timeline: Some(TIMELINE),
-                slot_sync_worker: None,
+                slot_sync_worker: Some(worker),
             },
             slot_collection_started_at: base + Duration::from_millis(2),
             slot_collection_finished_at: base + Duration::from_millis(3),
+            post_worker_collection_started_at: base + Duration::from_millis(4),
+            post_worker_collection_finished_at: base + Duration::from_millis(5),
+            post_slot_sync_worker: Some(LocalSlotSyncWorkerObservation {
+                activity: LocalSlotSyncWorkerActivity::WaitingAfterCycle,
+                ..worker
+            }),
             entries: vec![
                 LogicalSlotSnapshotEntry {
                     target: policy.local_decoder().clone(),
@@ -944,8 +1027,8 @@ mod tests {
         LocalPrimaryReplicationObservationBatch {
             database_name: "shardschema".to_owned(),
             database_oid: DATABASE_OID,
-            collection_started_at: base + Duration::from_millis(4),
-            collection_finished_at: base + Duration::from_millis(5),
+            collection_started_at: base + Duration::from_millis(6),
+            collection_finished_at: base + Duration::from_millis(7),
             system_identifier: SYSTEM_IDENTIFIER,
             checkpoint_timeline: TIMELINE,
             current_timeline: Some(TIMELINE),
@@ -981,7 +1064,7 @@ mod tests {
             standby: standby_batch(&policy, base),
             primary: primary_batch(&policy, base),
             policy,
-            evaluated_at: base + Duration::from_millis(6),
+            evaluated_at: base + Duration::from_millis(8),
         }
     }
 
@@ -1067,7 +1150,7 @@ mod tests {
 
         assert_eq!(proof.source_identity(), fixture.policy.expected_source());
         assert_eq!(proof.member_ordinal(), 1);
-        assert_eq!(proof.oldest_observation_age(), Duration::from_millis(6));
+        assert_eq!(proof.oldest_observation_age(), Duration::from_millis(8));
         assert_eq!(proof.standby_replay_floor_lsn(), STANDBY_REPLAY_FLOOR);
         assert_eq!(
             proof.source_bound_replay_floor().source_identity(),
@@ -1079,6 +1162,11 @@ mod tests {
         );
         assert_eq!(proof.physical_slot(), fixture.policy.physical_slot());
         assert_eq!(proof.wal_receiver_pid(), nonzero_u32(401));
+        assert_eq!(proof.slot_sync_worker_identity().pid(), nonzero_u32(301));
+        assert_eq!(
+            proof.slot_sync_worker_identity().start_epoch_micros(),
+            nonzero_u64(1_700_000_000_123_456)
+        );
         assert_eq!(proof.walsender_identity().pid(), nonzero_u32(501));
         assert_eq!(
             proof.walsender_identity().start_epoch_micros(),
@@ -1155,6 +1243,20 @@ mod tests {
         reject(
             |fixture| {
                 fixture.evaluated_at = fixture.primary.collection_started_at;
+            },
+            StandbyReplicationPathCorrelationError::ObservationWindowInconsistent,
+        );
+        reject(
+            |fixture| {
+                fixture.standby.post_worker_collection_started_at =
+                    fixture.standby.slot_collection_finished_at - Duration::from_millis(1);
+            },
+            StandbyReplicationPathCorrelationError::ObservationWindowInconsistent,
+        );
+        reject(
+            |fixture| {
+                fixture.standby.post_worker_collection_finished_at =
+                    fixture.standby.post_worker_collection_started_at - Duration::from_millis(1);
             },
             StandbyReplicationPathCorrelationError::ObservationWindowInconsistent,
         );
@@ -1282,6 +1384,50 @@ mod tests {
             },
             StandbyReplicationPathCorrelationError::FailoverSlotNotGated,
         );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_changed_slot_sync_worker_windows() {
+        reject(
+            |fixture| prerequisites(fixture).slot_sync_worker = None,
+            StandbyReplicationPathCorrelationError::SlotSyncWorkerMissingBeforeSnapshot,
+        );
+        reject(
+            |fixture| fixture.standby.post_slot_sync_worker = None,
+            StandbyReplicationPathCorrelationError::SlotSyncWorkerMissingAfterSnapshot,
+        );
+        for (pid, start_epoch_micros) in
+            [(302, 1_700_000_000_123_456), (301, 1_700_000_000_123_457)]
+        {
+            reject(
+                |fixture| {
+                    fixture.standby.post_slot_sync_worker = Some(slot_sync_worker(
+                        pid,
+                        start_epoch_micros,
+                        LocalSlotSyncWorkerActivity::WaitingAfterCycle,
+                    ));
+                },
+                StandbyReplicationPathCorrelationError::SlotSyncWorkerChangedDuringSnapshot,
+            );
+        }
+        for activity in [
+            LocalSlotSyncWorkerActivity::Running,
+            LocalSlotSyncWorkerActivity::OtherWait,
+        ] {
+            reject(
+                |fixture| {
+                    fixture
+                        .standby
+                        .post_slot_sync_worker
+                        .as_mut()
+                        .expect("fixture post-slot worker")
+                        .activity = activity;
+                },
+                StandbyReplicationPathCorrelationError::SlotSyncWorkerNotWaitingAfterSnapshot {
+                    observed: activity,
+                },
+            );
+        }
     }
 
     #[test]
