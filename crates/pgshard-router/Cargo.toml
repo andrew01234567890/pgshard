@@ -8,19 +8,13 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-[dependencies]
+[dev-dependencies]
 pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-pgwire = { path = "../pgshard-pgwire", version = "=0.1.0" }
 pgshard-planner = { path = "../pgshard-planner", version = "=0.1.0" }
 pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 thiserror.workspace = true
-
-[dev-dependencies]
 uuid.workspace = true
-
-[[bench]]
-name = "route_bound_parameter"
-harness = false
 
 [lints]
 workspace = true
