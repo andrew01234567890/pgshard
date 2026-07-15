@@ -33,7 +33,7 @@ preflight rejects a changed standby member or direct-primary source identity, a 
 multi-server observation, a cascading upstream, insufficient WAL level,
 disabled feedback, a reporting interval without a fixed freshness margin,
 stale feedback, an absent, wrong-source, stale, or connection-generation-mixed
-slot-sync worker observation, a replay position behind the durable checkpoint,
+slot-sync worker observation, a replay floor behind the durable checkpoint,
 a live receiver slot or primary walsender that cannot be tied to the exact
 physical-slot owner, unsafe physical or logical slot WAL retention, an active
 or unowned primary anchor or standby-local decoder, a physical slot omitted
@@ -214,18 +214,24 @@ slot as persistent. Primary-side `catalog_xmin`, reply timestamps, and
 coverage proofs. A pure correlator now combines one standby batch and one
 primary batch inside the catalog-selected monotonic age bound. It fails closed
 unless their database, observable system/timeline/database identity, roles, WAL
-levels, mandatory feedback and continuous synchronization settings, receiver
-slot, gated physical slot, active PID, retained WAL,
+levels, mandatory feedback and continuous synchronization settings, a standby
+control-file replay floor at or after the durable checkpoint, receiver slot,
+gated physical slot, active PID, retained WAL,
 walsender generation, `application_name`, and streaming state agree. Its result
 is a non-authorizing endpoint-compatibility and change-token carrier, not proof
 that the two endpoints were connected and not permission to attach. PostgreSQL
 18's SQL API returns the replay LSN without its atomically sampled replay
 timeline, so the correlator deliberately neither compares nor carries that raw
-LSN. The separate attachment contract accepts only an opaque source-bound
-replay position. The raw local observer cannot construct it, and no production
-constructor exists until an exact replay-lineage observer is implemented. The
+LSN. Instead, the coherent checkpoint LSN and timeline from the standby control
+file establish a conservative replay floor. A new standby can inherit that
+checkpoint from its base backup; SQL is available only after recovery reaches
+consistency. Later control-file advances follow the restartpoint flush phase,
+when PostgreSQL installs the safe checkpoint pair. The
+correlator binds the floor to the catalog source in the opaque replay-floor
+type accepted by the separate attachment contract. This floor can lag live
+replay until a later restartpoint. The
 restore incarnation and catalog epoch come from the fenced policy rather than
-PostgreSQL observation. Exact replay lineage, upstream identity and network
+PostgreSQL observation. Exact live replay, upstream identity and network
 adjacency, feedback freshness, catalog-horizon coverage,
 physical-slot lifecycle persistence, source-bound slot-sync-cycle evidence,
 logical-slot ownership, mutation-history attestation, and every create,
@@ -317,9 +323,9 @@ synchronized slot are not accepted as worker health: a missing
 different connection, or a stale cycle fences the member.
 
 The current Rust observer reads the local PostgreSQL 18 control-file system
-identifier and checkpoint timeline, recovery role, WAL level,
+identifier plus checkpoint LSN and timeline, recovery role, WAL level,
 `hot_standby_feedback`, exact `wal_receiver_status_interval`,
-`sync_replication_slots`, `primary_slot_name`, replay position, and live WAL
+`sync_replication_slots`, `primary_slot_name`, raw replay position, and live WAL
 receiver PID, raw activity, physical-slot name, and last received timeline
 immediately before it reads the requested local slots. It also records the
 local slot-sync worker's PID,
@@ -361,15 +367,21 @@ within its age limit. It accepts only compatible standby/primary endpoint
 reports with the same database and observable source components, mandatory
 `hot_standby_feedback`, a safe positive feedback interval,
 `sync_replication_slots`, exact receiver and physical-slot names, both recorded
-checkpoints plus the live receiver and writable primary on the catalog timeline,
+checkpoint timelines plus the live receiver and writable primary on the catalog timeline,
+and the standby checkpoint record at or after the durable consumer checkpoint,
 primary gating, retained non-temporary slot state, the active slot PID's
 streaming walsender, and the expected `application_name`. Requiring both live
-timeline signals as well as both checkpoints prevents a lagging control-file
+timeline signals as well as both checkpoint timelines prevents a lagging control-file
 checkpoint, a receiver that has already switched timelines, or a newly promoted
-primary from masquerading as the selected endpoint lineage. It does not bind
+primary from masquerading as the selected endpoint lineage. A queryable standby
+may inherit this checkpoint from its base backup; later advances are recorded
+after the restartpoint flush phase, when PostgreSQL installs the safe checkpoint
+pair. Its coherent checkpoint LSN and timeline
+therefore provide an older replay floor. The correlator exports it as an opaque
+source-bound value. It does not bind
 `pg_last_wal_replay_lsn()` to that lineage because PostgreSQL does not expose the
-atomically paired replay timeline through SQL. A future exact replay-lineage
-observation must supply that proof before any checkpoint comparison. The
+atomically paired live replay timeline through SQL. Exact live replay remains a
+future optimization. The
 physical slot's public-view persistence remains `Unproven`; its raw
 `catalog_xmin` and peer
 reply timestamp are carried without being promoted to horizon or freshness
