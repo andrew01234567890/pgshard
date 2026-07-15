@@ -21,9 +21,10 @@ safe catalog transport. Overall application readiness stays false because
 there is no SQL data plane. The migration now also contains the permanent
 logical-consumer, checkpoint-generation, source-attachment, and managed-slot
 allocation registry described below. Its live PostgreSQL 18 test exercises the
-fenced lifecycle and tombstones, but no Rust reconciler loads or mutates those
-records yet. Authenticated TLS, remote catalog transport, and
-operator-provisioned credentials are not wired yet; see
+fenced lifecycle and tombstones. Bounded Rust primitives now authorize exact
+slot creation, activation, deletion, and final retirement; no long-running
+consumer reconciler owns those records yet. Authenticated TLS, remote catalog
+transport, and operator-provisioned credentials are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
@@ -42,6 +43,8 @@ The current internal `pgshard_catalog` migration records:
 - Routing, schema, authorization, and catalog epochs.
 - Permanent logical-consumer identities and per-shard ownership fences.
 - Never-reused checkpoint, source-attachment, and managed-slot generations.
+- A permanent creation-attempt ledger hidden from catalog roles whose opaque
+  capabilities authorize exact activation and absence-fenced retirement.
 - Permanent fixed-size operation tombstones for idempotency.
 
 Durable DDL, reshard, backup/restore and delivered-change journals remain
@@ -73,6 +76,15 @@ rows cannot be changed, deleted, or reused. A selected source may be a
 member-bound standby-local decoder or the cluster-scoped primary failover
 anchor, preserving the fail-closed primary fallback. Synchronized anchor copies
 remain observed PostgreSQL state rather than separate catalog allocations.
+Pending creation attempts version the shared catalog fence so older
+repeatable-read lifecycle writers serialize instead of overlooking a newly
+durable barrier. Consumer and probe activation and final retirement use narrow
+security-definer functions that accept caller-held receipts without exposing raw
+receipt columns. Final retirement must run on the canonical backend that owns the
+hidden target absence fence and must present its exact opaque fence ID. Catalog
+roles cannot inspect the attempt ledger or target-fence registry. Parent
+lifecycle locks consider only live slot generations, not permanent retired
+history.
 
 The future live-health record will also bind slot-sync success to the current
 direct-primary connection generation; it does not mistake that worker's SQL

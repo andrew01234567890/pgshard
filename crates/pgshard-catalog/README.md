@@ -31,8 +31,30 @@ checkpoint advance, require both activation boundaries before snapshot
 completion, and retain immutable retired names and generations as tombstones.
 Probe allocation, activation, cleanup, and retirement are similarly ordered:
 an active or possibly-created probe must enter `retiring` and be proven absent
-by future reconciliation before its permanent tombstone permits a replacement
-or restore retirement.
+before its permanent tombstone permits a replacement or restore retirement.
+The orchestrator crate now exposes bounded `REPEATABLE READ` operations that
+load and conditionally advance this exact lifecycle. A first allocation accepts
+the catalog's genesis epoch, returns only after the insert advances it, and then
+supplies a nonzero source identity to the PostgreSQL slot mutator. Activation
+requires that mutator's unforgeable exact creation receipt; final retirement
+requires its exact drop/absence receipt. Repeating an already-applied operation
+is read-only, while an ambiguous commit is reconciled by reloading the permanent
+generation before retry. This composes the clean same-process lifecycle but is
+not yet a long-running controller or crash/external-mutation reconciler.
+Creation-attempt rows, raw probe receipt columns, and the per-target fence
+registry are hidden from catalog reader and administrator roles. Every fence
+acquisition stores an opaque fence ID bound to the exact PostgreSQL backend PID,
+backend start, and postmaster start. PID reuse, a public slot name, or a guessed
+advisory-lock key therefore cannot manufacture lifecycle authority. PostgreSQL
+advisory locks are not target-registry authority; mutation sessions preserve
+bounded caller-held advisory locks. Registry writers first lock an existing
+target row. Only first insertion of a target takes a fail-fast,
+self-conflicting table lock, so unrelated established targets remain
+independent while same-name first insertion cannot hide a unique-index wait.
+Built-in advisory-lock ACLs remain at PostgreSQL defaults: defending a shared
+postmaster against deliberately hostile or resource-exhausting SQL requires a
+future all-database operator policy and is not claimed by this database-local
+migration.
 The restricted catalog role cannot update checkpoint progress directly. Its
 checkpoint CAS requires the caller's expected ownership fence and checkpoint
 ordinal, so a fence that wins the catalog lock makes an in-flight stale advance
@@ -40,16 +62,53 @@ fail before it can reinterpret durable WAL progress.
 The Rust routing snapshot intentionally does not load this registry yet;
 catalog records do not authorize a live replication session.
 
-The migration expects a pre-created UTF8 database and a trusted migration
-principal able to create the two NOLOGIN group roles:
+The migration expects a pre-created UTF8 database and a short-lived superuser
+bootstrap principal. Superuser authority is required to create a dedicated
+`pgshard_catalog_owner` NOLOGIN role plus the fixed reader and administrator
+NOLOGIN group roles, reject unsafe pre-existing attributes or delegable role
+memberships, and grant only the owner `pg_read_all_stats` so security-definer
+fence functions can read exact backend generations. An upgrade from the
+released shared-owner layout is accepted only when that legacy owner is already
+a superuser, the schema and every relation, routine, type, and collation share
+that owner, and its schema-local default privileges match the released
+reader-only boundary. Rejecting a non-superuser legacy owner prevents arbitrary
+triggers or security-definer routines from being promoted into the trusted
+dedicated owner. It also rejects independently owned schema object classes that
+the released layout did not contain rather than leaving them behind during a
+partial transfer. Before inspecting attachments, the migration locks every
+pre-existing trigger/FK-capable catalog relation through transaction end. It
+explicitly uses `READ COMMITTED` even when the session default is stronger.
+The requirements pass verifies the live transaction setting before takeover,
+so removing or bypassing that override fails closed.
+Every relation lock uses `NOWAIT`: concurrent catalog activity returns `55P03`
+and the caller must retry the complete migration after catalog traffic is
+quiesced instead of waiting with a partial lock set that can deadlock normal
+target-table then `cluster_state` DML. Existing non-internal triggers must match
+the released relation, name, function, event, timing, level, enabled mode,
+predicate, argument, transition-table, parent, and constraint shape. Internal
+referential triggers must belong to foreign keys wholly inside the catalog.
+External executable triggers, altered released triggers, and cross-schema
+references are rejected before ownership changes. For an eligible upgrade, the
+migration preserves
+non-delegable runtime grants already rooted at PostgreSQL's bootstrap
+superuser, otherwise re-homes the legacy owner's grants there, and removes
+explicit fixed-role memberships held by the legacy owner with `CASCADE`. It
+transfers standalone composite types with the rest of the catalog and clears
+all existing fixed-role schema, relation, column, routine and type ACLs plus
+grant options before rebuilding the exact runtime boundary. It then runs
+catalog DDL as the dedicated owner:
 
 ```sql
 CREATE DATABASE shardschema TEMPLATE template0 ENCODING 'UTF8';
 ```
 
 Apply `migrations/0001_shardschema.sql` while connected to that database. It is
-transactional and idempotent. Application credentials, passwords, connection
-strings, and other secret material do not belong in the catalog.
+transactional, idempotent, and rejects a non-superuser owner before creating
+objects on a clean install. It also rejects a released catalog owned by a
+non-superuser instead of elevating its executable objects. Runtime catalog and
+mutation credentials are not superusers.
+Application credentials, passwords, connection strings, and other secret
+material do not belong in the catalog.
 
 The checked-in live test requires a disposable PostgreSQL 18 database:
 

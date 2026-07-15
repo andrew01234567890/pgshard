@@ -6,10 +6,11 @@
 //! and slot changes are not rolled back with the surrounding transaction. The
 //! caller must observe the exact generation-qualified target before deciding
 //! what reconciliation is safe; blind retries are never implied by this API.
-//! The server can validate the source's system identifier, timeline and
-//! database OID, but not the catalog's restore incarnation or epoch. A future
-//! catalog-bound reconciler must fence those unobservable components before it
-//! invokes this local primitive.
+//! A separate writable connection to the canonical `shardschema` database
+//! serializes every managed mutation on the target name, then revalidates the
+//! exact durable generation, lifecycle, restore incarnation, source lineage,
+//! role and catalog epoch after acquiring that fence. The mutation connection
+//! may target another database, but it must match the catalog allocation.
 //! Cancelling a mutation future discards its typed result; callers must then
 //! conservatively reconcile the target as outcome-unknown.
 
@@ -20,15 +21,16 @@ use std::{
     time::Duration,
 };
 
-use pgshard_catalog::CatalogOperationTimeout;
-use pgshard_types::PgLsn;
+use pgshard_catalog::{CatalogOperationTimeout, SHARDSCHEMA_DATABASE};
+use pgshard_types::{CatalogEpoch, PgLsn};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     task::JoinError,
-    time::{Instant, timeout_at},
+    time::{Instant, sleep, timeout_at},
 };
-use tokio_postgres::{Client, Connection, Statement};
+use tokio_postgres::{Client, Connection, IsolationLevel, Statement, Transaction, error::SqlState};
+use uuid::Uuid;
 
 use crate::{
     postgres_connection::{ConnectionTask, ConnectionTaskError},
@@ -39,17 +41,106 @@ use crate::{
     standby_slots::{
         LogicalSlotKind, LogicalSlotObservation, LogicalSlotPlugin, ManagedSlotTarget,
         RecoveryState, ReplicationSlotName, ReplicationSourceIdentity, SettingState, SlotActivity,
-        SlotInvalidation, SlotOwnership, SlotPersistence, SlotWalRetention,
+        SlotGeneration, SlotInvalidation, SlotOwnership, SlotPersistence, SlotWalRetention,
     },
 };
 
 const MIN_POSTGRES_VERSION_NUM: i32 = 180_000;
 const MAX_ADVISORY_LOCK_ROWS: usize = 16;
-const ADVISORY_LOCK_QUERY_LIMIT: i64 = 17;
 const SERVER_STATEMENT_TIMEOUT_HEADROOM: Duration = Duration::from_millis(25);
+const SERVER_TRANSACTION_TIMEOUT_GRACE: Duration = Duration::from_millis(101);
+const TARGET_FENCE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const TARGET_FENCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const PIN_SEARCH_PATH_SQL: &str = "SELECT pg_catalog.set_config('search_path', '', false)";
 const SET_STATEMENT_TIMEOUT_SQL: &str =
     "SELECT pg_catalog.set_config('statement_timeout', $1, false)";
+const RESET_STATEMENT_TIMEOUT_SQL: &str =
+    "SELECT pg_catalog.set_config('statement_timeout', '0', false)";
+const SET_LOCAL_CATALOG_RETIREMENT_TIMEOUTS_SQL: &str = "\
+    SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+           pg_catalog.set_config('transaction_timeout', $2, true)";
+const DISABLE_LOCAL_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = 0";
+const CATALOG_FENCE_REQUIREMENTS_SQL: &str = "\
+    SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4, \
+           pg_catalog.current_database()::pg_catalog.text, \
+           pg_catalog.getdatabaseencoding()::pg_catalog.text, \
+           pg_catalog.pg_is_in_recovery(), \
+           pg_catalog.pg_backend_pid()::pg_catalog.int4";
+const CATALOG_SLOT_AUTHORIZATION_SQL: &str = "\
+    WITH candidates AS ( \
+        SELECT 'probe'::pg_catalog.text AS allocation_kind, probes.state, \
+               probes.probe_generation::pg_catalog.text AS slot_generation, \
+               probes.slot_name::pg_catalog.text AS slot_name, \
+               'primary-anchor'::pg_catalog.text AS slot_role, \
+               probes.database_name::pg_catalog.text AS database_name, \
+               probes.system_identifier::pg_catalog.text AS system_identifier, \
+               probes.database_oid, probes.source_timeline, \
+               probes.restore_incarnation::pg_catalog.text AS restore_incarnation, \
+               probes.creation_receipt_id::pg_catalog.text AS creation_receipt_id, \
+               probes.cleanup_receipt_id::pg_catalog.text AS cleanup_receipt_id, \
+               pgshard_catalog.managed_slot_creation_attempt_state( \
+                   probes.probe_generation, probes.slot_name::pg_catalog.text, \
+                   $3::pg_catalog.text::pg_catalog.uuid \
+               ) AS creation_attempt_state, \
+               restores.state::pg_catalog.text AS restore_state, \
+               shards.state::pg_catalog.text AS shard_state, \
+               NULL::pg_catalog.text AS attachment_state, \
+               NULL::pg_catalog.text AS consumer_shard_state, \
+               NULL::pg_catalog.text AS consumer_state, \
+               NULL::pg_catalog.text AS logical_database_state \
+          FROM pgshard_catalog.slot_sync_probes AS probes \
+          JOIN pgshard_catalog.shard_restore_incarnations AS restores \
+            ON restores.restore_incarnation = probes.restore_incarnation \
+           AND restores.shard_id = probes.shard_id \
+          JOIN pgshard_catalog.shards AS shards \
+            ON shards.shard_id = probes.shard_id \
+         WHERE probes.probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
+           AND probes.slot_name OPERATOR(pg_catalog.=) $2::pg_catalog.name \
+        UNION ALL \
+        SELECT 'consumer'::pg_catalog.text, slots.state, \
+               slots.slot_generation::pg_catalog.text, \
+               slots.slot_name::pg_catalog.text, slots.slot_role, \
+               attachments.database_name::pg_catalog.text, \
+               attachments.system_identifier::pg_catalog.text, \
+               attachments.database_oid, attachments.selected_source_timeline, \
+               attachments.restore_incarnation::pg_catalog.text, \
+               NULL::pg_catalog.text, NULL::pg_catalog.text, \
+               pgshard_catalog.managed_slot_creation_attempt_state( \
+                   slots.slot_generation, slots.slot_name::pg_catalog.text, \
+                   $3::pg_catalog.text::pg_catalog.uuid \
+               ), \
+               restores.state::pg_catalog.text, shards.state::pg_catalog.text, \
+               attachments.state::pg_catalog.text, \
+               consumer_shards.state::pg_catalog.text, \
+               consumers.state::pg_catalog.text, databases.state::pg_catalog.text \
+          FROM pgshard_catalog.managed_replication_slots AS slots \
+          JOIN pgshard_catalog.logical_consumer_attachments AS attachments \
+            ON attachments.attachment_generation = slots.attachment_generation \
+           AND attachments.consumer_id = slots.consumer_id \
+           AND attachments.logical_database_id = slots.logical_database_id \
+           AND attachments.shard_id = slots.shard_id \
+          JOIN pgshard_catalog.shard_restore_incarnations AS restores \
+            ON restores.restore_incarnation = attachments.restore_incarnation \
+           AND restores.shard_id = attachments.shard_id \
+          JOIN pgshard_catalog.shards AS shards \
+            ON shards.shard_id = attachments.shard_id \
+          JOIN pgshard_catalog.logical_consumer_shards AS consumer_shards \
+            ON consumer_shards.consumer_id = slots.consumer_id \
+           AND consumer_shards.logical_database_id = slots.logical_database_id \
+           AND consumer_shards.shard_id = slots.shard_id \
+          JOIN pgshard_catalog.logical_consumers AS consumers \
+            ON consumers.consumer_id = slots.consumer_id \
+           AND consumers.logical_database_id = slots.logical_database_id \
+          JOIN pgshard_catalog.logical_databases AS databases \
+            ON databases.logical_database_id = slots.logical_database_id \
+         WHERE slots.slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+           AND slots.slot_name OPERATOR(pg_catalog.=) $2::pg_catalog.name \
+    ) \
+    SELECT candidates.*, state.catalog_epoch \
+      FROM candidates \
+      CROSS JOIN pgshard_catalog.cluster_state AS state \
+     WHERE state.singleton \
+     LIMIT 2";
 const BASIC_REQUIREMENTS_SQL: &str = "\
     SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4, \
            pg_catalog.current_database(), \
@@ -137,6 +228,46 @@ const CREATE_SLOT_SQL: &str = "\
                $1::pg_catalog.name, 'pgoutput'::pg_catalog.name, false, true, \
                $2::pg_catalog.bool)";
 const DROP_SLOT_SQL: &str = "SELECT pg_catalog.pg_drop_replication_slot($1::pg_catalog.name)";
+const BEGIN_CATALOG_CREATION_ATTEMPT_SQL: &str = "\
+    SELECT pgshard_catalog.begin_managed_slot_creation_attempt( \
+        $1::pg_catalog.text::pg_catalog.uuid, $2::pg_catalog.text, \
+        $3::pg_catalog.text, $4::pg_catalog.text::pg_catalog.numeric, \
+        $5::pg_catalog.int8, $6::pg_catalog.int8, \
+        $7::pg_catalog.text::pg_catalog.uuid, $8::pg_catalog.int8, \
+        $9::pg_catalog.text::pg_catalog.uuid \
+    )::pg_catalog.text";
+const ABANDON_CATALOG_CREATION_ATTEMPT_SQL: &str = "\
+    SELECT pgshard_catalog.abandon_managed_slot_creation_attempt( \
+        $1::pg_catalog.text::pg_catalog.uuid, $2::pg_catalog.text, \
+        $3::pg_catalog.text::pg_catalog.uuid \
+    )";
+const COMPLETE_CATALOG_CONSUMER_RETIREMENT_SQL: &str = "\
+    SELECT pgshard_catalog.complete_managed_replication_slot_retirement( \
+        $1::pg_catalog.text::pg_catalog.uuid, $2::pg_catalog.text, \
+        $3::pg_catalog.text::pg_catalog.uuid, $4::pg_catalog.text::pg_catalog.uuid \
+    )";
+const ACTIVATE_CATALOG_CONSUMER_SLOT_SQL: &str = "\
+    SELECT pgshard_catalog.activate_managed_replication_slot( \
+        $1::pg_catalog.text::pg_catalog.uuid, \
+        $2::pg_catalog.text::pg_catalog.uuid, \
+        $3::pg_catalog.text::pg_catalog.pg_lsn, \
+        $3::pg_catalog.text::pg_catalog.pg_lsn \
+    )";
+pub(crate) const ACQUIRE_TARGET_FENCE_SQL: &str = "\
+    SELECT acquired_fence_id::pg_catalog.text, acquired_backend_pid \
+      FROM pgshard_catalog.acquire_managed_slot_target_fence($1::pg_catalog.text)";
+const RELEASE_TARGET_FENCE_SQL: &str = "\
+    SELECT pgshard_catalog.release_managed_slot_target_fence( \
+        $1::pg_catalog.text, $2::pg_catalog.text::pg_catalog.uuid \
+    )";
+const RELEASE_CURRENT_TARGET_FENCE_SQL: &str = "\
+    SELECT pgshard_catalog.release_managed_slot_target_fence( \
+        $1::pg_catalog.text, NULL::pg_catalog.uuid \
+    )";
+const VERIFY_TARGET_FENCE_SQL: &str = "\
+    SELECT pgshard_catalog.verify_managed_slot_target_fence( \
+        $1::pg_catalog.text, $2::pg_catalog.text::pg_catalog.uuid \
+    )";
 
 /// Managed logical-slot shape this primitive may create.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +279,13 @@ pub enum ManagedLogicalSlotRole {
 }
 
 impl ManagedLogicalSlotRole {
+    const fn catalog_label(self) -> &'static str {
+        match self {
+            Self::PrimaryFailoverAnchor => "primary-anchor",
+            Self::StandbyLocalDecoder => "standby-decoder",
+        }
+    }
+
     const fn recovery(self) -> RecoveryState {
         match self {
             Self::PrimaryFailoverAnchor => RecoveryState::Writable,
@@ -265,10 +403,12 @@ impl ManagedLogicalSlotCreateRequest {
 /// The receipt is intentionally not serializable and has no public constructor.
 /// It can authorize bounded cleanup in the same process, but it is not a
 /// durable mutation ledger, a live-slot lease, or proof against later external
-/// deletion and recreation. Crash reconciliation requires the future
-/// `shardschema` mutation history.
+/// deletion and recreation. `shardschema` persists the matching pre-dispatch
+/// creation attempt, while crash reconciliation must also observe the exact
+/// physical target because post-dispatch outcomes can remain unknown.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ManagedLogicalSlotReceipt {
+    receipt_id: ManagedLogicalSlotReceiptId,
     target: ManagedSlotTarget,
     source: ReplicationSourceIdentity,
     role: ManagedLogicalSlotRole,
@@ -280,6 +420,12 @@ pub struct ManagedLogicalSlotReceipt {
 }
 
 impl ManagedLogicalSlotReceipt {
+    /// Returns the opaque identity of this exact successful creation attempt.
+    #[must_use]
+    pub const fn receipt_id(&self) -> ManagedLogicalSlotReceiptId {
+        self.receipt_id
+    }
+
     /// Returns the exact generation-qualified server target.
     #[must_use]
     pub const fn target(&self) -> &ManagedSlotTarget {
@@ -332,6 +478,35 @@ impl ManagedLogicalSlotReceipt {
     }
 }
 
+/// Opaque identity for one exact successful managed-slot creation attempt.
+///
+/// The value has no public constructor. It distinguishes a later recreation
+/// even when `PostgreSQL` returns the same slot name and creation LSN.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ManagedLogicalSlotReceiptId(Uuid);
+
+impl fmt::Debug for ManagedLogicalSlotReceiptId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ManagedLogicalSlotReceiptId(<redacted>)")
+    }
+}
+
+impl ManagedLogicalSlotReceiptId {
+    fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Reconstructs a non-nil ID loaded from the trusted catalog boundary.
+    pub(crate) fn from_uuid(value: Uuid) -> Option<Self> {
+        (!value.is_nil()).then_some(Self(value))
+    }
+
+    /// Returns the UUID representation persisted in `shardschema`.
+    pub(crate) const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
 /// Known result of a receipt-authorized drop attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedLogicalSlotDropOutcome {
@@ -339,6 +514,318 @@ pub enum ManagedLogicalSlotDropOutcome {
     Dropped,
     /// The exact generation-qualified name was already absent before dispatch.
     AlreadyAbsent,
+}
+
+/// Point-in-time proof that an exact receipt-authorized slot was absent.
+///
+/// This value has no public constructor and is returned only after the drop
+/// path verifies the exact source, role, session fence, and slot shape. It is
+/// carried inside [`ManagedLogicalSlotDropFence`] while it can close a durable
+/// catalog lifecycle. After that connection-bound fence is released, this
+/// receipt is historical evidence only and cannot authorize catalog retirement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedLogicalSlotDropReceipt {
+    receipt_id: ManagedLogicalSlotReceiptId,
+    target: ManagedSlotTarget,
+    source: ReplicationSourceIdentity,
+    role: ManagedLogicalSlotRole,
+    database_name: String,
+    outcome: ManagedLogicalSlotDropOutcome,
+}
+
+impl ManagedLogicalSlotDropReceipt {
+    /// Returns the exact successful creation attempt proven absent.
+    #[must_use]
+    pub const fn receipt_id(&self) -> ManagedLogicalSlotReceiptId {
+        self.receipt_id
+    }
+
+    /// Returns the exact generation-qualified target proven absent.
+    #[must_use]
+    pub const fn target(&self) -> &ManagedSlotTarget {
+        &self.target
+    }
+
+    /// Returns the source lineage verified by the drop preflight.
+    #[must_use]
+    pub const fn source(&self) -> ReplicationSourceIdentity {
+        self.source
+    }
+
+    /// Returns the managed role whose exact shape was checked.
+    #[must_use]
+    pub const fn role(&self) -> ManagedLogicalSlotRole {
+        self.role
+    }
+
+    /// Returns the database name verified by the drop preflight.
+    #[must_use]
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    /// Returns whether the exact slot was dropped or already absent.
+    #[must_use]
+    pub const fn outcome(&self) -> ManagedLogicalSlotDropOutcome {
+        self.outcome
+    }
+}
+
+/// Connection-bound absence proof that still excludes managed same-name creation.
+///
+/// The canonical `shardschema` session holds pgshard's hidden per-target fence
+/// from before the final slot observation until this value is released or
+/// dropped. Every creation and deletion performed through this module uses that
+/// registry. Direct SQL issued by a bypassing actor is outside that coordination
+/// boundary.
+///
+/// A catalog lifecycle must borrow this value through its COMMIT and verify the
+/// same backend afterward before treating the absence proof as durable.
+pub struct ManagedLogicalSlotDropFence {
+    receipt: ManagedLogicalSlotDropReceipt,
+    client: Client,
+    connection_task: ConnectionTask,
+    backend_pid: NonZeroU32,
+    fence_id: Uuid,
+}
+
+impl fmt::Debug for ManagedLogicalSlotDropFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedLogicalSlotDropFence")
+            .field("receipt", &self.receipt)
+            .field("backend_pid", &self.backend_pid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedLogicalSlotDropFence {
+    fn new(
+        receipt: ManagedLogicalSlotDropReceipt,
+        client: Client,
+        connection_task: ConnectionTask,
+        backend_pid: NonZeroU32,
+        fence_id: Uuid,
+    ) -> Self {
+        Self {
+            receipt,
+            client,
+            connection_task,
+            backend_pid,
+            fence_id,
+        }
+    }
+
+    /// Returns the exact point-in-time absence receipt protected by this fence.
+    #[must_use]
+    pub fn receipt(&self) -> &ManagedLogicalSlotDropReceipt {
+        &self.receipt
+    }
+
+    /// Returns the canonical `shardschema` backend that currently owns the fence.
+    ///
+    /// This identifier is diagnostic only. Possessing it does not grant fence
+    /// authority; callers must retain this value and pass its live session
+    /// verification before making catalog retirement durable.
+    #[must_use]
+    pub const fn catalog_fence_backend_pid(&self) -> NonZeroU32 {
+        self.backend_pid
+    }
+
+    /// Releases the hidden target fence after its caller no longer needs it.
+    ///
+    /// Registry cleanup is best-effort and bounded. The catalog connection is
+    /// always closed, so a timed-out row lock leaves a stale backend identity
+    /// that the next acquisition can safely reclaim.
+    pub async fn release(self) -> ManagedLogicalSlotDropReceipt {
+        let Self {
+            receipt,
+            client,
+            connection_task,
+            backend_pid: _,
+            fence_id,
+        } = self;
+        let release_deadline = Instant::now() + TARGET_FENCE_RELEASE_TIMEOUT;
+        let _ = timeout_at(
+            release_deadline,
+            client.query_one(
+                RELEASE_TARGET_FENCE_SQL,
+                &[&receipt.target().name().as_str(), &fence_id.to_string()],
+            ),
+        )
+        .await;
+        drop(client);
+        connection_task.abort_and_wait().await;
+        receipt
+    }
+
+    pub(crate) async fn verify_held_until(
+        &self,
+        deadline: Instant,
+        duration: Duration,
+    ) -> Result<(), ManagedLogicalSlotTargetFenceError> {
+        timeout_at(deadline, set_statement_timeout(&self.client, deadline))
+            .await
+            .map_err(|_| ManagedLogicalSlotTargetFenceError::Timeout { duration })??;
+        let row = timeout_at(
+            deadline,
+            self.client.query_one(
+                VERIFY_TARGET_FENCE_SQL,
+                &[
+                    &self.receipt.target().name().as_str(),
+                    &self.fence_id.to_string(),
+                ],
+            ),
+        )
+        .await
+        .map_err(|_| ManagedLogicalSlotTargetFenceError::Timeout { duration })??;
+        let backend_pid = positive_nonzero_u32(
+            row.try_get(0)
+                .map_err(ManagedLogicalSlotTargetFenceError::Postgres)?,
+            "target_fence_backend_pid",
+        )
+        .map_err(|_| ManagedLogicalSlotTargetFenceError::BackendChanged)?;
+        if backend_pid != self.backend_pid {
+            return Err(ManagedLogicalSlotTargetFenceError::BackendChanged);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn catalog_client_mut(&mut self) -> &mut Client {
+        &mut self.client
+    }
+
+    pub(crate) const fn fence_id(&self) -> Uuid {
+        self.fence_id
+    }
+}
+
+/// Failure to prove that the same canonical `shardschema` session still holds a target fence.
+#[derive(Debug, Error)]
+pub enum ManagedLogicalSlotTargetFenceError {
+    /// Fence liveness could not be checked before the operation deadline.
+    #[error("managed logical-slot target-fence verification exceeded {duration:?}")]
+    Timeout {
+        /// Whole-operation deadline supplied by the catalog lifecycle.
+        duration: Duration,
+    },
+    /// The canonical `shardschema` session failed while its fence should have remained held.
+    #[error("managed logical-slot target-fence verification failed: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+    /// The live connection no longer identifies the backend that acquired the fence.
+    #[error("managed logical-slot target fence moved to another PostgreSQL backend")]
+    BackendChanged,
+}
+
+/// Failure while binding a successful physical creation receipt to a consumer slot.
+#[derive(Debug, Error)]
+pub enum ManagedLogicalSlotCatalogActivationError {
+    /// The deadline elapsed before `COMMIT` and the transaction was rolled back.
+    #[error("managed logical-slot catalog activation for {target:?} exceeded {duration:?}")]
+    OperationTimeout {
+        /// Exact generation-qualified target whose transaction was rolled back.
+        target: ManagedSlotTarget,
+        /// Whole-operation timeout supplied by the caller.
+        duration: Duration,
+    },
+    /// The bounded operation elapsed after dispatch may have begun.
+    #[error(
+        "managed logical-slot catalog activation outcome for {target:?} is unknown after {duration:?}"
+    )]
+    OutcomeUnknownDeadline {
+        /// Exact generation-qualified target that must be reconciled.
+        target: ManagedSlotTarget,
+        /// Whole-operation timeout supplied by the caller.
+        duration: Duration,
+    },
+    /// `COMMIT` may have succeeded before its response was lost.
+    #[error("managed logical-slot catalog activation outcome for {target:?} is unknown: {source}")]
+    OutcomeUnknownPostgres {
+        /// Exact generation-qualified target that must be reconciled.
+        target: ManagedSlotTarget,
+        /// Failure observed at the commit boundary.
+        #[source]
+        source: tokio_postgres::Error,
+    },
+    /// A pre-commit operation failed and the catalog transaction was rolled back.
+    #[error("managed logical-slot catalog activation was rejected: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+    /// The transaction could not be explicitly rolled back after a known failure.
+    #[error("managed logical-slot catalog activation rollback failed: {0}")]
+    RollbackFailed(#[source] tokio_postgres::Error),
+}
+
+impl ManagedLogicalSlotCatalogActivationError {
+    /// Returns whether the durable activation outcome needs exact catalog reconciliation.
+    #[must_use]
+    pub const fn outcome_is_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::OutcomeUnknownDeadline { .. } | Self::OutcomeUnknownPostgres { .. }
+        )
+    }
+}
+
+/// Failure while making a consumer-slot absence proof durable in `shardschema`.
+#[derive(Debug, Error)]
+pub enum ManagedLogicalSlotCatalogRetirementError {
+    /// The deadline elapsed before `COMMIT` and the transaction was rolled back.
+    #[error("managed logical-slot catalog retirement for {target:?} exceeded {duration:?}")]
+    OperationTimeout {
+        /// Exact generation-qualified target whose transaction was rolled back.
+        target: ManagedSlotTarget,
+        /// Whole-operation timeout supplied by the caller.
+        duration: Duration,
+    },
+    /// The bounded catalog operation elapsed before a known result was returned.
+    #[error(
+        "managed logical-slot catalog retirement outcome for {target:?} is unknown after {duration:?}"
+    )]
+    OutcomeUnknownDeadline {
+        /// Exact generation-qualified target that must be reconciled.
+        target: ManagedSlotTarget,
+        /// Whole-operation timeout supplied by the caller.
+        duration: Duration,
+    },
+    /// `COMMIT` may have succeeded before its response was lost.
+    #[error("managed logical-slot catalog retirement outcome for {target:?} is unknown: {source}")]
+    OutcomeUnknownPostgres {
+        /// Exact generation-qualified target that must be reconciled.
+        target: ManagedSlotTarget,
+        /// Failure observed at the commit boundary.
+        #[source]
+        source: tokio_postgres::Error,
+    },
+    /// A pre-commit operation failed and the catalog transaction was rolled back.
+    #[error("managed logical-slot catalog retirement was rejected: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+    /// The transaction could not be explicitly rolled back after a known failure.
+    #[error("managed logical-slot catalog retirement rollback failed: {0}")]
+    RollbackFailed(#[source] tokio_postgres::Error),
+    /// The canonical target fence was no longer provable across retirement.
+    #[error(
+        "managed logical-slot target fence for {target:?} was lost across catalog retirement: {source}"
+    )]
+    TargetFenceLost {
+        /// Exact generation-qualified target whose absence must be reconciled.
+        target: ManagedSlotTarget,
+        /// Canonical `shardschema` session liveness failure.
+        #[source]
+        source: ManagedLogicalSlotTargetFenceError,
+    },
+}
+
+impl ManagedLogicalSlotCatalogRetirementError {
+    /// Returns true when the durable catalog outcome must be reloaded.
+    #[must_use]
+    pub const fn outcome_is_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::OutcomeUnknownDeadline { .. }
+                | Self::OutcomeUnknownPostgres { .. }
+                | Self::TargetFenceLost { .. }
+        )
+    }
 }
 
 /// A receipt-authorized drop failure with explicit retry authority.
@@ -545,6 +1032,96 @@ pub enum LocalSlotMutationError {
     /// The connected database is not UTF8.
     #[error("managed slot mutation requires UTF8; observed {0:?}")]
     WrongEncoding(String),
+    /// The serialization connection did not target the authoritative catalog.
+    #[error(
+        "managed slot mutation target fencing requires the writable shardschema database; observed {0:?}"
+    )]
+    WrongCatalogFenceDatabase(String),
+    /// A standby catalog connection can return stale authorization state.
+    #[error("managed slot mutation target fencing requires writable shardschema")]
+    CatalogFenceInRecovery,
+    /// The catalog-fence backend changed while acquiring the target lock.
+    #[error("managed slot mutation catalog-fence backend changed")]
+    CatalogFenceBackendChanged,
+    /// A pre-dispatch failure could not durably abandon its creation barrier.
+    #[error(
+        "managed slot target {target:?} retains an unresolved catalog creation attempt after {original}; cleanup failed: {source}"
+    )]
+    CatalogCreationAttemptUnresolved {
+        /// Exact generation-qualified target that must be reconciled.
+        target: ManagedSlotTarget,
+        /// Pre-dispatch failure that required durable attempt cleanup.
+        original: Box<LocalSlotMutationError>,
+        /// Catalog failure while releasing the fence or abandoning the attempt.
+        #[source]
+        source: tokio_postgres::Error,
+    },
+    /// Bounded cleanup could not prove that the pre-dispatch barrier was abandoned.
+    #[error(
+        "managed slot target {target:?} creation-attempt cleanup after {original} exceeded {duration:?}; reconcile the durable attempt before retrying"
+    )]
+    CatalogCreationAttemptCleanupTimeout {
+        /// Exact generation-qualified target that must be reconciled.
+        target: ManagedSlotTarget,
+        /// Pre-dispatch failure that required durable attempt cleanup.
+        original: Box<LocalSlotMutationError>,
+        /// Cleanup bound.
+        duration: Duration,
+    },
+    /// The generation already has a durable create whose outcome must be reconciled.
+    #[error(
+        "managed slot target {0:?} already has an unresolved catalog creation attempt; reconcile it before retrying"
+    )]
+    CatalogCreationAttemptPending(ManagedSlotTarget),
+    /// No permanent catalog allocation authorizes the requested target.
+    #[error("managed slot target {0:?} has no exact shardschema allocation")]
+    CatalogAuthorizationMissing(ManagedSlotTarget),
+    /// More than one permanent allocation claimed one supposedly unique target.
+    #[error("managed slot target {0:?} has duplicate shardschema allocations")]
+    DuplicateCatalogAuthorization(ManagedSlotTarget),
+    /// A catalog authorization row could not be represented safely.
+    #[error("managed slot shardschema authorization field {0} is invalid")]
+    InvalidCatalogAuthorizationField(&'static str),
+    /// The durable allocation no longer matches the requested target or source.
+    #[error("managed slot target {0:?} no longer matches its shardschema allocation")]
+    CatalogAuthorizationIdentityChanged(ManagedSlotTarget),
+    /// The durable lifecycle no longer permits this local mutation.
+    #[error(
+        "managed slot target {target:?} is in catalog state {state:?}, which does not authorize {operation}"
+    )]
+    CatalogAuthorizationStateChanged {
+        /// Persistent mutation that was not dispatched.
+        operation: LocalSlotMutationOperation,
+        /// Exact target whose lifecycle changed.
+        target: ManagedSlotTarget,
+        /// Current durable lifecycle label.
+        state: String,
+    },
+    /// The cleanup capability does not match the durable probe retirement.
+    #[error("managed slot target {0:?} cleanup receipt no longer matches shardschema")]
+    CatalogCleanupReceiptChanged(ManagedSlotTarget),
+    /// The request was built from an older catalog snapshot.
+    #[error(
+        "managed slot target {target:?} expected catalog epoch {expected:?}, observed {observed:?}"
+    )]
+    StaleCatalogAuthorization {
+        /// Exact target that must be reloaded.
+        target: ManagedSlotTarget,
+        /// Epoch carried by the request.
+        expected: pgshard_types::CatalogEpoch,
+        /// Current authoritative epoch after target-fence acquisition.
+        observed: pgshard_types::CatalogEpoch,
+    },
+    /// The target connection used another logical database than its allocation.
+    #[error(
+        "managed slot mutation connected to database {observed:?}, expected catalog database {expected:?}"
+    )]
+    CatalogDatabaseMismatch {
+        /// Database name stored in the durable allocation.
+        expected: String,
+        /// Database name observed on the mutation connection.
+        observed: String,
+    },
     /// Backend, session role, effective role, or advisory-lock fence changed.
     #[error("managed slot mutation session identity or advisory-lock fence changed")]
     SessionFenceChanged,
@@ -789,6 +1366,37 @@ struct MutationSessionIdentity {
 struct PreparedServer {
     database_name: String,
     session: MutationSessionIdentity,
+    caller_advisory_lock_count: usize,
+}
+
+struct PreparedCatalogFence {
+    backend_pid: NonZeroU32,
+    fence_id: Uuid,
+    database_name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogAllocationKind {
+    Probe,
+    Consumer,
+}
+
+struct CatalogAuthorization {
+    kind: CatalogAllocationKind,
+    state: String,
+    target: ManagedSlotTarget,
+    role: ManagedLogicalSlotRole,
+    database_name: String,
+    source: ReplicationSourceIdentity,
+    creation_receipt_id: Option<ManagedLogicalSlotReceiptId>,
+    cleanup_receipt_id: Option<ManagedLogicalSlotReceiptId>,
+    creation_attempt_state: Option<String>,
+    restore_state: String,
+    shard_state: String,
+    attachment_state: Option<String>,
+    consumer_shard_state: Option<String>,
+    consumer_state: Option<String>,
+    logical_database_state: Option<String>,
 }
 
 struct PreparedCreate {
@@ -796,12 +1404,27 @@ struct PreparedCreate {
     statement: Statement,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogCreationAttemptStart {
+    Persisted,
+    TargetBusy,
+}
+
 enum PreparedDrop {
-    Absent,
+    Absent {
+        server: PreparedServer,
+    },
     Present {
         server: PreparedServer,
         statement: Statement,
     },
+}
+
+struct DropSessions {
+    catalog_client: Client,
+    catalog_connection_task: ConnectionTask,
+    mutation_client: Client,
+    mutation_connection_task: ConnectionTask,
 }
 
 struct ObservedSource {
@@ -832,7 +1455,11 @@ struct ObservedWalReceiver {
 ///
 /// The target must be absent, the source must match the connected `PostgreSQL`
 /// 18 endpoint, and the endpoint must have the requested primary or standby
-/// role. A standby-local request can only be constructed by consuming a fresh
+/// role. The first connection must target the authoritative writable
+/// `shardschema` database. It holds the hidden catalog-backed target fence and
+/// revalidates the durable allocation after any retry; the second connection
+/// performs the slot mutation against the allocation's exact database. A
+/// standby-local request can only be constructed by consuming a fresh
 /// [`CorrelatedStandbyReplicationPath`]. Its live receiver timeline, physical
 /// slot, feedback interval, feedback setting and slot-sync-worker generation
 /// are rechecked around dispatch. The caller's effective role and advisory
@@ -846,13 +1473,17 @@ struct ObservedWalReceiver {
 /// and must not be retried blindly. Cancelling this future has the same
 /// reconciliation requirement because the caller cannot know whether dispatch
 /// had already occurred.
-pub async fn create_managed_logical_slot<S, T>(
+pub async fn create_managed_logical_slot<CS, CT, S, T>(
+    catalog_client: Client,
+    catalog_connection: Connection<CS, CT>,
     client: Client,
     connection: Connection<S, T>,
     operation_timeout: CatalogOperationTimeout,
     request: ManagedLogicalSlotCreateRequest,
 ) -> Result<ManagedLogicalSlotReceipt, LocalSlotMutationError>
 where
+    CS: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    CT: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -861,21 +1492,81 @@ where
         request.into(),
         operation_timeout,
     );
+    // Persist capability identity before the target endpoint can observe a
+    // mutation. The durable pending attempt survives loss of this process or
+    // its catalog-fence backend and prevents the allocation from retiring
+    // beneath an in-flight create.
+    let receipt_id = ManagedLogicalSlotReceiptId::new();
+    let catalog_connection_task = ConnectionTask::new(tokio::spawn(catalog_connection));
     let connection_task = ConnectionTask::new(tokio::spawn(connection));
+    let catalog_fence = match bounded_preflight(
+        &context,
+        prepare_catalog_create_fence(&catalog_client, &context, receipt_id),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            drop(client);
+            connection_task.abort_and_wait().await;
+            let error = if matches!(
+                error,
+                LocalSlotMutationError::CatalogCreationAttemptPending(_)
+            ) {
+                error
+            } else {
+                abandon_after_known_create_failure(&catalog_client, &context, receipt_id, error)
+                    .await
+            };
+            drop(catalog_client);
+            catalog_connection_task.abort_and_wait().await;
+            return Err(error);
+        }
+    };
     let prepared = match bounded_preflight(&context, prepare_create(&client, &context)).await {
         Ok(prepared) => prepared,
         Err(error) => {
             drop(client);
             connection_task.abort_and_wait().await;
+            let error =
+                abandon_after_known_create_failure(&catalog_client, &context, receipt_id, error)
+                    .await;
+            drop(catalog_client);
+            catalog_connection_task.abort_and_wait().await;
             return Err(error);
         }
     };
+    if prepared.server.database_name != catalog_fence.database_name {
+        let error = LocalSlotMutationError::CatalogDatabaseMismatch {
+            expected: catalog_fence.database_name,
+            observed: prepared.server.database_name,
+        };
+        drop(client);
+        connection_task.abort_and_wait().await;
+        let error =
+            abandon_after_known_create_failure(&catalog_client, &context, receipt_id, error).await;
+        drop(catalog_client);
+        catalog_connection_task.abort_and_wait().await;
+        return Err(error);
+    }
     let result = timeout_at(
         context.deadline,
-        create_at_dispatch_boundary(&client, &context, prepared),
+        create_at_dispatch_boundary(&client, &context, prepared, receipt_id),
     )
     .await;
-    finish_mutation(client, connection_task, &context, result).await
+    let result = finish_mutation(client, connection_task, &context, result).await;
+    let result = match result {
+        Err(error) if !error.outcome_is_unknown() => {
+            Err(
+                abandon_after_known_create_failure(&catalog_client, &context, receipt_id, error)
+                    .await,
+            )
+        }
+        result => result,
+    };
+    drop(catalog_client);
+    catalog_connection_task.abort_and_wait().await;
+    result
 }
 
 /// Drops only the inactive exact slot represented by a successful create receipt.
@@ -883,7 +1574,11 @@ where
 /// An absent target is an idempotent known result. Any changed plugin,
 /// database, role, prepared-decoding boundary, activity, or progress fails
 /// before dispatch. A failed or timed-out drop after dispatch has an unknown
-/// persistent outcome and must be observed before reconciliation.
+/// persistent outcome and must be observed before reconciliation. A known
+/// absence returns the canonical `shardschema` connection-bound target fence;
+/// callers must retain it through any catalog COMMIT that makes the absence
+/// durable. The second connection performs deletion against the allocation's
+/// exact database.
 ///
 /// # Errors
 ///
@@ -891,13 +1586,17 @@ where
 /// [`ManagedLogicalSlotDropError::BeforeDispatch`]. An error after dispatch is
 /// explicitly outcome-unknown and carries no reusable receipt. Cancelling this
 /// future likewise requires exact-target reconciliation.
-pub async fn drop_managed_logical_slot<S, T>(
+pub async fn drop_managed_logical_slot<CS, CT, S, T>(
+    catalog_client: Client,
+    catalog_connection: Connection<CS, CT>,
     client: Client,
     connection: Connection<S, T>,
     operation_timeout: CatalogOperationTimeout,
     receipt: ManagedLogicalSlotReceipt,
-) -> Result<ManagedLogicalSlotDropOutcome, ManagedLogicalSlotDropError>
+) -> Result<ManagedLogicalSlotDropFence, ManagedLogicalSlotDropError>
 where
+    CS: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    CT: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -913,48 +1612,425 @@ where
         identity,
         operation_timeout,
     );
+    let catalog_connection_task = ConnectionTask::new(tokio::spawn(catalog_connection));
     let connection_task = ConnectionTask::new(tokio::spawn(connection));
+    let catalog_fence = match bounded_preflight(
+        &context,
+        prepare_catalog_fence(&catalog_client, &context, Some(receipt.receipt_id)),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            drop(client);
+            connection_task.abort_and_wait().await;
+            drop(catalog_client);
+            catalog_connection_task.abort_and_wait().await;
+            return Err(ManagedLogicalSlotDropError::BeforeDispatch {
+                receipt: Box::new(receipt),
+                source: error,
+            });
+        }
+    };
     let prepared =
         match bounded_preflight(&context, prepare_drop(&client, &context, creation_lsn)).await {
             Ok(present) => present,
             Err(error) => {
                 drop(client);
                 connection_task.abort_and_wait().await;
+                drop(catalog_client);
+                catalog_connection_task.abort_and_wait().await;
                 return Err(ManagedLogicalSlotDropError::BeforeDispatch {
                     receipt: Box::new(receipt),
                     source: error,
                 });
             }
         };
-    let PreparedDrop::Present { server, statement } = prepared else {
-        drop(client);
-        connection_task.abort_and_wait().await;
-        return Ok(ManagedLogicalSlotDropOutcome::AlreadyAbsent);
-    };
-    let result = timeout_at(
-        context.deadline,
-        drop_at_dispatch_boundary(&client, &context, &server, &statement),
-    )
-    .await;
-    classify_drop_result(
+    finish_prepared_drop(
+        DropSessions {
+            catalog_client,
+            catalog_connection_task,
+            mutation_client: client,
+            mutation_connection_task: connection_task,
+        },
+        &context,
+        catalog_fence,
+        prepared,
         receipt,
-        finish_mutation(client, connection_task, &context, result).await,
     )
+    .await
 }
 
-fn classify_drop_result(
-    receipt: ManagedLogicalSlotReceipt,
-    result: Result<ManagedLogicalSlotDropOutcome, LocalSlotMutationError>,
-) -> Result<ManagedLogicalSlotDropOutcome, ManagedLogicalSlotDropError> {
-    match result {
-        Ok(outcome) => Ok(outcome),
-        Err(source) if source.outcome_is_unknown() => {
-            Err(ManagedLogicalSlotDropError::OutcomeUnknown(source))
+/// Atomically binds an exact physical creation receipt to its consumer-slot allocation.
+///
+/// The receipt capability is supplied by the caller and is never reloaded from
+/// `shardschema`. A failed `COMMIT` response is outcome-unknown and must be
+/// reconciled with the same receipt before any retry.
+///
+/// # Errors
+///
+/// Returns a known rejection when the receipt, allocation, or activation
+/// boundary does not match. Deadline and `COMMIT` response loss are reported as
+/// outcome-unknown.
+pub async fn activate_managed_consumer_slot<S, T>(
+    mut client: Client,
+    connection: Connection<S, T>,
+    operation_timeout: CatalogOperationTimeout,
+    receipt: &ManagedLogicalSlotReceipt,
+) -> Result<(), ManagedLogicalSlotCatalogActivationError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let duration = operation_timeout.get();
+    let deadline = Instant::now() + duration;
+    let target = receipt.target().clone();
+    let connection_task = ConnectionTask::new(tokio::spawn(connection));
+    let result = timeout_at(
+        deadline,
+        execute_consumer_catalog_activation(&mut client, deadline, duration, receipt),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(ManagedLogicalSlotCatalogActivationError::OutcomeUnknownDeadline { target, duration })
+    });
+    drop(client);
+    connection_task.abort_and_wait().await;
+    result
+}
+
+async fn execute_consumer_catalog_activation(
+    client: &mut Client,
+    deadline: Instant,
+    duration: Duration,
+    receipt: &ManagedLogicalSlotReceipt,
+) -> Result<(), ManagedLogicalSlotCatalogActivationError> {
+    client.batch_execute("DISCARD ALL").await?;
+    let transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    if let Err(source) = set_catalog_retirement_timeouts(&transaction, deadline).await {
+        return rollback_consumer_catalog_activation(transaction, source.into()).await;
+    }
+    let generation = receipt.target().generation().as_uuid().to_string();
+    let receipt_id = receipt.receipt_id().as_uuid().to_string();
+    let creation_lsn = receipt.creation_lsn();
+    let consistent_point = format!(
+        "{:X}/{:X}",
+        creation_lsn.0 >> 32,
+        creation_lsn.0 & u64::from(u32::MAX)
+    );
+    if let Err(source) = transaction
+        .query_one(
+            ACTIVATE_CATALOG_CONSUMER_SLOT_SQL,
+            &[&generation, &receipt_id, &consistent_point],
+        )
+        .await
+    {
+        return rollback_consumer_catalog_activation(transaction, source.into()).await;
+    }
+    if let Err(source) = transaction
+        .batch_execute(DISABLE_LOCAL_STATEMENT_TIMEOUT_SQL)
+        .await
+    {
+        return rollback_consumer_catalog_activation(transaction, source.into()).await;
+    }
+    if Instant::now() >= deadline {
+        return rollback_consumer_catalog_activation(
+            transaction,
+            ManagedLogicalSlotCatalogActivationError::OperationTimeout {
+                target: receipt.target().clone(),
+                duration,
+            },
+        )
+        .await;
+    }
+    transaction.commit().await.map_err(|source| {
+        ManagedLogicalSlotCatalogActivationError::OutcomeUnknownPostgres {
+            target: receipt.target().clone(),
+            source,
         }
-        Err(source) => Err(ManagedLogicalSlotDropError::BeforeDispatch {
+    })
+}
+
+async fn rollback_consumer_catalog_activation<T>(
+    transaction: Transaction<'_>,
+    error: ManagedLogicalSlotCatalogActivationError,
+) -> Result<T, ManagedLogicalSlotCatalogActivationError> {
+    transaction
+        .rollback()
+        .await
+        .map_err(ManagedLogicalSlotCatalogActivationError::RollbackFailed)?;
+    Err(error)
+}
+
+/// Commits consumer-slot retirement while the exact physical absence remains fenced.
+///
+/// The hidden creation receipt and generation-qualified target are taken from
+/// `absence`; callers cannot substitute catalog authority. The transaction is
+/// executed by the same canonical `shardschema` backend that has held the hidden
+/// target fence since the final physical observation. Its opaque fence ID is
+/// checked on both sides of `COMMIT` and remains owned by `absence` afterward.
+///
+/// # Errors
+///
+/// A database rejection before `COMMIT` is returned as a known rolled-back
+/// result. A deadline, failed `COMMIT` response, or lost fence is explicitly
+/// outcome-unknown and requires loading the exact durable generation before
+/// any further reconciliation.
+pub async fn complete_managed_consumer_slot_retirement(
+    operation_timeout: CatalogOperationTimeout,
+    absence: &mut ManagedLogicalSlotDropFence,
+) -> Result<(), ManagedLogicalSlotCatalogRetirementError> {
+    let duration = operation_timeout.get();
+    let deadline = Instant::now() + duration;
+    let target = absence.receipt().target().clone();
+    let creation_receipt_id = absence.receipt().receipt_id().as_uuid().to_string();
+    let fence_id = absence.fence_id().to_string();
+
+    absence
+        .verify_held_until(deadline, duration)
+        .await
+        .map_err(
+            |source| ManagedLogicalSlotCatalogRetirementError::TargetFenceLost {
+                target: target.clone(),
+                source,
+            },
+        )?;
+    let result = timeout_at(
+        deadline,
+        execute_consumer_catalog_retirement(
+            absence.catalog_client_mut(),
+            deadline,
+            duration,
+            &target,
+            &creation_receipt_id,
+            &fence_id,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(
+            ManagedLogicalSlotCatalogRetirementError::OutcomeUnknownDeadline {
+                target: target.clone(),
+                duration,
+            },
+        )
+    });
+    let fence_result = absence.verify_held_until(deadline, duration).await;
+    match (result, fence_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(source)) => {
+            Err(ManagedLogicalSlotCatalogRetirementError::TargetFenceLost { target, source })
+        }
+    }
+}
+
+async fn execute_consumer_catalog_retirement(
+    client: &mut Client,
+    deadline: Instant,
+    duration: Duration,
+    target: &ManagedSlotTarget,
+    creation_receipt_id: &str,
+    fence_id: &str,
+) -> Result<(), ManagedLogicalSlotCatalogRetirementError> {
+    let slot_generation = target.generation().as_uuid().to_string();
+    let slot_name = target.name().as_str();
+    let transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await
+        .map_err(ManagedLogicalSlotCatalogRetirementError::Postgres)?;
+    if let Err(source) = set_catalog_retirement_timeouts(&transaction, deadline).await {
+        return rollback_consumer_catalog_retirement(transaction, source.into()).await;
+    }
+    if let Err(source) = transaction
+        .query_one(
+            COMPLETE_CATALOG_CONSUMER_RETIREMENT_SQL,
+            &[
+                &slot_generation.as_str(),
+                &slot_name,
+                &creation_receipt_id,
+                &fence_id,
+            ],
+        )
+        .await
+    {
+        return rollback_consumer_catalog_retirement(transaction, source.into()).await;
+    }
+    if let Err(source) = transaction
+        .batch_execute(DISABLE_LOCAL_STATEMENT_TIMEOUT_SQL)
+        .await
+    {
+        return rollback_consumer_catalog_retirement(transaction, source.into()).await;
+    }
+    if Instant::now() >= deadline {
+        return rollback_consumer_catalog_retirement(
+            transaction,
+            ManagedLogicalSlotCatalogRetirementError::OperationTimeout {
+                target: target.clone(),
+                duration,
+            },
+        )
+        .await;
+    }
+    transaction.commit().await.map_err(|source| {
+        ManagedLogicalSlotCatalogRetirementError::OutcomeUnknownPostgres {
+            target: target.clone(),
+            source,
+        }
+    })
+}
+
+async fn rollback_consumer_catalog_retirement<T>(
+    transaction: Transaction<'_>,
+    error: ManagedLogicalSlotCatalogRetirementError,
+) -> Result<T, ManagedLogicalSlotCatalogRetirementError> {
+    transaction
+        .rollback()
+        .await
+        .map_err(ManagedLogicalSlotCatalogRetirementError::RollbackFailed)?;
+    Err(error)
+}
+
+async fn set_catalog_retirement_timeouts(
+    transaction: &Transaction<'_>,
+    deadline: Instant,
+) -> Result<(), tokio_postgres::Error> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let statement = remaining
+        .saturating_sub(SERVER_STATEMENT_TIMEOUT_HEADROOM)
+        .max(Duration::from_millis(1));
+    let transaction_timeout = remaining.saturating_add(SERVER_TRANSACTION_TIMEOUT_GRACE);
+    let statement = postgres_milliseconds(statement);
+    let transaction_timeout = postgres_milliseconds(transaction_timeout);
+    transaction
+        .query_one(
+            SET_LOCAL_CATALOG_RETIREMENT_TIMEOUTS_SQL,
+            &[&statement, &transaction_timeout],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn finish_prepared_drop(
+    sessions: DropSessions,
+    context: &MutationContext,
+    catalog_fence: PreparedCatalogFence,
+    prepared: PreparedDrop,
+    receipt: ManagedLogicalSlotReceipt,
+) -> Result<ManagedLogicalSlotDropFence, ManagedLogicalSlotDropError> {
+    let DropSessions {
+        catalog_client,
+        catalog_connection_task,
+        mutation_client: client,
+        mutation_connection_task: connection_task,
+    } = sessions;
+    let mutation_database = prepared_drop_database(&prepared);
+    if mutation_database != catalog_fence.database_name {
+        let error = LocalSlotMutationError::CatalogDatabaseMismatch {
+            expected: catalog_fence.database_name,
+            observed: mutation_database.to_owned(),
+        };
+        drop(client);
+        connection_task.abort_and_wait().await;
+        drop(catalog_client);
+        catalog_connection_task.abort_and_wait().await;
+        return Err(ManagedLogicalSlotDropError::BeforeDispatch {
+            receipt: Box::new(receipt),
+            source: error,
+        });
+    }
+    match prepared {
+        PreparedDrop::Absent { .. } => {
+            drop(client);
+            connection_task.abort_and_wait().await;
+            Ok(ManagedLogicalSlotDropFence::new(
+                drop_receipt(receipt, ManagedLogicalSlotDropOutcome::AlreadyAbsent),
+                catalog_client,
+                catalog_connection_task,
+                catalog_fence.backend_pid,
+                catalog_fence.fence_id,
+            ))
+        }
+        PreparedDrop::Present { server, statement } => {
+            let result = timeout_at(
+                context.deadline,
+                drop_at_dispatch_boundary(&client, context, &server, &statement),
+            )
+            .await;
+            match result {
+                Ok(Ok(outcome)) => {
+                    drop(client);
+                    connection_task.abort_and_wait().await;
+                    Ok(ManagedLogicalSlotDropFence::new(
+                        drop_receipt(receipt, outcome),
+                        catalog_client,
+                        catalog_connection_task,
+                        catalog_fence.backend_pid,
+                        catalog_fence.fence_id,
+                    ))
+                }
+                Ok(Err(source)) => {
+                    drop(client);
+                    connection_task.abort_and_wait().await;
+                    drop(catalog_client);
+                    catalog_connection_task.abort_and_wait().await;
+                    classify_drop_failure(receipt, source)
+                }
+                Err(_) => {
+                    drop(client);
+                    connection_task.abort_and_wait().await;
+                    drop(catalog_client);
+                    catalog_connection_task.abort_and_wait().await;
+                    Err(ManagedLogicalSlotDropError::OutcomeUnknown(
+                        context.unknown(LocalSlotMutationUnknownCause::Deadline {
+                            duration: context.duration,
+                        }),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn prepared_drop_database(prepared: &PreparedDrop) -> &str {
+    match prepared {
+        PreparedDrop::Absent { server } | PreparedDrop::Present { server, .. } => {
+            &server.database_name
+        }
+    }
+}
+
+fn classify_drop_failure(
+    receipt: ManagedLogicalSlotReceipt,
+    source: LocalSlotMutationError,
+) -> Result<ManagedLogicalSlotDropFence, ManagedLogicalSlotDropError> {
+    if source.outcome_is_unknown() {
+        Err(ManagedLogicalSlotDropError::OutcomeUnknown(source))
+    } else {
+        Err(ManagedLogicalSlotDropError::BeforeDispatch {
             receipt: Box::new(receipt),
             source,
-        }),
+        })
+    }
+}
+
+fn drop_receipt(
+    receipt: ManagedLogicalSlotReceipt,
+    outcome: ManagedLogicalSlotDropOutcome,
+) -> ManagedLogicalSlotDropReceipt {
+    ManagedLogicalSlotDropReceipt {
+        receipt_id: receipt.receipt_id,
+        target: receipt.target,
+        source: receipt.source,
+        role: receipt.role,
+        database_name: receipt.database_name,
+        outcome,
     }
 }
 
@@ -983,11 +2059,640 @@ async fn finish_mutation<V>(
     }
 }
 
+async fn prepare_catalog_fence(
+    client: &Client,
+    context: &MutationContext,
+    cleanup_receipt_id: Option<ManagedLogicalSlotReceiptId>,
+) -> Result<PreparedCatalogFence, LocalSlotMutationError> {
+    client
+        .batch_execute("DISCARD ALL")
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    set_statement_timeout(client, context.preflight_deadline())
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let before = client
+        .query_one(CATALOG_FENCE_REQUIREMENTS_SQL, &[])
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let backend_pid = validate_catalog_fence_requirements(&before, context)?;
+
+    let fence_id = acquire_catalog_target_fence(client, context, backend_pid).await?;
+
+    set_statement_timeout(client, context.preflight_deadline())
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let after = client
+        .query_one(CATALOG_FENCE_REQUIREMENTS_SQL, &[])
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let after_backend_pid = validate_catalog_fence_requirements(&after, context)?;
+    if after_backend_pid != backend_pid {
+        return Err(LocalSlotMutationError::CatalogFenceBackendChanged);
+    }
+
+    set_statement_timeout(client, context.preflight_deadline())
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let generation = context.identity.target.generation().as_uuid().to_string();
+    let cleanup_receipt_id = cleanup_receipt_id
+        .expect("drop catalog preflight always carries the exact cleanup receipt");
+    let cleanup_receipt_text = cleanup_receipt_id.as_uuid().to_string();
+    let rows = client
+        .query(
+            CATALOG_SLOT_AUTHORIZATION_SQL,
+            &[
+                &generation,
+                &context.identity.target.name().as_str(),
+                &cleanup_receipt_text,
+            ],
+        )
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let authorization = match rows.as_slice() {
+        [] => {
+            return Err(LocalSlotMutationError::CatalogAuthorizationMissing(
+                context.identity.target.clone(),
+            ));
+        }
+        [row] => parse_catalog_authorization(row)?,
+        _ => {
+            return Err(LocalSlotMutationError::DuplicateCatalogAuthorization(
+                context.identity.target.clone(),
+            ));
+        }
+    };
+    validate_catalog_authorization(&authorization, context, None, Some(cleanup_receipt_id))?;
+    client
+        .query_one(RESET_STATEMENT_TIMEOUT_SQL, &[])
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    Ok(PreparedCatalogFence {
+        backend_pid,
+        fence_id,
+        database_name: authorization.database_name,
+    })
+}
+
+async fn prepare_catalog_create_fence(
+    client: &Client,
+    context: &MutationContext,
+    creation_attempt_id: ManagedLogicalSlotReceiptId,
+) -> Result<PreparedCatalogFence, LocalSlotMutationError> {
+    client
+        .batch_execute("DISCARD ALL")
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    set_statement_timeout(client, context.preflight_deadline())
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let before = client
+        .query_one(CATALOG_FENCE_REQUIREMENTS_SQL, &[])
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let backend_pid = validate_catalog_fence_requirements(&before, context)?;
+
+    let attempt_start =
+        begin_catalog_creation_attempt(client, context, creation_attempt_id).await?;
+
+    async {
+        let fence_id = acquire_catalog_target_fence(client, context, backend_pid).await?;
+
+        if attempt_start == CatalogCreationAttemptStart::TargetBusy {
+            set_statement_timeout(client, context.preflight_deadline())
+                .await
+                .map_err(|source| context.preflight_postgres(source))?;
+            let retry =
+                begin_catalog_creation_attempt(client, context, creation_attempt_id).await?;
+            if retry != CatalogCreationAttemptStart::Persisted {
+                return Err(LocalSlotMutationError::CatalogFenceBackendChanged);
+            }
+        }
+
+        set_statement_timeout(client, context.preflight_deadline())
+            .await
+            .map_err(|source| context.preflight_postgres(source))?;
+        let after = client
+            .query_one(CATALOG_FENCE_REQUIREMENTS_SQL, &[])
+            .await
+            .map_err(|source| context.preflight_postgres(source))?;
+        let after_backend_pid = validate_catalog_fence_requirements(&after, context)?;
+        if after_backend_pid != backend_pid {
+            return Err(LocalSlotMutationError::CatalogFenceBackendChanged);
+        }
+
+        set_statement_timeout(client, context.preflight_deadline())
+            .await
+            .map_err(|source| context.preflight_postgres(source))?;
+        let generation = context.identity.target.generation().as_uuid().to_string();
+        let creation_attempt_text = creation_attempt_id.as_uuid().to_string();
+        let rows = client
+            .query(
+                CATALOG_SLOT_AUTHORIZATION_SQL,
+                &[
+                    &generation,
+                    &context.identity.target.name().as_str(),
+                    &creation_attempt_text,
+                ],
+            )
+            .await
+            .map_err(|source| context.preflight_postgres(source))?;
+        let authorization = match rows.as_slice() {
+            [] => {
+                return Err(LocalSlotMutationError::CatalogAuthorizationMissing(
+                    context.identity.target.clone(),
+                ));
+            }
+            [row] => parse_catalog_authorization(row)?,
+            _ => {
+                return Err(LocalSlotMutationError::DuplicateCatalogAuthorization(
+                    context.identity.target.clone(),
+                ));
+            }
+        };
+        validate_catalog_authorization(&authorization, context, Some(creation_attempt_id), None)?;
+        client
+            .query_one(RESET_STATEMENT_TIMEOUT_SQL, &[])
+            .await
+            .map_err(|source| context.preflight_postgres(source))?;
+        Ok(PreparedCatalogFence {
+            backend_pid,
+            fence_id,
+            database_name: authorization.database_name,
+        })
+    }
+    .await
+}
+
+async fn begin_catalog_creation_attempt(
+    client: &Client,
+    context: &MutationContext,
+    creation_attempt_id: ManagedLogicalSlotReceiptId,
+) -> Result<CatalogCreationAttemptStart, LocalSlotMutationError> {
+    let source = context.identity.source;
+    let database_oid = i64::from(source.database_oid());
+    let timeline = i64::from(source.timeline());
+    let catalog_epoch = i64::try_from(source.catalog_epoch().0)
+        .map_err(|_| LocalSlotMutationError::InvalidCatalogAuthorizationField("catalog_epoch"))?;
+    let row = match client
+        .query_one(
+            BEGIN_CATALOG_CREATION_ATTEMPT_SQL,
+            &[
+                &context.identity.target.generation().as_uuid().to_string(),
+                &context.identity.target.name().as_str(),
+                &context.identity.role.catalog_label(),
+                &source.system_identifier().to_string(),
+                &database_oid,
+                &timeline,
+                &source.restore_incarnation().to_string(),
+                &catalog_epoch,
+                &creation_attempt_id.as_uuid().to_string(),
+            ],
+        )
+        .await
+    {
+        Ok(row) => row,
+        Err(source)
+            if source
+                .as_db_error()
+                .is_some_and(|error| error.code() == &SqlState::LOCK_NOT_AVAILABLE) =>
+        {
+            return Ok(CatalogCreationAttemptStart::TargetBusy);
+        }
+        Err(source)
+            if source.as_db_error().is_some_and(|error| {
+                error.code() == &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+                    && error.message() == "managed slot already has an unresolved creation attempt"
+            }) =>
+        {
+            return Err(LocalSlotMutationError::CatalogCreationAttemptPending(
+                context.identity.target.clone(),
+            ));
+        }
+        Err(source) => return Err(context.preflight_postgres(source)),
+    };
+    let allocation_kind: String = row
+        .try_get(0)
+        .map_err(|source| context.preflight_postgres(source))?;
+    if !matches!(allocation_kind.as_str(), "probe" | "consumer") {
+        return Err(LocalSlotMutationError::InvalidCatalogAuthorizationField(
+            "allocation_kind",
+        ));
+    }
+    Ok(CatalogCreationAttemptStart::Persisted)
+}
+
+async fn abandon_after_known_create_failure(
+    client: &Client,
+    context: &MutationContext,
+    creation_attempt_id: ManagedLogicalSlotReceiptId,
+    original: LocalSlotMutationError,
+) -> LocalSlotMutationError {
+    let cleanup_deadline = Instant::now() + context.duration;
+    let cleanup = async {
+        set_statement_timeout(client, cleanup_deadline).await?;
+        let _: bool = client
+            .query_one(
+                RELEASE_CURRENT_TARGET_FENCE_SQL,
+                &[&context.identity.target.name().as_str()],
+            )
+            .await?
+            .try_get(0)?;
+        set_statement_timeout(client, cleanup_deadline).await?;
+        client
+            .query_one(
+                ABANDON_CATALOG_CREATION_ATTEMPT_SQL,
+                &[
+                    &context.identity.target.generation().as_uuid().to_string(),
+                    &context.identity.target.name().as_str(),
+                    &creation_attempt_id.as_uuid().to_string(),
+                ],
+            )
+            .await?;
+        Ok::<(), tokio_postgres::Error>(())
+    };
+    match timeout_at(cleanup_deadline, cleanup).await {
+        Ok(Ok(())) => original,
+        Ok(Err(source)) => LocalSlotMutationError::CatalogCreationAttemptUnresolved {
+            target: context.identity.target.clone(),
+            original: Box::new(original),
+            source,
+        },
+        Err(_) => LocalSlotMutationError::CatalogCreationAttemptCleanupTimeout {
+            target: context.identity.target.clone(),
+            original: Box::new(original),
+            duration: context.duration,
+        },
+    }
+}
+
+fn validate_catalog_fence_requirements(
+    row: &tokio_postgres::Row,
+    context: &MutationContext,
+) -> Result<NonZeroU32, LocalSlotMutationError> {
+    let version: i32 = row
+        .try_get(0)
+        .map_err(|source| context.preflight_postgres(source))?;
+    if version < MIN_POSTGRES_VERSION_NUM {
+        return Err(LocalSlotMutationError::UnsupportedPostgresVersion(version));
+    }
+    let database: String = row
+        .try_get(1)
+        .map_err(|source| context.preflight_postgres(source))?;
+    if database != SHARDSCHEMA_DATABASE {
+        return Err(LocalSlotMutationError::WrongCatalogFenceDatabase(database));
+    }
+    let encoding: String = row
+        .try_get(2)
+        .map_err(|source| context.preflight_postgres(source))?;
+    if encoding != "UTF8" {
+        return Err(LocalSlotMutationError::WrongEncoding(encoding));
+    }
+    let recovery: bool = row
+        .try_get(3)
+        .map_err(|source| context.preflight_postgres(source))?;
+    if recovery {
+        return Err(LocalSlotMutationError::CatalogFenceInRecovery);
+    }
+    positive_nonzero_u32(
+        row.try_get(4)
+            .map_err(|source| context.preflight_postgres(source))?,
+        "catalog_fence_backend_pid",
+    )
+}
+
+async fn acquire_catalog_target_fence(
+    client: &Client,
+    context: &MutationContext,
+    expected_backend_pid: NonZeroU32,
+) -> Result<Uuid, LocalSlotMutationError> {
+    loop {
+        set_statement_timeout(client, context.preflight_deadline())
+            .await
+            .map_err(|source| context.preflight_postgres(source))?;
+        match client
+            .query_one(
+                ACQUIRE_TARGET_FENCE_SQL,
+                &[&context.identity.target.name().as_str()],
+            )
+            .await
+        {
+            Ok(row) => return validate_acquired_catalog_fence(&row, expected_backend_pid),
+            Err(source)
+                if source
+                    .as_db_error()
+                    .is_some_and(|error| error.code() == &SqlState::LOCK_NOT_AVAILABLE) =>
+            {
+                sleep(TARGET_FENCE_RETRY_INTERVAL).await;
+            }
+            Err(source) => return Err(context.preflight_postgres(source)),
+        }
+    }
+}
+
+fn validate_acquired_catalog_fence(
+    row: &tokio_postgres::Row,
+    expected_backend_pid: NonZeroU32,
+) -> Result<Uuid, LocalSlotMutationError> {
+    let fence_text: String = row
+        .try_get(0)
+        .map_err(|_| LocalSlotMutationError::InvalidCatalogAuthorizationField("target_fence_id"))?;
+    let fence_id = Uuid::parse_str(&fence_text)
+        .ok()
+        .filter(|value| !value.is_nil())
+        .ok_or(LocalSlotMutationError::InvalidCatalogAuthorizationField(
+            "target_fence_id",
+        ))?;
+    let backend_pid = positive_nonzero_u32(
+        row.try_get(1).map_err(|_| {
+            LocalSlotMutationError::InvalidCatalogAuthorizationField("target_fence_backend_pid")
+        })?,
+        "target_fence_backend_pid",
+    )
+    .map_err(|_| {
+        LocalSlotMutationError::InvalidCatalogAuthorizationField("target_fence_backend_pid")
+    })?;
+    if backend_pid != expected_backend_pid {
+        return Err(LocalSlotMutationError::CatalogFenceBackendChanged);
+    }
+    Ok(fence_id)
+}
+
+fn parse_catalog_authorization(
+    row: &tokio_postgres::Row,
+) -> Result<CatalogAuthorization, LocalSlotMutationError> {
+    let field = |name| LocalSlotMutationError::InvalidCatalogAuthorizationField(name);
+    let kind = match row
+        .try_get::<_, String>("allocation_kind")
+        .map_err(|_| field("allocation_kind"))?
+        .as_str()
+    {
+        "probe" => CatalogAllocationKind::Probe,
+        "consumer" => CatalogAllocationKind::Consumer,
+        _ => return Err(field("allocation_kind")),
+    };
+    let generation_text: String = row
+        .try_get("slot_generation")
+        .map_err(|_| field("slot_generation"))?;
+    let generation = Uuid::parse_str(&generation_text)
+        .ok()
+        .and_then(|value| SlotGeneration::new(value).ok())
+        .ok_or_else(|| field("slot_generation"))?;
+    let slot_name: String = row.try_get("slot_name").map_err(|_| field("slot_name"))?;
+    let target = ManagedSlotTarget::new(
+        ReplicationSlotName::new(slot_name).map_err(|_| field("slot_name"))?,
+        generation,
+    )
+    .map_err(|_| field("slot_name"))?;
+    let role = match row
+        .try_get::<_, String>("slot_role")
+        .map_err(|_| field("slot_role"))?
+        .as_str()
+    {
+        "primary-anchor" => ManagedLogicalSlotRole::PrimaryFailoverAnchor,
+        "standby-decoder" => ManagedLogicalSlotRole::StandbyLocalDecoder,
+        _ => return Err(field("slot_role")),
+    };
+    let system_identifier = row
+        .try_get::<_, String>("system_identifier")
+        .map_err(|_| field("system_identifier"))?
+        .parse::<u64>()
+        .map_err(|_| field("system_identifier"))?;
+    let database_oid = u32::try_from(
+        row.try_get::<_, i64>("database_oid")
+            .map_err(|_| field("database_oid"))?,
+    )
+    .map_err(|_| field("database_oid"))?;
+    let timeline = u32::try_from(
+        row.try_get::<_, i64>("source_timeline")
+            .map_err(|_| field("source_timeline"))?,
+    )
+    .map_err(|_| field("source_timeline"))?;
+    let restore_incarnation = Uuid::parse_str(
+        &row.try_get::<_, String>("restore_incarnation")
+            .map_err(|_| field("restore_incarnation"))?,
+    )
+    .map_err(|_| field("restore_incarnation"))?;
+    let catalog_epoch = u64::try_from(
+        row.try_get::<_, i64>("catalog_epoch")
+            .map_err(|_| field("catalog_epoch"))?,
+    )
+    .map_err(|_| field("catalog_epoch"))?;
+    let source = ReplicationSourceIdentity::new(
+        system_identifier,
+        timeline,
+        database_oid,
+        restore_incarnation,
+        CatalogEpoch(catalog_epoch),
+    )
+    .map_err(|_| field("source_identity"))?;
+    Ok(CatalogAuthorization {
+        kind,
+        state: row.try_get("state").map_err(|_| field("state"))?,
+        target,
+        role,
+        database_name: row
+            .try_get("database_name")
+            .map_err(|_| field("database_name"))?,
+        source,
+        creation_receipt_id: parse_catalog_receipt_id(row, "creation_receipt_id")?,
+        cleanup_receipt_id: parse_catalog_receipt_id(row, "cleanup_receipt_id")?,
+        creation_attempt_state: row
+            .try_get("creation_attempt_state")
+            .map_err(|_| field("creation_attempt_state"))?,
+        restore_state: row
+            .try_get("restore_state")
+            .map_err(|_| field("restore_state"))?,
+        shard_state: row
+            .try_get("shard_state")
+            .map_err(|_| field("shard_state"))?,
+        attachment_state: row
+            .try_get("attachment_state")
+            .map_err(|_| field("attachment_state"))?,
+        consumer_shard_state: row
+            .try_get("consumer_shard_state")
+            .map_err(|_| field("consumer_shard_state"))?,
+        consumer_state: row
+            .try_get("consumer_state")
+            .map_err(|_| field("consumer_state"))?,
+        logical_database_state: row
+            .try_get("logical_database_state")
+            .map_err(|_| field("logical_database_state"))?,
+    })
+}
+
+fn parse_catalog_receipt_id(
+    row: &tokio_postgres::Row,
+    name: &'static str,
+) -> Result<Option<ManagedLogicalSlotReceiptId>, LocalSlotMutationError> {
+    let value: Option<String> = row
+        .try_get(name)
+        .map_err(|_| LocalSlotMutationError::InvalidCatalogAuthorizationField(name))?;
+    value
+        .map(|value| {
+            Uuid::parse_str(&value)
+                .ok()
+                .and_then(ManagedLogicalSlotReceiptId::from_uuid)
+                .ok_or(LocalSlotMutationError::InvalidCatalogAuthorizationField(
+                    name,
+                ))
+        })
+        .transpose()
+}
+
+fn validate_catalog_authorization(
+    authorization: &CatalogAuthorization,
+    context: &MutationContext,
+    creation_attempt_id: Option<ManagedLogicalSlotReceiptId>,
+    cleanup_receipt_id: Option<ManagedLogicalSlotReceiptId>,
+) -> Result<(), LocalSlotMutationError> {
+    validate_catalog_authorization_identity_and_parent_state(authorization, context)?;
+    match context.operation {
+        LocalSlotMutationOperation::Create => {
+            validate_catalog_create_authorization(authorization, context, creation_attempt_id)
+        }
+        LocalSlotMutationOperation::Drop => {
+            validate_catalog_drop_authorization(authorization, context, cleanup_receipt_id)
+        }
+    }
+}
+
+fn validate_catalog_authorization_identity_and_parent_state(
+    authorization: &CatalogAuthorization,
+    context: &MutationContext,
+) -> Result<(), LocalSlotMutationError> {
+    let expected = context.identity.source;
+    let observed = authorization.source;
+    let exact_identity = authorization.target == context.identity.target
+        && authorization.role == context.identity.role
+        && observed.system_identifier() == expected.system_identifier()
+        && observed.timeline() == expected.timeline()
+        && observed.database_oid() == expected.database_oid()
+        && observed.restore_incarnation() == expected.restore_incarnation();
+    if !exact_identity {
+        return Err(LocalSlotMutationError::CatalogAuthorizationIdentityChanged(
+            context.identity.target.clone(),
+        ));
+    }
+    let shard_is_eligible = match context.operation {
+        LocalSlotMutationOperation::Create => matches!(
+            authorization.shard_state.as_str(),
+            "provisioning" | "active"
+        ),
+        LocalSlotMutationOperation::Drop => matches!(
+            authorization.shard_state.as_str(),
+            "provisioning" | "active" | "draining"
+        ),
+    };
+    if authorization.restore_state != "active" || !shard_is_eligible {
+        return Err(LocalSlotMutationError::CatalogAuthorizationStateChanged {
+            operation: context.operation,
+            target: context.identity.target.clone(),
+            state: format!(
+                "{} restore/{} shard/{} slot",
+                authorization.restore_state, authorization.shard_state, authorization.state
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_catalog_create_authorization(
+    authorization: &CatalogAuthorization,
+    context: &MutationContext,
+    creation_attempt_id: Option<ManagedLogicalSlotReceiptId>,
+) -> Result<(), LocalSlotMutationError> {
+    creation_attempt_id.expect("create always carries a durable attempt receipt");
+    let lifecycle_ready = authorization.state == "allocated"
+        && authorization.creation_attempt_state.as_deref() == Some("pending")
+        && match authorization.kind {
+            CatalogAllocationKind::Probe => {
+                authorization.creation_receipt_id.is_none()
+                    && authorization.cleanup_receipt_id.is_none()
+            }
+            CatalogAllocationKind::Consumer => {
+                authorization.attachment_state.as_deref() == Some("staged")
+                    && matches!(
+                        authorization.consumer_shard_state.as_deref(),
+                        Some("provisioning" | "fenced")
+                    )
+                    && authorization.consumer_state.as_deref() == Some("active")
+                    && authorization.logical_database_state.as_deref() == Some("active")
+            }
+        };
+    if !lifecycle_ready {
+        return Err(LocalSlotMutationError::CatalogAuthorizationStateChanged {
+            operation: context.operation,
+            target: context.identity.target.clone(),
+            state: authorization.state.clone(),
+        });
+    }
+    let expected = context.identity.source;
+    let observed = authorization.source;
+    if observed.catalog_epoch() != expected.catalog_epoch() {
+        return Err(LocalSlotMutationError::StaleCatalogAuthorization {
+            target: context.identity.target.clone(),
+            expected: expected.catalog_epoch(),
+            observed: observed.catalog_epoch(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_catalog_drop_authorization(
+    authorization: &CatalogAuthorization,
+    context: &MutationContext,
+    cleanup_receipt_id: Option<ManagedLogicalSlotReceiptId>,
+) -> Result<(), LocalSlotMutationError> {
+    let receipt_id = cleanup_receipt_id.expect("drop always carries a cleanup receipt");
+    let lifecycle_ready = match authorization.kind {
+        CatalogAllocationKind::Probe => {
+            authorization.state == "retiring"
+                && authorization.cleanup_receipt_id == Some(receipt_id)
+                && authorization
+                    .creation_attempt_state
+                    .as_deref()
+                    .is_none_or(|state| state == "activated")
+        }
+        CatalogAllocationKind::Consumer => match authorization.state.as_str() {
+            "allocated" => {
+                authorization.attachment_state.as_deref() == Some("staged")
+                    && authorization.creation_attempt_state.as_deref() == Some("pending")
+            }
+            "active" => {
+                (authorization.attachment_state.as_deref() == Some("staged")
+                    || (authorization.attachment_state.as_deref() == Some("retiring")
+                        && authorization.consumer_shard_state.as_deref() == Some("fenced")))
+                    && authorization.creation_attempt_state.as_deref() == Some("activated")
+            }
+            "retiring" => {
+                authorization.attachment_state.as_deref() == Some("retiring")
+                    && authorization.consumer_shard_state.as_deref() == Some("fenced")
+                    && authorization.creation_attempt_state.as_deref() == Some("activated")
+            }
+            _ => false,
+        },
+    };
+    if !lifecycle_ready {
+        if authorization.kind == CatalogAllocationKind::Probe && authorization.state == "retiring" {
+            return Err(LocalSlotMutationError::CatalogCleanupReceiptChanged(
+                context.identity.target.clone(),
+            ));
+        }
+        return Err(LocalSlotMutationError::CatalogAuthorizationStateChanged {
+            operation: context.operation,
+            target: context.identity.target.clone(),
+            state: authorization.state.clone(),
+        });
+    }
+    Ok(())
+}
+
 async fn prepare_create(
     client: &Client,
     context: &MutationContext,
 ) -> Result<PreparedCreate, LocalSlotMutationError> {
-    let server = prepare_server(client, context).await?;
+    let server = prepare_server(client, context, MAX_ADVISORY_LOCK_ROWS).await?;
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
@@ -1035,7 +2740,7 @@ async fn prepare_drop(
     context: &MutationContext,
     creation_lsn: PgLsn,
 ) -> Result<PreparedDrop, LocalSlotMutationError> {
-    let server = prepare_server(client, context).await?;
+    let server = prepare_server(client, context, MAX_ADVISORY_LOCK_ROWS).await?;
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
@@ -1048,7 +2753,7 @@ async fn prepare_drop(
         .await
         .map_err(|source| context.preflight_postgres(source))?;
     let Some(row) = row else {
-        return Ok(PreparedDrop::Absent);
+        return Ok(PreparedDrop::Absent { server });
     };
     let observation = parse_logical_slot(&row).map_err(|source| {
         LocalSlotMutationError::UnsafeDropObservation {
@@ -1071,6 +2776,7 @@ async fn prepare_drop(
 async fn prepare_server(
     client: &Client,
     context: &MutationContext,
+    maximum_advisory_locks: usize,
 ) -> Result<PreparedServer, LocalSlotMutationError> {
     client
         .query_one(PIN_SEARCH_PATH_SQL, &[])
@@ -1079,8 +2785,10 @@ async fn prepare_server(
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
+    let advisory_lock_query_limit = i64::try_from(maximum_advisory_locks.saturating_add(1))
+        .expect("small advisory-lock bound fits PostgreSQL bigint");
     let basic = client
-        .query_one(BASIC_REQUIREMENTS_SQL, &[&ADVISORY_LOCK_QUERY_LIMIT])
+        .query_one(BASIC_REQUIREMENTS_SQL, &[&advisory_lock_query_limit])
         .await
         .map_err(|source| context.preflight_postgres(source))?;
     let version: i32 = basic
@@ -1104,18 +2812,26 @@ async fn prepare_server(
     if encoding != "UTF8" {
         return Err(LocalSlotMutationError::WrongEncoding(encoding));
     }
-    let session = parse_mutation_session(&basic, 4, context)?;
+    let session = parse_mutation_session(&basic, 4, maximum_advisory_locks, context)?;
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
     let source = client
-        .query_one(SOURCE_REQUIREMENTS_SQL, &[&ADVISORY_LOCK_QUERY_LIMIT])
+        .query_one(SOURCE_REQUIREMENTS_SQL, &[&advisory_lock_query_limit])
         .await
         .map_err(|error| context.preflight_postgres(error))?;
-    validate_source_row(&source, database_oid, &session, context)?;
+    validate_source_row(
+        &source,
+        database_oid,
+        &session,
+        maximum_advisory_locks,
+        context,
+    )?;
+    let caller_advisory_lock_count = session.advisory_locks.len();
     Ok(PreparedServer {
         database_name,
         session,
+        caller_advisory_lock_count,
     })
 }
 
@@ -1123,9 +2839,10 @@ async fn create_at_dispatch_boundary(
     client: &Client,
     context: &MutationContext,
     prepared: PreparedCreate,
+    receipt_id: ManagedLogicalSlotReceiptId,
 ) -> Result<ManagedLogicalSlotReceipt, LocalSlotMutationError> {
     dispatch_mutation_before_deadline(context, async {
-        create_after_dispatch(client, context, prepared)
+        create_after_dispatch(client, context, prepared, receipt_id)
             .await
             .map_err(|source| context.unknown(source))
     })
@@ -1147,6 +2864,7 @@ async fn create_after_dispatch(
     client: &Client,
     context: &MutationContext,
     prepared: PreparedCreate,
+    receipt_id: ManagedLogicalSlotReceiptId,
 ) -> Result<ManagedLogicalSlotReceipt, LocalSlotMutationUnknownCause> {
     let row = client
         .query_one(
@@ -1180,6 +2898,7 @@ async fn create_after_dispatch(
     let observation = validate_slot_shape(&observation, &context.identity, creation_lsn, true)
         .map_err(LocalSlotMutationUnknownCause::PostflightShape)?;
     Ok(ManagedLogicalSlotReceipt {
+        receipt_id,
         target: context.identity.target.clone(),
         source: context.identity.source,
         role: context.identity.role,
@@ -1187,7 +2906,7 @@ async fn create_after_dispatch(
         creation_lsn,
         observation,
         effective_role_oid: prepared.server.session.effective_role_oid,
-        advisory_lock_count: prepared.server.session.advisory_locks.len(),
+        advisory_lock_count: prepared.server.caller_advisory_lock_count,
     })
 }
 
@@ -1237,13 +2956,16 @@ async fn revalidate_server_after_dispatch(
     prepared: &PreparedServer,
 ) -> Result<(), LocalSlotMutationUnknownCause> {
     set_statement_timeout(client, context.deadline).await?;
+    let advisory_lock_query_limit = i64::try_from(MAX_ADVISORY_LOCK_ROWS.saturating_add(1))
+        .expect("small advisory-lock bound fits PostgreSQL bigint");
     let row = client
-        .query_one(SOURCE_REQUIREMENTS_SQL, &[&ADVISORY_LOCK_QUERY_LIMIT])
+        .query_one(SOURCE_REQUIREMENTS_SQL, &[&advisory_lock_query_limit])
         .await?;
     validate_source_row(
         &row,
         context.identity.source.database_oid(),
         &prepared.session,
+        MAX_ADVISORY_LOCK_ROWS,
         context,
     )
     .map_err(postflight_source_error)
@@ -1262,6 +2984,7 @@ fn validate_source_row(
     row: &tokio_postgres::Row,
     database_oid: u32,
     expected_session: &MutationSessionIdentity,
+    maximum_advisory_locks: usize,
     context: &MutationContext,
 ) -> Result<(), LocalSlotMutationError> {
     let system_identifier = row
@@ -1312,7 +3035,7 @@ fn validate_source_row(
     )?;
     let receiver = parse_observed_wal_receiver(row, context)?;
     let slot_sync_worker = parse_observed_slot_sync_worker(row, context)?;
-    let session = parse_mutation_session(row, 16, context)?;
+    let session = parse_mutation_session(row, 16, maximum_advisory_locks, context)?;
     if &session != expected_session {
         return Err(LocalSlotMutationError::SessionFenceChanged);
     }
@@ -1416,11 +3139,13 @@ fn parse_observed_slot_sync_worker(
 fn parse_mutation_session(
     row: &tokio_postgres::Row,
     first_column: usize,
+    maximum_advisory_locks: usize,
     context: &MutationContext,
 ) -> Result<MutationSessionIdentity, LocalSlotMutationError> {
     let advisory_locks = bounded_advisory_locks(
         row.try_get(first_column + 3)
             .map_err(|source| context.preflight_postgres(source))?,
+        maximum_advisory_locks,
     )?;
     Ok(MutationSessionIdentity {
         backend_pid: positive_nonzero_u32(
@@ -1444,11 +3169,10 @@ fn parse_mutation_session(
 
 fn bounded_advisory_locks(
     advisory_locks: Vec<String>,
+    maximum: usize,
 ) -> Result<Vec<String>, LocalSlotMutationError> {
-    if advisory_locks.len() > MAX_ADVISORY_LOCK_ROWS {
-        return Err(LocalSlotMutationError::TooManyAdvisoryLocks {
-            maximum: MAX_ADVISORY_LOCK_ROWS,
-        });
+    if advisory_locks.len() > maximum {
+        return Err(LocalSlotMutationError::TooManyAdvisoryLocks { maximum });
     }
     Ok(advisory_locks)
 }
@@ -1718,6 +3442,12 @@ async fn set_statement_timeout(
     Ok(())
 }
 
+fn postgres_milliseconds(duration: Duration) -> String {
+    let milliseconds = u64::try_from(duration.as_millis())
+        .expect("bounded slot mutation timeout fits PostgreSQL milliseconds");
+    format!("{milliseconds}ms")
+}
+
 impl From<tokio_postgres::Error> for LocalSlotMutationUnknownCause {
     fn from(source: tokio_postgres::Error) -> Self {
         Self::Postgres(source)
@@ -1748,6 +3478,27 @@ mod tests {
 
     use super::*;
     use crate::standby_slots::{ReplicationSlotName, SlotGeneration};
+
+    #[test]
+    fn receipt_capability_debug_output_is_redacted() {
+        let secret = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+        let receipt_id = ManagedLogicalSlotReceiptId(secret);
+        let debug = format!("{receipt_id:?}");
+        assert_eq!(debug, "ManagedLogicalSlotReceiptId(<redacted>)");
+        assert!(!debug.contains(&secret.to_string()));
+        assert!(!debug.contains(&secret.simple().to_string()));
+
+        let identity = identity(ManagedLogicalSlotRole::StandbyLocalDecoder);
+        let mut receipt = receipt(&identity);
+        receipt.receipt_id = receipt_id;
+        let debug = format!("{receipt:?}");
+        assert!(!debug.contains(&secret.to_string()));
+        assert!(!debug.contains(&secret.simple().to_string()));
+        let drop_receipt = drop_receipt(receipt, ManagedLogicalSlotDropOutcome::AlreadyAbsent);
+        let debug = format!("{drop_receipt:?}");
+        assert!(!debug.contains(&secret.to_string()));
+        assert!(!debug.contains(&secret.simple().to_string()));
+    }
 
     fn identity(role: ManagedLogicalSlotRole) -> MutationIdentity {
         let generation = SlotGeneration::new(Uuid::from_u128(1)).expect("generation");
@@ -1796,6 +3547,7 @@ mod tests {
 
     fn receipt(identity: &MutationIdentity) -> ManagedLogicalSlotReceipt {
         ManagedLogicalSlotReceipt {
+            receipt_id: ManagedLogicalSlotReceiptId(Uuid::from_u128(3)),
             target: identity.target.clone(),
             source: identity.source,
             role: identity.role,
@@ -1850,6 +3602,32 @@ mod tests {
         identity: MutationIdentity,
     ) -> MutationContext {
         MutationContext::new(operation, identity, CatalogOperationTimeout::default())
+    }
+
+    fn catalog_authorization(
+        identity: &MutationIdentity,
+        kind: CatalogAllocationKind,
+    ) -> CatalogAuthorization {
+        CatalogAuthorization {
+            kind,
+            state: "allocated".to_owned(),
+            target: identity.target.clone(),
+            role: identity.role,
+            database_name: SHARDSCHEMA_DATABASE.to_owned(),
+            source: identity.source,
+            creation_receipt_id: None,
+            cleanup_receipt_id: None,
+            creation_attempt_state: Some("pending".to_owned()),
+            restore_state: "active".to_owned(),
+            shard_state: "active".to_owned(),
+            attachment_state: (kind == CatalogAllocationKind::Consumer)
+                .then(|| "staged".to_owned()),
+            consumer_shard_state: (kind == CatalogAllocationKind::Consumer)
+                .then(|| "provisioning".to_owned()),
+            consumer_state: (kind == CatalogAllocationKind::Consumer).then(|| "active".to_owned()),
+            logical_database_state: (kind == CatalogAllocationKind::Consumer)
+                .then(|| "active".to_owned()),
+        }
     }
 
     #[test]
@@ -1909,6 +3687,111 @@ mod tests {
     }
 
     #[test]
+    fn create_revalidates_catalog_state_and_epoch_after_waiting_for_the_fence() {
+        let identity = identity(ManagedLogicalSlotRole::PrimaryFailoverAnchor);
+        let context = context(identity.clone());
+        let mut authorization = catalog_authorization(&identity, CatalogAllocationKind::Probe);
+        let attempt = Some(ManagedLogicalSlotReceiptId(Uuid::from_u128(3)));
+        assert!(validate_catalog_authorization(&authorization, &context, attempt, None).is_ok());
+
+        authorization.state = "retired".to_owned();
+        assert!(matches!(
+            validate_catalog_authorization(&authorization, &context, attempt, None),
+            Err(LocalSlotMutationError::CatalogAuthorizationStateChanged {
+                operation: LocalSlotMutationOperation::Create,
+                ..
+            })
+        ));
+        authorization.state = "allocated".to_owned();
+        authorization.source = ReplicationSourceIdentity::new(
+            identity.source.system_identifier(),
+            identity.source.timeline(),
+            identity.source.database_oid(),
+            identity.source.restore_incarnation(),
+            CatalogEpoch(identity.source.catalog_epoch().0 + 1),
+        )
+        .expect("newer catalog epoch");
+        assert!(matches!(
+            validate_catalog_authorization(&authorization, &context, attempt, None),
+            Err(LocalSlotMutationError::StaleCatalogAuthorization { .. })
+        ));
+    }
+
+    #[test]
+    fn probe_drop_requires_the_exact_retirement_receipt() {
+        let identity = identity(ManagedLogicalSlotRole::PrimaryFailoverAnchor);
+        let context = context_for(LocalSlotMutationOperation::Drop, identity.clone());
+        let expected_receipt = ManagedLogicalSlotReceiptId(Uuid::from_u128(3));
+        let mut authorization = catalog_authorization(&identity, CatalogAllocationKind::Probe);
+        authorization.state = "retiring".to_owned();
+        authorization.cleanup_receipt_id = Some(expected_receipt);
+        authorization.creation_attempt_state = Some("activated".to_owned());
+        assert!(
+            validate_catalog_authorization(&authorization, &context, None, Some(expected_receipt))
+                .is_ok()
+        );
+
+        authorization.cleanup_receipt_id = Some(ManagedLogicalSlotReceiptId(Uuid::from_u128(4)));
+        assert!(matches!(
+            validate_catalog_authorization(&authorization, &context, None, Some(expected_receipt)),
+            Err(LocalSlotMutationError::CatalogCleanupReceiptChanged(_))
+        ));
+    }
+
+    #[test]
+    fn consumer_drop_rejects_an_active_attachment_and_requires_fencing() {
+        let identity = identity(ManagedLogicalSlotRole::StandbyLocalDecoder);
+        let context = context_for(LocalSlotMutationOperation::Drop, identity.clone());
+        let receipt = ManagedLogicalSlotReceiptId(Uuid::from_u128(3));
+        let mut authorization = catalog_authorization(&identity, CatalogAllocationKind::Consumer);
+        authorization.state = "active".to_owned();
+        authorization.creation_attempt_state = Some("activated".to_owned());
+
+        assert!(
+            validate_catalog_authorization(&authorization, &context, None, Some(receipt)).is_ok(),
+            "a staged activation rollback remains eligible"
+        );
+        authorization.attachment_state = Some("active".to_owned());
+        assert!(matches!(
+            validate_catalog_authorization(&authorization, &context, None, Some(receipt)),
+            Err(LocalSlotMutationError::CatalogAuthorizationStateChanged { .. })
+        ));
+
+        authorization.attachment_state = Some("retiring".to_owned());
+        authorization.consumer_shard_state = Some("ready".to_owned());
+        assert!(matches!(
+            validate_catalog_authorization(&authorization, &context, None, Some(receipt)),
+            Err(LocalSlotMutationError::CatalogAuthorizationStateChanged { .. })
+        ));
+        authorization.consumer_shard_state = Some("fenced".to_owned());
+        assert!(
+            validate_catalog_authorization(&authorization, &context, None, Some(receipt)).is_ok()
+        );
+
+        authorization.state = "retiring".to_owned();
+        assert!(
+            validate_catalog_authorization(&authorization, &context, None, Some(receipt)).is_ok()
+        );
+    }
+
+    #[test]
+    fn standby_decoder_create_requires_a_staged_attachment() {
+        let identity = identity(ManagedLogicalSlotRole::StandbyLocalDecoder);
+        let context = context(identity.clone());
+        let mut authorization = catalog_authorization(&identity, CatalogAllocationKind::Consumer);
+        let attempt = Some(ManagedLogicalSlotReceiptId(Uuid::from_u128(3)));
+        assert!(validate_catalog_authorization(&authorization, &context, attempt, None).is_ok());
+        authorization.attachment_state = Some("retiring".to_owned());
+        assert!(matches!(
+            validate_catalog_authorization(&authorization, &context, attempt, None),
+            Err(LocalSlotMutationError::CatalogAuthorizationStateChanged {
+                operation: LocalSlotMutationOperation::Create,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn standby_drop_skips_receiver_and_creation_health() {
         let mut identity = identity(ManagedLogicalSlotRole::StandbyLocalDecoder);
         identity.standby_path = None;
@@ -1960,9 +3843,18 @@ mod tests {
 
     #[test]
     fn advisory_lock_snapshot_is_hard_bounded() {
-        assert!(bounded_advisory_locks(vec![String::new(); MAX_ADVISORY_LOCK_ROWS]).is_ok());
+        assert!(
+            bounded_advisory_locks(
+                vec![String::new(); MAX_ADVISORY_LOCK_ROWS],
+                MAX_ADVISORY_LOCK_ROWS,
+            )
+            .is_ok()
+        );
         assert!(matches!(
-            bounded_advisory_locks(vec![String::new(); MAX_ADVISORY_LOCK_ROWS + 1]),
+            bounded_advisory_locks(
+                vec![String::new(); MAX_ADVISORY_LOCK_ROWS + 1],
+                MAX_ADVISORY_LOCK_ROWS,
+            ),
             Err(LocalSlotMutationError::TooManyAdvisoryLocks {
                 maximum: MAX_ADVISORY_LOCK_ROWS
             })
@@ -2094,7 +3986,7 @@ mod tests {
         let identity = identity(ManagedLogicalSlotRole::PrimaryFailoverAnchor);
         let expected_target = identity.target.clone();
         let context = context_for(LocalSlotMutationOperation::Drop, identity.clone());
-        let error = classify_drop_result(receipt(&identity), Err(context.preflight_timeout()))
+        let error = classify_drop_failure(receipt(&identity), context.preflight_timeout())
             .expect_err("a drop rejected before dispatch must fail");
 
         assert!(!error.outcome_is_unknown());
@@ -2106,5 +3998,18 @@ mod tests {
             source,
             LocalSlotMutationError::PreflightTimeout { .. }
         ));
+    }
+
+    #[test]
+    fn successful_drop_receipt_preserves_the_verified_identity() {
+        let identity = identity(ManagedLogicalSlotRole::PrimaryFailoverAnchor);
+        let proof = drop_receipt(receipt(&identity), ManagedLogicalSlotDropOutcome::Dropped);
+
+        assert_eq!(proof.target(), &identity.target);
+        assert_eq!(proof.receipt_id(), receipt(&identity).receipt_id());
+        assert_eq!(proof.source(), identity.source);
+        assert_eq!(proof.role(), identity.role);
+        assert_eq!(proof.database_name(), "postgres");
+        assert_eq!(proof.outcome(), ManagedLogicalSlotDropOutcome::Dropped);
     }
 }

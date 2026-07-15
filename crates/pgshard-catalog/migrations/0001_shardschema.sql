@@ -1,7 +1,30 @@
 BEGIN;
 
+-- Takeover validation uses statement snapshots.  Override a non-default
+-- session characteristic before the transaction takes its first snapshot.  An
+-- already-active stronger-isolation snapshot fails closed; an enclosing READ
+-- COMMITTED transaction continues to receive a fresh snapshot per statement.
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
 DO $pgshard_requirements$
 BEGIN
+    IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '25000',
+            MESSAGE = 'the shardschema migration requires READ COMMITTED isolation';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_roles AS roles
+         WHERE roles.rolname = current_user
+           AND roles.rolsuper
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pgshard catalog migration requires a superuser bootstrap principal';
+    END IF;
+
     IF current_setting('server_version_num')::integer < 180000 THEN
         RAISE EXCEPTION USING
             ERRCODE = '0A000',
@@ -22,38 +45,777 @@ BEGIN
 END
 $pgshard_requirements$;
 
-CREATE SCHEMA IF NOT EXISTS pgshard_catalog;
-REVOKE ALL ON SCHEMA pgshard_catalog FROM PUBLIC;
+-- Freeze every pre-existing trigger/FK-capable catalog relation before
+-- inspecting attached triggers or foreign keys.  CREATE TRIGGER and
+-- referential-constraint DDL require a conflicting relation lock.  Fail rather
+-- than wait while holding an earlier relation: normal catalog DML takes its
+-- target relation before cluster_state, so a partial blocking lock set can
+-- deadlock that order.  The caller retries the complete transaction after a
+-- quiet window.  A successful pass retains every lock through ownership
+-- transfer, ACL reset, and trigger recreation.
+DO $pgshard_lock_existing_catalog_relations$
+DECLARE
+    catalog_relation record;
+BEGIN
+    FOR catalog_relation IN
+        SELECT namespaces.nspname, relations.relname
+          FROM pg_catalog.pg_class AS relations
+          JOIN pg_catalog.pg_namespace AS namespaces
+            ON namespaces.oid = relations.relnamespace
+         WHERE namespaces.nspname = 'pgshard_catalog'
+           AND relations.relkind IN ('r', 'p', 'v', 'm', 'f')
+         ORDER BY relations.oid
+    LOOP
+        EXECUTE pg_catalog.format(
+            'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE NOWAIT',
+            catalog_relation.nspname,
+            catalog_relation.relname
+        );
+    END LOOP;
+END
+$pgshard_lock_existing_catalog_relations$;
+
+DO $pgshard_role_bootstrap$
+DECLARE
+    bootstrap_superuser_oid CONSTANT pg_catalog.oid := 10;
+    catalog_schema_oid oid;
+    catalog_schema_owner oid;
+    catalog_schema_owner_name name;
+    catalog_schema_owner_is_superuser boolean;
+    dependent_membership record;
+    owner_membership record;
+    mismatched_object text;
+BEGIN
+    SELECT namespaces.oid, owners.oid, owners.rolname, owners.rolsuper
+      INTO catalog_schema_oid,
+           catalog_schema_owner,
+           catalog_schema_owner_name,
+           catalog_schema_owner_is_superuser
+      FROM pg_catalog.pg_namespace AS namespaces
+      JOIN pg_catalog.pg_roles AS owners ON owners.oid = namespaces.nspowner
+     WHERE namespaces.nspname = 'pgshard_catalog';
+
+    IF NOT FOUND THEN
+        IF EXISTS (
+            SELECT
+              FROM pg_catalog.pg_roles AS roles
+             WHERE roles.rolname IN (
+                       'pgshard_catalog_owner',
+                       'pgshard_catalog_reader',
+                       'pgshard_catalog_admin'
+                   )
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = 'pgshard catalog roles exist before catalog bootstrap';
+        END IF;
+        RETURN;
+    END IF;
+
+    SELECT objects.object_identity
+      INTO mismatched_object
+      FROM (
+          SELECT pg_catalog.format('relation %I', relations.relname) AS object_identity,
+                 relations.relowner AS object_owner
+            FROM pg_catalog.pg_class AS relations
+           WHERE relations.relnamespace = catalog_schema_oid
+          UNION ALL
+          SELECT pg_catalog.format('routine %I', routines.proname), routines.proowner
+            FROM pg_catalog.pg_proc AS routines
+           WHERE routines.pronamespace = catalog_schema_oid
+          UNION ALL
+          SELECT pg_catalog.format('type %I', types.typname), types.typowner
+            FROM pg_catalog.pg_type AS types
+           WHERE types.typnamespace = catalog_schema_oid
+          UNION ALL
+          SELECT pg_catalog.format('collation %I', collations.collname), collations.collowner
+            FROM pg_catalog.pg_collation AS collations
+           WHERE collations.collnamespace = catalog_schema_oid
+      ) AS objects
+     WHERE objects.object_owner <> catalog_schema_owner
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog objects must share the schema owner',
+            DETAIL = mismatched_object;
+    END IF;
+
+    -- The released catalog contains only relations, routines, types and
+    -- collations as independently owned schema objects. Reject any other
+    -- namespaced object class rather than transferring only part of its state.
+    SELECT pg_catalog.pg_describe_object(
+               dependencies.classid,
+               dependencies.objid,
+               dependencies.objsubid
+           )
+      INTO mismatched_object
+      FROM pg_catalog.pg_depend AS dependencies
+     WHERE dependencies.refclassid =
+               'pg_catalog.pg_namespace'::pg_catalog.regclass
+       AND dependencies.refobjid = catalog_schema_oid
+       AND dependencies.refobjsubid = 0
+       AND dependencies.deptype = 'n'
+       AND dependencies.classid NOT IN (
+               'pg_catalog.pg_class'::pg_catalog.regclass,
+               'pg_catalog.pg_proc'::pg_catalog.regclass,
+               'pg_catalog.pg_type'::pg_catalog.regclass,
+               'pg_catalog.pg_collation'::pg_catalog.regclass
+           )
+     ORDER BY dependencies.classid, dependencies.objid, dependencies.objsubid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains an unsupported schema object',
+            DETAIL = mismatched_object;
+    END IF;
+
+    -- A role with TRIGGER or REFERENCES can attach executable or referential
+    -- triggers without owning a catalog relation. Those rows do not depend
+    -- directly on the namespace, so validate them separately before any
+    -- trusted ownership or ACL transition.
+    SELECT pg_catalog.format(
+               'trigger %I on pgshard_catalog.%I',
+               triggers.tgname,
+               relations.relname
+           )
+      INTO mismatched_object
+      FROM pg_catalog.pg_trigger AS triggers
+      JOIN pg_catalog.pg_class AS relations
+        ON relations.oid = triggers.tgrelid
+      JOIN pg_catalog.pg_proc AS routines
+        ON routines.oid = triggers.tgfoid
+      JOIN pg_catalog.pg_namespace AS routine_namespaces
+        ON routine_namespaces.oid = routines.pronamespace
+     WHERE relations.relnamespace = catalog_schema_oid
+       AND (
+           (
+               NOT triggers.tgisinternal
+               AND (
+                   routine_namespaces.nspname <> 'pgshard_catalog'
+                   OR routines.pronargs <> 0
+                   OR triggers.tgenabled <> 'O'
+                   OR triggers.tgconstraint <> 0
+                   OR triggers.tgconstrrelid <> 0
+                   OR triggers.tgconstrindid <> 0
+                   OR triggers.tgdeferrable
+                   OR triggers.tginitdeferred
+                   OR triggers.tgparentid <> 0
+                   OR triggers.tgnargs <> 0
+                   OR pg_catalog.octet_length(triggers.tgargs) <> 0
+                   OR triggers.tgattr <> ''::pg_catalog.int2vector
+                   OR triggers.tgqual IS NOT NULL
+                   OR triggers.tgoldtable IS NOT NULL
+                   OR triggers.tgnewtable IS NOT NULL
+                   OR NOT EXISTS (
+                       SELECT
+                         FROM (VALUES
+                             ('cluster_configuration', 'cluster_configuration_immutable', 'reject_all_changes', 27),
+                             ('cluster_state', 'cluster_state_notify', 'notify_catalog_state', 17),
+                             ('logical_consumer_attachments', 'logical_consumer_attachments_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_consumer_attachments', 'logical_consumer_attachments_protect_history', 'protect_logical_consumer_attachment', 31),
+                             ('logical_consumer_attachments', 'logical_consumer_attachments_touch_catalog', 'touch_catalog_state', 28),
+                             ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_protect_history', 'protect_logical_consumer_checkpoint', 31),
+                             ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_touch_catalog', 'touch_catalog_state', 28),
+                             ('logical_consumer_shards', 'logical_consumer_shards_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_consumer_shards', 'logical_consumer_shards_protect_lifecycle', 'protect_logical_consumer_shard_lifecycle', 31),
+                             ('logical_consumer_shards', 'logical_consumer_shards_touch_catalog', 'touch_catalog_state', 28),
+                             ('logical_consumers', 'logical_consumers_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_consumers', 'logical_consumers_protect_lifecycle', 'protect_logical_consumer_lifecycle', 31),
+                             ('logical_consumers', 'logical_consumers_touch_catalog', 'touch_catalog_state', 28),
+                             ('logical_databases', 'logical_databases_lock_catalog', 'lock_catalog_state', 30),
+                             ('logical_databases', 'logical_databases_protect_active_routing', 'protect_database_lifecycle', 27),
+                             ('logical_databases', 'logical_databases_touch_catalog', 'touch_catalog_state', 28),
+                             ('managed_replication_slots', 'managed_replication_slots_lock_catalog', 'lock_catalog_state', 30),
+                             ('managed_replication_slots', 'managed_replication_slots_protect_history', 'protect_managed_replication_slot', 31),
+                             ('managed_replication_slots', 'managed_replication_slots_touch_catalog', 'touch_catalog_state', 28),
+                             ('managed_slot_creation_attempts', 'managed_slot_creation_attempts_protect_history', 'protect_managed_slot_creation_attempt', 31),
+                             ('operation_tombstones', 'operation_tombstone_immutable', 'reject_all_changes', 27),
+                             ('registered_tables', 'registered_tables_lock_catalog', 'lock_catalog_state', 30),
+                             ('registered_tables', 'registered_tables_touch_catalog', 'touch_catalog_state', 28),
+                             ('routing_epochs', 'routing_epoch_history_immutable', 'protect_routing_epoch_history', 27),
+                             ('routing_ranges', 'routing_range_history_immutable', 'protect_routing_range_history', 31),
+                             ('shard_restore_incarnations', 'shard_restore_incarnations_lock_catalog', 'lock_catalog_state', 30),
+                             ('shard_restore_incarnations', 'shard_restore_incarnations_protect_history', 'protect_shard_restore_incarnation', 31),
+                             ('shard_restore_incarnations', 'shard_restore_incarnations_touch_catalog', 'touch_catalog_state', 28),
+                             ('shards', 'shards_install_restore_incarnation', 'install_initial_shard_restore_incarnation', 5),
+                             ('shards', 'shards_lock_catalog', 'lock_catalog_state', 30),
+                             ('shards', 'shards_protect_active_routing', 'protect_shard_lifecycle', 27),
+                             ('shards', 'shards_touch_catalog', 'touch_catalog_state', 28),
+                             ('slot_sync_probes', 'slot_sync_probes_lock_catalog', 'lock_catalog_state', 30),
+                             ('slot_sync_probes', 'slot_sync_probes_protect_history', 'protect_slot_sync_probe', 31),
+                             ('slot_sync_probes', 'slot_sync_probes_touch_catalog', 'touch_catalog_state', 28)
+                         ) AS allowed_triggers(
+                             relation_name,
+                             trigger_name,
+                             routine_name,
+                             trigger_type
+                         )
+                        WHERE allowed_triggers.relation_name = relations.relname
+                          AND allowed_triggers.trigger_name = triggers.tgname
+                          AND allowed_triggers.routine_name = routines.proname
+                          AND allowed_triggers.trigger_type = triggers.tgtype
+                   )
+               )
+           )
+           OR (
+               triggers.tgisinternal
+               AND (
+                   routine_namespaces.nspname <> 'pg_catalog'
+                   OR pg_catalog.left(routines.proname, 8) <> 'RI_FKey_'
+                   OR NOT EXISTS (
+                       SELECT
+                         FROM pg_catalog.pg_constraint AS constraints
+                         JOIN pg_catalog.pg_class AS source_relations
+                           ON source_relations.oid = constraints.conrelid
+                         JOIN pg_catalog.pg_class AS referenced_relations
+                           ON referenced_relations.oid = constraints.confrelid
+                        WHERE constraints.oid = triggers.tgconstraint
+                          AND constraints.contype = 'f'
+                          AND constraints.connamespace = catalog_schema_oid
+                          AND source_relations.relnamespace = catalog_schema_oid
+                          AND referenced_relations.relnamespace = catalog_schema_oid
+                   )
+               )
+           )
+       )
+     ORDER BY relations.oid, triggers.oid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains an unsupported attached trigger',
+            DETAIL = mismatched_object;
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.pg_default_acl AS defaults
+         WHERE defaults.defaclnamespace = catalog_schema_oid
+           AND (
+               defaults.defaclrole <> catalog_schema_owner
+               OR defaults.defaclobjtype <> 'r'
+               OR EXISTS (
+                   SELECT
+                     FROM pg_catalog.aclexplode(defaults.defaclacl) AS acl
+                     LEFT JOIN pg_catalog.pg_roles AS grantees
+                       ON grantees.oid = acl.grantee
+                    WHERE grantees.rolname IS DISTINCT FROM 'pgshard_catalog_reader'
+                       OR acl.privilege_type <> 'SELECT'
+                       OR acl.is_grantable
+               )
+           )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog default privileges do not match the released boundary';
+    END IF;
+
+    IF catalog_schema_owner_name IN (
+        'pgshard_catalog_reader',
+        'pgshard_catalog_admin'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog schema has an unsafe fixed-role owner';
+    END IF;
+
+    IF catalog_schema_owner_name <> 'pgshard_catalog_owner'
+       AND NOT catalog_schema_owner_is_superuser THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog schema owner must be a superuser';
+    END IF;
+
+    -- PostgreSQL 18 can leave a formerly non-superuser CREATEROLE owner with
+    -- ADMIN OPTION on roles it created. A superuser-owned released catalog can
+    -- instead have explicit GRANTED BY history under that owner. Re-home safe
+    -- downstream grants under the bootstrap principal before removing every
+    -- legacy-owner membership with CASCADE.
+    IF catalog_schema_owner_name <> 'pgshard_catalog_owner' THEN
+        IF (
+            SELECT pg_catalog.count(*)
+              FROM pg_catalog.pg_roles AS roles
+             WHERE roles.rolname IN (
+                       'pgshard_catalog_reader',
+                       'pgshard_catalog_admin'
+                   )
+        ) <> 2 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = 'legacy pgshard_catalog schema requires both released fixed roles';
+        END IF;
+
+        IF EXISTS (
+            SELECT
+              FROM pg_catalog.pg_auth_members AS memberships
+             WHERE memberships.roleid IN (
+                       'pgshard_catalog_reader'::pg_catalog.regrole,
+                       'pgshard_catalog_admin'::pg_catalog.regrole
+                   )
+               AND memberships.member <> catalog_schema_owner
+               AND memberships.admin_option
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = 'pre-existing pgshard catalog role has a delegable membership';
+        END IF;
+
+        -- PostgreSQL records every superuser-issued role grant under the
+        -- bootstrap superuser. If that role already owns the released catalog,
+        -- its downstream grants are already rooted at the destination grantor;
+        -- regranting and then revoking that same row would delete it.
+        IF catalog_schema_owner <> bootstrap_superuser_oid THEN
+            FOR dependent_membership IN
+                SELECT granted_roles.rolname AS granted_role_name,
+                       member_roles.rolname AS member_role_name,
+                       pg_catalog.bool_or(memberships.inherit_option) AS inherit_option,
+                       pg_catalog.bool_or(memberships.set_option) AS set_option
+                  FROM pg_catalog.pg_auth_members AS memberships
+                  JOIN pg_catalog.pg_roles AS granted_roles
+                    ON granted_roles.oid = memberships.roleid
+                  JOIN pg_catalog.pg_roles AS member_roles
+                    ON member_roles.oid = memberships.member
+                 WHERE memberships.roleid IN (
+                           'pgshard_catalog_reader'::pg_catalog.regrole,
+                           'pgshard_catalog_admin'::pg_catalog.regrole
+                       )
+                   AND memberships.member <> catalog_schema_owner
+                   AND EXISTS (
+                       SELECT
+                         FROM pg_catalog.pg_auth_members AS legacy_grants
+                        WHERE legacy_grants.roleid = memberships.roleid
+                          AND legacy_grants.member = memberships.member
+                          AND legacy_grants.grantor = catalog_schema_owner
+                   )
+                 GROUP BY granted_roles.rolname, member_roles.rolname
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'GRANT %I TO %I WITH ADMIN FALSE, INHERIT %s, SET %s',
+                    dependent_membership.granted_role_name,
+                    dependent_membership.member_role_name,
+                    CASE WHEN dependent_membership.inherit_option THEN 'TRUE' ELSE 'FALSE' END,
+                    CASE WHEN dependent_membership.set_option THEN 'TRUE' ELSE 'FALSE' END
+                );
+            END LOOP;
+
+            FOR dependent_membership IN
+                SELECT granted_roles.rolname AS granted_role_name,
+                       member_roles.rolname AS member_role_name
+                  FROM pg_catalog.pg_auth_members AS memberships
+                  JOIN pg_catalog.pg_roles AS granted_roles
+                    ON granted_roles.oid = memberships.roleid
+                  JOIN pg_catalog.pg_roles AS member_roles
+                    ON member_roles.oid = memberships.member
+                 WHERE memberships.roleid IN (
+                           'pgshard_catalog_reader'::pg_catalog.regrole,
+                           'pgshard_catalog_admin'::pg_catalog.regrole
+                       )
+                   AND memberships.member <> catalog_schema_owner
+                   AND memberships.grantor = catalog_schema_owner
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'REVOKE %I FROM %I GRANTED BY %I CASCADE',
+                    dependent_membership.granted_role_name,
+                    dependent_membership.member_role_name,
+                    catalog_schema_owner_name
+                );
+            END LOOP;
+        END IF;
+
+        FOR owner_membership IN
+            SELECT granted_roles.rolname AS granted_role_name,
+                   grantors.rolname AS grantor_name
+              FROM pg_catalog.pg_auth_members AS memberships
+              JOIN pg_catalog.pg_roles AS granted_roles
+                ON granted_roles.oid = memberships.roleid
+              JOIN pg_catalog.pg_roles AS grantors
+                ON grantors.oid = memberships.grantor
+             WHERE memberships.roleid IN (
+                       'pgshard_catalog_reader'::pg_catalog.regrole,
+                       'pgshard_catalog_admin'::pg_catalog.regrole
+                   )
+               AND memberships.member = catalog_schema_owner
+        LOOP
+            EXECUTE pg_catalog.format(
+                'REVOKE %I FROM %I GRANTED BY %I CASCADE',
+                owner_membership.granted_role_name,
+                catalog_schema_owner_name,
+                owner_membership.grantor_name
+            );
+        END LOOP;
+    END IF;
+END
+$pgshard_role_bootstrap$;
 
 DO $pgshard_roles$
 DECLARE
-    role_can_login boolean;
+    role_name text;
+    role_attributes record;
 BEGIN
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_catalog_reader') THEN
-        CREATE ROLE pgshard_catalog_reader NOLOGIN;
-    ELSE
-        SELECT rolcanlogin INTO role_can_login
-          FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_catalog_reader';
-        IF role_can_login THEN
-            RAISE EXCEPTION USING ERRCODE = '42501',
-                MESSAGE = 'pre-existing pgshard_catalog_reader role must be NOLOGIN';
+    FOREACH role_name IN ARRAY ARRAY[
+        'pgshard_catalog_owner',
+        'pgshard_catalog_reader',
+        'pgshard_catalog_admin'
+    ]
+    LOOP
+        SELECT roles.rolsuper,
+               roles.rolinherit,
+               roles.rolcreaterole,
+               roles.rolcreatedb,
+               roles.rolcanlogin,
+               roles.rolreplication,
+               roles.rolbypassrls,
+               roles.rolconnlimit,
+               roles.rolpassword,
+               roles.rolvaliduntil,
+               EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_db_role_setting AS settings
+                    WHERE settings.setrole = roles.oid
+               ) AS has_role_settings
+          INTO role_attributes
+          FROM pg_catalog.pg_authid AS roles
+         WHERE roles.rolname = role_name;
+        IF NOT FOUND THEN
+            EXECUTE pg_catalog.format('CREATE ROLE %I NOLOGIN', role_name);
+        ELSIF role_attributes.rolsuper
+           OR NOT role_attributes.rolinherit
+           OR role_attributes.rolcreaterole
+           OR role_attributes.rolcreatedb
+           OR role_attributes.rolcanlogin
+           OR role_attributes.rolreplication
+           OR role_attributes.rolbypassrls
+           OR role_attributes.rolconnlimit <> -1
+           OR role_attributes.rolpassword IS NOT NULL
+           OR role_attributes.rolvaliduntil IS NOT NULL
+           OR role_attributes.has_role_settings THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = pg_catalog.format(
+                    'pre-existing %s role has unsafe attributes',
+                    role_name
+                );
         END IF;
+    END LOOP;
+
+    -- A formerly non-superuser CREATEROLE principal can retain ADMIN OPTION on
+    -- roles it created. Reject that and every other delegable membership before
+    -- these fixed roles receive catalog privileges.
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.pg_auth_members AS memberships
+          JOIN pg_catalog.pg_roles AS granted_roles
+            ON granted_roles.oid = memberships.roleid
+         WHERE granted_roles.rolname IN (
+                   'pgshard_catalog_owner',
+                   'pgshard_catalog_reader',
+                   'pgshard_catalog_admin'
+               )
+           AND memberships.admin_option
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard catalog role has a delegable membership';
     END IF;
 
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_catalog_admin') THEN
-        CREATE ROLE pgshard_catalog_admin NOLOGIN;
-    ELSE
-        SELECT rolcanlogin INTO role_can_login
-          FROM pg_catalog.pg_roles WHERE rolname = 'pgshard_catalog_admin';
-        IF role_can_login THEN
-            RAISE EXCEPTION USING ERRCODE = '42501',
-                MESSAGE = 'pre-existing pgshard_catalog_admin role must be NOLOGIN';
-        END IF;
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.pg_auth_members AS memberships
+          JOIN pg_catalog.pg_roles AS member_roles
+            ON member_roles.oid = memberships.member
+          JOIN pg_catalog.pg_roles AS granted_roles
+            ON granted_roles.oid = memberships.roleid
+         WHERE member_roles.rolname = 'pgshard_catalog_reader'
+            OR (
+                member_roles.rolname = 'pgshard_catalog_admin'
+                AND granted_roles.rolname <> 'pgshard_catalog_reader'
+            )
+            OR (
+                member_roles.rolname = 'pgshard_catalog_owner'
+                AND granted_roles.rolname <> 'pg_read_all_stats'
+            )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard catalog role inherits an unexpected role';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.pg_auth_members AS memberships
+          JOIN pg_catalog.pg_roles AS granted_roles
+            ON granted_roles.oid = memberships.roleid
+         WHERE granted_roles.rolname = 'pgshard_catalog_owner'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog_owner role has a member';
     END IF;
 END
 $pgshard_roles$;
 
+GRANT pg_read_all_stats TO pgshard_catalog_owner;
 GRANT pgshard_catalog_reader TO pgshard_catalog_admin;
+CREATE SCHEMA IF NOT EXISTS pgshard_catalog AUTHORIZATION pgshard_catalog_owner;
+REVOKE ALL ON SCHEMA pgshard_catalog FROM PUBLIC;
+
+DO $pgshard_owner_takeover$
+DECLARE
+    catalog_schema_oid oid;
+    legacy_owner oid;
+    legacy_owner_name name;
+    object record;
+    grantee record;
+BEGIN
+    SELECT namespaces.oid, owners.oid, owners.rolname
+      INTO STRICT catalog_schema_oid, legacy_owner, legacy_owner_name
+      FROM pg_catalog.pg_namespace AS namespaces
+      JOIN pg_catalog.pg_roles AS owners ON owners.oid = namespaces.nspowner
+     WHERE namespaces.nspname = 'pgshard_catalog';
+    IF legacy_owner_name = 'pgshard_catalog_owner' THEN
+        RETURN;
+    END IF;
+
+    FOR object IN
+        SELECT relations.relkind, relations.relname
+         FROM pg_catalog.pg_class AS relations
+         WHERE relations.relnamespace = catalog_schema_oid
+           AND relations.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+           AND NOT (
+               relations.relkind = 'S'
+               AND EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_depend AS dependencies
+                    WHERE dependencies.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                      AND dependencies.objid = relations.oid
+                      AND dependencies.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                      AND dependencies.deptype IN ('a', 'i')
+               )
+           )
+         ORDER BY relations.oid
+    LOOP
+        EXECUTE CASE object.relkind
+            WHEN 'S' THEN pg_catalog.format(
+                'ALTER SEQUENCE pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+            WHEN 'v' THEN pg_catalog.format(
+                'ALTER VIEW pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+            WHEN 'm' THEN pg_catalog.format(
+                'ALTER MATERIALIZED VIEW pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+            WHEN 'f' THEN pg_catalog.format(
+                'ALTER FOREIGN TABLE pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+            ELSE pg_catalog.format(
+                'ALTER TABLE pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.relname
+            )
+        END;
+    END LOOP;
+
+    FOR object IN
+        SELECT routines.prokind,
+               routines.proname,
+               pg_catalog.pg_get_function_identity_arguments(routines.oid) AS identity_arguments
+          FROM pg_catalog.pg_proc AS routines
+         WHERE routines.pronamespace = catalog_schema_oid
+         ORDER BY routines.oid
+    LOOP
+        EXECUTE CASE object.prokind
+            WHEN 'p' THEN pg_catalog.format(
+                'ALTER PROCEDURE pgshard_catalog.%I(%s) OWNER TO pgshard_catalog_owner',
+                object.proname,
+                object.identity_arguments
+            )
+            WHEN 'a' THEN pg_catalog.format(
+                'ALTER AGGREGATE pgshard_catalog.%I(%s) OWNER TO pgshard_catalog_owner',
+                object.proname,
+                object.identity_arguments
+            )
+            ELSE pg_catalog.format(
+                'ALTER FUNCTION pgshard_catalog.%I(%s) OWNER TO pgshard_catalog_owner',
+                object.proname,
+                object.identity_arguments
+            )
+        END;
+    END LOOP;
+
+    FOR object IN
+        SELECT types.typtype, types.typname
+          FROM pg_catalog.pg_type AS types
+         WHERE types.typnamespace = catalog_schema_oid
+           AND (
+               (
+                   types.typrelid = 0
+                   AND NOT EXISTS (
+                       SELECT
+                         FROM pg_catalog.pg_type AS element_types
+                        WHERE element_types.typarray = types.oid
+                   )
+               )
+               OR EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_class AS composite_relations
+                    WHERE composite_relations.oid = types.typrelid
+                      AND composite_relations.relkind = 'c'
+               )
+           )
+         ORDER BY types.oid
+    LOOP
+        EXECUTE CASE object.typtype
+            WHEN 'd' THEN pg_catalog.format(
+                'ALTER DOMAIN pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.typname
+            )
+            ELSE pg_catalog.format(
+                'ALTER TYPE pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+                object.typname
+            )
+        END;
+    END LOOP;
+
+    FOR object IN
+        SELECT collations.collname
+          FROM pg_catalog.pg_collation AS collations
+         WHERE collations.collnamespace = catalog_schema_oid
+         ORDER BY collations.oid
+    LOOP
+        EXECUTE pg_catalog.format(
+            'ALTER COLLATION pgshard_catalog.%I OWNER TO pgshard_catalog_owner',
+            object.collname
+        );
+    END LOOP;
+
+    ALTER SCHEMA pgshard_catalog OWNER TO pgshard_catalog_owner;
+
+    -- Ownership changes do not remove explicit grants. Strip every direct
+    -- grant except the dedicated owner, including the two fixed runtime groups;
+    -- the migration recreates their exact boundary below.
+    FOR grantee IN
+        SELECT DISTINCT roles.rolname
+          FROM (
+              SELECT acl.grantee
+                FROM pg_catalog.pg_namespace AS namespaces
+                CROSS JOIN LATERAL pg_catalog.aclexplode(namespaces.nspacl) AS acl
+               WHERE namespaces.oid = catalog_schema_oid
+              UNION
+              SELECT acl.grantee
+                FROM pg_catalog.pg_class AS relations
+                CROSS JOIN LATERAL pg_catalog.aclexplode(relations.relacl) AS acl
+               WHERE relations.relnamespace = catalog_schema_oid
+              UNION
+              SELECT acl.grantee
+                FROM pg_catalog.pg_proc AS routines
+                CROSS JOIN LATERAL pg_catalog.aclexplode(routines.proacl) AS acl
+               WHERE routines.pronamespace = catalog_schema_oid
+              UNION
+              SELECT acl.grantee
+                FROM pg_catalog.pg_type AS types
+                CROSS JOIN LATERAL pg_catalog.aclexplode(types.typacl) AS acl
+               WHERE types.typnamespace = catalog_schema_oid
+              UNION
+              SELECT acl.grantee
+                FROM pg_catalog.pg_attribute AS attributes
+                JOIN pg_catalog.pg_class AS relations
+                  ON relations.oid = attributes.attrelid
+                CROSS JOIN LATERAL pg_catalog.aclexplode(attributes.attacl) AS acl
+               WHERE relations.relnamespace = catalog_schema_oid
+          ) AS grants
+          JOIN pg_catalog.pg_roles AS roles ON roles.oid = grants.grantee
+         WHERE roles.rolname <> 'pgshard_catalog_owner'
+    LOOP
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON SCHEMA pgshard_catalog FROM %I CASCADE',
+            grantee.rolname
+        );
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA pgshard_catalog FROM %I CASCADE',
+            grantee.rolname
+        );
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA pgshard_catalog FROM %I CASCADE',
+            grantee.rolname
+        );
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA pgshard_catalog FROM %I CASCADE',
+            grantee.rolname
+        );
+        FOR object IN
+            SELECT types.typname
+              FROM pg_catalog.pg_type AS types
+             WHERE types.typnamespace = catalog_schema_oid
+               AND (
+                   (
+                       types.typrelid = 0
+                       AND NOT EXISTS (
+                           SELECT
+                             FROM pg_catalog.pg_type AS element_types
+                            WHERE element_types.typarray = types.oid
+                       )
+                   )
+                   OR EXISTS (
+                       SELECT
+                         FROM pg_catalog.pg_class AS composite_relations
+                        WHERE composite_relations.oid = types.typrelid
+                          AND composite_relations.relkind = 'c'
+                   )
+               )
+        LOOP
+            EXECUTE pg_catalog.format(
+                'REVOKE ALL PRIVILEGES ON TYPE pgshard_catalog.%I FROM %I CASCADE',
+                object.typname,
+                grantee.rolname
+            );
+        END LOOP;
+        FOR object IN
+            SELECT relations.relname, attributes.attname
+              FROM pg_catalog.pg_attribute AS attributes
+              JOIN pg_catalog.pg_class AS relations
+                ON relations.oid = attributes.attrelid
+             WHERE relations.relnamespace = catalog_schema_oid
+               AND attributes.attnum > 0
+               AND NOT attributes.attisdropped
+               AND attributes.attacl IS NOT NULL
+        LOOP
+            EXECUTE pg_catalog.format(
+                'REVOKE ALL PRIVILEGES (%I) ON TABLE pgshard_catalog.%I FROM %I CASCADE',
+                object.attname,
+                object.relname,
+                grantee.rolname
+            );
+        END LOOP;
+    END LOOP;
+
+    -- Reset the released owner's schema-local default privileges so the old
+    -- bootstrap role has no remaining catalog dependency and can be dropped.
+    EXECUTE pg_catalog.format(
+        'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA pgshard_catalog '
+        'REVOKE ALL PRIVILEGES ON TABLES FROM pgshard_catalog_reader',
+        legacy_owner_name
+    );
+    EXECUTE pg_catalog.format(
+        'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA pgshard_catalog '
+        'REVOKE ALL PRIVILEGES ON TABLES FROM pgshard_catalog_admin',
+        legacy_owner_name
+    );
+    EXECUTE pg_catalog.format(
+        'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA pgshard_catalog '
+        'REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC',
+        legacy_owner_name
+    );
+END
+$pgshard_owner_takeover$;
+
+SET LOCAL ROLE pgshard_catalog_owner;
+
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_admin;
 
@@ -186,6 +948,8 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
     source_timeline bigint NOT NULL CHECK (source_timeline BETWEEN 1 AND 4294967295),
     slot_name pgshard_catalog.replication_slot_name NOT NULL,
     consistent_point pg_lsn,
+    creation_receipt_id uuid,
+    cleanup_receipt_id uuid,
     state text NOT NULL DEFAULT 'allocated'
         CHECK (state IN ('allocated', 'active', 'retiring', 'retired')),
     created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
@@ -197,45 +961,148 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
         REFERENCES pgshard_catalog.shard_restore_incarnations(restore_incarnation, shard_id)
         ON DELETE RESTRICT,
     CHECK (right(slot_name::text, 32) = replace(probe_generation::text, '-', '')),
-    CHECK (consistent_point IS NULL OR consistent_point > '0/0'),
-    CHECK (
-        (
-            state = 'allocated'
-            AND consistent_point IS NULL
-            AND activated_at IS NULL
-            AND retiring_at IS NULL
-            AND retired_at IS NULL
-        )
-        OR
-        (
-            state = 'active'
-            AND consistent_point IS NOT NULL
-            AND activated_at IS NOT NULL
-            AND retiring_at IS NULL
-            AND retired_at IS NULL
-        )
-        OR
-        (
-            state = 'retiring'
-            AND retiring_at IS NOT NULL
-            AND retired_at IS NULL
-            AND (
-                (consistent_point IS NULL AND activated_at IS NULL)
-                OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
-            )
-        )
-        OR
-        (
-            state = 'retired'
-            AND retiring_at IS NOT NULL
-            AND retired_at IS NOT NULL
-            AND (
-                (consistent_point IS NULL AND activated_at IS NULL)
-                OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
-            )
-        )
-    )
+    CHECK (consistent_point IS NULL OR consistent_point > '0/0')
 );
+
+-- v0.50 forward migration. CREATE TABLE IF NOT EXISTS does not add columns to
+-- catalogs installed by v0.49 and earlier, so upgrade the existing relation
+-- before any function or grant below references receipt identity. Receiptless
+-- active/retiring rows cannot be assigned an honest create-attempt capability:
+-- operators must finish their cleanup with the previous release first.
+ALTER TABLE pgshard_catalog.slot_sync_probes
+    ADD COLUMN IF NOT EXISTS creation_receipt_id uuid;
+ALTER TABLE pgshard_catalog.slot_sync_probes
+    ADD COLUMN IF NOT EXISTS cleanup_receipt_id uuid;
+
+DO $pgshard_slot_sync_probe_receipts$
+BEGIN
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes
+         WHERE (state = 'active' AND creation_receipt_id IS NULL)
+            OR (state = 'retiring' AND cleanup_receipt_id IS NULL)
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'receiptless live slot-sync probes block catalog upgrade',
+            DETAIL = 'v0.49 and earlier active or retiring probes have no exact create-attempt receipt',
+            HINT = 'finish retiring every live probe with the previous release, then retry the migration';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_constraint
+         WHERE conrelid = 'pgshard_catalog.slot_sync_probes'::regclass
+           AND conname = 'slot_sync_probes_receipt_ids_nonzero'
+    ) THEN
+        ALTER TABLE pgshard_catalog.slot_sync_probes
+            ADD CONSTRAINT slot_sync_probes_receipt_ids_nonzero
+            CHECK (
+                (
+                    creation_receipt_id IS NULL
+                    OR creation_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid
+                )
+                AND (
+                    cleanup_receipt_id IS NULL
+                    OR cleanup_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid
+                )
+            ) NOT VALID;
+    END IF;
+    ALTER TABLE pgshard_catalog.slot_sync_probes
+        VALIDATE CONSTRAINT slot_sync_probes_receipt_ids_nonzero;
+
+    IF NOT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_constraint
+         WHERE conrelid = 'pgshard_catalog.slot_sync_probes'::regclass
+           AND conname = 'slot_sync_probes_receipt_lifecycle'
+    ) THEN
+        ALTER TABLE pgshard_catalog.slot_sync_probes
+            ADD CONSTRAINT slot_sync_probes_receipt_lifecycle
+            CHECK (
+                (
+                    state = 'allocated'
+                    AND consistent_point IS NULL
+                    AND creation_receipt_id IS NULL
+                    AND cleanup_receipt_id IS NULL
+                    AND activated_at IS NULL
+                    AND retiring_at IS NULL
+                    AND retired_at IS NULL
+                )
+                OR
+                (
+                    state = 'active'
+                    AND consistent_point IS NOT NULL
+                    AND creation_receipt_id IS NOT NULL
+                    AND cleanup_receipt_id IS NULL
+                    AND activated_at IS NOT NULL
+                    AND retiring_at IS NULL
+                    AND retired_at IS NULL
+                )
+                OR
+                (
+                    state = 'retiring'
+                    AND retiring_at IS NOT NULL
+                    AND retired_at IS NULL
+                    AND cleanup_receipt_id IS NOT NULL
+                    AND (
+                        creation_receipt_id IS NULL
+                        OR cleanup_receipt_id = creation_receipt_id
+                    )
+                    AND (
+                        (
+                            consistent_point IS NULL
+                            AND creation_receipt_id IS NULL
+                            AND activated_at IS NULL
+                        )
+                        OR (
+                            consistent_point IS NOT NULL
+                            AND creation_receipt_id IS NOT NULL
+                            AND activated_at IS NOT NULL
+                        )
+                    )
+                )
+                OR
+                (
+                    state = 'retired'
+                    AND retiring_at IS NOT NULL
+                    AND retired_at IS NOT NULL
+                    AND (
+                        (
+                            cleanup_receipt_id IS NOT NULL
+                            AND (
+                                creation_receipt_id IS NULL
+                                OR cleanup_receipt_id = creation_receipt_id
+                            )
+                            AND (
+                                (
+                                    consistent_point IS NULL
+                                    AND creation_receipt_id IS NULL
+                                    AND activated_at IS NULL
+                                )
+                                OR (
+                                    consistent_point IS NOT NULL
+                                    AND creation_receipt_id IS NOT NULL
+                                    AND activated_at IS NOT NULL
+                                )
+                            )
+                        )
+                        OR (
+                            creation_receipt_id IS NULL
+                            AND cleanup_receipt_id IS NULL
+                            AND (
+                                (consistent_point IS NULL AND activated_at IS NULL)
+                                OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
+                            )
+                        )
+                    )
+                )
+            ) NOT VALID;
+    END IF;
+    ALTER TABLE pgshard_catalog.slot_sync_probes
+        VALIDATE CONSTRAINT slot_sync_probes_receipt_lifecycle;
+END
+$pgshard_slot_sync_probe_receipts$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS slot_sync_probes_one_live_per_shard
     ON pgshard_catalog.slot_sync_probes(shard_id)
@@ -541,8 +1408,110 @@ CREATE UNIQUE INDEX IF NOT EXISTS managed_replication_slots_one_live_primary_anc
     ON pgshard_catalog.managed_replication_slots(attachment_generation)
     WHERE slot_role = 'primary-anchor' AND state IN ('allocated', 'active', 'retiring');
 
+CREATE INDEX IF NOT EXISTS managed_replication_slots_live_by_attachment
+    ON pgshard_catalog.managed_replication_slots(attachment_generation, slot_name)
+    WHERE state IN ('allocated', 'active', 'retiring');
+
+CREATE INDEX IF NOT EXISTS managed_replication_slots_live_by_shard
+    ON pgshard_catalog.managed_replication_slots(shard_id, slot_name)
+    WHERE state IN ('allocated', 'active', 'retiring');
+
+CREATE INDEX IF NOT EXISTS managed_replication_slots_live_by_logical_consumer
+    ON pgshard_catalog.managed_replication_slots(
+        logical_database_id,
+        consumer_id,
+        shard_id,
+        slot_name
+    )
+    WHERE state IN ('allocated', 'active', 'retiring');
+
 COMMENT ON TABLE pgshard_catalog.managed_replication_slots IS
     'Permanent managed-slot allocations. Names encode the full simple UUID generation and are never reused within a shard.';
+
+CREATE TABLE IF NOT EXISTS pgshard_catalog.managed_slot_creation_attempts (
+    creation_receipt_id uuid PRIMARY KEY
+        CHECK (creation_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid),
+    slot_generation uuid NOT NULL
+        CHECK (slot_generation <> '00000000-0000-0000-0000-000000000000'::uuid),
+    slot_name pgshard_catalog.replication_slot_name NOT NULL,
+    allocation_kind text NOT NULL CHECK (allocation_kind IN ('probe', 'consumer')),
+    slot_role text NOT NULL CHECK (slot_role IN ('primary-anchor', 'standby-decoder')),
+    state text NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'abandoned', 'activated', 'retired')),
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    resolved_at timestamptz,
+    CHECK (right(slot_name::text, 32) = replace(slot_generation::text, '-', '')),
+    CHECK ((state = 'pending') = (resolved_at IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS managed_slot_creation_attempts_one_pending
+    ON pgshard_catalog.managed_slot_creation_attempts(slot_generation)
+    WHERE state = 'pending';
+
+CREATE UNIQUE INDEX IF NOT EXISTS managed_slot_creation_attempts_one_activated
+    ON pgshard_catalog.managed_slot_creation_attempts(slot_generation)
+    WHERE state = 'activated';
+
+COMMENT ON TABLE pgshard_catalog.managed_slot_creation_attempts IS
+    'Permanent create-attempt ledger. A pending row is a durable barrier against owner retirement after the orchestration or catalog-fence session is lost.';
+
+-- The create-attempt ledger is capability authority, not reconstructable
+-- bookkeeping. A catalog from before the ledger existed can retain allocated
+-- rows, because no physical effect has yet been acknowledged. Active or
+-- retiring consumer slots cannot be assigned an honest receipt after the fact.
+DO $pgshard_managed_slot_creation_attempt_upgrade$
+BEGIN
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.state IN ('active', 'retiring')
+           AND NOT EXISTS (
+               SELECT
+                 FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+                WHERE attempts.slot_generation = slots.slot_generation
+                  AND attempts.slot_name = slots.slot_name
+                  AND attempts.allocation_kind = 'consumer'
+                  AND attempts.slot_role = slots.slot_role
+           )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'receiptless live managed replication slots block catalog upgrade',
+            DETAIL = 'pre-ledger active or retiring consumer slots have no exact create-attempt receipt',
+            HINT = 'finish retiring every live consumer slot with the previous release, then retry the migration';
+    END IF;
+END
+$pgshard_managed_slot_creation_attempt_upgrade$;
+
+CREATE TABLE IF NOT EXISTS pgshard_catalog.managed_slot_target_fences (
+    target_name pgshard_catalog.replication_slot_name PRIMARY KEY,
+    fence_id uuid UNIQUE,
+    owner_pid integer CHECK (owner_pid IS NULL OR owner_pid > 0),
+    owner_backend_start timestamptz,
+    owner_postmaster_start timestamptz,
+    acquired_at timestamptz,
+    CHECK (
+        (
+            fence_id IS NULL
+            AND owner_pid IS NULL
+            AND owner_backend_start IS NULL
+            AND owner_postmaster_start IS NULL
+            AND acquired_at IS NULL
+        )
+        OR
+        (
+            fence_id IS NOT NULL
+            AND owner_pid IS NOT NULL
+            AND owner_backend_start IS NOT NULL
+            AND owner_postmaster_start IS NOT NULL
+            AND acquired_at IS NOT NULL
+        )
+    ),
+    CHECK (fence_id IS NULL OR fence_id <> '00000000-0000-0000-0000-000000000000'::uuid)
+);
+
+COMMENT ON TABLE pgshard_catalog.managed_slot_target_fences IS
+    'Hidden per-target session fences. A random capability is bound to the exact live PostgreSQL backend and postmaster generation without acquiring an advisory lock.';
 
 CREATE TABLE IF NOT EXISTS pgshard_catalog.operation_tombstones (
     operation_kind pgshard_catalog.sql_identifier NOT NULL,
@@ -746,6 +1715,1123 @@ BEGIN
 END
 $function$;
 
+CREATE OR REPLACE FUNCTION pgshard_catalog.managed_slot_backend_identity_live(
+    expected_owner_pid integer,
+    expected_backend_start timestamptz,
+    expected_postmaster_start timestamptz
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+    SELECT expected_owner_pid IS NOT NULL
+       AND expected_backend_start IS NOT NULL
+       AND expected_postmaster_start = pg_catalog.pg_postmaster_start_time()
+       AND EXISTS (
+        SELECT
+          FROM pg_catalog.pg_stat_activity AS activity
+         WHERE activity.pid = expected_owner_pid
+           AND activity.datid = (
+               SELECT databases.oid
+                 FROM pg_catalog.pg_database AS databases
+                WHERE databases.datname = pg_catalog.current_database()
+           )
+           AND activity.backend_start = expected_backend_start
+           AND activity.backend_type = 'client backend'
+    )
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.lock_managed_slot_target_row(target_name text)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+    PERFORM 1
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1
+     FOR UPDATE NOWAIT;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    -- A missing unique-key row cannot be protected with FOR UPDATE. SHARE
+    -- UPDATE EXCLUSIVE serializes first insertion with itself but remains
+    -- compatible with ROW EXCLUSIVE updates and ROW SHARE row locking on
+    -- unrelated targets. NOWAIT prevents same-name speculative insertion from
+    -- becoming a hidden wait edge.
+    LOCK TABLE pgshard_catalog.managed_slot_target_fences
+        IN SHARE UPDATE EXCLUSIVE MODE NOWAIT;
+    INSERT INTO pgshard_catalog.managed_slot_target_fences(target_name)
+    VALUES ($1)
+    ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
+    PERFORM 1
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1
+     FOR UPDATE NOWAIT;
+EXCEPTION
+    WHEN lock_not_available THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55P03',
+            MESSAGE = 'managed slot target fence is busy';
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.lock_managed_slot_target(target_name text)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    existing_fence_id uuid;
+    existing_owner_pid integer;
+    existing_backend_start timestamptz;
+    existing_postmaster_start timestamptz;
+BEGIN
+    IF target_name IS NULL OR target_name = '' THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot target is required';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_target_row($1);
+
+    SELECT fences.fence_id,
+           fences.owner_pid,
+           fences.owner_backend_start,
+           fences.owner_postmaster_start
+      INTO existing_fence_id,
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1;
+
+    IF existing_fence_id IS NOT NULL THEN
+        IF pgshard_catalog.managed_slot_backend_identity_live(
+            existing_owner_pid,
+            existing_backend_start,
+            existing_postmaster_start
+        ) THEN
+            IF existing_owner_pid <> pg_catalog.pg_backend_pid() THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '55P03',
+                    MESSAGE = 'managed slot target fence is busy';
+            END IF;
+            RETURN;
+        END IF;
+
+        UPDATE pgshard_catalog.managed_slot_target_fences AS fences
+           SET fence_id = NULL,
+               owner_pid = NULL,
+               owner_backend_start = NULL,
+               owner_postmaster_start = NULL,
+               acquired_at = NULL
+         WHERE fences.target_name::text = $1;
+    END IF;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.lock_managed_slot_targets(target_names text[])
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    target_name text;
+BEGIN
+    FOR target_name IN
+        SELECT DISTINCT names.name
+          FROM pg_catalog.unnest(target_names) AS names(name)
+         WHERE names.name IS NOT NULL
+         ORDER BY names.name
+    LOOP
+        PERFORM pgshard_catalog.lock_managed_slot_target(target_name);
+    END LOOP;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.acquire_managed_slot_target_fence(target_name text)
+RETURNS TABLE(acquired_fence_id uuid, acquired_backend_pid integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    existing_fence_id uuid;
+    existing_owner_pid integer;
+    existing_backend_start timestamptz;
+    existing_postmaster_start timestamptz;
+    new_fence_id uuid;
+    new_backend_start timestamptz;
+    new_postmaster_start timestamptz;
+BEGIN
+    IF target_name IS NULL OR target_name = '' THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot target is required';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_target_row($1);
+
+    SELECT fences.fence_id,
+           fences.owner_pid,
+           fences.owner_backend_start,
+           fences.owner_postmaster_start
+      INTO existing_fence_id,
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1;
+
+    IF existing_fence_id IS NOT NULL
+       AND pgshard_catalog.managed_slot_backend_identity_live(
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
+       ) THEN
+        IF existing_owner_pid = pg_catalog.pg_backend_pid() THEN
+            RETURN QUERY SELECT existing_fence_id, existing_owner_pid;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = '55P03',
+            MESSAGE = 'managed slot target fence is busy';
+    END IF;
+
+    UPDATE pgshard_catalog.managed_slot_target_fences AS fences
+       SET fence_id = NULL,
+           owner_pid = NULL,
+           owner_backend_start = NULL,
+           owner_postmaster_start = NULL,
+           acquired_at = NULL
+     WHERE fences.target_name::text = $1;
+
+    SELECT activity.backend_start,
+           pg_catalog.pg_postmaster_start_time()
+      INTO new_backend_start,
+           new_postmaster_start
+      FROM pg_catalog.pg_stat_activity AS activity
+     WHERE activity.pid = pg_catalog.pg_backend_pid()
+       AND activity.datid = (
+           SELECT databases.oid
+             FROM pg_catalog.pg_database AS databases
+            WHERE databases.datname = pg_catalog.current_database()
+       )
+       AND activity.backend_type = 'client backend';
+    IF new_backend_start IS NULL OR new_postmaster_start IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'could not identify the managed slot target fence backend';
+    END IF;
+    new_fence_id := pg_catalog.gen_random_uuid();
+
+    UPDATE pgshard_catalog.managed_slot_target_fences AS fences
+       SET fence_id = new_fence_id,
+           owner_pid = pg_catalog.pg_backend_pid(),
+           owner_backend_start = new_backend_start,
+           owner_postmaster_start = new_postmaster_start,
+           acquired_at = statement_timestamp()
+     WHERE fences.target_name::text = $1;
+
+    RETURN QUERY SELECT new_fence_id, pg_catalog.pg_backend_pid();
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.managed_slot_target_fence_held(target_name text)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+    SELECT EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_target_fences AS fences
+         WHERE fences.target_name::text = $1
+           AND fences.fence_id IS NOT NULL
+           AND fences.owner_pid = pg_catalog.pg_backend_pid()
+           AND pgshard_catalog.managed_slot_backend_identity_live(
+               fences.owner_pid,
+               fences.owner_backend_start,
+               fences.owner_postmaster_start
+           )
+    )
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.managed_slot_target_fence_matches(
+    target_name text,
+    expected_fence_id uuid
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+    SELECT expected_fence_id IS NOT NULL
+       AND expected_fence_id <> '00000000-0000-0000-0000-000000000000'::uuid
+       AND EXISTS (
+           SELECT
+             FROM pgshard_catalog.managed_slot_target_fences AS fences
+            WHERE fences.target_name::text = $1
+              AND fences.fence_id = expected_fence_id
+              AND fences.owner_pid = pg_catalog.pg_backend_pid()
+              AND pgshard_catalog.managed_slot_backend_identity_live(
+                  fences.owner_pid,
+                  fences.owner_backend_start,
+                  fences.owner_postmaster_start
+              )
+       )
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.verify_managed_slot_target_fence(
+    target_name text,
+    expected_fence_id uuid
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+    IF NOT pgshard_catalog.managed_slot_target_fence_matches(
+        target_name,
+        expected_fence_id
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot target fence is not held by this backend';
+    END IF;
+    RETURN pg_catalog.pg_backend_pid();
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.release_managed_slot_target_fence(
+    target_name text,
+    expected_fence_id uuid DEFAULT NULL
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    existing_fence_id uuid;
+    existing_owner_pid integer;
+    existing_backend_start timestamptz;
+    existing_postmaster_start timestamptz;
+BEGIN
+    SELECT fences.fence_id,
+           fences.owner_pid,
+           fences.owner_backend_start,
+           fences.owner_postmaster_start
+      INTO existing_fence_id,
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1
+     FOR UPDATE NOWAIT;
+    IF NOT FOUND OR existing_fence_id IS NULL THEN
+        RETURN false;
+    END IF;
+    IF existing_owner_pid <> pg_catalog.pg_backend_pid()
+       OR NOT pgshard_catalog.managed_slot_backend_identity_live(
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
+       ) THEN
+        IF expected_fence_id IS NULL THEN
+            RETURN false;
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot target fence is owned by another capability';
+    END IF;
+    IF expected_fence_id IS NOT NULL AND existing_fence_id <> expected_fence_id THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot target fence is owned by another capability';
+    END IF;
+
+    UPDATE pgshard_catalog.managed_slot_target_fences AS fences
+       SET fence_id = NULL,
+           owner_pid = NULL,
+           owner_backend_start = NULL,
+           owner_postmaster_start = NULL,
+           acquired_at = NULL
+     WHERE fences.target_name::text = $1;
+    RETURN true;
+EXCEPTION
+    WHEN lock_not_available THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55P03',
+            MESSAGE = 'managed slot target fence is busy';
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.begin_managed_slot_creation_attempt(
+    expected_slot_generation uuid,
+    expected_slot_name text,
+    expected_slot_role text,
+    expected_system_identifier numeric,
+    expected_database_oid bigint,
+    expected_source_timeline bigint,
+    expected_restore_incarnation uuid,
+    expected_catalog_epoch bigint,
+    requested_creation_receipt_id uuid
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    observed_catalog_epoch bigint;
+    allocation_kind text;
+    existing_attempt pgshard_catalog.managed_slot_creation_attempts%ROWTYPE;
+BEGIN
+    IF expected_slot_generation IS NULL
+       OR expected_slot_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR requested_creation_receipt_id IS NULL
+       OR requested_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot creation identities must be non-nil';
+    END IF;
+
+    SELECT catalog_epoch
+      INTO observed_catalog_epoch
+      FROM pgshard_catalog.cluster_state
+     WHERE singleton
+     FOR UPDATE;
+    IF observed_catalog_epoch IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'catalog state is missing';
+    END IF;
+    IF observed_catalog_epoch IS DISTINCT FROM expected_catalog_epoch THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001',
+            MESSAGE = 'managed slot creation used a stale catalog epoch';
+    END IF;
+
+    -- This fails fast rather than retaining the cluster-state row while
+    -- waiting. The Rust caller waits at session scope, then invokes this
+    -- function again while owning the same target fence.
+    PERFORM pgshard_catalog.lock_managed_slot_target(expected_slot_name);
+
+    SELECT 'probe'
+      INTO allocation_kind
+      FROM pgshard_catalog.slot_sync_probes AS probes
+      JOIN pgshard_catalog.shard_restore_incarnations AS restores
+        ON restores.restore_incarnation = probes.restore_incarnation
+       AND restores.shard_id = probes.shard_id
+      JOIN pgshard_catalog.shards AS shards ON shards.shard_id = probes.shard_id
+     WHERE probes.probe_generation = expected_slot_generation
+       AND probes.slot_name::text = expected_slot_name
+       AND expected_slot_role = 'primary-anchor'
+       AND probes.state = 'allocated'
+       AND probes.creation_receipt_id IS NULL
+       AND probes.cleanup_receipt_id IS NULL
+       AND probes.system_identifier = expected_system_identifier
+       AND probes.database_oid = expected_database_oid
+       AND probes.source_timeline = expected_source_timeline
+       AND probes.restore_incarnation = expected_restore_incarnation
+       AND restores.state = 'active'
+       AND shards.state IN ('provisioning', 'active')
+     FOR KEY SHARE OF probes, restores, shards;
+
+    IF allocation_kind IS NULL THEN
+        SELECT 'consumer'
+          INTO allocation_kind
+          FROM pgshard_catalog.managed_replication_slots AS slots
+          JOIN pgshard_catalog.logical_consumer_attachments AS attachments
+            ON attachments.attachment_generation = slots.attachment_generation
+           AND attachments.consumer_id = slots.consumer_id
+           AND attachments.logical_database_id = slots.logical_database_id
+           AND attachments.shard_id = slots.shard_id
+          JOIN pgshard_catalog.logical_consumer_shards AS consumer_shards
+            ON consumer_shards.consumer_id = slots.consumer_id
+           AND consumer_shards.logical_database_id = slots.logical_database_id
+           AND consumer_shards.shard_id = slots.shard_id
+          JOIN pgshard_catalog.logical_consumers AS consumers
+            ON consumers.consumer_id = slots.consumer_id
+           AND consumers.logical_database_id = slots.logical_database_id
+          JOIN pgshard_catalog.logical_databases AS databases
+            ON databases.logical_database_id = slots.logical_database_id
+          JOIN pgshard_catalog.shard_restore_incarnations AS restores
+            ON restores.restore_incarnation = attachments.restore_incarnation
+           AND restores.shard_id = attachments.shard_id
+          JOIN pgshard_catalog.shards AS shards ON shards.shard_id = attachments.shard_id
+         WHERE slots.slot_generation = expected_slot_generation
+           AND slots.slot_name::text = expected_slot_name
+           AND slots.slot_role = expected_slot_role
+           AND slots.state = 'allocated'
+           AND attachments.state = 'staged'
+           AND attachments.system_identifier = expected_system_identifier
+           AND attachments.database_oid = expected_database_oid
+           AND attachments.selected_source_timeline = expected_source_timeline
+           AND attachments.restore_incarnation = expected_restore_incarnation
+           AND consumer_shards.state IN ('provisioning', 'fenced')
+           AND consumers.state = 'active'
+           AND databases.state = 'active'
+           AND restores.state = 'active'
+           AND shards.state IN ('provisioning', 'active')
+         FOR KEY SHARE OF slots, attachments, consumer_shards, consumers, databases, restores, shards;
+    END IF;
+
+    IF allocation_kind IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot allocation is not eligible for creation';
+    END IF;
+
+    SELECT *
+      INTO existing_attempt
+      FROM pgshard_catalog.managed_slot_creation_attempts
+     WHERE creation_receipt_id = requested_creation_receipt_id
+     FOR KEY SHARE;
+    IF FOUND THEN
+        IF existing_attempt.slot_generation = expected_slot_generation
+           AND existing_attempt.slot_name::text = expected_slot_name
+           AND existing_attempt.allocation_kind = allocation_kind
+           AND existing_attempt.slot_role = expected_slot_role
+           AND existing_attempt.state = 'pending' THEN
+            RETURN allocation_kind;
+        END IF;
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'creation receipt identity was already used';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts
+         WHERE slot_generation = expected_slot_generation
+           AND state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot already has an unresolved creation attempt';
+    END IF;
+
+    INSERT INTO pgshard_catalog.managed_slot_creation_attempts(
+        creation_receipt_id,
+        slot_generation,
+        slot_name,
+        allocation_kind,
+        slot_role
+    ) VALUES (
+        requested_creation_receipt_id,
+        expected_slot_generation,
+        expected_slot_name,
+        allocation_kind,
+        expected_slot_role
+    );
+
+    -- Version the shared catalog fence in the same transaction as the new
+    -- phantom. A lifecycle transaction that already took an older
+    -- REPEATABLE READ snapshot must then fail when its statement trigger locks
+    -- cluster_state instead of missing this pending attempt.
+    UPDATE pgshard_catalog.cluster_state
+       SET changed_at = statement_timestamp()
+     WHERE singleton;
+    RETURN allocation_kind;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.abandon_managed_slot_creation_attempt(
+    expected_slot_generation uuid,
+    expected_slot_name text,
+    expected_creation_receipt_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    changed bigint;
+    existing_attempt pgshard_catalog.managed_slot_creation_attempts%ROWTYPE;
+BEGIN
+    PERFORM 1
+      FROM pgshard_catalog.cluster_state
+     WHERE singleton
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'catalog state is missing';
+    END IF;
+
+    SELECT *
+      INTO existing_attempt
+      FROM pgshard_catalog.managed_slot_creation_attempts
+     WHERE creation_receipt_id = expected_creation_receipt_id
+     FOR KEY SHARE;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    IF existing_attempt.slot_generation IS DISTINCT FROM expected_slot_generation
+       OR existing_attempt.slot_name::text IS DISTINCT FROM expected_slot_name THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot creation attempt cannot be abandoned';
+    END IF;
+    IF existing_attempt.state = 'abandoned' THEN
+        RETURN;
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_target(expected_slot_name);
+
+    UPDATE pgshard_catalog.managed_slot_creation_attempts
+       SET state = 'abandoned', resolved_at = statement_timestamp()
+     WHERE creation_receipt_id = expected_creation_receipt_id
+       AND slot_generation = expected_slot_generation
+       AND slot_name::text = expected_slot_name
+       AND state = 'pending';
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed = 1 THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot creation attempt cannot be abandoned';
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.managed_slot_creation_attempt_state(
+    expected_slot_generation uuid,
+    expected_slot_name text,
+    expected_creation_receipt_id uuid
+)
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+    SELECT attempts.state
+      FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+     WHERE attempts.slot_generation = expected_slot_generation
+       AND attempts.slot_name::text = expected_slot_name
+       AND attempts.creation_receipt_id = expected_creation_receipt_id
+     LIMIT 1
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.activate_managed_replication_slot(
+    expected_slot_generation uuid,
+    expected_creation_receipt_id uuid,
+    expected_consistent_point pg_lsn,
+    expected_two_phase_at pg_lsn
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    target_name text;
+    target_role text;
+    target_state text;
+    target_consistent_point pg_lsn;
+    target_two_phase_at pg_lsn;
+    changed bigint;
+BEGIN
+    IF expected_slot_generation IS NULL
+       OR expected_slot_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_creation_receipt_id IS NULL
+       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_consistent_point IS NULL
+       OR expected_consistent_point <= '0/0'
+       OR expected_two_phase_at IS NULL
+       OR expected_two_phase_at <= '0/0' THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot activation authority is incomplete';
+    END IF;
+
+    PERFORM 1
+      FROM pgshard_catalog.cluster_state
+     WHERE singleton
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'catalog state is missing';
+    END IF;
+
+    SELECT slots.slot_name::text,
+           slots.slot_role,
+           slots.state,
+           slots.consistent_point,
+           slots.two_phase_at
+      INTO target_name,
+           target_role,
+           target_state,
+           target_consistent_point,
+           target_two_phase_at
+      FROM pgshard_catalog.managed_replication_slots AS slots
+     WHERE slots.slot_generation = expected_slot_generation
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot allocation is missing';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_target(target_name);
+
+    IF target_state = 'active' THEN
+        IF target_consistent_point = expected_consistent_point
+           AND target_two_phase_at = expected_two_phase_at
+           AND EXISTS (
+               SELECT
+                 FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+                WHERE attempts.creation_receipt_id = expected_creation_receipt_id
+                  AND attempts.slot_generation = expected_slot_generation
+                  AND attempts.slot_name::text = target_name
+                  AND attempts.allocation_kind = 'consumer'
+                  AND attempts.slot_role = target_role
+                  AND attempts.state = 'activated'
+           ) THEN
+            RETURN;
+        END IF;
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot activation authority changed';
+    END IF;
+    IF target_state <> 'allocated' THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot allocation is not eligible for activation';
+    END IF;
+
+    UPDATE pgshard_catalog.managed_slot_creation_attempts
+       SET state = 'activated', resolved_at = statement_timestamp()
+     WHERE creation_receipt_id = expected_creation_receipt_id
+       AND slot_generation = expected_slot_generation
+       AND slot_name::text = target_name
+       AND allocation_kind = 'consumer'
+       AND slot_role = target_role
+       AND state = 'pending';
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed <> 1 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot activation requires its exact pending creation attempt';
+    END IF;
+
+    UPDATE pgshard_catalog.managed_replication_slots
+       SET state = 'active',
+           consistent_point = expected_consistent_point,
+           two_phase_at = expected_two_phase_at,
+           activated_at = statement_timestamp()
+     WHERE slot_generation = expected_slot_generation
+       AND state = 'allocated';
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed <> 1 THEN
+        RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'managed slot allocation changed during activation';
+    END IF;
+END
+$function$;
+
+DROP FUNCTION IF EXISTS pgshard_catalog.complete_managed_replication_slot_retirement(
+    uuid,
+    text,
+    uuid
+);
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.complete_managed_replication_slot_retirement(
+    expected_slot_generation uuid,
+    expected_slot_name text,
+    expected_creation_receipt_id uuid,
+    expected_fence_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    target_name text;
+    target_role text;
+    target_state text;
+    attachment_state text;
+    consumer_shard_state text;
+    attempt_state text;
+    changed bigint;
+BEGIN
+    IF expected_slot_generation IS NULL
+       OR expected_slot_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_slot_name IS NULL
+       OR expected_slot_name = ''
+       OR expected_creation_receipt_id IS NULL
+       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_fence_id IS NULL
+       OR expected_fence_id = '00000000-0000-0000-0000-000000000000'::uuid THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'managed slot retirement authority is incomplete';
+    END IF;
+
+    PERFORM 1
+      FROM pgshard_catalog.cluster_state
+     WHERE singleton
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'catalog state is missing';
+    END IF;
+
+    SELECT slots.slot_name::text,
+           slots.slot_role,
+           slots.state,
+           attachments.state,
+           consumer_shards.state
+      INTO target_name,
+           target_role,
+           target_state,
+           attachment_state,
+           consumer_shard_state
+      FROM pgshard_catalog.managed_replication_slots AS slots
+      JOIN pgshard_catalog.logical_consumer_attachments AS attachments
+        ON attachments.attachment_generation = slots.attachment_generation
+       AND attachments.consumer_id = slots.consumer_id
+       AND attachments.logical_database_id = slots.logical_database_id
+       AND attachments.shard_id = slots.shard_id
+      JOIN pgshard_catalog.logical_consumer_shards AS consumer_shards
+        ON consumer_shards.consumer_id = slots.consumer_id
+       AND consumer_shards.logical_database_id = slots.logical_database_id
+       AND consumer_shards.shard_id = slots.shard_id
+     WHERE slots.slot_generation = expected_slot_generation
+     FOR UPDATE OF slots;
+    IF NOT FOUND OR target_name IS DISTINCT FROM expected_slot_name THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot retirement authority changed';
+    END IF;
+
+    IF NOT pgshard_catalog.managed_slot_target_fence_matches(
+        target_name,
+        expected_fence_id
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot final retirement requires its live target fence';
+    END IF;
+
+    SELECT attempts.state
+      INTO attempt_state
+      FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+     WHERE attempts.creation_receipt_id = expected_creation_receipt_id
+       AND attempts.slot_generation = expected_slot_generation
+       AND attempts.slot_name::text = target_name
+       AND attempts.allocation_kind = 'consumer'
+       AND attempts.slot_role = target_role
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot retirement requires its exact creation attempt';
+    END IF;
+
+    IF target_state = 'retired' THEN
+        IF attempt_state = 'retired' THEN
+            RETURN;
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot retirement authority changed';
+    END IF;
+
+    IF target_state = 'allocated' THEN
+        IF attachment_state <> 'staged' OR attempt_state <> 'pending' THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'allocated managed slot is not eligible for absence reconciliation';
+        END IF;
+    ELSIF target_state = 'active' THEN
+        IF attempt_state <> 'activated'
+           OR NOT (
+               attachment_state = 'staged'
+               OR (
+                   attachment_state = 'retiring'
+                   AND consumer_shard_state = 'fenced'
+               )
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'active managed slot is not eligible for absence reconciliation';
+        END IF;
+    ELSIF target_state = 'retiring' THEN
+        IF attempt_state <> 'activated'
+           OR attachment_state <> 'retiring'
+           OR consumer_shard_state <> 'fenced' THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'active managed slot is not eligible for absence reconciliation';
+        END IF;
+    ELSE
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot is not eligible for absence reconciliation';
+    END IF;
+
+    UPDATE pgshard_catalog.managed_slot_creation_attempts
+       SET state = 'retired', resolved_at = statement_timestamp()
+     WHERE creation_receipt_id = expected_creation_receipt_id
+       AND slot_generation = expected_slot_generation
+       AND slot_name::text = target_name
+       AND allocation_kind = 'consumer'
+       AND slot_role = target_role
+       AND state = attempt_state;
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed <> 1 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001',
+            MESSAGE = 'managed slot creation attempt changed during retirement';
+    END IF;
+
+    UPDATE pgshard_catalog.managed_replication_slots
+       SET state = 'retired', retired_at = statement_timestamp()
+     WHERE slot_generation = expected_slot_generation
+       AND state = target_state;
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed <> 1 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001',
+            MESSAGE = 'managed slot allocation changed during retirement';
+    END IF;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.protect_managed_slot_creation_attempt()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot creation attempts are permanent';
+    END IF;
+    IF NOT (
+        TG_OP = 'UPDATE'
+        AND OLD.allocation_kind = 'probe'
+        AND OLD.state = 'activated'
+        AND NEW.state = 'retired'
+    ) THEN
+        PERFORM pgshard_catalog.lock_managed_slot_target(
+            CASE WHEN TG_OP = 'INSERT' THEN NEW.slot_name::text ELSE OLD.slot_name::text END
+        );
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.state <> 'pending' OR NEW.resolved_at IS NOT NULL THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'a managed slot creation attempt must start pending';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
+       OR NEW.slot_generation IS DISTINCT FROM OLD.slot_generation
+       OR NEW.slot_name IS DISTINCT FROM OLD.slot_name
+       OR NEW.allocation_kind IS DISTINCT FROM OLD.allocation_kind
+       OR NEW.slot_role IS DISTINCT FROM OLD.slot_role
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot creation attempt identity is immutable';
+    END IF;
+    IF NOT (
+        (OLD.state = 'pending' AND NEW.state IN ('abandoned', 'activated', 'retired'))
+        OR (OLD.state = 'activated' AND NEW.state = 'retired')
+    ) OR NEW.resolved_at IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid managed slot creation attempt transition';
+    END IF;
+    RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.slot_sync_probe_receipt_state(
+    expected_probe_generation uuid,
+    candidate_receipt_id uuid
+)
+RETURNS TABLE(
+    creation_receipt_present boolean,
+    cleanup_receipt_present boolean,
+    creation_receipt_matches boolean,
+    cleanup_receipt_matches boolean
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+    SELECT probes.creation_receipt_id IS NOT NULL,
+           probes.cleanup_receipt_id IS NOT NULL,
+           candidate_receipt_id IS NOT NULL
+               AND probes.creation_receipt_id = candidate_receipt_id,
+           candidate_receipt_id IS NOT NULL
+               AND probes.cleanup_receipt_id = candidate_receipt_id
+      FROM pgshard_catalog.slot_sync_probes AS probes
+     WHERE probes.probe_generation = expected_probe_generation
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.activate_slot_sync_probe(
+    expected_probe_generation uuid,
+    expected_creation_receipt_id uuid,
+    expected_consistent_point pg_lsn
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    changed bigint;
+BEGIN
+    IF expected_probe_generation IS NULL
+       OR expected_probe_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_creation_receipt_id IS NULL
+       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_consistent_point IS NULL
+       OR expected_consistent_point = '0/0'::pg_lsn THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'slot-sync probe activation authority is incomplete';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.probe_generation = expected_probe_generation
+           AND probes.state = 'active'
+           AND probes.creation_receipt_id = expected_creation_receipt_id
+           AND probes.consistent_point = expected_consistent_point
+    ) THEN
+        RETURN;
+    END IF;
+
+    UPDATE pgshard_catalog.slot_sync_probes
+       SET consistent_point = expected_consistent_point,
+           creation_receipt_id = expected_creation_receipt_id,
+           state = 'active',
+           activated_at = statement_timestamp()
+     WHERE probe_generation = expected_probe_generation
+       AND state = 'allocated';
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed = 1 THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe activation authority changed';
+END
+$function$;
+
+DROP FUNCTION IF EXISTS pgshard_catalog.begin_slot_sync_probe_retirement(uuid, uuid);
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.begin_slot_sync_probe_retirement(
+    expected_probe_generation uuid,
+    expected_creation_receipt_id uuid,
+    expected_consistent_point pg_lsn
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    changed bigint;
+BEGIN
+    IF expected_probe_generation IS NULL
+       OR expected_probe_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_creation_receipt_id IS NULL
+       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_consistent_point IS NULL
+       OR expected_consistent_point = '0/0'::pg_lsn THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'slot-sync probe retirement authority is incomplete';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.probe_generation = expected_probe_generation
+           AND probes.state IN ('retiring', 'retired')
+           AND probes.cleanup_receipt_id = expected_creation_receipt_id
+           AND (
+               (
+                   probes.creation_receipt_id IS NULL
+                   AND probes.consistent_point IS NULL
+               )
+               OR (
+                   probes.creation_receipt_id = expected_creation_receipt_id
+                   AND probes.consistent_point = expected_consistent_point
+               )
+           )
+    ) THEN
+        RETURN;
+    END IF;
+
+    UPDATE pgshard_catalog.slot_sync_probes
+       SET state = 'retiring',
+           cleanup_receipt_id = expected_creation_receipt_id,
+           retiring_at = statement_timestamp()
+     WHERE probe_generation = expected_probe_generation
+       AND state IN ('allocated', 'active')
+       AND (
+           (
+               state = 'allocated'
+               AND consistent_point IS NULL
+               AND creation_receipt_id IS NULL
+           )
+           OR (
+               state = 'active'
+               AND consistent_point = expected_consistent_point
+               AND creation_receipt_id = expected_creation_receipt_id
+           )
+       );
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed = 1 THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe retirement authority changed';
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.complete_slot_sync_probe_retirement(
+    expected_probe_generation uuid,
+    expected_slot_name text,
+    expected_creation_receipt_id uuid,
+    expected_fence_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    changed bigint;
+BEGIN
+    IF expected_probe_generation IS NULL
+       OR expected_probe_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_slot_name IS NULL
+       OR expected_slot_name = ''
+       OR expected_creation_receipt_id IS NULL
+       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_fence_id IS NULL
+       OR expected_fence_id = '00000000-0000-0000-0000-000000000000'::uuid THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'slot-sync probe final retirement authority is incomplete';
+    END IF;
+    IF NOT pgshard_catalog.managed_slot_target_fence_matches(
+        expected_slot_name,
+        expected_fence_id
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'slot-sync probe final retirement requires its exact live target fence';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.probe_generation = expected_probe_generation
+           AND probes.slot_name::text = expected_slot_name
+           AND probes.cleanup_receipt_id = expected_creation_receipt_id
+           AND probes.state = 'retired'
+    ) THEN
+        RETURN;
+    END IF;
+
+    UPDATE pgshard_catalog.slot_sync_probes
+       SET state = 'retired', retired_at = statement_timestamp()
+     WHERE probe_generation = expected_probe_generation
+       AND slot_name::text = expected_slot_name
+       AND cleanup_receipt_id = expected_creation_receipt_id
+       AND state = 'retiring';
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed = 1 THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe final retirement authority changed';
+END
+$function$;
+
 CREATE OR REPLACE FUNCTION pgshard_catalog.protect_shard_lifecycle()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -763,6 +2849,37 @@ BEGIN
        OR NEW.shard_number IS DISTINCT FROM OLD.shard_number
        OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'shard identity is immutable';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT probes.slot_name::text
+         FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.shard_id = OLD.shard_id
+           AND probes.state IN ('allocated', 'active', 'retiring')
+        UNION
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.shard_id = OLD.shard_id
+           AND slots.state IN ('allocated', 'active', 'retiring')
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.slot_sync_probes AS probes
+            ON probes.probe_generation = attempts.slot_generation
+         WHERE probes.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+        UNION ALL
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'shard lifecycle is blocked by a pending managed slot creation';
     END IF;
 
     IF NOT (
@@ -804,7 +2921,7 @@ BEGIN
         SELECT
           FROM pgshard_catalog.slot_sync_probes AS probes
          WHERE probes.shard_id = OLD.shard_id
-           AND probes.state <> 'retired'
+           AND probes.state IN ('allocated', 'active', 'retiring')
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
@@ -850,6 +2967,45 @@ BEGIN
        OR NEW.shard_id IS DISTINCT FROM OLD.shard_id
        OR NEW.installed_at IS DISTINCT FROM OLD.installed_at THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'shard restore incarnation identity is immutable';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT probes.slot_name::text
+         FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.restore_incarnation = OLD.restore_incarnation
+           AND probes.shard_id = OLD.shard_id
+           AND probes.state IN ('allocated', 'active', 'retiring')
+        UNION
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+          JOIN pgshard_catalog.logical_consumer_attachments AS attachments
+            ON attachments.attachment_generation = slots.attachment_generation
+         WHERE attachments.restore_incarnation = OLD.restore_incarnation
+           AND attachments.shard_id = OLD.shard_id
+           AND slots.state IN ('allocated', 'active', 'retiring')
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.slot_sync_probes AS probes
+            ON probes.probe_generation = attempts.slot_generation
+         WHERE probes.restore_incarnation = OLD.restore_incarnation
+           AND probes.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+        UNION ALL
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+          JOIN pgshard_catalog.logical_consumer_attachments AS attachments
+            ON attachments.attachment_generation = slots.attachment_generation
+         WHERE attachments.restore_incarnation = OLD.restore_incarnation
+           AND attachments.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'restore lifecycle is blocked by a pending managed slot creation';
     END IF;
 
     IF OLD.state = 'retired' THEN
@@ -904,7 +3060,7 @@ BEGIN
           FROM pgshard_catalog.slot_sync_probes AS probes
          WHERE probes.shard_id = NEW.shard_id
            AND probes.restore_incarnation = NEW.restore_incarnation
-           AND probes.state <> 'retired'
+           AND probes.state IN ('allocated', 'active', 'retiring')
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
@@ -924,9 +3080,29 @@ AS $function$
 DECLARE
     restore_state text;
     shard_state text;
+    attempts_changed bigint;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe generations are permanent';
+    END IF;
+
+    -- Final retirement must run on the same catalog backend that still owns
+    -- the connection-bound absence fence. Every earlier transition takes the
+    -- database-enforced target lock in cluster-state-before-target order.
+    IF (
+        TG_OP = 'UPDATE'
+        AND OLD.state = 'retiring'
+        AND NEW.state = 'retired'
+    ) THEN
+        IF NOT pgshard_catalog.managed_slot_target_fence_held(OLD.slot_name::text) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'slot-sync probe final retirement requires its live target fence';
+        END IF;
+    ELSE
+        PERFORM pgshard_catalog.lock_managed_slot_target(
+            CASE WHEN TG_OP = 'INSERT' THEN NEW.slot_name::text ELSE OLD.slot_name::text END
+        );
     END IF;
 
     SELECT incarnations.state, shards.state
@@ -941,6 +3117,8 @@ BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.state <> 'allocated'
            OR NEW.consistent_point IS NOT NULL
+           OR NEW.creation_receipt_id IS NOT NULL
+           OR NEW.cleanup_receipt_id IS NOT NULL
            OR NEW.activated_at IS NOT NULL
            OR NEW.retiring_at IS NOT NULL
            OR NEW.retired_at IS NOT NULL THEN
@@ -981,6 +3159,8 @@ BEGIN
 
     IF NEW.state = OLD.state THEN
         IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+           OR NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
+           OR NEW.cleanup_receipt_id IS DISTINCT FROM OLD.cleanup_receipt_id
            OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
            OR NEW.retiring_at IS DISTINCT FROM OLD.retiring_at
            OR NEW.retired_at IS DISTINCT FROM OLD.retired_at THEN
@@ -994,25 +3174,76 @@ BEGIN
            OR shard_state IS NULL
            OR shard_state NOT IN ('provisioning', 'active')
            OR NEW.consistent_point IS NULL
+           OR NEW.creation_receipt_id IS NULL
+           OR NEW.cleanup_receipt_id IS NOT NULL
            OR NEW.activated_at IS NULL
            OR NEW.retiring_at IS NOT NULL
            OR NEW.retired_at IS NOT NULL THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe activation is incomplete or misplaced';
         END IF;
+        UPDATE pgshard_catalog.managed_slot_creation_attempts
+           SET state = 'activated', resolved_at = statement_timestamp()
+         WHERE creation_receipt_id = NEW.creation_receipt_id
+           AND slot_generation = NEW.probe_generation
+           AND slot_name = NEW.slot_name
+           AND allocation_kind = 'probe'
+           AND slot_role = 'primary-anchor'
+           AND state = 'pending';
+        GET DIAGNOSTICS attempts_changed = ROW_COUNT;
+        IF attempts_changed <> 1 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'slot-sync probe activation requires its exact pending creation attempt';
+        END IF;
     ELSIF OLD.state IN ('allocated', 'active') AND NEW.state = 'retiring' THEN
         IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+           OR NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
            OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
+           OR NEW.cleanup_receipt_id IS NULL
+           OR (
+               OLD.creation_receipt_id IS NOT NULL
+               AND NEW.cleanup_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
+           )
            OR NEW.retiring_at IS NULL
            OR NEW.retired_at IS NOT NULL THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe retirement must preserve activation history';
         END IF;
+        IF OLD.state = 'allocated' AND EXISTS (
+            SELECT
+              FROM pgshard_catalog.managed_slot_creation_attempts
+             WHERE slot_generation = NEW.probe_generation
+               AND state = 'pending'
+        ) THEN
+            UPDATE pgshard_catalog.managed_slot_creation_attempts
+               SET state = 'activated', resolved_at = statement_timestamp()
+             WHERE creation_receipt_id = NEW.cleanup_receipt_id
+               AND slot_generation = NEW.probe_generation
+               AND slot_name = NEW.slot_name
+               AND allocation_kind = 'probe'
+               AND slot_role = 'primary-anchor'
+               AND state = 'pending';
+            GET DIAGNOSTICS attempts_changed = ROW_COUNT;
+            IF attempts_changed <> 1 THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '55000',
+                    MESSAGE = 'slot-sync probe retirement requires its exact pending creation attempt';
+            END IF;
+        END IF;
     ELSIF OLD.state = 'retiring' AND NEW.state = 'retired' THEN
         IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+           OR NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
+           OR NEW.cleanup_receipt_id IS DISTINCT FROM OLD.cleanup_receipt_id
            OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
            OR NEW.retiring_at IS DISTINCT FROM OLD.retiring_at
            OR NEW.retired_at IS NULL THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe retirement is incomplete';
         END IF;
+        UPDATE pgshard_catalog.managed_slot_creation_attempts
+           SET state = 'retired', resolved_at = statement_timestamp()
+         WHERE slot_generation = NEW.probe_generation
+           AND slot_name = NEW.slot_name
+           AND allocation_kind = 'probe'
+           AND state = 'activated';
     ELSE
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid slot-sync probe transition';
     END IF;
@@ -1040,6 +3271,25 @@ BEGIN
        OR NEW.schema_epoch < OLD.schema_epoch
        OR NEW.authorization_epoch < OLD.authorization_epoch THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'logical database identity and epochs are monotonic';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.logical_database_id = OLD.logical_database_id
+           AND slots.state IN ('allocated', 'active', 'retiring')
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.logical_database_id = OLD.logical_database_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'logical database lifecycle is blocked by a pending managed slot creation';
     END IF;
 
     IF NOT (
@@ -1115,6 +3365,27 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'logical consumer identity is immutable';
     END IF;
 
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.consumer_id = OLD.consumer_id
+           AND slots.logical_database_id = OLD.logical_database_id
+           AND slots.state IN ('allocated', 'active', 'retiring')
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.consumer_id = OLD.consumer_id
+           AND slots.logical_database_id = OLD.logical_database_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'logical consumer lifecycle is blocked by a pending managed slot creation';
+    END IF;
+
     IF NOT (
         NEW.state = OLD.state
         OR (OLD.state = 'active' AND NEW.state = 'draining')
@@ -1178,6 +3449,29 @@ BEGIN
        OR NEW.shard_id IS DISTINCT FROM OLD.shard_id
        OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'logical consumer shard identity is immutable';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.consumer_id = OLD.consumer_id
+           AND slots.logical_database_id = OLD.logical_database_id
+           AND slots.shard_id = OLD.shard_id
+           AND slots.state IN ('allocated', 'active', 'retiring')
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.consumer_id = OLD.consumer_id
+           AND slots.logical_database_id = OLD.logical_database_id
+           AND slots.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'consumer ownership fencing is blocked by a pending managed slot creation';
     END IF;
 
     IF NEW.ownership_fence NOT IN (OLD.ownership_fence, OLD.ownership_fence + 1) THEN
@@ -1495,6 +3789,25 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'source attachment identity is immutable';
     END IF;
 
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.attachment_generation = OLD.attachment_generation
+           AND slots.state IN ('allocated', 'active', 'retiring')
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.attachment_generation = OLD.attachment_generation
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'source attachment lifecycle is blocked by a pending managed slot creation';
+    END IF;
+
     IF OLD.state = 'retired' THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'retired source attachments are immutable';
     END IF;
@@ -1618,7 +3931,7 @@ BEGIN
             SELECT
               FROM pgshard_catalog.managed_replication_slots AS slots
              WHERE slots.attachment_generation = NEW.attachment_generation
-               AND slots.state <> 'retired'
+               AND slots.state IN ('allocated', 'active', 'retiring')
         ) THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'attachment retains non-retired managed slots';
         END IF;
@@ -1640,6 +3953,10 @@ BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot names and generations are permanent';
     END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_target(
+        CASE WHEN TG_OP = 'INSERT' THEN NEW.slot_name::text ELSE OLD.slot_name::text END
+    );
 
     SELECT state
       INTO attachment_state
@@ -1690,7 +4007,11 @@ BEGIN
         NEW.state = OLD.state
         OR (OLD.state = 'allocated' AND NEW.state IN ('active', 'retired'))
         OR (OLD.state = 'active' AND NEW.state = 'retiring')
-        OR (OLD.state = 'active' AND NEW.state = 'retired' AND attachment_state = 'staged')
+        OR (
+            OLD.state = 'active'
+            AND NEW.state = 'retired'
+            AND attachment_state IN ('staged', 'retiring')
+        )
         OR (OLD.state = 'retiring' AND NEW.state = 'retired')
     ) THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid managed slot transition';
@@ -1703,6 +4024,19 @@ BEGIN
            OR NEW.activated_at IS NULL
            OR NEW.retired_at IS NOT NULL THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot activation is incomplete or misplaced';
+        END IF;
+        IF NOT EXISTS (
+            SELECT
+              FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+             WHERE attempts.slot_generation = NEW.slot_generation
+               AND attempts.slot_name = NEW.slot_name
+               AND attempts.allocation_kind = 'consumer'
+               AND attempts.slot_role = NEW.slot_role
+               AND attempts.state = 'activated'
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'managed slot activation requires its receipt-authorized creation attempt';
         END IF;
     ELSIF OLD.state = 'active' AND NEW.state = 'retiring' THEN
         IF attachment_state <> 'retiring' THEN
@@ -1721,6 +4055,32 @@ BEGIN
             RAISE EXCEPTION USING
                 ERRCODE = '55000',
                 MESSAGE = 'an unactivated managed slot cannot fabricate activation history';
+        END IF;
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+             WHERE attempts.slot_generation = NEW.slot_generation
+               AND attempts.slot_name = NEW.slot_name
+               AND attempts.allocation_kind = 'consumer'
+               AND attempts.slot_role = NEW.slot_role
+               AND attempts.state IN ('pending', 'activated')
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'managed slot retirement requires receipt-authorized absence reconciliation';
+        END IF;
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+             WHERE attempts.slot_generation = NEW.slot_generation
+               AND attempts.slot_name = NEW.slot_name
+               AND attempts.allocation_kind = 'consumer'
+               AND attempts.slot_role = NEW.slot_role
+               AND attempts.state = 'retired'
+        ) AND NOT pgshard_catalog.managed_slot_target_fence_held(OLD.slot_name::text) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'managed slot final retirement requires its live target fence';
         END IF;
     END IF;
 
@@ -2173,12 +4533,72 @@ CREATE TRIGGER managed_replication_slots_protect_history
 BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.managed_replication_slots
 FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_managed_replication_slot();
 
+DROP TRIGGER IF EXISTS managed_slot_creation_attempts_protect_history
+    ON pgshard_catalog.managed_slot_creation_attempts;
+CREATE TRIGGER managed_slot_creation_attempts_protect_history
+BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.managed_slot_creation_attempts
+FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_managed_slot_creation_attempt();
+
 REVOKE ALL ON ALL TABLES IN SCHEMA pgshard_catalog FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA pgshard_catalog FROM PUBLIC;
-REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pgshard_catalog FROM PUBLIC;
+REVOKE ALL ON ALL ROUTINES IN SCHEMA pgshard_catalog FROM PUBLIC;
 
 GRANT SELECT ON ALL TABLES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;
+REVOKE SELECT ON pgshard_catalog.managed_slot_creation_attempts
+    FROM pgshard_catalog_reader;
+REVOKE SELECT ON pgshard_catalog.managed_slot_target_fences
+    FROM pgshard_catalog_reader;
+REVOKE SELECT ON pgshard_catalog.slot_sync_probes
+    FROM pgshard_catalog_reader;
+GRANT SELECT (
+    probe_generation,
+    shard_id,
+    restore_incarnation,
+    system_identifier,
+    database_oid,
+    database_name,
+    source_timeline,
+    slot_name,
+    consistent_point,
+    state,
+    created_at,
+    activated_at,
+    retiring_at,
+    retired_at
+) ON pgshard_catalog.slot_sync_probes TO pgshard_catalog_reader;
+
+GRANT EXECUTE ON FUNCTION pgshard_catalog.acquire_managed_slot_target_fence(text)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.verify_managed_slot_target_fence(text, uuid)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.release_managed_slot_target_fence(text, uuid)
+    TO pgshard_catalog_admin;
+
+GRANT EXECUTE ON FUNCTION pgshard_catalog.begin_managed_slot_creation_attempt(
+    uuid, text, text, numeric, bigint, bigint, uuid, bigint, uuid
+) TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.abandon_managed_slot_creation_attempt(
+    uuid, text, uuid
+) TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.managed_slot_creation_attempt_state(
+    uuid, text, uuid
+) TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.activate_managed_replication_slot(
+    uuid, uuid, pg_lsn, pg_lsn
+) TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.complete_managed_replication_slot_retirement(
+    uuid, text, uuid, uuid
+) TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.slot_sync_probe_receipt_state(uuid, uuid)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.activate_slot_sync_probe(uuid, uuid, pg_lsn)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.begin_slot_sync_probe_retirement(uuid, uuid, pg_lsn)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.complete_slot_sync_probe_retirement(
+    uuid, text, uuid, uuid
+) TO pgshard_catalog_admin;
 
 GRANT INSERT (database_name) ON pgshard_catalog.logical_databases TO pgshard_catalog_admin;
 GRANT INSERT (shard_id, shard_number, state), UPDATE (state)
@@ -2194,8 +4614,18 @@ GRANT INSERT (
     database_name,
     source_timeline,
     slot_name
-), UPDATE (consistent_point, state, activated_at, retiring_at, retired_at)
+)
     ON pgshard_catalog.slot_sync_probes TO pgshard_catalog_admin;
+REVOKE UPDATE ON pgshard_catalog.slot_sync_probes FROM pgshard_catalog_admin;
+REVOKE UPDATE (
+    consistent_point,
+    creation_receipt_id,
+    cleanup_receipt_id,
+    state,
+    activated_at,
+    retiring_at,
+    retired_at
+) ON pgshard_catalog.slot_sync_probes FROM pgshard_catalog_admin;
 GRANT INSERT (logical_database_id) ON pgshard_catalog.routing_epochs TO pgshard_catalog_admin;
 GRANT INSERT, UPDATE, DELETE ON pgshard_catalog.routing_ranges TO pgshard_catalog_admin;
 GRANT INSERT (
@@ -2246,8 +4676,10 @@ GRANT INSERT (
     slot_role,
     member_ordinal,
     slot_name
-), UPDATE (consistent_point, two_phase_at, state, activated_at, retired_at)
+), UPDATE (state, retired_at)
     ON pgshard_catalog.managed_replication_slots TO pgshard_catalog_admin;
+REVOKE UPDATE (consistent_point, two_phase_at, activated_at)
+    ON pgshard_catalog.managed_replication_slots FROM pgshard_catalog_admin;
 GRANT INSERT ON pgshard_catalog.operation_tombstones TO pgshard_catalog_admin;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA pgshard_catalog TO pgshard_catalog_admin;
 GRANT EXECUTE ON FUNCTION pgshard_catalog.validate_routing_epoch(bigint)
@@ -2265,7 +4697,7 @@ GRANT EXECUTE ON FUNCTION pgshard_catalog.advance_logical_consumer_checkpoint(
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog REVOKE ALL ON TABLES FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog REVOKE ALL ON SEQUENCES FROM PUBLIC;
-ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog GRANT SELECT ON TABLES TO pgshard_catalog_reader;
 
 COMMIT;
