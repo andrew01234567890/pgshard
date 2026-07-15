@@ -12,8 +12,8 @@ mod model;
 mod supervisor;
 
 pub use cache::{
-    CacheError, CatalogCache, CatalogNotification, InstallOutcome, NotificationError,
-    RefreshDecision, RequestEpochError,
+    CacheError, CatalogCache, CatalogNotification, InstallOutcome, MAX_CATALOG_SNAPSHOT_AGE,
+    MAX_RETAINED_SNAPSHOTS, NotificationError, RefreshDecision, RequestEpochError,
 };
 pub use driver::{
     CatalogOperation, CatalogOperationTimeout, CatalogOperationTimeoutError, CatalogPollInterval,
