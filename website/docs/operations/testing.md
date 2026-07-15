@@ -99,14 +99,24 @@ values as decimal JSON strings, and validate bounded phase, readiness, and
 failure labels in Prometheus exposition. Runtime tests compose the production
 supervisor with pre-bound HTTP and PostgreSQL listeners, observe a failed
 catalog connection enter retry without becoming ready, and prove coordinated
-shutdown marks catalog state stopped. They also prove a catalog-ready process
-stays application-unready. An HTTP regression holds a partial request under a
+shutdown marks catalog state stopped. Fault injection additionally proves a
+terminal PostgreSQL-listener failure closes the HTTP listener and simultaneous
+component errors remain available in deterministic order. Runtime tests also
+prove a catalog-ready process stays application-unready. An HTTP regression holds a partial request under a
 one-connection test policy and proves shutdown force-closes it after a bounded
 drain; the production policy also bounds headers and connection lifetime.
 Injected acceptor tests prove an accept error can recover, cancellation of an
-in-flight wait retains its deadline and exponential retry state, and shutdown
-can interrupt the capped retry backoff. A Linux subprocess test loads real
-environment variables, a CLI override, and file configuration, serves health,
+in-flight wait retains its deadline and exponential retry state, unusable
+listener descriptors fail immediately, continuous failures exhaust a bounded
+outage budget, pending Linux connection errors do not consume that budget, a
+quiet accept interval resets the failure streak even when the outer supervisor
+cancels and recreates the pending accept future, interleaved connection errors
+cannot clear a resource-failure streak, and shutdown can interrupt the capped
+retry backoff. Agent listener tests independently prove the same cancellation
+and interleaving invariants, transient and spaced failures recover, a permanent
+descriptor or exhausted zero budget is terminal after one attempt, and shutdown
+interrupts its retry wait. A Linux subprocess test loads
+real environment variables, a CLI override, and file configuration, serves health,
 returns an exact PostgreSQL `FATAL`/`57P03` startup rejection, receives
 `SIGTERM`, and exits successfully. A second subprocess starts with no DSN in
 explicit bootstrap mode, proves liveness stays independent while readiness and

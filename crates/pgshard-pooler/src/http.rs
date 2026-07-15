@@ -29,6 +29,7 @@ const MAX_HTTP_HEADERS: usize = 32;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const HTTP_ACCEPT_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
 const HTTP_ACCEPT_MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
+const HTTP_ACCEPT_MAX_FAILURE_DURATION: Duration = Duration::from_secs(30);
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -40,6 +41,7 @@ struct HttpServerPolicy {
     maximum_header_bytes: usize,
     accept_initial_retry_delay: Duration,
     accept_max_retry_delay: Duration,
+    accept_max_failure_duration: Duration,
     header_timeout: Duration,
     connection_timeout: Duration,
     shutdown_timeout: Duration,
@@ -53,6 +55,7 @@ const DEFAULT_HTTP_SERVER_POLICY: HttpServerPolicy = HttpServerPolicy {
     maximum_header_bytes: MAX_HTTP_HEADER_BYTES,
     accept_initial_retry_delay: HTTP_ACCEPT_INITIAL_RETRY_DELAY,
     accept_max_retry_delay: HTTP_ACCEPT_MAX_RETRY_DELAY,
+    accept_max_failure_duration: HTTP_ACCEPT_MAX_FAILURE_DURATION,
     header_timeout: HTTP_HEADER_TIMEOUT,
     connection_timeout: HTTP_CONNECTION_TIMEOUT,
     shutdown_timeout: HTTP_SHUTDOWN_TIMEOUT,
@@ -120,6 +123,7 @@ where
     let mut accept_backoff = AcceptBackoff::new(
         policy.accept_initial_retry_delay,
         policy.accept_max_retry_delay,
+        policy.accept_max_failure_duration,
     );
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
@@ -377,6 +381,7 @@ mod tests {
             maximum_header_bytes: MAX_HTTP_HEADER_BYTES,
             accept_initial_retry_delay: Duration::from_millis(1),
             accept_max_retry_delay: Duration::from_millis(2),
+            accept_max_failure_duration: Duration::from_millis(50),
             header_timeout: Duration::from_secs(30),
             connection_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_millis(25),

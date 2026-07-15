@@ -23,6 +23,19 @@ signal files and also runs the immutable PostgreSQL 18 `pg_controldata` sibling
 to verify its CRC-backed report. Recovery control states are rejected even if a
 signal file was lost, rather than silently turning former standby storage into
 a writable primary. It does not bootstrap or activate a server.
+The agent control listener retries resource and system accept failures with
+capped backoff for at most 30 seconds of consecutive rapid failures. A quiet
+pending accept resets that streak, and Linux pending-connection network errors
+retry without consuming or clearing it. Cancellation by another supervisor
+branch does not discard time already spent in the pending accept. An unusable
+listener descriptor fails immediately.
+Either terminal path enters the existing process-wide supervisor,
+which stops and reaps the quarantined postmaster because lease control and
+health can no longer be served. The pooler applies the same bounded retry
+contract; a terminal client-listener failure tears down its health listener so
+Kubernetes cannot observe a permanently false-positive liveness endpoint.
+Simultaneous component failures are retained in deterministic catalog, HTTP,
+then client-listener order.
 The operator renders inactive common plus per-member primary and standby
 PostgreSQL 18 configuration profiles, including promotion-safe slot capacity, `ANY 1`, and
 mandatory standby feedback and slot synchronization. A bounded local observer
