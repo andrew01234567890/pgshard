@@ -19,6 +19,7 @@ use crate::server::{AcceptBackoff, accept_bounded, connection_task_result, drain
 const MAX_FRONTEND_CONNECTIONS: usize = 1_024;
 const ACCEPT_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
 const ACCEPT_MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
+const ACCEPT_MAX_FAILURE_DURATION: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const UNAVAILABLE_SQLSTATE: [u8; 5] = *b"57P03";
@@ -29,6 +30,7 @@ struct FrontendServerPolicy {
     maximum_connections: usize,
     accept_initial_retry_delay: Duration,
     accept_max_retry_delay: Duration,
+    accept_max_failure_duration: Duration,
     startup_timeout: Duration,
     shutdown_timeout: Duration,
     #[cfg(test)]
@@ -39,6 +41,7 @@ const DEFAULT_FRONTEND_SERVER_POLICY: FrontendServerPolicy = FrontendServerPolic
     maximum_connections: MAX_FRONTEND_CONNECTIONS,
     accept_initial_retry_delay: ACCEPT_INITIAL_RETRY_DELAY,
     accept_max_retry_delay: ACCEPT_MAX_RETRY_DELAY,
+    accept_max_failure_duration: ACCEPT_MAX_FAILURE_DURATION,
     startup_timeout: STARTUP_TIMEOUT,
     shutdown_timeout: SHUTDOWN_TIMEOUT,
     #[cfg(test)]
@@ -54,7 +57,9 @@ const DEFAULT_FRONTEND_SERVER_POLICY: FrontendServerPolicy = FrontendServerPolic
 ///
 /// # Errors
 ///
-/// Returns an I/O error if a connection task panics.
+/// Returns an I/O error if a connection task panics, the listener becomes
+/// permanently unusable, or continuous non-connection accept failures exhaust
+/// the bounded outage budget.
 pub(crate) async fn serve_listener(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send,
@@ -71,6 +76,7 @@ async fn serve_listener_with_policy(
     let mut accept_backoff = AcceptBackoff::new(
         policy.accept_initial_retry_delay,
         policy.accept_max_retry_delay,
+        policy.accept_max_failure_duration,
     );
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);

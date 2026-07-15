@@ -22,8 +22,15 @@ PostgreSQL handshake listener down together on `SIGINT` or `SIGTERM`. The
 control HTTP server
 limits accepted connections, header count and bytes, header time, total
 connection lifetime, and shutdown drain time. Transient accept errors retry,
-with capped exponential backoff for resource and system failures. A hard
-runtime deadline aborts a child task that still does not stop.
+with capped exponential backoff for resource and system failures, but Linux
+pending-connection network errors do not consume the listener-outage budget and
+a quiet pending accept resets its streak. An unusable listener fails
+immediately and consecutive rapid failures have a 30-second ceiling. Because
+the runtime supervises both listeners together, a
+terminal PostgreSQL-listener failure also stops the HTTP task instead of
+leaving a false-positive health endpoint. Simultaneous component failures are
+retained in deterministic order. A hard runtime deadline aborts a child task
+that still does not stop.
 
 `PGSHARD_RW_BIND` selects a bounded PostgreSQL read-write listener. It allows
 at most 1,024 startup handshakes, caps each packet at PostgreSQL 18's 10,004-byte
