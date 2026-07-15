@@ -135,9 +135,33 @@ durable checkpoint, a different reported active backend PID, and a reported
 start other than that checkpoint before producing a non-authorizing report.
 Pure values cannot prove which PID and start LSN an actual socket used. These
 tests cover observation contracts only; the catalog allocation lifecycle is
-tested separately, while controlled PostgreSQL slot mutation,
-connection-bound command proof, quarantined COPY-BOTH attachment, and stream
-ownership remain future work.
+tested separately. A dedicated live PostgreSQL 18 suite now exercises bounded
+creation, exact postflight verification and receipt-authorized deletion of both
+a primary failover anchor and a standby-local decoder. The standby case
+consumes a fresh correlated primary/receiver/slot-sync-worker proof, rechecks
+the live receiver timeline, requires bounded feedback and configured continuous
+slot synchronization, and triggers the required standby snapshot record from
+the primary. The primary case proves an inherited restricted replication role
+and a bounded advisory-lock fence survive the whole mutation, while an
+oversized fence is rejected before dispatch. The primary fixture waits for the
+continuous worker to materialize the exact synchronized standby copy, then
+requires that copy to disappear after primary deletion. It also proves a
+PostgreSQL 17 pre-dispatch drop rejection returns the receipt before retrying
+cleanup on PostgreSQL 18. Unit tests cover the exposed known-versus-unknown classification,
+a blocked preflight and delayed CREATE preparation crossing proof expiry,
+expired proof and operation-deadline boundaries that never poll the dispatch callback,
+unsigned high-bit receiver timelines,
+and deterministic role, receiver lineage, feedback interval, synchronization,
+degraded receiver-free cleanup, progress and two-phase-boundary checks.
+Mutation fixtures use per-session advisory fences and an aggregate bound sized
+for their sequential one-minute phases. Snapshot-triggered standby creation has
+no detached mutation task: cancellation aborts connection ownership, the outer
+fixture is reaped, and cleanup waits for the recorded PostgreSQL backend to exit
+before it treats an absent target as final.
+Injected post-dispatch socket loss, cancellation and response-loss races are
+not yet exercised. Durable catalog mutation history, reconciliation after an
+unknown outcome, connection-bound command proof, quarantined COPY-BOTH
+attachment, and stream ownership remain future work.
 A lower-level correlation suite independently mutates every sampled path class.
 It accepts an unproven non-temporary physical slot only as raw evidence and
 rejects reversed or stale collection windows; database, source, role, WAL-level,

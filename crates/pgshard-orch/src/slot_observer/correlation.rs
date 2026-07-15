@@ -49,6 +49,8 @@ pub struct CorrelatedStandbyReplicationPath {
     source_identity: ReplicationSourceIdentity,
     member_ordinal: u16,
     oldest_observation_age: Duration,
+    valid_until: Instant,
+    maximum_feedback_reporting_interval: Duration,
     standby_replay_floor_lsn: PgLsn,
     physical_slot: ReplicationSlotName,
     wal_receiver_pid: NonZeroU32,
@@ -60,6 +62,7 @@ pub struct CorrelatedStandbyReplicationPath {
     physical_wal_retention: SlotWalRetention,
     peer_reply_epoch_micros: NonZeroU64,
     failover_anchor: ReplicationSlotName,
+    local_decoder: crate::standby_slots::ManagedSlotTarget,
     primary_failover_anchor_confirmed_lsn: PgLsn,
     synchronized_failover_anchor_confirmed_lsn: PgLsn,
 }
@@ -81,6 +84,14 @@ impl CorrelatedStandbyReplicationPath {
     #[must_use]
     pub const fn oldest_observation_age(&self) -> Duration {
         self.oldest_observation_age
+    }
+
+    pub(crate) const fn valid_until(&self) -> Instant {
+        self.valid_until
+    }
+
+    pub(crate) const fn maximum_feedback_reporting_interval(&self) -> Duration {
+        self.maximum_feedback_reporting_interval
     }
 
     /// Returns the source-bound lower bound on standby replay.
@@ -168,6 +179,12 @@ impl CorrelatedStandbyReplicationPath {
         &self.failover_anchor
     }
 
+    /// Returns the catalog-selected standby-local decoder allocation.
+    #[must_use]
+    pub const fn local_decoder(&self) -> &crate::standby_slots::ManagedSlotTarget {
+        &self.local_decoder
+    }
+
     /// Returns the primary failover anchor's conservative confirmed-flush LSN.
     ///
     /// This separately sampled value is comparison evidence, not attachment
@@ -216,11 +233,22 @@ fn correlate_standby_replication_path_at(
     let standby_path = validate_standby_path(policy, standby)?;
     let primary_path = validate_primary_path(policy, primary)?;
     let failover_anchor = validate_failover_anchors(policy, standby, primary)?;
+    let maximum_observation_age = policy.evidence_limits().maximum_observation_age();
+    let valid_until = evaluated_at
+        + maximum_observation_age
+            .checked_sub(oldest_observation_age)
+            .expect("accepted observation age is within its configured limit");
+    let maximum_feedback_reporting_interval = policy
+        .evidence_limits()
+        .maximum_feedback_age()
+        .saturating_sub(MIN_FEEDBACK_REPORTING_MARGIN);
 
     Ok(CorrelatedStandbyReplicationPath {
         source_identity: policy.expected_source(),
         member_ordinal: policy.member_ordinal(),
         oldest_observation_age,
+        valid_until,
+        maximum_feedback_reporting_interval,
         standby_replay_floor_lsn: standby_path.replay_floor_lsn,
         physical_slot: policy.physical_slot().clone(),
         wal_receiver_pid: standby_path.wal_receiver_pid,
@@ -232,6 +260,7 @@ fn correlate_standby_replication_path_at(
         physical_wal_retention: primary_path.wal_retention,
         peer_reply_epoch_micros: primary_path.peer_reply_epoch_micros,
         failover_anchor: policy.failover_anchor().name().clone(),
+        local_decoder: policy.local_decoder().clone(),
         primary_failover_anchor_confirmed_lsn: failover_anchor.primary_confirmed_lsn,
         synchronized_failover_anchor_confirmed_lsn: failover_anchor.synchronized_confirmed_lsn,
     })

@@ -60,12 +60,31 @@ value. Instead, the coherent control-file checkpoint pair provides a
 source-bound replay floor and can lag live replay. A fresh standby may inherit
 the pair from its base backup; later advances follow the restartpoint flush phase,
 when PostgreSQL installs the safe checkpoint pair.
-Both paths run in a real primary/standby CI fixture. Secure upstream connection
+A bounded Rust mutator now creates and verifies persistent two-phase
+`pgoutput` anchors on writable primaries and independent decoders on eligible
+standbys. Standby creation fails before dispatch unless
+the caller supplies a fresh correlated primary/standby path and the local
+recheck still sees its exact receiver timeline and physical slot, a positive
+bounded feedback interval, `hot_standby_feedback=on`,
+`sync_replication_slots=on`, and the correlated slot-sync-worker generation.
+The proof expiry is also the create-preflight deadline and is rechecked at the
+dispatch boundary.
+Create/drop errors after dispatch are always outcome-unknown and must be
+observed rather than retried. A successful create returns only a process-local
+cleanup receipt; source, role, a bounded session fence and required creation
+settings are rechecked after dispatch. Known pre-dispatch drop failures return
+that receipt, and cleanup does not depend on a live receiver, its physical slot,
+healthy feedback or slot synchronization.
+Restore incarnation and catalog epoch still require a future durable
+catalog-bound reconciler.
+
+The observation and mutation paths run in a real primary/standby CI fixture.
+Secure upstream connection
 material, exact live-replay, upstream and network-adjacency proof,
 restore-incarnation observation,
 worker-connection and recent successful-cycle correlation, feedback freshness and
 catalog-horizon proof, physical-slot lifecycle attestation, role activation,
-logical-slot ownership and server-attested generation,
+durable logical-slot ownership and server-attested generation,
 operator-managed replication, durable lease integration, promotion, automated
 recovery, and rolling restarts are not implemented; see
 [implementation status](../project/status.md).

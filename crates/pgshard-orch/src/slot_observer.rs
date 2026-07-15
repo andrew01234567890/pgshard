@@ -24,13 +24,18 @@ use std::{
 use pgshard_catalog::CatalogOperationTimeout;
 use pgshard_types::PgLsn;
 use thiserror::Error;
+#[cfg(test)]
+use tokio::time::timeout;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    task::{JoinError, JoinHandle},
-    time::{Instant, timeout, timeout_at},
+    task::JoinError,
+    time::{Instant, timeout_at},
 };
 use tokio_postgres::{Client, Connection, Row};
 
+#[cfg(test)]
+use crate::postgres_connection::CONNECTION_CLEANUP_TIMEOUT;
+use crate::postgres_connection::{ConnectionTask, ConnectionTaskError};
 use crate::standby_slots::{
     FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotObservation, LogicalSlotPlugin,
     LogicalWalLevel, ManagedSlotTarget, RecoveryState, ReplicationSlotName, SettingState,
@@ -42,7 +47,6 @@ const MIN_POSTGRES_VERSION_NUM: i32 = 180_000;
 const MAX_OBSERVATION_TARGETS: usize = 3;
 const MAX_SYNCHRONIZED_STANDBY_SLOTS_BYTES: i32 = 4096;
 const SERVER_STATEMENT_TIMEOUT_HEADROOM: Duration = Duration::from_millis(25);
-const CONNECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const PIN_SEARCH_PATH_SQL: &str = "SELECT pg_catalog.set_config('search_path', '', false)";
 const SET_STATEMENT_TIMEOUT_SQL: &str =
     "SELECT pg_catalog.set_config('statement_timeout', $1, false)";
@@ -494,6 +498,13 @@ impl LocalWalSenderObservation {
 }
 
 impl LocalPostgresBackendIdentity {
+    pub(crate) const fn from_parts(pid: NonZeroU32, start_epoch_micros: NonZeroU64) -> Self {
+        Self {
+            pid,
+            start_epoch_micros,
+        }
+    }
+
     /// Returns the local process identifier.
     #[must_use]
     pub const fn pid(self) -> NonZeroU32 {
@@ -895,59 +906,6 @@ impl LocalLogicalSlotObservationBatch {
     }
 }
 
-struct ConnectionTask {
-    handle: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
-}
-
-impl ConnectionTask {
-    fn new(handle: JoinHandle<Result<(), tokio_postgres::Error>>) -> Self {
-        Self {
-            handle: Some(handle),
-        }
-    }
-
-    fn handle_mut(&mut self) -> &mut JoinHandle<Result<(), tokio_postgres::Error>> {
-        self.handle
-            .as_mut()
-            .expect("slot observer connection task is consumed exactly once")
-    }
-
-    async fn abort_and_wait(mut self) {
-        self.abort();
-        let _ = timeout(CONNECTION_CLEANUP_TIMEOUT, self.handle_mut()).await;
-        self.handle.take();
-    }
-
-    async fn finish<V>(mut self, value: V) -> Result<V, LocalSlotObservationError> {
-        let result = match timeout(CONNECTION_CLEANUP_TIMEOUT, self.handle_mut()).await {
-            Ok(Ok(Ok(()))) => Ok(value),
-            Ok(Ok(Err(source))) => Err(LocalSlotObservationError::Connection(source)),
-            Ok(Err(source)) => Err(LocalSlotObservationError::ConnectionTask(source)),
-            Err(_) => {
-                self.abort();
-                let _ = timeout(CONNECTION_CLEANUP_TIMEOUT, self.handle_mut()).await;
-                Err(LocalSlotObservationError::ConnectionCleanupTimeout {
-                    duration: CONNECTION_CLEANUP_TIMEOUT,
-                })
-            }
-        };
-        self.handle.take();
-        result
-    }
-
-    fn abort(&self) {
-        if let Some(handle) = &self.handle {
-            handle.abort();
-        }
-    }
-}
-
-impl Drop for ConnectionTask {
-    fn drop(&mut self) {
-        self.abort();
-    }
-}
-
 /// Observes an exact local slot set using a consumed, dedicated connection.
 ///
 /// The matching client and connection driver are consumed together. An elapsed
@@ -976,7 +934,7 @@ where
     let deadline = Instant::now() + duration;
     let connection_task = ConnectionTask::new(tokio::spawn(connection));
     match timeout_at(deadline, observe_before(client, request, deadline)).await {
-        Ok(Ok(batch)) => connection_task.finish(batch).await,
+        Ok(Ok(batch)) => connection_task.finish(batch).await.map_err(Into::into),
         Ok(Err(error)) => {
             connection_task.abort_and_wait().await;
             Err(error)
@@ -1015,7 +973,7 @@ where
     let deadline = Instant::now() + duration;
     let connection_task = ConnectionTask::new(tokio::spawn(connection));
     match timeout_at(deadline, observe_primary_before(client, request, deadline)).await {
-        Ok(Ok(batch)) => connection_task.finish(batch).await,
+        Ok(Ok(batch)) => connection_task.finish(batch).await.map_err(Into::into),
         Ok(Err(error)) => {
             connection_task.abort_and_wait().await;
             Err(error)
@@ -1675,7 +1633,9 @@ struct LogicalSlotFields {
     confirmed_flush_lsn: Option<String>,
 }
 
-fn parse_logical_slot(row: &Row) -> Result<LogicalSlotObservation, LocalSlotObservationError> {
+pub(crate) fn parse_logical_slot(
+    row: &Row,
+) -> Result<LogicalSlotObservation, LocalSlotObservationError> {
     parse_logical_slot_fields(LogicalSlotFields {
         name_text: row.try_get("slot_name")?,
         plugin: row.try_get("plugin")?,
@@ -1908,7 +1868,7 @@ fn positive_u32(value: i64, field: &'static str) -> Result<u32, LocalSlotObserva
         .ok_or(LocalSlotObservationError::InvalidPositiveInteger { field, value })
 }
 
-fn parse_lsn(value: &str) -> Option<PgLsn> {
+pub(crate) fn parse_lsn(value: &str) -> Option<PgLsn> {
     let (high, low) = value.split_once('/')?;
     if high.is_empty() || high.len() > 8 || low.is_empty() || low.len() > 8 {
         return None;
@@ -2096,6 +2056,18 @@ pub enum LocalSlotObservationError {
     /// `PostgreSQL` returned a slot name outside the bounded identifier grammar.
     #[error(transparent)]
     SlotName(#[from] SlotNameError),
+}
+
+impl From<ConnectionTaskError> for LocalSlotObservationError {
+    fn from(error: ConnectionTaskError) -> Self {
+        match error {
+            ConnectionTaskError::Connection(source) => Self::Connection(source),
+            ConnectionTaskError::Task(source) => Self::ConnectionTask(source),
+            ConnectionTaskError::CleanupTimeout { duration } => {
+                Self::ConnectionCleanupTimeout { duration }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
