@@ -20,8 +20,8 @@ PostgreSQL 18 coverage shows that a Message emitted inside a savepoint retains
 that top-level XID while the Relation record carries the savepoint XID. It does
 not yet implement a complete
 transaction-order machine, relation cache, slots, acknowledgements, durable
-replay, snapshots, cross-shard merge, or a stream service; see [implementation
-status](../project/status.md).
+replay, snapshots, cross-shard merge, or the embedded pooler stream runtime; see
+[implementation status](../project/status.md).
 
 The operator's generated configuration plan now reserves separate capacity for
 primary failover anchors, synchronized copies, standby-local decoding slots,
@@ -137,16 +137,17 @@ and repeats that authorization after any fence wait. No PostgreSQL Pod consumes
 the profiles, and secure
 `primary_conninfo`, automatic outcome-unknown reconciliation,
 connection-owned multi-server collection and post-acquisition rechecks, role
-activation, quarantined attachment, slot advancement, and stream ownership
-remain unimplemented.
+activation, quarantined attachment, slot advancement, and connection-bound
+pooler stream-session ownership remain unimplemented.
 
 The source also contains a fixed-size PostgreSQL 18 Standby Status Update
 encoder. It validates that neither flush nor apply is ahead of write but does
 not decide when progress is durable or safe to acknowledge. PostgreSQL permits
 apply to be ahead of flush for locally written, unflushed work, so the actual
 within-sample checks are `flush <= write` and `apply <= write`. The future
-stream owner must advance its persisted checkpoint before reporting the
-corresponding flush position. A state machine scoped to one COPY-BOTH session
+pooler stream-worker sidecar must advance its persisted checkpoint before
+reporting the corresponding flush position. A state machine scoped to one
+COPY-BOTH session
 rejects any write, flush, or apply regression across samples all-or-nothing.
 After disconnect, the owner discards volatile write and apply progress and
 starts a new tracker with all positions at the last durable checkpoint.
@@ -159,6 +160,99 @@ Milestone 1 will expose a cluster change stream derived from PostgreSQL 18
 `pgoutput`. It is similar in purpose to Vitess VStream: clients consume one
 logical stream across shards while positions remain a vector rather than an
 invented global WAL order.
+
+## Runtime placement
+
+The change-stream API and its per-shard workers are part of
+`pgshard-pooler`. There is no `pgshard-stream` binary, Pod, Deployment or
+autoscaling unit. Selectorless query and stream Services expose named ports
+through separate operator-owned EndpointSlices containing only the healthy
+container endpoint of each non-terminating pooler Pod. Each Pod runs
+query/router and stream-worker modes of the same Rust binary as separate
+containers and credential domains. The query container has no replication or
+checkpoint-mutation credentials. The sidecar accepts no PostgreSQL client SQL;
+it owns dedicated native replication connections, snapshot holders, merge
+buffers and acknowledgement mutation. Their only local coordination path is a
+bounded, typed Unix-domain socket that authenticates the query container's
+distinct Linux UID and cannot carry arbitrary SQL or replication commands.
+
+The operator scales the whole pooler Deployment using either a fixed replica
+count or HPA, so the sidecar has no independent compute or autoscaling unit.
+Separate container limits, queues and health signals isolate the SQL path.
+Kubelet may conservatively mark the whole Pod unready, but query health controls
+only its query EndpointSlice entry and sidecar health controls only its stream
+entry. HPA policy uses query-container CPU, an external query-admission metric
+that remains valid during aggregate Pod unready state, and per-Pod stream queue
+fill. It applies a bounded pre-stop drain to selected scale-down Pods. A
+terminating Pod wins no new ownership or EndpointSlice entry.
+
+Normal replication connections terminate on eligible standbys and consume the
+member-bound, non-failover decoder slots described below. They do not use the
+SQL backend pool and do not consume the primary failover anchor during steady
+state. Loss of every safe standby fences the stream under the default policy;
+an emergency primary fallback is explicit, observable and never automatic.
+
+## Ownership transfer
+
+The durable per-shard ownership generation in `shardschema` is the fencing
+authority; an etcd lease is only its short-lived liveness guard. Every worker
+arms a local monotonic deadline no later than its lease expiry.
+
+No stream connection may create a slot, run `START_REPLICATION`, begin or import
+an exported snapshot, or acquire a copy-lifetime relation lock until this
+activation protocol completes:
+
+1. CAS-create a durable session intent under the current ownership generation,
+   including a unique session ID, purpose and expected source identity.
+2. Open an otherwise idle, quarantined connection whose authenticated
+   `application_name` carries that session ID and generation. The intent makes
+   a crash in this window discoverable even before a backend PID is recorded.
+3. On the PostgreSQL host, the agent opens a pidfd for the candidate OS process,
+   validates its `/proc` start tick and postmaster ancestry both before and
+   after that open, and correlates the database-observed PID, `backend_start`,
+   source identity and session ID. It CAS-registers that exact identity and its
+   agent generation against the still-current intent.
+4. Revalidate the ownership generation, lease deadline and registered pidfd
+   immediately before allowing the connection's first side effect. Only then
+   may the worker create or attach a slot, start COPY-BOTH, or activate a
+   snapshot transaction.
+
+Failure to renew stops event emission and acknowledgement, cancels COPY-BOTH,
+closes every holder connection, and asks the local agent to signal every
+registered replication or holder backend through its validated pidfd even when
+the control-plane connection is partitioned. An agent restart may reconstruct a
+pidfd only by repeating the same open-then-revalidate proof; inability to do so
+keeps the session fenced.
+
+A successor performs this order for every shard:
+
+1. CAS-increment the durable ownership generation so every stale checkpoint or
+   acknowledgement mutation fails.
+2. CAS-mark every incomplete snapshot belonging to the old generation
+   `ResnapshotRequired`.
+3. Resolve every old durable intent, including intents that never reached
+   registration. Through the local agent, close or signal the complete set of
+   exact old replication and snapshot-holder processes via validated pidfds;
+   never treat a PID-only `pg_cancel_backend` or `pg_terminate_backend` check as
+   exact cancellation proof.
+4. Re-observe every old backend as absent, re-observe the slot as inactive, and
+   verify that its retained WAL still covers the durable checkpoint.
+5. Authorize `START_REPLICATION`, snapshot creation, event emission and
+   acknowledgement under only the new ownership generation.
+
+Each delivery session carries that generation. The sidecar checks its live
+lease guard and generation before emission, checkpoint persistence and
+acknowledgement; durable updates use the generation in their CAS. If any intent
+cannot be resolved, or exact old backend inactivity or WAL coverage cannot be
+proved, takeover stays fenced. Lease expiry by itself never makes an active
+logical slot or snapshot holder transferable.
+
+After a proven takeover, ordinary WAL delivery resumes at least once from the
+last durable checkpoint. Exported snapshots are PostgreSQL-session-bound and
+cannot transfer between Pods. A graceful drain may finish and durably spool the
+snapshot first; otherwise loss of its holder CAS-marks the snapshot generation
+`ResnapshotRequired`. A successor never applies a saved mid-copy cursor to a new
+snapshot.
 
 ## Guarantees
 
@@ -233,9 +327,11 @@ All pgshard-managed `pgoutput` consumers use one placement policy. This includes
 public change streams, online-reshard catch-up and its target materializers, and
 future internal materializations. Normal decoding runs on an eligible direct
 physical standby to keep logical decoding work off the shard primary. This is a
-placement preference, not permission to lose or skip data: if no standby can
-prove that it retains the durable per-shard checkpoint, pgshard either uses the
-primary's anchor slot or fences the consumer and requires a new snapshot.
+placement requirement in the default policy, not permission to lose or skip
+data: if no standby can prove that it retains the durable per-shard checkpoint,
+pgshard fences the consumer and requires a replacement source or new snapshot.
+A separately configured emergency policy may select the primary anchor
+temporarily, but pgshard never falls back to it silently.
 
 `shardschema` is the authority for every managed logical consumer. Each
 per-shard record is keyed by consumer, `logical_database_id`, and shard. Its
@@ -636,11 +732,37 @@ and reshard materializers under steady standby decoding, primary write-load
 offload, slot synchronization, standby restart, consumer restart, promotion,
 decoder-source replacement, former-primary rejoin with retained same-named
 slots, lag and invalidation, feedback loss, timeline change, and resumption from
-the last durable checkpoint without gaps. They must also prove that a colliding
-former-primary slot keeps synchronization and promotion eligibility fenced
-until verified cleanup or rebuild; managed cleanup leaves unrelated user slots
-untouched; unknown collisions fail closed; independent consumers cannot share
-or advance each other's slots; a consumer cannot attach to a slot for another
+the last durable checkpoint without gaps. The rendered workload must contain no
+standalone stream Deployment or Pod. Selectorless query and stream Services
+must resolve only their respective healthy named ports through operator-owned
+EndpointSlices on non-terminating pooler Pods. The query container must not
+mount replication or checkpoint-mutation credentials, and the sidecar must not
+accept PostgreSQL client sessions. The owning sidecar must hold the native
+replication connection to the catalog-selected standby-local decoder, while the
+primary has no steady-state logical-decoding walsender for that consumer.
+Fixed-size reconciliation and HPA behavior are tested separately. Query CPU,
+external query-admission pressure, and stream queue fill ratio must each
+independently drive a real HPA scale-up through the declared `autoscaling/v2`
+metrics; after all three fall below threshold, the HPA-selected scale-down Pod
+must transfer fenced stream ownership through its bounded pre-stop drain.
+The test may not substitute a direct Deployment resize. Neither path may
+regress acknowledgements or make SQL routing unready because a stream consumer
+is backpressured. Forced termination during an exported snapshot must either
+finish and durably spool `SnapshotComplete` inside the drain bound or mark that
+generation `ResnapshotRequired`; no successor may reuse its mid-copy cursor.
+Asymmetric-partition tests must also prove that a stale worker self-fences at its
+local deadline and that takeover rotates the durable generation, rejects its
+checkpoint CAS, marks an incomplete snapshot for resnapshot, resolves every
+durable session intent, terminates and proves inactivity through an exact pidfd
+for every old replication and snapshot-holder backend, and only then authorizes
+new snapshot or WAL emission. Crash injection must cover both sides of intent
+creation, connection, pidfd registration, generation revalidation and first
+side effect, plus process exit and PID reuse during identity validation. The
+suites must also prove that a
+colliding former-primary slot keeps synchronization and promotion eligibility
+fenced until verified cleanup or rebuild; managed cleanup leaves unrelated user
+slots untouched; unknown collisions fail closed; independent consumers cannot
+share or advance each other's slots; a consumer cannot attach to a slot for another
 logical or source database; same-name and same-OID databases with a different
 system identifier are rejected; a zero or marginless feedback interval, missing
 slot-sync `dbname`, wrong-primary worker connection, success evidence from a
@@ -664,9 +786,10 @@ suites are planned and not yet present.
 
 ```mermaid
 sequenceDiagram
-  participant G as Stream service
-  participant P as Poolers
-  participant S as Shards
+  participant G as Pooler stream-worker sidecar
+  participant P as Pooler query container
+  participant S as Eligible standby sources
+  Note over G,P: Separate credential domains in one pgshard-pooler Pod
   G->>P: Acquire snapshot-init barrier
   Note over P,G: Block writes, DDL, reshard activation,<br/>and semantic stream-config changes
   G->>S: Create slots and exported snapshots
