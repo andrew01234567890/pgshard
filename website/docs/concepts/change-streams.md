@@ -253,7 +253,7 @@ PostgreSQL observation. Exact live replay, upstream identity and network
 adjacency, feedback freshness, catalog-horizon coverage,
 physical-slot lifecycle persistence, source-bound slot-sync-cycle evidence,
 logical-slot ownership, server-attested generation, mutation-history
-attestation, and every create,
+attestation beyond a cataloged probe allocation, and every create,
 advance, acquire, or drop action remain future reconciliation work.
 
 Each checkpoint generation is immutably bound to its shard restore incarnation,
@@ -283,6 +283,22 @@ consumer and shard:
   further than the durable checkpoint stored in `shardschema`; and
 - persistent, non-failover decoding slots created locally on eligible standbys,
   from which the active stream worker consumes `pgoutput`.
+
+Worker health uses a third slot that is not a consumer slot. `shardschema`
+allocates at most one live slot-sync probe per shard restore and binds its
+never-reused generation and generation-encoded name to the shard, restore
+incarnation, system identifier, database identity, and source timeline. The
+probe is a dedicated failover slot whose future challenge can make a fresh,
+non-consumer progress transition on the writable primary and require the same
+transition on a standby. No consumer checkpoint or primary anchor is advanced
+for that challenge. The catalog already enforces allocation, one-time
+activation, explicit cleanup, permanent retirement, and one-live-probe
+uniqueness. Consumer slots and probes cannot reuse each other's generation,
+including after retirement. Mutations serialize on the versioned catalog epoch;
+a stale concurrent `REPEATABLE READ` allocator fails with `40001` before it can
+validate against an older view of the other slot class. It deliberately does not
+claim the PostgreSQL slot exists: the mutating reconciler and source-bound
+challenge are not implemented yet.
 
 The operator automatically synchronizes each primary anchor to eligible direct
 standbys for promotion safety. Standby-local slots are independent and
