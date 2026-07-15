@@ -164,15 +164,20 @@ starts from genesis epoch zero when necessary, requires the allocation commit to
 produce a nonzero source identity, creates the exact primary failover slot,
 waits for the continuous worker's non-temporary synchronized copy, and permits
 catalog activation only from the creation receipt. Cleanup must return the exact
-drop/absence receipt and the synchronized copy must disappear before permanent
-retirement. Repeating allocation and every completed transition is checked as a
-read-only idempotent result. An unrelated epoch advance must fence a stale
-activation token before any lifecycle write, after which an exact reload can
-continue. The final assertion requires no live catalog, primary, or standby
-probe. Crash recovery and injected catalog COMMIT response loss remain separate
-future tests.
-Injected post-dispatch socket loss, cancellation and response-loss races are
-not yet exercised. A general durable slot-mutation ledger, automatic
+drop/absence receipt carrying the persisted create-attempt ID, and the
+synchronized copy must disappear before permanent retirement. The fixture
+creates and drops one slot, recreates the same exact name, and proves the first
+absence receipt cannot retire or remove the second creation. Repeating
+allocation and every completed transition is checked as a read-only idempotent
+result. An unrelated epoch advance must fence a stale activation token before
+any lifecycle write, after which an exact reload can continue. A TCP fault proxy
+then withholds the activation COMMIT response only after PostgreSQL confirms the
+commit; the client must classify `OutcomeUnknown`, reload the exact receipt ID
+and boundary, and safely replay the same activation. Always-run bounded cleanup
+requires no live catalog, primary, or standby probe even when the fixture fails.
+Crash recovery remains a separate future test.
+Injected post-dispatch slot-mutation socket loss and cancellation races are not
+yet exercised. A general durable slot-mutation ledger, automatic
 reconciliation after an unknown outcome, connection-bound command proof,
 quarantined COPY-BOTH
 attachment, and stream ownership remain future work.

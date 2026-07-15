@@ -29,6 +29,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 use tokio_postgres::{Client, Connection, Statement};
+use uuid::Uuid;
 
 use crate::{
     postgres_connection::{ConnectionTask, ConnectionTaskError},
@@ -269,6 +270,7 @@ impl ManagedLogicalSlotCreateRequest {
 /// `shardschema` mutation history.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ManagedLogicalSlotReceipt {
+    receipt_id: ManagedLogicalSlotReceiptId,
     target: ManagedSlotTarget,
     source: ReplicationSourceIdentity,
     role: ManagedLogicalSlotRole,
@@ -280,6 +282,12 @@ pub struct ManagedLogicalSlotReceipt {
 }
 
 impl ManagedLogicalSlotReceipt {
+    /// Returns the opaque identity of this exact successful creation attempt.
+    #[must_use]
+    pub const fn receipt_id(&self) -> ManagedLogicalSlotReceiptId {
+        self.receipt_id
+    }
+
     /// Returns the exact generation-qualified server target.
     #[must_use]
     pub const fn target(&self) -> &ManagedSlotTarget {
@@ -332,6 +340,29 @@ impl ManagedLogicalSlotReceipt {
     }
 }
 
+/// Opaque identity for one exact successful managed-slot creation attempt.
+///
+/// The value has no public constructor. It distinguishes a later recreation
+/// even when `PostgreSQL` returns the same slot name and creation LSN.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagedLogicalSlotReceiptId(Uuid);
+
+impl ManagedLogicalSlotReceiptId {
+    fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Reconstructs a non-nil ID loaded from the trusted catalog boundary.
+    pub(crate) fn from_uuid(value: Uuid) -> Option<Self> {
+        (!value.is_nil()).then_some(Self(value))
+    }
+
+    /// Returns the UUID representation persisted in `shardschema`.
+    pub(crate) const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
 /// Known result of a receipt-authorized drop attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedLogicalSlotDropOutcome {
@@ -349,6 +380,7 @@ pub enum ManagedLogicalSlotDropOutcome {
 /// a later external recreation of the server-side name.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedLogicalSlotDropReceipt {
+    receipt_id: ManagedLogicalSlotReceiptId,
     target: ManagedSlotTarget,
     source: ReplicationSourceIdentity,
     role: ManagedLogicalSlotRole,
@@ -357,6 +389,12 @@ pub struct ManagedLogicalSlotDropReceipt {
 }
 
 impl ManagedLogicalSlotDropReceipt {
+    /// Returns the exact successful creation attempt proven absent.
+    #[must_use]
+    pub const fn receipt_id(&self) -> ManagedLogicalSlotReceiptId {
+        self.receipt_id
+    }
+
     /// Returns the exact generation-qualified target proven absent.
     #[must_use]
     pub const fn target(&self) -> &ManagedSlotTarget {
@@ -917,9 +955,13 @@ where
             return Err(error);
         }
     };
+    // Generate capability identity before PostgreSQL can observe a mutation.
+    // If platform randomness is unavailable and UUID generation cannot
+    // complete, no slot has been dispatched yet.
+    let receipt_id = ManagedLogicalSlotReceiptId::new();
     let result = timeout_at(
         context.deadline,
-        create_at_dispatch_boundary(&client, &context, prepared),
+        create_at_dispatch_boundary(&client, &context, prepared, receipt_id),
     )
     .await;
     finish_mutation(client, connection_task, &context, result).await
@@ -1013,6 +1055,7 @@ fn drop_receipt(
     outcome: ManagedLogicalSlotDropOutcome,
 ) -> ManagedLogicalSlotDropReceipt {
     ManagedLogicalSlotDropReceipt {
+        receipt_id: receipt.receipt_id,
         target: receipt.target,
         source: receipt.source,
         role: receipt.role,
@@ -1186,9 +1229,10 @@ async fn create_at_dispatch_boundary(
     client: &Client,
     context: &MutationContext,
     prepared: PreparedCreate,
+    receipt_id: ManagedLogicalSlotReceiptId,
 ) -> Result<ManagedLogicalSlotReceipt, LocalSlotMutationError> {
     dispatch_mutation_before_deadline(context, async {
-        create_after_dispatch(client, context, prepared)
+        create_after_dispatch(client, context, prepared, receipt_id)
             .await
             .map_err(|source| context.unknown(source))
     })
@@ -1210,6 +1254,7 @@ async fn create_after_dispatch(
     client: &Client,
     context: &MutationContext,
     prepared: PreparedCreate,
+    receipt_id: ManagedLogicalSlotReceiptId,
 ) -> Result<ManagedLogicalSlotReceipt, LocalSlotMutationUnknownCause> {
     let row = client
         .query_one(
@@ -1243,6 +1288,7 @@ async fn create_after_dispatch(
     let observation = validate_slot_shape(&observation, &context.identity, creation_lsn, true)
         .map_err(LocalSlotMutationUnknownCause::PostflightShape)?;
     Ok(ManagedLogicalSlotReceipt {
+        receipt_id,
         target: context.identity.target.clone(),
         source: context.identity.source,
         role: context.identity.role,
@@ -1859,6 +1905,7 @@ mod tests {
 
     fn receipt(identity: &MutationIdentity) -> ManagedLogicalSlotReceipt {
         ManagedLogicalSlotReceipt {
+            receipt_id: ManagedLogicalSlotReceiptId(Uuid::from_u128(3)),
             target: identity.target.clone(),
             source: identity.source,
             role: identity.role,
@@ -2181,6 +2228,7 @@ mod tests {
         .expect("known drop result");
 
         assert_eq!(proof.target(), &identity.target);
+        assert_eq!(proof.receipt_id(), receipt(&identity).receipt_id());
         assert_eq!(proof.source(), identity.source);
         assert_eq!(proof.role(), identity.role);
         assert_eq!(proof.database_name(), "postgres");

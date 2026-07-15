@@ -42,7 +42,7 @@ tower = { version = "0.5.2", features = ["util"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 url = "2.5.4"
-uuid = "1.18.1"
+uuid = { version = "1.18.1", features = ["v4"] }
 xxhash-rust = { version = "=0.8.16", features = ["xxh3"] }
 
 [workspace.lints.rust]

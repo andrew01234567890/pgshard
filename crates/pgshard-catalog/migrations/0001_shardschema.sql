@@ -186,6 +186,16 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
     source_timeline bigint NOT NULL CHECK (source_timeline BETWEEN 1 AND 4294967295),
     slot_name pgshard_catalog.replication_slot_name NOT NULL,
     consistent_point pg_lsn,
+    creation_receipt_id uuid
+        CHECK (
+            creation_receipt_id IS NULL
+            OR creation_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid
+        ),
+    cleanup_receipt_id uuid
+        CHECK (
+            cleanup_receipt_id IS NULL
+            OR cleanup_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid
+        ),
     state text NOT NULL DEFAULT 'allocated'
         CHECK (state IN ('allocated', 'active', 'retiring', 'retired')),
     created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
@@ -202,6 +212,8 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
         (
             state = 'allocated'
             AND consistent_point IS NULL
+            AND creation_receipt_id IS NULL
+            AND cleanup_receipt_id IS NULL
             AND activated_at IS NULL
             AND retiring_at IS NULL
             AND retired_at IS NULL
@@ -210,6 +222,8 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
         (
             state = 'active'
             AND consistent_point IS NOT NULL
+            AND creation_receipt_id IS NOT NULL
+            AND cleanup_receipt_id IS NULL
             AND activated_at IS NOT NULL
             AND retiring_at IS NULL
             AND retired_at IS NULL
@@ -219,9 +233,22 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
             state = 'retiring'
             AND retiring_at IS NOT NULL
             AND retired_at IS NULL
+            AND cleanup_receipt_id IS NOT NULL
             AND (
-                (consistent_point IS NULL AND activated_at IS NULL)
-                OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
+                creation_receipt_id IS NULL
+                OR cleanup_receipt_id = creation_receipt_id
+            )
+            AND (
+                (
+                    consistent_point IS NULL
+                    AND creation_receipt_id IS NULL
+                    AND activated_at IS NULL
+                )
+                OR (
+                    consistent_point IS NOT NULL
+                    AND creation_receipt_id IS NOT NULL
+                    AND activated_at IS NOT NULL
+                )
             )
         )
         OR
@@ -229,9 +256,22 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
             state = 'retired'
             AND retiring_at IS NOT NULL
             AND retired_at IS NOT NULL
+            AND cleanup_receipt_id IS NOT NULL
             AND (
-                (consistent_point IS NULL AND activated_at IS NULL)
-                OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
+                creation_receipt_id IS NULL
+                OR cleanup_receipt_id = creation_receipt_id
+            )
+            AND (
+                (
+                    consistent_point IS NULL
+                    AND creation_receipt_id IS NULL
+                    AND activated_at IS NULL
+                )
+                OR (
+                    consistent_point IS NOT NULL
+                    AND creation_receipt_id IS NOT NULL
+                    AND activated_at IS NOT NULL
+                )
             )
         )
     )
@@ -941,6 +981,8 @@ BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.state <> 'allocated'
            OR NEW.consistent_point IS NOT NULL
+           OR NEW.creation_receipt_id IS NOT NULL
+           OR NEW.cleanup_receipt_id IS NOT NULL
            OR NEW.activated_at IS NOT NULL
            OR NEW.retiring_at IS NOT NULL
            OR NEW.retired_at IS NOT NULL THEN
@@ -981,6 +1023,8 @@ BEGIN
 
     IF NEW.state = OLD.state THEN
         IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+           OR NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
+           OR NEW.cleanup_receipt_id IS DISTINCT FROM OLD.cleanup_receipt_id
            OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
            OR NEW.retiring_at IS DISTINCT FROM OLD.retiring_at
            OR NEW.retired_at IS DISTINCT FROM OLD.retired_at THEN
@@ -994,6 +1038,8 @@ BEGIN
            OR shard_state IS NULL
            OR shard_state NOT IN ('provisioning', 'active')
            OR NEW.consistent_point IS NULL
+           OR NEW.creation_receipt_id IS NULL
+           OR NEW.cleanup_receipt_id IS NOT NULL
            OR NEW.activated_at IS NULL
            OR NEW.retiring_at IS NOT NULL
            OR NEW.retired_at IS NOT NULL THEN
@@ -1001,13 +1047,21 @@ BEGIN
         END IF;
     ELSIF OLD.state IN ('allocated', 'active') AND NEW.state = 'retiring' THEN
         IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+           OR NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
            OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
+           OR NEW.cleanup_receipt_id IS NULL
+           OR (
+               OLD.creation_receipt_id IS NOT NULL
+               AND NEW.cleanup_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
+           )
            OR NEW.retiring_at IS NULL
            OR NEW.retired_at IS NOT NULL THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe retirement must preserve activation history';
         END IF;
     ELSIF OLD.state = 'retiring' AND NEW.state = 'retired' THEN
         IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+           OR NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
+           OR NEW.cleanup_receipt_id IS DISTINCT FROM OLD.cleanup_receipt_id
            OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
            OR NEW.retiring_at IS DISTINCT FROM OLD.retiring_at
            OR NEW.retired_at IS NULL THEN
@@ -2194,7 +2248,15 @@ GRANT INSERT (
     database_name,
     source_timeline,
     slot_name
-), UPDATE (consistent_point, state, activated_at, retiring_at, retired_at)
+), UPDATE (
+    consistent_point,
+    creation_receipt_id,
+    cleanup_receipt_id,
+    state,
+    activated_at,
+    retiring_at,
+    retired_at
+)
     ON pgshard_catalog.slot_sync_probes TO pgshard_catalog_admin;
 GRANT INSERT (logical_database_id) ON pgshard_catalog.routing_epochs TO pgshard_catalog_admin;
 GRANT INSERT, UPDATE, DELETE ON pgshard_catalog.routing_ranges TO pgshard_catalog_admin;

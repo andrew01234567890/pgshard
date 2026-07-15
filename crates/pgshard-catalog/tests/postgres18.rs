@@ -367,8 +367,26 @@ async fn insert_slot_sync_probe(
 
 struct SlotSyncProbeFixture {
     generation: Uuid,
+    receipt_id: Uuid,
     replacement_generation: Uuid,
     replacement_name: String,
+}
+
+async fn assert_active_probe_receipt_immutable(
+    client: &Client,
+    probe: &SlotSyncProbeFixture,
+) -> TestResult {
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET creation_receipt_id = gen_random_uuid() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await
+        .expect_err("an active probe cannot rewrite its creation receipt identity");
+    assert_sqlstate(&error, "55000");
+    Ok(())
 }
 
 async fn allocate_slot_sync_probe_fixture(
@@ -425,6 +443,7 @@ async fn allocate_slot_sync_probe_fixture(
 
     Ok(SlotSyncProbeFixture {
         generation: probe_generation,
+        receipt_id: fixture_uuid(fixture.nonce, 94),
         replacement_generation,
         replacement_name,
     })
@@ -458,9 +477,10 @@ async fn assert_slot_sync_probe_activation(
         .execute(
             "UPDATE pgshard_catalog.slot_sync_probes \
              SET state = 'active', consistent_point = '0/10', \
+                 creation_receipt_id = $2::text::uuid, \
                  activated_at = statement_timestamp() \
              WHERE probe_generation = $1::text::uuid",
-            &[&probe.generation.to_string()],
+            &[&probe.generation.to_string(), &probe.receipt_id.to_string()],
         )
         .await?;
     let error = client
@@ -472,6 +492,7 @@ async fn assert_slot_sync_probe_activation(
         .await
         .expect_err("an active probe cannot rewrite its creation boundary");
     assert_sqlstate(&error, "55000");
+    assert_active_probe_receipt_immutable(client, probe).await?;
     let error = client
         .execute(
             "UPDATE pgshard_catalog.slot_sync_probes \
@@ -534,12 +555,24 @@ async fn assert_slot_sync_probe_retirement(
     fixture: &Fixture,
     probe: &SlotSyncProbeFixture,
 ) -> TestResult {
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retiring', cleanup_receipt_id = gen_random_uuid(), \
+                 retiring_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await
+        .expect_err("active cleanup must use its exact creation receipt identity");
+    assert_sqlstate(&error, "55000");
     client
         .execute(
             "UPDATE pgshard_catalog.slot_sync_probes \
-             SET state = 'retiring', retiring_at = statement_timestamp() \
+             SET state = 'retiring', cleanup_receipt_id = $2::text::uuid, \
+                 retiring_at = statement_timestamp() \
              WHERE probe_generation = $1::text::uuid",
-            &[&probe.generation.to_string()],
+            &[&probe.generation.to_string(), &probe.receipt_id.to_string()],
         )
         .await?;
     let error = insert_slot_sync_probe(
@@ -591,7 +624,8 @@ async fn assert_slot_sync_probe_retirement(
     client
         .execute(
             "UPDATE pgshard_catalog.slot_sync_probes \
-             SET state = 'retiring', retiring_at = statement_timestamp() \
+             SET state = 'retiring', cleanup_receipt_id = gen_random_uuid(), \
+                 retiring_at = statement_timestamp() \
              WHERE probe_generation = $1::text::uuid",
             &[&probe.replacement_generation.to_string()],
         )
@@ -892,6 +926,7 @@ async fn assert_admin_slot_sync_probe_write_path(
         .execute(
             "UPDATE pgshard_catalog.slot_sync_probes \
              SET state = 'active', consistent_point = '0/1', \
+                 creation_receipt_id = gen_random_uuid(), \
                  activated_at = statement_timestamp() \
              WHERE probe_generation = $1::text::uuid",
             &[&probe_generation.to_string()],
@@ -900,7 +935,8 @@ async fn assert_admin_slot_sync_probe_write_path(
     transaction
         .execute(
             "UPDATE pgshard_catalog.slot_sync_probes \
-             SET state = 'retiring', retiring_at = statement_timestamp() \
+             SET state = 'retiring', cleanup_receipt_id = creation_receipt_id, \
+                 retiring_at = statement_timestamp() \
              WHERE probe_generation = $1::text::uuid",
             &[&probe_generation.to_string()],
         )
@@ -1833,7 +1869,8 @@ async fn retire_racing_probe(client: &Client, generation: Uuid) -> TestResult {
     client
         .execute(
             "UPDATE pgshard_catalog.slot_sync_probes \
-             SET state = 'retiring', retiring_at = statement_timestamp() \
+             SET state = 'retiring', cleanup_receipt_id = gen_random_uuid(), \
+                 retiring_at = statement_timestamp() \
              WHERE probe_generation = $1::text::uuid",
             &[&generation.to_string()],
         )

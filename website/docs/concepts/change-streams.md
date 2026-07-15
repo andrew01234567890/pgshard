@@ -339,16 +339,19 @@ validate against an older view of the other slot class. It deliberately does not
 claim the PostgreSQL slot exists from a catalog row alone. A bounded Rust
 primitive now composes the clean lifecycle: allocate the immutable row, create
 and verify the exact primary failover slot, activate only from its unforgeable
-creation receipt, mark it `retiring`, drop the unchanged inactive slot, and
-retire only from the resulting exact absence receipt. The write transactions
-are conditional and idempotent; an ambiguous commit is resolved by reloading
-the permanent generation before retry. Genesis epoch zero is accepted only for
-the first allocation, whose committed catalog update returns a nonzero source
-identity before PostgreSQL mutation. Live PostgreSQL 18 coverage also requires
-the continuously synchronized standby copy to appear and disappear around this
-lifecycle. A long-running reconciler, restart-safe absence proof, injected
-commit-response loss, and the source-bound progress challenge are not
-implemented yet.
+creation receipt, persist that receipt's opaque create-attempt ID, copy the same
+ID when cleanup starts, drop the unchanged inactive slot, and retire only from
+an absence receipt carrying that exact ID. Recreating the same PostgreSQL name
+therefore cannot let an older absence receipt retire the later slot. The write
+transactions are conditional and idempotent; an ambiguous commit is resolved by
+reloading the permanent generation before retry. Genesis epoch zero is accepted
+only for the first allocation, whose committed catalog update returns a nonzero
+source identity before PostgreSQL mutation. Live PostgreSQL 18 coverage requires
+the continuously synchronized standby copy to appear and disappear, rejects a
+stale absence receipt after same-name recreation, and injects activation COMMIT
+response loss before reconciling the exact durable row. A long-running
+reconciler, restart-safe absence proof, slot-mutation response-loss injection,
+and the source-bound progress challenge are not implemented yet.
 
 The operator automatically synchronizes each primary anchor to eligible direct
 standbys for promotion safety. Standby-local slots are independent and

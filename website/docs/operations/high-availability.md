@@ -71,11 +71,14 @@ The proof expiry is also the create-preflight deadline and is rechecked at the
 dispatch boundary.
 Create/drop errors after dispatch are always outcome-unknown and must be
 observed rather than retried. A successful create returns only a process-local
-cleanup receipt; source, role, a bounded session fence and required creation
-settings are rechecked after dispatch. Known pre-dispatch drop failures return
-that receipt, and cleanup does not depend on a live receiver, its physical slot,
-healthy feedback or slot synchronization.
-Restore incarnation and catalog epoch still require a future durable
+cleanup receipt with an opaque identity for that exact create attempt; source,
+role, a bounded session fence and required creation settings are rechecked after
+dispatch. The slot-sync probe catalog persists that identity through activation
+and cleanup so an absence receipt from an earlier same-name creation cannot
+close the later lifecycle. Known pre-dispatch drop failures return the receipt,
+and cleanup does not depend on a live receiver, its physical slot, healthy
+feedback or slot synchronization. Restore incarnation outside probe allocation
+and automatic unknown-outcome recovery still require a future durable
 catalog-bound reconciler.
 
 The observation and mutation paths run in a real primary/standby CI fixture.
@@ -94,10 +97,13 @@ dedicated slot-sync probe per live shard restore. The probe is explicitly
 separate from consumer anchors, so a future freshness challenge cannot skip
 unconsumed data by advancing a consumer resume slot. The bounded clean path now
 allocates the catalog identity, creates the failover probe, observes its
-continuous synchronized copy, activates from the exact creation receipt, and
-retires only after exact primary absence and synchronized-copy removal. No
-controller yet runs that path continuously or recovers it after process loss,
-and the source-bound progress challenge is still absent.
+continuous synchronized copy, persists the exact creation-attempt receipt ID,
+and retires only after matching primary absence and synchronized-copy removal.
+The live fixture rejects replay of an older absence receipt after same-name
+recreation and reconciles one deliberately lost catalog activation COMMIT
+response by exact reload and same-input retry. No controller yet runs that path
+continuously or recovers it after process loss, and the source-bound progress
+challenge is still absent.
 :::
 
 The target default is one primary and two physical streaming replicas per shard,
