@@ -29,12 +29,14 @@ same eligible physical standby when one can retain the required point. This
 keeps both the bulk-copy scan and logical materialization workload off the
 primary. The materializer is a managed logical consumer with its own slot,
 ownership fence, and durable checkpoint in `shardschema`; it never shares the
-public change-stream slot. A synchronized primary failover anchor protects
-promotion, while independently created standby-local slots provide decoding
-before promotion. If the selected standby or its snapshot holder is lost,
-pgshard resumes only from a source that proves checkpoint coverage or restarts
-the affected snapshot. It never combines a snapshot from one history with a
-slot that cannot prove the same start point.
+public change-stream slot. Its change reader and target applier are supervised
+tasks in the `pgshard-pooler` stream-worker sidecar, not a separate stream
+Deployment. A synchronized primary failover anchor protects promotion, while
+independently created standby-local slots provide decoding before promotion. If
+the selected standby or its snapshot holder is lost, pgshard resumes only from
+a source that proves checkpoint coverage or restarts the affected snapshot. It
+never combines a snapshot from one history with a slot that cannot prove the
+same start point.
 
 ## Activation safety
 

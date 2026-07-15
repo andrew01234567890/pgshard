@@ -74,8 +74,10 @@ source identity, slot names, generations, consistent points, and two-phase
 boundaries are immutable. Source and slot retirement is ordered, and retired
 rows cannot be changed, deleted, or reused. A selected source may be a
 member-bound standby-local decoder or the cluster-scoped primary failover
-anchor, preserving the fail-closed primary fallback. Synchronized anchor copies
-remain observed PostgreSQL state rather than separate catalog allocations.
+anchor. The default pooler policy requires the standby decoder; selecting the
+primary anchor is an explicit, fail-closed emergency policy rather than an
+automatic fallback. Synchronized anchor copies remain observed PostgreSQL state
+rather than separate catalog allocations.
 Pending creation attempts version the shared catalog fence so older
 repeatable-read lifecycle writers serialize instead of overlooking a newly
 durable barrier. Consumer and probe activation and final retirement use narrow
@@ -95,9 +97,10 @@ UUIDs and atomically advance affected checkpoint generations before slot
 reconciliation or serving; restoring the catalog's old incarnation value never
 authorizes attachment to restored WAL or an old resume token. Retired managed slot names
 and generations are already permanent tombstones and are never allocated
-again. The controlled restore rotation and its CAS API, live observation,
-PostgreSQL slot creation/drop, and connection-bound stream ownership remain
-unimplemented; table rows alone do not authorize `START_REPLICATION`.
+again. The controlled restore rotation and its CAS API, long-running slot
+reconciliation, automatic outcome-unknown recovery, and connection-bound pooler
+stream ownership remain unimplemented; table rows alone do not authorize
+`START_REPLICATION`.
 
 Password material is never stored in `shardschema`.
 

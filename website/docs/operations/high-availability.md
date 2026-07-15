@@ -167,16 +167,17 @@ The primary must hold a renewable shard/term lease in the three-member etcd clus
 Promotion requires a candidate whose WAL and prepared-transaction state prove that all acknowledged commits are present. If no candidate satisfies that condition, pgshard stops writes instead of risking split brain or acknowledged-data loss.
 
 Managed logical consumers, including public change streams and reshard
-materializers, prefer a healthy physical standby as their decoding source. The
-primary retains a failover anchor at the last durable consumer checkpoint, and
+materializers, require an eligible physical standby as their normal decoding
+source. Loss of every safe standby fences the consumer by default; using the
+primary is a separately configured, visible emergency policy. The primary
+retains a failover anchor at the last durable consumer checkpoint, and
 PostgreSQL 18 automatically synchronizes that anchor to managed promotion
 candidates. Promotion can leave `synced = true` visible on the now-writable
 primary as a record that the slot originated as a synchronized copy, while the
-hot-standby restrictions no longer apply. Because
-PostgreSQL does not allow a synchronized logical slot to be
-decoded on a hot standby, normal standby decoding uses a distinct standby-local
-slot. Promotion and source changes are catalog-fenced and may replay events,
-but they must never skip an event. See
+hot-standby restrictions no longer apply. Because PostgreSQL does not allow a
+synchronized logical slot to be decoded on a hot standby, normal standby
+decoding uses a distinct standby-local slot. Promotion and source changes are
+catalog-fenced and may replay events, but they must never skip an event. See
 [change streams](../concepts/change-streams.md#standby-first-slot-topology) for
 the slot roles, required settings, retention bounds, and failure tests.
 

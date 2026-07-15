@@ -213,7 +213,7 @@ Message emitted inside a savepoint retains that top-level XID while the
 Relation record carries the savepoint XID. Decoder state proves segment layout,
 not complete transaction order: there is no relation cache, feedback runtime or
 scheduler, durable checkpoint, slot lifecycle, snapshot, cross-shard merge, or
-change-stream service yet.
+embedded pooler change-stream runtime yet.
 
 The future replication session must construct and bind that configuration only
 after the exact `START_REPLICATION` command enters COPY-BOTH mode and it has

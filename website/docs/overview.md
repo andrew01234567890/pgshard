@@ -39,6 +39,8 @@ status](./project/status.md) before using any command or guarantee.
 - PostgreSQL 18 is the only supported major.
 - Durable shard metadata lives in the `shardschema` database on `shard-0000`; etcd contains leases, not the authoritative shard map.
 - Applications connect through pooler services and do not receive a direct PostgreSQL Service.
+- Change-stream workers run inside `pgshard-pooler` and normally consume
+  `pgoutput` only from independently decoded standby-local slots.
 - Distributed transactions provide atomic final outcomes at `READ COMMITTED`, with documented phase-two visibility skew.
 - Routing, schema, authorization, and reshard cutovers are activated through monotonic epochs.
 - Restore operates on complete coordinated backup sets and an empty target.
