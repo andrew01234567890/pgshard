@@ -330,7 +330,8 @@ async fn assert_correlated_replication_path(
     anchor: &ManagedSlotTarget,
 ) -> TestResult {
     let physical_slot = ReplicationSlotName::new(EXPECTED_PRIMARY_SLOT_NAME)?;
-    let primary_request = PrimaryReplicationObservationRequest::new(physical_slot.clone());
+    let primary_request =
+        PrimaryReplicationObservationRequest::new(physical_slot.clone(), anchor.clone())?;
     let (replay_control, replay_control_connection) =
         tokio_postgres::connect(standby_database_url, NoTls).await?;
     let replay_control_task = tokio::spawn(replay_control_connection);
@@ -411,6 +412,13 @@ async fn assert_correlated_replication_path(
     assert_eq!(proof.physical_slot_persistence(), SlotPersistence::Unproven);
     assert_ne!(proof.physical_catalog_xmin().get().get(), 0);
     assert_ne!(proof.peer_reply_epoch_micros().get(), 0);
+    assert_eq!(proof.failover_anchor(), anchor.name());
+    assert_ne!(proof.primary_failover_anchor_confirmed_lsn().0, 0);
+    assert_ne!(proof.synchronized_failover_anchor_confirmed_lsn().0, 0);
+    assert!(
+        proof.synchronized_failover_anchor_confirmed_lsn().0
+            <= proof.primary_failover_anchor_confirmed_lsn().0
+    );
     Ok(())
 }
 
@@ -422,6 +430,17 @@ fn test_decoder_policy(
     required_checkpoint: PgLsn,
 ) -> TestResult<(ReplicationSourceIdentity, StandbyDecoderPolicy)> {
     let prerequisites = standby.prerequisites();
+    let failover_anchor_at = standby
+        .entries()
+        .iter()
+        .find(|entry| entry.target() == anchor)
+        .and_then(|entry| entry.observation())
+        .and_then(|observation| observation.two_phase_at)
+        .ok_or_else(|| {
+            io::Error::other(
+                "synchronized failover anchor has no prepared-decoding activation boundary",
+            )
+        })?;
     let source = ReplicationSourceIdentity::new(
         prerequisites.system_identifier(),
         prerequisites.checkpoint_timeline(),
@@ -439,7 +458,7 @@ fn test_decoder_policy(
         source,
         decoder_target,
         ManagedTwoPhasePolicy {
-            failover_anchor_at: replay_floor,
+            failover_anchor_at,
             local_decoder_at: replay_floor,
         },
         required_checkpoint,
@@ -955,6 +974,9 @@ async fn wait_for_managed_primary_path(
         }) && batch.wal_sender().is_some_and(|sender| {
             sender.activity() == LocalWalSenderActivity::Streaming
                 && sender.reply_epoch_micros().is_some()
+        }) && batch.failover_anchor().is_some_and(|anchor| {
+            anchor.confirmed_flush_lsn.is_some_and(|lsn| lsn.0 != 0)
+                && anchor.two_phase_at.is_some_and(|lsn| lsn.0 != 0)
         });
         if ready {
             return Ok(batch);
@@ -972,6 +994,7 @@ async fn wait_for_managed_primary_path(
 fn assert_managed_primary_path(
     batch: &LocalPrimaryReplicationObservationBatch,
     physical_slot: &ReplicationSlotName,
+    failover_anchor: &ManagedSlotTarget,
 ) {
     assert_eq!(batch.database_name(), "shardschema");
     assert_ne!(batch.database_oid(), 0);
@@ -1001,6 +1024,27 @@ fn assert_managed_primary_path(
     assert_eq!(sender.application_name(), physical_slot);
     assert_eq!(sender.activity(), LocalWalSenderActivity::Streaming);
     assert!(sender.reply_epoch_micros().is_some());
+
+    let anchor = batch.failover_anchor().expect("primary failover anchor");
+    assert_eq!(anchor.name, *failover_anchor.name());
+    assert_eq!(anchor.database_oid, batch.database_oid());
+    assert_eq!(anchor.plugin, LogicalSlotPlugin::PgOutput);
+    assert_eq!(anchor.kind, LogicalSlotKind::FailoverAnchor);
+    assert_eq!(anchor.persistence, SlotPersistence::Unproven);
+    assert_eq!(anchor.two_phase, SettingState::Enabled);
+    assert!(anchor.two_phase_at.is_some_and(|lsn| lsn.0 != 0));
+    assert_eq!(anchor.activity, SlotActivity::Inactive);
+    assert_eq!(anchor.ownership, SlotOwnership::Unknown);
+    assert_eq!(anchor.invalidation, None);
+    assert!(matches!(
+        anchor.wal_retention,
+        Some(SlotWalRetention::Reserved | SlotWalRetention::Extended)
+    ));
+    let confirmed_flush_lsn = anchor
+        .confirmed_flush_lsn
+        .expect("primary anchor confirmed-flush LSN");
+    assert_ne!(confirmed_flush_lsn.0, 0);
+    assert!(anchor.two_phase_at.expect("checked boundary").0 <= confirmed_flush_lsn.0);
 }
 
 async fn wait_for_missing_primary_path(
@@ -1024,6 +1068,7 @@ async fn wait_for_missing_primary_path(
                     FailoverSlotSynchronization::NotGated
                 );
                 assert_eq!(missing.wal_sender(), None);
+                assert!(missing.failover_anchor().is_some());
                 return Ok(());
             }
             Ok(_) => {}
@@ -1055,7 +1100,10 @@ async fn exercise_temporary_physical_slot(database_url: &str) -> TestResult {
     let (temporary_owner, temporary_connection) =
         tokio_postgres::connect(database_url, NoTls).await?;
     let temporary_task = tokio::spawn(temporary_connection);
-    let temporary_request = PrimaryReplicationObservationRequest::new(temporary_name.clone());
+    let temporary_request = PrimaryReplicationObservationRequest::new(
+        temporary_name.clone(),
+        expected_synced_anchor()?,
+    )?;
     let fixture_result: TestResult = async {
         temporary_owner
             .query_one(
@@ -1100,7 +1148,10 @@ async fn exercise_logical_physical_name_collision(database_url: &str) -> TestRes
     let (collision_owner, collision_connection) =
         tokio_postgres::connect(database_url, NoTls).await?;
     let collision_task = tokio::spawn(collision_connection);
-    let collision_request = PrimaryReplicationObservationRequest::new(collision_name.clone());
+    let collision_request = PrimaryReplicationObservationRequest::new(
+        collision_name.clone(),
+        expected_synced_anchor()?,
+    )?;
     let fixture_result: TestResult = async {
         create_logical_slot(&collision_owner, &collision_target, true, false, false).await?;
         let error = observe_primary_path(database_url, &collision_request)
@@ -1149,12 +1200,24 @@ async fn assert_primary_observation_requires_effective_stats(
 async fn observes_primary_physical_slot_and_exact_walsender() -> TestResult {
     let database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
     let physical_slot = ReplicationSlotName::new(EXPECTED_PRIMARY_SLOT_NAME)?;
-    let request = PrimaryReplicationObservationRequest::new(physical_slot.clone());
+    let failover_anchor = expected_synced_anchor()?;
+    let request =
+        PrimaryReplicationObservationRequest::new(physical_slot.clone(), failover_anchor.clone())?;
     let batch = wait_for_managed_primary_path(&database_url, &request).await?;
-    assert_managed_primary_path(&batch, &physical_slot);
+    assert_managed_primary_path(&batch, &physical_slot, &failover_anchor);
 
-    let missing_request =
-        PrimaryReplicationObservationRequest::new(ReplicationSlotName::new("pgshard_member_9999")?);
+    let absent_anchor = target("pgshard_test_missing_anchor")?;
+    let absent_anchor_request =
+        PrimaryReplicationObservationRequest::new(physical_slot.clone(), absent_anchor)?;
+    let absent_anchor_batch = observe_primary_path(&database_url, &absent_anchor_request).await?;
+    assert!(absent_anchor_batch.physical_slot().is_some());
+    assert!(absent_anchor_batch.wal_sender().is_some());
+    assert_eq!(absent_anchor_batch.failover_anchor(), None);
+
+    let missing_request = PrimaryReplicationObservationRequest::new(
+        ReplicationSlotName::new("pgshard_member_9999")?,
+        failover_anchor,
+    )?;
     wait_for_missing_primary_path(&database_url, &missing_request).await?;
     exercise_temporary_physical_slot(&database_url).await?;
     exercise_logical_physical_name_collision(&database_url).await?;
@@ -1208,9 +1271,10 @@ async fn rejects_legacy_server_before_postgres18_prerequisites() -> TestResult {
         LocalSlotObservationError::UnsupportedPostgresVersion(version) if version < 180_000
     ));
 
-    let primary_request = PrimaryReplicationObservationRequest::new(ReplicationSlotName::new(
-        EXPECTED_PRIMARY_SLOT_NAME,
-    )?);
+    let primary_request = PrimaryReplicationObservationRequest::new(
+        ReplicationSlotName::new(EXPECTED_PRIMARY_SLOT_NAME)?,
+        expected_synced_anchor()?,
+    )?;
     let (primary_client, primary_connection) =
         tokio_postgres::connect(&database_url, NoTls).await?;
     let error = observe_local_primary_replication(

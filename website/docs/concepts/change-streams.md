@@ -196,8 +196,10 @@ The current Rust foundation can load one ready standby-selected policy from
 `shardschema` and take a bounded, read-only observation batch of an exact small
 set of local PostgreSQL 18 replication slots. A companion primary-side sample
 observes one exact physical slot, plain-list synchronization-policy membership,
-and only the walsender whose PID owns that slot. PostgreSQL copies each slot under
-its own mutex, so neither batch is a point-in-time cross-slot snapshot. It
+only the walsender whose PID owns that slot, and the exact catalog-selected
+primary failover anchor in the same bounded SQL statement. PostgreSQL copies
+each slot under its own mutex, so that statement is not a point-in-time
+cross-slot snapshot and the primary and standby samples are not atomic. It
 records the local monotonic interval that brackets the server query; a future
 mutating reconciler must take a fresh post-acquisition batch and recheck every
 invariant. The observer consumes and owns both its dedicated client and
@@ -217,7 +219,20 @@ unless their database, observable system/timeline/database identity, roles, WAL
 levels, mandatory feedback and continuous synchronization settings, a standby
 control-file replay floor at or after the durable checkpoint, receiver slot,
 gated physical slot, active PID, retained WAL,
-walsender generation, `application_name`, and streaming state agree. Its result
+walsender generation, `application_name`, and streaming state agree. It also
+requires the primary anchor and its continuously synchronized standby copy to
+match the catalog-selected name and database, use `pgoutput`, expose the exact
+failover-enabled primary and synchronized-standby roles, be non-temporary,
+retain WAL, have enabled
+two-phase decoding at the catalog boundary, remain uninvalidated, and report a
+nonzero confirmed-flush LSN no later than the durable checkpoint. The primary
+anchor must be inactive. PostgreSQL 18 can retain `synced = true` as
+synchronized-origin metadata after standby promotion, while the restrictions
+on using or dropping that slot apply only during recovery. The correlator
+therefore accepts either failover-enabled primary shape after independently
+verifying the server is writable. PostgreSQL's slot-sync worker may transiently own the
+synchronized standby copy. Separately sampled synchronized progress must not
+lead the primary anchor. Its result
 is a non-authorizing endpoint-compatibility and change-token carrier, not proof
 that the two endpoints were connected and not permission to attach. PostgreSQL
 18's SQL API returns the replay LSN without its atomically sampled replay
@@ -234,7 +249,8 @@ restore incarnation and catalog epoch come from the fenced policy rather than
 PostgreSQL observation. Exact live replay, upstream identity and network
 adjacency, feedback freshness, catalog-horizon coverage,
 physical-slot lifecycle persistence, source-bound slot-sync-cycle evidence,
-logical-slot ownership, mutation-history attestation, and every create,
+logical-slot ownership, server-attested generation, mutation-history
+attestation, and every create,
 advance, acquire, or drop action remain future reconciliation work.
 
 Each checkpoint generation is immutably bound to its shard restore incarnation,
