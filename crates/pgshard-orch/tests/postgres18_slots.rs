@@ -3,19 +3,27 @@
 use std::{
     error::Error,
     io,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
 use pgshard_catalog::CatalogOperationTimeout;
 use pgshard_orch::{
+    slot_mutator::{
+        LocalSlotMutationError, ManagedLogicalSlotCreateRequest, ManagedLogicalSlotDropOutcome,
+        ManagedLogicalSlotReceipt, ManagedLogicalSlotRole, create_managed_logical_slot,
+        drop_managed_logical_slot,
+    },
     slot_observer::{
-        LocalLogicalSlotObservationBatch, LocalPrimaryReplicationObservationBatch,
-        LocalSlotObservationError, LocalSlotSyncWorkerActivity, LocalWalReceiverActivity,
-        LocalWalSenderActivity, LogicalSlotObservationRequest,
-        PrimaryReplicationObservationRequest, StandbyReplicationPathCorrelationError,
-        correlate_standby_replication_path, observe_local_logical_slots,
-        observe_local_primary_replication,
+        CorrelatedStandbyReplicationPath, LocalLogicalSlotObservationBatch,
+        LocalPrimaryReplicationObservationBatch, LocalSlotObservationError,
+        LocalSlotSyncWorkerActivity, LocalWalReceiverActivity, LocalWalSenderActivity,
+        LogicalSlotObservationRequest, PrimaryReplicationObservationRequest,
+        StandbyReplicationPathCorrelationError, correlate_standby_replication_path,
+        observe_local_logical_slots, observe_local_primary_replication,
     },
     standby_slots::{
         FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotPlugin, LogicalWalLevel,
@@ -44,13 +52,19 @@ const CREATE_LOGICAL_SLOT_SQL: &str = "\
 const CONNECTION_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const ADVISORY_FENCE_KEY_STRIDE: u64 = 32;
 const EXPECTED_PRIMARY_SLOT_NAME: &str = "pgshard_member_0001";
 const EXPECTED_SYNCED_ANCHOR_NAME: &str = "pgshard_ci_anchor_00000000000000000000000000000001";
+// Correlation, slot-sync appearance/removal, snapshot-triggered standby create,
+// and cleanup each retain their own one-minute bound. The outer mutation
+// fixture must cover those sequential phases instead of racing any one of them.
+const MUTATION_FIXTURE_TIMEOUT: Duration = Duration::from_mins(5);
 const STANDBY_CATCHUP_TIMEOUT: Duration = Duration::from_mins(1);
 const STANDBY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RESTRICTED_OBSERVER_ROLE: &str = "pgshard_observer_restricted";
 const RESTRICTED_OBSERVER_PASSWORD: &str = "pgshard-test-only";
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_ADVISORY_FENCE: AtomicU64 = AtomicU64::new(1);
 
 type TestError = Box<dyn Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
@@ -82,6 +96,70 @@ fn combine_fixture_results(
         .collect::<Vec<_>>()
         .join("; ");
     Err(io::Error::other(format!("multiple live-test failures: {detail}")).into())
+}
+
+struct AbortOnDropConnectionTask {
+    task: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
+}
+
+impl AbortOnDropConnectionTask {
+    fn new(task: JoinHandle<Result<(), tokio_postgres::Error>>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn finish(mut self, description: &'static str) -> TestResult {
+        let result = timeout(
+            CONNECTION_EXIT_TIMEOUT,
+            self.task.as_mut().expect("connection task is present"),
+        )
+        .await;
+        if let Ok(result) = result {
+            self.task.take();
+            result??;
+            Ok(())
+        } else {
+            self.abort();
+            let _ = timeout(
+                CONNECTION_EXIT_TIMEOUT,
+                self.task.as_mut().expect("connection task is present"),
+            )
+            .await;
+            self.task.take();
+            Err(io::Error::other(format!(
+                "{description} did not terminate after bounded abort"
+            ))
+            .into())
+        }
+    }
+
+    fn abort(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for AbortOnDropConnectionTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+async fn finish_bounded_fixture(
+    mut task: JoinHandle<TestResult>,
+    description: &'static str,
+) -> TestResult {
+    if let Ok(result) = timeout(MUTATION_FIXTURE_TIMEOUT, &mut task).await {
+        return result?;
+    }
+    task.abort();
+    let aborted = timeout(CONNECTION_EXIT_TIMEOUT, task).await.map_err(|_| {
+        io::Error::other(format!(
+            "{description} did not terminate after bounded abort"
+        ))
+    })?;
+    drop(aborted);
+    Err(io::Error::other(format!("{description} exceeded the test bound")).into())
 }
 
 fn target(prefix: &str) -> TestResult<ManagedSlotTarget> {
@@ -179,21 +257,82 @@ async fn finish_connection(task: JoinHandle<Result<(), tokio_postgres::Error>>) 
     Ok(())
 }
 
+async fn wait_for_synchronized_copy(
+    database_url: &str,
+    target: &ManagedSlotTarget,
+    expected_present: bool,
+) -> TestResult {
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    let (client, connection) = timeout_at(deadline, tokio_postgres::connect(database_url, NoTls))
+        .await
+        .map_err(|_| io::Error::other("standby copy connection exceeded the test bound"))??;
+    let connection_task = tokio::spawn(connection);
+    let observation = async {
+        loop {
+            let row = client
+                .query_opt(
+                    "SELECT synced, failover, temporary, active, \
+                            plugin OPERATOR(pg_catalog.=) 'pgoutput'::pg_catalog.name, \
+                            slot_type OPERATOR(pg_catalog.=) 'logical'::pg_catalog.text \
+                       FROM pg_catalog.pg_replication_slots \
+                      WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name",
+                    &[&target.name().as_str()],
+                )
+                .await?;
+            if !expected_present && row.is_none() {
+                return Ok::<(), TestError>(());
+            }
+            if let Some(row) = row {
+                let exact_synchronized_copy = row.try_get::<_, bool>(0)?
+                    && row.try_get::<_, bool>(1)?
+                    && !row.try_get::<_, bool>(2)?
+                    && !row.try_get::<_, bool>(3)?
+                    && row.try_get::<_, bool>(4)?
+                    && row.try_get::<_, bool>(5)?;
+                if expected_present && exact_synchronized_copy {
+                    return Ok::<(), TestError>(());
+                }
+            }
+            sleep(STANDBY_POLL_INTERVAL).await;
+        }
+    };
+    let result = timeout_at(deadline, observation).await.map_err(|_| {
+        let state = if expected_present {
+            "appear"
+        } else {
+            "disappear"
+        };
+        io::Error::other(format!(
+            "synchronized copy {:?} did not {state} within the test bound",
+            target.name().as_str()
+        ))
+    })?;
+    drop(client);
+    let connection_result = finish_connection(connection_task).await;
+    result?;
+    connection_result
+}
+
 async fn cleanup_slot(client: &Client, target: &ManagedSlotTarget) -> TestResult {
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
-        let row = client
-            .query_opt(
+        let row = timeout_at(
+            deadline,
+            client.query_opt(
                 "SELECT active FROM pg_catalog.pg_replication_slots \
                   WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name",
                 &[&target.name().as_str()],
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| io::Error::other("slot cleanup observation exceeded the bound"))??;
         let Some(row) = row else {
             return Ok(());
         };
         if !row.try_get::<_, bool>(0)? {
-            return drop_slot(client, target).await;
+            return timeout_at(deadline, drop_slot(client, target))
+                .await
+                .map_err(|_| io::Error::other("slot cleanup drop exceeded the bound"))?;
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
@@ -202,8 +341,51 @@ async fn cleanup_slot(client: &Client, target: &ManagedSlotTarget) -> TestResult
             ))
             .into());
         }
-        sleep(CLEANUP_RETRY_INTERVAL).await;
+        timeout_at(deadline, sleep(CLEANUP_RETRY_INTERVAL))
+            .await
+            .map_err(|_| io::Error::other("slot cleanup retry exceeded the bound"))?;
     }
+}
+
+async fn wait_for_mutation_backend_exit(client: &Client, backend_pid: &AtomicU32) -> TestResult {
+    let pid = backend_pid.load(Ordering::Acquire);
+    if pid == 0 {
+        return Ok(());
+    }
+    let pid = i32::try_from(pid)?;
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        let present: bool = timeout_at(
+            deadline,
+            client.query_one(
+                "SELECT pg_catalog.count(*) OPERATOR(pg_catalog.>) 0 \
+                   FROM pg_catalog.pg_stat_activity \
+                  WHERE pid OPERATOR(pg_catalog.=) $1::pg_catalog.int4",
+                &[&pid],
+            ),
+        )
+        .await
+        .map_err(|_| io::Error::other("mutation-backend cleanup exceeded the bound"))??
+        .try_get(0)?;
+        if !present {
+            backend_pid.store(0, Ordering::Release);
+            return Ok(());
+        }
+        timeout_at(deadline, sleep(CLEANUP_RETRY_INTERVAL))
+            .await
+            .map_err(|_| io::Error::other("mutation backend did not exit within the bound"))?;
+    }
+}
+
+async fn cleanup_standby_mutation_fixture(
+    client: &Client,
+    target: &ManagedSlotTarget,
+    backend_pid: &AtomicU32,
+) -> TestResult {
+    let backend_result = wait_for_mutation_backend_exit(client, backend_pid).await;
+    let slot_result = cleanup_slot(client, target).await;
+    backend_result?;
+    slot_result
 }
 
 async fn cleanup_observation_fixture(
@@ -219,13 +401,574 @@ async fn cleanup_observation_fixture(
             first_error = Some(error);
         }
     }
-    let drop_schema_result = client
-        .batch_execute(&format!("DROP SCHEMA IF EXISTS {hostile_schema} CASCADE"))
-        .await;
+    let drop_schema_result = timeout(
+        CLEANUP_TIMEOUT,
+        client.batch_execute(&format!("DROP SCHEMA IF EXISTS {hostile_schema} CASCADE")),
+    )
+    .await
+    .map_err(|_| io::Error::other("fixture schema cleanup exceeded the bound"))?;
     if let Some(error) = first_error {
         return Err(error);
     }
     drop_schema_result?;
+    Ok(())
+}
+
+async fn cleanup_primary_mutation_fixture(
+    client: &Client,
+    standby_database_url: &str,
+    target: &ManagedSlotTarget,
+    hostile_schema: &str,
+    mutation_role: &str,
+) -> TestResult {
+    let fixture_cleanup =
+        cleanup_observation_fixture(client, std::slice::from_ref(target), hostile_schema).await;
+    let role_cleanup = timeout(
+        CLEANUP_TIMEOUT,
+        client.batch_execute(&format!("DROP ROLE IF EXISTS {mutation_role}")),
+    )
+    .await
+    .map_err(|_| io::Error::other("mutation-role cleanup exceeded the bound"))?;
+    fixture_cleanup?;
+    role_cleanup?;
+    wait_for_synchronized_copy(standby_database_url, target, false).await
+}
+
+async fn fence_mutation_session<S, T>(
+    client: &Client,
+    connection: Connection<S, T>,
+    mutation_role: &str,
+    target: &ManagedSlotTarget,
+) -> TestResult<Connection<S, T>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fence_mutation_session_with_locks(client, connection, mutation_role, target, 1).await
+}
+
+async fn capture_mutation_backend_pid<S, T>(
+    client: &Client,
+    mut connection: Connection<S, T>,
+    backend_pid: &AtomicU32,
+) -> TestResult<Connection<S, T>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let query = client.query_one("SELECT pg_catalog.pg_backend_pid()::pg_catalog.int4", &[]);
+    tokio::pin!(query);
+    tokio::select! {
+        result = &mut query => {
+            let pid = u32::try_from(result?.try_get::<_, i32>(0)?)?;
+            if pid == 0 {
+                return Err(io::Error::other("standby mutation backend PID was zero").into());
+            }
+            backend_pid.store(pid, Ordering::Release);
+            Ok(connection)
+        }
+        result = &mut connection => {
+            result?;
+            Err(io::Error::other("standby mutation connection ended while capturing its backend PID").into())
+        }
+    }
+}
+
+async fn fence_mutation_session_with_locks<S, T>(
+    client: &Client,
+    mut connection: Connection<S, T>,
+    mutation_role: &str,
+    target: &ManagedSlotTarget,
+    advisory_lock_count: usize,
+) -> TestResult<Connection<S, T>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let role_query = format!("SET ROLE {mutation_role}");
+    let generation = target.generation().as_uuid();
+    let key_bytes: [u8; 8] = generation.as_bytes()[8..].try_into()?;
+    let session_nonce = NEXT_ADVISORY_FENCE.fetch_add(1, Ordering::Relaxed);
+    let session_key_offset = session_nonce.wrapping_mul(ADVISORY_FENCE_KEY_STRIDE);
+    let first_lock_key = i64::from_be_bytes(key_bytes)
+        .wrapping_add(i64::from_ne_bytes(session_key_offset.to_ne_bytes()));
+    let lock_keys = (0..advisory_lock_count)
+        .map(|offset| first_lock_key.wrapping_add(i64::try_from(offset).expect("small test bound")))
+        .collect::<Vec<_>>();
+    let setup = async {
+        client.batch_execute(&role_query).await?;
+        let all_acquired: bool = client
+            .query_one(
+                "SELECT pg_catalog.bool_and( \
+                            pg_catalog.pg_try_advisory_lock(lock_key) \
+                        ) \
+                   FROM pg_catalog.unnest($1::pg_catalog.int8[]) AS keys(lock_key)",
+                &[&lock_keys],
+            )
+            .await?
+            .try_get(0)?;
+        if !all_acquired {
+            client
+                .query_one("SELECT pg_catalog.pg_advisory_unlock_all()", &[])
+                .await?;
+            return Err::<(), TestError>(
+                io::Error::other("unique mutation advisory fence was already held").into(),
+            );
+        }
+        Ok::<(), TestError>(())
+    };
+    tokio::pin!(setup);
+    tokio::select! {
+        result = &mut setup => {
+            result?;
+            Ok(connection)
+        }
+        result = &mut connection => {
+            result?;
+            Err(io::Error::other("mutation connection ended during session fencing").into())
+        }
+    }
+}
+
+async fn recover_receipt_after_legacy_drop_rejection(
+    legacy_database_url: &str,
+    receipt: ManagedLogicalSlotReceipt,
+) -> TestResult<ManagedLogicalSlotReceipt> {
+    let (client, connection) = tokio_postgres::connect(legacy_database_url, NoTls).await?;
+    let error = drop_managed_logical_slot(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        receipt,
+    )
+    .await
+    .expect_err("PostgreSQL 17 drop preflight must return the cleanup receipt");
+    assert!(!error.outcome_is_unknown());
+    let (receipt, source) = error
+        .into_retry_receipt()
+        .expect("pre-dispatch rejection returns the receipt");
+    assert!(matches!(
+        source,
+        LocalSlotMutationError::UnsupportedPostgresVersion(_)
+    ));
+    Ok(receipt)
+}
+
+async fn assert_oversized_advisory_fence_rejected(
+    config: &Config,
+    mutation_role: &str,
+    target: &ManagedSlotTarget,
+    source: ReplicationSourceIdentity,
+) -> TestResult {
+    let (client, connection) = config.connect(NoTls).await?;
+    let connection =
+        fence_mutation_session_with_locks(&client, connection, mutation_role, target, 17).await?;
+    let error = create_managed_logical_slot(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        ManagedLogicalSlotCreateRequest::primary_failover_anchor(target.clone(), source),
+    )
+    .await
+    .expect_err("an oversized advisory-lock fence must fail before dispatch");
+    assert!(matches!(
+        error,
+        LocalSlotMutationError::TooManyAdvisoryLocks { maximum: 16 }
+    ));
+    Ok(())
+}
+
+async fn mutation_source(
+    client: &Client,
+    expected_recovery: RecoveryState,
+) -> TestResult<ReplicationSourceIdentity> {
+    let row = client
+        .query_one(
+            "SELECT control.system_identifier::pg_catalog.int8, \
+                    checkpoint.timeline_id, pg_catalog.pg_is_in_recovery(), \
+                    CASE WHEN NOT pg_catalog.pg_is_in_recovery() \
+                         THEN pg_catalog.substring( \
+                                  pg_catalog.pg_walfile_name( \
+                                      pg_catalog.pg_current_wal_lsn()), 1, 8) \
+                    END, \
+                    (SELECT oid::pg_catalog.int8 FROM pg_catalog.pg_database \
+                      WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) \
+               FROM pg_catalog.pg_control_system() AS control \
+              CROSS JOIN pg_catalog.pg_control_checkpoint() AS checkpoint",
+            &[],
+        )
+        .await?;
+    let recovery = if row.try_get::<_, bool>(2)? {
+        RecoveryState::Standby
+    } else {
+        RecoveryState::Writable
+    };
+    assert_eq!(recovery, expected_recovery);
+    let checkpoint_timeline = row.try_get::<_, i32>(1)?.cast_unsigned();
+    let timeline = match recovery {
+        RecoveryState::Standby => checkpoint_timeline,
+        RecoveryState::Writable => {
+            let value: String = row.try_get(3)?;
+            u32::from_str_radix(&value, 16)?
+        }
+    };
+    ReplicationSourceIdentity::new(
+        row.try_get::<_, i64>(0)?.cast_unsigned(),
+        timeline,
+        u32::try_from(row.try_get::<_, i64>(4)?)?,
+        Uuid::from_u128(0xd1),
+        CatalogEpoch(1),
+    )
+    .map_err(Into::into)
+}
+
+fn assert_created_receipt(
+    receipt: &ManagedLogicalSlotReceipt,
+    target: &ManagedSlotTarget,
+    source: ReplicationSourceIdentity,
+    role: ManagedLogicalSlotRole,
+) {
+    assert_eq!(receipt.target(), target);
+    assert_eq!(receipt.source(), source);
+    assert_eq!(receipt.role(), role);
+    assert_eq!(receipt.database_name(), "shardschema");
+    assert_ne!(receipt.creation_lsn().0, 0);
+    let observation = receipt.observation();
+    assert_eq!(observation.name, *target.name());
+    assert_eq!(observation.plugin, LogicalSlotPlugin::PgOutput);
+    assert_eq!(observation.persistence, SlotPersistence::Persistent);
+    assert_eq!(
+        observation.ownership,
+        SlotOwnership::Managed(target.generation())
+    );
+    assert_eq!(observation.two_phase, SettingState::Enabled);
+    assert_eq!(observation.two_phase_at, Some(receipt.creation_lsn()));
+    assert_eq!(
+        observation.confirmed_flush_lsn,
+        Some(receipt.creation_lsn())
+    );
+    assert_eq!(observation.activity, SlotActivity::Inactive);
+    assert_eq!(observation.invalidation, None);
+}
+
+async fn run_primary_mutation_fixture(
+    database_url: String,
+    legacy_database_url: String,
+    standby_database_url: String,
+    target: ManagedSlotTarget,
+    hostile_schema: String,
+    mutation_role: String,
+) -> TestResult {
+    let (setup, setup_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let setup_task = tokio::spawn(setup_connection);
+    setup
+        .batch_execute(&format!(
+            "CREATE ROLE {mutation_role} WITH REPLICATION; \
+             GRANT pg_monitor TO {mutation_role}; \
+             CREATE SCHEMA {hostile_schema}; \
+             CREATE FUNCTION {hostile_schema}.current_database() \
+             RETURNS pg_catalog.name LANGUAGE SQL IMMUTABLE \
+             AS 'SELECT ''hostile''::pg_catalog.name'; \
+             CREATE FUNCTION {hostile_schema}.current_setting(pg_catalog.text) \
+             RETURNS pg_catalog.text LANGUAGE SQL IMMUTABLE \
+             AS 'SELECT ''0''::pg_catalog.text'"
+        ))
+        .await?;
+    let source = mutation_source(&setup, RecoveryState::Writable).await?;
+    let mutation_role_oid = u32::try_from(
+        setup
+            .query_one(
+                "SELECT oid::pg_catalog.int8 FROM pg_catalog.pg_roles \
+                  WHERE rolname OPERATOR(pg_catalog.=) $1::pg_catalog.name",
+                &[&mutation_role],
+            )
+            .await?
+            .try_get::<_, i64>(0)?,
+    )?;
+    drop(setup);
+    finish_connection(setup_task).await?;
+
+    let mut hostile_config: Config = database_url.parse()?;
+    hostile_config.options(format!("-csearch_path={hostile_schema},pg_catalog"));
+    assert_hostile_path_is_effective(&hostile_config).await?;
+    assert_oversized_advisory_fence_rejected(&hostile_config, &mutation_role, &target, source)
+        .await?;
+    let (client, connection) = hostile_config.connect(NoTls).await?;
+    let connection = fence_mutation_session(&client, connection, &mutation_role, &target).await?;
+    let receipt = create_managed_logical_slot(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        ManagedLogicalSlotCreateRequest::primary_failover_anchor(target.clone(), source),
+    )
+    .await?;
+    assert_created_receipt(
+        &receipt,
+        &target,
+        source,
+        ManagedLogicalSlotRole::PrimaryFailoverAnchor,
+    );
+    assert_eq!(receipt.effective_role_oid(), mutation_role_oid);
+    assert_eq!(receipt.advisory_lock_count(), 1);
+    wait_for_synchronized_copy(&standby_database_url, &target, true).await?;
+    let (client, connection) = hostile_config.connect(NoTls).await?;
+    let connection = fence_mutation_session(&client, connection, &mutation_role, &target).await?;
+    let error = create_managed_logical_slot(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        ManagedLogicalSlotCreateRequest::primary_failover_anchor(target.clone(), source),
+    )
+    .await
+    .expect_err("exact name collision must fail before dispatch");
+    assert!(matches!(
+        error,
+        LocalSlotMutationError::TargetOccupied(ref occupied) if occupied == &target
+    ));
+
+    let observed = observe(
+        &database_url,
+        &LogicalSlotObservationRequest::new(vec![target.clone()])?,
+    )
+    .await?;
+    let public_row = observed.entries()[0]
+        .observation()
+        .expect("created primary failover anchor");
+    assert_eq!(public_row.persistence, SlotPersistence::Unproven);
+    assert_eq!(public_row.ownership, SlotOwnership::Unknown);
+
+    let receipt =
+        recover_receipt_after_legacy_drop_rejection(&legacy_database_url, receipt).await?;
+
+    let (client, connection) = hostile_config.connect(NoTls).await?;
+    let connection = fence_mutation_session(&client, connection, &mutation_role, &target).await?;
+    let outcome = drop_managed_logical_slot(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        receipt,
+    )
+    .await?;
+    assert_eq!(outcome, ManagedLogicalSlotDropOutcome::Dropped);
+    wait_for_synchronized_copy(&standby_database_url, &target, false).await?;
+    let absent = observe(
+        &database_url,
+        &LogicalSlotObservationRequest::new(vec![target])?,
+    )
+    .await?;
+    assert!(absent.entries()[0].observation().is_none());
+    Ok(())
+}
+
+async fn create_standby_slot_with_snapshot_trigger(
+    primary_database_url: &str,
+    standby_database_url: &str,
+    request: ManagedLogicalSlotCreateRequest,
+    backend_pid: &AtomicU32,
+) -> TestResult<ManagedLogicalSlotReceipt> {
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    let (primary, primary_connection) = timeout_at(
+        deadline,
+        tokio_postgres::connect(primary_database_url, NoTls),
+    )
+    .await
+    .map_err(|_| io::Error::other("primary snapshot-trigger connection exceeded the bound"))??;
+    let (standby, standby_connection) = timeout_at(
+        deadline,
+        tokio_postgres::connect(standby_database_url, NoTls),
+    )
+    .await
+    .map_err(|_| io::Error::other("standby mutation connection exceeded the bound"))??;
+    let standby_connection =
+        capture_mutation_backend_pid(&standby, standby_connection, backend_pid).await?;
+    let primary_task = AbortOnDropConnectionTask::new(tokio::spawn(primary_connection));
+    let create_result: TestResult<ManagedLogicalSlotReceipt> = {
+        let create = create_managed_logical_slot(
+            standby,
+            standby_connection,
+            CatalogOperationTimeout::default(),
+            request,
+        );
+        let trigger = continuously_trigger_standby_snapshots(&primary);
+        tokio::pin!(create);
+        tokio::pin!(trigger);
+        timeout_at(deadline, async {
+            tokio::select! {
+                result = &mut create => result.map_err(|error| Box::new(error) as TestError),
+                result = &mut trigger => match result {
+                    Ok(()) => Err(Box::new(io::Error::other("standby snapshot trigger stopped unexpectedly")) as TestError),
+                    Err(error) => Err(Box::new(error) as TestError),
+                },
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("standby slot creation exceeded the test bound"))?
+    };
+    drop(primary);
+    let connection_result = primary_task
+        .finish("primary snapshot-trigger connection")
+        .await;
+    let receipt = create_result?;
+    connection_result?;
+    Ok(receipt)
+}
+
+async fn continuously_trigger_standby_snapshots(
+    primary: &Client,
+) -> Result<(), tokio_postgres::Error> {
+    loop {
+        primary
+            .query_one("SELECT pg_catalog.pg_log_standby_snapshot()", &[])
+            .await?;
+        sleep(STANDBY_POLL_INTERVAL).await;
+    }
+}
+
+async fn correlated_standby_mutation_path(
+    primary_database_url: &str,
+    standby_database_url: &str,
+    local_decoder: ManagedSlotTarget,
+) -> TestResult<CorrelatedStandbyReplicationPath> {
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    let physical_slot = ReplicationSlotName::new(EXPECTED_PRIMARY_SLOT_NAME)?;
+    let anchor = expected_synced_anchor()?;
+    let standby_request = LogicalSlotObservationRequest::new(vec![anchor.clone()])?;
+    let primary_request =
+        PrimaryReplicationObservationRequest::new(physical_slot.clone(), anchor.clone())?;
+    let required_checkpoint = create_primary_checkpoint(primary_database_url).await?;
+    wait_for_standby_replay_past_checkpoint(standby_database_url, required_checkpoint).await?;
+    advance_standby_replay_floor(standby_database_url, &standby_request, required_checkpoint)
+        .await?;
+    let mut last_rejection = "no correlated samples collected".to_owned();
+
+    loop {
+        let primary = timeout_at(
+            deadline,
+            observe_primary_path(primary_database_url, &primary_request),
+        )
+        .await
+        .map_err(|_| io::Error::other("primary mutation-path observation exceeded the bound"))??;
+        let standby = timeout_at(deadline, observe(standby_database_url, &standby_request))
+            .await
+            .map_err(|_| {
+                io::Error::other("standby mutation-path observation exceeded the bound")
+            })??;
+        let prerequisites = standby.prerequisites();
+        let failover_anchor_at = standby
+            .entries()
+            .first()
+            .and_then(|entry| entry.observation())
+            .and_then(|slot| slot.two_phase_at);
+        if required_checkpoint.0 != 0
+            && let Some(failover_anchor_at) = failover_anchor_at
+        {
+            let source = ReplicationSourceIdentity::new(
+                prerequisites.system_identifier(),
+                prerequisites.checkpoint_timeline(),
+                standby.database_oid(),
+                Uuid::from_u128(0xd1),
+                CatalogEpoch(1),
+            )?;
+            let target = StandbyDecoderTarget::new(
+                1,
+                physical_slot.clone(),
+                anchor.clone(),
+                local_decoder.clone(),
+            )?;
+            let policy = StandbyDecoderPolicy::new(
+                source,
+                target,
+                ManagedTwoPhasePolicy {
+                    failover_anchor_at,
+                    local_decoder_at: required_checkpoint,
+                },
+                required_checkpoint,
+                StandbyDecoderEvidenceLimits::new(
+                    Duration::from_secs(30),
+                    Duration::from_secs(3),
+                    Duration::from_secs(3),
+                )?,
+            );
+            match policy {
+                Ok(policy) => match correlate_standby_replication_path(&policy, &standby, &primary)
+                {
+                    Ok(proof) => return Ok(proof),
+                    Err(error) => last_rejection = error.to_string(),
+                },
+                Err(error) => last_rejection = error.to_string(),
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "standby mutation path did not correlate within the bound: {last_rejection}"
+            ))
+            .into());
+        }
+        timeout_at(deadline, sleep(STANDBY_POLL_INTERVAL))
+            .await
+            .map_err(|_| io::Error::other("standby mutation-path wait exceeded the bound"))?;
+    }
+}
+
+async fn run_standby_mutation_fixture(
+    primary_database_url: String,
+    standby_database_url: String,
+    target: ManagedSlotTarget,
+    backend_pid: Arc<AtomicU32>,
+) -> TestResult {
+    let proof = correlated_standby_mutation_path(
+        &primary_database_url,
+        &standby_database_url,
+        target.clone(),
+    )
+    .await?;
+    let source = proof.source_identity();
+    let receipt = create_standby_slot_with_snapshot_trigger(
+        &primary_database_url,
+        &standby_database_url,
+        ManagedLogicalSlotCreateRequest::standby_local_decoder(proof),
+        &backend_pid,
+    )
+    .await?;
+    assert_created_receipt(
+        &receipt,
+        &target,
+        source,
+        ManagedLogicalSlotRole::StandbyLocalDecoder,
+    );
+    assert_eq!(
+        receipt.observation().kind,
+        LogicalSlotKind::StandbyLocalDecoder
+    );
+
+    let observed = observe(
+        &standby_database_url,
+        &LogicalSlotObservationRequest::new(vec![target.clone()])?,
+    )
+    .await?;
+    assert_eq!(
+        observed.entries()[0]
+            .observation()
+            .expect("standby-local decoder")
+            .kind,
+        LogicalSlotKind::StandbyLocalDecoder
+    );
+    let (standby, standby_connection) =
+        tokio_postgres::connect(&standby_database_url, NoTls).await?;
+    let outcome = drop_managed_logical_slot(
+        standby,
+        standby_connection,
+        CatalogOperationTimeout::default(),
+        receipt,
+    )
+    .await?;
+    assert_eq!(outcome, ManagedLogicalSlotDropOutcome::Dropped);
+    let absent = observe(
+        &standby_database_url,
+        &LogicalSlotObservationRequest::new(vec![target])?,
+    )
+    .await?;
+    assert!(absent.entries()[0].observation().is_none());
     Ok(())
 }
 
@@ -951,22 +1694,87 @@ async fn observes_exact_slot_states_with_pinned_search_path_and_final_cleanup() 
     let hostile_schema = format!("hostile_{}", anchor.generation().as_uuid().simple());
     let targets = vec![anchor.clone(), decoder.clone(), temporary.clone()];
 
-    let fixture_result = match tokio::spawn(run_observation_fixture(
-        database_url,
-        anchor,
-        decoder,
-        temporary,
-        hostile_schema.clone(),
-    ))
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => Err(error.into()),
-    };
+    let fixture_result = finish_bounded_fixture(
+        tokio::spawn(run_observation_fixture(
+            database_url,
+            anchor,
+            decoder,
+            temporary,
+            hostile_schema.clone(),
+        )),
+        "slot-observation fixture",
+    )
+    .await;
     let cleanup_result = cleanup_observation_fixture(&cleanup, &targets, &hostile_schema).await;
     drop(cleanup);
     let cleanup_connection_result = finish_connection(cleanup_task).await;
 
+    combine_fixture_results(fixture_result, cleanup_result, cleanup_connection_result)
+}
+
+#[tokio::test]
+#[ignore = "requires the CI PostgreSQL 18 primary, streaming standby, and logical-slot settings"]
+async fn creates_verifies_and_drops_primary_failover_anchor() -> TestResult {
+    let database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
+    let legacy_database_url = std::env::var("PGSHARD_TEST_LEGACY_DATABASE_URL")?;
+    let standby_database_url = std::env::var("PGSHARD_TEST_STANDBY_DATABASE_URL")?;
+    let (cleanup, cleanup_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let cleanup_task = tokio::spawn(cleanup_connection);
+    let target = target("pgshard_mutation_anchor")?;
+    let hostile_schema = format!("hostile_{}", target.generation().as_uuid().simple());
+    let mutation_role = format!(
+        "pgshard_mutator_{}",
+        &target.generation().as_uuid().simple().to_string()[..16]
+    );
+    let fixture_result = finish_bounded_fixture(
+        tokio::spawn(run_primary_mutation_fixture(
+            database_url,
+            legacy_database_url,
+            standby_database_url.clone(),
+            target.clone(),
+            hostile_schema.clone(),
+            mutation_role.clone(),
+        )),
+        "primary slot-mutation fixture",
+    )
+    .await;
+    let cleanup_result = cleanup_primary_mutation_fixture(
+        &cleanup,
+        &standby_database_url,
+        &target,
+        &hostile_schema,
+        &mutation_role,
+    )
+    .await;
+    drop(cleanup);
+    let cleanup_connection_result = finish_connection(cleanup_task).await;
+    combine_fixture_results(fixture_result, cleanup_result, cleanup_connection_result)
+}
+
+#[tokio::test]
+#[ignore = "requires the CI PostgreSQL 18 primary and streaming standby"]
+async fn creates_verifies_and_drops_standby_local_decoder() -> TestResult {
+    let primary_database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
+    let standby_database_url = std::env::var("PGSHARD_TEST_STANDBY_DATABASE_URL")?;
+    let (cleanup, cleanup_connection) =
+        tokio_postgres::connect(&standby_database_url, NoTls).await?;
+    let cleanup_task = tokio::spawn(cleanup_connection);
+    let target = target("pgshard_mutation_decoder")?;
+    let mutation_backend_pid = Arc::new(AtomicU32::new(0));
+    let fixture_result = finish_bounded_fixture(
+        tokio::spawn(run_standby_mutation_fixture(
+            primary_database_url,
+            standby_database_url,
+            target.clone(),
+            Arc::clone(&mutation_backend_pid),
+        )),
+        "standby slot-mutation fixture",
+    )
+    .await;
+    let cleanup_result =
+        cleanup_standby_mutation_fixture(&cleanup, &target, &mutation_backend_pid).await;
+    drop(cleanup);
+    let cleanup_connection_result = finish_connection(cleanup_task).await;
     combine_fixture_results(fixture_result, cleanup_result, cleanup_connection_result)
 }
 

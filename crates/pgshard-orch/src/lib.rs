@@ -6,7 +6,9 @@
 pub mod config;
 pub mod domain;
 pub mod http;
+mod postgres_connection;
 pub mod slot_catalog;
+pub mod slot_mutator;
 pub mod slot_observer;
 pub mod standby_slots;
 pub mod telemetry;
