@@ -74,8 +74,9 @@ standby-local decoder with two-phase decoding enabled. The first must be the
 writable authoritative `shardschema` database; it acquires the target's hidden
 catalog fence and then reloads the exact durable generation, lifecycle, restore
 incarnation, source, role, target database, and current catalog epoch. Each
-acquisition uses a fresh random session advisory-lock key and opaque fence ID;
-neither is derived from the visible slot name. The second connection performs
+acquisition uses a fresh opaque fence ID bound to the exact live backend and
+postmaster generation; it does not consume the public advisory-lock pool or
+derive authority from the visible slot name. The second connection performs
 the slot mutation in that allocated database. This split retains one canonical
 cluster-wide target registry while the physical mutation runs in the allocated
 database. The mutator requires an absent
@@ -373,8 +374,9 @@ allocation and its shard, restore, database, consumer, ownership or attachment
 parents from changing underneath the create. Every managed create and drop
 serializes through a hidden per-target registry in the writable `shardschema`
 database, then revalidates the exact catalog row after acquisition. The registry
-binds a fresh random session advisory-lock key to an opaque fence ID; public
-target names and name-derived hashes are not authority. Allocation, activation,
+binds an opaque fence ID to the exact backend start time, PID, and postmaster
+generation. Public advisory locks, target names, PID reuse, and name-derived
+hashes are not authority. Allocation, activation,
 cleanup-start, and related parent lifecycle writes, including direct
 administrative writes to managed catalog tables, use that same canonical
 registry. They fail fast on a busy target rather than retaining the catalog-state

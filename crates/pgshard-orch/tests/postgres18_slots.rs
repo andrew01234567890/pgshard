@@ -13,7 +13,8 @@ use std::{
 use pgshard_catalog::{CatalogOperationTimeout, MIGRATION_SQL};
 use pgshard_orch::{
     slot_mutator::{
-        LocalSlotMutationError, ManagedLogicalSlotCreateRequest, ManagedLogicalSlotDropFence,
+        LocalSlotMutationError, ManagedLogicalSlotCatalogActivationError,
+        ManagedLogicalSlotCreateRequest, ManagedLogicalSlotDropFence,
         ManagedLogicalSlotDropOutcome, ManagedLogicalSlotReceipt, ManagedLogicalSlotRole,
         activate_managed_consumer_slot, complete_managed_consumer_slot_retirement,
         create_managed_logical_slot, drop_managed_logical_slot,
@@ -49,7 +50,7 @@ use tokio::{
     time::{Instant, sleep, timeout, timeout_at},
 };
 use tokio_postgres::{
-    Client, Config, Connection, NoTls, error::SqlState, types::PgLsn as WirePgLsn,
+    Client, Config, Connection, GenericClient, NoTls, error::SqlState, types::PgLsn as WirePgLsn,
 };
 use url::Url;
 use uuid::Uuid;
@@ -77,13 +78,51 @@ const STANDBY_CATCHUP_TIMEOUT: Duration = Duration::from_mins(1);
 const STANDBY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RESTRICTED_OBSERVER_ROLE: &str = "pgshard_observer_restricted";
 const RESTRICTED_OBSERVER_PASSWORD: &str = "pgshard-test-only";
-const CATALOG_ADMIN_TEST_ROLE: &str = "pgshard_catalog_admin_test";
-const CATALOG_ADMIN_TEST_PASSWORD: &str = "pgshard-catalog-test-only";
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_ADVISORY_FENCE: AtomicU64 = AtomicU64::new(1);
 
 type TestError = Box<dyn Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
+
+struct CatalogAdminTestPrincipal {
+    role_name: String,
+    password: String,
+}
+
+impl CatalogAdminTestPrincipal {
+    fn new() -> Self {
+        let identity = Uuid::new_v4().simple().to_string();
+        Self {
+            role_name: format!("pgshard_test_{identity}"),
+            password: Uuid::new_v4().simple().to_string(),
+        }
+    }
+
+    fn config(&self, database_url: &str) -> TestResult<Config> {
+        let mut config: Config = database_url.parse()?;
+        config.user(&self.role_name);
+        config.password(&self.password);
+        Ok(config)
+    }
+
+    async fn create(&self, client: &Client) -> TestResult {
+        client
+            .batch_execute(&format!(
+                "CREATE ROLE {} LOGIN PASSWORD '{}'; \
+                 GRANT pgshard_catalog_admin TO {}",
+                self.role_name, self.password, self.role_name
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn drop_if_exists(&self, client: &Client) -> TestResult {
+        client
+            .batch_execute(&format!("DROP ROLE IF EXISTS {}", self.role_name))
+            .await?;
+        Ok(())
+    }
+}
 
 fn combine_fixture_results(
     fixture: TestResult,
@@ -1597,6 +1636,7 @@ async fn complete_retirement_after_catalog_fence_loss(
     assert_eq!(retired.state(), SlotSyncProbeState::Retired);
     assert!(retired.creation_receipt_present());
     assert!(retired.cleanup_receipt_present());
+    reclaim_stale_target_fence(database_url, retiring.target()).await?;
     Ok(retired)
 }
 
@@ -1606,6 +1646,89 @@ async fn release_known_drop(fence: ManagedLogicalSlotDropFence) {
         ManagedLogicalSlotDropOutcome::Dropped
     );
     let _receipt = fence.release().await;
+}
+
+async fn reclaim_stale_target_fence(database_url: &str, target: &ManagedSlotTarget) -> TestResult {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let fence_id: String = client
+        .query_one(
+            "SELECT acquired_fence_id::pg_catalog.text \
+               FROM pgshard_catalog.acquire_managed_slot_target_fence($1::pg_catalog.text)",
+            &[&target.name().as_str()],
+        )
+        .await?
+        .try_get(0)?;
+    let released: bool = client
+        .query_one(
+            "SELECT pgshard_catalog.release_managed_slot_target_fence( \
+                        $1::pg_catalog.text, $2::pg_catalog.text::pg_catalog.uuid \
+                    )",
+            &[&target.name().as_str(), &fence_id],
+        )
+        .await?
+        .try_get(0)?;
+    assert!(released, "the stale target fence must be reclaimable");
+    drop(client);
+    finish_connection(connection_task).await
+}
+
+async fn release_known_drop_while_registry_row_is_blocked(
+    database_url: &str,
+    fence: ManagedLogicalSlotDropFence,
+) -> TestResult {
+    assert_eq!(
+        fence.receipt().outcome(),
+        ManagedLogicalSlotDropOutcome::Dropped
+    );
+    let target_name = fence.receipt().target().name().as_str().to_owned();
+    let expected_receipt_id = fence.receipt().receipt_id();
+    let (blocker, blocker_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let blocker_task = tokio::spawn(blocker_connection);
+    blocker.batch_execute("BEGIN").await?;
+    blocker
+        .query_one(
+            "SELECT target_name::pg_catalog.text \
+               FROM pgshard_catalog.managed_slot_target_fences \
+              WHERE target_name::pg_catalog.text = $1::pg_catalog.text \
+              FOR UPDATE",
+            &[&target_name],
+        )
+        .await?;
+
+    let released = timeout(Duration::from_secs(3), fence.release())
+        .await
+        .map_err(|_| io::Error::other("blocked target-fence release exceeded its hard bound"))?;
+    assert_eq!(released.receipt_id(), expected_receipt_id);
+    blocker.batch_execute("ROLLBACK").await?;
+    drop(blocker);
+    finish_connection(blocker_task).await?;
+
+    let (reclaimer, reclaimer_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let reclaimer_task = tokio::spawn(reclaimer_connection);
+    let replacement_fence: String = reclaimer
+        .query_one(
+            "SELECT acquired_fence_id::pg_catalog.text \
+               FROM pgshard_catalog.acquire_managed_slot_target_fence($1::pg_catalog.text)",
+            &[&target_name],
+        )
+        .await?
+        .try_get(0)?;
+    let release_succeeded: bool = reclaimer
+        .query_one(
+            "SELECT pgshard_catalog.release_managed_slot_target_fence( \
+                        $1::pg_catalog.text, $2::pg_catalog.text::pg_catalog.uuid \
+                    )",
+            &[&target_name, &replacement_fence],
+        )
+        .await?
+        .try_get(0)?;
+    assert!(
+        release_succeeded,
+        "the timed-out stale fence must be reclaimable"
+    );
+    drop(reclaimer);
+    finish_connection(reclaimer_task).await
 }
 
 async fn refresh_after_stale_activation(
@@ -2270,7 +2393,7 @@ async fn run_primary_mutation_fixture(
     wait_for_synchronized_copy(&standby_database_url, &target, false).await?;
     let retired = complete_catalog_probe_retirement(&retiring, &mut drop_receipt).await?;
     assert_eq!(retired.state(), SlotSyncProbeState::Retired);
-    release_known_drop(drop_receipt).await;
+    release_known_drop_while_registry_row_is_blocked(&database_url, drop_receipt).await?;
     let absent = observe(
         &database_url,
         &LogicalSlotObservationRequest::new(vec![target])?,
@@ -2280,12 +2403,15 @@ async fn run_primary_mutation_fixture(
     Ok(())
 }
 
-async fn insert_standby_consumer_registry(
-    client: &Client,
+async fn insert_standby_consumer_registry<C>(
+    client: &C,
     logical_database: Uuid,
     consumer: Uuid,
     suffix: &str,
-) -> TestResult {
+) -> TestResult
+where
+    C: GenericClient + Sync,
+{
     client
         .execute(
             "INSERT INTO pgshard_catalog.logical_databases( \
@@ -2332,16 +2458,16 @@ async fn allocate_standby_decoder(
     target: &ManagedSlotTarget,
     source: ReplicationSourceIdentity,
 ) -> TestResult {
-    let (client, connection) = tokio_postgres::connect(catalog_database_url, NoTls).await?;
+    let (mut client, connection) = tokio_postgres::connect(catalog_database_url, NoTls).await?;
     let connection_task = tokio::spawn(connection);
     let logical_database = Uuid::new_v4();
     let consumer = Uuid::new_v4();
     let attachment = Uuid::new_v4();
     let suffix = logical_database.simple().to_string();
     let result: TestResult = async {
-        ensure_catalog_admin_test_role(&client).await?;
-        insert_standby_consumer_registry(&client, logical_database, consumer, &suffix).await?;
-        client
+        let transaction = client.transaction().await?;
+        insert_standby_consumer_registry(&transaction, logical_database, consumer, &suffix).await?;
+        transaction
             .execute(
                 "INSERT INTO pgshard_catalog.logical_consumer_attachments( \
                      attachment_generation, consumer_id, logical_database_id, shard_id, \
@@ -2367,7 +2493,7 @@ async fn allocate_standby_decoder(
                 ],
             )
             .await?;
-        client
+        transaction
             .execute(
                 "INSERT INTO pgshard_catalog.managed_replication_slots( \
                      slot_generation, attachment_generation, consumer_id, \
@@ -2388,6 +2514,7 @@ async fn allocate_standby_decoder(
                 ],
             )
             .await?;
+        transaction.commit().await?;
         Ok(())
     }
     .await;
@@ -2397,79 +2524,200 @@ async fn allocate_standby_decoder(
     connection_result
 }
 
-async fn ensure_catalog_admin_test_role(client: &Client) -> TestResult {
-    client
-        .batch_execute(
-            "DO $pgshard_catalog_admin_test$ \
-             BEGIN \
-                 IF NOT EXISTS ( \
-                     SELECT FROM pg_catalog.pg_roles \
-                      WHERE rolname = 'pgshard_catalog_admin_test' \
-                 ) THEN \
-                     CREATE ROLE pgshard_catalog_admin_test \
-                         LOGIN PASSWORD 'pgshard-catalog-test-only'; \
-                 END IF; \
-             END \
-             $pgshard_catalog_admin_test$; \
-             ALTER ROLE pgshard_catalog_admin_test \
-                 LOGIN PASSWORD 'pgshard-catalog-test-only'; \
-             GRANT pgshard_catalog_admin TO pgshard_catalog_admin_test",
-        )
-        .await?;
-    Ok(())
-}
-
-fn catalog_admin_test_config(database_url: &str) -> TestResult<Config> {
-    let mut config: Config = database_url.parse()?;
-    config.user(CATALOG_ADMIN_TEST_ROLE);
-    config.password(CATALOG_ADMIN_TEST_PASSWORD);
-    Ok(config)
-}
-
 async fn activate_standby_decoder(
     catalog_database_url: &str,
     target: &ManagedSlotTarget,
     receipt: &ManagedLogicalSlotReceipt,
 ) -> TestResult {
     assert_eq!(receipt.target(), target);
-    let config = catalog_admin_test_config(catalog_database_url)?;
+    let principal = CatalogAdminTestPrincipal::new();
+    let (admin, admin_connection) = tokio_postgres::connect(catalog_database_url, NoTls).await?;
+    let admin_task = tokio::spawn(admin_connection);
+    let result: TestResult = async {
+        principal.create(&admin).await?;
+        exercise_standby_decoder_activation(catalog_database_url, target, receipt, &principal).await
+    }
+    .await;
+    let cleanup = principal.drop_if_exists(&admin).await;
+    drop(admin);
+    let connection_result = finish_connection(admin_task).await;
+    combine_fixture_results(result, cleanup, connection_result)
+}
+
+async fn exercise_standby_decoder_activation(
+    catalog_database_url: &str,
+    target: &ManagedSlotTarget,
+    receipt: &ManagedLogicalSlotReceipt,
+    principal: &CatalogAdminTestPrincipal,
+) -> TestResult {
+    let config = principal.config(catalog_database_url)?;
     let (wrong_client, wrong_connection) = config.connect(NoTls).await?;
-    let wrong_task = tokio::spawn(wrong_connection);
+    let wrong_task = AbortOnDropConnectionTask::new(tokio::spawn(wrong_connection));
     let wrong_receipt = Uuid::new_v4().to_string();
     let creation_lsn = pg_lsn_text(receipt.creation_lsn());
-    let wrong = wrong_client
+    let validation: TestResult = async {
+        let Err(wrong) = wrong_client
+            .query_one(
+                "SELECT pgshard_catalog.activate_managed_replication_slot( \
+                            $1::pg_catalog.text::pg_catalog.uuid, \
+                            $2::pg_catalog.text::pg_catalog.uuid, \
+                            $3::pg_catalog.text::pg_catalog.pg_lsn, \
+                            $3::pg_catalog.text::pg_catalog.pg_lsn \
+                        )",
+                &[
+                    &target.generation().as_uuid().to_string(),
+                    &wrong_receipt,
+                    &creation_lsn,
+                ],
+            )
+            .await
+        else {
+            return Err(
+                io::Error::other("a guessed consumer activation receipt was accepted").into(),
+            );
+        };
+        if wrong.code() != Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE) {
+            return Err(io::Error::other(format!(
+                "guessed consumer receipt returned unexpected SQLSTATE: {wrong}"
+            ))
+            .into());
+        }
+        let Err(hidden) = wrong_client
+            .query_one(
+                "SELECT creation_receipt_id \
+                   FROM pgshard_catalog.managed_slot_creation_attempts \
+                  LIMIT 1",
+                &[],
+            )
+            .await
+        else {
+            return Err(io::Error::other("catalog admin reloaded hidden receipt authority").into());
+        };
+        if hidden.code() != Some(&SqlState::INSUFFICIENT_PRIVILEGE) {
+            return Err(io::Error::other(format!(
+                "hidden receipt query returned unexpected SQLSTATE: {hidden}"
+            ))
+            .into());
+        }
+        Ok(())
+    }
+    .await;
+    drop(wrong_client);
+    let connection_result = wrong_task
+        .finish("catalog-admin receipt validation connection")
+        .await;
+    validation?;
+    connection_result?;
+
+    activate_managed_consumer_with_commit_response_loss(
+        catalog_database_url,
+        target,
+        receipt,
+        principal,
+    )
+    .await
+}
+
+async fn assert_managed_consumer_active(
+    database_url: &str,
+    target: &ManagedSlotTarget,
+    receipt: &ManagedLogicalSlotReceipt,
+    principal: &CatalogAdminTestPrincipal,
+) -> TestResult {
+    let (client, connection) = principal.config(database_url)?.connect(NoTls).await?;
+    let connection_task = AbortOnDropConnectionTask::new(tokio::spawn(connection));
+    let row = client
         .query_one(
-            "SELECT pgshard_catalog.activate_managed_replication_slot( \
-                        $1::pg_catalog.text::pg_catalog.uuid, \
-                        $2::pg_catalog.text::pg_catalog.uuid, \
-                        $3::pg_catalog.text::pg_catalog.pg_lsn, \
-                        $3::pg_catalog.text::pg_catalog.pg_lsn \
-                    )",
+            "SELECT state::pg_catalog.text, \
+                    consistent_point = $2::pg_catalog.text::pg_catalog.pg_lsn \
+               FROM pgshard_catalog.managed_replication_slots \
+              WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid",
             &[
                 &target.generation().as_uuid().to_string(),
-                &wrong_receipt,
-                &creation_lsn,
+                &pg_lsn_text(receipt.creation_lsn()),
             ],
         )
-        .await
-        .expect_err("a guessed consumer activation receipt must be rejected");
-    assert_eq!(
-        wrong.code(),
-        Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)
-    );
-    let hidden = wrong_client
-        .query_one(
-            "SELECT creation_receipt_id FROM pgshard_catalog.managed_slot_creation_attempts \
-             LIMIT 1",
-            &[],
+        .await?;
+    let state: String = row.try_get(0)?;
+    let boundary_matches: bool = row.try_get(1)?;
+    if state != "active" || !boundary_matches {
+        return Err(io::Error::other(
+            "consumer activation did not retain its exact durable state and boundary",
         )
+        .into());
+    }
+    drop(client);
+    connection_task
+        .finish("catalog-admin durable-state connection")
         .await
-        .expect_err("catalog admin must not be able to reload hidden receipt authority");
-    assert_eq!(hidden.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
-    drop(wrong_client);
-    finish_connection(wrong_task).await?;
+}
 
-    let (client, connection) = config.connect(NoTls).await?;
+async fn arm_commit_response_loss_proxy(arm: oneshot::Sender<oneshot::Sender<()>>) -> TestResult {
+    let (armed_acknowledgement, armed) = oneshot::channel();
+    arm.send(armed_acknowledgement)
+        .map_err(|_| io::Error::other("catalog fault proxy exited before it was armed"))?;
+    timeout(CONNECTION_EXIT_TIMEOUT, armed)
+        .await
+        .map_err(|_| {
+            io::Error::other("catalog fault proxy arm acknowledgement exceeded the bound")
+        })?
+        .map_err(|_| io::Error::other("catalog fault proxy exited before acknowledging its arm"))?;
+    Ok(())
+}
+
+async fn activate_managed_consumer_with_commit_response_loss(
+    database_url: &str,
+    target: &ManagedSlotTarget,
+    receipt: &ManagedLogicalSlotReceipt,
+    principal: &CatalogAdminTestPrincipal,
+) -> TestResult {
+    let CommitResponseLossProxy {
+        database_url: proxy_database_url,
+        arm,
+        task,
+    } = start_commit_response_loss_proxy(database_url).await?;
+    let mut proxy_task = AbortOnDropTask::new(task);
+    let (client, connection) = principal
+        .config(&proxy_database_url)?
+        .connect(NoTls)
+        .await?;
+    arm_commit_response_loss_proxy(arm).await?;
+    let error = match activate_managed_consumer_slot(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        receipt,
+    )
+    .await
+    {
+        Ok(()) => {
+            return Err(io::Error::other(
+                "consumer activation reported success after its COMMIT response was lost",
+            )
+            .into());
+        }
+        Err(error) => error,
+    };
+    match error {
+        ManagedLogicalSlotCatalogActivationError::OutcomeUnknownPostgres {
+            target: ref failed_target,
+            ..
+        } if failed_target == target => {}
+        other => {
+            return Err(io::Error::other(format!(
+                "consumer activation response loss returned a non-ambiguous error: {other}"
+            ))
+            .into());
+        }
+    }
+    timeout(CONNECTION_EXIT_TIMEOUT, proxy_task.task_mut())
+        .await
+        .map_err(|_| {
+            io::Error::other("catalog fault proxy did not confirm consumer activation COMMIT")
+        })???;
+    assert_managed_consumer_active(database_url, target, receipt, principal).await?;
+
+    let (client, connection) = principal.config(database_url)?.connect(NoTls).await?;
     activate_managed_consumer_slot(
         client,
         connection,
@@ -2477,7 +2725,7 @@ async fn activate_standby_decoder(
         receipt,
     )
     .await?;
-    Ok(())
+    assert_managed_consumer_active(database_url, target, receipt, principal).await
 }
 
 async fn retire_standby_decoder(

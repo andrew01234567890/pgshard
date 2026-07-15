@@ -202,7 +202,16 @@ connection, closes the client response half when it receives the exact COMMIT
 frame, forwards that frame, and then independently requires PostgreSQL's
 `CommandComplete` and `ReadyForQuery`. The client must classify
 `OutcomeUnknown`, reload the exact durable row, and safely replay the same held
-receipt and boundary. Always-run bounded cleanup retires the catalog row only
+receipt and boundary. The same fault is injected into typed consumer-slot
+activation through a unique ephemeral catalog-admin login: the test proves the
+committed state before replay, reuses the same opaque receipt idempotently, and
+always drops the login. Its complete consumer hierarchy is inserted in one
+transaction so setup failure cannot strand undiscoverable parent rows. Fence
+tests also replace a dead owner PID with a live PID while retaining the stale
+backend generation, release a real fence before acquiring a transaction
+advisory lock, and row-lock the hidden registry through release. PID reuse and
+transaction locks must not restore authority; release must remain bounded and
+the stale row must then be reclaimable. Always-run bounded cleanup retires the catalog row only
 after both primary-slot removal and synchronized standby-copy disappearance
 succeed; cleanup owns a separately deadline-bounded connection with PostgreSQL
 statement, lock, and transaction timeouts. It then retires the attachment,

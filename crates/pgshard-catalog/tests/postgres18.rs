@@ -605,8 +605,101 @@ async fn assert_pre_receipt_probe_upgrade(client: &Client) -> TestResult {
     Ok(())
 }
 
+async fn assert_pre_creation_attempt_consumer_upgrade(client: &Client) -> TestResult {
+    let fixture = create_fixture(client).await?;
+    let consumer = create_consumer_registry_fixture(client, &fixture).await?;
+    allocate_managed_slots(client, &fixture, &consumer).await?;
+    begin_managed_slot_creation_attempt(
+        client,
+        consumer.anchor_generation,
+        consumer.anchor_receipt_id,
+    )
+    .await?;
+    begin_managed_slot_creation_attempt(
+        client,
+        consumer.decoder_generation,
+        consumer.decoder_receipt_id,
+    )
+    .await?;
+    activate_managed_replication_slot(
+        client,
+        consumer.anchor_generation,
+        consumer.anchor_receipt_id,
+        "0/30",
+        "0/30",
+    )
+    .await?;
+    activate_managed_replication_slot(
+        client,
+        consumer.decoder_generation,
+        consumer.decoder_receipt_id,
+        "0/20",
+        "0/40",
+    )
+    .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+                SET state = 'active', activated_at = statement_timestamp() \
+              WHERE attachment_generation = $1::text::uuid",
+            &[&consumer.attachment_generation],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_shards \
+                SET state = 'fenced' \
+              WHERE consumer_id = $1::text::uuid \
+                AND logical_database_id = $2::text::uuid \
+                AND shard_id = $3::text",
+            &[
+                &consumer.consumer_id,
+                &fixture.logical_database_id,
+                &fixture.shard_id,
+            ],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+                SET state = 'retiring' \
+              WHERE attachment_generation = $1::text::uuid",
+            &[&consumer.attachment_generation],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+                SET state = 'retiring' \
+              WHERE slot_generation = $1::text::uuid",
+            &[&consumer.decoder_generation.to_string()],
+        )
+        .await?;
+    client
+        .batch_execute("DROP TABLE pgshard_catalog.managed_slot_creation_attempts CASCADE")
+        .await?;
+
+    let blocked = client
+        .batch_execute(pgshard_catalog::MIGRATION_SQL)
+        .await
+        .expect_err("receiptless active and retiring consumer slots must block the upgrade");
+    assert_sqlstate(&blocked, "55000");
+    assert_database_message(
+        &blocked,
+        "receiptless live managed replication slots block catalog upgrade",
+    );
+    client.batch_execute("ROLLBACK").await?;
+
+    client
+        .batch_execute("DROP SCHEMA pgshard_catalog CASCADE")
+        .await?;
+    client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
+    Ok(())
+}
+
 async fn assert_installation_contract(client: &Client) -> TestResult {
     assert_pre_receipt_probe_upgrade(client).await?;
+    assert_pre_creation_attempt_consumer_upgrade(client).await?;
     let epoch_after_first_migration = catalog_epoch(client).await?;
     client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
     assert_eq!(
@@ -1504,6 +1597,53 @@ async fn assert_catalog_reader_cannot_seize_target_fence(database_url: &str) -> 
     assert!(public_released);
     drop(reader);
     tokio::time::timeout(Duration::from_secs(5), reader_task).await???;
+    Ok(())
+}
+
+async fn assert_stale_target_fence_backend_generation_is_reclaimed(
+    database_url: &str,
+) -> TestResult {
+    let target_name = format!("stale_fence_{}", Uuid::new_v4().simple());
+    let (holder, holder_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let holder_task = tokio::spawn(holder_connection);
+    holder
+        .batch_execute("SET ROLE pgshard_catalog_admin")
+        .await?;
+    let stale_fence_id = acquire_target_fence(&holder, &target_name).await?;
+    drop(holder);
+    tokio::time::timeout(Duration::from_secs(5), holder_task).await???;
+
+    let (controller, controller_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let controller_task = tokio::spawn(controller_connection);
+    let controller_pid: i32 = controller
+        .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    controller
+        .execute(
+            "UPDATE pgshard_catalog.managed_slot_target_fences \
+                SET owner_pid = $2 \
+              WHERE target_name::text = $1::text",
+            &[&target_name, &controller_pid],
+        )
+        .await?;
+    controller
+        .batch_execute("SET ROLE pgshard_catalog_admin")
+        .await?;
+    let replacement_fence_id = acquire_target_fence(&controller, &target_name).await?;
+    assert_ne!(replacement_fence_id, stale_fence_id);
+    let released: bool = controller
+        .query_one(
+            "SELECT pgshard_catalog.release_managed_slot_target_fence( \
+                        $1::text, $2::text::uuid \
+                    )",
+            &[&target_name, &replacement_fence_id],
+        )
+        .await?
+        .get(0);
+    assert!(released);
+    drop(controller);
+    tokio::time::timeout(Duration::from_secs(5), controller_task).await???;
     Ok(())
 }
 
@@ -2988,6 +3128,8 @@ async fn retire_racing_probe(client: &Client, generation: Uuid) -> TestResult {
         "slot-sync probe final retirement requires its live target fence",
     );
     client.batch_execute("ROLLBACK").await?;
+
+    assert_released_probe_fence_cannot_be_replaced(client, generation, &slot_name).await?;
     complete_slot_sync_probe_retirement(client, generation).await?;
     let managed_rows: i64 = client
         .query_one(
@@ -2998,6 +3140,63 @@ async fn retire_racing_probe(client: &Client, generation: Uuid) -> TestResult {
         .await?
         .get(0);
     assert_eq!(managed_rows, 0);
+    Ok(())
+}
+
+async fn assert_released_probe_fence_cannot_be_replaced(
+    client: &Client,
+    generation: Uuid,
+    slot_name: &str,
+) -> TestResult {
+    let cleanup_receipt_id: String = client
+        .query_one(
+            "SELECT cleanup_receipt_id::text \
+               FROM pgshard_catalog.slot_sync_probes \
+              WHERE probe_generation = $1::text::uuid",
+            &[&generation.to_string()],
+        )
+        .await?
+        .get(0);
+    let released_fence_id = acquire_target_fence(client, slot_name).await?;
+    let released: bool = client
+        .query_one(
+            "SELECT pgshard_catalog.release_managed_slot_target_fence( \
+                        $1::text, $2::text::uuid \
+                    )",
+            &[&slot_name, &released_fence_id],
+        )
+        .await?
+        .get(0);
+    assert!(released);
+    client.batch_execute("BEGIN").await?;
+    client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+                        pg_catalog.hashtextextended($1::text, 1346851656::bigint) \
+                    )",
+            &[&released_fence_id],
+        )
+        .await?;
+    let error = client
+        .query_one(
+            "SELECT pgshard_catalog.complete_slot_sync_probe_retirement( \
+                        $1::text::uuid, $2::text, $3::text::uuid, $4::text::uuid \
+                    )",
+            &[
+                &generation.to_string(),
+                &slot_name,
+                &cleanup_receipt_id,
+                &released_fence_id,
+            ],
+        )
+        .await
+        .expect_err("a transaction advisory lock cannot replace a released probe fence");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "slot-sync probe final retirement requires its exact live target fence",
+    );
+    client.batch_execute("ROLLBACK").await?;
     Ok(())
 }
 
@@ -3872,6 +4071,48 @@ async fn assert_consumer_retirement_requires_hidden_fences(
         "managed slot final retirement requires its live target fence",
     );
     client.batch_execute("ROLLBACK").await?;
+
+    let released_fence_id = acquire_target_fence(client, slot_name).await?;
+    let released: bool = client
+        .query_one(
+            "SELECT pgshard_catalog.release_managed_slot_target_fence( \
+                        $1::text, $2::text::uuid \
+                    )",
+            &[&slot_name, &released_fence_id],
+        )
+        .await?
+        .get(0);
+    assert!(released);
+    client.batch_execute("BEGIN").await?;
+    client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+                        pg_catalog.hashtextextended($1::text, 1346851656::bigint) \
+                    )",
+            &[&released_fence_id],
+        )
+        .await?;
+    let error = client
+        .query_one(
+            "SELECT pgshard_catalog.complete_managed_replication_slot_retirement( \
+                        $1::text::uuid, $2::text, $3::text::uuid, $4::text::uuid \
+                    )",
+            &[
+                &slot_generation.to_string(),
+                &slot_name,
+                &receipt_id.to_string(),
+                &released_fence_id,
+            ],
+        )
+        .await
+        .expect_err("a transaction advisory lock cannot replace a released consumer fence");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "managed slot final retirement requires its live target fence",
+    );
+    client.batch_execute("ROLLBACK").await?;
+
     let error =
         complete_managed_replication_slot_retirement(client, slot_generation, Uuid::new_v4())
             .await
@@ -5269,6 +5510,7 @@ async fn run_migration_and_activation_contract(
     assert_catalog_reader_rejects_existing_transaction(client, database_url).await?;
     assert_admin_privilege_contract(client).await?;
     assert_catalog_reader_cannot_seize_target_fence(database_url).await?;
+    assert_stale_target_fence_backend_generation_is_reclaimed(database_url).await?;
     assert_admin_write_path(client).await?;
     let fixture = create_fixture(client).await?;
     assert_migration_does_not_resurrect_retired_restore(client, fixture.nonce).await?;

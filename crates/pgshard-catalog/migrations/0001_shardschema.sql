@@ -691,24 +691,65 @@ CREATE UNIQUE INDEX IF NOT EXISTS managed_slot_creation_attempts_one_activated
     WHERE state = 'activated';
 
 COMMENT ON TABLE pgshard_catalog.managed_slot_creation_attempts IS
-    'Permanent create-attempt ledger. A pending row is a durable barrier against owner retirement after the orchestration session or advisory fence is lost.';
+    'Permanent create-attempt ledger. A pending row is a durable barrier against owner retirement after the orchestration or catalog-fence session is lost.';
+
+-- The create-attempt ledger is capability authority, not reconstructable
+-- bookkeeping. A catalog from before the ledger existed can retain allocated
+-- rows, because no physical effect has yet been acknowledged. Active or
+-- retiring consumer slots cannot be assigned an honest receipt after the fact.
+DO $pgshard_managed_slot_creation_attempt_upgrade$
+BEGIN
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.state IN ('active', 'retiring')
+           AND NOT EXISTS (
+               SELECT
+                 FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+                WHERE attempts.slot_generation = slots.slot_generation
+                  AND attempts.slot_name = slots.slot_name
+                  AND attempts.allocation_kind = 'consumer'
+                  AND attempts.slot_role = slots.slot_role
+           )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'receiptless live managed replication slots block catalog upgrade',
+            DETAIL = 'pre-ledger active or retiring consumer slots have no exact create-attempt receipt',
+            HINT = 'finish retiring every live consumer slot with the previous release, then retry the migration';
+    END IF;
+END
+$pgshard_managed_slot_creation_attempt_upgrade$;
 
 CREATE TABLE IF NOT EXISTS pgshard_catalog.managed_slot_target_fences (
     target_name pgshard_catalog.replication_slot_name PRIMARY KEY,
     fence_id uuid UNIQUE,
-    lock_key bigint,
     owner_pid integer CHECK (owner_pid IS NULL OR owner_pid > 0),
+    owner_backend_start timestamptz,
+    owner_postmaster_start timestamptz,
     acquired_at timestamptz,
     CHECK (
-        (fence_id IS NULL AND lock_key IS NULL AND owner_pid IS NULL AND acquired_at IS NULL)
+        (
+            fence_id IS NULL
+            AND owner_pid IS NULL
+            AND owner_backend_start IS NULL
+            AND owner_postmaster_start IS NULL
+            AND acquired_at IS NULL
+        )
         OR
-        (fence_id IS NOT NULL AND lock_key IS NOT NULL AND owner_pid IS NOT NULL AND acquired_at IS NOT NULL)
+        (
+            fence_id IS NOT NULL
+            AND owner_pid IS NOT NULL
+            AND owner_backend_start IS NOT NULL
+            AND owner_postmaster_start IS NOT NULL
+            AND acquired_at IS NOT NULL
+        )
     ),
     CHECK (fence_id IS NULL OR fence_id <> '00000000-0000-0000-0000-000000000000'::uuid)
 );
 
 COMMENT ON TABLE pgshard_catalog.managed_slot_target_fences IS
-    'Hidden per-target session fences. Each acquisition uses a fresh unpredictable advisory-lock key so public advisory-lock callers cannot monopolize a published target hash.';
+    'Hidden per-target session fences. A random capability is bound to the exact live PostgreSQL backend and postmaster generation without consuming the public advisory-lock pool.';
 
 CREATE TABLE IF NOT EXISTS pgshard_catalog.operation_tombstones (
     operation_kind pgshard_catalog.sql_identifier NOT NULL,
@@ -912,9 +953,10 @@ BEGIN
 END
 $function$;
 
-CREATE OR REPLACE FUNCTION pgshard_catalog.managed_slot_advisory_lock_held(
-    expected_lock_key bigint,
-    expected_owner_pid integer
+CREATE OR REPLACE FUNCTION pgshard_catalog.managed_slot_backend_identity_live(
+    expected_owner_pid integer,
+    expected_backend_start timestamptz,
+    expected_postmaster_start timestamptz
 )
 RETURNS boolean
 LANGUAGE sql
@@ -922,21 +964,20 @@ STABLE
 SECURITY DEFINER
 SET search_path = pg_catalog, pgshard_catalog, pg_temp
 AS $function$
-    SELECT EXISTS (
+    SELECT expected_owner_pid IS NOT NULL
+       AND expected_backend_start IS NOT NULL
+       AND expected_postmaster_start = pg_catalog.pg_postmaster_start_time()
+       AND EXISTS (
         SELECT
-          FROM pg_catalog.pg_locks AS locks
-         WHERE locks.locktype = 'advisory'
-           AND locks.database = (
+          FROM pg_catalog.pg_stat_activity AS activity
+         WHERE activity.pid = expected_owner_pid
+           AND activity.datid = (
                SELECT databases.oid
                  FROM pg_catalog.pg_database AS databases
                 WHERE databases.datname = pg_catalog.current_database()
            )
-           AND locks.classid::bigint = ((expected_lock_key >> 32) & 4294967295)
-           AND locks.objid::bigint = (expected_lock_key & 4294967295)
-           AND locks.objsubid = 1
-           AND locks.pid = expected_owner_pid
-           AND locks.mode = 'ExclusiveLock'
-           AND locks.granted
+           AND activity.backend_start = expected_backend_start
+           AND activity.backend_type = 'client backend'
     )
 $function$;
 
@@ -948,8 +989,9 @@ SET search_path = pg_catalog, pgshard_catalog, pg_temp
 AS $function$
 DECLARE
     existing_fence_id uuid;
-    existing_lock_key bigint;
     existing_owner_pid integer;
+    existing_backend_start timestamptz;
+    existing_postmaster_start timestamptz;
 BEGIN
     IF target_name IS NULL OR target_name = '' THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot target is required';
@@ -959,16 +1001,23 @@ BEGIN
     VALUES ($1)
     ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
 
-    SELECT fences.fence_id, fences.lock_key, fences.owner_pid
-      INTO existing_fence_id, existing_lock_key, existing_owner_pid
+    SELECT fences.fence_id,
+           fences.owner_pid,
+           fences.owner_backend_start,
+           fences.owner_postmaster_start
+      INTO existing_fence_id,
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
       FROM pgshard_catalog.managed_slot_target_fences AS fences
      WHERE fences.target_name::text = $1
      FOR UPDATE;
 
     IF existing_fence_id IS NOT NULL THEN
-        IF pgshard_catalog.managed_slot_advisory_lock_held(
-            existing_lock_key,
-            existing_owner_pid
+        IF pgshard_catalog.managed_slot_backend_identity_live(
+            existing_owner_pid,
+            existing_backend_start,
+            existing_postmaster_start
         ) THEN
             IF existing_owner_pid <> pg_catalog.pg_backend_pid() THEN
                 RAISE EXCEPTION USING
@@ -980,8 +1029,9 @@ BEGIN
 
         UPDATE pgshard_catalog.managed_slot_target_fences AS fences
            SET fence_id = NULL,
-               lock_key = NULL,
                owner_pid = NULL,
+               owner_backend_start = NULL,
+               owner_postmaster_start = NULL,
                acquired_at = NULL
          WHERE fences.target_name::text = $1;
     END IF;
@@ -1016,11 +1066,12 @@ SET search_path = pg_catalog, pgshard_catalog, pg_temp
 AS $function$
 DECLARE
     existing_fence_id uuid;
-    existing_lock_key bigint;
     existing_owner_pid integer;
+    existing_backend_start timestamptz;
+    existing_postmaster_start timestamptz;
     new_fence_id uuid;
-    new_lock_key bigint;
-    acquired boolean := false;
+    new_backend_start timestamptz;
+    new_postmaster_start timestamptz;
 BEGIN
     IF target_name IS NULL OR target_name = '' THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot target is required';
@@ -1030,16 +1081,23 @@ BEGIN
     VALUES ($1)
     ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
 
-    SELECT fences.fence_id, fences.lock_key, fences.owner_pid
-      INTO existing_fence_id, existing_lock_key, existing_owner_pid
+    SELECT fences.fence_id,
+           fences.owner_pid,
+           fences.owner_backend_start,
+           fences.owner_postmaster_start
+      INTO existing_fence_id,
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
       FROM pgshard_catalog.managed_slot_target_fences AS fences
      WHERE fences.target_name::text = $1
      FOR UPDATE;
 
     IF existing_fence_id IS NOT NULL
-       AND pgshard_catalog.managed_slot_advisory_lock_held(
-           existing_lock_key,
-           existing_owner_pid
+       AND pgshard_catalog.managed_slot_backend_identity_live(
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
        ) THEN
         IF existing_owner_pid = pg_catalog.pg_backend_pid() THEN
             RETURN QUERY SELECT existing_fence_id, existing_owner_pid;
@@ -1052,27 +1110,36 @@ BEGIN
 
     UPDATE pgshard_catalog.managed_slot_target_fences AS fences
        SET fence_id = NULL,
-           lock_key = NULL,
            owner_pid = NULL,
+           owner_backend_start = NULL,
+           owner_postmaster_start = NULL,
            acquired_at = NULL
      WHERE fences.target_name::text = $1;
 
-    FOR attempt IN 1..16 LOOP
-        new_fence_id := pg_catalog.gen_random_uuid();
-        new_lock_key := pg_catalog.hashtextextended(new_fence_id::text, 1346851656);
-        acquired := pg_catalog.pg_try_advisory_lock(new_lock_key);
-        EXIT WHEN acquired;
-    END LOOP;
-    IF NOT acquired THEN
+    SELECT activity.backend_start,
+           pg_catalog.pg_postmaster_start_time()
+      INTO new_backend_start,
+           new_postmaster_start
+      FROM pg_catalog.pg_stat_activity AS activity
+     WHERE activity.pid = pg_catalog.pg_backend_pid()
+       AND activity.datid = (
+           SELECT databases.oid
+             FROM pg_catalog.pg_database AS databases
+            WHERE databases.datname = pg_catalog.current_database()
+       )
+       AND activity.backend_type = 'client backend';
+    IF new_backend_start IS NULL OR new_postmaster_start IS NULL THEN
         RAISE EXCEPTION USING
-            ERRCODE = '55P03',
-            MESSAGE = 'could not allocate a managed slot target fence';
+            ERRCODE = '55000',
+            MESSAGE = 'could not identify the managed slot target fence backend';
     END IF;
+    new_fence_id := pg_catalog.gen_random_uuid();
 
     UPDATE pgshard_catalog.managed_slot_target_fences AS fences
        SET fence_id = new_fence_id,
-           lock_key = new_lock_key,
            owner_pid = pg_catalog.pg_backend_pid(),
+           owner_backend_start = new_backend_start,
+           owner_postmaster_start = new_postmaster_start,
            acquired_at = statement_timestamp()
      WHERE fences.target_name::text = $1;
 
@@ -1093,9 +1160,10 @@ AS $function$
          WHERE fences.target_name::text = $1
            AND fences.fence_id IS NOT NULL
            AND fences.owner_pid = pg_catalog.pg_backend_pid()
-           AND pgshard_catalog.managed_slot_advisory_lock_held(
-               fences.lock_key,
-               fences.owner_pid
+           AND pgshard_catalog.managed_slot_backend_identity_live(
+               fences.owner_pid,
+               fences.owner_backend_start,
+               fences.owner_postmaster_start
            )
     )
 $function$;
@@ -1118,9 +1186,10 @@ AS $function$
             WHERE fences.target_name::text = $1
               AND fences.fence_id = expected_fence_id
               AND fences.owner_pid = pg_catalog.pg_backend_pid()
-              AND pgshard_catalog.managed_slot_advisory_lock_held(
-                  fences.lock_key,
-                  fences.owner_pid
+              AND pgshard_catalog.managed_slot_backend_identity_live(
+                  fences.owner_pid,
+                  fences.owner_backend_start,
+                  fences.owner_postmaster_start
               )
        )
 $function$;
@@ -1158,19 +1227,30 @@ SET search_path = pg_catalog, pgshard_catalog, pg_temp
 AS $function$
 DECLARE
     existing_fence_id uuid;
-    existing_lock_key bigint;
     existing_owner_pid integer;
-    released boolean;
+    existing_backend_start timestamptz;
+    existing_postmaster_start timestamptz;
 BEGIN
-    SELECT fences.fence_id, fences.lock_key, fences.owner_pid
-      INTO existing_fence_id, existing_lock_key, existing_owner_pid
+    SELECT fences.fence_id,
+           fences.owner_pid,
+           fences.owner_backend_start,
+           fences.owner_postmaster_start
+      INTO existing_fence_id,
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
       FROM pgshard_catalog.managed_slot_target_fences AS fences
      WHERE fences.target_name::text = $1
      FOR UPDATE;
     IF NOT FOUND OR existing_fence_id IS NULL THEN
         RETURN false;
     END IF;
-    IF existing_owner_pid <> pg_catalog.pg_backend_pid() THEN
+    IF existing_owner_pid <> pg_catalog.pg_backend_pid()
+       OR NOT pgshard_catalog.managed_slot_backend_identity_live(
+           existing_owner_pid,
+           existing_backend_start,
+           existing_postmaster_start
+       ) THEN
         IF expected_fence_id IS NULL THEN
             RETURN false;
         END IF;
@@ -1184,14 +1264,14 @@ BEGIN
             MESSAGE = 'managed slot target fence is owned by another capability';
     END IF;
 
-    released := pg_catalog.pg_advisory_unlock(existing_lock_key);
     UPDATE pgshard_catalog.managed_slot_target_fences AS fences
        SET fence_id = NULL,
-           lock_key = NULL,
            owner_pid = NULL,
+           owner_backend_start = NULL,
+           owner_postmaster_start = NULL,
            acquired_at = NULL
      WHERE fences.target_name::text = $1;
-    RETURN released;
+    RETURN true;
 END
 $function$;
 

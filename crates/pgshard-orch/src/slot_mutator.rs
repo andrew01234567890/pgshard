@@ -50,6 +50,7 @@ const MAX_ADVISORY_LOCK_ROWS: usize = 16;
 const SERVER_STATEMENT_TIMEOUT_HEADROOM: Duration = Duration::from_millis(25);
 const SERVER_TRANSACTION_TIMEOUT_GRACE: Duration = Duration::from_millis(101);
 const TARGET_FENCE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const TARGET_FENCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const PIN_SEARCH_PATH_SQL: &str = "SELECT pg_catalog.set_config('search_path', '', false)";
 const SET_STATEMENT_TIMEOUT_SQL: &str =
     "SELECT pg_catalog.set_config('statement_timeout', $1, false)";
@@ -632,6 +633,10 @@ impl ManagedLogicalSlotDropFence {
     }
 
     /// Releases the hidden target fence after its caller no longer needs it.
+    ///
+    /// Registry cleanup is best-effort and bounded. The catalog connection is
+    /// always closed, so a timed-out row lock leaves a stale backend identity
+    /// that the next acquisition can safely reclaim.
     pub async fn release(self) -> ManagedLogicalSlotDropReceipt {
         let Self {
             receipt,
@@ -640,12 +645,15 @@ impl ManagedLogicalSlotDropFence {
             backend_pid: _,
             fence_id,
         } = self;
-        let _ = client
-            .query_one(
+        let release_deadline = Instant::now() + TARGET_FENCE_RELEASE_TIMEOUT;
+        let _ = timeout_at(
+            release_deadline,
+            client.query_one(
                 RELEASE_TARGET_FENCE_SQL,
                 &[&receipt.target().name().as_str(), &fence_id.to_string()],
-            )
-            .await;
+            ),
+        )
+        .await;
         drop(client);
         connection_task.abort_and_wait().await;
         receipt

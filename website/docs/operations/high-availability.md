@@ -76,11 +76,12 @@ never-reused generation. The transaction locks catalog state before the target
 name and validates the exact source, role, restore, owner and lifecycle. A busy
 database-enforced target fence fails fast so no writer retains global catalog
 state while queued; the Rust create path retries acquisition within its bounded
-preflight window. Each acquisition records a fresh opaque fence ID and random
-session advisory-lock key in a hidden per-target registry in the authoritative
-writable `shardschema` database. The key is not derived from the public slot
-name, so an ordinary advisory-lock caller cannot counterfeit the fence or block
-the control plane by monopolizing a published name hash. A successful create
+preflight window. Each acquisition records a fresh opaque fence ID bound to the
+exact backend start time, backend PID, and postmaster generation in a hidden
+per-target registry in the authoritative writable `shardschema` database. The
+registry does not consume PostgreSQL's public advisory-lock pool. A stale row is
+reclaimable only after that exact backend generation is no longer live, so PID
+reuse after a backend or Pod restart is not fence authority. A successful create
 returns the matching process-local cleanup receipt; source, role, the bounded
 session state and required creation settings are rechecked after dispatch. After
 any retry, the mutator reloads the
