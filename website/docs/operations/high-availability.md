@@ -73,13 +73,16 @@ Create/drop errors after dispatch are always outcome-unknown and must be
 observed rather than retried. A successful create returns only a process-local
 cleanup receipt with an opaque identity for that exact create attempt; source,
 role, a bounded session fence and required creation settings are rechecked after
-dispatch. The slot-sync probe catalog persists that identity through activation
-and cleanup so an absence receipt from an earlier same-name creation cannot
-close the later lifecycle. Known pre-dispatch drop failures return the receipt,
-and cleanup does not depend on a live receiver, its physical slot, healthy
-feedback or slot synchronization. Restore incarnation outside probe allocation
-and automatic unknown-outcome recovery still require a future durable
-catalog-bound reconciler.
+dispatch. All managed create/drop calls also take the same target-name advisory
+fence. The slot-sync probe catalog persists the create-attempt identity through
+activation and cleanup, and final retirement borrows the drop path's live
+connection-bound fence through catalog COMMIT. It verifies the same source
+backend on both sides of that COMMIT before returning success. Known
+pre-dispatch drop failures return the receipt, and cleanup does not depend on a
+live receiver, its physical slot, healthy feedback or slot synchronization. The
+fence coordinates pgshard paths rather than privileged direct SQL. Restore
+incarnation outside probe allocation and automatic unknown-outcome recovery
+still require a future durable catalog-bound reconciler.
 
 The observation and mutation paths run in a real primary/standby CI fixture.
 Secure upstream connection
@@ -99,11 +102,13 @@ unconsumed data by advancing a consumer resume slot. The bounded clean path now
 allocates the catalog identity, creates the failover probe, observes its
 continuous synchronized copy, persists the exact creation-attempt receipt ID,
 and retires only after matching primary absence and synchronized-copy removal.
-The live fixture rejects replay of an older absence receipt after same-name
-recreation and reconciles one deliberately lost catalog activation COMMIT
-response by exact reload and same-input retry. No controller yet runs that path
-continuously or recovers it after process loss, and the source-bound progress
-challenge is still absent.
+The live fixture starts a same-name managed recreation after primary absence,
+observes it waiting on the target fence, commits permanent retirement while it
+remains blocked, and cancels plus terminates its waiting backend before releasing
+the fence. It also reconciles
+one deliberately lost catalog activation COMMIT response by exact reload and
+same-input retry. No controller yet runs that path continuously or recovers it
+after process loss, and the source-bound progress challenge is still absent.
 :::
 
 The target default is one primary and two physical streaming replicas per shard,

@@ -340,18 +340,25 @@ claim the PostgreSQL slot exists from a catalog row alone. A bounded Rust
 primitive now composes the clean lifecycle: allocate the immutable row, create
 and verify the exact primary failover slot, activate only from its unforgeable
 creation receipt, persist that receipt's opaque create-attempt ID, copy the same
-ID when cleanup starts, drop the unchanged inactive slot, and retire only from
-an absence receipt carrying that exact ID. Recreating the same PostgreSQL name
-therefore cannot let an older absence receipt retire the later slot. The write
-transactions are conditional and idempotent; an ambiguous commit is resolved by
-reloading the permanent generation before retry. Genesis epoch zero is accepted
+ID when cleanup starts, and drop the unchanged inactive slot. Every managed
+create and drop serializes on a target-name advisory fence. A successful drop
+returns a connection-bound absence guard, not a freely replayable receipt; final
+retirement verifies the same source backend immediately before and after the
+catalog COMMIT, then releases the fence. A same-name managed creation therefore
+cannot enter the absence-to-COMMIT gap. The fence coordinates pgshard mutation
+paths only and cannot stop privileged direct SQL. The write transactions are
+conditional and idempotent; an ambiguous commit is resolved by reloading the
+permanent generation before retry. Genesis epoch zero is accepted
 only for the first allocation, whose committed catalog update returns a nonzero
 source identity before PostgreSQL mutation. Live PostgreSQL 18 coverage requires
-the continuously synchronized standby copy to appear and disappear, rejects a
-stale absence receipt after same-name recreation, and injects activation COMMIT
-response loss before reconciling the exact durable row. A long-running
-reconciler, restart-safe absence proof, slot-mutation response-loss injection,
-and the source-bound progress challenge are not implemented yet.
+the continuously synchronized standby copy to appear and disappear, observes a
+same-name managed recreation blocked across final catalog COMMIT, and injects
+activation COMMIT response loss before reconciling the exact durable row. The
+forward migration never invents receipt authority: receiptless active or
+retiring rows from v0.49 and earlier must first finish cleanup on the previous
+release, while allocated rows and immutable retired history upgrade in place. A
+long-running reconciler, restart-safe absence proof, slot-mutation response-loss
+injection, and the source-bound progress challenge are not implemented yet.
 
 The operator automatically synchronizes each primary anchor to eligible direct
 standbys for promotion safety. Standby-local slots are independent and

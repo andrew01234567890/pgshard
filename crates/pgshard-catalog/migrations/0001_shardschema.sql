@@ -186,16 +186,8 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
     source_timeline bigint NOT NULL CHECK (source_timeline BETWEEN 1 AND 4294967295),
     slot_name pgshard_catalog.replication_slot_name NOT NULL,
     consistent_point pg_lsn,
-    creation_receipt_id uuid
-        CHECK (
-            creation_receipt_id IS NULL
-            OR creation_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid
-        ),
-    cleanup_receipt_id uuid
-        CHECK (
-            cleanup_receipt_id IS NULL
-            OR cleanup_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid
-        ),
+    creation_receipt_id uuid,
+    cleanup_receipt_id uuid,
     state text NOT NULL DEFAULT 'allocated'
         CHECK (state IN ('allocated', 'active', 'retiring', 'retired')),
     created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
@@ -207,75 +199,148 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.slot_sync_probes (
         REFERENCES pgshard_catalog.shard_restore_incarnations(restore_incarnation, shard_id)
         ON DELETE RESTRICT,
     CHECK (right(slot_name::text, 32) = replace(probe_generation::text, '-', '')),
-    CHECK (consistent_point IS NULL OR consistent_point > '0/0'),
-    CHECK (
-        (
-            state = 'allocated'
-            AND consistent_point IS NULL
-            AND creation_receipt_id IS NULL
-            AND cleanup_receipt_id IS NULL
-            AND activated_at IS NULL
-            AND retiring_at IS NULL
-            AND retired_at IS NULL
-        )
-        OR
-        (
-            state = 'active'
-            AND consistent_point IS NOT NULL
-            AND creation_receipt_id IS NOT NULL
-            AND cleanup_receipt_id IS NULL
-            AND activated_at IS NOT NULL
-            AND retiring_at IS NULL
-            AND retired_at IS NULL
-        )
-        OR
-        (
-            state = 'retiring'
-            AND retiring_at IS NOT NULL
-            AND retired_at IS NULL
-            AND cleanup_receipt_id IS NOT NULL
-            AND (
-                creation_receipt_id IS NULL
-                OR cleanup_receipt_id = creation_receipt_id
-            )
-            AND (
-                (
-                    consistent_point IS NULL
-                    AND creation_receipt_id IS NULL
-                    AND activated_at IS NULL
-                )
-                OR (
-                    consistent_point IS NOT NULL
-                    AND creation_receipt_id IS NOT NULL
-                    AND activated_at IS NOT NULL
-                )
-            )
-        )
-        OR
-        (
-            state = 'retired'
-            AND retiring_at IS NOT NULL
-            AND retired_at IS NOT NULL
-            AND cleanup_receipt_id IS NOT NULL
-            AND (
-                creation_receipt_id IS NULL
-                OR cleanup_receipt_id = creation_receipt_id
-            )
-            AND (
-                (
-                    consistent_point IS NULL
-                    AND creation_receipt_id IS NULL
-                    AND activated_at IS NULL
-                )
-                OR (
-                    consistent_point IS NOT NULL
-                    AND creation_receipt_id IS NOT NULL
-                    AND activated_at IS NOT NULL
-                )
-            )
-        )
-    )
+    CHECK (consistent_point IS NULL OR consistent_point > '0/0')
 );
+
+-- v0.50 forward migration. CREATE TABLE IF NOT EXISTS does not add columns to
+-- catalogs installed by v0.49 and earlier, so upgrade the existing relation
+-- before any function or grant below references receipt identity. Receiptless
+-- active/retiring rows cannot be assigned an honest create-attempt capability:
+-- operators must finish their cleanup with the previous release first.
+ALTER TABLE pgshard_catalog.slot_sync_probes
+    ADD COLUMN IF NOT EXISTS creation_receipt_id uuid;
+ALTER TABLE pgshard_catalog.slot_sync_probes
+    ADD COLUMN IF NOT EXISTS cleanup_receipt_id uuid;
+
+DO $pgshard_slot_sync_probe_receipts$
+BEGIN
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes
+         WHERE (state = 'active' AND creation_receipt_id IS NULL)
+            OR (state = 'retiring' AND cleanup_receipt_id IS NULL)
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'receiptless live slot-sync probes block catalog upgrade',
+            DETAIL = 'v0.49 and earlier active or retiring probes have no exact create-attempt receipt',
+            HINT = 'finish retiring every live probe with the previous release, then retry the migration';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_constraint
+         WHERE conrelid = 'pgshard_catalog.slot_sync_probes'::regclass
+           AND conname = 'slot_sync_probes_receipt_ids_nonzero'
+    ) THEN
+        ALTER TABLE pgshard_catalog.slot_sync_probes
+            ADD CONSTRAINT slot_sync_probes_receipt_ids_nonzero
+            CHECK (
+                (
+                    creation_receipt_id IS NULL
+                    OR creation_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid
+                )
+                AND (
+                    cleanup_receipt_id IS NULL
+                    OR cleanup_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid
+                )
+            ) NOT VALID;
+    END IF;
+    ALTER TABLE pgshard_catalog.slot_sync_probes
+        VALIDATE CONSTRAINT slot_sync_probes_receipt_ids_nonzero;
+
+    IF NOT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_constraint
+         WHERE conrelid = 'pgshard_catalog.slot_sync_probes'::regclass
+           AND conname = 'slot_sync_probes_receipt_lifecycle'
+    ) THEN
+        ALTER TABLE pgshard_catalog.slot_sync_probes
+            ADD CONSTRAINT slot_sync_probes_receipt_lifecycle
+            CHECK (
+                (
+                    state = 'allocated'
+                    AND consistent_point IS NULL
+                    AND creation_receipt_id IS NULL
+                    AND cleanup_receipt_id IS NULL
+                    AND activated_at IS NULL
+                    AND retiring_at IS NULL
+                    AND retired_at IS NULL
+                )
+                OR
+                (
+                    state = 'active'
+                    AND consistent_point IS NOT NULL
+                    AND creation_receipt_id IS NOT NULL
+                    AND cleanup_receipt_id IS NULL
+                    AND activated_at IS NOT NULL
+                    AND retiring_at IS NULL
+                    AND retired_at IS NULL
+                )
+                OR
+                (
+                    state = 'retiring'
+                    AND retiring_at IS NOT NULL
+                    AND retired_at IS NULL
+                    AND cleanup_receipt_id IS NOT NULL
+                    AND (
+                        creation_receipt_id IS NULL
+                        OR cleanup_receipt_id = creation_receipt_id
+                    )
+                    AND (
+                        (
+                            consistent_point IS NULL
+                            AND creation_receipt_id IS NULL
+                            AND activated_at IS NULL
+                        )
+                        OR (
+                            consistent_point IS NOT NULL
+                            AND creation_receipt_id IS NOT NULL
+                            AND activated_at IS NOT NULL
+                        )
+                    )
+                )
+                OR
+                (
+                    state = 'retired'
+                    AND retiring_at IS NOT NULL
+                    AND retired_at IS NOT NULL
+                    AND (
+                        (
+                            cleanup_receipt_id IS NOT NULL
+                            AND (
+                                creation_receipt_id IS NULL
+                                OR cleanup_receipt_id = creation_receipt_id
+                            )
+                            AND (
+                                (
+                                    consistent_point IS NULL
+                                    AND creation_receipt_id IS NULL
+                                    AND activated_at IS NULL
+                                )
+                                OR (
+                                    consistent_point IS NOT NULL
+                                    AND creation_receipt_id IS NOT NULL
+                                    AND activated_at IS NOT NULL
+                                )
+                            )
+                        )
+                        OR (
+                            creation_receipt_id IS NULL
+                            AND cleanup_receipt_id IS NULL
+                            AND (
+                                (consistent_point IS NULL AND activated_at IS NULL)
+                                OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
+                            )
+                        )
+                    )
+                )
+            ) NOT VALID;
+    END IF;
+    ALTER TABLE pgshard_catalog.slot_sync_probes
+        VALIDATE CONSTRAINT slot_sync_probes_receipt_lifecycle;
+END
+$pgshard_slot_sync_probe_receipts$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS slot_sync_probes_one_live_per_shard
     ON pgshard_catalog.slot_sync_probes(shard_id)

@@ -46,7 +46,8 @@ use crate::{
 
 const MIN_POSTGRES_VERSION_NUM: i32 = 180_000;
 const MAX_ADVISORY_LOCK_ROWS: usize = 16;
-const ADVISORY_LOCK_QUERY_LIMIT: i64 = 17;
+const MAX_FENCED_ADVISORY_LOCK_ROWS: usize = MAX_ADVISORY_LOCK_ROWS + 1;
+const TARGET_FENCE_HASH_SEED: i64 = 1_346_851_656;
 const SERVER_STATEMENT_TIMEOUT_HEADROOM: Duration = Duration::from_millis(25);
 const PIN_SEARCH_PATH_SQL: &str = "SELECT pg_catalog.set_config('search_path', '', false)";
 const SET_STATEMENT_TIMEOUT_SQL: &str =
@@ -138,6 +139,11 @@ const CREATE_SLOT_SQL: &str = "\
                $1::pg_catalog.name, 'pgoutput'::pg_catalog.name, false, true, \
                $2::pg_catalog.bool)";
 const DROP_SLOT_SQL: &str = "SELECT pg_catalog.pg_drop_replication_slot($1::pg_catalog.name)";
+const ACQUIRE_TARGET_FENCE_SQL: &str = "\
+    SELECT pg_catalog.pg_advisory_lock( \
+        pg_catalog.hashtextextended($1::pg_catalog.text, $2::pg_catalog.int8) \
+    )";
+const VERIFY_TARGET_FENCE_SQL: &str = "SELECT pg_catalog.pg_backend_pid()::pg_catalog.int4";
 
 /// Managed logical-slot shape this primitive may create.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,9 +381,10 @@ pub enum ManagedLogicalSlotDropOutcome {
 /// Point-in-time proof that an exact receipt-authorized slot was absent.
 ///
 /// This value has no public constructor and is returned only after the drop
-/// path verifies the exact source, role, session fence, and slot shape. It can
-/// close the matching durable catalog lifecycle, but it is not a lease against
-/// a later external recreation of the server-side name.
+/// path verifies the exact source, role, session fence, and slot shape. It is
+/// carried inside [`ManagedLogicalSlotDropFence`] while it can close a durable
+/// catalog lifecycle. After that connection-bound fence is released, this
+/// receipt is historical evidence only and cannot authorize catalog retirement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedLogicalSlotDropReceipt {
     receipt_id: ManagedLogicalSlotReceiptId,
@@ -424,6 +431,107 @@ impl ManagedLogicalSlotDropReceipt {
     pub const fn outcome(&self) -> ManagedLogicalSlotDropOutcome {
         self.outcome
     }
+}
+
+/// Connection-bound absence proof that still excludes managed same-name creation.
+///
+/// The source session holds pgshard's target-name advisory fence from before
+/// the final slot observation until this value is released or dropped. Every
+/// creation and deletion performed through this module takes the same fence.
+/// Direct SQL issued by a bypassing actor is outside that coordination boundary.
+///
+/// A catalog lifecycle must borrow this value through its COMMIT and verify the
+/// same backend afterward before treating the absence proof as durable.
+pub struct ManagedLogicalSlotDropFence {
+    receipt: ManagedLogicalSlotDropReceipt,
+    client: Client,
+    connection_task: ConnectionTask,
+    backend_pid: NonZeroU32,
+}
+
+impl fmt::Debug for ManagedLogicalSlotDropFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedLogicalSlotDropFence")
+            .field("receipt", &self.receipt)
+            .field("backend_pid", &self.backend_pid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedLogicalSlotDropFence {
+    fn new(
+        receipt: ManagedLogicalSlotDropReceipt,
+        client: Client,
+        connection_task: ConnectionTask,
+        backend_pid: NonZeroU32,
+    ) -> Self {
+        Self {
+            receipt,
+            client,
+            connection_task,
+            backend_pid,
+        }
+    }
+
+    /// Returns the exact point-in-time absence receipt protected by this fence.
+    #[must_use]
+    pub fn receipt(&self) -> &ManagedLogicalSlotDropReceipt {
+        &self.receipt
+    }
+
+    /// Releases the target-name fence after its caller no longer needs it.
+    pub async fn release(self) -> ManagedLogicalSlotDropReceipt {
+        let Self {
+            receipt,
+            client,
+            connection_task,
+            backend_pid: _,
+        } = self;
+        drop(client);
+        connection_task.abort_and_wait().await;
+        receipt
+    }
+
+    pub(crate) async fn verify_held_until(
+        &self,
+        deadline: Instant,
+        duration: Duration,
+    ) -> Result<(), ManagedLogicalSlotTargetFenceError> {
+        let row = timeout_at(
+            deadline,
+            self.client.query_one(VERIFY_TARGET_FENCE_SQL, &[]),
+        )
+        .await
+        .map_err(|_| ManagedLogicalSlotTargetFenceError::Timeout { duration })??;
+        let backend_pid = positive_nonzero_u32(
+            row.try_get(0)
+                .map_err(ManagedLogicalSlotTargetFenceError::Postgres)?,
+            "target_fence_backend_pid",
+        )
+        .map_err(|_| ManagedLogicalSlotTargetFenceError::BackendChanged)?;
+        if backend_pid != self.backend_pid {
+            return Err(ManagedLogicalSlotTargetFenceError::BackendChanged);
+        }
+        Ok(())
+    }
+}
+
+/// Failure to prove that the same source session still holds a target fence.
+#[derive(Debug, Error)]
+pub enum ManagedLogicalSlotTargetFenceError {
+    /// Fence liveness could not be checked before the operation deadline.
+    #[error("managed logical-slot target-fence verification exceeded {duration:?}")]
+    Timeout {
+        /// Whole-operation deadline supplied by the catalog lifecycle.
+        duration: Duration,
+    },
+    /// The source session failed while its fence should have remained held.
+    #[error("managed logical-slot target-fence verification failed: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+    /// The live connection no longer identifies the backend that acquired the fence.
+    #[error("managed logical-slot target fence moved to another PostgreSQL backend")]
+    BackendChanged,
 }
 
 /// A receipt-authorized drop failure with explicit retry authority.
@@ -874,6 +982,7 @@ struct MutationSessionIdentity {
 struct PreparedServer {
     database_name: String,
     session: MutationSessionIdentity,
+    caller_advisory_lock_count: usize,
 }
 
 struct PreparedCreate {
@@ -882,7 +991,9 @@ struct PreparedCreate {
 }
 
 enum PreparedDrop {
-    Absent,
+    Absent {
+        server: PreparedServer,
+    },
     Present {
         server: PreparedServer,
         statement: Statement,
@@ -972,7 +1083,9 @@ where
 /// An absent target is an idempotent known result. Any changed plugin,
 /// database, role, prepared-decoding boundary, activity, or progress fails
 /// before dispatch. A failed or timed-out drop after dispatch has an unknown
-/// persistent outcome and must be observed before reconciliation.
+/// persistent outcome and must be observed before reconciliation. A known
+/// absence returns a connection-bound target fence; callers must retain it
+/// through any catalog COMMIT that makes the absence durable.
 ///
 /// # Errors
 ///
@@ -985,7 +1098,7 @@ pub async fn drop_managed_logical_slot<S, T>(
     connection: Connection<S, T>,
     operation_timeout: CatalogOperationTimeout,
     receipt: ManagedLogicalSlotReceipt,
-) -> Result<ManagedLogicalSlotDropReceipt, ManagedLogicalSlotDropError>
+) -> Result<ManagedLogicalSlotDropFence, ManagedLogicalSlotDropError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1015,38 +1128,56 @@ where
                 });
             }
         };
-    let PreparedDrop::Present { server, statement } = prepared else {
-        drop(client);
-        connection_task.abort_and_wait().await;
-        return Ok(drop_receipt(
-            receipt,
-            ManagedLogicalSlotDropOutcome::AlreadyAbsent,
-        ));
-    };
-    let result = timeout_at(
-        context.deadline,
-        drop_at_dispatch_boundary(&client, &context, &server, &statement),
-    )
-    .await;
-    classify_drop_result(
-        receipt,
-        finish_mutation(client, connection_task, &context, result).await,
-    )
+    match prepared {
+        PreparedDrop::Absent { server } => Ok(ManagedLogicalSlotDropFence::new(
+            drop_receipt(receipt, ManagedLogicalSlotDropOutcome::AlreadyAbsent),
+            client,
+            connection_task,
+            server.session.backend_pid,
+        )),
+        PreparedDrop::Present { server, statement } => {
+            let result = timeout_at(
+                context.deadline,
+                drop_at_dispatch_boundary(&client, &context, &server, &statement),
+            )
+            .await;
+            match result {
+                Ok(Ok(outcome)) => Ok(ManagedLogicalSlotDropFence::new(
+                    drop_receipt(receipt, outcome),
+                    client,
+                    connection_task,
+                    server.session.backend_pid,
+                )),
+                Ok(Err(source)) => {
+                    drop(client);
+                    connection_task.abort_and_wait().await;
+                    classify_drop_failure(receipt, source)
+                }
+                Err(_) => {
+                    drop(client);
+                    connection_task.abort_and_wait().await;
+                    Err(ManagedLogicalSlotDropError::OutcomeUnknown(
+                        context.unknown(LocalSlotMutationUnknownCause::Deadline {
+                            duration: context.duration,
+                        }),
+                    ))
+                }
+            }
+        }
+    }
 }
 
-fn classify_drop_result(
+fn classify_drop_failure(
     receipt: ManagedLogicalSlotReceipt,
-    result: Result<ManagedLogicalSlotDropOutcome, LocalSlotMutationError>,
-) -> Result<ManagedLogicalSlotDropReceipt, ManagedLogicalSlotDropError> {
-    match result {
-        Ok(outcome) => Ok(drop_receipt(receipt, outcome)),
-        Err(source) if source.outcome_is_unknown() => {
-            Err(ManagedLogicalSlotDropError::OutcomeUnknown(source))
-        }
-        Err(source) => Err(ManagedLogicalSlotDropError::BeforeDispatch {
+    source: LocalSlotMutationError,
+) -> Result<ManagedLogicalSlotDropFence, ManagedLogicalSlotDropError> {
+    if source.outcome_is_unknown() {
+        Err(ManagedLogicalSlotDropError::OutcomeUnknown(source))
+    } else {
+        Err(ManagedLogicalSlotDropError::BeforeDispatch {
             receipt: Box::new(receipt),
             source,
-        }),
+        })
     }
 }
 
@@ -1093,7 +1224,7 @@ async fn prepare_create(
     client: &Client,
     context: &MutationContext,
 ) -> Result<PreparedCreate, LocalSlotMutationError> {
-    let server = prepare_server(client, context).await?;
+    let server = prepare_fenced_server(client, context).await?;
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
@@ -1141,7 +1272,7 @@ async fn prepare_drop(
     context: &MutationContext,
     creation_lsn: PgLsn,
 ) -> Result<PreparedDrop, LocalSlotMutationError> {
-    let server = prepare_server(client, context).await?;
+    let server = prepare_fenced_server(client, context).await?;
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
@@ -1154,7 +1285,7 @@ async fn prepare_drop(
         .await
         .map_err(|source| context.preflight_postgres(source))?;
     let Some(row) = row else {
-        return Ok(PreparedDrop::Absent);
+        return Ok(PreparedDrop::Absent { server });
     };
     let observation = parse_logical_slot(&row).map_err(|source| {
         LocalSlotMutationError::UnsafeDropObservation {
@@ -1174,9 +1305,53 @@ async fn prepare_drop(
     Ok(PreparedDrop::Present { server, statement })
 }
 
+async fn prepare_fenced_server(
+    client: &Client,
+    context: &MutationContext,
+) -> Result<PreparedServer, LocalSlotMutationError> {
+    let unfenced = prepare_server(client, context, MAX_ADVISORY_LOCK_ROWS).await?;
+    set_statement_timeout(client, context.preflight_deadline())
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    client
+        .query_one(
+            ACQUIRE_TARGET_FENCE_SQL,
+            &[
+                &context.identity.target.name().as_str(),
+                &TARGET_FENCE_HASH_SEED,
+            ],
+        )
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let mut fenced = prepare_server(client, context, MAX_FENCED_ADVISORY_LOCK_ROWS).await?;
+    validate_target_fenced_session(&unfenced.session, &fenced.session)?;
+    fenced.caller_advisory_lock_count = unfenced.session.advisory_locks.len();
+    Ok(fenced)
+}
+
+fn validate_target_fenced_session(
+    unfenced: &MutationSessionIdentity,
+    fenced: &MutationSessionIdentity,
+) -> Result<(), LocalSlotMutationError> {
+    let same_principal = unfenced.backend_pid == fenced.backend_pid
+        && unfenced.session_role_oid == fenced.session_role_oid
+        && unfenced.effective_role_oid == fenced.effective_role_oid;
+    let caller_locks_preserved = unfenced
+        .advisory_locks
+        .iter()
+        .all(|lock| fenced.advisory_locks.contains(lock));
+    let only_internal_lock_added =
+        fenced.advisory_locks.len() <= unfenced.advisory_locks.len().saturating_add(1);
+    if !same_principal || !caller_locks_preserved || !only_internal_lock_added {
+        return Err(LocalSlotMutationError::SessionFenceChanged);
+    }
+    Ok(())
+}
+
 async fn prepare_server(
     client: &Client,
     context: &MutationContext,
+    maximum_advisory_locks: usize,
 ) -> Result<PreparedServer, LocalSlotMutationError> {
     client
         .query_one(PIN_SEARCH_PATH_SQL, &[])
@@ -1185,8 +1360,10 @@ async fn prepare_server(
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
+    let advisory_lock_query_limit = i64::try_from(maximum_advisory_locks.saturating_add(1))
+        .expect("small advisory-lock bound fits PostgreSQL bigint");
     let basic = client
-        .query_one(BASIC_REQUIREMENTS_SQL, &[&ADVISORY_LOCK_QUERY_LIMIT])
+        .query_one(BASIC_REQUIREMENTS_SQL, &[&advisory_lock_query_limit])
         .await
         .map_err(|source| context.preflight_postgres(source))?;
     let version: i32 = basic
@@ -1210,18 +1387,26 @@ async fn prepare_server(
     if encoding != "UTF8" {
         return Err(LocalSlotMutationError::WrongEncoding(encoding));
     }
-    let session = parse_mutation_session(&basic, 4, context)?;
+    let session = parse_mutation_session(&basic, 4, maximum_advisory_locks, context)?;
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
     let source = client
-        .query_one(SOURCE_REQUIREMENTS_SQL, &[&ADVISORY_LOCK_QUERY_LIMIT])
+        .query_one(SOURCE_REQUIREMENTS_SQL, &[&advisory_lock_query_limit])
         .await
         .map_err(|error| context.preflight_postgres(error))?;
-    validate_source_row(&source, database_oid, &session, context)?;
+    validate_source_row(
+        &source,
+        database_oid,
+        &session,
+        maximum_advisory_locks,
+        context,
+    )?;
+    let caller_advisory_lock_count = session.advisory_locks.len();
     Ok(PreparedServer {
         database_name,
         session,
+        caller_advisory_lock_count,
     })
 }
 
@@ -1296,7 +1481,7 @@ async fn create_after_dispatch(
         creation_lsn,
         observation,
         effective_role_oid: prepared.server.session.effective_role_oid,
-        advisory_lock_count: prepared.server.session.advisory_locks.len(),
+        advisory_lock_count: prepared.server.caller_advisory_lock_count,
     })
 }
 
@@ -1346,13 +1531,16 @@ async fn revalidate_server_after_dispatch(
     prepared: &PreparedServer,
 ) -> Result<(), LocalSlotMutationUnknownCause> {
     set_statement_timeout(client, context.deadline).await?;
+    let advisory_lock_query_limit = i64::try_from(MAX_FENCED_ADVISORY_LOCK_ROWS.saturating_add(1))
+        .expect("small advisory-lock bound fits PostgreSQL bigint");
     let row = client
-        .query_one(SOURCE_REQUIREMENTS_SQL, &[&ADVISORY_LOCK_QUERY_LIMIT])
+        .query_one(SOURCE_REQUIREMENTS_SQL, &[&advisory_lock_query_limit])
         .await?;
     validate_source_row(
         &row,
         context.identity.source.database_oid(),
         &prepared.session,
+        MAX_FENCED_ADVISORY_LOCK_ROWS,
         context,
     )
     .map_err(postflight_source_error)
@@ -1371,6 +1559,7 @@ fn validate_source_row(
     row: &tokio_postgres::Row,
     database_oid: u32,
     expected_session: &MutationSessionIdentity,
+    maximum_advisory_locks: usize,
     context: &MutationContext,
 ) -> Result<(), LocalSlotMutationError> {
     let system_identifier = row
@@ -1421,7 +1610,7 @@ fn validate_source_row(
     )?;
     let receiver = parse_observed_wal_receiver(row, context)?;
     let slot_sync_worker = parse_observed_slot_sync_worker(row, context)?;
-    let session = parse_mutation_session(row, 16, context)?;
+    let session = parse_mutation_session(row, 16, maximum_advisory_locks, context)?;
     if &session != expected_session {
         return Err(LocalSlotMutationError::SessionFenceChanged);
     }
@@ -1525,11 +1714,13 @@ fn parse_observed_slot_sync_worker(
 fn parse_mutation_session(
     row: &tokio_postgres::Row,
     first_column: usize,
+    maximum_advisory_locks: usize,
     context: &MutationContext,
 ) -> Result<MutationSessionIdentity, LocalSlotMutationError> {
     let advisory_locks = bounded_advisory_locks(
         row.try_get(first_column + 3)
             .map_err(|source| context.preflight_postgres(source))?,
+        maximum_advisory_locks,
     )?;
     Ok(MutationSessionIdentity {
         backend_pid: positive_nonzero_u32(
@@ -1553,11 +1744,10 @@ fn parse_mutation_session(
 
 fn bounded_advisory_locks(
     advisory_locks: Vec<String>,
+    maximum: usize,
 ) -> Result<Vec<String>, LocalSlotMutationError> {
-    if advisory_locks.len() > MAX_ADVISORY_LOCK_ROWS {
-        return Err(LocalSlotMutationError::TooManyAdvisoryLocks {
-            maximum: MAX_ADVISORY_LOCK_ROWS,
-        });
+    if advisory_locks.len() > maximum {
+        return Err(LocalSlotMutationError::TooManyAdvisoryLocks { maximum });
     }
     Ok(advisory_locks)
 }
@@ -2070,9 +2260,18 @@ mod tests {
 
     #[test]
     fn advisory_lock_snapshot_is_hard_bounded() {
-        assert!(bounded_advisory_locks(vec![String::new(); MAX_ADVISORY_LOCK_ROWS]).is_ok());
+        assert!(
+            bounded_advisory_locks(
+                vec![String::new(); MAX_ADVISORY_LOCK_ROWS],
+                MAX_ADVISORY_LOCK_ROWS,
+            )
+            .is_ok()
+        );
         assert!(matches!(
-            bounded_advisory_locks(vec![String::new(); MAX_ADVISORY_LOCK_ROWS + 1]),
+            bounded_advisory_locks(
+                vec![String::new(); MAX_ADVISORY_LOCK_ROWS + 1],
+                MAX_ADVISORY_LOCK_ROWS,
+            ),
             Err(LocalSlotMutationError::TooManyAdvisoryLocks {
                 maximum: MAX_ADVISORY_LOCK_ROWS
             })
@@ -2204,7 +2403,7 @@ mod tests {
         let identity = identity(ManagedLogicalSlotRole::PrimaryFailoverAnchor);
         let expected_target = identity.target.clone();
         let context = context_for(LocalSlotMutationOperation::Drop, identity.clone());
-        let error = classify_drop_result(receipt(&identity), Err(context.preflight_timeout()))
+        let error = classify_drop_failure(receipt(&identity), context.preflight_timeout())
             .expect_err("a drop rejected before dispatch must fail");
 
         assert!(!error.outcome_is_unknown());
@@ -2221,11 +2420,7 @@ mod tests {
     #[test]
     fn successful_drop_receipt_preserves_the_verified_identity() {
         let identity = identity(ManagedLogicalSlotRole::PrimaryFailoverAnchor);
-        let proof = classify_drop_result(
-            receipt(&identity),
-            Ok(ManagedLogicalSlotDropOutcome::Dropped),
-        )
-        .expect("known drop result");
+        let proof = drop_receipt(receipt(&identity), ManagedLogicalSlotDropOutcome::Dropped);
 
         assert_eq!(proof.target(), &identity.target);
         assert_eq!(proof.receipt_id(), receipt(&identity).receipt_id());

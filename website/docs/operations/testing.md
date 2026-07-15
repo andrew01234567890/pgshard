@@ -28,7 +28,11 @@ allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying
 the migration cannot resurrect a retired restore incarnation or advance the
-catalog epoch. The trigger suite rejects slot names that
+catalog epoch. Before the clean install contract, it recreates the pre-receipt
+probe table, proves a receiptless active row blocks upgrade with SQLSTATE
+`55000`, retires that row under the old contract, and then proves allocated and
+retired history upgrade in place with both new constraints validated. The
+trigger suite rejects slot names that
 do not encode their complete UUID generation, activation without both the
 primary anchor and selected source, an attachment that invents a restore
 incarnation, snapshot completion behind either slot's consistent point or
@@ -167,14 +171,23 @@ catalog activation only from the creation receipt. Cleanup must return the exact
 drop/absence receipt carrying the persisted create-attempt ID, and the
 synchronized copy must disappear before permanent retirement. The fixture
 creates and drops one slot, recreates the same exact name, and proves the first
-absence receipt cannot retire or remove the second creation. Repeating
+create-attempt ID differs from the second. The final drop retains a
+connection-bound target fence, starts another same-name managed create, observes
+its backend waiting on the advisory lock across catalog COMMIT, cancels it
+and explicitly terminates that waiting backend before releasing the fence, and
+proves the target remains absent. Repeating
 allocation and every completed transition is checked as a read-only idempotent
 result. An unrelated epoch advance must fence a stale activation token before
 any lifecycle write, after which an exact reload can continue. A TCP fault proxy
-then withholds the activation COMMIT response only after PostgreSQL confirms the
-commit; the client must classify `OutcomeUnknown`, reload the exact receipt ID
-and boundary, and safely replay the same activation. Always-run bounded cleanup
-requires no live catalog, primary, or standby probe even when the fixture fails.
+acknowledges that its frame parser is armed on the idle authenticated
+connection, closes the client response half when it receives the exact COMMIT
+frame, forwards that frame, and then independently requires PostgreSQL's
+`CommandComplete` and `ReadyForQuery`. The client must classify
+`OutcomeUnknown`, reload the exact receipt ID and boundary, and safely replay
+the same activation. Always-run bounded cleanup retires the catalog row only
+after both primary-slot removal and synchronized standby-copy disappearance
+succeed; a failed absence check preserves the live or retiring row for
+diagnosis and reconciliation.
 Crash recovery remains a separate future test.
 Injected post-dispatch slot-mutation socket loss and cancellation races are not
 yet exercised. A general durable slot-mutation ledger, automatic

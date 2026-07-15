@@ -13,9 +13,9 @@ use std::{
 use pgshard_catalog::{CatalogOperationTimeout, MIGRATION_SQL};
 use pgshard_orch::{
     slot_mutator::{
-        LocalSlotMutationError, ManagedLogicalSlotCreateRequest, ManagedLogicalSlotDropOutcome,
-        ManagedLogicalSlotDropReceipt, ManagedLogicalSlotReceipt, ManagedLogicalSlotRole,
-        create_managed_logical_slot, drop_managed_logical_slot,
+        LocalSlotMutationError, ManagedLogicalSlotCreateRequest, ManagedLogicalSlotDropFence,
+        ManagedLogicalSlotDropOutcome, ManagedLogicalSlotDropReceipt, ManagedLogicalSlotReceipt,
+        ManagedLogicalSlotRole, create_managed_logical_slot, drop_managed_logical_slot,
     },
     slot_observer::{
         CorrelatedStandbyReplicationPath, LocalLogicalSlotObservationBatch,
@@ -176,7 +176,7 @@ async fn finish_bounded_fixture(
 
 struct CommitResponseLossProxy {
     database_url: String,
-    arm: oneshot::Sender<()>,
+    arm: oneshot::Sender<oneshot::Sender<()>>,
     task: JoinHandle<TestResult>,
 }
 
@@ -227,7 +227,7 @@ async fn run_commit_response_loss_proxy(
     listener: TcpListener,
     upstream_host: String,
     upstream_port: u16,
-    armed: oneshot::Receiver<()>,
+    armed: oneshot::Receiver<oneshot::Sender<()>>,
 ) -> TestResult {
     let (downstream, _) = timeout(CONNECTION_EXIT_TIMEOUT, listener.accept())
         .await
@@ -242,7 +242,7 @@ async fn run_commit_response_loss_proxy(
     upstream.set_nodelay(true)?;
     let (mut downstream_read, mut downstream_write) = downstream.into_split();
     let (mut upstream_read, mut upstream_write) = upstream.into_split();
-    Box::pin(relay_until_proxy_armed(
+    let acknowledge_armed = Box::pin(relay_until_proxy_armed(
         &mut downstream_read,
         &mut downstream_write,
         &mut upstream_read,
@@ -250,6 +250,9 @@ async fn run_commit_response_loss_proxy(
         armed,
     ))
     .await?;
+    acknowledge_armed
+        .send(())
+        .map_err(|()| io::Error::other("catalog fault proxy arm acknowledgement was dropped"))?;
     Box::pin(relay_until_commit(
         &mut downstream_read,
         &mut downstream_write,
@@ -264,15 +267,14 @@ async fn relay_until_proxy_armed(
     downstream_write: &mut tcp::OwnedWriteHalf,
     upstream_read: &mut tcp::OwnedReadHalf,
     upstream_write: &mut tcp::OwnedWriteHalf,
-    mut armed: oneshot::Receiver<()>,
-) -> TestResult {
+    mut armed: oneshot::Receiver<oneshot::Sender<()>>,
+) -> TestResult<oneshot::Sender<()>> {
     let mut frontend = [0_u8; 8192];
     let mut backend = [0_u8; 8192];
     loop {
         tokio::select! {
             arm_result = &mut armed => {
-                arm_result.map_err(|_| io::Error::other("catalog fault proxy arm sender was dropped"))?;
-                return Ok(());
+                return arm_result.map_err(|_| io::Error::other("catalog fault proxy arm sender was dropped").into());
             }
             read = downstream_read.read(&mut frontend) => {
                 let read = read?;
@@ -596,6 +598,90 @@ async fn wait_for_mutation_backend_exit(client: &Client, backend_pid: &AtomicU32
     }
 }
 
+async fn wait_for_backend_advisory_fence(database_url: &str, backend_pid: i32) -> TestResult {
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let result = async {
+        loop {
+            let row = client
+                .query_opt(
+                    "SELECT wait_event_type::pg_catalog.text, wait_event::pg_catalog.text \
+                       FROM pg_catalog.pg_stat_activity \
+                      WHERE pid OPERATOR(pg_catalog.=) $1::pg_catalog.int4",
+                    &[&backend_pid],
+                )
+                .await?
+                .ok_or_else(|| {
+                    io::Error::other(
+                        "same-name recreation backend exited before waiting on its fence",
+                    )
+                })?;
+            let wait_type: Option<String> = row.try_get(0)?;
+            let wait_event: Option<String> = row.try_get(1)?;
+            if wait_type.as_deref() == Some("Lock") && wait_event.as_deref() == Some("advisory") {
+                return Ok::<(), TestError>(());
+            }
+            timeout_at(deadline, sleep(CLEANUP_RETRY_INTERVAL))
+                .await
+                .map_err(|_| {
+                    io::Error::other(
+                        "same-name recreation did not block on the target fence within the bound",
+                    )
+                })?;
+        }
+    }
+    .await;
+    drop(client);
+    let connection_result = finish_connection(connection_task).await;
+    result?;
+    connection_result
+}
+
+async fn terminate_and_wait_for_database_backend_exit(
+    database_url: &str,
+    backend_pid: i32,
+) -> TestResult {
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let result = async {
+        let _terminated: bool = client
+            .query_one(
+                "SELECT pg_catalog.pg_terminate_backend($1::pg_catalog.int4)",
+                &[&backend_pid],
+            )
+            .await?
+            .try_get(0)?;
+        loop {
+            let present: bool = client
+                .query_one(
+                    "SELECT count(*) OPERATOR(pg_catalog.>) 0 \
+                       FROM pg_catalog.pg_stat_activity \
+                      WHERE pid OPERATOR(pg_catalog.=) $1::pg_catalog.int4",
+                    &[&backend_pid],
+                )
+                .await?
+                .try_get(0)?;
+            if !present {
+                return Ok::<(), TestError>(());
+            }
+            timeout_at(deadline, sleep(CLEANUP_RETRY_INTERVAL))
+                .await
+                .map_err(|_| {
+                    io::Error::other(
+                        "cancelled same-name recreation backend did not exit within the bound",
+                    )
+                })?;
+        }
+    }
+    .await;
+    drop(client);
+    let connection_result = finish_connection(connection_task).await;
+    result?;
+    connection_result
+}
+
 async fn cleanup_standby_mutation_fixture(
     client: &Client,
     target: &ManagedSlotTarget,
@@ -661,10 +747,9 @@ async fn cleanup_catalog_probe_fixture(
     let slot_cleanup = cleanup_slot(client, target).await;
     let synchronized_copy_cleanup =
         wait_for_synchronized_copy(standby_database_url, target, false).await;
-    let catalog_cleanup = cleanup_catalog_probe_row(client, target).await;
     slot_cleanup?;
     synchronized_copy_cleanup?;
-    catalog_cleanup
+    cleanup_catalog_probe_row(client, target).await
 }
 
 async fn cleanup_catalog_probe_row(client: &Client, target: &ManagedSlotTarget) -> TestResult {
@@ -993,8 +1078,15 @@ async fn activate_catalog_probe_with_commit_response_loss(
         mut task,
     } = start_commit_response_loss_proxy(database_url).await?;
     let (client, connection) = tokio_postgres::connect(&proxy_database_url, NoTls).await?;
-    arm.send(())
-        .map_err(|()| io::Error::other("catalog fault proxy exited before it was armed"))?;
+    let (armed_acknowledgement, armed) = oneshot::channel();
+    arm.send(armed_acknowledgement)
+        .map_err(|_| io::Error::other("catalog fault proxy exited before it was armed"))?;
+    timeout(CONNECTION_EXIT_TIMEOUT, armed)
+        .await
+        .map_err(|_| {
+            io::Error::other("catalog fault proxy arm acknowledgement exceeded the bound")
+        })?
+        .map_err(|_| io::Error::other("catalog fault proxy exited before acknowledging its arm"))?;
     let error = activate_slot_sync_probe(
         client,
         connection,
@@ -1085,7 +1177,7 @@ async fn load_live_catalog_probe(database_url: &str) -> TestResult<Option<Catalo
 async fn complete_catalog_probe_retirement(
     database_url: &str,
     probe: &CatalogSlotSyncProbe,
-    absence: &ManagedLogicalSlotDropReceipt,
+    absence: &ManagedLogicalSlotDropFence,
 ) -> TestResult<CatalogSlotSyncProbe> {
     let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
     Ok(complete_slot_sync_probe_retirement(
@@ -1096,6 +1188,72 @@ async fn complete_catalog_probe_retirement(
         absence,
     )
     .await?)
+}
+
+async fn complete_retirement_while_recreation_waits(
+    database_url: &str,
+    target: &ManagedSlotTarget,
+    retiring: &CatalogSlotSyncProbe,
+    absence: ManagedLogicalSlotDropFence,
+) -> TestResult<CatalogSlotSyncProbe> {
+    let expected_receipt_id = absence.receipt().receipt_id();
+    let (recreate_client, recreate_connection) =
+        tokio_postgres::connect(database_url, NoTls).await?;
+    let recreate_backend = AtomicU32::new(0);
+    let recreate_connection =
+        capture_mutation_backend_pid(&recreate_client, recreate_connection, &recreate_backend)
+            .await?;
+    let recreate_backend_pid = i32::try_from(recreate_backend.load(Ordering::Acquire))?;
+    let request =
+        ManagedLogicalSlotCreateRequest::primary_failover_anchor(target.clone(), retiring.source());
+    let mut recreate = tokio::spawn(async move {
+        create_managed_logical_slot(
+            recreate_client,
+            recreate_connection,
+            CatalogOperationTimeout::default(),
+            request,
+        )
+        .await
+    });
+    wait_for_backend_advisory_fence(database_url, recreate_backend_pid).await?;
+    assert!(
+        !recreate.is_finished(),
+        "same-name recreation must remain blocked before catalog retirement"
+    );
+
+    let retired = complete_catalog_probe_retirement(database_url, retiring, &absence).await?;
+    assert_eq!(retired.state(), SlotSyncProbeState::Retired);
+    assert!(
+        !recreate.is_finished(),
+        "catalog retirement must return while the source target fence is still held"
+    );
+    assert_eq!(
+        complete_catalog_probe_retirement(database_url, &retired, &absence).await?,
+        retired
+    );
+    recreate.abort();
+    let cancelled = timeout(CONNECTION_EXIT_TIMEOUT, &mut recreate)
+        .await
+        .map_err(|_| io::Error::other("blocked same-name recreation did not cancel in time"))?
+        .expect_err("blocked same-name recreation must be cancelled before fence release");
+    assert!(cancelled.is_cancelled());
+    terminate_and_wait_for_database_backend_exit(database_url, recreate_backend_pid).await?;
+    assert_eq!(absence.release().await.receipt_id(), expected_receipt_id);
+    let observed = observe(
+        database_url,
+        &LogicalSlotObservationRequest::new(vec![target.clone()])?,
+    )
+    .await?;
+    assert!(observed.entries()[0].observation().is_none());
+    Ok(retired)
+}
+
+async fn release_known_drop(fence: ManagedLogicalSlotDropFence) {
+    assert_eq!(
+        fence.receipt().outcome(),
+        ManagedLogicalSlotDropOutcome::Dropped
+    );
+    let _receipt = fence.release().await;
 }
 
 async fn refresh_after_stale_activation(
@@ -1191,11 +1349,12 @@ async fn create_drop_and_recreate_catalog_probe_slot(
     )
     .await?;
     assert_eq!(
-        stale_absence.outcome(),
+        stale_absence.receipt().outcome(),
         ManagedLogicalSlotDropOutcome::Dropped
     );
-    assert_eq!(stale_absence.receipt_id(), first_receipt_id);
+    assert_eq!(stale_absence.receipt().receipt_id(), first_receipt_id);
     wait_for_synchronized_copy(standby_database_url, target, false).await?;
+    let stale_absence = stale_absence.release().await;
 
     let (primary, primary_connection) =
         tokio_postgres::connect(primary_database_url, NoTls).await?;
@@ -1265,19 +1424,10 @@ async fn run_catalog_probe_fixture(
         begin_catalog_probe_retirement(&primary_database_url, &retiring, &receipt).await?;
     assert_eq!(retiring_retry, retiring);
 
-    let stale_error =
-        complete_catalog_probe_retirement(&primary_database_url, &retiring_retry, &stale_absence)
-            .await
-            .expect_err(
-                "an absence receipt from an earlier recreation must not retire the live slot",
-            );
-    assert!(matches!(
-        stale_error.downcast_ref::<SlotSyncProbeCatalogError>(),
-        Some(SlotSyncProbeCatalogError::AbsenceReceiptMismatch)
-    ));
+    assert_ne!(stale_absence.receipt_id(), receipt.receipt_id());
     let still_retiring = load_exact_catalog_probe(&primary_database_url, &probe_target)
         .await?
-        .expect("stale absence proof must preserve the retiring row");
+        .expect("the typed retirement API cannot accept an unfenced stale receipt");
     assert_eq!(still_retiring, retiring);
     assert_catalog_probe_slot_present(&primary_database_url, &probe_target).await?;
 
@@ -1290,15 +1440,18 @@ async fn run_catalog_probe_fixture(
         receipt,
     )
     .await?;
-    assert_eq!(absence.outcome(), ManagedLogicalSlotDropOutcome::Dropped);
+    assert_eq!(
+        absence.receipt().outcome(),
+        ManagedLogicalSlotDropOutcome::Dropped
+    );
     wait_for_synchronized_copy(&standby_database_url, &probe_target, false).await?;
-
-    let retired =
-        complete_catalog_probe_retirement(&primary_database_url, &still_retiring, &absence).await?;
-    assert_eq!(retired.state(), SlotSyncProbeState::Retired);
-    let retired_retry =
-        complete_catalog_probe_retirement(&primary_database_url, &retired, &absence).await?;
-    assert_eq!(retired_retry, retired);
+    let retired = complete_retirement_while_recreation_waits(
+        &primary_database_url,
+        &probe_target,
+        &still_retiring,
+        absence,
+    )
+    .await?;
     assert_eq!(
         load_exact_catalog_probe(&primary_database_url, &probe_target)
             .await?
@@ -1494,10 +1647,7 @@ async fn run_primary_mutation_fixture(
         receipt,
     )
     .await?;
-    assert_eq!(
-        drop_receipt.outcome(),
-        ManagedLogicalSlotDropOutcome::Dropped
-    );
+    release_known_drop(drop_receipt).await;
     wait_for_synchronized_copy(&standby_database_url, &target, false).await?;
     let absent = observe(
         &database_url,
@@ -1710,10 +1860,7 @@ async fn run_standby_mutation_fixture(
         receipt,
     )
     .await?;
-    assert_eq!(
-        drop_receipt.outcome(),
-        ManagedLogicalSlotDropOutcome::Dropped
-    );
+    release_known_drop(drop_receipt).await;
     let absent = observe(
         &standby_database_url,
         &LogicalSlotObservationRequest::new(vec![target])?,

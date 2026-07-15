@@ -5,7 +5,7 @@
 //! connection and a `REPEATABLE READ` transaction. Every write is conditional,
 //! so an ambiguous commit can be reconciled by loading the exact generation and
 //! retrying the same transition. Final retirement additionally requires the
-//! unforgeable absence receipt returned by the local slot mutator.
+//! connection-bound absence fence returned by the local slot mutator.
 //!
 //! Every operation consumes a newly connected, idle catalog session and starts
 //! with `DISCARD ALL`. The connection must therefore authenticate as a
@@ -31,8 +31,8 @@ use crate::{
     postgres_connection::ConnectionTask,
     slot_catalog::valid_resource_name,
     slot_mutator::{
-        ManagedLogicalSlotDropReceipt, ManagedLogicalSlotReceipt, ManagedLogicalSlotReceiptId,
-        ManagedLogicalSlotRole,
+        ManagedLogicalSlotDropFence, ManagedLogicalSlotDropReceipt, ManagedLogicalSlotReceipt,
+        ManagedLogicalSlotReceiptId, ManagedLogicalSlotRole, ManagedLogicalSlotTargetFenceError,
     },
     standby_slots::{
         ManagedSlotTarget, ManagedSlotTargetError, ReplicationSlotName, ReplicationSourceIdentity,
@@ -559,36 +559,62 @@ where
 
 /// Permanently retires a probe after the exact local slot is proven absent.
 ///
-/// The drop receipt is intentionally process-local. Recovery after a process
-/// restart or external mutation still requires a future durable reconciler and
-/// fresh absence proof; callers cannot manufacture retirement authority from a
-/// catalog row alone.
+/// The drop fence is intentionally process-local and must still identify the
+/// same source backend after catalog COMMIT. Recovery after a process restart
+/// or external mutation still requires a future durable reconciler and fresh
+/// absence proof; callers cannot manufacture retirement authority from a
+/// catalog row or a released receipt alone.
 ///
 /// # Errors
 ///
-/// Rejects a mismatched absence receipt, stale catalog authority, a row that is
-/// not retiring, or a catalog/connection failure. Repeating an already-applied
-/// retirement is a read-only idempotent success.
+/// Rejects a mismatched absence receipt, lost target fence, stale catalog
+/// authority, a row that is not retiring, or a catalog/connection failure.
+/// Repeating an already-applied retirement under the same live fence is a
+/// read-only idempotent success.
 pub async fn complete_slot_sync_probe_retirement<S, T>(
     client: Client,
     connection: Connection<S, T>,
     operation_timeout: CatalogOperationTimeout,
     probe: &CatalogSlotSyncProbe,
-    absence: &ManagedLogicalSlotDropReceipt,
+    absence: &ManagedLogicalSlotDropFence,
 ) -> Result<CatalogSlotSyncProbe, SlotSyncProbeCatalogError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    Ok(expect_probe(
-        run_command(
-            client,
-            connection,
-            operation_timeout,
-            ProbeCommand::CompleteRetirement { probe, absence },
-        )
-        .await?,
-    ))
+    let duration = operation_timeout.get();
+    let deadline = Instant::now() + duration;
+    absence
+        .verify_held_until(deadline, duration)
+        .await
+        .map_err(|source| target_fence_lost(probe, source))?;
+    let result = run_command_until(
+        client,
+        connection,
+        deadline,
+        duration,
+        ProbeCommand::CompleteRetirement {
+            probe,
+            absence: absence.receipt(),
+        },
+    )
+    .await;
+    let fence_result = absence.verify_held_until(deadline, duration).await;
+    match (result, fence_result) {
+        (Ok(result), Ok(())) => Ok(expect_probe(result)),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(source)) => Err(target_fence_lost(probe, source)),
+    }
+}
+
+fn target_fence_lost(
+    probe: &CatalogSlotSyncProbe,
+    source: ManagedLogicalSlotTargetFenceError,
+) -> SlotSyncProbeCatalogError {
+    SlotSyncProbeCatalogError::TargetFenceLost {
+        target: probe.target.clone(),
+        source,
+    }
 }
 
 fn expect_probe(result: ProbeCommandResult) -> CatalogSlotSyncProbe {
@@ -647,7 +673,7 @@ enum ProbeCommandResult {
 }
 
 async fn run_command<S, T>(
-    mut client: Client,
+    client: Client,
     connection: Connection<S, T>,
     operation_timeout: CatalogOperationTimeout,
     command: ProbeCommand<'_>,
@@ -658,6 +684,20 @@ where
 {
     let duration = operation_timeout.get();
     let deadline = Instant::now() + duration;
+    run_command_until(client, connection, deadline, duration, command).await
+}
+
+async fn run_command_until<S, T>(
+    mut client: Client,
+    connection: Connection<S, T>,
+    deadline: Instant,
+    duration: Duration,
+    command: ProbeCommand<'_>,
+) -> Result<ProbeCommandResult, SlotSyncProbeCatalogError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mutation = command.mutation();
     let target = command.target().cloned();
     let connection_task = ConnectionTask::new(tokio::spawn(connection));
@@ -1275,12 +1315,20 @@ fn parse_probe(
                 && creation_receipt_id.is_some()
                 && cleanup_receipt_id.is_none()
         }
-        SlotSyncProbeState::Retiring | SlotSyncProbeState::Retired => {
+        SlotSyncProbeState::Retiring => {
             cleanup_receipt_id.is_some()
                 && consistent_point.is_some() == creation_receipt_id.is_some()
                 && creation_receipt_id
                     .zip(cleanup_receipt_id)
                     .is_none_or(|(creation, cleanup)| creation == cleanup)
+        }
+        SlotSyncProbeState::Retired => {
+            (cleanup_receipt_id.is_some()
+                && consistent_point.is_some() == creation_receipt_id.is_some()
+                && creation_receipt_id
+                    .zip(cleanup_receipt_id)
+                    .is_none_or(|(creation, cleanup)| creation == cleanup))
+                || (creation_receipt_id.is_none() && cleanup_receipt_id.is_none())
         }
     };
     if !lifecycle_is_consistent {
@@ -1549,6 +1597,17 @@ pub enum SlotSyncProbeCatalogError {
         #[source]
         source: SlotSyncProbeCatalogUnknownCause,
     },
+    /// The source-side name fence was lost before the catalog boundary was proven.
+    #[error(
+        "slot-sync probe target fence for {target:?} was lost across catalog retirement; reconcile the exact slot and catalog row: {source}"
+    )]
+    TargetFenceLost {
+        /// Exact generation-qualified target whose absence is no longer fenced.
+        target: ManagedSlotTarget,
+        /// Source-session liveness failure.
+        #[source]
+        source: ManagedLogicalSlotTargetFenceError,
+    },
     /// Explicit rollback failed; the dedicated session is discarded.
     #[error("slot-sync probe catalog rollback failed: {source}")]
     RollbackFailed {
@@ -1681,7 +1740,10 @@ impl SlotSyncProbeCatalogError {
     /// Returns true only when the catalog commit must be reloaded before retry.
     #[must_use]
     pub const fn outcome_is_unknown(&self) -> bool {
-        matches!(self, Self::OutcomeUnknown { .. })
+        matches!(
+            self,
+            Self::OutcomeUnknown { .. } | Self::TargetFenceLost { .. }
+        )
     }
 }
 

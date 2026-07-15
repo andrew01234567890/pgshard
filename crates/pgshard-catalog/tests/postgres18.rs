@@ -221,8 +221,226 @@ fn assert_no_notification(receiver: &Receiver<String>, context: &str) {
     }
 }
 
-async fn assert_installation_contract(client: &Client) -> TestResult {
+const PRE_RECEIPT_PROBE_SCHEMA_SQL: &str = r"
+            BEGIN;
+            CREATE SCHEMA pgshard_catalog;
+            CREATE DOMAIN pgshard_catalog.sql_identifier AS text
+                CHECK (octet_length(VALUE) BETWEEN 1 AND 63);
+            CREATE DOMAIN pgshard_catalog.resource_name AS text
+                CHECK (
+                    VALUE ~ '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$'
+                    AND octet_length(VALUE) BETWEEN 1 AND 63
+                );
+            CREATE DOMAIN pgshard_catalog.replication_slot_name AS text
+                CHECK (
+                    VALUE ~ '^[a-z0-9_]+$'
+                    AND octet_length(VALUE) BETWEEN 1 AND 63
+                );
+            CREATE TABLE pgshard_catalog.shards (
+                shard_id pgshard_catalog.resource_name PRIMARY KEY,
+                shard_number bigint NOT NULL UNIQUE
+                    CHECK (shard_number BETWEEN 0 AND 4294967295),
+                state text NOT NULL DEFAULT 'active'
+                    CHECK (state IN ('provisioning', 'active', 'draining', 'retired')),
+                created_at timestamptz NOT NULL DEFAULT statement_timestamp()
+            );
+            CREATE TABLE pgshard_catalog.shard_restore_incarnations (
+                restore_incarnation uuid PRIMARY KEY
+                    CHECK (restore_incarnation <> '00000000-0000-0000-0000-000000000000'::uuid),
+                shard_id pgshard_catalog.resource_name NOT NULL
+                    REFERENCES pgshard_catalog.shards(shard_id) ON DELETE RESTRICT,
+                state text NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'retired')),
+                installed_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+                retired_at timestamptz,
+                UNIQUE (restore_incarnation, shard_id),
+                CHECK ((state = 'active') = (retired_at IS NULL))
+            );
+            CREATE TABLE pgshard_catalog.slot_sync_probes (
+                probe_generation uuid PRIMARY KEY
+                    CHECK (probe_generation <> '00000000-0000-0000-0000-000000000000'::uuid),
+                shard_id pgshard_catalog.resource_name NOT NULL
+                    REFERENCES pgshard_catalog.shards(shard_id) ON DELETE RESTRICT,
+                restore_incarnation uuid NOT NULL
+                    CHECK (restore_incarnation <> '00000000-0000-0000-0000-000000000000'::uuid),
+                system_identifier numeric(20, 0) NOT NULL
+                    CHECK (system_identifier BETWEEN 1 AND 18446744073709551615),
+                database_oid bigint NOT NULL CHECK (database_oid BETWEEN 1 AND 4294967295),
+                database_name pgshard_catalog.sql_identifier NOT NULL,
+                source_timeline bigint NOT NULL CHECK (source_timeline BETWEEN 1 AND 4294967295),
+                slot_name pgshard_catalog.replication_slot_name NOT NULL,
+                consistent_point pg_lsn,
+                state text NOT NULL DEFAULT 'allocated'
+                    CHECK (state IN ('allocated', 'active', 'retiring', 'retired')),
+                created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+                activated_at timestamptz,
+                retiring_at timestamptz,
+                retired_at timestamptz,
+                UNIQUE (shard_id, slot_name),
+                FOREIGN KEY (restore_incarnation, shard_id)
+                    REFERENCES pgshard_catalog.shard_restore_incarnations(
+                        restore_incarnation,
+                        shard_id
+                    ) ON DELETE RESTRICT,
+                CHECK (right(slot_name::text, 32) = replace(probe_generation::text, '-', '')),
+                CHECK (consistent_point IS NULL OR consistent_point > '0/0'),
+                CHECK (
+                    (
+                        state = 'allocated'
+                        AND consistent_point IS NULL
+                        AND activated_at IS NULL
+                        AND retiring_at IS NULL
+                        AND retired_at IS NULL
+                    ) OR (
+                        state = 'active'
+                        AND consistent_point IS NOT NULL
+                        AND activated_at IS NOT NULL
+                        AND retiring_at IS NULL
+                        AND retired_at IS NULL
+                    ) OR (
+                        state = 'retiring'
+                        AND retiring_at IS NOT NULL
+                        AND retired_at IS NULL
+                        AND (
+                            (consistent_point IS NULL AND activated_at IS NULL)
+                            OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
+                        )
+                    ) OR (
+                        state = 'retired'
+                        AND retiring_at IS NOT NULL
+                        AND retired_at IS NOT NULL
+                        AND (
+                            (consistent_point IS NULL AND activated_at IS NULL)
+                            OR (consistent_point IS NOT NULL AND activated_at IS NOT NULL)
+                        )
+                    )
+                )
+            );
+            INSERT INTO pgshard_catalog.shards(shard_id, shard_number)
+            VALUES ('legacy-shard', 4000000000);
+            INSERT INTO pgshard_catalog.shard_restore_incarnations(
+                restore_incarnation,
+                shard_id
+            ) VALUES (
+                '10000000-0000-0000-0000-000000000001',
+                'legacy-shard'
+            );
+            INSERT INTO pgshard_catalog.slot_sync_probes(
+                probe_generation,
+                shard_id,
+                restore_incarnation,
+                system_identifier,
+                database_oid,
+                database_name,
+                source_timeline,
+                slot_name
+            ) VALUES (
+                '20000000-0000-0000-0000-000000000001',
+                'legacy-shard',
+                '10000000-0000-0000-0000-000000000001',
+                1,
+                1,
+                'shardschema',
+                1,
+                'legacy_probe_20000000000000000000000000000001'
+            );
+            INSERT INTO pgshard_catalog.slot_sync_probes(
+                probe_generation,
+                shard_id,
+                restore_incarnation,
+                system_identifier,
+                database_oid,
+                database_name,
+                source_timeline,
+                slot_name,
+                consistent_point,
+                state,
+                activated_at
+            ) VALUES (
+                '20000000-0000-0000-0000-000000000002',
+                'legacy-shard',
+                '10000000-0000-0000-0000-000000000001',
+                1,
+                1,
+                'shardschema',
+                1,
+                'legacy_probe_20000000000000000000000000000002',
+                '0/10',
+                'active',
+                statement_timestamp()
+            );
+            COMMIT;
+            ";
+
+async fn install_pre_receipt_probe_schema(client: &Client) -> TestResult {
+    client.batch_execute(PRE_RECEIPT_PROBE_SCHEMA_SQL).await?;
+    Ok(())
+}
+
+async fn assert_pre_receipt_probe_upgrade(client: &Client) -> TestResult {
+    install_pre_receipt_probe_schema(client).await?;
+    let blocked = client
+        .batch_execute(pgshard_catalog::MIGRATION_SQL)
+        .await
+        .expect_err("a receiptless active probe must block the forward migration");
+    assert_eq!(
+        blocked.code().map(tokio_postgres::error::SqlState::code),
+        Some("55000")
+    );
+    assert_eq!(
+        blocked
+            .as_db_error()
+            .map(tokio_postgres::error::DbError::message),
+        Some("receiptless live slot-sync probes block catalog upgrade")
+    );
+    client.batch_execute("ROLLBACK").await?;
+
+    client
+        .batch_execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+                SET state = 'retired', \
+                    retiring_at = statement_timestamp(), \
+                    retired_at = statement_timestamp() \
+              WHERE state = 'active'",
+        )
+        .await?;
     client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
+
+    let rows = client
+        .query(
+            "SELECT state, creation_receipt_id::text, cleanup_receipt_id::text \
+               FROM pgshard_catalog.slot_sync_probes \
+              WHERE shard_id = 'legacy-shard' \
+              ORDER BY state",
+            &[],
+        )
+        .await?;
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let state: String = row.try_get(0)?;
+        assert!(matches!(state.as_str(), "allocated" | "retired"));
+        assert_eq!(row.try_get::<_, Option<String>>(1)?, None);
+        assert_eq!(row.try_get::<_, Option<String>>(2)?, None);
+    }
+    let validated_constraints: i64 = client
+        .query_one(
+            "SELECT count(*) \
+               FROM pg_catalog.pg_constraint \
+              WHERE conrelid = 'pgshard_catalog.slot_sync_probes'::regclass \
+                AND conname IN ( \
+                    'slot_sync_probes_receipt_ids_nonzero', \
+                    'slot_sync_probes_receipt_lifecycle' \
+                ) \
+                AND convalidated",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    assert_eq!(validated_constraints, 2);
+    Ok(())
+}
+
+async fn assert_installation_contract(client: &Client) -> TestResult {
+    assert_pre_receipt_probe_upgrade(client).await?;
     let epoch_after_first_migration = catalog_epoch(client).await?;
     client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
     assert_eq!(
