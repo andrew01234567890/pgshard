@@ -101,6 +101,24 @@ const OBSERVE_SLOTS_SQL: &str = "\
      WHERE slot_name::pg_catalog.text OPERATOR(pg_catalog.=) \
            ANY($1::pg_catalog.text[]) \
      ORDER BY slot_name";
+const OBSERVE_SLOT_SYNC_WORKER_SQL: &str = "\
+    SELECT pg_catalog.pg_has_role( \
+               current_user, 'pg_read_all_stats', 'USAGE' \
+           ) AS has_read_all_stats, \
+           slotsync.pid::pg_catalog.int4 AS slotsync_pid, \
+           pg_catalog.floor( \
+               pg_catalog.date_part('epoch', slotsync.backend_start) * 1000000 \
+           )::pg_catalog.int8 AS slotsync_backend_start_epoch_micros, \
+           slotsync.wait_event_type::pg_catalog.text AS slotsync_wait_event_type, \
+           slotsync.wait_event::pg_catalog.text AS slotsync_wait_event \
+      FROM (VALUES (true)) AS singleton(only_row) \
+      LEFT JOIN LATERAL ( \
+            SELECT activity.pid, activity.backend_start, \
+                   activity.wait_event_type, activity.wait_event \
+              FROM pg_catalog.pg_stat_get_activity(NULL) AS activity \
+             WHERE activity.backend_type OPERATOR(pg_catalog.=) 'slotsync worker' \
+             LIMIT 2 \
+      ) AS slotsync ON singleton.only_row";
 const OBSERVE_PRIMARY_REPLICATION_SQL: &str = "\
     SELECT control.system_identifier::pg_catalog.int8, \
            checkpoint_control.timeline_id, \
@@ -673,8 +691,10 @@ impl LogicalSlotSnapshotEntry {
 /// One bounded, non-atomic local `PostgreSQL` logical-slot observation batch.
 ///
 /// `pg_replication_slots` copies different slots while holding their individual
-/// mutexes, not under one cross-slot lock. The interval conservatively brackets
-/// the catalog query, but entries are not a point-in-time snapshot. A future
+/// mutexes, not under one cross-slot lock. Separate monotonic intervals bracket
+/// the prerequisite, slot, and post-slot worker queries. Matching worker
+/// identities prove only that one local process generation surrounded the slot
+/// query; entries are not a point-in-time snapshot. A future
 /// mutating reconciler must collect a fresh batch after exclusive acquisition
 /// and recheck every invariant before authorizing use.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -686,6 +706,9 @@ pub struct LocalLogicalSlotObservationBatch {
     prerequisites: LocalStandbyPrerequisiteObservation,
     slot_collection_started_at: Instant,
     slot_collection_finished_at: Instant,
+    post_worker_collection_started_at: Instant,
+    post_worker_collection_finished_at: Instant,
+    post_slot_sync_worker: Option<LocalSlotSyncWorkerObservation>,
     entries: Vec<LogicalSlotSnapshotEntry>,
 }
 
@@ -842,6 +865,29 @@ impl LocalLogicalSlotObservationBatch {
         self.slot_collection_finished_at
     }
 
+    /// Returns the local monotonic instant before the post-slot worker query.
+    #[must_use]
+    pub const fn post_worker_collection_started_at(&self) -> Instant {
+        self.post_worker_collection_started_at
+    }
+
+    /// Returns the local monotonic instant after the post-slot worker query.
+    #[must_use]
+    pub const fn post_worker_collection_finished_at(&self) -> Instant {
+        self.post_worker_collection_finished_at
+    }
+
+    /// Returns the slot-sync worker observed immediately after the slot query.
+    ///
+    /// When either side reports a worker, the observer accepts the batch only
+    /// if both samples carry the same PID and backend-start identity. The
+    /// server-wall-clock start value is an equality token, not a freshness
+    /// timestamp.
+    #[must_use]
+    pub const fn post_slot_sync_worker(&self) -> Option<LocalSlotSyncWorkerObservation> {
+        self.post_slot_sync_worker
+    }
+
     /// Returns entries in exact request order, including missing slots.
     #[must_use]
     pub fn entries(&self) -> &[LogicalSlotSnapshotEntry] {
@@ -913,8 +959,9 @@ impl Drop for ConnectionTask {
 /// # Errors
 ///
 /// Returns an error on timeout, SQL or typed-row failure, `PostgreSQL` older than
-/// 18, non-UTF8 encoding, malformed built-in state, a physical slot occupying
-/// a requested logical name, or a result outside the exact request set.
+/// 18, non-UTF8 encoding, missing statistics privilege, malformed built-in
+/// state, a slot-sync worker generation change, a physical slot occupying a
+/// requested logical name, or a result outside the exact request set.
 pub async fn observe_local_logical_slots<S, T>(
     client: Client,
     connection: Connection<S, T>,
@@ -1090,6 +1137,12 @@ async fn observe_before(
     let slot_collection_started_at = Instant::now();
     let rows = client.query(OBSERVE_SLOTS_SQL, &[&names]).await?;
     let slot_collection_finished_at = Instant::now();
+    set_statement_timeout(&client, deadline).await?;
+    let post_worker_collection_started_at = Instant::now();
+    let post_worker_row = client.query_one(OBSERVE_SLOT_SYNC_WORKER_SQL, &[]).await?;
+    let post_worker_collection_finished_at = Instant::now();
+    let post_slot_sync_worker = parse_slot_sync_worker_row(&post_worker_row)?;
+    validate_slot_sync_worker_window(prerequisites.slot_sync_worker(), post_slot_sync_worker)?;
     let mut observations = vec![None; request.targets.len()];
     for row in rows {
         let name: String = row.try_get("slot_name")?;
@@ -1124,6 +1177,9 @@ async fn observe_before(
         prerequisites,
         slot_collection_started_at,
         slot_collection_finished_at,
+        post_worker_collection_started_at,
+        post_worker_collection_finished_at,
+        post_slot_sync_worker,
         entries,
     })
 }
@@ -1352,15 +1408,7 @@ fn parse_prerequisites(
         receiver_slot_name,
         receiver_timeline,
     )?;
-    if !row.try_get::<_, bool>(14)? {
-        return Err(LocalSlotObservationError::StatisticsPrivilegeRequired);
-    }
-    let slot_sync_worker = parse_slot_sync_worker(
-        row.try_get(15)?,
-        row.try_get(16)?,
-        row.try_get::<_, Option<String>>(17)?.as_deref(),
-        row.try_get::<_, Option<String>>(18)?.as_deref(),
-    )?;
+    let slot_sync_worker = parse_slot_sync_worker_row(row)?;
 
     Ok(LocalStandbyPrerequisiteObservation {
         system_identifier,
@@ -1379,6 +1427,22 @@ fn parse_prerequisites(
         wal_receiver_received_timeline,
         slot_sync_worker,
     })
+}
+
+fn parse_slot_sync_worker_row(
+    row: &Row,
+) -> Result<Option<LocalSlotSyncWorkerObservation>, LocalSlotObservationError> {
+    if !row.try_get::<_, bool>("has_read_all_stats")? {
+        return Err(LocalSlotObservationError::StatisticsPrivilegeRequired);
+    }
+    parse_slot_sync_worker(
+        row.try_get("slotsync_pid")?,
+        row.try_get("slotsync_backend_start_epoch_micros")?,
+        row.try_get::<_, Option<String>>("slotsync_wait_event_type")?
+            .as_deref(),
+        row.try_get::<_, Option<String>>("slotsync_wait_event")?
+            .as_deref(),
+    )
 }
 
 fn parse_system_identifier(value: i64) -> Result<u64, LocalSlotObservationError> {
@@ -1524,6 +1588,19 @@ fn parse_slot_sync_worker(
         },
         activity,
     }))
+}
+
+fn validate_slot_sync_worker_window(
+    before: Option<LocalSlotSyncWorkerObservation>,
+    after: Option<LocalSlotSyncWorkerObservation>,
+) -> Result<(), LocalSlotObservationError> {
+    if before.map(LocalSlotSyncWorkerObservation::identity)
+        == after.map(LocalSlotSyncWorkerObservation::identity)
+    {
+        Ok(())
+    } else {
+        Err(LocalSlotObservationError::SlotSyncWorkerChanged)
+    }
 }
 
 const fn setting_state(enabled: bool) -> SettingState {
@@ -1935,6 +2012,9 @@ pub enum LocalSlotObservationError {
     /// `PostgreSQL` returned a partial slot-sync worker identity or wait event.
     #[error("PostgreSQL slot-sync worker details are internally inconsistent")]
     InconsistentSlotSyncWorker,
+    /// The slot-sync worker started, exited, or restarted across the slot query.
+    #[error("PostgreSQL slot-sync worker changed during logical-slot observation")]
+    SlotSyncWorkerChanged,
     /// The requested physical slot name is occupied by another slot kind.
     #[error("requested physical replication slot name {0:?} is occupied by a non-physical slot")]
     PhysicalSlotNameCollision(String),
@@ -2428,6 +2508,47 @@ mod tests {
                     inconsistent.3,
                 ),
                 Err(LocalSlotObservationError::InconsistentSlotSyncWorker)
+            ));
+        }
+    }
+
+    #[test]
+    fn slot_snapshot_requires_one_stable_worker_generation() {
+        let waiting = parse_slot_sync_worker(
+            Some(42),
+            Some(1_700_000_000_123_456),
+            Some("Activity"),
+            Some("ReplicationSlotsyncMain"),
+        )
+        .expect("waiting worker");
+        let running = parse_slot_sync_worker(Some(42), Some(1_700_000_000_123_456), None, None)
+            .expect("same running worker");
+        let same_pid_restarted = parse_slot_sync_worker(
+            Some(42),
+            Some(1_700_000_000_123_457),
+            Some("Activity"),
+            Some("ReplicationSlotsyncMain"),
+        )
+        .expect("replacement worker");
+        let pid_reused_start = parse_slot_sync_worker(
+            Some(43),
+            Some(1_700_000_000_123_456),
+            Some("Activity"),
+            Some("ReplicationSlotsyncMain"),
+        )
+        .expect("replacement worker with reused start token");
+
+        assert!(validate_slot_sync_worker_window(None, None).is_ok());
+        assert!(validate_slot_sync_worker_window(running, waiting).is_ok());
+        for changed in [
+            (None, waiting),
+            (waiting, None),
+            (waiting, same_pid_restarted),
+            (waiting, pid_reused_start),
+        ] {
+            assert!(matches!(
+                validate_slot_sync_worker_window(changed.0, changed.1),
+                Err(LocalSlotObservationError::SlotSyncWorkerChanged)
             ));
         }
     }

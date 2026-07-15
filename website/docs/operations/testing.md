@@ -141,7 +141,9 @@ ownership remain future work.
 A lower-level correlation suite independently mutates every sampled path class.
 It accepts an unproven non-temporary physical slot only as raw evidence and
 rejects reversed or stale collection windows; database, source, role, WAL-level,
-feedback, slot-sync, replay-floor coverage, receiver, gate, physical-slot,
+feedback, slot-sync, a missing or changed before/after worker generation, a
+post-query worker outside its completed-cycle wait, replay-floor coverage,
+receiver, gate, physical-slot,
 retention, invalidation, PID, application-name, activity, and peer-reply
 mismatches. It independently mutates both failover-anchor endpoints and rejects
 an absent or misidentified row, wrong database/plugin/flags, temporary state,
@@ -189,7 +191,7 @@ built-in state, records the non-atomic collection interval, treats every
 non-temporary public-view row's persistence as unproven, and reports ownership
 as unknown; this is local catalog observation, not a multi-server eligibility
 proof or creation attestation. The same consumed connection also brackets a
-preceding PostgreSQL 18 prerequisite query. The live primary fixture verifies
+preceding PostgreSQL 18 prerequisite query and a following worker query. The live primary fixture verifies
 its control-file system identifier and checkpoint timeline, writable role,
 logical WAL level, enabled feedback and slot-sync settings, exact one-second
 receiver interval, configured test physical-slot name, absent replay position,
@@ -203,8 +205,10 @@ mandatory feedback, and continuous slot synchronization. The test waits past
 PostgreSQL's temporary synchronized-slot state for a
 non-temporary synchronized copy and observes the local slot-sync worker at its
 post-cycle `ReplicationSlotsyncMain` wait boundary with a nonzero PID and
-backend-start identity. That identity is compared only for equality; it does
-not turn the server wall clock into a freshness source. A primary login without
+backend-start identity. The slot query is bracketed by before/after samples of
+that same process generation, and the complete local monotonic order is checked.
+That identity is compared only for equality; it does not turn the server wall
+clock into a freshness source or date the completed cycle. A primary login without
 effective `pg_read_all_stats` privileges is rejected before redacted
 auxiliary-worker rows can be classified as absent. The fixture grants that role
 with `INHERIT FALSE`, proving that membership alone is insufficient. On the
