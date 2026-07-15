@@ -68,10 +68,46 @@ through commit. Only a statement cancellation followed by completed rollback
 retains the connection for retry. A hard client deadline or transaction timeout
 makes the reader terminal and requires a fresh connection. It does not
 select a member, observe or mutate PostgreSQL slots, or authorize a connection.
-No PostgreSQL Pod consumes the profiles, and secure `primary_conninfo`,
-connection-owned multi-server collection and post-acquisition rechecks, slot
-creation or mutation, role activation, quarantined attachment, and stream
-ownership remain unimplemented.
+A separate bounded Rust primitive now consumes a dedicated PostgreSQL 18
+connection to create either a persistent `pgoutput` primary failover anchor or
+standby-local decoder with two-phase decoding enabled. It requires an absent
+generation-qualified name, checks the observable system/timeline/database
+source, recovery role and logical WAL before dispatch. Standby creation must
+consume a still-fresh proof from the multi-server correlator. The mutator then
+rechecks the expected `primary_slot_name`, live receiver PID, receiver slot and
+timeline, positive bounded feedback interval, `hot_standby_feedback=on`,
+`sync_replication_slots=on`, and the same slot-sync-worker generation before
+and after dispatch. Proof expiry bounds the entire create preflight, including
+preparation of the CREATE statement; freshness and the absolute operation
+deadline are checked again immediately before that prepared statement is
+enqueued. DROP is likewise prepared before its receipt-returning preflight
+completes, so statement preparation is never misclassified as a dispatched
+effect. It pins an empty `search_path` without
+resetting the caller's effective role or advisory-lock fence, rejects callers
+with more than 16 advisory-lock rows, verifies the bounded fence remains
+unchanged, and checks the exact inactive, non-temporary slot row and create LSN
+before returning a process-local receipt.
+
+Only that receipt can request bounded deletion; deletion rechecks the exact
+endpoint source identity and recovery role plus the inactive plugin, database,
+slot role, two-phase boundary and non-regressed progress bound into the receipt.
+Cleanup deliberately does not require creation-only WAL-level, receiver,
+physical-slot, feedback, interval, or slot-sync-worker health. An already
+absent name is idempotent. A failure before drop dispatch returns the sole
+receipt for another bounded attempt. Every timeout, connection failure or
+other error after create/drop dispatch is explicitly outcome-unknown because
+PostgreSQL can persist the effect before its response reaches the client. The
+API never treats that error as permission for a blind retry.
+
+The receipt is not a durable mutation ledger or a live lease. PostgreSQL cannot
+observe the catalog's restore-incarnation UUID or epoch, so the current
+primitive does not independently prove those components or authorize use after
+a restore, failover, process restart or concurrent external mutation. No
+PostgreSQL Pod consumes the profiles, and secure `primary_conninfo`, durable
+catalog-bound mutation history, outcome-unknown reconciliation,
+connection-owned multi-server collection and post-acquisition rechecks, role
+activation, quarantined attachment, slot advancement, and stream ownership
+remain unimplemented.
 
 The source also contains a fixed-size PostgreSQL 18 Standby Status Update
 encoder. It validates that neither flush nor apply is ahead of write but does
@@ -253,8 +289,11 @@ PostgreSQL observation. Exact live replay, upstream identity and network
 adjacency, feedback freshness, catalog-horizon coverage,
 physical-slot lifecycle persistence, source-bound slot-sync-cycle evidence,
 logical-slot ownership, server-attested generation, mutation-history
-attestation beyond a cataloged probe allocation, and every create,
-advance, acquire, or drop action remain future reconciliation work.
+attestation beyond a cataloged probe allocation, slot advancement and
+acquisition, and durable reconciliation remain future work. The separate local
+mutation primitive can create and receipt-authorized-drop exact slots, but its
+process-local receipt is deliberately not promoted to durable lifecycle proof
+by this observer.
 
 Each checkpoint generation is immutably bound to its shard restore incarnation,
 PostgreSQL system identifier, database OID, and source timeline. Physical
@@ -298,7 +337,9 @@ including after retirement. Mutations serialize on the versioned catalog epoch;
 a stale concurrent `REPEATABLE READ` allocator fails with `40001` before it can
 validate against an older view of the other slot class. It deliberately does not
 claim the PostgreSQL slot exists: the mutating reconciler and source-bound
-challenge are not implemented yet.
+challenge are not implemented yet. The local create/drop primitive is not wired
+to this catalog lifecycle and cannot turn a probe row into durable mutation
+attestation by itself.
 
 The operator automatically synchronizes each primary anchor to eligible direct
 standbys for promotion safety. Standby-local slots are independent and
