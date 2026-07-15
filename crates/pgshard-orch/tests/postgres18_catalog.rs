@@ -187,12 +187,11 @@ async fn allocate_active_slots(
             )
             .await?;
         client
-            .execute(
-                "UPDATE pgshard_catalog.managed_replication_slots \
-                    SET state = 'active', consistent_point = '0/10', \
-                        two_phase_at = '0/10', activated_at = statement_timestamp() \
-                  WHERE slot_generation = $1::text::uuid",
-                &[&generation.to_string()],
+            .query_one(
+                "SELECT pgshard_catalog.activate_managed_replication_slot( \
+                            $1::text::uuid, $2::text::uuid, '0/10', '0/10' \
+                        )",
+                &[&generation.to_string(), &creation_receipt_id.to_string()],
             )
             .await?;
     }

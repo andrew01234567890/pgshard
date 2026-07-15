@@ -551,13 +551,18 @@ async fn assert_pre_receipt_probe_upgrade(client: &Client) -> TestResult {
               WHERE state = 'active'",
         )
         .await?;
-    client
-        .batch_execute(
-            "UPDATE pgshard_catalog.slot_sync_probes \
-                SET state = 'retired', retired_at = statement_timestamp() \
+    let retiring_generations = client
+        .query(
+            "SELECT probe_generation::text \
+               FROM pgshard_catalog.slot_sync_probes \
               WHERE state = 'retiring'",
+            &[],
         )
         .await?;
+    for row in retiring_generations {
+        let generation = Uuid::parse_str(&row.try_get::<_, String>(0)?)?;
+        complete_slot_sync_probe_retirement(client, generation).await?;
+    }
     client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
 
     let rows = client
@@ -738,6 +743,50 @@ async fn insert_slot_sync_probe(
         .await
 }
 
+async fn complete_slot_sync_probe_retirement<C>(
+    client: &C,
+    probe_generation: Uuid,
+) -> Result<u64, PgError>
+where
+    C: GenericClient + Sync,
+{
+    let slot_name: String = client
+        .query_one(
+            "SELECT slot_name::text FROM pgshard_catalog.slot_sync_probes \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe_generation.to_string()],
+        )
+        .await?
+        .get(0);
+    client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_lock( \
+                        pg_catalog.hashtextextended($1::text, $2::bigint) \
+                    )",
+            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?;
+    let retirement = client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid AND state = 'retiring'",
+            &[&probe_generation.to_string()],
+        )
+        .await;
+    let released: bool = client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_unlock( \
+                        pg_catalog.hashtextextended($1::text, $2::bigint) \
+                    )",
+            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?
+        .get(0);
+    assert!(released, "test fixture must release its target fence");
+    retirement
+}
+
 async fn begin_managed_slot_creation_attempt<C>(
     client: &C,
     slot_generation: Uuid,
@@ -781,6 +830,84 @@ where
             ],
         )
         .await?;
+    Ok(())
+}
+
+async fn activate_managed_replication_slot<C>(
+    client: &C,
+    slot_generation: Uuid,
+    creation_receipt_id: Uuid,
+    consistent_point: &str,
+    two_phase_at: &str,
+) -> Result<(), PgError>
+where
+    C: GenericClient + Sync,
+{
+    client
+        .query_one(
+            "SELECT pgshard_catalog.activate_managed_replication_slot( \
+                        $1::text::uuid, $2::text::uuid, \
+                        $3::text::pg_lsn, $4::text::pg_lsn \
+                    )",
+            &[
+                &slot_generation.to_string(),
+                &creation_receipt_id.to_string(),
+                &consistent_point,
+                &two_phase_at,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn complete_managed_replication_slot_retirement<C>(
+    client: &C,
+    slot_generation: Uuid,
+    creation_receipt_id: Uuid,
+) -> Result<(), PgError>
+where
+    C: GenericClient + Sync,
+{
+    let slot_name: String = client
+        .query_one(
+            "SELECT slot_name::text \
+               FROM pgshard_catalog.managed_replication_slots \
+              WHERE slot_generation = $1::text::uuid",
+            &[&slot_generation.to_string()],
+        )
+        .await?
+        .get(0);
+    client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_lock( \
+                        pg_catalog.hashtextextended($1::text, $2::bigint) \
+                    )",
+            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?;
+    let retirement = client
+        .query_one(
+            "SELECT pgshard_catalog.complete_managed_replication_slot_retirement( \
+                        $1::text::uuid, $2::text, $3::text::uuid \
+                    )",
+            &[
+                &slot_generation.to_string(),
+                &slot_name,
+                &creation_receipt_id.to_string(),
+            ],
+        )
+        .await;
+    let released: bool = client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_unlock( \
+                        pg_catalog.hashtextextended($1::text, $2::bigint) \
+                    )",
+            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?
+        .get(0);
+    assert!(released, "test fixture must release its target fence");
+    retirement?;
     Ok(())
 }
 
@@ -1029,14 +1156,7 @@ async fn assert_slot_sync_probe_retirement(
     .await
     .expect_err("cleanup must finish before a replacement probe is allocated");
     assert_sqlstate(&error, "23505");
-    client
-        .execute(
-            "UPDATE pgshard_catalog.slot_sync_probes \
-             SET state = 'retired', retired_at = statement_timestamp() \
-             WHERE probe_generation = $1::text::uuid",
-            &[&probe.generation.to_string()],
-        )
-        .await?;
+    complete_slot_sync_probe_retirement(client, probe.generation).await?;
     let error = client
         .execute(
             "DELETE FROM pgshard_catalog.slot_sync_probes \
@@ -1074,14 +1194,7 @@ async fn assert_slot_sync_probe_retirement(
             &[&probe.replacement_generation.to_string()],
         )
         .await?;
-    client
-        .execute(
-            "UPDATE pgshard_catalog.slot_sync_probes \
-             SET state = 'retired', retired_at = statement_timestamp() \
-             WHERE probe_generation = $1::text::uuid",
-            &[&probe.replacement_generation.to_string()],
-        )
-        .await?;
+    complete_slot_sync_probe_retirement(client, probe.replacement_generation).await?;
     Ok(())
 }
 
@@ -1212,6 +1325,30 @@ async fn assert_admin_privilege_contract(client: &mut Client) -> TestResult {
     transaction
         .batch_execute("SET LOCAL ROLE pgshard_catalog_admin")
         .await?;
+    transaction
+        .batch_execute("SAVEPOINT hidden_creation_attempt_ledger")
+        .await?;
+    let error = transaction
+        .query_one(
+            "SELECT count(*) FROM pgshard_catalog.managed_slot_creation_attempts",
+            &[],
+        )
+        .await
+        .expect_err("catalog roles must not read managed-slot capability receipts");
+    assert_sqlstate(&error, "42501");
+    transaction
+        .batch_execute("ROLLBACK TO SAVEPOINT hidden_creation_attempt_ledger")
+        .await?;
+    let unknown_receipt_state: Option<String> = transaction
+        .query_one(
+            "SELECT pgshard_catalog.managed_slot_creation_attempt_state( \
+                        $1::text::uuid, 'unknown_slot', $2::text::uuid \
+                    )",
+            &[&Uuid::new_v4().to_string(), &Uuid::new_v4().to_string()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(unknown_receipt_state, None);
     transaction
         .execute(
             "INSERT INTO pgshard_catalog.logical_databases(database_name) VALUES ($1::text)",
@@ -1390,14 +1527,7 @@ async fn assert_admin_slot_sync_probe_write_path(
             &[&probe_generation.to_string()],
         )
         .await?;
-    transaction
-        .execute(
-            "UPDATE pgshard_catalog.slot_sync_probes \
-             SET state = 'retired', retired_at = statement_timestamp() \
-             WHERE probe_generation = $1::text::uuid",
-            &[&probe_generation.to_string()],
-        )
-        .await?;
+    complete_slot_sync_probe_retirement(transaction, probe_generation).await?;
     Ok(())
 }
 
@@ -1500,15 +1630,9 @@ async fn assert_admin_checkpoint_write_path(
     attachment_generation: &str,
     slot_generation: Uuid,
 ) -> TestResult {
-    begin_managed_slot_creation_attempt(transaction, slot_generation, Uuid::new_v4()).await?;
-    transaction
-        .execute(
-            "UPDATE pgshard_catalog.managed_replication_slots \
-             SET state = 'active', consistent_point = '0/1', two_phase_at = '0/1', \
-                 activated_at = statement_timestamp() \
-             WHERE slot_generation = $1::text::uuid",
-            &[&slot_generation.to_string()],
-        )
+    let receipt_id = Uuid::new_v4();
+    begin_managed_slot_creation_attempt(transaction, slot_generation, receipt_id).await?;
+    activate_managed_replication_slot(transaction, slot_generation, receipt_id, "0/1", "0/1")
         .await?;
     transaction
         .execute(
@@ -1673,7 +1797,9 @@ struct ConsumerRegistryFixture {
     attachment_generation: String,
     selected_member_ordinal: i32,
     anchor_generation: Uuid,
+    anchor_receipt_id: Uuid,
     decoder_generation: Uuid,
+    decoder_receipt_id: Uuid,
     decoder_name: String,
 }
 
@@ -1824,7 +1950,9 @@ async fn create_consumer_registry_fixture(
         attachment_generation,
         selected_member_ordinal,
         anchor_generation,
+        anchor_receipt_id: fixture_uuid(shard.nonce, 40),
         decoder_generation,
+        decoder_receipt_id: fixture_uuid(shard.nonce, 41),
         decoder_name: format!("decoder_{}", decoder_generation.simple()),
     })
 }
@@ -2027,8 +2155,90 @@ async fn assert_pending_consumer_creation_fences(
     let generation = consumer.anchor_generation;
     let slot_name = format!("anchor_{}", generation.simple());
     let receipt_id = Uuid::new_v4();
-    begin_managed_slot_creation_attempt(observer, generation, receipt_id).await?;
 
+    assert_old_snapshot_cannot_miss_pending_attempt(database_url, observer, generation, receipt_id)
+        .await?;
+    assert_pending_attempt_respects_target_fence(
+        observer,
+        database_url,
+        shard,
+        consumer,
+        generation,
+        &slot_name,
+    )
+    .await?;
+    assert_direct_pending_consumer_lifecycle_rejected(observer, generation).await?;
+    assert_pending_attempt_blocks_parent_changes(observer, shard, consumer).await?;
+
+    for _ in 0..2 {
+        observer
+            .query_one(
+                "SELECT pgshard_catalog.abandon_managed_slot_creation_attempt( \
+                            $1::text::uuid, $2::text, $3::text::uuid \
+                        )",
+                &[&generation.to_string(), &slot_name, &receipt_id.to_string()],
+            )
+            .await?;
+    }
+    let attempt_state: String = observer
+        .query_one(
+            "SELECT state FROM pgshard_catalog.managed_slot_creation_attempts \
+              WHERE creation_receipt_id = $1::text::uuid",
+            &[&receipt_id.to_string()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(attempt_state, "abandoned");
+    Ok(())
+}
+
+async fn assert_old_snapshot_cannot_miss_pending_attempt(
+    database_url: &str,
+    observer: &Client,
+    generation: Uuid,
+    receipt_id: Uuid,
+) -> TestResult {
+    let (mut stale_client, stale_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let stale_connection_task = tokio::spawn(stale_connection);
+    let stale_transaction = stale_client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    stale_transaction
+        .batch_execute("SET LOCAL ROLE pgshard_catalog_admin")
+        .await?;
+    stale_transaction
+        .query_one(
+            "SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton",
+            &[],
+        )
+        .await?;
+
+    begin_managed_slot_creation_attempt(observer, generation, receipt_id).await?;
+    let stale_error = stale_transaction
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots SET state = state \
+             WHERE slot_generation = $1::text::uuid",
+            &[&generation.to_string()],
+        )
+        .await
+        .expect_err("an older snapshot cannot miss a newly pending creation attempt");
+    assert_sqlstate(&stale_error, "40001");
+    stale_transaction.rollback().await?;
+    drop(stale_client);
+    tokio::time::timeout(Duration::from_secs(5), stale_connection_task).await???;
+    Ok(())
+}
+
+async fn assert_pending_attempt_respects_target_fence(
+    observer: &Client,
+    database_url: &str,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+    generation: Uuid,
+    slot_name: &str,
+) -> TestResult {
     let (holder, holder_connection) = tokio_postgres::connect(database_url, NoTls).await?;
     let holder_connection = tokio::spawn(holder_connection);
     holder
@@ -2055,34 +2265,43 @@ async fn assert_pending_consumer_creation_fences(
         .await?;
 
     assert_target_fence_blocks_catalog_writes(observer, shard, consumer, generation).await?;
-    release_target_fence(holder, holder_connection, &slot_name).await?;
-    assert_pending_attempt_blocks_parent_changes(observer, shard, consumer).await?;
+    release_target_fence(holder, holder_connection, slot_name).await?;
+    Ok(())
+}
 
-    observer
-        .query_one(
-            "SELECT pgshard_catalog.abandon_managed_slot_creation_attempt( \
-                        $1::text::uuid, $2::text, $3::text::uuid \
-                    )",
-            &[&generation.to_string(), &slot_name, &receipt_id.to_string()],
+async fn assert_direct_pending_consumer_lifecycle_rejected(
+    observer: &Client,
+    generation: Uuid,
+) -> TestResult {
+    let activation_error = observer
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+                SET state = 'active', consistent_point = '0/10', two_phase_at = '0/10', \
+                    activated_at = statement_timestamp() \
+              WHERE slot_generation = $1::text::uuid",
+            &[&generation.to_string()],
         )
-        .await?;
-    observer
-        .query_one(
-            "SELECT pgshard_catalog.abandon_managed_slot_creation_attempt( \
-                        $1::text::uuid, $2::text, $3::text::uuid \
-                    )",
-            &[&generation.to_string(), &slot_name, &receipt_id.to_string()],
+        .await
+        .expect_err("direct DML cannot consume a pending consumer creation attempt");
+    assert_sqlstate(&activation_error, "55000");
+    assert_database_message(
+        &activation_error,
+        "managed slot activation requires its receipt-authorized creation attempt",
+    );
+    let retirement_error = observer
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+                SET state = 'retired', retired_at = statement_timestamp() \
+              WHERE slot_generation = $1::text::uuid",
+            &[&generation.to_string()],
         )
-        .await?;
-    let attempt_state: String = observer
-        .query_one(
-            "SELECT state FROM pgshard_catalog.managed_slot_creation_attempts \
-              WHERE creation_receipt_id = $1::text::uuid",
-            &[&receipt_id.to_string()],
-        )
-        .await?
-        .get(0);
-    assert_eq!(attempt_state, "abandoned");
+        .await
+        .expect_err("direct DML cannot retire an unresolved consumer creation attempt");
+    assert_sqlstate(&retirement_error, "55000");
+    assert_database_message(
+        &retirement_error,
+        "managed slot retirement requires receipt-authorized absence reconciliation",
+    );
     Ok(())
 }
 
@@ -2151,6 +2370,105 @@ async fn release_target_fence(
     );
     drop(holder);
     tokio::time::timeout(Duration::from_secs(5), holder_connection).await???;
+    Ok(())
+}
+
+async fn assert_retired_probe_history_does_not_expand_parent_fences(
+    observer: &Client,
+    database_url: &str,
+) -> TestResult {
+    const HISTORY_ROWS: usize = 64;
+    let fixture = create_fixture(observer).await?;
+    let mut first_retired_name = None;
+    for index in 0..HISTORY_ROWS {
+        let generation = Uuid::new_v4();
+        let slot_name = format!("history_{index}_{}", generation.simple());
+        insert_slot_sync_probe(
+            observer,
+            &fixture,
+            generation,
+            &fixture.restore_incarnation,
+            &slot_name,
+        )
+        .await?;
+        observer
+            .execute(
+                "UPDATE pgshard_catalog.slot_sync_probes \
+                    SET state = 'retiring', cleanup_receipt_id = gen_random_uuid(), \
+                        retiring_at = statement_timestamp() \
+                  WHERE probe_generation = $1::text::uuid",
+                &[&generation.to_string()],
+            )
+            .await?;
+        complete_slot_sync_probe_retirement(observer, generation).await?;
+        first_retired_name.get_or_insert(slot_name);
+    }
+
+    let retired_name = first_retired_name.expect("retired history is non-empty");
+    let (holder, holder_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let holder_connection = tokio::spawn(holder_connection);
+    holder
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_lock( \
+                        pg_catalog.hashtextextended($1::text, $2::bigint) \
+                    )",
+            &[&retired_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?;
+    observer
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'draining' WHERE shard_id = $1::text",
+            &[&fixture.shard_id],
+        )
+        .await?;
+    observer
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'active' WHERE shard_id = $1::text",
+            &[&fixture.shard_id],
+        )
+        .await?;
+    release_target_fence(holder, holder_connection, &retired_name).await?;
+
+    let live_generation = Uuid::new_v4();
+    let live_name = format!("history_live_{}", live_generation.simple());
+    insert_slot_sync_probe(
+        observer,
+        &fixture,
+        live_generation,
+        &fixture.restore_incarnation,
+        &live_name,
+    )
+    .await?;
+    let (holder, holder_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let holder_connection = tokio::spawn(holder_connection);
+    holder
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_lock( \
+                        pg_catalog.hashtextextended($1::text, $2::bigint) \
+                    )",
+            &[&live_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?;
+    let error = observer
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'draining' WHERE shard_id = $1::text",
+            &[&fixture.shard_id],
+        )
+        .await
+        .expect_err("a live probe target must still fence its parent lifecycle");
+    assert_sqlstate(&error, "55P03");
+    release_target_fence(holder, holder_connection, &live_name).await?;
+
+    observer
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+                SET state = 'retiring', cleanup_receipt_id = gen_random_uuid(), \
+                    retiring_at = statement_timestamp() \
+              WHERE probe_generation = $1::text::uuid",
+            &[&live_generation.to_string()],
+        )
+        .await?;
+    complete_slot_sync_probe_retirement(observer, live_generation).await?;
     Ok(())
 }
 
@@ -2502,14 +2820,21 @@ async fn retire_racing_probe(client: &Client, generation: Uuid) -> TestResult {
             &[&generation.to_string()],
         )
         .await?;
-    client
+    let error = client
         .execute(
             "UPDATE pgshard_catalog.slot_sync_probes \
              SET state = 'retired', retired_at = statement_timestamp() \
              WHERE probe_generation = $1::text::uuid",
             &[&generation.to_string()],
         )
-        .await?;
+        .await
+        .expect_err("final probe retirement cannot run without the live target fence");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "slot-sync probe final retirement requires its live target fence",
+    );
+    complete_slot_sync_probe_retirement(client, generation).await?;
     let managed_rows: i64 = client
         .query_one(
             "SELECT count(*) FROM pgshard_catalog.managed_replication_slots \
@@ -2529,6 +2854,7 @@ async fn assert_managed_slot_allocation(
     consumer: &ConsumerRegistryFixture,
 ) -> TestResult {
     assert_invalid_managed_slot_allocations(client, shard, consumer).await?;
+    assert_retired_probe_history_does_not_expand_parent_fences(client, database_url).await?;
     assert_repeatable_read_probe_lifecycle_races_are_fenced(client, database_url, shard, consumer)
         .await?;
     allocate_managed_slots(client, shard, consumer).await?;
@@ -2574,27 +2900,34 @@ async fn activate_consumer_registry_fixture(
     shard: &Fixture,
     consumer: &ConsumerRegistryFixture,
 ) -> TestResult {
-    begin_managed_slot_creation_attempt(client, consumer.anchor_generation, Uuid::new_v4()).await?;
-    begin_managed_slot_creation_attempt(client, consumer.decoder_generation, Uuid::new_v4())
-        .await?;
-    client
-        .execute(
-            "UPDATE pgshard_catalog.managed_replication_slots \
-             SET state = 'active', consistent_point = '0/30', two_phase_at = '0/30', \
-                 activated_at = statement_timestamp() \
-             WHERE slot_generation = $1::text::uuid",
-            &[&consumer.anchor_generation.to_string()],
-        )
-        .await?;
-    client
-        .execute(
-            "UPDATE pgshard_catalog.managed_replication_slots \
-             SET state = 'active', consistent_point = '0/20', two_phase_at = '0/40', \
-                 activated_at = statement_timestamp() \
-             WHERE slot_generation = $1::text::uuid",
-            &[&consumer.decoder_generation.to_string()],
-        )
-        .await?;
+    begin_managed_slot_creation_attempt(
+        client,
+        consumer.anchor_generation,
+        consumer.anchor_receipt_id,
+    )
+    .await?;
+    begin_managed_slot_creation_attempt(
+        client,
+        consumer.decoder_generation,
+        consumer.decoder_receipt_id,
+    )
+    .await?;
+    activate_managed_replication_slot(
+        client,
+        consumer.anchor_generation,
+        consumer.anchor_receipt_id,
+        "0/30",
+        "0/30",
+    )
+    .await?;
+    activate_managed_replication_slot(
+        client,
+        consumer.decoder_generation,
+        consumer.decoder_receipt_id,
+        "0/20",
+        "0/40",
+    )
+    .await?;
     client
         .execute(
             "UPDATE pgshard_catalog.logical_consumer_attachments \
@@ -2789,17 +3122,16 @@ async fn activate_snapshot_boundary_fixture(
             boundary.decoder_two_phase,
         ),
     ] {
-        begin_managed_slot_creation_attempt(transaction, generation, Uuid::new_v4()).await?;
-        transaction
-            .execute(
-                "UPDATE pgshard_catalog.managed_replication_slots \
-                 SET state = 'active', consistent_point = $2::text::pg_lsn, \
-                     two_phase_at = $3::text::pg_lsn, \
-                     activated_at = statement_timestamp() \
-                 WHERE slot_generation = $1::text::uuid",
-                &[&generation.to_string(), &consistent_point, &two_phase_at],
-            )
-            .await?;
+        let receipt_id = Uuid::new_v4();
+        begin_managed_slot_creation_attempt(transaction, generation, receipt_id).await?;
+        activate_managed_replication_slot(
+            transaction,
+            generation,
+            receipt_id,
+            consistent_point,
+            two_phase_at,
+        )
+        .await?;
     }
     transaction
         .execute(
@@ -3217,14 +3549,32 @@ async fn fence_and_retire_consumer_attachment(
             &[&consumer.attachment_generation],
         )
         .await?;
-    client
+    let error = client
         .execute(
             "UPDATE pgshard_catalog.managed_replication_slots \
              SET state = 'retired', retired_at = statement_timestamp() \
              WHERE attachment_generation = $1::text::uuid AND state = 'retiring'",
             &[&consumer.attachment_generation],
         )
-        .await?;
+        .await
+        .expect_err("direct DML cannot consume activated retirement capabilities");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "managed slot retirement requires receipt-authorized absence reconciliation",
+    );
+    complete_managed_replication_slot_retirement(
+        client,
+        consumer.anchor_generation,
+        consumer.anchor_receipt_id,
+    )
+    .await?;
+    complete_managed_replication_slot_retirement(
+        client,
+        consumer.decoder_generation,
+        consumer.decoder_receipt_id,
+    )
+    .await?;
     client
         .execute(
             "UPDATE pgshard_catalog.logical_consumer_attachments \
@@ -3286,16 +3636,9 @@ async fn assert_primary_fallback_attachment(
             ],
         )
         .await?;
-    begin_managed_slot_creation_attempt(client, slot_generation, Uuid::new_v4()).await?;
-    client
-        .execute(
-            "UPDATE pgshard_catalog.managed_replication_slots \
-             SET state = 'active', consistent_point = '0/20', two_phase_at = '0/20', \
-                 activated_at = statement_timestamp() \
-             WHERE slot_generation = $1::text::uuid",
-            &[&slot_generation.to_string()],
-        )
-        .await?;
+    let receipt_id = Uuid::new_v4();
+    begin_managed_slot_creation_attempt(client, slot_generation, receipt_id).await?;
+    activate_managed_replication_slot(client, slot_generation, receipt_id, "0/20", "0/20").await?;
     client
         .execute(
             "UPDATE pgshard_catalog.logical_consumer_attachments \
@@ -3319,14 +3662,36 @@ async fn assert_primary_fallback_attachment(
             &[&slot_generation.to_string()],
         )
         .await?;
-    client
-        .execute(
-            "UPDATE pgshard_catalog.managed_replication_slots \
-             SET state = 'retired', retired_at = statement_timestamp() \
-             WHERE slot_generation = $1::text::uuid",
-            &[&slot_generation.to_string()],
+    let slot_name = format!("anchor_{}", slot_generation.simple());
+    let error = client
+        .query_one(
+            "SELECT pgshard_catalog.complete_managed_replication_slot_retirement( \
+                        $1::text::uuid, $2::text, $3::text::uuid \
+                    )",
+            &[
+                &slot_generation.to_string(),
+                &slot_name,
+                &receipt_id.to_string(),
+            ],
         )
-        .await?;
+        .await
+        .expect_err("consumer retirement cannot outlive its absence fence");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "managed slot final retirement requires its live target fence",
+    );
+    let error =
+        complete_managed_replication_slot_retirement(client, slot_generation, Uuid::new_v4())
+            .await
+            .expect_err("consumer retirement requires its exact hidden receipt");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "managed slot retirement requires its exact creation attempt",
+    );
+    complete_managed_replication_slot_retirement(client, slot_generation, receipt_id).await?;
+    complete_managed_replication_slot_retirement(client, slot_generation, receipt_id).await?;
     client
         .execute(
             "UPDATE pgshard_catalog.logical_consumer_attachments \
@@ -3430,16 +3795,9 @@ async fn assert_mismatched_source_requires_snapshot(
             ],
         )
         .await?;
-    begin_managed_slot_creation_attempt(client, slot_generation, Uuid::new_v4()).await?;
-    client
-        .execute(
-            "UPDATE pgshard_catalog.managed_replication_slots \
-             SET state = 'active', consistent_point = '0/20', two_phase_at = '0/20', \
-                 activated_at = statement_timestamp() \
-             WHERE slot_generation = $1::text::uuid",
-            &[&slot_generation.to_string()],
-        )
-        .await?;
+    let receipt_id = Uuid::new_v4();
+    begin_managed_slot_creation_attempt(client, slot_generation, receipt_id).await?;
+    activate_managed_replication_slot(client, slot_generation, receipt_id, "0/20", "0/20").await?;
     let error = client
         .execute(
             "UPDATE pgshard_catalog.logical_consumer_attachments \
@@ -3450,14 +3808,7 @@ async fn assert_mismatched_source_requires_snapshot(
         .await
         .expect_err("a checkpoint cannot resume on a different source timeline");
     assert_sqlstate(&error, "55000");
-    client
-        .execute(
-            "UPDATE pgshard_catalog.managed_replication_slots \
-             SET state = 'retired', retired_at = statement_timestamp() \
-             WHERE slot_generation = $1::text::uuid",
-            &[&slot_generation.to_string()],
-        )
-        .await?;
+    complete_managed_replication_slot_retirement(client, slot_generation, receipt_id).await?;
     client
         .execute(
             "UPDATE pgshard_catalog.logical_consumer_attachments \

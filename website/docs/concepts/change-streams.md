@@ -105,10 +105,23 @@ other error after create/drop dispatch is explicitly outcome-unknown because
 PostgreSQL can persist the effect before its response reaches the client. The
 API never treats that error as permission for a blind retry.
 
+A successful consumer drop returns a connection-bound absence guard rather
+than a freely replayable receipt. Consumer retirement runs on that guard's
+canonical `shardschema` backend, supplies the exact hidden creation capability,
+commits the attempt and slot tombstones atomically, and verifies the same
+backend after `COMMIT`. Generic catalog DML cannot activate a pending attempt
+or retire an activated one. This keeps same-name managed creation excluded
+from the physical-absence-to-catalog-retirement interval.
+
 The process-local receipt is not a live lease. `shardschema` now keeps a
 permanent creation-attempt ledger so loss of the catalog backend before dispatch
 cannot erase the in-flight barrier. A pending attempt prevents related catalog
 lifecycle and ownership changes until it is abandoned, activated, or retired.
+Catalog reader and administrator roles cannot select that ledger; narrowly
+scoped security-definer functions reveal only whether a caller-supplied exact
+capability is in the required state. Creating an attempt also versions the
+shared catalog fence, so an older `REPEATABLE READ` lifecycle transaction fails
+with serialization error instead of missing the new pending row.
 This is not a complete post-dispatch outcome ledger: a lost response still
 requires restart recovery to reload the permanent generation and observe the
 exact server target. The canonical catalog preflight proves the
@@ -361,13 +374,17 @@ acquisition. Allocation, activation, cleanup-start, and related parent lifecycle
 writes, including direct administrative writes to managed catalog tables, use
 that same canonical lock namespace. They fail fast on a busy target rather than
 retaining the catalog-state row while queued; the Rust create path waits at
-session scope and retries while owning the key. Final probe retirement instead
-requires the typed path's live connection-bound absence fence.
+session scope and retries while owning the key. Final probe and consumer-slot
+retirement instead require the typed path's live connection-bound absence
+fence. Retired history is excluded from parent lifecycle target-lock sets, so
+permanent tombstones do not make those updates grow with historical slot count.
 Using the slot's mutation database would be unsafe because advisory locks are
 database-scoped. A successful drop returns a connection-bound absence guard,
 not a freely replayable receipt; final retirement verifies the same canonical
 catalog backend immediately before and after the catalog COMMIT, then releases
-the fence. A same-name managed creation therefore cannot enter the
+the fence. Consumer finalization additionally presents the exact opaque
+creation capability and retires that attempt in the same transaction. A
+same-name managed creation therefore cannot enter the
 absence-to-COMMIT gap, even when its mutation connection targets a different
 database. Privileged direct SQL against PostgreSQL's physical slot functions
 remains outside the boundary. The write transactions are

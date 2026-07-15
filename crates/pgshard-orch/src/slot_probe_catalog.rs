@@ -575,40 +575,55 @@ where
 /// authority, a row that is not retiring, or a catalog/connection failure.
 /// Repeating an already-applied retirement under the same live fence is a
 /// read-only idempotent success.
-pub async fn complete_slot_sync_probe_retirement<S, T>(
-    client: Client,
-    connection: Connection<S, T>,
+pub async fn complete_slot_sync_probe_retirement(
     operation_timeout: CatalogOperationTimeout,
     probe: &CatalogSlotSyncProbe,
-    absence: &ManagedLogicalSlotDropFence,
-) -> Result<CatalogSlotSyncProbe, SlotSyncProbeCatalogError>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+    absence: &mut ManagedLogicalSlotDropFence,
+) -> Result<CatalogSlotSyncProbe, SlotSyncProbeCatalogError> {
     let duration = operation_timeout.get();
     let deadline = Instant::now() + duration;
+    validate_absence_receipt(probe, absence.receipt())?;
     absence
         .verify_held_until(deadline, duration)
         .await
         .map_err(|source| target_fence_lost(probe, source))?;
-    let result = run_command_until(
-        client,
-        connection,
+    let result = timeout_at(
         deadline,
-        duration,
-        ProbeCommand::CompleteRetirement {
-            probe,
-            absence: absence.receipt(),
-        },
+        execute_fenced_retirement(absence.catalog_client_mut(), deadline, duration, probe),
     )
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        Err(SlotSyncProbeCatalogError::OutcomeUnknown {
+            operation: SlotSyncProbeCatalogMutation::CompleteRetirement,
+            target: probe.target.clone(),
+            source: SlotSyncProbeCatalogUnknownCause::Deadline { duration },
+        })
+    });
     let fence_result = absence.verify_held_until(deadline, duration).await;
     match (result, fence_result) {
         (Ok(result), Ok(())) => Ok(expect_probe(result)),
         (Err(error), Ok(())) => Err(error),
         (_, Err(source)) => Err(target_fence_lost(probe, source)),
     }
+}
+
+async fn execute_fenced_retirement(
+    client: &mut Client,
+    deadline: Instant,
+    duration: Duration,
+    probe: &CatalogSlotSyncProbe,
+) -> Result<ProbeCommandResult, SlotSyncProbeCatalogError> {
+    set_session_timeouts(client, deadline).await?;
+    let requirements = client.query_one(REQUIREMENTS_SQL, &[]).await?;
+    validate_requirements(&requirements)?;
+    let loaded = run_mutation_transaction(
+        client,
+        deadline,
+        duration,
+        ProbeMutation::CompleteRetirement(probe),
+    )
+    .await?;
+    Ok(ProbeCommandResult::Probe(loaded))
 }
 
 fn target_fence_lost(
@@ -640,10 +655,6 @@ enum ProbeCommand<'a> {
         probe: &'a CatalogSlotSyncProbe,
         receipt: &'a ManagedLogicalSlotReceipt,
     },
-    CompleteRetirement {
-        probe: &'a CatalogSlotSyncProbe,
-        absence: &'a ManagedLogicalSlotDropReceipt,
-    },
 }
 
 impl ProbeCommand<'_> {
@@ -653,9 +664,6 @@ impl ProbeCommand<'_> {
             Self::Allocate(_) => Some(SlotSyncProbeCatalogMutation::Allocate),
             Self::Activate { .. } => Some(SlotSyncProbeCatalogMutation::Activate),
             Self::BeginRetirement { .. } => Some(SlotSyncProbeCatalogMutation::BeginRetirement),
-            Self::CompleteRetirement { .. } => {
-                Some(SlotSyncProbeCatalogMutation::CompleteRetirement)
-            }
         }
     }
 
@@ -664,9 +672,9 @@ impl ProbeCommand<'_> {
             Self::LoadExact(target) => Some(target),
             Self::LoadLive(_) => None,
             Self::Allocate(allocation) => Some(&allocation.target),
-            Self::Activate { probe, .. }
-            | Self::BeginRetirement { probe, .. }
-            | Self::CompleteRetirement { probe, .. } => Some(&probe.target),
+            Self::Activate { probe, .. } | Self::BeginRetirement { probe, .. } => {
+                Some(&probe.target)
+            }
         }
     }
 }
@@ -785,17 +793,6 @@ async fn execute_before_deadline(
                     receipt_id: receipt.receipt_id(),
                     consistent_point: receipt.creation_lsn(),
                 },
-            )
-            .await?;
-            Ok(ProbeCommandResult::Probe(loaded))
-        }
-        ProbeCommand::CompleteRetirement { probe, absence } => {
-            validate_absence_receipt(probe, absence)?;
-            let loaded = run_mutation_transaction(
-                client,
-                deadline,
-                duration,
-                ProbeMutation::CompleteRetirement(probe),
             )
             .await?;
             Ok(ProbeCommandResult::Probe(loaded))
@@ -1601,14 +1598,14 @@ pub enum SlotSyncProbeCatalogError {
         #[source]
         source: SlotSyncProbeCatalogUnknownCause,
     },
-    /// The source-side name fence was lost before the catalog boundary was proven.
+    /// The canonical catalog target fence was lost before the boundary was proven.
     #[error(
         "slot-sync probe target fence for {target:?} was lost across catalog retirement; reconcile the exact slot and catalog row: {source}"
     )]
     TargetFenceLost {
         /// Exact generation-qualified target whose absence is no longer fenced.
         target: ManagedSlotTarget,
-        /// Source-session liveness failure.
+        /// Canonical `shardschema` session liveness failure.
         #[source]
         source: ManagedLogicalSlotTargetFenceError,
     },

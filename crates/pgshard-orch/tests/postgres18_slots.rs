@@ -15,7 +15,8 @@ use pgshard_orch::{
     slot_mutator::{
         LocalSlotMutationError, ManagedLogicalSlotCreateRequest, ManagedLogicalSlotDropFence,
         ManagedLogicalSlotDropOutcome, ManagedLogicalSlotReceipt, ManagedLogicalSlotRole,
-        create_managed_logical_slot, drop_managed_logical_slot,
+        complete_managed_consumer_slot_retirement, create_managed_logical_slot,
+        drop_managed_logical_slot,
     },
     slot_observer::{
         CorrelatedStandbyReplicationPath, LocalLogicalSlotObservationBatch,
@@ -66,6 +67,7 @@ const MAX_PROXY_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const COMMIT_QUERY_FRAME: &[u8] = b"Q\0\0\0\x0bCOMMIT\0";
 const COMMIT_COMPLETE_PAYLOAD: &[u8] = b"COMMIT\0";
 const ADVISORY_FENCE_KEY_STRIDE: u64 = 32;
+const MANAGED_TARGET_FENCE_HASH_SEED: i64 = 1_346_851_656;
 const EXPECTED_PRIMARY_SLOT_NAME: &str = "pgshard_member_0001";
 const EXPECTED_SYNCED_ANCHOR_NAME: &str = "pgshard_ci_anchor_00000000000000000000000000000001";
 // Correlation, slot-sync appearance/removal, snapshot-triggered standby create,
@@ -796,19 +798,22 @@ async fn wait_for_backend_lock(
     let connection_task = tokio::spawn(connection);
     let result = async {
         loop {
-            let row = client
-                .query_opt(
+            let row = timeout_at(
+                deadline,
+                client.query_opt(
                     "SELECT wait_event_type::pg_catalog.text, wait_event::pg_catalog.text \
                        FROM pg_catalog.pg_stat_activity \
                       WHERE pid OPERATOR(pg_catalog.=) $1::pg_catalog.int4",
                     &[&backend_pid],
-                )
-                .await?
-                .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "{operation} backend exited before waiting on its lock"
-                    ))
-                })?;
+                ),
+            )
+            .await
+            .map_err(|_| io::Error::other("backend lock observation exceeded the bound"))??
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "{operation} backend exited before waiting on its lock"
+                ))
+            })?;
             let wait_type: Option<String> = row.try_get(0)?;
             let wait_event: Option<String> = row.try_get(1)?;
             if wait_type.as_deref() == Some("Lock")
@@ -859,15 +864,18 @@ async fn wait_for_pending_creation_attempt(
 ) -> TestResult<Uuid> {
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
-        let row = client
-            .query_opt(
+        let row = timeout_at(
+            deadline,
+            client.query_opt(
                 "SELECT creation_receipt_id::pg_catalog.text \
                    FROM pgshard_catalog.managed_slot_creation_attempts \
                   WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
                     AND state = 'pending'",
                 &[&target.generation().as_uuid().to_string()],
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| io::Error::other("creation-attempt observation exceeded the bound"))??;
         if let Some(row) = row {
             return Ok(Uuid::parse_str(&row.try_get::<_, String>(0)?)?);
         }
@@ -881,13 +889,15 @@ async fn wait_for_pending_creation_attempt(
 
 async fn cleanup_standby_mutation_fixture(
     client: &Client,
+    catalog_database_url: &str,
     target: &ManagedSlotTarget,
     backend_pid: &AtomicU32,
 ) -> TestResult {
     let backend_result = wait_for_mutation_backend_exit(client, backend_pid).await;
     let slot_result = cleanup_slot(client, target).await;
     backend_result?;
-    slot_result
+    slot_result?;
+    retire_standby_decoder(catalog_database_url, target).await
 }
 
 async fn cleanup_observation_fixture(
@@ -963,86 +973,134 @@ async fn cleanup_catalog_probe_row(
     .await
     .map_err(|_| io::Error::other("catalog-probe cleanup connection exceeded the bound"))??;
     let connection_task = tokio::spawn(connection);
-    let result = timeout(CLEANUP_TIMEOUT, async {
-        client
-            .batch_execute(
-                "SET statement_timeout = '4s'; \
-                 SET lock_timeout = '4s'; \
-                 SET transaction_timeout = '4s'",
-            )
-            .await?;
-        let table: Option<String> = client
-            .query_one(
-                "SELECT pg_catalog.to_regclass( \
-                     'pgshard_catalog.slot_sync_probes')::pg_catalog.text",
-                &[],
-            )
-            .await?
-            .try_get(0)?;
-        if table.is_none() {
-            return Ok::<(), TestError>(());
-        }
-        let generation = target.generation().as_uuid().to_string();
-        client
-            .execute(
-                "SELECT pgshard_catalog.abandon_managed_slot_creation_attempt( \
-                            attempts.slot_generation, attempts.slot_name::pg_catalog.text, \
-                            attempts.creation_receipt_id \
-                        ) \
-                   FROM pgshard_catalog.managed_slot_creation_attempts AS attempts \
-                  WHERE attempts.slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
-                    AND attempts.state = 'pending'",
-                &[&generation],
-            )
-            .await?;
-        let fallback_receipt_id = Uuid::new_v4().to_string();
-        client
-            .execute(
-                "UPDATE pgshard_catalog.slot_sync_probes \
-                    SET state = 'retiring', \
-                        cleanup_receipt_id = CASE \
-                            WHEN state = 'active' THEN creation_receipt_id \
-                            ELSE $2::pg_catalog.text::pg_catalog.uuid \
-                        END, \
-                        retiring_at = pg_catalog.statement_timestamp() \
-                  WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
-                    AND state IN ('allocated', 'active')",
-                &[&generation, &fallback_receipt_id],
-            )
-            .await?;
-        client
-            .execute(
-                "UPDATE pgshard_catalog.slot_sync_probes \
-                    SET state = 'retired', retired_at = pg_catalog.statement_timestamp() \
-                  WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
-                    AND state = 'retiring'",
-                &[&generation],
-            )
-            .await?;
-        let nonretired: i64 = client
-            .query_one(
-                "SELECT pg_catalog.count(*) \
-                   FROM pgshard_catalog.slot_sync_probes \
-                  WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
-                    AND state <> 'retired'",
-                &[&generation],
-            )
-            .await?
-            .try_get(0)?;
-        if nonretired != 0 {
-            return Err(io::Error::other(
-                "catalog probe cleanup left the exact generation non-retired",
-            )
-            .into());
-        }
-        Ok(())
-    })
+    let result = timeout(
+        CLEANUP_TIMEOUT,
+        cleanup_catalog_probe_row_with_client(&client, target),
+    )
     .await
     .map_err(|_| io::Error::other("catalog-probe row cleanup exceeded the bound"));
     drop(client);
     let connection_result = finish_connection(connection_task).await;
     result??;
     connection_result
+}
+
+async fn cleanup_catalog_probe_row_with_client(
+    client: &Client,
+    target: &ManagedSlotTarget,
+) -> TestResult {
+    client
+        .batch_execute(
+            "SET statement_timeout = '4s'; \
+             SET lock_timeout = '4s'; \
+             SET transaction_timeout = '4s'",
+        )
+        .await?;
+    let table: Option<String> = client
+        .query_one(
+            "SELECT pg_catalog.to_regclass( \
+                 'pgshard_catalog.slot_sync_probes')::pg_catalog.text",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    if table.is_none() {
+        return Ok(());
+    }
+    let generation = target.generation().as_uuid().to_string();
+    client
+        .execute(
+            "SELECT pgshard_catalog.abandon_managed_slot_creation_attempt( \
+                        attempts.slot_generation, attempts.slot_name::pg_catalog.text, \
+                        attempts.creation_receipt_id \
+                    ) \
+               FROM pgshard_catalog.managed_slot_creation_attempts AS attempts \
+              WHERE attempts.slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                AND attempts.state = 'pending'",
+            &[&generation],
+        )
+        .await?;
+    let fallback_receipt_id = Uuid::new_v4().to_string();
+    client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+                SET state = 'retiring', \
+                    cleanup_receipt_id = CASE \
+                        WHEN state = 'active' THEN creation_receipt_id \
+                        ELSE $2::pg_catalog.text::pg_catalog.uuid \
+                    END, \
+                    retiring_at = pg_catalog.statement_timestamp() \
+              WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                AND state IN ('allocated', 'active')",
+            &[&generation, &fallback_receipt_id],
+        )
+        .await?;
+    let retiring_name: Option<String> = client
+        .query_opt(
+            "SELECT slot_name::pg_catalog.text \
+               FROM pgshard_catalog.slot_sync_probes \
+              WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                AND state = 'retiring'",
+            &[&generation],
+        )
+        .await?
+        .map(|row| row.get(0));
+    if let Some(retiring_name) = retiring_name {
+        complete_catalog_probe_cleanup(client, &generation, &retiring_name).await?;
+    }
+    let nonretired: i64 = client
+        .query_one(
+            "SELECT pg_catalog.count(*) \
+               FROM pgshard_catalog.slot_sync_probes \
+              WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                AND state <> 'retired'",
+            &[&generation],
+        )
+        .await?
+        .try_get(0)?;
+    if nonretired != 0 {
+        return Err(io::Error::other(
+            "catalog probe cleanup left the exact generation non-retired",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn complete_catalog_probe_cleanup(
+    client: &Client,
+    generation: &str,
+    slot_name: &str,
+) -> TestResult {
+    client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_lock( \
+                        pg_catalog.hashtextextended($1::pg_catalog.text, $2) \
+                    )",
+            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?;
+    let retirement = client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+                SET state = 'retired', retired_at = pg_catalog.statement_timestamp() \
+              WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                AND state = 'retiring'",
+            &[&generation],
+        )
+        .await;
+    let released: bool = client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_unlock( \
+                        pg_catalog.hashtextextended($1::pg_catalog.text, $2) \
+                    )",
+            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?
+        .try_get(0)?;
+    assert!(released, "catalog cleanup must release the target fence");
+    retirement?;
+    Ok(())
 }
 
 async fn fence_mutation_session<S, T>(
@@ -1399,26 +1457,20 @@ async fn load_live_catalog_probe(database_url: &str) -> TestResult<Option<Catalo
 }
 
 async fn complete_catalog_probe_retirement(
-    database_url: &str,
     probe: &CatalogSlotSyncProbe,
-    absence: &ManagedLogicalSlotDropFence,
+    absence: &mut ManagedLogicalSlotDropFence,
 ) -> TestResult<CatalogSlotSyncProbe> {
-    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
-    Ok(complete_slot_sync_probe_retirement(
-        client,
-        connection,
-        CatalogOperationTimeout::default(),
-        probe,
-        absence,
+    Ok(
+        complete_slot_sync_probe_retirement(CatalogOperationTimeout::default(), probe, absence)
+            .await?,
     )
-    .await?)
 }
 
 async fn complete_retirement_while_recreation_waits(
     database_url: &str,
     target: &ManagedSlotTarget,
     retiring: &CatalogSlotSyncProbe,
-    absence: ManagedLogicalSlotDropFence,
+    mut absence: ManagedLogicalSlotDropFence,
 ) -> TestResult<CatalogSlotSyncProbe> {
     let expected_receipt_id = absence.receipt().receipt_id();
     let mut other_database_url = Url::parse(database_url)?;
@@ -1454,14 +1506,14 @@ async fn complete_retirement_while_recreation_waits(
         "same-name recreation must remain blocked before catalog retirement"
     );
 
-    let retired = complete_catalog_probe_retirement(database_url, retiring, &absence).await?;
+    let retired = complete_catalog_probe_retirement(retiring, &mut absence).await?;
     assert_eq!(retired.state(), SlotSyncProbeState::Retired);
     assert!(
         !recreate.task().is_finished(),
         "catalog retirement must return while the canonical target fence is still held"
     );
     assert_eq!(
-        complete_catalog_probe_retirement(database_url, &retired, &absence).await?,
+        complete_catalog_probe_retirement(&retired, &mut absence).await?,
         retired
     );
     assert_eq!(absence.release().await.receipt_id(), expected_receipt_id);
@@ -1509,94 +1561,47 @@ async fn complete_retirement_while_recreation_waits(
 async fn complete_retirement_after_catalog_fence_loss(
     database_url: &str,
     retiring: &CatalogSlotSyncProbe,
-    absence: ManagedLogicalSlotDropFence,
+    mut absence: ManagedLogicalSlotDropFence,
+    proxy: CommitResponseLossProxy,
 ) -> TestResult<CatalogSlotSyncProbe> {
     let expected_receipt_id = absence.receipt().receipt_id();
-    let fence_backend_pid = i32::try_from(absence.catalog_fence_backend_pid().get())?;
-    let (completion_client, completion_connection) =
-        tokio_postgres::connect(database_url, NoTls).await?;
-    let completion_backend = AtomicU32::new(0);
-    let completion_connection = capture_mutation_backend_pid(
-        &completion_client,
-        completion_connection,
-        &completion_backend,
-    )
-    .await?;
-    let completion_backend_pid = i32::try_from(completion_backend.load(Ordering::Acquire))?;
-
-    let (blocker, blocker_connection) = tokio_postgres::connect(database_url, NoTls).await?;
-    let blocker_connection_task = tokio::spawn(blocker_connection);
-    let blocker_setup = lock_catalog_probe_for_update(&blocker, retiring.target()).await;
-    if let Err(error) = blocker_setup {
-        drop(blocker);
-        let blocker_connection_result = finish_connection(blocker_connection_task).await;
-        let _receipt = absence.release().await;
-        blocker_connection_result?;
-        return Err(error);
-    }
-
-    let absence = Arc::new(absence);
-    let completion_absence = Arc::clone(&absence);
-    let completion_probe = retiring.clone();
-    let mut completion_task = tokio::spawn(async move {
-        complete_slot_sync_probe_retirement(
-            completion_client,
-            completion_connection,
-            CatalogOperationTimeout::default(),
-            &completion_probe,
-            &completion_absence,
-        )
+    let CommitResponseLossProxy {
+        database_url: _,
+        arm,
+        mut task,
+    } = proxy;
+    let (armed_acknowledgement, armed) = oneshot::channel();
+    arm.send(armed_acknowledgement)
+        .map_err(|_| io::Error::other("retirement fault proxy exited before it was armed"))?;
+    timeout(CONNECTION_EXIT_TIMEOUT, armed)
         .await
-    });
+        .map_err(|_| {
+            io::Error::other("retirement fault proxy arm acknowledgement exceeded the bound")
+        })?
+        .map_err(|_| {
+            io::Error::other("retirement fault proxy exited before acknowledging its arm")
+        })?;
 
-    let fault_result: TestResult = async {
-        wait_for_backend_lock(
-            database_url,
-            completion_backend_pid,
-            None,
-            "catalog retirement",
-        )
-        .await?;
-        terminate_backend(&blocker, fence_backend_pid).await?;
-        wait_for_backend_exit(&blocker, fence_backend_pid).await
-    }
-    .await;
-    let rollback_result = timeout(CLEANUP_TIMEOUT, blocker.batch_execute("ROLLBACK")).await;
-    let completion_result = timeout(CONNECTION_EXIT_TIMEOUT, &mut completion_task).await;
-    if completion_result.is_err() {
-        completion_task.abort();
-        let _ = timeout(CONNECTION_EXIT_TIMEOUT, completion_task).await;
-    }
-    drop(blocker);
-    let blocker_connection_result = finish_connection(blocker_connection_task).await;
-    let release_result: TestResult = match Arc::try_unwrap(absence) {
-        Ok(absence) => {
-            let receipt = absence.release().await;
-            if receipt.receipt_id() == expected_receipt_id {
-                Ok(())
-            } else {
-                Err(io::Error::other("fence-loss cleanup released a changed receipt").into())
-            }
-        }
-        Err(_) => Err(io::Error::other(
-            "catalog retirement retained the drop fence after task completion",
-        )
-        .into()),
-    };
-
-    fault_result?;
-    rollback_result.map_err(|_| io::Error::other("row-lock rollback exceeded the bound"))??;
-    blocker_connection_result?;
-    release_result?;
-    let error = completion_result
-        .map_err(|_| io::Error::other("fence-loss catalog retirement did not finish in time"))??
-        .expect_err("losing the source fence after catalog COMMIT must reject retirement success");
+    let error = complete_slot_sync_probe_retirement(
+        CatalogOperationTimeout::default(),
+        retiring,
+        &mut absence,
+    )
+    .await
+    .expect_err("losing the catalog COMMIT response must reject retirement success");
     assert!(error.outcome_is_unknown());
     assert!(matches!(
         error,
         SlotSyncProbeCatalogError::TargetFenceLost { ref target, .. }
             if target == retiring.target()
     ));
+    timeout(CONNECTION_EXIT_TIMEOUT, &mut task)
+        .await
+        .map_err(|_| {
+            io::Error::other("retirement fault proxy did not confirm COMMIT in time")
+        })???;
+    let released = absence.release().await;
+    assert_eq!(released.receipt_id(), expected_receipt_id);
     let retired = load_exact_catalog_probe(database_url, retiring.target())
         .await?
         .expect("the exact catalog generation committed before post-COMMIT fence verification");
@@ -1604,27 +1609,6 @@ async fn complete_retirement_after_catalog_fence_loss(
     assert_eq!(retired.creation_receipt_id(), Some(expected_receipt_id));
     assert_eq!(retired.cleanup_receipt_id(), Some(expected_receipt_id));
     Ok(retired)
-}
-
-async fn lock_catalog_probe_for_update(client: &Client, target: &ManagedSlotTarget) -> TestResult {
-    client
-        .batch_execute(
-            "BEGIN; \
-             SET LOCAL statement_timeout = '10s'; \
-             SET LOCAL lock_timeout = '10s'; \
-             SET LOCAL transaction_timeout = '10s'",
-        )
-        .await?;
-    client
-        .query_one(
-            "SELECT probe_generation \
-               FROM pgshard_catalog.slot_sync_probes \
-              WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
-              FOR UPDATE",
-            &[&target.generation().as_uuid().to_string()],
-        )
-        .await?;
-    Ok(())
 }
 
 async fn release_known_drop(fence: ManagedLogicalSlotDropFence) {
@@ -1840,8 +1824,8 @@ async fn run_catalog_probe_fence_loss_fixture(
     let active = activate_catalog_probe(&primary_database_url, &allocated, &receipt).await?;
     let retiring = begin_catalog_probe_retirement(&primary_database_url, &active, &receipt).await?;
 
-    let (catalog, catalog_connection) =
-        tokio_postgres::connect(&primary_database_url, NoTls).await?;
+    let proxy = start_commit_response_loss_proxy(&primary_database_url).await?;
+    let (catalog, catalog_connection) = tokio_postgres::connect(&proxy.database_url, NoTls).await?;
     let (primary, primary_connection) =
         tokio_postgres::connect(&primary_database_url, NoTls).await?;
     let absence = drop_managed_logical_slot(
@@ -1858,9 +1842,13 @@ async fn run_catalog_probe_fence_loss_fixture(
         ManagedLogicalSlotDropOutcome::Dropped
     );
     wait_for_synchronized_copy(&standby_database_url, &probe_target, false).await?;
-    let retired =
-        complete_retirement_after_catalog_fence_loss(&primary_database_url, &retiring, absence)
-            .await?;
+    let retired = complete_retirement_after_catalog_fence_loss(
+        &primary_database_url,
+        &retiring,
+        absence,
+        proxy,
+    )
+    .await?;
     assert_eq!(retired.target(), &probe_target);
     assert_eq!(retired.state(), SlotSyncProbeState::Retired);
     Ok(())
@@ -2032,7 +2020,7 @@ async fn reconcile_backend_loss_creation(
     let retiring = begin_catalog_probe_retirement(database_url, &active, &receipt).await?;
     let (catalog, catalog_connection) = tokio_postgres::connect(database_url, NoTls).await?;
     let (primary, primary_connection) = tokio_postgres::connect(database_url, NoTls).await?;
-    let absence = drop_managed_logical_slot(
+    let mut absence = drop_managed_logical_slot(
         catalog,
         catalog_connection,
         primary,
@@ -2042,7 +2030,7 @@ async fn reconcile_backend_loss_creation(
     )
     .await?;
     wait_for_synchronized_copy(standby_database_url, probe_target, false).await?;
-    let retired = complete_catalog_probe_retirement(database_url, &retiring, &absence).await?;
+    let retired = complete_catalog_probe_retirement(&retiring, &mut absence).await?;
     assert_eq!(retired.state(), SlotSyncProbeState::Retired);
     release_known_drop(absence).await;
 
@@ -2275,7 +2263,7 @@ async fn run_primary_mutation_fixture(
         tokio_postgres::connect(&database_url, NoTls).await?;
     let (client, connection) = hostile_config.connect(NoTls).await?;
     let connection = fence_mutation_session(&client, connection, &mutation_role, &target).await?;
-    let drop_receipt = drop_managed_logical_slot(
+    let mut drop_receipt = drop_managed_logical_slot(
         catalog_client,
         catalog_connection,
         client,
@@ -2285,8 +2273,7 @@ async fn run_primary_mutation_fixture(
     )
     .await?;
     wait_for_synchronized_copy(&standby_database_url, &target, false).await?;
-    let retired =
-        complete_catalog_probe_retirement(&database_url, &retiring, &drop_receipt).await?;
+    let retired = complete_catalog_probe_retirement(&retiring, &mut drop_receipt).await?;
     assert_eq!(retired.state(), SlotSyncProbeState::Retired);
     release_known_drop(drop_receipt).await;
     let absent = observe(
@@ -2422,22 +2409,31 @@ async fn activate_standby_decoder(
     let (client, connection) = tokio_postgres::connect(catalog_database_url, NoTls).await?;
     let connection_task = tokio::spawn(connection);
     let creation_lsn = pg_lsn_text(receipt.creation_lsn());
-    let changed = client
-        .execute(
-            "UPDATE pgshard_catalog.managed_replication_slots \
-                SET state = 'active', \
-                    consistent_point = $2::pg_catalog.text::pg_catalog.pg_lsn, \
-                    two_phase_at = $2::pg_catalog.text::pg_catalog.pg_lsn, \
-                    activated_at = pg_catalog.statement_timestamp() \
+    let creation_receipt_id: String = client
+        .query_one(
+            "SELECT creation_receipt_id::pg_catalog.text \
+               FROM pgshard_catalog.managed_slot_creation_attempts \
               WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
-                AND state = 'allocated'",
-            &[&target.generation().as_uuid().to_string(), &creation_lsn],
+                AND state = 'pending'",
+            &[&target.generation().as_uuid().to_string()],
+        )
+        .await?
+        .try_get(0)?;
+    client
+        .query_one(
+            "SELECT pgshard_catalog.activate_managed_replication_slot( \
+                        $1::pg_catalog.text::pg_catalog.uuid, \
+                        $2::pg_catalog.text::pg_catalog.uuid, \
+                        $3::pg_catalog.text::pg_catalog.pg_lsn, \
+                        $3::pg_catalog.text::pg_catalog.pg_lsn \
+                    )",
+            &[
+                &target.generation().as_uuid().to_string(),
+                &creation_receipt_id,
+                &creation_lsn,
+            ],
         )
         .await?;
-    assert_eq!(
-        changed, 1,
-        "the standby decoder allocation must activate once"
-    );
     let attempt_state: String = client
         .query_one(
             "SELECT state FROM pgshard_catalog.managed_slot_creation_attempts \
@@ -2462,31 +2458,149 @@ async fn retire_standby_decoder(
     .await
     .map_err(|_| io::Error::other("standby-decoder cleanup connection exceeded the bound"))??;
     let connection_task = tokio::spawn(connection);
-    let result = timeout(CLEANUP_TIMEOUT, async {
-        client
-            .batch_execute(
-                "SET statement_timeout = '4s'; \
-                 SET lock_timeout = '4s'; \
-                 SET transaction_timeout = '4s'",
-            )
-            .await?;
-        client
-            .execute(
-                "UPDATE pgshard_catalog.managed_replication_slots \
-                    SET state = 'retired', retired_at = pg_catalog.statement_timestamp() \
-                  WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
-                    AND state IN ('allocated', 'active')",
-                &[&target.generation().as_uuid().to_string()],
-            )
-            .await?;
-        Ok::<(), TestError>(())
-    })
+    let result = timeout(
+        CLEANUP_TIMEOUT,
+        retire_standby_decoder_with_client(&client, target),
+    )
     .await
     .map_err(|_| io::Error::other("standby-decoder row cleanup exceeded the bound"));
     drop(client);
     let connection_result = finish_connection(connection_task).await;
     result??;
     connection_result
+}
+
+async fn retire_standby_decoder_with_client(
+    client: &Client,
+    target: &ManagedSlotTarget,
+) -> TestResult {
+    client
+        .batch_execute(
+            "SET statement_timeout = '4s'; \
+             SET lock_timeout = '4s'; \
+             SET transaction_timeout = '4s'",
+        )
+        .await?;
+    let table: Option<String> = client
+        .query_one(
+            "SELECT pg_catalog.to_regclass( \
+                 'pgshard_catalog.managed_replication_slots')::pg_catalog.text",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    if table.is_none() {
+        return Ok(());
+    }
+    reconcile_standby_creation_attempt(client, target).await?;
+    let generation = target.generation().as_uuid().to_string();
+    client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+                SET state = 'retired', retired_at = pg_catalog.statement_timestamp() \
+              WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                AND state = 'allocated'",
+            &[&generation],
+        )
+        .await?;
+    let unresolved: i64 = client
+        .query_one(
+            "SELECT ( \
+                        SELECT pg_catalog.count(*) \
+                          FROM pgshard_catalog.managed_replication_slots \
+                         WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                           AND state <> 'retired' \
+                    ) + ( \
+                        SELECT pg_catalog.count(*) \
+                          FROM pgshard_catalog.managed_slot_creation_attempts \
+                         WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                           AND state = 'pending' \
+                    )",
+            &[&generation],
+        )
+        .await?
+        .try_get(0)?;
+    if unresolved != 0 {
+        return Err(io::Error::other("standby-decoder cleanup left live catalog state").into());
+    }
+    Ok(())
+}
+
+async fn reconcile_standby_creation_attempt(
+    client: &Client,
+    target: &ManagedSlotTarget,
+) -> TestResult {
+    let generation = target.generation().as_uuid().to_string();
+    let attempt = client
+        .query_opt(
+            "SELECT attempts.slot_name::pg_catalog.text, \
+                    attempts.creation_receipt_id::pg_catalog.text, attempts.state \
+               FROM pgshard_catalog.managed_slot_creation_attempts AS attempts \
+              WHERE attempts.slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                AND attempts.state IN ('pending', 'activated')",
+            &[&generation],
+        )
+        .await?;
+    let Some(row) = attempt else {
+        return Ok(());
+    };
+    let slot_name: String = row.try_get(0)?;
+    let receipt_id: String = row.try_get(1)?;
+    let attempt_state: String = row.try_get(2)?;
+    if attempt_state == "pending" {
+        client
+            .query_one(
+                "SELECT pgshard_catalog.abandon_managed_slot_creation_attempt( \
+                            $1::pg_catalog.text::pg_catalog.uuid, $2::pg_catalog.text, \
+                            $3::pg_catalog.text::pg_catalog.uuid \
+                        )",
+                &[&generation, &slot_name, &receipt_id],
+            )
+            .await?;
+        return Ok(());
+    }
+    complete_standby_catalog_cleanup(client, &generation, &slot_name, &receipt_id).await
+}
+
+async fn complete_standby_catalog_cleanup(
+    client: &Client,
+    generation: &str,
+    slot_name: &str,
+    receipt_id: &str,
+) -> TestResult {
+    client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_lock( \
+                        pg_catalog.hashtextextended($1::pg_catalog.text, $2) \
+                    )",
+            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?;
+    let retirement = client
+        .query_one(
+            "SELECT pgshard_catalog.complete_managed_replication_slot_retirement( \
+                        $1::pg_catalog.text::pg_catalog.uuid, $2::pg_catalog.text, \
+                        $3::pg_catalog.text::pg_catalog.uuid \
+                    )",
+            &[&generation, &slot_name, &receipt_id],
+        )
+        .await;
+    let released: bool = client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_unlock( \
+                        pg_catalog.hashtextextended($1::pg_catalog.text, $2) \
+                    )",
+            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+        )
+        .await?
+        .try_get(0)?;
+    if !released {
+        return Err(
+            io::Error::other("standby-decoder cleanup failed to release its target fence").into(),
+        );
+    }
+    retirement?;
+    Ok(())
 }
 
 async fn create_standby_slot_with_snapshot_trigger(
@@ -2649,12 +2763,39 @@ async fn correlated_standby_mutation_path(
     }
 }
 
+async fn ensure_nonzero_catalog_epoch(database_url: &str) -> TestResult {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let epoch: i64 = client
+        .query_one(
+            "SELECT catalog_epoch \
+               FROM pgshard_catalog.cluster_state \
+              WHERE singleton",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    if epoch == 0 {
+        client
+            .execute(
+                "UPDATE pgshard_catalog.shards \
+                    SET state = state \
+                  WHERE shard_id = 'shard-0000'",
+                &[],
+            )
+            .await?;
+    }
+    drop(client);
+    finish_connection(connection_task).await
+}
+
 async fn run_standby_mutation_fixture(
     primary_database_url: String,
     standby_database_url: String,
     target: ManagedSlotTarget,
     backend_pid: Arc<AtomicU32>,
 ) -> TestResult {
+    ensure_nonzero_catalog_epoch(&primary_database_url).await?;
     let provisional = correlated_standby_mutation_path(
         &primary_database_url,
         &standby_database_url,
@@ -2709,7 +2850,7 @@ async fn run_standby_mutation_fixture(
         tokio_postgres::connect(&primary_database_url, NoTls).await?;
     let (standby, standby_connection) =
         tokio_postgres::connect(&standby_database_url, NoTls).await?;
-    let drop_receipt = drop_managed_logical_slot(
+    let mut drop_fence = drop_managed_logical_slot(
         catalog,
         catalog_connection,
         standby,
@@ -2718,14 +2859,47 @@ async fn run_standby_mutation_fixture(
         receipt,
     )
     .await?;
-    release_known_drop(drop_receipt).await;
-    retire_standby_decoder(&primary_database_url, &target).await?;
+    complete_managed_consumer_slot_retirement(CatalogOperationTimeout::default(), &mut drop_fence)
+        .await?;
+    release_known_drop(drop_fence).await;
+    assert_standby_decoder_retired(&primary_database_url, &target).await?;
     let absent = observe(
         &standby_database_url,
         &LogicalSlotObservationRequest::new(vec![target])?,
     )
     .await?;
     assert!(absent.entries()[0].observation().is_none());
+    Ok(())
+}
+
+async fn assert_standby_decoder_retired(
+    catalog_database_url: &str,
+    target: &ManagedSlotTarget,
+) -> TestResult {
+    let (client, connection) = tokio_postgres::connect(catalog_database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let unresolved: i64 = client
+        .query_one(
+            "SELECT ( \
+                        SELECT pg_catalog.count(*) \
+                          FROM pgshard_catalog.managed_replication_slots \
+                         WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                           AND state <> 'retired' \
+                    ) + ( \
+                        SELECT pg_catalog.count(*) \
+                          FROM pgshard_catalog.managed_slot_creation_attempts \
+                         WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                           AND state <> 'retired' \
+                    )",
+            &[&target.generation().as_uuid().to_string()],
+        )
+        .await?
+        .try_get(0)?;
+    drop(client);
+    finish_connection(connection_task).await?;
+    if unresolved != 0 {
+        return Err(io::Error::other("standby-decoder retirement left live catalog state").into());
+    }
     Ok(())
 }
 
@@ -3605,7 +3779,7 @@ async fn creates_verifies_and_drops_standby_local_decoder() -> TestResult {
     let mutation_backend_pid = Arc::new(AtomicU32::new(0));
     let fixture_result = finish_bounded_fixture(
         tokio::spawn(run_standby_mutation_fixture(
-            primary_database_url,
+            primary_database_url.clone(),
             standby_database_url,
             target.clone(),
             Arc::clone(&mutation_backend_pid),
@@ -3613,8 +3787,13 @@ async fn creates_verifies_and_drops_standby_local_decoder() -> TestResult {
         "standby slot-mutation fixture",
     )
     .await;
-    let cleanup_result =
-        cleanup_standby_mutation_fixture(&cleanup, &target, &mutation_backend_pid).await;
+    let cleanup_result = cleanup_standby_mutation_fixture(
+        &cleanup,
+        &primary_database_url,
+        &target,
+        &mutation_backend_pid,
+    )
+    .await;
     drop(cleanup);
     let cleanup_connection_result = finish_connection(cleanup_task).await;
     combine_fixture_results(fixture_result, cleanup_result, cleanup_connection_result)

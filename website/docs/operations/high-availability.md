@@ -88,15 +88,21 @@ mutation connection. Known pre-dispatch failures durably abandon the attempt.
 If the catalog-fence backend is lost before that cleanup commits, the pending
 attempt remains visible and blocks slot, shard, restore, database, consumer,
 ownership and attachment lifecycle changes until reconciliation. Activation
-resolves the same attempt as activated; cleanup resolves it as retired. Final
-probe retirement borrows the drop path's
-live connection-bound catalog fence through COMMIT. It verifies the same
-canonical backend on both sides of that COMMIT before returning success. Known
+resolves the same attempt as activated through an exact-capability
+security-definer function; catalog roles cannot read the attempt ledger.
+Creating an attempt versions the shared catalog fence so an older
+`REPEATABLE READ` lifecycle transaction cannot miss it. Cleanup resolves the
+same attempt as retired. Final probe and consumer-slot retirement borrow the
+drop path's live connection-bound catalog fence through COMMIT. Consumer
+finalization also presents the exact opaque creation capability and atomically
+retires the attempt and slot. Both paths verify the same canonical backend on
+both sides of that COMMIT before returning success. Known
 pre-dispatch drop failures return the receipt, and cleanup does not depend on a
 live receiver, its physical slot, healthy feedback or slot synchronization.
 Catalog triggers serialize allocation, activation, cleanup-start, and related
-parent lifecycle writes in the same lock namespace. Final probe retirement
-instead requires the typed path's live connection-bound absence fence.
+parent lifecycle writes in the same lock namespace. Final retirement instead
+requires the typed path's live connection-bound absence fence. Permanent
+retired slot history is omitted from parent target-lock sets.
 Privileged SQL that bypasses that typed finalization or mutates physical
 replication slots directly remains outside the boundary. Automatic
 observation and reconciliation of unknown post-dispatch outcomes still require
