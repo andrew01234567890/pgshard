@@ -339,6 +339,280 @@ async fn create_fixture(client: &Client) -> TestResult<Fixture> {
     })
 }
 
+async fn insert_slot_sync_probe(
+    client: &Client,
+    fixture: &Fixture,
+    probe_generation: Uuid,
+    restore_incarnation: &str,
+    slot_name: &str,
+) -> Result<u64, PgError> {
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.slot_sync_probes( \
+                 probe_generation, shard_id, restore_incarnation, system_identifier, \
+                 database_oid, database_name, source_timeline, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text, $3::text::uuid, 18446744073709551615, \
+                 4294967295, 'postgres', 4294967295, $4::text \
+             )",
+            &[
+                &probe_generation.to_string(),
+                &fixture.shard_id,
+                &restore_incarnation,
+                &slot_name,
+            ],
+        )
+        .await
+}
+
+struct SlotSyncProbeFixture {
+    generation: Uuid,
+    replacement_generation: Uuid,
+    replacement_name: String,
+}
+
+async fn allocate_slot_sync_probe_fixture(
+    client: &Client,
+    fixture: &Fixture,
+) -> TestResult<SlotSyncProbeFixture> {
+    let probe_generation = fixture_uuid(fixture.nonce, 90);
+    let probe_name = format!("sync_probe_{}", probe_generation.simple());
+    let wrong_name = format!("sync_probe_{}", fixture_uuid(fixture.nonce, 91).simple());
+    let error = insert_slot_sync_probe(
+        client,
+        fixture,
+        probe_generation,
+        &fixture.restore_incarnation,
+        &wrong_name,
+    )
+    .await
+    .expect_err("a slot-sync probe name must encode its complete generation");
+    assert_sqlstate(&error, "23514");
+
+    let unknown_restore = fixture_uuid(fixture.nonce, 92).to_string();
+    let error = insert_slot_sync_probe(
+        client,
+        fixture,
+        probe_generation,
+        &unknown_restore,
+        &probe_name,
+    )
+    .await
+    .expect_err("a probe cannot invent its shard restore lineage");
+    assert_sqlstate(&error, "55000");
+
+    insert_slot_sync_probe(
+        client,
+        fixture,
+        probe_generation,
+        &fixture.restore_incarnation,
+        &probe_name,
+    )
+    .await?;
+
+    let replacement_generation = fixture_uuid(fixture.nonce, 93);
+    let replacement_name = format!("sync_probe_{}", replacement_generation.simple());
+    let error = insert_slot_sync_probe(
+        client,
+        fixture,
+        replacement_generation,
+        &fixture.restore_incarnation,
+        &replacement_name,
+    )
+    .await
+    .expect_err("one shard cannot have two live slot-sync probes");
+    assert_sqlstate(&error, "23505");
+
+    Ok(SlotSyncProbeFixture {
+        generation: probe_generation,
+        replacement_generation,
+        replacement_name,
+    })
+}
+
+async fn assert_slot_sync_probe_activation(
+    client: &Client,
+    fixture: &Fixture,
+    probe: &SlotSyncProbeFixture,
+) -> TestResult {
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes SET state = 'active' \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await
+        .expect_err("probe activation requires its PostgreSQL consistent point");
+    assert_sqlstate(&error, "55000");
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes SET source_timeline = 1 \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await
+        .expect_err("probe source identity must remain immutable");
+    assert_sqlstate(&error, "55000");
+
+    client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'active', consistent_point = '0/10', \
+                 activated_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes SET consistent_point = '0/20' \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await
+        .expect_err("an active probe cannot rewrite its creation boundary");
+    assert_sqlstate(&error, "55000");
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retired', retiring_at = statement_timestamp(), \
+                 retired_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await
+        .expect_err("an active probe must enter cleanup before retirement");
+    assert_sqlstate(&error, "55000");
+
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.shard_restore_incarnations \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE restore_incarnation = $1::text::uuid",
+            &[&fixture.restore_incarnation],
+        )
+        .await
+        .expect_err("a restore cannot retire while its probe may exist");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "restore incarnation retains a non-retired slot-sync probe",
+    );
+    client
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'draining' WHERE shard_id = $1::text",
+            &[&fixture.shard_id],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'retired' WHERE shard_id = $1::text",
+            &[&fixture.shard_id],
+        )
+        .await
+        .expect_err("a shard cannot retire while its probe may exist");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        &format!(
+            "shard {} still has a non-retired slot-sync probe",
+            fixture.shard_id
+        ),
+    );
+    client
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'active' WHERE shard_id = $1::text",
+            &[&fixture.shard_id],
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn assert_slot_sync_probe_retirement(
+    client: &Client,
+    fixture: &Fixture,
+    probe: &SlotSyncProbeFixture,
+) -> TestResult {
+    client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retiring', retiring_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await?;
+    let error = insert_slot_sync_probe(
+        client,
+        fixture,
+        probe.replacement_generation,
+        &fixture.restore_incarnation,
+        &probe.replacement_name,
+    )
+    .await
+    .expect_err("cleanup must finish before a replacement probe is allocated");
+    assert_sqlstate(&error, "23505");
+    client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "DELETE FROM pgshard_catalog.slot_sync_probes \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await
+        .expect_err("probe generation tombstones must be permanent");
+    assert_sqlstate(&error, "55000");
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET retired_at = retired_at + interval '1 second' \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.generation.to_string()],
+        )
+        .await
+        .expect_err("retired probe history must be immutable");
+    assert_sqlstate(&error, "55000");
+
+    insert_slot_sync_probe(
+        client,
+        fixture,
+        probe.replacement_generation,
+        &fixture.restore_incarnation,
+        &probe.replacement_name,
+    )
+    .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retiring', retiring_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.replacement_generation.to_string()],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe.replacement_generation.to_string()],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn assert_slot_sync_probe_contract(client: &Client, fixture: &Fixture) -> TestResult {
+    let probe = allocate_slot_sync_probe_fixture(client, fixture).await?;
+    assert_slot_sync_probe_activation(client, fixture, &probe).await?;
+    assert_slot_sync_probe_retirement(client, fixture, &probe).await
+}
+
 async fn assert_migration_does_not_resurrect_retired_restore(
     client: &Client,
     nonce: u128,
@@ -524,6 +798,8 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
             &[&logical_database_id],
         )
         .await?;
+    assert_admin_slot_sync_probe_write_path(&transaction, nonce, &shard_id, &restore_incarnation)
+        .await?;
     assert_admin_consumer_write_path(
         &transaction,
         nonce,
@@ -532,6 +808,17 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
         &restore_incarnation,
     )
     .await?;
+    assert_admin_routing_write_path(&transaction, nonce, &logical_database_id, &shard_id).await?;
+    transaction.rollback().await?;
+    Ok(())
+}
+
+async fn assert_admin_routing_write_path(
+    transaction: &tokio_postgres::Transaction<'_>,
+    nonce: u128,
+    logical_database_id: &str,
+    shard_id: &str,
+) -> TestResult {
     let routing_epoch: i64 = transaction
         .query_one(
             "INSERT INTO pgshard_catalog.routing_epochs(logical_database_id) \
@@ -574,7 +861,58 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
             &[&format!("admin_{nonce}")],
         )
         .await?;
-    transaction.rollback().await?;
+    Ok(())
+}
+
+async fn assert_admin_slot_sync_probe_write_path(
+    transaction: &tokio_postgres::Transaction<'_>,
+    nonce: u128,
+    shard_id: &str,
+    restore_incarnation: &str,
+) -> TestResult {
+    let probe_generation = fixture_uuid(nonce, 100);
+    transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.slot_sync_probes( \
+                 probe_generation, shard_id, restore_incarnation, system_identifier, \
+                 database_oid, database_name, source_timeline, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text, $3::text::uuid, 1, 1, \
+                 'admin_database', 1, $4::text \
+             )",
+            &[
+                &probe_generation.to_string(),
+                &shard_id,
+                &restore_incarnation,
+                &format!("sync_probe_{}", probe_generation.simple()),
+            ],
+        )
+        .await?;
+    transaction
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'active', consistent_point = '0/1', \
+                 activated_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe_generation.to_string()],
+        )
+        .await?;
+    transaction
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retiring', retiring_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe_generation.to_string()],
+        )
+        .await?;
+    transaction
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&probe_generation.to_string()],
+        )
+        .await?;
     Ok(())
 }
 
@@ -1115,6 +1453,29 @@ async fn assert_invalid_managed_slot_allocations(
         .await
         .expect_err("a standby decoder must identify its member");
     assert_sqlstate(&error, "23514");
+
+    let retired_probe_generation = fixture_uuid(shard.nonce, 90);
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                 slot_generation, attachment_generation, consumer_id, logical_database_id, \
+                 shard_id, slot_role, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, \
+                 $5::text, 'primary-anchor', $6::text \
+             )",
+            &[
+                &retired_probe_generation.to_string(),
+                &consumer.attachment_generation,
+                &consumer.consumer_id,
+                &shard.logical_database_id,
+                &shard.shard_id,
+                &format!("sync_probe_{}", retired_probe_generation.simple()),
+            ],
+        )
+        .await
+        .expect_err("a retired probe generation cannot be reused by a consumer slot");
+    assert_sqlstate(&error, "55000");
     Ok(())
 }
 
@@ -1163,13 +1524,361 @@ async fn allocate_managed_slots(
     Ok(())
 }
 
+struct ManagedSlotAllocation {
+    shard_id: String,
+    logical_database_id: String,
+    consumer_id: String,
+    attachment_generation: String,
+    generation: Uuid,
+}
+
+enum StaleCatalogMutation {
+    AllocateManagedSlot(Box<ManagedSlotAllocation>),
+    RetireRestore(String),
+    RetireShard(String),
+}
+
+impl StaleCatalogMutation {
+    async fn execute(&self, transaction: &tokio_postgres::Transaction<'_>) -> Result<(), PgError> {
+        match self {
+            Self::AllocateManagedSlot(allocation) => {
+                transaction
+                    .execute(
+                        "INSERT INTO pgshard_catalog.managed_replication_slots( \
+                             slot_generation, attachment_generation, consumer_id, \
+                             logical_database_id, shard_id, slot_role, slot_name \
+                         ) VALUES ( \
+                             $1::text::uuid, $2::text::uuid, $3::text::uuid, \
+                             $4::text::uuid, $5::text, 'primary-anchor', $6::text \
+                         )",
+                        &[
+                            &allocation.generation.to_string(),
+                            &allocation.attachment_generation,
+                            &allocation.consumer_id,
+                            &allocation.logical_database_id,
+                            &allocation.shard_id,
+                            &format!("anchor_{}", allocation.generation.simple()),
+                        ],
+                    )
+                    .await?;
+            }
+            Self::RetireRestore(restore_incarnation) => {
+                transaction
+                    .execute(
+                        "UPDATE pgshard_catalog.shard_restore_incarnations \
+                         SET state = 'retired', retired_at = statement_timestamp() \
+                         WHERE restore_incarnation = $1::text::uuid",
+                        &[restore_incarnation],
+                    )
+                    .await?;
+            }
+            Self::RetireShard(shard_id) => {
+                transaction
+                    .execute(
+                        "UPDATE pgshard_catalog.shards SET state = 'draining' \
+                         WHERE shard_id = $1::text",
+                        &[shard_id],
+                    )
+                    .await?;
+                transaction
+                    .execute(
+                        "UPDATE pgshard_catalog.shards SET state = 'retired' \
+                         WHERE shard_id = $1::text",
+                        &[shard_id],
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn run_repeatable_read_catalog_mutation(
+    mut client: Client,
+    snapshot_ready: tokio::sync::oneshot::Sender<()>,
+    start: tokio::sync::oneshot::Receiver<()>,
+    mutation: StaleCatalogMutation,
+) -> Result<Option<PgError>, PgError> {
+    let transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    transaction
+        .batch_execute("SET LOCAL ROLE pgshard_catalog_admin")
+        .await?;
+    transaction
+        .query_one(
+            "SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton",
+            &[],
+        )
+        .await?;
+    let _ = snapshot_ready.send(());
+    if start.await.is_err() {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+
+    let result = mutation.execute(&transaction).await;
+    match result {
+        Ok(()) => {
+            transaction.commit().await?;
+            Ok(None)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Ok(Some(error))
+        }
+    }
+}
+
+struct RepeatableReadRace {
+    pid: i32,
+    snapshot_ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    start: Option<tokio::sync::oneshot::Sender<()>>,
+    mutation_task: Option<JoinHandle<Result<Option<PgError>, PgError>>>,
+    connection_task: Option<JoinHandle<Result<(), PgError>>>,
+}
+
+impl RepeatableReadRace {
+    async fn spawn(database_url: &str, mutation: StaleCatalogMutation) -> TestResult<Self> {
+        let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+        let connection_task = tokio::spawn(connection);
+        let pid = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let (snapshot_ready_sender, snapshot_ready) = tokio::sync::oneshot::channel();
+        let (start, start_receiver) = tokio::sync::oneshot::channel();
+        let mutation_task = tokio::spawn(run_repeatable_read_catalog_mutation(
+            client,
+            snapshot_ready_sender,
+            start_receiver,
+            mutation,
+        ));
+        Ok(Self {
+            pid,
+            snapshot_ready: Some(snapshot_ready),
+            start: Some(start),
+            mutation_task: Some(mutation_task),
+            connection_task: Some(connection_task),
+        })
+    }
+
+    async fn wait_for_snapshot(&mut self) -> TestResult {
+        self.snapshot_ready
+            .take()
+            .ok_or("repeatable-read snapshot was already observed")?
+            .await?;
+        Ok(())
+    }
+
+    fn start(&mut self) -> TestResult {
+        self.start
+            .take()
+            .ok_or("repeatable-read mutation was already started")?
+            .send(())
+            .map_err(|()| "repeatable-read mutation ended before start".into())
+    }
+
+    async fn finish(mut self) -> TestResult<PgError> {
+        let mutation_task = self
+            .mutation_task
+            .take()
+            .ok_or("repeatable-read mutation task was already consumed")?;
+        let error = tokio::time::timeout(Duration::from_secs(5), mutation_task)
+            .await???
+            .ok_or("stale repeatable-read catalog mutation committed")?;
+        let connection_task = self
+            .connection_task
+            .take()
+            .ok_or("repeatable-read connection task was already consumed")?;
+        tokio::time::timeout(Duration::from_secs(5), connection_task).await???;
+        Ok(error)
+    }
+}
+
+impl Drop for RepeatableReadRace {
+    fn drop(&mut self) {
+        if let Some(task) = &self.mutation_task {
+            task.abort();
+        }
+        if let Some(task) = &self.connection_task {
+            task.abort();
+        }
+    }
+}
+
+async fn assert_repeatable_read_probe_lifecycle_races_are_fenced(
+    observer: &Client,
+    database_url: &str,
+    shard: &Fixture,
+    consumer: &ConsumerRegistryFixture,
+) -> TestResult {
+    let generation = fixture_uuid(shard.nonce, 94);
+    let probe_name = format!("sync_probe_{}", generation.simple());
+    let probe_shard = create_fixture(observer).await?;
+    let (mut probe_client, probe_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let probe_connection_task = tokio::spawn(probe_connection);
+    let probe_transaction = probe_client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    probe_transaction
+        .batch_execute("SET LOCAL ROLE pgshard_catalog_admin")
+        .await?;
+    probe_transaction
+        .query_one(
+            "SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton",
+            &[],
+        )
+        .await?;
+
+    let mut races = vec![
+        RepeatableReadRace::spawn(
+            database_url,
+            StaleCatalogMutation::AllocateManagedSlot(Box::new(ManagedSlotAllocation {
+                shard_id: shard.shard_id.clone(),
+                logical_database_id: shard.logical_database_id.clone(),
+                consumer_id: consumer.consumer_id.clone(),
+                attachment_generation: consumer.attachment_generation.clone(),
+                generation,
+            })),
+        )
+        .await?,
+        RepeatableReadRace::spawn(
+            database_url,
+            StaleCatalogMutation::RetireRestore(probe_shard.restore_incarnation.clone()),
+        )
+        .await?,
+        RepeatableReadRace::spawn(
+            database_url,
+            StaleCatalogMutation::RetireShard(probe_shard.shard_id.clone()),
+        )
+        .await?,
+    ];
+    for race in &mut races {
+        race.wait_for_snapshot().await?;
+    }
+
+    probe_transaction
+        .execute(
+            "INSERT INTO pgshard_catalog.slot_sync_probes( \
+                 probe_generation, shard_id, restore_incarnation, system_identifier, \
+                 database_oid, database_name, source_timeline, slot_name \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text, $3::text::uuid, 18446744073709551615, \
+                 4294967295, 'postgres', 4294967295, $4::text \
+             )",
+            &[
+                &generation.to_string(),
+                &probe_shard.shard_id,
+                &probe_shard.restore_incarnation,
+                &probe_name,
+            ],
+        )
+        .await?;
+    for race in &mut races {
+        if race.start().is_err() {
+            probe_transaction.rollback().await?;
+            probe_connection_task.abort();
+            return Err("repeatable-read race task ended before mutation".into());
+        }
+    }
+    for race in &races {
+        if !wait_for_backend_lock(observer, race.pid).await? {
+            probe_transaction.rollback().await?;
+            probe_connection_task.abort();
+            return Err("catalog mutation did not wait on the versioned epoch gate".into());
+        }
+    }
+
+    probe_transaction.commit().await?;
+    for race in races {
+        let error = race.finish().await?;
+        assert_sqlstate(&error, "40001");
+        assert_database_message(
+            &error,
+            "could not serialize access due to concurrent update",
+        );
+    }
+    retire_racing_probe(observer, generation).await?;
+    assert_racing_probe_parents_remain_active(observer, &probe_shard).await?;
+
+    drop(probe_client);
+    tokio::time::timeout(Duration::from_secs(5), probe_connection_task).await???;
+    Ok(())
+}
+
+async fn assert_racing_probe_parents_remain_active(
+    client: &Client,
+    probe_shard: &Fixture,
+) -> TestResult {
+    let parent_states = client
+        .query_one(
+            "SELECT shards.state, incarnations.state \
+             FROM pgshard_catalog.shards AS shards \
+             JOIN pgshard_catalog.shard_restore_incarnations AS incarnations USING (shard_id) \
+             WHERE shards.shard_id = $1::text",
+            &[&probe_shard.shard_id],
+        )
+        .await?;
+    assert_eq!(parent_states.get::<_, &str>(0), "active");
+    assert_eq!(parent_states.get::<_, &str>(1), "active");
+    Ok(())
+}
+
+async fn retire_racing_probe(client: &Client, generation: Uuid) -> TestResult {
+    client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retiring', retiring_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&generation.to_string()],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+             SET state = 'retired', retired_at = statement_timestamp() \
+             WHERE probe_generation = $1::text::uuid",
+            &[&generation.to_string()],
+        )
+        .await?;
+    let managed_rows: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pgshard_catalog.managed_replication_slots \
+             WHERE slot_generation = $1::text::uuid",
+            &[&generation.to_string()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(managed_rows, 0);
+    Ok(())
+}
+
 async fn assert_managed_slot_allocation(
     client: &Client,
+    database_url: &str,
     shard: &Fixture,
     consumer: &ConsumerRegistryFixture,
 ) -> TestResult {
     assert_invalid_managed_slot_allocations(client, shard, consumer).await?;
+    assert_repeatable_read_probe_lifecycle_races_are_fenced(client, database_url, shard, consumer)
+        .await?;
     allocate_managed_slots(client, shard, consumer).await?;
+    let anchor_name = format!("anchor_{}", consumer.anchor_generation.simple());
+    let error = insert_slot_sync_probe(
+        client,
+        shard,
+        consumer.anchor_generation,
+        &shard.restore_incarnation,
+        &anchor_name,
+    )
+    .await
+    .expect_err("a consumer slot generation cannot be reused by a probe");
+    assert_sqlstate(&error, "55000");
     let error = client
         .execute(
             "UPDATE pgshard_catalog.managed_replication_slots \
@@ -2226,7 +2935,7 @@ async fn assert_logical_consumer_registry_contract(
     fixture: &Fixture,
 ) -> TestResult {
     let consumer = create_consumer_registry_fixture(client, fixture).await?;
-    assert_managed_slot_allocation(client, fixture, &consumer).await?;
+    assert_managed_slot_allocation(client, database_url, fixture, &consumer).await?;
     activate_consumer_registry_fixture(client, database_url, fixture, &consumer).await?;
     assert_consumer_registry_history_guards(client, fixture, &consumer).await?;
     fence_and_retire_consumer_attachment(client, database_url, fixture, &consumer).await?;
@@ -3361,6 +4070,7 @@ async fn migration_and_activation_contract() -> TestResult {
     assert_admin_write_path(&mut client).await?;
     let fixture = create_fixture(&client).await?;
     assert_migration_does_not_resurrect_retired_restore(&client, fixture.nonce).await?;
+    assert_slot_sync_probe_contract(&client, &fixture).await?;
     assert_identity_history_contract(&client, &fixture).await?;
     assert_registered_table_contract(&client, &fixture).await?;
     assert_tombstone_contract(&client, &fixture).await?;
