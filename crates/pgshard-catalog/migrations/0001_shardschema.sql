@@ -129,6 +129,100 @@ BEGIN
             DETAIL = mismatched_object;
     END IF;
 
+    -- A role with TRIGGER or REFERENCES can attach executable or referential
+    -- triggers without owning a catalog relation. Those rows do not depend
+    -- directly on the namespace, so validate them separately before any
+    -- trusted ownership or ACL transition.
+    SELECT pg_catalog.format(
+               'trigger %I on pgshard_catalog.%I',
+               triggers.tgname,
+               relations.relname
+           )
+      INTO mismatched_object
+      FROM pg_catalog.pg_trigger AS triggers
+      JOIN pg_catalog.pg_class AS relations
+        ON relations.oid = triggers.tgrelid
+      JOIN pg_catalog.pg_proc AS routines
+        ON routines.oid = triggers.tgfoid
+      JOIN pg_catalog.pg_namespace AS routine_namespaces
+        ON routine_namespaces.oid = routines.pronamespace
+     WHERE relations.relnamespace = catalog_schema_oid
+       AND (
+           (
+               NOT triggers.tgisinternal
+               AND (
+                   routine_namespaces.nspname <> 'pgshard_catalog'
+                   OR routines.pronargs <> 0
+                   OR (relations.relname, triggers.tgname, routines.proname) NOT IN (
+                       ('cluster_configuration', 'cluster_configuration_immutable', 'reject_all_changes'),
+                       ('cluster_state', 'cluster_state_notify', 'notify_catalog_state'),
+                       ('logical_consumer_attachments', 'logical_consumer_attachments_lock_catalog', 'lock_catalog_state'),
+                       ('logical_consumer_attachments', 'logical_consumer_attachments_protect_history', 'protect_logical_consumer_attachment'),
+                       ('logical_consumer_attachments', 'logical_consumer_attachments_touch_catalog', 'touch_catalog_state'),
+                       ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_lock_catalog', 'lock_catalog_state'),
+                       ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_protect_history', 'protect_logical_consumer_checkpoint'),
+                       ('logical_consumer_checkpoints', 'logical_consumer_checkpoints_touch_catalog', 'touch_catalog_state'),
+                       ('logical_consumer_shards', 'logical_consumer_shards_lock_catalog', 'lock_catalog_state'),
+                       ('logical_consumer_shards', 'logical_consumer_shards_protect_lifecycle', 'protect_logical_consumer_shard_lifecycle'),
+                       ('logical_consumer_shards', 'logical_consumer_shards_touch_catalog', 'touch_catalog_state'),
+                       ('logical_consumers', 'logical_consumers_lock_catalog', 'lock_catalog_state'),
+                       ('logical_consumers', 'logical_consumers_protect_lifecycle', 'protect_logical_consumer_lifecycle'),
+                       ('logical_consumers', 'logical_consumers_touch_catalog', 'touch_catalog_state'),
+                       ('logical_databases', 'logical_databases_lock_catalog', 'lock_catalog_state'),
+                       ('logical_databases', 'logical_databases_protect_active_routing', 'protect_database_lifecycle'),
+                       ('logical_databases', 'logical_databases_touch_catalog', 'touch_catalog_state'),
+                       ('managed_replication_slots', 'managed_replication_slots_lock_catalog', 'lock_catalog_state'),
+                       ('managed_replication_slots', 'managed_replication_slots_protect_history', 'protect_managed_replication_slot'),
+                       ('managed_replication_slots', 'managed_replication_slots_touch_catalog', 'touch_catalog_state'),
+                       ('managed_slot_creation_attempts', 'managed_slot_creation_attempts_protect_history', 'protect_managed_slot_creation_attempt'),
+                       ('operation_tombstones', 'operation_tombstone_immutable', 'reject_all_changes'),
+                       ('registered_tables', 'registered_tables_lock_catalog', 'lock_catalog_state'),
+                       ('registered_tables', 'registered_tables_touch_catalog', 'touch_catalog_state'),
+                       ('routing_epochs', 'routing_epoch_history_immutable', 'protect_routing_epoch_history'),
+                       ('routing_ranges', 'routing_range_history_immutable', 'protect_routing_range_history'),
+                       ('shard_restore_incarnations', 'shard_restore_incarnations_lock_catalog', 'lock_catalog_state'),
+                       ('shard_restore_incarnations', 'shard_restore_incarnations_protect_history', 'protect_shard_restore_incarnation'),
+                       ('shard_restore_incarnations', 'shard_restore_incarnations_touch_catalog', 'touch_catalog_state'),
+                       ('shards', 'shards_install_restore_incarnation', 'install_initial_shard_restore_incarnation'),
+                       ('shards', 'shards_lock_catalog', 'lock_catalog_state'),
+                       ('shards', 'shards_protect_active_routing', 'protect_shard_lifecycle'),
+                       ('shards', 'shards_touch_catalog', 'touch_catalog_state'),
+                       ('slot_sync_probes', 'slot_sync_probes_lock_catalog', 'lock_catalog_state'),
+                       ('slot_sync_probes', 'slot_sync_probes_protect_history', 'protect_slot_sync_probe'),
+                       ('slot_sync_probes', 'slot_sync_probes_touch_catalog', 'touch_catalog_state')
+                   )
+               )
+           )
+           OR (
+               triggers.tgisinternal
+               AND (
+                   routine_namespaces.nspname <> 'pg_catalog'
+                   OR pg_catalog.left(routines.proname, 8) <> 'RI_FKey_'
+                   OR NOT EXISTS (
+                       SELECT
+                         FROM pg_catalog.pg_constraint AS constraints
+                         JOIN pg_catalog.pg_class AS source_relations
+                           ON source_relations.oid = constraints.conrelid
+                         JOIN pg_catalog.pg_class AS referenced_relations
+                           ON referenced_relations.oid = constraints.confrelid
+                        WHERE constraints.oid = triggers.tgconstraint
+                          AND constraints.contype = 'f'
+                          AND constraints.connamespace = catalog_schema_oid
+                          AND source_relations.relnamespace = catalog_schema_oid
+                          AND referenced_relations.relnamespace = catalog_schema_oid
+                   )
+               )
+           )
+       )
+     ORDER BY relations.oid, triggers.oid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains an unsupported attached trigger',
+            DETAIL = mismatched_object;
+    END IF;
+
     IF EXISTS (
         SELECT
           FROM pg_catalog.pg_default_acl AS defaults
@@ -168,12 +262,11 @@ BEGIN
             MESSAGE = 'pre-existing pgshard_catalog schema owner must be a superuser';
     END IF;
 
-    -- PostgreSQL 18 automatically gives a non-superuser CREATEROLE principal
-    -- ADMIN OPTION on roles that it creates. SET ROLE can produce the same
-    -- memberships for a superuser-owned released catalog, with downstream
-    -- grants recorded under the schema owner. Re-home non-delegable downstream
-    -- grants under this trusted bootstrap principal before removing every
-    -- legacy creator membership with CASCADE.
+    -- PostgreSQL 18 can leave a formerly non-superuser CREATEROLE owner with
+    -- ADMIN OPTION on roles it created. A superuser-owned released catalog can
+    -- instead have explicit GRANTED BY history under that owner. Re-home safe
+    -- downstream grants under the bootstrap principal before removing every
+    -- legacy-owner membership with CASCADE.
     IF catalog_schema_owner_name <> 'pgshard_catalog_owner' THEN
         IF (
             SELECT pg_catalog.count(*)
@@ -341,9 +434,9 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- PostgreSQL 18 gives a CREATEROLE principal ADMIN OPTION on every role it
-    -- creates. Reject that and every other delegable membership before these
-    -- fixed roles receive catalog privileges.
+    -- A formerly non-superuser CREATEROLE principal can retain ADMIN OPTION on
+    -- roles it created. Reject that and every other delegable membership before
+    -- these fixed roles receive catalog privileges.
     IF EXISTS (
         SELECT
           FROM pg_catalog.pg_auth_members AS memberships

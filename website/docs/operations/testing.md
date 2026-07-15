@@ -41,9 +41,9 @@ standalone composite type proves complete ownership transfer. Rollback-only
 cases cover unsafe fixed-role attributes, delegable memberships, unexpected
 reader/admin/owner inheritance, owner members, fixed-role schema ownership,
 missing released roles, mixed object ownership, unsupported schema object
-classes, and unexpected default privileges without advancing the catalog epoch
-or retaining fixture roles. A separate
-rollback-only smoke path creates the registry allocation set through
+classes, external executable or referential triggers, and unexpected default
+privileges without advancing the catalog epoch or retaining fixture roles. A
+separate rollback-only smoke path creates the registry allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying
 the migration cannot resurrect a retired restore incarnation or advance the

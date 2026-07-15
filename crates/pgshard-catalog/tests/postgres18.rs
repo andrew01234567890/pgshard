@@ -903,6 +903,7 @@ async fn assert_distinct_superuser_v049_owner_upgrade(client: &Client) -> TestRe
 
     let mut upgrade_committed = false;
     let upgrade_result: TestResult = async {
+        assert_external_catalog_trigger_rejections(client).await?;
         client
             .batch_execute(&format!(
                 "GRANT pgshard_catalog_reader TO {legacy_owner} WITH ADMIN OPTION; \
@@ -962,6 +963,59 @@ async fn assert_distinct_superuser_v049_owner_upgrade(client: &Client) -> TestRe
     upgrade_result?;
     cleanup_result?;
     Ok(())
+}
+
+async fn assert_external_catalog_trigger_rejections(client: &Client) -> TestResult {
+    assert_external_executable_trigger_is_rejected(client).await?;
+    assert_external_reference_trigger_is_rejected(client).await
+}
+
+async fn assert_external_executable_trigger_is_rejected(client: &Client) -> TestResult {
+    let role = format!("pgshard_trigger_role_{}", Uuid::new_v4().simple());
+    let schema = format!("pgshard_trigger_schema_{}", Uuid::new_v4().simple());
+    assert_catalog_migration_rejection(
+        client,
+        &format!(
+            "CREATE ROLE {role} NOLOGIN; \
+             CREATE SCHEMA {schema} AUTHORIZATION {role}; \
+             GRANT USAGE ON SCHEMA pgshard_catalog TO {role}; \
+             GRANT TRIGGER ON pgshard_catalog.cluster_state TO {role}; \
+             SET ROLE {role}; \
+             CREATE FUNCTION {schema}.observe_catalog_write() RETURNS trigger \
+                 LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; \
+             CREATE TRIGGER external_catalog_write \
+                 BEFORE UPDATE ON pgshard_catalog.cluster_state \
+                 FOR EACH ROW EXECUTE FUNCTION {schema}.observe_catalog_write(); \
+             RESET ROLE"
+        ),
+        "pre-existing pgshard_catalog contains an unsupported attached trigger",
+        &[&role],
+    )
+    .await
+}
+
+async fn assert_external_reference_trigger_is_rejected(client: &Client) -> TestResult {
+    let role = format!("pgshard_reference_role_{}", Uuid::new_v4().simple());
+    let schema = format!("pgshard_reference_schema_{}", Uuid::new_v4().simple());
+    assert_catalog_migration_rejection(
+        client,
+        &format!(
+            "CREATE ROLE {role} NOLOGIN; \
+             CREATE SCHEMA {schema} AUTHORIZATION {role}; \
+             GRANT USAGE ON SCHEMA pgshard_catalog TO {role}; \
+             GRANT REFERENCES (singleton) \
+                 ON pgshard_catalog.cluster_state TO {role}; \
+             SET ROLE {role}; \
+             CREATE TABLE {schema}.catalog_reference ( \
+                 singleton boolean PRIMARY KEY \
+                     REFERENCES pgshard_catalog.cluster_state(singleton) \
+             ); \
+             RESET ROLE"
+        ),
+        "pre-existing pgshard_catalog contains an unsupported attached trigger",
+        &[&role],
+    )
+    .await
 }
 
 async fn assert_bootstrap_superuser_v049_owner_upgrade(client: &Client) -> TestResult {
