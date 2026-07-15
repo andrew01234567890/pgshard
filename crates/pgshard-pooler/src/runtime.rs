@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pgshard_catalog::{CatalogCache, CatalogSupervisor};
+use pgshard_catalog::{CatalogCache, CatalogFailureKind, CatalogSupervisor};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -86,13 +86,16 @@ impl PoolerRuntime {
 
         let catalog_shutdown = wait_for_stop(stop_receiver.clone());
         let catalog_task = match catalog {
-            Some(SupervisedCatalog { supervisor, config }) => tokio::spawn(supervisor.run(
-                move || {
-                    let config = config.clone();
-                    async move { config.connect(NoTls).await }
-                },
-                catalog_shutdown,
-            )),
+            Some(SupervisedCatalog { supervisor, config }) => {
+                tokio::spawn(supervisor.run_classified(
+                    move || {
+                        let config = config.clone();
+                        async move { config.connect(NoTls).await }
+                    },
+                    CatalogFailureKind::from,
+                    catalog_shutdown,
+                ))
+            }
             None => tokio::spawn(catalog_shutdown),
         };
         let http_task = tokio::spawn(crate::http::serve_listener(

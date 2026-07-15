@@ -86,7 +86,12 @@ activation fails, completes the ordered fence, slot, attachment, checkpoint,
 consumer, and restore-incarnation rotation path, and proves the retired records
 remain
 immutable. Unit coverage separately holds the cache publication lock through
-expiry and proves no late snapshot is installed. The supervisor scenario
+expiry and proves no late snapshot is installed, bounds retained epochs,
+rejects a cache-only snapshot at the hard age ceiling, refreshes that age on an
+authoritative replay, checks safe connector-cause classification, and proves a
+successful internally bounded publication wins a simultaneous outer deadline
+timer, while a boundary error remains a timeout.
+The supervisor scenario
 then kills its live backend, deliberately blocks the next connection attempt,
 observes repeated bounded connection timeouts, verifies readiness survives only
 inside the configured stale-cache grace, observes readiness expire at the exact
