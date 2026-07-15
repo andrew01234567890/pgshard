@@ -23,12 +23,51 @@ second blocked initial load and a later refresh each reach their operation
 deadline and prove exact phase classification, unchanged cache state, and
 backend exit. The same PostgreSQL 18 fixture exercises the logical-consumer
 registry's core trigger and ownership-fenced checkpoint CAS paths through its
-migration principal; a separate rollback-only smoke path creates the registry
-allocation set through
+migration principal. A negative bootstrap test first proves that a non-superuser
+principal is rejected before object creation. Upgrade coverage embeds the exact
+v0.49 migration bytes and installs them through `SET ROLE`, first proving that a
+non-superuser `CREATEROLE` owner and its real PostgreSQL 18 grantor chain are
+rejected rather than elevated. An exact fixture installed as PostgreSQL's
+bootstrap superuser proves its non-delegable runtime memberships and their
+`INHERIT` and `SET` options survive takeover without a same-grantor revoke. A
+second eligible superuser-owned fixture moves the released catalog to the
+dedicated NOLOGIN owner, re-homes those memberships under the bootstrap
+grantor, removes explicit fixed-role memberships held by the old owner,
+preserves the epoch, and proves the deprivileged old owner has no residual
+catalog access and can be dropped. Hostile reader/admin schema, table, column,
+function, procedure, type, and grant-option ACLs, including PUBLIC procedure
+execution, are cleared before the documented boundary is rebuilt, and a
+standalone composite type proves complete ownership transfer. Rollback-only
+cases cover unsafe fixed-role attributes, delegable memberships, unexpected
+reader/admin/owner inheritance, owner members, fixed-role schema ownership,
+missing released roles, mixed object ownership, unsupported schema object
+classes, external executable or referential triggers, a same-identity released
+trigger with altered predicate and arguments, and unexpected default privileges
+without advancing the catalog epoch or retaining fixture roles. A concurrent
+case holds an uncommitted external trigger on a target relation and requires the
+migration's `NOWAIT` lock pass to fail promptly with `55P03`. After that DDL
+commits, a complete migration retry must reject the trigger. The migration
+client starts with a `REPEATABLE READ` session default, proving the migration
+explicitly selects `READ COMMITTED` before its first snapshot; the migration's
+requirements pass checks the live transaction setting, so removing the override
+makes this regression fail before its expected lock result. Every migration
+attempt, cancellation, and rollback is bounded, and teardown awaits both
+connection drivers after aborting them. A successful lock pass retains every
+trigger/FK-capable relation lock through ownership transfer, ACL reset, and
+trigger recreation. A
+separate rollback-only smoke path creates the registry allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying
 the migration cannot resurrect a retired restore incarnation or advance the
-catalog epoch. The trigger suite rejects slot names that
+catalog epoch. The live test owns a disposable catalog-schema lifecycle so a
+second invocation starts clean and removes its objects afterward. Before the
+clean install contract, it recreates the pre-receipt probe table and v0.49
+lifecycle trigger, reaches `active` through the historical `allocated → active`
+transition, proves that receiptless row blocks upgrade with SQLSTATE `55000`,
+then retires it through `active → retiring → retired` under the old trigger. It
+finally proves allocated and retired history upgrade in place, reapplies the
+migration, and validates both new constraints. The
+trigger suite rejects slot names that
 do not encode their complete UUID generation, activation without both the
 primary anchor and selected source, an attachment that invents a restore
 incarnation, snapshot completion behind either slot's consistent point or
@@ -158,9 +197,73 @@ for their sequential one-minute phases. Snapshot-triggered standby creation has
 no detached mutation task: cancellation aborts connection ownership, the outer
 fixture is reaped, and cleanup waits for the recorded PostgreSQL backend to exit
 before it treats an absent target as final.
-Injected post-dispatch socket loss, cancellation and response-loss races are
-not yet exercised. Durable catalog mutation history, reconciliation after an
-unknown outcome, connection-bound command proof, quarantined COPY-BOTH
+The same primary/standby fixture now drives one permanent `shardschema`
+slot-sync probe through `allocated`, `active`, `retiring`, and `retired`. It
+starts from genesis epoch zero when necessary, requires the allocation commit to
+produce a nonzero source identity, creates the exact primary failover slot,
+waits for the continuous worker's non-temporary synchronized copy, and permits
+catalog activation only from the creation receipt. Cleanup must return the exact
+drop/absence receipt carrying the persisted create-attempt ID, and the
+synchronized copy must disappear before permanent retirement. The fixture
+retains the final drop's connection-bound target fence, starts a same-name
+managed create whose mutation connection deliberately targets another database,
+and observes that task retrying the busy hidden `shardschema` fence across
+catalog COMMIT. Releasing the fence must let that task finish with a pre-dispatch
+rejection because its exact durable generation is now retired; the test reaps
+the task and proves the target remains absent. This cross-database case proves
+that all mutation databases share the canonical registry for cluster-wide slot
+names. A second fixture row-locks retirement immediately
+before COMMIT, terminates the absence-fence backend, releases the row lock, and
+requires outcome-unknown `TargetFenceLost`. It then reloads the exact generation
+and confirms the retirement committed, covering the post-COMMIT verification
+branch. A third fixture gates target-server preflight after the creation attempt
+commits, terminates that catalog backend, and requires the permanent pending row
+to fence both shard and probe retirement. It then lets creation finish, activates
+the exact receipt, and removes both the primary slot and synchronized copy before
+retiring the durable allocation. Catalog tests also require raw consumer-slot
+and ownership lifecycle writes to fail fast while the same target lock is held,
+reject ownership and attachment transitions during a pending create, reject
+creation on a draining shard, and preserve the valid
+active-slot/staged-attachment drop path. Repeating
+allocation and every completed transition is checked as a read-only idempotent
+result. An unrelated epoch advance must fence a stale activation token before
+any lifecycle write, after which an exact reload can continue. A TCP fault proxy
+acknowledges that its frame parser is armed on the idle authenticated
+connection, closes the client response half when it receives the exact COMMIT
+frame, forwards that frame, and then independently requires PostgreSQL's
+`CommandComplete` and `ReadyForQuery`. The client must classify
+`OutcomeUnknown`, reload the exact durable row, and safely replay the same held
+receipt and boundary. The same fault is injected into typed consumer-slot
+activation through a unique ephemeral catalog-admin login: the test proves the
+committed state before replay, reuses the same opaque receipt idempotently, and
+always drops the login. Its complete consumer hierarchy is inserted in one
+transaction so setup failure cannot strand undiscoverable parent rows. Fence
+tests also replace a dead owner PID with a live PID while retaining the stale
+backend generation, release a real fence before acquiring a transaction
+advisory lock, deny the untrusted catalog reader access to fence acquisition and
+state, and row-lock the hidden registry through release. PID reuse and
+transaction locks must not restore authority; release must remain bounded, its
+backend must exit, and the stale row must then be reclaimable. A two-session
+test retains `cluster_state` opposite same-target first insertion and requires
+`55P03` within one second. A reverse-wait test then proves with
+`pg_blocking_pids` that an uncommitted different-target insertion is blocked by
+that exact `cluster_state` holder while an established target still locks within
+one second. Every setup, timeout, and error branch attempts rollback or forced
+termination, reaps both connection drivers, and observes both backend exits
+before it reports accumulated cleanup failures.
+Always-run
+bounded cleanup retires the catalog row only
+after both primary-slot removal and synchronized standby-copy disappearance
+succeed; cleanup owns a separately deadline-bounded connection with PostgreSQL
+statement, lock, and transaction timeouts. It then retires the attachment,
+consumer shard, consumer, and logical database created by the fixture and proves
+that no live hierarchy remains. A failed absence check preserves the live or
+retiring row for diagnosis and reconciliation.
+Automatic crash reconciliation remains a separate future test.
+Injected post-dispatch slot-mutation socket loss and cancellation races are not
+yet exercised. A complete post-dispatch slot-outcome ledger, automatic
+reconciliation after an unknown outcome, connection-bound command proof,
+quarantined COPY-BOTH
 attachment, and stream ownership remain future work.
 A lower-level correlation suite independently mutates every sampled path class.
 It accepts an unproven non-temporary physical slot only as raw evidence and

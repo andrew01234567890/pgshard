@@ -70,13 +70,56 @@ bounded feedback interval, `hot_standby_feedback=on`,
 The proof expiry is also the create-preflight deadline and is rechecked at the
 dispatch boundary.
 Create/drop errors after dispatch are always outcome-unknown and must be
-observed rather than retried. A successful create returns only a process-local
-cleanup receipt; source, role, a bounded session fence and required creation
-settings are rechecked after dispatch. Known pre-dispatch drop failures return
-that receipt, and cleanup does not depend on a live receiver, its physical slot,
-healthy feedback or slot synchronization.
-Restore incarnation and catalog epoch still require a future durable
-catalog-bound reconciler.
+observed rather than retried. Before target preflight, create persists a
+permanent pending attempt in `shardschema`, keyed by its opaque receipt and
+never-reused generation. The transaction locks catalog state before the target
+name and validates the exact source, role, restore, owner and lifecycle. A busy
+database-enforced target fence fails fast so no writer retains global catalog
+state while queued; the Rust create path retries acquisition within its bounded
+preflight window. Each acquisition records a fresh opaque fence ID bound to the
+exact backend start time, backend PID, and postmaster generation in a hidden
+per-target registry in the authoritative writable `shardschema` database.
+PostgreSQL advisory locks are not target-registry authority, and a mutation
+session may retain its bounded caller-held advisory locks. A registry writer
+first locks an established target row. Only first insertion of a target takes
+the fail-fast, self-conflicting table lock, keeping established unrelated
+targets independent while preventing a same-name unique-index wait. This
+database-local migration deliberately does not alter built-in advisory-lock
+ACLs because doing so in `shardschema` alone cannot protect the postmaster-wide
+lock table. Hostile SQL resource isolation remains an operator/bootstrap
+responsibility across every database. A stale row is
+reclaimable only after that exact backend generation is no longer live, so PID
+reuse after a backend or Pod restart is not fence authority. A successful create
+returns the matching process-local cleanup receipt; source, role, the bounded
+session state and required creation settings are rechecked after dispatch. After
+any retry, the mutator reloads the
+exact durable generation, lifecycle, restore/source identity, role, target
+database, catalog epoch and pending receipt before it can dispatch on a separate
+mutation connection. Known pre-dispatch failures durably abandon the attempt.
+If the catalog-fence backend is lost before that cleanup commits, the pending
+attempt remains visible and blocks slot, shard, restore, database, consumer,
+ownership and attachment lifecycle changes until reconciliation. Activation
+resolves the same attempt as activated through an exact-capability
+security-definer function. Catalog roles cannot read the attempt ledger, raw
+probe receipt columns, or target-fence registry.
+Creating an attempt versions the shared catalog fence so an older
+`REPEATABLE READ` lifecycle transaction cannot miss it. Cleanup resolves the
+same attempt as retired. Final probe and consumer-slot retirement borrow the
+drop path's live connection-bound catalog fence through COMMIT. Consumer
+finalization also presents the exact opaque creation capability and atomically
+retires the attempt and slot. Both paths present the exact opaque fence ID and
+verify the same canonical backend on both sides of that COMMIT before returning
+success. Known
+pre-dispatch drop failures return the receipt, and cleanup does not depend on a
+live receiver, its physical slot, healthy feedback or slot synchronization.
+Catalog triggers serialize allocation, activation, cleanup-start, and related
+parent lifecycle writes in the same lock namespace. Final retirement instead
+requires the typed path's live connection-bound absence fence. Permanent
+retired slot history is omitted from parent target-lock sets.
+Privileged SQL that bypasses that typed finalization or mutates physical
+replication slots directly remains outside the boundary. Automatic
+observation and reconciliation of unknown post-dispatch outcomes still require
+a long-running controller.
 
 The observation and mutation paths run in a real primary/standby CI fixture.
 Secure upstream connection
@@ -92,8 +135,24 @@ recovery, and rolling restarts are not implemented; see
 `shardschema` now reserves one permanent generation/name history for a
 dedicated slot-sync probe per live shard restore. The probe is explicitly
 separate from consumer anchors, so a future freshness challenge cannot skip
-unconsumed data by advancing a consumer resume slot. Only its catalog lifecycle
-is implemented: no current runtime creates, advances, or drops that probe.
+unconsumed data by advancing a consumer resume slot. The bounded clean path now
+allocates the catalog identity, creates the failover probe, observes its
+continuous synchronized copy, persists the exact creation-attempt receipt ID,
+and retires only after matching primary absence and synchronized-copy removal.
+The live fixture starts a same-name managed recreation after primary absence,
+observes it retrying the busy hidden target fence, commits permanent retirement
+while it remains blocked, releases the fence, and requires the waiter to reject
+the now retired durable generation even though its mutation connection targets
+another database. A separate fault case terminates the absence-fence backend
+while the retirement transaction is blocked immediately before COMMIT; the API
+reports outcome-unknown `TargetFenceLost`, and an exact reload confirms whether
+the retirement committed. Another fault case gates target-server preflight after a
+pending create is durable, terminates the canonical catalog backend, proves
+catalog retirement stays fenced, then completes and cleans up the physical slot
+without producing a retired tombstone with a live name. The fixture also reconciles
+one deliberately lost catalog activation COMMIT response by exact reload and
+same-input retry. No controller yet runs that path continuously or recovers it
+after process loss, and the source-bound progress challenge is still absent.
 :::
 
 The target default is one primary and two physical streaming replicas per shard,
