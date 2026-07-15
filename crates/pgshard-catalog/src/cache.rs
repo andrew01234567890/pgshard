@@ -1,26 +1,50 @@
 //! Monotonic, lock-free catalog snapshot publication.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant as StdInstant};
 
 use arc_swap::ArcSwap;
 use pgshard_types::CatalogEpoch;
 use thiserror::Error;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::{CatalogSnapshot, ClusterId, DatabaseId, RoutingHashConfig, SnapshotError};
+
+/// Maximum snapshots owned by one process-local cache.
+///
+/// Callers can continue reading an older immutable snapshot through their own
+/// [`Arc`], but execution revalidation fails closed once its epoch is evicted.
+pub const MAX_RETAINED_SNAPSHOTS: usize = 8;
+/// Absolute maximum age of a snapshot returned without supervisor context.
+///
+/// The supervisor normally applies its lower configured stale grace. This
+/// ceiling prevents callers of the cache API from routing indefinitely when
+/// they fail to consult supervisor readiness.
+pub const MAX_CATALOG_SNAPSHOT_AGE: Duration = Duration::from_mins(15);
 
 #[derive(Debug)]
 struct CacheState {
     current: Option<Arc<CatalogSnapshot>>,
     snapshots: BTreeMap<u64, Arc<CatalogSnapshot>>,
     minimum_epoch: u64,
+    refreshed_at: Option<Instant>,
 }
 
 #[derive(Debug)]
 pub(crate) enum InstallBeforeError {
     Cache(CacheError),
     DeadlineElapsed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogCacheView {
+    pub(crate) age: Option<Duration>,
+    pub(crate) epoch: Option<CatalogEpoch>,
+    pub(crate) minimum_epoch: u64,
 }
 
 /// Process-local cache of immutable, checksummed catalog snapshots.
@@ -31,6 +55,45 @@ pub(crate) enum InstallBeforeError {
 pub struct CatalogCache {
     state: ArcSwap<CacheState>,
     write_lock: Mutex<()>,
+    write_unlocked: Notify,
+    #[cfg(test)]
+    write_waiters: AtomicUsize,
+    #[cfg(test)]
+    write_wakes: AtomicUsize,
+}
+
+struct CacheWriteGuard<'a> {
+    guard: Option<MutexGuard<'a, ()>>,
+    write_unlocked: &'a Notify,
+}
+
+#[cfg(test)]
+struct CacheWaiterGuard<'a>(&'a AtomicUsize);
+
+#[cfg(test)]
+impl CacheWaiterGuard<'_> {
+    fn new(waiters: &AtomicUsize) -> CacheWaiterGuard<'_> {
+        waiters.fetch_add(1, Ordering::SeqCst);
+        CacheWaiterGuard(waiters)
+    }
+}
+
+#[cfg(test)]
+impl Drop for CacheWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for CacheWriteGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        // Timed-out waiters must not consume the only wake while another
+        // installer remains blocked behind a now-free mutex. Installs are rare
+        // control-plane operations, so broadcasting on release is preferable
+        // to false deadline failures.
+        self.write_unlocked.notify_waiters();
+    }
 }
 
 impl Default for CatalogCache {
@@ -48,8 +111,14 @@ impl CatalogCache {
                 current: None,
                 snapshots: BTreeMap::new(),
                 minimum_epoch: 0,
+                refreshed_at: None,
             }),
             write_lock: Mutex::new(()),
+            write_unlocked: Notify::new(),
+            #[cfg(test)]
+            write_waiters: AtomicUsize::new(0),
+            #[cfg(test)]
+            write_wakes: AtomicUsize::new(0),
         }
     }
 
@@ -61,40 +130,64 @@ impl CatalogCache {
     /// # Errors
     ///
     /// Returns [`RequestEpochError::Uninitialized`] before the first install,
-    /// or [`RequestEpochError::SnapshotFenced`] if a refresh is required to
-    /// reach the accepted minimum epoch.
+    /// [`RequestEpochError::SnapshotExpired`] when age reaches the absolute
+    /// cache-age ceiling, or [`RequestEpochError::SnapshotFenced`] if a refresh is
+    /// required to reach the accepted minimum epoch.
     pub fn current_for_planning(&self) -> Result<Arc<CatalogSnapshot>, RequestEpochError> {
+        self.current_for_planning_at(Instant::now())
+    }
+
+    fn current_for_planning_at(
+        &self,
+        now: Instant,
+    ) -> Result<Arc<CatalogSnapshot>, RequestEpochError> {
         let state = self.state.load();
-        let snapshot = state
+        current_for_planning_in_state(&state, now)
+    }
+
+    pub(crate) fn supervisor_view_at(&self, now: StdInstant) -> CatalogCacheView {
+        let state = self.state.load();
+        let now = Instant::from_std(now);
+        let age = state
+            .refreshed_at
+            .map(|refreshed_at| now.saturating_duration_since(refreshed_at));
+        let epoch = state
             .current
             .as_ref()
-            .ok_or(RequestEpochError::Uninitialized)?;
-        let actual = snapshot.catalog_epoch().0;
-        if actual < state.minimum_epoch {
-            return Err(RequestEpochError::SnapshotFenced {
-                actual,
-                minimum: state.minimum_epoch,
-            });
+            .map(|snapshot| snapshot.catalog_epoch());
+        CatalogCacheView {
+            age,
+            epoch,
+            minimum_epoch: state.minimum_epoch,
         }
-        Ok(Arc::clone(snapshot))
     }
 
     /// Validates an epoch carried by a routed request and returns the snapshot
     /// against which execution must be checked.
     ///
-    /// An older installed request epoch remains usable until an explicit fence
-    /// advances beyond it. A future or unknown request fails closed until this
+    /// A recently installed request epoch remains usable while it is inside the
+    /// bounded retention window and no explicit fence has retired it. A future,
+    /// evicted, or unknown request fails closed until it is replanned or this
     /// process refreshes.
     /// Callers must repeat this check at the execution boundary, not only when
     /// a request first enters a queue.
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty cache, a fenced request, a future request,
-    /// or a current snapshot that has itself fallen behind the fence.
+    /// Returns an error for an empty or expired cache, a fenced request, a
+    /// future request, or a current snapshot that has itself fallen behind the
+    /// fence.
     pub fn validate_request_epoch(
         &self,
         requested: CatalogEpoch,
+    ) -> Result<Arc<CatalogSnapshot>, RequestEpochError> {
+        self.validate_request_epoch_at(requested, Instant::now())
+    }
+
+    fn validate_request_epoch_at(
+        &self,
+        requested: CatalogEpoch,
+        now: Instant,
     ) -> Result<Arc<CatalogSnapshot>, RequestEpochError> {
         let state = self.state.load();
         if requested.0 < state.minimum_epoch {
@@ -107,6 +200,7 @@ impl CatalogCache {
             .current
             .as_ref()
             .ok_or(RequestEpochError::Uninitialized)?;
+        ensure_snapshot_fresh(&state, now)?;
         let current = snapshot.catalog_epoch().0;
         if current < state.minimum_epoch {
             return Err(RequestEpochError::SnapshotFenced {
@@ -143,10 +237,7 @@ impl CatalogCache {
     pub fn install(&self, candidate: CatalogSnapshot) -> Result<InstallOutcome, CacheError> {
         candidate.verify_checksum()?;
         let candidate = Arc::new(candidate);
-        let guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self.lock_write();
         match self.install_locked(candidate, guard, None) {
             Ok(outcome) => Ok(outcome),
             Err(InstallBeforeError::Cache(error)) => Err(error),
@@ -169,25 +260,62 @@ impl CatalogCache {
         self.install_locked(candidate, guard, Some(deadline))
     }
 
+    fn lock_write(&self) -> CacheWriteGuard<'_> {
+        CacheWriteGuard {
+            guard: Some(
+                self.write_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            write_unlocked: &self.write_unlocked,
+        }
+    }
+
     async fn write_lock_before(
         &self,
         deadline: Instant,
-    ) -> Result<MutexGuard<'_, ()>, InstallBeforeError> {
+    ) -> Result<CacheWriteGuard<'_>, InstallBeforeError> {
         loop {
             ensure_install_deadline(Some(deadline))?;
+            let unlocked = self.write_unlocked.notified();
+            tokio::pin!(unlocked);
+            // `notify_waiters` does not retain a permit. Register before the
+            // optimistic lock attempt so an intervening unlock cannot be lost.
+            unlocked.as_mut().enable();
             match self.write_lock.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Ok(guard) => {
+                    return Ok(CacheWriteGuard {
+                        guard: Some(guard),
+                        write_unlocked: &self.write_unlocked,
+                    });
+                }
+                Err(TryLockError::Poisoned(error)) => {
+                    return Ok(CacheWriteGuard {
+                        guard: Some(error.into_inner()),
+                        write_unlocked: &self.write_unlocked,
+                    });
+                }
                 Err(TryLockError::WouldBlock) => {}
             }
-            tokio::task::yield_now().await;
+            #[cfg(test)]
+            let _waiter_guard = CacheWaiterGuard::new(&self.write_waiters);
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(InstallBeforeError::DeadlineElapsed);
+                }
+                () = unlocked.as_mut() => {
+                    #[cfg(test)]
+                    self.write_wakes.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         }
     }
 
     fn install_locked(
         &self,
         candidate: Arc<CatalogSnapshot>,
-        _guard: MutexGuard<'_, ()>,
+        _guard: CacheWriteGuard<'_>,
         deadline: Option<Instant>,
     ) -> Result<InstallOutcome, InstallBeforeError> {
         ensure_install_deadline(deadline)?;
@@ -211,6 +339,12 @@ impl CatalogCache {
             if epoch == current_epoch {
                 if candidate.checksum() == current.checksum() {
                     ensure_install_deadline(deadline)?;
+                    self.state.store(Arc::new(CacheState {
+                        current: state.current.clone(),
+                        snapshots: state.snapshots.clone(),
+                        minimum_epoch: state.minimum_epoch,
+                        refreshed_at: Some(Instant::now()),
+                    }));
                     return Ok(InstallOutcome::AlreadyCurrent);
                 }
                 return reject_install(
@@ -226,11 +360,15 @@ impl CatalogCache {
 
         let mut snapshots = state.snapshots.clone();
         snapshots.insert(epoch, Arc::clone(&candidate));
+        while snapshots.len() > MAX_RETAINED_SNAPSHOTS {
+            snapshots.pop_first();
+        }
         ensure_install_deadline(deadline)?;
         self.state.store(Arc::new(CacheState {
             current: Some(candidate),
             snapshots,
             minimum_epoch: state.minimum_epoch,
+            refreshed_at: Some(Instant::now()),
         }));
         Ok(InstallOutcome::Installed)
     }
@@ -248,10 +386,7 @@ impl CatalogCache {
         if minimum.0 == 0 {
             return Err(CacheError::ZeroFence);
         }
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.lock_write();
         let state = self.state.load_full();
         if minimum.0 <= state.minimum_epoch {
             return Ok(false);
@@ -262,6 +397,7 @@ impl CatalogCache {
             current: state.current.clone(),
             snapshots,
             minimum_epoch: minimum.0,
+            refreshed_at: state.refreshed_at,
         }));
         Ok(true)
     }
@@ -283,6 +419,35 @@ impl CatalogCache {
             _ => RefreshDecision::Refresh,
         }
     }
+}
+
+fn current_for_planning_in_state(
+    state: &CacheState,
+    now: Instant,
+) -> Result<Arc<CatalogSnapshot>, RequestEpochError> {
+    let snapshot = state
+        .current
+        .as_ref()
+        .ok_or(RequestEpochError::Uninitialized)?;
+    ensure_snapshot_fresh(state, now)?;
+    let actual = snapshot.catalog_epoch().0;
+    if actual < state.minimum_epoch {
+        return Err(RequestEpochError::SnapshotFenced {
+            actual,
+            minimum: state.minimum_epoch,
+        });
+    }
+    Ok(Arc::clone(snapshot))
+}
+
+fn ensure_snapshot_fresh(state: &CacheState, now: Instant) -> Result<(), RequestEpochError> {
+    let refreshed_at = state.refreshed_at.ok_or(RequestEpochError::Uninitialized)?;
+    if now.saturating_duration_since(refreshed_at) >= MAX_CATALOG_SNAPSHOT_AGE {
+        return Err(RequestEpochError::SnapshotExpired {
+            maximum: MAX_CATALOG_SNAPSHOT_AGE,
+        });
+    }
+    Ok(())
 }
 
 fn ensure_install_deadline(deadline: Option<Instant>) -> Result<(), InstallBeforeError> {
@@ -517,6 +682,7 @@ pub enum CacheError {
 
 /// Request/catalog epoch mismatch.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RequestEpochError {
     /// No snapshot has been installed.
     #[error("catalog cache is uninitialized")]
@@ -537,7 +703,7 @@ pub enum RequestEpochError {
         /// Current cache epoch.
         current: u64,
     },
-    /// The requested non-fenced epoch was never installed in this process.
+    /// The requested non-fenced epoch is not retained in this process.
     #[error("catalog epoch {requested} is not available in this process")]
     Unavailable {
         /// Missing request epoch.
@@ -550,6 +716,12 @@ pub enum RequestEpochError {
         actual: u64,
         /// Accepted minimum epoch.
         minimum: u64,
+    },
+    /// The last authoritative refresh reached the cache's hard ceiling.
+    #[error("current catalog snapshot reached maximum age {maximum:?}")]
+    SnapshotExpired {
+        /// Hard maximum age enforced without supervisor context.
+        maximum: Duration,
     },
 }
 
@@ -579,6 +751,16 @@ mod tests {
 
     fn snapshot(cluster: u128, epoch: u64, database_epoch: u64) -> CatalogSnapshot {
         snapshot_with_database(cluster, epoch, 2, "app", database_epoch)
+    }
+
+    async fn wait_for_counter(counter: &AtomicUsize, minimum: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while counter.load(Ordering::SeqCst) < minimum {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cache waiter observation timed out");
     }
 
     fn snapshot_with_database(
@@ -645,10 +827,7 @@ mod tests {
         let (locked_sender, locked_receiver) = std::sync::mpsc::channel();
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
         let holder = thread::spawn(move || {
-            let _guard = lock_cache
-                .write_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _guard = lock_cache.lock_write();
             locked_sender.send(()).expect("report held cache lock");
             let _ = release_receiver.recv();
         });
@@ -673,6 +852,152 @@ mod tests {
 
         release_sender.send(()).expect("release cache lock");
         holder.join().expect("cache lock holder");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_install_wakes_after_lock_release() {
+        let cache = Arc::new(CatalogCache::new());
+        cache.install(snapshot(1, 1, 1)).expect("initial install");
+        let lock_cache = Arc::clone(&cache);
+        let (locked_sender, locked_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _guard = lock_cache.lock_write();
+            locked_sender.send(()).expect("report held cache lock");
+            let _ = release_receiver.recv();
+        });
+        locked_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("cache lock held within one second");
+
+        let install_cache = Arc::clone(&cache);
+        let install = tokio::spawn(async move {
+            install_cache
+                .install_before(
+                    snapshot(1, 2, 2),
+                    Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        release_sender.send(()).expect("release cache lock");
+        holder.join().expect("cache lock holder");
+
+        assert_eq!(
+            install.await.expect("install task").expect("timed install"),
+            InstallOutcome::Installed
+        );
+        assert_eq!(
+            cache
+                .current_for_planning()
+                .expect("installed snapshot")
+                .catalog_epoch(),
+            CatalogEpoch(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_release_wakes_every_registered_installer() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let cache = Arc::new(CatalogCache::new());
+                let lock_cache = Arc::clone(&cache);
+                let (locked_sender, locked_receiver) = std::sync::mpsc::channel();
+                let (release_sender, release_receiver) = std::sync::mpsc::channel();
+                let holder = thread::spawn(move || {
+                    let _guard = lock_cache.lock_write();
+                    locked_sender.send(()).expect("report held cache lock");
+                    let _ = release_receiver.recv();
+                });
+                locked_receiver
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("cache lock held within one second");
+
+                let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                let releases = Arc::new(tokio::sync::Semaphore::new(0));
+                let (acquired_sender, mut acquired_receiver) =
+                    tokio::sync::mpsc::unbounded_channel();
+                let mut waiters = Vec::new();
+                for id in 0..2 {
+                    let wait_cache = Arc::clone(&cache);
+                    let wait_releases = Arc::clone(&releases);
+                    let acquired_sender = acquired_sender.clone();
+                    waiters.push(tokio::task::spawn_local(async move {
+                        let guard = wait_cache
+                            .write_lock_before(deadline)
+                            .await
+                            .expect("registered writer acquires before deadline");
+                        acquired_sender
+                            .send(id)
+                            .expect("report acquired cache lock");
+                        wait_releases
+                            .acquire()
+                            .await
+                            .expect("release semaphore remains open")
+                            .forget();
+                        drop(guard);
+                    }));
+                }
+                drop(acquired_sender);
+                wait_for_counter(&cache.write_waiters, 2).await;
+                cache.write_wakes.store(0, Ordering::SeqCst);
+                release_sender.send(()).expect("release cache lock");
+                holder.join().expect("cache lock holder");
+
+                wait_for_counter(&cache.write_wakes, 2).await;
+                let first = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    acquired_receiver.recv(),
+                )
+                .await
+                .expect("first writer acquisition timed out")
+                .expect("first writer reports acquisition");
+                releases.add_permits(1);
+                let second = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    acquired_receiver.recv(),
+                )
+                .await
+                .expect("second writer acquisition timed out")
+                .expect("second writer reports acquisition");
+                assert_ne!(first, second);
+                releases.add_permits(1);
+                for waiter in waiters {
+                    waiter.await.expect("cache waiter task");
+                }
+            })
+            .await;
+    }
+
+    #[test]
+    fn absolute_snapshot_age_fails_closed_and_replay_refreshes_it() {
+        let cache = CatalogCache::new();
+        cache.install(snapshot(1, 1, 1)).expect("initial install");
+        let refreshed_at = cache
+            .state
+            .load()
+            .refreshed_at
+            .expect("installed snapshot has refresh time");
+        let expired_at = refreshed_at + MAX_CATALOG_SNAPSHOT_AGE;
+
+        assert!(matches!(
+            cache.current_for_planning_at(expired_at),
+            Err(RequestEpochError::SnapshotExpired { maximum })
+                if maximum == MAX_CATALOG_SNAPSHOT_AGE
+        ));
+        assert!(matches!(
+            cache.validate_request_epoch_at(CatalogEpoch(1), expired_at),
+            Err(RequestEpochError::SnapshotExpired { .. })
+        ));
+
+        assert_eq!(
+            cache
+                .install(snapshot(1, 1, 1))
+                .expect("authoritative replay"),
+            InstallOutcome::AlreadyCurrent
+        );
+        assert!(cache.current_for_planning().is_ok());
+        assert!(cache.validate_request_epoch(CatalogEpoch(1)).is_ok());
     }
 
     #[test]
@@ -768,6 +1093,35 @@ mod tests {
             cache.validate_request_epoch(CatalogEpoch(2)),
             Err(RequestEpochError::RequestFenced { .. })
         ));
+    }
+
+    #[test]
+    fn bounds_retained_history_and_fails_closed_after_eviction() {
+        let cache = CatalogCache::new();
+        for epoch in 1..=MAX_RETAINED_SNAPSHOTS as u64 {
+            cache
+                .install(snapshot(1, epoch, epoch))
+                .expect("install retained epoch");
+        }
+        let oldest = cache
+            .validate_request_epoch(CatalogEpoch(1))
+            .expect("oldest epoch inside retention window");
+
+        let next = MAX_RETAINED_SNAPSHOTS as u64 + 1;
+        cache
+            .install(snapshot(1, next, next))
+            .expect("install evicting epoch");
+        assert_eq!(cache.state.load().snapshots.len(), MAX_RETAINED_SNAPSHOTS);
+        assert!(matches!(
+            cache.validate_request_epoch(CatalogEpoch(1)),
+            Err(RequestEpochError::Unavailable { requested: 1 })
+        ));
+        assert_eq!(oldest.catalog_epoch(), CatalogEpoch(1));
+        oldest
+            .verify_checksum()
+            .expect("held snapshot remains valid");
+        assert!(cache.validate_request_epoch(CatalogEpoch(2)).is_ok());
+        assert!(cache.validate_request_epoch(CatalogEpoch(next)).is_ok());
     }
 
     #[test]

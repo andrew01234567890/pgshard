@@ -218,29 +218,29 @@ where
     tokio::pin!(shutdown);
     let subscription = {
         let deadline = Instant::now() + operation_timeout.get();
-        let subscription = CatalogReader::subscribe_before(client, &cache, deadline);
+        let subscription = complete_result_before_deadline(
+            CatalogReader::subscribe_before(client, &cache, deadline),
+            deadline,
+        );
         tokio::pin!(subscription);
-        let deadline_timer = sleep_until(deadline);
-        tokio::pin!(deadline_timer);
         tokio::select! {
             biased;
             () = shutdown.as_mut() => return stop_connection(connection_task).await,
-            () = deadline_timer.as_mut() => TimedOperation::Elapsed,
-            result = subscription.as_mut() => {
-                if Instant::now() >= deadline
-                    || result
-                        .as_ref()
-                        .is_err_and(LoadError::is_operation_timeout)
-                {
-                    TimedOperation::Elapsed
-                } else {
-                    TimedOperation::Completed(result)
-                }
-            }
+            result = subscription.as_mut() => result,
         }
     };
     let (reader, _) = match subscription {
         TimedOperation::Completed(Ok(reader)) => reader,
+        TimedOperation::Completed(Err(source)) if source.is_operation_timeout() => {
+            return Err(cleanup_after_driver_error(
+                connection_task,
+                CatalogRefreshError::OperationTimeout {
+                    operation: CatalogOperation::InitialLoad,
+                    timeout: operation_timeout.get(),
+                },
+            )
+            .await);
+        }
         TimedOperation::Completed(Err(source)) => {
             return Err(cleanup_after_load_error(connection_task, source).await);
         }
@@ -351,6 +351,29 @@ enum TimedOperation<T> {
     Elapsed,
 }
 
+async fn complete_result_before_deadline<F, T, E>(
+    operation: F,
+    deadline: Instant,
+) -> TimedOperation<Result<T, E>>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    tokio::pin!(operation);
+    let deadline_timer = sleep_until(deadline);
+    tokio::pin!(deadline_timer);
+    tokio::select! {
+        biased;
+        result = operation.as_mut() => {
+            if result.is_err() && Instant::now() >= deadline {
+                TimedOperation::Elapsed
+            } else {
+                TimedOperation::Completed(result)
+            }
+        },
+        () = deadline_timer.as_mut() => TimedOperation::Elapsed,
+    }
+}
+
 enum RefreshLoopError {
     Load(LoadError),
     OperationTimeout,
@@ -397,24 +420,23 @@ where
             continue;
         }
         let deadline = Instant::now() + operation_timeout.get();
-        let refresh = reader.refresh_before(cache, deadline);
+        let refresh =
+            complete_result_before_deadline(reader.refresh_before(cache, deadline), deadline);
         tokio::pin!(refresh);
-        let deadline_timer = sleep_until(deadline);
-        tokio::pin!(deadline_timer);
         tokio::select! {
             biased;
             () = shutdown.as_mut() => return Ok(RefreshLoopExit::Shutdown),
-            () = deadline_timer.as_mut() => return Err(RefreshLoopError::OperationTimeout),
-            result = refresh.as_mut() => {
-                if Instant::now() >= deadline
-                    || result
-                        .as_ref()
-                        .is_err_and(LoadError::is_operation_timeout)
-                {
+            result = refresh.as_mut() => match result {
+                TimedOperation::Elapsed => {
                     return Err(RefreshLoopError::OperationTimeout);
                 }
-                result?;
-                refreshed();
+                TimedOperation::Completed(Err(source)) if source.is_operation_timeout() => {
+                    return Err(RefreshLoopError::OperationTimeout);
+                }
+                TimedOperation::Completed(result) => {
+                    result?;
+                    refreshed();
+                }
             }
         }
     }
@@ -544,6 +566,20 @@ mod tests {
             let error = CatalogOperationTimeout::new(rejected).expect_err("invalid timeout");
             assert_eq!(error.timeout(), rejected);
         }
+    }
+
+    #[tokio::test]
+    async fn completed_success_wins_at_the_deadline_boundary() {
+        let result =
+            complete_result_before_deadline(async { Ok::<u8, ()>(7) }, Instant::now()).await;
+        assert!(matches!(result, TimedOperation::Completed(Ok(7))));
+    }
+
+    #[tokio::test]
+    async fn completed_error_loses_at_the_deadline_boundary() {
+        let result =
+            complete_result_before_deadline(async { Err::<u8, ()>(()) }, Instant::now()).await;
+        assert!(matches!(result, TimedOperation::Elapsed));
     }
 
     #[tokio::test]

@@ -116,9 +116,16 @@ The checked-in live test requires a disposable PostgreSQL 18 database:
 PGSHARD_TEST_DATABASE_URL=postgresql://postgres:password@127.0.0.1:5432/shardschema make catalog-test
 ```
 
-The cache retains the exact immutable snapshot used by an in-flight request
-until an explicit monotonic fence retires that epoch. PostgreSQL notifications
-contain only the committed decimal catalog epoch and are wake-up hints;
+An in-flight request owns its exact immutable planning snapshot independently.
+The cache itself owns at most the eight most recently installed snapshots; an
+older caller-held snapshot remains memory-safe after eviction, but execution
+revalidation returns `Unavailable` and requires replanning. An explicit
+monotonic fence can retire an epoch sooner. Cache-only planning and execution
+checks also fail closed after a hard 15-minute age ceiling; the supervisor
+normally enforces its lower configured stale grace. Replaying the exact
+authoritative snapshot refreshes that age without growing retained history.
+PostgreSQL notifications contain only the committed decimal catalog epoch and
+are wake-up hints;
 periodic polling remains required. `CatalogReader::subscribe` takes ownership
 of a dedicated connection, rejects a manually opened transaction, clears
 session-local state, and commits its subscription before the initial
@@ -127,8 +134,9 @@ coalesces notification bursts through one latest-wins wakeup slot, ignores
 invalid hints, and performs authoritative repeatable-read polling every 1 to
 300 seconds. Each committed subscription/initial load and each later refresh
 has a validated 100-millisecond-to-five-minute client deadline covering SQL,
-validation, and cache publication. Deadline-first selection and a timed cache
-write lock prevent a result from being published after expiry. A deadline
+validation, and cache publication. Deadline-bound publication waits on lock
+release instead of spinning. A successful internally checked publication wins
+a simultaneous outer timer wakeup; a boundary error remains a timeout. A deadline
 closes the dedicated session, leaves the last validated snapshot unchanged, and
 is terminal to that driver instance. A slightly later PostgreSQL 18
 `transaction_timeout` also interrupts server-side lock waits and rolls back if
@@ -139,11 +147,15 @@ jittered exponential backoff and bounds each connection attempt between 100
 milliseconds and 30 seconds. Its cloneable status handle keeps a pooler
 unready until the first validated load, permits an existing snapshot only
 within a configured 2-to-900-second stale grace, fails readiness exactly at the
-deadline or immediately after an epoch fence, and reports connection phase,
-cache age, epoch, connection attempts, sessions completing their initial
-authoritative load, and credential-safe connection, connection-timeout,
-operation-timeout, load, and connection-pump failure classes. The default
-policy uses a five-second connection deadline and 30-second operation deadline.
+deadline or immediately after an epoch fence, and reports connection phase plus
+an epoch/age pair from one atomic cache publication. Both fields are suppressed
+while an epoch-changing refresh awaits supervisor acknowledgement. It also
+reports connection attempts, sessions
+completing their initial authoritative load, and credential-safe authentication,
+configuration, refusal, network, I/O-timeout, server, connection-timeout,
+operation-timeout, load, and connection-pump failure classes. Raw connector
+errors are not retained. The default policy uses a five-second connection
+deadline and 30-second operation deadline.
 Its 90-second stale grace is strictly longer than the default 30-second poll.
 The `pgshard-pooler` Linux control executable composes the supervisor with its
 HTTP and Prometheus translation, bounded runtime configuration, a file-backed

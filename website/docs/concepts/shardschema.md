@@ -136,9 +136,11 @@ range end.
    only its latest valid epoch.
 7. The driver polls every bounded 1 to 300 seconds. Each subscription/initial
    load and refresh has a bounded 100-millisecond-to-five-minute deadline that
-   covers SQL, validation, and cache publication. Deadline-first selection and
-   a timed cache write lock reject publication after expiry. A deadline closes
-   that session without replacing the last validated cache;
+   covers SQL, validation, and cache publication. A completed, internally
+   deadline-checked success wins at the outer timer boundary; an error observed
+   at that boundary is still a timeout. Internal deadline checks and a timed
+   cache write lock reject publication after expiry. A deadline closes that
+   session without replacing the last validated cache;
    a slightly later PostgreSQL 18 `transaction_timeout` interrupts server-side
    lock waits and guarantees rollback. Connection loss is also terminal to that
    driver instance.
@@ -156,12 +158,14 @@ The default policy polls every 30 seconds, allows 90 seconds of cache age, uses
 a five-second connection deadline and a 30-second catalog-operation deadline,
 and grows reconnect-window ceilings from 100 milliseconds to five seconds.
 Each process waits within the upper half of its current window so replicas do
-not reconnect in lockstep. The status handle reports connection phase, catalog
-epoch, monotonic cache age, attempts, connections completing their initial
-authoritative load, and credential-safe failure categories including separate
-connection and operation timeouts. The pooler control executable publishes
-that catalog usability independently in exact JSON status and bounded-label
-Prometheus metrics. Its overall readiness remains false with reason
+not reconnect in lockstep. The status handle reports catalog epoch and monotonic
+cache age only when both come from the same atomic publication, suppressing both
+while an epoch-changing refresh awaits supervisor acknowledgement. It also
+reports connection phase, attempts,
+connections completing their initial authoritative load, and credential-safe
+failure categories including separate connection and operation timeouts. The
+pooler control executable publishes that catalog usability independently in
+exact JSON status and bounded-label Prometheus metrics. Its overall readiness remains false with reason
 `data_plane_unavailable`, even when the catalog is ready. It opens one regular
 DSN file nonblockingly, performs a bounded read, and accepts only loopback IP
 literals or Unix sockets with `sslmode=disable`, the exact `shardschema`
@@ -182,10 +186,21 @@ tables across one snapshot. Queries fetch only the limit plus one row so a
 runaway catalog cannot force an unbounded materialization before rejection.
 
 A request retains the exact immutable snapshot with which it was planned. The
-cache retains installed snapshots across newer publications and removes old
-ones only when an explicit monotonic fence retires them. Components reject a
-request if its epoch is unknown, future, or fenced before execution or
-activation.
+process-local cache owns at most the eight most recently installed snapshots,
+and an explicit monotonic fence can retire them sooner. A caller-held immutable
+snapshot remains readable after eviction, but components reject its epoch as
+unavailable at execution or activation and require replanning. They also reject
+unknown, future, or fenced epochs. Independently of supervisor readiness,
+cache-only planning and execution checks reject a snapshot once its last
+authoritative refresh reaches the hard 15-minute ceiling. The supervisor still
+applies its normally lower configured stale grace.
+
+Deadline-bound cache publication waits on lock-release notification rather than
+polling the executor. If an internally deadline-checked load and its outer timer
+become ready together, a successful publication wins; an error observed at the
+boundary remains a timeout. A successful snapshot is not mislabeled and its
+healthy connection is retained. Reconnect status preserves a bounded
+credential-safe cause category without retaining raw connector errors.
 
 The migration is transactional and idempotent, requires PostgreSQL 18 or newer,
 and must run in a pre-created UTF8 database named exactly `shardschema`. It
