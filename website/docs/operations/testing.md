@@ -143,8 +143,15 @@ It accepts an unproven non-temporary physical slot only as raw evidence and
 rejects reversed or stale collection windows; database, source, role, WAL-level,
 feedback, slot-sync, replay-floor coverage, receiver, gate, physical-slot,
 retention, invalidation, PID, application-name, activity, and peer-reply
-mismatches. It also proves that the output carries the coherent standby
-control-file checkpoint as an opaque source-bound replay floor while preserving
+mismatches. It independently mutates both failover-anchor endpoints and rejects
+an absent or misidentified row, wrong database/plugin/flags, temporary state,
+disabled or mismatched two-phase decoding, an active primary anchor,
+invalidation, missing or lost WAL retention, missing or unsafe progress, and a
+synchronized copy ahead of its primary. It accepts transient slot-sync worker
+ownership only on the synchronized copy and accepts the `synced = true` flag
+that PostgreSQL 18 can retain after promoting that copy to a writable primary.
+It also proves that the output carries
+the coherent standby control-file checkpoint as an opaque source-bound replay floor while preserving
 raw `catalog_xmin`, physical restart LSN, persistence classification, backend
 generation, and peer reply only as non-authorizing tokens.
 The `Orchestrator catalog / PostgreSQL 18` CI job applies the real migration,
@@ -207,8 +214,14 @@ primary-side coverage also requires the bounded plain synchronized-slot list to
 contain the managed physical slot, observes its nonzero `catalog_xmin`, retained
 restart LSN and active PID, and joins that PID to a streaming walsender with the
 expected managed `application_name`, nonzero backend generation, and a
-peer-supplied reply timestamp. The live topology confirms that WAL replay is
-paused, issues a new primary checkpoint, records the standby control-file floor,
+peer-supplied reply timestamp. That same bounded primary statement reads the
+exact failover anchor. The live case requires its catalog-selected name,
+database, `pgoutput` plugin, primary flags, non-temporary inactive state,
+two-phase activation boundary, retained WAL, and confirmed-flush progress; an
+absent requested anchor remains absent rather than producing a synthetic row.
+The final correlation compares that row with the continuously synchronized
+standby copy and requires compatible bounded progress. The live topology
+confirms that WAL replay is paused, issues a new primary checkpoint, records the standby control-file floor,
 and uses the new checkpoint record as the catalog requirement. The snapshot
 taken while replay remains paused fails correlation because its floor is behind
 that requirement. A bounded cleanup path always attempts to resume replay and
@@ -229,7 +242,9 @@ attachment authority. An absent ungated slot returns no synthetic rows.
 The reply timestamp and 32-bit transaction ID are equality-only raw values;
 feedback freshness and horizon coverage,
 new-anchor reconciliation on already-running standbys, and a timestamped
-successful source-bound slot-sync cycle remain part of the later runtime suite.
+successful source-bound slot-sync cycle, authenticated upstream adjacency,
+logical-slot ownership, and server-attested generation remain part of the later
+runtime suite.
 The same fixture proves that a session-owned temporary physical slot is active
 without inventing a walsender row, that it disappears within a bounded cleanup
 window after its backend exits, and that a temporary logical slot occupying the

@@ -31,13 +31,24 @@ logical-slot state plus the local continuous worker's process generation and
 post-cycle wait boundary. A primary-side sample bounds the plain unique
 synchronized-slot list and joins one managed physical slot's active PID to its
 exact walsender while keeping peer-supplied reply time and `catalog_xmin`
-non-authorizing. A pure bounded correlator now requires the separately sampled
-standby and primary paths to match the catalog's observable source components,
-database, roles, mandatory feedback and slot-sync configuration, matching
+non-authorizing. The same bounded primary statement also reads the exact
+catalog-selected failover anchor. A pure bounded correlator now requires the
+separately sampled standby and primary paths to match the catalog's observable
+source components, database, roles, mandatory feedback and slot-sync configuration, matching
 standby and primary checkpoint timelines plus live receiver and
 writable-primary timelines, a standby control-file replay floor covering the
 durable checkpoint, receiver slot, gated
 active physical slot, retained WAL, and exact streaming walsender identity. It
+compares the primary anchor with the continuously synchronized standby copy,
+requiring their name, database, plugin, failover-enabled primary and
+synchronized-standby roles, non-temporary state,
+two-phase boundary, invalidation, retained WAL, and bounded confirmed-flush
+progress to be compatible. Synchronized progress cannot lead primary progress;
+the primary anchor must be inactive. A promoted writable primary may retain
+PostgreSQL 18's `synced = true` synchronized-origin marker, while its
+hot-standby restrictions no longer apply, so either failover-enabled primary
+shape is accepted. Transient slot-sync ownership of the standby copy is
+accepted. It
 remains a preflight endpoint-compatibility and
 change token rather than proof of network adjacency or decoder authorization.
 PostgreSQL's SQL API does not expose the live replay LSN with its atomically
@@ -51,6 +62,7 @@ material, exact live-replay, upstream and network-adjacency proof,
 restore-incarnation observation,
 worker-connection and successful-cycle correlation, feedback freshness and
 catalog-horizon proof, physical-slot lifecycle attestation, role activation,
+logical-slot ownership and server-attested generation,
 operator-managed replication, durable lease integration, promotion, automated
 recovery, and rolling restarts are not implemented; see
 [implementation status](../project/status.md).
@@ -71,7 +83,10 @@ Managed logical consumers, including public change streams and reshard
 materializers, prefer a healthy physical standby as their decoding source. The
 primary retains a failover anchor at the last durable consumer checkpoint, and
 PostgreSQL 18 automatically synchronizes that anchor to managed promotion
-candidates. Because PostgreSQL does not allow a synchronized logical slot to be
+candidates. Promotion can leave `synced = true` visible on the now-writable
+primary as a record that the slot originated as a synchronized copy, while the
+hot-standby restrictions no longer apply. Because
+PostgreSQL does not allow a synchronized logical slot to be
 decoded on a hot standby, normal standby decoding uses a distinct standby-local
 slot. Promotion and source changes are catalog-fenced and may replay events,
 but they must never skip an event. See

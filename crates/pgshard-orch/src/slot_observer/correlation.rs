@@ -21,15 +21,16 @@ use super::{
     LocalPrimaryReplicationObservationBatch, LocalWalReceiverActivity, LocalWalSenderActivity,
 };
 use crate::standby_slots::{
-    FailoverSlotSynchronization, LogicalWalLevel, MIN_FEEDBACK_REPORTING_MARGIN, RecoveryState,
-    ReplicationSlotName, ReplicationSourceIdentity, SettingState, SlotActivity, SlotInvalidation,
-    SlotPersistence, SlotWalRetention, SourceBoundReplayFloor, StandbyDecoderPolicy,
+    FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotObservation, LogicalSlotPlugin,
+    LogicalWalLevel, MIN_FEEDBACK_REPORTING_MARGIN, RecoveryState, ReplicationSlotName,
+    ReplicationSourceIdentity, SettingState, SlotActivity, SlotInvalidation, SlotPersistence,
+    SlotWalRetention, SourceBoundReplayFloor, StandbyDecoderPolicy,
 };
 
 /// Bounded correlation of one standby receiver with its primary-side path.
 ///
 /// The proof binds catalog-selected source identity components, database,
-/// physical-slot name, receiver state, primary slot ownership, and walsender
+/// physical-slot name, receiver state, primary slot activity, and walsender
 /// PID/application state across a local monotonic observation window. It can
 /// become stale immediately and is not decoder-attachment authorization.
 ///
@@ -56,6 +57,9 @@ pub struct CorrelatedStandbyReplicationPath {
     physical_restart_lsn: PgLsn,
     physical_wal_retention: SlotWalRetention,
     peer_reply_epoch_micros: NonZeroU64,
+    failover_anchor: ReplicationSlotName,
+    primary_failover_anchor_confirmed_lsn: PgLsn,
+    synchronized_failover_anchor_confirmed_lsn: PgLsn,
 }
 
 impl CorrelatedStandbyReplicationPath {
@@ -142,6 +146,33 @@ impl CorrelatedStandbyReplicationPath {
     pub const fn peer_reply_epoch_micros(&self) -> NonZeroU64 {
         self.peer_reply_epoch_micros
     }
+
+    /// Returns the catalog-selected failover-anchor slot name observed at both ends.
+    ///
+    /// The name encodes the requested generation, but the observations do not
+    /// attest lifecycle ownership or mutation history.
+    #[must_use]
+    pub const fn failover_anchor(&self) -> &ReplicationSlotName {
+        &self.failover_anchor
+    }
+
+    /// Returns the primary failover anchor's conservative confirmed-flush LSN.
+    ///
+    /// This separately sampled value is comparison evidence, not attachment
+    /// authority or proof of a recent slot-sync cycle.
+    #[must_use]
+    pub const fn primary_failover_anchor_confirmed_lsn(&self) -> PgLsn {
+        self.primary_failover_anchor_confirmed_lsn
+    }
+
+    /// Returns the synchronized standby copy's conservative confirmed-flush LSN.
+    ///
+    /// This separately sampled value is comparison evidence, not attachment
+    /// authority or proof of direct upstream adjacency.
+    #[must_use]
+    pub const fn synchronized_failover_anchor_confirmed_lsn(&self) -> PgLsn {
+        self.synchronized_failover_anchor_confirmed_lsn
+    }
 }
 
 /// Correlates compatible separately sampled standby and primary endpoint state.
@@ -153,7 +184,7 @@ impl CorrelatedStandbyReplicationPath {
 ///
 /// Rejects stale or inconsistent sample windows; a source, database, role, or
 /// configuration mismatch; an unready receiver; or an unsafe/incomplete
-/// primary physical-slot and walsender path.
+/// primary physical-slot, walsender, or failover-anchor path.
 pub fn correlate_standby_replication_path(
     policy: &StandbyDecoderPolicy,
     standby: &LocalLogicalSlotObservationBatch,
@@ -172,6 +203,7 @@ fn correlate_standby_replication_path_at(
     validate_sources_and_roles(policy, standby, primary)?;
     let (standby_replay_floor_lsn, wal_receiver_pid) = validate_standby_path(policy, standby)?;
     let primary_path = validate_primary_path(policy, primary)?;
+    let failover_anchor = validate_failover_anchors(policy, standby, primary)?;
 
     Ok(CorrelatedStandbyReplicationPath {
         source_identity: policy.expected_source(),
@@ -186,6 +218,9 @@ fn correlate_standby_replication_path_at(
         physical_restart_lsn: primary_path.restart_lsn,
         physical_wal_retention: primary_path.wal_retention,
         peer_reply_epoch_micros: primary_path.peer_reply_epoch_micros,
+        failover_anchor: policy.failover_anchor().name().clone(),
+        primary_failover_anchor_confirmed_lsn: failover_anchor.primary_confirmed_lsn,
+        synchronized_failover_anchor_confirmed_lsn: failover_anchor.synchronized_confirmed_lsn,
     })
 }
 
@@ -291,6 +326,128 @@ struct PrimaryPathEvidence {
     restart_lsn: PgLsn,
     wal_retention: SlotWalRetention,
     peer_reply_epoch_micros: NonZeroU64,
+}
+
+struct FailoverAnchorEvidence {
+    primary_confirmed_lsn: PgLsn,
+    synchronized_confirmed_lsn: PgLsn,
+}
+
+fn validate_failover_anchors(
+    policy: &StandbyDecoderPolicy,
+    standby: &LocalLogicalSlotObservationBatch,
+    primary: &LocalPrimaryReplicationObservationBatch,
+) -> Result<FailoverAnchorEvidence, StandbyReplicationPathCorrelationError> {
+    let primary_confirmed_lsn = validate_failover_anchor(
+        policy,
+        ObservedFailoverAnchorSide::Primary,
+        primary.failover_anchor(),
+    )?;
+    let synchronized_anchor = standby
+        .entries()
+        .iter()
+        .find(|entry| entry.target() == policy.failover_anchor())
+        .and_then(|entry| entry.observation());
+    let synchronized_confirmed_lsn = validate_failover_anchor(
+        policy,
+        ObservedFailoverAnchorSide::SynchronizedStandby,
+        synchronized_anchor,
+    )?;
+    if synchronized_confirmed_lsn.0 > primary_confirmed_lsn.0 {
+        return Err(
+            StandbyReplicationPathCorrelationError::SynchronizedAnchorAhead {
+                synchronized: synchronized_confirmed_lsn,
+                primary: primary_confirmed_lsn,
+            },
+        );
+    }
+    Ok(FailoverAnchorEvidence {
+        primary_confirmed_lsn,
+        synchronized_confirmed_lsn,
+    })
+}
+
+fn validate_failover_anchor(
+    policy: &StandbyDecoderPolicy,
+    side: ObservedFailoverAnchorSide,
+    slot: Option<&LogicalSlotObservation>,
+) -> Result<PgLsn, StandbyReplicationPathCorrelationError> {
+    let reject = |problem| StandbyReplicationPathCorrelationError::FailoverAnchor { side, problem };
+    let slot = slot.ok_or_else(|| reject(ObservedFailoverAnchorProblem::Missing))?;
+    if slot.name != *policy.failover_anchor().name() {
+        return Err(reject(ObservedFailoverAnchorProblem::NameMismatch));
+    }
+    if slot.database_oid != policy.expected_source().database_oid() {
+        return Err(reject(ObservedFailoverAnchorProblem::DatabaseMismatch));
+    }
+    if slot.plugin != LogicalSlotPlugin::PgOutput {
+        return Err(reject(ObservedFailoverAnchorProblem::WrongPlugin));
+    }
+    if slot.persistence == SlotPersistence::NonPersistent {
+        return Err(reject(ObservedFailoverAnchorProblem::Temporary));
+    }
+    let flags_match = match side {
+        ObservedFailoverAnchorSide::Primary => matches!(
+            slot.kind,
+            LogicalSlotKind::FailoverAnchor | LogicalSlotKind::SynchronizedFailoverAnchor
+        ),
+        ObservedFailoverAnchorSide::SynchronizedStandby => {
+            slot.kind == LogicalSlotKind::SynchronizedFailoverAnchor
+        }
+    };
+    if !flags_match {
+        return Err(reject(ObservedFailoverAnchorProblem::WrongFlags));
+    }
+    if slot.two_phase != SettingState::Enabled {
+        return Err(reject(ObservedFailoverAnchorProblem::TwoPhaseDisabled));
+    }
+    let expected_two_phase_at = policy.two_phase_policy().failover_anchor_at;
+    if slot.two_phase_at != Some(expected_two_phase_at) {
+        return Err(reject(
+            ObservedFailoverAnchorProblem::TwoPhaseBoundaryMismatch {
+                expected: expected_two_phase_at,
+                observed: slot.two_phase_at,
+            },
+        ));
+    }
+    if side == ObservedFailoverAnchorSide::Primary
+        && !matches!(slot.activity, SlotActivity::Inactive)
+    {
+        return Err(reject(ObservedFailoverAnchorProblem::Active));
+    }
+    if let Some(reason) = slot.invalidation {
+        return Err(reject(ObservedFailoverAnchorProblem::Invalidated(reason)));
+    }
+    let wal_retention = slot
+        .wal_retention
+        .ok_or_else(|| reject(ObservedFailoverAnchorProblem::WalRetentionMissing))?;
+    if !matches!(
+        wal_retention,
+        SlotWalRetention::Reserved | SlotWalRetention::Extended
+    ) {
+        return Err(reject(ObservedFailoverAnchorProblem::WalNotRetained(
+            wal_retention,
+        )));
+    }
+    let confirmed_flush_lsn = slot
+        .confirmed_flush_lsn
+        .filter(|lsn| lsn.0 != 0)
+        .ok_or_else(|| reject(ObservedFailoverAnchorProblem::ProgressMissing))?;
+    if expected_two_phase_at.0 > confirmed_flush_lsn.0 {
+        return Err(reject(
+            ObservedFailoverAnchorProblem::TwoPhaseBoundaryAhead {
+                two_phase_at: expected_two_phase_at,
+                confirmed_flush_lsn,
+            },
+        ));
+    }
+    if confirmed_flush_lsn.0 > policy.durable_checkpoint_lsn().0 {
+        return Err(reject(ObservedFailoverAnchorProblem::ProgressAhead {
+            confirmed_flush_lsn,
+            durable_checkpoint_lsn: policy.durable_checkpoint_lsn(),
+        }));
+    }
+    Ok(confirmed_flush_lsn)
 }
 
 fn validate_primary_path(
@@ -404,6 +561,84 @@ fn matches_source(
     system_identifier == expected.system_identifier()
         && timeline == expected.timeline()
         && database_oid == expected.database_oid()
+}
+
+/// Endpoint whose failover-anchor row failed conservative correlation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservedFailoverAnchorSide {
+    /// Failover-enabled slot sampled on the writable primary.
+    ///
+    /// `PostgreSQL` can retain `synced = true` as synchronized-origin metadata
+    /// after promoting a standby, while its hot-standby restrictions no longer
+    /// apply once the server is writable.
+    Primary,
+    /// Continuously synchronized promotion copy sampled on the standby.
+    SynchronizedStandby,
+}
+
+/// Unsafe or incomplete state in one observed failover-anchor row.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ObservedFailoverAnchorProblem {
+    /// Exact catalog-selected slot was absent.
+    #[error("slot is absent")]
+    Missing,
+    /// Row name differs from the catalog-selected target.
+    #[error("slot name does not match the catalog target")]
+    NameMismatch,
+    /// Slot belongs to another database.
+    #[error("slot database does not match the catalog source")]
+    DatabaseMismatch,
+    /// Slot does not use the built-in `pgoutput` plugin.
+    #[error("slot does not use pgoutput")]
+    WrongPlugin,
+    /// Slot is known to be temporary.
+    #[error("slot is temporary")]
+    Temporary,
+    /// `failover` or `synced` flags do not match the endpoint role.
+    #[error("slot failover or synchronized flags do not match its endpoint")]
+    WrongFlags,
+    /// Prepared-transaction decoding is disabled.
+    #[error("slot does not decode prepared transactions")]
+    TwoPhaseDisabled,
+    /// Prepared-decoding activation boundary differs from the catalog fence.
+    #[error("slot prepared-decoding boundary does not match the catalog fence")]
+    TwoPhaseBoundaryMismatch {
+        /// Catalog-selected activation boundary.
+        expected: PgLsn,
+        /// Boundary exposed by `PostgreSQL`.
+        observed: Option<PgLsn>,
+    },
+    /// Primary anchor is already owned by a decoder backend.
+    #[error("primary slot is active")]
+    Active,
+    /// `PostgreSQL` invalidated the slot.
+    #[error("slot is invalidated: {0:?}")]
+    Invalidated(SlotInvalidation),
+    /// `PostgreSQL` omitted the slot's WAL-retention classification.
+    #[error("slot WAL-retention state is absent")]
+    WalRetentionMissing,
+    /// Required slot WAL is no longer guaranteed to be retained.
+    #[error("slot WAL is not retained: {0:?}")]
+    WalNotRetained(SlotWalRetention),
+    /// Slot has no nonzero confirmed consistent point.
+    #[error("slot confirmed-flush progress is absent")]
+    ProgressMissing,
+    /// Slot has not reached the prepared-decoding activation boundary.
+    #[error("slot confirmed-flush progress precedes its prepared-decoding boundary")]
+    TwoPhaseBoundaryAhead {
+        /// Catalog-selected prepared-decoding boundary.
+        two_phase_at: PgLsn,
+        /// Slot confirmed-flush progress.
+        confirmed_flush_lsn: PgLsn,
+    },
+    /// Slot has advanced beyond the catalog's durable consumer checkpoint.
+    #[error("slot confirmed-flush progress is ahead of the durable checkpoint")]
+    ProgressAhead {
+        /// Slot confirmed-flush progress.
+        confirmed_flush_lsn: PgLsn,
+        /// Catalog's durable consumer checkpoint.
+        durable_checkpoint_lsn: PgLsn,
+    },
 }
 
 /// A fail-closed rejection while correlating one primary/standby path.
@@ -526,6 +761,24 @@ pub enum StandbyReplicationPathCorrelationError {
     /// `PostgreSQL` has not reported any peer reply on this walsender.
     #[error("primary walsender has no peer reply token")]
     WalSenderReplyMissing,
+    /// One primary or synchronized failover-anchor row is unusable.
+    #[error("{side:?} failover anchor is unusable: {problem}")]
+    FailoverAnchor {
+        /// Endpoint that exposed the problem.
+        side: ObservedFailoverAnchorSide,
+        /// Unsafe or incomplete row state.
+        problem: ObservedFailoverAnchorProblem,
+    },
+    /// Separately sampled synchronized progress cannot lead its primary source.
+    #[error(
+        "synchronized failover-anchor progress {synchronized:?} is ahead of primary progress {primary:?}"
+    )]
+    SynchronizedAnchorAhead {
+        /// Synchronized standby copy's confirmed-flush LSN.
+        synchronized: PgLsn,
+        /// Original primary anchor's confirmed-flush LSN.
+        primary: PgLsn,
+    },
 }
 
 #[cfg(test)]
@@ -541,8 +794,8 @@ mod tests {
     };
     use super::*;
     use crate::standby_slots::{
-        ManagedSlotTarget, ManagedTwoPhasePolicy, SlotGeneration, StandbyDecoderEvidenceLimits,
-        StandbyDecoderTarget,
+        ManagedSlotTarget, ManagedTwoPhasePolicy, SlotGeneration, SlotOwnership,
+        StandbyDecoderEvidenceLimits, StandbyDecoderTarget,
     };
 
     const SYSTEM_IDENTIFIER: u64 = 7_219_834_723_984_723;
@@ -551,6 +804,7 @@ mod tests {
     const CHECKPOINT: PgLsn = PgLsn(0x3000);
     const STANDBY_REPLAY_FLOOR: PgLsn = PgLsn(0x4000);
     const RESTART: PgLsn = PgLsn(0x2000);
+    const ANCHOR_PROGRESS: PgLsn = PgLsn(CHECKPOINT.0 - 1);
 
     #[derive(Clone)]
     struct Fixture {
@@ -646,10 +900,39 @@ mod tests {
             },
             slot_collection_started_at: base + Duration::from_millis(2),
             slot_collection_finished_at: base + Duration::from_millis(3),
-            entries: vec![LogicalSlotSnapshotEntry {
-                target: policy.local_decoder().clone(),
-                observation: None,
-            }],
+            entries: vec![
+                LogicalSlotSnapshotEntry {
+                    target: policy.local_decoder().clone(),
+                    observation: None,
+                },
+                LogicalSlotSnapshotEntry {
+                    target: policy.failover_anchor().clone(),
+                    observation: Some(anchor_observation(
+                        policy,
+                        LogicalSlotKind::SynchronizedFailoverAnchor,
+                    )),
+                },
+            ],
+        }
+    }
+
+    fn anchor_observation(
+        policy: &StandbyDecoderPolicy,
+        kind: LogicalSlotKind,
+    ) -> LogicalSlotObservation {
+        LogicalSlotObservation {
+            name: policy.failover_anchor().name().clone(),
+            database_oid: DATABASE_OID,
+            plugin: LogicalSlotPlugin::PgOutput,
+            kind,
+            persistence: SlotPersistence::Unproven,
+            two_phase: SettingState::Enabled,
+            two_phase_at: Some(policy.two_phase_policy().failover_anchor_at),
+            activity: SlotActivity::Inactive,
+            ownership: SlotOwnership::Unknown,
+            invalidation: None,
+            wal_retention: Some(SlotWalRetention::Reserved),
+            confirmed_flush_lsn: Some(ANCHOR_PROGRESS),
         }
     }
 
@@ -687,6 +970,7 @@ mod tests {
                 activity: LocalWalSenderActivity::Streaming,
                 reply_epoch_micros: Some(nonzero_u64(1_700_000_001_000_000)),
             }),
+            failover_anchor: Some(anchor_observation(policy, LogicalSlotKind::FailoverAnchor)),
         }
     }
 
@@ -715,6 +999,13 @@ mod tests {
         );
     }
 
+    fn anchor_error(
+        side: ObservedFailoverAnchorSide,
+        problem: ObservedFailoverAnchorProblem,
+    ) -> StandbyReplicationPathCorrelationError {
+        StandbyReplicationPathCorrelationError::FailoverAnchor { side, problem }
+    }
+
     fn prerequisites(fixture: &mut Fixture) -> &mut LocalStandbyPrerequisiteObservation {
         &mut fixture.standby.prerequisites
     }
@@ -733,6 +1024,34 @@ mod tests {
             .wal_sender
             .as_mut()
             .expect("fixture walsender")
+    }
+
+    fn primary_anchor(fixture: &mut Fixture) -> &mut LogicalSlotObservation {
+        fixture
+            .primary
+            .failover_anchor
+            .as_mut()
+            .expect("fixture primary anchor")
+    }
+
+    fn synchronized_anchor(fixture: &mut Fixture) -> &mut LogicalSlotObservation {
+        fixture
+            .standby
+            .entries
+            .iter_mut()
+            .find(|entry| entry.target == *fixture.policy.failover_anchor())
+            .and_then(|entry| entry.observation.as_mut())
+            .expect("fixture synchronized anchor")
+    }
+
+    fn anchor(
+        fixture: &mut Fixture,
+        side: ObservedFailoverAnchorSide,
+    ) -> &mut LogicalSlotObservation {
+        match side {
+            ObservedFailoverAnchorSide::Primary => primary_anchor(fixture),
+            ObservedFailoverAnchorSide::SynchronizedStandby => synchronized_anchor(fixture),
+        }
     }
 
     #[test]
@@ -772,6 +1091,18 @@ mod tests {
         assert_eq!(
             proof.peer_reply_epoch_micros(),
             nonzero_u64(1_700_000_001_000_000)
+        );
+        assert_eq!(
+            proof.failover_anchor(),
+            fixture.policy.failover_anchor().name()
+        );
+        assert_eq!(
+            proof.primary_failover_anchor_confirmed_lsn(),
+            ANCHOR_PROGRESS
+        );
+        assert_eq!(
+            proof.synchronized_failover_anchor_confirmed_lsn(),
+            ANCHOR_PROGRESS
         );
     }
 
@@ -1018,6 +1349,182 @@ mod tests {
         reject(
             |fixture| wal_sender(fixture).reply_epoch_micros = None,
             StandbyReplicationPathCorrelationError::WalSenderReplyMissing,
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_misidentified_failover_anchors() {
+        reject(
+            |fixture| fixture.primary.failover_anchor = None,
+            anchor_error(
+                ObservedFailoverAnchorSide::Primary,
+                ObservedFailoverAnchorProblem::Missing,
+            ),
+        );
+        reject(
+            |fixture| {
+                fixture.standby.entries.pop();
+            },
+            anchor_error(
+                ObservedFailoverAnchorSide::SynchronizedStandby,
+                ObservedFailoverAnchorProblem::Missing,
+            ),
+        );
+        for side in [
+            ObservedFailoverAnchorSide::Primary,
+            ObservedFailoverAnchorSide::SynchronizedStandby,
+        ] {
+            reject(
+                |fixture| anchor(fixture, side).name = slot("another_anchor"),
+                anchor_error(side, ObservedFailoverAnchorProblem::NameMismatch),
+            );
+            reject(
+                |fixture| anchor(fixture, side).database_oid += 1,
+                anchor_error(side, ObservedFailoverAnchorProblem::DatabaseMismatch),
+            );
+            reject(
+                |fixture| anchor(fixture, side).plugin = LogicalSlotPlugin::Other,
+                anchor_error(side, ObservedFailoverAnchorProblem::WrongPlugin),
+            );
+            reject(
+                |fixture| anchor(fixture, side).persistence = SlotPersistence::NonPersistent,
+                anchor_error(side, ObservedFailoverAnchorProblem::Temporary),
+            );
+        }
+        reject(
+            |fixture| {
+                primary_anchor(fixture).kind = LogicalSlotKind::StandbyLocalDecoder;
+            },
+            anchor_error(
+                ObservedFailoverAnchorSide::Primary,
+                ObservedFailoverAnchorProblem::WrongFlags,
+            ),
+        );
+        reject(
+            |fixture| {
+                synchronized_anchor(fixture).kind = LogicalSlotKind::FailoverAnchor;
+            },
+            anchor_error(
+                ObservedFailoverAnchorSide::SynchronizedStandby,
+                ObservedFailoverAnchorProblem::WrongFlags,
+            ),
+        );
+    }
+
+    #[test]
+    fn accepts_a_synchronized_anchor_left_by_primary_promotion() {
+        let mut fixture = fixture();
+        primary_anchor(&mut fixture).kind = LogicalSlotKind::SynchronizedFailoverAnchor;
+
+        correlate_standby_replication_path_at(
+            &fixture.policy,
+            &fixture.standby,
+            &fixture.primary,
+            fixture.evaluated_at,
+        )
+        .expect("a promoted primary retains origin metadata without standby restrictions");
+    }
+
+    #[test]
+    fn rejects_unsafe_failover_anchor_state_and_progress() {
+        for side in [
+            ObservedFailoverAnchorSide::Primary,
+            ObservedFailoverAnchorSide::SynchronizedStandby,
+        ] {
+            reject(
+                |fixture| anchor(fixture, side).two_phase = SettingState::Disabled,
+                anchor_error(side, ObservedFailoverAnchorProblem::TwoPhaseDisabled),
+            );
+            reject(
+                |fixture| anchor(fixture, side).two_phase_at = None,
+                anchor_error(
+                    side,
+                    ObservedFailoverAnchorProblem::TwoPhaseBoundaryMismatch {
+                        expected: PgLsn(CHECKPOINT.0 - 2),
+                        observed: None,
+                    },
+                ),
+            );
+            reject(
+                |fixture| {
+                    anchor(fixture, side).invalidation = Some(SlotInvalidation::WalRemoved);
+                },
+                anchor_error(
+                    side,
+                    ObservedFailoverAnchorProblem::Invalidated(SlotInvalidation::WalRemoved),
+                ),
+            );
+            reject(
+                |fixture| anchor(fixture, side).wal_retention = None,
+                anchor_error(side, ObservedFailoverAnchorProblem::WalRetentionMissing),
+            );
+            reject(
+                |fixture| {
+                    anchor(fixture, side).wal_retention = Some(SlotWalRetention::Unreserved);
+                },
+                anchor_error(
+                    side,
+                    ObservedFailoverAnchorProblem::WalNotRetained(SlotWalRetention::Unreserved),
+                ),
+            );
+            reject(
+                |fixture| anchor(fixture, side).confirmed_flush_lsn = Some(PgLsn(0)),
+                anchor_error(side, ObservedFailoverAnchorProblem::ProgressMissing),
+            );
+            reject(
+                |fixture| {
+                    anchor(fixture, side).confirmed_flush_lsn = Some(PgLsn(CHECKPOINT.0 - 3));
+                },
+                anchor_error(
+                    side,
+                    ObservedFailoverAnchorProblem::TwoPhaseBoundaryAhead {
+                        two_phase_at: PgLsn(CHECKPOINT.0 - 2),
+                        confirmed_flush_lsn: PgLsn(CHECKPOINT.0 - 3),
+                    },
+                ),
+            );
+            reject(
+                |fixture| {
+                    anchor(fixture, side).confirmed_flush_lsn = Some(PgLsn(CHECKPOINT.0 + 1));
+                },
+                anchor_error(
+                    side,
+                    ObservedFailoverAnchorProblem::ProgressAhead {
+                        confirmed_flush_lsn: PgLsn(CHECKPOINT.0 + 1),
+                        durable_checkpoint_lsn: CHECKPOINT,
+                    },
+                ),
+            );
+        }
+        reject(
+            |fixture| primary_anchor(fixture).activity = SlotActivity::Active(nonzero_u32(601)),
+            anchor_error(
+                ObservedFailoverAnchorSide::Primary,
+                ObservedFailoverAnchorProblem::Active,
+            ),
+        );
+    }
+
+    #[test]
+    fn synchronized_anchor_may_be_active_but_cannot_lead_primary() {
+        let mut fixture = fixture();
+        synchronized_anchor(&mut fixture).activity = SlotActivity::Active(nonzero_u32(701));
+        correlate_standby_replication_path_at(
+            &fixture.policy,
+            &fixture.standby,
+            &fixture.primary,
+            fixture.evaluated_at,
+        )
+        .expect("slot-sync worker may transiently own the synchronized copy");
+
+        reject(
+            |fixture| {
+                primary_anchor(fixture).confirmed_flush_lsn = Some(PgLsn(CHECKPOINT.0 - 2));
+            },
+            StandbyReplicationPathCorrelationError::SynchronizedAnchorAhead {
+                synchronized: ANCHOR_PROGRESS,
+                primary: PgLsn(CHECKPOINT.0 - 2),
+            },
         );
     }
 }
