@@ -38,10 +38,16 @@ DECLARE
     catalog_schema_oid oid;
     catalog_schema_owner oid;
     catalog_schema_owner_name name;
+    catalog_schema_owner_is_superuser boolean;
+    dependent_membership record;
+    owner_membership record;
     mismatched_object text;
 BEGIN
-    SELECT namespaces.oid, owners.oid, owners.rolname
-      INTO catalog_schema_oid, catalog_schema_owner, catalog_schema_owner_name
+    SELECT namespaces.oid, owners.oid, owners.rolname, owners.rolsuper
+      INTO catalog_schema_oid,
+           catalog_schema_owner,
+           catalog_schema_owner_name,
+           catalog_schema_owner_is_superuser
       FROM pg_catalog.pg_namespace AS namespaces
       JOIN pg_catalog.pg_roles AS owners ON owners.oid = namespaces.nspowner
      WHERE namespaces.nspname = 'pgshard_catalog';
@@ -124,10 +130,19 @@ BEGIN
             MESSAGE = 'pre-existing pgshard_catalog schema has an unsafe fixed-role owner';
     END IF;
 
+    IF catalog_schema_owner_name <> 'pgshard_catalog_owner'
+       AND NOT catalog_schema_owner_is_superuser THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog schema owner must be a superuser';
+    END IF;
+
     -- PostgreSQL 18 automatically gives a non-superuser CREATEROLE principal
-    -- ADMIN OPTION on roles that it creates. The released catalog migration
-    -- allowed that principal to own the whole schema, so remove only those two
-    -- legacy creator memberships after proving the schema has one owner.
+    -- ADMIN OPTION on roles that it creates. SET ROLE can produce the same
+    -- memberships for a superuser-owned released catalog, with downstream
+    -- grants recorded under the schema owner. Re-home non-delegable downstream
+    -- grants under this trusted bootstrap principal before removing every
+    -- legacy creator membership with CASCADE.
     IF catalog_schema_owner_name <> 'pgshard_catalog_owner' THEN
         IF (
             SELECT pg_catalog.count(*)
@@ -141,28 +156,99 @@ BEGIN
                 ERRCODE = '42501',
                 MESSAGE = 'legacy pgshard_catalog schema requires both released fixed roles';
         END IF;
+
         IF EXISTS (
             SELECT
               FROM pg_catalog.pg_auth_members AS memberships
-             WHERE memberships.member = catalog_schema_owner
-               AND memberships.roleid = 'pgshard_catalog_reader'::pg_catalog.regrole
+             WHERE memberships.roleid IN (
+                       'pgshard_catalog_reader'::pg_catalog.regrole,
+                       'pgshard_catalog_admin'::pg_catalog.regrole
+                   )
+               AND memberships.member <> catalog_schema_owner
+               AND memberships.admin_option
         ) THEN
-            EXECUTE pg_catalog.format(
-                'REVOKE pgshard_catalog_reader FROM %I',
-                catalog_schema_owner_name
-            );
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = 'pre-existing pgshard catalog role has a delegable membership';
         END IF;
-        IF EXISTS (
-            SELECT
+
+        FOR dependent_membership IN
+            SELECT granted_roles.rolname AS granted_role_name,
+                   member_roles.rolname AS member_role_name,
+                   pg_catalog.bool_or(memberships.inherit_option) AS inherit_option,
+                   pg_catalog.bool_or(memberships.set_option) AS set_option
               FROM pg_catalog.pg_auth_members AS memberships
-             WHERE memberships.member = catalog_schema_owner
-               AND memberships.roleid = 'pgshard_catalog_admin'::pg_catalog.regrole
-        ) THEN
+              JOIN pg_catalog.pg_roles AS granted_roles
+                ON granted_roles.oid = memberships.roleid
+              JOIN pg_catalog.pg_roles AS member_roles
+                ON member_roles.oid = memberships.member
+             WHERE memberships.roleid IN (
+                       'pgshard_catalog_reader'::pg_catalog.regrole,
+                       'pgshard_catalog_admin'::pg_catalog.regrole
+                   )
+               AND memberships.member <> catalog_schema_owner
+               AND EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_auth_members AS legacy_grants
+                    WHERE legacy_grants.roleid = memberships.roleid
+                      AND legacy_grants.member = memberships.member
+                      AND legacy_grants.grantor = catalog_schema_owner
+               )
+             GROUP BY granted_roles.rolname, member_roles.rolname
+        LOOP
             EXECUTE pg_catalog.format(
-                'REVOKE pgshard_catalog_admin FROM %I',
+                'GRANT %I TO %I WITH ADMIN FALSE, INHERIT %s, SET %s',
+                dependent_membership.granted_role_name,
+                dependent_membership.member_role_name,
+                CASE WHEN dependent_membership.inherit_option THEN 'TRUE' ELSE 'FALSE' END,
+                CASE WHEN dependent_membership.set_option THEN 'TRUE' ELSE 'FALSE' END
+            );
+        END LOOP;
+
+        FOR dependent_membership IN
+            SELECT granted_roles.rolname AS granted_role_name,
+                   member_roles.rolname AS member_role_name
+              FROM pg_catalog.pg_auth_members AS memberships
+              JOIN pg_catalog.pg_roles AS granted_roles
+                ON granted_roles.oid = memberships.roleid
+              JOIN pg_catalog.pg_roles AS member_roles
+                ON member_roles.oid = memberships.member
+             WHERE memberships.roleid IN (
+                       'pgshard_catalog_reader'::pg_catalog.regrole,
+                       'pgshard_catalog_admin'::pg_catalog.regrole
+                   )
+               AND memberships.member <> catalog_schema_owner
+               AND memberships.grantor = catalog_schema_owner
+        LOOP
+            EXECUTE pg_catalog.format(
+                'REVOKE %I FROM %I GRANTED BY %I CASCADE',
+                dependent_membership.granted_role_name,
+                dependent_membership.member_role_name,
                 catalog_schema_owner_name
             );
-        END IF;
+        END LOOP;
+
+        FOR owner_membership IN
+            SELECT granted_roles.rolname AS granted_role_name,
+                   grantors.rolname AS grantor_name
+              FROM pg_catalog.pg_auth_members AS memberships
+              JOIN pg_catalog.pg_roles AS granted_roles
+                ON granted_roles.oid = memberships.roleid
+              JOIN pg_catalog.pg_roles AS grantors
+                ON grantors.oid = memberships.grantor
+             WHERE memberships.roleid IN (
+                       'pgshard_catalog_reader'::pg_catalog.regrole,
+                       'pgshard_catalog_admin'::pg_catalog.regrole
+                   )
+               AND memberships.member = catalog_schema_owner
+        LOOP
+            EXECUTE pg_catalog.format(
+                'REVOKE %I FROM %I GRANTED BY %I CASCADE',
+                owner_membership.granted_role_name,
+                catalog_schema_owner_name,
+                owner_membership.grantor_name
+            );
+        END LOOP;
     END IF;
 END
 $pgshard_role_bootstrap$;
@@ -369,11 +455,21 @@ BEGIN
         SELECT types.typtype, types.typname
           FROM pg_catalog.pg_type AS types
          WHERE types.typnamespace = catalog_schema_oid
-           AND types.typrelid = 0
-           AND NOT EXISTS (
-               SELECT
-                 FROM pg_catalog.pg_type AS element_types
-                WHERE element_types.typarray = types.oid
+           AND (
+               (
+                   types.typrelid = 0
+                   AND NOT EXISTS (
+                       SELECT
+                         FROM pg_catalog.pg_type AS element_types
+                        WHERE element_types.typarray = types.oid
+                   )
+               )
+               OR EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_class AS composite_relations
+                    WHERE composite_relations.oid = types.typrelid
+                      AND composite_relations.relkind = 'c'
+               )
            )
          ORDER BY types.oid
     LOOP
@@ -404,8 +500,8 @@ BEGIN
     ALTER SCHEMA pgshard_catalog OWNER TO pgshard_catalog_owner;
 
     -- Ownership changes do not remove explicit grants. Strip every direct
-    -- grant outside the two runtime groups; the migration recreates the exact
-    -- reader/admin boundary below.
+    -- grant except the dedicated owner, including the two fixed runtime groups;
+    -- the migration recreates their exact boundary below.
     FOR grantee IN
         SELECT DISTINCT roles.rolname
           FROM (
@@ -437,41 +533,47 @@ BEGIN
                WHERE relations.relnamespace = catalog_schema_oid
           ) AS grants
           JOIN pg_catalog.pg_roles AS roles ON roles.oid = grants.grantee
-         WHERE roles.rolname NOT IN (
-                   'pgshard_catalog_owner',
-                   'pgshard_catalog_reader',
-                   'pgshard_catalog_admin'
-               )
+         WHERE roles.rolname <> 'pgshard_catalog_owner'
     LOOP
         EXECUTE pg_catalog.format(
-            'REVOKE ALL PRIVILEGES ON SCHEMA pgshard_catalog FROM %I',
+            'REVOKE ALL PRIVILEGES ON SCHEMA pgshard_catalog FROM %I CASCADE',
             grantee.rolname
         );
         EXECUTE pg_catalog.format(
-            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA pgshard_catalog FROM %I',
+            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA pgshard_catalog FROM %I CASCADE',
             grantee.rolname
         );
         EXECUTE pg_catalog.format(
-            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA pgshard_catalog FROM %I',
+            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA pgshard_catalog FROM %I CASCADE',
             grantee.rolname
         );
         EXECUTE pg_catalog.format(
-            'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA pgshard_catalog FROM %I',
+            'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA pgshard_catalog FROM %I CASCADE',
             grantee.rolname
         );
         FOR object IN
             SELECT types.typname
               FROM pg_catalog.pg_type AS types
              WHERE types.typnamespace = catalog_schema_oid
-               AND types.typrelid = 0
-               AND NOT EXISTS (
-                   SELECT
-                     FROM pg_catalog.pg_type AS element_types
-                    WHERE element_types.typarray = types.oid
+               AND (
+                   (
+                       types.typrelid = 0
+                       AND NOT EXISTS (
+                           SELECT
+                             FROM pg_catalog.pg_type AS element_types
+                            WHERE element_types.typarray = types.oid
+                       )
+                   )
+                   OR EXISTS (
+                       SELECT
+                         FROM pg_catalog.pg_class AS composite_relations
+                        WHERE composite_relations.oid = types.typrelid
+                          AND composite_relations.relkind = 'c'
+                   )
                )
         LOOP
             EXECUTE pg_catalog.format(
-                'REVOKE ALL PRIVILEGES ON TYPE pgshard_catalog.%I FROM %I',
+                'REVOKE ALL PRIVILEGES ON TYPE pgshard_catalog.%I FROM %I CASCADE',
                 object.typname,
                 grantee.rolname
             );
@@ -487,7 +589,7 @@ BEGIN
                AND attributes.attacl IS NOT NULL
         LOOP
             EXECUTE pg_catalog.format(
-                'REVOKE ALL PRIVILEGES (%I) ON TABLE pgshard_catalog.%I FROM %I',
+                'REVOKE ALL PRIVILEGES (%I) ON TABLE pgshard_catalog.%I FROM %I CASCADE',
                 object.attname,
                 object.relname,
                 grantee.rolname

@@ -24,11 +24,21 @@ deadline and prove exact phase classification, unchanged cache state, and
 backend exit. The same PostgreSQL 18 fixture exercises the logical-consumer
 registry's core trigger and ownership-fenced checkpoint CAS paths through its
 migration principal. A negative bootstrap test first proves that a non-superuser
-principal is rejected before object creation. Upgrade coverage moves a
-realistic single-owner released catalog to the dedicated NOLOGIN owner, removes
-its PostgreSQL 18 automatic fixed-role memberships, preserves the epoch, proves
-the old owner has no catalog access and can be dropped, and rejects both unsafe
-fixed-role attributes and mixed legacy object ownership. A separate
+principal is rejected before object creation. Upgrade coverage embeds the exact
+v0.49 migration bytes and installs them through `SET ROLE`, first proving that a
+non-superuser `CREATEROLE` owner and its real PostgreSQL 18 grantor chain are
+rejected rather than elevated. The eligible superuser-owned fixture then moves
+the released catalog to the dedicated NOLOGIN owner, re-homes non-delegable
+runtime memberships with their exact `INHERIT` and `SET` options, removes the
+old creator memberships, preserves the epoch, and proves the deprivileged old
+owner has no residual catalog access and can be dropped. Hostile reader/admin
+schema, table, column, routine, type, and grant-option ACLs are cleared before
+the documented boundary is rebuilt, and a standalone composite type proves
+complete ownership transfer. Rollback-only cases cover unsafe fixed-role
+attributes, delegable memberships, unexpected reader/admin/owner inheritance,
+owner members, fixed-role schema ownership, missing released roles, mixed
+object ownership, and unexpected default privileges without advancing the
+catalog epoch or retaining fixture roles. A separate
 rollback-only smoke path creates the registry allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying
@@ -219,10 +229,12 @@ state, and row-lock the hidden registry through release. PID reuse and
 transaction locks must not restore authority; release must remain bounded, its
 backend must exit, and the stale row must then be reclaimable. A two-session
 test retains `cluster_state` opposite same-target first insertion and requires
-`55P03` within one second. A reverse-wait test then holds an uncommitted
-different-target insertion behind `cluster_state` and proves an established
-target still locks within one second. Every setup, timeout, and error branch
-reaps both test sessions before it reports the assertion.
+`55P03` within one second. A reverse-wait test then proves with
+`pg_blocking_pids` that an uncommitted different-target insertion is blocked by
+that exact `cluster_state` holder while an established target still locks within
+one second. Every setup, timeout, and error branch attempts rollback or forced
+termination, reaps both connection drivers, and observes both backend exits
+before it reports accumulated cleanup failures.
 Always-run
 bounded cleanup retires the catalog row only
 after both primary-slot removal and synchronized standby-copy disappearance

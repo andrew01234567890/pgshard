@@ -68,12 +68,17 @@ bootstrap principal. Superuser authority is required to create a dedicated
 NOLOGIN group roles, reject unsafe pre-existing attributes or delegable role
 memberships, and grant only the owner `pg_read_all_stats` so security-definer
 fence functions can read exact backend generations. An upgrade from the
-released shared-owner layout is accepted only when the schema, every relation,
-routine, type, and collation share one legacy owner and its schema-local default
-privileges match the released reader-only boundary. The migration then removes
-PostgreSQL 18's automatic creator
-memberships, transfers the complete catalog and strips direct legacy grants
-before running catalog DDL as the dedicated owner:
+released shared-owner layout is accepted only when that legacy owner is already
+a superuser, the schema and every relation, routine, type, and collation share
+that owner, and its schema-local default privileges match the released
+reader-only boundary. Rejecting a non-superuser legacy owner prevents arbitrary
+triggers or security-definer routines from being promoted into the trusted
+dedicated owner. For an eligible upgrade, the migration re-homes the legacy
+owner's non-delegable reader and administrator grants under the bootstrap
+principal, removes PostgreSQL 18's automatic creator memberships with
+`CASCADE`, transfers standalone composite types with the rest of the catalog,
+and clears all existing fixed-role ACLs and grant options before rebuilding the
+exact runtime boundary. It then runs catalog DDL as the dedicated owner:
 
 ```sql
 CREATE DATABASE shardschema TEMPLATE template0 ENCODING 'UTF8';
@@ -81,7 +86,9 @@ CREATE DATABASE shardschema TEMPLATE template0 ENCODING 'UTF8';
 
 Apply `migrations/0001_shardschema.sql` while connected to that database. It is
 transactional, idempotent, and rejects a non-superuser owner before creating
-objects. Runtime catalog and mutation credentials are not superusers.
+objects on a clean install. It also rejects a released catalog owned by a
+non-superuser instead of elevating its executable objects. Runtime catalog and
+mutation credentials are not superusers.
 Application credentials, passwords, connection strings, and other secret
 material do not belong in the catalog.
 
