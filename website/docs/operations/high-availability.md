@@ -70,22 +70,35 @@ bounded feedback interval, `hot_standby_feedback=on`,
 The proof expiry is also the create-preflight deadline and is rechecked at the
 dispatch boundary.
 Create/drop errors after dispatch are always outcome-unknown and must be
-observed rather than retried. A successful create returns only a process-local
-cleanup receipt with an opaque identity for that exact create attempt; source,
+observed rather than retried. Before target preflight, create persists a
+permanent pending attempt in `shardschema`, keyed by its opaque receipt and
+never-reused generation. The transaction locks catalog state before the target
+name and validates the exact source, role, restore, owner and lifecycle. A busy
+database-enforced target lock fails fast so no writer retains global catalog
+state while queued; the Rust create path waits at session scope and retries. A
+successful create returns the matching process-local cleanup receipt; source,
 role, a bounded session fence and required creation settings are rechecked after
 dispatch. All managed create/drop calls also take the same target-name advisory
 fence in the authoritative writable `shardschema` database. This canonical
 namespace matters because PostgreSQL advisory locks are database-scoped while
 logical-slot names are cluster-wide. After any wait, the mutator reloads the
 exact durable generation, lifecycle, restore/source identity, role, target
-database, and catalog epoch before it can dispatch on a separate mutation
-connection. The slot-sync probe catalog persists the create-attempt identity
-through activation and cleanup, and final retirement borrows the drop path's
+database, catalog epoch and pending receipt before it can dispatch on a separate
+mutation connection. Known pre-dispatch failures durably abandon the attempt.
+If the catalog-fence backend is lost before that cleanup commits, the pending
+attempt remains visible and blocks slot, shard, restore, database, consumer,
+ownership and attachment lifecycle changes until reconciliation. Activation
+resolves the same attempt as activated; cleanup resolves it as retired. Final
+probe retirement borrows the drop path's
 live connection-bound catalog fence through COMMIT. It verifies the same
 canonical backend on both sides of that COMMIT before returning success. Known
 pre-dispatch drop failures return the receipt, and cleanup does not depend on a
-live receiver, its physical slot, healthy feedback or slot synchronization. The
-fence coordinates pgshard paths rather than privileged direct SQL. Automatic
+live receiver, its physical slot, healthy feedback or slot synchronization.
+Catalog triggers serialize allocation, activation, cleanup-start, and related
+parent lifecycle writes in the same lock namespace. Final probe retirement
+instead requires the typed path's live connection-bound absence fence.
+Privileged SQL that bypasses that typed finalization or mutates physical
+replication slots directly remains outside the boundary. Automatic
 observation and reconciliation of unknown post-dispatch outcomes still require
 a long-running controller.
 
@@ -114,7 +127,10 @@ retired durable generation even though its mutation connection targets another
 database. A separate fault case terminates the absence-fence backend while the
 retirement transaction is blocked immediately before COMMIT; the API reports
 outcome-unknown `TargetFenceLost`, and an exact reload confirms whether the
-retirement committed. The fixture also reconciles
+retirement committed. Another fault case gates target-server preflight after a
+pending create is durable, terminates the canonical catalog backend, proves
+catalog retirement stays fenced, then completes and cleans up the physical slot
+without producing a retired tombstone with a live name. The fixture also reconciles
 one deliberately lost catalog activation COMMIT response by exact reload and
 same-input retry. No controller yet runs that path continuously or recovers it
 after process loss, and the source-bound progress challenge is still absent.

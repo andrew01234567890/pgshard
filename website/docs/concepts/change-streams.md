@@ -105,12 +105,16 @@ other error after create/drop dispatch is explicitly outcome-unknown because
 PostgreSQL can persist the effect before its response reaches the client. The
 API never treats that error as permission for a blind retry.
 
-The receipt is not a durable mutation ledger or a live lease. The canonical
-catalog preflight now proves the restore-incarnation UUID and catalog epoch that
-PostgreSQL itself cannot observe, and it repeats that authorization after any
-fence wait. It still cannot turn a lost post-dispatch response into a known
-effect: restart recovery must reload the permanent generation and observe the
-exact server target. No PostgreSQL Pod consumes the profiles, and secure
+The process-local receipt is not a live lease. `shardschema` now keeps a
+permanent creation-attempt ledger so loss of the catalog backend before dispatch
+cannot erase the in-flight barrier. A pending attempt prevents related catalog
+lifecycle and ownership changes until it is abandoned, activated, or retired.
+This is not a complete post-dispatch outcome ledger: a lost response still
+requires restart recovery to reload the permanent generation and observe the
+exact server target. The canonical catalog preflight proves the
+restore-incarnation UUID and catalog epoch that PostgreSQL itself cannot observe
+and repeats that authorization after any fence wait. No PostgreSQL Pod consumes
+the profiles, and secure
 `primary_conninfo`, automatic outcome-unknown reconciliation,
 connection-owned multi-server collection and post-acquisition rechecks, role
 activation, quarantined attachment, slot advancement, and stream ownership
@@ -346,19 +350,27 @@ validate against an older view of the other slot class. It deliberately does not
 claim the PostgreSQL slot exists from a catalog row alone. A bounded Rust
 primitive now composes the clean lifecycle: allocate the immutable row, create
 and verify the exact primary failover slot, activate only from its unforgeable
-creation receipt, persist that receipt's opaque create-attempt ID, copy the same
-ID when cleanup starts, and drop the unchanged inactive slot. Every managed
+creation receipt, persist that receipt's opaque create-attempt ID before target
+preflight, copy the same ID when cleanup starts, and drop the unchanged inactive
+slot. Pending attempts survive process or catalog-backend loss and prevent the
+allocation and its shard, restore, database, consumer, ownership or attachment
+parents from changing underneath the create. Every managed
 create and drop serializes in the writable `shardschema` database on a
 target-name advisory fence, then revalidates the exact catalog row after
-acquisition. Catalog lifecycle writes use that same canonical lock namespace;
-using the slot's mutation database would be unsafe because advisory locks are
+acquisition. Allocation, activation, cleanup-start, and related parent lifecycle
+writes, including direct administrative writes to managed catalog tables, use
+that same canonical lock namespace. They fail fast on a busy target rather than
+retaining the catalog-state row while queued; the Rust create path waits at
+session scope and retries while owning the key. Final probe retirement instead
+requires the typed path's live connection-bound absence fence.
+Using the slot's mutation database would be unsafe because advisory locks are
 database-scoped. A successful drop returns a connection-bound absence guard,
 not a freely replayable receipt; final retirement verifies the same canonical
 catalog backend immediately before and after the catalog COMMIT, then releases
 the fence. A same-name managed creation therefore cannot enter the
 absence-to-COMMIT gap, even when its mutation connection targets a different
-database. The fence coordinates pgshard mutation paths only and cannot stop
-privileged direct SQL. The write transactions are
+database. Privileged direct SQL against PostgreSQL's physical slot functions
+remains outside the boundary. The write transactions are
 conditional and idempotent; an ambiguous commit is resolved by reloading the
 permanent generation before retry. Genesis epoch zero is accepted
 only for the first allocation, whose committed catalog update returns a nonzero
@@ -369,7 +381,13 @@ and then rejected from the retired durable generation, injects activation
 COMMIT response loss before reconciling the exact durable row, and terminates
 the absence-fence backend while retirement is blocked just before COMMIT. That
 last case must return `TargetFenceLost` as outcome-unknown even though an exact
-reload proves the catalog row committed as retired. The
+reload proves the catalog row committed as retired. The backend-loss case
+deterministically commits a pending attempt, kills the canonical catalog backend
+before target dispatch, verifies the physical name is absent, and requires
+reconciliation of that exact receipt before the durable generation can advance.
+Consumer coverage separately proves a direct slot lifecycle write fails fast on
+the busy target fence and that ownership and attachment changes reject a pending
+attempt. The
 forward migration never invents receipt authority: receiptless active or
 retiring rows from v0.49 and earlier must first finish cleanup on the previous
 release, while allocated rows and immutable retired history upgrade in place. A

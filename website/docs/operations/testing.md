@@ -185,7 +185,15 @@ slot names are cluster-wide. A second fixture row-locks retirement immediately
 before COMMIT, terminates the absence-fence backend, releases the row lock, and
 requires outcome-unknown `TargetFenceLost`. It then reloads the exact generation
 and confirms the retirement committed, covering the post-COMMIT verification
-branch. Repeating
+branch. A third fixture gates target-server preflight after the creation attempt
+commits, terminates that catalog backend, and requires the permanent pending row
+to fence both shard and probe retirement. It then lets creation finish, activates
+the exact receipt, and removes both the primary slot and synchronized copy before
+retiring the durable allocation. Catalog tests also require raw consumer-slot
+and ownership lifecycle writes to fail fast while the same target lock is held,
+reject ownership and attachment transitions during a pending create, reject
+creation on a draining shard, and preserve the valid
+active-slot/staged-attachment drop path. Repeating
 allocation and every completed transition is checked as a read-only idempotent
 result. An unrelated epoch advance must fence a stale activation token before
 any lifecycle write, after which an exact reload can continue. A TCP fault proxy
@@ -199,9 +207,9 @@ after both primary-slot removal and synchronized standby-copy disappearance
 succeed; cleanup owns a separately deadline-bounded connection with PostgreSQL
 statement, lock, and transaction timeouts. A failed absence check preserves the
 live or retiring row for diagnosis and reconciliation.
-Crash recovery remains a separate future test.
+Automatic crash reconciliation remains a separate future test.
 Injected post-dispatch slot-mutation socket loss and cancellation races are not
-yet exercised. A general durable slot-mutation ledger, automatic
+yet exercised. A complete post-dispatch slot-outcome ledger, automatic
 reconciliation after an unknown outcome, connection-bound command proof,
 quarantined COPY-BOTH
 attachment, and stream ownership remain future work.

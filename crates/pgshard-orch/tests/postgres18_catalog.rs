@@ -169,6 +169,23 @@ async fn allocate_active_slots(
                 ],
             )
             .await?;
+        let creation_receipt_id = random_uuid(client).await?;
+        client
+            .query_one(
+                "SELECT pgshard_catalog.begin_managed_slot_creation_attempt( \
+                     $1::text::uuid, $2::text, $3::text, 7219834723984723, \
+                     16384, 7, $4::text::uuid, state.catalog_epoch, $5::text::uuid \
+                 ) \
+                 FROM pgshard_catalog.cluster_state AS state WHERE state.singleton",
+                &[
+                    &generation.to_string(),
+                    &name,
+                    &role,
+                    &ids.restore_incarnation,
+                    &creation_receipt_id.to_string(),
+                ],
+            )
+            .await?;
         client
             .execute(
                 "UPDATE pgshard_catalog.managed_replication_slots \

@@ -649,6 +649,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS managed_replication_slots_one_live_primary_anc
 COMMENT ON TABLE pgshard_catalog.managed_replication_slots IS
     'Permanent managed-slot allocations. Names encode the full simple UUID generation and are never reused within a shard.';
 
+CREATE TABLE IF NOT EXISTS pgshard_catalog.managed_slot_creation_attempts (
+    creation_receipt_id uuid PRIMARY KEY
+        CHECK (creation_receipt_id <> '00000000-0000-0000-0000-000000000000'::uuid),
+    slot_generation uuid NOT NULL
+        CHECK (slot_generation <> '00000000-0000-0000-0000-000000000000'::uuid),
+    slot_name pgshard_catalog.replication_slot_name NOT NULL,
+    allocation_kind text NOT NULL CHECK (allocation_kind IN ('probe', 'consumer')),
+    slot_role text NOT NULL CHECK (slot_role IN ('primary-anchor', 'standby-decoder')),
+    state text NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'abandoned', 'activated', 'retired')),
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    resolved_at timestamptz,
+    CHECK (right(slot_name::text, 32) = replace(slot_generation::text, '-', '')),
+    CHECK ((state = 'pending') = (resolved_at IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS managed_slot_creation_attempts_one_pending
+    ON pgshard_catalog.managed_slot_creation_attempts(slot_generation)
+    WHERE state = 'pending';
+
+CREATE UNIQUE INDEX IF NOT EXISTS managed_slot_creation_attempts_one_activated
+    ON pgshard_catalog.managed_slot_creation_attempts(slot_generation)
+    WHERE state = 'activated';
+
+COMMENT ON TABLE pgshard_catalog.managed_slot_creation_attempts IS
+    'Permanent create-attempt ledger. A pending row is a durable barrier against owner retirement after the orchestration session or advisory fence is lost.';
+
 CREATE TABLE IF NOT EXISTS pgshard_catalog.operation_tombstones (
     operation_kind pgshard_catalog.sql_identifier NOT NULL,
     operation_id uuid NOT NULL,
@@ -851,6 +878,301 @@ BEGIN
 END
 $function$;
 
+CREATE OR REPLACE FUNCTION pgshard_catalog.lock_managed_slot_target(target_name text)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+    IF target_name IS NULL OR target_name = '' THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot target is required';
+    END IF;
+    IF NOT pg_catalog.pg_try_advisory_xact_lock(
+        pg_catalog.hashtextextended(target_name, 1346851656)
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55P03',
+            MESSAGE = 'managed slot target fence is busy';
+    END IF;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.lock_managed_slot_targets(target_names text[])
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    target_name text;
+BEGIN
+    FOR target_name IN
+        SELECT DISTINCT names.name
+          FROM pg_catalog.unnest(target_names) AS names(name)
+         WHERE names.name IS NOT NULL
+         ORDER BY names.name
+    LOOP
+        PERFORM pgshard_catalog.lock_managed_slot_target(target_name);
+    END LOOP;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.begin_managed_slot_creation_attempt(
+    expected_slot_generation uuid,
+    expected_slot_name text,
+    expected_slot_role text,
+    expected_system_identifier numeric,
+    expected_database_oid bigint,
+    expected_source_timeline bigint,
+    expected_restore_incarnation uuid,
+    expected_catalog_epoch bigint,
+    requested_creation_receipt_id uuid
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    observed_catalog_epoch bigint;
+    allocation_kind text;
+    existing_attempt pgshard_catalog.managed_slot_creation_attempts%ROWTYPE;
+BEGIN
+    IF expected_slot_generation IS NULL
+       OR expected_slot_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR requested_creation_receipt_id IS NULL
+       OR requested_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot creation identities must be non-nil';
+    END IF;
+
+    SELECT catalog_epoch
+      INTO observed_catalog_epoch
+      FROM pgshard_catalog.cluster_state
+     WHERE singleton
+     FOR UPDATE;
+    IF observed_catalog_epoch IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'catalog state is missing';
+    END IF;
+    IF observed_catalog_epoch IS DISTINCT FROM expected_catalog_epoch THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001',
+            MESSAGE = 'managed slot creation used a stale catalog epoch';
+    END IF;
+
+    -- This fails fast rather than retaining the cluster-state row while
+    -- waiting. The Rust caller waits at session scope, then invokes this
+    -- function again while owning the same target key.
+    PERFORM pgshard_catalog.lock_managed_slot_target(expected_slot_name);
+
+    SELECT 'probe'
+      INTO allocation_kind
+      FROM pgshard_catalog.slot_sync_probes AS probes
+      JOIN pgshard_catalog.shard_restore_incarnations AS restores
+        ON restores.restore_incarnation = probes.restore_incarnation
+       AND restores.shard_id = probes.shard_id
+      JOIN pgshard_catalog.shards AS shards ON shards.shard_id = probes.shard_id
+     WHERE probes.probe_generation = expected_slot_generation
+       AND probes.slot_name::text = expected_slot_name
+       AND expected_slot_role = 'primary-anchor'
+       AND probes.state = 'allocated'
+       AND probes.creation_receipt_id IS NULL
+       AND probes.cleanup_receipt_id IS NULL
+       AND probes.system_identifier = expected_system_identifier
+       AND probes.database_oid = expected_database_oid
+       AND probes.source_timeline = expected_source_timeline
+       AND probes.restore_incarnation = expected_restore_incarnation
+       AND restores.state = 'active'
+       AND shards.state IN ('provisioning', 'active')
+     FOR KEY SHARE OF probes, restores, shards;
+
+    IF allocation_kind IS NULL THEN
+        SELECT 'consumer'
+          INTO allocation_kind
+          FROM pgshard_catalog.managed_replication_slots AS slots
+          JOIN pgshard_catalog.logical_consumer_attachments AS attachments
+            ON attachments.attachment_generation = slots.attachment_generation
+           AND attachments.consumer_id = slots.consumer_id
+           AND attachments.logical_database_id = slots.logical_database_id
+           AND attachments.shard_id = slots.shard_id
+          JOIN pgshard_catalog.logical_consumer_shards AS consumer_shards
+            ON consumer_shards.consumer_id = slots.consumer_id
+           AND consumer_shards.logical_database_id = slots.logical_database_id
+           AND consumer_shards.shard_id = slots.shard_id
+          JOIN pgshard_catalog.logical_consumers AS consumers
+            ON consumers.consumer_id = slots.consumer_id
+           AND consumers.logical_database_id = slots.logical_database_id
+          JOIN pgshard_catalog.logical_databases AS databases
+            ON databases.logical_database_id = slots.logical_database_id
+          JOIN pgshard_catalog.shard_restore_incarnations AS restores
+            ON restores.restore_incarnation = attachments.restore_incarnation
+           AND restores.shard_id = attachments.shard_id
+          JOIN pgshard_catalog.shards AS shards ON shards.shard_id = attachments.shard_id
+         WHERE slots.slot_generation = expected_slot_generation
+           AND slots.slot_name::text = expected_slot_name
+           AND slots.slot_role = expected_slot_role
+           AND slots.state = 'allocated'
+           AND attachments.state = 'staged'
+           AND attachments.system_identifier = expected_system_identifier
+           AND attachments.database_oid = expected_database_oid
+           AND attachments.selected_source_timeline = expected_source_timeline
+           AND attachments.restore_incarnation = expected_restore_incarnation
+           AND consumer_shards.state IN ('provisioning', 'fenced')
+           AND consumers.state = 'active'
+           AND databases.state = 'active'
+           AND restores.state = 'active'
+           AND shards.state IN ('provisioning', 'active')
+         FOR KEY SHARE OF slots, attachments, consumer_shards, consumers, databases, restores, shards;
+    END IF;
+
+    IF allocation_kind IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot allocation is not eligible for creation';
+    END IF;
+
+    SELECT *
+      INTO existing_attempt
+      FROM pgshard_catalog.managed_slot_creation_attempts
+     WHERE creation_receipt_id = requested_creation_receipt_id
+     FOR KEY SHARE;
+    IF FOUND THEN
+        IF existing_attempt.slot_generation = expected_slot_generation
+           AND existing_attempt.slot_name::text = expected_slot_name
+           AND existing_attempt.allocation_kind = allocation_kind
+           AND existing_attempt.slot_role = expected_slot_role
+           AND existing_attempt.state = 'pending' THEN
+            RETURN allocation_kind;
+        END IF;
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'creation receipt identity was already used';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts
+         WHERE slot_generation = expected_slot_generation
+           AND state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot already has an unresolved creation attempt';
+    END IF;
+
+    INSERT INTO pgshard_catalog.managed_slot_creation_attempts(
+        creation_receipt_id,
+        slot_generation,
+        slot_name,
+        allocation_kind,
+        slot_role
+    ) VALUES (
+        requested_creation_receipt_id,
+        expected_slot_generation,
+        expected_slot_name,
+        allocation_kind,
+        expected_slot_role
+    );
+    RETURN allocation_kind;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.abandon_managed_slot_creation_attempt(
+    expected_slot_generation uuid,
+    expected_slot_name text,
+    expected_creation_receipt_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    changed bigint;
+    existing_attempt pgshard_catalog.managed_slot_creation_attempts%ROWTYPE;
+BEGIN
+    PERFORM 1
+      FROM pgshard_catalog.cluster_state
+     WHERE singleton
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'catalog state is missing';
+    END IF;
+
+    SELECT *
+      INTO existing_attempt
+      FROM pgshard_catalog.managed_slot_creation_attempts
+     WHERE creation_receipt_id = expected_creation_receipt_id
+     FOR KEY SHARE;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    IF existing_attempt.slot_generation IS DISTINCT FROM expected_slot_generation
+       OR existing_attempt.slot_name::text IS DISTINCT FROM expected_slot_name THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot creation attempt cannot be abandoned';
+    END IF;
+    IF existing_attempt.state = 'abandoned' THEN
+        RETURN;
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_target(expected_slot_name);
+
+    UPDATE pgshard_catalog.managed_slot_creation_attempts
+       SET state = 'abandoned', resolved_at = statement_timestamp()
+     WHERE creation_receipt_id = expected_creation_receipt_id
+       AND slot_generation = expected_slot_generation
+       AND slot_name::text = expected_slot_name
+       AND state = 'pending';
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed = 1 THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot creation attempt cannot be abandoned';
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.protect_managed_slot_creation_attempt()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot creation attempts are permanent';
+    END IF;
+    IF NOT (
+        TG_OP = 'UPDATE'
+        AND OLD.allocation_kind = 'probe'
+        AND OLD.state = 'activated'
+        AND NEW.state = 'retired'
+    ) THEN
+        PERFORM pgshard_catalog.lock_managed_slot_target(
+            CASE WHEN TG_OP = 'INSERT' THEN NEW.slot_name::text ELSE OLD.slot_name::text END
+        );
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.state <> 'pending' OR NEW.resolved_at IS NOT NULL THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'a managed slot creation attempt must start pending';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
+       OR NEW.slot_generation IS DISTINCT FROM OLD.slot_generation
+       OR NEW.slot_name IS DISTINCT FROM OLD.slot_name
+       OR NEW.allocation_kind IS DISTINCT FROM OLD.allocation_kind
+       OR NEW.slot_role IS DISTINCT FROM OLD.slot_role
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot creation attempt identity is immutable';
+    END IF;
+    IF NOT (
+        (OLD.state = 'pending' AND NEW.state IN ('abandoned', 'activated', 'retired'))
+        OR (OLD.state = 'activated' AND NEW.state = 'retired')
+    ) OR NEW.resolved_at IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid managed slot creation attempt transition';
+    END IF;
+    RETURN NEW;
+END
+$function$;
+
 CREATE OR REPLACE FUNCTION pgshard_catalog.protect_shard_lifecycle()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -868,6 +1190,35 @@ BEGIN
        OR NEW.shard_number IS DISTINCT FROM OLD.shard_number
        OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'shard identity is immutable';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT probes.slot_name::text
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.shard_id = OLD.shard_id
+        UNION
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.shard_id = OLD.shard_id
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.slot_sync_probes AS probes
+            ON probes.probe_generation = attempts.slot_generation
+         WHERE probes.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+        UNION ALL
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'shard lifecycle is blocked by a pending managed slot creation';
     END IF;
 
     IF NOT (
@@ -957,6 +1308,43 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'shard restore incarnation identity is immutable';
     END IF;
 
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT probes.slot_name::text
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.restore_incarnation = OLD.restore_incarnation
+           AND probes.shard_id = OLD.shard_id
+        UNION
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+          JOIN pgshard_catalog.logical_consumer_attachments AS attachments
+            ON attachments.attachment_generation = slots.attachment_generation
+         WHERE attachments.restore_incarnation = OLD.restore_incarnation
+           AND attachments.shard_id = OLD.shard_id
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.slot_sync_probes AS probes
+            ON probes.probe_generation = attempts.slot_generation
+         WHERE probes.restore_incarnation = OLD.restore_incarnation
+           AND probes.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+        UNION ALL
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+          JOIN pgshard_catalog.logical_consumer_attachments AS attachments
+            ON attachments.attachment_generation = slots.attachment_generation
+         WHERE attachments.restore_incarnation = OLD.restore_incarnation
+           AND attachments.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'restore lifecycle is blocked by a pending managed slot creation';
+    END IF;
+
     IF OLD.state = 'retired' THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'retired shard restore incarnation is immutable';
     END IF;
@@ -1029,9 +1417,23 @@ AS $function$
 DECLARE
     restore_state text;
     shard_state text;
+    attempts_changed bigint;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe generations are permanent';
+    END IF;
+
+    -- Final retirement is already covered by the live, connection-bound
+    -- absence fence. Every earlier transition takes the database-enforced
+    -- target lock in cluster-state-before-target order.
+    IF NOT (
+        TG_OP = 'UPDATE'
+        AND OLD.state = 'retiring'
+        AND NEW.state = 'retired'
+    ) THEN
+        PERFORM pgshard_catalog.lock_managed_slot_target(
+            CASE WHEN TG_OP = 'INSERT' THEN NEW.slot_name::text ELSE OLD.slot_name::text END
+        );
     END IF;
 
     SELECT incarnations.state, shards.state
@@ -1110,6 +1512,20 @@ BEGIN
            OR NEW.retired_at IS NOT NULL THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe activation is incomplete or misplaced';
         END IF;
+        UPDATE pgshard_catalog.managed_slot_creation_attempts
+           SET state = 'activated', resolved_at = statement_timestamp()
+         WHERE creation_receipt_id = NEW.creation_receipt_id
+           AND slot_generation = NEW.probe_generation
+           AND slot_name = NEW.slot_name
+           AND allocation_kind = 'probe'
+           AND slot_role = 'primary-anchor'
+           AND state = 'pending';
+        GET DIAGNOSTICS attempts_changed = ROW_COUNT;
+        IF attempts_changed <> 1 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'slot-sync probe activation requires its exact pending creation attempt';
+        END IF;
     ELSIF OLD.state IN ('allocated', 'active') AND NEW.state = 'retiring' THEN
         IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
            OR NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
@@ -1123,6 +1539,27 @@ BEGIN
            OR NEW.retired_at IS NOT NULL THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe retirement must preserve activation history';
         END IF;
+        IF OLD.state = 'allocated' AND EXISTS (
+            SELECT
+              FROM pgshard_catalog.managed_slot_creation_attempts
+             WHERE slot_generation = NEW.probe_generation
+               AND state = 'pending'
+        ) THEN
+            UPDATE pgshard_catalog.managed_slot_creation_attempts
+               SET state = 'activated', resolved_at = statement_timestamp()
+             WHERE creation_receipt_id = NEW.cleanup_receipt_id
+               AND slot_generation = NEW.probe_generation
+               AND slot_name = NEW.slot_name
+               AND allocation_kind = 'probe'
+               AND slot_role = 'primary-anchor'
+               AND state = 'pending';
+            GET DIAGNOSTICS attempts_changed = ROW_COUNT;
+            IF attempts_changed <> 1 THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '55000',
+                    MESSAGE = 'slot-sync probe retirement requires its exact pending creation attempt';
+            END IF;
+        END IF;
     ELSIF OLD.state = 'retiring' AND NEW.state = 'retired' THEN
         IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
            OR NEW.creation_receipt_id IS DISTINCT FROM OLD.creation_receipt_id
@@ -1132,6 +1569,12 @@ BEGIN
            OR NEW.retired_at IS NULL THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe retirement is incomplete';
         END IF;
+        UPDATE pgshard_catalog.managed_slot_creation_attempts
+           SET state = 'retired', resolved_at = statement_timestamp()
+         WHERE slot_generation = NEW.probe_generation
+           AND slot_name = NEW.slot_name
+           AND allocation_kind = 'probe'
+           AND state = 'activated';
     ELSE
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid slot-sync probe transition';
     END IF;
@@ -1159,6 +1602,24 @@ BEGIN
        OR NEW.schema_epoch < OLD.schema_epoch
        OR NEW.authorization_epoch < OLD.authorization_epoch THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'logical database identity and epochs are monotonic';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.logical_database_id = OLD.logical_database_id
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.logical_database_id = OLD.logical_database_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'logical database lifecycle is blocked by a pending managed slot creation';
     END IF;
 
     IF NOT (
@@ -1234,6 +1695,26 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'logical consumer identity is immutable';
     END IF;
 
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.consumer_id = OLD.consumer_id
+           AND slots.logical_database_id = OLD.logical_database_id
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.consumer_id = OLD.consumer_id
+           AND slots.logical_database_id = OLD.logical_database_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'logical consumer lifecycle is blocked by a pending managed slot creation';
+    END IF;
+
     IF NOT (
         NEW.state = OLD.state
         OR (OLD.state = 'active' AND NEW.state = 'draining')
@@ -1297,6 +1778,28 @@ BEGIN
        OR NEW.shard_id IS DISTINCT FROM OLD.shard_id
        OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'logical consumer shard identity is immutable';
+    END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.consumer_id = OLD.consumer_id
+           AND slots.logical_database_id = OLD.logical_database_id
+           AND slots.shard_id = OLD.shard_id
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.consumer_id = OLD.consumer_id
+           AND slots.logical_database_id = OLD.logical_database_id
+           AND slots.shard_id = OLD.shard_id
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'consumer ownership fencing is blocked by a pending managed slot creation';
     END IF;
 
     IF NEW.ownership_fence NOT IN (OLD.ownership_fence, OLD.ownership_fence + 1) THEN
@@ -1614,6 +2117,24 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'source attachment identity is immutable';
     END IF;
 
+    PERFORM pgshard_catalog.lock_managed_slot_targets(ARRAY(
+        SELECT slots.slot_name::text
+          FROM pgshard_catalog.managed_replication_slots AS slots
+         WHERE slots.attachment_generation = OLD.attachment_generation
+    ));
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.managed_slot_creation_attempts AS attempts
+          JOIN pgshard_catalog.managed_replication_slots AS slots
+            ON slots.slot_generation = attempts.slot_generation
+         WHERE slots.attachment_generation = OLD.attachment_generation
+           AND attempts.state = 'pending'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'source attachment lifecycle is blocked by a pending managed slot creation';
+    END IF;
+
     IF OLD.state = 'retired' THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'retired source attachments are immutable';
     END IF;
@@ -1755,10 +2276,15 @@ SET search_path = pg_catalog, pgshard_catalog, pg_temp
 AS $function$
 DECLARE
     attachment_state text;
+    attempts_changed bigint;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot names and generations are permanent';
     END IF;
+
+    PERFORM pgshard_catalog.lock_managed_slot_target(
+        CASE WHEN TG_OP = 'INSERT' THEN NEW.slot_name::text ELSE OLD.slot_name::text END
+    );
 
     SELECT state
       INTO attachment_state
@@ -1823,6 +2349,19 @@ BEGIN
            OR NEW.retired_at IS NOT NULL THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'managed slot activation is incomplete or misplaced';
         END IF;
+        UPDATE pgshard_catalog.managed_slot_creation_attempts
+           SET state = 'activated', resolved_at = statement_timestamp()
+         WHERE slot_generation = NEW.slot_generation
+           AND slot_name = NEW.slot_name
+           AND allocation_kind = 'consumer'
+           AND slot_role = NEW.slot_role
+           AND state = 'pending';
+        GET DIAGNOSTICS attempts_changed = ROW_COUNT;
+        IF attempts_changed <> 1 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'managed slot activation requires one exact pending creation attempt';
+        END IF;
     ELSIF OLD.state = 'active' AND NEW.state = 'retiring' THEN
         IF attachment_state <> 'retiring' THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot retirement requires a retiring attachment';
@@ -1840,6 +2379,23 @@ BEGIN
             RAISE EXCEPTION USING
                 ERRCODE = '55000',
                 MESSAGE = 'an unactivated managed slot cannot fabricate activation history';
+        END IF;
+        IF OLD.state = 'allocated' THEN
+            UPDATE pgshard_catalog.managed_slot_creation_attempts
+               SET state = 'retired', resolved_at = statement_timestamp()
+             WHERE slot_generation = NEW.slot_generation
+               AND slot_name = NEW.slot_name
+               AND allocation_kind = 'consumer'
+               AND slot_role = NEW.slot_role
+               AND state = 'pending';
+        ELSE
+            UPDATE pgshard_catalog.managed_slot_creation_attempts
+               SET state = 'retired', resolved_at = statement_timestamp()
+             WHERE slot_generation = NEW.slot_generation
+               AND slot_name = NEW.slot_name
+               AND allocation_kind = 'consumer'
+               AND slot_role = NEW.slot_role
+               AND state = 'activated';
         END IF;
     END IF;
 
@@ -2292,12 +2848,25 @@ CREATE TRIGGER managed_replication_slots_protect_history
 BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.managed_replication_slots
 FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_managed_replication_slot();
 
+DROP TRIGGER IF EXISTS managed_slot_creation_attempts_protect_history
+    ON pgshard_catalog.managed_slot_creation_attempts;
+CREATE TRIGGER managed_slot_creation_attempts_protect_history
+BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.managed_slot_creation_attempts
+FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_managed_slot_creation_attempt();
+
 REVOKE ALL ON ALL TABLES IN SCHEMA pgshard_catalog FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA pgshard_catalog FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pgshard_catalog FROM PUBLIC;
 
 GRANT SELECT ON ALL TABLES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;
+
+GRANT EXECUTE ON FUNCTION pgshard_catalog.begin_managed_slot_creation_attempt(
+    uuid, text, text, numeric, bigint, bigint, uuid, bigint, uuid
+) TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.abandon_managed_slot_creation_attempt(
+    uuid, text, uuid
+) TO pgshard_catalog_admin;
 
 GRANT INSERT (database_name) ON pgshard_catalog.logical_databases TO pgshard_catalog_admin;
 GRANT INSERT (shard_id, shard_number, state), UPDATE (state)

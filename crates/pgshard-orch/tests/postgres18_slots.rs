@@ -59,6 +59,7 @@ const CREATE_LOGICAL_SLOT_SQL: &str = "\
                $1::pg_catalog.name, 'pgoutput'::pg_catalog.name, \
                $2::pg_catalog.bool, $3::pg_catalog.bool, $4::pg_catalog.bool)";
 const CONNECTION_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const FAULT_BACKEND_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROXY_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -157,6 +158,30 @@ impl Drop for AbortOnDropConnectionTask {
     }
 }
 
+struct AbortOnDropTask<T> {
+    task: JoinHandle<T>,
+}
+
+impl<T> AbortOnDropTask<T> {
+    fn new(task: JoinHandle<T>) -> Self {
+        Self { task }
+    }
+
+    fn task(&self) -> &JoinHandle<T> {
+        &self.task
+    }
+
+    fn task_mut(&mut self) -> &mut JoinHandle<T> {
+        &mut self.task
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn finish_bounded_fixture(
     mut task: JoinHandle<TestResult>,
     description: &'static str,
@@ -178,6 +203,158 @@ struct CommitResponseLossProxy {
     database_url: String,
     arm: oneshot::Sender<oneshot::Sender<()>>,
     task: JoinHandle<TestResult>,
+}
+
+type TargetGateArm = (
+    oneshot::Sender<()>,
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+);
+
+struct TargetPreflightGateProxy {
+    database_url: String,
+    arm: oneshot::Sender<TargetGateArm>,
+    task: JoinHandle<TestResult>,
+}
+
+async fn start_target_preflight_gate_proxy(
+    database_url: &str,
+) -> TestResult<TargetPreflightGateProxy> {
+    let mut url = Url::parse(database_url)?;
+    let upstream_host = url
+        .host_str()
+        .ok_or_else(|| io::Error::other("target gate requires a TCP database host"))?
+        .to_owned();
+    let upstream_port = url.port().unwrap_or(5432);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let proxy_port = listener.local_addr()?.port();
+    url.set_host(Some("127.0.0.1"))
+        .map_err(|_| io::Error::other("target gate could not replace the database host"))?;
+    url.set_port(Some(proxy_port))
+        .map_err(|()| io::Error::other("target gate could not replace the database port"))?;
+    let query_parameters = url
+        .query_pairs()
+        .filter(|(name, _)| name != "sslmode")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (name, value) in query_parameters {
+            query.append_pair(&name, &value);
+        }
+        query.append_pair("sslmode", "disable");
+    }
+    let (arm, armed) = oneshot::channel();
+    let task = tokio::spawn(run_target_preflight_gate_proxy(
+        listener,
+        upstream_host,
+        upstream_port,
+        armed,
+    ));
+    Ok(TargetPreflightGateProxy {
+        database_url: url.into(),
+        arm,
+        task,
+    })
+}
+
+async fn run_target_preflight_gate_proxy(
+    listener: TcpListener,
+    upstream_host: String,
+    upstream_port: u16,
+    armed: oneshot::Receiver<TargetGateArm>,
+) -> TestResult {
+    let (downstream, _) = timeout(CONNECTION_EXIT_TIMEOUT, listener.accept())
+        .await
+        .map_err(|_| io::Error::other("target gate accept exceeded the bound"))??;
+    let upstream = timeout(
+        CONNECTION_EXIT_TIMEOUT,
+        TcpStream::connect((upstream_host.as_str(), upstream_port)),
+    )
+    .await
+    .map_err(|_| io::Error::other("target gate upstream connect exceeded the bound"))??;
+    downstream.set_nodelay(true)?;
+    upstream.set_nodelay(true)?;
+    let (mut downstream_read, mut downstream_write) = downstream.into_split();
+    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+    let (acknowledge_armed, blocked, release) = Box::pin(relay_until_target_gate_armed(
+        &mut downstream_read,
+        &mut downstream_write,
+        &mut upstream_read,
+        &mut upstream_write,
+        armed,
+    ))
+    .await?;
+    acknowledge_armed
+        .send(())
+        .map_err(|()| io::Error::other("target gate arm acknowledgement was dropped"))?;
+    let mut blocked_frontend = [0_u8; 8192];
+    let blocked_bytes = timeout(
+        CONNECTION_EXIT_TIMEOUT,
+        downstream_read.read(&mut blocked_frontend),
+    )
+    .await
+    .map_err(|_| io::Error::other("target preflight did not reach the armed gate"))??;
+    if blocked_bytes == 0 {
+        return Err(
+            io::Error::other("target client closed before preflight reached the gate").into(),
+        );
+    }
+    blocked
+        .send(())
+        .map_err(|()| io::Error::other("target gate blocked-query observer was dropped"))?;
+    release
+        .await
+        .map_err(|_| io::Error::other("target gate release authority was dropped"))?;
+    upstream_write
+        .write_all(&blocked_frontend[..blocked_bytes])
+        .await?;
+    upstream_write.flush().await?;
+
+    tokio::select! {
+        result = tokio::io::copy(&mut downstream_read, &mut upstream_write) => {
+            result?;
+        }
+        result = tokio::io::copy(&mut upstream_read, &mut downstream_write) => {
+            result?;
+        }
+    }
+    Ok(())
+}
+
+async fn relay_until_target_gate_armed(
+    downstream_read: &mut tcp::OwnedReadHalf,
+    downstream_write: &mut tcp::OwnedWriteHalf,
+    upstream_read: &mut tcp::OwnedReadHalf,
+    upstream_write: &mut tcp::OwnedWriteHalf,
+    mut armed: oneshot::Receiver<TargetGateArm>,
+) -> TestResult<TargetGateArm> {
+    let mut frontend = [0_u8; 8192];
+    let mut backend = [0_u8; 8192];
+    loop {
+        tokio::select! {
+            arm_result = &mut armed => {
+                return arm_result.map_err(|_| io::Error::other("target gate arm sender was dropped").into());
+            }
+            read = downstream_read.read(&mut frontend) => {
+                let read = read?;
+                if read == 0 {
+                    return Err(io::Error::other("target client closed before the gate was armed").into());
+                }
+                upstream_write.write_all(&frontend[..read]).await?;
+                upstream_write.flush().await?;
+            }
+            read = upstream_read.read(&mut backend) => {
+                let read = read?;
+                if read == 0 {
+                    return Err(io::Error::other("target server closed before the gate was armed").into());
+                }
+                downstream_write.write_all(&backend[..read]).await?;
+                downstream_write.flush().await?;
+            }
+        }
+    }
 }
 
 async fn start_commit_response_loss_proxy(
@@ -676,6 +853,32 @@ async fn terminate_backend(client: &Client, backend_pid: i32) -> TestResult {
     Ok(())
 }
 
+async fn wait_for_pending_creation_attempt(
+    client: &Client,
+    target: &ManagedSlotTarget,
+) -> TestResult<Uuid> {
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        let row = client
+            .query_opt(
+                "SELECT creation_receipt_id::pg_catalog.text \
+                   FROM pgshard_catalog.managed_slot_creation_attempts \
+                  WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                    AND state = 'pending'",
+                &[&target.generation().as_uuid().to_string()],
+            )
+            .await?;
+        if let Some(row) = row {
+            return Ok(Uuid::parse_str(&row.try_get::<_, String>(0)?)?);
+        }
+        timeout_at(deadline, sleep(CLEANUP_RETRY_INTERVAL))
+            .await
+            .map_err(|_| {
+                io::Error::other("durable managed-slot creation attempt did not appear")
+            })?;
+    }
+}
+
 async fn cleanup_standby_mutation_fixture(
     client: &Client,
     target: &ManagedSlotTarget,
@@ -715,6 +918,7 @@ async fn cleanup_observation_fixture(
 
 async fn cleanup_primary_mutation_fixture(
     client: &Client,
+    catalog_database_url: &str,
     standby_database_url: &str,
     target: &ManagedSlotTarget,
     hostile_schema: &str,
@@ -730,7 +934,8 @@ async fn cleanup_primary_mutation_fixture(
     .map_err(|_| io::Error::other("mutation-role cleanup exceeded the bound"))?;
     fixture_cleanup?;
     role_cleanup?;
-    wait_for_synchronized_copy(standby_database_url, target, false).await
+    wait_for_synchronized_copy(standby_database_url, target, false).await?;
+    cleanup_catalog_probe_row(catalog_database_url, target).await
 }
 
 async fn cleanup_catalog_probe_fixture(
@@ -778,6 +983,18 @@ async fn cleanup_catalog_probe_row(
             return Ok::<(), TestError>(());
         }
         let generation = target.generation().as_uuid().to_string();
+        client
+            .execute(
+                "SELECT pgshard_catalog.abandon_managed_slot_creation_attempt( \
+                            attempts.slot_generation, attempts.slot_name::pg_catalog.text, \
+                            attempts.creation_receipt_id \
+                        ) \
+                   FROM pgshard_catalog.managed_slot_creation_attempts AS attempts \
+                  WHERE attempts.slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                    AND attempts.state = 'pending'",
+                &[&generation],
+            )
+            .await?;
         let fallback_receipt_id = Uuid::new_v4().to_string();
         client
             .execute(
@@ -1220,7 +1437,7 @@ async fn complete_retirement_while_recreation_waits(
     let recreate_backend_pid = i32::try_from(recreate_backend.load(Ordering::Acquire))?;
     let request =
         ManagedLogicalSlotCreateRequest::primary_failover_anchor(target.clone(), retiring.source());
-    let mut recreate = tokio::spawn(async move {
+    let mut recreate = AbortOnDropTask::new(tokio::spawn(async move {
         create_managed_logical_slot(
             recreate_catalog,
             recreate_catalog_connection,
@@ -1230,36 +1447,56 @@ async fn complete_retirement_while_recreation_waits(
             request,
         )
         .await
-    });
+    }));
     wait_for_backend_advisory_fence(database_url, recreate_backend_pid).await?;
     assert!(
-        !recreate.is_finished(),
+        !recreate.task().is_finished(),
         "same-name recreation must remain blocked before catalog retirement"
     );
 
     let retired = complete_catalog_probe_retirement(database_url, retiring, &absence).await?;
     assert_eq!(retired.state(), SlotSyncProbeState::Retired);
     assert!(
-        !recreate.is_finished(),
-        "catalog retirement must return while the source target fence is still held"
+        !recreate.task().is_finished(),
+        "catalog retirement must return while the canonical target fence is still held"
     );
     assert_eq!(
         complete_catalog_probe_retirement(database_url, &retired, &absence).await?,
         retired
     );
     assert_eq!(absence.release().await.receipt_id(), expected_receipt_id);
-    let rejection = timeout(CONNECTION_EXIT_TIMEOUT, &mut recreate)
+    let rejection = timeout(CONNECTION_EXIT_TIMEOUT, recreate.task_mut())
         .await
         .map_err(|_| io::Error::other("blocked same-name recreation did not reject in time"))??
         .expect_err("retired catalog authority must reject same-name recreation");
-    assert!(matches!(
-        rejection,
+    let rejected_by_retired_authority = match &rejection {
         LocalSlotMutationError::CatalogAuthorizationStateChanged {
             operation: pgshard_orch::slot_mutator::LocalSlotMutationOperation::Create,
-            ref target,
-            ref state,
-        } if target == retiring.target() && state == "retired"
-    ));
+            target,
+            state,
+        } => target == retiring.target() && state == "retired",
+        LocalSlotMutationError::PreflightPostgres {
+            operation: pgshard_orch::slot_mutator::LocalSlotMutationOperation::Create,
+            target,
+            source,
+        } => {
+            target == retiring.target()
+                && source.as_db_error().is_some_and(|error| {
+                    matches!(
+                        error.message(),
+                        "managed slot allocation is not eligible for creation"
+                            | "managed slot creation used a stale catalog epoch"
+                    )
+                })
+        }
+        _ => false,
+    };
+    if !rejected_by_retired_authority {
+        return Err(io::Error::other(format!(
+            "retired catalog authority returned an unexpected rejection: {rejection}"
+        ))
+        .into());
+    }
     let observed = observe(
         database_url,
         &LogicalSlotObservationRequest::new(vec![target.clone()])?,
@@ -1320,7 +1557,8 @@ async fn complete_retirement_after_catalog_fence_loss(
             "catalog retirement",
         )
         .await?;
-        terminate_backend(&blocker, fence_backend_pid).await
+        terminate_backend(&blocker, fence_backend_pid).await?;
+        wait_for_backend_exit(&blocker, fence_backend_pid).await
     }
     .await;
     let rollback_result = timeout(CLEANUP_TIMEOUT, blocker.batch_execute("ROLLBACK")).await;
@@ -1628,6 +1866,203 @@ async fn run_catalog_probe_fence_loss_fixture(
     Ok(())
 }
 
+async fn run_catalog_creation_backend_loss_fixture(
+    database_url: String,
+    standby_database_url: String,
+    probe_target: ManagedSlotTarget,
+) -> TestResult {
+    let allocation = slot_sync_probe_allocation(&database_url, probe_target.clone()).await?;
+    let allocated = allocate_catalog_probe(&database_url, &allocation).await?;
+
+    let TargetPreflightGateProxy {
+        database_url: gated_database_url,
+        arm,
+        task: gate_task,
+    } = start_target_preflight_gate_proxy(&database_url).await?;
+    let mut gate_task = AbortOnDropTask::new(gate_task);
+    let (primary, primary_connection) = tokio_postgres::connect(&gated_database_url, NoTls).await?;
+    let (armed_acknowledgement, armed) = oneshot::channel();
+    let (blocked_sender, blocked) = oneshot::channel();
+    let (release_gate, gate_release) = oneshot::channel();
+    arm.send((armed_acknowledgement, blocked_sender, gate_release))
+        .map_err(|_| io::Error::other("target preflight gate exited before it was armed"))?;
+    timeout(CONNECTION_EXIT_TIMEOUT, armed)
+        .await
+        .map_err(|_| io::Error::other("target preflight gate arm exceeded the bound"))?
+        .map_err(|_| io::Error::other("target preflight gate exited before acknowledgement"))?;
+
+    let (observer, observer_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let observer_task = AbortOnDropConnectionTask::new(tokio::spawn(observer_connection));
+    let (catalog, catalog_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let catalog_backend = AtomicU32::new(0);
+    let catalog_connection =
+        capture_mutation_backend_pid(&catalog, catalog_connection, &catalog_backend).await?;
+    let catalog_backend_pid = i32::try_from(catalog_backend.load(Ordering::Acquire))?;
+    let request = ManagedLogicalSlotCreateRequest::primary_failover_anchor(
+        probe_target.clone(),
+        allocated.source(),
+    );
+    let mut create = AbortOnDropTask::new(tokio::spawn(async move {
+        create_managed_logical_slot(
+            catalog,
+            catalog_connection,
+            primary,
+            primary_connection,
+            CatalogOperationTimeout::default(),
+            request,
+        )
+        .await
+    }));
+
+    timeout(CONNECTION_EXIT_TIMEOUT, blocked)
+        .await
+        .map_err(|_| io::Error::other("target preflight did not reach the armed gate in time"))?
+        .map_err(|_| io::Error::other("target preflight gate exited before blocking a query"))?;
+    let _pending_receipt = wait_for_pending_creation_attempt(&observer, &probe_target).await?;
+    assert!(
+        !create.task().is_finished(),
+        "the armed target gate must hold create in target preflight"
+    );
+    assert_backend_loss_preserves_creation_fences(&observer, &probe_target, catalog_backend_pid)
+        .await?;
+
+    release_gate
+        .send(())
+        .map_err(|()| io::Error::other("target preflight gate exited before release"))?;
+    let receipt = timeout(CONNECTION_EXIT_TIMEOUT, create.task_mut())
+        .await
+        .map_err(|_| io::Error::other("backend-loss create did not finish in time"))???;
+    timeout(CONNECTION_EXIT_TIMEOUT, gate_task.task_mut())
+        .await
+        .map_err(|_| io::Error::other("target preflight gate did not finish in time"))???;
+    assert_created_receipt(
+        &receipt,
+        &probe_target,
+        allocated.source(),
+        ManagedLogicalSlotRole::PrimaryFailoverAnchor,
+    );
+    wait_for_synchronized_copy(&standby_database_url, &probe_target, true).await?;
+    reconcile_backend_loss_creation(
+        &database_url,
+        &standby_database_url,
+        &probe_target,
+        &allocated,
+        receipt,
+        &observer,
+    )
+    .await?;
+    drop(observer);
+    observer_task
+        .finish("creation backend-loss observer connection")
+        .await
+}
+
+async fn assert_backend_loss_preserves_creation_fences(
+    observer: &Client,
+    probe_target: &ManagedSlotTarget,
+    catalog_backend_pid: i32,
+) -> TestResult {
+    terminate_backend(observer, catalog_backend_pid).await?;
+    wait_for_backend_exit(observer, catalog_backend_pid).await?;
+
+    let shard_error = observer
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'draining' WHERE shard_id = 'shard-0000'",
+            &[],
+        )
+        .await
+        .expect_err("a pending create must fence its shard lifecycle");
+    assert_eq!(
+        shard_error
+            .as_db_error()
+            .map(tokio_postgres::error::DbError::message),
+        Some("shard lifecycle is blocked by a pending managed slot creation")
+    );
+    let retirement_error = observer
+        .execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+                SET state = 'retiring', cleanup_receipt_id = pg_catalog.gen_random_uuid(), \
+                    retiring_at = pg_catalog.statement_timestamp() \
+              WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid",
+            &[&probe_target.generation().as_uuid().to_string()],
+        )
+        .await
+        .expect_err("a mismatched cleanup cannot retire an unresolved create");
+    assert_eq!(
+        retirement_error
+            .as_db_error()
+            .map(tokio_postgres::error::DbError::message),
+        Some("slot-sync probe retirement requires its exact pending creation attempt")
+    );
+    let catalog_state: String = observer
+        .query_one(
+            "SELECT state FROM pgshard_catalog.slot_sync_probes \
+              WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid",
+            &[&probe_target.generation().as_uuid().to_string()],
+        )
+        .await?
+        .try_get(0)?;
+    assert_eq!(catalog_state, "allocated");
+    let physical_slot_present: bool = observer
+        .query_one(
+            "SELECT EXISTS ( \
+                        SELECT FROM pg_catalog.pg_replication_slots \
+                         WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name \
+                    )",
+            &[&probe_target.name().as_str()],
+        )
+        .await?
+        .try_get(0)?;
+    assert!(
+        !physical_slot_present,
+        "catalog-backend loss before target dispatch cannot create the physical slot"
+    );
+    Ok(())
+}
+
+async fn reconcile_backend_loss_creation(
+    database_url: &str,
+    standby_database_url: &str,
+    probe_target: &ManagedSlotTarget,
+    allocated: &CatalogSlotSyncProbe,
+    receipt: ManagedLogicalSlotReceipt,
+    observer: &Client,
+) -> TestResult {
+    let active = activate_catalog_probe(database_url, allocated, &receipt).await?;
+    let retiring = begin_catalog_probe_retirement(database_url, &active, &receipt).await?;
+    let (catalog, catalog_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (primary, primary_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let absence = drop_managed_logical_slot(
+        catalog,
+        catalog_connection,
+        primary,
+        primary_connection,
+        CatalogOperationTimeout::default(),
+        receipt,
+    )
+    .await?;
+    wait_for_synchronized_copy(standby_database_url, probe_target, false).await?;
+    let retired = complete_catalog_probe_retirement(database_url, &retiring, &absence).await?;
+    assert_eq!(retired.state(), SlotSyncProbeState::Retired);
+    release_known_drop(absence).await;
+
+    let physical_slot_present: bool = observer
+        .query_one(
+            "SELECT EXISTS ( \
+                        SELECT FROM pg_catalog.pg_replication_slots \
+                         WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name \
+                    )",
+            &[&probe_target.name().as_str()],
+        )
+        .await?
+        .try_get(0)?;
+    assert!(
+        !physical_slot_present,
+        "reconciled catalog retirement cannot retain the physical slot"
+    );
+    Ok(())
+}
+
 async fn assert_catalog_probe_allocation_fencing(
     primary_database_url: &str,
     allocation: &SlotSyncProbeAllocation,
@@ -1815,7 +2250,7 @@ async fn run_primary_mutation_fixture(
     .expect_err("exact name collision must fail before dispatch");
     assert!(matches!(
         error,
-        LocalSlotMutationError::TargetOccupied(ref occupied) if occupied == &target
+        LocalSlotMutationError::CatalogCreationAttemptPending(ref pending) if pending == &target
     ));
 
     let observed = observe(
@@ -1979,7 +2414,44 @@ async fn allocate_standby_decoder(
     connection_result
 }
 
-async fn retire_allocated_standby_decoder(
+async fn activate_standby_decoder(
+    catalog_database_url: &str,
+    target: &ManagedSlotTarget,
+    receipt: &ManagedLogicalSlotReceipt,
+) -> TestResult {
+    let (client, connection) = tokio_postgres::connect(catalog_database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let creation_lsn = pg_lsn_text(receipt.creation_lsn());
+    let changed = client
+        .execute(
+            "UPDATE pgshard_catalog.managed_replication_slots \
+                SET state = 'active', \
+                    consistent_point = $2::pg_catalog.text::pg_catalog.pg_lsn, \
+                    two_phase_at = $2::pg_catalog.text::pg_catalog.pg_lsn, \
+                    activated_at = pg_catalog.statement_timestamp() \
+              WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                AND state = 'allocated'",
+            &[&target.generation().as_uuid().to_string(), &creation_lsn],
+        )
+        .await?;
+    assert_eq!(
+        changed, 1,
+        "the standby decoder allocation must activate once"
+    );
+    let attempt_state: String = client
+        .query_one(
+            "SELECT state FROM pgshard_catalog.managed_slot_creation_attempts \
+              WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid",
+            &[&target.generation().as_uuid().to_string()],
+        )
+        .await?
+        .try_get(0)?;
+    assert_eq!(attempt_state, "activated");
+    drop(client);
+    finish_connection(connection_task).await
+}
+
+async fn retire_standby_decoder(
     catalog_database_url: &str,
     target: &ManagedSlotTarget,
 ) -> TestResult {
@@ -2003,7 +2475,7 @@ async fn retire_allocated_standby_decoder(
                 "UPDATE pgshard_catalog.managed_replication_slots \
                     SET state = 'retired', retired_at = pg_catalog.statement_timestamp() \
                   WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
-                    AND state = 'allocated'",
+                    AND state IN ('allocated', 'active')",
                 &[&target.generation().as_uuid().to_string()],
             )
             .await?;
@@ -2219,6 +2691,7 @@ async fn run_standby_mutation_fixture(
         receipt.observation().kind,
         LogicalSlotKind::StandbyLocalDecoder
     );
+    activate_standby_decoder(&primary_database_url, &target, &receipt).await?;
 
     let observed = observe(
         &standby_database_url,
@@ -2245,8 +2718,8 @@ async fn run_standby_mutation_fixture(
         receipt,
     )
     .await?;
-    retire_allocated_standby_decoder(&primary_database_url, &target).await?;
     release_known_drop(drop_receipt).await;
+    retire_standby_decoder(&primary_database_url, &target).await?;
     let absent = observe(
         &standby_database_url,
         &LogicalSlotObservationRequest::new(vec![target])?,
@@ -3012,7 +3485,7 @@ async fn creates_verifies_and_drops_primary_failover_anchor() -> TestResult {
     );
     let fixture_result = finish_bounded_fixture(
         tokio::spawn(run_primary_mutation_fixture(
-            database_url,
+            database_url.clone(),
             legacy_database_url,
             standby_database_url.clone(),
             target.clone(),
@@ -3024,6 +3497,7 @@ async fn creates_verifies_and_drops_primary_failover_anchor() -> TestResult {
     .await;
     let cleanup_result = cleanup_primary_mutation_fixture(
         &cleanup,
+        &database_url,
         &standby_database_url,
         &target,
         &hostile_schema,
@@ -3090,6 +3564,30 @@ async fn reports_unknown_when_catalog_commit_outlives_its_target_fence() -> Test
         &probe,
     )
     .await;
+    drop(cleanup);
+    let cleanup_connection_result = finish_connection(cleanup_task).await;
+    combine_fixture_results(fixture_result, cleanup_result, cleanup_connection_result)
+}
+
+#[tokio::test]
+#[ignore = "requires the CI PostgreSQL 18 primary, streaming standby, catalog, and logical-slot settings"]
+async fn catalog_backend_loss_preserves_the_durable_creation_fence() -> TestResult {
+    let database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
+    let standby_database_url = std::env::var("PGSHARD_TEST_STANDBY_DATABASE_URL")?;
+    let (cleanup, cleanup_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let cleanup_task = tokio::spawn(cleanup_connection);
+    let probe = target("pgshard_creation_fence_loss")?;
+    let fixture_result = finish_bounded_fixture(
+        tokio::spawn(run_catalog_creation_backend_loss_fixture(
+            database_url.clone(),
+            standby_database_url.clone(),
+            probe.clone(),
+        )),
+        "managed-slot creation backend-loss fixture",
+    )
+    .await;
+    let cleanup_result =
+        cleanup_catalog_probe_fixture(&cleanup, &database_url, &standby_database_url, &probe).await;
     drop(cleanup);
     let cleanup_connection_result = finish_connection(cleanup_task).await;
     combine_fixture_results(fixture_result, cleanup_result, cleanup_connection_result)
@@ -3519,11 +4017,11 @@ async fn backend_pid_for_application(client: &Client, application_name: &str) ->
 }
 
 async fn wait_for_backend_exit(client: &Client, backend_pid: i32) -> TestResult {
-    let deadline = Instant::now() + CONNECTION_EXIT_TIMEOUT;
+    let deadline = Instant::now() + FAULT_BACKEND_EXIT_TIMEOUT;
     while backend_exists(client, backend_pid).await? {
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
-                "timed-out observer backend {backend_pid} remained connected"
+                "terminated test backend {backend_pid} remained connected past the bound"
             ))
             .into());
         }
