@@ -67,6 +67,11 @@ exception only when GitHub's commit API reports a valid signed commit created by
 the `web-flow` committer and the local committer uses GitHub's noreply address.
 The exception does not rewrite or hide author metadata.
 
+The same audit scans every added or modified historical blob as raw bytes. Safe
+non-UTF-8 assets are permitted, while forbidden ASCII credential and private-path
+signatures remain rejected inside text or binary content, including content
+removed by a later commit in the pull request.
+
 Runtime version strings are derived from the exact release tag when building a
 tagged commit. Untagged builds report a development SemVer containing the commit
 SHA; workspace package metadata is not presented as the running release version.

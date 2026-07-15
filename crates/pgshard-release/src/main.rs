@@ -312,8 +312,8 @@ fn audit(base: &str, head: &str, allow_github_squash_author: bool) -> Result<()>
         ])?;
         for path in names.lines() {
             audit_repository_path(path)?;
-            let content = git(&["show", &format!("{commit}:{path}")])?;
-            audit_content(path, &content)?;
+            let content = git_bytes(&["show", &format!("{commit}:{path}")])?;
+            audit_content_bytes(path, &content)?;
         }
     }
     println!("public repository audit passed for {range}");
@@ -384,6 +384,10 @@ fn audit_content(path: &str, content: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn audit_content_bytes(path: &str, content: &[u8]) -> Result<()> {
+    audit_content(path, &String::from_utf8_lossy(content))
 }
 
 fn is_legacy_scanner_fixture(path: &str, line: &str, pattern: &str) -> bool {
@@ -1303,11 +1307,15 @@ fn ensure_release_exists(tag: &str, sha: &str) -> Result<()> {
 }
 
 fn git(args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8(git_bytes(args)?)?.trim().to_owned())
+}
+
+fn git_bytes(args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .args(args)
         .output()
         .with_context(|| format!("failed to run git {}", args.join(" ")))?;
-    output_text("git", output)
+    output_bytes("git", output)
 }
 
 fn run<I, S>(program: &str, args: I) -> Result<String>
@@ -1323,13 +1331,19 @@ where
 }
 
 fn output_text(program: &str, output: Output) -> Result<String> {
+    Ok(String::from_utf8(output_bytes(program, output)?)?
+        .trim()
+        .to_owned())
+}
+
+fn output_bytes(program: &str, output: Output) -> Result<Vec<u8>> {
     if !output.status.success() {
         bail!(
             "{program} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
