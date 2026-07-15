@@ -76,9 +76,12 @@ triggers or security-definer routines from being promoted into the trusted
 dedicated owner. It also rejects independently owned schema object classes that
 the released layout did not contain rather than leaving them behind during a
 partial transfer. Before inspecting attachments, the migration locks every
-pre-existing catalog relation through transaction end; a trigger or foreign-key
-transaction that commits while lock acquisition waits is therefore visible to
-the next statement's fresh snapshot. Existing non-internal triggers must match
+pre-existing trigger/FK-capable catalog relation through transaction end. It
+explicitly uses `READ COMMITTED` even when the session default is stronger.
+Every relation lock uses `NOWAIT`: concurrent catalog activity returns `55P03`
+and the caller must retry the complete migration after catalog traffic is
+quiesced instead of waiting with a partial lock set that can deadlock normal
+target-table then `cluster_state` DML. Existing non-internal triggers must match
 the released relation, name, function, event, timing, level, enabled mode,
 predicate, argument, transition-table, parent, and constraint shape. Internal
 referential triggers must belong to foreign keys wholly inside the catalog.

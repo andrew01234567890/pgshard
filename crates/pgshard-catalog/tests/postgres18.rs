@@ -1068,7 +1068,7 @@ async fn assert_concurrent_external_trigger_is_rejected(
         .await?;
 
     let concurrent_result =
-        run_concurrent_external_trigger_rejection(client, database_url, &role, &schema).await;
+        run_concurrent_external_trigger_rejection(database_url, &role, &schema).await;
 
     let cleanup_result = client
         .batch_execute(&format!(
@@ -1083,7 +1083,6 @@ async fn assert_concurrent_external_trigger_is_rejected(
 }
 
 async fn run_concurrent_external_trigger_rejection(
-    observer: &Client,
     database_url: &str,
     role: &str,
     schema: &str,
@@ -1095,6 +1094,12 @@ async fn run_concurrent_external_trigger_rejection(
     let migration_connection_task = tokio::spawn(migration_connection);
 
     let test_result: TestResult = async {
+        migration_client
+            .batch_execute(
+                "SET SESSION CHARACTERISTICS AS TRANSACTION \
+                 ISOLATION LEVEL REPEATABLE READ",
+            )
+            .await?;
         attacker
             .batch_execute(&format!(
                 "BEGIN; \
@@ -1104,77 +1109,66 @@ async fn run_concurrent_external_trigger_rejection(
                      FOR EACH ROW EXECUTE FUNCTION {schema}.observe_catalog_write()"
             ))
             .await?;
-        let attacker_pid: i32 = attacker
-            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
-            .await?
-            .get(0);
-        let migration_pid: i32 = migration_client
-            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
-            .await?
-            .get(0);
-        let mut migration = tokio::spawn(async move {
-            let result = migration_client
-                .batch_execute(pgshard_catalog::MIGRATION_SQL)
-                .await;
-            (migration_client, result)
-        });
-
-        let migration_blocked =
-            match observe_backend_blocked_by(observer, migration_pid, attacker_pid).await {
-                Ok(blocked) => blocked,
-                Err(error) => {
-                    let _ = attacker.batch_execute("ROLLBACK").await;
-                    migration.abort();
-                    let _ = migration.await;
-                    return Err(error.into());
-                }
-            };
-        if !migration_blocked {
-            let _ = attacker.batch_execute("ROLLBACK").await;
-            migration.abort();
-            let _ = migration.await;
-            return Err(
-                "catalog migration did not wait for the concurrent trigger transaction".into(),
-            );
-        }
-
-        if let Err(error) = attacker.batch_execute("COMMIT").await {
-            migration.abort();
-            let _ = migration.await;
-            return Err(error.into());
-        }
-        let Ok(joined) = tokio::time::timeout(Duration::from_secs(10), &mut migration).await else {
-            migration.abort();
-            let _ = migration.await;
-            return Err(
-                "catalog migration did not finish after the trigger transaction committed".into(),
-            );
-        };
-        let (migration_client, migration_result) = joined?;
+        let lock_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            migration_client.batch_execute(pgshard_catalog::MIGRATION_SQL),
+        )
+        .await
+        .map_err(|_| "catalog migration waited for a concurrent catalog relation lock")?;
         let rollback_result = migration_client.batch_execute("ROLLBACK").await;
-        let migration_error = match migration_result {
+        let lock_error = match lock_result {
             Ok(()) => {
                 rollback_result?;
                 return Err(
-                    "migration accepted a trigger committed while relation locking waited".into(),
+                    "catalog migration accepted an uncommitted attached-trigger transaction".into(),
                 );
             }
             Err(error) => error,
         };
         rollback_result?;
-        let actual_sqlstate = migration_error
+        let lock_sqlstate = lock_error
             .as_db_error()
             .map(|database_error| database_error.code().code());
-        let actual_message = migration_error
+        if lock_sqlstate != Some("55P03") {
+            return Err(format!("unexpected concurrent-lock rejection: {lock_error}").into());
+        }
+
+        attacker.batch_execute("COMMIT").await?;
+        let migration_result = migration_client
+            .batch_execute(pgshard_catalog::MIGRATION_SQL)
+            .await;
+        let rollback_result = migration_client.batch_execute("ROLLBACK").await;
+        let migration_error = match migration_result {
+            Ok(()) => {
+                rollback_result?;
+                return Err("migration accepted a concurrently committed trigger".into());
+            }
+            Err(error) => error,
+        };
+        rollback_result?;
+        let rejection_sqlstate = migration_error
+            .as_db_error()
+            .map(|database_error| database_error.code().code());
+        let rejection_message = migration_error
             .as_db_error()
             .map(tokio_postgres::error::DbError::message);
-        if actual_sqlstate != Some("42501")
-            || actual_message
+        if rejection_sqlstate != Some("42501")
+            || rejection_message
                 != Some("pre-existing pgshard_catalog contains an unsupported attached trigger")
         {
             return Err(
                 format!("unexpected concurrent-trigger rejection: {migration_error}").into(),
             );
+        }
+        let default_isolation: String = migration_client
+            .query_one(
+                "SELECT pg_catalog.current_setting('default_transaction_isolation')",
+                &[],
+            )
+            .await?
+            .get(0);
+        if default_isolation != "repeatable read" {
+            return Err("migration changed the session's default isolation".into());
         }
         Ok(())
     }

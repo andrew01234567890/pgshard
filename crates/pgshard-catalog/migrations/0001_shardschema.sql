@@ -1,5 +1,10 @@
 BEGIN;
 
+-- Takeover validation uses statement snapshots.  Override a non-default
+-- session characteristic before the transaction takes its first snapshot; an
+-- already-active outer snapshot makes this statement fail closed instead.
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
 DO $pgshard_requirements$
 BEGIN
     IF NOT EXISTS (
@@ -33,12 +38,14 @@ BEGIN
 END
 $pgshard_requirements$;
 
--- Freeze every pre-existing catalog relation before inspecting attached
--- triggers or foreign keys.  CREATE TRIGGER and referential-constraint DDL
--- require a conflicting relation lock.  This is a separate statement so a
--- transaction that committed while this block waited is visible to the fresh
--- snapshot used by the takeover checks below.  The locks remain held through
--- ownership transfer, ACL reset, and trigger recreation.
+-- Freeze every pre-existing trigger/FK-capable catalog relation before
+-- inspecting attached triggers or foreign keys.  CREATE TRIGGER and
+-- referential-constraint DDL require a conflicting relation lock.  Fail rather
+-- than wait while holding an earlier relation: normal catalog DML takes its
+-- target relation before cluster_state, so a partial blocking lock set can
+-- deadlock that order.  The caller retries the complete transaction after a
+-- quiet window.  A successful pass retains every lock through ownership
+-- transfer, ACL reset, and trigger recreation.
 DO $pgshard_lock_existing_catalog_relations$
 DECLARE
     catalog_relation record;
@@ -53,7 +60,7 @@ BEGIN
          ORDER BY relations.oid
     LOOP
         EXECUTE pg_catalog.format(
-            'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+            'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE NOWAIT',
             catalog_relation.nspname,
             catalog_relation.relname
         );
