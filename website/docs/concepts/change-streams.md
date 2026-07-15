@@ -68,9 +68,15 @@ through commit. Only a statement cancellation followed by completed rollback
 retains the connection for retry. A hard client deadline or transaction timeout
 makes the reader terminal and requires a fresh connection. It does not
 select a member, observe or mutate PostgreSQL slots, or authorize a connection.
-A separate bounded Rust primitive now consumes a dedicated PostgreSQL 18
-connection to create either a persistent `pgoutput` primary failover anchor or
-standby-local decoder with two-phase decoding enabled. It requires an absent
+A separate bounded Rust primitive now consumes two dedicated PostgreSQL 18
+connections to create either a persistent `pgoutput` primary failover anchor or
+standby-local decoder with two-phase decoding enabled. The first must be the
+writable authoritative `shardschema` database; it acquires the canonical
+target-name fence and then reloads the exact durable generation, lifecycle,
+restore incarnation, source, role, target database, and current catalog epoch.
+The second connection performs the slot mutation in that allocated database.
+This split is required because logical-slot names are cluster-wide while
+PostgreSQL advisory locks are database-scoped. The mutator requires an absent
 generation-qualified name, checks the observable system/timeline/database
 source, recovery role and logical WAL before dispatch. Standby creation must
 consume a still-fresh proof from the multi-server correlator. The mutator then
@@ -99,12 +105,13 @@ other error after create/drop dispatch is explicitly outcome-unknown because
 PostgreSQL can persist the effect before its response reaches the client. The
 API never treats that error as permission for a blind retry.
 
-The receipt is not a durable mutation ledger or a live lease. PostgreSQL cannot
-observe the catalog's restore-incarnation UUID or epoch, so the current
-primitive does not independently prove those components or authorize use after
-a restore, failover, process restart or concurrent external mutation. No
-PostgreSQL Pod consumes the profiles, and secure `primary_conninfo`, durable
-catalog-bound mutation history, outcome-unknown reconciliation,
+The receipt is not a durable mutation ledger or a live lease. The canonical
+catalog preflight now proves the restore-incarnation UUID and catalog epoch that
+PostgreSQL itself cannot observe, and it repeats that authorization after any
+fence wait. It still cannot turn a lost post-dispatch response into a known
+effect: restart recovery must reload the permanent generation and observe the
+exact server target. No PostgreSQL Pod consumes the profiles, and secure
+`primary_conninfo`, automatic outcome-unknown reconciliation,
 connection-owned multi-server collection and post-acquisition rechecks, role
 activation, quarantined attachment, slot advancement, and stream ownership
 remain unimplemented.
@@ -341,19 +348,28 @@ primitive now composes the clean lifecycle: allocate the immutable row, create
 and verify the exact primary failover slot, activate only from its unforgeable
 creation receipt, persist that receipt's opaque create-attempt ID, copy the same
 ID when cleanup starts, and drop the unchanged inactive slot. Every managed
-create and drop serializes on a target-name advisory fence. A successful drop
-returns a connection-bound absence guard, not a freely replayable receipt; final
-retirement verifies the same source backend immediately before and after the
-catalog COMMIT, then releases the fence. A same-name managed creation therefore
-cannot enter the absence-to-COMMIT gap. The fence coordinates pgshard mutation
-paths only and cannot stop privileged direct SQL. The write transactions are
+create and drop serializes in the writable `shardschema` database on a
+target-name advisory fence, then revalidates the exact catalog row after
+acquisition. Catalog lifecycle writes use that same canonical lock namespace;
+using the slot's mutation database would be unsafe because advisory locks are
+database-scoped. A successful drop returns a connection-bound absence guard,
+not a freely replayable receipt; final retirement verifies the same canonical
+catalog backend immediately before and after the catalog COMMIT, then releases
+the fence. A same-name managed creation therefore cannot enter the
+absence-to-COMMIT gap, even when its mutation connection targets a different
+database. The fence coordinates pgshard mutation paths only and cannot stop
+privileged direct SQL. The write transactions are
 conditional and idempotent; an ambiguous commit is resolved by reloading the
 permanent generation before retry. Genesis epoch zero is accepted
 only for the first allocation, whose committed catalog update returns a nonzero
 source identity before PostgreSQL mutation. Live PostgreSQL 18 coverage requires
 the continuously synchronized standby copy to appear and disappear, observes a
-same-name managed recreation blocked across final catalog COMMIT, and injects
-activation COMMIT response loss before reconciling the exact durable row. The
+cross-database same-name managed recreation blocked across final catalog COMMIT
+and then rejected from the retired durable generation, injects activation
+COMMIT response loss before reconciling the exact durable row, and terminates
+the absence-fence backend while retirement is blocked just before COMMIT. That
+last case must return `TargetFenceLost` as outcome-unknown even though an exact
+reload proves the catalog row committed as retired. The
 forward migration never invents receipt authority: receiptless active or
 retiring rows from v0.49 and earlier must first finish cleanup on the previous
 release, while allocated rows and immutable retired history upgrade in place. A

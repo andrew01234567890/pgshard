@@ -28,10 +28,14 @@ allocation set through
 the restricted catalog-admin role. It also verifies that privileged functions
 place the temporary schema last in their fixed search paths and that replaying
 the migration cannot resurrect a retired restore incarnation or advance the
-catalog epoch. Before the clean install contract, it recreates the pre-receipt
-probe table, proves a receiptless active row blocks upgrade with SQLSTATE
-`55000`, retires that row under the old contract, and then proves allocated and
-retired history upgrade in place with both new constraints validated. The
+catalog epoch. The live test owns a disposable catalog-schema lifecycle so a
+second invocation starts clean and removes its objects afterward. Before the
+clean install contract, it recreates the pre-receipt probe table and v0.49
+lifecycle trigger, reaches `active` through the historical `allocated → active`
+transition, proves that receiptless row blocks upgrade with SQLSTATE `55000`,
+then retires it through `active → retiring → retired` under the old trigger. It
+finally proves allocated and retired history upgrade in place, reapplies the
+migration, and validates both new constraints. The
 trigger suite rejects slot names that
 do not encode their complete UUID generation, activation without both the
 primary anchor and selected source, an attachment that invents a restore
@@ -170,12 +174,18 @@ waits for the continuous worker's non-temporary synchronized copy, and permits
 catalog activation only from the creation receipt. Cleanup must return the exact
 drop/absence receipt carrying the persisted create-attempt ID, and the
 synchronized copy must disappear before permanent retirement. The fixture
-creates and drops one slot, recreates the same exact name, and proves the first
-create-attempt ID differs from the second. The final drop retains a
-connection-bound target fence, starts another same-name managed create, observes
-its backend waiting on the advisory lock across catalog COMMIT, cancels it
-and explicitly terminates that waiting backend before releasing the fence, and
-proves the target remains absent. Repeating
+retains the final drop's connection-bound target fence, starts a same-name
+managed create whose mutation connection deliberately targets another database,
+and observes its canonical `shardschema` backend waiting on the advisory lock
+across catalog COMMIT. Releasing the fence must let that task finish with a
+pre-dispatch rejection because its exact durable generation is now retired; the
+test reaps the task and proves the target remains absent. This cross-database
+case is required because advisory locks are database-scoped while replication
+slot names are cluster-wide. A second fixture row-locks retirement immediately
+before COMMIT, terminates the absence-fence backend, releases the row lock, and
+requires outcome-unknown `TargetFenceLost`. It then reloads the exact generation
+and confirms the retirement committed, covering the post-COMMIT verification
+branch. Repeating
 allocation and every completed transition is checked as a read-only idempotent
 result. An unrelated epoch advance must fence a stale activation token before
 any lifecycle write, after which an exact reload can continue. A TCP fault proxy
@@ -186,8 +196,9 @@ frame, forwards that frame, and then independently requires PostgreSQL's
 `OutcomeUnknown`, reload the exact receipt ID and boundary, and safely replay
 the same activation. Always-run bounded cleanup retires the catalog row only
 after both primary-slot removal and synchronized standby-copy disappearance
-succeed; a failed absence check preserves the live or retiring row for
-diagnosis and reconciliation.
+succeed; cleanup owns a separately deadline-bounded connection with PostgreSQL
+statement, lock, and transaction timeouts. A failed absence check preserves the
+live or retiring row for diagnosis and reconciliation.
 Crash recovery remains a separate future test.
 Injected post-dispatch slot-mutation socket loss and cancellation races are not
 yet exercised. A general durable slot-mutation ledger, automatic

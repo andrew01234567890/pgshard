@@ -1,6 +1,7 @@
 //! Live `PostgreSQL` 18 contract tests for the shard schema catalog.
 //!
-//! Run explicitly with a superuser URL whose database name is `shardschema`:
+//! Run explicitly with a superuser URL for a disposable database whose name is
+//! `shardschema`; the test recreates and removes `pgshard_catalog`:
 //! `PGSHARD_TEST_DATABASE_URL=... cargo test -p pgshard-catalog --test postgres18 -- --ignored`
 
 use std::error::Error;
@@ -315,6 +316,136 @@ const PRE_RECEIPT_PROBE_SCHEMA_SQL: &str = r"
                     )
                 )
             );
+            CREATE VIEW pgshard_catalog.managed_replication_slots AS
+            SELECT NULL::uuid AS slot_generation WHERE false;
+            CREATE FUNCTION pgshard_catalog.protect_slot_sync_probe()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            SECURITY DEFINER
+            SET search_path = pg_catalog, pgshard_catalog, pg_temp
+            AS $function$
+            DECLARE
+                restore_state text;
+                shard_state text;
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '55000',
+                        MESSAGE = 'slot-sync probe generations are permanent';
+                END IF;
+
+                SELECT incarnations.state, shards.state
+                  INTO restore_state, shard_state
+                  FROM pgshard_catalog.shard_restore_incarnations AS incarnations
+                  JOIN pgshard_catalog.shards AS shards
+                    ON shards.shard_id = incarnations.shard_id
+                 WHERE incarnations.restore_incarnation = NEW.restore_incarnation
+                   AND incarnations.shard_id = NEW.shard_id
+                 FOR KEY SHARE OF incarnations, shards;
+
+                IF TG_OP = 'INSERT' THEN
+                    IF NEW.state <> 'allocated'
+                       OR NEW.consistent_point IS NOT NULL
+                       OR NEW.activated_at IS NOT NULL
+                       OR NEW.retiring_at IS NOT NULL
+                       OR NEW.retired_at IS NOT NULL THEN
+                        RAISE EXCEPTION USING
+                            ERRCODE = '55000',
+                            MESSAGE = 'a slot-sync probe must start allocated';
+                    END IF;
+                    IF restore_state IS DISTINCT FROM 'active'
+                       OR shard_state IS NULL
+                       OR shard_state NOT IN ('provisioning', 'active') THEN
+                        RAISE EXCEPTION USING
+                            ERRCODE = '55000',
+                            MESSAGE = 'slot-sync probes require an active shard restore';
+                    END IF;
+                    IF EXISTS (
+                        SELECT
+                          FROM pgshard_catalog.managed_replication_slots AS slots
+                         WHERE slots.slot_generation = NEW.probe_generation
+                    ) THEN
+                        RAISE EXCEPTION USING
+                            ERRCODE = '55000',
+                            MESSAGE = 'replication-slot generations cannot be reused across managed roles';
+                    END IF;
+                    RETURN NEW;
+                END IF;
+
+                IF NEW.probe_generation IS DISTINCT FROM OLD.probe_generation
+                   OR NEW.shard_id IS DISTINCT FROM OLD.shard_id
+                   OR NEW.restore_incarnation IS DISTINCT FROM OLD.restore_incarnation
+                   OR NEW.system_identifier IS DISTINCT FROM OLD.system_identifier
+                   OR NEW.database_oid IS DISTINCT FROM OLD.database_oid
+                   OR NEW.database_name IS DISTINCT FROM OLD.database_name
+                   OR NEW.source_timeline IS DISTINCT FROM OLD.source_timeline
+                   OR NEW.slot_name IS DISTINCT FROM OLD.slot_name
+                   OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '55000',
+                        MESSAGE = 'slot-sync probe allocation identity is immutable';
+                END IF;
+
+                IF OLD.state = 'retired' THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '55000',
+                        MESSAGE = 'retired slot-sync probes are immutable';
+                END IF;
+
+                IF NEW.state = OLD.state THEN
+                    IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+                       OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
+                       OR NEW.retiring_at IS DISTINCT FROM OLD.retiring_at
+                       OR NEW.retired_at IS DISTINCT FROM OLD.retired_at THEN
+                        RAISE EXCEPTION USING
+                            ERRCODE = '55000',
+                            MESSAGE = 'slot-sync probe lifecycle history is immutable';
+                    END IF;
+                    RETURN NEW;
+                END IF;
+
+                IF OLD.state = 'allocated' AND NEW.state = 'active' THEN
+                    IF restore_state IS DISTINCT FROM 'active'
+                       OR shard_state IS NULL
+                       OR shard_state NOT IN ('provisioning', 'active')
+                       OR NEW.consistent_point IS NULL
+                       OR NEW.activated_at IS NULL
+                       OR NEW.retiring_at IS NOT NULL
+                       OR NEW.retired_at IS NOT NULL THEN
+                        RAISE EXCEPTION USING
+                            ERRCODE = '55000',
+                            MESSAGE = 'slot-sync probe activation is incomplete or misplaced';
+                    END IF;
+                ELSIF OLD.state IN ('allocated', 'active') AND NEW.state = 'retiring' THEN
+                    IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+                       OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
+                       OR NEW.retiring_at IS NULL
+                       OR NEW.retired_at IS NOT NULL THEN
+                        RAISE EXCEPTION USING
+                            ERRCODE = '55000',
+                            MESSAGE = 'slot-sync probe retirement must preserve activation history';
+                    END IF;
+                ELSIF OLD.state = 'retiring' AND NEW.state = 'retired' THEN
+                    IF NEW.consistent_point IS DISTINCT FROM OLD.consistent_point
+                       OR NEW.activated_at IS DISTINCT FROM OLD.activated_at
+                       OR NEW.retiring_at IS DISTINCT FROM OLD.retiring_at
+                       OR NEW.retired_at IS NULL THEN
+                        RAISE EXCEPTION USING
+                            ERRCODE = '55000',
+                            MESSAGE = 'slot-sync probe retirement is incomplete';
+                    END IF;
+                ELSE
+                    RAISE EXCEPTION USING
+                        ERRCODE = '55000',
+                        MESSAGE = 'invalid slot-sync probe transition';
+                END IF;
+
+                RETURN NEW;
+            END
+            $function$;
+            CREATE TRIGGER slot_sync_probes_protect_history
+            BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.slot_sync_probes
+            FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_slot_sync_probe();
             INSERT INTO pgshard_catalog.shards(shard_id, shard_number)
             VALUES ('legacy-shard', 4000000000);
             INSERT INTO pgshard_catalog.shard_restore_incarnations(
@@ -351,10 +482,7 @@ const PRE_RECEIPT_PROBE_SCHEMA_SQL: &str = r"
                 database_oid,
                 database_name,
                 source_timeline,
-                slot_name,
-                consistent_point,
-                state,
-                activated_at
+                slot_name
             ) VALUES (
                 '20000000-0000-0000-0000-000000000002',
                 'legacy-shard',
@@ -363,15 +491,21 @@ const PRE_RECEIPT_PROBE_SCHEMA_SQL: &str = r"
                 1,
                 'shardschema',
                 1,
-                'legacy_probe_20000000000000000000000000000002',
-                '0/10',
-                'active',
-                statement_timestamp()
+                'legacy_probe_20000000000000000000000000000002'
             );
+            UPDATE pgshard_catalog.slot_sync_probes
+               SET state = 'active',
+                   consistent_point = '0/10',
+                   activated_at = statement_timestamp()
+             WHERE probe_generation = '20000000-0000-0000-0000-000000000002';
+            DROP VIEW pgshard_catalog.managed_replication_slots;
             COMMIT;
             ";
 
 async fn install_pre_receipt_probe_schema(client: &Client) -> TestResult {
+    client
+        .batch_execute("DROP SCHEMA IF EXISTS pgshard_catalog CASCADE")
+        .await?;
     client.batch_execute(PRE_RECEIPT_PROBE_SCHEMA_SQL).await?;
     Ok(())
 }
@@ -397,10 +531,16 @@ async fn assert_pre_receipt_probe_upgrade(client: &Client) -> TestResult {
     client
         .batch_execute(
             "UPDATE pgshard_catalog.slot_sync_probes \
-                SET state = 'retired', \
-                    retiring_at = statement_timestamp(), \
-                    retired_at = statement_timestamp() \
+                SET state = 'retiring', \
+                    retiring_at = statement_timestamp() \
               WHERE state = 'active'",
+        )
+        .await?;
+    client
+        .batch_execute(
+            "UPDATE pgshard_catalog.slot_sync_probes \
+                SET state = 'retired', retired_at = statement_timestamp() \
+              WHERE state = 'retiring'",
         )
         .await?;
     client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
@@ -4308,51 +4448,66 @@ async fn reconnect_gate_preserves_current_state_across_subscribers() {
         .expect("an enabled reconnect gate should release immediately");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires PGSHARD_TEST_DATABASE_URL pointing to a PostgreSQL 18 shardschema database"]
-async fn migration_and_activation_contract() -> TestResult {
-    let database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
-    let (mut client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
-    let connection_task = tokio::spawn(connection);
-
-    assert_installation_contract(&client).await?;
-    assert_shutdown_interrupts_initial_load(&mut client, &database_url).await?;
-    assert_operation_timeout_aborts_blocked_initial_load(&mut client, &database_url).await?;
-    assert_operation_timeout_aborts_blocked_refresh(&mut client, &database_url).await?;
-    assert_initial_catalog_reader_contract(&client, &database_url).await?;
-    assert_catalog_reader_rejects_existing_transaction(&client, &database_url).await?;
-    assert_admin_privilege_contract(&mut client).await?;
-    assert_admin_write_path(&mut client).await?;
-    let fixture = create_fixture(&client).await?;
-    assert_migration_does_not_resurrect_retired_restore(&client, fixture.nonce).await?;
-    assert_slot_sync_probe_contract(&client, &fixture).await?;
-    assert_identity_history_contract(&client, &fixture).await?;
-    assert_registered_table_contract(&client, &fixture).await?;
-    assert_tombstone_contract(&client, &fixture).await?;
-    assert_consumer_requires_active_database(&client, fixture.nonce).await?;
-    assert_logical_consumer_registry_contract(&client, &database_url, &fixture).await?;
-    let routing = assert_invalid_routing_contracts(&client, &fixture).await?;
-    let listener = connect_listener(&database_url).await?;
-    commit_valid_activation(&mut client, &listener, &fixture, &routing).await?;
+async fn run_migration_and_activation_contract(
+    client: &mut Client,
+    database_url: &str,
+) -> TestResult {
+    assert_installation_contract(client).await?;
+    assert_shutdown_interrupts_initial_load(client, database_url).await?;
+    assert_operation_timeout_aborts_blocked_initial_load(client, database_url).await?;
+    assert_operation_timeout_aborts_blocked_refresh(client, database_url).await?;
+    assert_initial_catalog_reader_contract(client, database_url).await?;
+    assert_catalog_reader_rejects_existing_transaction(client, database_url).await?;
+    assert_admin_privilege_contract(client).await?;
+    assert_admin_write_path(client).await?;
+    let fixture = create_fixture(client).await?;
+    assert_migration_does_not_resurrect_retired_restore(client, fixture.nonce).await?;
+    assert_slot_sync_probe_contract(client, &fixture).await?;
+    assert_identity_history_contract(client, &fixture).await?;
+    assert_registered_table_contract(client, &fixture).await?;
+    assert_tombstone_contract(client, &fixture).await?;
+    assert_consumer_requires_active_database(client, fixture.nonce).await?;
+    assert_logical_consumer_registry_contract(client, database_url, &fixture).await?;
+    let routing = assert_invalid_routing_contracts(client, &fixture).await?;
+    let listener = connect_listener(database_url).await?;
+    commit_valid_activation(client, &listener, &fixture, &routing).await?;
     let activated_epoch = assert_loader_contract(
-        &mut client,
-        &database_url,
+        client,
+        database_url,
         &listener,
         &fixture,
         routing.valid_epoch,
     )
     .await?;
-    assert_rollback_contract(&mut client, &listener, &fixture, &routing, activated_epoch).await?;
-    assert_routing_epoch_cannot_regress(&client, &listener, &fixture, routing.valid_epoch).await?;
+    assert_rollback_contract(client, &listener, &fixture, &routing, activated_epoch).await?;
+    assert_routing_epoch_cannot_regress(client, &listener, &fixture, routing.valid_epoch).await?;
     assert_repeatable_read_activation_fences_concurrent_range_mutation(
-        &client,
-        &database_url,
+        client,
+        database_url,
         &listener,
         &fixture,
     )
     .await?;
 
     listener.task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires PGSHARD_TEST_DATABASE_URL pointing to a disposable PostgreSQL 18 shardschema database"]
+async fn migration_and_activation_contract() -> TestResult {
+    let database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
+    let (mut client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+
+    let result = run_migration_and_activation_contract(&mut client, &database_url).await;
+    let rollback_result = client.batch_execute("ROLLBACK").await;
+    let cleanup_result = client
+        .batch_execute("DROP SCHEMA IF EXISTS pgshard_catalog CASCADE")
+        .await;
     connection_task.abort();
+    result?;
+    rollback_result?;
+    cleanup_result?;
     Ok(())
 }

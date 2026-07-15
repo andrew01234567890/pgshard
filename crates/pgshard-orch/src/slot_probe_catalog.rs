@@ -6,6 +6,11 @@
 //! so an ambiguous commit can be reconciled by loading the exact generation and
 //! retrying the same transition. Final retirement additionally requires the
 //! connection-bound absence fence returned by the local slot mutator.
+//! Allocation, activation and retirement-start acquire that same target-name
+//! fence in the canonical writable `shardschema` database before opening their
+//! catalog transaction. This single database is required because `PostgreSQL`
+//! advisory locks are database-scoped even though replication-slot names are
+//! cluster-wide.
 //!
 //! Every operation consumes a newly connected, idle catalog session and starts
 //! with `DISCARD ALL`. The connection must therefore authenticate as a
@@ -31,8 +36,9 @@ use crate::{
     postgres_connection::ConnectionTask,
     slot_catalog::valid_resource_name,
     slot_mutator::{
-        ManagedLogicalSlotDropFence, ManagedLogicalSlotDropReceipt, ManagedLogicalSlotReceipt,
-        ManagedLogicalSlotReceiptId, ManagedLogicalSlotRole, ManagedLogicalSlotTargetFenceError,
+        ACQUIRE_TARGET_FENCE_SQL, ManagedLogicalSlotDropFence, ManagedLogicalSlotDropReceipt,
+        ManagedLogicalSlotReceipt, ManagedLogicalSlotReceiptId, ManagedLogicalSlotRole,
+        ManagedLogicalSlotTargetFenceError, TARGET_FENCE_HASH_SEED,
     },
     standby_slots::{
         ManagedSlotTarget, ManagedSlotTargetError, ReplicationSlotName, ReplicationSourceIdentity,
@@ -745,6 +751,7 @@ async fn execute_before_deadline(
             Ok(ProbeCommandResult::Optional(probe))
         }
         ProbeCommand::Allocate(allocation) => {
+            acquire_target_fence(client, deadline, &allocation.target).await?;
             let probe = run_mutation_transaction(
                 client,
                 deadline,
@@ -756,6 +763,7 @@ async fn execute_before_deadline(
         }
         ProbeCommand::Activate { probe, receipt } => {
             validate_creation_receipt_identity(probe, receipt)?;
+            acquire_target_fence(client, deadline, &probe.target).await?;
             let consistent_point = receipt.creation_lsn();
             let loaded = run_mutation_transaction(
                 client,
@@ -772,6 +780,7 @@ async fn execute_before_deadline(
         }
         ProbeCommand::BeginRetirement { probe, receipt } => {
             validate_creation_receipt_identity(probe, receipt)?;
+            acquire_target_fence(client, deadline, &probe.target).await?;
             let loaded = run_mutation_transaction(
                 client,
                 deadline,
@@ -797,6 +806,21 @@ async fn execute_before_deadline(
             Ok(ProbeCommandResult::Probe(loaded))
         }
     }
+}
+
+async fn acquire_target_fence(
+    client: &Client,
+    deadline: Instant,
+    target: &ManagedSlotTarget,
+) -> Result<(), SlotSyncProbeCatalogError> {
+    set_session_timeouts(client, deadline).await?;
+    client
+        .query_one(
+            ACQUIRE_TARGET_FENCE_SQL,
+            &[&target.name().as_str(), &TARGET_FENCE_HASH_SEED],
+        )
+        .await?;
+    Ok(())
 }
 
 enum ProbeRead<'a> {

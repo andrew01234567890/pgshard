@@ -74,15 +74,20 @@ observed rather than retried. A successful create returns only a process-local
 cleanup receipt with an opaque identity for that exact create attempt; source,
 role, a bounded session fence and required creation settings are rechecked after
 dispatch. All managed create/drop calls also take the same target-name advisory
-fence. The slot-sync probe catalog persists the create-attempt identity through
-activation and cleanup, and final retirement borrows the drop path's live
-connection-bound fence through catalog COMMIT. It verifies the same source
-backend on both sides of that COMMIT before returning success. Known
+fence in the authoritative writable `shardschema` database. This canonical
+namespace matters because PostgreSQL advisory locks are database-scoped while
+logical-slot names are cluster-wide. After any wait, the mutator reloads the
+exact durable generation, lifecycle, restore/source identity, role, target
+database, and catalog epoch before it can dispatch on a separate mutation
+connection. The slot-sync probe catalog persists the create-attempt identity
+through activation and cleanup, and final retirement borrows the drop path's
+live connection-bound catalog fence through COMMIT. It verifies the same
+canonical backend on both sides of that COMMIT before returning success. Known
 pre-dispatch drop failures return the receipt, and cleanup does not depend on a
 live receiver, its physical slot, healthy feedback or slot synchronization. The
-fence coordinates pgshard paths rather than privileged direct SQL. Restore
-incarnation outside probe allocation and automatic unknown-outcome recovery
-still require a future durable catalog-bound reconciler.
+fence coordinates pgshard paths rather than privileged direct SQL. Automatic
+observation and reconciliation of unknown post-dispatch outcomes still require
+a long-running controller.
 
 The observation and mutation paths run in a real primary/standby CI fixture.
 Secure upstream connection
@@ -104,8 +109,12 @@ continuous synchronized copy, persists the exact creation-attempt receipt ID,
 and retires only after matching primary absence and synchronized-copy removal.
 The live fixture starts a same-name managed recreation after primary absence,
 observes it waiting on the target fence, commits permanent retirement while it
-remains blocked, and cancels plus terminates its waiting backend before releasing
-the fence. It also reconciles
+remains blocked, releases the fence, and requires the waiter to reject the now
+retired durable generation even though its mutation connection targets another
+database. A separate fault case terminates the absence-fence backend while the
+retirement transaction is blocked immediately before COMMIT; the API reports
+outcome-unknown `TargetFenceLost`, and an exact reload confirms whether the
+retirement committed. The fixture also reconciles
 one deliberately lost catalog activation COMMIT response by exact reload and
 same-input retry. No controller yet runs that path continuously or recovers it
 after process loss, and the source-bound progress challenge is still absent.
