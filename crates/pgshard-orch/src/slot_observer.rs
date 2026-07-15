@@ -12,8 +12,8 @@
 mod correlation;
 
 pub use correlation::{
-    CorrelatedStandbyReplicationPath, StandbyReplicationPathCorrelationError,
-    correlate_standby_replication_path,
+    CorrelatedStandbyReplicationPath, ObservedFailoverAnchorProblem, ObservedFailoverAnchorSide,
+    StandbyReplicationPathCorrelationError, correlate_standby_replication_path,
 };
 
 use std::{
@@ -131,13 +131,27 @@ const OBSERVE_PRIMARY_REPLICATION_SQL: &str = "\
            sender.state::pg_catalog.text AS sender_state, \
            pg_catalog.floor( \
                pg_catalog.date_part('epoch', sender.reply_time) * 1000000 \
-           )::pg_catalog.int8 AS sender_reply_epoch_micros \
+           )::pg_catalog.int8 AS sender_reply_epoch_micros, \
+           anchor.slot_name::pg_catalog.text AS anchor_slot_name, \
+           anchor.plugin::pg_catalog.text AS anchor_plugin, \
+           anchor.slot_type::pg_catalog.text AS anchor_slot_type, \
+           anchor.datoid::pg_catalog.int8 AS anchor_database_oid, \
+           anchor.temporary AS anchor_temporary, \
+           anchor.active AS anchor_active, \
+           anchor.active_pid::pg_catalog.int8 AS anchor_active_pid, \
+           anchor.wal_status::pg_catalog.text AS anchor_wal_status, \
+           anchor.two_phase AS anchor_two_phase, \
+           anchor.two_phase_at::pg_catalog.text AS anchor_two_phase_at, \
+           anchor.invalidation_reason::pg_catalog.text AS anchor_invalidation_reason, \
+           anchor.failover AS anchor_failover, \
+           anchor.synced AS anchor_synced, \
+           anchor.confirmed_flush_lsn::pg_catalog.text AS anchor_confirmed_flush_lsn \
       FROM pg_catalog.pg_control_system() AS control \
      CROSS JOIN pg_catalog.pg_control_checkpoint() AS checkpoint_control \
      CROSS JOIN LATERAL ( \
            SELECT pg_catalog.octet_length(setting)::pg_catalog.int8 AS octets, \
                   CASE WHEN pg_catalog.octet_length(setting) \
-                                  OPERATOR(pg_catalog.<=) $2::pg_catalog.int4 \
+                                  OPERATOR(pg_catalog.<=) $3::pg_catalog.int4 \
                        THEN setting END AS value \
              FROM ( \
                    SELECT pg_catalog.current_setting( \
@@ -161,7 +175,15 @@ const OBSERVE_PRIMARY_REPLICATION_SQL: &str = "\
                 ON walsender.pid OPERATOR(pg_catalog.=) activity.pid \
              WHERE activity.pid OPERATOR(pg_catalog.=) physical.active_pid \
              LIMIT 2 \
-      ) AS sender ON true";
+      ) AS sender ON true \
+      LEFT JOIN LATERAL ( \
+            SELECT slot_name, plugin, slot_type, datoid, temporary, active, \
+                   active_pid, wal_status, two_phase, two_phase_at, \
+                   invalidation_reason, failover, synced, confirmed_flush_lsn \
+              FROM pg_catalog.pg_replication_slots \
+             WHERE slot_name OPERATOR(pg_catalog.=) $2::pg_catalog.name \
+             LIMIT 2 \
+      ) AS anchor ON true";
 
 /// Validated, bounded set of managed slot targets to observe on one server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,23 +252,39 @@ pub enum SlotObservationRequestError {
     DuplicateGeneration,
 }
 
-/// Exact primary-side physical replication path to observe.
+/// Exact primary-side physical path and failover anchor to observe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrimaryReplicationObservationRequest {
     physical_slot: ReplicationSlotName,
+    failover_anchor: ManagedSlotTarget,
 }
 
 impl PrimaryReplicationObservationRequest {
-    /// Creates a request for one exact physical replication-slot name.
-    #[must_use]
-    pub fn new(physical_slot: ReplicationSlotName) -> Self {
-        Self { physical_slot }
+    /// Creates a request for distinct physical and logical slot names.
+    ///
+    /// # Errors
+    ///
+    /// Rejects reuse of `PostgreSQL`'s cluster-wide slot namespace.
+    pub fn new(
+        physical_slot: ReplicationSlotName,
+        failover_anchor: ManagedSlotTarget,
+    ) -> Result<Self, PrimaryReplicationObservationRequestError> {
+        if physical_slot == *failover_anchor.name() {
+            return Err(PrimaryReplicationObservationRequestError::SlotNameCollision);
+        }
+        Ok(Self {
+            physical_slot,
+            failover_anchor,
+        })
     }
 
-    /// Derives the physical path from a catalog-fenced decoder policy.
+    /// Derives both exact primary-side targets from a catalog-fenced policy.
     #[must_use]
     pub fn from_policy(policy: &StandbyDecoderPolicy) -> Self {
-        Self::new(policy.physical_slot().clone())
+        Self {
+            physical_slot: policy.physical_slot().clone(),
+            failover_anchor: policy.failover_anchor().clone(),
+        }
     }
 
     /// Returns the exact physical slot expected to own the walsender.
@@ -254,6 +292,20 @@ impl PrimaryReplicationObservationRequest {
     pub const fn physical_slot(&self) -> &ReplicationSlotName {
         &self.physical_slot
     }
+
+    /// Returns the primary failover anchor expected to synchronize downstream.
+    #[must_use]
+    pub const fn failover_anchor(&self) -> &ManagedSlotTarget {
+        &self.failover_anchor
+    }
+}
+
+/// Invalid primary replication observation target set.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PrimaryReplicationObservationRequestError {
+    /// `PostgreSQL`'s cluster-wide replication-slot namespace was reused.
+    #[error("primary physical slot and failover anchor names must be distinct")]
+    SlotNameCollision,
 }
 
 /// One requested target and its optional server-side observation.
@@ -637,11 +689,12 @@ pub struct LocalLogicalSlotObservationBatch {
     entries: Vec<LogicalSlotSnapshotEntry>,
 }
 
-/// One bounded, non-authorizing primary-side physical replication sample.
+/// One bounded, non-authorizing primary-side replication sample.
 ///
 /// `PostgreSQL` does not expose a monotonic timestamp for hot-standby feedback,
 /// and this query is not atomic with a standby-side sample. The returned data
-/// can prove local PID joins and configuration membership, but a later
+/// can prove local PID joins, configuration membership, and raw failover-anchor
+/// state, but a later
 /// multi-server correlator must establish source identity, freshness, catalog
 /// horizon coverage, and lifecycle ownership before decoder attachment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -658,6 +711,7 @@ pub struct LocalPrimaryReplicationObservationBatch {
     failover_slot_synchronization: FailoverSlotSynchronization,
     physical_slot: Option<LocalPhysicalReplicationSlotObservation>,
     wal_sender: Option<LocalWalSenderObservation>,
+    failover_anchor: Option<LogicalSlotObservation>,
 }
 
 impl LocalPrimaryReplicationObservationBatch {
@@ -734,6 +788,14 @@ impl LocalPrimaryReplicationObservationBatch {
     #[must_use]
     pub const fn wal_sender(&self) -> Option<&LocalWalSenderObservation> {
         self.wal_sender.as_ref()
+    }
+
+    /// Returns the exact primary failover-anchor row, if present.
+    ///
+    /// The generation remains catalog-selected rather than server-attested.
+    #[must_use]
+    pub const fn failover_anchor(&self) -> Option<&LogicalSlotObservation> {
+        self.failover_anchor.as_ref()
     }
 }
 
@@ -947,6 +1009,7 @@ async fn observe_primary_before(
             OBSERVE_PRIMARY_REPLICATION_SQL,
             &[
                 &request.physical_slot().as_str(),
+                &request.failover_anchor().name().as_str(),
                 &MAX_SYNCHRONIZED_STANDBY_SLOTS_BYTES,
             ],
         )
@@ -972,6 +1035,7 @@ async fn observe_primary_before(
         parse_synchronized_slot_policy(row.try_get(6)?, row.try_get(7)?, request.physical_slot())?;
     let physical_slot = parse_physical_slot(&row, request.physical_slot())?;
     let wal_sender = parse_wal_sender(&row, physical_slot.as_ref())?;
+    let failover_anchor = parse_primary_failover_anchor(&row, request.failover_anchor())?;
 
     Ok(LocalPrimaryReplicationObservationBatch {
         database_name,
@@ -986,6 +1050,7 @@ async fn observe_primary_before(
         failover_slot_synchronization,
         physical_slot,
         wal_sender,
+        failover_anchor,
     })
 }
 
@@ -1513,40 +1578,147 @@ async fn set_statement_timeout(
     Ok(())
 }
 
+// These booleans are the exact PostgreSQL view columns. Keeping the raw row
+// together preserves validation order before it is converted to closed enums.
+#[allow(clippy::struct_excessive_bools)]
+struct LogicalSlotFields {
+    name_text: String,
+    plugin: Option<String>,
+    slot_type: String,
+    database_oid: Option<i64>,
+    temporary: bool,
+    active: bool,
+    active_pid: Option<i64>,
+    wal_status: Option<String>,
+    two_phase: bool,
+    two_phase_at: Option<String>,
+    invalidation_reason: Option<String>,
+    failover: bool,
+    synced: bool,
+    confirmed_flush_lsn: Option<String>,
+}
+
 fn parse_logical_slot(row: &Row) -> Result<LogicalSlotObservation, LocalSlotObservationError> {
-    let name_text: String = row.try_get("slot_name")?;
+    parse_logical_slot_fields(LogicalSlotFields {
+        name_text: row.try_get("slot_name")?,
+        plugin: row.try_get("plugin")?,
+        slot_type: row.try_get("slot_type")?,
+        database_oid: row.try_get("database_oid")?,
+        temporary: row.try_get("temporary")?,
+        active: row.try_get("active")?,
+        active_pid: row.try_get("active_pid")?,
+        wal_status: row.try_get("wal_status")?,
+        two_phase: row.try_get("two_phase")?,
+        two_phase_at: row.try_get("two_phase_at")?,
+        invalidation_reason: row.try_get("invalidation_reason")?,
+        failover: row.try_get("failover")?,
+        synced: row.try_get("synced")?,
+        confirmed_flush_lsn: row.try_get("confirmed_flush_lsn")?,
+    })
+}
+
+fn parse_primary_failover_anchor(
+    row: &Row,
+    target: &ManagedSlotTarget,
+) -> Result<Option<LogicalSlotObservation>, LocalSlotObservationError> {
+    let name_text: Option<String> = row.try_get(24)?;
+    let plugin: Option<String> = row.try_get(25)?;
+    let slot_type: Option<String> = row.try_get(26)?;
+    let database_oid: Option<i64> = row.try_get(27)?;
+    let temporary: Option<bool> = row.try_get(28)?;
+    let active: Option<bool> = row.try_get(29)?;
+    let active_pid: Option<i64> = row.try_get(30)?;
+    let wal_status: Option<String> = row.try_get(31)?;
+    let two_phase: Option<bool> = row.try_get(32)?;
+    let two_phase_at: Option<String> = row.try_get(33)?;
+    let invalidation_reason: Option<String> = row.try_get(34)?;
+    let failover: Option<bool> = row.try_get(35)?;
+    let synced: Option<bool> = row.try_get(36)?;
+    let confirmed_flush_lsn: Option<String> = row.try_get(37)?;
+    let Some(name_text) = name_text else {
+        if plugin.is_some()
+            || slot_type.is_some()
+            || database_oid.is_some()
+            || temporary.is_some()
+            || active.is_some()
+            || active_pid.is_some()
+            || wal_status.is_some()
+            || two_phase.is_some()
+            || two_phase_at.is_some()
+            || invalidation_reason.is_some()
+            || failover.is_some()
+            || synced.is_some()
+            || confirmed_flush_lsn.is_some()
+        {
+            return Err(LocalSlotObservationError::InconsistentPrimaryFailoverAnchor);
+        }
+        return Ok(None);
+    };
+    if name_text != target.name().as_str() {
+        return Err(LocalSlotObservationError::UnexpectedSlot(name_text));
+    }
+    let fields = LogicalSlotFields {
+        name_text,
+        plugin,
+        slot_type: slot_type.ok_or(LocalSlotObservationError::InconsistentPrimaryFailoverAnchor)?,
+        database_oid,
+        temporary: temporary.ok_or(LocalSlotObservationError::InconsistentPrimaryFailoverAnchor)?,
+        active: active.ok_or(LocalSlotObservationError::InconsistentPrimaryFailoverAnchor)?,
+        active_pid,
+        wal_status,
+        two_phase: two_phase.ok_or(LocalSlotObservationError::InconsistentPrimaryFailoverAnchor)?,
+        two_phase_at,
+        invalidation_reason,
+        failover: failover.ok_or(LocalSlotObservationError::InconsistentPrimaryFailoverAnchor)?,
+        synced: synced.ok_or(LocalSlotObservationError::InconsistentPrimaryFailoverAnchor)?,
+        confirmed_flush_lsn,
+    };
+    parse_logical_slot_fields(fields).map(Some)
+}
+
+fn parse_logical_slot_fields(
+    fields: LogicalSlotFields,
+) -> Result<LogicalSlotObservation, LocalSlotObservationError> {
+    let LogicalSlotFields {
+        name_text,
+        plugin,
+        slot_type,
+        database_oid,
+        temporary,
+        active,
+        active_pid,
+        wal_status,
+        two_phase,
+        two_phase_at,
+        invalidation_reason,
+        failover,
+        synced,
+        confirmed_flush_lsn,
+    } = fields;
     let name = ReplicationSlotName::new(name_text.clone())?;
-    let slot_type: String = row.try_get("slot_type")?;
     if slot_type != "logical" {
         return Err(LocalSlotObservationError::NonLogicalTarget(name_text));
     }
-    let database_oid = row
-        .try_get::<_, Option<i64>>("database_oid")?
+    let database_oid = database_oid
         .ok_or_else(|| LocalSlotObservationError::MissingDatabaseOid(name_text.clone()))?;
     let database_oid = positive_u32(database_oid, "database_oid")?;
-    let plugin = match row.try_get::<_, Option<String>>("plugin")?.as_deref() {
+    let plugin = match plugin.as_deref() {
         Some("pgoutput") => LogicalSlotPlugin::PgOutput,
         _ => LogicalSlotPlugin::Other,
     };
-    let failover: bool = row.try_get("failover")?;
-    let synced: bool = row.try_get("synced")?;
     let kind = match (failover, synced) {
         (true, false) => LogicalSlotKind::FailoverAnchor,
         (true, true) => LogicalSlotKind::SynchronizedFailoverAnchor,
         (false, false) => LogicalSlotKind::StandbyLocalDecoder,
         (false, true) => LogicalSlotKind::Other,
     };
-    let temporary: bool = row.try_get("temporary")?;
-    let two_phase = if row.try_get::<_, bool>("two_phase")? {
+    let two_phase = if two_phase {
         SettingState::Enabled
     } else {
         SettingState::Disabled
     };
-    let active: bool = row.try_get("active")?;
-    let active_pid: Option<i64> = row.try_get("active_pid")?;
     let activity = parse_slot_activity(&name_text, active, active_pid)?;
     let persistence = classify_persistence(temporary);
-
     Ok(LogicalSlotObservation {
         name,
         database_oid,
@@ -1554,12 +1726,12 @@ fn parse_logical_slot(row: &Row) -> Result<LogicalSlotObservation, LocalSlotObse
         kind,
         persistence,
         two_phase,
-        two_phase_at: optional_lsn(row, "two_phase_at")?,
+        two_phase_at: parse_optional_lsn_value(two_phase_at, "two_phase_at")?,
         activity,
         ownership: SlotOwnership::Unknown,
-        invalidation: parse_invalidation(row.try_get("invalidation_reason")?)?,
-        wal_retention: parse_wal_retention(row.try_get("wal_status")?)?,
-        confirmed_flush_lsn: optional_lsn(row, "confirmed_flush_lsn")?,
+        invalidation: parse_invalidation(invalidation_reason)?,
+        wal_retention: parse_wal_retention(wal_status)?,
+        confirmed_flush_lsn: parse_optional_lsn_value(confirmed_flush_lsn, "confirmed_flush_lsn")?,
     })
 }
 
@@ -1627,7 +1799,14 @@ fn optional_lsn(
     row: &Row,
     field: &'static str,
 ) -> Result<Option<PgLsn>, LocalSlotObservationError> {
-    row.try_get::<_, Option<String>>(field)?
+    parse_optional_lsn_value(row.try_get(field)?, field)
+}
+
+fn parse_optional_lsn_value(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<Option<PgLsn>, LocalSlotObservationError> {
+    value
         .map(|value| {
             parse_lsn(&value).ok_or(LocalSlotObservationError::InvalidLsn { field, value })
         })
@@ -1762,6 +1941,9 @@ pub enum LocalSlotObservationError {
     /// `PostgreSQL` returned a partial or impossible physical-slot row.
     #[error("PostgreSQL physical replication slot details are internally inconsistent")]
     InconsistentPhysicalSlot,
+    /// `PostgreSQL` returned a partial primary failover-anchor row.
+    #[error("PostgreSQL primary failover-anchor details are internally inconsistent")]
+    InconsistentPrimaryFailoverAnchor,
     /// A physical-slot catalog horizon was not a valid nonzero transaction ID.
     #[error("PostgreSQL physical slot catalog_xmin is invalid")]
     InvalidTransactionId,
@@ -1898,26 +2080,44 @@ mod tests {
 
     #[test]
     fn primary_policy_membership_is_exact_bounded_and_plain() {
-        let target = ReplicationSlotName::new("pgshard_member_0001").expect("slot");
-        let request = PrimaryReplicationObservationRequest::new(target.clone());
-        assert_eq!(request.physical_slot(), &target);
+        let physical_slot = ReplicationSlotName::new("pgshard_member_0001").expect("slot");
+        let failover_anchor = target("anchor", 1);
+        let request = PrimaryReplicationObservationRequest::new(
+            physical_slot.clone(),
+            failover_anchor.clone(),
+        )
+        .expect("distinct primary observation targets");
+        assert_eq!(request.physical_slot(), &physical_slot);
+        assert_eq!(request.failover_anchor(), &failover_anchor);
+        assert_eq!(
+            PrimaryReplicationObservationRequest::new(
+                failover_anchor.name().clone(),
+                failover_anchor,
+            ),
+            Err(PrimaryReplicationObservationRequestError::SlotNameCollision)
+        );
         let configured = "pgshard_member_0000,pgshard_member_0001";
         assert_eq!(
             parse_synchronized_slot_policy(
                 i64::try_from(configured.len()).expect("length"),
                 Some(configured.to_owned()),
-                &target,
+                &physical_slot,
             )
             .expect("plain unique policy"),
             FailoverSlotSynchronization::GatedOnPhysicalSlot
         );
         assert_eq!(
-            parse_synchronized_slot_policy(0, Some(String::new()), &target).expect("empty policy"),
+            parse_synchronized_slot_policy(0, Some(String::new()), &physical_slot)
+                .expect("empty policy"),
             FailoverSlotSynchronization::NotGated
         );
         assert_eq!(
-            parse_synchronized_slot_policy(19, Some("pgshard_member_0002".to_owned()), &target,)
-                .expect("other member"),
+            parse_synchronized_slot_policy(
+                19,
+                Some("pgshard_member_0002".to_owned()),
+                &physical_slot,
+            )
+            .expect("other member"),
             FailoverSlotSynchronization::NotGated
         );
         for unsupported in [
@@ -1931,7 +2131,7 @@ mod tests {
                 parse_synchronized_slot_policy(
                     i64::try_from(unsupported.len()).expect("length"),
                     Some(unsupported.to_owned()),
-                    &target,
+                    &physical_slot,
                 ),
                 Err(LocalSlotObservationError::UnsupportedSynchronizedStandbySlotsList)
             ));
@@ -1940,12 +2140,12 @@ mod tests {
             parse_synchronized_slot_policy(
                 i64::from(MAX_SYNCHRONIZED_STANDBY_SLOTS_BYTES) + 1,
                 None,
-                &target,
+                &physical_slot,
             ),
             Err(LocalSlotObservationError::SynchronizedStandbySlotsTooLong { .. })
         ));
         assert!(matches!(
-            parse_synchronized_slot_policy(1, Some(String::new()), &target),
+            parse_synchronized_slot_policy(1, Some(String::new()), &physical_slot),
             Err(LocalSlotObservationError::InconsistentSynchronizedStandbySlots)
         ));
     }
