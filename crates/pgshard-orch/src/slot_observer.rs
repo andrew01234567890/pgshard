@@ -77,7 +77,8 @@ const OBSERVE_PREREQUISITES_SQL: &str = "\
                pg_catalog.date_part('epoch', slotsync.backend_start) * 1000000 \
            )::pg_catalog.int8 AS slotsync_backend_start_epoch_micros, \
            slotsync.wait_event_type::pg_catalog.text AS slotsync_wait_event_type, \
-           slotsync.wait_event::pg_catalog.text AS slotsync_wait_event \
+           slotsync.wait_event::pg_catalog.text AS slotsync_wait_event, \
+           checkpoint_control.checkpoint_lsn::pg_catalog.text AS checkpoint_lsn \
       FROM pg_catalog.pg_control_system() AS control \
      CROSS JOIN pg_catalog.pg_control_checkpoint() AS checkpoint_control \
       LEFT JOIN pg_catalog.pg_stat_get_wal_receiver() AS receiver \
@@ -472,11 +473,12 @@ impl LocalSlotSyncWorkerObservation {
 ///
 /// This is observation only. In particular, an enabled slot-sync setting is
 /// not evidence that the background worker completed a cycle, and the latest
-/// checkpoint timeline can conservatively lag a recovery timeline change until
+/// checkpoint position and timeline can conservatively lag recovery until
 /// `PostgreSQL` records a later restartpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalStandbyPrerequisiteObservation {
     system_identifier: u64,
+    checkpoint_lsn: PgLsn,
     checkpoint_timeline: u32,
     recovery: RecoveryState,
     wal_level: LogicalWalLevel,
@@ -497,6 +499,18 @@ impl LocalStandbyPrerequisiteObservation {
     #[must_use]
     pub const fn system_identifier(&self) -> u64 {
         self.system_identifier
+    }
+
+    /// Returns the control-file checkpoint WAL record.
+    ///
+    /// This value and `checkpoint_timeline` come from one CRC-checked
+    /// `pg_control` snapshot. On a queryable standby it is a conservative
+    /// replay floor. It may be inherited from the base backup; later advances
+    /// are recorded after the restartpoint flush phase, when `PostgreSQL` installs
+    /// the safe checkpoint pair.
+    #[must_use]
+    pub const fn checkpoint_lsn(&self) -> PgLsn {
+        self.checkpoint_lsn
     }
 
     /// Returns the timeline stored in `PostgreSQL`'s latest control-file checkpoint.
@@ -544,7 +558,7 @@ impl LocalStandbyPrerequisiteObservation {
     /// Returns the raw last replayed WAL location, if `PostgreSQL` exposes one.
     ///
     /// SQL does not return its replay timeline atomically, so this value cannot
-    /// construct a `SourceBoundReplayPosition` or authorize LSN ordering.
+    /// construct a `SourceBoundReplayFloor` or authorize LSN ordering.
     #[must_use]
     pub const fn replay_lsn(&self) -> Option<PgLsn> {
         self.replay_lsn
@@ -571,8 +585,9 @@ impl LocalStandbyPrerequisiteObservation {
     /// Returns the live receiver's last received timeline, if available.
     ///
     /// Neither this value nor the control-file checkpoint timeline binds the
-    /// raw replay LSN to a lineage. Ordering replay requires an atomically
-    /// paired replay timeline and the opaque source-bound replay contract.
+    /// raw replay LSN to a lineage. The coherent checkpoint LSN and timeline
+    /// instead supply a separate conservative replay floor after source
+    /// correlation.
     #[must_use]
     pub const fn wal_receiver_received_timeline(&self) -> Option<u32> {
         self.wal_receiver_received_timeline
@@ -1240,6 +1255,7 @@ fn parse_prerequisites(
     row: &Row,
 ) -> Result<LocalStandbyPrerequisiteObservation, LocalSlotObservationError> {
     let system_identifier = parse_system_identifier(row.try_get(0)?)?;
+    let checkpoint_lsn = required_nonzero_lsn(row, "checkpoint_lsn")?;
     let checkpoint_timeline = parse_timeline_id(row.try_get(1)?)?;
     let recovery = if row.try_get(2)? {
         RecoveryState::Standby
@@ -1283,6 +1299,7 @@ fn parse_prerequisites(
 
     Ok(LocalStandbyPrerequisiteObservation {
         system_identifier,
+        checkpoint_lsn,
         checkpoint_timeline,
         recovery,
         wal_level,
@@ -1617,6 +1634,16 @@ fn optional_lsn(
         .transpose()
 }
 
+fn required_nonzero_lsn(
+    row: &Row,
+    field: &'static str,
+) -> Result<PgLsn, LocalSlotObservationError> {
+    let value = row.try_get::<_, String>(field)?;
+    parse_lsn(&value)
+        .filter(|lsn| lsn.0 != 0)
+        .ok_or(LocalSlotObservationError::InvalidLsn { field, value })
+}
+
 fn positive_u32(value: i64, field: &'static str) -> Result<u32, LocalSlotObservationError> {
     u32::try_from(value)
         .ok()
@@ -1797,7 +1824,7 @@ pub enum LocalSlotObservationError {
     #[error("unsupported PostgreSQL 18 replication slot invalidation reason {0:?}")]
     UnsupportedInvalidationReason(String),
     /// `PostgreSQL` returned a malformed LSN.
-    #[error("logical slot field {field} contains invalid PostgreSQL LSN {value:?}")]
+    #[error("PostgreSQL field {field} contains invalid LSN {value:?}")]
     InvalidLsn {
         /// Rejected field.
         field: &'static str,

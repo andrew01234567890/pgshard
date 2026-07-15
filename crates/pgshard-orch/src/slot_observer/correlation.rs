@@ -23,7 +23,7 @@ use super::{
 use crate::standby_slots::{
     FailoverSlotSynchronization, LogicalWalLevel, MIN_FEEDBACK_REPORTING_MARGIN, RecoveryState,
     ReplicationSlotName, ReplicationSourceIdentity, SettingState, SlotActivity, SlotInvalidation,
-    SlotPersistence, SlotWalRetention, StandbyDecoderPolicy,
+    SlotPersistence, SlotWalRetention, SourceBoundReplayFloor, StandbyDecoderPolicy,
 };
 
 /// Bounded correlation of one standby receiver with its primary-side path.
@@ -47,6 +47,7 @@ pub struct CorrelatedStandbyReplicationPath {
     source_identity: ReplicationSourceIdentity,
     member_ordinal: u16,
     oldest_observation_age: Duration,
+    standby_replay_floor_lsn: PgLsn,
     physical_slot: ReplicationSlotName,
     wal_receiver_pid: NonZeroU32,
     walsender_identity: LocalPostgresBackendIdentity,
@@ -74,6 +75,24 @@ impl CorrelatedStandbyReplicationPath {
     #[must_use]
     pub const fn oldest_observation_age(&self) -> Duration {
         self.oldest_observation_age
+    }
+
+    /// Returns the source-bound lower bound on standby replay.
+    ///
+    /// This is the standby control-file checkpoint record, not the unpaired
+    /// live replay LSN. It may have been inherited from a base backup.
+    #[must_use]
+    pub const fn standby_replay_floor_lsn(&self) -> PgLsn {
+        self.standby_replay_floor_lsn
+    }
+
+    /// Returns an opaque source-bound replay floor for later attachment gates.
+    ///
+    /// The value comes from a coherent control-file checkpoint pair already
+    /// matched to the catalog source, never from the raw SQL replay getter.
+    #[must_use]
+    pub const fn source_bound_replay_floor(&self) -> SourceBoundReplayFloor {
+        SourceBoundReplayFloor::from_correlated_path(self)
     }
 
     /// Returns the exact physical slot reported at both ends of the path.
@@ -151,13 +170,14 @@ fn correlate_standby_replication_path_at(
 ) -> Result<CorrelatedStandbyReplicationPath, StandbyReplicationPathCorrelationError> {
     let oldest_observation_age = observation_age(policy, standby, primary, evaluated_at)?;
     validate_sources_and_roles(policy, standby, primary)?;
-    let wal_receiver_pid = validate_standby_path(policy, standby)?;
+    let (standby_replay_floor_lsn, wal_receiver_pid) = validate_standby_path(policy, standby)?;
     let primary_path = validate_primary_path(policy, primary)?;
 
     Ok(CorrelatedStandbyReplicationPath {
         source_identity: policy.expected_source(),
         member_ordinal: policy.member_ordinal(),
         oldest_observation_age,
+        standby_replay_floor_lsn,
         physical_slot: policy.physical_slot().clone(),
         wal_receiver_pid,
         walsender_identity: primary_path.walsender_identity,
@@ -216,8 +236,17 @@ fn validate_sources_and_roles(
 fn validate_standby_path(
     policy: &StandbyDecoderPolicy,
     standby: &LocalLogicalSlotObservationBatch,
-) -> Result<NonZeroU32, StandbyReplicationPathCorrelationError> {
+) -> Result<(PgLsn, NonZeroU32), StandbyReplicationPathCorrelationError> {
     let prerequisites = standby.prerequisites();
+    let standby_replay_floor_lsn = prerequisites.checkpoint_lsn();
+    if standby_replay_floor_lsn.0 < policy.durable_checkpoint_lsn().0 {
+        return Err(
+            StandbyReplicationPathCorrelationError::StandbyReplayFloorBehind {
+                observed: standby_replay_floor_lsn,
+                required: policy.durable_checkpoint_lsn(),
+            },
+        );
+    }
     if prerequisites.hot_standby_feedback() != SettingState::Enabled {
         return Err(StandbyReplicationPathCorrelationError::HotStandbyFeedbackDisabled);
     }
@@ -252,7 +281,7 @@ fn validate_standby_path(
     if prerequisites.wal_receiver_received_timeline() != Some(policy.expected_source().timeline()) {
         return Err(StandbyReplicationPathCorrelationError::WalReceiverTimelineMismatch);
     }
-    Ok(wal_receiver_pid)
+    Ok((standby_replay_floor_lsn, wal_receiver_pid))
 }
 
 struct PrimaryPathEvidence {
@@ -432,6 +461,14 @@ pub enum StandbyReplicationPathCorrelationError {
     /// Standby configuration names another or no physical slot.
     #[error("primary_slot_name does not match the catalog-selected physical slot")]
     PrimarySlotNameMismatch,
+    /// Standby's conservative control-file replay floor precedes the checkpoint.
+    #[error("standby control-file replay floor {observed:?} is behind checkpoint {required:?}")]
+    StandbyReplayFloorBehind {
+        /// Standby's control-file checkpoint record.
+        observed: PgLsn,
+        /// Durable consumer checkpoint required by the catalog.
+        required: PgLsn,
+    },
     /// No displayable WAL receiver exists.
     #[error("standby WAL receiver is absent")]
     WalReceiverMissing,
@@ -512,6 +549,7 @@ mod tests {
     const TIMELINE: u32 = 7;
     const DATABASE_OID: u32 = 16_384;
     const CHECKPOINT: PgLsn = PgLsn(0x3000);
+    const STANDBY_REPLAY_FLOOR: PgLsn = PgLsn(0x4000);
     const RESTART: PgLsn = PgLsn(0x2000);
 
     #[derive(Clone)]
@@ -591,6 +629,7 @@ mod tests {
             prerequisite_collection_finished_at: base + Duration::from_millis(1),
             prerequisites: LocalStandbyPrerequisiteObservation {
                 system_identifier: SYSTEM_IDENTIFIER,
+                checkpoint_lsn: STANDBY_REPLAY_FLOOR,
                 checkpoint_timeline: TIMELINE,
                 recovery: RecoveryState::Standby,
                 wal_level: LogicalWalLevel::Logical,
@@ -710,6 +749,15 @@ mod tests {
         assert_eq!(proof.source_identity(), fixture.policy.expected_source());
         assert_eq!(proof.member_ordinal(), 1);
         assert_eq!(proof.oldest_observation_age(), Duration::from_millis(6));
+        assert_eq!(proof.standby_replay_floor_lsn(), STANDBY_REPLAY_FLOOR);
+        assert_eq!(
+            proof.source_bound_replay_floor().source_identity(),
+            fixture.policy.expected_source()
+        );
+        assert_eq!(
+            proof.source_bound_replay_floor().lsn(),
+            STANDBY_REPLAY_FLOOR
+        );
         assert_eq!(proof.physical_slot(), fixture.policy.physical_slot());
         assert_eq!(proof.wal_receiver_pid(), nonzero_u32(401));
         assert_eq!(proof.walsender_identity().pid(), nonzero_u32(501));
@@ -741,6 +789,27 @@ mod tests {
             )
             .expect("raw replay SQL evidence must remain non-authorizing");
         }
+    }
+
+    #[test]
+    fn standby_replay_floor_must_cover_the_durable_checkpoint() {
+        reject(
+            |fixture| prerequisites(fixture).checkpoint_lsn = PgLsn(CHECKPOINT.0 - 1),
+            StandbyReplicationPathCorrelationError::StandbyReplayFloorBehind {
+                observed: PgLsn(CHECKPOINT.0 - 1),
+                required: CHECKPOINT,
+            },
+        );
+
+        let mut fixture = fixture();
+        prerequisites(&mut fixture).checkpoint_lsn = CHECKPOINT;
+        correlate_standby_replication_path_at(
+            &fixture.policy,
+            &fixture.standby,
+            &fixture.primary,
+            fixture.evaluated_at,
+        )
+        .expect("replay floor exactly at the checkpoint must be eligible");
     }
 
     #[test]

@@ -35,14 +35,19 @@ non-authorizing. A pure bounded correlator now requires the separately sampled
 standby and primary paths to match the catalog's observable source components,
 database, roles, mandatory feedback and slot-sync configuration, matching
 standby and primary checkpoint timelines plus live receiver and
-writable-primary timelines, receiver slot, gated
+writable-primary timelines, a standby control-file replay floor covering the
+durable checkpoint, receiver slot, gated
 active physical slot, retained WAL, and exact streaming walsender identity. It
 remains a preflight endpoint-compatibility and
 change token rather than proof of network adjacency or decoder authorization.
-PostgreSQL's SQL API does not expose the replay LSN with its atomically sampled
-replay timeline, so this correlator neither compares nor carries the raw replay
-LSN. Both paths run in a real primary/standby CI fixture. Secure upstream
-connection material, exact replay-lineage, upstream and network-adjacency proof,
+PostgreSQL's SQL API does not expose the live replay LSN with its atomically
+sampled replay timeline, so this correlator neither compares nor carries the raw
+value. Instead, the coherent control-file checkpoint pair provides a
+source-bound replay floor and can lag live replay. A fresh standby may inherit
+the pair from its base backup; later advances follow the restartpoint flush phase,
+when PostgreSQL installs the safe checkpoint pair.
+Both paths run in a real primary/standby CI fixture. Secure upstream connection
+material, exact live-replay, upstream and network-adjacency proof,
 restore-incarnation observation,
 worker-connection and successful-cycle correlation, feedback freshness and
 catalog-horizon proof, physical-slot lifecycle attestation, role activation,
