@@ -78,10 +78,13 @@ anchor, preserving the fail-closed primary fallback. Synchronized anchor copies
 remain observed PostgreSQL state rather than separate catalog allocations.
 Pending creation attempts version the shared catalog fence so older
 repeatable-read lifecycle writers serialize instead of overlooking a newly
-durable barrier. Consumer activation and final retirement use narrow
-security-definer functions; final retirement must run on the canonical backend
-that still owns the target-name absence fence. Parent lifecycle locks consider
-only live slot generations, not permanent retired history.
+durable barrier. Consumer and probe activation and final retirement use narrow
+security-definer functions that accept caller-held receipts without exposing raw
+receipt columns. Final retirement must run on the canonical backend that owns the
+hidden target absence fence and must present its exact opaque fence ID. Catalog
+roles cannot inspect the attempt ledger or target-fence registry. Parent
+lifecycle locks consider only live slot generations, not permanent retired
+history.
 
 The future live-health record will also bind slot-sync success to the current
 direct-primary connection generation; it does not mistake that worker's SQL

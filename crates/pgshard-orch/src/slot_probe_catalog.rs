@@ -7,9 +7,9 @@
 //! retrying the same transition. Final retirement additionally requires the
 //! connection-bound absence fence returned by the local slot mutator.
 //! Allocation, activation and retirement-start are serialized by the catalog's
-//! database-enforced transaction advisory lock. The trigger acquires it after
-//! the catalog-state row, preserving one lock order for typed and direct admin
-//! writes. Final retirement additionally carries the live absence fence.
+//! hidden per-target registry. The trigger checks it after the catalog-state row,
+//! preserving one lock order for typed and direct admin writes. Final retirement
+//! additionally carries the exact live absence-fence capability.
 //!
 //! Every operation consumes a newly connected, idle catalog session and starts
 //! with `DISCARD ALL`. The connection must therefore authenticate as a
@@ -74,10 +74,12 @@ const SELECT_PROBE_SQL: &str = "\
            database_oid, database_name::pg_catalog.text AS database_name, \
            source_timeline, slot_name::pg_catalog.text AS slot_name, \
            consistent_point::pg_catalog.text AS consistent_point, \
-           creation_receipt_id::pg_catalog.text AS creation_receipt_id, \
-           cleanup_receipt_id::pg_catalog.text AS cleanup_receipt_id, state \
-      FROM pgshard_catalog.slot_sync_probes \
-     WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
+           receipts.creation_receipt_present, receipts.cleanup_receipt_present, state \
+      FROM pgshard_catalog.slot_sync_probes AS probes \
+      CROSS JOIN LATERAL pgshard_catalog.slot_sync_probe_receipt_state( \
+          probes.probe_generation, NULL::pg_catalog.uuid \
+      ) AS receipts \
+     WHERE probes.probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
      LIMIT 2";
 
 const SELECT_LIVE_PROBE_SQL: &str = "\
@@ -88,12 +90,14 @@ const SELECT_LIVE_PROBE_SQL: &str = "\
            database_oid, database_name::pg_catalog.text AS database_name, \
            source_timeline, slot_name::pg_catalog.text AS slot_name, \
            consistent_point::pg_catalog.text AS consistent_point, \
-           creation_receipt_id::pg_catalog.text AS creation_receipt_id, \
-           cleanup_receipt_id::pg_catalog.text AS cleanup_receipt_id, state \
-      FROM pgshard_catalog.slot_sync_probes \
-     WHERE shard_id = $1::pg_catalog.text \
-       AND state IN ('allocated', 'active', 'retiring') \
-     ORDER BY probe_generation \
+           receipts.creation_receipt_present, receipts.cleanup_receipt_present, state \
+      FROM pgshard_catalog.slot_sync_probes AS probes \
+      CROSS JOIN LATERAL pgshard_catalog.slot_sync_probe_receipt_state( \
+          probes.probe_generation, NULL::pg_catalog.uuid \
+      ) AS receipts \
+     WHERE probes.shard_id = $1::pg_catalog.text \
+       AND probes.state IN ('allocated', 'active', 'retiring') \
+     ORDER BY probes.probe_generation \
      LIMIT 2";
 
 const INSERT_PROBE_SQL: &str = "\
@@ -108,26 +112,25 @@ const INSERT_PROBE_SQL: &str = "\
     )";
 
 const ACTIVATE_PROBE_SQL: &str = "\
-    UPDATE pgshard_catalog.slot_sync_probes \
-       SET consistent_point = $2::pg_catalog.text::pg_catalog.pg_lsn, \
-           creation_receipt_id = $3::pg_catalog.text::pg_catalog.uuid, \
-           state = 'active', activated_at = pg_catalog.statement_timestamp() \
-     WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
-       AND state = 'allocated'";
+    SELECT pgshard_catalog.activate_slot_sync_probe( \
+        $1::pg_catalog.text::pg_catalog.uuid, \
+        $3::pg_catalog.text::pg_catalog.uuid, \
+        $2::pg_catalog.text::pg_catalog.pg_lsn \
+    )";
 
 const BEGIN_RETIREMENT_SQL: &str = "\
-    UPDATE pgshard_catalog.slot_sync_probes \
-       SET state = 'retiring', \
-           cleanup_receipt_id = $2::pg_catalog.text::pg_catalog.uuid, \
-           retiring_at = pg_catalog.statement_timestamp() \
-     WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
-       AND state IN ('allocated', 'active')";
+    SELECT pgshard_catalog.begin_slot_sync_probe_retirement( \
+        $1::pg_catalog.text::pg_catalog.uuid, \
+        $2::pg_catalog.text::pg_catalog.uuid, \
+        $3::pg_catalog.text::pg_catalog.pg_lsn \
+    )";
 
 const COMPLETE_RETIREMENT_SQL: &str = "\
-    UPDATE pgshard_catalog.slot_sync_probes \
-       SET state = 'retired', retired_at = pg_catalog.statement_timestamp() \
-     WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
-       AND state = 'retiring'";
+    SELECT pgshard_catalog.complete_slot_sync_probe_retirement( \
+        $1::pg_catalog.text::pg_catalog.uuid, $2::pg_catalog.text, \
+        $3::pg_catalog.text::pg_catalog.uuid, \
+        $4::pg_catalog.text::pg_catalog.uuid \
+    )";
 
 /// Immutable source components used to reserve a probe generation.
 ///
@@ -332,8 +335,8 @@ pub struct CatalogSlotSyncProbe {
     source: ReplicationSourceIdentity,
     database_name: String,
     consistent_point: Option<PgLsn>,
-    creation_receipt_id: Option<ManagedLogicalSlotReceiptId>,
-    cleanup_receipt_id: Option<ManagedLogicalSlotReceiptId>,
+    creation_receipt_present: bool,
+    cleanup_receipt_present: bool,
     state: SlotSyncProbeState,
 }
 
@@ -368,16 +371,16 @@ impl CatalogSlotSyncProbe {
         self.consistent_point
     }
 
-    /// Returns the exact creation receipt persisted by activation, if any.
+    /// Returns whether activation persisted a hidden creation capability.
     #[must_use]
-    pub const fn creation_receipt_id(&self) -> Option<ManagedLogicalSlotReceiptId> {
-        self.creation_receipt_id
+    pub const fn creation_receipt_present(&self) -> bool {
+        self.creation_receipt_present
     }
 
-    /// Returns the exact receipt selected for cleanup, if retirement began.
+    /// Returns whether retirement persisted a hidden cleanup capability.
     #[must_use]
-    pub const fn cleanup_receipt_id(&self) -> Option<ManagedLogicalSlotReceiptId> {
-        self.cleanup_receipt_id
+    pub const fn cleanup_receipt_present(&self) -> bool {
+        self.cleanup_receipt_present
     }
 
     /// Returns the durable lifecycle state.
@@ -583,13 +586,22 @@ pub async fn complete_slot_sync_probe_retirement(
     let duration = operation_timeout.get();
     let deadline = Instant::now() + duration;
     validate_absence_receipt(probe, absence.receipt())?;
+    let receipt_id = absence.receipt().receipt_id();
+    let fence_id = absence.fence_id();
     absence
         .verify_held_until(deadline, duration)
         .await
         .map_err(|source| target_fence_lost(probe, source))?;
     let result = timeout_at(
         deadline,
-        execute_fenced_retirement(absence.catalog_client_mut(), deadline, duration, probe),
+        execute_fenced_retirement(
+            absence.catalog_client_mut(),
+            deadline,
+            duration,
+            probe,
+            receipt_id,
+            fence_id,
+        ),
     )
     .await
     .unwrap_or_else(|_| {
@@ -612,6 +624,8 @@ async fn execute_fenced_retirement(
     deadline: Instant,
     duration: Duration,
     probe: &CatalogSlotSyncProbe,
+    receipt_id: ManagedLogicalSlotReceiptId,
+    fence_id: Uuid,
 ) -> Result<ProbeCommandResult, SlotSyncProbeCatalogError> {
     set_session_timeouts(client, deadline).await?;
     let requirements = client.query_one(REQUIREMENTS_SQL, &[]).await?;
@@ -620,7 +634,11 @@ async fn execute_fenced_retirement(
         client,
         deadline,
         duration,
-        ProbeMutation::CompleteRetirement(probe),
+        ProbeMutation::CompleteRetirement {
+            probe,
+            receipt_id,
+            fence_id,
+        },
     )
     .await?;
     Ok(ProbeCommandResult::Probe(loaded))
@@ -817,7 +835,11 @@ enum ProbeMutation<'a> {
         receipt_id: ManagedLogicalSlotReceiptId,
         consistent_point: PgLsn,
     },
-    CompleteRetirement(&'a CatalogSlotSyncProbe),
+    CompleteRetirement {
+        probe: &'a CatalogSlotSyncProbe,
+        receipt_id: ManagedLogicalSlotReceiptId,
+        fence_id: Uuid,
+    },
 }
 
 impl ProbeMutation<'_> {
@@ -826,7 +848,7 @@ impl ProbeMutation<'_> {
             Self::Allocate(_) => SlotSyncProbeCatalogMutation::Allocate,
             Self::Activate { .. } => SlotSyncProbeCatalogMutation::Activate,
             Self::BeginRetirement { .. } => SlotSyncProbeCatalogMutation::BeginRetirement,
-            Self::CompleteRetirement(_) => SlotSyncProbeCatalogMutation::CompleteRetirement,
+            Self::CompleteRetirement { .. } => SlotSyncProbeCatalogMutation::CompleteRetirement,
         }
     }
 
@@ -835,7 +857,7 @@ impl ProbeMutation<'_> {
             Self::Allocate(allocation) => &allocation.target,
             Self::Activate { probe, .. }
             | Self::BeginRetirement { probe, .. }
-            | Self::CompleteRetirement(probe) => &probe.target,
+            | Self::CompleteRetirement { probe, .. } => &probe.target,
         }
     }
 }
@@ -939,8 +961,13 @@ async fn run_mutation_transaction(
             )
             .await
         }
-        ProbeMutation::CompleteRetirement(probe) => {
-            complete_retirement_in_transaction(&transaction, probe, epoch).await
+        ProbeMutation::CompleteRetirement {
+            probe,
+            receipt_id,
+            fence_id,
+        } => {
+            complete_retirement_in_transaction(&transaction, probe, receipt_id, fence_id, epoch)
+                .await
         }
     };
     let value = match mutation_result {
@@ -1062,19 +1089,7 @@ async fn activate_in_transaction(
 ) -> Result<CatalogSlotSyncProbe, SlotSyncProbeCatalogError> {
     let current = load_expected(transaction, expected, epoch).await?;
     match current.state {
-        SlotSyncProbeState::Active => {
-            if current.creation_receipt_id != Some(receipt_id) {
-                return Err(SlotSyncProbeCatalogError::ActivationReceiptMismatch);
-            }
-            if current.consistent_point == Some(consistent_point) {
-                return Ok(current);
-            }
-            return Err(SlotSyncProbeCatalogError::ActivationBoundaryChanged {
-                catalog: current.consistent_point,
-                receipt: consistent_point,
-            });
-        }
-        SlotSyncProbeState::Allocated => {}
+        SlotSyncProbeState::Active | SlotSyncProbeState::Allocated => {}
         SlotSyncProbeState::Retiring | SlotSyncProbeState::Retired => {
             return Err(SlotSyncProbeCatalogError::InvalidTransition {
                 operation: SlotSyncProbeCatalogMutation::Activate,
@@ -1083,8 +1098,8 @@ async fn activate_in_transaction(
         }
     }
     require_current_epoch(expected.source.catalog_epoch(), epoch)?;
-    let changed = transaction
-        .execute(
+    transaction
+        .query_one(
             ACTIVATE_PROBE_SQL,
             &[
                 &expected.target.generation().as_uuid().to_string(),
@@ -1093,7 +1108,6 @@ async fn activate_in_transaction(
             ],
         )
         .await?;
-    require_single_row(changed, SlotSyncProbeCatalogMutation::Activate)?;
     load_after_mutation(
         transaction,
         expected,
@@ -1110,40 +1124,22 @@ async fn begin_retirement_in_transaction(
     epoch: CatalogEpoch,
 ) -> Result<CatalogSlotSyncProbe, SlotSyncProbeCatalogError> {
     let current = load_expected(transaction, expected, epoch).await?;
-    match current.state {
-        SlotSyncProbeState::Retiring | SlotSyncProbeState::Retired => {
-            if current.cleanup_receipt_id == Some(receipt_id)
-                && current
-                    .creation_receipt_id
-                    .is_none_or(|id| id == receipt_id)
-                && current
-                    .consistent_point
-                    .is_none_or(|point| point == consistent_point)
-            {
-                return Ok(current);
-            }
-            return Err(SlotSyncProbeCatalogError::RetirementReceiptMismatch);
-        }
-        SlotSyncProbeState::Active => {
-            if current.creation_receipt_id != Some(receipt_id)
-                || current.consistent_point != Some(consistent_point)
-            {
-                return Err(SlotSyncProbeCatalogError::RetirementReceiptMismatch);
-            }
-        }
-        SlotSyncProbeState::Allocated => {}
+    if matches!(
+        current.state,
+        SlotSyncProbeState::Allocated | SlotSyncProbeState::Active
+    ) {
+        require_current_epoch(expected.source.catalog_epoch(), epoch)?;
     }
-    require_current_epoch(expected.source.catalog_epoch(), epoch)?;
-    let changed = transaction
-        .execute(
+    transaction
+        .query_one(
             BEGIN_RETIREMENT_SQL,
             &[
                 &expected.target.generation().as_uuid().to_string(),
                 &receipt_id.as_uuid().to_string(),
+                &lsn_text(consistent_point),
             ],
         )
         .await?;
-    require_single_row(changed, SlotSyncProbeCatalogMutation::BeginRetirement)?;
     load_after_mutation(
         transaction,
         expected,
@@ -1155,12 +1151,13 @@ async fn begin_retirement_in_transaction(
 async fn complete_retirement_in_transaction(
     transaction: &Transaction<'_>,
     expected: &CatalogSlotSyncProbe,
+    receipt_id: ManagedLogicalSlotReceiptId,
+    fence_id: Uuid,
     epoch: CatalogEpoch,
 ) -> Result<CatalogSlotSyncProbe, SlotSyncProbeCatalogError> {
     let current = load_expected(transaction, expected, epoch).await?;
     match current.state {
-        SlotSyncProbeState::Retired => return Ok(current),
-        SlotSyncProbeState::Retiring => {}
+        SlotSyncProbeState::Retired | SlotSyncProbeState::Retiring => {}
         SlotSyncProbeState::Allocated | SlotSyncProbeState::Active => {
             return Err(SlotSyncProbeCatalogError::InvalidTransition {
                 operation: SlotSyncProbeCatalogMutation::CompleteRetirement,
@@ -1168,14 +1165,20 @@ async fn complete_retirement_in_transaction(
             });
         }
     }
-    require_current_epoch(expected.source.catalog_epoch(), epoch)?;
-    let changed = transaction
-        .execute(
+    if current.state == SlotSyncProbeState::Retiring {
+        require_current_epoch(expected.source.catalog_epoch(), epoch)?;
+    }
+    transaction
+        .query_one(
             COMPLETE_RETIREMENT_SQL,
-            &[&expected.target.generation().as_uuid().to_string()],
+            &[
+                &expected.target.generation().as_uuid().to_string(),
+                &expected.target.name().as_str(),
+                &receipt_id.as_uuid().to_string(),
+                &fence_id.to_string(),
+            ],
         )
         .await?;
-    require_single_row(changed, SlotSyncProbeCatalogMutation::CompleteRetirement)?;
     load_after_mutation(
         transaction,
         expected,
@@ -1295,8 +1298,8 @@ fn parse_probe(
             )
         })
         .transpose()?;
-    let creation_receipt_id = optional_receipt_id(row, "creation_receipt_id")?;
-    let cleanup_receipt_id = optional_receipt_id(row, "cleanup_receipt_id")?;
+    let creation_receipt_present: bool = row.try_get("creation_receipt_present")?;
+    let cleanup_receipt_present: bool = row.try_get("cleanup_receipt_present")?;
     let state_text = required_string(row, "state")?;
     let state = match state_text.as_str() {
         "allocated" => SlotSyncProbeState::Allocated,
@@ -1307,29 +1310,17 @@ fn parse_probe(
     };
     let lifecycle_is_consistent = match state {
         SlotSyncProbeState::Allocated => {
-            consistent_point.is_none()
-                && creation_receipt_id.is_none()
-                && cleanup_receipt_id.is_none()
+            consistent_point.is_none() && !creation_receipt_present && !cleanup_receipt_present
         }
         SlotSyncProbeState::Active => {
-            consistent_point.is_some()
-                && creation_receipt_id.is_some()
-                && cleanup_receipt_id.is_none()
+            consistent_point.is_some() && creation_receipt_present && !cleanup_receipt_present
         }
         SlotSyncProbeState::Retiring => {
-            cleanup_receipt_id.is_some()
-                && consistent_point.is_some() == creation_receipt_id.is_some()
-                && creation_receipt_id
-                    .zip(cleanup_receipt_id)
-                    .is_none_or(|(creation, cleanup)| creation == cleanup)
+            cleanup_receipt_present && consistent_point.is_some() == creation_receipt_present
         }
         SlotSyncProbeState::Retired => {
-            (cleanup_receipt_id.is_some()
-                && consistent_point.is_some() == creation_receipt_id.is_some()
-                && creation_receipt_id
-                    .zip(cleanup_receipt_id)
-                    .is_none_or(|(creation, cleanup)| creation == cleanup))
-                || (creation_receipt_id.is_none() && cleanup_receipt_id.is_none())
+            (cleanup_receipt_present && consistent_point.is_some() == creation_receipt_present)
+                || (!creation_receipt_present && !cleanup_receipt_present)
         }
     };
     if !lifecycle_is_consistent {
@@ -1341,8 +1332,8 @@ fn parse_probe(
         source,
         database_name,
         consistent_point,
-        creation_receipt_id,
-        cleanup_receipt_id,
+        creation_receipt_present,
+        cleanup_receipt_present,
         state,
     })
 }
@@ -1388,7 +1379,6 @@ fn validate_absence_receipt(
         || absence.role() != ManagedLogicalSlotRole::PrimaryFailoverAnchor
         || absence.database_name() != probe.database_name
         || !same_source_lineage(absence.source(), probe.source)
-        || probe.cleanup_receipt_id != Some(absence.receipt_id())
     {
         return Err(SlotSyncProbeCatalogError::AbsenceReceiptMismatch);
     }
@@ -1524,20 +1514,6 @@ fn parse_uuid(row: &Row, field: &'static str) -> Result<Uuid, SlotSyncProbeCatal
         return Err(SlotSyncProbeCatalogError::InvalidCatalogField(field));
     }
     Ok(parsed)
-}
-
-fn optional_receipt_id(
-    row: &Row,
-    field: &'static str,
-) -> Result<Option<ManagedLogicalSlotReceiptId>, SlotSyncProbeCatalogError> {
-    optional_string(row, field)?
-        .map(|value| {
-            Uuid::parse_str(&value)
-                .ok()
-                .and_then(ManagedLogicalSlotReceiptId::from_uuid)
-                .ok_or(SlotSyncProbeCatalogError::InvalidCatalogField(field))
-        })
-        .transpose()
 }
 
 fn positive_u32(row: &Row, field: &'static str) -> Result<u32, SlotSyncProbeCatalogError> {
@@ -1685,25 +1661,9 @@ pub enum SlotSyncProbeCatalogError {
     /// Creation receipt does not authorize this probe.
     #[error("logical-slot creation receipt does not match the slot-sync probe")]
     CreationReceiptMismatch,
-    /// An active row belongs to another successful creation attempt.
-    #[error("slot-sync probe activation receipt differs from the catalog receipt")]
-    ActivationReceiptMismatch,
     /// Absence receipt does not authorize this probe tombstone.
     #[error("logical-slot absence receipt does not match the slot-sync probe")]
     AbsenceReceiptMismatch,
-    /// Retirement was requested with another successful creation attempt.
-    #[error("logical-slot creation receipt does not match the probe cleanup receipt")]
-    RetirementReceiptMismatch,
-    /// An active row already recorded another one-time boundary.
-    #[error(
-        "slot-sync probe activation boundary changed: catalog {catalog:?}, receipt {receipt:?}"
-    )]
-    ActivationBoundaryChanged {
-        /// Existing catalog boundary.
-        catalog: Option<PgLsn>,
-        /// Receipt boundary.
-        receipt: PgLsn,
-    },
     /// Lifecycle operation is not valid from the loaded state.
     #[error("cannot {operation} a slot-sync probe in state {state}")]
     InvalidTransition {

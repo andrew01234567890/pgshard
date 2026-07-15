@@ -74,14 +74,16 @@ observed rather than retried. Before target preflight, create persists a
 permanent pending attempt in `shardschema`, keyed by its opaque receipt and
 never-reused generation. The transaction locks catalog state before the target
 name and validates the exact source, role, restore, owner and lifecycle. A busy
-database-enforced target lock fails fast so no writer retains global catalog
-state while queued; the Rust create path waits at session scope and retries. A
-successful create returns the matching process-local cleanup receipt; source,
-role, a bounded session fence and required creation settings are rechecked after
-dispatch. All managed create/drop calls also take the same target-name advisory
-fence in the authoritative writable `shardschema` database. This canonical
-namespace matters because PostgreSQL advisory locks are database-scoped while
-logical-slot names are cluster-wide. After any wait, the mutator reloads the
+database-enforced target fence fails fast so no writer retains global catalog
+state while queued; the Rust create path retries acquisition within its bounded
+preflight window. Each acquisition records a fresh opaque fence ID and random
+session advisory-lock key in a hidden per-target registry in the authoritative
+writable `shardschema` database. The key is not derived from the public slot
+name, so an ordinary advisory-lock caller cannot counterfeit the fence or block
+the control plane by monopolizing a published name hash. A successful create
+returns the matching process-local cleanup receipt; source, role, the bounded
+session state and required creation settings are rechecked after dispatch. After
+any retry, the mutator reloads the
 exact durable generation, lifecycle, restore/source identity, role, target
 database, catalog epoch and pending receipt before it can dispatch on a separate
 mutation connection. Known pre-dispatch failures durably abandon the attempt.
@@ -89,14 +91,16 @@ If the catalog-fence backend is lost before that cleanup commits, the pending
 attempt remains visible and blocks slot, shard, restore, database, consumer,
 ownership and attachment lifecycle changes until reconciliation. Activation
 resolves the same attempt as activated through an exact-capability
-security-definer function; catalog roles cannot read the attempt ledger.
+security-definer function. Catalog roles cannot read the attempt ledger, raw
+probe receipt columns, or target-fence registry.
 Creating an attempt versions the shared catalog fence so an older
 `REPEATABLE READ` lifecycle transaction cannot miss it. Cleanup resolves the
 same attempt as retired. Final probe and consumer-slot retirement borrow the
 drop path's live connection-bound catalog fence through COMMIT. Consumer
 finalization also presents the exact opaque creation capability and atomically
-retires the attempt and slot. Both paths verify the same canonical backend on
-both sides of that COMMIT before returning success. Known
+retires the attempt and slot. Both paths present the exact opaque fence ID and
+verify the same canonical backend on both sides of that COMMIT before returning
+success. Known
 pre-dispatch drop failures return the receipt, and cleanup does not depend on a
 live receiver, its physical slot, healthy feedback or slot synchronization.
 Catalog triggers serialize allocation, activation, cleanup-start, and related
@@ -127,13 +131,13 @@ allocates the catalog identity, creates the failover probe, observes its
 continuous synchronized copy, persists the exact creation-attempt receipt ID,
 and retires only after matching primary absence and synchronized-copy removal.
 The live fixture starts a same-name managed recreation after primary absence,
-observes it waiting on the target fence, commits permanent retirement while it
-remains blocked, releases the fence, and requires the waiter to reject the now
-retired durable generation even though its mutation connection targets another
-database. A separate fault case terminates the absence-fence backend while the
-retirement transaction is blocked immediately before COMMIT; the API reports
-outcome-unknown `TargetFenceLost`, and an exact reload confirms whether the
-retirement committed. Another fault case gates target-server preflight after a
+observes it retrying the busy hidden target fence, commits permanent retirement
+while it remains blocked, releases the fence, and requires the waiter to reject
+the now retired durable generation even though its mutation connection targets
+another database. A separate fault case terminates the absence-fence backend
+while the retirement transaction is blocked immediately before COMMIT; the API
+reports outcome-unknown `TargetFenceLost`, and an exact reload confirms whether
+the retirement committed. Another fault case gates target-server preflight after a
 pending create is durable, terminates the canonical catalog backend, proves
 catalog retirement stays fenced, then completes and cleans up the physical slot
 without producing a retired tombstone with a live name. The fixture also reconciles

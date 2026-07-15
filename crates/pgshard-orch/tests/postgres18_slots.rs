@@ -15,8 +15,8 @@ use pgshard_orch::{
     slot_mutator::{
         LocalSlotMutationError, ManagedLogicalSlotCreateRequest, ManagedLogicalSlotDropFence,
         ManagedLogicalSlotDropOutcome, ManagedLogicalSlotReceipt, ManagedLogicalSlotRole,
-        complete_managed_consumer_slot_retirement, create_managed_logical_slot,
-        drop_managed_logical_slot,
+        activate_managed_consumer_slot, complete_managed_consumer_slot_retirement,
+        create_managed_logical_slot, drop_managed_logical_slot,
     },
     slot_observer::{
         CorrelatedStandbyReplicationPath, LocalLogicalSlotObservationBatch,
@@ -67,7 +67,6 @@ const MAX_PROXY_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const COMMIT_QUERY_FRAME: &[u8] = b"Q\0\0\0\x0bCOMMIT\0";
 const COMMIT_COMPLETE_PAYLOAD: &[u8] = b"COMMIT\0";
 const ADVISORY_FENCE_KEY_STRIDE: u64 = 32;
-const MANAGED_TARGET_FENCE_HASH_SEED: i64 = 1_346_851_656;
 const EXPECTED_PRIMARY_SLOT_NAME: &str = "pgshard_member_0001";
 const EXPECTED_SYNCED_ANCHOR_NAME: &str = "pgshard_ci_anchor_00000000000000000000000000000001";
 // Correlation, slot-sync appearance/removal, snapshot-triggered standby create,
@@ -78,6 +77,8 @@ const STANDBY_CATCHUP_TIMEOUT: Duration = Duration::from_mins(1);
 const STANDBY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RESTRICTED_OBSERVER_ROLE: &str = "pgshard_observer_restricted";
 const RESTRICTED_OBSERVER_PASSWORD: &str = "pgshard-test-only";
+const CATALOG_ADMIN_TEST_ROLE: &str = "pgshard_catalog_admin_test";
+const CATALOG_ADMIN_TEST_PASSWORD: &str = "pgshard-catalog-test-only";
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_ADVISORY_FENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -777,57 +778,34 @@ async fn wait_for_mutation_backend_exit(client: &Client, backend_pid: &AtomicU32
     }
 }
 
-async fn wait_for_backend_advisory_fence(database_url: &str, backend_pid: i32) -> TestResult {
-    wait_for_backend_lock(
-        database_url,
-        backend_pid,
-        Some("advisory"),
-        "same-name recreation",
-    )
-    .await
-}
-
-async fn wait_for_backend_lock(
-    database_url: &str,
-    backend_pid: i32,
-    expected_wait_event: Option<&str>,
-    operation: &str,
-) -> TestResult {
+async fn wait_for_backend_target_fence_retry(database_url: &str, backend_pid: i32) -> TestResult {
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
     let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
     let connection_task = tokio::spawn(connection);
     let result = async {
         loop {
-            let row = timeout_at(
+            let query = timeout_at(
                 deadline,
                 client.query_opt(
-                    "SELECT wait_event_type::pg_catalog.text, wait_event::pg_catalog.text \
+                    "SELECT query::pg_catalog.text \
                        FROM pg_catalog.pg_stat_activity \
                       WHERE pid OPERATOR(pg_catalog.=) $1::pg_catalog.int4",
                     &[&backend_pid],
                 ),
             )
             .await
-            .map_err(|_| io::Error::other("backend lock observation exceeded the bound"))??
+            .map_err(|_| io::Error::other("target-fence retry observation exceeded the bound"))??
             .ok_or_else(|| {
-                io::Error::other(format!(
-                    "{operation} backend exited before waiting on its lock"
-                ))
-            })?;
-            let wait_type: Option<String> = row.try_get(0)?;
-            let wait_event: Option<String> = row.try_get(1)?;
-            if wait_type.as_deref() == Some("Lock")
-                && expected_wait_event
-                    .is_none_or(|expected| wait_event.as_deref() == Some(expected))
-            {
+                io::Error::other("same-name recreation backend exited before fence retry")
+            })?
+            .try_get::<_, String>(0)?;
+            if query.contains("acquire_managed_slot_target_fence") {
                 return Ok::<(), TestError>(());
             }
             timeout_at(deadline, sleep(CLEANUP_RETRY_INTERVAL))
                 .await
                 .map_err(|_| {
-                    io::Error::other(format!(
-                        "{operation} did not block on the expected lock within the bound"
-                    ))
+                    io::Error::other("same-name recreation did not retry the hidden target fence")
                 })?;
         }
     }
@@ -1072,29 +1050,40 @@ async fn complete_catalog_probe_cleanup(
     generation: &str,
     slot_name: &str,
 ) -> TestResult {
-    client
+    let cleanup_receipt: String = client
         .query_one(
-            "SELECT pg_catalog.pg_advisory_lock( \
-                        pg_catalog.hashtextextended($1::pg_catalog.text, $2) \
-                    )",
-            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
-        )
-        .await?;
-    let retirement = client
-        .execute(
-            "UPDATE pgshard_catalog.slot_sync_probes \
-                SET state = 'retired', retired_at = pg_catalog.statement_timestamp() \
+            "SELECT cleanup_receipt_id::pg_catalog.text \
+               FROM pgshard_catalog.slot_sync_probes \
               WHERE probe_generation = $1::pg_catalog.text::pg_catalog.uuid \
                 AND state = 'retiring'",
             &[&generation],
         )
+        .await?
+        .try_get(0)?;
+    let fence_id: String = client
+        .query_one(
+            "SELECT acquired_fence_id::pg_catalog.text \
+               FROM pgshard_catalog.acquire_managed_slot_target_fence($1::pg_catalog.text)",
+            &[&slot_name],
+        )
+        .await?
+        .try_get(0)?;
+    let retirement = client
+        .query_one(
+            "SELECT pgshard_catalog.complete_slot_sync_probe_retirement( \
+                        $1::pg_catalog.text::pg_catalog.uuid, $2::pg_catalog.text, \
+                        $3::pg_catalog.text::pg_catalog.uuid, \
+                        $4::pg_catalog.text::pg_catalog.uuid \
+                    )",
+            &[&generation, &slot_name, &cleanup_receipt, &fence_id],
+        )
         .await;
     let released: bool = client
         .query_one(
-            "SELECT pg_catalog.pg_advisory_unlock( \
-                        pg_catalog.hashtextextended($1::pg_catalog.text, $2) \
+            "SELECT pgshard_catalog.release_managed_slot_target_fence( \
+                        $1::pg_catalog.text, $2::pg_catalog.text::pg_catalog.uuid \
                     )",
-            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+            &[&slot_name, &fence_id],
         )
         .await?
         .try_get(0)?;
@@ -1409,8 +1398,8 @@ async fn activate_catalog_probe_with_commit_response_loss(
         .expect("the committed activation remains durable after response loss");
     assert_eq!(active.state(), SlotSyncProbeState::Active);
     assert_eq!(active.consistent_point(), Some(receipt.creation_lsn()));
-    assert_eq!(active.creation_receipt_id(), Some(receipt.receipt_id()));
-    assert_eq!(active.cleanup_receipt_id(), None);
+    assert!(active.creation_receipt_present());
+    assert!(!active.cleanup_receipt_present());
     assert!(active.source().catalog_epoch().0 > probe.source().catalog_epoch().0);
     Ok(active)
 }
@@ -1500,7 +1489,7 @@ async fn complete_retirement_while_recreation_waits(
         )
         .await
     }));
-    wait_for_backend_advisory_fence(database_url, recreate_backend_pid).await?;
+    wait_for_backend_target_fence_retry(database_url, recreate_backend_pid).await?;
     assert!(
         !recreate.task().is_finished(),
         "same-name recreation must remain blocked before catalog retirement"
@@ -1606,8 +1595,8 @@ async fn complete_retirement_after_catalog_fence_loss(
         .await?
         .expect("the exact catalog generation committed before post-COMMIT fence verification");
     assert_eq!(retired.state(), SlotSyncProbeState::Retired);
-    assert_eq!(retired.creation_receipt_id(), Some(expected_receipt_id));
-    assert_eq!(retired.cleanup_receipt_id(), Some(expected_receipt_id));
+    assert!(retired.creation_receipt_present());
+    assert!(retired.cleanup_receipt_present());
     Ok(retired)
 }
 
@@ -1720,8 +1709,8 @@ async fn run_catalog_probe_fixture(
     assert_eq!(allocated.database_name(), "shardschema");
     assert_eq!(allocated.state(), SlotSyncProbeState::Allocated);
     assert_eq!(allocated.consistent_point(), None);
-    assert_eq!(allocated.creation_receipt_id(), None);
-    assert_eq!(allocated.cleanup_receipt_id(), None);
+    assert!(!allocated.creation_receipt_present());
+    assert!(!allocated.cleanup_receipt_present());
 
     assert_catalog_probe_allocation_fencing(&primary_database_url, &allocation, &allocated).await?;
 
@@ -1743,20 +1732,26 @@ async fn run_catalog_probe_fixture(
     .await?;
     assert_eq!(active.state(), SlotSyncProbeState::Active);
     assert_eq!(active.consistent_point(), Some(receipt.creation_lsn()));
-    assert_eq!(active.creation_receipt_id(), Some(receipt.receipt_id()));
-    assert_eq!(active.cleanup_receipt_id(), None);
+    assert!(active.creation_receipt_present());
+    assert!(!active.cleanup_receipt_present());
     let active_retry = allocate_catalog_probe(&primary_database_url, &allocation).await?;
-    assert_eq!(active_retry, active);
+    assert_eq!(active_retry.target(), active.target());
+    assert_eq!(active_retry.state(), active.state());
+    assert_eq!(active_retry.consistent_point(), active.consistent_point());
+    assert!(
+        active_retry.source().catalog_epoch().0 >= active.source().catalog_epoch().0,
+        "an idempotent load may observe a newer unrelated catalog epoch"
+    );
     assert_eq!(
         activate_catalog_probe(&primary_database_url, &active_retry, &receipt).await?,
-        active
+        active_retry
     );
 
     let retiring =
         begin_catalog_probe_retirement(&primary_database_url, &active_retry, &receipt).await?;
     assert_eq!(retiring.state(), SlotSyncProbeState::Retiring);
-    assert_eq!(retiring.creation_receipt_id(), Some(receipt.receipt_id()));
-    assert_eq!(retiring.cleanup_receipt_id(), Some(receipt.receipt_id()));
+    assert!(retiring.creation_receipt_present());
+    assert!(retiring.cleanup_receipt_present());
     let retiring_retry =
         begin_catalog_probe_retirement(&primary_database_url, &retiring, &receipt).await?;
     assert_eq!(retiring_retry, retiring);
@@ -2344,6 +2339,7 @@ async fn allocate_standby_decoder(
     let attachment = Uuid::new_v4();
     let suffix = logical_database.simple().to_string();
     let result: TestResult = async {
+        ensure_catalog_admin_test_role(&client).await?;
         insert_standby_consumer_registry(&client, logical_database, consumer, &suffix).await?;
         client
             .execute(
@@ -2401,25 +2397,47 @@ async fn allocate_standby_decoder(
     connection_result
 }
 
+async fn ensure_catalog_admin_test_role(client: &Client) -> TestResult {
+    client
+        .batch_execute(
+            "DO $pgshard_catalog_admin_test$ \
+             BEGIN \
+                 IF NOT EXISTS ( \
+                     SELECT FROM pg_catalog.pg_roles \
+                      WHERE rolname = 'pgshard_catalog_admin_test' \
+                 ) THEN \
+                     CREATE ROLE pgshard_catalog_admin_test \
+                         LOGIN PASSWORD 'pgshard-catalog-test-only'; \
+                 END IF; \
+             END \
+             $pgshard_catalog_admin_test$; \
+             ALTER ROLE pgshard_catalog_admin_test \
+                 LOGIN PASSWORD 'pgshard-catalog-test-only'; \
+             GRANT pgshard_catalog_admin TO pgshard_catalog_admin_test",
+        )
+        .await?;
+    Ok(())
+}
+
+fn catalog_admin_test_config(database_url: &str) -> TestResult<Config> {
+    let mut config: Config = database_url.parse()?;
+    config.user(CATALOG_ADMIN_TEST_ROLE);
+    config.password(CATALOG_ADMIN_TEST_PASSWORD);
+    Ok(config)
+}
+
 async fn activate_standby_decoder(
     catalog_database_url: &str,
     target: &ManagedSlotTarget,
     receipt: &ManagedLogicalSlotReceipt,
 ) -> TestResult {
-    let (client, connection) = tokio_postgres::connect(catalog_database_url, NoTls).await?;
-    let connection_task = tokio::spawn(connection);
+    assert_eq!(receipt.target(), target);
+    let config = catalog_admin_test_config(catalog_database_url)?;
+    let (wrong_client, wrong_connection) = config.connect(NoTls).await?;
+    let wrong_task = tokio::spawn(wrong_connection);
+    let wrong_receipt = Uuid::new_v4().to_string();
     let creation_lsn = pg_lsn_text(receipt.creation_lsn());
-    let creation_receipt_id: String = client
-        .query_one(
-            "SELECT creation_receipt_id::pg_catalog.text \
-               FROM pgshard_catalog.managed_slot_creation_attempts \
-              WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid \
-                AND state = 'pending'",
-            &[&target.generation().as_uuid().to_string()],
-        )
-        .await?
-        .try_get(0)?;
-    client
+    let wrong = wrong_client
         .query_one(
             "SELECT pgshard_catalog.activate_managed_replication_slot( \
                         $1::pg_catalog.text::pg_catalog.uuid, \
@@ -2429,22 +2447,37 @@ async fn activate_standby_decoder(
                     )",
             &[
                 &target.generation().as_uuid().to_string(),
-                &creation_receipt_id,
+                &wrong_receipt,
                 &creation_lsn,
             ],
         )
-        .await?;
-    let attempt_state: String = client
+        .await
+        .expect_err("a guessed consumer activation receipt must be rejected");
+    assert_eq!(
+        wrong.code(),
+        Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)
+    );
+    let hidden = wrong_client
         .query_one(
-            "SELECT state FROM pgshard_catalog.managed_slot_creation_attempts \
-              WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid",
-            &[&target.generation().as_uuid().to_string()],
+            "SELECT creation_receipt_id FROM pgshard_catalog.managed_slot_creation_attempts \
+             LIMIT 1",
+            &[],
         )
-        .await?
-        .try_get(0)?;
-    assert_eq!(attempt_state, "activated");
-    drop(client);
-    finish_connection(connection_task).await
+        .await
+        .expect_err("catalog admin must not be able to reload hidden receipt authority");
+    assert_eq!(hidden.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+    drop(wrong_client);
+    finish_connection(wrong_task).await?;
+
+    let (client, connection) = config.connect(NoTls).await?;
+    activate_managed_consumer_slot(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        receipt,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn retire_standby_decoder(
@@ -2492,8 +2525,17 @@ async fn retire_standby_decoder_with_client(
     if table.is_none() {
         return Ok(());
     }
-    reconcile_standby_creation_attempt(client, target).await?;
     let generation = target.generation().as_uuid().to_string();
+    let registry = client
+        .query_opt(
+            "SELECT attachment_generation::pg_catalog.text, \
+                    consumer_id::pg_catalog.text, logical_database_id::pg_catalog.text \
+               FROM pgshard_catalog.managed_replication_slots \
+              WHERE slot_generation = $1::pg_catalog.text::pg_catalog.uuid",
+            &[&generation],
+        )
+        .await?;
+    reconcile_standby_creation_attempt(client, target).await?;
     client
         .execute(
             "UPDATE pgshard_catalog.managed_replication_slots \
@@ -2522,6 +2564,119 @@ async fn retire_standby_decoder_with_client(
         .try_get(0)?;
     if unresolved != 0 {
         return Err(io::Error::other("standby-decoder cleanup left live catalog state").into());
+    }
+    if let Some(registry) = registry {
+        retire_standby_consumer_registry(
+            client,
+            &registry.try_get::<_, String>(0)?,
+            &registry.try_get::<_, String>(1)?,
+            &registry.try_get::<_, String>(2)?,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn retire_standby_consumer_registry(
+    client: &Client,
+    attachment: &str,
+    consumer: &str,
+    logical_database: &str,
+) -> TestResult {
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_attachments \
+                SET state = 'retired', retired_at = pg_catalog.statement_timestamp() \
+              WHERE attachment_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                AND state <> 'retired'",
+            &[&attachment],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_shards \
+                SET state = 'fenced', \
+                    ownership_fence = CASE \
+                        WHEN state = 'ready' THEN ownership_fence + 1 \
+                        ELSE ownership_fence \
+                    END \
+              WHERE consumer_id = $1::pg_catalog.text::pg_catalog.uuid \
+                AND logical_database_id = $2::pg_catalog.text::pg_catalog.uuid \
+                AND shard_id = 'shard-0000' \
+                AND state IN ('provisioning', 'ready')",
+            &[&consumer, &logical_database],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumer_shards \
+                SET state = 'retired' \
+              WHERE consumer_id = $1::pg_catalog.text::pg_catalog.uuid \
+                AND logical_database_id = $2::pg_catalog.text::pg_catalog.uuid \
+                AND shard_id = 'shard-0000' AND state = 'fenced'",
+            &[&consumer, &logical_database],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumers SET state = 'draining' \
+              WHERE consumer_id = $1::pg_catalog.text::pg_catalog.uuid \
+                AND logical_database_id = $2::pg_catalog.text::pg_catalog.uuid \
+                AND state = 'active'",
+            &[&consumer, &logical_database],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_consumers SET state = 'retired' \
+              WHERE consumer_id = $1::pg_catalog.text::pg_catalog.uuid \
+                AND logical_database_id = $2::pg_catalog.text::pg_catalog.uuid \
+                AND state = 'draining'",
+            &[&consumer, &logical_database],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_databases SET state = 'draining' \
+              WHERE logical_database_id = $1::pg_catalog.text::pg_catalog.uuid \
+                AND state = 'active'",
+            &[&logical_database],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.logical_databases SET state = 'retired' \
+              WHERE logical_database_id = $1::pg_catalog.text::pg_catalog.uuid \
+                AND state = 'draining'",
+            &[&logical_database],
+        )
+        .await?;
+    let remaining: i64 = client
+        .query_one(
+            "SELECT (SELECT pg_catalog.count(*) \
+                       FROM pgshard_catalog.logical_consumer_attachments \
+                      WHERE attachment_generation = $1::pg_catalog.text::pg_catalog.uuid \
+                        AND state <> 'retired') \
+                  + (SELECT pg_catalog.count(*) \
+                       FROM pgshard_catalog.logical_consumer_shards \
+                      WHERE consumer_id = $2::pg_catalog.text::pg_catalog.uuid \
+                        AND logical_database_id = $3::pg_catalog.text::pg_catalog.uuid \
+                        AND state <> 'retired') \
+                  + (SELECT pg_catalog.count(*) \
+                       FROM pgshard_catalog.logical_consumers \
+                      WHERE consumer_id = $2::pg_catalog.text::pg_catalog.uuid \
+                        AND logical_database_id = $3::pg_catalog.text::pg_catalog.uuid \
+                        AND state <> 'retired') \
+                  + (SELECT pg_catalog.count(*) \
+                       FROM pgshard_catalog.logical_databases \
+                      WHERE logical_database_id = $3::pg_catalog.text::pg_catalog.uuid \
+                        AND state <> 'retired')",
+            &[&attachment, &consumer, &logical_database],
+        )
+        .await?
+        .try_get(0)?;
+    if remaining != 0 {
+        return Err(io::Error::other("standby-decoder cleanup left live registry state").into());
     }
     Ok(())
 }
@@ -2568,29 +2723,30 @@ async fn complete_standby_catalog_cleanup(
     slot_name: &str,
     receipt_id: &str,
 ) -> TestResult {
-    client
+    let fence_id: String = client
         .query_one(
-            "SELECT pg_catalog.pg_advisory_lock( \
-                        pg_catalog.hashtextextended($1::pg_catalog.text, $2) \
-                    )",
-            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+            "SELECT acquired_fence_id::pg_catalog.text \
+               FROM pgshard_catalog.acquire_managed_slot_target_fence($1::pg_catalog.text)",
+            &[&slot_name],
         )
-        .await?;
+        .await?
+        .try_get(0)?;
     let retirement = client
         .query_one(
             "SELECT pgshard_catalog.complete_managed_replication_slot_retirement( \
                         $1::pg_catalog.text::pg_catalog.uuid, $2::pg_catalog.text, \
-                        $3::pg_catalog.text::pg_catalog.uuid \
+                        $3::pg_catalog.text::pg_catalog.uuid, \
+                        $4::pg_catalog.text::pg_catalog.uuid \
                     )",
-            &[&generation, &slot_name, &receipt_id],
+            &[&generation, &slot_name, &receipt_id, &fence_id],
         )
         .await;
     let released: bool = client
         .query_one(
-            "SELECT pg_catalog.pg_advisory_unlock( \
-                        pg_catalog.hashtextextended($1::pg_catalog.text, $2) \
+            "SELECT pgshard_catalog.release_managed_slot_target_fence( \
+                        $1::pg_catalog.text, $2::pg_catalog.text::pg_catalog.uuid \
                     )",
-            &[&slot_name, &MANAGED_TARGET_FENCE_HASH_SEED],
+            &[&slot_name, &fence_id],
         )
         .await?
         .try_get(0)?;

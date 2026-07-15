@@ -41,6 +41,11 @@ requires its exact drop/absence receipt. Repeating an already-applied operation
 is read-only, while an ambiguous commit is reconciled by reloading the permanent
 generation before retry. This composes the clean same-process lifecycle but is
 not yet a long-running controller or crash/external-mutation reconciler.
+Creation-attempt rows, raw probe receipt columns, and the per-target fence
+registry are hidden from catalog reader and administrator roles. Every fence
+acquisition stores a fresh random session advisory-lock key and opaque fence ID,
+so a public slot name or name-derived advisory lock cannot manufacture lifecycle
+authority or monopolize the control-plane fence.
 The restricted catalog role cannot update checkpoint progress directly. Its
 checkpoint CAS requires the caller's expected ownership fence and checkpoint
 ordinal, so a fence that wins the catalog lock makes an in-flight stale advance

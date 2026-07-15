@@ -71,12 +71,14 @@ select a member, observe or mutate PostgreSQL slots, or authorize a connection.
 A separate bounded Rust primitive now consumes two dedicated PostgreSQL 18
 connections to create either a persistent `pgoutput` primary failover anchor or
 standby-local decoder with two-phase decoding enabled. The first must be the
-writable authoritative `shardschema` database; it acquires the canonical
-target-name fence and then reloads the exact durable generation, lifecycle,
-restore incarnation, source, role, target database, and current catalog epoch.
-The second connection performs the slot mutation in that allocated database.
-This split is required because logical-slot names are cluster-wide while
-PostgreSQL advisory locks are database-scoped. The mutator requires an absent
+writable authoritative `shardschema` database; it acquires the target's hidden
+catalog fence and then reloads the exact durable generation, lifecycle, restore
+incarnation, source, role, target database, and current catalog epoch. Each
+acquisition uses a fresh random session advisory-lock key and opaque fence ID;
+neither is derived from the visible slot name. The second connection performs
+the slot mutation in that allocated database. This split retains one canonical
+cluster-wide target registry while the physical mutation runs in the allocated
+database. The mutator requires an absent
 generation-qualified name, checks the observable system/timeline/database
 source, recovery role and logical WAL before dispatch. Standby creation must
 consume a still-fresh proof from the multi-server correlator. The mutator then
@@ -117,9 +119,10 @@ The process-local receipt is not a live lease. `shardschema` now keeps a
 permanent creation-attempt ledger so loss of the catalog backend before dispatch
 cannot erase the in-flight barrier. A pending attempt prevents related catalog
 lifecycle and ownership changes until it is abandoned, activated, or retired.
-Catalog reader and administrator roles cannot select that ledger; narrowly
-scoped security-definer functions reveal only whether a caller-supplied exact
-capability is in the required state. Creating an attempt also versions the
+Catalog reader and administrator roles cannot select that ledger, raw probe
+receipt columns, or the target-fence registry. Narrowly scoped security-definer
+functions reveal only whether a caller-supplied exact capability is in the
+required state. Creating an attempt also versions the
 shared catalog fence, so an older `REPEATABLE READ` lifecycle transaction fails
 with serialization error instead of missing the new pending row.
 This is not a complete post-dispatch outcome ledger: a lost response still
@@ -367,23 +370,26 @@ creation receipt, persist that receipt's opaque create-attempt ID before target
 preflight, copy the same ID when cleanup starts, and drop the unchanged inactive
 slot. Pending attempts survive process or catalog-backend loss and prevent the
 allocation and its shard, restore, database, consumer, ownership or attachment
-parents from changing underneath the create. Every managed
-create and drop serializes in the writable `shardschema` database on a
-target-name advisory fence, then revalidates the exact catalog row after
-acquisition. Allocation, activation, cleanup-start, and related parent lifecycle
-writes, including direct administrative writes to managed catalog tables, use
-that same canonical lock namespace. They fail fast on a busy target rather than
-retaining the catalog-state row while queued; the Rust create path waits at
-session scope and retries while owning the key. Final probe and consumer-slot
+parents from changing underneath the create. Every managed create and drop
+serializes through a hidden per-target registry in the writable `shardschema`
+database, then revalidates the exact catalog row after acquisition. The registry
+binds a fresh random session advisory-lock key to an opaque fence ID; public
+target names and name-derived hashes are not authority. Allocation, activation,
+cleanup-start, and related parent lifecycle writes, including direct
+administrative writes to managed catalog tables, use that same canonical
+registry. They fail fast on a busy target rather than retaining the catalog-state
+row while queued; the Rust create path retries without retaining global catalog
+state. Final probe and consumer-slot
 retirement instead require the typed path's live connection-bound absence
 fence. Retired history is excluded from parent lifecycle target-lock sets, so
 permanent tombstones do not make those updates grow with historical slot count.
-Using the slot's mutation database would be unsafe because advisory locks are
-database-scoped. A successful drop returns a connection-bound absence guard,
+Using the slot's mutation database as the registry would split serialization
+across databases. A successful drop returns a connection-bound absence guard,
 not a freely replayable receipt; final retirement verifies the same canonical
-catalog backend immediately before and after the catalog COMMIT, then releases
-the fence. Consumer finalization additionally presents the exact opaque
-creation capability and retires that attempt in the same transaction. A
+catalog backend and exact opaque fence ID immediately before and after the
+catalog COMMIT, then releases the fence. Consumer finalization additionally
+presents the exact opaque creation capability and retires that attempt in the
+same transaction. A
 same-name managed creation therefore cannot enter the
 absence-to-COMMIT gap, even when its mutation connection targets a different
 database. Privileged direct SQL against PostgreSQL's physical slot functions

@@ -176,12 +176,12 @@ drop/absence receipt carrying the persisted create-attempt ID, and the
 synchronized copy must disappear before permanent retirement. The fixture
 retains the final drop's connection-bound target fence, starts a same-name
 managed create whose mutation connection deliberately targets another database,
-and observes its canonical `shardschema` backend waiting on the advisory lock
-across catalog COMMIT. Releasing the fence must let that task finish with a
-pre-dispatch rejection because its exact durable generation is now retired; the
-test reaps the task and proves the target remains absent. This cross-database
-case is required because advisory locks are database-scoped while replication
-slot names are cluster-wide. A second fixture row-locks retirement immediately
+and observes that task retrying the busy hidden `shardschema` fence across
+catalog COMMIT. Releasing the fence must let that task finish with a pre-dispatch
+rejection because its exact durable generation is now retired; the test reaps
+the task and proves the target remains absent. This cross-database case proves
+that all mutation databases share the canonical registry for cluster-wide slot
+names. A second fixture row-locks retirement immediately
 before COMMIT, terminates the absence-fence backend, releases the row lock, and
 requires outcome-unknown `TargetFenceLost`. It then reloads the exact generation
 and confirms the retirement committed, covering the post-COMMIT verification
@@ -201,12 +201,14 @@ acknowledges that its frame parser is armed on the idle authenticated
 connection, closes the client response half when it receives the exact COMMIT
 frame, forwards that frame, and then independently requires PostgreSQL's
 `CommandComplete` and `ReadyForQuery`. The client must classify
-`OutcomeUnknown`, reload the exact receipt ID and boundary, and safely replay
-the same activation. Always-run bounded cleanup retires the catalog row only
+`OutcomeUnknown`, reload the exact durable row, and safely replay the same held
+receipt and boundary. Always-run bounded cleanup retires the catalog row only
 after both primary-slot removal and synchronized standby-copy disappearance
 succeed; cleanup owns a separately deadline-bounded connection with PostgreSQL
-statement, lock, and transaction timeouts. A failed absence check preserves the
-live or retiring row for diagnosis and reconciliation.
+statement, lock, and transaction timeouts. It then retires the attachment,
+consumer shard, consumer, and logical database created by the fixture and proves
+that no live hierarchy remains. A failed absence check preserves the live or
+retiring row for diagnosis and reconciliation.
 Automatic crash reconciliation remains a separate future test.
 Injected post-dispatch slot-mutation socket loss and cancellation races are not
 yet exercised. A complete post-dispatch slot-outcome ledger, automatic

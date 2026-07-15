@@ -693,6 +693,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS managed_slot_creation_attempts_one_activated
 COMMENT ON TABLE pgshard_catalog.managed_slot_creation_attempts IS
     'Permanent create-attempt ledger. A pending row is a durable barrier against owner retirement after the orchestration session or advisory fence is lost.';
 
+CREATE TABLE IF NOT EXISTS pgshard_catalog.managed_slot_target_fences (
+    target_name pgshard_catalog.replication_slot_name PRIMARY KEY,
+    fence_id uuid UNIQUE,
+    lock_key bigint,
+    owner_pid integer CHECK (owner_pid IS NULL OR owner_pid > 0),
+    acquired_at timestamptz,
+    CHECK (
+        (fence_id IS NULL AND lock_key IS NULL AND owner_pid IS NULL AND acquired_at IS NULL)
+        OR
+        (fence_id IS NOT NULL AND lock_key IS NOT NULL AND owner_pid IS NOT NULL AND acquired_at IS NOT NULL)
+    ),
+    CHECK (fence_id IS NULL OR fence_id <> '00000000-0000-0000-0000-000000000000'::uuid)
+);
+
+COMMENT ON TABLE pgshard_catalog.managed_slot_target_fences IS
+    'Hidden per-target session fences. Each acquisition uses a fresh unpredictable advisory-lock key so public advisory-lock callers cannot monopolize a published target hash.';
+
 CREATE TABLE IF NOT EXISTS pgshard_catalog.operation_tombstones (
     operation_kind pgshard_catalog.sql_identifier NOT NULL,
     operation_id uuid NOT NULL,
@@ -895,22 +912,78 @@ BEGIN
 END
 $function$;
 
+CREATE OR REPLACE FUNCTION pgshard_catalog.managed_slot_advisory_lock_held(
+    expected_lock_key bigint,
+    expected_owner_pid integer
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+    SELECT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_locks AS locks
+         WHERE locks.locktype = 'advisory'
+           AND locks.database = (
+               SELECT databases.oid
+                 FROM pg_catalog.pg_database AS databases
+                WHERE databases.datname = pg_catalog.current_database()
+           )
+           AND locks.classid::bigint = ((expected_lock_key >> 32) & 4294967295)
+           AND locks.objid::bigint = (expected_lock_key & 4294967295)
+           AND locks.objsubid = 1
+           AND locks.pid = expected_owner_pid
+           AND locks.mode = 'ExclusiveLock'
+           AND locks.granted
+    )
+$function$;
+
 CREATE OR REPLACE FUNCTION pgshard_catalog.lock_managed_slot_target(target_name text)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pgshard_catalog, pg_temp
 AS $function$
+DECLARE
+    existing_fence_id uuid;
+    existing_lock_key bigint;
+    existing_owner_pid integer;
 BEGIN
     IF target_name IS NULL OR target_name = '' THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot target is required';
     END IF;
-    IF NOT pg_catalog.pg_try_advisory_xact_lock(
-        pg_catalog.hashtextextended(target_name, 1346851656)
-    ) THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55P03',
-            MESSAGE = 'managed slot target fence is busy';
+
+    INSERT INTO pgshard_catalog.managed_slot_target_fences(target_name)
+    VALUES ($1)
+    ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
+
+    SELECT fences.fence_id, fences.lock_key, fences.owner_pid
+      INTO existing_fence_id, existing_lock_key, existing_owner_pid
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1
+     FOR UPDATE;
+
+    IF existing_fence_id IS NOT NULL THEN
+        IF pgshard_catalog.managed_slot_advisory_lock_held(
+            existing_lock_key,
+            existing_owner_pid
+        ) THEN
+            IF existing_owner_pid <> pg_catalog.pg_backend_pid() THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '55P03',
+                    MESSAGE = 'managed slot target fence is busy';
+            END IF;
+            RETURN;
+        END IF;
+
+        UPDATE pgshard_catalog.managed_slot_target_fences AS fences
+           SET fence_id = NULL,
+               lock_key = NULL,
+               owner_pid = NULL,
+               acquired_at = NULL
+         WHERE fences.target_name::text = $1;
     END IF;
 END
 $function$;
@@ -935,6 +1008,78 @@ BEGIN
 END
 $function$;
 
+CREATE OR REPLACE FUNCTION pgshard_catalog.acquire_managed_slot_target_fence(target_name text)
+RETURNS TABLE(acquired_fence_id uuid, acquired_backend_pid integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    existing_fence_id uuid;
+    existing_lock_key bigint;
+    existing_owner_pid integer;
+    new_fence_id uuid;
+    new_lock_key bigint;
+    acquired boolean := false;
+BEGIN
+    IF target_name IS NULL OR target_name = '' THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'managed slot target is required';
+    END IF;
+
+    INSERT INTO pgshard_catalog.managed_slot_target_fences(target_name)
+    VALUES ($1)
+    ON CONFLICT ON CONSTRAINT managed_slot_target_fences_pkey DO NOTHING;
+
+    SELECT fences.fence_id, fences.lock_key, fences.owner_pid
+      INTO existing_fence_id, existing_lock_key, existing_owner_pid
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1
+     FOR UPDATE;
+
+    IF existing_fence_id IS NOT NULL
+       AND pgshard_catalog.managed_slot_advisory_lock_held(
+           existing_lock_key,
+           existing_owner_pid
+       ) THEN
+        IF existing_owner_pid = pg_catalog.pg_backend_pid() THEN
+            RETURN QUERY SELECT existing_fence_id, existing_owner_pid;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = '55P03',
+            MESSAGE = 'managed slot target fence is busy';
+    END IF;
+
+    UPDATE pgshard_catalog.managed_slot_target_fences AS fences
+       SET fence_id = NULL,
+           lock_key = NULL,
+           owner_pid = NULL,
+           acquired_at = NULL
+     WHERE fences.target_name::text = $1;
+
+    FOR attempt IN 1..16 LOOP
+        new_fence_id := pg_catalog.gen_random_uuid();
+        new_lock_key := pg_catalog.hashtextextended(new_fence_id::text, 1346851656);
+        acquired := pg_catalog.pg_try_advisory_lock(new_lock_key);
+        EXIT WHEN acquired;
+    END LOOP;
+    IF NOT acquired THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55P03',
+            MESSAGE = 'could not allocate a managed slot target fence';
+    END IF;
+
+    UPDATE pgshard_catalog.managed_slot_target_fences AS fences
+       SET fence_id = new_fence_id,
+           lock_key = new_lock_key,
+           owner_pid = pg_catalog.pg_backend_pid(),
+           acquired_at = statement_timestamp()
+     WHERE fences.target_name::text = $1;
+
+    RETURN QUERY SELECT new_fence_id, pg_catalog.pg_backend_pid();
+END
+$function$;
+
 CREATE OR REPLACE FUNCTION pgshard_catalog.managed_slot_target_fence_held(target_name text)
 RETURNS boolean
 LANGUAGE sql
@@ -942,26 +1087,112 @@ STABLE
 SECURITY DEFINER
 SET search_path = pg_catalog, pgshard_catalog, pg_temp
 AS $function$
-    WITH target_key AS (
-        SELECT pg_catalog.hashtextextended(target_name, 1346851656) AS value
-    )
     SELECT EXISTS (
         SELECT
-          FROM pg_catalog.pg_locks AS locks
-          CROSS JOIN target_key
-         WHERE locks.locktype = 'advisory'
-           AND locks.database = (
-               SELECT databases.oid
-                 FROM pg_catalog.pg_database AS databases
-                WHERE databases.datname = pg_catalog.current_database()
+          FROM pgshard_catalog.managed_slot_target_fences AS fences
+         WHERE fences.target_name::text = $1
+           AND fences.fence_id IS NOT NULL
+           AND fences.owner_pid = pg_catalog.pg_backend_pid()
+           AND pgshard_catalog.managed_slot_advisory_lock_held(
+               fences.lock_key,
+               fences.owner_pid
            )
-           AND locks.classid::bigint = ((target_key.value >> 32) & 4294967295)
-           AND locks.objid::bigint = (target_key.value & 4294967295)
-           AND locks.objsubid = 1
-           AND locks.pid = pg_catalog.pg_backend_pid()
-           AND locks.mode = 'ExclusiveLock'
-           AND locks.granted
     )
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.managed_slot_target_fence_matches(
+    target_name text,
+    expected_fence_id uuid
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+    SELECT expected_fence_id IS NOT NULL
+       AND expected_fence_id <> '00000000-0000-0000-0000-000000000000'::uuid
+       AND EXISTS (
+           SELECT
+             FROM pgshard_catalog.managed_slot_target_fences AS fences
+            WHERE fences.target_name::text = $1
+              AND fences.fence_id = expected_fence_id
+              AND fences.owner_pid = pg_catalog.pg_backend_pid()
+              AND pgshard_catalog.managed_slot_advisory_lock_held(
+                  fences.lock_key,
+                  fences.owner_pid
+              )
+       )
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.verify_managed_slot_target_fence(
+    target_name text,
+    expected_fence_id uuid
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+    IF NOT pgshard_catalog.managed_slot_target_fence_matches(
+        target_name,
+        expected_fence_id
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot target fence is not held by this backend';
+    END IF;
+    RETURN pg_catalog.pg_backend_pid();
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.release_managed_slot_target_fence(
+    target_name text,
+    expected_fence_id uuid DEFAULT NULL
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    existing_fence_id uuid;
+    existing_lock_key bigint;
+    existing_owner_pid integer;
+    released boolean;
+BEGIN
+    SELECT fences.fence_id, fences.lock_key, fences.owner_pid
+      INTO existing_fence_id, existing_lock_key, existing_owner_pid
+      FROM pgshard_catalog.managed_slot_target_fences AS fences
+     WHERE fences.target_name::text = $1
+     FOR UPDATE;
+    IF NOT FOUND OR existing_fence_id IS NULL THEN
+        RETURN false;
+    END IF;
+    IF existing_owner_pid <> pg_catalog.pg_backend_pid() THEN
+        IF expected_fence_id IS NULL THEN
+            RETURN false;
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot target fence is owned by another capability';
+    END IF;
+    IF expected_fence_id IS NOT NULL AND existing_fence_id <> expected_fence_id THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'managed slot target fence is owned by another capability';
+    END IF;
+
+    released := pg_catalog.pg_advisory_unlock(existing_lock_key);
+    UPDATE pgshard_catalog.managed_slot_target_fences AS fences
+       SET fence_id = NULL,
+           lock_key = NULL,
+           owner_pid = NULL,
+           acquired_at = NULL
+     WHERE fences.target_name::text = $1;
+    RETURN released;
+END
 $function$;
 
 CREATE OR REPLACE FUNCTION pgshard_catalog.begin_managed_slot_creation_attempt(
@@ -1309,10 +1540,17 @@ BEGIN
 END
 $function$;
 
+DROP FUNCTION IF EXISTS pgshard_catalog.complete_managed_replication_slot_retirement(
+    uuid,
+    text,
+    uuid
+);
+
 CREATE OR REPLACE FUNCTION pgshard_catalog.complete_managed_replication_slot_retirement(
     expected_slot_generation uuid,
     expected_slot_name text,
-    expected_creation_receipt_id uuid
+    expected_creation_receipt_id uuid,
+    expected_fence_id uuid
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -1333,7 +1571,9 @@ BEGIN
        OR expected_slot_name IS NULL
        OR expected_slot_name = ''
        OR expected_creation_receipt_id IS NULL
-       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid THEN
+       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_fence_id IS NULL
+       OR expected_fence_id = '00000000-0000-0000-0000-000000000000'::uuid THEN
         RAISE EXCEPTION USING
             ERRCODE = '22023',
             MESSAGE = 'managed slot retirement authority is incomplete';
@@ -1375,7 +1615,10 @@ BEGIN
             MESSAGE = 'managed slot retirement authority changed';
     END IF;
 
-    IF NOT pgshard_catalog.managed_slot_target_fence_held(target_name) THEN
+    IF NOT pgshard_catalog.managed_slot_target_fence_matches(
+        target_name,
+        expected_fence_id
+    ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
             MESSAGE = 'managed slot final retirement requires its live target fence';
@@ -1507,6 +1750,207 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid managed slot creation attempt transition';
     END IF;
     RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.slot_sync_probe_receipt_state(
+    expected_probe_generation uuid,
+    candidate_receipt_id uuid
+)
+RETURNS TABLE(
+    creation_receipt_present boolean,
+    cleanup_receipt_present boolean,
+    creation_receipt_matches boolean,
+    cleanup_receipt_matches boolean
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+    SELECT probes.creation_receipt_id IS NOT NULL,
+           probes.cleanup_receipt_id IS NOT NULL,
+           candidate_receipt_id IS NOT NULL
+               AND probes.creation_receipt_id = candidate_receipt_id,
+           candidate_receipt_id IS NOT NULL
+               AND probes.cleanup_receipt_id = candidate_receipt_id
+      FROM pgshard_catalog.slot_sync_probes AS probes
+     WHERE probes.probe_generation = expected_probe_generation
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.activate_slot_sync_probe(
+    expected_probe_generation uuid,
+    expected_creation_receipt_id uuid,
+    expected_consistent_point pg_lsn
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    changed bigint;
+BEGIN
+    IF expected_probe_generation IS NULL
+       OR expected_probe_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_creation_receipt_id IS NULL
+       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_consistent_point IS NULL
+       OR expected_consistent_point = '0/0'::pg_lsn THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'slot-sync probe activation authority is incomplete';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.probe_generation = expected_probe_generation
+           AND probes.state = 'active'
+           AND probes.creation_receipt_id = expected_creation_receipt_id
+           AND probes.consistent_point = expected_consistent_point
+    ) THEN
+        RETURN;
+    END IF;
+
+    UPDATE pgshard_catalog.slot_sync_probes
+       SET consistent_point = expected_consistent_point,
+           creation_receipt_id = expected_creation_receipt_id,
+           state = 'active',
+           activated_at = statement_timestamp()
+     WHERE probe_generation = expected_probe_generation
+       AND state = 'allocated';
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed = 1 THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe activation authority changed';
+END
+$function$;
+
+DROP FUNCTION IF EXISTS pgshard_catalog.begin_slot_sync_probe_retirement(uuid, uuid);
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.begin_slot_sync_probe_retirement(
+    expected_probe_generation uuid,
+    expected_creation_receipt_id uuid,
+    expected_consistent_point pg_lsn
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    changed bigint;
+BEGIN
+    IF expected_probe_generation IS NULL
+       OR expected_probe_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_creation_receipt_id IS NULL
+       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_consistent_point IS NULL
+       OR expected_consistent_point = '0/0'::pg_lsn THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'slot-sync probe retirement authority is incomplete';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.probe_generation = expected_probe_generation
+           AND probes.state IN ('retiring', 'retired')
+           AND probes.cleanup_receipt_id = expected_creation_receipt_id
+           AND (
+               (
+                   probes.creation_receipt_id IS NULL
+                   AND probes.consistent_point IS NULL
+               )
+               OR (
+                   probes.creation_receipt_id = expected_creation_receipt_id
+                   AND probes.consistent_point = expected_consistent_point
+               )
+           )
+    ) THEN
+        RETURN;
+    END IF;
+
+    UPDATE pgshard_catalog.slot_sync_probes
+       SET state = 'retiring',
+           cleanup_receipt_id = expected_creation_receipt_id,
+           retiring_at = statement_timestamp()
+     WHERE probe_generation = expected_probe_generation
+       AND state IN ('allocated', 'active')
+       AND (
+           (
+               state = 'allocated'
+               AND consistent_point IS NULL
+               AND creation_receipt_id IS NULL
+           )
+           OR (
+               state = 'active'
+               AND consistent_point = expected_consistent_point
+               AND creation_receipt_id = expected_creation_receipt_id
+           )
+       );
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed = 1 THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe retirement authority changed';
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.complete_slot_sync_probe_retirement(
+    expected_probe_generation uuid,
+    expected_slot_name text,
+    expected_creation_receipt_id uuid,
+    expected_fence_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    changed bigint;
+BEGIN
+    IF expected_probe_generation IS NULL
+       OR expected_probe_generation = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_slot_name IS NULL
+       OR expected_slot_name = ''
+       OR expected_creation_receipt_id IS NULL
+       OR expected_creation_receipt_id = '00000000-0000-0000-0000-000000000000'::uuid
+       OR expected_fence_id IS NULL
+       OR expected_fence_id = '00000000-0000-0000-0000-000000000000'::uuid THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'slot-sync probe final retirement authority is incomplete';
+    END IF;
+    IF NOT pgshard_catalog.managed_slot_target_fence_matches(
+        expected_slot_name,
+        expected_fence_id
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'slot-sync probe final retirement requires its exact live target fence';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pgshard_catalog.slot_sync_probes AS probes
+         WHERE probes.probe_generation = expected_probe_generation
+           AND probes.slot_name::text = expected_slot_name
+           AND probes.cleanup_receipt_id = expected_creation_receipt_id
+           AND probes.state = 'retired'
+    ) THEN
+        RETURN;
+    END IF;
+
+    UPDATE pgshard_catalog.slot_sync_probes
+       SET state = 'retired', retired_at = statement_timestamp()
+     WHERE probe_generation = expected_probe_generation
+       AND slot_name::text = expected_slot_name
+       AND cleanup_receipt_id = expected_creation_receipt_id
+       AND state = 'retiring';
+    GET DIAGNOSTICS changed = ROW_COUNT;
+    IF changed = 1 THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'slot-sync probe final retirement authority changed';
 END
 $function$;
 
@@ -3225,6 +3669,33 @@ GRANT SELECT ON ALL TABLES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 REVOKE SELECT ON pgshard_catalog.managed_slot_creation_attempts
     FROM pgshard_catalog_reader;
+REVOKE SELECT ON pgshard_catalog.managed_slot_target_fences
+    FROM pgshard_catalog_reader;
+REVOKE SELECT ON pgshard_catalog.slot_sync_probes
+    FROM pgshard_catalog_reader;
+GRANT SELECT (
+    probe_generation,
+    shard_id,
+    restore_incarnation,
+    system_identifier,
+    database_oid,
+    database_name,
+    source_timeline,
+    slot_name,
+    consistent_point,
+    state,
+    created_at,
+    activated_at,
+    retiring_at,
+    retired_at
+) ON pgshard_catalog.slot_sync_probes TO pgshard_catalog_reader;
+
+GRANT EXECUTE ON FUNCTION pgshard_catalog.acquire_managed_slot_target_fence(text)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.verify_managed_slot_target_fence(text, uuid)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.release_managed_slot_target_fence(text, uuid)
+    TO pgshard_catalog_admin;
 
 GRANT EXECUTE ON FUNCTION pgshard_catalog.begin_managed_slot_creation_attempt(
     uuid, text, text, numeric, bigint, bigint, uuid, bigint, uuid
@@ -3239,7 +3710,16 @@ GRANT EXECUTE ON FUNCTION pgshard_catalog.activate_managed_replication_slot(
     uuid, uuid, pg_lsn, pg_lsn
 ) TO pgshard_catalog_admin;
 GRANT EXECUTE ON FUNCTION pgshard_catalog.complete_managed_replication_slot_retirement(
-    uuid, text, uuid
+    uuid, text, uuid, uuid
+) TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.slot_sync_probe_receipt_state(uuid, uuid)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.activate_slot_sync_probe(uuid, uuid, pg_lsn)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.begin_slot_sync_probe_retirement(uuid, uuid, pg_lsn)
+    TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.complete_slot_sync_probe_retirement(
+    uuid, text, uuid, uuid
 ) TO pgshard_catalog_admin;
 
 GRANT INSERT (database_name) ON pgshard_catalog.logical_databases TO pgshard_catalog_admin;
@@ -3256,7 +3736,10 @@ GRANT INSERT (
     database_name,
     source_timeline,
     slot_name
-), UPDATE (
+)
+    ON pgshard_catalog.slot_sync_probes TO pgshard_catalog_admin;
+REVOKE UPDATE ON pgshard_catalog.slot_sync_probes FROM pgshard_catalog_admin;
+REVOKE UPDATE (
     consistent_point,
     creation_receipt_id,
     cleanup_receipt_id,
@@ -3264,8 +3747,7 @@ GRANT INSERT (
     activated_at,
     retiring_at,
     retired_at
-)
-    ON pgshard_catalog.slot_sync_probes TO pgshard_catalog_admin;
+) ON pgshard_catalog.slot_sync_probes FROM pgshard_catalog_admin;
 GRANT INSERT (logical_database_id) ON pgshard_catalog.routing_epochs TO pgshard_catalog_admin;
 GRANT INSERT, UPDATE, DELETE ON pgshard_catalog.routing_ranges TO pgshard_catalog_admin;
 GRANT INSERT (
