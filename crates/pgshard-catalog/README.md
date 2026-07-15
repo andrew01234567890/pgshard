@@ -31,8 +31,16 @@ checkpoint advance, require both activation boundaries before snapshot
 completion, and retain immutable retired names and generations as tombstones.
 Probe allocation, activation, cleanup, and retirement are similarly ordered:
 an active or possibly-created probe must enter `retiring` and be proven absent
-by future reconciliation before its permanent tombstone permits a replacement
-or restore retirement.
+before its permanent tombstone permits a replacement or restore retirement.
+The orchestrator crate now exposes bounded `REPEATABLE READ` operations that
+load and conditionally advance this exact lifecycle. A first allocation accepts
+the catalog's genesis epoch, returns only after the insert advances it, and then
+supplies a nonzero source identity to the PostgreSQL slot mutator. Activation
+requires that mutator's unforgeable exact creation receipt; final retirement
+requires its exact drop/absence receipt. Repeating an already-applied operation
+is read-only, while an ambiguous commit is reconciled by reloading the permanent
+generation before retry. This composes the clean same-process lifecycle but is
+not yet a long-running controller or crash/external-mutation reconciler.
 The restricted catalog role cannot update checkpoint progress directly. Its
 checkpoint CAS requires the caller's expected ownership fence and checkpoint
 ordinal, so a fence that wins the catalog lock makes an in-flight stale advance

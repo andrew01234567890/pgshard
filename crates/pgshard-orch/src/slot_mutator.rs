@@ -341,6 +341,53 @@ pub enum ManagedLogicalSlotDropOutcome {
     AlreadyAbsent,
 }
 
+/// Point-in-time proof that an exact receipt-authorized slot was absent.
+///
+/// This value has no public constructor and is returned only after the drop
+/// path verifies the exact source, role, session fence, and slot shape. It can
+/// close the matching durable catalog lifecycle, but it is not a lease against
+/// a later external recreation of the server-side name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedLogicalSlotDropReceipt {
+    target: ManagedSlotTarget,
+    source: ReplicationSourceIdentity,
+    role: ManagedLogicalSlotRole,
+    database_name: String,
+    outcome: ManagedLogicalSlotDropOutcome,
+}
+
+impl ManagedLogicalSlotDropReceipt {
+    /// Returns the exact generation-qualified target proven absent.
+    #[must_use]
+    pub const fn target(&self) -> &ManagedSlotTarget {
+        &self.target
+    }
+
+    /// Returns the source lineage verified by the drop preflight.
+    #[must_use]
+    pub const fn source(&self) -> ReplicationSourceIdentity {
+        self.source
+    }
+
+    /// Returns the managed role whose exact shape was checked.
+    #[must_use]
+    pub const fn role(&self) -> ManagedLogicalSlotRole {
+        self.role
+    }
+
+    /// Returns the database name verified by the drop preflight.
+    #[must_use]
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    /// Returns whether the exact slot was dropped or already absent.
+    #[must_use]
+    pub const fn outcome(&self) -> ManagedLogicalSlotDropOutcome {
+        self.outcome
+    }
+}
+
 /// A receipt-authorized drop failure with explicit retry authority.
 #[derive(Debug, Error)]
 pub enum ManagedLogicalSlotDropError {
@@ -896,7 +943,7 @@ pub async fn drop_managed_logical_slot<S, T>(
     connection: Connection<S, T>,
     operation_timeout: CatalogOperationTimeout,
     receipt: ManagedLogicalSlotReceipt,
-) -> Result<ManagedLogicalSlotDropOutcome, ManagedLogicalSlotDropError>
+) -> Result<ManagedLogicalSlotDropReceipt, ManagedLogicalSlotDropError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -929,7 +976,10 @@ where
     let PreparedDrop::Present { server, statement } = prepared else {
         drop(client);
         connection_task.abort_and_wait().await;
-        return Ok(ManagedLogicalSlotDropOutcome::AlreadyAbsent);
+        return Ok(drop_receipt(
+            receipt,
+            ManagedLogicalSlotDropOutcome::AlreadyAbsent,
+        ));
     };
     let result = timeout_at(
         context.deadline,
@@ -945,9 +995,9 @@ where
 fn classify_drop_result(
     receipt: ManagedLogicalSlotReceipt,
     result: Result<ManagedLogicalSlotDropOutcome, LocalSlotMutationError>,
-) -> Result<ManagedLogicalSlotDropOutcome, ManagedLogicalSlotDropError> {
+) -> Result<ManagedLogicalSlotDropReceipt, ManagedLogicalSlotDropError> {
     match result {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => Ok(drop_receipt(receipt, outcome)),
         Err(source) if source.outcome_is_unknown() => {
             Err(ManagedLogicalSlotDropError::OutcomeUnknown(source))
         }
@@ -955,6 +1005,19 @@ fn classify_drop_result(
             receipt: Box::new(receipt),
             source,
         }),
+    }
+}
+
+fn drop_receipt(
+    receipt: ManagedLogicalSlotReceipt,
+    outcome: ManagedLogicalSlotDropOutcome,
+) -> ManagedLogicalSlotDropReceipt {
+    ManagedLogicalSlotDropReceipt {
+        target: receipt.target,
+        source: receipt.source,
+        role: receipt.role,
+        database_name: receipt.database_name,
+        outcome,
     }
 }
 
@@ -2106,5 +2169,21 @@ mod tests {
             source,
             LocalSlotMutationError::PreflightTimeout { .. }
         ));
+    }
+
+    #[test]
+    fn successful_drop_receipt_preserves_the_verified_identity() {
+        let identity = identity(ManagedLogicalSlotRole::PrimaryFailoverAnchor);
+        let proof = classify_drop_result(
+            receipt(&identity),
+            Ok(ManagedLogicalSlotDropOutcome::Dropped),
+        )
+        .expect("known drop result");
+
+        assert_eq!(proof.target(), &identity.target);
+        assert_eq!(proof.source(), identity.source);
+        assert_eq!(proof.role(), identity.role);
+        assert_eq!(proof.database_name(), "postgres");
+        assert_eq!(proof.outcome(), ManagedLogicalSlotDropOutcome::Dropped);
     }
 }

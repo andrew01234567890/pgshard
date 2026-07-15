@@ -10,5 +10,6 @@ mod postgres_connection;
 pub mod slot_catalog;
 pub mod slot_mutator;
 pub mod slot_observer;
+pub mod slot_probe_catalog;
 pub mod standby_slots;
 pub mod telemetry;

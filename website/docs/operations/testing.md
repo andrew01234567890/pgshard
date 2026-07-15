@@ -158,9 +158,23 @@ for their sequential one-minute phases. Snapshot-triggered standby creation has
 no detached mutation task: cancellation aborts connection ownership, the outer
 fixture is reaped, and cleanup waits for the recorded PostgreSQL backend to exit
 before it treats an absent target as final.
+The same primary/standby fixture now drives one permanent `shardschema`
+slot-sync probe through `allocated`, `active`, `retiring`, and `retired`. It
+starts from genesis epoch zero when necessary, requires the allocation commit to
+produce a nonzero source identity, creates the exact primary failover slot,
+waits for the continuous worker's non-temporary synchronized copy, and permits
+catalog activation only from the creation receipt. Cleanup must return the exact
+drop/absence receipt and the synchronized copy must disappear before permanent
+retirement. Repeating allocation and every completed transition is checked as a
+read-only idempotent result. An unrelated epoch advance must fence a stale
+activation token before any lifecycle write, after which an exact reload can
+continue. The final assertion requires no live catalog, primary, or standby
+probe. Crash recovery and injected catalog COMMIT response loss remain separate
+future tests.
 Injected post-dispatch socket loss, cancellation and response-loss races are
-not yet exercised. Durable catalog mutation history, reconciliation after an
-unknown outcome, connection-bound command proof, quarantined COPY-BOTH
+not yet exercised. A general durable slot-mutation ledger, automatic
+reconciliation after an unknown outcome, connection-bound command proof,
+quarantined COPY-BOTH
 attachment, and stream ownership remain future work.
 A lower-level correlation suite independently mutates every sampled path class.
 It accepts an unproven non-temporary physical slot only as raw evidence and

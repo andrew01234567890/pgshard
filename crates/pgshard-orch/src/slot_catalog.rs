@@ -176,7 +176,7 @@ impl LogicalConsumerShardKey {
     }
 }
 
-fn valid_resource_name(value: &str) -> bool {
+pub(crate) fn valid_resource_name(value: &str) -> bool {
     let bytes = value.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 63

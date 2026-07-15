@@ -10,12 +10,12 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use pgshard_catalog::CatalogOperationTimeout;
+use pgshard_catalog::{CatalogOperationTimeout, MIGRATION_SQL};
 use pgshard_orch::{
     slot_mutator::{
         LocalSlotMutationError, ManagedLogicalSlotCreateRequest, ManagedLogicalSlotDropOutcome,
-        ManagedLogicalSlotReceipt, ManagedLogicalSlotRole, create_managed_logical_slot,
-        drop_managed_logical_slot,
+        ManagedLogicalSlotDropReceipt, ManagedLogicalSlotReceipt, ManagedLogicalSlotRole,
+        create_managed_logical_slot, drop_managed_logical_slot,
     },
     slot_observer::{
         CorrelatedStandbyReplicationPath, LocalLogicalSlotObservationBatch,
@@ -24,6 +24,12 @@ use pgshard_orch::{
         LogicalSlotObservationRequest, PrimaryReplicationObservationRequest,
         StandbyReplicationPathCorrelationError, correlate_standby_replication_path,
         observe_local_logical_slots, observe_local_primary_replication,
+    },
+    slot_probe_catalog::{
+        CatalogSlotSyncProbe, SlotSyncProbeAllocation, SlotSyncProbeAllocationSource,
+        SlotSyncProbeCatalogError, SlotSyncProbeState, activate_slot_sync_probe,
+        allocate_slot_sync_probe, begin_slot_sync_probe_retirement,
+        complete_slot_sync_probe_retirement, load_live_slot_sync_probe, load_slot_sync_probe,
     },
     standby_slots::{
         FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotPlugin, LogicalWalLevel,
@@ -622,6 +628,301 @@ async fn mutation_source(
     .map_err(Into::into)
 }
 
+async fn slot_sync_probe_allocation(
+    database_url: &str,
+    target: ManagedSlotTarget,
+) -> TestResult<SlotSyncProbeAllocation> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    client.batch_execute(MIGRATION_SQL).await?;
+    let row = client
+        .query_one(
+            "SELECT control.system_identifier::pg_catalog.int8, \
+                    pg_catalog.substring( \
+                        pg_catalog.pg_walfile_name(pg_catalog.pg_current_wal_lsn()), 1, 8), \
+                    database.oid::pg_catalog.int8, \
+                    restore.restore_incarnation::pg_catalog.text, \
+                    state.catalog_epoch \
+               FROM pg_catalog.pg_control_system() AS control \
+               JOIN pg_catalog.pg_database AS database \
+                 ON database.datname OPERATOR(pg_catalog.=) pg_catalog.current_database() \
+               JOIN pgshard_catalog.shard_restore_incarnations AS restore \
+                 ON restore.shard_id = 'shard-0000' AND restore.state = 'active' \
+               JOIN pgshard_catalog.cluster_state AS state ON state.singleton",
+            &[],
+        )
+        .await?;
+    let source = SlotSyncProbeAllocationSource::new(
+        row.try_get::<_, i64>(0)?.cast_unsigned(),
+        u32::from_str_radix(&row.try_get::<_, String>(1)?, 16)?,
+        u32::try_from(row.try_get::<_, i64>(2)?)?,
+        Uuid::parse_str(&row.try_get::<_, String>(3)?)?,
+        CatalogEpoch(u64::try_from(row.try_get::<_, i64>(4)?)?),
+    )?;
+    drop(client);
+    finish_connection(connection_task).await?;
+    Ok(SlotSyncProbeAllocation::new(
+        "shard-0000",
+        target,
+        source,
+        "shardschema",
+    )?)
+}
+
+async fn allocate_catalog_probe(
+    database_url: &str,
+    allocation: &SlotSyncProbeAllocation,
+) -> TestResult<CatalogSlotSyncProbe> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    Ok(allocate_slot_sync_probe(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        allocation,
+    )
+    .await?)
+}
+
+async fn activate_catalog_probe(
+    database_url: &str,
+    probe: &CatalogSlotSyncProbe,
+    receipt: &ManagedLogicalSlotReceipt,
+) -> TestResult<CatalogSlotSyncProbe> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    Ok(activate_slot_sync_probe(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        probe,
+        receipt,
+    )
+    .await?)
+}
+
+async fn begin_catalog_probe_retirement(
+    database_url: &str,
+    probe: &CatalogSlotSyncProbe,
+) -> TestResult<CatalogSlotSyncProbe> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    Ok(begin_slot_sync_probe_retirement(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        probe,
+    )
+    .await?)
+}
+
+async fn load_exact_catalog_probe(
+    database_url: &str,
+    target: &ManagedSlotTarget,
+) -> TestResult<Option<CatalogSlotSyncProbe>> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    Ok(load_slot_sync_probe(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        target,
+    )
+    .await?)
+}
+
+async fn load_live_catalog_probe(database_url: &str) -> TestResult<Option<CatalogSlotSyncProbe>> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    Ok(load_live_slot_sync_probe(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        "shard-0000",
+    )
+    .await?)
+}
+
+async fn complete_catalog_probe_retirement(
+    database_url: &str,
+    probe: &CatalogSlotSyncProbe,
+    absence: &ManagedLogicalSlotDropReceipt,
+) -> TestResult<CatalogSlotSyncProbe> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    Ok(complete_slot_sync_probe_retirement(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        probe,
+        absence,
+    )
+    .await?)
+}
+
+async fn refresh_after_stale_activation(
+    database_url: &str,
+    stale: &CatalogSlotSyncProbe,
+    receipt: &ManagedLogicalSlotReceipt,
+) -> TestResult<CatalogSlotSyncProbe> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    client
+        .batch_execute("UPDATE pgshard_catalog.slot_sync_probes SET state = state WHERE false")
+        .await?;
+    drop(client);
+    finish_connection(connection_task).await?;
+
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let error = activate_slot_sync_probe(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        stale,
+        receipt,
+    )
+    .await
+    .expect_err("a catalog change must fence the stale activation token");
+    assert!(matches!(
+        error,
+        SlotSyncProbeCatalogError::StaleCatalogEpoch { .. }
+    ));
+
+    let refreshed = load_exact_catalog_probe(database_url, stale.target())
+        .await?
+        .expect("allocated probe remains durable after stale activation");
+    assert_eq!(refreshed.state(), SlotSyncProbeState::Allocated);
+    assert!(refreshed.source().catalog_epoch().0 > stale.source().catalog_epoch().0);
+    Ok(refreshed)
+}
+
+async fn run_catalog_probe_fixture(
+    primary_database_url: String,
+    standby_database_url: String,
+    probe_target: ManagedSlotTarget,
+) -> TestResult {
+    let allocation =
+        slot_sync_probe_allocation(&primary_database_url, probe_target.clone()).await?;
+    let allocated = allocate_catalog_probe(&primary_database_url, &allocation).await?;
+    assert_eq!(allocated.shard_id(), "shard-0000");
+    assert_eq!(allocated.target(), &probe_target);
+    assert_eq!(allocated.database_name(), "shardschema");
+    assert_eq!(allocated.state(), SlotSyncProbeState::Allocated);
+    assert_eq!(allocated.consistent_point(), None);
+
+    assert_catalog_probe_allocation_fencing(&primary_database_url, &allocation, &allocated).await?;
+
+    let (primary, primary_connection) =
+        tokio_postgres::connect(&primary_database_url, NoTls).await?;
+    let receipt = create_managed_logical_slot(
+        primary,
+        primary_connection,
+        CatalogOperationTimeout::default(),
+        ManagedLogicalSlotCreateRequest::primary_failover_anchor(
+            probe_target.clone(),
+            allocated.source(),
+        ),
+    )
+    .await?;
+    wait_for_synchronized_copy(&standby_database_url, &probe_target, true).await?;
+
+    let allocated =
+        refresh_after_stale_activation(&primary_database_url, &allocated, &receipt).await?;
+    let active = activate_catalog_probe(&primary_database_url, &allocated, &receipt).await?;
+    assert_eq!(active.state(), SlotSyncProbeState::Active);
+    assert_eq!(active.consistent_point(), Some(receipt.creation_lsn()));
+    let active_retry = allocate_catalog_probe(&primary_database_url, &allocation).await?;
+    assert_eq!(active_retry, active);
+    assert_eq!(
+        activate_catalog_probe(&primary_database_url, &active_retry, &receipt).await?,
+        active
+    );
+
+    let retiring = begin_catalog_probe_retirement(&primary_database_url, &active_retry).await?;
+    assert_eq!(retiring.state(), SlotSyncProbeState::Retiring);
+    let retiring_retry = begin_catalog_probe_retirement(&primary_database_url, &retiring).await?;
+    assert_eq!(retiring_retry, retiring);
+
+    let (primary, primary_connection) =
+        tokio_postgres::connect(&primary_database_url, NoTls).await?;
+    let absence = drop_managed_logical_slot(
+        primary,
+        primary_connection,
+        CatalogOperationTimeout::default(),
+        receipt,
+    )
+    .await?;
+    assert_eq!(absence.outcome(), ManagedLogicalSlotDropOutcome::Dropped);
+    wait_for_synchronized_copy(&standby_database_url, &probe_target, false).await?;
+
+    let retired =
+        complete_catalog_probe_retirement(&primary_database_url, &retiring, &absence).await?;
+    assert_eq!(retired.state(), SlotSyncProbeState::Retired);
+    let retired_retry =
+        complete_catalog_probe_retirement(&primary_database_url, &retired, &absence).await?;
+    assert_eq!(retired_retry, retired);
+    assert_eq!(
+        load_exact_catalog_probe(&primary_database_url, &probe_target)
+            .await?
+            .expect("permanent retired probe"),
+        retired
+    );
+    assert!(
+        load_live_catalog_probe(&primary_database_url)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+async fn assert_catalog_probe_allocation_fencing(
+    primary_database_url: &str,
+    allocation: &SlotSyncProbeAllocation,
+    allocated: &CatalogSlotSyncProbe,
+) -> TestResult {
+    let stale_allocation = SlotSyncProbeAllocation::new(
+        "shard-0000",
+        target("pgshard_sync_probe_stale")?,
+        allocation.source(),
+        "shardschema",
+    )?;
+    let (client, connection) = tokio_postgres::connect(primary_database_url, NoTls).await?;
+    let error = allocate_slot_sync_probe(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        &stale_allocation,
+    )
+    .await
+    .expect_err("a new probe cannot use the pre-allocation catalog epoch");
+    assert!(matches!(
+        error,
+        SlotSyncProbeCatalogError::StaleCatalogEpoch { .. }
+    ));
+
+    let current_source = allocated.source();
+    let competing_allocation = SlotSyncProbeAllocation::new(
+        "shard-0000",
+        target("pgshard_sync_probe_competing")?,
+        SlotSyncProbeAllocationSource::new(
+            current_source.system_identifier(),
+            current_source.timeline(),
+            current_source.database_oid(),
+            current_source.restore_incarnation(),
+            current_source.catalog_epoch(),
+        )?,
+        "shardschema",
+    )?;
+    let (client, connection) = tokio_postgres::connect(primary_database_url, NoTls).await?;
+    let error = allocate_slot_sync_probe(
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        &competing_allocation,
+    )
+    .await
+    .expect_err("one shard cannot allocate a second live probe");
+    assert!(matches!(
+        error,
+        SlotSyncProbeCatalogError::LiveProbeExists { .. }
+    ));
+    Ok(())
+}
+
 fn assert_created_receipt(
     receipt: &ManagedLogicalSlotReceipt,
     target: &ManagedSlotTarget,
@@ -742,14 +1043,17 @@ async fn run_primary_mutation_fixture(
 
     let (client, connection) = hostile_config.connect(NoTls).await?;
     let connection = fence_mutation_session(&client, connection, &mutation_role, &target).await?;
-    let outcome = drop_managed_logical_slot(
+    let drop_receipt = drop_managed_logical_slot(
         client,
         connection,
         CatalogOperationTimeout::default(),
         receipt,
     )
     .await?;
-    assert_eq!(outcome, ManagedLogicalSlotDropOutcome::Dropped);
+    assert_eq!(
+        drop_receipt.outcome(),
+        ManagedLogicalSlotDropOutcome::Dropped
+    );
     wait_for_synchronized_copy(&standby_database_url, &target, false).await?;
     let absent = observe(
         &database_url,
@@ -955,14 +1259,17 @@ async fn run_standby_mutation_fixture(
     );
     let (standby, standby_connection) =
         tokio_postgres::connect(&standby_database_url, NoTls).await?;
-    let outcome = drop_managed_logical_slot(
+    let drop_receipt = drop_managed_logical_slot(
         standby,
         standby_connection,
         CatalogOperationTimeout::default(),
         receipt,
     )
     .await?;
-    assert_eq!(outcome, ManagedLogicalSlotDropOutcome::Dropped);
+    assert_eq!(
+        drop_receipt.outcome(),
+        ManagedLogicalSlotDropOutcome::Dropped
+    );
     let absent = observe(
         &standby_database_url,
         &LogicalSlotObservationRequest::new(vec![target])?,
@@ -1752,6 +2059,23 @@ async fn creates_verifies_and_drops_primary_failover_anchor() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires the CI PostgreSQL 18 primary, streaming standby, catalog, and logical-slot settings"]
+async fn persists_the_exact_slot_sync_probe_lifecycle() -> TestResult {
+    let primary_database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
+    let standby_database_url = std::env::var("PGSHARD_TEST_STANDBY_DATABASE_URL")?;
+    let probe = target("pgshard_sync_probe")?;
+    finish_bounded_fixture(
+        tokio::spawn(run_catalog_probe_fixture(
+            primary_database_url,
+            standby_database_url,
+            probe,
+        )),
+        "slot-sync probe catalog fixture",
+    )
+    .await
+}
+
+#[tokio::test]
 #[ignore = "requires the CI PostgreSQL 18 primary and streaming standby"]
 async fn creates_verifies_and_drops_standby_local_decoder() -> TestResult {
     let primary_database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
@@ -2091,6 +2415,22 @@ async fn observes_streaming_standby_slot_sync_and_rejects_redacted_receiver() ->
 #[ignore = "requires PGSHARD_TEST_LEGACY_DATABASE_URL pointing at PostgreSQL 17"]
 async fn rejects_legacy_server_before_postgres18_prerequisites() -> TestResult {
     let database_url = std::env::var("PGSHARD_TEST_LEGACY_DATABASE_URL")?;
+    let catalog_target = target("pgshard_test_legacy_catalog")?;
+    let (catalog_client, catalog_connection) =
+        tokio_postgres::connect(&database_url, NoTls).await?;
+    let error = load_slot_sync_probe(
+        catalog_client,
+        catalog_connection,
+        CatalogOperationTimeout::default(),
+        &catalog_target,
+    )
+    .await
+    .expect_err("PostgreSQL 17 must fail before slot-sync probe catalog reads");
+    assert!(matches!(
+        error,
+        SlotSyncProbeCatalogError::UnsupportedPostgresVersion(version) if version < 180_000
+    ));
+
     let request = LogicalSlotObservationRequest::new(vec![target("pgshard_test_legacy")?])?;
     let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
     let error = observe_local_logical_slots(

@@ -92,8 +92,12 @@ recovery, and rolling restarts are not implemented; see
 `shardschema` now reserves one permanent generation/name history for a
 dedicated slot-sync probe per live shard restore. The probe is explicitly
 separate from consumer anchors, so a future freshness challenge cannot skip
-unconsumed data by advancing a consumer resume slot. Only its catalog lifecycle
-is implemented: no current runtime creates, advances, or drops that probe.
+unconsumed data by advancing a consumer resume slot. The bounded clean path now
+allocates the catalog identity, creates the failover probe, observes its
+continuous synchronized copy, activates from the exact creation receipt, and
+retires only after exact primary absence and synchronized-copy removal. No
+controller yet runs that path continuously or recovers it after process loss,
+and the source-bound progress challenge is still absent.
 :::
 
 The target default is one primary and two physical streaming replicas per shard,

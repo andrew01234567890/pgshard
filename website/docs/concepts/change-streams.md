@@ -336,10 +336,19 @@ uniqueness. Consumer slots and probes cannot reuse each other's generation,
 including after retirement. Mutations serialize on the versioned catalog epoch;
 a stale concurrent `REPEATABLE READ` allocator fails with `40001` before it can
 validate against an older view of the other slot class. It deliberately does not
-claim the PostgreSQL slot exists: the mutating reconciler and source-bound
-challenge are not implemented yet. The local create/drop primitive is not wired
-to this catalog lifecycle and cannot turn a probe row into durable mutation
-attestation by itself.
+claim the PostgreSQL slot exists from a catalog row alone. A bounded Rust
+primitive now composes the clean lifecycle: allocate the immutable row, create
+and verify the exact primary failover slot, activate only from its unforgeable
+creation receipt, mark it `retiring`, drop the unchanged inactive slot, and
+retire only from the resulting exact absence receipt. The write transactions
+are conditional and idempotent; an ambiguous commit is resolved by reloading
+the permanent generation before retry. Genesis epoch zero is accepted only for
+the first allocation, whose committed catalog update returns a nonzero source
+identity before PostgreSQL mutation. Live PostgreSQL 18 coverage also requires
+the continuously synchronized standby copy to appear and disappear around this
+lifecycle. A long-running reconciler, restart-safe absence proof, injected
+commit-response loss, and the source-bound progress challenge are not
+implemented yet.
 
 The operator automatically synchronizes each primary anchor to eligible direct
 standbys for promotion safety. Standby-local slots are independent and
