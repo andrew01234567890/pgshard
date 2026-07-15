@@ -1,19 +1,25 @@
 //! Fail-closed routing for already-resolved `PostgreSQL` bind parameters.
 //!
 //! SQL parsing and wire-protocol handling are deliberately outside this crate.
-//! The caller must resolve one registered table and its shard-key parameter
-//! before invoking this hot-path core.
+//! The resolved routing composition remains private test scaffolding until a
+//! connection-owning physical-catalog reader can issue an opaque capability. A
+//! caller-supplied planner observation is not authority to inspect bind bytes.
 
+#[cfg(test)]
 use pgshard_catalog::{CatalogSnapshot, DatabaseId, ShardKeyType, TableName};
-use pgshard_pgwire::{BindParameters, FormatCode};
-pub use pgshard_pgwire::{ClientEncoding, ClientEncodingError};
+#[cfg(test)]
+use pgshard_pgwire::{BindParameters, ClientEncoding, FormatCode};
+#[cfg(test)]
 use pgshard_planner::{CatalogOnlySearchPath, ResolvedParameterRoute};
+#[cfg(test)]
 use pgshard_types::{CatalogEpoch, RoutingHashV1, ShardId, ShardKey};
+#[cfg(test)]
 use thiserror::Error;
 
 /// `PostgreSQL` bind-parameter representation.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ParameterFormat {
+enum ParameterFormat {
     /// `PostgreSQL` text format.
     Text,
     /// `PostgreSQL` binary format.
@@ -21,13 +27,15 @@ pub enum ParameterFormat {
 }
 
 /// Immutable result attached to a planned request.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RoutePlan {
+struct RoutePlan {
     catalog_epoch: CatalogEpoch,
     shard_id: ShardId,
     hash: u64,
 }
 
+#[cfg(test)]
 impl RoutePlan {
     /// Returns the exact catalog epoch retained for execution fencing.
     #[must_use]
@@ -60,7 +68,8 @@ impl RoutePlan {
 ///
 /// Fails closed for an unknown database/table, NULL, unsupported parameter
 /// format, malformed length, or invalid UTF8.
-pub fn route_bound_parameter(
+#[cfg(test)]
+fn route_bound_parameter(
     snapshot: &CatalogSnapshot,
     database_id: DatabaseId,
     table_name: &TableName,
@@ -112,7 +121,8 @@ pub fn route_bound_parameter(
 /// Fails closed for a different or stale snapshot, a parameter-count mismatch,
 /// an internally inconsistent resolved route, NULL, an unsupported parameter
 /// format, malformed bytes, invalid UTF8, or a text NUL byte.
-pub fn route_resolved_bind(
+#[cfg(test)]
+fn route_resolved_bind(
     snapshot: &CatalogSnapshot,
     resolved: &ResolvedParameterRoute,
     _search_path: CatalogOnlySearchPath,
@@ -156,6 +166,7 @@ pub fn route_resolved_bind(
     .map_err(BindRouteError::Route)
 }
 
+#[cfg(test)]
 enum DecodedKey<'a> {
     Int64(i64),
     Uuid([u8; 16]),
@@ -163,6 +174,7 @@ enum DecodedKey<'a> {
     Bytes(&'a [u8]),
 }
 
+#[cfg(test)]
 impl<'a> DecodedKey<'a> {
     fn decode(
         key_type: ShardKeyType,
@@ -209,8 +221,9 @@ impl<'a> DecodedKey<'a> {
 }
 
 /// Bound-parameter routing failure.
+#[cfg(test)]
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum RouteError {
+enum RouteError {
     /// The snapshot does not contain the requested logical database.
     #[error("unknown logical database {0}")]
     UnknownDatabase(DatabaseId),
@@ -249,8 +262,9 @@ pub enum RouteError {
 }
 
 /// Failure to compose a resolved Parse-time route with one decoded Bind.
+#[cfg(test)]
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum BindRouteError {
+enum BindRouteError {
     /// The retained snapshot is not the exact snapshot used for route proof.
     #[error("resolved route does not match the retained catalog snapshot")]
     SnapshotMismatch,
@@ -277,8 +291,8 @@ mod tests {
         RoutingHashConfig, ShardRoute,
     };
     use pgshard_pgwire::{
-        BindParameters, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, FormatCode, FrontendPhase,
-        decode_bind, decode_frontend,
+        BindParameters, ClientEncodingError, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, FormatCode,
+        FrontendPhase, decode_bind, decode_frontend,
     };
     use pgshard_planner::{
         CatalogOnlySearchPath, PhysicalShardKeyCatalogIdentity, PhysicalShardKeyObservation,
@@ -513,6 +527,25 @@ mod tests {
             .expect("route");
             assert_eq!(plan.hash(), RoutingHashV1::new(42).hash(key));
         }
+    }
+
+    #[test]
+    fn text_format_matches_canonical_hash() {
+        let (snapshot, database_id, table) = snapshot(ShardKeyType::Text);
+        let value = "tenant-α";
+        let plan = route_bound_parameter(
+            &snapshot,
+            database_id,
+            &table,
+            utf8(),
+            ParameterFormat::Text,
+            Some(value.as_bytes()),
+        )
+        .expect("route text-format text key");
+        assert_eq!(
+            plan.hash(),
+            RoutingHashV1::new(42).hash(ShardKey::Text(value))
+        );
     }
 
     #[test]

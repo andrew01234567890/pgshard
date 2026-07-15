@@ -342,7 +342,7 @@ impl DatabaseCatalog {
     ) -> Result<Self, SnapshotError> {
         let name = name.into();
         validate_identifier("database", &name)?;
-        routes.sort_by_key(|route| route.key_range.start);
+        routes.sort_by_key(|route| route.key_range.start());
         validate_routes(&routes)?;
 
         let mut table_map = HashMap::with_capacity(tables.len());
@@ -406,7 +406,7 @@ impl DatabaseCatalog {
         let hash = u128::from(hash);
         let upper = self
             .routes
-            .partition_point(|route| route.key_range.start <= hash);
+            .partition_point(|route| route.key_range.start() <= hash);
         self.routes[upper.saturating_sub(1)].shard_id
     }
 }
@@ -415,14 +415,14 @@ fn validate_routes(routes: &[ShardRoute]) -> Result<(), SnapshotError> {
     let Some(first) = routes.first() else {
         return Err(SnapshotError::EmptyRouting);
     };
-    if first.key_range.start != 0 {
+    if first.key_range.start() != 0 {
         return Err(SnapshotError::RoutingDoesNotStartAtZero(
-            first.key_range.start,
+            first.key_range.start(),
         ));
     }
     for pair in routes.windows(2) {
-        let previous_end = pair[0].key_range.end;
-        let next_start = pair[1].key_range.start;
+        let previous_end = pair[0].key_range.end();
+        let next_start = pair[1].key_range.start();
         if previous_end != next_start {
             return Err(SnapshotError::RoutingBoundaryMismatch {
                 previous_end,
@@ -430,7 +430,11 @@ fn validate_routes(routes: &[ShardRoute]) -> Result<(), SnapshotError> {
             });
         }
     }
-    let end = routes.last().expect("nonempty checked above").key_range.end;
+    let end = routes
+        .last()
+        .expect("nonempty checked above")
+        .key_range
+        .end();
     if end != KEYSPACE_END {
         return Err(SnapshotError::RoutingDoesNotEndAtKeyspace(end));
     }
@@ -615,8 +619,8 @@ impl CatalogSnapshot {
             writer.u64(database.routes.len() as u64);
             for route in &database.routes {
                 writer.u32(route.shard_id.0);
-                writer.u128(route.key_range.start);
-                writer.u128(route.key_range.end);
+                writer.u128(route.key_range.start());
+                writer.u128(route.key_range.end());
             }
 
             let mut tables: Vec<_> = database.tables.values().collect();
