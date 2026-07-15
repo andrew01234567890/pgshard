@@ -33,9 +33,9 @@ pub struct PgLsn(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyRange {
     /// Inclusive range start.
-    pub start: u128,
+    start: u128,
     /// Exclusive range end. `2^64` represents the end of the keyspace.
-    pub end: u128,
+    end: u128,
 }
 
 impl KeyRange {
@@ -45,7 +45,7 @@ impl KeyRange {
     ///
     /// Returns [`KeyRangeError`] when the bounds are empty, reversed, or
     /// outside the unsigned 64-bit keyspace.
-    pub fn new(start: u128, end: u128) -> Result<Self, KeyRangeError> {
+    pub const fn new(start: u128, end: u128) -> Result<Self, KeyRangeError> {
         if start >= end {
             return Err(KeyRangeError::EmptyOrReversed { start, end });
         }
@@ -53,6 +53,18 @@ impl KeyRange {
             return Err(KeyRangeError::OutsideKeyspace { end });
         }
         Ok(Self { start, end })
+    }
+
+    /// Returns the inclusive range start.
+    #[must_use]
+    pub const fn start(self) -> u128 {
+        self.start
+    }
+
+    /// Returns the exclusive range end.
+    #[must_use]
+    pub const fn end(self) -> u128 {
+        self.end
     }
 
     /// Returns whether a hash belongs to this range.
@@ -229,6 +241,8 @@ mod tests {
     #[test]
     fn range_is_half_open() {
         let range = KeyRange::new(10, 20).expect("range is valid");
+        assert_eq!(range.start(), 10);
+        assert_eq!(range.end(), 20);
         assert!(range.contains(10));
         assert!(range.contains(19));
         assert!(!range.contains(20));

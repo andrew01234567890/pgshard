@@ -40,7 +40,7 @@ PostgreSQL implicitly searches `pg_catalog` for operators; an attacker-schema
 `=` overload cannot shadow built-in equality.
 This observation is not durable by itself: PostgreSQL can re-analyze a cached
 statement under a later path and select a newly visible operator. The implemented
-resolved-Bind core rechecks the exact retained snapshot, accepts a validated
+private resolved-Bind core rechecks the exact retained snapshot, accepts a validated
 empty-path token that the caller must rebuild from the current backend, and
 checks PostgreSQL's authoritative parameter count plus the selected
 format/NULL/value bytes without copying before producing a canonical shard
@@ -54,6 +54,11 @@ generation, pins the same backend, keeps the path empty through Parse, Describe,
 Bind, and Execute, and retains the snapshot/schema fences is not yet
 implemented. Neither is the schema runtime that gathers and fences physical
 observations.
+Consequently, the observation constructors and pure proof checker are test and
+validation scaffolding, not evidence that PostgreSQL supplied those values. The
+resolved router composition therefore remains private test scaffolding until a
+connection-owning physical-catalog reader can issue an opaque capability bound
+to the observed backend generations.
 A successful syntax parse or template extraction alone is not PostgreSQL
 semantic validation or permission to route. The source does not yet
 authenticate or execute clients. The
