@@ -1094,28 +1094,18 @@ async fn run_concurrent_external_trigger_rejection(
     let migration_connection_task = tokio::spawn(migration_connection);
 
     let test_result: TestResult = async {
-        migration_client
-            .batch_execute(
-                "SET SESSION CHARACTERISTICS AS TRANSACTION \
-                 ISOLATION LEVEL REPEATABLE READ",
-            )
-            .await?;
-        attacker
-            .batch_execute(&format!(
-                "BEGIN; \
-                 SET LOCAL ROLE {role}; \
-                 CREATE TRIGGER concurrent_catalog_write \
-                     BEFORE UPDATE ON pgshard_catalog.cluster_state \
-                     FOR EACH ROW EXECUTE FUNCTION {schema}.observe_catalog_write()"
-            ))
-            .await?;
+        begin_concurrent_external_trigger(&attacker, &migration_client, role, schema).await?;
         let lock_result = run_bounded_concurrent_migration(
             &migration_client,
             Duration::from_secs(2),
             "catalog migration waited for a concurrent catalog relation lock",
         )
         .await?;
-        let rollback_result = migration_client.batch_execute("ROLLBACK").await;
+        let rollback_result = rollback_concurrent_migration_connection(
+            &migration_client,
+            "migration before lock rejection retry",
+        )
+        .await;
         let lock_error = match lock_result {
             Ok(()) => {
                 rollback_result?;
@@ -1140,7 +1130,11 @@ async fn run_concurrent_external_trigger_rejection(
             "catalog migration retry did not finish after catalog traffic quiesced",
         )
         .await?;
-        let rollback_result = migration_client.batch_execute("ROLLBACK").await;
+        let rollback_result = rollback_concurrent_migration_connection(
+            &migration_client,
+            "migration after committed-trigger retry",
+        )
+        .await;
         let migration_error = match migration_result {
             Ok(()) => {
                 rollback_result?;
@@ -1177,6 +1171,47 @@ async fn run_concurrent_external_trigger_rejection(
     }
     .await;
 
+    let cleanup_result = cleanup_concurrent_migration_connections(
+        attacker,
+        migration_client,
+        attacker_connection_task,
+        migration_connection_task,
+    )
+    .await;
+    test_result?;
+    cleanup_result
+}
+
+async fn begin_concurrent_external_trigger(
+    attacker: &Client,
+    migration_client: &Client,
+    role: &str,
+    schema: &str,
+) -> TestResult {
+    migration_client
+        .batch_execute(
+            "SET SESSION CHARACTERISTICS AS TRANSACTION \
+             ISOLATION LEVEL REPEATABLE READ",
+        )
+        .await?;
+    attacker
+        .batch_execute(&format!(
+            "BEGIN; \
+             SET LOCAL ROLE {role}; \
+             CREATE TRIGGER concurrent_catalog_write \
+                 BEFORE UPDATE ON pgshard_catalog.cluster_state \
+                 FOR EACH ROW EXECUTE FUNCTION {schema}.observe_catalog_write()"
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn cleanup_concurrent_migration_connections(
+    attacker: Client,
+    migration_client: Client,
+    attacker_connection_task: JoinHandle<Result<(), PgError>>,
+    migration_connection_task: JoinHandle<Result<(), PgError>>,
+) -> TestResult {
     let attacker_cleanup = rollback_concurrent_migration_connection(&attacker, "attacker").await;
     let migration_cleanup =
         rollback_concurrent_migration_connection(&migration_client, "migration").await;
@@ -1184,7 +1219,8 @@ async fn run_concurrent_external_trigger_rejection(
     drop(migration_client);
     attacker_connection_task.abort();
     migration_connection_task.abort();
-    test_result?;
+    let _ = attacker_connection_task.await;
+    let _ = migration_connection_task.await;
     attacker_cleanup?;
     migration_cleanup
 }
