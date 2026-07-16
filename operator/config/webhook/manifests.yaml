@@ -146,6 +146,27 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-core-v1-postgresqlpodbinding
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpostgresqlpodbinding.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods/binding
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-core-v1-postgresqlpodmetadata
   failurePolicy: Fail
   matchPolicy: Equivalent
@@ -159,5 +180,26 @@ webhooks:
     - UPDATE
     resources:
     - pods
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-core-v1-postgresqlpodstatus
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpostgresqlpodstatus.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - UPDATE
+    resources:
+    - pods/status
   sideEffects: None
   timeoutSeconds: 5

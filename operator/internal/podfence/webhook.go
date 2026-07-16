@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
@@ -26,35 +27,40 @@ const (
 	NamespaceLabel      = "pgshard.io/pod-fencing"
 	NamespaceLabelValue = "enabled"
 
-	NodeUIDAnnotation            = "pgshard.io/postgresql-node-uid"
-	NodeBootIDAnnotation         = "pgshard.io/postgresql-node-boot-id"
+	NodeUIDAnnotation            = owned.PostgreSQLNodeUIDAnnotation
+	NodeBootIDAnnotation         = owned.PostgreSQLNodeBootIDAnnotation
 	HandshakeChallengeAnnotation = "pgshard.io/pod-fencing-challenge"
 	HandshakeReceiptAnnotation   = "pgshard.io/pod-fencing-admission"
 
 	TerminationConditionType corev1.PodConditionType = "pgshard.io/PostgreSQLProcessTerminated"
 	TerminationReason                                = "AuthenticatedKubelet"
 
-	BindingWebhookName   = "mpostgresqlpodbinding.pgshard.io"
-	BindingWebhookPath   = "/mutate-core-v1-postgresqlpodbinding"
-	StatusWebhookName    = "mpostgresqlpodstatus.pgshard.io"
-	StatusWebhookPath    = "/mutate-core-v1-postgresqlpodstatus"
-	HandshakeWebhookName = "mpostgresqlfencinghandshake.pgshard.io"
-	HandshakeWebhookPath = "/mutate-pgshard-io-v1alpha1-postgresqlfencinghandshake"
-	MetadataWebhookName  = "vpostgresqlpodmetadata.pgshard.io"
-	MetadataWebhookPath  = "/validate-core-v1-postgresqlpodmetadata"
-	NamespaceWebhookName = "vpostgresqlfencingnamespace.pgshard.io"
-	NamespaceWebhookPath = "/validate-core-v1-postgresqlfencingnamespace"
+	BindingWebhookName           = "mpostgresqlpodbinding.pgshard.io"
+	BindingWebhookPath           = "/mutate-core-v1-postgresqlpodbinding"
+	BindingValidationWebhookName = "vpostgresqlpodbinding.pgshard.io"
+	BindingValidationWebhookPath = "/validate-core-v1-postgresqlpodbinding"
+	StatusWebhookName            = "mpostgresqlpodstatus.pgshard.io"
+	StatusWebhookPath            = "/mutate-core-v1-postgresqlpodstatus"
+	StatusValidationWebhookName  = "vpostgresqlpodstatus.pgshard.io"
+	StatusValidationWebhookPath  = "/validate-core-v1-postgresqlpodstatus"
+	HandshakeWebhookName         = "mpostgresqlfencinghandshake.pgshard.io"
+	HandshakeWebhookPath         = "/mutate-pgshard-io-v1alpha1-postgresqlfencinghandshake"
+	MetadataWebhookName          = "vpostgresqlpodmetadata.pgshard.io"
+	MetadataWebhookPath          = "/validate-core-v1-postgresqlpodmetadata"
+	NamespaceWebhookName         = "vpostgresqlfencingnamespace.pgshard.io"
+	NamespaceWebhookPath         = "/validate-core-v1-postgresqlfencingnamespace"
 )
 
 type HandshakeAttestor struct {
 	decoder admission.Decoder
+	codec   *HandshakeCodec
 }
 
-func NewHandshakeAttestor(scheme *runtime.Scheme) *HandshakeAttestor {
-	return &HandshakeAttestor{decoder: admission.NewDecoder(scheme)}
+func NewHandshakeAttestor(codec *HandshakeCodec, scheme *runtime.Scheme) *HandshakeAttestor {
+	return &HandshakeAttestor{decoder: admission.NewDecoder(scheme), codec: codec}
 }
 
-func (a *HandshakeAttestor) Handle(_ context.Context, request admission.Request) admission.Response {
+func (a *HandshakeAttestor) Handle(ctx context.Context, request admission.Request) admission.Response {
 	if request.Operation != admissionv1.Update || request.SubResource != "" {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL fencing handshake request %s %q", request.Operation, request.SubResource))
 	}
@@ -66,13 +72,20 @@ func (a *HandshakeAttestor) Handle(_ context.Context, request admission.Request)
 		return admission.Allowed("cluster does not publish direct PostgreSQL Pods")
 	}
 	challenge := cluster.Annotations[HandshakeChallengeAnnotation]
-	if challenge == "" || cluster.Annotations[HandshakeReceiptAnnotation] == challenge {
+	if challenge == "" {
+		return admission.Allowed("PostgreSQL Pod fencing handshake is unchanged")
+	}
+	receipt, err := a.codec.Receipt(ctx, cluster)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("authenticate PgShardCluster fencing handshake: %w", err))
+	}
+	if cluster.Annotations[HandshakeReceiptAnnotation] == receipt {
 		return admission.Allowed("PostgreSQL Pod fencing handshake is unchanged")
 	}
 	if cluster.Annotations == nil {
 		cluster.Annotations = make(map[string]string, 1)
 	}
-	cluster.Annotations[HandshakeReceiptAnnotation] = challenge
+	cluster.Annotations[HandshakeReceiptAnnotation] = receipt
 	marshaled, err := json.Marshal(cluster)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("encode PgShardCluster fencing handshake: %w", err))
@@ -85,8 +98,22 @@ type BindingAttestor struct {
 	decoder admission.Decoder
 }
 
+type BindingValidator struct {
+	reader  client.Reader
+	decoder admission.Decoder
+}
+
+type bindingEvidence struct {
+	pod  *corev1.Pod
+	node *corev1.Node
+}
+
 func NewBindingAttestor(reader client.Reader, scheme *runtime.Scheme) *BindingAttestor {
 	return &BindingAttestor{reader: reader, decoder: admission.NewDecoder(scheme)}
+}
+
+func NewBindingValidator(reader client.Reader, scheme *runtime.Scheme) *BindingValidator {
+	return &BindingValidator{reader: reader, decoder: admission.NewDecoder(scheme)}
 }
 
 func (a *BindingAttestor) Handle(ctx context.Context, request admission.Request) admission.Response {
@@ -97,34 +124,22 @@ func (a *BindingAttestor) Handle(ctx context.Context, request admission.Request)
 	if err := a.decoder.Decode(request, binding); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode Pod binding: %w", err))
 	}
-	pod := &corev1.Pod{}
-	if err := a.reader.Get(ctx, types.NamespacedName{Namespace: binding.Namespace, Name: binding.Name}, pod); err != nil {
-		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("read Pod selected for binding: %w", err))
-	}
-	if !IsManagedPostgreSQLPod(pod) {
-		return admission.Allowed("Pod is not a managed PostgreSQL member")
-	}
-	if pod.DeletionTimestamp != nil || pod.Spec.NodeName != "" {
-		return admission.Denied("managed PostgreSQL Pod must be live and unassigned when its node identity is bound")
-	}
-	if binding.UID == "" || binding.UID != pod.UID {
-		return admission.Denied("managed PostgreSQL Pod binding must carry the exact Pod UID")
-	}
-	if binding.Target.Kind != "Node" || binding.Target.Name == "" {
-		return admission.Denied("managed PostgreSQL Pod binding must select a named Node")
-	}
-	node := &corev1.Node{}
-	if err := a.reader.Get(ctx, types.NamespacedName{Name: binding.Target.Name}, node); err != nil {
-		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("read Node selected for PostgreSQL Pod: %w", err))
-	}
-	if node.UID == "" || node.Status.NodeInfo.BootID == "" {
-		return admission.Denied("selected Node has no stable UID and boot ID")
+	evidence, response := readBindingEvidence(ctx, a.reader, binding)
+	if response != nil {
+		return *response
 	}
 	if binding.Annotations == nil {
-		binding.Annotations = make(map[string]string, 2)
+		binding.Annotations = make(map[string]string, 3)
 	}
-	binding.Annotations[NodeUIDAnnotation] = string(node.UID)
-	binding.Annotations[NodeBootIDAnnotation] = node.Status.NodeInfo.BootID
+	if binding.Labels == nil {
+		binding.Labels = make(map[string]string, 6)
+	}
+	for _, key := range protectedBindingLabels() {
+		binding.Labels[key] = evidence.pod.Labels[key]
+	}
+	binding.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] = evidence.pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]
+	binding.Annotations[NodeUIDAnnotation] = string(evidence.node.UID)
+	binding.Annotations[NodeBootIDAnnotation] = evidence.node.Status.NodeInfo.BootID
 	marshaled, err := json.Marshal(binding)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("encode attested Pod binding: %w", err))
@@ -132,13 +147,90 @@ func (a *BindingAttestor) Handle(ctx context.Context, request admission.Request)
 	return admission.PatchResponseFromRaw(request.Object.Raw, marshaled)
 }
 
+func (v *BindingValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
+	if request.Operation != admissionv1.Create || request.SubResource != "binding" {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL Pod binding validation request %s %q", request.Operation, request.SubResource))
+	}
+	binding := &corev1.Binding{}
+	if err := v.decoder.Decode(request, binding); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode final Pod binding: %w", err))
+	}
+	evidence, response := readBindingEvidence(ctx, v.reader, binding)
+	if response != nil {
+		return *response
+	}
+	for _, key := range protectedBindingLabels() {
+		if binding.Labels[key] != evidence.pod.Labels[key] {
+			return admission.Denied(fmt.Sprintf("managed PostgreSQL Pod binding label %s does not match the selected Pod", key))
+		}
+	}
+	if binding.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != evidence.pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] {
+		return admission.Denied("managed PostgreSQL Pod binding does not carry the selected Pod cluster identity")
+	}
+	if binding.Annotations[NodeUIDAnnotation] != string(evidence.node.UID) || binding.Annotations[NodeBootIDAnnotation] != evidence.node.Status.NodeInfo.BootID {
+		return admission.Denied("managed PostgreSQL Pod binding does not carry the selected Node incarnation")
+	}
+	return admission.Allowed("final Pod binding preserves the PostgreSQL Pod and Node identities")
+}
+
+func readBindingEvidence(ctx context.Context, reader client.Reader, binding *corev1.Binding) (*bindingEvidence, *admission.Response) {
+	pod := &corev1.Pod{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: binding.Namespace, Name: binding.Name}, pod); err != nil {
+		response := admission.Errored(http.StatusInternalServerError, fmt.Errorf("read Pod selected for binding: %w", err))
+		return nil, &response
+	}
+	if !isPotentialManagedPostgreSQLPod(pod) {
+		response := admission.Allowed("Pod is not a managed PostgreSQL member")
+		return nil, &response
+	}
+	if !IsManagedPostgreSQLPod(pod) {
+		response := admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
+		return nil, &response
+	}
+	if pod.DeletionTimestamp != nil || pod.Spec.NodeName != "" {
+		response := admission.Denied("managed PostgreSQL Pod must be live and unassigned when its node identity is bound")
+		return nil, &response
+	}
+	if binding.UID == "" || binding.UID != pod.UID {
+		response := admission.Denied("managed PostgreSQL Pod binding must carry the exact Pod UID")
+		return nil, &response
+	}
+	if binding.Target.Kind != "Node" || binding.Target.Name == "" {
+		response := admission.Denied("managed PostgreSQL Pod binding must select a named Node")
+		return nil, &response
+	}
+	node := &corev1.Node{}
+	if err := reader.Get(ctx, types.NamespacedName{Name: binding.Target.Name}, node); err != nil {
+		response := admission.Errored(http.StatusInternalServerError, fmt.Errorf("read Node selected for PostgreSQL Pod: %w", err))
+		return nil, &response
+	}
+	if node.UID == "" || node.Status.NodeInfo.BootID == "" {
+		response := admission.Denied("selected Node has no stable UID and boot ID")
+		return nil, &response
+	}
+	return &bindingEvidence{pod: pod, node: node}, nil
+}
+
+func protectedBindingLabels() [6]string {
+	return [6]string{owned.ManagedByLabel, owned.ComponentLabel, owned.ClusterLabel, owned.ShardLabel, owned.RoleLabel, owned.MemberLabel}
+}
+
+func isPotentialManagedPostgreSQLPod(pod *corev1.Pod) bool {
+	return pod != nil && (pod.Labels[owned.ManagedByLabel] == owned.ManagedByValue ||
+		pod.Labels[owned.ClusterLabel] != "" || pod.Labels[owned.ShardLabel] != "" ||
+		pod.Labels[owned.RoleLabel] != "" || pod.Labels[owned.MemberLabel] != "" ||
+		pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != "" ||
+		slices.Contains(pod.Finalizers, owned.PostgreSQLPodTerminationFinalizer))
+}
+
 type StatusAttestor struct {
 	reader  client.Reader
 	decoder admission.Decoder
+	codec   *HandshakeCodec
 }
 
-func NewStatusAttestor(reader client.Reader, scheme *runtime.Scheme) *StatusAttestor {
-	return &StatusAttestor{reader: reader, decoder: admission.NewDecoder(scheme)}
+func NewStatusAttestor(reader client.Reader, codec *HandshakeCodec, scheme *runtime.Scheme) *StatusAttestor {
+	return &StatusAttestor{reader: reader, decoder: admission.NewDecoder(scheme), codec: codec}
 }
 
 func (a *StatusAttestor) Handle(ctx context.Context, request admission.Request) admission.Response {
@@ -169,6 +261,16 @@ func (a *StatusAttestor) Handle(ctx context.Context, request admission.Request) 
 		if oldCount != newCount || !reflect.DeepEqual(oldAttestation, newAttestation) {
 			return admission.Denied("process-termination attestation is immutable")
 		}
+		verified, err := a.codec.VerifyTermination(ctx, newPod)
+		if err != nil {
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("verify process-termination attestation: %w", err))
+		}
+		if !verified {
+			return admission.Denied("process-termination attestation is not authenticated")
+		}
+		if err := validateStoppedContainers(newPod); err != nil {
+			return admission.Denied(err.Error())
+		}
 		return admission.Allowed("status update preserves termination evidence")
 	}
 	if !hasTerminalPhase(newPod) {
@@ -180,13 +282,17 @@ func (a *StatusAttestor) Handle(ctx context.Context, request admission.Request) 
 	if err := a.validateKubelet(ctx, request, newPod); err != nil {
 		return admission.Denied(err.Error())
 	}
+	receipt, err := a.codec.TerminationReceipt(ctx, newPod)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("authenticate process-termination attestation: %w", err))
+	}
 	conditions := make([]corev1.PodCondition, 0, len(newPod.Status.Conditions)+1)
 	for _, condition := range newPod.Status.Conditions {
 		if condition.Type != TerminationConditionType {
 			conditions = append(conditions, condition)
 		}
 	}
-	conditions = append(conditions, NewTerminationAttestation(newPod, metav1.Now()))
+	conditions = append(conditions, NewTerminationAttestation(newPod, metav1.Now(), receipt))
 	newPod.Status.Conditions = conditions
 	marshaled, err := json.Marshal(newPod)
 	if err != nil {
@@ -226,6 +332,10 @@ func (a *StatusAttestor) validateKubelet(ctx context.Context, request admission.
 	if string(node.UID) != pod.Annotations[NodeUIDAnnotation] || node.Status.NodeInfo.BootID != pod.Annotations[NodeBootIDAnnotation] {
 		return fmt.Errorf("bound Node %s is not the Pod's binding-time node incarnation", pod.Spec.NodeName)
 	}
+	return validateStoppedContainers(pod)
+}
+
+func validateStoppedContainers(pod *corev1.Pod) error {
 	for _, group := range []struct {
 		kind     string
 		names    []string
@@ -240,6 +350,76 @@ func (a *StatusAttestor) validateKubelet(ctx context.Context, request admission.
 		}
 	}
 	return nil
+}
+
+type StatusValidator struct {
+	attestor *StatusAttestor
+}
+
+func NewStatusValidator(reader client.Reader, codec *HandshakeCodec, scheme *runtime.Scheme) *StatusValidator {
+	return &StatusValidator{attestor: NewStatusAttestor(reader, codec, scheme)}
+}
+
+func (v *StatusValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
+	if request.Operation != admissionv1.Update || request.SubResource != "status" {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL Pod status validation request %s %q", request.Operation, request.SubResource))
+	}
+	oldPod, newPod, response := v.attestor.decodeUpdate(request)
+	if response != nil {
+		return *response
+	}
+	oldManaged := IsManagedPostgreSQLPod(oldPod)
+	newManaged := IsManagedPostgreSQLPod(newPod)
+	if !oldManaged && !newManaged {
+		return admission.Allowed("Pod is not a managed PostgreSQL member")
+	}
+	if !oldManaged || !newManaged || !managedIdentityEqual(oldPod, newPod) {
+		return admission.Denied("managed PostgreSQL Pod identity changed during final status admission")
+	}
+	oldAttestation, oldCount := terminationAttestation(oldPod)
+	newAttestation, newCount := terminationAttestation(newPod)
+	if oldCount > 1 || newCount > 1 {
+		return admission.Denied("managed PostgreSQL Pod has duplicate process-termination attestations")
+	}
+	if hasTerminalPhase(oldPod) && !hasTerminalPhase(newPod) {
+		return admission.Denied("managed PostgreSQL Pod terminal phase is immutable")
+	}
+	if oldCount != 0 {
+		if oldCount != newCount || !reflect.DeepEqual(oldAttestation, newAttestation) {
+			return admission.Denied("process-termination attestation is immutable")
+		}
+		if err := validateStoppedContainers(newPod); err != nil {
+			return admission.Denied(err.Error())
+		}
+		verified, err := v.attestor.codec.VerifyTermination(ctx, newPod)
+		if err != nil {
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("verify final process-termination attestation: %w", err))
+		}
+		if !verified {
+			return admission.Denied("process-termination attestation is not authenticated")
+		}
+		return admission.Allowed("final status preserves authenticated termination evidence")
+	}
+	if !hasTerminalPhase(newPod) {
+		if newCount != 0 {
+			return admission.Denied("a nonterminal PostgreSQL Pod cannot carry process-termination evidence")
+		}
+		return admission.Allowed("final status is nonterminal and preserves the lifecycle fence")
+	}
+	if newCount != 1 || !HasTerminationAttestation(newPod) {
+		return admission.Denied("terminal PostgreSQL Pod lacks the authenticated process-termination attestation")
+	}
+	if err := v.attestor.validateKubelet(ctx, request, newPod); err != nil {
+		return admission.Denied(err.Error())
+	}
+	verified, err := v.attestor.codec.VerifyTermination(ctx, newPod)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("verify final process-termination attestation: %w", err))
+	}
+	if !verified {
+		return admission.Denied("process-termination attestation is not authenticated")
+	}
+	return admission.Allowed("final status contains authenticated termination evidence")
 }
 
 func validateStoppedContainerStatuses(kind string, names []string, statuses []corev1.ContainerStatus) error {
@@ -299,6 +479,7 @@ func ephemeralContainerNames(containers []corev1.EphemeralContainer) []string {
 
 type MetadataValidator struct {
 	decoder admission.Decoder
+	codec   *HandshakeCodec
 }
 
 type NamespaceValidator struct {
@@ -331,11 +512,11 @@ func (v *NamespaceValidator) Handle(_ context.Context, request admission.Request
 	return admission.Allowed("namespace preserves PostgreSQL Pod fencing")
 }
 
-func NewMetadataValidator(scheme *runtime.Scheme) *MetadataValidator {
-	return &MetadataValidator{decoder: admission.NewDecoder(scheme)}
+func NewMetadataValidator(codec *HandshakeCodec, scheme *runtime.Scheme) *MetadataValidator {
+	return &MetadataValidator{decoder: admission.NewDecoder(scheme), codec: codec}
 }
 
-func (v *MetadataValidator) Handle(_ context.Context, request admission.Request) admission.Response {
+func (v *MetadataValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
 	if request.Operation != admissionv1.Update || request.SubResource != "" {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL Pod metadata request %s %q", request.Operation, request.SubResource))
 	}
@@ -361,8 +542,14 @@ func (v *MetadataValidator) Handle(_ context.Context, request admission.Request)
 	if !oldFinalizer || oldPod.DeletionTimestamp == nil {
 		return admission.Denied("managed PostgreSQL Pod termination fence may only be removed during deletion")
 	}
-	if oldPod.Spec.NodeName != "" && !HasTerminationAttestation(oldPod) {
-		return admission.Denied("managed PostgreSQL Pod termination fence requires authenticated process-stop evidence")
+	if oldPod.Spec.NodeName != "" {
+		verified, err := v.codec.VerifyTermination(ctx, oldPod)
+		if err != nil {
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("verify process-stop evidence before finalizer removal: %w", err))
+		}
+		if !verified {
+			return admission.Denied("managed PostgreSQL Pod termination fence requires authenticated process-stop evidence")
+		}
 	}
 	return admission.Allowed("managed PostgreSQL Pod termination fence has safe release evidence")
 }
@@ -381,20 +568,24 @@ func IsManagedPostgreSQLPod(pod *corev1.Pod) bool {
 
 func HasTerminationAttestation(pod *corev1.Pod) bool {
 	condition, count := terminationAttestation(pod)
+	receipt := ""
+	if condition != nil {
+		receipt = terminationReceiptFromMessage(condition.Message)
+	}
 	return count == 1 && hasTerminalPhase(pod) &&
 		pod.Annotations[NodeUIDAnnotation] != "" && pod.Annotations[NodeBootIDAnnotation] != "" &&
 		condition.Status == corev1.ConditionTrue && condition.ObservedGeneration == pod.Generation &&
-		condition.Reason == TerminationReason && condition.Message == nodeIdentityMessage(pod)
+		condition.Reason == TerminationReason && receipt != "" && condition.Message == nodeIdentityMessage(pod)+";receipt="+receipt
 }
 
-func NewTerminationAttestation(pod *corev1.Pod, transitionTime metav1.Time) corev1.PodCondition {
+func NewTerminationAttestation(pod *corev1.Pod, transitionTime metav1.Time, receipt string) corev1.PodCondition {
 	return corev1.PodCondition{
 		Type:               TerminationConditionType,
 		Status:             corev1.ConditionTrue,
 		ObservedGeneration: pod.Generation,
 		LastTransitionTime: transitionTime,
 		Reason:             TerminationReason,
-		Message:            nodeIdentityMessage(pod),
+		Message:            nodeIdentityMessage(pod) + ";receipt=" + receipt,
 	}
 }
 
@@ -432,12 +623,22 @@ func nodeIdentityMessage(pod *corev1.Pod) string {
 	return fmt.Sprintf("nodeUID=%s;bootID=%s", pod.Annotations[NodeUIDAnnotation], pod.Annotations[NodeBootIDAnnotation])
 }
 
+func terminationReceiptFromMessage(message string) string {
+	_, receipt, found := strings.Cut(message, ";receipt=")
+	if !found || strings.Contains(receipt, ";") {
+		return ""
+	}
+	return receipt
+}
+
 func hasTerminalPhase(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 }
 
 // +kubebuilder:webhook:path=/mutate-core-v1-postgresqlpodbinding,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/binding,verbs=create,versions=v1,name=mpostgresqlpodbinding.pgshard.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodbinding,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/binding,verbs=create,versions=v1,name=vpostgresqlpodbinding.pgshard.io,admissionReviewVersions=v1
 // +kubebuilder:webhook:path=/mutate-core-v1-postgresqlpodstatus,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=mpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1
 // +kubebuilder:webhook:path=/mutate-pgshard-io-v1alpha1-postgresqlfencinghandshake,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=update,versions=v1alpha1,name=mpostgresqlfencinghandshake.pgshard.io,admissionReviewVersions=v1
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodmetadata,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods,verbs=update,versions=v1,name=vpostgresqlpodmetadata.pgshard.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodstatus,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=vpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlfencingnamespace,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=namespaces;namespaces/status;namespaces/finalize,verbs=update,versions=v1,name=vpostgresqlfencingnamespace.pgshard.io,admissionReviewVersions=v1

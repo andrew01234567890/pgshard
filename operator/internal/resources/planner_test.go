@@ -232,7 +232,9 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "sync \"$staging/pg_hba.conf\" \"$staging/.pgshard-bootstrap-complete\" \"$staging\"") || !strings.Contains(bootstrap.Command[2], "sync \"$final\" \"$parent\"") || strings.Contains(bootstrap.Command[2], "\nsync\n") || strings.Contains(bootstrap.Command[2], "sync -f") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) {
 			t.Fatalf("PostgreSQL atomic bootstrap contract = %#v", bootstrap)
 		}
-		if len(bootstrap.Env) != 2 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) {
+		if len(bootstrap.Env) != 4 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
+			bootstrap.Env[2].Name != "PGSHARD_NODE_UID" || bootstrap.Env[2].ValueFrom == nil || bootstrap.Env[2].ValueFrom.FieldRef == nil || bootstrap.Env[2].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-uid']" ||
+			bootstrap.Env[3].Name != "PGSHARD_NODE_BOOT_ID" || bootstrap.Env[3].ValueFrom == nil || bootstrap.Env[3].ValueFrom.FieldRef == nil || bootstrap.Env[3].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-boot-id']" {
 			t.Fatalf("PostgreSQL bootstrap identity = %#v", bootstrap.Env)
 		}
 		if bootstrap.SecurityContext == nil || bootstrap.SecurityContext.ReadOnlyRootFilesystem == nil || !*bootstrap.SecurityContext.ReadOnlyRootFilesystem || bootstrap.Resources.Limits.Memory() == nil {
@@ -282,6 +284,36 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	}
 }
 
+func TestPostgreSQLBootstrapRequiresBindingIdentityBeforeDataAccess(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{name: "node UID", env: []string{"PGSHARD_NODE_BOOT_ID=boot-a"}, want: "binding-time node UID is required"},
+		{name: "node boot ID", env: []string{"PGSHARD_NODE_UID=node-a"}, want: "binding-time node boot ID is required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			parent := t.TempDir()
+			script := strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", fmt.Sprintf("parent=%q", parent), 1)
+			command := exec.Command("bash", "-c", script)
+			command.Env = append(os.Environ(), "PGSHARD_CLUSTER_UID=cluster-uid", "PGSHARD_SHARD_ID=0000")
+			command.Env = append(command.Env, test.env...)
+			output, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), test.want) {
+				t.Fatalf("bootstrap without %s error = %v, output = %q", test.name, err, output)
+			}
+			for _, path := range []string{filepath.Join(parent, ".pgshard-init"), filepath.Join(parent, "docker")} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("bootstrap touched PGDATA before binding identity validation: %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
 func TestPostgreSQLBootstrapRefusesMismatchedDurableIdentity(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -309,7 +341,7 @@ func TestPostgreSQLBootstrapRefusesMismatchedDurableIdentity(t *testing.T) {
 			}
 			script := strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", fmt.Sprintf("parent=%q", parent), 1)
 			command := exec.Command("bash", "-c", script)
-			command.Env = append(os.Environ(), "PGSHARD_CLUSTER_UID="+test.clusterUID, "PGSHARD_SHARD_ID="+test.shard)
+			command.Env = append(os.Environ(), "PGSHARD_CLUSTER_UID="+test.clusterUID, "PGSHARD_SHARD_ID="+test.shard, "PGSHARD_NODE_UID=node-a", "PGSHARD_NODE_BOOT_ID=boot-a")
 			output, err := command.CombinedOutput()
 			if err == nil {
 				t.Fatal("bootstrap accepted a PostgreSQL data directory from a different identity")

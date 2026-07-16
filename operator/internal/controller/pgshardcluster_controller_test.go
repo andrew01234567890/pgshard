@@ -659,8 +659,8 @@ func TestReconcileWaitsForPodFencingAdmissionHandshake(t *testing.T) {
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	base := newFakeClient(t, cluster)
 	current := getCluster(t, ctx, base, cluster)
-	delete(current.Annotations, podfence.HandshakeChallengeAnnotation)
-	delete(current.Annotations, podfence.HandshakeReceiptAnnotation)
+	current.Annotations[podfence.HandshakeChallengeAnnotation] = "forged"
+	current.Annotations[podfence.HandshakeReceiptAnnotation] = "forged"
 	if err := base.Update(ctx, current); err != nil {
 		t.Fatal(err)
 	}
@@ -670,16 +670,18 @@ func TestReconcileWaitsForPodFencingAdmissionHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	current = getCluster(t, ctx, base, cluster)
-	if current.Annotations[podfence.HandshakeChallengeAnnotation] == "" || current.Annotations[podfence.HandshakeReceiptAnnotation] != "" || contains(current.Finalizers, resourceFinalizer) {
+	if current.Annotations[podfence.HandshakeChallengeAnnotation] == "" || current.Annotations[podfence.HandshakeChallengeAnnotation] == "forged" || current.Annotations[podfence.HandshakeReceiptAnnotation] != "" || contains(current.Finalizers, resourceFinalizer) {
 		t.Fatalf("unacknowledged fencing handshake crossed creation barrier: annotations=%#v finalizers=%#v", current.Annotations, current.Finalizers)
 	}
 
+	codec := podfence.NewStaticHandshakeCodec([]byte(testPodFencingKey))
 	admitted := interceptedClient(t, base, interceptor.Funcs{Patch: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
 		if candidate, ok := object.(*pgshardv1alpha1.PgShardCluster); ok {
-			challenge := candidate.Annotations[podfence.HandshakeChallengeAnnotation]
-			if challenge != "" {
-				candidate.Annotations[podfence.HandshakeReceiptAnnotation] = challenge
+			receipt, err := codec.Receipt(ctx, candidate)
+			if err != nil {
+				return err
 			}
+			candidate.Annotations[podfence.HandshakeReceiptAnnotation] = receipt
 		}
 		return kubeClient.Patch(ctx, object, patch, options...)
 	}})
@@ -688,7 +690,11 @@ func TestReconcileWaitsForPodFencingAdmissionHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	current = getCluster(t, ctx, base, cluster)
-	if challenge := current.Annotations[podfence.HandshakeChallengeAnnotation]; challenge == "" || current.Annotations[podfence.HandshakeReceiptAnnotation] != challenge || contains(current.Finalizers, resourceFinalizer) {
+	verified, err := codec.Verify(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verified || contains(current.Finalizers, resourceFinalizer) {
 		t.Fatalf("admission handshake was not durably acknowledged before requeue: annotations=%#v finalizers=%#v", current.Annotations, current.Finalizers)
 	}
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
@@ -999,7 +1005,7 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), terminating); err != nil || !controllerutil.ContainsFinalizer(terminating, owned.PostgreSQLPodTerminationFinalizer) {
 		t.Fatalf("unattested terminal PostgreSQL Pod lost its fence: pod=%#v err=%v", terminating.ObjectMeta, err)
 	}
-	terminating.Status.Conditions = append(terminating.Status.Conditions, podfence.NewTerminationAttestation(terminating, metav1.Now()))
+	terminating.Status.Conditions = append(terminating.Status.Conditions, testTerminationAttestation(t, terminating))
 	if err := base.Status().Update(ctx, terminating); err != nil {
 		t.Fatal(err)
 	}
@@ -1120,7 +1126,7 @@ func TestPostgreSQLPodTerminationFenceRequiresAuthenticatedKubeletAttestation(t 
 	if !controllerutil.ContainsFinalizer(current, owned.PostgreSQLPodTerminationFinalizer) {
 		t.Fatalf("unattested terminal Pod finalizers = %q", current.Finalizers)
 	}
-	current.Status.Conditions = append(current.Status.Conditions, podfence.NewTerminationAttestation(current, metav1.Now()))
+	current.Status.Conditions = append(current.Status.Conditions, testTerminationAttestation(t, current))
 	if err := base.Status().Update(ctx, current); err != nil {
 		t.Fatal(err)
 	}
@@ -3357,9 +3363,20 @@ func getPostgreSQLConfigMap(t *testing.T, ctx context.Context, kubeClient client
 	return found
 }
 
+const testPodFencingKey = "0123456789abcdef0123456789abcdef"
+
+func testTerminationAttestation(t *testing.T, pod *corev1.Pod) corev1.PodCondition {
+	t.Helper()
+	receipt, err := podfence.NewStaticHandshakeCodec([]byte(testPodFencingKey)).TerminationReceipt(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return podfence.NewTerminationAttestation(pod, metav1.Now(), receipt)
+}
+
 func newFakeClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
-	objects = withPodFencingNamespaces(objects)
+	objects = withPodFencingNamespaces(t, objects)
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -3381,7 +3398,8 @@ func newFakeClient(t *testing.T, objects ...client.Object) client.Client {
 		Build()
 }
 
-func withPodFencingNamespaces(objects []client.Object) []client.Object {
+func withPodFencingNamespaces(t *testing.T, objects []client.Object) []client.Object {
+	t.Helper()
 	prepared := append([]client.Object(nil), objects...)
 	namespaces := make(map[string]*corev1.Namespace)
 	for _, object := range prepared {
@@ -3394,11 +3412,18 @@ func withPodFencingNamespaces(objects []client.Object) []client.Object {
 		if !ok {
 			continue
 		}
+		if cluster.UID == "" {
+			cluster.UID = types.UID(utiluuid.NewUUID())
+		}
 		if cluster.Annotations == nil {
 			cluster.Annotations = make(map[string]string, 2)
 		}
 		cluster.Annotations[podfence.HandshakeChallengeAnnotation] = "test-admission-handshake"
-		cluster.Annotations[podfence.HandshakeReceiptAnnotation] = "test-admission-handshake"
+		receipt, err := podfence.NewStaticHandshakeCodec([]byte(testPodFencingKey)).Receipt(context.Background(), cluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cluster.Annotations[podfence.HandshakeReceiptAnnotation] = receipt
 		namespace := namespaces[cluster.Namespace]
 		if namespace == nil {
 			namespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}}
@@ -3410,6 +3435,10 @@ func withPodFencingNamespaces(objects []client.Object) []client.Object {
 		}
 		namespace.Labels[podfence.NamespaceLabel] = podfence.NamespaceLabelValue
 	}
+	prepared = append(prepared, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingKeySecret},
+		Data:       map[string][]byte{defaultPodFencingKeyData: []byte(testPodFencingKey)},
+	})
 	return prepared
 }
 

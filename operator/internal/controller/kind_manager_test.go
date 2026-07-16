@@ -109,7 +109,15 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err != nil {
 		t.Fatal(err)
 	}
-	if challenge := current.Annotations[podfence.HandshakeChallengeAnnotation]; challenge == "" || current.Annotations[podfence.HandshakeReceiptAnnotation] != challenge {
+	verifiedHandshake, handshakeErr := podfence.NewSecretHandshakeCodec(
+		kubeClient,
+		types.NamespacedName{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingKeySecret},
+		defaultPodFencingKeyData,
+	).Verify(ctx, current)
+	if handshakeErr != nil {
+		t.Fatal(handshakeErr)
+	}
+	if !verifiedHandshake {
 		t.Fatalf("PostgreSQL Pod fencing admission handshake = %#v", current.Annotations)
 	}
 	shardZeroBootstrap := bootstrapForShard(t, current, 0)
@@ -202,6 +210,17 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	}
 	if beforeForceDelete.Annotations[podfence.NodeUIDAnnotation] != string(boundNode.UID) || beforeForceDelete.Annotations[podfence.NodeBootIDAnnotation] != boundNode.Status.NodeInfo.BootID {
 		t.Fatalf("PostgreSQL Pod binding identity = %#v, node = %#v", beforeForceDelete.Annotations, boundNode.ObjectMeta)
+	}
+	if beforeForceDelete.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != string(current.UID) {
+		t.Fatalf("PostgreSQL Pod binding cluster identity = %#v, want %s", beforeForceDelete.Annotations, current.UID)
+	}
+	for key, value := range map[string]string{
+		owned.ManagedByLabel: owned.ManagedByValue, owned.ComponentLabel: "postgresql", owned.ClusterLabel: cluster.Name,
+		owned.ShardLabel: "0000", owned.RoleLabel: "primary", owned.MemberLabel: "0000",
+	} {
+		if beforeForceDelete.Labels[key] != value {
+			t.Fatalf("PostgreSQL Pod binding label %s = %q, want %q", key, beforeForceDelete.Labels[key], value)
+		}
 	}
 	zeroGrace := int64(0)
 	if err := kubeClient.Delete(ctx, beforeForceDelete, &client.DeleteOptions{GracePeriodSeconds: &zeroGrace}); err != nil {

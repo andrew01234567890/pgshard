@@ -464,6 +464,10 @@ func installObjects() []client.Object {
 		},
 	}})
 	namespaceValidating.ObjectSelector = podFencingNamespaceSelector()
+	statusValidating := validatingWebhook(podfence.StatusValidationWebhookName, podfence.StatusValidationWebhookPath, coreRules(admissionregistrationv1.Update, "pods/status"))
+	statusValidating.ObjectSelector = postgreSQLPodSelector()
+	bindingValidating := validatingWebhook(podfence.BindingValidationWebhookName, podfence.BindingValidationWebhookPath, coreRules(admissionregistrationv1.Create, "pods/binding"))
+	bindingValidating.NamespaceSelector = podFencingNamespaceSelector()
 	return []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testCASecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testServingSecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
@@ -473,7 +477,7 @@ func installObjects() []client.Object {
 		},
 		&admissionregistrationv1.ValidatingWebhookConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: testValidatingConfigurationName},
-			Webhooks:   []admissionregistrationv1.ValidatingWebhook{clusterValidating, metadataValidating, namespaceValidating},
+			Webhooks:   []admissionregistrationv1.ValidatingWebhook{clusterValidating, metadataValidating, namespaceValidating, statusValidating, bindingValidating},
 		},
 	}
 }
@@ -513,7 +517,7 @@ func assertInjectedBundles(t *testing.T, kubeClient client.Client, wanted []byte
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: testValidatingConfigurationName}, validating); err != nil {
 		t.Fatal(err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 3 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 5 {
 		t.Fatalf("CA bundles were not injected: mutating=%#v validating=%#v", mutating.Webhooks, validating.Webhooks)
 	}
 	for _, webhook := range mutating.Webhooks {

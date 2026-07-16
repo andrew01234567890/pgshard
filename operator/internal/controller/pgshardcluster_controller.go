@@ -36,19 +36,22 @@ import (
 )
 
 const (
-	readyCondition               = "Ready"
-	reconciledCondition          = "ResourcesReconciled"
-	supportingAvailableCondition = "SupportingWorkloadsAvailable"
-	postgresqlAvailableCondition = "PostgreSQLPrimariesAvailable"
-	transportSecurityCondition   = "TransportSecurityReady"
-	resourceFinalizer            = "pgshard.io/owned-resources"
-	hpaScaleFieldManager         = "pgshard-hpa-scale"
-	ownershipMigrationManager    = "pgshard-ownership-migration"
-	retryDelay                   = 15 * time.Second
-	bootstrapIntegrityInterval   = 30 * time.Second
-	postgresqlPasswordBytes      = 32
-	bootstrapNameRandomBytes     = 16
-	fencingChallengeRandomBytes  = 16
+	readyCondition                = "Ready"
+	reconciledCondition           = "ResourcesReconciled"
+	supportingAvailableCondition  = "SupportingWorkloadsAvailable"
+	postgresqlAvailableCondition  = "PostgreSQLPrimariesAvailable"
+	transportSecurityCondition    = "TransportSecurityReady"
+	resourceFinalizer             = "pgshard.io/owned-resources"
+	hpaScaleFieldManager          = "pgshard-hpa-scale"
+	ownershipMigrationManager     = "pgshard-ownership-migration"
+	retryDelay                    = 15 * time.Second
+	bootstrapIntegrityInterval    = 30 * time.Second
+	postgresqlPasswordBytes       = 32
+	bootstrapNameRandomBytes      = 16
+	fencingChallengeRandomBytes   = 16
+	defaultPodFencingKeyNamespace = "pgshard-system"
+	defaultPodFencingKeySecret    = "pgshard-webhook-ca"
+	defaultPodFencingKeyData      = "ca.key"
 )
 
 // PgShardClusterReconciler owns safe supporting resources and single-member
@@ -61,8 +64,10 @@ type PgShardClusterReconciler struct {
 	// gates, storage-class selection, replica handoff, deletion-finalizer absence
 	// proofs, and post-apply workload status.
 	// Writes and plan reconciliation continue through Client.
-	APIReader client.Reader
-	Images    owned.Images
+	APIReader           client.Reader
+	Images              owned.Images
+	PodFencingKeySecret types.NamespacedName
+	PodFencingKeyData   string
 }
 
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
@@ -264,8 +269,11 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLPodFencingHandshake(ctx conte
 	if cluster.Spec.MembersPerShard != 1 {
 		return true, nil
 	}
-	challenge := cluster.Annotations[podfence.HandshakeChallengeAnnotation]
-	if challenge != "" && cluster.Annotations[podfence.HandshakeReceiptAnnotation] == challenge {
+	verified, err := r.podFencingHandshakeCodec().Verify(ctx, cluster)
+	if err != nil {
+		return false, fmt.Errorf("verify Pod fencing admission receipt: %w", err)
+	}
+	if verified {
 		return true, nil
 	}
 	random := make([]byte, fencingChallengeRandomBytes)
@@ -282,6 +290,21 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLPodFencingHandshake(ctx conte
 		return false, fmt.Errorf("request Pod fencing admission handshake: %w", err)
 	}
 	return false, nil
+}
+
+func (r *PgShardClusterReconciler) podFencingHandshakeCodec() *podfence.HandshakeCodec {
+	secret := r.PodFencingKeySecret
+	if secret.Namespace == "" {
+		secret.Namespace = defaultPodFencingKeyNamespace
+	}
+	if secret.Name == "" {
+		secret.Name = defaultPodFencingKeySecret
+	}
+	dataKey := r.PodFencingKeyData
+	if dataKey == "" {
+		dataKey = defaultPodFencingKeyData
+	}
+	return podfence.NewSecretHandshakeCodec(r.authoritativeReader(), secret, dataKey)
 }
 
 func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
@@ -1740,7 +1763,14 @@ func (r *PgShardClusterReconciler) releaseTerminatedPostgreSQLPodFences(ctx cont
 	released := false
 	for index := range pods.Items {
 		pod := &pods.Items[index]
-		if !controllerutil.ContainsFinalizer(pod, owned.PostgreSQLPodTerminationFinalizer) || pod.DeletionTimestamp == nil || !podHasSafeTerminationEvidence(pod) {
+		if !controllerutil.ContainsFinalizer(pod, owned.PostgreSQLPodTerminationFinalizer) || pod.DeletionTimestamp == nil {
+			continue
+		}
+		safe, err := r.podHasSafeTerminationEvidence(ctx, pod)
+		if err != nil {
+			return false, fmt.Errorf("verify PostgreSQL Pod %s termination receipt: %w", pod.Name, err)
+		}
+		if !safe {
 			continue
 		}
 		matching, err := postgreSQLDataBootstrapIndexForPod(pod, cluster)
@@ -1794,8 +1824,14 @@ func (r *PgShardClusterReconciler) verifyPostgreSQLPodTerminationFences(ctx cont
 		if controllerutil.ContainsFinalizer(pod, owned.PostgreSQLPodTerminationFinalizer) {
 			continue
 		}
-		if pod.DeletionTimestamp != nil && podHasSafeTerminationEvidence(pod) {
-			continue
+		if pod.DeletionTimestamp != nil {
+			safe, err := r.podHasSafeTerminationEvidence(ctx, pod)
+			if err != nil {
+				return fmt.Errorf("verify PostgreSQL Pod %s termination receipt: %w", pod.Name, err)
+			}
+			if safe {
+				continue
+			}
 		}
 		return fmt.Errorf("PostgreSQL Pod %s with UID %s lacks its termination finalizer", pod.Name, pod.UID)
 	}
@@ -1831,8 +1867,14 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPodsForFinalization(ctx conte
 			return false, err
 		}
 		if !controllerutil.ContainsFinalizer(pod, owned.PostgreSQLPodTerminationFinalizer) {
-			if pod.DeletionTimestamp != nil && podHasSafeTerminationEvidence(pod) {
-				continue
+			if pod.DeletionTimestamp != nil {
+				safe, err := r.podHasSafeTerminationEvidence(ctx, pod)
+				if err != nil {
+					return false, fmt.Errorf("verify PostgreSQL Pod %s termination receipt: %w", pod.Name, err)
+				}
+				if safe {
+					continue
+				}
 			}
 			return false, fmt.Errorf("PostgreSQL Pod %s with UID %s lacks its termination finalizer", pod.Name, pod.UID)
 		}
@@ -1876,8 +1918,11 @@ func podHasTerminalPhase(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 }
 
-func podHasSafeTerminationEvidence(pod *corev1.Pod) bool {
-	return pod.Spec.NodeName == "" || podfence.HasTerminationAttestation(pod)
+func (r *PgShardClusterReconciler) podHasSafeTerminationEvidence(ctx context.Context, pod *corev1.Pod) (bool, error) {
+	if pod.Spec.NodeName == "" {
+		return true, nil
+	}
+	return r.podFencingHandshakeCodec().VerifyTermination(ctx, pod)
 }
 
 func validatePostgreSQLFinalizationPod(pod *corev1.Pod, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) error {

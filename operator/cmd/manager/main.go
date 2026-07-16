@@ -112,14 +112,21 @@ func main() {
 	}
 
 	if err := (&controller.PgShardClusterReconciler{
-		Client:    manager.GetClient(),
-		APIReader: manager.GetAPIReader(),
-		Images:    options.images,
+		Client:              manager.GetClient(),
+		APIReader:           manager.GetAPIReader(),
+		Images:              options.images,
+		PodFencingKeySecret: client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
+		PodFencingKeyData:   pki.CAPrivateKeyKey,
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
 	}
 	if options.webhookEnabled {
+		handshakeCodec := podfence.NewSecretHandshakeCodec(
+			manager.GetAPIReader(),
+			client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
+			pki.CAPrivateKeyKey,
+		)
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCluster{}).
 			WithDefaulter(&pgshardv1alpha1.PgShardClusterDefaulter{}).
 			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{}).
@@ -130,14 +137,20 @@ func main() {
 		webhookServer.Register(podfence.BindingWebhookPath, &admission.Webhook{
 			Handler: podfence.NewBindingAttestor(manager.GetAPIReader(), scheme),
 		})
+		webhookServer.Register(podfence.BindingValidationWebhookPath, &admission.Webhook{
+			Handler: podfence.NewBindingValidator(manager.GetAPIReader(), scheme),
+		})
 		webhookServer.Register(podfence.StatusWebhookPath, &admission.Webhook{
-			Handler: podfence.NewStatusAttestor(manager.GetAPIReader(), scheme),
+			Handler: podfence.NewStatusAttestor(manager.GetAPIReader(), handshakeCodec, scheme),
 		})
 		webhookServer.Register(podfence.HandshakeWebhookPath, &admission.Webhook{
-			Handler: podfence.NewHandshakeAttestor(scheme),
+			Handler: podfence.NewHandshakeAttestor(handshakeCodec, scheme),
 		})
 		webhookServer.Register(podfence.MetadataWebhookPath, &admission.Webhook{
-			Handler: podfence.NewMetadataValidator(scheme),
+			Handler: podfence.NewMetadataValidator(handshakeCodec, scheme),
+		})
+		webhookServer.Register(podfence.StatusValidationWebhookPath, &admission.Webhook{
+			Handler: podfence.NewStatusValidator(manager.GetAPIReader(), handshakeCodec, scheme),
 		})
 		webhookServer.Register(podfence.NamespaceWebhookPath, &admission.Webhook{
 			Handler: podfence.NewNamespaceValidator(scheme),

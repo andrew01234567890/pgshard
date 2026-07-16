@@ -28,10 +28,18 @@ func TestBindingAttestorPinsTheNodeIncarnationInTheBinding(t *testing.T) {
 	pod.Spec.NodeName = ""
 	pod.DeletionTimestamp = nil
 	node := testNode("node-a", "node-uid-a", "boot-a")
-	handler := NewBindingAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node).Build(), scheme)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node).Build()
+	handler := NewBindingAttestor(reader, scheme)
 	binding := &corev1.Binding{
-		ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
-		Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID,
+			Labels: map[string]string{
+				owned.ManagedByLabel: "attacker", owned.ComponentLabel: "attacker", owned.ClusterLabel: "attacker",
+				owned.ShardLabel: "attacker", owned.RoleLabel: "attacker", owned.MemberLabel: "attacker",
+			},
+			Annotations: map[string]string{owned.PostgreSQLPodClusterUIDAnnotation: "attacker"},
+		},
+		Target: corev1.ObjectReference{Kind: "Node", Name: node.Name},
 	}
 	raw := marshalObject(t, binding)
 	response := handler.Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
@@ -48,6 +56,66 @@ func TestBindingAttestorPinsTheNodeIncarnationInTheBinding(t *testing.T) {
 	if got.Annotations[NodeUIDAnnotation] != string(node.UID) || got.Annotations[NodeBootIDAnnotation] != node.Status.NodeInfo.BootID {
 		t.Fatalf("binding identity = %#v", got.Annotations)
 	}
+	if got.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] {
+		t.Fatalf("binding cluster identity = %#v", got.Annotations)
+	}
+	for _, key := range []string{owned.ManagedByLabel, owned.ComponentLabel, owned.ClusterLabel, owned.ShardLabel, owned.RoleLabel, owned.MemberLabel} {
+		if got.Labels[key] != pod.Labels[key] {
+			t.Fatalf("binding label %s = %q, want %q", key, got.Labels[key], pod.Labels[key])
+		}
+	}
+	validationRequest := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, got)},
+	}}
+	validated := NewBindingValidator(reader, scheme).Handle(context.Background(), validationRequest)
+	if !validated.Allowed {
+		t.Fatalf("attested final binding denied: %#v", validated.Result)
+	}
+
+	conflicting := got.DeepCopy()
+	conflicting.Labels[owned.ClusterLabel] = "rewritten-after-attestation"
+	validationRequest.Object = runtime.RawExtension{Raw: marshalObject(t, conflicting)}
+	validated = NewBindingValidator(reader, scheme).Handle(context.Background(), validationRequest)
+	if validated.Allowed || validated.Result == nil || !strings.Contains(validated.Result.Message, "does not match") {
+		t.Fatalf("post-mutation conflicting binding response = %#v", validated)
+	}
+
+	conflicting = got.DeepCopy()
+	conflicting.Annotations[NodeBootIDAnnotation] = "replacement-boot"
+	validationRequest.Object = runtime.RawExtension{Raw: marshalObject(t, conflicting)}
+	validated = NewBindingValidator(reader, scheme).Handle(context.Background(), validationRequest)
+	if validated.Allowed || validated.Result == nil || !strings.Contains(validated.Result.Message, "Node incarnation") {
+		t.Fatalf("post-mutation conflicting Node identity response = %#v", validated)
+	}
+}
+
+func TestBindingAdmissionRejectsPartiallyStrippedManagedPods(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	pod := managedPod()
+	pod.Spec.NodeName = ""
+	pod.DeletionTimestamp = nil
+	pod.Finalizers = nil
+	node := testNode("node-a", "node-uid-a", "boot-a")
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node).Build()
+	binding := &corev1.Binding{
+		ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
+		Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+	}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+	}}
+	for name, handler := range map[string]admission.Handler{
+		"mutating":   NewBindingAttestor(reader, scheme),
+		"validating": NewBindingValidator(reader, scheme),
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := handler.Handle(context.Background(), request)
+			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "incomplete identity or no termination fence") {
+				t.Fatalf("partially stripped Pod binding response = %#v", response)
+			}
+		})
+	}
 }
 
 func TestHandshakeAttestorAcknowledgesTheCurrentChallenge(t *testing.T) {
@@ -55,13 +123,14 @@ func TestHandshakeAttestorAcknowledgesTheCurrentChallenge(t *testing.T) {
 	scheme := testScheme(t)
 	cluster := &pgshardv1alpha1.PgShardCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "example", Namespace: "database",
+			Name: "example", Namespace: "database", UID: "cluster-uid",
 			Annotations: map[string]string{HandshakeChallengeAnnotation: "challenge-a"},
 		},
 		Spec: pgshardv1alpha1.PgShardClusterSpec{MembersPerShard: 1},
 	}
 	raw := marshalObject(t, cluster)
-	response := NewHandshakeAttestor(scheme).Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+	codec := NewStaticHandshakeCodec([]byte("0123456789abcdef0123456789abcdef"))
+	response := NewHandshakeAttestor(codec, scheme).Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
 		Operation: admissionv1.Update, Object: runtime.RawExtension{Raw: raw},
 	}})
 	if !response.Allowed {
@@ -71,8 +140,21 @@ func TestHandshakeAttestorAcknowledgesTheCurrentChallenge(t *testing.T) {
 	if err := json.Unmarshal(applyResponsePatch(t, raw, response), got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Annotations[HandshakeReceiptAnnotation] != "challenge-a" {
+	verified, err := codec.Verify(context.Background(), got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verified {
 		t.Fatalf("fencing handshake receipt = %#v", got.Annotations)
+	}
+	replayed := got.DeepCopy()
+	replayed.UID = "another-cluster-uid"
+	verified, err = codec.Verify(context.Background(), replayed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified {
+		t.Fatal("fencing handshake receipt was replayable across cluster UIDs")
 	}
 }
 
@@ -86,7 +168,7 @@ func TestStatusAttestorAddsDurableKubeletProof(t *testing.T) {
 	newPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
 		Name: "postgresql", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137}},
 	}}
-	handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build(), scheme)
+	handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build(), testCodec(), scheme)
 	request, raw := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
 	response := handler.Handle(context.Background(), request)
 	if !response.Allowed {
@@ -112,7 +194,7 @@ func TestStatusAttestorCanAttestAnExistingTerminalPhase(t *testing.T) {
 	}}
 	newPod := oldPod.DeepCopy()
 	newPod.Status.Message = "kubelet retry"
-	handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build(), scheme)
+	handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build(), testCodec(), scheme)
 	request, raw := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
 	response := handler.Handle(context.Background(), request)
 	if !response.Allowed {
@@ -141,7 +223,7 @@ func TestStatusAttestorAcceptsNeverStartedWaitingContainers(t *testing.T) {
 	newPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
 		Name: "postgresql", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
 	}}
-	handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build(), scheme)
+	handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build(), testCodec(), scheme)
 	request, raw := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
 	response := handler.Handle(context.Background(), request)
 	if !response.Allowed {
@@ -181,7 +263,7 @@ func TestStatusAttestorProtectsManagedMetadataOnTheStatusSubresource(t *testing.
 			newPod := oldPod.DeepCopy()
 			test.mutate(newPod)
 			request, _ := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
-			response := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).Build(), scheme).Handle(context.Background(), request)
+			response := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).Build(), testCodec(), scheme).Handle(context.Background(), request)
 			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "identity changed") {
 				t.Fatalf("protected metadata removal response = %#v", response)
 			}
@@ -198,9 +280,52 @@ func TestStatusAttestorRejectsTerminalPhaseReversal(t *testing.T) {
 	newPod := oldPod.DeepCopy()
 	newPod.Status.Phase = corev1.PodRunning
 	request, _ := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
-	response := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).Build(), scheme).Handle(context.Background(), request)
+	response := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).Build(), testCodec(), scheme).Handle(context.Background(), request)
 	if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "terminal phase is immutable") {
 		t.Fatalf("terminal phase reversal response = %#v", response)
+	}
+}
+
+func TestStatusValidatorAcceptsOnlyTheAttestorOutput(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	node := testNode("node-a", "node-uid-a", "boot-a")
+	oldPod := managedPod()
+	terminal := oldPod.DeepCopy()
+	terminal.Status.Phase = corev1.PodFailed
+	terminal.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "postgresql", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137}},
+	}}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+	request, raw := statusRequest(t, oldPod, terminal, "system:node:node-a", []string{"system:nodes"})
+	mutated := NewStatusAttestor(reader, testCodec(), scheme).Handle(context.Background(), request)
+	if !mutated.Allowed {
+		t.Fatalf("authentic terminal status mutation denied: %#v", mutated.Result)
+	}
+	finalPod := &corev1.Pod{}
+	if err := json.Unmarshal(applyResponsePatch(t, raw, mutated), finalPod); err != nil {
+		t.Fatal(err)
+	}
+	request, _ = statusRequest(t, oldPod, finalPod, "system:node:node-a", []string{"system:nodes"})
+	validated := NewStatusValidator(reader, testCodec(), scheme).Handle(context.Background(), request)
+	if !validated.Allowed {
+		t.Fatalf("authentic terminal status validation denied: %#v", validated.Result)
+	}
+
+	forged := terminal.DeepCopy()
+	forged.Status.Conditions = append(forged.Status.Conditions, NewTerminationAttestation(forged, metav1.Now(), "v1.forged"))
+	request, _ = statusRequest(t, oldPod, forged, "system:node:node-a", []string{"system:nodes"})
+	validated = NewStatusValidator(reader, testCodec(), scheme).Handle(context.Background(), request)
+	if validated.Allowed || validated.Result == nil || !strings.Contains(validated.Result.Message, "not authenticated") {
+		t.Fatalf("post-mutation forged terminal receipt response = %#v", validated)
+	}
+
+	stripped := finalPod.DeepCopy()
+	stripped.Finalizers = nil
+	request, _ = statusRequest(t, oldPod, stripped, "system:node:node-a", []string{"system:nodes"})
+	validated = NewStatusValidator(reader, testCodec(), scheme).Handle(context.Background(), request)
+	if validated.Allowed || validated.Result == nil || !strings.Contains(validated.Result.Message, "identity changed during final status admission") {
+		t.Fatalf("post-mutation finalizer stripping response = %#v", validated)
 	}
 }
 
@@ -241,7 +366,7 @@ func TestStatusAttestorRejectsControlPlaneAndWrongNodeHistories(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(test.objects...).Build(), scheme)
+			handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(test.objects...).Build(), testCodec(), scheme)
 			request, _ := statusRequest(t, oldPod, terminal, test.username, test.groups)
 			response := handler.Handle(context.Background(), request)
 			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, test.want) {
@@ -271,7 +396,7 @@ func TestStatusAttestorRequiresCompleteStoppedContainerEvidence(t *testing.T) {
 			terminal := oldPod.DeepCopy()
 			terminal.Status.Phase = corev1.PodFailed
 			terminal.Status.ContainerStatuses = test.statuses
-			handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(node.DeepCopy()).Build(), scheme)
+			handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(node.DeepCopy()).Build(), testCodec(), scheme)
 			request, _ := statusRequest(t, oldPod, terminal, "system:node:node-a", []string{"system:nodes"})
 			response := handler.Handle(context.Background(), request)
 			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, test.want) {
@@ -288,7 +413,7 @@ func TestPhaseAloneNeverReleasesTheMetadataFence(t *testing.T) {
 	oldPod.Status.Phase = corev1.PodFailed
 	newPod := oldPod.DeepCopy()
 	newPod.Finalizers = nil
-	handler := NewMetadataValidator(scheme)
+	handler := NewMetadataValidator(testCodec(), scheme)
 	response := handler.Handle(context.Background(), updateRequest(t, oldPod, newPod, ""))
 	if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "authenticated process-stop evidence") {
 		t.Fatalf("phase-only finalizer removal response = %#v", response)
@@ -310,7 +435,7 @@ func TestMetadataValidatorProtectsTheBindingIdentity(t *testing.T) {
 	oldPod := managedPod()
 	changed := oldPod.DeepCopy()
 	changed.Annotations[NodeUIDAnnotation] = "replacement"
-	response := NewMetadataValidator(scheme).Handle(context.Background(), updateRequest(t, oldPod, changed, ""))
+	response := NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, changed, ""))
 	if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "immutable") {
 		t.Fatalf("binding identity mutation response = %#v", response)
 	}
@@ -325,7 +450,7 @@ func TestUnscheduledDeletingPodCanReleaseItsFence(t *testing.T) {
 	delete(oldPod.Annotations, NodeBootIDAnnotation)
 	newPod := oldPod.DeepCopy()
 	newPod.Finalizers = nil
-	response := NewMetadataValidator(scheme).Handle(context.Background(), updateRequest(t, oldPod, newPod, ""))
+	response := NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, newPod, ""))
 	if !response.Allowed {
 		t.Fatalf("unassigned Pod fence release denied: %#v", response.Result)
 	}
@@ -380,7 +505,15 @@ func testNode(name string, uid types.UID, bootID string) *corev1.Node {
 }
 
 func validAttestation(pod *corev1.Pod) corev1.PodCondition {
-	return NewTerminationAttestation(pod, metav1.Now())
+	receipt, err := testCodec().TerminationReceipt(context.Background(), pod)
+	if err != nil {
+		panic(err)
+	}
+	return NewTerminationAttestation(pod, metav1.Now(), receipt)
+}
+
+func testCodec() *HandshakeCodec {
+	return NewStaticHandshakeCodec([]byte("0123456789abcdef0123456789abcdef"))
 }
 
 func statusRequest(t *testing.T, oldPod, newPod *corev1.Pod, username string, groups []string) (admission.Request, []byte) {

@@ -386,23 +386,25 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.validatingConfigurationName}, validating); err != nil {
 		return nil, fmt.Errorf("get validating webhook configuration: %w", err)
 	}
-	if len(validating.Webhooks) != 3 {
-		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly three", len(validating.Webhooks))
+	if len(validating.Webhooks) != 5 {
+		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly five", len(validating.Webhooks))
 	}
 	for _, expected := range []struct {
-		name, path string
-		rules      func([]admissionregistrationv1.RuleWithOperations) bool
-		object     *metav1.LabelSelector
+		name, path        string
+		rules             func([]admissionregistrationv1.RuleWithOperations) bool
+		namespace, object *metav1.LabelSelector
 	}{
 		{name: validatingWebhookName, path: validatingWebhookPath, rules: matchesPgShardClusterRules},
 		{name: podfence.MetadataWebhookName, path: podfence.MetadataWebhookPath, rules: matchesPostgreSQLMetadataRules, object: postgreSQLPodSelector()},
 		{name: podfence.NamespaceWebhookName, path: podfence.NamespaceWebhookPath, rules: matchesPostgreSQLNamespaceRules, object: podFencingNamespaceSelector()},
+		{name: podfence.StatusValidationWebhookName, path: podfence.StatusValidationWebhookPath, rules: matchesPostgreSQLStatusRules, object: postgreSQLPodSelector()},
+		{name: podfence.BindingValidationWebhookName, path: podfence.BindingValidationWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
 	} {
 		webhook := findValidatingWebhook(validating.Webhooks, expected.name)
 		if webhook == nil {
 			return nil, fmt.Errorf("validating webhook configuration does not contain %q", expected.name)
 		}
-		if err := p.validateWebhookPolicy(policyForValidating(webhook), caBundle, expected.name, expected.path, expected.rules, nil, expected.object); err != nil {
+		if err := p.validateWebhookPolicy(policyForValidating(webhook), caBundle, expected.name, expected.path, expected.rules, expected.namespace, expected.object); err != nil {
 			return nil, fmt.Errorf("validating webhook %q: %w", webhook.Name, err)
 		}
 	}

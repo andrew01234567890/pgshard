@@ -64,11 +64,16 @@ const (
 	PostgreSQLDataClusterUIDAnnotation      = "pgshard.io/data-cluster-uid"
 	PostgreSQLDataProtectionFinalizer       = "pgshard.io/postgresql-data-protection"
 	PostgreSQLPodClusterUIDAnnotation       = "pgshard.io/postgresql-cluster-uid"
+	PostgreSQLNodeUIDAnnotation             = "pgshard.io/postgresql-node-uid"
+	PostgreSQLNodeBootIDAnnotation          = "pgshard.io/postgresql-node-boot-id"
 	PostgreSQLPodTerminationFinalizer       = "pgshard.io/postgresql-termination"
 	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 )
 
 const postgresqlBootstrapScript = `set -Eeuo pipefail
+: "${PGSHARD_NODE_UID:?binding-time node UID is required}"
+: "${PGSHARD_NODE_BOOT_ID:?binding-time node boot ID is required}"
+
 parent=/var/lib/postgresql/18
 final="$parent/docker"
 staging="$parent/.pgshard-init"
@@ -590,6 +595,8 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 		Env: []corev1.EnvVar{
 			{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
 			{Name: "PGSHARD_SHARD_ID", Value: shardLabel(shard)},
+			{Name: "PGSHARD_NODE_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeUIDAnnotation)}}},
+			{Name: "PGSHARD_NODE_BOOT_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeBootIDAnnotation)}}},
 		},
 		Resources:       cluster.Spec.PostgreSQL.Resources,
 		SecurityContext: postgresSecurity.DeepCopy(),

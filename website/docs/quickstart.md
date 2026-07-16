@@ -14,10 +14,13 @@ minimum data claim. When `storage.storageClassName` is omitted, the operator
 resolves the current Kubernetes default and checkpoints that exact class before
 creating any claim; later default-class rotation does not change existing data
 intent. Admission records the selected Node UID and boot ID atomically with Pod
-binding, then attaches a durable process-stop condition only to a terminal
-status update from that exact authenticated kubelet. PodGC, a missing or
-recreated Node, and a webhook outage cannot produce that receipt, so cluster
-deletion fails closed with the PVC protected. This is lifecycle protection, not
+binding and validates the final Binding after all mutators run. The PostgreSQL
+init container refuses to touch PGDATA unless that evidence reaches the Pod.
+Admission then attaches an HMAC-authenticated process-stop condition only to a
+terminal status update from that exact authenticated kubelet, and validates the
+final status after all mutators run. PodGC, copied annotation or condition text,
+a missing or recreated Node, and a webhook outage cannot produce that receipt,
+so cluster deletion fails closed with the PVC protected. This is lifecycle protection, not
 HA takeover or physical node fencing. It has no standby, promotion,
 backup execution, `shardschema`
 bootstrap, or SQL pooler. Restarting a primary interrupts that shard even though
@@ -105,12 +108,18 @@ kubectl exec --namespace pgshard-single-member \
 
 The `pgshard.io/pod-fencing=enabled` namespace label is mandatory for managed
 PostgreSQL Pods. Before publishing a workload, the controller completes an
-admission challenge through the same namespace selector used for Pod binding.
-The label then remains admission-immutable until the namespace is deleted.
-Binding admission copies the selected Node UID and boot ID into each Pod
-atomically with `spec.nodeName`; omitting the label prevents PostgreSQL
-creation. Status admission also rejects removal of the managed identity,
-binding identity, or termination finalizer. This receipt is lifecycle evidence,
+authenticated admission challenge through the same namespace selector used for
+Pod binding. The label then remains admission-immutable until the namespace is
+deleted. The handshake confirms the admission path used for that update; it is
+not a claim that every API-server selector cache has converged. Binding
+admission copies the managed identity and selected Node UID and boot ID into
+each Pod atomically with `spec.nodeName`, and final validation rejects a later
+mutator that changes them. The init container exits before accessing PGDATA if
+the binding evidence is absent, including when binding admission was skipped;
+omitting the label therefore prevents PostgreSQL startup. Status admission also
+rejects removal of the managed identity, binding identity, or termination
+finalizer and cryptographically authenticates the durable terminal receipt.
+This receipt is lifecycle evidence,
 not physical node fencing. Do not
 reuse a Node name while its old machine may still run a bound Pod; externally
 fence that machine or its storage before recovery.

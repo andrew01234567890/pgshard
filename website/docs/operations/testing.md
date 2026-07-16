@@ -572,12 +572,16 @@ and PVC remain fenced without a terminal receipt, restarts the operator, and
 verifies the authenticated kubelet receipt permits a replacement Pod to read
 the persisted row. The same test proves the namespace opt-in cannot be removed
 through ordinary or status updates, the cluster admission challenge is
-acknowledged before publication, binding admission copied the exact Node UID
-and boot ID, and status updates cannot strip managed identity, cluster identity,
-or the finalizer. Unit coverage rejects PodGC-authored `Failed`, missing
+cryptographically acknowledged before publication, binding admission preserved
+the exact managed identity and copied the exact Node UID and boot ID, and final
+status admission cannot strip managed identity, cluster identity, or the
+finalizer after mutation. The init-container contract is also exercised with
+missing binding annotations and must exit before touching PGDATA. Unit coverage
+passes a Binding and terminal status through their mutators and final validators,
+then rejects conflicting later mutations. It also rejects PodGC-authored `Failed`, missing
 Nodes, same-name replacement Nodes, changed boot IDs, wrong kubelet identities,
-running-container terminal reports, forged receipts, and receipt or binding
-metadata changes, including through the status subresource. It permits release
+running-container terminal reports, copied or forged HMAC receipts, and receipt
+or binding metadata changes, including through the status subresource. It permits release
 only after the admitted condition (or when
 the Pod was never assigned) and refuses to prune a managed workload whose Pod
 lacks its finalizer. Fault injection separately places a late StatefulSet Pod

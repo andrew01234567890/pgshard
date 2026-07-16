@@ -9,6 +9,13 @@ Milestone 1 is under active development. Design contracts describe the intended
 end state; they are not claims that a feature is available. This page is updated
 in the same pull request whenever implementation status changes.
 
+The current Pod-lifecycle slice cryptographically authenticates cluster and
+terminal receipts. Binding and status each have a final validator after their
+mutator, and PostgreSQL startup fails before PGDATA access when binding-time
+Node evidence is absent. The namespace handshake proves the selected admission
+path handled a fresh challenge; it is not evidence that every API-server
+selector cache converged simultaneously.
+
 | Area | Current evidence | Status |
 |---|---|---|
 | Core key ranges and routing hash | Rust types, no-allocation hash, golden vectors, microbenchmark | Implemented in source |

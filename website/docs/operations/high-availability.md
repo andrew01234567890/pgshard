@@ -161,14 +161,20 @@ credential tombstone back to it. The exact claim name cannot be reused until
 the mounting workload is pruned, so a late empty claim cannot enter bootstrap.
 Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
 finalizer. Before workload publication, a cluster challenge update proves that
-admission has observed the namespace's immutable fencing opt-in. Binding
-admission then copies the selected Node UID and boot ID into the Pod atomically
-with `spec.nodeName`. Status admission rejects attempts to remove the managed
-identity, binding identity, or finalizer through the status subresource. On
-deletion, it adds a
-durable process-terminated condition only to a terminal update from the
-authenticated kubelet for that same live Node incarnation. PodGC's
-control-plane-authored `Failed` phase cannot create this condition. An uncached
+the selected admission path has observed the namespace's immutable fencing
+opt-in and returns an HMAC receipt bound to the cluster UID and fresh challenge.
+This does not prove simultaneous selector-cache convergence across every API
+server. Binding admission copies the managed identity and selected Node UID and
+boot ID into the Pod atomically with `spec.nodeName`; a final validator checks
+the result after every mutator. The init container reads those annotations
+through the Downward API and exits before touching PGDATA if either is absent,
+which independently closes a missed-binding-admission path. Status admission
+rejects attempts to remove the managed identity, binding identity, or finalizer
+through the status subresource. On deletion, it adds a durable HMAC-authenticated
+process-terminated condition only to a terminal update from the authenticated
+kubelet for that same live Node incarnation, and a final validator rechecks the
+post-mutation status. PodGC's control-plane-authored `Failed` phase and copied
+condition text cannot create this condition. An uncached
 Pod read must then prove absence before PVC protection is released. If admission
 is unavailable, the Node is absent or rebooted, or the Node name now identifies
 another UID, deletion deliberately remains blocked and the PVC stays protected.
