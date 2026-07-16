@@ -51,6 +51,37 @@ pub enum ScramMechanisms {
     Sha256Plus,
 }
 
+/// Proof that this process successfully encoded a bounded SCRAM advertisement.
+///
+/// The frontend decoder requires this token before it will enter SCRAM framing,
+/// so a caller cannot select the 1,024-byte authentication limit without first
+/// producing the corresponding server challenge through the checked encoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScramAuthenticationPhase {
+    _private: (),
+}
+
+/// A complete encoded SCRAM advertisement and its frontend-phase proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncodedScramAdvertisement {
+    frame_length: usize,
+    phase: ScramAuthenticationPhase,
+}
+
+impl EncodedScramAdvertisement {
+    /// Returns the initialized prefix length in the caller-owned output buffer.
+    #[must_use]
+    pub const fn frame_length(self) -> usize {
+        self.frame_length
+    }
+
+    /// Returns the proof required to decode the client's SCRAM responses.
+    #[must_use]
+    pub const fn frontend_phase(self) -> ScramAuthenticationPhase {
+        self.phase
+    }
+}
+
 impl ScramMechanisms {
     const fn ordered(self) -> &'static [&'static [u8]] {
         match self {
@@ -81,7 +112,7 @@ pub const fn encode_authentication_ok() -> [u8; AUTHENTICATION_OK_FRAME_LENGTH] 
 pub fn encode_authentication_sasl(
     mechanisms: ScramMechanisms,
     output: &mut [u8],
-) -> Result<usize, BackendEncodeError> {
+) -> Result<EncodedScramAdvertisement, BackendEncodeError> {
     let mechanisms = mechanisms.ordered();
     let body_length = mechanisms.iter().try_fold(
         5_usize,
@@ -108,7 +139,10 @@ pub fn encode_authentication_sasl(
     output[offset] = 0;
     offset += 1;
     debug_assert_eq!(offset, frame_length);
-    Ok(frame_length)
+    Ok(EncodedScramAdvertisement {
+        frame_length,
+        phase: ScramAuthenticationPhase { _private: () },
+    })
 }
 
 /// Encodes a minimal `PostgreSQL` 18 `ErrorResponse` into caller-owned storage.
@@ -189,14 +223,17 @@ pub fn encode_error_response(
 
 /// Encodes opaque `AuthenticationSASLContinue` bytes.
 ///
-/// The output is not modified on error. The exchange owner must validate the
-/// SCRAM state and generated payload before calling this wire primitive.
+/// The encoder-issued `phase` proves that this process first produced a
+/// bounded SCRAM advertisement. The output is not modified on error. The
+/// exchange owner must still bind the proof to the same connection, validate
+/// the SCRAM state, and validate the generated payload.
 ///
 /// # Errors
 ///
 /// Rejects a complete frame above libpq's startup-message bound, arithmetic
 /// overflow, or caller-owned storage smaller than the complete frame.
 pub fn encode_authentication_sasl_continue(
+    _phase: ScramAuthenticationPhase,
     data: &[u8],
     output: &mut [u8],
 ) -> Result<usize, BackendEncodeError> {
@@ -205,14 +242,17 @@ pub fn encode_authentication_sasl_continue(
 
 /// Encodes opaque `AuthenticationSASLFinal` bytes.
 ///
-/// The output is not modified on error. The exchange owner must validate the
-/// SCRAM state and generated payload before calling this wire primitive.
+/// The encoder-issued `phase` proves that this process first produced a
+/// bounded SCRAM advertisement. The output is not modified on error. The
+/// exchange owner must still bind the proof to the same connection, validate
+/// the SCRAM state, and validate the generated payload.
 ///
 /// # Errors
 ///
 /// Rejects a complete frame above libpq's startup-message bound, arithmetic
 /// overflow, or caller-owned storage smaller than the complete frame.
 pub fn encode_authentication_sasl_final(
+    _phase: ScramAuthenticationPhase,
     data: &[u8],
     output: &mut [u8],
 ) -> Result<usize, BackendEncodeError> {
@@ -526,6 +566,13 @@ mod tests {
         frame
     }
 
+    fn scram_phase() -> ScramAuthenticationPhase {
+        let mut output = [0; 64];
+        encode_authentication_sasl(ScramMechanisms::Sha256, &mut output)
+            .expect("fixed SCRAM advertisement")
+            .frontend_phase()
+    }
+
     #[test]
     fn fixed_startup_controls_round_trip() {
         let authentication = encode_authentication_ok();
@@ -554,19 +601,27 @@ mod tests {
             ),
         ] {
             let mut output = [0; 64];
-            let length = encode_authentication_sasl(advertisement, &mut output)
+            let encoded = encode_authentication_sasl(advertisement, &mut output)
                 .expect("fixed SCRAM advertisement");
+            let length = encoded.frame_length();
+            let _phase = encoded.frontend_phase();
             let request = decode_authentication_request(complete(&output[..length]))
                 .expect("encoded AuthenticationSASL");
             let AuthenticationRequest::Sasl { mechanisms } = request else {
                 panic!("encoded another authentication request");
             };
-            assert_eq!(mechanisms.collect::<Vec<_>>(), expected);
+            assert_eq!(
+                mechanisms
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("validated mechanisms"),
+                expected
+            );
         }
 
         let mut output = [0; 64];
         let continue_data = b"r=nonce,s=c2FsdA==,i=4096";
-        let length = encode_authentication_sasl_continue(continue_data, &mut output)
+        let phase = scram_phase();
+        let length = encode_authentication_sasl_continue(phase, continue_data, &mut output)
             .expect("bounded AuthenticationSASLContinue");
         let request = decode_authentication_request(complete(&output[..length]))
             .expect("encoded AuthenticationSASLContinue");
@@ -576,7 +631,7 @@ mod tests {
         assert_eq!(data, continue_data);
 
         let final_data = b"v=c2lnbmF0dXJl";
-        let length = encode_authentication_sasl_final(final_data, &mut output)
+        let length = encode_authentication_sasl_final(phase, final_data, &mut output)
             .expect("bounded AuthenticationSASLFinal");
         let request = decode_authentication_request(complete(&output[..length]))
             .expect("encoded AuthenticationSASLFinal");
@@ -661,7 +716,13 @@ mod tests {
         let decoded = decode_protocol_negotiation(complete(&output[..length]))
             .expect("encoded protocol negotiation");
         assert_eq!(decoded.selected_protocol(), protocol(3, 2));
-        assert_eq!(decoded.unsupported_options().collect::<Vec<_>>(), options);
+        assert_eq!(
+            decoded
+                .unsupported_options()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated protocol options"),
+            options
+        );
 
         let length = encode_protocol_negotiation(protocol(3, 0), &[], &mut output)
             .expect("empty option list");
@@ -750,14 +811,15 @@ mod tests {
     #[test]
     fn variable_encoders_fail_before_modifying_output() {
         assert!(matches!(
-            assert_error_does_not_modify(|output| encode_authentication_sasl(
-                ScramMechanisms::Sha256Plus,
-                &mut output[..8],
-            )),
+            assert_error_does_not_modify(|output| {
+                encode_authentication_sasl(ScramMechanisms::Sha256Plus, &mut output[..8])
+                    .map(EncodedScramAdvertisement::frame_length)
+            }),
             BackendEncodeError::OutputTooSmall { .. }
         ));
         assert!(matches!(
             assert_error_does_not_modify(|output| encode_authentication_sasl_continue(
+                scram_phase(),
                 b"challenge",
                 &mut output[..8],
             )),
@@ -846,8 +908,9 @@ mod tests {
         let maximum_sasl_data_length = BACKEND_STARTUP_MESSAGE_LENGTH - 8;
         let sasl_data = vec![b'x'; maximum_sasl_data_length];
         let mut sasl_output = vec![0; BACKEND_STARTUP_MESSAGE_LENGTH + 1];
-        let length = encode_authentication_sasl_continue(&sasl_data, &mut sasl_output)
-            .expect("maximum AuthenticationSASLContinue");
+        let length =
+            encode_authentication_sasl_continue(scram_phase(), &sasl_data, &mut sasl_output)
+                .expect("maximum AuthenticationSASLContinue");
         assert_eq!(length, BACKEND_STARTUP_MESSAGE_LENGTH + 1);
         let AuthenticationRequest::SaslContinue { data } =
             decode_authentication_request(complete(&sasl_output))
@@ -903,7 +966,7 @@ mod tests {
             .expect("maximum NegotiateProtocolVersion frame");
         assert_eq!(
             decoded.unsupported_options().next(),
-            Some(option.as_slice())
+            Some(Ok(option.as_slice()))
         );
     }
 
@@ -913,7 +976,7 @@ mod tests {
         let original = output;
         let oversized_sasl_data = vec![b'x'; BACKEND_STARTUP_MESSAGE_LENGTH - 7];
         assert_eq!(
-            encode_authentication_sasl_final(&oversized_sasl_data, &mut output),
+            encode_authentication_sasl_final(scram_phase(), &oversized_sasl_data, &mut output,),
             Err(BackendEncodeError::MessageTooLarge {
                 actual: BACKEND_STARTUP_MESSAGE_LENGTH + 1,
                 maximum: BACKEND_STARTUP_MESSAGE_LENGTH,
@@ -1050,8 +1113,12 @@ mod tests {
             )
             .expect_err("short diagnostic output"),
             encode_backend_key_data(1, b"s3k", &mut output).expect_err("short secret key"),
-            encode_authentication_sasl_continue(b"server-nonce-secret", &mut output[..8])
-                .expect_err("short SASL output"),
+            encode_authentication_sasl_continue(
+                scram_phase(),
+                b"server-nonce-secret",
+                &mut output[..8],
+            )
+            .expect_err("short SASL output"),
             encode_parameter_status("name", "topsecret\0payload", &mut output)
                 .expect_err("embedded parameter terminator"),
             encode_protocol_negotiation(protocol(3, 2), &[b"private-option"], &mut output)

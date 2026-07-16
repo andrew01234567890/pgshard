@@ -54,6 +54,7 @@ fn main() {
         };
         let bind = decode_bind(frame, client_encoding).expect("bind decode");
         for parameter in bind.parameters().iter() {
+            let parameter = parameter.expect("validated benchmark Bind parameter");
             digest = digest.wrapping_add(parameter.value().map_or(0, <[u8]>::len));
         }
     }

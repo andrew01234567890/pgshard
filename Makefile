@@ -1,4 +1,4 @@
-.PHONY: check rust-check rust-static rust-test catalog-test orch-catalog-test orch-slot-observer-test pgwire-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check actions-check public-check images release-build
+.PHONY: check rust-check rust-static rust-test pgwire-fuzz-static catalog-test orch-catalog-test orch-slot-observer-test pgwire-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check actions-check public-check images release-build
 
 PGSHARD_GIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
 PGSHARD_BUILD_VERSION ?= 0.0.0-dev+local.$(shell printf '%.12s' "$(PGSHARD_GIT_SHA)")$(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" || printf '.dirty')
@@ -10,11 +10,17 @@ check: rust-check proto-check go-check docs-check actions-check public-check
 
 rust-check: rust-static rust-test
 
-rust-static:
+rust-static: pgwire-fuzz-static
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 	cargo deny --locked check
 	cargo audit --deny warnings
+
+pgwire-fuzz-static:
+	cargo fmt --manifest-path crates/pgshard-pgwire/fuzz/Cargo.toml --all -- --check
+	cargo clippy --manifest-path crates/pgshard-pgwire/fuzz/Cargo.toml --all-targets --locked -- -D warnings
+	cargo deny --locked --manifest-path crates/pgshard-pgwire/fuzz/Cargo.toml check
+	cargo audit --deny warnings --file crates/pgshard-pgwire/fuzz/Cargo.lock
 
 rust-test:
 	cargo test --workspace --all-features --locked

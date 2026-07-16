@@ -1,0 +1,45 @@
+[package]
+name = "pgshard-pgwire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+pgshard-pgwire = { version = "=0.1.0", path = ".." }
+
+[[bin]]
+name = "decode_startup"
+path = "fuzz_targets/decode_startup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_frontend"
+path = "fuzz_targets/decode_frontend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_backend"
+path = "fuzz_targets/decode_backend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgoutput_decoder"
+path = "fuzz_targets/pgoutput_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+resolver = "3"
