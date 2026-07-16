@@ -15,6 +15,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/pki"
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -119,9 +120,9 @@ func assertFencingKeyLossFailsReadiness(t *testing.T, ctx context.Context, kubeC
 			}
 		}
 	}
-	cleanupNeeded := true
+	dirty := false
 	defer func() {
-		if !cleanupNeeded {
+		if !dirty {
 			return
 		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
@@ -130,18 +131,30 @@ func assertFencingKeyLossFailsReadiness(t *testing.T, ctx context.Context, kubeC
 		waitForManagerReadiness(t, cleanupCtx, kubeClient, true)
 	}()
 
+	dirty = true
 	replace(ctx, nil)
 	waitForManagerReadiness(t, ctx, kubeClient, false)
 	replace(ctx, valid())
+	dirty = false
 	waitForManagerReadiness(t, ctx, kubeClient, true)
 
 	malformed := valid()
-	malformed.Data[pki.PodFencingKeyKey] = make([]byte, 31)
+	malformed.Data[pki.PodFencingKeyKey] = make([]byte, podfence.SecretKeyBytes-1)
+	dirty = true
 	replace(ctx, malformed)
 	waitForManagerReadiness(t, ctx, kubeClient, false)
 	replace(ctx, valid())
+	dirty = false
 	waitForManagerReadiness(t, ctx, kubeClient, true)
-	cleanupNeeded = false
+
+	different := valid()
+	different.Data[pki.PodFencingKeyKey][0] ^= 0xff
+	dirty = true
+	replace(ctx, different)
+	waitForManagerReadiness(t, ctx, kubeClient, false)
+	replace(ctx, valid())
+	dirty = false
+	waitForManagerReadiness(t, ctx, kubeClient, true)
 }
 
 func waitForManagerReadiness(t *testing.T, ctx context.Context, kubeClient client.Client, wanted bool) {
@@ -186,8 +199,11 @@ func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient cli
 	if caSecret.Labels[pki.ManagedByLabel] != pki.ManagedByValue || servingSecret.Labels[pki.ManagedByLabel] != pki.ManagedByValue || fencingKeySecret.Labels[pki.ManagedByLabel] != pki.ManagedByValue {
 		t.Fatalf("webhook Secret ownership = %#v / %#v / %#v", caSecret.Labels, servingSecret.Labels, fencingKeySecret.Labels)
 	}
-	if fencingKeySecret.Immutable == nil || !*fencingKeySecret.Immutable || len(fencingKeySecret.Data) != 1 || len(fencingKeySecret.Data[pki.PodFencingKeyKey]) != 32 {
+	if fencingKeySecret.Immutable == nil || !*fencingKeySecret.Immutable || len(fencingKeySecret.Data) != 1 || len(fencingKeySecret.Data[pki.PodFencingKeyKey]) != podfence.SecretKeyBytes {
 		t.Fatalf("webhook Pod fencing key = %#v", fencingKeySecret)
+	}
+	if !bytes.Equal(caSecret.Data[pki.PodFencingKeyFingerprintKey], podfence.SecretHandshakeKeyFingerprint(fencingKeySecret.Data[pki.PodFencingKeyKey])) {
+		t.Fatal("webhook CA Secret does not anchor the Pod fencing key")
 	}
 	if _, err := tls.X509KeyPair(servingSecret.Data[pki.TLSCertificateKey], servingSecret.Data[pki.TLSPrivateKeyKey]); err != nil {
 		t.Fatalf("serving key pair: %v", err)

@@ -52,6 +52,8 @@ const (
 	defaultPodFencingKeyNamespace = "pgshard-system"
 	defaultPodFencingKeySecret    = "pgshard-webhook-fencing-key"
 	defaultPodFencingKeyData      = "hmac.key"
+	defaultPodFencingAnchorSecret = "pgshard-webhook-ca"
+	defaultPodFencingAnchorData   = "pod-fencing-key.sha256"
 )
 
 // PgShardClusterReconciler owns safe supporting resources and single-member
@@ -64,10 +66,12 @@ type PgShardClusterReconciler struct {
 	// gates, storage-class selection, replica handoff, deletion-finalizer absence
 	// proofs, and post-apply workload status.
 	// Writes and plan reconciliation continue through Client.
-	APIReader           client.Reader
-	Images              owned.Images
-	PodFencingKeySecret types.NamespacedName
-	PodFencingKeyData   string
+	APIReader              client.Reader
+	Images                 owned.Images
+	PodFencingKeySecret    types.NamespacedName
+	PodFencingKeyData      string
+	PodFencingAnchorSecret types.NamespacedName
+	PodFencingAnchorData   string
 }
 
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
@@ -304,7 +308,18 @@ func (r *PgShardClusterReconciler) podFencingHandshakeCodec() *podfence.Handshak
 	if dataKey == "" {
 		dataKey = defaultPodFencingKeyData
 	}
-	return podfence.NewSecretHandshakeCodec(r.authoritativeReader(), secret, dataKey)
+	anchor := r.PodFencingAnchorSecret
+	if anchor.Namespace == "" {
+		anchor.Namespace = defaultPodFencingKeyNamespace
+	}
+	if anchor.Name == "" {
+		anchor.Name = defaultPodFencingAnchorSecret
+	}
+	anchorData := r.PodFencingAnchorData
+	if anchorData == "" {
+		anchorData = defaultPodFencingAnchorData
+	}
+	return podfence.NewSecretHandshakeCodec(r.authoritativeReader(), secret, dataKey, anchor, anchorData)
 }
 
 func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {

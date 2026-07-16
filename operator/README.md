@@ -340,9 +340,15 @@ Before the webhook listener starts, each manager Pod creates an ECDSA P-256 CA,
 a TLS 1.3 serving key pair, and a separate random 256-bit fencing key in those
 Secrets, validates the Service references, injects the CA bundle, and writes the
 serving files into a private memory-backed `emptyDir`. The fencing key Secret is
-made immutable by the same update that initializes it. It authenticates cluster-
-handshake and Pod-termination receipts independently of certificate renewal or
-CA encoding; the key bytes are never stored in resource annotations.
+made immutable by the same update that initializes it. A SHA-256 continuity
+fingerprint is stored separately in the CA Secret. Startup, readiness, webhook
+admission, and controller reconciliation all require the exact immutable key to
+match that anchor, so an empty, mutable, oversized, or different replacement
+fails closed instead of silently invalidating outstanding receipts. Existing
+installs without the fingerprint anchor their current key without rotating it.
+The key authenticates cluster-handshake and Pod-termination receipts
+independently of certificate renewal or CA encoding; its bytes are never stored
+in resource annotations.
 The 90-day serving certificate is checked hourly and renewed 30
 days before expiry. Controller-runtime reloads a renewed key pair without a Pod
 restart, and readiness fails if the local certificate becomes untrusted,
@@ -355,9 +361,11 @@ Automatic CA rotation is not implemented. The generated CA is valid for about
 ten years, and startup fails once it can no longer safely issue a full 90-day
 leaf certificate. This explicit boundary avoids an unsafe one-step CA swap;
 overlapping trust and rollout proof are required before automated CA rotation
-is added. Automatic fencing-key rotation is also not implemented; replacing its
-immutable Secret requires an explicit recovery boundary for outstanding
-termination receipts.
+is added. Automatic fencing-key rotation is also not implemented. Restore the
+original Secret after accidental loss. Changing the key or its CA-Secret
+continuity anchor is an explicit recovery operation that invalidates outstanding
+cluster and termination receipts and is unsafe while any fenced lifecycle is
+unresolved.
 
 After loading the three local images, install the admission path with:
 

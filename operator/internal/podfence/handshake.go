@@ -1,6 +1,7 @@
 package podfence
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -9,18 +10,23 @@ import (
 	"fmt"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const handshakeReceiptVersion = "v1"
+const (
+	handshakeReceiptVersion = "v1"
+	// SecretKeyBytes is the exact length of a pgshard receipt key.
+	SecretKeyBytes = sha256.Size
+)
 
 type HandshakeCodec struct {
 	key func(context.Context) ([]byte, error)
 }
 
-func NewSecretHandshakeCodec(reader client.Reader, secret types.NamespacedName, dataKey string) *HandshakeCodec {
+func NewSecretHandshakeCodec(reader client.Reader, secret types.NamespacedName, dataKey string, anchorSecret types.NamespacedName, anchorDataKey string) *HandshakeCodec {
 	return &HandshakeCodec{key: func(ctx context.Context) ([]byte, error) {
 		if reader == nil {
 			return nil, fmt.Errorf("Pod fencing handshake Secret reader is required")
@@ -29,21 +35,84 @@ func NewSecretHandshakeCodec(reader client.Reader, secret types.NamespacedName, 
 		if err := reader.Get(ctx, secret, value); err != nil {
 			return nil, fmt.Errorf("read Pod fencing handshake Secret %s: %w", secret, err)
 		}
-		key := value.Data[dataKey]
-		if len(key) < sha256.Size {
-			return nil, fmt.Errorf("Pod fencing handshake Secret %s key %q is missing or too short", secret, dataKey)
+		key, err := ValidateSecretHandshakeKey(value, dataKey)
+		if err != nil {
+			return nil, err
+		}
+		anchor := &corev1.Secret{}
+		if err := reader.Get(ctx, anchorSecret, anchor); err != nil {
+			return nil, fmt.Errorf("read Pod fencing handshake anchor Secret %s: %w", anchorSecret, err)
+		}
+		if err := ValidateSecretHandshakeKeyFingerprint(anchor, anchorDataKey, key); err != nil {
+			return nil, err
 		}
 		return key, nil
 	}}
 }
 
 func NewStaticHandshakeCodec(key []byte) *HandshakeCodec {
+	key = bytes.Clone(key)
 	return &HandshakeCodec{key: func(context.Context) ([]byte, error) {
-		if len(key) < sha256.Size {
-			return nil, fmt.Errorf("Pod fencing handshake key is too short")
+		if len(key) != SecretKeyBytes {
+			return nil, fmt.Errorf("Pod fencing handshake key must be exactly %d bytes", SecretKeyBytes)
 		}
 		return key, nil
 	}}
+}
+
+// ValidateSecretHandshakeKey returns the exact immutable key from an
+// operator-owned Secret.
+func ValidateSecretHandshakeKey(secret *corev1.Secret, dataKey string) ([]byte, error) {
+	if err := validateOwnedOpaqueSecret(secret); err != nil {
+		return nil, err
+	}
+	if secret.Immutable == nil || !*secret.Immutable {
+		return nil, fmt.Errorf("Pod fencing handshake Secret %s/%s must be immutable", secret.Namespace, secret.Name)
+	}
+	key, exists := secret.Data[dataKey]
+	if dataKey == "" || len(secret.Data) != 1 || !exists || len(key) != SecretKeyBytes {
+		return nil, fmt.Errorf("Pod fencing handshake Secret %s/%s must contain exactly one %d-byte %s", secret.Namespace, secret.Name, SecretKeyBytes, dataKey)
+	}
+	return bytes.Clone(key), nil
+}
+
+// SecretHandshakeKeyFingerprint returns the continuity anchor for a receipt
+// key. The fingerprint is not secret.
+func SecretHandshakeKeyFingerprint(key []byte) []byte {
+	fingerprint := sha256.Sum256(key)
+	return fingerprint[:]
+}
+
+// ValidateSecretHandshakeKeyFingerprint proves that key is the generation
+// anchored outside its replaceable key Secret.
+func ValidateSecretHandshakeKeyFingerprint(secret *corev1.Secret, dataKey string, key []byte) error {
+	if len(key) != SecretKeyBytes {
+		return fmt.Errorf("Pod fencing handshake key must be exactly %d bytes", SecretKeyBytes)
+	}
+	if err := validateOwnedOpaqueSecret(secret); err != nil {
+		return err
+	}
+	fingerprint, exists := secret.Data[dataKey]
+	if dataKey == "" || !exists || len(fingerprint) != sha256.Size {
+		return fmt.Errorf("Pod fencing handshake anchor Secret %s/%s must contain a %d-byte %s", secret.Namespace, secret.Name, sha256.Size, dataKey)
+	}
+	if !hmac.Equal(fingerprint, SecretHandshakeKeyFingerprint(key)) {
+		return fmt.Errorf("Pod fencing handshake key does not match the anchored fingerprint; restore the original key or perform explicit fencing recovery")
+	}
+	return nil
+}
+
+func validateOwnedOpaqueSecret(secret *corev1.Secret) error {
+	if secret == nil {
+		return fmt.Errorf("Pod fencing handshake Secret is required")
+	}
+	if secret.Labels[owned.ManagedByLabel] != owned.ManagedByValue {
+		return fmt.Errorf("Secret %s/%s is not labeled as managed by %s", secret.Namespace, secret.Name, owned.ManagedByValue)
+	}
+	if secret.Type != corev1.SecretTypeOpaque {
+		return fmt.Errorf("managed Secret %s/%s has type %q, want %q", secret.Namespace, secret.Name, secret.Type, corev1.SecretTypeOpaque)
+	}
+	return nil
 }
 
 func (c *HandshakeCodec) Receipt(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (string, error) {

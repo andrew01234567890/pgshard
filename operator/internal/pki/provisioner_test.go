@@ -45,8 +45,11 @@ func TestBootstrapCreatesValidIdempotentMaterial(t *testing.T) {
 	if servingSecret.Type != corev1.SecretTypeOpaque {
 		t.Fatalf("initialized serving Secret type = %q", servingSecret.Type)
 	}
-	if fencingKeySecret.Immutable == nil || !*fencingKeySecret.Immutable || len(fencingKeySecret.Data) != 1 || len(fencingKeySecret.Data[PodFencingKeyKey]) != podFencingKeyBytes {
+	if fencingKeySecret.Immutable == nil || !*fencingKeySecret.Immutable || len(fencingKeySecret.Data) != 1 || len(fencingKeySecret.Data[PodFencingKeyKey]) != podfence.SecretKeyBytes {
 		t.Fatalf("initialized Pod fencing key Secret = %#v", fencingKeySecret)
+	}
+	if !bytes.Equal(caSecret.Data[PodFencingKeyFingerprintKey], podfence.SecretHandshakeKeyFingerprint(fencingKeySecret.Data[PodFencingKeyKey])) {
+		t.Fatal("CA Secret does not anchor the initialized Pod fencing key")
 	}
 	authority, err := parseCertificateAuthority(caSecret.Data[CACertificateKey], caSecret.Data[CAPrivateKeyKey], now)
 	if err != nil {
@@ -166,10 +169,32 @@ func TestCheckerRejectsMissingOrMalformedPodFencingKey(t *testing.T) {
 					},
 					Type:      corev1.SecretTypeOpaque,
 					Immutable: &immutable,
-					Data:      map[string][]byte{PodFencingKeyKey: make([]byte, podFencingKeyBytes-1)},
+					Data:      map[string][]byte{PodFencingKeyKey: make([]byte, podfence.SecretKeyBytes-1)},
 				})
 			},
 			want: "exactly one 32-byte hmac.key",
+		},
+		{
+			name: "different valid key",
+			mutate: func(ctx context.Context, kubeClient client.Client, secret *corev1.Secret) error {
+				if err := kubeClient.Delete(ctx, secret); err != nil {
+					return err
+				}
+				replacement := bytes.Clone(secret.Data[PodFencingKeyKey])
+				replacement[0] ^= 0xff
+				immutable := true
+				return kubeClient.Create(ctx, &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: secret.Namespace,
+						Name:      secret.Name,
+						Labels:    map[string]string{ManagedByLabel: ManagedByValue},
+					},
+					Type:      corev1.SecretTypeOpaque,
+					Immutable: &immutable,
+					Data:      map[string][]byte{PodFencingKeyKey: replacement},
+				})
+			},
+			want: "does not match the anchored fingerprint",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -188,6 +213,92 @@ func TestCheckerRejectsMissingOrMalformedPodFencingKey(t *testing.T) {
 				t.Fatalf("Checker() error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestBootstrapRefusesRecreatedFencingKeyAfterContinuityIsAnchored(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name        string
+		replacement func(*corev1.Secret) *corev1.Secret
+		want        string
+	}{
+		{
+			name: "empty",
+			replacement: func(original *corev1.Secret) *corev1.Secret {
+				return &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Namespace: original.Namespace, Name: original.Name, Labels: map[string]string{ManagedByLabel: ManagedByValue}},
+					Type:       corev1.SecretTypeOpaque,
+				}
+			},
+			want: "continuity fingerprint exists",
+		},
+		{
+			name: "different valid key",
+			replacement: func(original *corev1.Secret) *corev1.Secret {
+				key := bytes.Clone(original.Data[PodFencingKeyKey])
+				key[0] ^= 0xff
+				immutable := true
+				return &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Namespace: original.Namespace, Name: original.Name, Labels: map[string]string{ManagedByLabel: ManagedByValue}},
+					Type:       corev1.SecretTypeOpaque,
+					Immutable:  &immutable,
+					Data:       map[string][]byte{PodFencingKeyKey: key},
+				}
+			},
+			want: "does not match the anchored fingerprint",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			kubeClient := newTestClient(t, installObjects()...)
+			provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+			if err := provisioner.Bootstrap(ctx); err != nil {
+				t.Fatal(err)
+			}
+			original := getSecret(t, kubeClient, testFencingKeySecretName)
+			if err := kubeClient.Delete(ctx, original); err != nil {
+				t.Fatal(err)
+			}
+			if err := kubeClient.Create(ctx, test.replacement(original)); err != nil {
+				t.Fatal(err)
+			}
+			if err := provisioner.Bootstrap(ctx); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Bootstrap() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBootstrapAnchorsAnExistingFencingKeyWithoutReplacingIt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	kubeClient := newTestClient(t, installObjects()...)
+	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keyBefore := getSecret(t, kubeClient, testFencingKeySecretName)
+	caSecret := getSecret(t, kubeClient, testCASecretName)
+	delete(caSecret.Data, PodFencingKeyFingerprintKey)
+	if err := kubeClient.Update(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keyAfter := getSecret(t, kubeClient, testFencingKeySecretName)
+	caSecret = getSecret(t, kubeClient, testCASecretName)
+	if keyAfter.ResourceVersion != keyBefore.ResourceVersion || !bytes.Equal(keyAfter.Data[PodFencingKeyKey], keyBefore.Data[PodFencingKeyKey]) {
+		t.Fatal("continuity migration replaced the existing Pod fencing key")
+	}
+	if !bytes.Equal(caSecret.Data[PodFencingKeyFingerprintKey], podfence.SecretHandshakeKeyFingerprint(keyBefore.Data[PodFencingKeyKey])) {
+		t.Fatal("continuity migration did not anchor the existing Pod fencing key")
+	}
+	if err := provisioner.Checker(nil); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -215,9 +326,19 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 		{
 			name: "mutable initialized fencing key",
 			mutate: func(objects []client.Object) {
-				objects[4].(*corev1.Secret).Data = map[string][]byte{PodFencingKeyKey: make([]byte, podFencingKeyBytes)}
+				objects[4].(*corev1.Secret).Data = map[string][]byte{PodFencingKeyKey: make([]byte, podfence.SecretKeyBytes)}
 			},
 			want: "must be immutable",
+		},
+		{
+			name: "oversized initialized fencing key",
+			mutate: func(objects []client.Object) {
+				immutable := true
+				secret := objects[4].(*corev1.Secret)
+				secret.Immutable = &immutable
+				secret.Data = map[string][]byte{PodFencingKeyKey: make([]byte, podfence.SecretKeyBytes+1)}
+			},
+			want: "exactly one 32-byte",
 		},
 		{
 			name: "foreign CA bundle",

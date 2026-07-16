@@ -3462,10 +3462,21 @@ func withPodFencingNamespaces(t *testing.T, objects []client.Object) []client.Ob
 		}
 		namespace.Labels[podfence.NamespaceLabel] = podfence.NamespaceLabelValue
 	}
-	prepared = append(prepared, &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingKeySecret},
-		Data:       map[string][]byte{defaultPodFencingKeyData: []byte(testPodFencingKey)},
-	})
+	immutable := true
+	managedLabels := map[string]string{owned.ManagedByLabel: owned.ManagedByValue}
+	prepared = append(prepared,
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingKeySecret, Labels: maps.Clone(managedLabels)},
+			Type:       corev1.SecretTypeOpaque,
+			Immutable:  &immutable,
+			Data:       map[string][]byte{defaultPodFencingKeyData: []byte(testPodFencingKey)},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingAnchorSecret, Labels: maps.Clone(managedLabels)},
+			Type:       corev1.SecretTypeOpaque,
+			Data:       map[string][]byte{defaultPodFencingAnchorData: podfence.SecretHandshakeKeyFingerprint([]byte(testPodFencingKey))},
+		},
+	)
 	return prepared
 }
 

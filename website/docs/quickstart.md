@@ -82,10 +82,12 @@ kubectl apply --namespace pgshard-development -f operator/config/samples/pgshard
 
 The admission overlay provisions an ECDSA serving chain and a separate immutable
 256-bit fencing key into exact-name operator-managed Secrets, injects the CA
-bundle, and keeps semantic validation fail closed. Receipt verification is
-therefore independent of leaf renewal and CA encoding. The leaf certificate
-renews without a Pod restart; automatic CA or fencing-key rotation is not yet
-implemented. Expect the sample to remain `Ready=False`, its
+bundle, and anchors the key's SHA-256 continuity fingerprint in the independent
+CA Secret. Startup, readiness, admission, and reconciliation reject an empty,
+mutable, incorrectly sized, or different replacement key. Receipt verification
+is therefore independent of leaf renewal and CA encoding without silently
+accepting key replacement. The leaf certificate renews without a Pod restart;
+automatic CA or fencing-key rotation is not yet implemented. Expect the sample to remain `Ready=False`, its
 pooler and orchestrator Pods to remain unready, and its application Services to
 have no ready endpoints. This path is for source validation only.
 

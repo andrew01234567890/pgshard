@@ -32,6 +32,9 @@ const (
 	ManagedByLabel   = "app.kubernetes.io/managed-by"
 	ManagedByValue   = "pgshard-operator"
 	PodFencingKeyKey = "hmac.key"
+	// PodFencingKeyFingerprintKey anchors key continuity in the independent CA
+	// Secret so replacing the key Secret cannot silently invalidate receipts.
+	PodFencingKeyFingerprintKey = "pod-fencing-key.sha256"
 
 	defaultBootstrapTimeout    = 90 * time.Second
 	defaultMaintenanceInterval = time.Hour
@@ -42,7 +45,6 @@ const (
 	validatingWebhookPath      = "/validate-pgshard-io-v1alpha1-pgshardcluster"
 	webhookServicePort         = int32(443)
 	webhookTimeoutSeconds      = int32(5)
-	podFencingKeyBytes         = 32
 )
 
 type Config struct {
@@ -244,11 +246,11 @@ func (p *Provisioner) Checker(request *http.Request) error {
 }
 
 func (p *Provisioner) ensureOnce(ctx context.Context) error {
-	if err := p.ensurePodFencingKey(ctx); err != nil {
-		return err
-	}
 	authority, err := p.ensureAuthority(ctx)
 	if err != nil {
+		return err
+	}
+	if err := p.ensurePodFencingKey(ctx); err != nil {
 		return err
 	}
 	configs, err := p.readConfigurations(ctx, authority.certificatePEM)
@@ -273,6 +275,10 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	anchor, anchored, err := p.readPodFencingKeyAnchor(ctx)
+	if err != nil {
+		return err
+	}
 	if len(secret.Data) == 0 {
 		if err := validatePodFencingKeyMetadata(secret); err != nil {
 			return err
@@ -280,7 +286,10 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 		if secret.Immutable != nil && *secret.Immutable {
 			return fmt.Errorf("empty Pod fencing key Secret %s/%s is immutable", secret.Namespace, secret.Name)
 		}
-		value := make([]byte, podFencingKeyBytes)
+		if anchored {
+			return fmt.Errorf("Pod fencing key Secret is empty but a continuity fingerprint exists; restore the original key or perform explicit fencing recovery")
+		}
+		value := make([]byte, podfence.SecretKeyBytes)
 		if _, err := io.ReadFull(p.random, value); err != nil {
 			return fmt.Errorf("generate Pod fencing key: %w", err)
 		}
@@ -290,9 +299,19 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 		if err := p.client.Update(ctx, secret); err != nil {
 			return fmt.Errorf("initialize Pod fencing key Secret: %w", err)
 		}
-		return nil
 	}
-	return validateInitializedPodFencingKey(secret)
+	key, err := podfence.ValidateSecretHandshakeKey(secret, PodFencingKeyKey)
+	if err != nil {
+		return err
+	}
+	if anchored {
+		return podfence.ValidateSecretHandshakeKeyFingerprint(anchor, PodFencingKeyFingerprintKey, key)
+	}
+	anchor.Data[PodFencingKeyFingerprintKey] = podfence.SecretHandshakeKeyFingerprint(key)
+	if err := p.client.Update(ctx, anchor); err != nil {
+		return fmt.Errorf("anchor Pod fencing key fingerprint: %w", err)
+	}
+	return p.checkPodFencingKey(ctx)
 }
 
 func (p *Provisioner) checkPodFencingKey(ctx context.Context) error {
@@ -300,7 +319,18 @@ func (p *Provisioner) checkPodFencingKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return validateInitializedPodFencingKey(secret)
+	key, err := podfence.ValidateSecretHandshakeKey(secret, PodFencingKeyKey)
+	if err != nil {
+		return err
+	}
+	anchor, anchored, err := p.readPodFencingKeyAnchor(ctx)
+	if err != nil {
+		return err
+	}
+	if !anchored {
+		return fmt.Errorf("Pod fencing key continuity fingerprint is missing")
+	}
+	return podfence.ValidateSecretHandshakeKeyFingerprint(anchor, PodFencingKeyFingerprintKey, key)
 }
 
 func (p *Provisioner) readPodFencingKey(ctx context.Context) (*corev1.Secret, error) {
@@ -312,18 +342,20 @@ func (p *Provisioner) readPodFencingKey(ctx context.Context) (*corev1.Secret, er
 	return secret, nil
 }
 
-func validateInitializedPodFencingKey(secret *corev1.Secret) error {
-	if err := validatePodFencingKeyMetadata(secret); err != nil {
-		return err
+func (p *Provisioner) readPodFencingKeyAnchor(ctx context.Context) (*corev1.Secret, bool, error) {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: p.namespace, Name: p.caSecretName}
+	if err := p.client.Get(ctx, key, secret); err != nil {
+		return nil, false, fmt.Errorf("get Pod fencing key anchor Secret: %w", err)
 	}
-	value, exists := secret.Data[PodFencingKeyKey]
-	if len(secret.Data) != 1 || !exists || len(value) != podFencingKeyBytes {
-		return fmt.Errorf("managed Pod fencing key Secret must be empty or contain exactly one %d-byte %s", podFencingKeyBytes, PodFencingKeyKey)
+	if err := validateManagedSecret(secret, corev1.SecretTypeOpaque); err != nil {
+		return nil, false, err
 	}
-	if secret.Immutable == nil || !*secret.Immutable {
-		return fmt.Errorf("initialized Pod fencing key Secret %s/%s must be immutable", secret.Namespace, secret.Name)
+	fingerprint, exists := secret.Data[PodFencingKeyFingerprintKey]
+	if exists && len(fingerprint) != podfence.SecretKeyBytes {
+		return nil, false, fmt.Errorf("Pod fencing key continuity fingerprint must be exactly %d bytes", podfence.SecretKeyBytes)
 	}
-	return nil
+	return secret, exists, nil
 }
 
 func validatePodFencingKeyMetadata(secret *corev1.Secret) error {
@@ -361,8 +393,16 @@ func (p *Provisioner) ensureAuthority(ctx context.Context) (*certificateAuthorit
 	}
 	certificatePEM, certificateExists := secret.Data[CACertificateKey]
 	privateKeyPEM, privateKeyExists := secret.Data[CAPrivateKeyKey]
-	if len(secret.Data) != 2 || !certificateExists || !privateKeyExists {
-		return nil, fmt.Errorf("managed CA Secret must be empty or contain exactly %s and %s", CACertificateKey, CAPrivateKeyKey)
+	fingerprint, fingerprintExists := secret.Data[PodFencingKeyFingerprintKey]
+	wantedData := 2
+	if fingerprintExists {
+		wantedData++
+		if len(fingerprint) != podfence.SecretKeyBytes {
+			return nil, fmt.Errorf("managed CA Secret %s must be exactly %d bytes", PodFencingKeyFingerprintKey, podfence.SecretKeyBytes)
+		}
+	}
+	if len(secret.Data) != wantedData || !certificateExists || !privateKeyExists {
+		return nil, fmt.Errorf("managed CA Secret must be empty or contain exactly %s and %s, with optional %s", CACertificateKey, CAPrivateKeyKey, PodFencingKeyFingerprintKey)
 	}
 	authority, err := parseCertificateAuthority(certificatePEM, privateKeyPEM, p.now())
 	if err != nil {
