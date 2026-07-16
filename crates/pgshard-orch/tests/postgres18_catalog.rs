@@ -293,6 +293,52 @@ async fn catalog_identity(client: &Client) -> TestResult<(Uuid, u64)> {
     Ok((cluster_id, catalog_epoch))
 }
 
+async fn load_with_hostile_default_search_path(
+    database_url: &str,
+    role: &str,
+    fixture: &Fixture,
+) -> TestResult {
+    let mut config: tokio_postgres::Config = database_url.parse()?;
+    config.user(role).password("pgshard-ci-only");
+    let (reader_client, reader_connection) = config.connect(NoTls).await?;
+    let reader_task = tokio::spawn(reader_connection);
+    let exercise = async {
+        let hostile = reader_client
+            .query_one(
+                "SELECT current_setting('server_version_num'), \
+                        current_database()::pg_catalog.text, \
+                        getdatabaseencoding()::pg_catalog.text",
+                &[],
+            )
+            .await?;
+        assert_eq!(hostile.try_get::<_, String>(0)?, "1");
+        assert_eq!(hostile.try_get::<_, String>(1)?, "hostile");
+        assert_eq!(hostile.try_get::<_, String>(2)?, "SQL_ASCII");
+
+        let mut reader =
+            SlotCatalogReader::new(reader_client, CatalogOperationTimeout::default()).await?;
+        let key = LogicalConsumerShardKey::new(
+            fixture.consumer_id,
+            fixture.logical_database_id,
+            "shard-0000",
+        )?;
+        assert!(
+            reader
+                .load_standby_policy(&key, 1, limits())
+                .await?
+                .is_some(),
+            "the pinned reader must load the real catalog through a hostile role default"
+        );
+        drop(reader);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    let connection = tokio::time::timeout(Duration::from_secs(5), reader_task).await?;
+    exercise?;
+    connection??;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires PGSHARD_TEST_DATABASE_URL pointing at PostgreSQL 18 shardschema"]
 async fn loads_only_the_ready_exact_member_policy() -> TestResult {
@@ -393,6 +439,54 @@ async fn loads_only_the_ready_exact_member_policy() -> TestResult {
     drop(reader);
     drop(admin);
     tokio::time::timeout(Duration::from_secs(5), reader_task).await???;
+    tokio::time::timeout(Duration::from_secs(5), admin_task).await???;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires PGSHARD_TEST_DATABASE_URL pointing at PostgreSQL 18 shardschema"]
+async fn resets_and_pins_a_hostile_default_search_path() -> TestResult {
+    let database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
+    let (admin, admin_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let admin_task = tokio::spawn(admin_connection);
+    admin.batch_execute(MIGRATION_SQL).await?;
+    let fixture = create_fixture(&admin).await?;
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let role = format!("slot_reader_{suffix}");
+    let schema = format!("hostile_path_{suffix}");
+    admin
+        .batch_execute(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD 'pgshard-ci-only'; \
+             CREATE SCHEMA {schema}; \
+             CREATE FUNCTION {schema}.current_setting(pg_catalog.text) \
+                 RETURNS pg_catalog.text LANGUAGE sql IMMUTABLE \
+                 AS $function$ SELECT '1'::pg_catalog.text $function$; \
+             CREATE FUNCTION {schema}.current_database() \
+                 RETURNS pg_catalog.name LANGUAGE sql IMMUTABLE \
+                 AS $function$ SELECT 'hostile'::pg_catalog.name $function$; \
+             CREATE FUNCTION {schema}.getdatabaseencoding() \
+                 RETURNS pg_catalog.name LANGUAGE sql IMMUTABLE \
+                 AS $function$ SELECT 'SQL_ASCII'::pg_catalog.name $function$; \
+             GRANT CONNECT ON DATABASE shardschema TO {role}; \
+             GRANT USAGE ON SCHEMA pgshard_catalog, {schema} TO {role}; \
+             GRANT SELECT ON ALL TABLES IN SCHEMA pgshard_catalog TO {role}; \
+             ALTER ROLE {role} IN DATABASE shardschema \
+                 SET search_path TO {schema}, pg_catalog"
+        ))
+        .await?;
+
+    let exercise = load_with_hostile_default_search_path(&database_url, &role, &fixture).await;
+    let cleanup = admin
+        .batch_execute(&format!(
+            "DROP SCHEMA {schema} CASCADE; \
+             DROP OWNED BY {role}; \
+             DROP ROLE {role}"
+        ))
+        .await;
+    exercise?;
+    cleanup?;
+
+    drop(admin);
     tokio::time::timeout(Duration::from_secs(5), admin_task).await???;
     Ok(())
 }

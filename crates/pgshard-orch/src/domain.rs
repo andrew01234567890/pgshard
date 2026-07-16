@@ -1,11 +1,16 @@
 //! In-memory operation identity and conservative per-shard lease ownership.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pgshard_types::ShardId;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
+
+const DEFAULT_MAX_LEASE_TTL_MS: u64 = 15_000;
+const MAX_LEASE_TTL_MS: u64 = 300_000;
 
 /// Stable identity assigned to one orchestrator process.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -119,8 +124,6 @@ pub struct ExecutionPreconditions {
     pub catalog_epoch: u64,
     /// Fencing epoch the executor is about to install.
     pub fencing_epoch: u64,
-    /// Current Unix time in microseconds from the same execution decision.
-    pub now_unix_micros: u64,
 }
 
 /// Current lease for one shard.
@@ -135,7 +138,8 @@ pub struct ShardLease {
     pub epoch: u64,
     /// Operation whose execution is fenced by this lease.
     pub operation_id: OperationId,
-    /// Expiration timestamp in Unix milliseconds.
+    /// Reportable expiration timestamp in Unix milliseconds. Process-local
+    /// liveness is bounded independently by a monotonic deadline.
     #[serde(serialize_with = "serialize_u64_decimal")]
     pub expires_at_unix_ms: u64,
 }
@@ -149,7 +153,11 @@ where
     serializer.serialize_str(&value.to_string())
 }
 
-/// Result of a conservative lease acquisition.
+/// Informational result of a conservative lease acquisition.
+///
+/// This value describes the in-memory mutation only. It is never evidence that
+/// the lease is still live when execution is dispatched; use the returned
+/// [`LeaseGrant`] to revalidate at that boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LeaseOutcome {
     /// A new lease was recorded.
@@ -158,6 +166,171 @@ pub enum LeaseOutcome {
     Existing,
     /// The current operation received a later bounded expiration.
     Renewed,
+}
+
+/// Handle to a lease term that must be revalidated immediately before dispatch.
+///
+/// Acquiring this handle does not authorize execution: the process can be
+/// descheduled after acquisition, the term can expire, or a higher epoch can
+/// replace it. Call [`Self::validate_for_execution`] with a coherent observation
+/// of the execution preconditions at the dispatch boundary. The receiving
+/// target must still enforce [`LeaseExecutionGuard::fencing_epoch`]; a local
+/// guard cannot prove that a remote side effect completed before expiry.
+#[must_use = "lease acquisition is informational until the grant is revalidated for execution"]
+pub struct LeaseGrant {
+    inner: Arc<Mutex<OrchInner>>,
+    clock_origin: Instant,
+    outcome: LeaseOutcome,
+    shard_id: ShardId,
+    owner_id: String,
+    epoch: u64,
+    operation_id: OperationId,
+    expires_at_unix_ms: u64,
+    monotonic_deadline: Duration,
+}
+
+impl fmt::Debug for LeaseGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeaseGrant")
+            .field("outcome", &self.outcome)
+            .field("shard_id", &self.shard_id)
+            .field("epoch", &self.epoch)
+            .field("operation_id", &self.operation_id)
+            .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LeaseGrant {
+    /// Returns the informational result of the acquisition attempt.
+    #[must_use]
+    pub const fn outcome(&self) -> LeaseOutcome {
+        self.outcome
+    }
+
+    /// Revalidates this exact term at an execution-dispatch boundary.
+    ///
+    /// The returned guard proves only that the local term and supplied catalog
+    /// and fencing observations matched at the validation instant. A target
+    /// receiving work must atomically reject stale fencing epochs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this handle was superseded, its monotonic deadline
+    /// passed, or the execution observations no longer match the operation.
+    pub fn validate_for_execution(
+        &self,
+        execution: ExecutionPreconditions,
+    ) -> Result<LeaseExecutionGuard<'_>, OrchError> {
+        self.validate_for_execution_with_clock(execution, || self.clock_origin.elapsed())
+    }
+
+    #[cfg(test)]
+    fn validate_for_execution_at(
+        &self,
+        execution: ExecutionPreconditions,
+        now_monotonic: Duration,
+    ) -> Result<LeaseExecutionGuard<'_>, OrchError> {
+        self.validate_for_execution_with_clock(execution, || now_monotonic)
+    }
+
+    fn validate_for_execution_with_clock<F>(
+        &self,
+        execution: ExecutionPreconditions,
+        mut clock: F,
+    ) -> Result<LeaseExecutionGuard<'_>, OrchError>
+    where
+        F: FnMut() -> Duration,
+    {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current_lease = inner.leases.get(&self.shard_id);
+        let current_deadline = inner.lease_deadlines.get(&self.shard_id);
+        let exact_term = current_lease.is_some_and(|lease| {
+            lease.owner_id == self.owner_id
+                && lease.epoch == self.epoch
+                && lease.operation_id == self.operation_id
+                && lease.expires_at_unix_ms == self.expires_at_unix_ms
+        }) && current_deadline == Some(&self.monotonic_deadline);
+        if !exact_term {
+            return Err(OrchError::LeaseGrantSuperseded {
+                shard_id: self.shard_id,
+                epoch: self.epoch,
+            });
+        }
+        // Sample only after waiting for and inspecting shared state. Otherwise
+        // lock contention can carry a stale timestamp past the deadline.
+        if clock() >= self.monotonic_deadline {
+            return Err(OrchError::LeaseGrantExpired {
+                shard_id: self.shard_id,
+                epoch: self.epoch,
+            });
+        }
+        let operation = inner
+            .operations
+            .get(&self.operation_id)
+            .ok_or_else(|| OrchError::UnknownOperation(self.operation_id.clone()))?;
+        if operation.phase != OperationPhase::Running {
+            return Err(OrchError::LeaseGrantSuperseded {
+                shard_id: self.shard_id,
+                epoch: self.epoch,
+            });
+        }
+        validate_execution_epochs(operation, &self.operation_id, self.epoch, execution)?;
+        // Epoch validation is deliberately bracketed too: descheduling during
+        // those checks must not return a guard after the local deadline.
+        if clock() >= self.monotonic_deadline {
+            return Err(OrchError::LeaseGrantExpired {
+                shard_id: self.shard_id,
+                epoch: self.epoch,
+            });
+        }
+        Ok(LeaseExecutionGuard { grant: self })
+    }
+}
+
+/// Non-constructible proof of one local lease check at a dispatch boundary.
+///
+/// This guard is intentionally neither `Clone` nor `Copy`. It is not a promise
+/// that time stops after validation; dispatch must carry its fencing epoch to a
+/// target that atomically rejects stale work.
+#[must_use = "dispatch must carry this guard's fencing epoch to the fenced target"]
+pub struct LeaseExecutionGuard<'grant> {
+    grant: &'grant LeaseGrant,
+}
+
+impl fmt::Debug for LeaseExecutionGuard<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeaseExecutionGuard")
+            .field("shard_id", &self.grant.shard_id)
+            .field("epoch", &self.grant.epoch)
+            .field("operation_id", &self.grant.operation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LeaseExecutionGuard<'_> {
+    /// Returns the shard whose target must enforce this guard.
+    #[must_use]
+    pub const fn shard_id(&self) -> ShardId {
+        self.grant.shard_id
+    }
+
+    /// Returns the exact operation admitted by the local check.
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.grant.operation_id
+    }
+
+    /// Returns the epoch the receiving target must atomically fence.
+    #[must_use]
+    pub const fn fencing_epoch(&self) -> u64 {
+        self.grant.epoch
+    }
 }
 
 /// Externally reportable orchestrator status.
@@ -200,14 +373,29 @@ struct OrchInner {
     identity: Option<OrchestratorIdentity>,
     operations: HashMap<OperationId, OperationRecord>,
     leases: HashMap<ShardId, ShardLease>,
+    // Monotonic deadlines are process-local liveness authority. The Unix
+    // expiry remains the external validation and reporting value; wall-clock
+    // steps never decide whether the current process still owns the term.
+    lease_deadlines: HashMap<ShardId, Duration>,
     last_epochs: HashMap<ShardId, u64>,
 }
 
 /// Thread-safe registry for operation IDs and shard leases.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct OrchState {
     inner: Arc<Mutex<OrchInner>>,
     max_lease_ttl_ms: u64,
+    clock_origin: Instant,
+}
+
+impl Default for OrchState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(OrchInner::default())),
+            max_lease_ttl_ms: DEFAULT_MAX_LEASE_TTL_MS,
+            clock_origin: Instant::now(),
+        }
+    }
 }
 
 impl OrchState {
@@ -220,7 +408,7 @@ impl OrchState {
         identity: OrchestratorIdentity,
         max_lease_ttl_ms: u64,
     ) -> Result<Self, OrchError> {
-        if !(1..=300_000).contains(&max_lease_ttl_ms) {
+        if !(1..=MAX_LEASE_TTL_MS).contains(&max_lease_ttl_ms) {
             return Err(OrchError::InvalidMaximumLeaseTtl(max_lease_ttl_ms));
         }
         Ok(Self {
@@ -229,6 +417,7 @@ impl OrchState {
                 ..OrchInner::default()
             })),
             max_lease_ttl_ms,
+            clock_origin: Instant::now(),
         })
     }
 
@@ -328,7 +517,65 @@ impl OrchState {
         &self,
         request: LeaseRequest,
         execution: ExecutionPreconditions,
-    ) -> Result<LeaseOutcome, OrchError> {
+    ) -> Result<LeaseGrant, OrchError> {
+        self.acquire_lease_with_clock(request, execution, || trusted_clock(self.clock_origin))
+    }
+
+    #[cfg(test)]
+    fn acquire_lease_at(
+        &self,
+        request: LeaseRequest,
+        execution: ExecutionPreconditions,
+        now_unix_micros: u64,
+    ) -> Result<LeaseGrant, OrchError> {
+        self.acquire_lease_at_clocks(
+            request,
+            execution,
+            now_unix_micros,
+            Duration::from_micros(now_unix_micros),
+        )
+    }
+
+    #[cfg(test)]
+    fn acquire_lease_at_clocks(
+        &self,
+        request: LeaseRequest,
+        execution: ExecutionPreconditions,
+        now_unix_micros: u64,
+        now_monotonic: Duration,
+    ) -> Result<LeaseGrant, OrchError> {
+        self.acquire_lease_with_sample(
+            request,
+            execution,
+            ClockSample {
+                wall_before_unix_micros: now_unix_micros,
+                wall_after_unix_micros: now_unix_micros,
+                monotonic_before_first_wall: now_monotonic,
+                monotonic_between_walls: now_monotonic,
+                monotonic_after: now_monotonic,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn acquire_lease_with_sample(
+        &self,
+        request: LeaseRequest,
+        execution: ExecutionPreconditions,
+        sample: ClockSample,
+    ) -> Result<LeaseGrant, OrchError> {
+        self.acquire_lease_with_clock(request, execution, || Ok(sample))
+    }
+
+    fn acquire_lease_with_clock<F>(
+        &self,
+        request: LeaseRequest,
+        execution: ExecutionPreconditions,
+        clock: F,
+    ) -> Result<LeaseGrant, OrchError>
+    where
+        F: FnOnce() -> Result<ClockSample, OrchError>,
+    {
         let mut inner = self
             .inner
             .lock()
@@ -351,38 +598,33 @@ impl OrchState {
                 requested: request.shard_id,
             });
         }
-        let now_unix_ms =
-            validate_execution(operation, &request, execution, self.max_lease_ttl_ms)?;
-        if let Some(existing) = inner.leases.get(&request.shard_id).cloned()
-            && existing.expires_at_unix_ms > now_unix_ms
+        let now = clock()?;
+        validate_execution(
+            operation,
+            &request,
+            execution,
+            now.conservative_unix_micros(),
+            self.max_lease_ttl_ms,
+        )?;
+        if let Some((existing, existing_deadline)) =
+            live_lease(&inner, request.shard_id, now.monotonic_after)
         {
-            let same_term = existing.owner_id == request.owner_id
-                && existing.epoch == request.epoch
-                && existing.operation_id == request.operation_id;
-            if !same_term {
-                return Err(OrchError::LeaseHeld {
-                    shard_id: request.shard_id,
-                    epoch: existing.epoch,
-                });
-            }
-            if request.expires_at_unix_ms < existing.expires_at_unix_ms {
-                return Err(OrchError::RegressiveLeaseExpiry {
-                    current: existing.expires_at_unix_ms,
-                    requested: request.expires_at_unix_ms,
-                });
-            }
-            if request.expires_at_unix_ms == existing.expires_at_unix_ms {
-                return Ok(LeaseOutcome::Existing);
-            }
-            inner.leases.insert(
-                request.shard_id,
-                ShardLease {
-                    expires_at_unix_ms: request.expires_at_unix_ms,
-                    ..existing
-                },
-            );
-            return Ok(LeaseOutcome::Renewed);
+            let (outcome, monotonic_deadline) = renew_live_lease(
+                &mut inner,
+                &request,
+                existing,
+                existing_deadline,
+                now.monotonic_after,
+                self.max_lease_ttl_ms,
+            )?;
+            return Ok(self.lease_grant(&request, outcome, monotonic_deadline));
         }
+        let monotonic_deadline = now.earliest_deadline(request.expires_at_unix_ms)?;
+        validate_monotonic_ttl(
+            now.monotonic_after,
+            monotonic_deadline,
+            self.max_lease_ttl_ms,
+        )?;
         let last_epoch = inner
             .last_epochs
             .get(&request.shard_id)
@@ -402,48 +644,169 @@ impl OrchState {
         }
         let lease = ShardLease {
             shard_id: request.shard_id,
-            owner_id: request.owner_id,
+            owner_id: request.owner_id.clone(),
             epoch: request.epoch,
             operation_id: request.operation_id.clone(),
             expires_at_unix_ms: request.expires_at_unix_ms,
         };
         inner.last_epochs.insert(request.shard_id, request.epoch);
         inner.leases.insert(request.shard_id, lease);
+        inner
+            .lease_deadlines
+            .insert(request.shard_id, monotonic_deadline);
         if let Some(operation) = inner.operations.get_mut(&request.operation_id) {
             operation.phase = OperationPhase::Running;
         }
-        Ok(LeaseOutcome::Acquired)
+        Ok(self.lease_grant(&request, LeaseOutcome::Acquired, monotonic_deadline))
     }
+
+    fn lease_grant(
+        &self,
+        request: &LeaseRequest,
+        outcome: LeaseOutcome,
+        monotonic_deadline: Duration,
+    ) -> LeaseGrant {
+        LeaseGrant {
+            inner: Arc::clone(&self.inner),
+            clock_origin: self.clock_origin,
+            outcome,
+            shard_id: request.shard_id,
+            owner_id: request.owner_id.clone(),
+            epoch: request.epoch,
+            operation_id: request.operation_id.clone(),
+            expires_at_unix_ms: request.expires_at_unix_ms,
+            monotonic_deadline,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClockSample {
+    wall_before_unix_micros: u64,
+    wall_after_unix_micros: u64,
+    monotonic_before_first_wall: Duration,
+    monotonic_between_walls: Duration,
+    monotonic_after: Duration,
+}
+
+impl ClockSample {
+    const fn conservative_unix_micros(self) -> u64 {
+        if self.wall_before_unix_micros >= self.wall_after_unix_micros {
+            self.wall_before_unix_micros
+        } else {
+            self.wall_after_unix_micros
+        }
+    }
+
+    fn earliest_deadline(self, expires_at_unix_ms: u64) -> Result<Duration, OrchError> {
+        let before = self
+            .monotonic_before_first_wall
+            .checked_add(Duration::from_millis(lease_ttl_ms(
+                expires_at_unix_ms,
+                self.wall_before_unix_micros,
+            )?))
+            .ok_or(OrchError::ClockUnavailable)?;
+        let after = self
+            .monotonic_between_walls
+            .checked_add(Duration::from_millis(lease_ttl_ms(
+                expires_at_unix_ms,
+                self.wall_after_unix_micros,
+            )?))
+            .ok_or(OrchError::ClockUnavailable)?;
+        Ok(before.min(after))
+    }
+}
+
+fn renew_live_lease(
+    inner: &mut OrchInner,
+    request: &LeaseRequest,
+    existing: ShardLease,
+    existing_deadline: Duration,
+    now: Duration,
+    max_lease_ttl_ms: u64,
+) -> Result<(LeaseOutcome, Duration), OrchError> {
+    let same_term = existing.owner_id == request.owner_id
+        && existing.epoch == request.epoch
+        && existing.operation_id == request.operation_id;
+    if !same_term {
+        return Err(OrchError::LeaseHeld {
+            shard_id: request.shard_id,
+            epoch: existing.epoch,
+        });
+    }
+    if request.expires_at_unix_ms < existing.expires_at_unix_ms {
+        return Err(OrchError::RegressiveLeaseExpiry {
+            current: existing.expires_at_unix_ms,
+            requested: request.expires_at_unix_ms,
+        });
+    }
+    if request.expires_at_unix_ms == existing.expires_at_unix_ms {
+        return Ok((LeaseOutcome::Existing, existing_deadline));
+    }
+    let extension_ms = request.expires_at_unix_ms - existing.expires_at_unix_ms;
+    let monotonic_deadline = existing_deadline
+        .checked_add(Duration::from_millis(extension_ms))
+        .ok_or(OrchError::ClockUnavailable)?;
+    validate_monotonic_ttl(now, monotonic_deadline, max_lease_ttl_ms)?;
+    inner.leases.insert(
+        request.shard_id,
+        ShardLease {
+            expires_at_unix_ms: request.expires_at_unix_ms,
+            ..existing
+        },
+    );
+    inner
+        .lease_deadlines
+        .insert(request.shard_id, monotonic_deadline);
+    Ok((LeaseOutcome::Renewed, monotonic_deadline))
+}
+
+fn live_lease(
+    inner: &OrchInner,
+    shard_id: ShardId,
+    now: Duration,
+) -> Option<(ShardLease, Duration)> {
+    let deadline = *inner.lease_deadlines.get(&shard_id)?;
+    let lease = inner.leases.get(&shard_id)?.clone();
+    (deadline > now).then_some((lease, deadline))
+}
+
+fn validate_monotonic_ttl(
+    now: Duration,
+    deadline: Duration,
+    max_lease_ttl_ms: u64,
+) -> Result<(), OrchError> {
+    let Some(remaining) = deadline.checked_sub(now) else {
+        return Err(OrchError::InvalidLeaseRequest);
+    };
+    if remaining.is_zero() {
+        return Err(OrchError::InvalidLeaseRequest);
+    }
+    if remaining > Duration::from_millis(max_lease_ttl_ms) {
+        let requested_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(remaining.subsec_nanos() % 1_000_000 != 0));
+        return Err(OrchError::LeaseTtlExceeded {
+            requested_ms,
+            maximum_ms: max_lease_ttl_ms,
+        });
+    }
+    Ok(())
 }
 
 fn validate_execution(
     operation: &OperationRecord,
     request: &LeaseRequest,
     execution: ExecutionPreconditions,
+    now_unix_micros: u64,
     max_lease_ttl_ms: u64,
-) -> Result<u64, OrchError> {
-    if operation.spec.required_catalog_epoch != execution.catalog_epoch {
-        return Err(OrchError::CatalogEpochMismatch {
-            operation_id: request.operation_id.clone(),
-            required: operation.spec.required_catalog_epoch,
-            observed: execution.catalog_epoch,
-        });
-    }
-    if operation.spec.required_fencing_epoch != execution.fencing_epoch
-        || request.epoch != execution.fencing_epoch
-    {
-        return Err(OrchError::ExecutionFencingEpochMismatch {
-            operation_id: request.operation_id.clone(),
-            required: operation.spec.required_fencing_epoch,
-            observed: execution.fencing_epoch,
-            requested: request.epoch,
-        });
-    }
-    if execution.now_unix_micros >= operation.spec.deadline_unix_micros {
+) -> Result<(), OrchError> {
+    validate_execution_epochs(operation, &request.operation_id, request.epoch, execution)?;
+    if now_unix_micros >= operation.spec.deadline_unix_micros {
         return Err(OrchError::OperationDeadlineExceeded {
             operation_id: request.operation_id.clone(),
             deadline_unix_micros: operation.spec.deadline_unix_micros,
-            now_unix_micros: execution.now_unix_micros,
+            now_unix_micros,
         });
     }
     let deadline_unix_ms = operation.spec.deadline_unix_micros / 1_000;
@@ -454,20 +817,78 @@ fn validate_execution(
             requested_expiry_unix_ms: request.expires_at_unix_ms,
         });
     }
-    let now_unix_ms = execution.now_unix_micros.div_ceil(1_000);
-    let Some(ttl_ms) = request.expires_at_unix_ms.checked_sub(now_unix_ms) else {
-        return Err(OrchError::InvalidLeaseRequest);
-    };
-    if ttl_ms == 0 {
-        return Err(OrchError::InvalidLeaseRequest);
-    }
+    let ttl_ms = lease_ttl_ms(request.expires_at_unix_ms, now_unix_micros)?;
     if ttl_ms > max_lease_ttl_ms {
         return Err(OrchError::LeaseTtlExceeded {
             requested_ms: ttl_ms,
             maximum_ms: max_lease_ttl_ms,
         });
     }
-    Ok(now_unix_ms)
+    Ok(())
+}
+
+fn lease_ttl_ms(expires_at_unix_ms: u64, now_unix_micros: u64) -> Result<u64, OrchError> {
+    let now_unix_ms = now_unix_micros.div_ceil(1_000);
+    let Some(ttl_ms) = expires_at_unix_ms.checked_sub(now_unix_ms) else {
+        return Err(OrchError::InvalidLeaseRequest);
+    };
+    if ttl_ms == 0 {
+        return Err(OrchError::InvalidLeaseRequest);
+    }
+    Ok(ttl_ms)
+}
+
+fn validate_execution_epochs(
+    operation: &OperationRecord,
+    operation_id: &OperationId,
+    requested_epoch: u64,
+    execution: ExecutionPreconditions,
+) -> Result<(), OrchError> {
+    if operation.spec.required_catalog_epoch != execution.catalog_epoch {
+        return Err(OrchError::CatalogEpochMismatch {
+            operation_id: operation_id.clone(),
+            required: operation.spec.required_catalog_epoch,
+            observed: execution.catalog_epoch,
+        });
+    }
+    if operation.spec.required_fencing_epoch != execution.fencing_epoch
+        || requested_epoch != execution.fencing_epoch
+    {
+        return Err(OrchError::ExecutionFencingEpochMismatch {
+            operation_id: operation_id.clone(),
+            required: operation.spec.required_fencing_epoch,
+            observed: execution.fencing_epoch,
+            requested: requested_epoch,
+        });
+    }
+    Ok(())
+}
+
+fn trusted_clock(origin: Instant) -> Result<ClockSample, OrchError> {
+    // Pair each wall read with a preceding monotonic sample. Admission uses the
+    // greater wall value, while deadline translation chooses the earlier of the
+    // two paired candidates. A pause plus a backward wall step therefore cannot
+    // add the pause to the lease term. The final monotonic sample rejects a term
+    // consumed anywhere in the sampling window.
+    let monotonic_before_first_wall = origin.elapsed();
+    let wall_before_unix_micros = unix_clock_micros()?;
+    let monotonic_between_walls = origin.elapsed();
+    let wall_after_unix_micros = unix_clock_micros()?;
+    let monotonic_after = origin.elapsed();
+    Ok(ClockSample {
+        wall_before_unix_micros,
+        wall_after_unix_micros,
+        monotonic_before_first_wall,
+        monotonic_between_walls,
+        monotonic_after,
+    })
+}
+
+fn unix_clock_micros() -> Result<u64, OrchError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| OrchError::ClockUnavailable)?;
+    u64::try_from(elapsed.as_micros()).map_err(|_| OrchError::ClockUnavailable)
 }
 
 fn validate_operation_id(operation_id: &OperationId) -> Result<(), OrchError> {
@@ -489,6 +910,9 @@ pub enum OrchError {
     /// The authority was constructed with an unsafe lease policy.
     #[error("maximum lease TTL {0} ms must be between 1 and 300000 ms")]
     InvalidMaximumLeaseTtl(u64),
+    /// The process clock cannot supply a representable Unix timestamp.
+    #[error("orchestrator process clock cannot supply Unix microseconds")]
+    ClockUnavailable,
     /// State has no stable operator-assigned identity.
     #[error("orchestrator identity is missing")]
     IdentityMissing,
@@ -607,6 +1031,22 @@ pub enum OrchError {
         /// Current epoch.
         epoch: u64,
     },
+    /// An acquisition handle no longer describes the exact installed term.
+    #[error("lease grant for shard {shard_id:?} at epoch {epoch} was superseded")]
+    LeaseGrantSuperseded {
+        /// Shard named by the stale handle.
+        shard_id: ShardId,
+        /// Epoch named by the stale handle.
+        epoch: u64,
+    },
+    /// A handle reached its process-local monotonic deadline before dispatch.
+    #[error("lease grant for shard {shard_id:?} at epoch {epoch} expired before dispatch")]
+    LeaseGrantExpired {
+        /// Shard whose local term expired.
+        shard_id: ShardId,
+        /// Expired epoch.
+        epoch: u64,
+    },
     /// Fencing epochs must increase on every ownership transition.
     #[error("stale fencing epoch {requested}; next epoch must be at least {minimum}")]
     StaleEpoch {
@@ -654,12 +1094,62 @@ mod tests {
         OrchState::with_identity(identity(), 100).expect("valid lease policy")
     }
 
-    fn execution(fencing_epoch: u64, now_unix_ms: u64) -> ExecutionPreconditions {
+    fn execution(fencing_epoch: u64) -> ExecutionPreconditions {
         ExecutionPreconditions {
             catalog_epoch: 7,
             fencing_epoch,
-            now_unix_micros: now_unix_ms * 1_000,
         }
+    }
+
+    fn acquire_at(
+        state: &OrchState,
+        request: LeaseRequest,
+        fencing_epoch: u64,
+        now_unix_ms: u64,
+    ) -> Result<LeaseOutcome, OrchError> {
+        state
+            .acquire_lease_at(request, execution(fencing_epoch), now_unix_ms * 1_000)
+            .map(|grant| grant.outcome())
+    }
+
+    fn acquire_at_clocks(
+        state: &OrchState,
+        request: LeaseRequest,
+        fencing_epoch: u64,
+        now_unix_ms: u64,
+        now_monotonic_ms: u64,
+    ) -> Result<LeaseOutcome, OrchError> {
+        state
+            .acquire_lease_at_clocks(
+                request,
+                execution(fencing_epoch),
+                now_unix_ms * 1_000,
+                Duration::from_millis(now_monotonic_ms),
+            )
+            .map(|grant| grant.outcome())
+    }
+
+    fn acquire_in_clock_window(
+        state: &OrchState,
+        request: LeaseRequest,
+        fencing_epoch: u64,
+        now_unix_ms: u64,
+        monotonic_before_ms: u64,
+        monotonic_after_ms: u64,
+    ) -> Result<LeaseOutcome, OrchError> {
+        state
+            .acquire_lease_with_sample(
+                request,
+                execution(fencing_epoch),
+                ClockSample {
+                    wall_before_unix_micros: now_unix_ms * 1_000,
+                    wall_after_unix_micros: now_unix_ms * 1_000,
+                    monotonic_before_first_wall: Duration::from_millis(monotonic_before_ms),
+                    monotonic_between_walls: Duration::from_millis(monotonic_before_ms),
+                    monotonic_after: Duration::from_millis(monotonic_after_ms),
+                },
+            )
+            .map(|grant| grant.outcome())
     }
 
     fn lease(id: &str, owner: &str, epoch: u64, expires: u64) -> LeaseRequest {
@@ -674,10 +1164,12 @@ mod tests {
 
     #[test]
     fn readiness_requires_identity() {
+        let unconfigured = OrchState::default();
         assert_eq!(
-            OrchState::default().readiness().reason,
+            unconfigured.readiness().reason,
             OrchReadinessReason::IdentityMissing
         );
+        assert_eq!(unconfigured.max_lease_ttl_ms, DEFAULT_MAX_LEASE_TTL_MS);
         assert_eq!(
             state().readiness(),
             OrchReadiness {
@@ -741,30 +1233,24 @@ mod tests {
             .expect("register");
         let request = lease("op-1", "orch-0", 11, 200);
         assert_eq!(
-            state
-                .acquire_lease(request.clone(), execution(11, 100))
-                .expect("acquire"),
+            acquire_at(&state, request.clone(), 11, 100).expect("acquire"),
             LeaseOutcome::Acquired
         );
         assert_eq!(
-            state
-                .acquire_lease(request, execution(11, 100))
-                .expect("idempotent"),
+            acquire_at(&state, request, 11, 100).expect("idempotent"),
             LeaseOutcome::Existing
         );
         assert_eq!(
-            state
-                .acquire_lease(lease("op-1", "orch-0", 11, 250), execution(11, 150),)
-                .expect("renew"),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 250), 11, 150).expect("renew"),
             LeaseOutcome::Renewed
         );
         assert_eq!(state.snapshot().leases[0].expires_at_unix_ms, 250);
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 240), execution(11, 150)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 240), 11, 150),
             Err(OrchError::RegressiveLeaseExpiry { .. })
         ));
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-1", 11, 250), execution(11, 150)),
+            acquire_at(&state, lease("op-1", "orch-1", 11, 250), 11, 150),
             Err(OrchError::LeaseOwnerMismatch { .. })
         ));
 
@@ -772,7 +1258,7 @@ mod tests {
             .register_operation(operation_with_fence("op-2", 1, OperationKind::Backup, 12))
             .expect("register competitor");
         assert!(matches!(
-            state.acquire_lease(lease("op-2", "orch-0", 12, 250), execution(12, 150)),
+            acquire_at(&state, lease("op-2", "orch-0", 12, 250), 12, 150),
             Err(OrchError::LeaseHeld { .. })
         ));
     }
@@ -783,11 +1269,9 @@ mod tests {
         state
             .register_operation(operation("op-1", 1, OperationKind::Failover))
             .expect("register");
-        state
-            .acquire_lease(lease("op-1", "orch-0", 11, 200), execution(11, 100))
-            .expect("acquire");
+        acquire_at(&state, lease("op-1", "orch-0", 11, 200), 11, 100).expect("acquire");
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 300), execution(11, 200)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 300), 11, 200),
             Err(OrchError::StaleEpoch {
                 requested: 11,
                 minimum: 12
@@ -797,9 +1281,7 @@ mod tests {
             .register_operation(operation_with_fence("op-2", 1, OperationKind::Failover, 12))
             .expect("register next term");
         assert_eq!(
-            state
-                .acquire_lease(lease("op-2", "orch-0", 12, 300), execution(12, 200))
-                .expect("new term"),
+            acquire_at(&state, lease("op-2", "orch-0", 12, 300), 12, 200).expect("new term"),
             LeaseOutcome::Acquired
         );
     }
@@ -808,9 +1290,442 @@ mod tests {
     fn unknown_operation_cannot_acquire_lease() {
         let state = state();
         assert!(matches!(
-            state.acquire_lease(lease("missing", "orch-0", 1, 200), execution(1, 100)),
+            acquire_at(&state, lease("missing", "orch-0", 1, 200), 1, 100),
             Err(OrchError::UnknownOperation(_))
         ));
+    }
+
+    #[test]
+    fn public_lease_liveness_uses_the_process_clock() {
+        let state = state();
+        state
+            .register_operation(operation("expired", 1, OperationKind::Backup))
+            .expect("register expired operation");
+        assert!(matches!(
+            state.acquire_lease(lease("expired", "orch-0", 11, 200), execution(11),),
+            Err(OrchError::OperationDeadlineExceeded { .. })
+        ));
+        assert!(state.snapshot().leases.is_empty());
+    }
+
+    #[test]
+    fn process_clock_failure_is_fail_closed() {
+        let state = state();
+        state
+            .register_operation(operation("clock-error", 1, OperationKind::Backup))
+            .expect("register operation");
+        assert!(matches!(
+            state.acquire_lease_with_clock(
+                lease("clock-error", "orch-0", 11, 200),
+                execution(11),
+                || Err(OrchError::ClockUnavailable),
+            ),
+            Err(OrchError::ClockUnavailable)
+        ));
+        assert!(state.snapshot().leases.is_empty());
+    }
+
+    #[test]
+    fn sampling_delay_cannot_install_an_already_expired_lease() {
+        let state = state();
+        state
+            .register_operation(operation("delayed", 1, OperationKind::Backup))
+            .expect("register operation");
+
+        assert_eq!(
+            acquire_in_clock_window(
+                &state,
+                lease("delayed", "orch-0", 11, 200),
+                11,
+                100,
+                100,
+                200,
+            ),
+            Err(OrchError::InvalidLeaseRequest)
+        );
+        assert!(state.snapshot().leases.is_empty());
+    }
+
+    #[test]
+    fn sampling_delay_cannot_renew_a_term_that_expired_inside_the_window() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register first writer");
+        state
+            .register_operation(operation_with_fence(
+                "writer-2",
+                1,
+                OperationKind::Failover,
+                12,
+            ))
+            .expect("register successor");
+        acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 200), 11, 100, 100)
+            .expect("acquire initial lease");
+
+        assert!(matches!(
+            acquire_in_clock_window(
+                &state,
+                lease("writer-1", "orch-0", 11, 250),
+                11,
+                150,
+                150,
+                201,
+            ),
+            Err(OrchError::StaleEpoch {
+                requested: 11,
+                minimum: 12,
+            })
+        ));
+        assert_eq!(state.snapshot().leases[0].expires_at_unix_ms, 200);
+        assert_eq!(
+            acquire_at_clocks(&state, lease("writer-2", "orch-0", 12, 301), 12, 201, 201,)
+                .expect("expired term admits its successor"),
+            LeaseOutcome::Acquired
+        );
+    }
+
+    #[test]
+    fn lease_grant_revalidation_rejects_post_sample_dispatch_delay() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register writer");
+        let grant = state
+            .acquire_lease_at_clocks(
+                lease("writer-1", "orch-0", 11, 200),
+                execution(11),
+                100_000,
+                Duration::from_millis(100),
+            )
+            .expect("acquire grant");
+        assert_eq!(grant.outcome(), LeaseOutcome::Acquired);
+
+        let guard = grant
+            .validate_for_execution_at(execution(11), Duration::from_millis(199))
+            .expect("term remains live immediately before its deadline");
+        assert_eq!(guard.shard_id(), ShardId(1));
+        assert_eq!(guard.operation_id(), &OperationId("writer-1".to_owned()));
+        assert_eq!(guard.fencing_epoch(), 11);
+        assert!(matches!(
+            grant.validate_for_execution_at(execution(11), Duration::from_millis(200)),
+            Err(OrchError::LeaseGrantExpired {
+                shard_id: ShardId(1),
+                epoch: 11,
+            })
+        ));
+    }
+
+    #[test]
+    fn dispatch_clock_is_sampled_while_state_is_locked() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register writer");
+        let grant = state
+            .acquire_lease_at_clocks(
+                lease("writer-1", "orch-0", 11, 200),
+                execution(11),
+                100_000,
+                Duration::from_millis(100),
+            )
+            .expect("acquire grant");
+        let inner = Arc::clone(&grant.inner);
+
+        let _guard = grant
+            .validate_for_execution_with_clock(execution(11), || {
+                assert!(matches!(
+                    inner.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                Duration::from_millis(199)
+            })
+            .expect("clock read occurs after locking shared state");
+    }
+
+    #[test]
+    fn mutex_wait_cannot_revalidate_a_term_past_its_deadline() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register writer");
+        let grant = state
+            .acquire_lease_at_clocks(
+                lease("writer-1", "orch-0", 11, 200),
+                execution(11),
+                100_000,
+                Duration::from_millis(100),
+            )
+            .expect("acquire grant");
+        let now_ms = Arc::new(std::sync::atomic::AtomicU64::new(199));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let state_lock = state
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let validation_now = Arc::clone(&now_ms);
+            let validation = scope.spawn(move || {
+                started_tx.send(()).expect("announce validation attempt");
+                grant
+                    .validate_for_execution_with_clock(execution(11), || {
+                        Duration::from_millis(
+                            validation_now.load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                    })
+                    .map(|_| ())
+            });
+            started_rx.recv().expect("validation thread started");
+            std::thread::sleep(Duration::from_millis(20));
+            now_ms.store(200, std::sync::atomic::Ordering::SeqCst);
+            drop(state_lock);
+
+            assert!(matches!(
+                validation.join().expect("validation thread joins"),
+                Err(OrchError::LeaseGrantExpired { epoch: 11, .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn pause_and_backward_wall_step_cannot_extend_new_term() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register writer");
+        let grant = state
+            .acquire_lease_with_sample(
+                lease("writer-1", "orch-0", 11, 200),
+                execution(11),
+                ClockSample {
+                    wall_before_unix_micros: 100_000,
+                    wall_after_unix_micros: 50_000,
+                    monotonic_before_first_wall: Duration::from_millis(100),
+                    monotonic_between_walls: Duration::from_millis(150),
+                    monotonic_after: Duration::from_millis(150),
+                },
+            )
+            .expect("use the earliest paired deadline");
+
+        assert!(
+            grant
+                .validate_for_execution_at(execution(11), Duration::from_millis(199))
+                .is_ok()
+        );
+        assert!(matches!(
+            grant.validate_for_execution_at(execution(11), Duration::from_millis(200)),
+            Err(OrchError::LeaseGrantExpired { epoch: 11, .. })
+        ));
+    }
+
+    #[test]
+    fn renewed_or_replaced_term_supersedes_older_grants() {
+        let state = OrchState::with_identity(identity(), 1_000).expect("valid lease policy");
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register first writer");
+        state
+            .register_operation(operation_with_fence(
+                "writer-2",
+                1,
+                OperationKind::Failover,
+                12,
+            ))
+            .expect("register successor");
+        let original = state
+            .acquire_lease_at_clocks(
+                lease("writer-1", "orch-0", 11, 200),
+                execution(11),
+                100_000,
+                Duration::from_millis(100),
+            )
+            .expect("acquire original term");
+        let renewed = state
+            .acquire_lease_at_clocks(
+                lease("writer-1", "orch-0", 11, 250),
+                execution(11),
+                150_000,
+                Duration::from_millis(150),
+            )
+            .expect("renew term");
+        assert_eq!(renewed.outcome(), LeaseOutcome::Renewed);
+        assert!(matches!(
+            original.validate_for_execution_at(execution(11), Duration::from_millis(150)),
+            Err(OrchError::LeaseGrantSuperseded { epoch: 11, .. })
+        ));
+        assert!(
+            renewed
+                .validate_for_execution_at(execution(11), Duration::from_millis(199))
+                .is_ok()
+        );
+
+        let successor = state
+            .acquire_lease_at_clocks(
+                lease("writer-2", "orch-0", 12, 350),
+                execution(12),
+                250_000,
+                Duration::from_millis(250),
+            )
+            .expect("replace expired term");
+        assert_eq!(successor.outcome(), LeaseOutcome::Acquired);
+        assert!(matches!(
+            renewed.validate_for_execution_at(execution(11), Duration::from_millis(250)),
+            Err(OrchError::LeaseGrantSuperseded { epoch: 11, .. })
+        ));
+    }
+
+    #[test]
+    fn lease_grant_rechecks_execution_epochs_at_dispatch() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Ddl))
+            .expect("register operation");
+        let grant = state
+            .acquire_lease_at_clocks(
+                lease("writer-1", "orch-0", 11, 200),
+                execution(11),
+                100_000,
+                Duration::from_millis(100),
+            )
+            .expect("acquire grant");
+        let mut wrong_catalog = execution(11);
+        wrong_catalog.catalog_epoch = 8;
+        assert!(matches!(
+            grant.validate_for_execution_at(wrong_catalog, Duration::from_millis(101)),
+            Err(OrchError::CatalogEpochMismatch { .. })
+        ));
+        assert!(matches!(
+            grant.validate_for_execution_at(execution(12), Duration::from_millis(101)),
+            Err(OrchError::ExecutionFencingEpochMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn concurrent_dual_writers_cannot_both_acquire_one_shard() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register first writer");
+        state
+            .register_operation(operation_with_fence(
+                "writer-2",
+                1,
+                OperationKind::Failover,
+                12,
+            ))
+            .expect("register second writer");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let first_state = state.clone();
+            let first_barrier = Arc::clone(&barrier);
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                acquire_at(&first_state, lease("writer-1", "orch-0", 11, 200), 11, 100)
+            });
+            let second_state = state.clone();
+            let second = scope.spawn(move || {
+                barrier.wait();
+                acquire_at(&second_state, lease("writer-2", "orch-0", 12, 200), 12, 100)
+            });
+            [
+                first.join().expect("first writer thread"),
+                second.join().expect("second writer thread"),
+            ]
+        });
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(LeaseOutcome::Acquired)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(OrchError::LeaseHeld { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(state.snapshot().leases.len(), 1);
+    }
+
+    #[test]
+    fn a_forward_wall_step_during_renewal_cannot_cut_a_live_lease_short() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register first writer");
+        state
+            .register_operation(operation_with_fence(
+                "writer-2",
+                1,
+                OperationKind::Failover,
+                12,
+            ))
+            .expect("register successor");
+        acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 200), 11, 100, 100)
+            .expect("acquire initial lease");
+        assert_eq!(
+            acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 201), 11, 190, 150,)
+                .expect("renew after a forward wall-clock step"),
+            LeaseOutcome::Renewed
+        );
+
+        assert!(matches!(
+            acquire_at_clocks(&state, lease("writer-2", "orch-0", 12, 400), 12, 300, 200,),
+            Err(OrchError::LeaseHeld { epoch: 11, .. })
+        ));
+        assert_eq!(state.snapshot().leases[0].epoch, 11);
+    }
+
+    #[test]
+    fn a_backward_wall_step_during_renewal_cannot_extend_a_live_lease() {
+        let state = OrchState::with_identity(identity(), 1_000).expect("valid lease policy");
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register first writer");
+        state
+            .register_operation(operation_with_fence(
+                "writer-2",
+                1,
+                OperationKind::Failover,
+                12,
+            ))
+            .expect("register successor");
+        acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 600), 11, 500, 100)
+            .expect("acquire initial lease");
+        assert_eq!(
+            acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 601), 11, 400, 150,)
+                .expect("renew after a backward wall-clock step"),
+            LeaseOutcome::Renewed
+        );
+
+        assert_eq!(
+            acquire_at_clocks(&state, lease("writer-2", "orch-0", 12, 601), 12, 401, 202,)
+                .expect("monotonic expiry admits the higher epoch"),
+            LeaseOutcome::Acquired
+        );
+        assert_eq!(state.snapshot().leases[0].epoch, 12);
+    }
+
+    #[test]
+    fn renewal_cannot_move_the_monotonic_deadline_beyond_policy() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register writer");
+        acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 200), 11, 100, 100)
+            .expect("acquire initial lease");
+
+        assert_eq!(
+            acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 400), 11, 300, 150,),
+            Err(OrchError::LeaseTtlExceeded {
+                requested_ms: 250,
+                maximum_ms: 100,
+            })
+        );
+        assert_eq!(state.snapshot().leases[0].expires_at_unix_ms, 200);
     }
 
     #[test]
@@ -845,12 +1760,13 @@ mod tests {
                 u64::MAX - 1,
             ))
             .expect("register");
-        state
-            .acquire_lease(
-                lease("op-1", "orch-0", u64::MAX - 1, 200),
-                execution(u64::MAX - 1, 100),
-            )
-            .expect("acquire");
+        acquire_at(
+            &state,
+            lease("op-1", "orch-0", u64::MAX - 1, 200),
+            u64::MAX - 1,
+            100,
+        )
+        .expect("acquire");
         let json = serde_json::to_value(state.snapshot()).expect("serialize status");
         assert_eq!(json["leases"][0]["epoch"], (u64::MAX - 1).to_string());
         assert_eq!(json["leases"][0]["expires_at_unix_ms"], "200");
@@ -864,20 +1780,18 @@ mod tests {
             .expect("register");
         let request = lease("op-1", "orch-0", 11, 200);
 
-        let mut wrong_catalog = execution(11, 100);
+        let mut wrong_catalog = execution(11);
         wrong_catalog.catalog_epoch = 8;
         assert!(matches!(
-            state.acquire_lease(request.clone(), wrong_catalog),
+            state.acquire_lease_at(request.clone(), wrong_catalog, 100_000),
             Err(OrchError::CatalogEpochMismatch { .. })
         ));
         assert!(matches!(
-            state.acquire_lease(request.clone(), execution(12, 100)),
+            state.acquire_lease_at(request.clone(), execution(12), 100_000),
             Err(OrchError::ExecutionFencingEpochMismatch { .. })
         ));
-        let mut expired = execution(11, 100);
-        expired.now_unix_micros = 1_000_000;
         assert!(matches!(
-            state.acquire_lease(request, expired),
+            state.acquire_lease_at(request, execution(11), 1_000_000),
             Err(OrchError::OperationDeadlineExceeded { .. })
         ));
 
@@ -926,22 +1840,22 @@ mod tests {
             .register_operation(operation("op-1", 1, OperationKind::Backup))
             .expect("register");
         assert_eq!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 100), execution(11, 100)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 100), 11, 100),
             Err(OrchError::InvalidLeaseRequest)
         );
         assert_eq!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 201), execution(11, 100)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 201), 11, 100),
             Err(OrchError::LeaseTtlExceeded {
                 requested_ms: 101,
                 maximum_ms: 100,
             })
         );
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, u64::MAX), execution(11, 100)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, u64::MAX), 11, 100),
             Err(OrchError::LeasePastOperationDeadline { .. })
         ));
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 1_001), execution(11, 900)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 1_001), 11, 900),
             Err(OrchError::LeasePastOperationDeadline { .. })
         ));
     }
