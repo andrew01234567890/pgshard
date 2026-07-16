@@ -99,8 +99,9 @@ func TestKINDAdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec(t *testing.T) {
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(transition), current); err != nil {
 			t.Fatal(err)
 		}
+		before := current.DeepCopy()
 		mutate(current)
-		if err := kubeClient.Update(ctx, current); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
+		if err := kubeClient.Patch(ctx, current, client.MergeFrom(before)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
 			t.Fatalf("CRD admitted %s without the validating webhook: %v", name, err)
 		}
 	}
