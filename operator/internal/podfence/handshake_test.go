@@ -20,24 +20,38 @@ func TestSecretHandshakeCodecValidatesAnchoredKeyState(t *testing.T) {
 	keyName := types.NamespacedName{Namespace: "pgshard-system", Name: "receipt-key"}
 	anchorName := types.NamespacedName{Namespace: "pgshard-system", Name: "receipt-anchor"}
 	dataKey := "hmac.key"
-	anchorDataKey := "pod-fencing-key.sha256"
+	anchorAnnotation := "pgshard.io/pod-fencing-key-sha256"
 	key := []byte("0123456789abcdef0123456789abcdef")
 	immutable := true
 	baseKey := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: keyName.Namespace, Name: keyName.Name, Labels: map[string]string{owned.ManagedByLabel: owned.ManagedByValue}},
-		Type:       corev1.SecretTypeOpaque,
-		Immutable:  &immutable,
-		Data:       map[string][]byte{dataKey: bytes.Clone(key)},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: keyName.Namespace,
+			Name:      keyName.Name,
+			Labels:    map[string]string{owned.ManagedByLabel: owned.ManagedByValue},
+			Annotations: map[string]string{
+				SecretKeyContinuityAnnotation: SecretKeyContinuityValue,
+			},
+		},
+		Type:      corev1.SecretTypeOpaque,
+		Immutable: &immutable,
+		Data:      map[string][]byte{dataKey: bytes.Clone(key)},
 	}
 	baseAnchor := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: anchorName.Namespace, Name: anchorName.Name, Labels: map[string]string{owned.ManagedByLabel: owned.ManagedByValue}},
-		Type:       corev1.SecretTypeOpaque,
-		Data:       map[string][]byte{anchorDataKey: SecretHandshakeKeyFingerprint(key)},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: anchorName.Namespace,
+			Name:      anchorName.Name,
+			Labels:    map[string]string{owned.ManagedByLabel: owned.ManagedByValue},
+			Annotations: map[string]string{
+				anchorAnnotation: SecretHandshakeKeyFingerprint(key),
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
 	}
 	for _, test := range []struct {
-		name   string
-		mutate func(*corev1.Secret, *corev1.Secret)
-		want   string
+		name       string
+		mutate     func(*corev1.Secret, *corev1.Secret)
+		omitAnchor bool
+		want       string
 	}{
 		{name: "valid"},
 		{
@@ -69,11 +83,51 @@ func TestSecretHandshakeCodecValidatesAnchoredKeyState(t *testing.T) {
 			want: "exactly one 32-byte",
 		},
 		{
+			name: "missing continuity marker",
+			mutate: func(key, _ *corev1.Secret) {
+				key.Annotations = nil
+			},
+			want: "lacks its continuity marker",
+		},
+		{
 			name: "different valid key",
 			mutate: func(key, _ *corev1.Secret) {
 				key.Data[dataKey][0] ^= 0xff
 			},
 			want: "does not match the anchored fingerprint",
+		},
+		{
+			name:       "missing anchor",
+			omitAnchor: true,
+			want:       "read Pod fencing handshake anchor Secret",
+		},
+		{
+			name: "unmanaged anchor",
+			mutate: func(_, anchor *corev1.Secret) {
+				anchor.Labels = nil
+			},
+			want: "is not labeled as managed",
+		},
+		{
+			name: "wrong anchor type",
+			mutate: func(_, anchor *corev1.Secret) {
+				anchor.Type = corev1.SecretTypeTLS
+			},
+			want: "has type",
+		},
+		{
+			name: "missing anchor fingerprint",
+			mutate: func(_, anchor *corev1.Secret) {
+				anchor.Annotations = nil
+			},
+			want: "canonical SHA-256 annotation",
+		},
+		{
+			name: "malformed anchor fingerprint",
+			mutate: func(_, anchor *corev1.Secret) {
+				anchor.Annotations[anchorAnnotation] = "not-a-fingerprint"
+			},
+			want: "canonical SHA-256 annotation",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -87,8 +141,12 @@ func TestSecretHandshakeCodecValidatesAnchoredKeyState(t *testing.T) {
 			if err := corev1.AddToScheme(scheme); err != nil {
 				t.Fatal(err)
 			}
-			reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(keySecret, anchorSecret).Build()
-			codec := NewSecretHandshakeCodec(reader, keyName, dataKey, anchorName, anchorDataKey)
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(keySecret)
+			if !test.omitAnchor {
+				builder = builder.WithObjects(anchorSecret)
+			}
+			reader := builder.Build()
+			codec := NewSecretHandshakeCodec(reader, keyName, dataKey, anchorName, anchorAnnotation)
 			cluster := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{
 				Namespace: "application", Name: "database", UID: "cluster-uid",
 				Annotations: map[string]string{HandshakeChallengeAnnotation: "challenge"},

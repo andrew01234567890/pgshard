@@ -120,7 +120,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		types.NamespacedName{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingKeySecret},
 		defaultPodFencingKeyData,
 		types.NamespacedName{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingAnchorSecret},
-		defaultPodFencingAnchorData,
+		defaultPodFencingAnchorAnnotation,
 	).Verify(ctx, current)
 	if handshakeErr != nil {
 		t.Fatal(handshakeErr)

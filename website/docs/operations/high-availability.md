@@ -165,9 +165,12 @@ the selected admission path has observed the namespace's immutable fencing
 opt-in and returns an HMAC receipt bound to the cluster UID and fresh challenge.
 This does not prove simultaneous selector-cache convergence across every API
 server. The receipt key is an independent immutable Secret whose SHA-256
-continuity fingerprint is anchored in the CA Secret. Readiness, admission, and
-controller use all require the exact key to match that anchor; recreating an
-empty or different key fails closed and does not mint replacement authority.
+continuity fingerprint is anchored in backward-compatible CA Secret metadata.
+First adoption verifies every stored cluster and terminal receipt with the
+candidate key, and a separate completion marker prevents later anchor loss from
+re-entering adoption. Readiness, admission, and controller use all require the
+exact key to match that anchor; recreating an empty or different key fails closed
+and does not mint replacement authority.
 Binding admission copies the managed identity and selected Node UID and
 boot ID into the Pod atomically with `spec.nodeName`; a final validator checks
 the result after every mutator. The init container reads those annotations

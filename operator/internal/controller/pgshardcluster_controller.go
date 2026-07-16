@@ -36,24 +36,24 @@ import (
 )
 
 const (
-	readyCondition                = "Ready"
-	reconciledCondition           = "ResourcesReconciled"
-	supportingAvailableCondition  = "SupportingWorkloadsAvailable"
-	postgresqlAvailableCondition  = "PostgreSQLPrimariesAvailable"
-	transportSecurityCondition    = "TransportSecurityReady"
-	resourceFinalizer             = "pgshard.io/owned-resources"
-	hpaScaleFieldManager          = "pgshard-hpa-scale"
-	ownershipMigrationManager     = "pgshard-ownership-migration"
-	retryDelay                    = 15 * time.Second
-	bootstrapIntegrityInterval    = 30 * time.Second
-	postgresqlPasswordBytes       = 32
-	bootstrapNameRandomBytes      = 16
-	fencingChallengeRandomBytes   = 16
-	defaultPodFencingKeyNamespace = "pgshard-system"
-	defaultPodFencingKeySecret    = "pgshard-webhook-fencing-key"
-	defaultPodFencingKeyData      = "hmac.key"
-	defaultPodFencingAnchorSecret = "pgshard-webhook-ca"
-	defaultPodFencingAnchorData   = "pod-fencing-key.sha256"
+	readyCondition                    = "Ready"
+	reconciledCondition               = "ResourcesReconciled"
+	supportingAvailableCondition      = "SupportingWorkloadsAvailable"
+	postgresqlAvailableCondition      = "PostgreSQLPrimariesAvailable"
+	transportSecurityCondition        = "TransportSecurityReady"
+	resourceFinalizer                 = "pgshard.io/owned-resources"
+	hpaScaleFieldManager              = "pgshard-hpa-scale"
+	ownershipMigrationManager         = "pgshard-ownership-migration"
+	retryDelay                        = 15 * time.Second
+	bootstrapIntegrityInterval        = 30 * time.Second
+	postgresqlPasswordBytes           = 32
+	bootstrapNameRandomBytes          = 16
+	fencingChallengeRandomBytes       = 16
+	defaultPodFencingKeyNamespace     = "pgshard-system"
+	defaultPodFencingKeySecret        = "pgshard-webhook-fencing-key"
+	defaultPodFencingKeyData          = "hmac.key"
+	defaultPodFencingAnchorSecret     = "pgshard-webhook-ca"
+	defaultPodFencingAnchorAnnotation = "pgshard.io/pod-fencing-key-sha256"
 )
 
 // PgShardClusterReconciler owns safe supporting resources and single-member
@@ -66,12 +66,12 @@ type PgShardClusterReconciler struct {
 	// gates, storage-class selection, replica handoff, deletion-finalizer absence
 	// proofs, and post-apply workload status.
 	// Writes and plan reconciliation continue through Client.
-	APIReader              client.Reader
-	Images                 owned.Images
-	PodFencingKeySecret    types.NamespacedName
-	PodFencingKeyData      string
-	PodFencingAnchorSecret types.NamespacedName
-	PodFencingAnchorData   string
+	APIReader                  client.Reader
+	Images                     owned.Images
+	PodFencingKeySecret        types.NamespacedName
+	PodFencingKeyData          string
+	PodFencingAnchorSecret     types.NamespacedName
+	PodFencingAnchorAnnotation string
 }
 
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
@@ -315,11 +315,11 @@ func (r *PgShardClusterReconciler) podFencingHandshakeCodec() *podfence.Handshak
 	if anchor.Name == "" {
 		anchor.Name = defaultPodFencingAnchorSecret
 	}
-	anchorData := r.PodFencingAnchorData
-	if anchorData == "" {
-		anchorData = defaultPodFencingAnchorData
+	anchorAnnotation := r.PodFencingAnchorAnnotation
+	if anchorAnnotation == "" {
+		anchorAnnotation = defaultPodFencingAnchorAnnotation
 	}
-	return podfence.NewSecretHandshakeCodec(r.authoritativeReader(), secret, dataKey, anchor, anchorData)
+	return podfence.NewSecretHandshakeCodec(r.authoritativeReader(), secret, dataKey, anchor, anchorAnnotation)
 }
 
 func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {

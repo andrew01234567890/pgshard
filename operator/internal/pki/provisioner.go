@@ -16,6 +16,7 @@ import (
 	"slices"
 	"time"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	"github.com/go-logr/logr"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
@@ -32,9 +33,9 @@ const (
 	ManagedByLabel   = "app.kubernetes.io/managed-by"
 	ManagedByValue   = "pgshard-operator"
 	PodFencingKeyKey = "hmac.key"
-	// PodFencingKeyFingerprintKey anchors key continuity in the independent CA
-	// Secret so replacing the key Secret cannot silently invalidate receipts.
-	PodFencingKeyFingerprintKey = "pod-fencing-key.sha256"
+	// PodFencingKeyFingerprintAnnotation anchors key continuity in backward-
+	// compatible metadata on the independent CA Secret.
+	PodFencingKeyFingerprintAnnotation = "pgshard.io/pod-fencing-key-sha256"
 
 	defaultBootstrapTimeout    = 90 * time.Second
 	defaultMaintenanceInterval = time.Hour
@@ -279,6 +280,14 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	marker := secret.Annotations[podfence.SecretKeyContinuityAnnotation]
+	if marker != "" && marker != podfence.SecretKeyContinuityValue {
+		return fmt.Errorf("Pod fencing key Secret has unsupported continuity marker %q", marker)
+	}
+	continuityComplete := marker == podfence.SecretKeyContinuityValue
+	if continuityComplete && !anchored {
+		return fmt.Errorf("Pod fencing key continuity marker exists but its fingerprint anchor is missing; restore the anchor or perform explicit fencing recovery")
+	}
 	if len(secret.Data) == 0 {
 		if err := validatePodFencingKeyMetadata(secret); err != nil {
 			return err
@@ -286,8 +295,11 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 		if secret.Immutable != nil && *secret.Immutable {
 			return fmt.Errorf("empty Pod fencing key Secret %s/%s is immutable", secret.Namespace, secret.Name)
 		}
-		if anchored {
+		if anchored || continuityComplete {
 			return fmt.Errorf("Pod fencing key Secret is empty but a continuity fingerprint exists; restore the original key or perform explicit fencing recovery")
+		}
+		if err := p.verifyExistingReceiptHistory(ctx, nil); err != nil {
+			return err
 		}
 		value := make([]byte, podfence.SecretKeyBytes)
 		if _, err := io.ReadFull(p.random, value); err != nil {
@@ -300,16 +312,41 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 			return fmt.Errorf("initialize Pod fencing key Secret: %w", err)
 		}
 	}
-	key, err := podfence.ValidateSecretHandshakeKey(secret, PodFencingKeyKey)
+	key, err := podfence.ValidateSecretHandshakeKeyCandidate(secret, PodFencingKeyKey)
 	if err != nil {
 		return err
 	}
 	if anchored {
-		return podfence.ValidateSecretHandshakeKeyFingerprint(anchor, PodFencingKeyFingerprintKey, key)
+		if err := podfence.ValidateSecretHandshakeKeyFingerprint(anchor, PodFencingKeyFingerprintAnnotation, key); err != nil {
+			return err
+		}
+		if !continuityComplete {
+			if err := p.verifyExistingReceiptHistory(ctx, key); err != nil {
+				return err
+			}
+			if err := p.markPodFencingKeyContinuity(ctx, secret); err != nil {
+				return err
+			}
+		}
+		return p.checkPodFencingKey(ctx)
 	}
-	anchor.Data[PodFencingKeyFingerprintKey] = podfence.SecretHandshakeKeyFingerprint(key)
+	if err := p.verifyExistingReceiptHistory(ctx, key); err != nil {
+		return err
+	}
+	if anchor.Annotations == nil {
+		anchor.Annotations = make(map[string]string, 1)
+	}
+	anchor.Annotations[PodFencingKeyFingerprintAnnotation] = podfence.SecretHandshakeKeyFingerprint(key)
 	if err := p.client.Update(ctx, anchor); err != nil {
 		return fmt.Errorf("anchor Pod fencing key fingerprint: %w", err)
+	}
+	// Recheck after installing the anchor so a receipt written by an older
+	// manager during a rolling upgrade cannot be skipped by the migration.
+	if err := p.verifyExistingReceiptHistory(ctx, key); err != nil {
+		return err
+	}
+	if err := p.markPodFencingKeyContinuity(ctx, secret); err != nil {
+		return err
 	}
 	return p.checkPodFencingKey(ctx)
 }
@@ -330,7 +367,73 @@ func (p *Provisioner) checkPodFencingKey(ctx context.Context) error {
 	if !anchored {
 		return fmt.Errorf("Pod fencing key continuity fingerprint is missing")
 	}
-	return podfence.ValidateSecretHandshakeKeyFingerprint(anchor, PodFencingKeyFingerprintKey, key)
+	return podfence.ValidateSecretHandshakeKeyFingerprint(anchor, PodFencingKeyFingerprintAnnotation, key)
+}
+
+func (p *Provisioner) markPodFencingKeyContinuity(ctx context.Context, secret *corev1.Secret) error {
+	if secret.Annotations == nil {
+		secret.Annotations = make(map[string]string, 1)
+	}
+	secret.Annotations[podfence.SecretKeyContinuityAnnotation] = podfence.SecretKeyContinuityValue
+	if err := p.client.Update(ctx, secret); err != nil {
+		return fmt.Errorf("mark Pod fencing key continuity: %w", err)
+	}
+	return nil
+}
+
+func (p *Provisioner) verifyExistingReceiptHistory(ctx context.Context, key []byte) error {
+	var codec *podfence.HandshakeCodec
+	if key != nil {
+		codec = podfence.NewStaticHandshakeCodec(key)
+	}
+	clusters := &pgshardv1alpha1.PgShardClusterList{}
+	if err := p.client.List(ctx, clusters); err != nil {
+		return fmt.Errorf("list PgShardClusters before anchoring Pod fencing key: %w", err)
+	}
+	for index := range clusters.Items {
+		cluster := &clusters.Items[index]
+		if cluster.Annotations[podfence.HandshakeReceiptAnnotation] == "" {
+			continue
+		}
+		if codec == nil {
+			return fmt.Errorf("cannot generate a Pod fencing key while PgShardCluster %s/%s has an outstanding handshake receipt", cluster.Namespace, cluster.Name)
+		}
+		verified, err := codec.Verify(ctx, cluster)
+		if err != nil {
+			return fmt.Errorf("verify existing PgShardCluster %s/%s handshake receipt: %w", cluster.Namespace, cluster.Name, err)
+		}
+		if !verified {
+			return fmt.Errorf("existing PgShardCluster %s/%s handshake receipt does not match the candidate Pod fencing key", cluster.Namespace, cluster.Name)
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := p.client.List(ctx, pods); err != nil {
+		return fmt.Errorf("list Pods before anchoring Pod fencing key: %w", err)
+	}
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		hasTerminationCondition := false
+		for conditionIndex := range pod.Status.Conditions {
+			if pod.Status.Conditions[conditionIndex].Type == podfence.TerminationConditionType {
+				hasTerminationCondition = true
+				break
+			}
+		}
+		if !hasTerminationCondition {
+			continue
+		}
+		if codec == nil {
+			return fmt.Errorf("cannot generate a Pod fencing key while Pod %s/%s has an outstanding termination receipt", pod.Namespace, pod.Name)
+		}
+		verified, err := codec.VerifyTermination(ctx, pod)
+		if err != nil {
+			return fmt.Errorf("verify existing Pod %s/%s termination receipt: %w", pod.Namespace, pod.Name, err)
+		}
+		if !verified {
+			return fmt.Errorf("existing Pod %s/%s termination receipt does not match the candidate Pod fencing key", pod.Namespace, pod.Name)
+		}
+	}
+	return nil
 }
 
 func (p *Provisioner) readPodFencingKey(ctx context.Context) (*corev1.Secret, error) {
@@ -351,10 +454,7 @@ func (p *Provisioner) readPodFencingKeyAnchor(ctx context.Context) (*corev1.Secr
 	if err := validateManagedSecret(secret, corev1.SecretTypeOpaque); err != nil {
 		return nil, false, err
 	}
-	fingerprint, exists := secret.Data[PodFencingKeyFingerprintKey]
-	if exists && len(fingerprint) != podfence.SecretKeyBytes {
-		return nil, false, fmt.Errorf("Pod fencing key continuity fingerprint must be exactly %d bytes", podfence.SecretKeyBytes)
-	}
+	_, exists := secret.Annotations[PodFencingKeyFingerprintAnnotation]
 	return secret, exists, nil
 }
 
@@ -393,16 +493,8 @@ func (p *Provisioner) ensureAuthority(ctx context.Context) (*certificateAuthorit
 	}
 	certificatePEM, certificateExists := secret.Data[CACertificateKey]
 	privateKeyPEM, privateKeyExists := secret.Data[CAPrivateKeyKey]
-	fingerprint, fingerprintExists := secret.Data[PodFencingKeyFingerprintKey]
-	wantedData := 2
-	if fingerprintExists {
-		wantedData++
-		if len(fingerprint) != podfence.SecretKeyBytes {
-			return nil, fmt.Errorf("managed CA Secret %s must be exactly %d bytes", PodFencingKeyFingerprintKey, podfence.SecretKeyBytes)
-		}
-	}
-	if len(secret.Data) != wantedData || !certificateExists || !privateKeyExists {
-		return nil, fmt.Errorf("managed CA Secret must be empty or contain exactly %s and %s, with optional %s", CACertificateKey, CAPrivateKeyKey, PodFencingKeyFingerprintKey)
+	if len(secret.Data) != 2 || !certificateExists || !privateKeyExists {
+		return nil, fmt.Errorf("managed CA Secret must be empty or contain exactly %s and %s", CACertificateKey, CAPrivateKeyKey)
 	}
 	authority, err := parseCertificateAuthority(certificatePEM, privateKeyPEM, p.now())
 	if err != nil {

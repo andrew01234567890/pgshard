@@ -3466,15 +3466,28 @@ func withPodFencingNamespaces(t *testing.T, objects []client.Object) []client.Ob
 	managedLabels := map[string]string{owned.ManagedByLabel: owned.ManagedByValue}
 	prepared = append(prepared,
 		&corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingKeySecret, Labels: maps.Clone(managedLabels)},
-			Type:       corev1.SecretTypeOpaque,
-			Immutable:  &immutable,
-			Data:       map[string][]byte{defaultPodFencingKeyData: []byte(testPodFencingKey)},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: defaultPodFencingKeyNamespace,
+				Name:      defaultPodFencingKeySecret,
+				Labels:    maps.Clone(managedLabels),
+				Annotations: map[string]string{
+					podfence.SecretKeyContinuityAnnotation: podfence.SecretKeyContinuityValue,
+				},
+			},
+			Type:      corev1.SecretTypeOpaque,
+			Immutable: &immutable,
+			Data:      map[string][]byte{defaultPodFencingKeyData: []byte(testPodFencingKey)},
 		},
 		&corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingAnchorSecret, Labels: maps.Clone(managedLabels)},
-			Type:       corev1.SecretTypeOpaque,
-			Data:       map[string][]byte{defaultPodFencingAnchorData: podfence.SecretHandshakeKeyFingerprint([]byte(testPodFencingKey))},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: defaultPodFencingKeyNamespace,
+				Name:      defaultPodFencingAnchorSecret,
+				Labels:    maps.Clone(managedLabels),
+				Annotations: map[string]string{
+					defaultPodFencingAnchorAnnotation: podfence.SecretHandshakeKeyFingerprint([]byte(testPodFencingKey)),
+				},
+			},
+			Type: corev1.SecretTypeOpaque,
 		},
 	)
 	return prepared

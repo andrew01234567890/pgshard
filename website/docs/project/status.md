@@ -15,9 +15,11 @@ mutator, and PostgreSQL startup fails before PGDATA access when binding-time
 Node evidence is absent. The namespace handshake proves the selected admission
 path handled a fresh challenge; it is not evidence that every API-server
 selector cache converged simultaneously. The independent immutable receipt key
-is continuity-anchored by a SHA-256 fingerprint in the CA Secret; startup,
-readiness, admission, and reconciliation reject key loss or replacement rather
-than silently invalidating outstanding receipts.
+is continuity-anchored by a SHA-256 fingerprint in backward-compatible CA Secret
+metadata. First adoption verifies all stored cluster and terminal receipts, and
+a separate completion marker prevents later anchor loss from re-entering
+adoption. Startup, readiness, admission, and reconciliation reject key loss or
+replacement rather than silently invalidating outstanding receipts.
 
 | Area | Current evidence | Status |
 |---|---|---|

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -48,8 +49,14 @@ func TestBootstrapCreatesValidIdempotentMaterial(t *testing.T) {
 	if fencingKeySecret.Immutable == nil || !*fencingKeySecret.Immutable || len(fencingKeySecret.Data) != 1 || len(fencingKeySecret.Data[PodFencingKeyKey]) != podfence.SecretKeyBytes {
 		t.Fatalf("initialized Pod fencing key Secret = %#v", fencingKeySecret)
 	}
-	if !bytes.Equal(caSecret.Data[PodFencingKeyFingerprintKey], podfence.SecretHandshakeKeyFingerprint(fencingKeySecret.Data[PodFencingKeyKey])) {
+	if caSecret.Annotations[PodFencingKeyFingerprintAnnotation] != podfence.SecretHandshakeKeyFingerprint(fencingKeySecret.Data[PodFencingKeyKey]) {
 		t.Fatal("CA Secret does not anchor the initialized Pod fencing key")
+	}
+	if fencingKeySecret.Annotations[podfence.SecretKeyContinuityAnnotation] != podfence.SecretKeyContinuityValue {
+		t.Fatal("initialized Pod fencing key lacks its continuity marker")
+	}
+	if len(caSecret.Data) != 2 {
+		t.Fatalf("continuity metadata changed the rollback-compatible CA data shape: %#v", caSecret.Data)
 	}
 	authority, err := parseCertificateAuthority(caSecret.Data[CACertificateKey], caSecret.Data[CAPrivateKeyKey], now)
 	if err != nil {
@@ -166,6 +173,9 @@ func TestCheckerRejectsMissingOrMalformedPodFencingKey(t *testing.T) {
 						Namespace: secret.Namespace,
 						Name:      secret.Name,
 						Labels:    map[string]string{ManagedByLabel: ManagedByValue},
+						Annotations: map[string]string{
+							podfence.SecretKeyContinuityAnnotation: podfence.SecretKeyContinuityValue,
+						},
 					},
 					Type:      corev1.SecretTypeOpaque,
 					Immutable: &immutable,
@@ -188,6 +198,9 @@ func TestCheckerRejectsMissingOrMalformedPodFencingKey(t *testing.T) {
 						Namespace: secret.Namespace,
 						Name:      secret.Name,
 						Labels:    map[string]string{ManagedByLabel: ManagedByValue},
+						Annotations: map[string]string{
+							podfence.SecretKeyContinuityAnnotation: podfence.SecretKeyContinuityValue,
+						},
 					},
 					Type:      corev1.SecretTypeOpaque,
 					Immutable: &immutable,
@@ -281,8 +294,20 @@ func TestBootstrapAnchorsAnExistingFencingKeyWithoutReplacingIt(t *testing.T) {
 	}
 	keyBefore := getSecret(t, kubeClient, testFencingKeySecretName)
 	caSecret := getSecret(t, kubeClient, testCASecretName)
-	delete(caSecret.Data, PodFencingKeyFingerprintKey)
+	delete(caSecret.Annotations, PodFencingKeyFingerprintAnnotation)
 	if err := kubeClient.Update(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	delete(keyBefore.Annotations, podfence.SecretKeyContinuityAnnotation)
+	if err := kubeClient.Update(ctx, keyBefore); err != nil {
+		t.Fatal(err)
+	}
+	cluster := clusterWithHandshakeReceipt(t, keyBefore.Data[PodFencingKeyKey], "existing-receipt")
+	if err := kubeClient.Create(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	pod := podWithTerminationReceipt(t, keyBefore.Data[PodFencingKeyKey], "existing-terminal-pod")
+	if err := kubeClient.Create(ctx, pod); err != nil {
 		t.Fatal(err)
 	}
 
@@ -291,14 +316,213 @@ func TestBootstrapAnchorsAnExistingFencingKeyWithoutReplacingIt(t *testing.T) {
 	}
 	keyAfter := getSecret(t, kubeClient, testFencingKeySecretName)
 	caSecret = getSecret(t, kubeClient, testCASecretName)
-	if keyAfter.ResourceVersion != keyBefore.ResourceVersion || !bytes.Equal(keyAfter.Data[PodFencingKeyKey], keyBefore.Data[PodFencingKeyKey]) {
+	if !bytes.Equal(keyAfter.Data[PodFencingKeyKey], keyBefore.Data[PodFencingKeyKey]) {
 		t.Fatal("continuity migration replaced the existing Pod fencing key")
 	}
-	if !bytes.Equal(caSecret.Data[PodFencingKeyFingerprintKey], podfence.SecretHandshakeKeyFingerprint(keyBefore.Data[PodFencingKeyKey])) {
+	if caSecret.Annotations[PodFencingKeyFingerprintAnnotation] != podfence.SecretHandshakeKeyFingerprint(keyBefore.Data[PodFencingKeyKey]) {
 		t.Fatal("continuity migration did not anchor the existing Pod fencing key")
 	}
 	if err := provisioner.Checker(nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBootstrapRefusesPreAnchorCandidateThatCannotVerifyExistingReceipt(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name        string
+		replacement func(*corev1.Secret) *corev1.Secret
+		want        string
+	}{
+		{
+			name: "empty candidate",
+			replacement: func(original *corev1.Secret) *corev1.Secret {
+				return &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Namespace: original.Namespace, Name: original.Name, Labels: map[string]string{ManagedByLabel: ManagedByValue}},
+					Type:       corev1.SecretTypeOpaque,
+				}
+			},
+			want: "has an outstanding handshake receipt",
+		},
+		{
+			name: "different valid candidate",
+			replacement: func(original *corev1.Secret) *corev1.Secret {
+				key := bytes.Clone(original.Data[PodFencingKeyKey])
+				key[0] ^= 0xff
+				immutable := true
+				return &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Namespace: original.Namespace, Name: original.Name, Labels: map[string]string{ManagedByLabel: ManagedByValue}},
+					Type:       corev1.SecretTypeOpaque,
+					Immutable:  &immutable,
+					Data:       map[string][]byte{PodFencingKeyKey: key},
+				}
+			},
+			want: "does not match the candidate Pod fencing key",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			kubeClient := newTestClient(t, installObjects()...)
+			provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+			if err := provisioner.Bootstrap(ctx); err != nil {
+				t.Fatal(err)
+			}
+			original := getSecret(t, kubeClient, testFencingKeySecretName)
+			caSecret := getSecret(t, kubeClient, testCASecretName)
+			delete(caSecret.Annotations, PodFencingKeyFingerprintAnnotation)
+			if err := kubeClient.Update(ctx, caSecret); err != nil {
+				t.Fatal(err)
+			}
+			cluster := clusterWithHandshakeReceipt(t, original.Data[PodFencingKeyKey], "outstanding-receipt")
+			if err := kubeClient.Create(ctx, cluster); err != nil {
+				t.Fatal(err)
+			}
+			if err := kubeClient.Delete(ctx, original); err != nil {
+				t.Fatal(err)
+			}
+			if err := kubeClient.Create(ctx, test.replacement(original)); err != nil {
+				t.Fatal(err)
+			}
+			if err := provisioner.Bootstrap(ctx); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Bootstrap() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBootstrapRefusesPreAnchorCandidateThatCannotVerifyTerminationReceipt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	kubeClient := newTestClient(t, installObjects()...)
+	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	original := getSecret(t, kubeClient, testFencingKeySecretName)
+	caSecret := getSecret(t, kubeClient, testCASecretName)
+	delete(caSecret.Annotations, PodFencingKeyFingerprintAnnotation)
+	if err := kubeClient.Update(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Create(ctx, podWithTerminationReceipt(t, original.Data[PodFencingKeyKey], "outstanding-terminal-pod")); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Delete(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	replacementKey := bytes.Clone(original.Data[PodFencingKeyKey])
+	replacementKey[0] ^= 0xff
+	immutable := true
+	replacement := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: original.Namespace, Name: original.Name, Labels: map[string]string{ManagedByLabel: ManagedByValue}},
+		Type:       corev1.SecretTypeOpaque,
+		Immutable:  &immutable,
+		Data:       map[string][]byte{PodFencingKeyKey: replacementKey},
+	}
+	if err := kubeClient.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := provisioner.Bootstrap(ctx); err == nil || !strings.Contains(err.Error(), "termination receipt does not match the candidate Pod fencing key") {
+		t.Fatalf("Bootstrap() error = %v", err)
+	}
+}
+
+func TestBootstrapRefusesAnchorLossAfterContinuityCompleted(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	kubeClient := newTestClient(t, installObjects()...)
+	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	caSecret := getSecret(t, kubeClient, testCASecretName)
+	delete(caSecret.Annotations, PodFencingKeyFingerprintAnnotation)
+	if err := kubeClient.Update(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := provisioner.Bootstrap(ctx); err == nil || !strings.Contains(err.Error(), "continuity marker exists but its fingerprint anchor is missing") {
+		t.Fatalf("Bootstrap() error = %v", err)
+	}
+	if err := provisioner.Checker(nil); err == nil || !strings.Contains(err.Error(), "continuity fingerprint is missing") {
+		t.Fatalf("Checker() error = %v", err)
+	}
+}
+
+func TestBootstrapRechecksReceiptsBeforeCompletingAnchoredMigration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	kubeClient := newTestClient(t, installObjects()...)
+	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keySecret := getSecret(t, kubeClient, testFencingKeySecretName)
+	delete(keySecret.Annotations, podfence.SecretKeyContinuityAnnotation)
+	if err := kubeClient.Update(ctx, keySecret); err != nil {
+		t.Fatal(err)
+	}
+	differentKey := bytes.Repeat([]byte{0xff}, podfence.SecretKeyBytes)
+	cluster := clusterWithHandshakeReceipt(t, differentKey, "late-receipt")
+	if err := kubeClient.Create(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+
+	err := provisioner.Bootstrap(ctx)
+	if err == nil || !strings.Contains(err.Error(), "does not match the candidate Pod fencing key") {
+		t.Fatalf("Bootstrap() error = %v", err)
+	}
+	keySecret = getSecret(t, kubeClient, testFencingKeySecretName)
+	if keySecret.Annotations[podfence.SecretKeyContinuityAnnotation] != "" {
+		t.Fatal("failed migration wrote the continuity completion marker")
+	}
+}
+
+func TestBootstrapCompletesInterruptedAnchoredMigration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	kubeClient := newTestClient(t, installObjects()...)
+	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keySecret := getSecret(t, kubeClient, testFencingKeySecretName)
+	delete(keySecret.Annotations, podfence.SecretKeyContinuityAnnotation)
+	if err := kubeClient.Update(ctx, keySecret); err != nil {
+		t.Fatal(err)
+	}
+	key := keySecret.Data[PodFencingKeyKey]
+	if err := kubeClient.Create(ctx, clusterWithHandshakeReceipt(t, key, "interrupted-cluster")); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Create(ctx, podWithTerminationReceipt(t, key, "interrupted-pod")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keySecret = getSecret(t, kubeClient, testFencingKeySecretName)
+	if keySecret.Annotations[podfence.SecretKeyContinuityAnnotation] != podfence.SecretKeyContinuityValue {
+		t.Fatal("interrupted migration did not write its completion marker")
+	}
+}
+
+func TestContinuityMetadataPreservesPreviousManagerSecretDataShapes(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.July, 14, 12, 0, 0, 0, time.UTC)
+	kubeClient := newTestClient(t, installObjects()...)
+	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), func() time.Time { return now })
+	if err := provisioner.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	caSecret := getSecret(t, kubeClient, testCASecretName)
+	keySecret := getSecret(t, kubeClient, testFencingKeySecretName)
+	if len(caSecret.Data) != 2 || len(keySecret.Data) != 1 {
+		t.Fatalf("previous-manager Secret data shapes changed: CA=%#v key=%#v", caSecret.Data, keySecret.Data)
+	}
+	if _, err := parseCertificateAuthority(caSecret.Data[CACertificateKey], caSecret.Data[CAPrivateKeyKey], now); err != nil {
+		t.Fatalf("previous manager cannot parse anchored CA Secret: %v", err)
 	}
 }
 
@@ -691,10 +915,59 @@ func newTestClientWithInterceptors(t *testing.T, objects []client.Object, functi
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := pgshardv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	if err := admissionregistrationv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithInterceptorFuncs(functions).Build()
+}
+
+func clusterWithHandshakeReceipt(t *testing.T, key []byte, name string) *pgshardv1alpha1.PgShardCluster {
+	t.Helper()
+	cluster := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{
+		Namespace: testNamespace,
+		Name:      name,
+		UID:       types.UID(name + "-uid"),
+		Annotations: map[string]string{
+			podfence.HandshakeChallengeAnnotation: name + "-challenge",
+		},
+	}}
+	receipt, err := podfence.NewStaticHandshakeCodec(key).Receipt(context.Background(), cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster.Annotations[podfence.HandshakeReceiptAnnotation] = receipt
+	return cluster
+}
+
+func podWithTerminationReceipt(t *testing.T, key []byte, name string) *corev1.Pod {
+	t.Helper()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNamespace,
+			Name:      name,
+			UID:       types.UID(name + "-uid"),
+			Annotations: map[string]string{
+				podfence.NodeUIDAnnotation:    "node-uid",
+				podfence.NodeBootIDAnnotation: "boot-id",
+			},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "postgresql", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+			}},
+		},
+	}
+	receipt, err := podfence.NewStaticHandshakeCodec(key).TerminationReceipt(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.Conditions = []corev1.PodCondition{podfence.NewTerminationAttestation(pod, metav1.Now(), receipt)}
+	return pod
 }
 
 func getSecret(t *testing.T, kubeClient client.Client, name string) *corev1.Secret {

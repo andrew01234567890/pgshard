@@ -341,11 +341,17 @@ a TLS 1.3 serving key pair, and a separate random 256-bit fencing key in those
 Secrets, validates the Service references, injects the CA bundle, and writes the
 serving files into a private memory-backed `emptyDir`. The fencing key Secret is
 made immutable by the same update that initializes it. A SHA-256 continuity
-fingerprint is stored separately in the CA Secret. Startup, readiness, webhook
-admission, and controller reconciliation all require the exact immutable key to
-match that anchor, so an empty, mutable, oversized, or different replacement
-fails closed instead of silently invalidating outstanding receipts. Existing
-installs without the fingerprint anchor their current key without rotating it.
+fingerprint annotation is stored separately on the CA Secret, followed by a
+completion annotation on the key Secret. These metadata-only additions preserve
+the data shapes accepted by the previous manager, so a rollout can be rolled
+back. On first adoption, every stored cluster-handshake and Pod-termination
+receipt must verify with the candidate key; an empty key is generated only when
+no receipt exists. Once complete, loss of the fingerprint fails closed instead
+of re-entering adoption. Startup, readiness, webhook admission, and controller
+reconciliation all require the exact immutable key to match that anchor, so an
+empty, mutable, oversized, or different replacement cannot silently invalidate
+outstanding receipts. Existing installs adopt their verified current key without
+rotating it.
 The key authenticates cluster-handshake and Pod-termination receipts
 independently of certificate renewal or CA encoding; its bytes are never stored
 in resource annotations.

@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
@@ -20,13 +21,17 @@ const (
 	handshakeReceiptVersion = "v1"
 	// SecretKeyBytes is the exact length of a pgshard receipt key.
 	SecretKeyBytes = sha256.Size
+	// SecretKeyContinuityAnnotation records that the independent fingerprint
+	// anchor was durably installed for this key generation.
+	SecretKeyContinuityAnnotation = "pgshard.io/pod-fencing-key-continuity"
+	SecretKeyContinuityValue      = "v1"
 )
 
 type HandshakeCodec struct {
 	key func(context.Context) ([]byte, error)
 }
 
-func NewSecretHandshakeCodec(reader client.Reader, secret types.NamespacedName, dataKey string, anchorSecret types.NamespacedName, anchorDataKey string) *HandshakeCodec {
+func NewSecretHandshakeCodec(reader client.Reader, secret types.NamespacedName, dataKey string, anchorSecret types.NamespacedName, anchorAnnotation string) *HandshakeCodec {
 	return &HandshakeCodec{key: func(ctx context.Context) ([]byte, error) {
 		if reader == nil {
 			return nil, fmt.Errorf("Pod fencing handshake Secret reader is required")
@@ -43,7 +48,7 @@ func NewSecretHandshakeCodec(reader client.Reader, secret types.NamespacedName, 
 		if err := reader.Get(ctx, anchorSecret, anchor); err != nil {
 			return nil, fmt.Errorf("read Pod fencing handshake anchor Secret %s: %w", anchorSecret, err)
 		}
-		if err := ValidateSecretHandshakeKeyFingerprint(anchor, anchorDataKey, key); err != nil {
+		if err := ValidateSecretHandshakeKeyFingerprint(anchor, anchorAnnotation, key); err != nil {
 			return nil, err
 		}
 		return key, nil
@@ -63,6 +68,19 @@ func NewStaticHandshakeCodec(key []byte) *HandshakeCodec {
 // ValidateSecretHandshakeKey returns the exact immutable key from an
 // operator-owned Secret.
 func ValidateSecretHandshakeKey(secret *corev1.Secret, dataKey string) ([]byte, error) {
+	key, err := ValidateSecretHandshakeKeyCandidate(secret, dataKey)
+	if err != nil {
+		return nil, err
+	}
+	if secret.Annotations[SecretKeyContinuityAnnotation] != SecretKeyContinuityValue {
+		return nil, fmt.Errorf("Pod fencing handshake Secret %s/%s lacks its continuity marker", secret.Namespace, secret.Name)
+	}
+	return key, nil
+}
+
+// ValidateSecretHandshakeKeyCandidate validates a pre-anchor key during a
+// bounded migration without treating it as runtime signing authority.
+func ValidateSecretHandshakeKeyCandidate(secret *corev1.Secret, dataKey string) ([]byte, error) {
 	if err := validateOwnedOpaqueSecret(secret); err != nil {
 		return nil, err
 	}
@@ -78,9 +96,9 @@ func ValidateSecretHandshakeKey(secret *corev1.Secret, dataKey string) ([]byte, 
 
 // SecretHandshakeKeyFingerprint returns the continuity anchor for a receipt
 // key. The fingerprint is not secret.
-func SecretHandshakeKeyFingerprint(key []byte) []byte {
+func SecretHandshakeKeyFingerprint(key []byte) string {
 	fingerprint := sha256.Sum256(key)
-	return fingerprint[:]
+	return hex.EncodeToString(fingerprint[:])
 }
 
 // ValidateSecretHandshakeKeyFingerprint proves that key is the generation
@@ -92,11 +110,13 @@ func ValidateSecretHandshakeKeyFingerprint(secret *corev1.Secret, dataKey string
 	if err := validateOwnedOpaqueSecret(secret); err != nil {
 		return err
 	}
-	fingerprint, exists := secret.Data[dataKey]
-	if dataKey == "" || !exists || len(fingerprint) != sha256.Size {
-		return fmt.Errorf("Pod fencing handshake anchor Secret %s/%s must contain a %d-byte %s", secret.Namespace, secret.Name, sha256.Size, dataKey)
+	encoded, exists := secret.Annotations[dataKey]
+	fingerprint, err := hex.DecodeString(encoded)
+	if dataKey == "" || !exists || err != nil || len(fingerprint) != sha256.Size || encoded != hex.EncodeToString(fingerprint) {
+		return fmt.Errorf("Pod fencing handshake anchor Secret %s/%s must contain a canonical SHA-256 annotation %s", secret.Namespace, secret.Name, dataKey)
 	}
-	if !hmac.Equal(fingerprint, SecretHandshakeKeyFingerprint(key)) {
+	wanted := sha256.Sum256(key)
+	if !hmac.Equal(fingerprint, wanted[:]) {
 		return fmt.Errorf("Pod fencing handshake key does not match the anchored fingerprint; restore the original key or perform explicit fencing recovery")
 	}
 	return nil

@@ -202,7 +202,7 @@ func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient cli
 	if fencingKeySecret.Immutable == nil || !*fencingKeySecret.Immutable || len(fencingKeySecret.Data) != 1 || len(fencingKeySecret.Data[pki.PodFencingKeyKey]) != podfence.SecretKeyBytes {
 		t.Fatalf("webhook Pod fencing key = %#v", fencingKeySecret)
 	}
-	if !bytes.Equal(caSecret.Data[pki.PodFencingKeyFingerprintKey], podfence.SecretHandshakeKeyFingerprint(fencingKeySecret.Data[pki.PodFencingKeyKey])) {
+	if caSecret.Annotations[pki.PodFencingKeyFingerprintAnnotation] != podfence.SecretHandshakeKeyFingerprint(fencingKeySecret.Data[pki.PodFencingKeyKey]) {
 		t.Fatal("webhook CA Secret does not anchor the Pod fencing key")
 	}
 	if _, err := tls.X509KeyPair(servingSecret.Data[pki.TLSCertificateKey], servingSecret.Data[pki.TLSPrivateKeyKey]); err != nil {

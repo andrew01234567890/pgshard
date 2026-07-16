@@ -114,13 +114,13 @@ func main() {
 	}
 
 	if err := (&controller.PgShardClusterReconciler{
-		Client:                 manager.GetClient(),
-		APIReader:              manager.GetAPIReader(),
-		Images:                 options.images,
-		PodFencingKeySecret:    client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.fencingKeySecretName},
-		PodFencingKeyData:      pki.PodFencingKeyKey,
-		PodFencingAnchorSecret: client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
-		PodFencingAnchorData:   pki.PodFencingKeyFingerprintKey,
+		Client:                     manager.GetClient(),
+		APIReader:                  manager.GetAPIReader(),
+		Images:                     options.images,
+		PodFencingKeySecret:        client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.fencingKeySecretName},
+		PodFencingKeyData:          pki.PodFencingKeyKey,
+		PodFencingAnchorSecret:     client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
+		PodFencingAnchorAnnotation: pki.PodFencingKeyFingerprintAnnotation,
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
@@ -131,7 +131,7 @@ func main() {
 			client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.fencingKeySecretName},
 			pki.PodFencingKeyKey,
 			client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
-			pki.PodFencingKeyFingerprintKey,
+			pki.PodFencingKeyFingerprintAnnotation,
 		)
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCluster{}).
 			WithDefaulter(&pgshardv1alpha1.PgShardClusterDefaulter{}).
