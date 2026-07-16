@@ -746,7 +746,7 @@ func TestDeletionPolicyRetainsPostgreSQLDataByDefault(t *testing.T) {
 	}
 }
 
-func TestRetainFinalizationDoesNotDeadlockAfterRecordedDataIsGone(t *testing.T) {
+func TestRetainFinalizationReleasesExplicitlyDeletingPostgreSQLData(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	cluster := validCluster()
@@ -765,23 +765,22 @@ func TestRetainFinalizationDoesNotDeadlockAfterRecordedDataIsGone(t *testing.T) 
 	if err := fakeClient.Get(ctx, key, claim); err != nil {
 		t.Fatal(err)
 	}
-	claim.Finalizers = nil
-	if err := fakeClient.Update(ctx, claim); err != nil {
-		t.Fatal(err)
-	}
 	if err := fakeClient.Delete(ctx, claim); err != nil {
 		t.Fatal(err)
 	}
 	if err := fakeClient.Delete(ctx, current); err != nil {
 		t.Fatal(err)
 	}
-	for range 4 {
+	for range 16 {
 		if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := fakeClient.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("Retain finalizer deadlocked after its exact recorded PVC was already gone: %v", err)
+		t.Fatalf("Retain finalizer deadlocked behind an explicitly deleting PVC: %v", err)
+	}
+	if err := fakeClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("explicitly deleting PostgreSQL data PVC survived Retain finalization: %v", err)
 	}
 }
 

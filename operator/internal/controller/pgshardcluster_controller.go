@@ -1264,18 +1264,16 @@ func (r *PgShardClusterReconciler) retainPostgreSQLPVCs(ctx context.Context, clu
 			return r.deleteLatePostgreSQLDataPVC(ctx, cluster, *bootstrap, claim, storageSize)
 		}
 		if claim.DeletionTimestamp != nil {
-			unavailable, unavailableErr := namespaceUnavailableForCreate(ctx, r.APIReader, cluster.Namespace)
-			if unavailableErr != nil {
-				return false, unavailableErr
-			}
-			if unavailable && postgresqlDataPVCIsProtected(claim) {
+			if postgresqlDataPVCIsProtected(claim) {
 				controllerutil.RemoveFinalizer(claim, owned.PostgreSQLDataProtectionFinalizer)
 				if err := r.Update(ctx, claim, client.FieldOwner(owned.ManagedByValue)); err != nil && !apierrors.IsNotFound(err) {
-					return false, fmt.Errorf("release PostgreSQL data protection during namespace deletion: %w", err)
+					return false, fmt.Errorf("release explicitly deleting PostgreSQL data PVC %s: %w", claim.Name, err)
 				}
-				return true, nil
 			}
-			return false, fmt.Errorf("PostgreSQL data PVC %s is already deleting and cannot be retained", claim.Name)
+			// A Delete request is irreversible. Workloads were pruned before this
+			// function, so release only our finalizer and wait for authoritative
+			// absence instead of misrepresenting the claim as retained.
+			return true, nil
 		}
 		if err := validatePostgreSQLDataPVC(claim, cluster, bootstrap.Shard, *bootstrap, storageSize); err != nil {
 			return false, err
