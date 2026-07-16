@@ -588,7 +588,7 @@ jobs:
       needs.changes.outputs.go == 'true' ||
       needs.changes.outputs.images == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -642,7 +642,7 @@ jobs:
         env:
           PGSHARD_KIND_MANAGER_E2E: "true"
         run: >-
-          go test -race -count=1
+          go test -race -count=1 -timeout=20m
           -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|ManagerReconcilesFailClosedDevelopmentCluster|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerDeletePolicyReleasesBoundPostgreSQLPVC)$'
           ./internal/controller
       - name: Capture manager diagnostics

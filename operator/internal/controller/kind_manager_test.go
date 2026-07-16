@@ -233,6 +233,16 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 	if pod.Status.Phase != corev1.PodRunning {
 		t.Fatalf("PostgreSQL Pod was not running against the bound claim: %#v", pod.Status)
 	}
+	mountedCheckpointedClaim := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == bootstrap.PVCName {
+			mountedCheckpointedClaim = true
+			break
+		}
+	}
+	if !mountedCheckpointedClaim {
+		t.Fatalf("PostgreSQL Pod does not mount checkpointed data claim %s: %#v", bootstrap.PVCName, pod.Spec.Volumes)
+	}
 
 	if err := kubeClient.Delete(ctx, current, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
 		t.Fatal(err)

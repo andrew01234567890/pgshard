@@ -27,6 +27,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		{group: "", resource: "events", verbs: []string{"create", "patch"}},
 		{group: "", resource: "persistentvolumeclaims", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "", resource: "secrets", verbs: []string{"create", "get"}},
+		{group: "storage.k8s.io", resource: "storageclasses", verbs: []string{"get"}},
 	} {
 		if !roleAllows(role, required.group, required.resource, required.verbs) {
 			t.Errorf("manager role does not authorize %q %q with verbs %v", required.group, required.resource, required.verbs)
@@ -38,6 +39,11 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 	for _, forbidden := range []string{"delete", "list", "patch", "update", "watch"} {
 		if roleAllows(role, "", "secrets", []string{forbidden}) {
 			t.Errorf("cluster-wide manager role grants forbidden Secret verb %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{"create", "delete", "list", "patch", "update", "watch"} {
+		if roleAllows(role, "storage.k8s.io", "storageclasses", []string{forbidden}) {
+			t.Errorf("cluster-wide manager role grants forbidden StorageClass verb %q", forbidden)
 		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -420,7 +421,14 @@ func TestReconcileCheckpointsRetroactivelyDefaultedStorageClass(t *testing.T) {
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	cluster.Spec.Storage.StorageClassName = nil
-	fakeClient := newFakeClient(t, cluster)
+	lateDefault := "late-default"
+	defaultClass := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{
+		Name: lateDefault,
+		Annotations: map[string]string{
+			"storageclass.kubernetes.io/is-default-class": "true",
+		},
+	}}
+	fakeClient := newFakeClient(t, cluster, defaultClass)
 	reconciler := &PgShardClusterReconciler{Client: fakeClient}
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
@@ -436,7 +444,6 @@ func TestReconcileCheckpointsRetroactivelyDefaultedStorageClass(t *testing.T) {
 	if err := fakeClient.Get(ctx, key, claim); err != nil {
 		t.Fatal(err)
 	}
-	lateDefault := "late-default"
 	claim.Spec.StorageClassName = &lateDefault
 	if err := fakeClient.Update(ctx, claim); err != nil {
 		t.Fatal(err)
@@ -460,6 +467,62 @@ func TestReconcileCheckpointsRetroactivelyDefaultedStorageClass(t *testing.T) {
 	}
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "storage class differs from its recorded API value") {
 		t.Fatalf("second storage-class transition was not fenced: %v", err)
+	}
+}
+
+func TestReconcileRejectsUnverifiedRetroactiveStorageClass(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name         string
+		storageClass string
+		objects      []client.Object
+		wantError    string
+	}{
+		{
+			name:         "explicit empty class",
+			storageClass: "",
+			wantError:    "storage class differs from its recorded API value",
+		},
+		{
+			name:         "non-default class",
+			storageClass: "user-selected",
+			objects: []client.Object{&storagev1.StorageClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "user-selected"},
+			}},
+			wantError: "is not marked as a default StorageClass",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			cluster.Spec.Storage.StorageClassName = nil
+			objects := append([]client.Object{cluster}, test.objects...)
+			fakeClient := newFakeClient(t, objects...)
+			reconciler := &PgShardClusterReconciler{Client: fakeClient}
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
+			}
+
+			current := getCluster(t, ctx, fakeClient, cluster)
+			bootstrap := bootstrapForShard(t, current, 0)
+			claim := &corev1.PersistentVolumeClaim{}
+			key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+			if err := fakeClient.Get(ctx, key, claim); err != nil {
+				t.Fatal(err)
+			}
+			claim.Spec.StorageClassName = &test.storageClass
+			if err := fakeClient.Update(ctx, claim); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("unverified storage-class transition error = %v, want %q", err, test.wantError)
+			}
+		})
 	}
 }
 
