@@ -63,6 +63,8 @@ const (
 	PostgreSQLBootstrapClusterUIDAnnotation = "pgshard.io/bootstrap-cluster-uid"
 	PostgreSQLDataClusterUIDAnnotation      = "pgshard.io/data-cluster-uid"
 	PostgreSQLDataProtectionFinalizer       = "pgshard.io/postgresql-data-protection"
+	PostgreSQLPodClusterUIDAnnotation       = "pgshard.io/postgresql-cluster-uid"
+	PostgreSQLPodTerminationFinalizer       = "pgshard.io/postgresql-termination"
 	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 )
 
@@ -608,7 +610,14 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 			UpdateStrategy:      appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
 			Selector:            &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: map[string]string{configHashAnnotation: configurationHash}},
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: selector,
+					Annotations: map[string]string{
+						configHashAnnotation:              configurationHash,
+						PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
+					},
+					Finalizers: []string{PostgreSQLPodTerminationFinalizer},
+				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken:  &automount,
 					EnableServiceLinks:            &enableServiceLinks,

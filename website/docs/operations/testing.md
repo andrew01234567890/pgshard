@@ -565,10 +565,18 @@ after provisioning and prove finalization uses only the stored snapshot. It also
 reads the durable cluster-UID and shard identity marker
 from the running data directory. Foreground deletion of the cluster then proves
 the default-retained PVCs are detached, keep their exact recorded UIDs, and have
-their credential tombstones removed. Fault injection separately places a late
-StatefulSet Pod after controller pruning and proves Retain keeps the PVC
-protected until credential absence and authoritative Pod absence have both been
-observed. A behavioral init test supplies a marker
+their credential tombstones removed. Every managed PostgreSQL Pod carries a
+cluster-UID-bound termination finalizer. The live manager test stops the
+operator, force-deletes a primary with zero grace, observes the API object
+remain through kubelet's terminal status and the PVC remain protected, restarts
+the operator, and verifies a replacement Pod can read the persisted row. Unit
+coverage keeps a nonterminal deleting Pod and its PVC fenced, permits release
+only after terminal status, and refuses to prune a managed workload whose Pod
+lacks that finalizer. Fault injection separately places a late StatefulSet Pod
+after controller pruning and proves Retain keeps the PVC protected until
+credential absence, kubelet terminal status, and authoritative Pod absence have
+all been observed. Running and completed credential-only SQL clients do not
+block the PGDATA barrier. A behavioral init test supplies a marker
 from another cluster or shard and proves bootstrap refuses it before entering
 initialization; the validated fast path repeats the final-data and
 parent-directory publication barrier before exit. It does not

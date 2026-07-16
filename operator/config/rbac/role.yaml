@@ -38,6 +38,7 @@ rules:
   verbs:
   - delete
   - list
+  - patch
 - apiGroups:
   - ""
   resources:

@@ -159,6 +159,17 @@ restarts. Before publishing that Pod, the controller protects the checkpointed
 PVC UID with its own finalizer, makes the live PVC ownerless, and anchors the
 credential tombstone back to it. The exact claim name cannot be reused until
 the mounting workload is pruned, so a late empty claim cannot enter bootstrap.
+Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
+finalizer. The controller removes that finalizer only after the Pod is deleting
+and kubelet has reported `Succeeded` or `Failed`; an uncached Pod read then has
+to prove absence before the PVC protection is released. Force deletion
+therefore cannot make a running process disappear from the API while the node
+is reachable. If the node is partitioned and cannot report terminal state,
+deletion deliberately remains blocked and the PVC stays protected. Manually
+removing this finalizer is not a storage-fencing operation and is outside the
+safe lifecycle boundary. Credential-only client Pods do not own PGDATA and do
+not block retention after the PostgreSQL process proof; their existing sessions
+are severed when that process stops.
 Its init container binds the durable bootstrap marker to the exact
 cluster UID and shard and repeats the scoped final-data and parent-directory
 publication barrier before

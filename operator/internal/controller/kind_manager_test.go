@@ -75,7 +75,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
 		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against the installed admission manager")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Minute)
 	defer cancel()
 	kubeClient := newKINDClient(t)
 
@@ -159,6 +159,64 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		t.Fatalf("query after StatefulSet restart = %q", got)
 	}
 
+	managerRestored := false
+	t.Cleanup(func() {
+		if managerRestored {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cleanupCancel()
+		for _, arguments := range [][]string{
+			{"--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1"},
+			{"--namespace", "pgshard-system", "rollout", "status", "deployment/pgshard-controller-manager", "--timeout=120s"},
+		} {
+			output, err := exec.CommandContext(cleanupCtx, "kubectl", arguments...).CombinedOutput()
+			if err != nil {
+				t.Errorf("restore manager with kubectl %s: %v\n%s", strings.Join(arguments, " "), err, output)
+			}
+		}
+	})
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=0")
+	waitForManagerReplicas(t, ctx, kubeClient, 0)
+	beforeForceDelete := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, beforeForceDelete); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(beforeForceDelete.Finalizers, owned.PostgreSQLPodTerminationFinalizer) {
+		t.Fatalf("PostgreSQL Pod lacks its termination fence: %q", beforeForceDelete.Finalizers)
+	}
+	zeroGrace := int64(0)
+	if err := kubeClient.Delete(ctx, beforeForceDelete, &client.DeleteOptions{GracePeriodSeconds: &zeroGrace}); err != nil {
+		t.Fatal(err)
+	}
+	terminating := &corev1.Pod{}
+	err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 45*time.Second, true, func(ctx context.Context) (bool, error) {
+		terminating = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, terminating); err != nil {
+			return false, err
+		}
+		return terminating.DeletionTimestamp != nil && contains(terminating.Finalizers, owned.PostgreSQLPodTerminationFinalizer) && podHasTerminalPhase(terminating), nil
+	})
+	if err != nil {
+		t.Fatalf("force-deleted PostgreSQL Pod did not remain fenced through kubelet terminalization: %v; last Pod = %#v", err, terminating)
+	}
+	forceDeleteClaim := &corev1.PersistentVolumeClaim{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroBootstrap.PVCName}, forceDeleteClaim); err != nil {
+		t.Fatal(err)
+	}
+	if !postgresqlDataPVCIsProtected(forceDeleteClaim) || forceDeleteClaim.Annotations[owned.RetainedFromAnnotation] != "" {
+		t.Fatalf("force deletion released PostgreSQL data before process termination was reconciled: %#v", forceDeleteClaim.ObjectMeta)
+	}
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1")
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "rollout", "status", "deployment/pgshard-controller-manager", "--timeout=120s")
+	waitForManagerReplicas(t, ctx, kubeClient, 1)
+	managerRestored = true
+	waitForRecreatedReadyPod(t, ctx, kubeClient, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, beforeForceDelete.UID)
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
+		t.Fatalf("query after force-deleted Pod recovery = %q", got)
+	}
+
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +238,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if err := kubeClient.Delete(ctx, current, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
 		t.Fatal(err)
 	}
-	err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), &pgshardv1alpha1.PgShardCluster{})
 		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
 	})
@@ -692,6 +750,28 @@ func waitForStableManagerPod(t *testing.T, ctx context.Context, kubeClient clien
 	})
 	if err != nil {
 		t.Fatalf("wait for stable manager pod: %v; last pods = %#v", err, pods.Items)
+	}
+}
+
+func waitForManagerReplicas(t *testing.T, ctx context.Context, kubeClient client.Client, wanted int32) {
+	t.Helper()
+	deployment := &appsv1.Deployment{}
+	key := types.NamespacedName{Namespace: "pgshard-system", Name: "pgshard-controller-manager"}
+	err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		deployment = &appsv1.Deployment{}
+		if err := kubeClient.Get(ctx, key, deployment); err != nil {
+			return false, err
+		}
+		if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != wanted || deployment.Status.ObservedGeneration < deployment.Generation {
+			return false, nil
+		}
+		if wanted == 0 {
+			return deployment.Status.Replicas == 0 && deployment.Status.ReadyReplicas == 0 && deployment.Status.AvailableReplicas == 0, nil
+		}
+		return deployment.Status.UpdatedReplicas == wanted && deployment.Status.ReadyReplicas == wanted && deployment.Status.AvailableReplicas == wanted, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for manager replicas %d: %v; last status = %#v", wanted, err, deployment.Status)
 	}
 }
 

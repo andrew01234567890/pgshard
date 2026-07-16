@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
@@ -781,6 +782,8 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 			Name:            statefulSet.Name + "-0",
 			Namespace:       cluster.Namespace,
 			Labels:          maps.Clone(statefulSet.Spec.Template.Labels),
+			Annotations:     maps.Clone(statefulSet.Spec.Template.Annotations),
+			Finalizers:      append([]string(nil), statefulSet.Spec.Template.Finalizers...),
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
 		},
 		Spec: corev1.PodSpec{Volumes: []corev1.Volume{
@@ -840,24 +843,56 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 		t.Fatalf("credential-only Pod was treated as a data-mounting Pod: %v", err)
 	}
 
-	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "active-sql-client") {
-		t.Fatalf("active credential-bearing Pod did not hold the data barrier: %v", err)
-	}
-	assertProtected("active credential client")
-	if err := base.Delete(ctx, activeCredentialPod); err != nil {
-		t.Fatal(err)
-	}
-
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
 	assertProtected("late Pod deletion")
-	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("late PostgreSQL Pod survived the finalization barrier: %v", err)
+	terminating := &corev1.Pod{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), terminating); err != nil {
+		t.Fatalf("late PostgreSQL Pod disappeared without a terminal proof: %v", err)
+	}
+	if terminating.DeletionTimestamp == nil || !controllerutil.ContainsFinalizer(terminating, owned.PostgreSQLPodTerminationFinalizer) {
+		t.Fatalf("late PostgreSQL Pod was not held behind its termination fence: %#v", terminating.ObjectMeta)
+	}
+	for _, credentialPod := range []*corev1.Pod{credentialOnlyPod, activeCredentialPod} {
+		if err := base.Get(ctx, client.ObjectKeyFromObject(credentialPod), &corev1.Pod{}); err != nil {
+			t.Fatalf("credential-only Pod %s blocked or was deleted by the PGDATA barrier: %v", credentialPod.Name, err)
+		}
 	}
 
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
+	}
+	assertProtected("nonterminal deleting Pod")
+	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), terminating); err != nil || !controllerutil.ContainsFinalizer(terminating, owned.PostgreSQLPodTerminationFinalizer) {
+		t.Fatalf("nonterminal PostgreSQL Pod lost its termination fence: pod=%#v err=%v", terminating.ObjectMeta, err)
+	}
+	terminating.Status.Phase = corev1.PodFailed
+	if err := base.Status().Update(ctx, terminating); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	assertProtected("terminal Pod fence release")
+	released := &corev1.Pod{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), released); err == nil {
+		if controllerutil.ContainsFinalizer(released, owned.PostgreSQLPodTerminationFinalizer) || !podHasTerminalPhase(released) {
+			t.Fatalf("terminal PostgreSQL Pod fence was not released: %#v", released)
+		}
+		// The fake client does not perform the API server's automatic final
+		// deletion after the last finalizer is patched away.
+		if err := base.Delete(ctx, released); err != nil {
+			t.Fatal(err)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+
+	for range 3 {
+		if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+			t.Fatal(err)
+		}
 	}
 	retained := &corev1.PersistentVolumeClaim{}
 	if err := base.Get(ctx, claimKey, retained); err != nil {
@@ -869,8 +904,130 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
 		t.Fatal(err)
 	}
-	if err := base.Get(ctx, client.ObjectKeyFromObject(credentialOnlyPod), &corev1.Pod{}); err != nil {
-		t.Fatalf("credential-only Pod blocked or was removed by completed finalization: %v", err)
+	for _, credentialPod := range []*corev1.Pod{credentialOnlyPod, activeCredentialPod} {
+		if err := base.Get(ctx, client.ObjectKeyFromObject(credentialPod), &corev1.Pod{}); err != nil {
+			t.Fatalf("credential-only Pod %s blocked or was removed by completed finalization: %v", credentialPod.Name, err)
+		}
+	}
+}
+
+func TestPostgreSQLPodTerminationFenceRequiresKubeletTerminalPhase(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
+	bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{
+		Shard: 0, PVCName: "recorded-data", PVCUID: "recorded-data-uid",
+		SecretName: "recorded-secret", SecretUID: "recorded-secret-uid", PVCFenceDetached: true,
+		PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
+	}
+	cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{bootstrap}
+	statefulSet := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name:      owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0),
+		Namespace: cluster.Namespace,
+		UID:       "statefulset-uid",
+	}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              statefulSet.Name + "-0",
+			Namespace:         cluster.Namespace,
+			UID:               "postgresql-pod-uid",
+			DeletionTimestamp: &metav1.Time{Time: time.Unix(100, 0)},
+			Finalizers:        []string{owned.PostgreSQLPodTerminationFinalizer},
+			Annotations:       map[string]string{owned.PostgreSQLPodClusterUIDAnnotation: string(cluster.UID)},
+			Labels: map[string]string{
+				owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "postgresql", owned.ShardLabel: "0000",
+				owned.RoleLabel: "primary", owned.MemberLabel: "0000",
+			},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
+		},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+			Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: bootstrap.PVCName}},
+		}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	base := newFakeClient(t, cluster, pod)
+	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+
+	released, err := reconciler.releaseTerminatedPostgreSQLPodFences(ctx, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released {
+		t.Fatal("nonterminal force-deleted PostgreSQL Pod released its termination fence")
+	}
+	current := &corev1.Pod{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(pod), current); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(current, owned.PostgreSQLPodTerminationFinalizer) {
+		t.Fatalf("nonterminal Pod finalizers = %q", current.Finalizers)
+	}
+
+	current.Status.Phase = corev1.PodFailed
+	if err := base.Status().Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	released, err = reconciler.releaseTerminatedPostgreSQLPodFences(ctx, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !released {
+		t.Fatal("terminal PostgreSQL Pod did not release its termination fence")
+	}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(pod), current); err == nil {
+		if controllerutil.ContainsFinalizer(current, owned.PostgreSQLPodTerminationFinalizer) {
+			t.Fatalf("terminal Pod finalizers = %q", current.Finalizers)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestDeletionRefusesPostgreSQLPodWithoutTerminationFence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	bootstrap := bootstrapForShard(t, current, 0)
+	statefulSet := &appsv1.StatefulSet{}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: statefulSet.Name + "-0", Namespace: cluster.Namespace, Labels: maps.Clone(statefulSet.Spec.Template.Labels),
+			Annotations:     maps.Clone(statefulSet.Spec.Template.Annotations),
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
+		},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+			Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: bootstrap.PVCName}},
+		}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	if err := base.Create(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "lacks its termination finalizer") {
+		t.Fatalf("deletion accepted an unfenced PostgreSQL Pod: %v", err)
+	}
+	if err := base.Get(ctx, statefulSetKey, &appsv1.StatefulSet{}); err != nil {
+		t.Fatalf("workload pruning began before termination-fence verification: %v", err)
 	}
 }
 

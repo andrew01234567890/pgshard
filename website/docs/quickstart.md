@@ -13,7 +13,11 @@ shard. Each shard receives a distinct immutable bootstrap Secret and a 4Gi
 minimum data claim. When `storage.storageClassName` is omitted, the operator
 resolves the current Kubernetes default and checkpoints that exact class before
 creating any claim; later default-class rotation does not change existing data
-intent. It has no standby, promotion, fencing, backup execution, `shardschema`
+intent. Managed PostgreSQL Pods retain their API identity through force deletion
+until kubelet reports a terminal phase; if a node cannot provide that proof,
+cluster deletion fails closed with the PVC still protected. This is lifecycle
+protection, not HA takeover or node fencing. It has no standby, promotion,
+backup execution, `shardschema`
 bootstrap, or SQL pooler. Restarting a primary interrupts that shard even though
 its data survives. Three- and five-member resources continue to fail closed
 without PostgreSQL Pods.
