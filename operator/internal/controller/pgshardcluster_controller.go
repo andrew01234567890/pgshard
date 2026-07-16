@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"time"
 
@@ -160,50 +161,107 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 }
 
 func (r *PgShardClusterReconciler) ensurePostgreSQLAuthSecret(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLAuthSuffix}
-	secret := &corev1.Secret{}
 	reader := client.Reader(r.Client)
 	if r.APIReader != nil {
 		reader = r.APIReader
 	}
-	err := reader.Get(ctx, key, secret)
-	if err == nil {
-		return validatePostgreSQLAuthSecret(secret, cluster)
-	}
-	if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("read credential Secret: %w", err)
-	}
-
-	workloads := &appsv1.StatefulSetList{}
-	if err := reader.List(ctx, workloads,
-		client.InNamespace(cluster.Namespace),
-		client.MatchingLabels{owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "postgresql"},
-	); err != nil {
-		return fmt.Errorf("prove PostgreSQL workload absence before generating credentials: %w", err)
-	}
-	if len(workloads.Items) != 0 {
-		return fmt.Errorf("credential Secret is missing after PostgreSQL workload creation; automatic replacement is unsafe")
-	}
-
-	random := make([]byte, postgresqlPasswordBytes)
-	if _, err := rand.Read(random); err != nil {
-		return fmt.Errorf("generate PostgreSQL credential: %w", err)
-	}
-	password := make([]byte, hex.EncodedLen(len(random)))
-	hex.Encode(password, random)
-	desired := owned.PostgreSQLAuthSecret(cluster, password)
-	if err := r.Create(ctx, desired, client.FieldOwner(owned.ManagedByValue)); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("credential Secret appeared after absence proof; refusing to adopt it")
+	recorded := make(map[int32]types.UID, len(cluster.Status.PostgreSQLCredentials))
+	for _, reference := range cluster.Status.PostgreSQLCredentials {
+		if reference.Shard < 0 || reference.SecretUID == "" {
+			return fmt.Errorf("recorded PostgreSQL credential identity is invalid")
 		}
-		return fmt.Errorf("create credential Secret: %w", err)
+		if _, duplicate := recorded[reference.Shard]; duplicate {
+			return fmt.Errorf("recorded PostgreSQL credential identity for shard %d is duplicated", reference.Shard)
+		}
+		recorded[reference.Shard] = reference.SecretUID
+	}
+
+	statusChanged := false
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLAuthSecretName(cluster.Name, shard)}
+		secret := &corev1.Secret{}
+		err := reader.Get(ctx, key, secret)
+		expectedUID, hasRecordedIdentity := recorded[shard]
+		if err == nil {
+			if !hasRecordedIdentity {
+				return fmt.Errorf("credential Secret %s exists without a controller-recorded API identity; refusing to adopt it", key.Name)
+			}
+			if secret.UID != expectedUID {
+				return fmt.Errorf("credential Secret %s has UID %s, expected recorded UID %s", key.Name, secret.UID, expectedUID)
+			}
+			if err := validatePostgreSQLAuthSecret(secret, cluster, shard); err != nil {
+				return err
+			}
+			continue
+		}
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("read credential Secret %s: %w", key.Name, err)
+		}
+		if hasRecordedIdentity {
+			return fmt.Errorf("credential Secret %s with recorded UID %s is missing; automatic replacement is unsafe", key.Name, expectedUID)
+		}
+		if err := provePostgreSQLDataAbsent(ctx, reader, cluster, shard); err != nil {
+			return err
+		}
+
+		random := make([]byte, postgresqlPasswordBytes)
+		if _, err := rand.Read(random); err != nil {
+			return fmt.Errorf("generate PostgreSQL credential for shard %d: %w", shard, err)
+		}
+		password := make([]byte, hex.EncodedLen(len(random)))
+		hex.Encode(password, random)
+		desired := owned.PostgreSQLAuthSecret(cluster, shard, password)
+		if err := r.Create(ctx, desired, client.FieldOwner(owned.ManagedByValue)); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return fmt.Errorf("credential Secret %s appeared after absence proof; refusing to adopt it", key.Name)
+			}
+			return fmt.Errorf("create credential Secret %s: %w", key.Name, err)
+		}
+		if desired.UID == "" {
+			return fmt.Errorf("created credential Secret %s has no API-assigned UID", key.Name)
+		}
+		cluster.Status.PostgreSQLCredentials = append(cluster.Status.PostgreSQLCredentials, pgshardv1alpha1.PostgreSQLCredentialStatus{
+			Shard:     shard,
+			SecretUID: desired.UID,
+		})
+		recorded[shard] = desired.UID
+		statusChanged = true
+	}
+	if !statusChanged {
+		return nil
+	}
+	sort.Slice(cluster.Status.PostgreSQLCredentials, func(left, right int) bool {
+		return cluster.Status.PostgreSQLCredentials[left].Shard < cluster.Status.PostgreSQLCredentials[right].Shard
+	})
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("record PostgreSQL credential identities before workload creation: %w", err)
 	}
 	return nil
 }
 
-func validatePostgreSQLAuthSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster) error {
+func provePostgreSQLDataAbsent(ctx context.Context, reader client.Reader, cluster *pgshardv1alpha1.PgShardCluster, shard int32) error {
+	objects := []client.Object{
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryDataPVCName(cluster.Name, shard)}},
+	}
+	for _, object := range objects {
+		err := reader.Get(ctx, client.ObjectKeyFromObject(object), object)
+		if err == nil {
+			return fmt.Errorf("credential Secret for shard %d is missing while %T %s still exists; automatic replacement is unsafe", shard, object, object.GetName())
+		}
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("prove PostgreSQL data absence for shard %d: %w", shard, err)
+		}
+	}
+	return nil
+}
+
+func validatePostgreSQLAuthSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, shard int32) error {
 	if !metav1.IsControlledBy(secret, cluster) {
 		return fmt.Errorf("credential Secret is not controlled by PgShardCluster UID %s", cluster.UID)
+	}
+	if secret.Name != owned.PostgreSQLAuthSecretName(cluster.Name, shard) || secret.Labels[owned.ClusterLabel] != cluster.Name || secret.Labels[owned.ComponentLabel] != "postgresql" || secret.Labels[owned.ShardLabel] != fmt.Sprintf("%04d", shard) {
+		return fmt.Errorf("credential Secret metadata does not match shard %d", shard)
 	}
 	if secret.Type != corev1.SecretTypeOpaque || secret.Immutable == nil || !*secret.Immutable {
 		return fmt.Errorf("credential Secret must be immutable and have type Opaque")
@@ -924,7 +982,7 @@ func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Cont
 		} else if err != nil {
 			return false, "", "", err
 		}
-		if workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) && statefulSet.Status.ReadyReplicas >= 1 && statefulSet.Status.UpdatedReplicas >= 1 {
+		if workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) && statefulSet.Status.ReadyReplicas >= 1 && statefulSet.Status.AvailableReplicas >= 1 && statefulSet.Status.UpdatedReplicas >= 1 {
 			ready++
 		}
 	}
@@ -1112,7 +1170,7 @@ func (r *PgShardClusterReconciler) updateStatus(ctx context.Context, cluster *pg
 }
 
 func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
-	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) {
+	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !slices.Equal(left.PostgreSQLCredentials, right.PostgreSQLCredentials) {
 		return false
 	}
 	for index := range left.Conditions {

@@ -534,8 +534,10 @@ rejection-only pooler and persistence-free orchestrator containers running
 without restarts while they remain unready, and proves the three-member sample
 has no PostgreSQL workload or ready application endpoint. The same job creates
 a restricted two-shard, one-member sample, waits for both PostgreSQL 18
-primaries, executes SQL across an internal shard Service, restarts one primary
-StatefulSet, and verifies its PVC-backed row survives. It does not claim
+primaries, proves shard passwords differ, executes SQL across an internal shard
+Service from a neutral restricted client using the destination-specific
+Secret, then restarts one primary StatefulSet and verifies its PVC-backed row
+survives. It does not claim
 uninterrupted traffic during that restart. A unit
 regression gives the informer cache a false absence while the authoritative API
 reader still sees an owned PVC, and proves that finalization continues waiting.

@@ -160,6 +160,42 @@ func TestValidationRejectsNamesAndShardCountsThatCannotBePlanned(t *testing.T) {
 	}
 }
 
+func TestValidationAcceptsMaximumNameForSingleMemberPodIdentity(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Name = strings.Repeat("a", MaximumClusterNameLength)
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = DurabilityAsynchronous
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
+		t.Fatalf("maximum safe cluster name was rejected: %v", err)
+	}
+}
+
+func TestValidationRejectsUnsafeStorageAndImmutableResize(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Spec.Storage.Size = resource.MustParse("2Gi")
+	_, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "at least 4Gi") {
+		t.Fatalf("undersized storage was accepted: %v", err)
+	}
+
+	cluster = validCluster()
+	cluster.Spec.PostgreSQL.Parameters = map[string]string{"max_wal_size": "4GB"}
+	_, err = (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "one quarter") {
+		t.Fatalf("unsafe WAL budget was accepted: %v", err)
+	}
+
+	oldCluster := validCluster()
+	newCluster := oldCluster.DeepCopy()
+	newCluster.Spec.Storage.Size = resource.MustParse("20Gi")
+	_, err = (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster)
+	if err == nil || !strings.Contains(err.Error(), "immutable until explicit PVC expansion") {
+		t.Fatalf("unsupported storage resize was accepted: %v", err)
+	}
+}
+
 func TestValidationRejectsUnsafeOpenTelemetryEndpoints(t *testing.T) {
 	t.Parallel()
 	for _, endpoint := range []string{

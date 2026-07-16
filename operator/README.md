@@ -10,19 +10,22 @@ API. The controller now reconciles the safe supporting-resource slice:
 - one internal headless Service per shard;
 - for an explicit one-member asynchronous topology, one digest-pinned
   PostgreSQL 18 primary StatefulSet and retained data PVC per shard, with a
-  generated immutable bootstrap credential and restricted Pod security;
+  generated per-shard immutable bootstrap credential and restricted Pod
+  security;
 - etcd, orchestrator, and pooler workload specifications, topology spread,
   security contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
   etcd ingress NetworkPolicy;
-- same-cluster-only PostgreSQL ingress on port 5432 for PostgreSQL, pooler, and
-  orchestrator Pods;
+- same-cluster-only PostgreSQL ingress on port 5432 for pooler and orchestrator
+  Pods, with PostgreSQL-to-PostgreSQL traffic restricted to the same shard;
 - an internal pooler HTTP Service plus fail-closed readiness and independent
   liveness probe contracts; the control Service retains unready endpoints for
   outage diagnostics while application Services continue filtering them; and
 - controller ownership, update pruning, and finalizer-based deletion pruning.
 
-Planned supporting resources use server-side apply. The generated PostgreSQL
-credential is a separate create-once immutable Secret. A one-time upgrade path
+Planned supporting resources use server-side apply. Each generated PostgreSQL
+credential is a separate create-once immutable Secret. Its API-assigned UID is
+recorded in status before any workload is created; an unrecorded, missing, or
+replaced Secret is rejected rather than adopted or regenerated. A one-time upgrade path
 first aligns objects created by the earlier whole-object Update controller, preserving
 Service allocations and API defaults, then establishes the operator's Apply
 field set and removes the legacy Update co-owners. The completion annotation is
@@ -53,15 +56,22 @@ This is not yet a working sharded database endpoint. An explicit
 PostgreSQL 18 primary per shard. The operator derives its configuration from
 the resource budget, listens on the internal shard Service, runs as UID/GID
 999 under the restricted Pod Security profile, and retains its data claim
-across StatefulSet restarts. `PostgreSQLPrimariesAvailable=True` means only that
-all of those single-member primaries are ready. It does not claim standby
+across StatefulSet restarts. The readiness probe uses `pg_isready`, while
+startup and liveness check only the postmaster process so long crash recovery
+is not killed merely because SQL is unavailable. Storage is at least 4Gi per
+shard, `max_wal_size` cannot exceed one quarter of that claim, and size is
+immutable until an explicit PVC expansion workflow exists.
+`PostgreSQLPrimariesAvailable=True` means only that all of those single-member
+primaries have passed the StatefulSet's minimum-ready window. It does not claim standby
 replication, failover, routing, or zero-downtime restart. Three- and five-member
 resources continue to create no PostgreSQL Pods until bootstrap, replication,
 fencing integration, promotion, and recovery exist.
 
-The generated bootstrap credential is immutable and stable across reconciles.
-If it disappears after a PostgreSQL workload exists, the controller fails
-closed instead of silently replacing it and rotating the server password.
+Generated bootstrap credentials are unique per shard, immutable, and stable
+across reconciles. If one disappears after its UID is recorded, or if its
+workload or retained PGDATA claim exists without a recorded credential, the
+controller fails closed instead of silently replacing it and rotating the
+server password.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
@@ -180,11 +190,14 @@ mutating and validating webhook configurations. It pre-creates empty,
 operator-labeled Secrets and grants the manager exact-name `get` and `update`
 access only in `pgshard-system` for webhook certificate mutation. The
 reconciler also has cluster-wide Secret `get` and `create` because it generates
-one credential at a cluster-derived name in each resource namespace;
+one credential per shard at cluster-derived names in each resource namespace;
 Kubernetes RBAC cannot restrict that permission to names derived from arbitrary
 custom resources. It has no Secret list, watch, update, patch, or delete
 permission, and the controller reads credentials through the uncached client
-rather than placing all Secret data in its informer cache. A separate
+rather than placing all Secret data in its informer cache. This remains a
+documented multi-tenant trust boundary: a compromised cluster-scoped manager
+could read or create unrelated Secrets, so a future namespace-scoped install
+mode is required for mutually untrusted tenants. A separate
 ClusterRole permits `get` and `patch` only on pgshard's two exact webhook-
 configuration names. Kubernetes RBAC cannot restrict a patch to individual
 fields, so the provisioner validates the full Service target and existing

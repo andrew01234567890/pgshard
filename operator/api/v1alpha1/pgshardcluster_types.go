@@ -4,14 +4,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
 	PostgreSQLMajor18 = "18"
 	MaximumShards     = 128
-	// MaximumClusterNameLength leaves room for the longest generated Service
-	// suffix while keeping workload identities valid DNS labels.
-	MaximumClusterNameLength = 50
+	// MaximumClusterNameLength leaves room for the longest generated
+	// StatefulSet identity while keeping its Pod identity a valid DNS label.
+	MaximumClusterNameLength = 42
 
 	DurabilitySynchronous  DurabilityMode = "Synchronous"
 	DurabilityAsynchronous DurabilityMode = "Asynchronous"
@@ -77,7 +78,7 @@ type PostgreSQLSpec struct {
 
 type StorageSpec struct {
 	// Size is the capacity of each PostgreSQL data volume.
-	// +kubebuilder:validation:XValidation:rule="quantity(self).compareTo(quantity('1Gi')) >= 0",message="storage size must be at least 1Gi"
+	// +kubebuilder:validation:XValidation:rule="quantity(self).compareTo(quantity('4Gi')) >= 0",message="storage size must be at least 4Gi"
 	Size resource.Quantity `json:"size"`
 	// StorageClassName is used for PostgreSQL data volumes and the supporting
 	// etcd quorum's independently sized volumes.
@@ -174,6 +175,22 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// PostgreSQLCredentials records the immutable Secret identity generated for
+	// each shard. A missing or replaced Secret is a recovery event; the
+	// controller never silently generates a new password for existing PGDATA.
+	// +listType=map
+	// +listMapKey=shard
+	PostgreSQLCredentials []PostgreSQLCredentialStatus `json:"postgresqlCredentials,omitempty"`
+}
+
+// PostgreSQLCredentialStatus binds one shard to the immutable bootstrap
+// Secret created before any PostgreSQL workload can consume it.
+type PostgreSQLCredentialStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	Shard int32 `json:"shard"`
+	// SecretUID is assigned by the API server and cannot be selected by a
+	// namespace principal racing deterministic Secret creation.
+	SecretUID types.UID `json:"secretUID"`
 }
 
 // +kubebuilder:object:root=true

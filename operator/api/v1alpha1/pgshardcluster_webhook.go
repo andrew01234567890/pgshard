@@ -93,6 +93,9 @@ func (v *PgShardClusterValidator) ValidateUpdate(_ context.Context, oldCluster, 
 	if !equalOptionalString(oldCluster.Spec.Storage.StorageClassName, newCluster.Spec.Storage.StorageClassName) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "storageClassName"), newCluster.Spec.Storage.StorageClassName, "storage class is immutable after cluster creation"))
 	}
+	if !oldCluster.Spec.Storage.Size.Equal(newCluster.Spec.Storage.Size) {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "size"), newCluster.Spec.Storage.Size.String(), "storage size is immutable until explicit PVC expansion is implemented"))
+	}
 	return warningsFor(newCluster), invalidIfAny(newCluster.Name, allErrs)
 }
 
@@ -163,8 +166,8 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 	if cluster.Spec.PostgreSQL.Version != PostgreSQLMajor18 {
 		allErrs = append(allErrs, field.NotSupported(specPath.Child("postgresql", "version"), cluster.Spec.PostgreSQL.Version, []string{PostgreSQLMajor18}))
 	}
-	if cluster.Spec.Storage.Size.Cmp(resource.MustParse("1Gi")) < 0 {
-		allErrs = append(allErrs, field.Invalid(specPath.Child("storage", "size"), cluster.Spec.Storage.Size.String(), "must be at least 1Gi"))
+	if cluster.Spec.Storage.Size.Cmp(resource.MustParse("4Gi")) < 0 {
+		allErrs = append(allErrs, field.Invalid(specPath.Child("storage", "size"), cluster.Spec.Storage.Size.String(), "must be at least 4Gi"))
 	}
 	if storageClass := cluster.Spec.Storage.StorageClassName; storageClass != nil && *storageClass != "" {
 		if err := ValidateObjectReferenceName(*storageClass); err != nil {
@@ -191,6 +194,10 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 	}
 	if err := tuning.ApplyOverrides(settingsForOverrides, cluster.Spec.PostgreSQL.Parameters); err != nil {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("postgresql", "parameters"), cluster.Spec.PostgreSQL.Parameters, err.Error()))
+	} else if _, tuningAvailable := settingsForOverrides["max_wal_size"]; tuningAvailable {
+		if err := tuning.ValidateStorage(settingsForOverrides, cluster.Spec.Storage.Size); err != nil {
+			allErrs = append(allErrs, field.Invalid(specPath.Child("postgresql", "parameters"), cluster.Spec.PostgreSQL.Parameters, err.Error()))
+		}
 	}
 
 	allErrs = append(allErrs, validateDatabases(cluster.Spec.Databases, specPath.Child("databases"))...)
@@ -429,6 +436,9 @@ func (cluster *PgShardCluster) ResolvedPostgreSQLConfiguration() (ResolvedPostgr
 		return ResolvedPostgreSQLConfiguration{}, err
 	}
 	if err := tuning.ApplyOverrides(result.Settings, cluster.Spec.PostgreSQL.Parameters); err != nil {
+		return ResolvedPostgreSQLConfiguration{}, err
+	}
+	if err := tuning.ValidateStorage(result.Settings, cluster.Spec.Storage.Size); err != nil {
 		return ResolvedPostgreSQLConfiguration{}, err
 	}
 	primaries := make([]ResolvedPostgreSQLPrimary, 0, len(result.Primaries))

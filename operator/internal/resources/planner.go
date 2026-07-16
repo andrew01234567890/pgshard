@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -35,14 +36,12 @@ const (
 
 	ManagedByValue = "pgshard-operator"
 
-	PostgreSQLConfigSuffix  = "-postgresql-config"
-	PostgreSQLAuthSuffix    = "-postgresql-auth"
-	PostgreSQLNetworkSuffix = "-postgresql-ingress"
-	PostgreSQLPasswordKey   = "superuser-password"
-	TopologyConfigSuffix    = "-topology"
-	EtcdSuffix              = "-etcd"
-	OrchestratorSuffix      = "-orchestrator"
-	PoolerSuffix            = "-pooler"
+	PostgreSQLConfigSuffix = "-postgresql-config"
+	PostgreSQLPasswordKey  = "superuser-password"
+	TopologyConfigSuffix   = "-topology"
+	EtcdSuffix             = "-etcd"
+	OrchestratorSuffix     = "-orchestrator"
+	PoolerSuffix           = "-pooler"
 
 	PostgreSQLPort int32 = 5432
 	PoolerRWPort   int32 = 5432
@@ -155,10 +154,9 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		orchestratorService(cluster),
 		poolerService(cluster),
 		etcdNetworkPolicy(cluster),
-		postgresqlNetworkPolicy(cluster),
 	)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
-		objects = append(objects, shardService(cluster, shard))
+		objects = append(objects, shardService(cluster, shard), postgresqlNetworkPolicy(cluster, shard))
 		if cluster.Spec.MembersPerShard == 1 {
 			objects = append(objects,
 				postgresqlPrimaryStatefulSet(cluster, shard, images.PostgreSQL, configMapDataHash(postgresqlConfig)),
@@ -360,11 +358,29 @@ func shardService(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *corev1.
 	}
 }
 
-// PostgreSQLAuthSecret returns the immutable operator-owned bootstrap Secret.
-// The controller generates the password once and refuses to recreate it after
-// a PostgreSQL workload exists.
-func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, password []byte) *corev1.Secret {
-	metadata := ownedMeta(cluster, cluster.Name+PostgreSQLAuthSuffix, "postgresql", nil)
+// PostgreSQLAuthSecretName returns the deterministic per-shard bootstrap
+// credential name.
+func PostgreSQLAuthSecretName(cluster string, shard int32) string {
+	return shardName(cluster, shard) + "-auth"
+}
+
+// PostgreSQLPrimaryStatefulSetName returns the deterministic singleton primary
+// workload name for one shard.
+func PostgreSQLPrimaryStatefulSetName(cluster string, shard int32) string {
+	return shardName(cluster, shard) + "-primary"
+}
+
+// PostgreSQLPrimaryDataPVCName returns the claim created from the singleton
+// primary's data volume template.
+func PostgreSQLPrimaryDataPVCName(cluster string, shard int32) string {
+	return "data-" + PostgreSQLPrimaryStatefulSetName(cluster, shard) + "-0"
+}
+
+// PostgreSQLAuthSecret returns one immutable operator-owned shard bootstrap
+// Secret. Credentials are never shared across shards.
+func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, password []byte) *corev1.Secret {
+	metadata := ownedMeta(cluster, PostgreSQLAuthSecretName(cluster.Name, shard), "postgresql", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
 	delete(metadata.Annotations, ApplyOwnershipAnnotation)
 	return &corev1.Secret{
 		ObjectMeta: metadata,
@@ -379,13 +395,16 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 		postgresUID = int64(999)
 		replicas    = int32(1)
 	)
-	name := shardName(cluster.Name, shard) + "-primary"
+	name := PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)
 	selector := componentSelector(cluster, "postgresql")
 	selector[ShardLabel] = shardLabel(shard)
 	selector[RoleLabel] = "primary"
 	selector[MemberLabel] = "0000"
 	claimMetadata := ownedMeta(cluster, "data", "postgresql", nil)
 	claimMetadata.Namespace = ""
+	claimMetadata.Labels[ShardLabel] = shardLabel(shard)
+	claimMetadata.Labels[RoleLabel] = "primary"
+	claimMetadata.Labels[MemberLabel] = "0000"
 	var storageClassName *string
 	if cluster.Spec.Storage.StorageClassName != nil {
 		storageClassName = ptr(*cluster.Spec.Storage.StorageClassName)
@@ -403,7 +422,8 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 		RunAsGroup:               ptr(postgresUID),
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
-	probeCommand := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
+	processProbeCommand := []string{"sh", "-ec", "kill -0 1"}
+	readinessProbeCommand := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
 	postgres := corev1.Container{
 		Name:            "postgresql",
 		Image:           image,
@@ -416,7 +436,7 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 			{Name: "POSTGRES_HOST_AUTH_METHOD", Value: "scram-sha-256"},
 			{Name: "POSTGRES_INITDB_ARGS", Value: "--auth-local=trust --auth-host=scram-sha-256 --data-checksums --encoding=UTF8 --locale=C"},
 			{Name: "POSTGRES_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + PostgreSQLAuthSuffix},
+				LocalObjectReference: corev1.LocalObjectReference{Name: PostgreSQLAuthSecretName(cluster.Name, shard)},
 				Key:                  PostgreSQLPasswordKey,
 			}}},
 		},
@@ -424,19 +444,19 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 		Resources:       cluster.Spec.PostgreSQL.Resources,
 		SecurityContext: postgresSecurity,
 		StartupProbe: &corev1.Probe{
-			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: probeCommand}},
+			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: processProbeCommand}},
 			PeriodSeconds:    2,
 			TimeoutSeconds:   2,
-			FailureThreshold: 90,
+			FailureThreshold: 30,
 		},
 		ReadinessProbe: &corev1.Probe{
-			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: probeCommand}},
+			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: readinessProbeCommand}},
 			PeriodSeconds:    2,
 			TimeoutSeconds:   2,
 			FailureThreshold: 2,
 		},
 		LivenessProbe: &corev1.Probe{
-			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: probeCommand}},
+			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: processProbeCommand}},
 			PeriodSeconds:    10,
 			TimeoutSeconds:   2,
 			FailureThreshold: 6,
@@ -578,23 +598,33 @@ func etcdNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster) *networkingv1.Ne
 	}
 }
 
-func postgresqlNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster) *networkingv1.NetworkPolicy {
+func postgresqlNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	postgresqlPort := intstr.FromInt32(PostgreSQLPort)
+	selector := componentSelector(cluster, "postgresql")
+	selector[ShardLabel] = shardLabel(shard)
+	postgresqlPeer := maps.Clone(selector)
+	controlPeer := map[string]string{ClusterLabel: cluster.Name}
 	return &networkingv1.NetworkPolicy{
-		ObjectMeta: ownedMeta(cluster, cluster.Name+PostgreSQLNetworkSuffix, "postgresql", nil),
+		ObjectMeta: ownedMeta(cluster, shardName(cluster.Name, shard)+"-ingress", "postgresql", nil),
 		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{MatchLabels: componentSelector(cluster, "postgresql")},
+			PodSelector: metav1.LabelSelector{MatchLabels: selector},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{{
-				From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{ClusterLabel: cluster.Name},
-					MatchExpressions: []metav1.LabelSelectorRequirement{{
-						Key: ComponentLabel, Operator: metav1.LabelSelectorOpIn, Values: []string{"orchestrator", "pooler", "postgresql"},
-					}},
-				}}},
-				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &postgresqlPort}},
-			}},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{
+						MatchLabels: controlPeer,
+						MatchExpressions: []metav1.LabelSelectorRequirement{{
+							Key: ComponentLabel, Operator: metav1.LabelSelectorOpIn, Values: []string{"orchestrator", "pooler"},
+						}},
+					}}},
+					Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &postgresqlPort}},
+				},
+				{
+					From:  []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: postgresqlPeer}}},
+					Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &postgresqlPort}},
+				},
+			},
 		},
 	}
 }

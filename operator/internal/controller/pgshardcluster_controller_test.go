@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -23,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	utiluuid "k8s.io/apimachinery/pkg/util/uuid"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -107,7 +107,7 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 	}
 }
 
-func TestReconcileCreatesSingleMemberPrimariesWithOneImmutableCredential(t *testing.T) {
+func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	cluster := validCluster()
@@ -119,20 +119,22 @@ func TestReconcileCreatesSingleMemberPrimariesWithOneImmutableCredential(t *test
 		t.Fatal(err)
 	}
 
-	secret := &corev1.Secret{}
-	secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLAuthSuffix}
-	if err := fakeClient.Get(ctx, secretKey, secret); err != nil {
-		t.Fatal(err)
-	}
-	if err := validatePostgreSQLAuthSecret(secret, cluster); err != nil {
-		t.Fatalf("generated credential is invalid: %v", err)
-	}
-	if len(secret.Data[owned.PostgreSQLPasswordKey]) != hex.EncodedLen(postgresqlPasswordBytes) {
-		t.Fatalf("generated password length = %d", len(secret.Data[owned.PostgreSQLPasswordKey]))
-	}
+	passwords := make(map[int32]string, cluster.Spec.Shards)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		secret := &corev1.Secret{}
+		secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLAuthSecretName(cluster.Name, shard)}
+		if err := fakeClient.Get(ctx, secretKey, secret); err != nil {
+			t.Fatal(err)
+		}
+		if err := validatePostgreSQLAuthSecret(secret, cluster, shard); err != nil {
+			t.Fatalf("generated credential for shard %d is invalid: %v", shard, err)
+		}
+		if len(secret.Data[owned.PostgreSQLPasswordKey]) != hex.EncodedLen(postgresqlPasswordBytes) {
+			t.Fatalf("generated password length for shard %d = %d", shard, len(secret.Data[owned.PostgreSQLPasswordKey]))
+		}
+		passwords[shard] = string(secret.Data[owned.PostgreSQLPasswordKey])
 		statefulSet := &appsv1.StatefulSet{}
-		name := fmt.Sprintf("%s-shard-%04d-primary", cluster.Name, shard)
+		name := owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet); err != nil {
 			t.Fatalf("get PostgreSQL StatefulSet %s: %v", name, err)
 		}
@@ -144,20 +146,43 @@ func TestReconcileCreatesSingleMemberPrimariesWithOneImmutableCredential(t *test
 			t.Fatalf("update PostgreSQL StatefulSet %s status: %v", name, err)
 		}
 	}
+	if passwords[0] == passwords[1] {
+		t.Fatal("different shards received the same PostgreSQL superuser credential")
+	}
 
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
-	unchanged := &corev1.Secret{}
-	if err := fakeClient.Get(ctx, secretKey, unchanged); err != nil {
+	got := getCluster(t, ctx, fakeClient, cluster)
+	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLPrimariesProgressing")
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		unchanged := &corev1.Secret{}
+		secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLAuthSecretName(cluster.Name, shard)}
+		if err := fakeClient.Get(ctx, secretKey, unchanged); err != nil {
+			t.Fatal(err)
+		}
+		if string(unchanged.Data[owned.PostgreSQLPasswordKey]) != passwords[shard] {
+			t.Fatalf("steady-state reconciliation rotated shard %d PostgreSQL credential", shard)
+		}
+		statefulSet := &appsv1.StatefulSet{}
+		name := owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)
+		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet); err != nil {
+			t.Fatal(err)
+		}
+		statefulSet.Status.AvailableReplicas = 1
+		if err := fakeClient.Status().Update(ctx, statefulSet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
-	if string(unchanged.Data[owned.PostgreSQLPasswordKey]) != string(secret.Data[owned.PostgreSQLPasswordKey]) {
-		t.Fatal("steady-state reconciliation rotated the PostgreSQL credential")
-	}
-	got := getCluster(t, ctx, fakeClient, cluster)
+	got = getCluster(t, ctx, fakeClient, cluster)
 	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionTrue, "SingleMemberPrimariesAvailable")
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "DataPlaneUnavailable")
+	if len(got.Status.PostgreSQLCredentials) != int(cluster.Spec.Shards) {
+		t.Fatalf("recorded PostgreSQL credentials = %#v", got.Status.PostgreSQLCredentials)
+	}
 }
 
 func TestReconcileRefusesToReplaceMissingCredentialAfterWorkloadCreation(t *testing.T) {
@@ -172,18 +197,51 @@ func TestReconcileRefusesToReplaceMissingCredentialAfterWorkloadCreation(t *test
 		t.Fatal(err)
 	}
 	secret := &corev1.Secret{}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLAuthSuffix}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLAuthSecretName(cluster.Name, 0)}
 	if err := fakeClient.Get(ctx, key, secret); err != nil {
 		t.Fatal(err)
 	}
 	if err := fakeClient.Delete(ctx, secret); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "automatic replacement is unsafe") {
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "recorded UID") || !strings.Contains(err.Error(), "automatic replacement is unsafe") {
 		t.Fatalf("missing credential was not fenced: %v", err)
 	}
 	if err := fakeClient.Get(ctx, key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("missing credential was recreated: %v", err)
+	}
+}
+
+func TestReconcileRejectsUnrecordedCredentialAndRetainedPGDATA(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for name, object := range map[string]client.Object{
+		"precreated Secret": func() client.Object {
+			cluster := validCluster()
+			secret := owned.PostgreSQLAuthSecret(cluster, 0, []byte(strings.Repeat("a", hex.EncodedLen(postgresqlPasswordBytes))))
+			secret.UID = "attacker-selected-secret"
+			return secret
+		}(),
+		"retained PGDATA": &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLPrimaryDataPVCName("example", 0), Namespace: "default"}},
+	} {
+		name, object := name, object
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			fakeClient := newFakeClient(t, cluster, object)
+			reconciler := &PgShardClusterReconciler{Client: fakeClient}
+			_, err := reconciler.Reconcile(ctx, requestFor(cluster))
+			if err == nil || (name == "precreated Secret" && !strings.Contains(err.Error(), "refusing to adopt")) || (name == "retained PGDATA" && !strings.Contains(err.Error(), "automatic replacement is unsafe")) {
+				t.Fatalf("unsafe credential history was accepted: %v", err)
+			}
+			statefulSet := &appsv1.StatefulSet{}
+			key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+			if getErr := fakeClient.Get(ctx, key, statefulSet); !apierrors.IsNotFound(getErr) {
+				t.Fatalf("unsafe credential history created a workload: %v", getErr)
+			}
+		})
 	}
 }
 
@@ -1606,6 +1664,12 @@ func newFakeClient(t *testing.T, objects ...client.Object) client.Client {
 		WithReturnManagedFields().
 		WithStatusSubresource(&pgshardv1alpha1.PgShardCluster{}, &appsv1.Deployment{}, &appsv1.StatefulSet{}, &autoscalingv2.HorizontalPodAutoscaler{}, &policyv1.PodDisruptionBudget{}).
 		WithObjects(objects...).
+		WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			if object.GetUID() == "" {
+				object.SetUID(types.UID(utiluuid.NewUUID()))
+			}
+			return kubeClient.Create(ctx, object, options...)
+		}}).
 		Build()
 }
 

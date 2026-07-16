@@ -9,7 +9,8 @@ description: Validate the current pgshard foundation source.
 There is no usable pgshard routing endpoint yet. The current operator can run a
 limited direct-PostgreSQL development slice: an explicit one-member
 asynchronous resource creates one PostgreSQL 18 primary and retained PVC per
-shard. It has no standby, promotion, fencing, backup execution, `shardschema`
+shard. Each shard receives a distinct immutable bootstrap Secret and a 4Gi
+minimum data claim. It has no standby, promotion, fencing, backup execution, `shardschema`
 bootstrap, or SQL pooler. Restarting a primary interrupts that shard even though
 its data survives. Three- and five-member resources continue to fail closed
 without PostgreSQL Pods.
@@ -31,8 +32,9 @@ make check
 This validates contracts, core and runtime foundations, generated Kubernetes
 resources, release policy and documentation. CI separately exercises the
 local-only lifecycle image with a disposable PostgreSQL 18 data directory. The
-operator KIND job also starts two single-member primaries, queries one through
-its shard Service, restarts it, and verifies persistence. Neither test proves a
+operator KIND job also starts two single-member primaries, queries one from a
+neutral client using that destination shard's credential, restarts it, and
+verifies persistence. Neither test proves a
 sharding runtime. Follow
 [implementation status](./project/status.md) for the first version with a real
 cluster quickstart.

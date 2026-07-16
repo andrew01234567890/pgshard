@@ -341,6 +341,28 @@ func ApplyOverrides(settings map[string]string, overrides map[string]string) err
 	return nil
 }
 
+// ValidateStorage keeps the configured checkpoint WAL budget below one
+// quarter of the PostgreSQL data volume. WAL, relations, catalogs, temporary
+// files, and filesystem headroom all share the same claim in Milestone 1.
+func ValidateStorage(settings map[string]string, storage resource.Quantity) error {
+	maximum, ok := settings["max_wal_size"]
+	if !ok {
+		return fmt.Errorf("PostgreSQL max_wal_size is absent")
+	}
+	maximumBytes, err := parsePostgreSQLSize(maximum)
+	if err != nil {
+		return fmt.Errorf("PostgreSQL max_wal_size is invalid: %w", err)
+	}
+	storageBytes := storage.Value()
+	if storageBytes < 4*1024*mib {
+		return fmt.Errorf("postgresql storage must be at least 4Gi")
+	}
+	if maximumBytes > storageBytes/4 {
+		return fmt.Errorf("PostgreSQL max_wal_size must not exceed one quarter of storage capacity")
+	}
+	return nil
+}
+
 func validateOverrideValue(key, value string, settings map[string]string) error {
 	switch key {
 	case "autovacuum_analyze_scale_factor", "autovacuum_vacuum_scale_factor", "checkpoint_completion_target":

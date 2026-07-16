@@ -49,7 +49,7 @@ func TestKINDAdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec(t *testing.T) {
 	if err := kubeClient.Create(ctx, namespace); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = kubeClient.Delete(context.Background(), namespace) })
+	deleteNamespaceAtCleanup(t, kubeClient, namespace)
 
 	valid := readDevelopmentSample(t)
 	valid.Namespace = namespace.Name

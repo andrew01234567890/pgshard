@@ -160,6 +160,10 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		if len(statefulSet.Spec.VolumeClaimTemplates) != 1 || statefulSet.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests.Storage().Cmp(cluster.Spec.Storage.Size) != 0 {
 			t.Fatalf("PostgreSQL PVC = %#v", statefulSet.Spec.VolumeClaimTemplates)
 		}
+		claimLabels := statefulSet.Spec.VolumeClaimTemplates[0].Labels
+		if claimLabels[ShardLabel] != shardLabel(shard) || claimLabels[RoleLabel] != "primary" || claimLabels[MemberLabel] != "0000" {
+			t.Fatalf("PostgreSQL PVC labels = %#v", claimLabels)
+		}
 		pod := statefulSet.Spec.Template.Spec
 		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 0 || len(pod.Containers) != 1 {
 			t.Fatalf("PostgreSQL Pod boundary = %#v", pod)
@@ -174,11 +178,16 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		if !containsString(postgres.Args, "config_file=/etc/pgshard/postgresql/primary-0000.conf") || postgres.StartupProbe == nil || postgres.ReadinessProbe == nil || postgres.LivenessProbe == nil {
 			t.Fatalf("PostgreSQL startup contract = %#v", postgres)
 		}
+		processProbe := []string{"sh", "-ec", "kill -0 1"}
+		readinessProbe := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
+		if !reflect.DeepEqual(postgres.StartupProbe.Exec.Command, processProbe) || !reflect.DeepEqual(postgres.LivenessProbe.Exec.Command, processProbe) || !reflect.DeepEqual(postgres.ReadinessProbe.Exec.Command, readinessProbe) {
+			t.Fatalf("PostgreSQL probes can interrupt recovery: startup=%#v readiness=%#v liveness=%#v", postgres.StartupProbe, postgres.ReadinessProbe, postgres.LivenessProbe)
+		}
 		passwordReferences := 0
 		for _, variable := range postgres.Env {
 			if variable.Name == "POSTGRES_PASSWORD" {
 				passwordReferences++
-				if variable.ValueFrom == nil || variable.ValueFrom.SecretKeyRef == nil || variable.ValueFrom.SecretKeyRef.Name != cluster.Name+PostgreSQLAuthSuffix || variable.ValueFrom.SecretKeyRef.Key != PostgreSQLPasswordKey {
+				if variable.ValueFrom == nil || variable.ValueFrom.SecretKeyRef == nil || variable.ValueFrom.SecretKeyRef.Name != PostgreSQLAuthSecretName(cluster.Name, shard) || variable.ValueFrom.SecretKeyRef.Key != PostgreSQLPasswordKey {
 					t.Fatalf("PostgreSQL password reference = %#v", variable)
 				}
 			}
@@ -192,8 +201,8 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		}
 	}
 
-	secret := PostgreSQLAuthSecret(cluster, []byte("0123456789abcdef"))
-	if secret.Immutable == nil || !*secret.Immutable || string(secret.Data[PostgreSQLPasswordKey]) != "0123456789abcdef" || secret.Annotations[ApplyOwnershipAnnotation] != "" {
+	secret := PostgreSQLAuthSecret(cluster, 1, []byte("0123456789abcdef"))
+	if secret.Name != "demo-shard-0001-auth" || secret.Labels[ShardLabel] != "0001" || secret.Immutable == nil || !*secret.Immutable || string(secret.Data[PostgreSQLPasswordKey]) != "0123456789abcdef" || secret.Annotations[ApplyOwnershipAnnotation] != "" {
 		t.Fatalf("PostgreSQL auth Secret = %#v", secret)
 	}
 	assertOwned(t, secret, cluster)
@@ -282,13 +291,19 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if len(policy.Spec.Ingress) != 2 || policy.Spec.Ingress[0].Ports[0].Port.IntVal != EtcdClientPort || policy.Spec.Ingress[1].Ports[0].Port.IntVal != EtcdPeerPort {
 		t.Fatalf("etcd NetworkPolicy = %#v", policy.Spec)
 	}
-	postgresqlPolicy := object[*networkingv1.NetworkPolicy](t, plan, "demo"+PostgreSQLNetworkSuffix)
-	if len(postgresqlPolicy.Spec.Ingress) != 1 || len(postgresqlPolicy.Spec.Ingress[0].Ports) != 1 || postgresqlPolicy.Spec.Ingress[0].Ports[0].Port.IntVal != PostgreSQLPort {
-		t.Fatalf("PostgreSQL NetworkPolicy = %#v", postgresqlPolicy.Spec)
-	}
-	peers := postgresqlPolicy.Spec.Ingress[0].From
-	if len(peers) != 1 || peers[0].PodSelector == nil || peers[0].PodSelector.MatchLabels[ClusterLabel] != cluster.Name || len(peers[0].PodSelector.MatchExpressions) != 1 || !reflect.DeepEqual(peers[0].PodSelector.MatchExpressions[0].Values, []string{"orchestrator", "pooler", "postgresql"}) {
-		t.Fatalf("PostgreSQL NetworkPolicy peers = %#v", peers)
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		postgresqlPolicy := object[*networkingv1.NetworkPolicy](t, plan, shardName(cluster.Name, shard)+"-ingress")
+		if postgresqlPolicy.Spec.PodSelector.MatchLabels[ShardLabel] != shardLabel(shard) || len(postgresqlPolicy.Spec.Ingress) != 2 || postgresqlPolicy.Spec.Ingress[0].Ports[0].Port.IntVal != PostgreSQLPort || postgresqlPolicy.Spec.Ingress[1].Ports[0].Port.IntVal != PostgreSQLPort {
+			t.Fatalf("PostgreSQL NetworkPolicy = %#v", postgresqlPolicy.Spec)
+		}
+		controlPeers := postgresqlPolicy.Spec.Ingress[0].From
+		if len(controlPeers) != 1 || controlPeers[0].PodSelector == nil || controlPeers[0].PodSelector.MatchLabels[ClusterLabel] != cluster.Name || len(controlPeers[0].PodSelector.MatchExpressions) != 1 || !reflect.DeepEqual(controlPeers[0].PodSelector.MatchExpressions[0].Values, []string{"orchestrator", "pooler"}) {
+			t.Fatalf("PostgreSQL control peers = %#v", controlPeers)
+		}
+		postgresqlPeers := postgresqlPolicy.Spec.Ingress[1].From
+		if len(postgresqlPeers) != 1 || postgresqlPeers[0].PodSelector == nil || postgresqlPeers[0].PodSelector.MatchLabels[ClusterLabel] != cluster.Name || postgresqlPeers[0].PodSelector.MatchLabels[ComponentLabel] != "postgresql" || postgresqlPeers[0].PodSelector.MatchLabels[ShardLabel] != shardLabel(shard) {
+			t.Fatalf("PostgreSQL same-shard peers = %#v", postgresqlPeers)
+		}
 	}
 }
 
@@ -381,6 +396,16 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	identity := orchestrator.Spec.Template.Spec.Containers[0].Env[1]
 	if identity.Name != "PGSHARD_ORCH_ID" || identity.ValueFrom == nil || identity.ValueFrom.FieldRef == nil || identity.ValueFrom.FieldRef.FieldPath != "metadata.uid" {
 		t.Fatalf("orchestrator identity = %#v", identity)
+	}
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	plan, err = Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	statefulSet := object[*appsv1.StatefulSet](t, plan, PostgreSQLPrimaryStatefulSetName(cluster.Name, 0))
+	if len(statefulSet.Name) > 63 || len(statefulSet.Name+"-0") > 63 {
+		t.Fatalf("maximum cluster name produced invalid StatefulSet or Pod name: %q", statefulSet.Name)
 	}
 }
 

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -107,8 +108,22 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
 		"CREATE TABLE live_marker (shard integer PRIMARY KEY, note text NOT NULL); INSERT INTO live_marker VALUES (0, 'kind-persistent');")
 	service := cluster.Name + "-shard-0000"
-	query := fmt.Sprintf(`PGPASSWORD="$POSTGRES_PASSWORD" psql -X -w -h %s -U postgres -d postgres -Atc "SELECT note FROM live_marker WHERE shard = 0"`, service)
-	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", shardOnePod, "--", "bash", "-ceu", query)); got != "kind-persistent" {
+	shardZeroSecret := &corev1.Secret{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLAuthSecretName(cluster.Name, 0)}, shardZeroSecret); err != nil {
+		t.Fatal(err)
+	}
+	shardOneSecret := &corev1.Secret{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLAuthSecretName(cluster.Name, 1)}, shardOneSecret); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(shardZeroSecret.Data[owned.PostgreSQLPasswordKey], shardOneSecret.Data[owned.PostgreSQLPasswordKey]) {
+		t.Fatal("different shards received the same PostgreSQL credential")
+	}
+	shardOne := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardOnePod}, shardOne); err != nil {
+		t.Fatal(err)
+	}
+	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, owned.PostgreSQLAuthSecretName(cluster.Name, 0), service, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
 		t.Fatalf("cross-shard-service query = %q", got)
 	}
 
@@ -124,6 +139,73 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
 		t.Fatalf("query after StatefulSet restart = %q", got)
 	}
+}
+
+func runPostgreSQLServiceQuery(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, image, secret, host, query string) string {
+	t.Helper()
+	allowPrivilegeEscalation := false
+	readOnlyRootFilesystem := true
+	runAsNonRoot := true
+	automount := false
+	postgresUID := int64(999)
+	clientPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("pgshard-sql-client-%d", os.Getpid()),
+			Namespace: namespace,
+			Labels: map[string]string{
+				owned.ClusterLabel:   cluster,
+				owned.ComponentLabel: "pooler",
+			},
+		},
+		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken: &automount,
+			RestartPolicy:                corev1.RestartPolicyNever,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot:   &runAsNonRoot,
+				RunAsUser:      &postgresUID,
+				RunAsGroup:     &postgresUID,
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
+			Containers: []corev1.Container{{
+				Name:    "psql",
+				Image:   image,
+				Command: []string{"psql"},
+				Args:    []string{"-X", "-w", "-h", host, "-U", "postgres", "-d", "postgres", "-Atc", query},
+				Env: []corev1.EnvVar{{
+					Name: "PGPASSWORD",
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: secret},
+						Key:                  owned.PostgreSQLPasswordKey,
+					}},
+				}},
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+					ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
+					RunAsNonRoot:             &runAsNonRoot,
+					RunAsUser:                &postgresUID,
+					RunAsGroup:               &postgresUID,
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				},
+			}},
+		},
+	}
+	if err := kubeClient.Create(ctx, clientPod); err != nil {
+		t.Fatal(err)
+	}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		current := &corev1.Pod{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(clientPod), current); err != nil {
+			return false, err
+		}
+		if current.Status.Phase == corev1.PodFailed {
+			return false, fmt.Errorf("PostgreSQL client Pod failed")
+		}
+		return current.Status.Phase == corev1.PodSucceeded, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for PostgreSQL client Pod: %v", err)
+	}
+	return strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
 }
 
 func newKINDClient(t *testing.T) client.Client {
@@ -147,6 +229,9 @@ func deleteNamespaceAtCleanup(t *testing.T, kubeClient client.Client, namespace 
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
+		if t.Failed() {
+			logNamespaceDiagnostics(t, ctx, namespace.Name)
+		}
 		if err := kubeClient.Delete(ctx, namespace); err != nil && !apierrors.IsNotFound(err) {
 			t.Errorf("delete test namespace %s: %v", namespace.Name, err)
 			return
@@ -164,6 +249,21 @@ func deleteNamespaceAtCleanup(t *testing.T, kubeClient client.Client, namespace 
 			t.Errorf("wait for test namespace %s deletion: %v", namespace.Name, err)
 		}
 	})
+}
+
+func logNamespaceDiagnostics(t *testing.T, ctx context.Context, namespace string) {
+	t.Helper()
+	for _, args := range [][]string{
+		{"--namespace", namespace, "get", "pods,statefulsets,persistentvolumeclaims", "--output=wide"},
+		{"--namespace", namespace, "describe", "pods"},
+		{"--namespace", namespace, "logs", "--selector=" + owned.ClusterLabel, "--all-containers", "--tail=100", "--prefix"},
+	} {
+		output, err := exec.CommandContext(ctx, "kubectl", args...).CombinedOutput()
+		t.Logf("kubectl %s\n%s", strings.Join(args, " "), strings.TrimSpace(string(output)))
+		if err != nil {
+			t.Logf("diagnostic command failed: %v", err)
+		}
+	}
 }
 
 func waitForSingleMemberPostgreSQL(t *testing.T, ctx context.Context, kubeClient client.Client, key client.ObjectKey) {
