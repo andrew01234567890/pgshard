@@ -50,8 +50,9 @@ const (
 	etcdExecutable   = "/usr/local/bin/etcd"
 	defaultEtcdImage = "registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534"
 
-	configHashAnnotation = "pgshard.io/config-hash"
-	ScaleOwnerAnnotation = "pgshard.io/hpa-scale-handed-off"
+	configHashAnnotation     = "pgshard.io/config-hash"
+	ApplyOwnershipAnnotation = "pgshard.io/apply-ownership"
+	ApplyOwnershipVersion    = "v1"
 )
 
 // Images contains the deployable images used by the supporting workloads.
@@ -567,12 +568,8 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 		{Name: "topology", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix}}}},
 		{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + PostgreSQLConfigSuffix}}}},
 	}
-	metadata := ownedMeta(cluster, cluster.Name+PoolerSuffix, "pooler", nil)
-	if cluster.Spec.Pooler.Scaling.Mode == pgshardv1alpha1.ScalingHPA {
-		metadata.Annotations = map[string]string{ScaleOwnerAnnotation: "true"}
-	}
 	return &appsv1.Deployment{
-		ObjectMeta: metadata,
+		ObjectMeta: ownedMeta(cluster, cluster.Name+PoolerSuffix, "pooler", nil),
 		Spec: appsv1.DeploymentSpec{
 			Replicas: desiredReplicas,
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
@@ -663,11 +660,16 @@ func securePodSpec(selector map[string]string, containers []corev1.Container) co
 func ownedMeta(cluster *pgshardv1alpha1.PgShardCluster, name, component string, annotations map[string]string) metav1.ObjectMeta {
 	controller := true
 	blockDeletion := true
+	ownedAnnotations := cloneMap(annotations)
+	if ownedAnnotations == nil {
+		ownedAnnotations = make(map[string]string, 1)
+	}
+	ownedAnnotations[ApplyOwnershipAnnotation] = ApplyOwnershipVersion
 	return metav1.ObjectMeta{
 		Name:        name,
 		Namespace:   cluster.Namespace,
 		Labels:      labels(cluster, component),
-		Annotations: cloneMap(annotations),
+		Annotations: ownedAnnotations,
 		OwnerReferences: []metav1.OwnerReference{{
 			APIVersion:         pgshardv1alpha1.GroupVersion.String(),
 			Kind:               "PgShardCluster",
