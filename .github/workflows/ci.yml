@@ -617,6 +617,7 @@ jobs:
           done
       - name: Create disposable Kubernetes cluster
         run: |
+          docker pull docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7
           go install sigs.k8s.io/kind@v0.32.0
           kind create cluster \
             --name pgshard-manager \
@@ -627,6 +628,7 @@ jobs:
             pgshard/operator:dev \
             pgshard/orchestrator:dev \
             pgshard/pooler:dev \
+            docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7 \
             --name pgshard-manager
       - name: Install the self-managed admission manager
         run: |
@@ -635,13 +637,13 @@ jobs:
             --namespace pgshard-system \
             deployment/pgshard-controller-manager \
             --timeout=180s
-      - name: Verify admission and real reconciliation stay fail closed
+      - name: Verify admission and real reconciliation
         working-directory: operator
         env:
           PGSHARD_KIND_MANAGER_E2E: "true"
         run: >-
           go test -race -count=1
-          -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|ManagerReconcilesFailClosedDevelopmentCluster)$'
+          -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|ManagerReconcilesFailClosedDevelopmentCluster|ManagerRunsSingleMemberPostgreSQL18Primaries)$'
           ./internal/controller
       - name: Capture manager diagnostics
         if: failure()

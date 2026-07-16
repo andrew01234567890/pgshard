@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -90,8 +92,9 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 	}
 	assertCondition(t, got, reconciledCondition, metav1.ConditionTrue, "ResourcesApplied")
 	assertCondition(t, got, supportingAvailableCondition, metav1.ConditionFalse, "SupportingWorkloadsProgressing")
-	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PostgreSQLLifecycleUnavailable")
-	assertCondition(t, got, transportSecurityCondition, metav1.ConditionFalse, "EtcdTLSUnavailable")
+	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+	assertCondition(t, got, transportSecurityCondition, metav1.ConditionFalse, "TransportTLSUnavailable")
 
 	// A steady-state reconcile must preserve condition transition times.
 	transition := meta.FindStatusCondition(got.Status.Conditions, readyCondition).LastTransitionTime
@@ -101,6 +104,86 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 	got = getCluster(t, ctx, fakeClient, cluster)
 	if !meta.FindStatusCondition(got.Status.Conditions, readyCondition).LastTransitionTime.Equal(&transition) {
 		t.Fatal("steady-state reconcile changed the Ready transition time")
+	}
+}
+
+func TestReconcileCreatesSingleMemberPrimariesWithOneImmutableCredential(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	fakeClient := newFakeClient(t, cluster)
+	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+
+	secret := &corev1.Secret{}
+	secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLAuthSuffix}
+	if err := fakeClient.Get(ctx, secretKey, secret); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePostgreSQLAuthSecret(secret, cluster); err != nil {
+		t.Fatalf("generated credential is invalid: %v", err)
+	}
+	if len(secret.Data[owned.PostgreSQLPasswordKey]) != hex.EncodedLen(postgresqlPasswordBytes) {
+		t.Fatalf("generated password length = %d", len(secret.Data[owned.PostgreSQLPasswordKey]))
+	}
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		statefulSet := &appsv1.StatefulSet{}
+		name := fmt.Sprintf("%s-shard-%04d-primary", cluster.Name, shard)
+		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet); err != nil {
+			t.Fatalf("get PostgreSQL StatefulSet %s: %v", name, err)
+		}
+		assertControllerOwner(t, statefulSet, cluster)
+		statefulSet.Status.ObservedGeneration = statefulSet.Generation
+		statefulSet.Status.ReadyReplicas = 1
+		statefulSet.Status.UpdatedReplicas = 1
+		if err := fakeClient.Status().Update(ctx, statefulSet); err != nil {
+			t.Fatalf("update PostgreSQL StatefulSet %s status: %v", name, err)
+		}
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	unchanged := &corev1.Secret{}
+	if err := fakeClient.Get(ctx, secretKey, unchanged); err != nil {
+		t.Fatal(err)
+	}
+	if string(unchanged.Data[owned.PostgreSQLPasswordKey]) != string(secret.Data[owned.PostgreSQLPasswordKey]) {
+		t.Fatal("steady-state reconciliation rotated the PostgreSQL credential")
+	}
+	got := getCluster(t, ctx, fakeClient, cluster)
+	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionTrue, "SingleMemberPrimariesAvailable")
+	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "DataPlaneUnavailable")
+}
+
+func TestReconcileRefusesToReplaceMissingCredentialAfterWorkloadCreation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	fakeClient := newFakeClient(t, cluster)
+	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLAuthSuffix}
+	if err := fakeClient.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	if err := fakeClient.Delete(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "automatic replacement is unsafe") {
+		t.Fatalf("missing credential was not fenced: %v", err)
+	}
+	if err := fakeClient.Get(ctx, key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("missing credential was recreated: %v", err)
 	}
 }
 
@@ -164,8 +247,9 @@ func TestReconcileObservesSupportingAvailabilityWithoutClaimingDatabaseReady(t *
 		t.Fatalf("phase = %q", got.Status.Phase)
 	}
 	assertCondition(t, got, supportingAvailableCondition, metav1.ConditionTrue, "SupportingWorkloadsAvailable")
-	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PostgreSQLLifecycleUnavailable")
-	assertCondition(t, got, transportSecurityCondition, metav1.ConditionFalse, "EtcdTLSUnavailable")
+	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+	assertCondition(t, got, transportSecurityCondition, metav1.ConditionFalse, "TransportTLSUnavailable")
 }
 
 func TestReconcilePrunesResourcesRemovedByUpdate(t *testing.T) {

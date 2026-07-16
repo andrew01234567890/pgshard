@@ -6,19 +6,18 @@ description: Validate the current pgshard foundation source.
 
 # Quickstart
 
-There is no installable pgshard database cluster yet. The source includes the Go
-custom-resource API and safe supporting-resource reconciler plus fail-closed
-Rust agent/orchestrator foundations and a local-only pooler catalog control
-executable plus local-only test image builds. The agent can structurally
-preflight PostgreSQL 18 state and supervise its postmaster with client TCP and
-replication ingress disabled and all local SQL rejected for lifecycle testing,
-but there is no bootstrap,
-role-aware recovery, replication, client activation,
-operator-managed PostgreSQL workload, executable SQL pooler, chart, or full
-database KIND environment. A self-managed admission manager manifest exercises
-the real operator, fail-closed webhooks, and supporting processes in KIND, but
-it creates no PostgreSQL workload and is not a database installation. A cluster
-quickstart will appear only after those end-to-end tests pass.
+There is no usable pgshard routing endpoint yet. The current operator can run a
+limited direct-PostgreSQL development slice: an explicit one-member
+asynchronous resource creates one PostgreSQL 18 primary and retained PVC per
+shard. It has no standby, promotion, fencing, backup execution, `shardschema`
+bootstrap, or SQL pooler. Restarting a primary interrupts that shard even though
+its data survives. Three- and five-member resources continue to fail closed
+without PostgreSQL Pods.
+
+The source also includes the Go custom-resource API, fail-closed Rust
+agent/orchestrator foundations, a rejection-only pooler, and local-only test
+image builds. The single-member path is useful for operator and storage testing;
+it is not a sharded database installation or zero-downtime evidence.
 
 ## Validate the current source
 
@@ -31,8 +30,10 @@ make check
 
 This validates contracts, core and runtime foundations, generated Kubernetes
 resources, release policy and documentation. CI separately exercises the
-local-only lifecycle image with a disposable PostgreSQL 18 data directory; the
-quickstart does not start PostgreSQL or prove a sharding runtime. Follow
+local-only lifecycle image with a disposable PostgreSQL 18 data directory. The
+operator KIND job also starts two single-member primaries, queries one through
+its shard Service, restarts it, and verifies persistence. Neither test proves a
+sharding runtime. Follow
 [implementation status](./project/status.md) for the first version with a real
 cluster quickstart.
 
@@ -69,5 +70,28 @@ operator-managed Secrets, injects the CA bundle, and keeps semantic validation
 fail closed. Its leaf certificate renews without a Pod restart; automatic CA
 rotation is not yet implemented. Expect the sample to remain `Ready=False`, its
 pooler and orchestrator Pods to remain unready, and its application Services to
-have no ready endpoints. This path is for source validation only. Delete the disposable cluster with
+have no ready endpoints. This path is for source validation only.
+
+To exercise the direct PostgreSQL slice in the same cluster:
+
+```console
+kubectl create namespace pgshard-single-member
+kubectl label namespace pgshard-single-member \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/enforce-version=latest
+kubectl apply --namespace pgshard-single-member \
+  -f operator/config/samples/pgshard_v1alpha1_single_member.yaml
+kubectl wait --namespace pgshard-single-member --for=condition=Ready \
+  pod/single-member-shard-0000-primary-0 \
+  pod/single-member-shard-0001-primary-0 --timeout=180s
+kubectl exec --namespace pgshard-single-member \
+  single-member-shard-0000-primary-0 -- \
+  psql -X -U postgres -d postgres -c \
+  "SELECT current_setting('server_version'), pg_is_in_recovery();"
+```
+
+Use the internal `single-member-shard-0000` and
+`single-member-shard-0001` Services for direct test traffic. The
+`single-member-rw`, `-ro`, and `-r` Services still lead to the rejection-only
+pooler. Delete the disposable cluster with
 `kind delete cluster --name pgshard-development`.

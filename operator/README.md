@@ -8,16 +8,22 @@ API. The controller now reconciles the safe supporting-resource slice:
 - CNPG-style `<cluster>-rw`, `<cluster>-ro`, and `<cluster>-r` application
   Services, each targeting its own pooler listener;
 - one internal headless Service per shard;
+- for an explicit one-member asynchronous topology, one digest-pinned
+  PostgreSQL 18 primary StatefulSet and retained data PVC per shard, with a
+  generated immutable bootstrap credential and restricted Pod security;
 - etcd, orchestrator, and pooler workload specifications, topology spread,
   security contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
   etcd ingress NetworkPolicy;
+- same-cluster-only PostgreSQL ingress on port 5432 for PostgreSQL, pooler, and
+  orchestrator Pods;
 - an internal pooler HTTP Service plus fail-closed readiness and independent
   liveness probe contracts; the control Service retains unready endpoints for
   outage diagnostics while application Services continue filtering them; and
 - controller ownership, update pruning, and finalizer-based deletion pruning.
 
-Supporting resources use server-side apply. A one-time upgrade path first
-aligns objects created by the earlier whole-object Update controller, preserving
+Planned supporting resources use server-side apply. The generated PostgreSQL
+credential is a separate create-once immutable Secret. A one-time upgrade path
+first aligns objects created by the earlier whole-object Update controller, preserving
 Service allocations and API defaults, then establishes the operator's Apply
 field set and removes the legacy Update co-owners. The completion annotation is
 written only by the final Apply, so a crash at any intermediate boundary safely
@@ -42,16 +48,28 @@ uncached API, checks its UID and resource version, retries concurrent updates
 within a fixed bound, and transfers only `spec.replicas` to a dedicated field
 manager.
 
-This is not a working PostgreSQL cluster. The controller intentionally creates
-no PostgreSQL Pods or data PVCs because bootstrap, replication, fencing
-integration, promotion, and recovery are not implemented. Application Services
-therefore must not be treated as usable endpoints. `Ready=False` with reason
-`PostgreSQLLifecycleUnavailable` remains authoritative even if the supporting
-workloads become available. Backup execution and ServiceMonitor reconciliation
-also remain unimplemented. The etcd NetworkPolicy allows only selected
-same-cluster Pods, but client and peer traffic is still unauthenticated
-plaintext; the independent `TransportSecurityReady=False` condition reports
-that TLS gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
+This is not yet a working sharded database endpoint. An explicit
+`membersPerShard: 1`, `durability: Asynchronous` resource creates one direct
+PostgreSQL 18 primary per shard. The operator derives its configuration from
+the resource budget, listens on the internal shard Service, runs as UID/GID
+999 under the restricted Pod Security profile, and retains its data claim
+across StatefulSet restarts. `PostgreSQLPrimariesAvailable=True` means only that
+all of those single-member primaries are ready. It does not claim standby
+replication, failover, routing, or zero-downtime restart. Three- and five-member
+resources continue to create no PostgreSQL Pods until bootstrap, replication,
+fencing integration, promotion, and recovery exist.
+
+The generated bootstrap credential is immutable and stable across reconciles.
+If it disappears after a PostgreSQL workload exists, the controller fails
+closed instead of silently replacing it and rotating the server password.
+Application Services still target the rejection-only pooler and must not be
+treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
+for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
+remains authoritative. Backup execution and ServiceMonitor reconciliation also
+remain unimplemented. The ingress NetworkPolicies allow only selected
+same-cluster Pods, but etcd client/peer and PostgreSQL shard traffic still lack
+authenticated TLS; the independent `TransportSecurityReady=False` condition
+reports that gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
 a bounded backend quota. Its default image is digest-pinned and the Pod command
 selects that image contract's `/usr/local/bin/etcd` executable explicitly;
 custom `--etcd-image` values must provide the same path. Scale transitions
@@ -100,14 +118,17 @@ rejection-only PostgreSQL read-write handshake listener. It accepts no SQL
 session, has no connection pool, and deliberately remains application-unready
 even when its catalog is usable. Its catalog connector is
 deliberately local-only until authenticated TLS exists, while this operator
-does not yet provision PostgreSQL, a catalog DSN Secret, or a compatible local
-catalog endpoint. The operator therefore selects the pooler's explicit
+does not yet provision a catalog DSN Secret or a compatible local shardschema
+endpoint. The operator therefore selects the pooler's explicit
 `bootstrap-unavailable` mode: the process exposes liveness and bounded status
 without a credential or connection attempt, while catalog and application
-readiness fail closed. Override the defaults with `--orchestrator-image` and
-`--pooler-image` when concrete images exist. `--etcd-image` is also
-configurable. Image pull or runtime readiness is reported only through
-`SupportingWorkloadsAvailable`, never as database readiness.
+readiness fail closed. Override the defaults with `--orchestrator-image`,
+`--pooler-image`, `--etcd-image`, and `--postgresql-image` when concrete images
+exist. Image pull or runtime readiness is reported by the relevant observed
+workload condition, never inferred from planned objects. A custom PostgreSQL
+image must preserve the pinned official image contract: PostgreSQL 18,
+UID/GID 999, the Docker entrypoint environment, and the
+`/var/lib/postgresql/18/docker` data layout.
 
 The module is pinned to Go 1.26.5, controller-runtime 0.24.1, and Kubernetes
 libraries 0.36.0. Only the Linux container deployment is supported.
@@ -140,20 +161,34 @@ kubectl get --namespace pgshard-development pgshardcluster development
 The sample proves only real manager reconciliation and fail-closed supporting
 processes. Its pooler and orchestrator Pods run but remain unready, application
 Services have no ready endpoints, no PostgreSQL workload is created, and the
-cluster reports `Ready=False` with `PostgreSQLLifecycleUnavailable`. The named
+cluster reports `Ready=False` with `PostgreSQLHAUnavailable`. The named
 backup PVC is only validated configuration; no backup job or repository is
 created.
+
+For direct PostgreSQL lifecycle development, apply the separate
+`pgshard_v1alpha1_single_member.yaml` sample. It creates two independent
+single-member primaries and retained PVCs. Query them through their internal
+`<cluster>-shard-0000` and `<cluster>-shard-0001` Services or by executing
+`psql` in their Pods; the `<cluster>-rw`, `-ro`, and `-r` Services are not yet
+usable. Restarting a primary preserves its PVC data but interrupts that shard,
+so this sample must not be used as zero-downtime evidence.
 
 ## Self-managed admission manager
 
 `config/admission` extends the same local-image install with the generated
 mutating and validating webhook configurations. It pre-creates empty,
 operator-labeled Secrets and grants the manager exact-name `get` and `update`
-access only in `pgshard-system`; the manager cannot list Secrets or read
-arbitrary Secret names. A separate ClusterRole permits `get` and `patch` only
-on pgshard's two exact webhook-configuration names. Kubernetes RBAC cannot
-restrict a patch to individual fields, so the provisioner validates the full
-Service target and existing trust state before changing only CA bundles.
+access only in `pgshard-system` for webhook certificate mutation. The
+reconciler also has cluster-wide Secret `get` and `create` because it generates
+one credential at a cluster-derived name in each resource namespace;
+Kubernetes RBAC cannot restrict that permission to names derived from arbitrary
+custom resources. It has no Secret list, watch, update, patch, or delete
+permission, and the controller reads credentials through the uncached client
+rather than placing all Secret data in its informer cache. A separate
+ClusterRole permits `get` and `patch` only on pgshard's two exact webhook-
+configuration names. Kubernetes RBAC cannot restrict a patch to individual
+fields, so the provisioner validates the full Service target and existing
+trust state before changing only CA bundles.
 
 Before the webhook listener starts, each manager Pod creates an ECDSA P-256 CA
 and TLS 1.3 serving key pair in those Secrets, validates the Service references,
@@ -179,8 +214,8 @@ kubectl rollout status --namespace pgshard-system deployment/pgshard-controller-
 ```
 
 This remains a development/source-validation install. It proves fail-closed
-admission and manager reconciliation, but still creates no PostgreSQL workload
-or usable application endpoint.
+admission and manager reconciliation and can run the explicit single-member
+primary sample, but it does not provide a usable routed application endpoint.
 
 Run the local checks from this directory:
 
@@ -216,6 +251,8 @@ CI creates separate digest-pinned Kubernetes 1.36 KIND clusters. One exercises
 StatefulSet/PVC creation, supervised deletion, and same-name recreation against
 real Kubernetes controllers. Another builds and loads local images, installs
 the self-managed admission manager, proves semantic admission rejection and
-certificate trust, waits for real reconciliation, and proves the fail-closed
-supporting boundary remains stable without container restarts. These targeted
-tests are not yet the full Milestone 1 KIND suite.
+certificate trust, preserves the fail-closed three-member boundary, and starts
+two restricted single-member PostgreSQL 18 primaries. It exercises TCP through
+a shard Service, restarts a primary StatefulSet, and verifies its data survives.
+The test does not claim uninterrupted traffic. These targeted tests are not yet
+the full Milestone 1 KIND suite.

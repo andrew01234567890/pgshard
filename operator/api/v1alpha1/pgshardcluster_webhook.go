@@ -108,6 +108,9 @@ func (*PgShardClusterValidator) ValidateDelete(_ context.Context, _ *PgShardClus
 }
 
 func warningsFor(cluster *PgShardCluster) admission.Warnings {
+	if cluster.Spec.MembersPerShard == 1 {
+		return admission.Warnings{"single-member topology has no standby or failover, and restarting its primary interrupts the shard"}
+	}
 	if cluster.Spec.Durability == DurabilityAsynchronous {
 		return admission.Warnings{"asynchronous replication can lose acknowledged transactions during failover"}
 	}

@@ -531,8 +531,12 @@ certificates, proves the generated serving chain and injected CA bundles,
 observes semantic validation reject an unsafe synchronous singleton, waits for
 leader-elected reconciliation, observes a restart-free etcd quorum, keeps
 rejection-only pooler and persistence-free orchestrator containers running
-without restarts while they remain unready, proves application Services have no
-ready endpoints, and verifies no PostgreSQL workload exists. A unit
+without restarts while they remain unready, and proves the three-member sample
+has no PostgreSQL workload or ready application endpoint. The same job creates
+a restricted two-shard, one-member sample, waits for both PostgreSQL 18
+primaries, executes SQL across an internal shard Service, restarts one primary
+StatefulSet, and verifies its PVC-backed row survives. It does not claim
+uninterrupted traffic during that restart. A unit
 regression gives the informer cache a false absence while the authoritative API
 reader still sees an owned PVC, and proves that finalization continues waiting.
 Operator unit tests also prove deterministic common, primary, and per-standby

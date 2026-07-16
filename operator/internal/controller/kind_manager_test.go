@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,23 +35,13 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	scheme := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := pgshardv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	kubeClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
-	if err != nil {
-		t.Fatal(err)
-	}
+	kubeClient := newKINDClient(t)
 
 	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pgshard-manager-smoke-%d", os.Getpid())}}
 	if err := kubeClient.Create(ctx, namespace); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = kubeClient.Delete(context.Background(), namespace) })
+	deleteNamespaceAtCleanup(t, kubeClient, namespace)
 
 	cluster := readDevelopmentSample(t)
 	cluster.Namespace = namespace.Name
@@ -63,8 +55,9 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	}
 	assertCondition(t, current, reconciledCondition, metav1.ConditionTrue, "ResourcesApplied")
 	assertCondition(t, current, supportingAvailableCondition, metav1.ConditionFalse, "SupportingWorkloadsProgressing")
-	assertCondition(t, current, readyCondition, metav1.ConditionFalse, "PostgreSQLLifecycleUnavailable")
-	assertCondition(t, current, transportSecurityCondition, metav1.ConditionFalse, "EtcdTLSUnavailable")
+	assertCondition(t, current, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+	assertCondition(t, current, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+	assertCondition(t, current, transportSecurityCondition, metav1.ConditionFalse, "TransportTLSUnavailable")
 	assertPostgreSQLRoleProfiles(t, ctx, kubeClient, current)
 
 	waitForEtcdQuorum(t, ctx, kubeClient, namespace.Name, cluster.Name)
@@ -74,6 +67,146 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	waitForStableManagerPod(t, ctx, kubeClient)
 	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertNoPostgreSQLWorkload(t, ctx, kubeClient, namespace.Name, cluster.Name)
+}
+
+func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
+	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
+		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against the installed admission manager")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	kubeClient := newKINDClient(t)
+
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: fmt.Sprintf("pgshard-manager-postgresql-%d", os.Getpid()),
+		Labels: map[string]string{
+			"pod-security.kubernetes.io/enforce":         "restricted",
+			"pod-security.kubernetes.io/enforce-version": "latest",
+		},
+	}}
+	if err := kubeClient.Create(ctx, namespace); err != nil {
+		t.Fatal(err)
+	}
+	deleteNamespaceAtCleanup(t, kubeClient, namespace)
+
+	cluster := readSingleMemberSample(t)
+	cluster.Namespace = namespace.Name
+	if err := kubeClient.Create(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	waitForSingleMemberPostgreSQL(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster))
+
+	shardZeroPod := cluster.Name + "-shard-0000-primary-0"
+	shardOnePod := cluster.Name + "-shard-0001-primary-0"
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
+		"SELECT current_setting('server_version_num')::integer / 10000, pg_is_in_recovery()")); got != "18|f" {
+		t.Fatalf("PostgreSQL identity = %q", got)
+	}
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", shardZeroPod, "--",
+		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
+		"CREATE TABLE live_marker (shard integer PRIMARY KEY, note text NOT NULL); INSERT INTO live_marker VALUES (0, 'kind-persistent');")
+	service := cluster.Name + "-shard-0000"
+	query := fmt.Sprintf(`PGPASSWORD="$POSTGRES_PASSWORD" psql -X -w -h %s -U postgres -d postgres -Atc "SELECT note FROM live_marker WHERE shard = 0"`, service)
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", shardOnePod, "--", "bash", "-ceu", query)); got != "kind-persistent" {
+		t.Fatalf("cross-shard-service query = %q", got)
+	}
+
+	before := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, before); err != nil {
+		t.Fatal(err)
+	}
+	statefulSet := cluster.Name + "-shard-0000-primary"
+	runKubectl(t, ctx, "--namespace", namespace.Name, "rollout", "restart", "statefulset/"+statefulSet)
+	runKubectl(t, ctx, "--namespace", namespace.Name, "rollout", "status", "statefulset/"+statefulSet, "--timeout=120s")
+	waitForRecreatedReadyPod(t, ctx, kubeClient, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, before.UID)
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
+		t.Fatalf("query after StatefulSet restart = %q", got)
+	}
+}
+
+func newKINDClient(t *testing.T) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgshardv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kubeClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kubeClient
+}
+
+func deleteNamespaceAtCleanup(t *testing.T, kubeClient client.Client, namespace *corev1.Namespace) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := kubeClient.Delete(ctx, namespace); err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("delete test namespace %s: %v", namespace.Name, err)
+			return
+		}
+		err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+			current := &corev1.Namespace{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: namespace.Name}, current); apierrors.IsNotFound(err) {
+				return true, nil
+			} else if err != nil {
+				return false, err
+			}
+			return false, nil
+		})
+		if err != nil {
+			t.Errorf("wait for test namespace %s deletion: %v", namespace.Name, err)
+		}
+	})
+}
+
+func waitForSingleMemberPostgreSQL(t *testing.T, ctx context.Context, kubeClient client.Client, key client.ObjectKey) {
+	t.Helper()
+	current := &pgshardv1alpha1.PgShardCluster{}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, key, current); err != nil {
+			return false, err
+		}
+		condition := meta.FindStatusCondition(current.Status.Conditions, postgresqlAvailableCondition)
+		return condition != nil && condition.Status == metav1.ConditionTrue && condition.Reason == "SingleMemberPrimariesAvailable", nil
+	})
+	if err != nil {
+		t.Fatalf("wait for single-member PostgreSQL primaries: %v; last status = %#v", err, current.Status)
+	}
+}
+
+func waitForRecreatedReadyPod(t *testing.T, ctx context.Context, kubeClient client.Client, key types.NamespacedName, previousUID types.UID) {
+	t.Helper()
+	pod := &corev1.Pod{}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		pod = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, key, pod); err != nil {
+			return false, client.IgnoreNotFound(err)
+		}
+		if pod.UID == previousUID || len(pod.Status.ContainerStatuses) != 1 {
+			return false, nil
+		}
+		return pod.Status.Phase == corev1.PodRunning && pod.Status.ContainerStatuses[0].Ready, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for recreated PostgreSQL Pod: %v; last Pod = %#v", err, pod)
+	}
+}
+
+func runKubectl(t *testing.T, ctx context.Context, arguments ...string) string {
+	t.Helper()
+	command := exec.CommandContext(ctx, "kubectl", arguments...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("kubectl %s: %v\n%s", strings.Join(arguments, " "), err, output)
+	}
+	return string(output)
 }
 
 func assertPostgreSQLRoleProfiles(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
@@ -91,6 +224,7 @@ func assertPostgreSQLRoleProfiles(t *testing.T, ctx context.Context, kubeClient 
 	for _, setting := range []string{
 		"hot_standby = on\n",
 		"idle_replication_slot_timeout = 0\n",
+		"listen_addresses = '*'\n",
 		"wal_level = logical\n",
 	} {
 		if !strings.Contains(common, setting) {
@@ -168,7 +302,7 @@ func waitForManagerStatus(t *testing.T, ctx context.Context, kubeClient client.C
 			return false, err
 		}
 		condition := meta.FindStatusCondition(current.Status.Conditions, readyCondition)
-		return current.Status.ObservedGeneration == current.Generation && current.Status.Phase == "Reconciling" && condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "PostgreSQLLifecycleUnavailable", nil
+		return current.Status.ObservedGeneration == current.Generation && current.Status.Phase == "Reconciling" && condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "PostgreSQLHAUnavailable", nil
 	})
 	if err != nil {
 		t.Fatalf("wait for manager status: %v; last status = %#v", err, current.Status)

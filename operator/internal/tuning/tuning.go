@@ -206,6 +206,7 @@ func Calculate(in Input) (Result, error) {
 		"full_page_writes":                "on",
 		"hot_standby":                     "on",
 		"idle_replication_slot_timeout":   "0",
+		"listen_addresses":                "'*'",
 		"maintenance_work_mem":            formatMiB(maintenance),
 		"max_connections":                 strconv.FormatInt(maxConnections, 10),
 		"max_parallel_workers":            strconv.FormatInt(parallelWorkers, 10),

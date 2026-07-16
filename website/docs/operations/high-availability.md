@@ -152,6 +152,14 @@ operator-managed replication, durable lease integration, promotion, automated
 recovery, and rolling restarts are not implemented; see
 [implementation status](../project/status.md).
 
+The operator's direct one-member development mode is intentionally outside the
+HA contract. It creates one writable PostgreSQL 18 Pod per shard and retains its
+PVC across a StatefulSet restart, but the shard is unavailable while that Pod
+restarts. `PostgreSQLPrimariesAvailable=True` reports process availability, not
+replication or failover. Zero-downtime restart evidence requires at least one
+eligible standby, a fenced switchover, pooler rerouting/buffering, and a
+continuous client probe with no failed or outcome-unknown transactions.
+
 `shardschema` now reserves one permanent generation/name history for a
 dedicated slot-sync probe per live shard restore. The probe is explicitly
 separate from consumer anchors, so a future freshness challenge cannot skip

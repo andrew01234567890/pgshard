@@ -83,6 +83,7 @@ func TestCalculateDeterministicSafeSettings(t *testing.T) {
 		"full_page_writes":                "on",
 		"hot_standby":                     "on",
 		"idle_replication_slot_timeout":   "0",
+		"listen_addresses":                "'*'",
 		"synchronous_commit":              "on",
 	}
 	for key, value := range want {

@@ -3,6 +3,8 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,16 +34,19 @@ const (
 	readyCondition               = "Ready"
 	reconciledCondition          = "ResourcesReconciled"
 	supportingAvailableCondition = "SupportingWorkloadsAvailable"
+	postgresqlAvailableCondition = "PostgreSQLPrimariesAvailable"
 	transportSecurityCondition   = "TransportSecurityReady"
 	resourceFinalizer            = "pgshard.io/owned-resources"
 	hpaScaleFieldManager         = "pgshard-hpa-scale"
 	ownershipMigrationManager    = "pgshard-ownership-migration"
 	retryDelay                   = 15 * time.Second
+	postgresqlPasswordBytes      = 32
 )
 
-// PgShardClusterReconciler owns safe supporting resources while failing closed
-// on the unavailable PostgreSQL lifecycle. Ready is never inferred merely from
-// desired objects existing; supporting availability comes from workload status.
+// PgShardClusterReconciler owns safe supporting resources and single-member
+// PostgreSQL primaries while failing closed on unavailable HA and SQL routing.
+// Ready is never inferred merely from desired objects existing; availability
+// comes from observed workload status.
 type PgShardClusterReconciler struct {
 	client.Client
 	// APIReader bypasses the informer cache for ownership migration, HPA presence
@@ -56,6 +61,7 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
@@ -120,6 +126,12 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
+	if cluster.Spec.MembersPerShard == 1 {
+		if err := r.ensurePostgreSQLAuthSecret(ctx, cluster); err != nil {
+			statusErr := r.reportFailure(ctx, cluster, "CredentialReconcileFailed", fmt.Sprintf("PostgreSQL credential reconciliation failed: %v", err))
+			return ctrl.Result{}, errors.Join(err, statusErr)
+		}
+	}
 	if err := r.applyPlan(ctx, cluster, plan, states); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "ReconcileFailed", fmt.Sprintf("owned resource reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
@@ -130,7 +142,12 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "ObservationFailed", fmt.Sprintf("cannot observe supporting workloads: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
-	if err := r.reportSuccess(ctx, cluster, available, message); err != nil {
+	postgresqlAvailable, postgresqlReason, postgresqlMessage, err := r.postgresqlWorkloadsAvailable(ctx, cluster)
+	if err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "ObservationFailed", fmt.Sprintf("cannot observe PostgreSQL workloads: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if err := r.reportSuccess(ctx, cluster, available, message, postgresqlAvailable, postgresqlReason, postgresqlMessage); err != nil {
 		if apierrors.IsConflict(err) {
 			return ctrl.Result{Requeue: true}, nil
 		}
@@ -140,6 +157,69 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		return ctrl.Result{RequeueAfter: retryDelay}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *PgShardClusterReconciler) ensurePostgreSQLAuthSecret(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLAuthSuffix}
+	secret := &corev1.Secret{}
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	err := reader.Get(ctx, key, secret)
+	if err == nil {
+		return validatePostgreSQLAuthSecret(secret, cluster)
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("read credential Secret: %w", err)
+	}
+
+	workloads := &appsv1.StatefulSetList{}
+	if err := reader.List(ctx, workloads,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "postgresql"},
+	); err != nil {
+		return fmt.Errorf("prove PostgreSQL workload absence before generating credentials: %w", err)
+	}
+	if len(workloads.Items) != 0 {
+		return fmt.Errorf("credential Secret is missing after PostgreSQL workload creation; automatic replacement is unsafe")
+	}
+
+	random := make([]byte, postgresqlPasswordBytes)
+	if _, err := rand.Read(random); err != nil {
+		return fmt.Errorf("generate PostgreSQL credential: %w", err)
+	}
+	password := make([]byte, hex.EncodedLen(len(random)))
+	hex.Encode(password, random)
+	desired := owned.PostgreSQLAuthSecret(cluster, password)
+	if err := r.Create(ctx, desired, client.FieldOwner(owned.ManagedByValue)); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("credential Secret appeared after absence proof; refusing to adopt it")
+		}
+		return fmt.Errorf("create credential Secret: %w", err)
+	}
+	return nil
+}
+
+func validatePostgreSQLAuthSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster) error {
+	if !metav1.IsControlledBy(secret, cluster) {
+		return fmt.Errorf("credential Secret is not controlled by PgShardCluster UID %s", cluster.UID)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || secret.Immutable == nil || !*secret.Immutable {
+		return fmt.Errorf("credential Secret must be immutable and have type Opaque")
+	}
+	if len(secret.Data) != 1 {
+		return fmt.Errorf("credential Secret has an unexpected key set")
+	}
+	password, ok := secret.Data[owned.PostgreSQLPasswordKey]
+	if !ok || len(password) != hex.EncodedLen(postgresqlPasswordBytes) {
+		return fmt.Errorf("credential Secret password has an invalid shape")
+	}
+	decoded := make([]byte, postgresqlPasswordBytes)
+	if _, err := hex.Decode(decoded, password); err != nil {
+		return fmt.Errorf("credential Secret password is not canonical hexadecimal")
+	}
+	return nil
 }
 
 func (r *PgShardClusterReconciler) applyPlan(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object, states map[string]ownershipState) error {
@@ -827,6 +907,34 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 	return etcdReady && orchestratorReady && poolerReady && autoscalingReady, message, nil
 }
 
+func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, string, string, error) {
+	if cluster.Spec.MembersPerShard != 1 {
+		return false, "PostgreSQLHAUnavailable", "three- and five-member PostgreSQL lifecycle remains disabled until bootstrap, replication, fencing, promotion, and recovery are implemented", nil
+	}
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	ready := int32(0)
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		statefulSet := &appsv1.StatefulSet{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: fmt.Sprintf("%s-shard-%04d-primary", cluster.Name, shard)}
+		if err := reader.Get(ctx, key, statefulSet); apierrors.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			return false, "", "", err
+		}
+		if workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) && statefulSet.Status.ReadyReplicas >= 1 && statefulSet.Status.UpdatedReplicas >= 1 {
+			ready++
+		}
+	}
+	message := fmt.Sprintf("single-member PostgreSQL primaries %d/%d ready; this mode has no standby, promotion, or zero-downtime restart guarantee", ready, cluster.Spec.Shards)
+	if ready != cluster.Spec.Shards {
+		return false, "PostgreSQLPrimariesProgressing", message, nil
+	}
+	return true, "SingleMemberPrimariesAvailable", message, nil
+}
+
 func hpaConditionTrue(hpa *autoscalingv2.HorizontalPodAutoscaler, conditionType autoscalingv2.HorizontalPodAutoscalerConditionType) bool {
 	for _, condition := range hpa.Status.Conditions {
 		if condition.Type == conditionType {
@@ -847,7 +955,7 @@ func poolerMinimum(cluster *pgshardv1alpha1.PgShardCluster) int32 {
 	return cluster.Spec.Pooler.Scaling.HPA.MinReplicas
 }
 
-func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, available bool, availabilityMessage string) error {
+func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, available bool, availabilityMessage string, postgresqlAvailable bool, postgresqlReason, postgresqlMessage string) error {
 	status := metav1.ConditionFalse
 	reason := "SupportingWorkloadsProgressing"
 	phase := "Reconciling"
@@ -855,6 +963,16 @@ func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *p
 		status = metav1.ConditionTrue
 		reason = "SupportingWorkloadsAvailable"
 		phase = "Pending"
+	}
+	postgresqlStatus := metav1.ConditionFalse
+	if postgresqlAvailable {
+		postgresqlStatus = metav1.ConditionTrue
+	}
+	readyReason := "PostgreSQLHAUnavailable"
+	readyMessage := "PostgreSQL Pods are intentionally absent until bootstrap, replication, fencing, promotion, and recovery are implemented"
+	if cluster.Spec.MembersPerShard == 1 {
+		readyReason = "DataPlaneUnavailable"
+		readyMessage = "single-member PostgreSQL primaries are supported, but SQL routing and high-availability failover are not implemented"
 	}
 	conditions := []metav1.Condition{
 		{
@@ -872,18 +990,25 @@ func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *p
 			Message:            availabilityMessage,
 		},
 		{
+			Type:               postgresqlAvailableCondition,
+			Status:             postgresqlStatus,
+			ObservedGeneration: cluster.Generation,
+			Reason:             postgresqlReason,
+			Message:            postgresqlMessage,
+		},
+		{
 			Type:               readyCondition,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: cluster.Generation,
-			Reason:             "PostgreSQLLifecycleUnavailable",
-			Message:            "PostgreSQL Pods are intentionally absent: bootstrap, replication, fencing integration, promotion, and recovery are not implemented",
+			Reason:             readyReason,
+			Message:            readyMessage,
 		},
 		{
 			Type:               transportSecurityCondition,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: cluster.Generation,
-			Reason:             "EtcdTLSUnavailable",
-			Message:            "an etcd ingress NetworkPolicy is reconciled, but authenticated TLS for client and peer traffic is not implemented",
+			Reason:             "TransportTLSUnavailable",
+			Message:            "etcd client/peer and PostgreSQL shard traffic lack authenticated TLS; ingress NetworkPolicies provide isolation only",
 		},
 	}
 	return r.updateStatus(ctx, cluster, cluster.Generation, phase, conditions)
@@ -904,6 +1029,13 @@ func (r *PgShardClusterReconciler) reportFailure(ctx context.Context, cluster *p
 			ObservedGeneration: cluster.Generation,
 			Reason:             "ObservationStale",
 			Message:            "supporting workload availability is not current because resource reconciliation did not complete",
+		},
+		{
+			Type:               postgresqlAvailableCondition,
+			Status:             metav1.ConditionUnknown,
+			ObservedGeneration: cluster.Generation,
+			Reason:             "ObservationStale",
+			Message:            "PostgreSQL workload availability is not current because resource reconciliation did not complete",
 		},
 		{
 			Type:               readyCondition,
@@ -942,11 +1074,18 @@ func (r *PgShardClusterReconciler) reportScalingTransition(ctx context.Context, 
 			Message:            "supporting workload availability is not evaluated during the pooler scaling handoff",
 		},
 		{
+			Type:               postgresqlAvailableCondition,
+			Status:             metav1.ConditionUnknown,
+			ObservedGeneration: cluster.Generation,
+			Reason:             "PoolerScalingTransition",
+			Message:            "PostgreSQL workload availability is not evaluated during the pooler scaling handoff",
+		},
+		{
 			Type:               readyCondition,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: cluster.Generation,
-			Reason:             "PostgreSQLLifecycleUnavailable",
-			Message:            "PostgreSQL Pods are intentionally absent: bootstrap, replication, fencing integration, promotion, and recovery are not implemented",
+			Reason:             "DataPlaneUnavailable",
+			Message:            "the data plane is not ready while the pooler scaling handoff is in progress",
 		},
 		{
 			Type:               transportSecurityCondition,

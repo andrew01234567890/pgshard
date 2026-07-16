@@ -124,8 +124,16 @@ func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient cli
 }
 
 func readDevelopmentSample(t *testing.T) *pgshardv1alpha1.PgShardCluster {
+	return readClusterSample(t, "../../config/samples/pgshard_v1alpha1_development.yaml")
+}
+
+func readSingleMemberSample(t *testing.T) *pgshardv1alpha1.PgShardCluster {
+	return readClusterSample(t, "../../config/samples/pgshard_v1alpha1_single_member.yaml")
+}
+
+func readClusterSample(t *testing.T, path string) *pgshardv1alpha1.PgShardCluster {
 	t.Helper()
-	contents, err := os.ReadFile("../../config/samples/pgshard_v1alpha1_development.yaml")
+	contents, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}

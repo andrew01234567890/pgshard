@@ -1,0 +1,38 @@
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardCluster
+metadata:
+  name: single-member
+spec:
+  shards: 2
+  membersPerShard: 1
+  durability: Asynchronous
+  postgresql:
+    version: "18"
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+  storage:
+    size: 1Gi
+  pooler:
+    scaling:
+      mode: Fixed
+      fixed:
+        replicas: 1
+  services:
+    rw:
+      type: ClusterIP
+    ro:
+      type: ClusterIP
+    r:
+      type: ClusterIP
+  backup:
+    repository:
+      type: Filesystem
+      filesystem:
+        persistentVolumeClaimName: single-member-backups
+  observability:
+    prometheus: true
