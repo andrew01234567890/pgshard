@@ -23,12 +23,18 @@ The release job is serialized and idempotent. Queue order is not trusted: each
 invocation finds the nearest SemVer tag on the selected commit's first-parent
 history and publishes every untagged first-parent commit oldest-first. A
 descendant job may therefore safely run before its ancestor's job. Before
-publishing, it waits for every planned ancestor's exact aggregate check and the
-default CodeQL analyses for Actions, Go, JavaScript/TypeScript, and Rust to
-succeed. A completed failure aborts publication, while a missing or running
-check remains pending until the bounded release deadline; this covers GitHub's
-explicitly unordered concurrency scheduling without releasing an unchecked
-gap. It creates no version-bump commit, preventing release loops.
+publishing, it resolves the active CI and GitHub-managed CodeQL workflows by
+their exact workflow paths. For every planned ancestor, it evaluates only the
+newest trusted run for that exact commit. The CI aggregate must succeed in one
+run attempt, and the Actions, Go, JavaScript/TypeScript, and Rust CodeQL jobs
+must all succeed in the same main-branch CodeQL run attempt. Older successes do
+not mask a newer failure or pending rerun, and jobs from separate runs are never
+combined. Workflow, run, and job listings are fully paginated and must match
+GitHub's reported total before they are trusted. A completed failure aborts
+publication, while a missing or running run remains pending until the bounded
+release deadline; this covers GitHub's explicitly unordered concurrency
+scheduling without releasing an unchecked gap. It creates no version-bump
+commit, preventing release loops.
 Documentation-only and CI-only default-branch commits still receive patch
 releases.
 
