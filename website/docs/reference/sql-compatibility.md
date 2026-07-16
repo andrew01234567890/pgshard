@@ -120,8 +120,9 @@ reject the zero byte exactly as PostgreSQL does.
 
 The decoder caps one frontend frame at 64 MiB. Startup, authentication, and
 control-message families retain PostgreSQL 18's smaller family-specific limits.
-SCRAM responses use a dedicated authentication phase that applies PostgreSQL
-18's 1,024-byte limit from the length word before buffering.
+SCRAM responses use a dedicated authentication phase whose proof is returned
+only after the bounded SCRAM advertisement encoder succeeds. That phase applies
+PostgreSQL 18's 1,024-byte limit from the length word before buffering.
 It reports oversized frames before their bodies are buffered; the future
 session layer must then close the client connection as a protocol violation.
 Backend framing likewise applies exact fixed-message and
@@ -172,6 +173,8 @@ Exact control encoders cover `AuthenticationOk`, minimal `ErrorResponse`,
 SCRAM-SHA-256 advertisement and opaque SASL continue/final frames. Frontend
 typed decoders borrow the selected SASL mechanism, preserve absent versus empty
 initial data, and borrow follow-up response bytes without rendering them.
+The advertisement result carries the otherwise-unconstructible proof required
+to select SCRAM frontend framing.
 Minimal errors contain canonical localized and nonlocalized severity, SQLSTATE,
 and primary-message fields; optional diagnostic fields are not encoded yet.
 The caller supplies the phase-appropriate error limit: 30,000 bytes before

@@ -16,8 +16,8 @@ use pgshard_pgwire::{
     MAX_STARTUP_FRAME_LENGTH, PgOutputConfiguration, PgOutputControlMessage, PgOutputDecoder,
     PgOutputEncoding, PgOutputMessage, PgOutputOldTuple, PgOutputStreaming, PgOutputTupleColumn,
     PgOutputVersion, Postgres18StartupNegotiation, ProtocolVersion, ReplicationCopyData,
-    StandbyStatusUpdate, TransactionStatus, decode_authentication_request, decode_backend,
-    decode_backend_key_data, decode_close, decode_describe, decode_frontend,
+    StandbyStatusUpdate, TransactionStatus, ValidatedIteratorError, decode_authentication_request,
+    decode_backend, decode_backend_key_data, decode_close, decode_describe, decode_frontend,
     decode_parameter_description, decode_parameter_status, decode_pgoutput_control,
     decode_protocol_negotiation, decode_ready_for_query, decode_replication_copy_data,
     decode_startup, encode_authentication_ok, encode_backend_key_data, encode_parameter_status,
@@ -125,7 +125,10 @@ fn assert_backend_control_encoding(server_bytes: &[u8], frame: pgshard_pgwire::B
         BackendTag::NegotiateProtocolVersion => {
             let response = decode_protocol_negotiation(frame).expect("protocol negotiation");
             let mut options = response.unsupported_options();
-            let option = options.next();
+            let option = options
+                .next()
+                .transpose()
+                .expect("validated live protocol option");
             assert!(
                 options.next().is_none(),
                 "live fixture requested at most one protocol option"
@@ -318,7 +321,10 @@ fn describe_statement(stream: &mut TcpStream, utf8: ClientEncoding) {
                 let description = decode_parameter_description(frame)
                     .expect("decode live ParameterDescription body");
                 assert_eq!(
-                    description.parameter_types().collect::<Vec<_>>(),
+                    description
+                        .parameter_types()
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("validated live parameter types"),
                     vec![20, 2950, 17]
                 );
                 parameter_description_count += 1;
@@ -438,6 +444,21 @@ fn streamed_message_configuration() -> PgOutputConfiguration {
     .expect("protocol v2 streaming configuration")
 }
 
+fn collect_validated<T>(
+    iterator: impl Iterator<Item = Result<T, ValidatedIteratorError>>,
+) -> Vec<T> {
+    iterator
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decoded-message iterator invariant")
+}
+
+fn first_validated<T>(iterator: &mut impl Iterator<Item = Result<T, ValidatedIteratorError>>) -> T {
+    iterator
+        .next()
+        .expect("decoded-message iterator item")
+        .expect("decoded-message iterator invariant")
+}
+
 fn assert_prepared_row_changes(messages: &[Vec<u8>], table: &str, encoding: PgOutputEncoding) {
     let configuration = persistent_two_phase_configuration();
     assert_eq!(
@@ -467,7 +488,7 @@ fn assert_prepared_row_changes(messages: &[Vec<u8>], table: &str, encoding: PgOu
     assert_eq!(relation.name(), table);
     assert_eq!(relation.column_count(), 1);
     let relation_id = relation.relation_id();
-    let column = relation.columns().next().expect("live relation column");
+    let column = first_validated(&mut relation.columns());
     assert!(column.part_of_replica_identity());
     assert_eq!(column.name(), "id");
     assert_eq!(column.type_oid(), 23);
@@ -479,7 +500,7 @@ fn assert_prepared_row_changes(messages: &[Vec<u8>], table: &str, encoding: PgOu
     assert_eq!(inserted.stream_xid(), None);
     assert_eq!(inserted.relation_id(), relation_id);
     assert_eq!(
-        inserted.new_tuple().columns().collect::<Vec<_>>(),
+        collect_validated(inserted.new_tuple().columns()),
         [PgOutputTupleColumn::Text("1")]
     );
     let PgOutputMessage::Update(updated) = decoder.decode(&messages[3]).expect("live Update")
@@ -491,11 +512,11 @@ fn assert_prepared_row_changes(messages: &[Vec<u8>], table: &str, encoding: PgOu
         panic!("live Update did not carry its replica-identity key");
     };
     assert_eq!(
-        old_key.columns().collect::<Vec<_>>(),
+        collect_validated(old_key.columns()),
         [PgOutputTupleColumn::Text("1")]
     );
     assert_eq!(
-        updated.new_tuple().columns().collect::<Vec<_>>(),
+        collect_validated(updated.new_tuple().columns()),
         [PgOutputTupleColumn::Text("2")]
     );
     let PgOutputMessage::Delete(deleted) = decoder.decode(&messages[4]).expect("live Delete")
@@ -506,7 +527,7 @@ fn assert_prepared_row_changes(messages: &[Vec<u8>], table: &str, encoding: PgOu
         panic!("live Delete did not carry its replica-identity key");
     };
     assert_eq!(
-        old_key.columns().collect::<Vec<_>>(),
+        collect_validated(old_key.columns()),
         [PgOutputTupleColumn::Text("2")]
     );
     let PgOutputMessage::Insert(inserted) =
@@ -515,7 +536,7 @@ fn assert_prepared_row_changes(messages: &[Vec<u8>], table: &str, encoding: PgOu
         panic!("second live Insert decoded as another message");
     };
     assert_eq!(
-        inserted.new_tuple().columns().collect::<Vec<_>>(),
+        collect_validated(inserted.new_tuple().columns()),
         [PgOutputTupleColumn::Text("3")]
     );
     assert!(matches!(
@@ -529,7 +550,7 @@ fn assert_prepared_row_changes(messages: &[Vec<u8>], table: &str, encoding: PgOu
     assert_eq!(truncated.relation_count(), 1);
     assert!(!truncated.cascade());
     assert!(!truncated.restart_identity());
-    assert_eq!(truncated.relation_ids().collect::<Vec<_>>(), [relation_id]);
+    assert_eq!(collect_validated(truncated.relation_ids()), [relation_id]);
     assert!(matches!(
         decoder.decode(&messages[8]),
         Ok(PgOutputMessage::Control(PgOutputControlMessage::Prepare(_)))

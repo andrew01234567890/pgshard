@@ -5,7 +5,9 @@ use std::num::NonZeroU64;
 
 use thiserror::Error;
 
-use crate::{BackendFrame, BackendTag, ClientEncoding, MAX_LARGE_MESSAGE_LENGTH};
+use crate::{
+    BackendFrame, BackendTag, ClientEncoding, MAX_LARGE_MESSAGE_LENGTH, ValidatedIteratorError,
+};
 
 const PGOUTPUT_GID_MAX_LENGTH: usize = 199;
 const STANDBY_STATUS_UPDATE_MESSAGE_LENGTH: u32 = 38;
@@ -992,27 +994,51 @@ impl fmt::Debug for PgOutputRelationColumnIter<'_> {
     }
 }
 
-impl<'a> Iterator for PgOutputRelationColumnIter<'a> {
-    type Item = PgOutputRelationColumn<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining_columns == 0 {
-            return None;
-        }
-        let mut cursor = Cursor::new(self.remaining);
-        let column = decode_relation_column(&mut cursor)
-            .expect("Relation columns were validated before iterator construction");
-        self.remaining = cursor.remaining();
-        self.remaining_columns -= 1;
-        Some(column)
+impl PgOutputRelationColumnIter<'_> {
+    /// Returns the number of validated relation columns not yet consumed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.remaining_columns
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining_columns, Some(self.remaining_columns))
+    /// Whether no validated relation columns remain.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.remaining_columns == 0
     }
 }
 
-impl ExactSizeIterator for PgOutputRelationColumnIter<'_> {}
+impl<'a> Iterator for PgOutputRelationColumnIter<'a> {
+    type Item = Result<PgOutputRelationColumn<'a>, ValidatedIteratorError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_columns == 0 {
+            if self.remaining.is_empty() {
+                return None;
+            }
+            self.remaining = &[];
+            return Some(Err(ValidatedIteratorError::new("pgoutput Relation column")));
+        }
+        let mut cursor = Cursor::new(self.remaining);
+        let Ok(column) = decode_relation_column(&mut cursor) else {
+            self.remaining = &[];
+            self.remaining_columns = 0;
+            return Some(Err(ValidatedIteratorError::new("pgoutput Relation column")));
+        };
+        self.remaining = cursor.remaining();
+        self.remaining_columns -= 1;
+        Some(Ok(column))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let upper = if self.remaining_columns == 0 && self.remaining.is_empty() {
+            0
+        } else {
+            self.remaining_columns.saturating_add(1)
+        };
+        (0, Some(upper))
+    }
+}
 
 /// Borrowed schema metadata from a Relation message.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1223,27 +1249,51 @@ impl fmt::Debug for PgOutputTupleColumnIter<'_> {
     }
 }
 
-impl<'a> Iterator for PgOutputTupleColumnIter<'a> {
-    type Item = PgOutputTupleColumn<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining_columns == 0 {
-            return None;
-        }
-        let mut cursor = Cursor::new(self.remaining);
-        let column = decode_tuple_column(&mut cursor)
-            .expect("tuple columns were validated before iterator construction");
-        self.remaining = cursor.remaining();
-        self.remaining_columns -= 1;
-        Some(column)
+impl PgOutputTupleColumnIter<'_> {
+    /// Returns the number of validated tuple columns not yet consumed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.remaining_columns
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining_columns, Some(self.remaining_columns))
+    /// Whether no validated tuple columns remain.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.remaining_columns == 0
     }
 }
 
-impl ExactSizeIterator for PgOutputTupleColumnIter<'_> {}
+impl<'a> Iterator for PgOutputTupleColumnIter<'a> {
+    type Item = Result<PgOutputTupleColumn<'a>, ValidatedIteratorError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_columns == 0 {
+            if self.remaining.is_empty() {
+                return None;
+            }
+            self.remaining = &[];
+            return Some(Err(ValidatedIteratorError::new("pgoutput tuple column")));
+        }
+        let mut cursor = Cursor::new(self.remaining);
+        let Ok(column) = decode_tuple_column(&mut cursor) else {
+            self.remaining = &[];
+            self.remaining_columns = 0;
+            return Some(Err(ValidatedIteratorError::new("pgoutput tuple column")));
+        };
+        self.remaining = cursor.remaining();
+        self.remaining_columns -= 1;
+        Some(Ok(column))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let upper = if self.remaining_columns == 0 && self.remaining.is_empty() {
+            0
+        } else {
+            self.remaining_columns.saturating_add(1)
+        };
+        (0, Some(upper))
+    }
+}
 
 /// Replica-identity tuple carried by an Update or Delete message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1371,28 +1421,58 @@ impl fmt::Debug for PgOutputRelationIdIter<'_> {
     }
 }
 
-impl Iterator for PgOutputRelationIdIter<'_> {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining_relations == 0 {
-            return None;
-        }
-        let bytes = self
-            .remaining
-            .get(..4)
-            .expect("Truncate relation IDs were prevalidated");
-        self.remaining = &self.remaining[4..];
-        self.remaining_relations -= 1;
-        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+impl PgOutputRelationIdIter<'_> {
+    /// Returns the number of validated relation OIDs not yet consumed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.remaining_relations
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining_relations, Some(self.remaining_relations))
+    /// Whether no validated relation OIDs remain.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.remaining_relations == 0
     }
 }
 
-impl ExactSizeIterator for PgOutputRelationIdIter<'_> {}
+impl Iterator for PgOutputRelationIdIter<'_> {
+    type Item = Result<u32, ValidatedIteratorError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_relations == 0 {
+            if self.remaining.is_empty() {
+                return None;
+            }
+            self.remaining = &[];
+            return Some(Err(ValidatedIteratorError::new(
+                "pgoutput Truncate relation ID",
+            )));
+        }
+        let Some(bytes) = self.remaining.get(..4) else {
+            self.remaining = &[];
+            self.remaining_relations = 0;
+            return Some(Err(ValidatedIteratorError::new(
+                "pgoutput Truncate relation ID",
+            )));
+        };
+        let bytes: &[u8; 4] = bytes
+            .try_into()
+            .expect("a checked four-byte slice has array length four");
+        let value = u32::from_be_bytes(*bytes);
+        self.remaining = &self.remaining[4..];
+        self.remaining_relations -= 1;
+        Some(Ok(value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let upper = if self.remaining_relations == 0 && self.remaining.is_empty() {
+            0
+        } else {
+            self.remaining_relations.saturating_add(1)
+        };
+        (0, Some(upper))
+    }
+}
 
 /// Borrowed Truncate row change.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1636,9 +1716,6 @@ impl PgOutputDecoder {
         message: &PgOutputControlMessage<'_>,
     ) -> Result<Option<u32>, PgOutputError> {
         match (self.active_stream_xid, message) {
-            (None, PgOutputControlMessage::StreamStart { xid: 0, .. }) => {
-                Err(PgOutputError::InvalidTransactionId("stream transaction ID"))
-            }
             (None, PgOutputControlMessage::StreamStart { xid, .. }) => Ok(Some(*xid)),
             (None, PgOutputControlMessage::StreamStop) => {
                 Err(PgOutputError::StreamStopWithoutStart)
@@ -1714,7 +1791,7 @@ pub fn decode_pgoutput_control(
         }
         b'S' => {
             require_streaming(configuration, tag)?;
-            let xid = cursor.u32("stream transaction ID")?;
+            let xid = decode_nonzero_xid(&mut cursor, "stream transaction ID")?;
             let first_segment = cursor.boolean("first stream segment")?;
             PgOutputControlMessage::StreamStart { xid, first_segment }
         }
@@ -1724,14 +1801,14 @@ pub fn decode_pgoutput_control(
         }
         b'c' => {
             require_streaming(configuration, tag)?;
-            let xid = cursor.u32("stream transaction ID")?;
+            let xid = decode_nonzero_xid(&mut cursor, "stream transaction ID")?;
             let commit = decode_commit(&mut cursor, "stream commit")?;
             PgOutputControlMessage::StreamCommit { xid, commit }
         }
         b'A' => {
             require_streaming(configuration, tag)?;
-            let xid = cursor.u32("stream transaction ID")?;
-            let subxid = cursor.u32("stream subtransaction ID")?;
+            let xid = decode_nonzero_xid(&mut cursor, "stream transaction ID")?;
+            let subxid = decode_nonzero_xid(&mut cursor, "stream subtransaction ID")?;
             let (abort_lsn, abort_time) = if configuration.parallel_streaming() {
                 (
                     Some(cursor.u64("stream abort LSN")?),
@@ -1749,15 +1826,15 @@ pub fn decode_pgoutput_control(
         }
         b'b' => {
             require_two_phase(configuration, tag)?;
-            PgOutputControlMessage::BeginPrepare(decode_prepared(&mut cursor, false, false)?)
+            PgOutputControlMessage::BeginPrepare(decode_prepared(&mut cursor, false)?)
         }
         b'P' => {
             require_two_phase(configuration, tag)?;
-            PgOutputControlMessage::Prepare(decode_prepared(&mut cursor, true, true)?)
+            PgOutputControlMessage::Prepare(decode_prepared(&mut cursor, true)?)
         }
         b'K' => {
             require_two_phase(configuration, tag)?;
-            PgOutputControlMessage::CommitPrepared(decode_prepared(&mut cursor, true, false)?)
+            PgOutputControlMessage::CommitPrepared(decode_prepared(&mut cursor, true)?)
         }
         b'r' => {
             require_two_phase(configuration, tag)?;
@@ -1766,7 +1843,7 @@ pub fn decode_pgoutput_control(
         b'p' => {
             require_streaming(configuration, tag)?;
             require_two_phase(configuration, tag)?;
-            PgOutputControlMessage::StreamPrepare(decode_prepared(&mut cursor, true, true)?)
+            PgOutputControlMessage::StreamPrepare(decode_prepared(&mut cursor, true)?)
         }
         b'I' | b'U' | b'D' | b'T' | b'R' | b'Y' | b'M' => {
             return Err(PgOutputError::NonControlMessage(tag));
@@ -2043,13 +2120,15 @@ fn decode_stream_xid(
     if !in_stream_segment {
         return Ok(None);
     }
-    let received = cursor.u32("stream transaction ID")?;
-    if received == 0 {
-        return Err(PgOutputError::InvalidTransactionId(
-            "streamed message transaction ID",
-        ));
+    decode_nonzero_xid(cursor, "streamed message transaction ID").map(Some)
+}
+
+fn decode_nonzero_xid(cursor: &mut Cursor<'_>, field: &'static str) -> Result<u32, PgOutputError> {
+    let xid = cursor.u32(field)?;
+    if xid == 0 {
+        return Err(PgOutputError::InvalidTransactionId(field));
     }
-    Ok(Some(received))
+    Ok(xid)
 }
 
 fn decode_relation_column<'a>(
@@ -2072,10 +2151,12 @@ fn decode_begin(cursor: &mut Cursor<'_>) -> Result<PgOutputBegin, PgOutputError>
     if final_lsn == 0 {
         return Err(PgOutputError::InvalidLsn("transaction final LSN"));
     }
+    let commit_time = cursor.i64("transaction commit time")?;
+    let xid = decode_nonzero_xid(cursor, "transaction ID")?;
     Ok(PgOutputBegin {
         final_lsn,
-        commit_time: cursor.i64("transaction commit time")?,
-        xid: cursor.u32("transaction ID")?,
+        commit_time,
+        xid,
     })
 }
 
@@ -2097,7 +2178,6 @@ fn decode_commit(
 fn decode_prepared<'a>(
     cursor: &mut Cursor<'a>,
     has_flags: bool,
-    require_xid: bool,
 ) -> Result<PgOutputPrepared<'a>, PgOutputError> {
     if has_flags {
         let flags = cursor.byte("prepared transaction flags")?;
@@ -2117,12 +2197,7 @@ fn decode_prepared<'a>(
         return Err(PgOutputError::InvalidLsn("prepared transaction end LSN"));
     }
     let timestamp = cursor.i64("prepared transaction time")?;
-    let xid = cursor.u32("prepared transaction ID")?;
-    if require_xid && xid == 0 {
-        return Err(PgOutputError::InvalidTransactionId(
-            "prepared transaction ID",
-        ));
-    }
+    let xid = decode_nonzero_xid(cursor, "prepared transaction ID")?;
     let gid = cursor.gid()?;
     Ok(PgOutputPrepared {
         lsn,
@@ -2160,7 +2235,7 @@ fn decode_rollback_prepared<'a>(
         rollback_end_lsn,
         prepare_time: cursor.i64("rollback prepared prepare time")?,
         rollback_time: cursor.i64("rollback prepared rollback time")?,
-        xid: cursor.u32("rollback prepared transaction ID")?,
+        xid: decode_nonzero_xid(cursor, "rollback prepared transaction ID")?,
         gid: cursor.gid()?,
     })
 }
@@ -2248,9 +2323,17 @@ impl<'a> Cursor<'a> {
         let Some(end) = self.remaining.iter().position(|byte| *byte == 0) else {
             return Err(PgOutputError::MissingTerminator(field));
         };
-        let value = std::str::from_utf8(&self.remaining[..end])
-            .map_err(|_| PgOutputError::InvalidUtf8(field))?;
-        self.remaining = &self.remaining[end + 1..];
+        let value = std::str::from_utf8(
+            self.remaining
+                .get(..end)
+                .ok_or(PgOutputError::Truncated(field))?,
+        )
+        .map_err(|_| PgOutputError::InvalidUtf8(field))?;
+        self.remaining = self
+            .remaining
+            .get(end..)
+            .and_then(|remaining| remaining.get(1..))
+            .ok_or(PgOutputError::Truncated(field))?;
         Ok(value)
     }
 
@@ -2267,7 +2350,10 @@ impl<'a> Cursor<'a> {
             .remaining
             .get(..length)
             .ok_or(PgOutputError::Truncated(field))?;
-        self.remaining = &self.remaining[length..];
+        self.remaining = self
+            .remaining
+            .get(length..)
+            .ok_or(PgOutputError::Truncated(field))?;
         Ok(value)
     }
 
@@ -2439,6 +2525,11 @@ mod tests {
     ) -> PgOutputConfiguration {
         PgOutputConfiguration::new(version, streaming, false, false, true)
             .expect("valid pgoutput message test configuration")
+    }
+
+    fn validated<T>(item: Option<Result<T, ValidatedIteratorError>>, description: &str) -> T {
+        item.expect(description)
+            .expect("decoded-message iterator invariant")
     }
 
     fn copy_data(body: &[u8]) -> Vec<u8> {
@@ -3247,12 +3338,12 @@ mod tests {
         assert_eq!(decoded_relation.column_count(), 2);
         let mut decoded_columns = decoded_relation.columns();
         assert_eq!(decoded_columns.len(), 2);
-        let key = decoded_columns.next().expect("identity column");
+        let key = validated(decoded_columns.next(), "identity column");
         assert!(key.part_of_replica_identity());
         assert_eq!(key.name(), "private-key");
         assert_eq!(key.type_oid(), 23);
         assert_eq!(key.type_modifier(), -1);
-        let value = decoded_columns.next().expect("value column");
+        let value = validated(decoded_columns.next(), "value column");
         assert!(!value.part_of_replica_identity());
         assert_eq!(value.name(), "private-value");
         assert_eq!(value.type_oid(), 25);
@@ -3450,12 +3541,12 @@ mod tests {
         assert_eq!(inserted.new_tuple().column_count(), 4);
         let mut tuple_columns = inserted.new_tuple().columns();
         assert_eq!(tuple_columns.len(), 4);
-        assert_eq!(tuple_columns.next(), Some(PgOutputTupleColumn::Null));
+        assert_eq!(tuple_columns.next(), Some(Ok(PgOutputTupleColumn::Null)));
         assert_eq!(
             tuple_columns.next(),
-            Some(PgOutputTupleColumn::UnchangedToast)
+            Some(Ok(PgOutputTupleColumn::UnchangedToast))
         );
-        let Some(PgOutputTupleColumn::Text(text)) = tuple_columns.next() else {
+        let Some(Ok(PgOutputTupleColumn::Text(text))) = tuple_columns.next() else {
             panic!("text column decoded as another representation");
         };
         assert_eq!(text, "private-text");
@@ -3466,7 +3557,7 @@ mod tests {
         assert_eq!(text.as_ptr(), packet[text_offset..].as_ptr());
         assert_eq!(
             tuple_columns.next(),
-            Some(PgOutputTupleColumn::Binary(b"private-binary"))
+            Some(Ok(PgOutputTupleColumn::Binary(b"private-binary")))
         );
         assert_eq!(tuple_columns.next(), None);
         assert!(!format!("{inserted:?}").contains("private"));
@@ -3483,10 +3574,13 @@ mod tests {
         let Some(PgOutputOldTuple::Key(old)) = updated.old_tuple() else {
             panic!("Update key tuple missing");
         };
-        assert_eq!(old.columns().next(), Some(PgOutputTupleColumn::Text("7")));
+        assert_eq!(
+            old.columns().next(),
+            Some(Ok(PgOutputTupleColumn::Text("7")))
+        );
         assert_eq!(
             updated.new_tuple().columns().next(),
-            Some(PgOutputTupleColumn::Text("replacement"))
+            Some(Ok(PgOutputTupleColumn::Text("replacement")))
         );
         let packet = update(None, 4_242, None, &replacement);
         let PgOutputMessage::Update(without_old) =
@@ -3514,11 +3608,23 @@ mod tests {
         assert_eq!(truncated.relation_count(), 2);
         assert!(truncated.cascade());
         assert!(truncated.restart_identity());
-        assert_eq!(truncated.relation_ids().collect::<Vec<_>>(), [4_242, 4_243]);
+        assert_eq!(
+            truncated
+                .relation_ids()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated relation IDs"),
+            [4_242, 4_243]
+        );
+    }
 
+    #[test]
+    fn streamed_rows_require_nonzero_subtransaction_ids() {
+        let config = configuration(PgOutputVersion::V2, PgOutputStreaming::On, false);
+        let mut decoder = PgOutputDecoder::new(config, utf8());
         decoder
             .decode(&stream_start(7, true))
             .expect("Stream Start");
+        let replacement = [(b't', b"replacement".as_slice())];
         let packet = insert(Some(8), 4_242, &replacement);
         let PgOutputMessage::Insert(streamed) = decoder.decode(&packet).expect("streamed Insert")
         else {
@@ -3879,17 +3985,6 @@ mod tests {
             Err(PgOutputError::InvalidLsn("transaction final LSN"))
         );
 
-        for tag in *b"Pp" {
-            let mut zero_xid = prepared(tag, true, b"gid");
-            zero_xid[26..30].fill(0);
-            assert_eq!(
-                decode_pgoutput_control(&zero_xid, two_phase, utf8()),
-                Err(PgOutputError::InvalidTransactionId(
-                    "prepared transaction ID"
-                ))
-            );
-        }
-
         let mut trailing = begin();
         trailing.push(0);
         assert_eq!(
@@ -3903,6 +3998,70 @@ mod tests {
         assert_eq!(
             decode_pgoutput_control(&invalid_origin, base, utf8()),
             Err(PgOutputError::InvalidUtf8("replication origin"))
+        );
+    }
+
+    #[test]
+    fn zero_transaction_ids_are_rejected_in_every_control_family() {
+        let base = configuration(PgOutputVersion::V1, PgOutputStreaming::Off, false);
+        let streaming = configuration(PgOutputVersion::V2, PgOutputStreaming::On, false);
+        let two_phase = configuration(PgOutputVersion::V4, PgOutputStreaming::On, true);
+
+        let mut zero_begin_xid = begin();
+        zero_begin_xid[17..21].fill(0);
+        assert_eq!(
+            decode_pgoutput_control(&zero_begin_xid, base, utf8()),
+            Err(PgOutputError::InvalidTransactionId("transaction ID"))
+        );
+
+        assert_eq!(
+            decode_pgoutput_control(&stream_start(0, true), streaming, utf8()),
+            Err(PgOutputError::InvalidTransactionId("stream transaction ID"))
+        );
+
+        let mut zero_stream_commit_xid = commit(b'c', Some(1));
+        zero_stream_commit_xid[1..5].fill(0);
+        assert_eq!(
+            decode_pgoutput_control(&zero_stream_commit_xid, streaming, utf8()),
+            Err(PgOutputError::InvalidTransactionId("stream transaction ID"))
+        );
+
+        for (xid, subxid, field) in [
+            (0, 2, "stream transaction ID"),
+            (1, 0, "stream subtransaction ID"),
+        ] {
+            let mut stream_abort = vec![b'A'];
+            push_u32(&mut stream_abort, xid);
+            push_u32(&mut stream_abort, subxid);
+            assert_eq!(
+                decode_pgoutput_control(&stream_abort, streaming, utf8()),
+                Err(PgOutputError::InvalidTransactionId(field))
+            );
+        }
+
+        for (tag, flags, xid_offset) in [
+            (b'b', false, 25),
+            (b'P', true, 26),
+            (b'K', true, 26),
+            (b'p', true, 26),
+        ] {
+            let mut zero_xid = prepared(tag, flags, b"gid");
+            zero_xid[xid_offset..xid_offset + 4].fill(0);
+            assert_eq!(
+                decode_pgoutput_control(&zero_xid, two_phase, utf8()),
+                Err(PgOutputError::InvalidTransactionId(
+                    "prepared transaction ID"
+                ))
+            );
+        }
+
+        let mut zero_rollback_xid = rollback_prepared(b"gid");
+        zero_rollback_xid[34..38].fill(0);
+        assert_eq!(
+            decode_pgoutput_control(&zero_rollback_xid, two_phase, utf8()),
+            Err(PgOutputError::InvalidTransactionId(
+                "rollback prepared transaction ID"
+            ))
         );
     }
 
@@ -3959,5 +4118,57 @@ mod tests {
                 Err(PgOutputError::UnknownPgOutputMessage(tag))
             );
         }
+    }
+
+    #[test]
+    fn validated_pgoutput_iterators_fail_closed_if_internal_state_is_inconsistent() {
+        let mut relation_columns = PgOutputRelationColumnIter {
+            remaining: &[],
+            remaining_columns: 1,
+        };
+        assert!(matches!(relation_columns.next(), Some(Err(_))));
+        assert_eq!(relation_columns.len(), 0);
+
+        let mut tuple_columns = PgOutputTupleColumnIter {
+            remaining: &[],
+            remaining_columns: 1,
+        };
+        assert!(matches!(tuple_columns.next(), Some(Err(_))));
+        assert_eq!(tuple_columns.len(), 0);
+
+        let mut relation_ids = PgOutputRelationIdIter {
+            remaining: &[0, 0, 0],
+            remaining_relations: 1,
+        };
+        assert!(matches!(relation_ids.next(), Some(Err(_))));
+        assert_eq!(relation_ids.len(), 0);
+
+        let relation_bytes = [0, b'c', 0, 0, 0, 0, 23, 0xff, 0xff, 0xff, 0xff, 0];
+        let mut relation_columns = PgOutputRelationColumnIter {
+            remaining: &relation_bytes,
+            remaining_columns: 1,
+        };
+        assert_eq!(relation_columns.size_hint().1, Some(2));
+        assert!(matches!(relation_columns.next(), Some(Ok(_))));
+        assert!(matches!(relation_columns.next(), Some(Err(_))));
+        assert_eq!(relation_columns.next(), None);
+
+        let mut tuple_columns = PgOutputTupleColumnIter {
+            remaining: b"nx",
+            remaining_columns: 1,
+        };
+        assert_eq!(tuple_columns.size_hint().1, Some(2));
+        assert!(matches!(tuple_columns.next(), Some(Ok(_))));
+        assert!(matches!(tuple_columns.next(), Some(Err(_))));
+        assert_eq!(tuple_columns.next(), None);
+
+        let mut relation_ids = PgOutputRelationIdIter {
+            remaining: &[0, 0, 0, 1, 0],
+            remaining_relations: 1,
+        };
+        assert_eq!(relation_ids.size_hint().1, Some(2));
+        assert!(matches!(relation_ids.next(), Some(Ok(1))));
+        assert!(matches!(relation_ids.next(), Some(Err(_))));
+        assert_eq!(relation_ids.next(), None);
     }
 }

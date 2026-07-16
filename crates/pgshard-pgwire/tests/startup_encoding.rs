@@ -42,7 +42,13 @@ fn public_startup_encoders_compose_with_decoders_and_protocol_proof() {
         panic!("encoded a special startup request");
     };
     assert_eq!(protocol, ProtocolVersion::new(3, 2));
-    assert_eq!(decoded_parameters.iter().collect::<Vec<_>>(), parameters);
+    assert_eq!(
+        decoded_parameters
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("validated startup parameters"),
+        parameters
+    );
 
     let protocol = Postgres18StartupNegotiation::begin(regular)
         .expect("protocol-three startup")

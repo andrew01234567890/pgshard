@@ -14,7 +14,9 @@ total limit; fixed negotiation and cancellation-key bounds are enforced from
 their eight-byte header before buffering the rest. Ordinary messages use the
 stricter of PostgreSQL's small-message limit, general authentication limit, or
 1,024-byte SCRAM limit and a caller-supplied large-message limit, with a hard
-64 MiB pooler ceiling. Bytes
+64 MiB pooler ceiling. Entering the SCRAM phase requires the proof returned by
+a successful bounded SCRAM-advertisement encode; callers cannot construct that
+phase directly. Bytes
 already present after an SSL request remain unconsumed so an accepted TLS
 handshake can consume an immediately pipelined ClientHello, as PostgreSQL 18
 does. The eventual transport must reject those bytes if it refuses TLS and,
@@ -56,18 +58,20 @@ tags are rejected before their length is trusted. Authentication, query-cycle,
 COPY, and replication phase legality remains the future session state machine's
 responsibility. The typed backend body decoders validate
 `ParameterDescription` exactly, expose its type OIDs through a borrowed
-iterator, validate `ParameterStatus` as exactly two UTF-8 strings, borrow the
+fallible iterator, validate `ParameterStatus` as exactly two UTF-8 strings, borrow the
 process identifier and secret key from `BackendKeyData`, validate the exact
 empty-response family, decode `ReadyForQuery` as idle, in-transaction, or
 failed-transaction state, and decode startup authentication and protocol
 negotiation controls. Authentication decoding covers the PostgreSQL 18 request
 codes and exact fixed payloads, borrows SASL mechanism lists and opaque exchange
 bytes, and redacts salts, mechanism names, and exchange data from debug output.
-Frontend SCRAM framing uses a distinct authentication phase so PostgreSQL 18's
-1,024-byte limit is enforced from the length word. Typed zero-copy decoders
+Frontend SCRAM framing uses an encoder-issued phase proof so PostgreSQL 18's
+1,024-byte limit is enforced from the length word only after this process has
+produced the corresponding bounded advertisement. Typed zero-copy decoders
 preserve the selected mechanism and distinguish an absent initial response
 from a present empty response, then borrow subsequent opaque response bytes;
-their debug output reports lengths only. The future authentication state
+frames buffered under the broader generic authentication limit are rejected by
+these typed SCRAM decoders. Their debug output reports lengths only. The future authentication state
 machine must match the selected mechanism to the exact advertisement and
 enforce exchange ordering.
 Protocol negotiation preserves the complete backend-selected version and exact
@@ -93,6 +97,8 @@ arrays plus caller-buffered minimal `ErrorResponse`, SCRAM
 `AuthenticationSASLFinal`, `BackendKeyData`, `ParameterStatus`, and
 `NegotiateProtocolVersion` frames. SCRAM advertisements are closed to
 PostgreSQL 18's SHA-256 mechanisms and put the channel-binding variant first.
+The advertisement encoder returns both its initialized frame length and the
+otherwise-unconstructible proof required to frame subsequent SCRAM responses.
 `ErrorResponse` encoding emits canonical `S`, `V`, `C`, and `M` fields,
 validates the five-byte SQLSTATE and nonempty UTF-8 message, and deliberately
 omits optional diagnostics. Its explicit caller limit uses libpq's 30,000-byte
@@ -146,11 +152,16 @@ different nonzero subtransaction. A custom Message inside a stream must be
 transactional and repeat the active top-level XID; PostgreSQL 18 attributes the
 tested Message emitted inside a savepoint to that top-level transaction rather
 than the savepoint Relation XID. Relation columns and logical tuples are
-prevalidated once and exposed through borrowed exact-size iterators. Tuple
+prevalidated once and exposed through borrowed fallible iterators. Tuple
 values distinguish null, unchanged-toast, UTF-8 text, and opaque binary without
 copying or rendering values in debug output. Custom Message prefixes require
 the connection UTF-8 proof; their binary contents remain borrowed and are
 represented only by length in debug output.
+Every Begin and streamed transaction identifier must be nonzero. Validated
+startup, query, backend, relation, tuple, and truncate iterators use checked
+slicing and return `ValidatedIteratorError` if their private construction
+invariants are ever violated, rather than silently shortening a message or
+retaining a latent panic path.
 Complete transaction ordering, relation cache semantics, feedback scheduling
 and persistence, durable checkpoints, cross-shard merge, and the VStream-like
 service remain later work.
@@ -169,6 +180,22 @@ fields, rows, or other frontend/backend bodies.
 Query-protocol C-strings require the validated UTF-8 session proof, are checked
 as UTF-8, and are exposed as `&str`. Parameter value bytes remain opaque until
 their declared PostgreSQL types and text/binary formats are resolved.
+
+Four `cargo-fuzz` targets exercise startup framing, every frontend phase and
+typed frontend body, backend framing and typed backend bodies, plus stateful
+`pgoutput` sequences across a branch-covering matrix containing all twelve
+streaming/two-phase/message behaviors plus every protocol version and both
+two-phase provenance paths. Every fallible borrowed iterator is traversed. A
+minimized valid corpus for each target is committed so a clean checkout
+immediately exercises deep typed messages and iterators. GitHub Actions runs the
+four targets as parallel jobs for 10,000 inputs on pgwire-affecting pull
+requests and main-branch pushes, and 100,000 inputs on the scheduled workflow,
+using pinned `cargo-fuzz` and nightly toolchains.
+Run one target locally from this crate with, for example:
+
+```console
+cargo +nightly-2026-06-24 fuzz run decode_frontend -- -runs=10000 -max_len=65536 -timeout=10
+```
 
 `cargo bench -p pgshard-pgwire --bench decode_frontend` measures framing alone.
 `cargo bench -p pgshard-pgwire --bench decode_bind` measures framing plus a

@@ -4,7 +4,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::{ClientEncoding, FrontendFrame, FrontendTag};
+use crate::{ClientEncoding, FrontendFrame, FrontendTag, ValidatedIteratorError};
 
 /// First frontend response to an advertised SASL mechanism list.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -225,24 +225,45 @@ impl<'a> ParameterTypeIter<'a> {
     pub(crate) const fn from_validated_bytes(bytes: &'a [u8]) -> Self {
         Self { remaining: bytes }
     }
+
+    /// Returns the number of validated type OIDs not yet consumed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.remaining.len() / 4
+    }
+
+    /// Whether no validated type OIDs remain.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
+    }
 }
 
 impl Iterator for ParameterTypeIter<'_> {
-    type Item = u32;
+    type Item = Result<u32, ValidatedIteratorError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let bytes = self.remaining.get(..4)?;
+        if self.remaining.is_empty() {
+            return None;
+        }
+        let Some(bytes) = self.remaining.get(..4) else {
+            self.remaining = &[];
+            return Some(Err(ValidatedIteratorError::new("parameter type")));
+        };
+        let value = u32::from_be_bytes(
+            bytes
+                .try_into()
+                .expect("a checked four-byte slice has array length four"),
+        );
         self.remaining = &self.remaining[4..];
-        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        Some(Ok(value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.remaining.len() / 4;
-        (remaining, Some(remaining))
+        let upper = self.remaining.len() / 4 + usize::from(!self.remaining.len().is_multiple_of(4));
+        (0, Some(upper))
     }
 }
-
-impl ExactSizeIterator for ParameterTypeIter<'_> {}
 
 /// `PostgreSQL` text or binary field format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -402,50 +423,128 @@ pub struct BindParameterIter<'a> {
 }
 
 impl<'a> Iterator for BindParameterIter<'a> {
-    type Item = BindParameter<'a>;
+    type Item = Result<BindParameter<'a>, ValidatedIteratorError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index == self.count {
-            return None;
+        if !self.format_layout_is_valid() {
+            self.index = self.count;
+            self.format_bytes = &[];
+            self.value_bytes = &[];
+            return Some(Err(ValidatedIteratorError::new("Bind parameter")));
         }
-        let format_index = match self.format_bytes.len() / 2 {
-            0 => None,
-            1 => Some(0),
-            _ => Some(usize::from(self.index) * 2),
-        };
-        let format = format_index.map_or(FormatCode::Text, |offset| {
-            FormatCode::decode(u16::from_be_bytes([
-                self.format_bytes[offset],
-                self.format_bytes[offset + 1],
-            ]))
-            .expect("bind formats were validated")
-        });
-        let length = i32::from_be_bytes([
-            self.value_bytes[0],
-            self.value_bytes[1],
-            self.value_bytes[2],
-            self.value_bytes[3],
-        ]);
-        self.value_bytes = &self.value_bytes[4..];
-        let value = if length == -1 {
-            None
-        } else {
-            let length = usize::try_from(length).expect("bind lengths were validated");
-            let value = &self.value_bytes[..length];
-            self.value_bytes = &self.value_bytes[length..];
-            Some(value)
-        };
-        self.index += 1;
-        Some(BindParameter { format, value })
+        if self.index == self.count {
+            if self.value_bytes.is_empty() {
+                return None;
+            }
+            self.value_bytes = &[];
+            return Some(Err(ValidatedIteratorError::new("Bind parameter")));
+        }
+        if self.index > self.count {
+            self.index = self.count;
+            self.value_bytes = &[];
+            return Some(Err(ValidatedIteratorError::new("Bind parameter")));
+        }
+        match self.next_validated() {
+            Ok(parameter) => {
+                self.index += 1;
+                Some(Ok(parameter))
+            }
+            Err(error) => {
+                self.index = self.count;
+                self.value_bytes = &[];
+                Some(Err(error))
+            }
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = usize::from(self.count - self.index);
-        (remaining, Some(remaining))
+        let remaining = usize::from(self.count.saturating_sub(self.index));
+        let upper = if self.index == self.count
+            && self.value_bytes.is_empty()
+            && self.format_layout_is_valid()
+        {
+            0
+        } else {
+            remaining.saturating_add(1)
+        };
+        (0, Some(upper))
     }
 }
 
-impl ExactSizeIterator for BindParameterIter<'_> {}
+impl<'a> BindParameterIter<'a> {
+    /// Returns the number of validated parameters not yet consumed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.count.saturating_sub(self.index) as usize
+    }
+
+    /// Whether no validated parameters remain.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.index >= self.count
+    }
+
+    fn format_layout_is_valid(&self) -> bool {
+        let length = self.format_bytes.len();
+        let expected = usize::from(self.count) * 2;
+        if !(length == 0 || length == 2 || length == expected) {
+            return false;
+        }
+        if self.count == 0 && length == 2 {
+            let bytes = [self.format_bytes[0], self.format_bytes[1]];
+            return FormatCode::decode(u16::from_be_bytes(bytes)).is_ok();
+        }
+        true
+    }
+
+    fn next_validated(&mut self) -> Result<BindParameter<'a>, ValidatedIteratorError> {
+        let invalid = || ValidatedIteratorError::new("Bind parameter");
+        let parameter_format_bytes = usize::from(self.count).checked_mul(2).ok_or_else(invalid)?;
+        let format_index = match self.format_bytes.len() {
+            0 => None,
+            2 => Some(0),
+            length if length == parameter_format_bytes => {
+                Some(usize::from(self.index).checked_mul(2).ok_or_else(invalid)?)
+            }
+            _ => return Err(invalid()),
+        };
+        let format = match format_index {
+            None => FormatCode::Text,
+            Some(offset) => {
+                let end = offset.checked_add(2).ok_or_else(invalid)?;
+                let bytes: &[u8; 2] = self
+                    .format_bytes
+                    .get(offset..end)
+                    .ok_or_else(invalid)?
+                    .try_into()
+                    .map_err(|_| invalid())?;
+                FormatCode::decode(u16::from_be_bytes(*bytes)).map_err(|_| invalid())?
+            }
+        };
+        let length_bytes: &[u8; 4] = self
+            .value_bytes
+            .get(..4)
+            .ok_or_else(invalid)?
+            .try_into()
+            .map_err(|_| invalid())?;
+        let remaining = self.value_bytes.get(4..).ok_or_else(invalid)?;
+        let length = i32::from_be_bytes(*length_bytes);
+        let value = if length == -1 {
+            None
+        } else {
+            let length = usize::try_from(length).map_err(|_| invalid())?;
+            let value = remaining.get(..length).ok_or_else(invalid)?;
+            Some(value)
+        };
+        let consumed = if length == -1 {
+            0
+        } else {
+            usize::try_from(length).map_err(|_| invalid())?
+        };
+        self.value_bytes = remaining.get(consumed..).ok_or_else(invalid)?;
+        Ok(BindParameter { format, value })
+    }
+}
 
 /// Iterator over validated format codes.
 #[derive(Clone)]
@@ -453,25 +552,47 @@ pub struct FormatCodeIter<'a> {
     remaining: &'a [u8],
 }
 
-impl Iterator for FormatCodeIter<'_> {
-    type Item = FormatCode;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let bytes = self.remaining.get(..2)?;
-        self.remaining = &self.remaining[2..];
-        Some(
-            FormatCode::decode(u16::from_be_bytes([bytes[0], bytes[1]]))
-                .expect("format codes were validated"),
-        )
+impl FormatCodeIter<'_> {
+    /// Returns the number of validated format codes not yet consumed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.remaining.len() / 2
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.remaining.len() / 2;
-        (remaining, Some(remaining))
+    /// Whether no validated format codes remain.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
     }
 }
 
-impl ExactSizeIterator for FormatCodeIter<'_> {}
+impl Iterator for FormatCodeIter<'_> {
+    type Item = Result<FormatCode, ValidatedIteratorError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining.is_empty() {
+            return None;
+        }
+        let Some(bytes) = self.remaining.get(..2) else {
+            self.remaining = &[];
+            return Some(Err(ValidatedIteratorError::new("format code")));
+        };
+        let bytes: &[u8; 2] = bytes
+            .try_into()
+            .expect("a checked two-byte slice has array length two");
+        let Ok(value) = FormatCode::decode(u16::from_be_bytes(*bytes)) else {
+            self.remaining = &[];
+            return Some(Err(ValidatedIteratorError::new("format code")));
+        };
+        self.remaining = &self.remaining[2..];
+        Some(Ok(value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let upper = self.remaining.len() / 2 + usize::from(!self.remaining.len().is_multiple_of(2));
+        (0, Some(upper))
+    }
+}
 
 /// Extended-query `Execute` message body.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -507,10 +628,10 @@ impl fmt::Debug for ExecuteMessage<'_> {
 /// Decodes a complete frontend `SASLInitialResponse` body.
 ///
 /// The caller must first frame this message under
-/// [`crate::FrontendPhase::ScramAuthentication`] so `PostgreSQL` 18's
-/// 1,024-byte SCRAM limit is enforced before buffering the body. Mechanism policy and
-/// comparison with the advertised list belong to the authentication state
-/// machine.
+/// [`crate::FrontendPhase::ScramAuthentication`] using the proof returned by
+/// [`crate::encode_authentication_sasl`], so `PostgreSQL` 18's 1,024-byte
+/// SCRAM limit is enforced before buffering the body. Mechanism policy and
+/// comparison with the advertised list belong to the authentication state machine.
 ///
 /// # Errors
 ///
@@ -521,6 +642,7 @@ pub fn decode_sasl_initial_response(
     frame: FrontendFrame<'_>,
 ) -> Result<SaslInitialResponse<'_>, MessageError> {
     require_tag(frame, FrontendTag::AuthenticationResponse)?;
+    require_scram_bound(frame)?;
     let mut cursor = Cursor::new(frame.body());
     let mechanism = cursor.cstring_bytes("SASL mechanism")?;
     let response_length = cursor.i32("SASL initial response length")?;
@@ -543,8 +665,9 @@ pub fn decode_sasl_initial_response(
 /// Borrows the complete body of a subsequent frontend `SASLResponse`.
 ///
 /// The caller must first frame this message under
-/// [`crate::FrontendPhase::ScramAuthentication`] and ensure it follows a valid
-/// initial response in the same authentication exchange.
+/// [`crate::FrontendPhase::ScramAuthentication`] with the encoder-issued proof
+/// and ensure it follows a valid initial response in the same authentication
+/// exchange.
 ///
 /// # Errors
 ///
@@ -552,7 +675,16 @@ pub fn decode_sasl_initial_response(
 /// response tag `p`.
 pub fn decode_sasl_response(frame: FrontendFrame<'_>) -> Result<SaslResponse<'_>, MessageError> {
     require_tag(frame, FrontendTag::AuthenticationResponse)?;
+    require_scram_bound(frame)?;
     Ok(SaslResponse { data: frame.body() })
+}
+
+fn require_scram_bound(frame: FrontendFrame<'_>) -> Result<(), MessageError> {
+    if frame.is_scram_bounded() {
+        Ok(())
+    } else {
+        Err(MessageError::ScramPhaseRequired)
+    }
 }
 
 /// Decodes a complete simple-query body.
@@ -777,7 +909,10 @@ impl<'a> Cursor<'a> {
     }
 
     fn cstring_bytes(&mut self, field: &'static str) -> Result<&'a [u8], MessageError> {
-        let remaining = &self.bytes[self.position..];
+        let remaining = self
+            .bytes
+            .get(self.position..)
+            .ok_or(MessageError::Truncated(field))?;
         let end = remaining
             .iter()
             .position(|byte| *byte == 0)
@@ -834,6 +969,9 @@ pub enum MessageError {
         /// Actual tag.
         actual: FrontendTag,
     },
+    /// A SCRAM body decoder received a frame buffered under a broader limit.
+    #[error("SASL response was not framed under the bounded SCRAM authentication phase")]
+    ScramPhaseRequired,
     /// A zero-terminated field has no terminator in the frame body.
     #[error("{0} is missing its zero terminator")]
     MissingTerminator(&'static str),
@@ -883,6 +1021,15 @@ mod tests {
         FrontendFrame {
             tag: FrontendTag::from_byte(tag).expect("test frontend tag"),
             body,
+            scram_bounded: false,
+        }
+    }
+
+    fn scram_frame(tag: u8, body: &[u8]) -> FrontendFrame<'_> {
+        FrontendFrame {
+            tag: FrontendTag::from_byte(tag).expect("test frontend tag"),
+            body,
+            scram_bounded: true,
         }
     }
 
@@ -903,7 +1050,7 @@ mod tests {
             i32::try_from(initial_bytes.len()).expect("test response length"),
         );
         body.extend_from_slice(initial_bytes);
-        let initial = decode_sasl_initial_response(frame(b'p', &body)).expect("SASL initial");
+        let initial = decode_sasl_initial_response(scram_frame(b'p', &body)).expect("SASL initial");
         assert_eq!(initial.mechanism(), b"SCRAM-SHA-256");
         assert_eq!(initial.initial_response(), Some(initial_bytes.as_slice()));
         assert!(std::ptr::eq(
@@ -920,7 +1067,8 @@ mod tests {
         }
 
         let response_bytes = b"c=biws,r=nonce,p=proof";
-        let response = decode_sasl_response(frame(b'p', response_bytes)).expect("SASL response");
+        let response =
+            decode_sasl_response(scram_frame(b'p', response_bytes)).expect("SASL response");
         assert_eq!(response.data(), response_bytes);
         let rendered = format!("{response:?}");
         for secret in ["nonce", "proof"] {
@@ -933,8 +1081,8 @@ mod tests {
         for (length, expected) in [(-1, None), (0, Some(b"".as_slice()))] {
             let mut body = b"SCRAM-SHA-256\0".to_vec();
             push_i32(&mut body, length);
-            let response =
-                decode_sasl_initial_response(frame(b'p', &body)).expect("bounded SASL initial");
+            let response = decode_sasl_initial_response(scram_frame(b'p', &body))
+                .expect("bounded SASL initial");
             assert_eq!(response.initial_response(), expected);
         }
     }
@@ -942,18 +1090,18 @@ mod tests {
     #[test]
     fn malformed_sasl_initial_responses_fail_closed() {
         assert_eq!(
-            decode_sasl_initial_response(frame(b'p', b"SCRAM-SHA-256")),
+            decode_sasl_initial_response(scram_frame(b'p', b"SCRAM-SHA-256")),
             Err(MessageError::MissingTerminator("SASL mechanism"))
         );
         assert_eq!(
-            decode_sasl_initial_response(frame(b'p', b"SCRAM-SHA-256\0")),
+            decode_sasl_initial_response(scram_frame(b'p', b"SCRAM-SHA-256\0")),
             Err(MessageError::Truncated("SASL initial response length"))
         );
 
         let mut invalid_negative = b"SCRAM-SHA-256\0".to_vec();
         push_i32(&mut invalid_negative, -2);
         assert_eq!(
-            decode_sasl_initial_response(frame(b'p', &invalid_negative)),
+            decode_sasl_initial_response(scram_frame(b'p', &invalid_negative)),
             Err(MessageError::InvalidSaslResponseLength(-2))
         );
 
@@ -961,7 +1109,7 @@ mod tests {
         push_i32(&mut truncated, 3);
         truncated.extend_from_slice(b"ab");
         assert_eq!(
-            decode_sasl_initial_response(frame(b'p', &truncated)),
+            decode_sasl_initial_response(scram_frame(b'p', &truncated)),
             Err(MessageError::Truncated("SASL initial response"))
         );
 
@@ -970,17 +1118,17 @@ mod tests {
             push_i32(&mut trailing, length);
             trailing.extend_from_slice(b"xy");
             assert_eq!(
-                decode_sasl_initial_response(frame(b'p', &trailing)),
+                decode_sasl_initial_response(scram_frame(b'p', &trailing)),
                 Err(MessageError::TrailingData(if length == -1 { 2 } else { 1 }))
             );
         }
 
         assert!(matches!(
-            decode_sasl_initial_response(frame(b'Q', b"")),
+            decode_sasl_initial_response(scram_frame(b'Q', b"")),
             Err(MessageError::WrongTag { .. })
         ));
         assert!(matches!(
-            decode_sasl_response(frame(b'Q', b"")),
+            decode_sasl_response(scram_frame(b'Q', b"")),
             Err(MessageError::WrongTag { .. })
         ));
     }
@@ -993,11 +1141,11 @@ mod tests {
 
         for length in 0..body.len() {
             assert!(
-                decode_sasl_initial_response(frame(b'p', &body[..length])).is_err(),
+                decode_sasl_initial_response(scram_frame(b'p', &body[..length])).is_err(),
                 "accepted truncated prefix of {length} bytes"
             );
         }
-        assert!(decode_sasl_initial_response(frame(b'p', &body)).is_ok());
+        assert!(decode_sasl_initial_response(scram_frame(b'p', &body)).is_ok());
     }
 
     #[test]
@@ -1011,7 +1159,13 @@ mod tests {
         parse_body.extend_from_slice(&0_u32.to_be_bytes());
         let parse = decode_parse(frame(b'P', &parse_body), utf8()).expect("parse");
         assert_eq!(parse.statement_name(), "find");
-        assert_eq!(parse.parameter_types().collect::<Vec<_>>(), vec![20, 0]);
+        assert_eq!(
+            parse
+                .parameter_types()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated parameter types"),
+            vec![20, 0]
+        );
 
         let mut execute_body = b"portal\0".to_vec();
         execute_body.extend_from_slice(&42_u32.to_be_bytes());
@@ -1100,7 +1254,10 @@ mod tests {
         assert_eq!(bind.portal_name(), "portal");
         assert_eq!(bind.statement_name(), "statement");
         assert_eq!(
-            bind.parameters().iter().collect::<Vec<_>>(),
+            bind.parameters()
+                .iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated Bind parameters"),
             vec![
                 BindParameter {
                     format: FormatCode::Text,
@@ -1117,7 +1274,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            bind.result_formats().collect::<Vec<_>>(),
+            bind.result_formats()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated result formats"),
             vec![FormatCode::Text, FormatCode::Binary]
         );
     }
@@ -1148,10 +1307,10 @@ mod tests {
         assert_eq!(consumed, bytes.len());
         assert_eq!(
             bind.parameters().iter().next(),
-            Some(BindParameter {
+            Some(Ok(BindParameter {
                 format: FormatCode::Binary,
                 value: Some(42_i64.to_be_bytes().as_slice()),
-            })
+            }))
         );
     }
 
@@ -1188,8 +1347,9 @@ mod tests {
                 .expect("bind")
                 .parameters()
                 .iter()
-                .map(BindParameter::format)
-                .collect::<Vec<_>>();
+                .map(|parameter| parameter.map(BindParameter::format))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated Bind parameters");
             assert_eq!(actual, expected);
         }
     }
@@ -1334,5 +1494,82 @@ mod tests {
             decode_describe(frame(b'D', b"Sdo-not-log-this\0"), utf8()).expect("describe");
         let close = decode_close(frame(b'C', b"Pdo-not-log-this\0"), utf8()).expect("close");
         assert!(!format!("{describe:?} {close:?}").contains("do-not-log-this"));
+    }
+
+    #[test]
+    fn validated_iterators_fail_closed_if_internal_state_is_inconsistent() {
+        let mut parameter_types = ParameterTypeIter {
+            remaining: &[0, 0, 0],
+        };
+        assert!(matches!(parameter_types.next(), Some(Err(_))));
+        assert_eq!(parameter_types.len(), 0);
+
+        let mut formats = FormatCodeIter { remaining: &[0, 2] };
+        assert!(matches!(formats.next(), Some(Err(_))));
+        assert_eq!(formats.len(), 0);
+
+        for mut parameters in [
+            BindParameterIter {
+                format_bytes: &[0],
+                value_bytes: &[0, 0, 0, 0],
+                index: 0,
+                count: 1,
+            },
+            BindParameterIter {
+                format_bytes: &[0, 1, 0],
+                value_bytes: &[0, 0, 0, 0],
+                index: 0,
+                count: 1,
+            },
+            BindParameterIter {
+                format_bytes: &[0, 2],
+                value_bytes: &[0, 0, 0, 0],
+                index: 0,
+                count: 1,
+            },
+            BindParameterIter {
+                format_bytes: &[],
+                value_bytes: &[0, 0, 0],
+                index: 0,
+                count: 1,
+            },
+            BindParameterIter {
+                format_bytes: &[],
+                value_bytes: &[0],
+                index: 0,
+                count: 0,
+            },
+            BindParameterIter {
+                format_bytes: &[0],
+                value_bytes: &[],
+                index: 0,
+                count: 0,
+            },
+            BindParameterIter {
+                format_bytes: &[0, 2],
+                value_bytes: &[],
+                index: 0,
+                count: 0,
+            },
+        ] {
+            assert!(matches!(parameters.next(), Some(Err(_))));
+            assert_eq!(parameters.len(), 0);
+            assert_eq!(parameters.next(), None);
+        }
+
+        let mut parameter_with_trailing_bytes = BindParameterIter {
+            format_bytes: &[],
+            value_bytes: &[0, 0, 0, 0, 1],
+            index: 0,
+            count: 1,
+        };
+        let upper = parameter_with_trailing_bytes
+            .size_hint()
+            .1
+            .expect("finite upper bound");
+        assert_eq!(upper, 2);
+        assert!(matches!(parameter_with_trailing_bytes.next(), Some(Ok(_))));
+        assert!(matches!(parameter_with_trailing_bytes.next(), Some(Err(_))));
+        assert_eq!(parameter_with_trailing_bytes.next(), None);
     }
 }
