@@ -15,6 +15,7 @@ import (
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -67,7 +68,8 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=list;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;delete
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
@@ -162,6 +164,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	if err := r.verifyPostgreSQLPodFencingNamespace(ctx, cluster); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing is unavailable: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	if !controllerutil.ContainsFinalizer(cluster, resourceFinalizer) {
 		controllerutil.AddFinalizer(cluster, resourceFinalizer)
 		if err := r.Update(ctx, cluster); err != nil {
@@ -226,6 +232,23 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		return ctrl.Result{RequeueAfter: bootstrapIntegrityInterval}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *PgShardClusterReconciler) verifyPostgreSQLPodFencingNamespace(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	if cluster.Spec.MembersPerShard != 1 {
+		return nil
+	}
+	namespace := &corev1.Namespace{}
+	if err := r.authoritativeReader().Get(ctx, types.NamespacedName{Name: cluster.Namespace}, namespace); err != nil {
+		return fmt.Errorf("read namespace %s before PostgreSQL creation: %w", cluster.Namespace, err)
+	}
+	if namespace.DeletionTimestamp != nil {
+		return fmt.Errorf("namespace %s is deleting", cluster.Namespace)
+	}
+	if namespace.Labels[podfence.NamespaceLabel] != podfence.NamespaceLabelValue {
+		return fmt.Errorf("namespace %s must be labelled %s=%s before PostgreSQL creation", cluster.Namespace, podfence.NamespaceLabel, podfence.NamespaceLabelValue)
+	}
+	return nil
 }
 
 func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
@@ -1666,9 +1689,10 @@ func (r *PgShardClusterReconciler) deletePostgreSQLCredentialFences(ctx context.
 }
 
 // releaseTerminatedPostgreSQLPodFences removes the operator's Pod finalizer
-// only after kubelet has published a terminal phase. Kubernetes keeps a
-// force-deleted Pod with a custom finalizer in the API, so a partitioned node
-// cannot turn object absence into false process-termination evidence.
+// only for a Pod that was never assigned or after admission has attached a
+// durable termination receipt to an authenticated terminal-phase update from
+// the exact binding-time kubelet. PodGC's control-plane-authored Failed phase
+// does not satisfy that proof.
 func (r *PgShardClusterReconciler) releaseTerminatedPostgreSQLPodFences(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	if len(cluster.Status.PostgreSQLBootstraps) == 0 {
 		return false, nil
@@ -1683,7 +1707,7 @@ func (r *PgShardClusterReconciler) releaseTerminatedPostgreSQLPodFences(ctx cont
 	released := false
 	for index := range pods.Items {
 		pod := &pods.Items[index]
-		if !controllerutil.ContainsFinalizer(pod, owned.PostgreSQLPodTerminationFinalizer) || pod.DeletionTimestamp == nil || !podHasTerminalPhase(pod) {
+		if !controllerutil.ContainsFinalizer(pod, owned.PostgreSQLPodTerminationFinalizer) || pod.DeletionTimestamp == nil || !podHasSafeTerminationEvidence(pod) {
 			continue
 		}
 		matching, err := postgreSQLDataBootstrapIndexForPod(pod, cluster)
@@ -1710,9 +1734,9 @@ func (r *PgShardClusterReconciler) releaseTerminatedPostgreSQLPodFences(ctx cont
 
 // verifyPostgreSQLPodTerminationFences runs before any workload controller is
 // deleted. Every live Pod that mounts recorded PGDATA must be the exact managed
-// Pod and must already carry the finalizer that preserves kubelet's terminal
-// status evidence. A terminal Pod whose finalizer was just released is safe and
-// will disappear before the PVC barrier can complete.
+// Pod and must already carry the finalizer that preserves authenticated process
+// termination evidence. A safely terminated Pod whose finalizer was just
+// released will disappear before the PVC barrier can complete.
 func (r *PgShardClusterReconciler) verifyPostgreSQLPodTerminationFences(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
 	if r.APIReader == nil {
 		return fmt.Errorf("authoritative API reader is required for PostgreSQL Pod termination-fence verification")
@@ -1737,7 +1761,7 @@ func (r *PgShardClusterReconciler) verifyPostgreSQLPodTerminationFences(ctx cont
 		if controllerutil.ContainsFinalizer(pod, owned.PostgreSQLPodTerminationFinalizer) {
 			continue
 		}
-		if pod.DeletionTimestamp != nil && podHasTerminalPhase(pod) {
+		if pod.DeletionTimestamp != nil && podHasSafeTerminationEvidence(pod) {
 			continue
 		}
 		return fmt.Errorf("PostgreSQL Pod %s with UID %s lacks its termination finalizer", pod.Name, pod.UID)
@@ -1747,9 +1771,9 @@ func (r *PgShardClusterReconciler) verifyPostgreSQLPodTerminationFences(ctx cont
 
 // deletePostgreSQLPodsForFinalization establishes an authoritative
 // PGDATA-Pod-absence barrier after every bootstrap Secret is absent. Credential
-// clients do not own storage and their sessions are severed by the terminal
-// PostgreSQL process proof. Any Pod that mounts the protected PVC remains in
-// the barrier regardless of phase or identity.
+// clients do not own storage and their sessions are severed by the authenticated
+// PostgreSQL process proof. Any Pod that mounts the protected PVC remains in the
+// barrier regardless of phase or identity.
 func (r *PgShardClusterReconciler) deletePostgreSQLPodsForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	if r.APIReader == nil {
 		return false, fmt.Errorf("authoritative API reader is required for PostgreSQL Pod finalization")
@@ -1774,7 +1798,7 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPodsForFinalization(ctx conte
 			return false, err
 		}
 		if !controllerutil.ContainsFinalizer(pod, owned.PostgreSQLPodTerminationFinalizer) {
-			if pod.DeletionTimestamp != nil && podHasTerminalPhase(pod) {
+			if pod.DeletionTimestamp != nil && podHasSafeTerminationEvidence(pod) {
 				continue
 			}
 			return false, fmt.Errorf("PostgreSQL Pod %s with UID %s lacks its termination finalizer", pod.Name, pod.UID)
@@ -1817,6 +1841,10 @@ func podSpecReferencesPostgreSQLDataPVC(spec corev1.PodSpec, pvcName string) boo
 
 func podHasTerminalPhase(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+}
+
+func podHasSafeTerminationEvidence(pod *corev1.Pod) bool {
+	return pod.Spec.NodeName == "" || podfence.HasTerminationAttestation(pod)
 }
 
 func validatePostgreSQLFinalizationPod(pod *corev1.Pod, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) error {

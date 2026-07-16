@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -164,7 +165,7 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 			mutate: func(objects []client.Object) {
 				objects[3].(*admissionregistrationv1.ValidatingWebhookConfiguration).Webhooks[0].NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"admission": "optional"}}
 			},
-			want: "must not use namespaceSelector",
+			want: "unexpected namespaceSelector",
 		},
 		{
 			name: "wrong webhook Service",
@@ -195,7 +196,7 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 				configuration := objects[2].(*admissionregistrationv1.MutatingWebhookConfiguration)
 				configuration.Webhooks = append(configuration.Webhooks, configuration.Webhooks[0])
 			},
-			want: "want exactly one",
+			want: "want exactly three",
 		},
 	}
 	for _, test := range tests {
@@ -406,7 +407,7 @@ func installObjects() []client.Object {
 	serviceReference := func(path string) admissionregistrationv1.WebhookClientConfig {
 		return admissionregistrationv1.WebhookClientConfig{Service: &admissionregistrationv1.ServiceReference{Namespace: testNamespace, Name: testServiceName, Path: &path, Port: &servicePort}}
 	}
-	rules := func() []admissionregistrationv1.RuleWithOperations {
+	clusterRules := func() []admissionregistrationv1.RuleWithOperations {
 		return []admissionregistrationv1.RuleWithOperations{{
 			Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
 			Rule: admissionregistrationv1.Rule{
@@ -417,39 +418,47 @@ func installObjects() []client.Object {
 			},
 		}}
 	}
+	coreRules := func(operation admissionregistrationv1.OperationType, resource string) []admissionregistrationv1.RuleWithOperations {
+		return []admissionregistrationv1.RuleWithOperations{{
+			Operations: []admissionregistrationv1.OperationType{operation},
+			Rule: admissionregistrationv1.Rule{
+				APIGroups: []string{""}, APIVersions: []string{"v1"}, Resources: []string{resource}, Scope: &scope,
+			},
+		}}
+	}
+	mutatingWebhook := func(name, path string, rules []admissionregistrationv1.RuleWithOperations) admissionregistrationv1.MutatingWebhook {
+		return admissionregistrationv1.MutatingWebhook{
+			Name: name, ClientConfig: serviceReference(path), Rules: rules,
+			FailurePolicy: &failurePolicy, MatchPolicy: &matchPolicy, SideEffects: &sideEffects, TimeoutSeconds: &timeoutSeconds,
+			AdmissionReviewVersions: []string{"v1"}, NamespaceSelector: &metav1.LabelSelector{}, ObjectSelector: &metav1.LabelSelector{},
+			ReinvocationPolicy: &reinvocationPolicy,
+		}
+	}
+	validatingWebhook := func(name, path string, rules []admissionregistrationv1.RuleWithOperations) admissionregistrationv1.ValidatingWebhook {
+		return admissionregistrationv1.ValidatingWebhook{
+			Name: name, ClientConfig: serviceReference(path), Rules: rules,
+			FailurePolicy: &failurePolicy, MatchPolicy: &matchPolicy, SideEffects: &sideEffects, TimeoutSeconds: &timeoutSeconds,
+			AdmissionReviewVersions: []string{"v1"}, NamespaceSelector: &metav1.LabelSelector{}, ObjectSelector: &metav1.LabelSelector{},
+		}
+	}
+	clusterMutating := mutatingWebhook(mutatingWebhookName, mutatingWebhookPath, clusterRules())
+	bindingMutating := mutatingWebhook(podfence.BindingWebhookName, podfence.BindingWebhookPath, coreRules(admissionregistrationv1.Create, "pods/binding"))
+	bindingMutating.NamespaceSelector = podFencingNamespaceSelector()
+	statusMutating := mutatingWebhook(podfence.StatusWebhookName, podfence.StatusWebhookPath, coreRules(admissionregistrationv1.Update, "pods/status"))
+	statusMutating.ObjectSelector = postgreSQLPodSelector()
+	clusterValidating := validatingWebhook(validatingWebhookName, validatingWebhookPath, clusterRules())
+	metadataValidating := validatingWebhook(podfence.MetadataWebhookName, podfence.MetadataWebhookPath, coreRules(admissionregistrationv1.Update, "pods"))
+	metadataValidating.ObjectSelector = postgreSQLPodSelector()
 	return []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testCASecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testServingSecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
 		&admissionregistrationv1.MutatingWebhookConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: testMutatingConfigurationName},
-			Webhooks: []admissionregistrationv1.MutatingWebhook{{
-				Name:                    mutatingWebhookName,
-				ClientConfig:            serviceReference(mutatingWebhookPath),
-				Rules:                   rules(),
-				FailurePolicy:           &failurePolicy,
-				MatchPolicy:             &matchPolicy,
-				SideEffects:             &sideEffects,
-				TimeoutSeconds:          &timeoutSeconds,
-				AdmissionReviewVersions: []string{"v1"},
-				NamespaceSelector:       &metav1.LabelSelector{},
-				ObjectSelector:          &metav1.LabelSelector{},
-				ReinvocationPolicy:      &reinvocationPolicy,
-			}},
+			Webhooks:   []admissionregistrationv1.MutatingWebhook{clusterMutating, bindingMutating, statusMutating},
 		},
 		&admissionregistrationv1.ValidatingWebhookConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: testValidatingConfigurationName},
-			Webhooks: []admissionregistrationv1.ValidatingWebhook{{
-				Name:                    validatingWebhookName,
-				ClientConfig:            serviceReference(validatingWebhookPath),
-				Rules:                   rules(),
-				FailurePolicy:           &failurePolicy,
-				MatchPolicy:             &matchPolicy,
-				SideEffects:             &sideEffects,
-				TimeoutSeconds:          &timeoutSeconds,
-				AdmissionReviewVersions: []string{"v1"},
-				NamespaceSelector:       &metav1.LabelSelector{},
-				ObjectSelector:          &metav1.LabelSelector{},
-			}},
+			Webhooks:   []admissionregistrationv1.ValidatingWebhook{clusterValidating, metadataValidating},
 		},
 	}
 }
@@ -489,8 +498,18 @@ func assertInjectedBundles(t *testing.T, kubeClient client.Client, wanted []byte
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: testValidatingConfigurationName}, validating); err != nil {
 		t.Fatal(err)
 	}
-	if len(mutating.Webhooks) != 1 || !bytes.Equal(mutating.Webhooks[0].ClientConfig.CABundle, wanted) || len(validating.Webhooks) != 1 || !bytes.Equal(validating.Webhooks[0].ClientConfig.CABundle, wanted) {
+	if len(mutating.Webhooks) != 3 || len(validating.Webhooks) != 2 {
 		t.Fatalf("CA bundles were not injected: mutating=%#v validating=%#v", mutating.Webhooks, validating.Webhooks)
+	}
+	for _, webhook := range mutating.Webhooks {
+		if !bytes.Equal(webhook.ClientConfig.CABundle, wanted) {
+			t.Fatalf("mutating webhook %s CA bundle was not injected", webhook.Name)
+		}
+	}
+	for _, webhook := range validating.Webhooks {
+		if !bytes.Equal(webhook.ClientConfig.CABundle, wanted) {
+			t.Fatalf("validating webhook %s CA bundle was not injected", webhook.Name)
+		}
 	}
 }
 

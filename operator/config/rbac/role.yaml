@@ -29,6 +29,7 @@ rules:
   - ""
   resources:
   - namespaces
+  - nodes
   verbs:
   - get
 - apiGroups:
@@ -37,6 +38,7 @@ rules:
   - pods
   verbs:
   - delete
+  - get
   - list
   - patch
 - apiGroups:

@@ -133,16 +133,23 @@ After all storage outcomes are closed, the controller deletes and observes
 authoritative absence of every exact credential tombstone. It then lists Pods
 through the uncached API reader and proves absence of every Pod that mounts a
 checkpointed data PVC. Each managed PostgreSQL Pod starts with a
-cluster-UID-bound termination finalizer. Before workload pruning, the controller
-requires that exact fence; after deletion it removes the finalizer only when
-kubelet reports `Succeeded` or `Failed`. A force-deleted Pod on a partitioned
-node therefore remains visible and keeps the PVC protected instead of turning
-API-object absence into a false process-termination proof. Credential-only
+cluster-UID-bound termination finalizer. In a namespace labelled
+`pgshard.io/pod-fencing=enabled`, the fail-closed binding webhook copies the
+selected Node UID and boot ID into the Pod in the same API update that assigns
+`spec.nodeName`. A second webhook permits an authenticated terminal status update to add
+the durable `pgshard.io/PostgreSQLProcessTerminated` condition only when the
+request is from `system:node:<spec.nodeName>` in `system:nodes` and the live Node
+still has that binding-time UID and boot ID. PodGC and other control-plane
+writers cannot create that receipt. The controller releases the finalizer only
+for that admitted condition, or for a deleting Pod that was never assigned;
+Kubernetes serializes binding against deletion for the latter case. A webhook
+outage, missing Node, reboot, or same-name replacement therefore leaves the Pod
+and PVC fenced. Credential-only
 clients do not own PGDATA and cannot keep a session after the PostgreSQL process
 has stopped, so they do not block this storage barrier. A Pod committed before
 credential deletion remains visible to the PVC barrier; a later managed Pod
 cannot obtain the deleted bootstrap credential. Only after the credential,
-terminal-process, and Pod-absence barriers does `Retain`
+authenticated-process, and Pod-absence barriers does `Retain`
 release its own PVC protection finalizer and mark the data retained. If a
 retained PVC was explicitly deleted, the controller releases only its own
 protection finalizer and waits for authoritative absence instead of replacing
@@ -160,6 +167,14 @@ namespace is deleted. Automated
 defragmentation is not implemented. PostgreSQL
 `archive_mode` remains off until a real archival pipeline is reconciled and
 verified, so the generated configuration cannot silently fill `pg_wal`.
+
+This lifecycle receipt is not physical node fencing. Do not delete and recreate
+a Node under the same name while a bound pgshard Pod may still exist on the old
+machine. If the bound Node disappears or its boot ID changes, fence the machine
+or storage externally and use an explicit recovery procedure; the MVP will not
+infer safety from Pod phase, `ReadWriteOnce`, a replacement Node, or an
+administrator-added condition. Removing the Pod finalizer or the admission
+configuration is outside the safe lifecycle contract.
 
 NetworkPolicy selectors are traffic controls, not workload authentication. A
 principal allowed to create Pods in a cluster namespace can forge the selected
@@ -232,7 +247,8 @@ overlay passes `--webhook-enabled=false` and deliberately omits the generated
 webhook configurations. Use `config/admission` to exercise self-managed
 certificates and admission. OpenAPI validation still applies here, and the
 reconciler repeats all semantic safety validation before creating children,
-but this is not a production admission setup.
+but this is not a production admission setup and must not manage direct
+PostgreSQL Pods.
 
 After building and loading the operator, orchestrator, and pooler `:dev` images
 into a local KIND cluster:
@@ -252,9 +268,10 @@ cluster reports `Ready=False` with `PostgreSQLHAUnavailable`. The named
 backup PVC is only validated configuration; no backup job or repository is
 created.
 
-For direct PostgreSQL lifecycle development, apply the separate
-`pgshard_v1alpha1_single_member.yaml` sample. It creates two independent
-single-member primaries and retained PVCs. Query them through their internal
+For direct PostgreSQL lifecycle development, first install `config/admission`,
+label the resource namespace `pgshard.io/pod-fencing=enabled`, and then apply
+the separate `pgshard_v1alpha1_single_member.yaml` sample. It creates two
+independent single-member primaries and retained PVCs. Query them through their internal
 `<cluster>-shard-0000` and `<cluster>-shard-0001` Services or by executing
 `psql` in their Pods; the `<cluster>-rw`, `-ro`, and `-r` Services are not yet
 usable. Restarting a primary preserves its PVC data but interrupts that shard,
@@ -262,8 +279,10 @@ so this sample must not be used as zero-downtime evidence.
 
 ## Self-managed admission manager
 
-`config/admission` extends the same local-image install with the generated
-mutating and validating webhook configurations. It pre-creates empty,
+`config/admission` extends the same local-image install with three generated
+mutating webhooks and two generated validating webhooks. The binding webhook is
+scoped to namespaces labelled `pgshard.io/pod-fencing=enabled`; the status and
+metadata webhooks are scoped to operator-managed PostgreSQL Pods. It pre-creates empty,
 operator-labeled Secrets and grants the manager exact-name `get` and `update`
 access only in `pgshard-system` for webhook certificate mutation. The
 reconciler also has cluster-wide Secret `get`, `create`, `update`, and `delete`
@@ -281,12 +300,13 @@ future namespace-scoped install mode is required for mutually untrusted
 tenants. Finalization also requires cluster-wide Pod `list` and `delete`
 because Kubernetes RBAC cannot restrict either permission to Pods that
 reference controller-generated resource names. The reconciler uses an
-authoritative namespace list, acts only on a Pod referencing an exact
-checkpointed shard PVC or a non-terminal Pod referencing its credential,
-validates the expected StatefulSet identity,
-labels, and controller reference before deletion, and fails closed on a
-collision. It has no Pod `get`, `watch`, `create`, `update`, or `patch`
-permission. A separate
+authoritative namespace list, acts only on a Pod mounting an exact checkpointed
+shard PVC, validates the expected StatefulSet identity, labels, and controller
+reference before deletion, and fails closed on a collision. Admission needs
+Pod `get` to inspect a binding, Node `get` to bind and revalidate the selected
+Node UID and boot ID, and Pod `patch` to remove only an authenticated termination
+finalizer. It has no Pod `watch`, `create`, or `update` permission, and no Node
+permission other than `get`. A separate
 ClusterRole permits `get` and `patch` only on pgshard's two exact webhook-
 configuration names. Kubernetes RBAC cannot restrict a patch to individual
 fields, so the provisioner validates the full Service target and existing

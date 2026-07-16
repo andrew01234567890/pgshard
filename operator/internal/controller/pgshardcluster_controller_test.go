@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -203,6 +204,48 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "DataPlaneUnavailable")
 	if len(got.Status.PostgreSQLBootstraps) != int(cluster.Spec.Shards) {
 		t.Fatalf("recorded PostgreSQL bootstraps = %#v", got.Status.PostgreSQLBootstraps)
+	}
+}
+
+func TestReconcileRefusesSingleMemberPostgreSQLWithoutPodFencingNamespace(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	namespace := &corev1.Namespace{}
+	if err := base.Get(ctx, types.NamespacedName{Name: cluster.Namespace}, namespace); err != nil {
+		t.Fatal(err)
+	}
+	delete(namespace.Labels, podfence.NamespaceLabel)
+	if err := base.Update(ctx, namespace); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "must be labelled pgshard.io/pod-fencing=enabled") {
+		t.Fatalf("unfenced namespace reconcile error = %v", err)
+	}
+	got := getCluster(t, ctx, base, cluster)
+	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PodFencingUnavailable")
+	if len(got.Status.PostgreSQLBootstraps) != 0 || controllerutil.ContainsFinalizer(got, resourceFinalizer) {
+		t.Fatalf("unfenced namespace crossed the PostgreSQL creation barrier: status=%#v finalizers=%#v", got.Status, got.Finalizers)
+	}
+	secrets := &corev1.SecretList{}
+	claims := &corev1.PersistentVolumeClaimList{}
+	statefulSets := &appsv1.StatefulSetList{}
+	if err := base.List(ctx, secrets, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.List(ctx, claims, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(secrets.Items) != 0 || len(claims.Items) != 0 || len(statefulSets.Items) != 0 {
+		t.Fatalf("unfenced namespace created PostgreSQL resources: secrets=%d claims=%d StatefulSets=%d", len(secrets.Items), len(claims.Items), len(statefulSets.Items))
 	}
 }
 
@@ -786,11 +829,13 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 			Finalizers:      append([]string(nil), statefulSet.Spec.Template.Finalizers...),
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
 		},
-		Spec: corev1.PodSpec{Volumes: []corev1.Volume{
+		Spec: corev1.PodSpec{NodeName: "node-a", Volumes: []corev1.Volume{
 			{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: bootstrap.PVCName}}},
 			{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: bootstrap.SecretName}}},
 		}},
 	}
+	latePod.Annotations[podfence.NodeUIDAnnotation] = "node-uid-a"
+	latePod.Annotations[podfence.NodeBootIDAnnotation] = "boot-a"
 	if err := base.Create(ctx, latePod); err != nil {
 		t.Fatal(err)
 	}
@@ -874,6 +919,17 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
+	assertProtected("control-plane terminal phase")
+	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), terminating); err != nil || !controllerutil.ContainsFinalizer(terminating, owned.PostgreSQLPodTerminationFinalizer) {
+		t.Fatalf("unattested terminal PostgreSQL Pod lost its fence: pod=%#v err=%v", terminating.ObjectMeta, err)
+	}
+	terminating.Status.Conditions = append(terminating.Status.Conditions, podfence.NewTerminationAttestation(terminating, metav1.Now()))
+	if err := base.Status().Update(ctx, terminating); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
 	assertProtected("terminal Pod fence release")
 	released := &corev1.Pod{}
 	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), released); err == nil {
@@ -911,7 +967,7 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	}
 }
 
-func TestPostgreSQLPodTerminationFenceRequiresKubeletTerminalPhase(t *testing.T) {
+func TestPostgreSQLPodTerminationFenceRequiresAuthenticatedKubeletAttestation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	cluster := validCluster()
@@ -937,14 +993,18 @@ func TestPostgreSQLPodTerminationFenceRequiresKubeletTerminalPhase(t *testing.T)
 			UID:               "postgresql-pod-uid",
 			DeletionTimestamp: &metav1.Time{Time: time.Unix(100, 0)},
 			Finalizers:        []string{owned.PostgreSQLPodTerminationFinalizer},
-			Annotations:       map[string]string{owned.PostgreSQLPodClusterUIDAnnotation: string(cluster.UID)},
+			Annotations: map[string]string{
+				owned.PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
+				podfence.NodeUIDAnnotation:              "node-uid-a",
+				podfence.NodeBootIDAnnotation:           "boot-a",
+			},
 			Labels: map[string]string{
 				owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "postgresql", owned.ShardLabel: "0000",
 				owned.RoleLabel: "primary", owned.MemberLabel: "0000",
 			},
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
 		},
-		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+		Spec: corev1.PodSpec{NodeName: "node-a", Volumes: []corev1.Volume{{
 			Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: bootstrap.PVCName}},
 		}}},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
@@ -975,8 +1035,25 @@ func TestPostgreSQLPodTerminationFenceRequiresKubeletTerminalPhase(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if released {
+		t.Fatal("control-plane-authored terminal phase released the PostgreSQL Pod fence")
+	}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(pod), current); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(current, owned.PostgreSQLPodTerminationFinalizer) {
+		t.Fatalf("unattested terminal Pod finalizers = %q", current.Finalizers)
+	}
+	current.Status.Conditions = append(current.Status.Conditions, podfence.NewTerminationAttestation(current, metav1.Now()))
+	if err := base.Status().Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	released, err = reconciler.releaseTerminatedPostgreSQLPodFences(ctx, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !released {
-		t.Fatal("terminal PostgreSQL Pod did not release its termination fence")
+		t.Fatal("attested terminal PostgreSQL Pod did not release its termination fence")
 	}
 	if err := base.Get(ctx, client.ObjectKeyFromObject(pod), current); err == nil {
 		if controllerutil.ContainsFinalizer(current, owned.PostgreSQLPodTerminationFinalizer) {
@@ -3206,6 +3283,7 @@ func getPostgreSQLConfigMap(t *testing.T, ctx context.Context, kubeClient client
 
 func newFakeClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
+	objects = withPodFencingNamespaces(objects)
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -3225,6 +3303,33 @@ func newFakeClient(t *testing.T, objects ...client.Object) client.Client {
 			return kubeClient.Create(ctx, object, options...)
 		}}).
 		Build()
+}
+
+func withPodFencingNamespaces(objects []client.Object) []client.Object {
+	prepared := append([]client.Object(nil), objects...)
+	namespaces := make(map[string]*corev1.Namespace)
+	for _, object := range prepared {
+		if namespace, ok := object.(*corev1.Namespace); ok {
+			namespaces[namespace.Name] = namespace
+		}
+	}
+	for _, object := range prepared {
+		cluster, ok := object.(*pgshardv1alpha1.PgShardCluster)
+		if !ok {
+			continue
+		}
+		namespace := namespaces[cluster.Namespace]
+		if namespace == nil {
+			namespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}}
+			prepared = append(prepared, namespace)
+			namespaces[cluster.Namespace] = namespace
+		}
+		if namespace.Labels == nil {
+			namespace.Labels = make(map[string]string, 1)
+		}
+		namespace.Labels[podfence.NamespaceLabel] = podfence.NamespaceLabelValue
+	}
+	return prepared
 }
 
 func interceptedClient(t *testing.T, base client.Client, funcs interceptor.Funcs) client.Client {

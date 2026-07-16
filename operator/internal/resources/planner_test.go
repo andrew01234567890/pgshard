@@ -76,11 +76,11 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	}
 
 	pooler := object[*appsv1.Deployment](t, first, "demo-pooler")
-	if len(pooler.Spec.Template.Spec.Volumes) != 2 {
+	if len(pooler.Spec.Template.Spec.Volumes) != 1 || pooler.Spec.Template.Spec.Volumes[0].Name != "topology" {
 		t.Fatalf("pooler volumes = %#v", pooler.Spec.Template.Spec.Volumes)
 	}
 	if pooler.Spec.Template.Annotations[configHashAnnotation] == "" {
-		t.Fatal("pooler does not roll when generated configuration changes")
+		t.Fatal("pooler does not roll when topology configuration changes")
 	}
 	for _, suffix := range []string{"rw", "ro", "r"} {
 		service := object[*corev1.Service](t, first, "demo-"+suffix)
@@ -144,6 +144,7 @@ func TestPostgreSQLConfigurationAndResourceLimitRollTogether(t *testing.T) {
 	}
 	beforeConfiguration := postgresqlConfigMap(t, before, cluster.Name)
 	beforeStatefulSet := object[*appsv1.StatefulSet](t, before, PostgreSQLPrimaryStatefulSetName(cluster.Name, 0))
+	beforePooler := object[*appsv1.Deployment](t, before, cluster.Name+PoolerSuffix)
 
 	cluster.Spec.PostgreSQL.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("3Gi")
 	cluster.Spec.PostgreSQL.Resources.Limits[corev1.ResourceMemory] = resource.MustParse("6Gi")
@@ -153,6 +154,7 @@ func TestPostgreSQLConfigurationAndResourceLimitRollTogether(t *testing.T) {
 	}
 	afterConfiguration := postgresqlConfigMap(t, after, cluster.Name)
 	afterStatefulSet := object[*appsv1.StatefulSet](t, after, PostgreSQLPrimaryStatefulSetName(cluster.Name, 0))
+	afterPooler := object[*appsv1.Deployment](t, after, cluster.Name+PoolerSuffix)
 	if beforeConfiguration.Name == afterConfiguration.Name {
 		t.Fatal("resource-derived PostgreSQL configuration name did not change")
 	}
@@ -164,6 +166,9 @@ func TestPostgreSQLConfigurationAndResourceLimitRollTogether(t *testing.T) {
 	}
 	if got := afterStatefulSet.Spec.Template.Spec.Containers[0].Resources.Limits.Memory(); got == nil || got.Cmp(resource.MustParse("6Gi")) != 0 {
 		t.Fatalf("new StatefulSet memory limit = %v", got)
+	}
+	if !reflect.DeepEqual(beforePooler.Spec, afterPooler.Spec) {
+		t.Fatal("PostgreSQL-only configuration change rolled the pooler")
 	}
 }
 

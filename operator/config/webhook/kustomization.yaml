@@ -5,3 +5,6 @@ resources:
   - manifests.yaml
   - service.yaml
   - serving_secret.yaml
+patches:
+  - path: mutating_selectors_patch.yaml
+  - path: validating_selectors_patch.yaml

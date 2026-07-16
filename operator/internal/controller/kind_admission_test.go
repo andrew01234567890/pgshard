@@ -119,8 +119,18 @@ func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient cli
 	if err := kubeClient.Get(ctx, types.NamespacedName{Name: "pgshard-validating-webhook-configuration"}, validating); err != nil {
 		t.Fatal(err)
 	}
-	if len(mutating.Webhooks) != 1 || len(validating.Webhooks) != 1 || !bytes.Equal(mutating.Webhooks[0].ClientConfig.CABundle, caSecret.Data[pki.CACertificateKey]) || !bytes.Equal(validating.Webhooks[0].ClientConfig.CABundle, caSecret.Data[pki.CACertificateKey]) {
+	if len(mutating.Webhooks) != 3 || len(validating.Webhooks) != 2 {
 		t.Fatalf("injected CA bundles = %#v / %#v", mutating.Webhooks, validating.Webhooks)
+	}
+	for _, webhook := range mutating.Webhooks {
+		if !bytes.Equal(webhook.ClientConfig.CABundle, caSecret.Data[pki.CACertificateKey]) {
+			t.Fatalf("mutating webhook %s CA bundle was not injected", webhook.Name)
+		}
+	}
+	for _, webhook := range validating.Webhooks {
+		if !bytes.Equal(webhook.ClientConfig.CABundle, caSecret.Data[pki.CACertificateKey]) {
+			t.Fatalf("validating webhook %s CA bundle was not injected", webhook.Name)
+		}
 	}
 }
 

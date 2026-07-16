@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -84,6 +85,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		Labels: map[string]string{
 			"pod-security.kubernetes.io/enforce":         "restricted",
 			"pod-security.kubernetes.io/enforce-version": "latest",
+			podfence.NamespaceLabel:                      podfence.NamespaceLabelValue,
 		},
 	}}
 	if err := kubeClient.Create(ctx, namespace); err != nil {
@@ -185,20 +187,33 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if !contains(beforeForceDelete.Finalizers, owned.PostgreSQLPodTerminationFinalizer) {
 		t.Fatalf("PostgreSQL Pod lacks its termination fence: %q", beforeForceDelete.Finalizers)
 	}
+	boundNode := &corev1.Node{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: beforeForceDelete.Spec.NodeName}, boundNode); err != nil {
+		t.Fatal(err)
+	}
+	if beforeForceDelete.Annotations[podfence.NodeUIDAnnotation] != string(boundNode.UID) || beforeForceDelete.Annotations[podfence.NodeBootIDAnnotation] != boundNode.Status.NodeInfo.BootID {
+		t.Fatalf("PostgreSQL Pod binding identity = %#v, node = %#v", beforeForceDelete.Annotations, boundNode.ObjectMeta)
+	}
 	zeroGrace := int64(0)
 	if err := kubeClient.Delete(ctx, beforeForceDelete, &client.DeleteOptions{GracePeriodSeconds: &zeroGrace}); err != nil {
 		t.Fatal(err)
 	}
 	terminating := &corev1.Pod{}
-	err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 45*time.Second, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
 		terminating = &corev1.Pod{}
 		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, terminating); err != nil {
 			return false, err
 		}
-		return terminating.DeletionTimestamp != nil && contains(terminating.Finalizers, owned.PostgreSQLPodTerminationFinalizer) && podHasTerminalPhase(terminating), nil
+		if terminating.DeletionTimestamp == nil {
+			return false, nil
+		}
+		if !contains(terminating.Finalizers, owned.PostgreSQLPodTerminationFinalizer) || podHasTerminalPhase(terminating) || podfence.HasTerminationAttestation(terminating) {
+			return false, fmt.Errorf("PostgreSQL Pod escaped its fail-closed webhook-outage fence: %#v", terminating)
+		}
+		return false, nil
 	})
-	if err != nil {
-		t.Fatalf("force-deleted PostgreSQL Pod did not remain fenced through kubelet terminalization: %v; last Pod = %#v", err, terminating)
+	if err == nil || !wait.Interrupted(err) {
+		t.Fatalf("force-deleted PostgreSQL Pod outage observation ended unexpectedly: %v; last Pod = %#v", err, terminating)
 	}
 	forceDeleteClaim := &corev1.PersistentVolumeClaim{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroBootstrap.PVCName}, forceDeleteClaim); err != nil {
@@ -276,6 +291,7 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 		Labels: map[string]string{
 			"pod-security.kubernetes.io/enforce":         "restricted",
 			"pod-security.kubernetes.io/enforce-version": "latest",
+			podfence.NamespaceLabel:                      podfence.NamespaceLabelValue,
 		},
 	}}
 	if err := kubeClient.Create(ctx, namespace); err != nil {
@@ -369,6 +385,7 @@ func TestKINDManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC(t *testi
 		Labels: map[string]string{
 			"pod-security.kubernetes.io/enforce":         "restricted",
 			"pod-security.kubernetes.io/enforce-version": "latest",
+			podfence.NamespaceLabel:                      podfence.NamespaceLabelValue,
 		},
 	}}
 	if err := kubeClient.Create(ctx, namespace); err != nil {

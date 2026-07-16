@@ -8,6 +8,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/controller"
 	"github.com/andrew01234567890/pgshard/operator/internal/pki"
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -18,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 var (
@@ -125,6 +127,15 @@ func main() {
 			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardCluster")
 			os.Exit(1)
 		}
+		webhookServer.Register(podfence.BindingWebhookPath, &admission.Webhook{
+			Handler: podfence.NewBindingAttestor(manager.GetAPIReader(), scheme),
+		})
+		webhookServer.Register(podfence.StatusWebhookPath, &admission.Webhook{
+			Handler: podfence.NewStatusAttestor(manager.GetAPIReader(), scheme),
+		})
+		webhookServer.Register(podfence.MetadataWebhookPath, &admission.Webhook{
+			Handler: podfence.NewMetadataValidator(scheme),
+		})
 	}
 	if err := manager.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to add health check")

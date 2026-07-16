@@ -6,10 +6,13 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
+	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	yamlutil "k8s.io/apimachinery/pkg/util/yaml"
 )
@@ -67,6 +70,18 @@ func TestAdmissionOverlayEnablesOnlyTheSelfManagedWebhookRuntime(t *testing.T) {
 
 func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 	t.Parallel()
+	type webhookKustomization struct {
+		APIVersion string   `json:"apiVersion"`
+		Kind       string   `json:"kind"`
+		Resources  []string `json:"resources"`
+		Patches    []struct {
+			Path string `json:"path"`
+		} `json:"patches"`
+	}
+	webhookConfig := readManifest[webhookKustomization](t, "../../config/webhook/kustomization.yaml")
+	if webhookConfig.APIVersion != "kustomize.config.k8s.io/v1beta1" || webhookConfig.Kind != "Kustomization" || len(webhookConfig.Resources) != 4 || len(webhookConfig.Patches) != 2 || webhookConfig.Patches[0].Path != "mutating_selectors_patch.yaml" || webhookConfig.Patches[1].Path != "validating_selectors_patch.yaml" {
+		t.Fatalf("webhook Kustomization patches = %#v", webhookConfig.Patches)
+	}
 	for _, item := range []struct {
 		path       string
 		name       string
@@ -98,6 +113,14 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 	if secretBinding.RoleRef.Kind != "Role" || secretBinding.RoleRef.Name != "webhook-certificate-role" || len(secretBinding.Subjects) != 1 || secretBinding.Subjects[0].Name != "controller-manager" || configurationBinding.RoleRef.Kind != "ClusterRole" || configurationBinding.RoleRef.Name != "webhook-configuration-role" || len(configurationBinding.Subjects) != 1 || configurationBinding.Subjects[0].Name != "controller-manager" {
 		t.Fatalf("webhook RBAC bindings = %#v / %#v", secretBinding, configurationBinding)
 	}
+	mutatingSelectors := readManifest[admissionregistrationv1.MutatingWebhookConfiguration](t, "../../config/webhook/mutating_selectors_patch.yaml")
+	if len(mutatingSelectors.Webhooks) != 2 || mutatingSelectors.Webhooks[0].Name != podfence.BindingWebhookName || mutatingSelectors.Webhooks[0].NamespaceSelector == nil || mutatingSelectors.Webhooks[0].NamespaceSelector.MatchLabels[podfence.NamespaceLabel] != podfence.NamespaceLabelValue || mutatingSelectors.Webhooks[1].Name != podfence.StatusWebhookName || !selectsManagedPostgreSQL(mutatingSelectors.Webhooks[1].ObjectSelector) {
+		t.Fatalf("mutating webhook selector patch = %#v", mutatingSelectors.Webhooks)
+	}
+	validatingSelectors := readManifest[admissionregistrationv1.ValidatingWebhookConfiguration](t, "../../config/webhook/validating_selectors_patch.yaml")
+	if len(validatingSelectors.Webhooks) != 1 || validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsManagedPostgreSQL(validatingSelectors.Webhooks[0].ObjectSelector) {
+		t.Fatalf("validating webhook selector patch = %#v", validatingSelectors.Webhooks)
+	}
 }
 
 func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
@@ -120,11 +143,15 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatalf("unexpected third webhook manifest: %v", err)
 	}
-	if len(mutating.Webhooks) != 1 || len(validating.Webhooks) != 1 {
+	if len(mutating.Webhooks) != 3 || len(validating.Webhooks) != 2 {
 		t.Fatalf("generated webhooks = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
-	assertWebhookPolicy(t, mutating.Webhooks[0].ClientConfig, mutating.Webhooks[0].FailurePolicy, mutating.Webhooks[0].MatchPolicy, mutating.Webhooks[0].TimeoutSeconds)
-	assertWebhookPolicy(t, validating.Webhooks[0].ClientConfig, validating.Webhooks[0].FailurePolicy, validating.Webhooks[0].MatchPolicy, validating.Webhooks[0].TimeoutSeconds)
+	for _, webhook := range mutating.Webhooks {
+		assertWebhookPolicy(t, webhook.ClientConfig, webhook.FailurePolicy, webhook.MatchPolicy, webhook.TimeoutSeconds)
+	}
+	for _, webhook := range validating.Webhooks {
+		assertWebhookPolicy(t, webhook.ClientConfig, webhook.FailurePolicy, webhook.MatchPolicy, webhook.TimeoutSeconds)
+	}
 }
 
 func assertWebhookPolicy(t *testing.T, clientConfig admissionregistrationv1.WebhookClientConfig, failurePolicy *admissionregistrationv1.FailurePolicyType, matchPolicy *admissionregistrationv1.MatchPolicyType, timeout *int32) {
@@ -132,4 +159,8 @@ func assertWebhookPolicy(t *testing.T, clientConfig admissionregistrationv1.Webh
 	if clientConfig.Service == nil || clientConfig.Service.Name != "webhook-service" || clientConfig.Service.Namespace != "system" || failurePolicy == nil || *failurePolicy != admissionregistrationv1.Fail || matchPolicy == nil || *matchPolicy != admissionregistrationv1.Equivalent || timeout == nil || *timeout != 5 {
 		t.Fatalf("webhook policy = client %#v failure %#v match %#v timeout %#v", clientConfig, failurePolicy, matchPolicy, timeout)
 	}
+}
+
+func selectsManagedPostgreSQL(selector *metav1.LabelSelector) bool {
+	return selector != nil && selector.MatchLabels[owned.ManagedByLabel] == owned.ManagedByValue && selector.MatchLabels[owned.ComponentLabel] == "postgresql" && len(selector.MatchLabels) == 2 && len(selector.MatchExpressions) == 0
 }

@@ -13,10 +13,12 @@ shard. Each shard receives a distinct immutable bootstrap Secret and a 4Gi
 minimum data claim. When `storage.storageClassName` is omitted, the operator
 resolves the current Kubernetes default and checkpoints that exact class before
 creating any claim; later default-class rotation does not change existing data
-intent. Managed PostgreSQL Pods retain their API identity through force deletion
-until kubelet reports a terminal phase; if a node cannot provide that proof,
-cluster deletion fails closed with the PVC still protected. This is lifecycle
-protection, not HA takeover or node fencing. It has no standby, promotion,
+intent. Admission records the selected Node UID and boot ID atomically with Pod
+binding, then attaches a durable process-stop condition only to a terminal
+status update from that exact authenticated kubelet. PodGC, a missing or
+recreated Node, and a webhook outage cannot produce that receipt, so cluster
+deletion fails closed with the PVC protected. This is lifecycle protection, not
+HA takeover or physical node fencing. It has no standby, promotion,
 backup execution, `shardschema`
 bootstrap, or SQL pooler. Restarting a primary interrupts that shard even though
 its data survives. Three- and five-member resources continue to fail closed
@@ -71,6 +73,7 @@ kind load docker-image pgshard/operator:dev pgshard/orchestrator:dev \
 kubectl apply -k operator/config/admission
 kubectl rollout status --namespace pgshard-system deployment/pgshard-controller-manager
 kubectl create namespace pgshard-development
+kubectl label namespace pgshard-development pgshard.io/pod-fencing=enabled
 kubectl apply --namespace pgshard-development -f operator/config/samples/pgshard_v1alpha1_development.yaml
 ```
 
@@ -86,6 +89,7 @@ To exercise the direct PostgreSQL slice in the same cluster:
 ```console
 kubectl create namespace pgshard-single-member
 kubectl label namespace pgshard-single-member \
+  pgshard.io/pod-fencing=enabled \
   pod-security.kubernetes.io/enforce=restricted \
   pod-security.kubernetes.io/enforce-version=latest
 kubectl apply --namespace pgshard-single-member \
@@ -98,6 +102,14 @@ kubectl exec --namespace pgshard-single-member \
   psql -X -U postgres -d postgres -c \
   "SELECT current_setting('server_version'), pg_is_in_recovery();"
 ```
+
+The `pgshard.io/pod-fencing=enabled` namespace label is mandatory for managed
+PostgreSQL Pods. It scopes binding admission so the selected Node UID and boot
+ID are copied into each Pod atomically with `spec.nodeName`; omitting it leaves
+deletion fail closed because no authenticated termination receipt can be
+created. This receipt is lifecycle evidence, not physical node fencing. Do not
+reuse a Node name while its old machine may still run a bound Pod; externally
+fence that machine or its storage before recovery.
 
 The internal `single-member-shard-0000` and
 `single-member-shard-0001` Services exist for operator lifecycle tests, not as

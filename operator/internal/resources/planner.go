@@ -198,7 +198,6 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		return nil, err
 	}
 	topologyHash := configHash(topologyConfig)
-	poolerHash := configHash(postgresqlHash, topologyConfig)
 	bootstraps, err := postgresqlBootstraps(cluster)
 	if err != nil {
 		return nil, err
@@ -230,7 +229,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	objects = append(objects,
 		etcdStatefulSet(cluster, images.Etcd),
 		orchestratorDeployment(cluster, images.Orchestrator, topologyHash),
-		poolerDeployment(cluster, images.Pooler, postgresqlConfigName, poolerHash),
+		poolerDeployment(cluster, images.Pooler, topologyHash),
 		podDisruptionBudget(cluster, "etcd", 1),
 		podDisruptionBudget(cluster, "orchestrator", 1),
 		podDisruptionBudget(cluster, "pooler", 1),
@@ -875,7 +874,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 	return deployment
 }
 
-func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, postgresqlConfigName, hash string) *appsv1.Deployment {
+func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash string) *appsv1.Deployment {
 	replicas := poolerReplicas(cluster)
 	var desiredReplicas *int32
 	if cluster.Spec.Pooler.Scaling.Mode == pgshardv1alpha1.ScalingFixed {
@@ -910,16 +909,10 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, postgresql
 		ReadinessProbe: httpReadinessProbe("/readyz", "http"),
 		LivenessProbe:  httpLivenessProbe("/healthz", "http"),
 		Lifecycle:      &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{Sleep: &corev1.SleepAction{Seconds: 10}}},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true},
-			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql", ReadOnly: true},
-		},
+		VolumeMounts:   []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true}},
 	}})
 	podSpec.TerminationGracePeriodSeconds = ptr(int64(60))
-	podSpec.Volumes = []corev1.Volume{
-		{Name: "topology", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix}}}},
-		{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: postgresqlConfigName}}}},
-	}
+	podSpec.Volumes = []corev1.Volume{{Name: "topology", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix}}}}}
 	return &appsv1.Deployment{
 		ObjectMeta: ownedMeta(cluster, cluster.Name+PoolerSuffix, "pooler", nil),
 		Spec: appsv1.DeploymentSpec{

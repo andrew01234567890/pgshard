@@ -8,12 +8,15 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	"github.com/go-logr/logr"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -354,56 +357,57 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.mutatingConfigurationName}, mutating); err != nil {
 		return nil, fmt.Errorf("get mutating webhook configuration: %w", err)
 	}
-	if len(mutating.Webhooks) != 1 {
-		return nil, fmt.Errorf("mutating webhook configuration contains %d webhooks, want exactly one", len(mutating.Webhooks))
+	if len(mutating.Webhooks) != 3 {
+		return nil, fmt.Errorf("mutating webhook configuration contains %d webhooks, want exactly three", len(mutating.Webhooks))
 	}
-	mutatingWebhook := mutating.Webhooks[0]
-	if mutatingWebhook.ReinvocationPolicy != nil && *mutatingWebhook.ReinvocationPolicy != admissionregistrationv1.NeverReinvocationPolicy {
-		return nil, fmt.Errorf("mutating webhook %q has reinvocationPolicy %q, want Never", mutatingWebhook.Name, *mutatingWebhook.ReinvocationPolicy)
-	}
-	if err := p.validateWebhookPolicy(webhookPolicy{
-		name:                    mutatingWebhook.Name,
-		clientConfig:            mutatingWebhook.ClientConfig,
-		rules:                   mutatingWebhook.Rules,
-		failurePolicy:           mutatingWebhook.FailurePolicy,
-		matchPolicy:             mutatingWebhook.MatchPolicy,
-		namespaceSelector:       mutatingWebhook.NamespaceSelector,
-		objectSelector:          mutatingWebhook.ObjectSelector,
-		sideEffects:             mutatingWebhook.SideEffects,
-		timeoutSeconds:          mutatingWebhook.TimeoutSeconds,
-		admissionReviewVersions: mutatingWebhook.AdmissionReviewVersions,
-		matchConditionCount:     len(mutatingWebhook.MatchConditions),
-	}, caBundle, mutatingWebhookName, mutatingWebhookPath); err != nil {
-		return nil, fmt.Errorf("mutating webhook %q: %w", mutating.Webhooks[0].Name, err)
+	for _, expected := range []struct {
+		name, path        string
+		rules             func([]admissionregistrationv1.RuleWithOperations) bool
+		namespace, object *metav1.LabelSelector
+	}{
+		{name: mutatingWebhookName, path: mutatingWebhookPath, rules: matchesPgShardClusterRules},
+		{name: podfence.BindingWebhookName, path: podfence.BindingWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
+		{name: podfence.StatusWebhookName, path: podfence.StatusWebhookPath, rules: matchesPostgreSQLStatusRules, object: postgreSQLPodSelector()},
+	} {
+		webhook := findMutatingWebhook(mutating.Webhooks, expected.name)
+		if webhook == nil {
+			return nil, fmt.Errorf("mutating webhook configuration does not contain %q", expected.name)
+		}
+		if webhook.ReinvocationPolicy != nil && *webhook.ReinvocationPolicy != admissionregistrationv1.NeverReinvocationPolicy {
+			return nil, fmt.Errorf("mutating webhook %q has reinvocationPolicy %q, want Never", webhook.Name, *webhook.ReinvocationPolicy)
+		}
+		if err := p.validateWebhookPolicy(policyForMutating(webhook), caBundle, expected.name, expected.path, expected.rules, expected.namespace, expected.object); err != nil {
+			return nil, fmt.Errorf("mutating webhook %q: %w", webhook.Name, err)
+		}
 	}
 
 	validating := &admissionregistrationv1.ValidatingWebhookConfiguration{}
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.validatingConfigurationName}, validating); err != nil {
 		return nil, fmt.Errorf("get validating webhook configuration: %w", err)
 	}
-	if len(validating.Webhooks) != 1 {
-		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly one", len(validating.Webhooks))
+	if len(validating.Webhooks) != 2 {
+		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly two", len(validating.Webhooks))
 	}
-	validatingWebhook := validating.Webhooks[0]
-	if err := p.validateWebhookPolicy(webhookPolicy{
-		name:                    validatingWebhook.Name,
-		clientConfig:            validatingWebhook.ClientConfig,
-		rules:                   validatingWebhook.Rules,
-		failurePolicy:           validatingWebhook.FailurePolicy,
-		matchPolicy:             validatingWebhook.MatchPolicy,
-		namespaceSelector:       validatingWebhook.NamespaceSelector,
-		objectSelector:          validatingWebhook.ObjectSelector,
-		sideEffects:             validatingWebhook.SideEffects,
-		timeoutSeconds:          validatingWebhook.TimeoutSeconds,
-		admissionReviewVersions: validatingWebhook.AdmissionReviewVersions,
-		matchConditionCount:     len(validatingWebhook.MatchConditions),
-	}, caBundle, validatingWebhookName, validatingWebhookPath); err != nil {
-		return nil, fmt.Errorf("validating webhook %q: %w", validating.Webhooks[0].Name, err)
+	for _, expected := range []struct {
+		name, path string
+		rules      func([]admissionregistrationv1.RuleWithOperations) bool
+		object     *metav1.LabelSelector
+	}{
+		{name: validatingWebhookName, path: validatingWebhookPath, rules: matchesPgShardClusterRules},
+		{name: podfence.MetadataWebhookName, path: podfence.MetadataWebhookPath, rules: matchesPostgreSQLMetadataRules, object: postgreSQLPodSelector()},
+	} {
+		webhook := findValidatingWebhook(validating.Webhooks, expected.name)
+		if webhook == nil {
+			return nil, fmt.Errorf("validating webhook configuration does not contain %q", expected.name)
+		}
+		if err := p.validateWebhookPolicy(policyForValidating(webhook), caBundle, expected.name, expected.path, expected.rules, nil, expected.object); err != nil {
+			return nil, fmt.Errorf("validating webhook %q: %w", webhook.Name, err)
+		}
 	}
 	return &configurations{mutating: mutating, validating: validating}, nil
 }
 
-func (p *Provisioner) validateWebhookPolicy(policy webhookPolicy, caBundle []byte, wantedName, wantedPath string) error {
+func (p *Provisioner) validateWebhookPolicy(policy webhookPolicy, caBundle []byte, wantedName, wantedPath string, matchesRules func([]admissionregistrationv1.RuleWithOperations) bool, wantedNamespaceSelector, wantedObjectSelector *metav1.LabelSelector) error {
 	if policy.name != wantedName {
 		return fmt.Errorf("has name %q, want %q", policy.name, wantedName)
 	}
@@ -422,17 +426,20 @@ func (p *Provisioner) validateWebhookPolicy(policy webhookPolicy, caBundle []byt
 	if !slices.Equal(policy.admissionReviewVersions, []string{"v1"}) {
 		return fmt.Errorf("has admissionReviewVersions %q, want [v1]", policy.admissionReviewVersions)
 	}
-	if selectorRestricts(policy.namespaceSelector) || selectorRestricts(policy.objectSelector) || policy.matchConditionCount != 0 {
-		return fmt.Errorf("must not use namespaceSelector, objectSelector, or matchConditions")
+	if !selectorsEqual(policy.namespaceSelector, wantedNamespaceSelector) || !selectorsEqual(policy.objectSelector, wantedObjectSelector) || policy.matchConditionCount != 0 {
+		return fmt.Errorf("has unexpected namespaceSelector, objectSelector, or matchConditions")
 	}
-	if !matchesPgShardClusterRules(policy.rules) {
-		return fmt.Errorf("rules do not exactly cover PgShardCluster create and update")
+	if !matchesRules(policy.rules) {
+		return fmt.Errorf("rules do not exactly cover the required operations")
 	}
 	return p.validateClientConfig(policy.clientConfig, caBundle, wantedPath)
 }
 
-func selectorRestricts(selector *metav1.LabelSelector) bool {
-	return selector != nil && (len(selector.MatchLabels) != 0 || len(selector.MatchExpressions) != 0)
+func selectorsEqual(actual, wanted *metav1.LabelSelector) bool {
+	if wanted == nil || len(wanted.MatchLabels) == 0 && len(wanted.MatchExpressions) == 0 {
+		return actual == nil || len(actual.MatchLabels) == 0 && len(actual.MatchExpressions) == 0
+	}
+	return actual != nil && maps.Equal(actual.MatchLabels, wanted.MatchLabels) && reflect.DeepEqual(actual.MatchExpressions, wanted.MatchExpressions)
 }
 
 func matchesPgShardClusterRules(rules []admissionregistrationv1.RuleWithOperations) bool {
@@ -445,6 +452,77 @@ func matchesPgShardClusterRules(rules []admissionregistrationv1.RuleWithOperatio
 		slices.Equal(rule.APIVersions, []string{"v1alpha1"}) &&
 		slices.Equal(rule.Resources, []string{"pgshardclusters"}) &&
 		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+func matchesPostgreSQLBindingRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Create}, "pods/binding")
+}
+
+func matchesPostgreSQLStatusRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}, "pods/status")
+}
+
+func matchesPostgreSQLMetadataRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}, "pods")
+}
+
+func matchesCoreRules(rules []admissionregistrationv1.RuleWithOperations, operations []admissionregistrationv1.OperationType, resource string) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	rule := rules[0]
+	return slices.Equal(rule.Operations, operations) && slices.Equal(rule.APIGroups, []string{""}) &&
+		slices.Equal(rule.APIVersions, []string{"v1"}) && slices.Equal(rule.Resources, []string{resource}) &&
+		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+func podFencingNamespaceSelector() *metav1.LabelSelector {
+	return &metav1.LabelSelector{MatchLabels: map[string]string{podfence.NamespaceLabel: podfence.NamespaceLabelValue}}
+}
+
+func postgreSQLPodSelector() *metav1.LabelSelector {
+	return &metav1.LabelSelector{MatchLabels: map[string]string{
+		"app.kubernetes.io/component": "postgresql",
+		ManagedByLabel:                ManagedByValue,
+	}}
+}
+
+func findMutatingWebhook(webhooks []admissionregistrationv1.MutatingWebhook, name string) *admissionregistrationv1.MutatingWebhook {
+	for index := range webhooks {
+		if webhooks[index].Name == name {
+			return &webhooks[index]
+		}
+	}
+	return nil
+}
+
+func findValidatingWebhook(webhooks []admissionregistrationv1.ValidatingWebhook, name string) *admissionregistrationv1.ValidatingWebhook {
+	for index := range webhooks {
+		if webhooks[index].Name == name {
+			return &webhooks[index]
+		}
+	}
+	return nil
+}
+
+func policyForMutating(webhook *admissionregistrationv1.MutatingWebhook) webhookPolicy {
+	return webhookPolicy{
+		name: webhook.Name, clientConfig: webhook.ClientConfig, rules: webhook.Rules,
+		failurePolicy: webhook.FailurePolicy, matchPolicy: webhook.MatchPolicy,
+		namespaceSelector: webhook.NamespaceSelector, objectSelector: webhook.ObjectSelector,
+		sideEffects: webhook.SideEffects, timeoutSeconds: webhook.TimeoutSeconds,
+		admissionReviewVersions: webhook.AdmissionReviewVersions, matchConditionCount: len(webhook.MatchConditions),
+	}
+}
+
+func policyForValidating(webhook *admissionregistrationv1.ValidatingWebhook) webhookPolicy {
+	return webhookPolicy{
+		name: webhook.Name, clientConfig: webhook.ClientConfig, rules: webhook.Rules,
+		failurePolicy: webhook.FailurePolicy, matchPolicy: webhook.MatchPolicy,
+		namespaceSelector: webhook.NamespaceSelector, objectSelector: webhook.ObjectSelector,
+		sideEffects: webhook.SideEffects, timeoutSeconds: webhook.TimeoutSeconds,
+		admissionReviewVersions: webhook.AdmissionReviewVersions, matchConditionCount: len(webhook.MatchConditions),
+	}
 }
 
 func (p *Provisioner) validateClientConfig(config admissionregistrationv1.WebhookClientConfig, caBundle []byte, wantedPath string) error {
