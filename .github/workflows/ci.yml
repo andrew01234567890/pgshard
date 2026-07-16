@@ -1417,7 +1417,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      checks: read
+      actions: read
       contents: write
     concurrency:
       group: pgshard-source-release

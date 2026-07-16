@@ -1,7 +1,9 @@
 //! Deterministic `SemVer` release and public-repository audit tooling.
 
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
+use std::hash::Hash;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use semver::Version;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const FIRST_VERSION: Version = Version::new(0, 1, 0);
@@ -16,6 +19,8 @@ const RELEASE_MARKER: &str = "crates/pgshard-release/RELEASE_START";
 const RELEASE_HELPER_SOURCE: &str = "crates/pgshard-release/src/main.rs";
 const RELEASE_CHECK_WAIT_TIMEOUT: Duration = Duration::from_mins(15);
 const RELEASE_CHECK_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
+const CODEQL_WORKFLOW_PATH: &str = "dynamic/github-code-scanning/codeql";
 const REQUIRED_CODEQL_ANALYSES: [&str; 4] = [
     "Analyze (actions)",
     "Analyze (go)",
@@ -154,17 +159,52 @@ struct CompareCommit {
 }
 
 #[derive(Debug, Deserialize)]
+struct Workflows {
+    total_count: usize,
+    workflows: Vec<Workflow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Workflow {
+    id: u64,
+    path: String,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct WorkflowRuns {
     total_count: usize,
     workflow_runs: Vec<WorkflowRun>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct WorkflowRun {
     id: u64,
+    workflow_id: u64,
     head_branch: String,
     head_sha: String,
+    path: String,
     event: String,
+    status: String,
+    conclusion: Option<String>,
+    run_attempt: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowJobs {
+    total_count: usize,
+    jobs: Vec<WorkflowJob>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WorkflowJob {
+    id: u64,
+    run_id: u64,
+    run_attempt: u64,
+    head_sha: String,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +278,12 @@ enum AggregateState {
     Passed,
     Pending,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReleaseWorkflows {
+    ci: u64,
+    codeql: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -509,27 +555,24 @@ fn publish_one(repository: &str, release: &PlannedRelease) -> Result<()> {
 fn ensure_release_checks_passed(repository: &str, sha: &str) -> Result<()> {
     let started = Instant::now();
     loop {
-        let response = run(
-            "gh",
-            [
-                "api",
-                "-H",
-                "Accept: application/vnd.github+json",
-                &format!("repos/{repository}/commits/{sha}/check-runs?filter=latest&per_page=100"),
-            ],
-        )?;
-        let checks: CheckRuns = serde_json::from_str(&response)?;
-        ensure!(
-            checks.check_runs.len() < 100,
-            "release check-run lookup reached its page limit and is ambiguous"
-        );
-        let ci = aggregate_state(&checks);
-        let codeql = required_codeql_state(&checks);
+        let workflows = release_workflows(repository)?;
+        let ci_runs = exact_workflow_runs(repository, workflows.ci, sha)?;
+        let codeql_runs = exact_workflow_runs(repository, workflows.codeql, sha)?;
+        let ci = match latest_ci_run(&ci_runs, workflows.ci, sha) {
+            Some(run) => ci_run_state(run, &workflow_jobs(repository, run)?),
+            None => AggregateState::Pending,
+        };
+        let codeql = match latest_codeql_run(&codeql_runs, workflows.codeql, sha) {
+            Some(run) if run.status == "completed" => {
+                codeql_run_state(run, &workflow_jobs(repository, run)?)
+            }
+            Some(_) | None => AggregateState::Pending,
+        };
         if ci == AggregateState::Failed {
-            bail!("commit {sha} has a failed exact-head CI aggregate check");
+            bail!("commit {sha} has a failed latest trusted CI aggregate");
         }
         if codeql == AggregateState::Failed {
-            bail!("commit {sha} has a failed exact-head required CodeQL analysis");
+            bail!("commit {sha} has a failed latest trusted CodeQL run");
         }
         if ci == AggregateState::Passed && codeql == AggregateState::Passed {
             return Ok(());
@@ -539,6 +582,209 @@ fn ensure_release_checks_passed(repository: &str, sha: &str) -> Result<()> {
         }
         println!("waiting for exact-head CI and CodeQL checks on ancestor {sha}");
         thread::sleep(RELEASE_CHECK_POLL_INTERVAL);
+    }
+}
+
+fn release_workflows(repository: &str) -> Result<ReleaseWorkflows> {
+    let endpoint = format!("repos/{repository}/actions/workflows?per_page=100");
+    let pages: Vec<Workflows> = github_api_pages(&endpoint)?;
+    let workflows = flatten_counted_pages(
+        pages,
+        |page| page.total_count,
+        |page| page.workflows,
+        "workflow catalog",
+    )?;
+    ensure_unique_by(&workflows, |workflow| workflow.id, "workflow catalog")?;
+    Ok(ReleaseWorkflows {
+        ci: required_active_workflow(&workflows, CI_WORKFLOW_PATH)?,
+        codeql: required_active_workflow(&workflows, CODEQL_WORKFLOW_PATH)?,
+    })
+}
+
+fn required_active_workflow(workflows: &[Workflow], path: &str) -> Result<u64> {
+    let matching = workflows
+        .iter()
+        .filter(|workflow| workflow.path == path && workflow.state == "active")
+        .collect::<Vec<_>>();
+    ensure!(
+        matching.len() == 1,
+        "expected one active trusted workflow at {path}"
+    );
+    Ok(matching[0].id)
+}
+
+fn exact_workflow_runs(repository: &str, workflow_id: u64, sha: &str) -> Result<Vec<WorkflowRun>> {
+    let endpoint = format!(
+        "repos/{repository}/actions/workflows/{workflow_id}/runs?head_sha={sha}&per_page=100"
+    );
+    let pages: Vec<WorkflowRuns> = github_api_pages(&endpoint)?;
+    let runs = flatten_counted_pages(
+        pages,
+        |page| page.total_count,
+        |page| page.workflow_runs,
+        "exact-SHA workflow runs",
+    )?;
+    ensure_unique_by(
+        &runs,
+        |run| (run.id, run.run_attempt),
+        "exact-SHA workflow runs",
+    )?;
+    ensure!(
+        runs.iter()
+            .all(|run| run.workflow_id == workflow_id && run.head_sha == sha),
+        "GitHub returned a mismatched exact-SHA workflow run"
+    );
+    Ok(runs)
+}
+
+fn workflow_jobs(repository: &str, run: &WorkflowRun) -> Result<Vec<WorkflowJob>> {
+    let endpoint = format!(
+        "repos/{repository}/actions/runs/{}/attempts/{}/jobs?per_page=100",
+        run.id, run.run_attempt
+    );
+    let pages: Vec<WorkflowJobs> = github_api_pages(&endpoint)?;
+    let jobs = flatten_counted_pages(
+        pages,
+        |page| page.total_count,
+        |page| page.jobs,
+        "workflow jobs",
+    )?;
+    ensure_unique_by(&jobs, |job| job.id, "workflow jobs")?;
+    ensure!(
+        jobs_belong_to_run(run, &jobs),
+        "GitHub returned a job from another workflow run or attempt"
+    );
+    Ok(jobs)
+}
+
+fn github_api_pages<T: DeserializeOwned>(endpoint: &str) -> Result<Vec<T>> {
+    let response = run(
+        "gh",
+        [
+            "api",
+            "--paginate",
+            "--slurp",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2026-03-10",
+            endpoint,
+        ],
+    )?;
+    serde_json::from_str(&response).context("GitHub returned invalid paginated JSON")
+}
+
+fn flatten_counted_pages<P, T, C, I>(
+    pages: Vec<P>,
+    count: C,
+    into_items: I,
+    description: &str,
+) -> Result<Vec<T>>
+where
+    C: Fn(&P) -> usize,
+    I: Fn(P) -> Vec<T>,
+{
+    ensure!(!pages.is_empty(), "GitHub returned no {description} page");
+    let expected = count(&pages[0]);
+    ensure!(
+        pages.iter().all(|page| count(page) == expected),
+        "GitHub changed the {description} count while paginating"
+    );
+    let items = pages.into_iter().flat_map(into_items).collect::<Vec<_>>();
+    ensure!(
+        items.len() == expected,
+        "GitHub returned an incomplete {description} result"
+    );
+    Ok(items)
+}
+
+fn ensure_unique_by<T, K, F>(items: &[T], key: F, description: &str) -> Result<()>
+where
+    K: Eq + Hash,
+    F: Fn(&T) -> K,
+{
+    let mut seen = HashSet::with_capacity(items.len());
+    ensure!(
+        items.iter().all(|item| seen.insert(key(item))),
+        "GitHub returned duplicate {description} entries"
+    );
+    Ok(())
+}
+
+fn jobs_belong_to_run(run: &WorkflowRun, jobs: &[WorkflowJob]) -> bool {
+    jobs.iter().all(|job| {
+        job.run_id == run.id && job.run_attempt == run.run_attempt && job.head_sha == run.head_sha
+    })
+}
+
+fn latest_ci_run<'a>(
+    runs: &'a [WorkflowRun],
+    workflow_id: u64,
+    sha: &str,
+) -> Option<&'a WorkflowRun> {
+    runs.iter()
+        .filter(|run| {
+            run.workflow_id == workflow_id
+                && run.path == CI_WORKFLOW_PATH
+                && run.head_sha == sha
+                && ((run.event == "push" && run.head_branch == "main")
+                    || run.event == "workflow_dispatch")
+        })
+        .max_by_key(|run| (run.id, run.run_attempt))
+}
+
+fn latest_codeql_run<'a>(
+    runs: &'a [WorkflowRun],
+    workflow_id: u64,
+    sha: &str,
+) -> Option<&'a WorkflowRun> {
+    runs.iter()
+        .filter(|run| {
+            run.workflow_id == workflow_id
+                && run.path == CODEQL_WORKFLOW_PATH
+                && run.head_sha == sha
+                && run.head_branch == "main"
+                && run.event == "dynamic"
+        })
+        .max_by_key(|run| (run.id, run.run_attempt))
+}
+
+fn ci_run_state(run: &WorkflowRun, jobs: &[WorkflowJob]) -> AggregateState {
+    let aggregates = jobs
+        .iter()
+        .filter(|job| job.name == "CI aggregate")
+        .collect::<Vec<_>>();
+    match aggregates.as_slice() {
+        [job] if job.status != "completed" => AggregateState::Pending,
+        [job] if job.conclusion.as_deref() == Some("success") => AggregateState::Passed,
+        [] if run.status != "completed" => AggregateState::Pending,
+        _ => AggregateState::Failed,
+    }
+}
+
+fn codeql_run_state(run: &WorkflowRun, jobs: &[WorkflowJob]) -> AggregateState {
+    if run.status != "completed" {
+        return AggregateState::Pending;
+    }
+    if run.conclusion.as_deref() != Some("success") {
+        return AggregateState::Failed;
+    }
+    let mut pending = false;
+    for name in REQUIRED_CODEQL_ANALYSES {
+        let matching = jobs
+            .iter()
+            .filter(|job| job.name == name)
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [job] if job.status != "completed" => pending = true,
+            [job] if job.conclusion.as_deref() == Some("success") => {}
+            _ => return AggregateState::Failed,
+        }
+    }
+    if pending {
+        AggregateState::Pending
+    } else {
+        AggregateState::Passed
     }
 }
 
@@ -561,30 +807,6 @@ fn aggregate_state(checks: &CheckRuns) -> AggregateState {
         AggregateState::Pending
     } else {
         AggregateState::Failed
-    }
-}
-
-fn required_codeql_state(checks: &CheckRuns) -> AggregateState {
-    let mut pending = false;
-    for required_name in REQUIRED_CODEQL_ANALYSES {
-        let analyses = checks
-            .check_runs
-            .iter()
-            .filter(|check| check.name == required_name && check.app.slug == "github-actions")
-            .collect::<Vec<_>>();
-        if analyses.iter().any(|check| {
-            check.status == "completed" && check.conclusion.as_deref() != Some("success")
-        }) {
-            return AggregateState::Failed;
-        }
-        if analyses.is_empty() || analyses.iter().any(|check| check.status != "completed") {
-            pending = true;
-        }
-    }
-    if pending {
-        AggregateState::Pending
-    } else {
-        AggregateState::Passed
     }
 }
 
@@ -1247,29 +1469,15 @@ fn is_exact_dispatch(
 }
 
 fn exact_ci_dispatches(repository: &str, merge_sha: &str) -> Result<Vec<WorkflowRun>> {
-    let response = run(
-        "gh",
-        [
-            "api",
-            "-H",
-            "X-GitHub-Api-Version: 2026-03-10",
-            &format!(
-                "repos/{repository}/actions/workflows/ci.yml/runs?event=workflow_dispatch&head_sha={merge_sha}&per_page=100"
-            ),
-        ],
-    )?;
-    let runs: WorkflowRuns = serde_json::from_str(&response)?;
-    ensure!(
-        runs.total_count == runs.workflow_runs.len() && runs.total_count < 100,
-        "exact-SHA workflow-run lookup reached its page limit and is ambiguous"
-    );
-    ensure!(
-        runs.workflow_runs
-            .iter()
-            .all(|run| run.head_sha == merge_sha && run.event == "workflow_dispatch"),
-        "GitHub returned a mismatched exact-SHA workflow run"
-    );
-    Ok(runs.workflow_runs)
+    let workflow_id = release_workflows(repository)?.ci;
+    Ok(exact_workflow_runs(repository, workflow_id, merge_sha)?
+        .into_iter()
+        .filter(|run| {
+            run.path == CI_WORKFLOW_PATH
+                && run.event == "workflow_dispatch"
+                && run.head_sha == merge_sha
+        })
+        .collect())
 }
 
 fn remote_tag_target(repository: &str, ref_name: &str) -> Result<Option<String>> {
@@ -1389,6 +1597,56 @@ fn output_bytes(program: &str, output: Output) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_workflow_run(
+        id: u64,
+        workflow_id: u64,
+        path: &str,
+        head_branch: &str,
+        event: &str,
+        status: &str,
+        conclusion: Option<&str>,
+    ) -> WorkflowRun {
+        WorkflowRun {
+            id,
+            workflow_id,
+            head_branch: head_branch.to_owned(),
+            head_sha: "a".repeat(40),
+            path: path.to_owned(),
+            event: event.to_owned(),
+            status: status.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+            run_attempt: 1,
+        }
+    }
+
+    fn test_workflow_job(
+        run: &WorkflowRun,
+        name: &str,
+        status: &str,
+        conclusion: Option<&str>,
+    ) -> WorkflowJob {
+        let name_id = REQUIRED_CODEQL_ANALYSES
+            .iter()
+            .position(|required| *required == name)
+            .map_or(50, |index| index as u64 + 1);
+        WorkflowJob {
+            id: run.id * 100 + name_id,
+            run_id: run.id,
+            run_attempt: run.run_attempt,
+            head_sha: run.head_sha.clone(),
+            name: name.to_owned(),
+            status: status.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+        }
+    }
+
+    fn successful_codeql_jobs(run: &WorkflowRun) -> Vec<WorkflowJob> {
+        REQUIRED_CODEQL_ANALYSES
+            .iter()
+            .map(|name| test_workflow_job(run, name, "completed", Some("success")))
+            .collect()
+    }
 
     #[test]
     fn first_release_is_fixed() {
@@ -1526,12 +1784,15 @@ mod tests {
         assert!(!is_complete_sha(&"a".repeat(39)));
         assert!(!is_complete_sha(&format!("{}g", "a".repeat(39))));
 
-        let run = WorkflowRun {
-            id: 17,
-            head_branch: format!("pgshard-ci-{}", "a".repeat(40)),
-            head_sha: "a".repeat(40),
-            event: "workflow_dispatch".to_owned(),
-        };
+        let run = test_workflow_run(
+            17,
+            7,
+            CI_WORKFLOW_PATH,
+            &format!("pgshard-ci-{}", "a".repeat(40)),
+            "workflow_dispatch",
+            "queued",
+            None,
+        );
         let expected_ref = format!("pgshard-ci-{}", "a".repeat(40));
         assert!(is_exact_dispatch(&run, 17, &"a".repeat(40), &expected_ref));
         assert!(!is_exact_dispatch(&run, 18, &"a".repeat(40), &expected_ref));
@@ -1799,53 +2060,299 @@ mod tests {
     }
 
     #[test]
-    fn release_requires_every_successful_default_codeql_analysis() {
-        let successful_analysis = |name: &str| CheckRun {
-            name: name.to_owned(),
-            status: "completed".to_owned(),
-            conclusion: Some("success".to_owned()),
-            app: CheckApp {
-                slug: "github-actions".to_owned(),
+    fn release_uses_only_the_latest_trusted_ci_run() {
+        let sha = "a".repeat(40);
+        let old_success = test_workflow_run(
+            10,
+            7,
+            CI_WORKFLOW_PATH,
+            "main",
+            "push",
+            "completed",
+            Some("success"),
+        );
+        let newer_failure = test_workflow_run(
+            11,
+            7,
+            CI_WORKFLOW_PATH,
+            "main",
+            "push",
+            "completed",
+            Some("failure"),
+        );
+        let impostor = test_workflow_run(
+            99,
+            99,
+            "dynamic/untrusted",
+            "main",
+            "push",
+            "completed",
+            Some("success"),
+        );
+        let runs = vec![old_success.clone(), newer_failure.clone(), impostor];
+        let selected = latest_ci_run(&runs, 7, &sha).expect("trusted CI run");
+        assert_eq!(selected.id, newer_failure.id);
+        assert_eq!(
+            ci_run_state(
+                selected,
+                &[test_workflow_job(
+                    selected,
+                    "CI aggregate",
+                    "completed",
+                    Some("failure")
+                )]
+            ),
+            AggregateState::Failed
+        );
+
+        let newer_success =
+            test_workflow_run(12, 7, CI_WORKFLOW_PATH, "main", "push", "in_progress", None);
+        let mut runs = vec![old_success, newer_failure, newer_success.clone()];
+        let selected = latest_ci_run(&runs, 7, &sha).expect("newer CI run");
+        assert_eq!(selected.id, newer_success.id);
+        assert_eq!(
+            ci_run_state(
+                selected,
+                &[test_workflow_job(
+                    selected,
+                    "CI aggregate",
+                    "completed",
+                    Some("success")
+                )]
+            ),
+            AggregateState::Passed
+        );
+
+        let newer_pending =
+            test_workflow_run(13, 7, CI_WORKFLOW_PATH, "main", "push", "in_progress", None);
+        runs.push(newer_pending.clone());
+        let selected = latest_ci_run(&runs, 7, &sha).expect("pending CI run");
+        assert_eq!(selected.id, newer_pending.id);
+        assert_eq!(ci_run_state(selected, &[]), AggregateState::Pending);
+    }
+
+    #[test]
+    fn release_requires_one_successful_codeql_job_set_from_the_latest_run() {
+        let sha = "a".repeat(40);
+        let old_failure = test_workflow_run(
+            20,
+            8,
+            CODEQL_WORKFLOW_PATH,
+            "main",
+            "dynamic",
+            "completed",
+            Some("failure"),
+        );
+        let newer_success = test_workflow_run(
+            21,
+            8,
+            CODEQL_WORKFLOW_PATH,
+            "main",
+            "dynamic",
+            "completed",
+            Some("success"),
+        );
+        let wrong_branch = test_workflow_run(
+            99,
+            8,
+            CODEQL_WORKFLOW_PATH,
+            "topic",
+            "dynamic",
+            "completed",
+            Some("success"),
+        );
+        let wrong_path = test_workflow_run(
+            100,
+            8,
+            "dynamic/untrusted/codeql",
+            "main",
+            "dynamic",
+            "completed",
+            Some("success"),
+        );
+        let runs = vec![old_failure, newer_success.clone(), wrong_branch, wrong_path];
+        let selected = latest_codeql_run(&runs, 8, &sha).expect("trusted CodeQL run");
+        assert_eq!(selected.id, newer_success.id);
+
+        let mut jobs = successful_codeql_jobs(selected);
+        assert_eq!(codeql_run_state(selected, &jobs), AggregateState::Passed);
+
+        let missing = jobs.pop().expect("required analysis");
+        assert_eq!(codeql_run_state(selected, &jobs), AggregateState::Failed);
+        jobs.push(missing);
+        jobs.push(test_workflow_job(
+            selected,
+            REQUIRED_CODEQL_ANALYSES[0],
+            "completed",
+            Some("success"),
+        ));
+        assert_eq!(codeql_run_state(selected, &jobs), AggregateState::Failed);
+
+        let mut pending = newer_success;
+        pending.id = 22;
+        pending.status = "in_progress".to_owned();
+        pending.conclusion = None;
+        assert_eq!(
+            codeql_run_state(&pending, &successful_codeql_jobs(&pending)),
+            AggregateState::Pending
+        );
+    }
+
+    #[test]
+    fn release_does_not_combine_codeql_jobs_across_runs() {
+        let old = test_workflow_run(
+            30,
+            8,
+            CODEQL_WORKFLOW_PATH,
+            "main",
+            "dynamic",
+            "completed",
+            Some("success"),
+        );
+        let new = test_workflow_run(
+            31,
+            8,
+            CODEQL_WORKFLOW_PATH,
+            "main",
+            "dynamic",
+            "completed",
+            Some("success"),
+        );
+        let mut new_jobs = successful_codeql_jobs(&new);
+        new_jobs.pop();
+        let old_jobs = successful_codeql_jobs(&old);
+        assert_eq!(codeql_run_state(&new, &new_jobs), AggregateState::Failed);
+        assert_eq!(codeql_run_state(&old, &old_jobs), AggregateState::Passed);
+    }
+
+    #[test]
+    fn counted_github_pages_accept_boundaries_and_reject_incomplete_results() {
+        let run = test_workflow_run(
+            1,
+            7,
+            CI_WORKFLOW_PATH,
+            "main",
+            "push",
+            "completed",
+            Some("success"),
+        );
+        let page_99 = vec![run.clone(); 99];
+        assert_eq!(
+            flatten_counted_pages(
+                vec![WorkflowRuns {
+                    total_count: 99,
+                    workflow_runs: page_99.clone(),
+                }],
+                |page| page.total_count,
+                |page| page.workflow_runs,
+                "test runs",
+            )
+            .expect("complete 99-item page")
+            .len(),
+            99
+        );
+        assert_eq!(
+            flatten_counted_pages(
+                vec![
+                    WorkflowRuns {
+                        total_count: 100,
+                        workflow_runs: page_99.clone(),
+                    },
+                    WorkflowRuns {
+                        total_count: 100,
+                        workflow_runs: vec![run.clone()],
+                    },
+                ],
+                |page| page.total_count,
+                |page| page.workflow_runs,
+                "test runs",
+            )
+            .expect("complete split result")
+            .len(),
+            100
+        );
+        assert!(
+            flatten_counted_pages(
+                vec![WorkflowRuns {
+                    total_count: 100,
+                    workflow_runs: page_99.clone(),
+                }],
+                |page| page.total_count,
+                |page| page.workflow_runs,
+                "test runs",
+            )
+            .is_err()
+        );
+        assert!(
+            flatten_counted_pages(
+                vec![
+                    WorkflowRuns {
+                        total_count: 100,
+                        workflow_runs: page_99,
+                    },
+                    WorkflowRuns {
+                        total_count: 101,
+                        workflow_runs: vec![run],
+                    },
+                ],
+                |page| page.total_count,
+                |page| page.workflow_runs,
+                "test runs",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_jobs_must_share_one_run_attempt_and_commit() {
+        let run = test_workflow_run(40, 7, CI_WORKFLOW_PATH, "main", "push", "in_progress", None);
+        let job = test_workflow_job(&run, "CI aggregate", "completed", Some("success"));
+        assert!(jobs_belong_to_run(&run, std::slice::from_ref(&job)));
+
+        let mut wrong_run = job.clone();
+        wrong_run.run_id += 1;
+        assert!(!jobs_belong_to_run(&run, &[wrong_run]));
+        let mut wrong_attempt = job.clone();
+        wrong_attempt.run_attempt += 1;
+        assert!(!jobs_belong_to_run(&run, &[wrong_attempt]));
+        let mut wrong_sha = job.clone();
+        wrong_sha.head_sha = "b".repeat(40);
+        assert!(!jobs_belong_to_run(&run, &[wrong_sha]));
+
+        assert!(ensure_unique_by(std::slice::from_ref(&job), |item| item.id, "test jobs").is_ok());
+        assert!(ensure_unique_by(&[job.clone(), job], |item| item.id, "test jobs").is_err());
+    }
+
+    #[test]
+    fn trusted_workflow_catalog_requires_one_active_exact_path() {
+        let workflows = vec![
+            Workflow {
+                id: 7,
+                path: CI_WORKFLOW_PATH.to_owned(),
+                state: "active".to_owned(),
             },
-        };
-        let mut checks = CheckRuns {
-            check_runs: REQUIRED_CODEQL_ANALYSES
-                .iter()
-                .map(|name| successful_analysis(name))
-                .collect(),
-        };
-        assert_eq!(required_codeql_state(&checks), AggregateState::Passed);
-
-        let missing = checks.check_runs.pop().expect("required analysis");
-        assert_eq!(required_codeql_state(&checks), AggregateState::Pending);
-        checks.check_runs.push(missing);
-
-        checks.check_runs[0].status = "in_progress".to_owned();
-        checks.check_runs[0].conclusion = None;
-        assert_eq!(required_codeql_state(&checks), AggregateState::Pending);
-
-        checks.check_runs[0].status = "completed".to_owned();
-        checks.check_runs[0].conclusion = Some("failure".to_owned());
-        assert_eq!(required_codeql_state(&checks), AggregateState::Failed);
-
-        let pending_duplicate = CheckRun {
-            name: REQUIRED_CODEQL_ANALYSES[0].to_owned(),
-            status: "in_progress".to_owned(),
-            conclusion: None,
-            app: CheckApp {
-                slug: "github-actions".to_owned(),
+            Workflow {
+                id: 8,
+                path: "dynamic/untrusted".to_owned(),
+                state: "active".to_owned(),
             },
-        };
-        checks.check_runs.push(pending_duplicate);
-        assert_eq!(required_codeql_state(&checks), AggregateState::Failed);
-        checks.check_runs.pop();
-
-        checks.check_runs[0].conclusion = Some("neutral".to_owned());
-        assert_eq!(required_codeql_state(&checks), AggregateState::Failed);
-
-        checks.check_runs[0] = successful_analysis(REQUIRED_CODEQL_ANALYSES[0]);
-        checks.check_runs[0].app.slug = "untrusted-check-app".to_owned();
-        assert_eq!(required_codeql_state(&checks), AggregateState::Pending);
+            Workflow {
+                id: 9,
+                path: CI_WORKFLOW_PATH.to_owned(),
+                state: "disabled_manually".to_owned(),
+            },
+        ];
+        assert_eq!(
+            required_active_workflow(&workflows, CI_WORKFLOW_PATH).unwrap(),
+            7
+        );
+        let mut duplicated = workflows;
+        duplicated.push(Workflow {
+            id: 10,
+            path: CI_WORKFLOW_PATH.to_owned(),
+            state: "active".to_owned(),
+        });
+        assert!(required_active_workflow(&duplicated, CI_WORKFLOW_PATH).is_err());
     }
 
     #[test]
