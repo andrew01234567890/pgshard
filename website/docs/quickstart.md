@@ -32,8 +32,8 @@ make check
 This validates contracts, core and runtime foundations, generated Kubernetes
 resources, release policy and documentation. CI separately exercises the
 local-only lifecycle image with a disposable PostgreSQL 18 data directory. The
-operator KIND job also starts two single-member primaries, queries one from a
-neutral client using that destination shard's credential, restarts it, and
+operator KIND job also starts two single-member primaries, queries one from an
+authorized restricted probe client using that destination shard's credential, restarts it, and
 verifies persistence. Neither test proves a
 sharding runtime. Follow
 [implementation status](./project/status.md) for the first version with a real

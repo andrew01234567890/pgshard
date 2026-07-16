@@ -96,6 +96,12 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForSingleMemberPostgreSQL(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster))
+	current := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err != nil {
+		t.Fatal(err)
+	}
+	shardZeroBootstrap := bootstrapForShard(t, current, 0)
+	shardOneBootstrap := bootstrapForShard(t, current, 1)
 
 	shardZeroPod := cluster.Name + "-shard-0000-primary-0"
 	shardOnePod := cluster.Name + "-shard-0001-primary-0"
@@ -109,11 +115,11 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"CREATE TABLE live_marker (shard integer PRIMARY KEY, note text NOT NULL); INSERT INTO live_marker VALUES (0, 'kind-persistent');")
 	service := cluster.Name + "-shard-0000"
 	shardZeroSecret := &corev1.Secret{}
-	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLAuthSecretName(cluster.Name, 0)}, shardZeroSecret); err != nil {
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroBootstrap.SecretName}, shardZeroSecret); err != nil {
 		t.Fatal(err)
 	}
 	shardOneSecret := &corev1.Secret{}
-	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLAuthSecretName(cluster.Name, 1)}, shardOneSecret); err != nil {
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardOneBootstrap.SecretName}, shardOneSecret); err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Equal(shardZeroSecret.Data[owned.PostgreSQLPasswordKey], shardOneSecret.Data[owned.PostgreSQLPasswordKey]) {
@@ -123,7 +129,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardOnePod}, shardOne); err != nil {
 		t.Fatal(err)
 	}
-	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, owned.PostgreSQLAuthSecretName(cluster.Name, 0), service, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
+	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, service, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
 		t.Fatalf("cross-shard-service query = %q", got)
 	}
 
@@ -255,6 +261,8 @@ func logNamespaceDiagnostics(t *testing.T, ctx context.Context, namespace string
 	t.Helper()
 	for _, args := range [][]string{
 		{"--namespace", namespace, "get", "pods,statefulsets,persistentvolumeclaims", "--output=wide"},
+		{"--namespace", namespace, "get", "pods", "--output=jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{range .status.containerStatuses[*]}  {.name}: waiting={.state.waiting.reason}: {.state.waiting.message}; terminated={.state.terminated.reason}: {.state.terminated.message}{\"\\n\"}{end}{end}"},
+		{"--namespace", namespace, "get", "events", "--sort-by=.lastTimestamp"},
 		{"--namespace", namespace, "describe", "pods"},
 		{"--namespace", namespace, "logs", "--selector=" + owned.ClusterLabel, "--all-containers", "--tail=100", "--prefix"},
 	} {
@@ -311,10 +319,22 @@ func runKubectl(t *testing.T, ctx context.Context, arguments ...string) string {
 
 func assertPostgreSQLRoleProfiles(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
 	t.Helper()
-	configuration := &corev1.ConfigMap{}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLConfigSuffix}
-	if err := kubeClient.Get(ctx, key, configuration); err != nil {
+	configurations := &corev1.ConfigMapList{}
+	if err := kubeClient.List(ctx, configurations, client.InNamespace(cluster.Namespace), client.MatchingLabels{owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "configuration"}); err != nil {
 		t.Fatal(err)
+	}
+	var configuration *corev1.ConfigMap
+	prefix := cluster.Name + owned.PostgreSQLConfigSuffix + "-"
+	for index := range configurations.Items {
+		if strings.HasPrefix(configurations.Items[index].Name, prefix) {
+			if configuration != nil {
+				t.Fatalf("multiple active PostgreSQL configurations found: %s and %s", configuration.Name, configurations.Items[index].Name)
+			}
+			configuration = &configurations.Items[index]
+		}
+	}
+	if configuration == nil {
+		t.Fatalf("PostgreSQL configuration with prefix %q not found", prefix)
 	}
 	wantDocuments := 1 + int(cluster.Spec.MembersPerShard)*2
 	if len(configuration.Data) != wantDocuments {

@@ -159,9 +159,10 @@ restarts. `PostgreSQLPrimariesAvailable=True` reports process availability, not
 replication or failover. Zero-downtime restart evidence requires at least one
 eligible standby, a fenced switchover, pooler rerouting/buffering, and a
 continuous client probe with no failed or outcome-unknown transactions.
-Startup and liveness probes check only that the postmaster process exists;
-`pg_isready` is reserved for readiness. Slow crash recovery therefore remains
-unready without being repeatedly killed by kubelet.
+`pg_isready` is used only for readiness. Direct PostgreSQL Pods have no kubelet
+startup or liveness kill probe: PID 1 exit is handled by the container runtime,
+while slow startup or crash recovery remains unready without being repeatedly
+killed by kubelet.
 
 `shardschema` now reserves one permanent generation/name history for a
 dedicated slot-sync probe per live shard restore. The probe is explicitly

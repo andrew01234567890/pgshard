@@ -337,6 +337,15 @@ spec:
                 type: integer
               storage:
                 properties:
+                  deletionPolicy:
+                    default: Retain
+                    description: |-
+                      DeletionPolicy controls PostgreSQL data PVC handling when the cluster is
+                      deleted. Retain is the safe default; Delete must be selected explicitly.
+                    enum:
+                    - Retain
+                    - Delete
+                    type: string
                   size:
                     anyOf:
                     - type: integer
@@ -355,11 +364,29 @@ spec:
                 required:
                 - size
                 type: object
+                x-kubernetes-validations:
+                - message: storage size is immutable until explicit PVC expansion
+                    is implemented
+                  rule: quantity(self.size).compareTo(quantity(oldSelf.size)) == 0
+                - message: storage class is immutable after cluster creation
+                  rule: has(self.storageClassName) == has(oldSelf.storageClassName)
+                    && (!has(self.storageClassName) || self.storageClassName == oldSelf.storageClassName)
+                - message: deletion policy is immutable after cluster creation
+                  rule: self.deletionPolicy == oldSelf.deletionPolicy
             required:
             - backup
             - postgresql
             - storage
             type: object
+            x-kubernetes-validations:
+            - message: shards is immutable until online resharding is implemented
+              rule: self.shards == oldSelf.shards
+            - message: membersPerShard is immutable until membership transitions are
+                implemented
+              rule: self.membersPerShard == oldSelf.membersPerShard
+            - message: durability is immutable until replication-mode transitions
+                are implemented
+              rule: self.durability == oldSelf.durability
           status:
             description: |-
               PgShardClusterStatus never reports readiness until the operator has actually
@@ -434,26 +461,67 @@ spec:
                 - Ready
                 - Degraded
                 type: string
-              postgresqlCredentials:
+              postgresqlBootstrapSpec:
                 description: |-
-                  PostgreSQLCredentials records the immutable Secret identity generated for
-                  each shard. A missing or replaced Secret is a recovery event; the
-                  controller never silently generates a new password for existing PGDATA.
+                  PostgreSQLBootstrapSpec records the topology and storage contract before
+                  any PostgreSQL credential or data volume is created. It provides a
+                  defensive fence when admission is unavailable or bypassed.
+                properties:
+                  durability:
+                    type: string
+                  membersPerShard:
+                    format: int32
+                    type: integer
+                  shards:
+                    format: int32
+                    type: integer
+                  storageClassName:
+                    type: string
+                  storageSize:
+                    type: string
+                required:
+                - durability
+                - membersPerShard
+                - shards
+                - storageSize
+                type: object
+              postgresqlBootstraps:
+                description: |-
+                  PostgreSQLBootstraps records the API-assigned Secret and PVC identities for
+                  each shard. Missing or replaced children require an explicit recovery;
+                  the controller never silently adopts or regenerates them.
                 items:
                   description: |-
-                    PostgreSQLCredentialStatus binds one shard to the immutable bootstrap
-                    Secret created before any PostgreSQL workload can consume it.
+                    PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified
+                    bootstrap resources. Names and UIDs are both required before a workload can
+                    consume either child.
                   properties:
+                    pvcName:
+                      type: string
+                    pvcStorageClassName:
+                      description: PVCStorageClassName records API defaulting as well
+                        as explicit selection.
+                      type: string
+                    pvcUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                    secretName:
+                      type: string
                     secretUID:
                       description: |-
-                        SecretUID is assigned by the API server and cannot be selected by a
-                        namespace principal racing deterministic Secret creation.
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
                       type: string
                     shard:
                       format: int32
                       minimum: 0
                       type: integer
                   required:
+                  - secretName
                   - secretUID
                   - shard
                   type: object

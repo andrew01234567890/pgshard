@@ -3,8 +3,9 @@
 This module contains the Go control plane for the namespaced `PgShardCluster`
 API. The controller now reconciles the safe supporting-resource slice:
 
-- generated topology and resource-derived PostgreSQL configuration ConfigMaps,
-  including common plus primary and standby role profiles for every member;
+- generated topology and immutable, content-addressed, resource-derived
+  PostgreSQL configuration ConfigMaps, including common plus primary and
+  standby role profiles for every member;
 - CNPG-style `<cluster>-rw`, `<cluster>-ro`, and `<cluster>-r` application
   Services, each targeting its own pooler listener;
 - one internal headless Service per shard;
@@ -23,9 +24,11 @@ API. The controller now reconciles the safe supporting-resource slice:
 - controller ownership, update pruning, and finalizer-based deletion pruning.
 
 Planned supporting resources use server-side apply. Each generated PostgreSQL
-credential is a separate create-once immutable Secret. Its API-assigned UID is
-recorded in status before any workload is created; an unrecorded, missing, or
-replaced Secret is rejected rather than adopted or regenerated. A one-time upgrade path
+credential and standalone data PVC has a cryptographically random name. The
+name and API-assigned UID are checkpointed separately in status before any
+workload can reference that child. A crash after creation but before the status
+write leaves an unused orphan rather than an adoptable deterministic name; a
+missing or replaced recorded child requires explicit recovery. A one-time upgrade path
 first aligns objects created by the earlier whole-object Update controller, preserving
 Service allocations and API defaults, then establishes the operator's Apply
 field set and removes the legacy Update co-owners. The completion annotation is
@@ -56,11 +59,12 @@ This is not yet a working sharded database endpoint. An explicit
 PostgreSQL 18 primary per shard. The operator derives its configuration from
 the resource budget, listens on the internal shard Service, runs as UID/GID
 999 under the restricted Pod Security profile, and retains its data claim
-across StatefulSet restarts. The readiness probe uses `pg_isready`, while
-startup and liveness check only the postmaster process so long crash recovery
-is not killed merely because SQL is unavailable. Storage is at least 4Gi per
-shard, `max_wal_size` cannot exceed one quarter of that claim, and size is
-immutable until an explicit PVC expansion workflow exists.
+across StatefulSet restarts. The readiness probe uses `pg_isready`. PostgreSQL
+has no kubelet startup or liveness kill probe: PID 1 exit is handled by the
+container runtime, while slow startup or crash recovery remains unready without
+being killed. Storage is at least 4Gi per shard, `max_wal_size` cannot exceed
+one quarter of that claim, and topology, durability, storage class, and size
+are immutable until their explicit transition workflows exist.
 `PostgreSQLPrimariesAvailable=True` means only that all of those single-member
 primaries have passed the StatefulSet's minimum-ready window. It does not claim standby
 replication, failover, routing, or zero-downtime restart. Three- and five-member
@@ -68,10 +72,10 @@ resources continue to create no PostgreSQL Pods until bootstrap, replication,
 fencing integration, promotion, and recovery exist.
 
 Generated bootstrap credentials are unique per shard, immutable, and stable
-across reconciles. If one disappears after its UID is recorded, or if its
-workload or retained PGDATA claim exists without a recorded credential, the
-controller fails closed instead of silently replacing it and rotating the
-server password.
+across reconciles. Each data PVC is likewise bound to its recorded name, UID,
+capacity, and API-defaulted storage class. The controller periodically
+revalidates both identities and fails closed instead of silently replacing a
+credential or empty data volume.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
@@ -83,13 +87,21 @@ reports that gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` w
 a bounded backend quota. Its default image is digest-pinned and the Pod command
 selects that image contract's `/usr/local/bin/etcd` executable explicitly;
 custom `--etcd-image` values must provide the same path. Scale transitions
-retain those claims; cluster deletion keeps the CR finalizer until UID-owned
-StatefulSets and PVCs are
-observed absent through the uncached Kubernetes API reader, preventing informer
-lag from allowing same-name recreation to mount stale etcd state. Automated
+retain those claims during scaling. On cluster deletion,
+`storage.deletionPolicy: Retain` (the default) detaches PostgreSQL data PVCs
+from garbage collection before other owned resources and supporting PVCs are
+removed. `Delete` must be selected explicitly at creation to delete PostgreSQL
+data. The CR finalizer waits for the selected policy to be observed through the
+uncached Kubernetes API reader. Automated
 defragmentation is not implemented. PostgreSQL
 `archive_mode` remains off until a real archival pipeline is reconciled and
 verified, so the generated configuration cannot silently fill `pg_wal`.
+
+NetworkPolicy selectors are traffic controls, not workload authentication. A
+principal allowed to create Pods in a cluster namespace can forge the selected
+labels, so each PgShardCluster namespace is currently a trusted administrative
+boundary. Mutually untrusted tenants require namespace-scoped operator installs
+and an admission-reserved workload identity that are not implemented yet.
 
 The PostgreSQL ConfigMap sizes every member for the largest slot footprint it
 can carry during promotion: primary physical slots and failover anchors,
@@ -190,7 +202,7 @@ mutating and validating webhook configurations. It pre-creates empty,
 operator-labeled Secrets and grants the manager exact-name `get` and `update`
 access only in `pgshard-system` for webhook certificate mutation. The
 reconciler also has cluster-wide Secret `get` and `create` because it generates
-one credential per shard at cluster-derived names in each resource namespace;
+one randomly named credential per shard in each resource namespace;
 Kubernetes RBAC cannot restrict that permission to names derived from arbitrary
 custom resources. It has no Secret list, watch, update, patch, or delete
 permission, and the controller reads credentials through the uncached client
@@ -266,6 +278,7 @@ real Kubernetes controllers. Another builds and loads local images, installs
 the self-managed admission manager, proves semantic admission rejection and
 certificate trust, preserves the fail-closed three-member boundary, and starts
 two restricted single-member PostgreSQL 18 primaries. It exercises TCP through
-a shard Service, restarts a primary StatefulSet, and verifies its data survives.
+a shard Service from an authorized restricted probe client, restarts a primary
+StatefulSet, and verifies its data survives.
 The test does not claim uninterrupted traffic. These targeted tests are not yet
 the full Milestone 1 KIND suite.

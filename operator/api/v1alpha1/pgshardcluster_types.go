@@ -22,13 +22,20 @@ const (
 
 	RepositoryS3         BackupRepositoryType = "S3"
 	RepositoryFilesystem BackupRepositoryType = "Filesystem"
+
+	DeletionRetain StorageDeletionPolicy = "Retain"
+	DeletionDelete StorageDeletionPolicy = "Delete"
 )
 
 type DurabilityMode string
 type PoolerScalingMode string
 type BackupRepositoryType string
+type StorageDeletionPolicy string
 
 // PgShardClusterSpec describes one namespaced pgshard installation.
+// +kubebuilder:validation:XValidation:rule="self.shards == oldSelf.shards",message="shards is immutable until online resharding is implemented"
+// +kubebuilder:validation:XValidation:rule="self.membersPerShard == oldSelf.membersPerShard",message="membersPerShard is immutable until membership transitions are implemented"
+// +kubebuilder:validation:XValidation:rule="self.durability == oldSelf.durability",message="durability is immutable until replication-mode transitions are implemented"
 type PgShardClusterSpec struct {
 	// Shards is the number of logical hash ranges. The catalog remains on shard-0000.
 	// +kubebuilder:validation:Minimum=1
@@ -76,6 +83,9 @@ type PostgreSQLSpec struct {
 	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="quantity(self.size).compareTo(quantity(oldSelf.size)) == 0",message="storage size is immutable until explicit PVC expansion is implemented"
+// +kubebuilder:validation:XValidation:rule="has(self.storageClassName) == has(oldSelf.storageClassName) && (!has(self.storageClassName) || self.storageClassName == oldSelf.storageClassName)",message="storage class is immutable after cluster creation"
+// +kubebuilder:validation:XValidation:rule="self.deletionPolicy == oldSelf.deletionPolicy",message="deletion policy is immutable after cluster creation"
 type StorageSpec struct {
 	// Size is the capacity of each PostgreSQL data volume.
 	// +kubebuilder:validation:XValidation:rule="quantity(self).compareTo(quantity('4Gi')) >= 0",message="storage size must be at least 4Gi"
@@ -83,6 +93,11 @@ type StorageSpec struct {
 	// StorageClassName is used for PostgreSQL data volumes and the supporting
 	// etcd quorum's independently sized volumes.
 	StorageClassName *string `json:"storageClassName,omitempty"`
+	// DeletionPolicy controls PostgreSQL data PVC handling when the cluster is
+	// deleted. Retain is the safe default; Delete must be selected explicitly.
+	// +kubebuilder:validation:Enum=Retain;Delete
+	// +kubebuilder:default=Retain
+	DeletionPolicy StorageDeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
 type DatabaseTemplate struct {
@@ -175,22 +190,39 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	// PostgreSQLCredentials records the immutable Secret identity generated for
-	// each shard. A missing or replaced Secret is a recovery event; the
-	// controller never silently generates a new password for existing PGDATA.
+	// PostgreSQLBootstrapSpec records the topology and storage contract before
+	// any PostgreSQL credential or data volume is created. It provides a
+	// defensive fence when admission is unavailable or bypassed.
+	PostgreSQLBootstrapSpec *PostgreSQLBootstrapSpecStatus `json:"postgresqlBootstrapSpec,omitempty"`
+	// PostgreSQLBootstraps records the API-assigned Secret and PVC identities for
+	// each shard. Missing or replaced children require an explicit recovery;
+	// the controller never silently adopts or regenerates them.
 	// +listType=map
 	// +listMapKey=shard
-	PostgreSQLCredentials []PostgreSQLCredentialStatus `json:"postgresqlCredentials,omitempty"`
+	PostgreSQLBootstraps []PostgreSQLBootstrapStatus `json:"postgresqlBootstraps,omitempty"`
 }
 
-// PostgreSQLCredentialStatus binds one shard to the immutable bootstrap
-// Secret created before any PostgreSQL workload can consume it.
-type PostgreSQLCredentialStatus struct {
+// PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract.
+type PostgreSQLBootstrapSpecStatus struct {
+	Shards           int32          `json:"shards"`
+	MembersPerShard  int32          `json:"membersPerShard"`
+	Durability       DurabilityMode `json:"durability"`
+	StorageSize      string         `json:"storageSize"`
+	StorageClassName *string        `json:"storageClassName,omitempty"`
+}
+
+// PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified
+// bootstrap resources. Names and UIDs are both required before a workload can
+// consume either child.
+type PostgreSQLBootstrapStatus struct {
 	// +kubebuilder:validation:Minimum=0
-	Shard int32 `json:"shard"`
-	// SecretUID is assigned by the API server and cannot be selected by a
-	// namespace principal racing deterministic Secret creation.
-	SecretUID types.UID `json:"secretUID"`
+	Shard      int32     `json:"shard"`
+	SecretName string    `json:"secretName"`
+	SecretUID  types.UID `json:"secretUID"`
+	PVCName    string    `json:"pvcName,omitempty"`
+	PVCUID     types.UID `json:"pvcUID,omitempty"`
+	// PVCStorageClassName records API defaulting as well as explicit selection.
+	PVCStorageClassName *string `json:"pvcStorageClassName,omitempty"`
 }
 
 // +kubebuilder:object:root=true

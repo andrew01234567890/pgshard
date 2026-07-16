@@ -25,7 +25,7 @@ func validCluster() *PgShardCluster {
 					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 				},
 			},
-			Storage: StorageSpec{Size: resource.MustParse("10Gi")},
+			Storage: StorageSpec{Size: resource.MustParse("10Gi"), DeletionPolicy: DeletionRetain},
 			Pooler:  PoolerSpec{Scaling: PoolerScaling{Mode: ScalingHPA, HPA: &HPAScaling{MinReplicas: 2, MaxReplicas: 10, TargetCPUUtilizationPercentage: 65}}},
 			Services: ServiceSet{
 				ReadWrite: ServiceTemplate{Type: corev1.ServiceTypeClusterIP},
@@ -44,13 +44,14 @@ func TestDefaultsAreSafetyOriented(t *testing.T) {
 	cluster.Spec.MembersPerShard = 0
 	cluster.Spec.Durability = ""
 	cluster.Spec.PostgreSQL.Version = ""
+	cluster.Spec.Storage.DeletionPolicy = ""
 	cluster.Spec.Pooler.Scaling = PoolerScaling{}
 	cluster.Spec.Services = ServiceSet{}
 	cluster.Spec.Observability = ObservabilitySpec{}
 	if err := (&PgShardClusterDefaulter{}).Default(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
-	if cluster.Spec.Shards != 1 || cluster.Spec.MembersPerShard != 3 || cluster.Spec.Durability != DurabilitySynchronous || cluster.Spec.PostgreSQL.Version != "18" {
+	if cluster.Spec.Shards != 1 || cluster.Spec.MembersPerShard != 3 || cluster.Spec.Durability != DurabilitySynchronous || cluster.Spec.PostgreSQL.Version != "18" || cluster.Spec.Storage.DeletionPolicy != DeletionRetain {
 		t.Fatalf("unexpected defaults: %#v", cluster.Spec)
 	}
 	if cluster.Spec.Pooler.Scaling.HPA == nil || cluster.Spec.Pooler.Scaling.HPA.MaxReplicas != 10 || cluster.Spec.Pooler.Scaling.HPA.TargetCPUUtilizationPercentage != 65 {
@@ -293,5 +294,27 @@ func TestValidationKeepsStorageClassImmutable(t *testing.T) {
 	newCluster.Spec.Storage.StorageClassName = &newClass
 	if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable") {
 		t.Fatalf("storage class update was admitted: %v", err)
+	}
+}
+
+func TestValidationKeepsUnimplementedDataTransitionsImmutable(t *testing.T) {
+	t.Parallel()
+	tests := map[string]func(*PgShardCluster){
+		"shards":          func(cluster *PgShardCluster) { cluster.Spec.Shards++ },
+		"membersPerShard": func(cluster *PgShardCluster) { cluster.Spec.MembersPerShard = 5 },
+		"durability":      func(cluster *PgShardCluster) { cluster.Spec.Durability = DurabilityAsynchronous },
+		"deletionPolicy":  func(cluster *PgShardCluster) { cluster.Spec.Storage.DeletionPolicy = DeletionDelete },
+	}
+	for name, mutate := range tests {
+		name, mutate := name, mutate
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			oldCluster := validCluster()
+			newCluster := oldCluster.DeepCopy()
+			mutate(newCluster)
+			if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable") {
+				t.Fatalf("%s transition was admitted: %v", name, err)
+			}
+		})
 	}
 }

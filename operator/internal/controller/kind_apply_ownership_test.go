@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,7 +109,8 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	if err := kubeClient.Get(ctx, request.NamespacedName, current); err != nil {
 		t.Fatal(err)
 	}
-	current.Spec.MembersPerShard = 3
+	oldConfiguration := plannedPostgreSQLConfiguration(t, current)
+	current.Spec.PostgreSQL.Parameters = map[string]string{"log_statement": "ddl"}
 	current.Spec.Pooler.Scaling = pgshardv1alpha1.PoolerScaling{
 		Mode: pgshardv1alpha1.ScalingHPA,
 		HPA: &pgshardv1alpha1.HPAScaling{
@@ -124,19 +126,18 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	desiredConfiguration := plannedPostgreSQLConfiguration(t, current)
 	configuration := &corev1.ConfigMap{}
-	configurationKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLConfigSuffix}
+	configurationKey := client.ObjectKeyFromObject(desiredConfiguration)
 	if err := kubeClient.Get(ctx, configurationKey, configuration); err != nil {
 		t.Fatal(err)
 	}
 	assertApplyOwner(t, configuration)
-	if len(configuration.Data) != 7 {
-		t.Fatalf("shrunk PostgreSQL configuration retained stale members: %#v", configuration.Data)
+	if len(configuration.Data) != 11 || !strings.Contains(configuration.Data["postgresql.conf"], "log_statement = ddl\n") {
+		t.Fatalf("new PostgreSQL configuration was not published: %#v", configuration.Data)
 	}
-	for _, stale := range []string{"primary-0003.conf", "primary-0004.conf", "standby-0003.conf", "standby-0004.conf"} {
-		if _, exists := configuration.Data[stale]; exists {
-			t.Fatalf("stale configuration key %q survived server-side apply", stale)
-		}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldConfiguration), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("stale immutable PostgreSQL configuration was not pruned: %v", err)
 	}
 	networkPolicy := &networkingv1.NetworkPolicy{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.EtcdSuffix}, networkPolicy); err != nil {
@@ -240,7 +241,7 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	}
 
 	legacyConfiguration := &corev1.ConfigMap{}
-	legacyConfigurationKey := types.NamespacedName{Namespace: legacy.Namespace, Name: legacy.Name + owned.PostgreSQLConfigSuffix}
+	legacyConfigurationKey := types.NamespacedName{Namespace: legacy.Namespace, Name: legacy.Name + owned.TopologyConfigSuffix}
 	if err := kubeClient.Get(ctx, legacyConfigurationKey, legacyConfiguration); err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +308,7 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	legacy.Spec.MembersPerShard = 3
+	legacy.Spec.PostgreSQL.Parameters = map[string]string{"log_statement": "ddl"}
 	legacy.Spec.Pooler.Scaling = pgshardv1alpha1.PoolerScaling{
 		Mode: pgshardv1alpha1.ScalingHPA,
 		HPA: &pgshardv1alpha1.HPAScaling{
@@ -334,13 +335,8 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertApplyOwner(t, legacyConfiguration)
-	if len(legacyConfiguration.Data) != 7 {
-		t.Fatalf("legacy configuration retained stale members: %#v", legacyConfiguration.Data)
-	}
-	for _, stale := range []string{"primary-0003.conf", "primary-0004.conf", "standby-0003.conf", "standby-0004.conf"} {
-		if _, exists := legacyConfiguration.Data[stale]; exists {
-			t.Fatalf("legacy configuration key %q survived migration", stale)
-		}
+	if strings.Contains(legacyConfiguration.Data["cluster.json"], "tempo.invalid") {
+		t.Fatalf("legacy topology retained removed OpenTelemetry endpoint: %#v", legacyConfiguration.Data)
 	}
 	legacyService := &corev1.Service{}
 	if err := kubeClient.Get(ctx, legacyServiceKey, legacyService); err != nil {
@@ -393,7 +389,8 @@ func exerciseCompletedLegacyApplyMigration(
 ) {
 	t.Helper()
 	cluster := createBareLegacyCluster(t, ctx, kubeClient, namespace, "legacy-completed", registerCleanup)
-	fullConfiguration := plannedPostgreSQLConfiguration(t, cluster)
+	fullConfiguration := plannedTopologyConfiguration(t, cluster)
+	fullConfiguration.Data["legacy-only"] = "remove during migration"
 	fullPooler := plannedPoolerDeployment(t, cluster)
 	removeApplyOwnershipMarker(fullConfiguration)
 	removeApplyOwnershipMarker(fullPooler)
@@ -406,7 +403,6 @@ func exerciseCompletedLegacyApplyMigration(
 	applyLegacyOperatorOwnership(t, ctx, kubeClient, fullConfiguration)
 	applyLegacyOperatorOwnership(t, ctx, kubeClient, fullPooler)
 
-	cluster.Spec.MembersPerShard = 3
 	cluster.Spec.Pooler.Scaling = pgshardv1alpha1.PoolerScaling{
 		Mode: pgshardv1alpha1.ScalingHPA,
 		HPA: &pgshardv1alpha1.HPAScaling{
@@ -416,7 +412,7 @@ func exerciseCompletedLegacyApplyMigration(
 	if err := kubeClient.Update(ctx, cluster); err != nil {
 		t.Fatal(err)
 	}
-	shrunkConfiguration := plannedPostgreSQLConfiguration(t, cluster)
+	shrunkConfiguration := plannedTopologyConfiguration(t, cluster)
 	applyLegacyOperatorOwnership(t, ctx, kubeClient, shrunkConfiguration)
 	applyLegacyWholeDeploymentHPAOwnership(t, ctx, kubeClient, cluster, 7)
 	desiredHPAPooler := plannedPoolerDeployment(t, cluster)
@@ -428,10 +424,8 @@ func exerciseCompletedLegacyApplyMigration(
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(shrunkConfiguration), configurationBefore); err != nil {
 		t.Fatal(err)
 	}
-	for _, stale := range []string{"primary-0003.conf", "primary-0004.conf", "standby-0003.conf", "standby-0004.conf"} {
-		if _, exists := configurationBefore.Data[stale]; !exists {
-			t.Fatalf("completed legacy Apply fixture did not retain Update-owned key %q: %#v", stale, configurationBefore.Data)
-		}
+	if _, exists := configurationBefore.Data["legacy-only"]; !exists {
+		t.Fatalf("completed legacy Apply fixture did not retain its Update-owned key: %#v", configurationBefore.Data)
 	}
 	if applyOwnershipMigrationComplete(configurationBefore) || !hasApplyOwnership(configurationBefore, owned.ManagedByValue) || !hasTopLevelUpdateOwnership(configurationBefore) {
 		t.Fatalf("completed legacy ConfigMap fixture has the wrong ownership boundary: annotations=%#v fields=%#v", configurationBefore.Annotations, configurationBefore.ManagedFields)
@@ -444,10 +438,8 @@ func exerciseCompletedLegacyApplyMigration(
 		t.Fatal(err)
 	}
 	assertApplyOwner(t, configurationAfter)
-	for _, stale := range []string{"primary-0003.conf", "primary-0004.conf", "standby-0003.conf", "standby-0004.conf"} {
-		if _, exists := configurationAfter.Data[stale]; exists {
-			t.Fatalf("Update-owned key %q survived completed legacy migration: %#v", stale, configurationAfter.Data)
-		}
+	if _, exists := configurationAfter.Data["legacy-only"]; exists {
+		t.Fatalf("Update-owned key survived completed legacy migration: %#v", configurationAfter.Data)
 	}
 
 	poolerBefore := &appsv1.Deployment{}
@@ -675,11 +667,27 @@ func plannedPostgreSQLConfiguration(t *testing.T, cluster *pgshardv1alpha1.PgSha
 	}
 	for _, object := range plan {
 		configuration, ok := object.(*corev1.ConfigMap)
-		if ok && configuration.Name == cluster.Name+owned.PostgreSQLConfigSuffix {
+		if ok && strings.HasPrefix(configuration.Name, cluster.Name+owned.PostgreSQLConfigSuffix+"-") {
 			return configuration
 		}
 	}
 	t.Fatal("planned PostgreSQL configuration is missing")
+	return nil
+}
+
+func plannedTopologyConfiguration(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster) *corev1.ConfigMap {
+	t.Helper()
+	plan, err := owned.Plan(cluster, owned.DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range plan {
+		configuration, ok := object.(*corev1.ConfigMap)
+		if ok && configuration.Name == cluster.Name+owned.TopologyConfigSuffix {
+			return configuration
+		}
+	}
+	t.Fatal("planned topology configuration is missing")
 	return nil
 }
 

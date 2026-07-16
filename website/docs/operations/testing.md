@@ -535,7 +535,7 @@ without restarts while they remain unready, and proves the three-member sample
 has no PostgreSQL workload or ready application endpoint. The same job creates
 a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard
-Service from a neutral restricted client using the destination-specific
+Service from an authorized restricted probe client using the destination-specific
 Secret, then restarts one primary StatefulSet and verifies its PVC-backed row
 survives. It does not claim
 uninterrupted traffic during that restart. A unit

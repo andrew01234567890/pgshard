@@ -70,7 +70,6 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 		}
 	}
 	for _, object := range []client.Object{
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "example-postgresql-config", Namespace: cluster.Namespace}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "example-topology", Namespace: cluster.Namespace}},
 		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "example-etcd", Namespace: cluster.Namespace}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "example-orchestrator", Namespace: cluster.Namespace}},
@@ -85,6 +84,7 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 		}
 		assertControllerOwner(t, object, cluster)
 	}
+	assertControllerOwner(t, getPostgreSQLConfigMap(t, ctx, fakeClient, cluster), cluster)
 
 	got := getCluster(t, ctx, fakeClient, cluster)
 	if got.Status.Phase != "Reconciling" || got.Status.ObservedGeneration != cluster.Generation {
@@ -118,16 +118,25 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
+	got := getCluster(t, ctx, fakeClient, cluster)
 
 	passwords := make(map[int32]string, cluster.Spec.Shards)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		bootstrap := bootstrapForShard(t, got, shard)
 		secret := &corev1.Secret{}
-		secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLAuthSecretName(cluster.Name, shard)}
+		secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}
 		if err := fakeClient.Get(ctx, secretKey, secret); err != nil {
 			t.Fatal(err)
 		}
-		if err := validatePostgreSQLAuthSecret(secret, cluster, shard); err != nil {
+		if err := validatePostgreSQLAuthSecret(secret, cluster, shard, bootstrap.SecretName); err != nil {
 			t.Fatalf("generated credential for shard %d is invalid: %v", shard, err)
+		}
+		claim := &corev1.PersistentVolumeClaim{}
+		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, claim); err != nil {
+			t.Fatal(err)
+		}
+		if claim.UID != bootstrap.PVCUID {
+			t.Fatalf("generated data PVC UID = %s, want %s", claim.UID, bootstrap.PVCUID)
 		}
 		if len(secret.Data[owned.PostgreSQLPasswordKey]) != hex.EncodedLen(postgresqlPasswordBytes) {
 			t.Fatalf("generated password length for shard %d = %d", shard, len(secret.Data[owned.PostgreSQLPasswordKey]))
@@ -153,11 +162,12 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
-	got := getCluster(t, ctx, fakeClient, cluster)
+	got = getCluster(t, ctx, fakeClient, cluster)
 	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLPrimariesProgressing")
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		bootstrap := bootstrapForShard(t, got, shard)
 		unchanged := &corev1.Secret{}
-		secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLAuthSecretName(cluster.Name, shard)}
+		secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}
 		if err := fakeClient.Get(ctx, secretKey, unchanged); err != nil {
 			t.Fatal(err)
 		}
@@ -180,8 +190,8 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	got = getCluster(t, ctx, fakeClient, cluster)
 	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionTrue, "SingleMemberPrimariesAvailable")
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "DataPlaneUnavailable")
-	if len(got.Status.PostgreSQLCredentials) != int(cluster.Spec.Shards) {
-		t.Fatalf("recorded PostgreSQL credentials = %#v", got.Status.PostgreSQLCredentials)
+	if len(got.Status.PostgreSQLBootstraps) != int(cluster.Spec.Shards) {
+		t.Fatalf("recorded PostgreSQL bootstraps = %#v", got.Status.PostgreSQLBootstraps)
 	}
 }
 
@@ -196,15 +206,17 @@ func TestReconcileRefusesToReplaceMissingCredentialAfterWorkloadCreation(t *test
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
+	current := getCluster(t, ctx, fakeClient, cluster)
+	bootstrap := bootstrapForShard(t, current, 0)
 	secret := &corev1.Secret{}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLAuthSecretName(cluster.Name, 0)}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}
 	if err := fakeClient.Get(ctx, key, secret); err != nil {
 		t.Fatal(err)
 	}
 	if err := fakeClient.Delete(ctx, secret); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "recorded UID") || !strings.Contains(err.Error(), "automatic replacement is unsafe") {
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "recorded UID") || !strings.Contains(err.Error(), "explicit recovery is required") {
 		t.Fatalf("missing credential was not fenced: %v", err)
 	}
 	if err := fakeClient.Get(ctx, key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
@@ -212,36 +224,177 @@ func TestReconcileRefusesToReplaceMissingCredentialAfterWorkloadCreation(t *test
 	}
 }
 
-func TestReconcileRejectsUnrecordedCredentialAndRetainedPGDATA(t *testing.T) {
+func TestReconcileNeverAdoptsUnrecordedBootstrapChildren(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	for name, object := range map[string]client.Object{
-		"precreated Secret": func() client.Object {
-			cluster := validCluster()
-			secret := owned.PostgreSQLAuthSecret(cluster, 0, []byte(strings.Repeat("a", hex.EncodedLen(postgresqlPasswordBytes))))
-			secret.UID = "attacker-selected-secret"
-			return secret
-		}(),
-		"retained PGDATA": &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLPrimaryDataPVCName("example", 0), Namespace: "default"}},
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	orphanSecret := owned.PostgreSQLAuthSecret(cluster, 0, owned.PostgreSQLAuthSecretPrefix(cluster.Name, 0)+"orphan", []byte(strings.Repeat("a", hex.EncodedLen(postgresqlPasswordBytes))))
+	orphanSecret.UID = "unrecorded-secret"
+	orphanClaim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, 0)+"orphan")
+	orphanClaim.UID = "unrecorded-pvc"
+	fakeClient := newFakeClient(t, cluster, orphanSecret, orphanClaim)
+	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, fakeClient, cluster)
+	bootstrap := bootstrapForShard(t, current, 0)
+	if bootstrap.SecretName == orphanSecret.Name || bootstrap.PVCName == orphanClaim.Name {
+		t.Fatalf("unrecorded bootstrap child was adopted: %#v", bootstrap)
+	}
+	statefulSet := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	if err := fakeClient.Get(ctx, key, statefulSet); err != nil {
+		t.Fatal(err)
+	}
+	if got := statefulSet.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName; got != bootstrap.PVCName {
+		t.Fatalf("workload data PVC = %q, want recorded %q", got, bootstrap.PVCName)
+	}
+	if err := fakeClient.Get(ctx, client.ObjectKeyFromObject(orphanSecret), &corev1.Secret{}); err != nil {
+		t.Fatalf("unrecorded Secret should remain an unused crash orphan until cluster deletion: %v", err)
+	}
+	if err := fakeClient.Get(ctx, client.ObjectKeyFromObject(orphanClaim), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("unrecorded PVC should remain unused: %v", err)
+	}
+}
+
+func TestReconcileFencesBypassedProvisionedSpecMutation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for name, mutate := range map[string]func(*pgshardv1alpha1.PgShardCluster){
+		"shards": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Shards++ },
+		"members": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.MembersPerShard = 3
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilitySynchronous
+		},
+		"storage": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Storage.Size = resource.MustParse("20Gi") },
 	} {
-		name, object := name, object
+		name, mutate := name, mutate
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			cluster := validCluster()
+			cluster.Spec.Shards = 1
 			cluster.Spec.MembersPerShard = 1
 			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
-			fakeClient := newFakeClient(t, cluster, object)
+			fakeClient := newFakeClient(t, cluster)
 			reconciler := &PgShardClusterReconciler{Client: fakeClient}
-			_, err := reconciler.Reconcile(ctx, requestFor(cluster))
-			if err == nil || (name == "precreated Secret" && !strings.Contains(err.Error(), "refusing to adopt")) || (name == "retained PGDATA" && !strings.Contains(err.Error(), "automatic replacement is unsafe")) {
-				t.Fatalf("unsafe credential history was accepted: %v", err)
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
 			}
-			statefulSet := &appsv1.StatefulSet{}
-			key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
-			if getErr := fakeClient.Get(ctx, key, statefulSet); !apierrors.IsNotFound(getErr) {
-				t.Fatalf("unsafe credential history created a workload: %v", getErr)
+			current := getCluster(t, ctx, fakeClient, cluster)
+			mutate(current)
+			if err := fakeClient.Update(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "differs from the provisioned PostgreSQL bootstrap spec") {
+				t.Fatalf("bypassed %s mutation was not fenced: %v", name, err)
 			}
 		})
+	}
+}
+
+func TestReconcileRefusesMissingOrReplacedPostgreSQLDataPVC(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for name, replace := range map[string]bool{"missing": false, "replaced": true} {
+		name, replace := name, replace
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			fakeClient := newFakeClient(t, cluster)
+			reconciler := &PgShardClusterReconciler{Client: fakeClient}
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
+			}
+			current := getCluster(t, ctx, fakeClient, cluster)
+			bootstrap := bootstrapForShard(t, current, 0)
+			claim := &corev1.PersistentVolumeClaim{}
+			key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+			if err := fakeClient.Get(ctx, key, claim); err != nil {
+				t.Fatal(err)
+			}
+			if err := fakeClient.Delete(ctx, claim); err != nil {
+				t.Fatal(err)
+			}
+			if replace {
+				replacement := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName)
+				replacement.UID = "replacement-pvc-uid"
+				if err := fakeClient.Create(ctx, replacement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := reconciler.Reconcile(ctx, requestFor(cluster))
+			if err == nil || (replace && !strings.Contains(err.Error(), "expected recorded UID")) || (!replace && !strings.Contains(err.Error(), "restore is required")) {
+				t.Fatalf("%s data PVC was not fenced: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestDeletionPolicyRetainsPostgreSQLDataByDefault(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	fakeClient := newFakeClient(t, cluster)
+	reconciler := &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, fakeClient, cluster)
+	bootstrap := bootstrapForShard(t, current, 0)
+	if err := fakeClient.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	result, err := reconciler.Reconcile(ctx, requestFor(cluster))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Requeue {
+		t.Fatalf("retention was not observed in a separate pass: %#v", result)
+	}
+	retained := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+	if err := fakeClient.Get(ctx, key, retained); err != nil {
+		t.Fatal(err)
+	}
+	if metav1.IsControlledBy(retained, cluster) || retained.Annotations[owned.RetainedFromAnnotation] != cluster.Namespace+"/"+cluster.Name {
+		t.Fatalf("PostgreSQL data PVC was not safely detached: %#v", retained.ObjectMeta)
+	}
+}
+
+func TestExplicitDeletePolicyDeletesPostgreSQLData(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
+	fakeClient := newFakeClient(t, cluster)
+	reconciler := &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, fakeClient, cluster)
+	bootstrap := bootstrapForShard(t, current, 0)
+	if err := fakeClient.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+	if err := fakeClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("explicit Delete policy retained PostgreSQL data: %v", err)
 	}
 }
 
@@ -1399,13 +1552,19 @@ func TestReconcileRefusesToAdoptDeterministicNameCollision(t *testing.T) {
 	if got.Data["belongs-to"] != "another-controller" || len(got.OwnerReferences) != 0 {
 		t.Fatalf("colliding object was adopted or overwritten: %#v", got)
 	}
-	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: "example-postgresql-config"}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("plan wrote an earlier artifact before discovering the collision: %v", err)
+	configurations := &corev1.ConfigMapList{}
+	if err := fakeClient.List(ctx, configurations, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	for _, configuration := range configurations.Items {
+		if strings.HasPrefix(configuration.Name, cluster.Name+owned.PostgreSQLConfigSuffix+"-") {
+			t.Fatalf("plan wrote %s before discovering the collision", configuration.Name)
+		}
 	}
 	status := getCluster(t, ctx, fakeClient, cluster)
 	assertCondition(t, status, reconciledCondition, metav1.ConditionFalse, "ReconcileFailed")
-	if contains(status.Finalizers, resourceFinalizer) {
-		t.Fatalf("collision-only plan acquired a cleanup finalizer: %#v", status.Finalizers)
+	if !contains(status.Finalizers, resourceFinalizer) {
+		t.Fatalf("collision failure did not retain the cleanup finalizer: %#v", status.Finalizers)
 	}
 }
 
@@ -1609,8 +1768,8 @@ func TestReconcileReportsPlanFailureWithoutAdvancingObservedGeneration(t *testin
 	if got.Status.Phase != "Degraded" || got.Status.ObservedGeneration != 0 {
 		t.Fatalf("status = %#v", got.Status)
 	}
-	if contains(got.Finalizers, resourceFinalizer) {
-		t.Fatalf("invalid plan acquired cleanup finalizer without children: %#v", got.Finalizers)
+	if !contains(got.Finalizers, resourceFinalizer) {
+		t.Fatalf("invalid plan did not retain its cleanup finalizer: %#v", got.Finalizers)
 	}
 	assertCondition(t, got, reconciledCondition, metav1.ConditionFalse, "PlanInvalid")
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PlanInvalid")
@@ -1632,7 +1791,7 @@ func validCluster() *pgshardv1alpha1.PgShardCluster {
 					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 				},
 			},
-			Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi")},
+			Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi"), DeletionPolicy: pgshardv1alpha1.DeletionRetain},
 			Pooler: pgshardv1alpha1.PoolerSpec{Scaling: pgshardv1alpha1.PoolerScaling{Mode: pgshardv1alpha1.ScalingHPA, HPA: &pgshardv1alpha1.HPAScaling{
 				MinReplicas: 2, MaxReplicas: 10, TargetCPUUtilizationPercentage: 65,
 			}}},
@@ -1648,6 +1807,40 @@ func validCluster() *pgshardv1alpha1.PgShardCluster {
 			Observability: pgshardv1alpha1.ObservabilitySpec{Prometheus: &prometheus},
 		},
 	}
+}
+
+func bootstrapForShard(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster, shard int32) pgshardv1alpha1.PostgreSQLBootstrapStatus {
+	t.Helper()
+	for _, bootstrap := range cluster.Status.PostgreSQLBootstraps {
+		if bootstrap.Shard == shard {
+			return bootstrap
+		}
+	}
+	t.Fatalf("PostgreSQL bootstrap for shard %d not found: %#v", shard, cluster.Status.PostgreSQLBootstraps)
+	return pgshardv1alpha1.PostgreSQLBootstrapStatus{}
+}
+
+func getPostgreSQLConfigMap(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) *corev1.ConfigMap {
+	t.Helper()
+	configurations := &corev1.ConfigMapList{}
+	if err := kubeClient.List(ctx, configurations, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	prefix := cluster.Name + owned.PostgreSQLConfigSuffix + "-"
+	var found *corev1.ConfigMap
+	for index := range configurations.Items {
+		if !strings.HasPrefix(configurations.Items[index].Name, prefix) {
+			continue
+		}
+		if found != nil {
+			t.Fatalf("multiple PostgreSQL configuration ConfigMaps found: %s and %s", found.Name, configurations.Items[index].Name)
+		}
+		found = configurations.Items[index].DeepCopy()
+	}
+	if found == nil {
+		t.Fatalf("PostgreSQL configuration ConfigMap with prefix %q not found", prefix)
+	}
+	return found
 }
 
 func newFakeClient(t *testing.T, objects ...client.Object) client.Client {

@@ -17,6 +17,7 @@ spec:
         memory: 4Gi
   storage:
     size: 4Gi
+    deletionPolicy: Retain
   pooler:
     scaling:
       mode: Fixed

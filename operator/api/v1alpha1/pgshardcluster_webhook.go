@@ -35,6 +35,9 @@ func (*PgShardClusterDefaulter) Default(_ context.Context, cluster *PgShardClust
 	if cluster.Spec.PostgreSQL.Version == "" {
 		cluster.Spec.PostgreSQL.Version = PostgreSQLMajor18
 	}
+	if cluster.Spec.Storage.DeletionPolicy == "" {
+		cluster.Spec.Storage.DeletionPolicy = DeletionRetain
+	}
 	defaultScaling(&cluster.Spec.Pooler.Scaling)
 	defaultService(&cluster.Spec.Services.ReadWrite)
 	defaultService(&cluster.Spec.Services.ReadOnly)
@@ -90,11 +93,23 @@ func (v *PgShardClusterValidator) ValidateUpdate(_ context.Context, oldCluster, 
 	if oldCluster.Spec.PostgreSQL.Version != newCluster.Spec.PostgreSQL.Version {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "postgresql", "version"), newCluster.Spec.PostgreSQL.Version, "PostgreSQL major is immutable"))
 	}
+	if oldCluster.Spec.Shards != newCluster.Spec.Shards {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "shards"), newCluster.Spec.Shards, "shards is immutable until online resharding is implemented"))
+	}
+	if oldCluster.Spec.MembersPerShard != newCluster.Spec.MembersPerShard {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "membersPerShard"), newCluster.Spec.MembersPerShard, "membersPerShard is immutable until membership transitions are implemented"))
+	}
+	if oldCluster.Spec.Durability != newCluster.Spec.Durability {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "durability"), newCluster.Spec.Durability, "durability is immutable until replication-mode transitions are implemented"))
+	}
 	if !equalOptionalString(oldCluster.Spec.Storage.StorageClassName, newCluster.Spec.Storage.StorageClassName) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "storageClassName"), newCluster.Spec.Storage.StorageClassName, "storage class is immutable after cluster creation"))
 	}
 	if !oldCluster.Spec.Storage.Size.Equal(newCluster.Spec.Storage.Size) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "size"), newCluster.Spec.Storage.Size.String(), "storage size is immutable until explicit PVC expansion is implemented"))
+	}
+	if oldCluster.Spec.Storage.DeletionPolicy != newCluster.Spec.Storage.DeletionPolicy {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "deletionPolicy"), newCluster.Spec.Storage.DeletionPolicy, "deletion policy is immutable after cluster creation"))
 	}
 	return warningsFor(newCluster), invalidIfAny(newCluster.Name, allErrs)
 }
@@ -173,6 +188,9 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 		if err := ValidateObjectReferenceName(*storageClass); err != nil {
 			allErrs = append(allErrs, field.Invalid(specPath.Child("storage", "storageClassName"), *storageClass, err.Error()))
 		}
+	}
+	if cluster.Spec.Storage.DeletionPolicy != DeletionRetain && cluster.Spec.Storage.DeletionPolicy != DeletionDelete {
+		allErrs = append(allErrs, field.NotSupported(specPath.Child("storage", "deletionPolicy"), cluster.Spec.Storage.DeletionPolicy, []string{string(DeletionRetain), string(DeletionDelete)}))
 	}
 
 	poolerMax, scalingErrs := validateScaling(cluster.Spec.Pooler.Scaling, specPath.Child("pooler", "scaling"))
