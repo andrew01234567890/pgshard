@@ -188,7 +188,15 @@ clean checkout. Pgwire-affecting pull requests and main-branch pushes run
 10,000 inputs per target in four parallel jobs; the scheduled workflow raises
 this to 100,000. The tooling is pinned to `cargo-fuzz` 0.13.2,
 `libfuzzer-sys` 0.4.13, and `nightly-2026-06-24`.
-Pure orchestrator tests exercise the standby-decoder attachment contract. They
+Pure orchestrator lease tests separate acquisition bookkeeping from execution
+authority. They inject descheduling after clock sampling, forward and backward
+wall steps, a backward step between the two wall samples, renewal, expiry, and
+higher-epoch replacement. An acquisition handle must revalidate the exact
+installed term, process-local monotonic deadline, catalog epoch, and fencing
+epoch at dispatch; expired and superseded handles fail closed. The receiving
+target still has to enforce that epoch because the local guard is an
+instant-in-time observation rather than a duration guarantee.
+Pure orchestrator tests also exercise the standby-decoder attachment contract. They
 require non-nil catalog generations encoded in slot names and matched exactly,
 an opaque test-only replay floor bound to the exact source identity, the
 current enabled two-phase mode and activation boundaries; a bounded
