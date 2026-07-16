@@ -2,10 +2,14 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pgshard_types::ShardId;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
+
+const DEFAULT_MAX_LEASE_TTL_MS: u64 = 15_000;
+const MAX_LEASE_TTL_MS: u64 = 300_000;
 
 /// Stable identity assigned to one orchestrator process.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -119,8 +123,6 @@ pub struct ExecutionPreconditions {
     pub catalog_epoch: u64,
     /// Fencing epoch the executor is about to install.
     pub fencing_epoch: u64,
-    /// Current Unix time in microseconds from the same execution decision.
-    pub now_unix_micros: u64,
 }
 
 /// Current lease for one shard.
@@ -204,10 +206,19 @@ struct OrchInner {
 }
 
 /// Thread-safe registry for operation IDs and shard leases.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct OrchState {
     inner: Arc<Mutex<OrchInner>>,
     max_lease_ttl_ms: u64,
+}
+
+impl Default for OrchState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(OrchInner::default())),
+            max_lease_ttl_ms: DEFAULT_MAX_LEASE_TTL_MS,
+        }
+    }
 }
 
 impl OrchState {
@@ -220,7 +231,7 @@ impl OrchState {
         identity: OrchestratorIdentity,
         max_lease_ttl_ms: u64,
     ) -> Result<Self, OrchError> {
-        if !(1..=300_000).contains(&max_lease_ttl_ms) {
+        if !(1..=MAX_LEASE_TTL_MS).contains(&max_lease_ttl_ms) {
             return Err(OrchError::InvalidMaximumLeaseTtl(max_lease_ttl_ms));
         }
         Ok(Self {
@@ -329,6 +340,28 @@ impl OrchState {
         request: LeaseRequest,
         execution: ExecutionPreconditions,
     ) -> Result<LeaseOutcome, OrchError> {
+        self.acquire_lease_with_clock(request, execution, trusted_unix_micros)
+    }
+
+    #[cfg(test)]
+    fn acquire_lease_at(
+        &self,
+        request: LeaseRequest,
+        execution: ExecutionPreconditions,
+        now_unix_micros: u64,
+    ) -> Result<LeaseOutcome, OrchError> {
+        self.acquire_lease_with_clock(request, execution, || Ok(now_unix_micros))
+    }
+
+    fn acquire_lease_with_clock<F>(
+        &self,
+        request: LeaseRequest,
+        execution: ExecutionPreconditions,
+        clock: F,
+    ) -> Result<LeaseOutcome, OrchError>
+    where
+        F: FnOnce() -> Result<u64, OrchError>,
+    {
         let mut inner = self
             .inner
             .lock()
@@ -351,8 +384,14 @@ impl OrchState {
                 requested: request.shard_id,
             });
         }
-        let now_unix_ms =
-            validate_execution(operation, &request, execution, self.max_lease_ttl_ms)?;
+        let now_unix_micros = clock()?;
+        let now_unix_ms = validate_execution(
+            operation,
+            &request,
+            execution,
+            now_unix_micros,
+            self.max_lease_ttl_ms,
+        )?;
         if let Some(existing) = inner.leases.get(&request.shard_id).cloned()
             && existing.expires_at_unix_ms > now_unix_ms
         {
@@ -420,6 +459,7 @@ fn validate_execution(
     operation: &OperationRecord,
     request: &LeaseRequest,
     execution: ExecutionPreconditions,
+    now_unix_micros: u64,
     max_lease_ttl_ms: u64,
 ) -> Result<u64, OrchError> {
     if operation.spec.required_catalog_epoch != execution.catalog_epoch {
@@ -439,11 +479,11 @@ fn validate_execution(
             requested: request.epoch,
         });
     }
-    if execution.now_unix_micros >= operation.spec.deadline_unix_micros {
+    if now_unix_micros >= operation.spec.deadline_unix_micros {
         return Err(OrchError::OperationDeadlineExceeded {
             operation_id: request.operation_id.clone(),
             deadline_unix_micros: operation.spec.deadline_unix_micros,
-            now_unix_micros: execution.now_unix_micros,
+            now_unix_micros,
         });
     }
     let deadline_unix_ms = operation.spec.deadline_unix_micros / 1_000;
@@ -454,7 +494,7 @@ fn validate_execution(
             requested_expiry_unix_ms: request.expires_at_unix_ms,
         });
     }
-    let now_unix_ms = execution.now_unix_micros.div_ceil(1_000);
+    let now_unix_ms = now_unix_micros.div_ceil(1_000);
     let Some(ttl_ms) = request.expires_at_unix_ms.checked_sub(now_unix_ms) else {
         return Err(OrchError::InvalidLeaseRequest);
     };
@@ -468,6 +508,13 @@ fn validate_execution(
         });
     }
     Ok(now_unix_ms)
+}
+
+fn trusted_unix_micros() -> Result<u64, OrchError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| OrchError::ClockUnavailable)?;
+    u64::try_from(elapsed.as_micros()).map_err(|_| OrchError::ClockUnavailable)
 }
 
 fn validate_operation_id(operation_id: &OperationId) -> Result<(), OrchError> {
@@ -489,6 +536,9 @@ pub enum OrchError {
     /// The authority was constructed with an unsafe lease policy.
     #[error("maximum lease TTL {0} ms must be between 1 and 300000 ms")]
     InvalidMaximumLeaseTtl(u64),
+    /// The process clock cannot supply a representable Unix timestamp.
+    #[error("orchestrator process clock cannot supply Unix microseconds")]
+    ClockUnavailable,
     /// State has no stable operator-assigned identity.
     #[error("orchestrator identity is missing")]
     IdentityMissing,
@@ -654,12 +704,20 @@ mod tests {
         OrchState::with_identity(identity(), 100).expect("valid lease policy")
     }
 
-    fn execution(fencing_epoch: u64, now_unix_ms: u64) -> ExecutionPreconditions {
+    fn execution(fencing_epoch: u64) -> ExecutionPreconditions {
         ExecutionPreconditions {
             catalog_epoch: 7,
             fencing_epoch,
-            now_unix_micros: now_unix_ms * 1_000,
         }
+    }
+
+    fn acquire_at(
+        state: &OrchState,
+        request: LeaseRequest,
+        fencing_epoch: u64,
+        now_unix_ms: u64,
+    ) -> Result<LeaseOutcome, OrchError> {
+        state.acquire_lease_at(request, execution(fencing_epoch), now_unix_ms * 1_000)
     }
 
     fn lease(id: &str, owner: &str, epoch: u64, expires: u64) -> LeaseRequest {
@@ -674,10 +732,12 @@ mod tests {
 
     #[test]
     fn readiness_requires_identity() {
+        let unconfigured = OrchState::default();
         assert_eq!(
-            OrchState::default().readiness().reason,
+            unconfigured.readiness().reason,
             OrchReadinessReason::IdentityMissing
         );
+        assert_eq!(unconfigured.max_lease_ttl_ms, DEFAULT_MAX_LEASE_TTL_MS);
         assert_eq!(
             state().readiness(),
             OrchReadiness {
@@ -741,30 +801,24 @@ mod tests {
             .expect("register");
         let request = lease("op-1", "orch-0", 11, 200);
         assert_eq!(
-            state
-                .acquire_lease(request.clone(), execution(11, 100))
-                .expect("acquire"),
+            acquire_at(&state, request.clone(), 11, 100).expect("acquire"),
             LeaseOutcome::Acquired
         );
         assert_eq!(
-            state
-                .acquire_lease(request, execution(11, 100))
-                .expect("idempotent"),
+            acquire_at(&state, request, 11, 100).expect("idempotent"),
             LeaseOutcome::Existing
         );
         assert_eq!(
-            state
-                .acquire_lease(lease("op-1", "orch-0", 11, 250), execution(11, 150),)
-                .expect("renew"),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 250), 11, 150).expect("renew"),
             LeaseOutcome::Renewed
         );
         assert_eq!(state.snapshot().leases[0].expires_at_unix_ms, 250);
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 240), execution(11, 150)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 240), 11, 150),
             Err(OrchError::RegressiveLeaseExpiry { .. })
         ));
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-1", 11, 250), execution(11, 150)),
+            acquire_at(&state, lease("op-1", "orch-1", 11, 250), 11, 150),
             Err(OrchError::LeaseOwnerMismatch { .. })
         ));
 
@@ -772,7 +826,7 @@ mod tests {
             .register_operation(operation_with_fence("op-2", 1, OperationKind::Backup, 12))
             .expect("register competitor");
         assert!(matches!(
-            state.acquire_lease(lease("op-2", "orch-0", 12, 250), execution(12, 150)),
+            acquire_at(&state, lease("op-2", "orch-0", 12, 250), 12, 150),
             Err(OrchError::LeaseHeld { .. })
         ));
     }
@@ -783,11 +837,9 @@ mod tests {
         state
             .register_operation(operation("op-1", 1, OperationKind::Failover))
             .expect("register");
-        state
-            .acquire_lease(lease("op-1", "orch-0", 11, 200), execution(11, 100))
-            .expect("acquire");
+        acquire_at(&state, lease("op-1", "orch-0", 11, 200), 11, 100).expect("acquire");
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 300), execution(11, 200)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 300), 11, 200),
             Err(OrchError::StaleEpoch {
                 requested: 11,
                 minimum: 12
@@ -797,9 +849,7 @@ mod tests {
             .register_operation(operation_with_fence("op-2", 1, OperationKind::Failover, 12))
             .expect("register next term");
         assert_eq!(
-            state
-                .acquire_lease(lease("op-2", "orch-0", 12, 300), execution(12, 200))
-                .expect("new term"),
+            acquire_at(&state, lease("op-2", "orch-0", 12, 300), 12, 200).expect("new term"),
             LeaseOutcome::Acquired
         );
     }
@@ -808,9 +858,88 @@ mod tests {
     fn unknown_operation_cannot_acquire_lease() {
         let state = state();
         assert!(matches!(
-            state.acquire_lease(lease("missing", "orch-0", 1, 200), execution(1, 100)),
+            acquire_at(&state, lease("missing", "orch-0", 1, 200), 1, 100),
             Err(OrchError::UnknownOperation(_))
         ));
+    }
+
+    #[test]
+    fn public_lease_liveness_uses_the_process_clock() {
+        let state = state();
+        state
+            .register_operation(operation("expired", 1, OperationKind::Backup))
+            .expect("register expired operation");
+        assert!(matches!(
+            state.acquire_lease(lease("expired", "orch-0", 11, 200), execution(11),),
+            Err(OrchError::OperationDeadlineExceeded { .. })
+        ));
+        assert!(state.snapshot().leases.is_empty());
+    }
+
+    #[test]
+    fn process_clock_failure_is_fail_closed() {
+        let state = state();
+        state
+            .register_operation(operation("clock-error", 1, OperationKind::Backup))
+            .expect("register operation");
+        assert!(matches!(
+            state.acquire_lease_with_clock(
+                lease("clock-error", "orch-0", 11, 200),
+                execution(11),
+                || Err(OrchError::ClockUnavailable),
+            ),
+            Err(OrchError::ClockUnavailable)
+        ));
+        assert!(state.snapshot().leases.is_empty());
+    }
+
+    #[test]
+    fn concurrent_dual_writers_cannot_both_acquire_one_shard() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register first writer");
+        state
+            .register_operation(operation_with_fence(
+                "writer-2",
+                1,
+                OperationKind::Failover,
+                12,
+            ))
+            .expect("register second writer");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let first_state = state.clone();
+            let first_barrier = Arc::clone(&barrier);
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                acquire_at(&first_state, lease("writer-1", "orch-0", 11, 200), 11, 100)
+            });
+            let second_state = state.clone();
+            let second = scope.spawn(move || {
+                barrier.wait();
+                acquire_at(&second_state, lease("writer-2", "orch-0", 12, 200), 12, 100)
+            });
+            [
+                first.join().expect("first writer thread"),
+                second.join().expect("second writer thread"),
+            ]
+        });
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(LeaseOutcome::Acquired)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(OrchError::LeaseHeld { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(state.snapshot().leases.len(), 1);
     }
 
     #[test]
@@ -845,12 +974,13 @@ mod tests {
                 u64::MAX - 1,
             ))
             .expect("register");
-        state
-            .acquire_lease(
-                lease("op-1", "orch-0", u64::MAX - 1, 200),
-                execution(u64::MAX - 1, 100),
-            )
-            .expect("acquire");
+        acquire_at(
+            &state,
+            lease("op-1", "orch-0", u64::MAX - 1, 200),
+            u64::MAX - 1,
+            100,
+        )
+        .expect("acquire");
         let json = serde_json::to_value(state.snapshot()).expect("serialize status");
         assert_eq!(json["leases"][0]["epoch"], (u64::MAX - 1).to_string());
         assert_eq!(json["leases"][0]["expires_at_unix_ms"], "200");
@@ -864,20 +994,18 @@ mod tests {
             .expect("register");
         let request = lease("op-1", "orch-0", 11, 200);
 
-        let mut wrong_catalog = execution(11, 100);
+        let mut wrong_catalog = execution(11);
         wrong_catalog.catalog_epoch = 8;
         assert!(matches!(
-            state.acquire_lease(request.clone(), wrong_catalog),
+            state.acquire_lease_at(request.clone(), wrong_catalog, 100_000),
             Err(OrchError::CatalogEpochMismatch { .. })
         ));
         assert!(matches!(
-            state.acquire_lease(request.clone(), execution(12, 100)),
+            state.acquire_lease_at(request.clone(), execution(12), 100_000),
             Err(OrchError::ExecutionFencingEpochMismatch { .. })
         ));
-        let mut expired = execution(11, 100);
-        expired.now_unix_micros = 1_000_000;
         assert!(matches!(
-            state.acquire_lease(request, expired),
+            state.acquire_lease_at(request, execution(11), 1_000_000),
             Err(OrchError::OperationDeadlineExceeded { .. })
         ));
 
@@ -926,22 +1054,22 @@ mod tests {
             .register_operation(operation("op-1", 1, OperationKind::Backup))
             .expect("register");
         assert_eq!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 100), execution(11, 100)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 100), 11, 100),
             Err(OrchError::InvalidLeaseRequest)
         );
         assert_eq!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 201), execution(11, 100)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 201), 11, 100),
             Err(OrchError::LeaseTtlExceeded {
                 requested_ms: 101,
                 maximum_ms: 100,
             })
         );
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, u64::MAX), execution(11, 100)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, u64::MAX), 11, 100),
             Err(OrchError::LeasePastOperationDeadline { .. })
         ));
         assert!(matches!(
-            state.acquire_lease(lease("op-1", "orch-0", 11, 1_001), execution(11, 900)),
+            acquire_at(&state, lease("op-1", "orch-0", 11, 1_001), 11, 900),
             Err(OrchError::LeasePastOperationDeadline { .. })
         ));
     }

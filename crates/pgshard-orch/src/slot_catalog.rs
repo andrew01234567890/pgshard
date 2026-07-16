@@ -8,13 +8,14 @@
 
 use std::time::Duration;
 
-use pgshard_catalog::CatalogOperationTimeout;
+use pgshard_catalog::{CatalogOperationTimeout, SHARDSCHEMA_DATABASE};
 use pgshard_types::{CatalogEpoch, PgLsn};
 use thiserror::Error;
 use tokio::time::{Instant, timeout_at};
 use tokio_postgres::{Client, IsolationLevel, Row, Transaction};
 use uuid::Uuid;
 
+use crate::parse_lsn;
 use crate::standby_slots::{
     ManagedSlotTarget, ManagedSlotTargetError, ManagedTwoPhasePolicy, ReplicationSlotName,
     ReplicationSourceIdentity, SlotGeneration, SlotGenerationError, SlotNameError,
@@ -23,8 +24,9 @@ use crate::standby_slots::{
 };
 
 const REQUIREMENTS_SQL: &str = "\
-    SELECT current_setting('server_version_num')::integer, current_database(), \
-           pg_catalog.getdatabaseencoding()";
+    SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4, \
+           pg_catalog.current_database()::pg_catalog.text, \
+           pg_catalog.getdatabaseencoding()::pg_catalog.text";
 
 const SINGLETONS_SQL: &str = "\
     SELECT ( \
@@ -100,8 +102,6 @@ const STANDBY_POLICY_SQL: &str = "\
        AND attachments.state = 'active' \
      LIMIT 2";
 
-/// Dedicated catalog database name for the Milestone 1 placement.
-const SHARDSCHEMA_DATABASE: &str = "shardschema";
 const MIN_POSTGRES_VERSION_NUM: i32 = 180_000;
 // The client deadline is authoritative. A slightly earlier statement timeout
 // gives PostgreSQL time to cancel a lock wait and process ROLLBACK so the
@@ -109,6 +109,7 @@ const MIN_POSTGRES_VERSION_NUM: i32 = 180_000;
 // timeout remains the fail-closed backstop for a stalled COMMIT or backend.
 const SERVER_STATEMENT_TIMEOUT_HEADROOM: Duration = Duration::from_millis(25);
 const SERVER_TRANSACTION_TIMEOUT_GRACE: Duration = Duration::from_millis(101);
+const PIN_SEARCH_PATH_SQL: &str = "SELECT pg_catalog.set_config('search_path', '', false)";
 const SET_SESSION_TIMEOUTS_SQL: &str = "\
     SELECT pg_catalog.set_config('statement_timeout', $1, false), \
            pg_catalog.set_config('transaction_timeout', $2, false)";
@@ -312,6 +313,7 @@ impl SlotCatalogReader {
         let deadline = Instant::now() + timeout;
         let construction = async {
             client.batch_execute("DISCARD ALL").await?;
+            client.query_one(PIN_SEARCH_PATH_SQL, &[]).await?;
             set_session_timeouts(&client, deadline).await?;
             let requirements = client.query_one(REQUIREMENTS_SQL, &[]).await?;
             client.batch_execute(RESET_SESSION_TIMEOUTS_SQL).await?;
@@ -816,16 +818,6 @@ fn required_i64(row: &Row, field: &'static str) -> Result<i64, SlotCatalogLoadEr
 fn required_bool(row: &Row, field: &'static str) -> Result<bool, SlotCatalogLoadError> {
     row.try_get::<_, Option<bool>>(field)?
         .ok_or(SlotCatalogLoadError::IncompleteReadyPolicy(field))
-}
-
-fn parse_lsn(value: &str) -> Option<PgLsn> {
-    let (high, low) = value.split_once('/')?;
-    if high.is_empty() || high.len() > 8 || low.is_empty() || low.len() > 8 {
-        return None;
-    }
-    let high = u32::from_str_radix(high, 16).ok()?;
-    let low = u32::from_str_radix(low, 16).ok()?;
-    Some(PgLsn((u64::from(high) << 32) | u64::from(low)))
 }
 
 /// Fail-closed catalog-policy loading error.

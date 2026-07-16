@@ -214,7 +214,10 @@ oversized fence is rejected before dispatch. The primary fixture waits for the
 continuous worker to materialize the exact synchronized standby copy, then
 requires that copy to disappear after primary deletion. It also proves a
 PostgreSQL 17 pre-dispatch drop rejection returns the receipt before retrying
-cleanup on PostgreSQL 18. Unit tests cover the exposed known-versus-unknown classification,
+cleanup on PostgreSQL 18. The same fixture gates the drop after inactive-slot
+preflight, starts a real logical-replication session, and proves PostgreSQL 18's
+exact `object_in_use` rejection preserves that receipt until the stream exits
+and a later bounded drop succeeds. Unit tests cover the exposed known-versus-unknown classification,
 a blocked preflight and delayed CREATE preparation crossing proof expiry,
 expired proof and operation-deadline boundaries that never poll the dispatch callback,
 unsigned high-bit receiver timelines,

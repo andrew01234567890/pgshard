@@ -10,6 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use bytes::BytesMut;
 use pgshard_catalog::{CatalogOperationTimeout, MIGRATION_SQL};
 use pgshard_orch::{
     slot_mutator::{
@@ -42,6 +43,10 @@ use pgshard_orch::{
     },
 };
 use pgshard_types::{CatalogEpoch, PgLsn};
+use postgres_protocol::{
+    authentication::sasl::{ChannelBinding, SCRAM_SHA_256, ScramSha256},
+    message::{backend::Message as BackendMessage, frontend},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, tcp},
@@ -50,7 +55,8 @@ use tokio::{
     time::{Instant, sleep, timeout, timeout_at},
 };
 use tokio_postgres::{
-    Client, Config, Connection, GenericClient, NoTls, error::SqlState, types::PgLsn as WirePgLsn,
+    Client, Config, Connection, GenericClient, NoTls, config::Host, error::SqlState,
+    types::PgLsn as WirePgLsn,
 };
 use url::Url;
 use uuid::Uuid;
@@ -253,6 +259,7 @@ struct CommitResponseLossProxy {
 }
 
 type TargetGateArm = (
+    Option<Vec<u8>>,
     oneshot::Sender<()>,
     oneshot::Sender<()>,
     oneshot::Receiver<()>,
@@ -325,7 +332,7 @@ async fn run_target_preflight_gate_proxy(
     upstream.set_nodelay(true)?;
     let (mut downstream_read, mut downstream_write) = downstream.into_split();
     let (mut upstream_read, mut upstream_write) = upstream.into_split();
-    let (acknowledge_armed, blocked, release) = Box::pin(relay_until_target_gate_armed(
+    let (marker, acknowledge_armed, blocked, release) = Box::pin(relay_until_target_gate_armed(
         &mut downstream_read,
         &mut downstream_write,
         &mut upstream_read,
@@ -336,27 +343,42 @@ async fn run_target_preflight_gate_proxy(
     acknowledge_armed
         .send(())
         .map_err(|()| io::Error::other("target gate arm acknowledgement was dropped"))?;
-    let mut blocked_frontend = [0_u8; 8192];
-    let blocked_bytes = timeout(
-        CONNECTION_EXIT_TIMEOUT,
-        downstream_read.read(&mut blocked_frontend),
-    )
-    .await
-    .map_err(|_| io::Error::other("target preflight did not reach the armed gate"))??;
-    if blocked_bytes == 0 {
-        return Err(
-            io::Error::other("target client closed before preflight reached the gate").into(),
-        );
-    }
+    let blocked_frontend = if let Some(marker) = marker {
+        Box::pin(timeout(
+            CONNECTION_EXIT_TIMEOUT,
+            relay_until_frontend_marker(
+                &mut downstream_read,
+                &mut downstream_write,
+                &mut upstream_read,
+                &mut upstream_write,
+                &marker,
+            ),
+        ))
+        .await
+        .map_err(|_| io::Error::other("target statement did not reach the armed gate"))??
+    } else {
+        let mut blocked_frontend = vec![0_u8; 8192];
+        let blocked_bytes = timeout(
+            CONNECTION_EXIT_TIMEOUT,
+            downstream_read.read(&mut blocked_frontend),
+        )
+        .await
+        .map_err(|_| io::Error::other("target preflight did not reach the armed gate"))??;
+        if blocked_bytes == 0 {
+            return Err(
+                io::Error::other("target client closed before preflight reached the gate").into(),
+            );
+        }
+        blocked_frontend.truncate(blocked_bytes);
+        blocked_frontend
+    };
     blocked
         .send(())
         .map_err(|()| io::Error::other("target gate blocked-query observer was dropped"))?;
     release
         .await
         .map_err(|_| io::Error::other("target gate release authority was dropped"))?;
-    upstream_write
-        .write_all(&blocked_frontend[..blocked_bytes])
-        .await?;
+    upstream_write.write_all(&blocked_frontend).await?;
     upstream_write.flush().await?;
 
     tokio::select! {
@@ -368,6 +390,66 @@ async fn run_target_preflight_gate_proxy(
         }
     }
     Ok(())
+}
+
+async fn relay_until_frontend_marker(
+    downstream_read: &mut tcp::OwnedReadHalf,
+    downstream_write: &mut tcp::OwnedWriteHalf,
+    upstream_read: &mut tcp::OwnedReadHalf,
+    upstream_write: &mut tcp::OwnedWriteHalf,
+    marker: &[u8],
+) -> TestResult<Vec<u8>> {
+    if marker.is_empty() {
+        return Err(io::Error::other("target statement marker must not be empty").into());
+    }
+    let mut pending = Vec::new();
+    let mut frontend = [0_u8; 8192];
+    let mut backend = [0_u8; 8192];
+    loop {
+        tokio::select! {
+            read = downstream_read.read(&mut frontend) => {
+                let read = read?;
+                if read == 0 {
+                    return Err(io::Error::other("target client closed before the marked statement").into());
+                }
+                pending.extend_from_slice(&frontend[..read]);
+                loop {
+                    if pending.len() < 5 {
+                        break;
+                    }
+                    let message_length = usize::try_from(u32::from_be_bytes([
+                        pending[1], pending[2], pending[3], pending[4],
+                    ]))?;
+                    if !(4..=MAX_PROXY_FRAME_BYTES).contains(&message_length) {
+                        return Err(io::Error::other("target client sent an invalid frontend frame length").into());
+                    }
+                    let total_length = message_length.checked_add(1).ok_or_else(|| {
+                        io::Error::other("target frontend frame length overflowed")
+                    })?;
+                    if pending.len() < total_length {
+                        break;
+                    }
+                    if pending[..total_length]
+                        .windows(marker.len())
+                        .any(|window| window == marker)
+                    {
+                        return Ok(pending);
+                    }
+                    upstream_write.write_all(&pending[..total_length]).await?;
+                    upstream_write.flush().await?;
+                    pending.drain(..total_length);
+                }
+            }
+            read = upstream_read.read(&mut backend) => {
+                let read = read?;
+                if read == 0 {
+                    return Err(io::Error::other("target server closed before the marked statement").into());
+                }
+                downstream_write.write_all(&backend[..read]).await?;
+                downstream_write.flush().await?;
+            }
+        }
+    }
 }
 
 async fn relay_until_target_gate_armed(
@@ -623,6 +705,13 @@ fn pg_lsn_text(lsn: PgLsn) -> String {
     format!("{:X}/{:X}", lsn.0 >> 32, lsn.0 & u64::from(u32::MAX))
 }
 
+fn active_drop_publication(target: &ManagedSlotTarget) -> String {
+    format!(
+        "pgshard_drop_race_{}",
+        &target.generation().as_uuid().simple().to_string()[..16]
+    )
+}
+
 fn expected_synced_anchor() -> TestResult<ManagedSlotTarget> {
     let generation = SlotGeneration::new(Uuid::from_u128(1))?;
     Ok(ManagedSlotTarget::new(
@@ -756,6 +845,36 @@ async fn wait_for_synchronized_copy(
     let connection_result = finish_connection(connection_task).await;
     result?;
     connection_result
+}
+
+async fn wait_for_slot_activity(
+    client: &Client,
+    target: &ManagedSlotTarget,
+    expected_active: bool,
+) -> TestResult {
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        let row = timeout_at(
+            deadline,
+            client.query_opt(
+                "SELECT active, active_pid IS NOT NULL \
+                   FROM pg_catalog.pg_replication_slots \
+                  WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name",
+                &[&target.name().as_str()],
+            ),
+        )
+        .await
+        .map_err(|_| io::Error::other("slot-activity observation exceeded the bound"))??
+        .ok_or_else(|| io::Error::other("managed slot disappeared during activity race"))?;
+        let active: bool = row.try_get(0)?;
+        let active_pid_present: bool = row.try_get(1)?;
+        if active == expected_active && active_pid_present == expected_active {
+            return Ok(());
+        }
+        timeout_at(deadline, sleep(CLEANUP_RETRY_INTERVAL))
+            .await
+            .map_err(|_| io::Error::other("slot activity did not reach the expected state"))?;
+    }
 }
 
 async fn cleanup_slot(client: &Client, target: &ManagedSlotTarget) -> TestResult {
@@ -956,6 +1075,13 @@ async fn cleanup_primary_mutation_fixture(
     hostile_schema: &str,
     mutation_role: &str,
 ) -> TestResult {
+    let publication = active_drop_publication(target);
+    let publication_cleanup = timeout(
+        CLEANUP_TIMEOUT,
+        client.batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication}")),
+    )
+    .await
+    .map_err(|_| io::Error::other("drop-race publication cleanup exceeded the bound"));
     let fixture_cleanup =
         cleanup_observation_fixture(client, std::slice::from_ref(target), hostile_schema).await;
     let role_cleanup = timeout(
@@ -964,6 +1090,7 @@ async fn cleanup_primary_mutation_fixture(
     )
     .await
     .map_err(|_| io::Error::other("mutation-role cleanup exceeded the bound"))?;
+    publication_cleanup??;
     fixture_cleanup?;
     role_cleanup?;
     wait_for_synchronized_copy(standby_database_url, target, false).await?;
@@ -1259,6 +1386,310 @@ async fn recover_receipt_after_legacy_drop_rejection(
         LocalSlotMutationError::UnsupportedPostgresVersion(_)
     ));
     Ok(receipt)
+}
+
+async fn read_backend_message(
+    stream: &mut TcpStream,
+    buffer: &mut BytesMut,
+) -> TestResult<BackendMessage> {
+    loop {
+        if let Some(message) = BackendMessage::parse(buffer)? {
+            return Ok(message);
+        }
+        if buffer.len() >= MAX_PROXY_FRAME_BYTES {
+            return Err(io::Error::other("replication startup response exceeded the bound").into());
+        }
+        if stream.read_buf(buffer).await? == 0 {
+            return Err(io::Error::other("replication server closed during startup").into());
+        }
+    }
+}
+
+fn replication_connection_parts(
+    database_url: &str,
+) -> TestResult<(String, u16, String, Vec<u8>, String)> {
+    let config: Config = database_url.parse()?;
+    let host = match config.get_hosts() {
+        [Host::Tcp(host)] => host.clone(),
+        _ => {
+            return Err(io::Error::other("replication test requires exactly one TCP host").into());
+        }
+    };
+    let port = match config.get_ports() {
+        [] => 5432,
+        [port] => *port,
+        _ => {
+            return Err(io::Error::other("replication test requires exactly one TCP port").into());
+        }
+    };
+    let user = config
+        .get_user()
+        .ok_or_else(|| io::Error::other("replication test URL must specify a user"))?
+        .to_owned();
+    let password = config
+        .get_password()
+        .ok_or_else(|| io::Error::other("replication test URL must specify a password"))?
+        .to_vec();
+    let database = config
+        .get_dbname()
+        .ok_or_else(|| io::Error::other("replication test URL must specify a database"))?
+        .to_owned();
+    Ok((host, port, user, password, database))
+}
+
+async fn send_frontend_message(stream: &mut TcpStream, message: &BytesMut) -> TestResult {
+    stream.write_all(message).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn start_logical_replication_stream(
+    database_url: &str,
+    target: &ManagedSlotTarget,
+    publication: &str,
+) -> TestResult<TcpStream> {
+    let (host, port, user, password, database) = replication_connection_parts(database_url)?;
+    let mut stream = TcpStream::connect((host.as_str(), port)).await?;
+    stream.set_nodelay(true)?;
+    let mut frontend_message = BytesMut::new();
+    frontend::startup_message(
+        [
+            ("client_encoding", "UTF8"),
+            ("user", user.as_str()),
+            ("database", database.as_str()),
+            ("replication", "database"),
+        ],
+        &mut frontend_message,
+    )?;
+    send_frontend_message(&mut stream, &frontend_message).await?;
+
+    let mut backend_buffer = BytesMut::new();
+    let mut scram = None;
+    let mut scram_finished = false;
+    let mut authenticated = false;
+    loop {
+        match read_backend_message(&mut stream, &mut backend_buffer).await? {
+            BackendMessage::AuthenticationSasl(_) => {
+                if scram.is_some() {
+                    return Err(io::Error::other("duplicate SCRAM challenge").into());
+                }
+                let state = ScramSha256::new(&password, ChannelBinding::unsupported());
+                frontend_message.clear();
+                frontend::sasl_initial_response(
+                    SCRAM_SHA_256,
+                    state.message(),
+                    &mut frontend_message,
+                )?;
+                send_frontend_message(&mut stream, &frontend_message).await?;
+                scram = Some(state);
+            }
+            BackendMessage::AuthenticationSaslContinue(challenge) => {
+                let state = scram
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("SCRAM continuation preceded its challenge"))?;
+                state.update(challenge.data())?;
+                frontend_message.clear();
+                frontend::sasl_response(state.message(), &mut frontend_message)?;
+                send_frontend_message(&mut stream, &frontend_message).await?;
+            }
+            BackendMessage::AuthenticationSaslFinal(final_message) => {
+                scram
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("SCRAM final preceded its challenge"))?
+                    .finish(final_message.data())?;
+                scram_finished = true;
+            }
+            BackendMessage::AuthenticationOk if scram_finished => authenticated = true,
+            BackendMessage::BackendKeyData(_)
+            | BackendMessage::NoticeResponse(_)
+            | BackendMessage::ParameterStatus(_) => {}
+            BackendMessage::ReadyForQuery(_) if authenticated => break,
+            BackendMessage::ErrorResponse(_) => {
+                return Err(io::Error::other("replication startup was rejected").into());
+            }
+            _ => {
+                return Err(io::Error::other("unexpected replication startup response").into());
+            }
+        }
+    }
+
+    frontend_message.clear();
+    frontend::query(
+        &format!(
+            "START_REPLICATION SLOT {} LOGICAL 0/0 (proto_version '1', publication_names '{}')",
+            target.name().as_str(),
+            publication
+        ),
+        &mut frontend_message,
+    )?;
+    send_frontend_message(&mut stream, &frontend_message).await?;
+    loop {
+        let mut header = [0_u8; 5];
+        stream.read_exact(&mut header).await?;
+        let frame_length = usize::try_from(u32::from_be_bytes([
+            header[1], header[2], header[3], header[4],
+        ]))?;
+        if !(4..=MAX_PROXY_FRAME_BYTES).contains(&frame_length) {
+            return Err(io::Error::other("invalid replication response length").into());
+        }
+        let mut payload = vec![0_u8; frame_length - 4];
+        stream.read_exact(&mut payload).await?;
+        match header[0] {
+            b'W' => return Ok(stream),
+            b'N' => {}
+            b'E' => return Err(io::Error::other("logical replication was rejected").into()),
+            _ => {
+                return Err(io::Error::other("unexpected logical replication response").into());
+            }
+        }
+    }
+}
+
+struct ActiveLogicalReplicationStream {
+    observer: Client,
+    observer_task: AbortOnDropConnectionTask,
+    stream: TcpStream,
+    target: ManagedSlotTarget,
+    publication: String,
+}
+
+impl ActiveLogicalReplicationStream {
+    async fn start(database_url: &str, target: ManagedSlotTarget) -> TestResult<Self> {
+        let publication = active_drop_publication(&target);
+        let (observer, observer_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+        let observer_task = AbortOnDropConnectionTask::new(tokio::spawn(observer_connection));
+        observer
+            .batch_execute(&format!("CREATE PUBLICATION {publication}"))
+            .await?;
+        let stream = timeout(
+            CONNECTION_EXIT_TIMEOUT,
+            start_logical_replication_stream(database_url, &target, &publication),
+        )
+        .await
+        .map_err(|_| io::Error::other("logical replication startup exceeded the bound"))??;
+        wait_for_slot_activity(&observer, &target, true).await?;
+        Ok(Self {
+            observer,
+            observer_task,
+            stream,
+            target,
+            publication,
+        })
+    }
+
+    async fn release(mut self) -> TestResult {
+        self.stream.shutdown().await?;
+        drop(self.stream);
+        wait_for_slot_activity(&self.observer, &self.target, false).await?;
+        self.observer
+            .batch_execute(&format!("DROP PUBLICATION {}", self.publication))
+            .await?;
+        drop(self.observer);
+        self.observer_task
+            .finish("active-drop observer connection")
+            .await
+    }
+}
+
+async fn recover_receipt_after_active_drop_rejection(
+    database_url: &str,
+    hostile_schema: &str,
+    mutation_role: &str,
+    receipt: ManagedLogicalSlotReceipt,
+) -> TestResult<ManagedLogicalSlotReceipt> {
+    let target = receipt.target().clone();
+    let TargetPreflightGateProxy {
+        database_url: gated_database_url,
+        arm,
+        task: gate_task,
+    } = start_target_preflight_gate_proxy(database_url).await?;
+    let mut gate_task = AbortOnDropTask::new(gate_task);
+    let mut gated_config: Config = gated_database_url.parse()?;
+    gated_config.options(format!("-csearch_path={hostile_schema},pg_catalog"));
+    let (target_client, target_connection) = gated_config.connect(NoTls).await?;
+    let target_connection =
+        fence_mutation_session(&target_client, target_connection, mutation_role, &target).await?;
+    let (catalog_client, catalog_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (armed_acknowledgement, armed) = oneshot::channel();
+    let (blocked_sender, blocked) = oneshot::channel();
+    let (release_gate, gate_release) = oneshot::channel();
+    arm.send((
+        Some(b"pg_catalog.pg_drop_replication_slot".to_vec()),
+        armed_acknowledgement,
+        blocked_sender,
+        gate_release,
+    ))
+    .map_err(|_| io::Error::other("active-drop gate exited before it was armed"))?;
+    timeout(CONNECTION_EXIT_TIMEOUT, armed)
+        .await
+        .map_err(|_| io::Error::other("active-drop gate arm exceeded the bound"))?
+        .map_err(|_| io::Error::other("active-drop gate exited before acknowledgement"))?;
+
+    let mut drop_attempt = AbortOnDropTask::new(tokio::spawn(async move {
+        drop_managed_logical_slot(
+            catalog_client,
+            catalog_connection,
+            target_client,
+            target_connection,
+            CatalogOperationTimeout::default(),
+            receipt,
+        )
+        .await
+    }));
+    timeout(CONNECTION_EXIT_TIMEOUT, blocked)
+        .await
+        .map_err(|_| io::Error::other("drop preparation did not reach the dispatch gate"))?
+        .map_err(|_| io::Error::other("active-drop gate closed before dispatch"))?;
+    assert!(
+        !drop_attempt.task().is_finished(),
+        "the prepared drop must remain blocked before dispatch"
+    );
+    let active_stream = ActiveLogicalReplicationStream::start(database_url, target.clone()).await?;
+
+    release_gate
+        .send(())
+        .map_err(|()| io::Error::other("active-drop gate exited before release"))?;
+    let error = timeout(CONNECTION_EXIT_TIMEOUT, drop_attempt.task_mut())
+        .await
+        .map_err(|_| io::Error::other("active-slot drop did not reject in time"))??
+        .expect_err("PostgreSQL must reject a drop raced by an active decoder");
+    let (receipt, source) = error
+        .into_retry_receipt()
+        .expect("object_in_use must preserve the sole retry receipt");
+    assert!(matches!(
+        source,
+        LocalSlotMutationError::DropRejected {
+            target: ref rejected_target,
+            source: ref postgres,
+        } if rejected_target == &target
+            && postgres
+                .as_db_error()
+                .is_some_and(|error| error.code() == &SqlState::OBJECT_IN_USE)
+    ));
+    timeout(CONNECTION_EXIT_TIMEOUT, gate_task.task_mut())
+        .await
+        .map_err(|_| io::Error::other("active-drop gate did not finish in time"))???;
+    active_stream.release().await?;
+    Ok(receipt)
+}
+
+async fn recover_receipt_after_drop_rejections(
+    database_url: &str,
+    legacy_database_url: &str,
+    hostile_schema: &str,
+    mutation_role: &str,
+    receipt: ManagedLogicalSlotReceipt,
+) -> TestResult<ManagedLogicalSlotReceipt> {
+    let receipt =
+        recover_receipt_after_legacy_drop_rejection(database_url, legacy_database_url, receipt)
+            .await?;
+    recover_receipt_after_active_drop_rejection(
+        database_url,
+        hostile_schema,
+        mutation_role,
+        receipt,
+    )
+    .await
 }
 
 async fn assert_oversized_advisory_fence_rejected(
@@ -1997,7 +2428,7 @@ async fn run_catalog_creation_backend_loss_fixture(
     let (armed_acknowledgement, armed) = oneshot::channel();
     let (blocked_sender, blocked) = oneshot::channel();
     let (release_gate, gate_release) = oneshot::channel();
-    arm.send((armed_acknowledgement, blocked_sender, gate_release))
+    arm.send((None, armed_acknowledgement, blocked_sender, gate_release))
         .map_err(|_| io::Error::other("target preflight gate exited before it was armed"))?;
     timeout(CONNECTION_EXIT_TIMEOUT, armed)
         .await
@@ -2299,6 +2730,40 @@ async fn setup_primary_mutation_role(
     Ok(role_oid)
 }
 
+async fn drop_and_retire_primary_slot(
+    database_url: &str,
+    standby_database_url: &str,
+    hostile_config: &Config,
+    mutation_role: &str,
+    target: &ManagedSlotTarget,
+    retiring: &CatalogSlotSyncProbe,
+    receipt: ManagedLogicalSlotReceipt,
+) -> TestResult {
+    let (catalog_client, catalog_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (client, connection) = hostile_config.connect(NoTls).await?;
+    let connection = fence_mutation_session(&client, connection, mutation_role, target).await?;
+    let mut drop_receipt = drop_managed_logical_slot(
+        catalog_client,
+        catalog_connection,
+        client,
+        connection,
+        CatalogOperationTimeout::default(),
+        receipt,
+    )
+    .await?;
+    wait_for_synchronized_copy(standby_database_url, target, false).await?;
+    let retired = complete_catalog_probe_retirement(retiring, &mut drop_receipt).await?;
+    assert_eq!(retired.state(), SlotSyncProbeState::Retired);
+    release_known_drop_while_registry_row_is_blocked(database_url, drop_receipt).await?;
+    let absent = observe(
+        database_url,
+        &LogicalSlotObservationRequest::new(vec![target.clone()])?,
+    )
+    .await?;
+    assert!(absent.entries()[0].observation().is_none());
+    Ok(())
+}
+
 async fn run_primary_mutation_fixture(
     database_url: String,
     legacy_database_url: String,
@@ -2309,11 +2774,9 @@ async fn run_primary_mutation_fixture(
 ) -> TestResult {
     let mutation_role_oid =
         setup_primary_mutation_role(&database_url, &hostile_schema, &mutation_role).await?;
-
     let allocation = slot_sync_probe_allocation(&database_url, target.clone()).await?;
     let allocated = allocate_catalog_probe(&database_url, &allocation).await?;
     let source = allocated.source();
-
     let mut hostile_config: Config = database_url.parse()?;
     hostile_config.options(format!("-csearch_path={hostile_schema},pg_catalog"));
     assert_hostile_path_is_effective(&hostile_config).await?;
@@ -2365,7 +2828,6 @@ async fn run_primary_mutation_fixture(
         error,
         LocalSlotMutationError::CatalogCreationAttemptPending(ref pending) if pending == &target
     ));
-
     let observed = observe(
         &database_url,
         &LogicalSlotObservationRequest::new(vec![target.clone()])?,
@@ -2376,38 +2838,28 @@ async fn run_primary_mutation_fixture(
         .expect("created primary failover anchor");
     assert_eq!(public_row.persistence, SlotPersistence::Unproven);
     assert_eq!(public_row.ownership, SlotOwnership::Unknown);
-
     let active = activate_catalog_probe(&database_url, &allocated, &receipt).await?;
     let retiring = begin_catalog_probe_retirement(&database_url, &active, &receipt).await?;
 
-    let receipt =
-        recover_receipt_after_legacy_drop_rejection(&database_url, &legacy_database_url, receipt)
-            .await?;
-
-    let (catalog_client, catalog_connection) =
-        tokio_postgres::connect(&database_url, NoTls).await?;
-    let (client, connection) = hostile_config.connect(NoTls).await?;
-    let connection = fence_mutation_session(&client, connection, &mutation_role, &target).await?;
-    let mut drop_receipt = drop_managed_logical_slot(
-        catalog_client,
-        catalog_connection,
-        client,
-        connection,
-        CatalogOperationTimeout::default(),
+    let receipt = recover_receipt_after_drop_rejections(
+        &database_url,
+        &legacy_database_url,
+        &hostile_schema,
+        &mutation_role,
         receipt,
     )
     .await?;
-    wait_for_synchronized_copy(&standby_database_url, &target, false).await?;
-    let retired = complete_catalog_probe_retirement(&retiring, &mut drop_receipt).await?;
-    assert_eq!(retired.state(), SlotSyncProbeState::Retired);
-    release_known_drop_while_registry_row_is_blocked(&database_url, drop_receipt).await?;
-    let absent = observe(
+
+    drop_and_retire_primary_slot(
         &database_url,
-        &LogicalSlotObservationRequest::new(vec![target])?,
+        &standby_database_url,
+        &hostile_config,
+        &mutation_role,
+        &target,
+        &retiring,
+        receipt,
     )
-    .await?;
-    assert!(absent.entries()[0].observation().is_none());
-    Ok(())
+    .await
 }
 
 async fn insert_standby_consumer_registry<C>(

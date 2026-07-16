@@ -24,6 +24,8 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
+postgres-protocol.workspace = true
 serde_json.workspace = true
 
 [lints]

@@ -33,10 +33,11 @@ use tokio_postgres::{Client, Connection, IsolationLevel, Statement, Transaction,
 use uuid::Uuid;
 
 use crate::{
+    parse_lsn,
     postgres_connection::{ConnectionTask, ConnectionTaskError},
     slot_observer::{
         CorrelatedStandbyReplicationPath, LocalPostgresBackendIdentity, LocalSlotObservationError,
-        parse_logical_slot, parse_lsn,
+        parse_logical_slot,
     },
     standby_slots::{
         LogicalSlotKind, LogicalSlotObservation, LogicalSlotPlugin, ManagedSlotTarget,
@@ -50,6 +51,7 @@ const MAX_ADVISORY_LOCK_ROWS: usize = 16;
 const SERVER_STATEMENT_TIMEOUT_HEADROOM: Duration = Duration::from_millis(25);
 const SERVER_TRANSACTION_TIMEOUT_GRACE: Duration = Duration::from_millis(101);
 const TARGET_FENCE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const TARGET_FENCE_POST_COMMIT_TIMEOUT: Duration = Duration::from_secs(1);
 const TARGET_FENCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const PIN_SEARCH_PATH_SQL: &str = "SELECT pg_catalog.set_config('search_path', '', false)";
 const SET_STATEMENT_TIMEOUT_SQL: &str =
@@ -691,6 +693,16 @@ impl ManagedLogicalSlotDropFence {
         Ok(())
     }
 
+    pub(crate) async fn verify_held_after_commit(
+        &self,
+    ) -> Result<(), ManagedLogicalSlotTargetFenceError> {
+        self.verify_held_until(
+            Instant::now() + TARGET_FENCE_POST_COMMIT_TIMEOUT,
+            TARGET_FENCE_POST_COMMIT_TIMEOUT,
+        )
+        .await
+    }
+
     pub(crate) fn catalog_client_mut(&mut self) -> &mut Client {
         &mut self.client
     }
@@ -703,10 +715,10 @@ impl ManagedLogicalSlotDropFence {
 /// Failure to prove that the same canonical `shardschema` session still holds a target fence.
 #[derive(Debug, Error)]
 pub enum ManagedLogicalSlotTargetFenceError {
-    /// Fence liveness could not be checked before the operation deadline.
+    /// Fence liveness could not be checked within its bounded verification window.
     #[error("managed logical-slot target-fence verification exceeded {duration:?}")]
     Timeout {
-        /// Whole-operation deadline supplied by the catalog lifecycle.
+        /// Verification window used for this fence check.
         duration: Duration,
     },
     /// The canonical `shardschema` session failed while its fence should have remained held.
@@ -831,12 +843,12 @@ impl ManagedLogicalSlotCatalogRetirementError {
 /// A receipt-authorized drop failure with explicit retry authority.
 #[derive(Debug, Error)]
 pub enum ManagedLogicalSlotDropError {
-    /// No drop was dispatched, so the unchanged receipt is returned to its caller.
-    #[error("managed logical-slot drop failed before dispatch: {source}")]
-    BeforeDispatch {
+    /// `PostgreSQL` is known not to have applied the drop, so retry authority is preserved.
+    #[error("managed logical-slot drop was rejected without effect: {source}")]
+    KnownRejected {
         /// Sole process-local authority for another bounded cleanup attempt.
         receipt: Box<ManagedLogicalSlotReceipt>,
-        /// Exact fail-closed preflight failure.
+        /// Exact failure that proves the drop did not take effect.
         #[source]
         source: LocalSlotMutationError,
     },
@@ -846,11 +858,11 @@ pub enum ManagedLogicalSlotDropError {
 }
 
 impl ManagedLogicalSlotDropError {
-    /// Returns the receipt only when no drop was dispatched.
+    /// Returns the receipt only when the drop is proven not to have taken effect.
     #[must_use]
     pub fn into_retry_receipt(self) -> Option<(ManagedLogicalSlotReceipt, LocalSlotMutationError)> {
         match self {
-            Self::BeforeDispatch { receipt, source } => Some((*receipt, source)),
+            Self::KnownRejected { receipt, source } => Some((*receipt, source)),
             Self::OutcomeUnknown(_) => None,
         }
     }
@@ -1009,6 +1021,17 @@ pub enum LocalSlotMutationError {
         /// Exact generation-qualified target.
         target: ManagedSlotTarget,
         /// `PostgreSQL` or protocol failure.
+        #[source]
+        source: tokio_postgres::Error,
+    },
+    /// The slot became active before mutation and `PostgreSQL` rejected the drop without effect.
+    #[error(
+        "PostgreSQL rejected the active managed slot drop for {target:?} without effect: {source}"
+    )]
+    DropRejected {
+        /// Exact generation-qualified target that remains safe to retry.
+        target: ManagedSlotTarget,
+        /// Exact `object_in_use` server error received for the drop statement.
         #[source]
         source: tokio_postgres::Error,
     },
@@ -1573,19 +1596,22 @@ where
 ///
 /// An absent target is an idempotent known result. Any changed plugin,
 /// database, role, prepared-decoding boundary, activity, or progress fails
-/// before dispatch. A failed or timed-out drop after dispatch has an unknown
-/// persistent outcome and must be observed before reconciliation. A known
-/// absence returns the canonical `shardschema` connection-bound target fence;
-/// callers must retain it through any catalog COMMIT that makes the absence
-/// durable. The second connection performs deletion against the allocation's
-/// exact database.
+/// before dispatch. `PostgreSQL` 18's exact `object_in_use` response also proves
+/// that non-waiting slot acquisition rejected the request before mutation. Any
+/// other failed or timed-out drop after dispatch has an unknown persistent
+/// outcome and must be observed before reconciliation. A known absence returns
+/// the canonical `shardschema` connection-bound target fence; callers must
+/// retain it through any catalog COMMIT that makes the absence durable. The
+/// second connection performs deletion against the allocation's exact database.
 ///
 /// # Errors
 ///
-/// A fail-closed preflight error returns the unchanged receipt through
-/// [`ManagedLogicalSlotDropError::BeforeDispatch`]. An error after dispatch is
-/// explicitly outcome-unknown and carries no reusable receipt. Cancelling this
-/// future likewise requires exact-target reconciliation.
+/// A fail-closed preflight error, or the exact `object_in_use` response emitted
+/// before `PostgreSQL` starts dropping the slot, returns the unchanged receipt
+/// through [`ManagedLogicalSlotDropError::KnownRejected`]. A connection,
+/// deadline, or postflight error after dispatch is explicitly outcome-unknown
+/// and carries no reusable receipt. Cancelling this future likewise requires
+/// exact-target reconciliation.
 pub async fn drop_managed_logical_slot<CS, CT, S, T>(
     catalog_client: Client,
     catalog_connection: Connection<CS, CT>,
@@ -1626,7 +1652,7 @@ where
             connection_task.abort_and_wait().await;
             drop(catalog_client);
             catalog_connection_task.abort_and_wait().await;
-            return Err(ManagedLogicalSlotDropError::BeforeDispatch {
+            return Err(ManagedLogicalSlotDropError::KnownRejected {
                 receipt: Box::new(receipt),
                 source: error,
             });
@@ -1640,7 +1666,7 @@ where
                 connection_task.abort_and_wait().await;
                 drop(catalog_client);
                 catalog_connection_task.abort_and_wait().await;
-                return Err(ManagedLogicalSlotDropError::BeforeDispatch {
+                return Err(ManagedLogicalSlotDropError::KnownRejected {
                     receipt: Box::new(receipt),
                     source: error,
                 });
@@ -1819,7 +1845,7 @@ pub async fn complete_managed_consumer_slot_retirement(
             },
         )
     });
-    let fence_result = absence.verify_held_until(deadline, duration).await;
+    let fence_result = absence.verify_held_after_commit().await;
     match (result, fence_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
@@ -1940,7 +1966,7 @@ async fn finish_prepared_drop(
         connection_task.abort_and_wait().await;
         drop(catalog_client);
         catalog_connection_task.abort_and_wait().await;
-        return Err(ManagedLogicalSlotDropError::BeforeDispatch {
+        return Err(ManagedLogicalSlotDropError::KnownRejected {
             receipt: Box::new(receipt),
             source: error,
         });
@@ -2013,7 +2039,7 @@ fn classify_drop_failure(
     if source.outcome_is_unknown() {
         Err(ManagedLogicalSlotDropError::OutcomeUnknown(source))
     } else {
-        Err(ManagedLogicalSlotDropError::BeforeDispatch {
+        Err(ManagedLogicalSlotDropError::KnownRejected {
             receipt: Box::new(receipt),
             source,
         })
@@ -2744,10 +2770,6 @@ async fn prepare_drop(
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
-    let statement = prepare_mutation_statement(context, client.prepare(DROP_SLOT_SQL)).await?;
-    set_statement_timeout(client, context.deadline)
-        .await
-        .map_err(|source| context.preflight_postgres(source))?;
     let row = client
         .query_opt(SELECT_SLOT_SQL, &[&context.identity.target.name().as_str()])
         .await
@@ -2767,6 +2789,10 @@ async fn prepare_drop(
             problem,
         },
     )?;
+    set_statement_timeout(client, context.deadline)
+        .await
+        .map_err(|source| context.preflight_postgres(source))?;
+    let statement = prepare_mutation_statement(context, client.prepare(DROP_SLOT_SQL)).await?;
     set_statement_timeout(client, context.deadline)
         .await
         .map_err(|source| context.preflight_postgres(source))?;
@@ -2915,12 +2941,32 @@ async fn drop_after_dispatch(
     context: &MutationContext,
     prepared: &PreparedServer,
     statement: &Statement,
-) -> Result<ManagedLogicalSlotDropOutcome, LocalSlotMutationUnknownCause> {
-    client
+) -> Result<ManagedLogicalSlotDropOutcome, LocalSlotMutationError> {
+    match client
         .query_one(statement, &[&context.identity.target.name().as_str()])
-        .await?;
-    revalidate_server_after_dispatch(client, context, prepared).await?;
-    set_statement_timeout(client, context.deadline).await?;
+        .await
+    {
+        Ok(_) => {}
+        Err(source)
+            if source
+                .as_db_error()
+                .is_some_and(|error| error.code() == &SqlState::OBJECT_IN_USE) =>
+        {
+            return Err(LocalSlotMutationError::DropRejected {
+                target: context.identity.target.clone(),
+                source,
+            });
+        }
+        Err(source) => {
+            return Err(context.unknown(LocalSlotMutationUnknownCause::Postgres(source)));
+        }
+    }
+    revalidate_server_after_dispatch(client, context, prepared)
+        .await
+        .map_err(|source| context.unknown(source))?;
+    set_statement_timeout(client, context.deadline)
+        .await
+        .map_err(|source| context.unknown(LocalSlotMutationUnknownCause::Postgres(source)))?;
     if client
         .query_opt(
             "SELECT slot_name::pg_catalog.text \
@@ -2928,10 +2974,11 @@ async fn drop_after_dispatch(
               WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name",
             &[&context.identity.target.name().as_str()],
         )
-        .await?
+        .await
+        .map_err(|source| context.unknown(LocalSlotMutationUnknownCause::Postgres(source)))?
         .is_some()
     {
-        return Err(LocalSlotMutationUnknownCause::SlotStillPresent);
+        return Err(context.unknown(LocalSlotMutationUnknownCause::SlotStillPresent));
     }
     Ok(ManagedLogicalSlotDropOutcome::Dropped)
 }
@@ -2943,9 +2990,7 @@ async fn drop_at_dispatch_boundary(
     statement: &Statement,
 ) -> Result<ManagedLogicalSlotDropOutcome, LocalSlotMutationError> {
     dispatch_mutation_before_deadline(context, async {
-        drop_after_dispatch(client, context, prepared, statement)
-            .await
-            .map_err(|source| context.unknown(source))
+        drop_after_dispatch(client, context, prepared, statement).await
     })
     .await
 }
@@ -3968,7 +4013,7 @@ mod tests {
     }
 
     #[test]
-    fn only_post_dispatch_failures_are_outcome_unknown() {
+    fn unknown_causes_are_post_dispatch_while_preflight_is_known() {
         let identity = identity(ManagedLogicalSlotRole::PrimaryFailoverAnchor);
         let context = context(identity);
         assert!(

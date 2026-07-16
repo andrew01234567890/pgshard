@@ -82,11 +82,16 @@ bounded feedback interval, `hot_standby_feedback=on`,
 `sync_replication_slots=on`, and the correlated slot-sync-worker generation.
 The proof expiry is also the create-preflight deadline and is rechecked at the
 dispatch boundary.
-Create/drop errors after dispatch are always outcome-unknown and must be
-observed rather than retried. Before target preflight, create persists a
-permanent pending attempt in `shardschema`, keyed by its opaque receipt and
-never-reused generation. The transaction locks catalog state before the target
-name and validates the exact source, role, restore, owner and lifecycle. A busy
+Create errors after dispatch are outcome-unknown and must be observed rather
+than retried. Drop has one narrower effect-free exception: PostgreSQL 18's exact
+`object_in_use` response from non-waiting replication-slot acquisition proves
+that an active slot was rejected before drop mutation began, so the unchanged
+receipt remains valid for a later bounded attempt. Every other received error,
+timeout, connection loss, or postflight failure after drop dispatch remains
+outcome-unknown. Before target preflight, create persists a permanent pending
+attempt in `shardschema`, keyed by its opaque receipt and never-reused
+generation. The transaction locks catalog state before the target name and
+validates the exact source, role, restore, owner and lifecycle. A busy
 database-enforced target fence fails fast so no writer retains global catalog
 state while queued; the Rust create path retries acquisition within its bounded
 preflight window. Each acquisition records a fresh opaque fence ID bound to the
@@ -122,9 +127,10 @@ drop path's live connection-bound catalog fence through COMMIT. Consumer
 finalization also presents the exact opaque creation capability and atomically
 retires the attempt and slot. Both paths present the exact opaque fence ID and
 verify the same canonical backend on both sides of that COMMIT before returning
-success. Known
-pre-dispatch drop failures return the receipt, and cleanup does not depend on a
-live receiver, its physical slot, healthy feedback or slot synchronization.
+success under a fresh bounded post-COMMIT fence check. Known pre-dispatch drop
+failures and the exact effect-free active-slot rejection return the receipt, and
+cleanup does not depend on a live receiver, its physical slot, healthy feedback
+or slot synchronization.
 Catalog triggers serialize allocation, activation, cleanup-start, and related
 parent lifecycle writes in the same lock namespace. Final retirement instead
 requires the typed path's live connection-bound absence fence. Permanent
