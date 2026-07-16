@@ -572,12 +572,9 @@ fn required_codeql_state(checks: &CheckRuns) -> AggregateState {
             .iter()
             .filter(|check| check.name == required_name && check.app.slug == "github-actions")
             .collect::<Vec<_>>();
-        if analyses
-            .iter()
-            .any(|check| {
-                check.status == "completed" && check.conclusion.as_deref() != Some("success")
-            })
-        {
+        if analyses.iter().any(|check| {
+            check.status == "completed" && check.conclusion.as_deref() != Some("success")
+        }) {
             return AggregateState::Failed;
         }
         if analyses.is_empty() || analyses.iter().any(|check| check.status != "completed") {
