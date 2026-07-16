@@ -421,41 +421,22 @@ impl OrchState {
             now.unix_micros,
             self.max_lease_ttl_ms,
         )?;
+        if let Some((existing, existing_deadline)) =
+            live_lease(&inner, request.shard_id, now.monotonic)
+        {
+            return renew_live_lease(
+                &mut inner,
+                &request,
+                existing,
+                existing_deadline,
+                now.monotonic,
+                self.max_lease_ttl_ms,
+            );
+        }
         let monotonic_deadline = now
             .monotonic
             .checked_add(Duration::from_millis(ttl_ms))
             .ok_or(OrchError::ClockUnavailable)?;
-        if let Some(existing) = live_lease(&inner, request.shard_id, now.monotonic) {
-            let same_term = existing.owner_id == request.owner_id
-                && existing.epoch == request.epoch
-                && existing.operation_id == request.operation_id;
-            if !same_term {
-                return Err(OrchError::LeaseHeld {
-                    shard_id: request.shard_id,
-                    epoch: existing.epoch,
-                });
-            }
-            if request.expires_at_unix_ms < existing.expires_at_unix_ms {
-                return Err(OrchError::RegressiveLeaseExpiry {
-                    current: existing.expires_at_unix_ms,
-                    requested: request.expires_at_unix_ms,
-                });
-            }
-            if request.expires_at_unix_ms == existing.expires_at_unix_ms {
-                return Ok(LeaseOutcome::Existing);
-            }
-            inner.leases.insert(
-                request.shard_id,
-                ShardLease {
-                    expires_at_unix_ms: request.expires_at_unix_ms,
-                    ..existing
-                },
-            );
-            inner
-                .lease_deadlines
-                .insert(request.shard_id, monotonic_deadline);
-            return Ok(LeaseOutcome::Renewed);
-        }
         let last_epoch = inner
             .last_epochs
             .get(&request.shard_id)
@@ -498,13 +479,78 @@ struct ClockSample {
     monotonic: Duration,
 }
 
-fn live_lease(inner: &OrchInner, shard_id: ShardId, now: Duration) -> Option<ShardLease> {
+fn renew_live_lease(
+    inner: &mut OrchInner,
+    request: &LeaseRequest,
+    existing: ShardLease,
+    existing_deadline: Duration,
+    now: Duration,
+    max_lease_ttl_ms: u64,
+) -> Result<LeaseOutcome, OrchError> {
+    let same_term = existing.owner_id == request.owner_id
+        && existing.epoch == request.epoch
+        && existing.operation_id == request.operation_id;
+    if !same_term {
+        return Err(OrchError::LeaseHeld {
+            shard_id: request.shard_id,
+            epoch: existing.epoch,
+        });
+    }
+    if request.expires_at_unix_ms < existing.expires_at_unix_ms {
+        return Err(OrchError::RegressiveLeaseExpiry {
+            current: existing.expires_at_unix_ms,
+            requested: request.expires_at_unix_ms,
+        });
+    }
+    if request.expires_at_unix_ms == existing.expires_at_unix_ms {
+        return Ok(LeaseOutcome::Existing);
+    }
+    let extension_ms = request.expires_at_unix_ms - existing.expires_at_unix_ms;
+    let monotonic_deadline = existing_deadline
+        .checked_add(Duration::from_millis(extension_ms))
+        .ok_or(OrchError::ClockUnavailable)?;
+    validate_monotonic_ttl(now, monotonic_deadline, max_lease_ttl_ms)?;
+    inner.leases.insert(
+        request.shard_id,
+        ShardLease {
+            expires_at_unix_ms: request.expires_at_unix_ms,
+            ..existing
+        },
+    );
     inner
         .lease_deadlines
-        .get(&shard_id)
-        .is_some_and(|deadline| *deadline > now)
-        .then(|| inner.leases.get(&shard_id).cloned())
-        .flatten()
+        .insert(request.shard_id, monotonic_deadline);
+    Ok(LeaseOutcome::Renewed)
+}
+
+fn live_lease(
+    inner: &OrchInner,
+    shard_id: ShardId,
+    now: Duration,
+) -> Option<(ShardLease, Duration)> {
+    let deadline = *inner.lease_deadlines.get(&shard_id)?;
+    let lease = inner.leases.get(&shard_id)?.clone();
+    (deadline > now).then_some((lease, deadline))
+}
+
+fn validate_monotonic_ttl(
+    now: Duration,
+    deadline: Duration,
+    max_lease_ttl_ms: u64,
+) -> Result<(), OrchError> {
+    let remaining = deadline
+        .checked_sub(now)
+        .ok_or(OrchError::ClockUnavailable)?;
+    if remaining > Duration::from_millis(max_lease_ttl_ms) {
+        let requested_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(remaining.subsec_nanos() % 1_000_000 != 0));
+        return Err(OrchError::LeaseTtlExceeded {
+            requested_ms,
+            maximum_ms: max_lease_ttl_ms,
+        });
+    }
+    Ok(())
 }
 
 fn validate_execution(
@@ -563,6 +609,10 @@ fn validate_execution(
 }
 
 fn trusted_clock(origin: Instant) -> Result<ClockSample, OrchError> {
+    // Sample monotonic time first. If this thread is descheduled between the
+    // two reads, the delay can only shorten the translated lease; it can never
+    // extend ownership beyond the requested wall-clock lifetime.
+    let monotonic = origin.elapsed();
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| OrchError::ClockUnavailable)?;
@@ -570,7 +620,7 @@ fn trusted_clock(origin: Instant) -> Result<ClockSample, OrchError> {
         u64::try_from(elapsed.as_micros()).map_err(|_| OrchError::ClockUnavailable)?;
     Ok(ClockSample {
         unix_micros,
-        monotonic: origin.elapsed(),
+        monotonic,
     })
 }
 
@@ -1015,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn wall_clock_steps_cannot_extend_or_cut_short_a_live_lease() {
+    fn a_forward_wall_step_during_renewal_cannot_cut_a_live_lease_short() {
         let state = state();
         state
             .register_operation(operation("writer-1", 1, OperationKind::Failover))
@@ -1030,19 +1080,66 @@ mod tests {
             .expect("register successor");
         acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 200), 11, 100, 100)
             .expect("acquire initial lease");
+        assert_eq!(
+            acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 201), 11, 190, 150,)
+                .expect("renew after a forward wall-clock step"),
+            LeaseOutcome::Renewed
+        );
 
         assert!(matches!(
-            acquire_at_clocks(&state, lease("writer-2", "orch-0", 12, 400), 12, 300, 150,),
+            acquire_at_clocks(&state, lease("writer-2", "orch-0", 12, 400), 12, 300, 200,),
             Err(OrchError::LeaseHeld { epoch: 11, .. })
         ));
         assert_eq!(state.snapshot().leases[0].epoch, 11);
+    }
+
+    #[test]
+    fn a_backward_wall_step_during_renewal_cannot_extend_a_live_lease() {
+        let state = OrchState::with_identity(identity(), 1_000).expect("valid lease policy");
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register first writer");
+        state
+            .register_operation(operation_with_fence(
+                "writer-2",
+                1,
+                OperationKind::Failover,
+                12,
+            ))
+            .expect("register successor");
+        acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 600), 11, 500, 100)
+            .expect("acquire initial lease");
+        assert_eq!(
+            acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 601), 11, 400, 150,)
+                .expect("renew after a backward wall-clock step"),
+            LeaseOutcome::Renewed
+        );
 
         assert_eq!(
-            acquire_at_clocks(&state, lease("writer-2", "orch-0", 12, 150), 12, 50, 201,)
+            acquire_at_clocks(&state, lease("writer-2", "orch-0", 12, 601), 12, 401, 202,)
                 .expect("monotonic expiry admits the higher epoch"),
             LeaseOutcome::Acquired
         );
         assert_eq!(state.snapshot().leases[0].epoch, 12);
+    }
+
+    #[test]
+    fn renewal_cannot_move_the_monotonic_deadline_beyond_policy() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register writer");
+        acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 200), 11, 100, 100)
+            .expect("acquire initial lease");
+
+        assert_eq!(
+            acquire_at_clocks(&state, lease("writer-1", "orch-0", 11, 400), 11, 300, 150,),
+            Err(OrchError::LeaseTtlExceeded {
+                requested_ms: 250,
+                maximum_ms: 100,
+            })
+        );
+        assert_eq!(state.snapshot().leases[0].expires_at_unix_ms, 200);
     }
 
     #[test]

@@ -183,7 +183,7 @@ a durability downgrade and must be surfaced as such.
 
 ## Primary fencing
 
-The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Both the orchestrator authority and receiving agent reject expired or overlong leases; configured TTL bounds are enforced by the state machines, not merely logged. The in-process orchestrator retains Unix expiry only for request validation and reporting and uses a separate monotonic deadline for live ownership, so forward or backward wall-clock steps cannot shorten or extend a term. Poolers route writes only to the primary identity and term currently authorized by the lease.
+The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Both the orchestrator authority and receiving agent reject expired or overlong leases; configured TTL bounds are enforced by the state machines, not merely logged. The in-process orchestrator retains Unix expiry only for request validation and reporting and uses a separate monotonic deadline for live ownership, so forward or backward wall-clock steps cannot shorten or extend a term. A renewal extends the installed monotonic deadline only by its requested Unix-expiry delta and cannot move that deadline beyond the current TTL policy. Poolers route writes only to the primary identity and term currently authorized by the lease.
 
 Promotion requires a candidate whose WAL and prepared-transaction state prove that all acknowledged commits are present. If no candidate satisfies that condition, pgshard stops writes instead of risking split brain or acknowledged-data loss.
 
