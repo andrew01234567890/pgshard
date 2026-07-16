@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"strings"
@@ -135,6 +136,14 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	}
 	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, service, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
 		t.Fatalf("cross-shard-service query = %q", got)
+	}
+	assertPostgreSQLServiceQueryDenied(t, ctx, kubeClient, namespace.Name, "unlabeled", nil, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, service)
+	assertPostgreSQLServiceQueryDenied(t, ctx, kubeClient, namespace.Name, "wrong-cluster", map[string]string{
+		owned.ClusterLabel:   "another-cluster",
+		owned.ComponentLabel: "pooler",
+	}, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, service)
+	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, service, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
+		t.Fatalf("authorized query after denied clients = %q", got)
 	}
 
 	before := &corev1.Pod{}
@@ -368,52 +377,10 @@ func TestKINDManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC(t *testi
 
 func runPostgreSQLServiceQuery(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, image, secret, host, query string) string {
 	t.Helper()
-	allowPrivilegeEscalation := false
-	readOnlyRootFilesystem := true
-	runAsNonRoot := true
-	automount := false
-	postgresUID := int64(999)
-	clientPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("pgshard-sql-client-%d", os.Getpid()),
-			Namespace: namespace,
-			Labels: map[string]string{
-				owned.ClusterLabel:   cluster,
-				owned.ComponentLabel: "pooler",
-			},
-		},
-		Spec: corev1.PodSpec{
-			AutomountServiceAccountToken: &automount,
-			RestartPolicy:                corev1.RestartPolicyNever,
-			SecurityContext: &corev1.PodSecurityContext{
-				RunAsNonRoot:   &runAsNonRoot,
-				RunAsUser:      &postgresUID,
-				RunAsGroup:     &postgresUID,
-				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-			},
-			Containers: []corev1.Container{{
-				Name:    "psql",
-				Image:   image,
-				Command: []string{"psql"},
-				Args:    []string{"-X", "-w", "-h", host, "-U", "postgres", "-d", "postgres", "-Atc", query},
-				Env: []corev1.EnvVar{{
-					Name: "PGPASSWORD",
-					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: secret},
-						Key:                  owned.PostgreSQLPasswordKey,
-					}},
-				}},
-				SecurityContext: &corev1.SecurityContext{
-					AllowPrivilegeEscalation: &allowPrivilegeEscalation,
-					ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
-					RunAsNonRoot:             &runAsNonRoot,
-					RunAsUser:                &postgresUID,
-					RunAsGroup:               &postgresUID,
-					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-				},
-			}},
-		},
-	}
+	clientPod := postgreSQLClientPod(namespace, fmt.Sprintf("pgshard-sql-client-%d-%d", os.Getpid(), time.Now().UnixNano()), map[string]string{
+		owned.ClusterLabel:   cluster,
+		owned.ComponentLabel: "pooler",
+	}, image, secret, host, query)
 	if err := kubeClient.Create(ctx, clientPod); err != nil {
 		t.Fatal(err)
 	}
@@ -431,6 +398,81 @@ func runPostgreSQLServiceQuery(t *testing.T, ctx context.Context, kubeClient cli
 		t.Fatalf("wait for PostgreSQL client Pod: %v", err)
 	}
 	return strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
+}
+
+func assertPostgreSQLServiceQueryDenied(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, suffix string, labels map[string]string, image, secret, host string) {
+	t.Helper()
+	clientPod := postgreSQLClientPod(namespace, fmt.Sprintf("pgshard-sql-client-%s-%d-%d", suffix, os.Getpid(), time.Now().UnixNano()), labels, image, secret, host, "SELECT 1")
+	if err := kubeClient.Create(ctx, clientPod); err != nil {
+		t.Fatal(err)
+	}
+	current := &corev1.Pod{}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		current = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(clientPod), current); err != nil {
+			return false, err
+		}
+		if current.Status.Phase == corev1.PodSucceeded {
+			return false, fmt.Errorf("network policy admitted PostgreSQL traffic from Pod %s with labels %#v", clientPod.Name, labels)
+		}
+		return current.Status.Phase == corev1.PodFailed, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for denied PostgreSQL client Pod: %v; last status = %#v", err, current.Status)
+	}
+	output := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
+	if !strings.Contains(output, "connection to server") || !strings.Contains(output, "timeout expired") {
+		t.Fatalf("denied PostgreSQL client failed for an unexpected reason: %q", output)
+	}
+}
+
+func postgreSQLClientPod(namespace, name string, labels map[string]string, image, secret, host, query string) *corev1.Pod {
+	allowPrivilegeEscalation := false
+	readOnlyRootFilesystem := true
+	runAsNonRoot := true
+	automount := false
+	postgresUID := int64(999)
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    maps.Clone(labels),
+		},
+		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken: &automount,
+			RestartPolicy:                corev1.RestartPolicyNever,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot:   &runAsNonRoot,
+				RunAsUser:      &postgresUID,
+				RunAsGroup:     &postgresUID,
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
+			Containers: []corev1.Container{{
+				Name:    "psql",
+				Image:   image,
+				Command: []string{"psql"},
+				Args:    []string{"-X", "-w", "-h", host, "-U", "postgres", "-d", "postgres", "-Atc", query},
+				Env: []corev1.EnvVar{
+					{Name: "PGCONNECT_TIMEOUT", Value: "5"},
+					{
+						Name: "PGPASSWORD",
+						ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: secret},
+							Key:                  owned.PostgreSQLPasswordKey,
+						}},
+					},
+				},
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+					ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
+					RunAsNonRoot:             &runAsNonRoot,
+					RunAsUser:                &postgresUID,
+					RunAsGroup:               &postgresUID,
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				},
+			}},
+		},
+	}
 }
 
 func newKINDClient(t *testing.T) client.Client {

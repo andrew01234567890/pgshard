@@ -95,8 +95,13 @@ kubectl exec --namespace pgshard-single-member \
   "SELECT current_setting('server_version'), pg_is_in_recovery();"
 ```
 
-Use the internal `single-member-shard-0000` and
-`single-member-shard-0001` Services for direct test traffic. The
-`single-member-rw`, `-ro`, and `-r` Services still lead to the rejection-only
-pooler. Delete the disposable cluster with
-`kind delete cluster --name pgshard-development`.
+The internal `single-member-shard-0000` and
+`single-member-shard-0001` Services exist for operator lifecycle tests, not as
+open application endpoints. Their NetworkPolicies admit only same-namespace
+Pods labelled for cluster `single-member` and component `pooler` or
+`orchestrator` (plus the matching PostgreSQL shard), and remote SCRAM also
+requires that shard's generated Secret. The operator does not yet distribute
+those credentials to applications, so use the in-Pod `kubectl exec` check above
+or the repository's restricted-client KIND test. The `single-member-rw`, `-ro`,
+and `-r` Services still lead to the rejection-only pooler. Delete the
+disposable cluster with `kind delete cluster --name pgshard-development`.

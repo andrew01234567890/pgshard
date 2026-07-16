@@ -503,8 +503,10 @@ create carrying that deleted Secret owner fence, and release of the exact
 protected PVC when an explicit delete precedes Retain cluster finalization.
 Fault-injection tests additionally fail the PVC UID checkpoint, delete that
 unprotected exact outcome, and prove Retain records abandonment without issuing
-a replacement create. CRD-only tests cover rejection of unsupported topology
-and storage transitions, and server-side-apply field pruning after PostgreSQL
+a replacement create. CRD-only tests cover rejection of unsupported topology,
+durability, deletion-policy, storage-size, and storage-class transitions,
+including absent-to-present storage-class mutation, and server-side-apply field
+pruning after PostgreSQL
 parameter, Service annotation, and OTEL configuration shrinkage. A delayed rollout keeps
 the old immutable PostgreSQL ConfigMap available until the workload reports the
 new revision, then proves it is pruned. The same suite covers both fresh creation
@@ -545,9 +547,10 @@ has no PostgreSQL workload or ready application endpoint. The same job creates
 a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard
 Service from an authorized restricted probe client using the destination-specific
-Secret, proves an omitted storage class was resolved and checkpointed on the
-resulting Bound PVC, then restarts one primary StatefulSet and verifies its
-PVC-backed row survives. A unit Create interceptor separately proves the
+Secret, rejects otherwise identical unlabeled and wrong-cluster clients through
+the live NetworkPolicy, proves an omitted storage class was resolved and
+checkpointed on the resulting Bound PVC, then restarts one primary StatefulSet
+and verifies its PVC-backed row survives. A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the
 resulting Bound PVC exactly matches that checkpoint, is ownerless with the
@@ -562,10 +565,13 @@ after provisioning and prove finalization uses only the stored snapshot. It also
 reads the durable cluster-UID and shard identity marker
 from the running data directory. Foreground deletion of the cluster then proves
 the default-retained PVCs are detached, keep their exact recorded UIDs, and have
-their credential tombstones removed. A behavioral init test supplies a marker
+their credential tombstones removed. Fault injection separately places a late
+StatefulSet Pod after controller pruning and proves Retain keeps the PVC
+protected until credential absence and authoritative Pod absence have both been
+observed. A behavioral init test supplies a marker
 from another cluster or shard and proves bootstrap refuses it before entering
-initialization; the validated fast path repeats the filesystem durability
-barrier before exit. It does not
+initialization; the validated fast path repeats the final-data and
+parent-directory publication barrier before exit. It does not
 claim uninterrupted traffic during that restart. A unit
 regression gives the informer cache a false absence while the authoritative API
 reader still sees an owned PVC, and proves that finalization continues waiting.

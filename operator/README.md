@@ -99,13 +99,13 @@ PostgreSQL initializes in a disposable staging
 directory and atomically renames only a complete cluster into the final data
 path. Its durable marker records the exact PgShardCluster UID and shard, so an
 interrupted `initdb` cannot publish a partial `PG_VERSION` and a reused volume
-cannot silently start for another cluster or shard. The validated restart path
-also flushes the changed marker, access configuration, and directory entries
-before PostgreSQL starts, so interruption after the atomic rename cannot skip
-the publication durability barrier on the next init pass. These flushes are
-limited to the cluster's data path; bootstrap never issues a node-wide
-filesystem sync that could couple Pod startup or termination to unrelated
-mounts.
+cannot silently start for another cluster or shard. Initial publication flushes
+the changed marker, access configuration, and staging and parent directory
+entries. The validated restart path repeats the final-data and parent-directory
+publication barrier before PostgreSQL starts, so interruption after the atomic
+rename cannot skip it on the next init pass. These flushes are limited to the
+cluster's data path; bootstrap never issues a node-wide filesystem sync that
+could couple Pod startup or termination to unrelated mounts.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
@@ -119,19 +119,28 @@ selects that image contract's `/usr/local/bin/etcd` executable explicitly;
 custom `--etcd-image` values must provide the same path. Scale transitions
 retain those claims during scaling. On cluster deletion, both storage policies
 keep each live PostgreSQL PVC ownerless and independently protected, with its
-API-identified credential tombstone anchored back to that exact PVC. For
-`storage.deletionPolicy: Retain` (the default), the finalizer first prunes every
-mounting workload. A visible outcome is validated against the provisioned
-snapshot and its API-assigned UID is checkpointed before that exact PVC is
-released and marked retained. If no outcome is visible before the UID
-checkpoint, status first records that creation intent as abandoned; no PVC is
+API-identified credential tombstone anchored back to that exact PVC. The
+finalizer first prunes every mounting controller, then resolves each possible
+PVC-create outcome while the credential tombstone still exists. A visible
+outcome is validated against the provisioned snapshot and its API-assigned UID
+is checkpointed. `Retain` (the default) makes that exact PVC ownerless and keeps
+it protected during the remaining barriers. If no outcome is visible before
+the UID checkpoint, status records that creation intent as abandoned; no PVC is
 created during finalization, and any later outcome remains bound to the Secret
-tombstone for deletion. Only then is the tombstone removed. If a retained PVC
-is explicitly deleted, the controller releases only its own protection
-finalizer and waits for authoritative absence instead of replacing it. `Delete` also
-prunes workloads first, requests deletion only for the status-recorded PVC
-UIDs, releases the protection finalizer after deletion is accepted, and then
-deletes the same creation tombstones. A same-name claim cannot reach bootstrap
+tombstone for deletion.
+
+After all storage outcomes are closed, the controller deletes and observes
+authoritative absence of every exact credential tombstone. It then lists Pods
+through the uncached API reader, deletes only an exact recorded shard
+StatefulSet Pod that still references a checkpointed PVC or Secret, and waits
+for authoritative Pod absence. A Pod committed before credential deletion is
+visible to that barrier; a later Pod cannot obtain the deleted bootstrap
+credential. Only after both barriers does `Retain` release its own PVC
+protection finalizer and mark the data retained. If a retained PVC was
+explicitly deleted, the controller releases only its own protection finalizer
+and waits for authoritative absence instead of replacing it. `Delete` requests
+deletion only for status-recorded PVC UIDs and releases the protection
+finalizer after deletion is accepted. A same-name claim cannot reach bootstrap
 while a workload exists. The CR finalizer
 uses the checkpointed creation-time policy and waits for the selected result to
 be observed through the uncached Kubernetes API reader. Finalization never
@@ -261,7 +270,14 @@ rather than placing all Secret data in its informer cache. This remains a
 documented multi-tenant trust boundary: a compromised cluster-scoped manager
 could read, create, change metadata on, or delete unrelated Secrets, so a
 future namespace-scoped install mode is required for mutually untrusted
-tenants. A separate
+tenants. Finalization also requires cluster-wide Pod `list` and `delete`
+because Kubernetes RBAC cannot restrict either permission to Pods that
+reference controller-generated resource names. The reconciler uses an
+authoritative namespace list, acts only on a Pod referencing an exact
+checkpointed shard PVC or Secret, validates the expected StatefulSet identity,
+labels, and controller reference before deletion, and fails closed on a
+collision. It has no Pod `get`, `watch`, `create`, `update`, or `patch`
+permission. A separate
 ClusterRole permits `get` and `patch` only on pgshard's two exact webhook-
 configuration names. Kubernetes RBAC cannot restrict a patch to individual
 fields, so the provisioner validates the full Service target and existing

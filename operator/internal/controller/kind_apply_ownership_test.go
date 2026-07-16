@@ -70,7 +70,18 @@ func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
 	for name, mutate := range map[string]func(*pgshardv1alpha1.PgShardCluster){
 		"shards":          func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Shards++ },
 		"membersPerShard": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.MembersPerShard = 5 },
-		"storage size":    func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Storage.Size = resource.MustParse("8Gi") },
+		"durability": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+		},
+		"storage size": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Storage.Size = resource.MustParse("8Gi") },
+		"storage class value": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			value := "replacement"
+			cluster.Spec.Storage.StorageClassName = &value
+		},
+		"storage class removed": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Storage.StorageClassName = nil },
+		"deletion policy": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
+		},
 	} {
 		current := &pgshardv1alpha1.PgShardCluster{}
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(transition), current); err != nil {
@@ -81,6 +92,25 @@ func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
 		if err := kubeClient.Patch(ctx, current, client.MergeFrom(before)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
 			t.Fatalf("CRD admitted %s without any admission webhook installed: %v", name, err)
 		}
+	}
+
+	absentClass := transition.DeepCopy()
+	absentClass.Name = "crd-transition-absent-class"
+	absentClass.ResourceVersion = ""
+	absentClass.UID = ""
+	absentClass.Spec.Storage.StorageClassName = nil
+	if err := kubeClient.Create(ctx, absentClass); err != nil {
+		t.Fatal(err)
+	}
+	currentAbsent := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(absentClass), currentAbsent); err != nil {
+		t.Fatal(err)
+	}
+	beforeAbsent := currentAbsent.DeepCopy()
+	present := "standard"
+	currentAbsent.Spec.Storage.StorageClassName = &present
+	if err := kubeClient.Patch(ctx, currentAbsent, client.MergeFrom(beforeAbsent)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("CRD admitted an absent-to-present storage class transition without any admission webhook installed: %v", err)
 	}
 }
 

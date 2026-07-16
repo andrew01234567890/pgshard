@@ -27,6 +27,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		{group: "", resource: "events", verbs: []string{"create", "patch"}},
 		{group: "", resource: "namespaces", verbs: []string{"get"}},
 		{group: "", resource: "persistentvolumeclaims", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
+		{group: "", resource: "pods", verbs: []string{"delete", "list"}},
 		{group: "", resource: "secrets", verbs: []string{"create", "delete", "get", "update"}},
 		{group: "storage.k8s.io", resource: "storageclasses", verbs: []string{"list"}},
 	} {
@@ -50,6 +51,11 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 	for _, forbidden := range []string{"create", "delete", "list", "patch", "update", "watch"} {
 		if roleAllows(role, "", "namespaces", []string{forbidden}) {
 			t.Errorf("cluster-wide manager role grants forbidden Namespace verb %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{"create", "get", "patch", "update", "watch"} {
+		if roleAllows(role, "", "pods", []string{forbidden}) {
+			t.Errorf("cluster-wide manager role grants forbidden Pod verb %q", forbidden)
 		}
 	}
 }
@@ -77,16 +83,37 @@ func roleAllows(role *rbacv1.ClusterRole, group, resource string, verbs []string
 }
 
 func rulesAllow(rules []rbacv1.PolicyRule, group, resource string, verbs []string) bool {
+	allowed := make(map[string]struct{})
 	for _, rule := range rules {
-		if !slices.Contains(rule.APIGroups, group) || !slices.Contains(rule.Resources, resource) {
+		if (!slices.Contains(rule.APIGroups, group) && !slices.Contains(rule.APIGroups, "*")) ||
+			(!slices.Contains(rule.Resources, resource) && !slices.Contains(rule.Resources, "*")) {
 			continue
 		}
-		for _, verb := range verbs {
-			if !slices.Contains(rule.Verbs, verb) && !slices.Contains(rule.Verbs, "*") {
-				return false
-			}
+		for _, verb := range rule.Verbs {
+			allowed[verb] = struct{}{}
 		}
+	}
+	if _, wildcard := allowed["*"]; wildcard {
 		return true
 	}
-	return false
+	for _, verb := range verbs {
+		if _, ok := allowed[verb]; !ok {
+			return false
+		}
+	}
+	return len(verbs) > 0
+}
+
+func TestRulesAllowCombinesMatchingRules(t *testing.T) {
+	t.Parallel()
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"list"}},
+		{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"delete"}},
+	}
+	if !rulesAllow(rules, "", "pods", []string{"list", "delete"}) {
+		t.Fatal("matching RBAC rules were not combined")
+	}
+	if rulesAllow(rules, "", "pods", []string{"get"}) {
+		t.Fatal("ungranted verb was inferred from matching RBAC rules")
+	}
 }

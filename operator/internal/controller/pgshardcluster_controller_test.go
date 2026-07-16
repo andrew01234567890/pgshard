@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -743,6 +744,134 @@ func TestDeletionPolicyRetainsPostgreSQLDataByDefault(t *testing.T) {
 	}
 	if metav1.IsControlledBy(retained, cluster) || retained.Annotations[owned.RetainedFromAnnotation] != cluster.Namespace+"/"+cluster.Name || postgresqlDataPVCIsProtected(retained) {
 		t.Fatalf("PostgreSQL data PVC was not safely retained outside garbage collection: %#v", retained.ObjectMeta)
+	}
+}
+
+func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	bootstrap := bootstrapForShard(t, current, 0)
+	statefulSet := &appsv1.StatefulSet{}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(ctx, statefulSetKey, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("PostgreSQL StatefulSet was not absent before the late Pod create: %v", err)
+	}
+
+	latePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            statefulSet.Name + "-0",
+			Namespace:       cluster.Namespace,
+			Labels:          maps.Clone(statefulSet.Spec.Template.Labels),
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
+		},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{
+			{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: bootstrap.PVCName}}},
+			{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: bootstrap.SecretName}}},
+		}},
+	}
+	if err := base.Create(ctx, latePod); err != nil {
+		t.Fatal(err)
+	}
+	claimKey := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+	assertProtected := func(stage string) {
+		t.Helper()
+		claim := &corev1.PersistentVolumeClaim{}
+		if err := base.Get(ctx, claimKey, claim); err != nil {
+			t.Fatalf("%s: read PostgreSQL data PVC: %v", stage, err)
+		}
+		if !postgresqlDataPVCIsProtected(claim) || claim.Annotations[owned.RetainedFromAnnotation] != "" {
+			t.Fatalf("%s released PostgreSQL data before the late-Pod barrier: %#v", stage, claim.ObjectMeta)
+		}
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	assertProtected("credential deletion")
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("credential tombstone remained before the Pod barrier: %v", err)
+	}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), &corev1.Pod{}); err != nil {
+		t.Fatalf("late Pod disappeared before its authoritative observation: %v", err)
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	assertProtected("late Pod deletion")
+	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("late PostgreSQL Pod survived the finalization barrier: %v", err)
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	retained := &corev1.PersistentVolumeClaim{}
+	if err := base.Get(ctx, claimKey, retained); err != nil {
+		t.Fatal(err)
+	}
+	if postgresqlDataPVCIsProtected(retained) || retained.Annotations[owned.RetainedFromAnnotation] != cluster.Namespace+"/"+cluster.Name {
+		t.Fatalf("PostgreSQL data was not retained after both absence barriers: %#v", retained.ObjectMeta)
+	}
+}
+
+func TestFinalizationRefusesUncheckpointedDeletingPVCWithoutCredentialFence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, policy := range []pgshardv1alpha1.StorageDeletionPolicy{pgshardv1alpha1.DeletionRetain, pgshardv1alpha1.DeletionDelete} {
+		policy := policy
+		t.Run(string(policy), func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			cluster.Spec.Storage.DeletionPolicy = policy
+			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
+			bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{
+				Shard: 0, SecretName: "expected-secret", SecretUID: "expected-secret-uid", PVCFenceDetached: true,
+				PVCName: "deleting-collision", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
+			}
+			cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{bootstrap}
+			claim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, "foreign-secret", "foreign-secret-uid")
+			claim.UID = "collision-uid"
+			claim.Finalizers = []string{owned.PostgreSQLDataProtectionFinalizer}
+			claim.DeletionTimestamp = &metav1.Time{Time: time.Unix(100, 0)}
+			base := newFakeClient(t, cluster, claim)
+			reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+			var err error
+			if policy == pgshardv1alpha1.DeletionRetain {
+				_, err = reconciler.retainPostgreSQLPVCs(ctx, cluster)
+			} else {
+				_, err = reconciler.deletePostgreSQLPVCs(ctx, cluster)
+			}
+			if err == nil || !strings.Contains(err.Error(), "without its exact credential creation fence") {
+				t.Fatalf("uncheckpointed deleting PVC collision was not rejected: %v", err)
+			}
+			unchanged := &corev1.PersistentVolumeClaim{}
+			if err := base.Get(ctx, client.ObjectKeyFromObject(claim), unchanged); err != nil {
+				t.Fatal(err)
+			}
+			if !postgresqlDataPVCIsProtected(unchanged) {
+				t.Fatalf("controller removed protection from an uncheckpointed collision: %#v", unchanged.ObjectMeta)
+			}
+		})
 	}
 }
 

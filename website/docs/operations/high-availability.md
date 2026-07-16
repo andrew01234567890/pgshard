@@ -160,7 +160,8 @@ PVC UID with its own finalizer, makes the live PVC ownerless, and anchors the
 credential tombstone back to it. The exact claim name cannot be reused until
 the mounting workload is pruned, so a late empty claim cannot enter bootstrap.
 Its init container binds the durable bootstrap marker to the exact
-cluster UID and shard and repeats the publication filesystem sync before
+cluster UID and shard and repeats the scoped final-data and parent-directory
+publication barrier before
 accepting an existing marker, while the running PostgreSQL container does not
 receive or mount the bootstrap password. `PostgreSQLPrimariesAvailable=True` reports
 process availability, not replication or failover. Zero-downtime restart
