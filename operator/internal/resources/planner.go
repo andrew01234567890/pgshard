@@ -82,8 +82,7 @@ if [[ -f "$marker" && -f "$final/PG_VERSION" ]]; then
     exit 1
   fi
   rm -rf -- "$staging"
-  sync -f "$final"
-  sync -f "$parent"
+  sync "$final" "$parent"
   exit 0
 fi
 if [[ -e "$final" ]]; then
@@ -106,9 +105,12 @@ initdb \
 printf '\nhost all all all scram-sha-256\n' >> "$staging/pg_hba.conf"
 cp -- "$expected" "$staging/.pgshard-bootstrap-complete"
 chmod 0600 "$staging/.pgshard-bootstrap-complete"
-sync
+# initdb has already persisted the new cluster. Flush only the files and
+# directory entries that this script added so another mounted filesystem
+# cannot delay PostgreSQL bootstrap or Pod termination.
+sync "$staging/pg_hba.conf" "$staging/.pgshard-bootstrap-complete" "$staging"
 mv -- "$staging" "$final"
-sync
+sync "$final" "$parent"
 `
 
 // Images contains the deployable images used by the supporting workloads.

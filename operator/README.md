@@ -100,9 +100,12 @@ directory and atomically renames only a complete cluster into the final data
 path. Its durable marker records the exact PgShardCluster UID and shard, so an
 interrupted `initdb` cannot publish a partial `PG_VERSION` and a reused volume
 cannot silently start for another cluster or shard. The validated restart path
-also synchronizes the data filesystem and its parent before PostgreSQL starts,
-so interruption after the atomic rename cannot skip the publication durability
-barrier on the next init pass.
+also flushes the changed marker, access configuration, and directory entries
+before PostgreSQL starts, so interruption after the atomic rename cannot skip
+the publication durability barrier on the next init pass. These flushes are
+limited to the cluster's data path; bootstrap never issues a node-wide
+filesystem sync that could couple Pod startup or termination to unrelated
+mounts.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
