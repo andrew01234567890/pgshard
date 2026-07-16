@@ -132,13 +132,17 @@ tombstone for deletion.
 After all storage outcomes are closed, the controller deletes and observes
 authoritative absence of every exact credential tombstone. It then lists Pods
 through the uncached API reader, deletes only an exact recorded shard
-StatefulSet Pod that still references a checkpointed PVC or Secret, and waits
+StatefulSet Pod that still references a checkpointed PVC or live credential,
+and waits
 for authoritative Pod absence. A Pod committed before credential deletion is
 visible to that barrier; a later Pod cannot obtain the deleted bootstrap
-credential. Only after both barriers does `Retain` release its own PVC
-protection finalizer and mark the data retained. If a retained PVC was
-explicitly deleted, the controller releases only its own protection finalizer
-and waits for authoritative absence instead of replacing it. `Delete` requests
+credential. Terminal credential-only clients are ignored because they cannot
+restart or mutate the retained database; Pods referencing the data PVC remain
+in the barrier regardless of phase. Only after both barriers does `Retain`
+release its own PVC protection finalizer and mark the data retained. If a
+retained PVC was explicitly deleted, the controller releases only its own
+protection finalizer and waits for authoritative absence instead of replacing
+it. `Delete` requests
 deletion only for status-recorded PVC UIDs and releases the protection
 finalizer after deletion is accepted. A same-name claim cannot reach bootstrap
 while a workload exists. The CR finalizer
@@ -274,7 +278,8 @@ tenants. Finalization also requires cluster-wide Pod `list` and `delete`
 because Kubernetes RBAC cannot restrict either permission to Pods that
 reference controller-generated resource names. The reconciler uses an
 authoritative namespace list, acts only on a Pod referencing an exact
-checkpointed shard PVC or Secret, validates the expected StatefulSet identity,
+checkpointed shard PVC or a non-terminal Pod referencing its credential,
+validates the expected StatefulSet identity,
 labels, and controller reference before deletion, and fails closed on a
 collision. It has no Pod `get`, `watch`, `create`, `update`, or `patch`
 permission. A separate

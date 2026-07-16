@@ -1676,6 +1676,13 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPodsForFinalization(ctx conte
 			if !podSpecReferencesPostgreSQLBootstrap(pod.Spec, bootstrap) {
 				continue
 			}
+			// A terminal credential-only client cannot restart or mutate the
+			// retained database. Keep data-mounting Pods in the barrier even
+			// when terminal so the protected PVC is not released while it is
+			// still referenced by an unexpected Pod identity.
+			if podHasTerminalPhase(pod) && !podSpecReferencesPostgreSQLDataPVC(pod.Spec, bootstrap.PVCName) {
+				continue
+			}
 			if matching >= 0 {
 				return false, fmt.Errorf("Pod %s references PostgreSQL bootstrap resources for multiple shards", pod.Name)
 			}
@@ -1740,6 +1747,15 @@ func podSpecReferencesPostgreSQLBootstrap(spec corev1.PodSpec, bootstrap pgshard
 	return false
 }
 
+func podSpecReferencesPostgreSQLDataPVC(spec corev1.PodSpec, pvcName string) bool {
+	for _, volume := range spec.Volumes {
+		if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == pvcName {
+			return true
+		}
+	}
+	return false
+}
+
 func containerReferencesSecret(env []corev1.EnvVar, envFrom []corev1.EnvFromSource, name string) bool {
 	for _, source := range envFrom {
 		if source.SecretRef != nil && source.SecretRef.Name == name {
@@ -1752,6 +1768,10 @@ func containerReferencesSecret(env []corev1.EnvVar, envFrom []corev1.EnvFromSour
 		}
 	}
 	return false
+}
+
+func podHasTerminalPhase(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 }
 
 func validatePostgreSQLFinalizationPod(pod *corev1.Pod, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) error {

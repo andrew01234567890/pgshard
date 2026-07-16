@@ -791,6 +791,29 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	if err := base.Create(ctx, latePod); err != nil {
 		t.Fatal(err)
 	}
+	credentialOnlyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "completed-sql-client", Namespace: cluster.Namespace},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "psql",
+			Env: []corev1.EnvVar{{
+				Name: "PGPASSWORD",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: bootstrap.SecretName},
+					Key:                  owned.PostgreSQLPasswordKey,
+				}},
+			}},
+		}}},
+		Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+	activeCredentialPod := credentialOnlyPod.DeepCopy()
+	activeCredentialPod.Name = "active-sql-client"
+	activeCredentialPod.Status.Phase = corev1.PodRunning
+	if err := base.Create(ctx, credentialOnlyPod); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Create(ctx, activeCredentialPod); err != nil {
+		t.Fatal(err)
+	}
 	claimKey := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
 	assertProtected := func(stage string) {
 		t.Helper()
@@ -813,6 +836,17 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	if err := base.Get(ctx, client.ObjectKeyFromObject(latePod), &corev1.Pod{}); err != nil {
 		t.Fatalf("late Pod disappeared before its authoritative observation: %v", err)
 	}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(credentialOnlyPod), &corev1.Pod{}); err != nil {
+		t.Fatalf("credential-only Pod was treated as a data-mounting Pod: %v", err)
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "active-sql-client") {
+		t.Fatalf("active credential-bearing Pod did not hold the data barrier: %v", err)
+	}
+	assertProtected("active credential client")
+	if err := base.Delete(ctx, activeCredentialPod); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
@@ -831,6 +865,12 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	}
 	if postgresqlDataPVCIsProtected(retained) || retained.Annotations[owned.RetainedFromAnnotation] != cluster.Namespace+"/"+cluster.Name {
 		t.Fatalf("PostgreSQL data was not retained after both absence barriers: %#v", retained.ObjectMeta)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(credentialOnlyPod), &corev1.Pod{}); err != nil {
+		t.Fatalf("credential-only Pod blocked or was removed by completed finalization: %v", err)
 	}
 }
 
