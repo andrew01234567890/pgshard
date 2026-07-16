@@ -89,6 +89,16 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		// The protected data-PVC name must remain reserved until every workload
+		// that can mount it is gone. This prevents a same-name late create from
+		// ever reaching the PostgreSQL bootstrap path.
+		remaining, err := r.prune(ctx, cluster, nil, true)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("prune resources before finalizing PostgreSQL data: %w", err)
+		}
+		if remaining {
+			return ctrl.Result{RequeueAfter: retryDelay}, nil
+		}
 		if deletionPolicy == pgshardv1alpha1.DeletionRetain {
 			retained, err := r.retainPostgreSQLPVCs(ctx, cluster)
 			if err != nil {
@@ -98,16 +108,6 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 				return ctrl.Result{Requeue: true}, nil
 			}
 		} else {
-			// A mounted PVC remains Terminating behind pvc-protection. Remove the
-			// workloads that can hold the exact data claims before requesting
-			// their deletion, otherwise finalization can deadlock on its own Pod.
-			remaining, err := r.prune(ctx, cluster, nil, true)
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("prune resources before deleting PostgreSQL data: %w", err)
-			}
-			if remaining {
-				return ctrl.Result{RequeueAfter: retryDelay}, nil
-			}
 			deleting, err := r.deletePostgreSQLPVCs(ctx, cluster)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("delete PostgreSQL data during cluster deletion: %w", err)
@@ -122,15 +122,6 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		}
 		if deletingFence {
 			return ctrl.Result{RequeueAfter: retryDelay}, nil
-		}
-		if deletionPolicy == pgshardv1alpha1.DeletionRetain {
-			remaining, err := r.prune(ctx, cluster, nil, true)
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("prune resources during cluster deletion: %w", err)
-			}
-			if remaining {
-				return ctrl.Result{RequeueAfter: retryDelay}, nil
-			}
 		}
 		controllerutil.RemoveFinalizer(cluster, resourceFinalizer)
 		if err := r.Update(ctx, cluster); err != nil {
@@ -311,6 +302,9 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 			return err
 		}
 		if bootstrap.SecretUID == "" {
+			if !postgresqlCredentialIsClusterFenced(secret, cluster) {
+				return fmt.Errorf("uncheckpointed credential Secret %s is not controlled by the exact cluster", secret.Name)
+			}
 			bootstrap.SecretUID = secret.UID
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				return fmt.Errorf("checkpoint PostgreSQL credential identity for shard %d: %w", shard, err)
@@ -330,8 +324,11 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 			}
 			bootstrap = &cluster.Status.PostgreSQLBootstraps[index]
 		}
-		if len(secret.OwnerReferences) != 0 {
+		if bootstrap.PVCUID == "" && len(secret.OwnerReferences) != 0 {
 			return fmt.Errorf("PostgreSQL PVC creation fence %s is still garbage-collection-owned", secret.Name)
+		}
+		if bootstrap.PVCUID != "" && len(secret.OwnerReferences) != 0 && !postgresqlCredentialIsDataAnchored(secret, *bootstrap) {
+			return fmt.Errorf("PostgreSQL credential tombstone %s has an unexpected garbage-collection owner", secret.Name)
 		}
 
 		storageSize, err := provisionedPostgreSQLStorageSize(cluster)
@@ -356,9 +353,10 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				return fmt.Errorf("checkpoint PostgreSQL data identity for shard %d: %w", shard, err)
 			}
+			bootstrap = &cluster.Status.PostgreSQLBootstraps[index]
 		}
-		if !postgresqlDataPVCIsCreationFenced(claim, *bootstrap) {
-			return fmt.Errorf("PostgreSQL data PVC %s is missing its credential creation fence", claim.Name)
+		if err := r.stabilizePostgreSQLDataFence(ctx, secret, claim, *bootstrap); err != nil {
+			return fmt.Errorf("stabilize PostgreSQL data PVC %s: %w", claim.Name, err)
 		}
 	}
 	return nil
@@ -471,6 +469,9 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLDataPVC(ctx context.Context, 
 	claim := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
 	if err := reader.Get(ctx, key, claim); err == nil {
+		if claim.DeletionTimestamp != nil {
+			return nil, fmt.Errorf("PostgreSQL data PVC %s with recorded UID %s is deleting; restore is required", bootstrap.PVCName, bootstrap.PVCUID)
+		}
 		return claim, nil
 	} else if !apierrors.IsNotFound(err) {
 		return nil, fmt.Errorf("read PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
@@ -508,9 +509,6 @@ func randomBootstrapName(prefix string) (string, error) {
 func validatePostgreSQLAuthSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, shard int32, expectedName string) error {
 	if secret.Annotations[owned.PostgreSQLBootstrapClusterUIDAnnotation] != string(cluster.UID) {
 		return fmt.Errorf("credential Secret is not bound to PgShardCluster UID %s", cluster.UID)
-	}
-	if len(secret.OwnerReferences) != 0 && !postgresqlCredentialIsClusterFenced(secret, cluster) {
-		return fmt.Errorf("credential Secret has an unexpected garbage-collection owner")
 	}
 	if secret.Name != expectedName || secret.DeletionTimestamp != nil || secret.Labels[owned.ClusterLabel] != cluster.Name || secret.Labels[owned.ComponentLabel] != "postgresql" || secret.Labels[owned.ShardLabel] != fmt.Sprintf("%04d", shard) {
 		return fmt.Errorf("credential Secret metadata does not match shard %d", shard)
@@ -580,6 +578,68 @@ func postgresqlDataPVCIsCreationFenced(claim *corev1.PersistentVolumeClaim, boot
 		owner.UID == bootstrap.SecretUID &&
 		owner.Controller != nil && *owner.Controller &&
 		owner.BlockOwnerDeletion != nil && *owner.BlockOwnerDeletion
+}
+
+func postgresqlCredentialIsDataAnchored(secret *corev1.Secret, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) bool {
+	if len(secret.OwnerReferences) != 1 {
+		return false
+	}
+	owner := secret.OwnerReferences[0]
+	return bootstrap.PVCUID != "" &&
+		owner.APIVersion == corev1.SchemeGroupVersion.String() &&
+		owner.Kind == "PersistentVolumeClaim" &&
+		owner.Name == bootstrap.PVCName &&
+		owner.UID == bootstrap.PVCUID &&
+		owner.Controller != nil && *owner.Controller &&
+		owner.BlockOwnerDeletion != nil && *owner.BlockOwnerDeletion
+}
+
+func postgresqlDataPVCIsProtected(claim *corev1.PersistentVolumeClaim) bool {
+	return slices.Contains(claim.Finalizers, owned.PostgreSQLDataProtectionFinalizer)
+}
+
+func (r *PgShardClusterReconciler) stabilizePostgreSQLDataFence(ctx context.Context, secret *corev1.Secret, claim *corev1.PersistentVolumeClaim, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) error {
+	if secret.UID != bootstrap.SecretUID || claim.UID != bootstrap.PVCUID {
+		return fmt.Errorf("resource identity differs from the recorded Secret or PVC UID")
+	}
+	if !postgresqlDataPVCIsProtected(claim) {
+		controllerutil.AddFinalizer(claim, owned.PostgreSQLDataProtectionFinalizer)
+		if err := r.Update(ctx, claim, client.FieldOwner(owned.ManagedByValue)); err != nil {
+			return fmt.Errorf("protect exact PostgreSQL data PVC: %w", err)
+		}
+	}
+	if len(claim.OwnerReferences) != 0 {
+		if !postgresqlDataPVCIsCreationFenced(claim, bootstrap) {
+			return fmt.Errorf("data PVC has an unexpected garbage-collection owner")
+		}
+		claim.OwnerReferences = nil
+		if err := r.Update(ctx, claim, client.FieldOwner(owned.ManagedByValue)); err != nil {
+			return fmt.Errorf("detach exact PostgreSQL data PVC from its creation fence: %w", err)
+		}
+	}
+	if !postgresqlDataPVCIsProtected(claim) || len(claim.OwnerReferences) != 0 {
+		return fmt.Errorf("data PVC is not independently protected and ownerless")
+	}
+	if postgresqlCredentialIsDataAnchored(secret, bootstrap) {
+		return nil
+	}
+	if len(secret.OwnerReferences) != 0 {
+		return fmt.Errorf("credential tombstone has an unexpected garbage-collection owner")
+	}
+	controller := true
+	blockDeletion := true
+	secret.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion:         corev1.SchemeGroupVersion.String(),
+		Kind:               "PersistentVolumeClaim",
+		Name:               bootstrap.PVCName,
+		UID:                bootstrap.PVCUID,
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockDeletion,
+	}}
+	if err := r.Update(ctx, secret, client.FieldOwner(owned.ManagedByValue)); err != nil {
+		return fmt.Errorf("anchor credential tombstone to exact PostgreSQL data PVC: %w", err)
+	}
+	return nil
 }
 
 func (r *PgShardClusterReconciler) detachPostgreSQLCredentialFence(ctx context.Context, secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster) error {
@@ -1201,12 +1261,21 @@ func (r *PgShardClusterReconciler) retainPostgreSQLPVCs(ctx context.Context, clu
 			continue
 		}
 		if bootstrap.PVCUID != "" && claim.UID != bootstrap.PVCUID {
-			return false, fmt.Errorf("PostgreSQL data PVC %s has UID %s, expected recorded UID %s", bootstrap.PVCName, claim.UID, bootstrap.PVCUID)
+			return r.deleteLatePostgreSQLDataPVC(ctx, cluster, *bootstrap, claim, storageSize)
 		}
 		if claim.DeletionTimestamp != nil {
-			// Kubernetes deletion is irreversible once accepted. In particular,
-			// an ownerless namespaced PVC is still deleted with its namespace.
-			continue
+			unavailable, unavailableErr := namespaceUnavailableForCreate(ctx, r.APIReader, cluster.Namespace)
+			if unavailableErr != nil {
+				return false, unavailableErr
+			}
+			if unavailable && postgresqlDataPVCIsProtected(claim) {
+				controllerutil.RemoveFinalizer(claim, owned.PostgreSQLDataProtectionFinalizer)
+				if err := r.Update(ctx, claim, client.FieldOwner(owned.ManagedByValue)); err != nil && !apierrors.IsNotFound(err) {
+					return false, fmt.Errorf("release PostgreSQL data protection during namespace deletion: %w", err)
+				}
+				return true, nil
+			}
+			return false, fmt.Errorf("PostgreSQL data PVC %s is already deleting and cannot be retained", claim.Name)
 		}
 		if err := validatePostgreSQLDataPVC(claim, cluster, bootstrap.Shard, *bootstrap, storageSize); err != nil {
 			return false, err
@@ -1227,10 +1296,8 @@ func (r *PgShardClusterReconciler) retainPostgreSQLPVCs(ctx context.Context, clu
 		}
 		retainedFrom := cluster.Namespace + "/" + cluster.Name
 		ownershipDetached := len(claim.OwnerReferences) == 0
-		if ownershipDetached && annotations[owned.RetainedFromAnnotation] != retainedFrom {
-			return false, fmt.Errorf("PostgreSQL data PVC %s is ownerless without the exact retention marker", claim.Name)
-		}
-		if annotations[owned.RetainedFromAnnotation] == retainedFrom && ownershipDetached {
+		protected := postgresqlDataPVCIsProtected(claim)
+		if annotations[owned.RetainedFromAnnotation] == retainedFrom && ownershipDetached && !protected {
 			continue
 		}
 		annotations[owned.RetainedFromAnnotation] = retainedFrom
@@ -1241,8 +1308,9 @@ func (r *PgShardClusterReconciler) retainPostgreSQLPVCs(ctx context.Context, clu
 			}
 			claim.OwnerReferences = nil
 		}
+		controllerutil.RemoveFinalizer(claim, owned.PostgreSQLDataProtectionFinalizer)
 		if err := r.Update(ctx, claim, client.FieldOwner(owned.ManagedByValue)); err != nil {
-			return false, fmt.Errorf("detach and mark retained PostgreSQL data PVC %s: %w", claim.Name, err)
+			return false, fmt.Errorf("detach, release, and mark retained PostgreSQL data PVC %s: %w", claim.Name, err)
 		}
 		changed = true
 	}
@@ -1273,26 +1341,33 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPVCs(ctx context.Context, clu
 			continue
 		}
 		if bootstrap.PVCUID != "" && claim.UID != bootstrap.PVCUID {
-			return false, fmt.Errorf("PostgreSQL data PVC %s has UID %s, expected recorded UID %s", bootstrap.PVCName, claim.UID, bootstrap.PVCUID)
+			return r.deleteLatePostgreSQLDataPVC(ctx, cluster, *bootstrap, claim, storageSize)
 		}
 		if claim.DeletionTimestamp != nil {
-			// Deletion is already irreversible for the exact recorded object.
-			// Wait for pvc-protection or the storage controller to finish instead
-			// of rejecting the expected intermediate state.
+			if postgresqlDataPVCIsProtected(claim) {
+				controllerutil.RemoveFinalizer(claim, owned.PostgreSQLDataProtectionFinalizer)
+				if err := r.Update(ctx, claim, client.FieldOwner(owned.ManagedByValue)); err != nil && !apierrors.IsNotFound(err) {
+					return false, fmt.Errorf("release deletable PostgreSQL data PVC %s: %w", claim.Name, err)
+				}
+			}
 			return true, nil
 		}
 		if err := validatePostgreSQLDataPVC(claim, cluster, bootstrap.Shard, *bootstrap, storageSize); err != nil {
 			return false, err
 		}
-		if !postgresqlDataPVCIsCreationFenced(claim, *bootstrap) {
-			return false, fmt.Errorf("Delete-policy PostgreSQL data PVC %s is missing its credential creation fence", claim.Name)
-		}
 		if bootstrap.PVCUID == "" {
+			if !postgresqlDataPVCIsCreationFenced(claim, *bootstrap) {
+				return false, fmt.Errorf("Delete-policy PostgreSQL data PVC %s has an unexpected owner before its API UID was checkpointed", claim.Name)
+			}
 			bootstrap.PVCUID = claim.UID
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				return false, fmt.Errorf("checkpoint deletable PostgreSQL data identity for shard %d: %w", bootstrap.Shard, err)
 			}
 			return true, nil
+		}
+		stable := len(claim.OwnerReferences) == 0 && postgresqlDataPVCIsProtected(claim)
+		if !stable && !postgresqlDataPVCIsCreationFenced(claim, *bootstrap) {
+			return false, fmt.Errorf("Delete-policy PostgreSQL data PVC %s is neither protected steady data nor exact creation-fenced data", claim.Name)
 		}
 		uid := bootstrap.PVCUID
 		resourceVersion := claim.ResourceVersion
@@ -1304,6 +1379,27 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPVCs(ctx context.Context, clu
 	return false, nil
 }
 
+func (r *PgShardClusterReconciler) deleteLatePostgreSQLDataPVC(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, claim *corev1.PersistentVolumeClaim, storageSize resource.Quantity) (bool, error) {
+	if !postgresqlDataPVCIsCreationFenced(claim, bootstrap) {
+		return false, fmt.Errorf("PostgreSQL data PVC %s has UID %s, expected recorded UID %s, and is not controlled by the exact credential tombstone", bootstrap.PVCName, claim.UID, bootstrap.PVCUID)
+	}
+	if postgresqlDataPVCIsProtected(claim) {
+		return false, fmt.Errorf("late PostgreSQL data PVC %s unexpectedly carries the protected-data finalizer", claim.Name)
+	}
+	if claim.DeletionTimestamp != nil {
+		return true, nil
+	}
+	if err := validatePostgreSQLDataPVC(claim, cluster, bootstrap.Shard, bootstrap, storageSize); err != nil {
+		return false, fmt.Errorf("validate late PostgreSQL data PVC %s before deletion: %w", claim.Name, err)
+	}
+	uid := claim.UID
+	resourceVersion := claim.ResourceVersion
+	if err := r.Delete(ctx, claim, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("delete late PostgreSQL data PVC %s with UID %s: %w", claim.Name, claim.UID, err)
+	}
+	return true, nil
+}
+
 func (r *PgShardClusterReconciler) resolvePostgreSQLDataPVCForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, deletionPolicy pgshardv1alpha1.StorageDeletionPolicy, storageSize resource.Quantity) (*corev1.PersistentVolumeClaim, error) {
 	claim := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
@@ -1311,11 +1407,6 @@ func (r *PgShardClusterReconciler) resolvePostgreSQLDataPVCForFinalization(ctx c
 	if err == nil {
 		if bootstrap.SecretUID == "" || !bootstrap.PVCFenceDetached {
 			return nil, fmt.Errorf("PostgreSQL data PVC %s exists before its credential creation fence was detached", bootstrap.PVCName)
-		}
-		if deletionPolicy == pgshardv1alpha1.DeletionRetain && len(claim.OwnerReferences) != 0 {
-			if _, err := r.readActivePostgreSQLCredentialFence(ctx, cluster, bootstrap); err != nil {
-				return nil, fmt.Errorf("retain PostgreSQL data PVC %s while its creation fence is unavailable: %w", bootstrap.PVCName, err)
-			}
 		}
 		return claim, nil
 	}
@@ -1412,7 +1503,21 @@ func (r *PgShardClusterReconciler) deletePostgreSQLCredentialFences(ctx context.
 			return true, nil
 		}
 		if secret.UID != bootstrap.SecretUID {
-			return false, fmt.Errorf("credential creation fence %s has UID %s, expected recorded UID %s", bootstrap.SecretName, secret.UID, bootstrap.SecretUID)
+			if !postgresqlCredentialIsClusterFenced(secret, cluster) {
+				return false, fmt.Errorf("credential creation fence %s has UID %s, expected recorded UID %s, and is not controlled by the exact deleting cluster", bootstrap.SecretName, secret.UID, bootstrap.SecretUID)
+			}
+			if secret.DeletionTimestamp != nil {
+				return true, nil
+			}
+			if err := validatePostgreSQLAuthSecret(secret, cluster, bootstrap.Shard, bootstrap.SecretName); err != nil {
+				return false, fmt.Errorf("validate late PostgreSQL credential fence %s before deletion: %w", secret.Name, err)
+			}
+			uid := secret.UID
+			resourceVersion := secret.ResourceVersion
+			if err := r.Delete(ctx, secret, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+				return false, fmt.Errorf("delete late PostgreSQL credential fence %s with UID %s: %w", secret.Name, secret.UID, err)
+			}
+			return true, nil
 		}
 		if bootstrap.PVCFenceDetached && bootstrap.PVCUID == "" {
 			unavailable, unavailableErr := namespaceUnavailableForCreate(ctx, r.APIReader, cluster.Namespace)
@@ -1429,6 +1534,17 @@ func (r *PgShardClusterReconciler) deletePostgreSQLCredentialFences(ctx context.
 		}
 		if secret.DeletionTimestamp != nil {
 			return true, nil
+		}
+		if !bootstrap.PVCFenceDetached {
+			if len(secret.OwnerReferences) != 0 && !postgresqlCredentialIsClusterFenced(secret, cluster) {
+				return false, fmt.Errorf("credential creation fence %s has an unexpected owner before detachment", secret.Name)
+			}
+		} else if bootstrap.PVCUID == "" {
+			if len(secret.OwnerReferences) != 0 {
+				return false, fmt.Errorf("credential creation fence %s is not detached while its PVC outcome is unresolved", secret.Name)
+			}
+		} else if len(secret.OwnerReferences) != 0 && !postgresqlCredentialIsDataAnchored(secret, *bootstrap) {
+			return false, fmt.Errorf("credential tombstone %s is not anchored to the exact recorded PVC", secret.Name)
 		}
 		uid := bootstrap.SecretUID
 		resourceVersion := secret.ResourceVersion

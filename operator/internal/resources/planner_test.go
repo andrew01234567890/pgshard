@@ -269,6 +269,9 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	if len(claim.OwnerReferences) != 1 || claim.OwnerReferences[0].Kind != "Secret" || claim.OwnerReferences[0].Name != secret.Name || claim.OwnerReferences[0].UID != secret.UID {
 		t.Fatalf("PostgreSQL data PVC creation fence = %#v", claim.OwnerReferences)
 	}
+	if len(claim.Finalizers) != 0 {
+		t.Fatalf("creation-fenced PVC received protection before its API UID checkpoint: %#v", claim.Finalizers)
+	}
 }
 
 func TestPostgreSQLBootstrapRefusesMismatchedDurableIdentity(t *testing.T) {

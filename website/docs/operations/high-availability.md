@@ -155,7 +155,11 @@ recovery, and rolling restarts are not implemented; see
 The operator's direct one-member development mode is intentionally outside the
 HA contract. It creates one writable PostgreSQL 18 Pod per shard and retains its
 PVC across a StatefulSet restart, but the shard is unavailable while that Pod
-restarts. Its init container binds the durable bootstrap marker to the exact
+restarts. Before publishing that Pod, the controller protects the checkpointed
+PVC UID with its own finalizer, makes the live PVC ownerless, and anchors the
+credential tombstone back to it. The exact claim name cannot be reused until
+the mounting workload is pruned, so a late empty claim cannot enter bootstrap.
+Its init container binds the durable bootstrap marker to the exact
 cluster UID and shard and repeats the publication filesystem sync before
 accepting an existing marker, while the running PostgreSQL container does not
 receive or mount the bootstrap password. `PostgreSQLPrimariesAvailable=True` reports

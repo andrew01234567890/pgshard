@@ -18,6 +18,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
@@ -59,7 +60,33 @@ func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
 	}
 	bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{
 		Shard: 0, SecretName: fence.Name, SecretUID: fence.UID, PVCFenceDetached: true,
-		PVCName: "late-postgresql-data", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
+		PVCName: "current-postgresql-data", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
+	}
+	current := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+	if err := kubeClient.Create(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap.PVCUID = current.UID
+	current.Finalizers = append(current.Finalizers, owned.PostgreSQLDataProtectionFinalizer)
+	current.OwnerReferences = nil
+	if err := kubeClient.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	blockDeletion := true
+	fence.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion:         corev1.SchemeGroupVersion.String(),
+		Kind:               "PersistentVolumeClaim",
+		Name:               current.Name,
+		UID:                current.UID,
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockDeletion,
+	}}
+	if err := kubeClient.Update(ctx, fence); err != nil {
+		t.Fatal(err)
+	}
+	if !postgresqlCredentialIsDataAnchored(fence, bootstrap) {
+		t.Fatalf("credential tombstone is not anchored to the current PVC: %#v", fence.OwnerReferences)
 	}
 	if err := kubeClient.Delete(ctx, cluster); err != nil {
 		t.Fatal(err)
@@ -81,9 +108,19 @@ func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("wait for credential-fence deletion: %v", err)
 	}
+	currentAfterSecretDelete := &corev1.PersistentVolumeClaim{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(current), currentAfterSecretDelete); err != nil {
+		t.Fatalf("deleting the anchored credential tombstone removed current PostgreSQL data: %v", err)
+	}
+	if currentAfterSecretDelete.UID != bootstrap.PVCUID || currentAfterSecretDelete.DeletionTimestamp != nil || len(currentAfterSecretDelete.OwnerReferences) != 0 || !postgresqlDataPVCIsProtected(currentAfterSecretDelete) {
+		t.Fatalf("current PostgreSQL data changed after credential deletion: %#v", currentAfterSecretDelete.ObjectMeta)
+	}
 
-	late := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
-	if !postgresqlDataPVCIsCreationFenced(late, bootstrap) {
+	lateBootstrap := bootstrap
+	lateBootstrap.PVCName = "late-postgresql-data"
+	lateBootstrap.PVCUID = ""
+	late := owned.PostgreSQLPrimaryDataPVC(cluster, 0, lateBootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, lateBootstrap.SecretName, lateBootstrap.SecretUID)
+	if !postgresqlDataPVCIsCreationFenced(late, lateBootstrap) {
 		t.Fatalf("late PVC lacks the deleted credential fence: %#v", late.OwnerReferences)
 	}
 	if err := kubeClient.Create(ctx, late); err != nil {
@@ -95,6 +132,13 @@ func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
 		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
 	}); err != nil {
 		t.Fatalf("garbage collector did not remove the late fenced PVC: %v", err)
+	}
+	controllerutil.RemoveFinalizer(currentAfterSecretDelete, owned.PostgreSQLDataProtectionFinalizer)
+	if err := kubeClient.Update(ctx, currentAfterSecretDelete); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Delete(ctx, currentAfterSecretDelete); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
 	}
 }
 

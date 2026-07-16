@@ -497,8 +497,9 @@ and lengths, replica identity, reserved flags, UTF-8, zero-copy iteration, and
 redaction. Complete transaction ordering, relation caching, feedback scheduling
 and durable-checkpoint restart integration, replay, and cross-shard stream tests
 are still absent. Targeted KIND tests verify operator PVC deletion and
-same-name recreation, garbage collection of a late PVC create carrying a
-deleted credential-Secret owner fence, CRD-only rejection of unsupported topology and
+same-name recreation, survival of the ownerless protected live PVC when its
+anchored credential tombstone is deleted, garbage collection of a late PVC
+create carrying that deleted Secret owner fence, CRD-only rejection of unsupported topology and
 storage transitions, and server-side-apply field pruning after PostgreSQL
 parameter, Service annotation, and OTEL configuration shrinkage. A delayed rollout keeps
 the old immutable PostgreSQL ConfigMap available until the workload reports the
@@ -545,8 +546,12 @@ resulting Bound PVC, then restarts one primary StatefulSet and verifies its
 PVC-backed row survives. A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the
-resulting Bound PVC exactly matches that checkpoint and is controlled by the
-exact detached Secret UID. Outcome-unknown tests cover both an uncommitted
+resulting Bound PVC exactly matches that checkpoint, is ownerless with the
+operator's data-protection finalizer, and owns the credential tombstone by its
+exact UID before any workload is published. Lost-response tests cover each
+protection, detachment, and tombstone-anchoring update boundary. A delete request
+cannot free the same claim name while its workload still exists. Outcome-unknown
+tests cover both an uncommitted
 timeout and a committed create whose response is lost, including the
 `AlreadyExists` recovery path. They also mutate the live size, class, and policy
 after provisioning and prove finalization uses only the stored snapshot. It also

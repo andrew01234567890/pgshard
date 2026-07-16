@@ -62,6 +62,7 @@ const (
 	RetainedFromAnnotation                  = "pgshard.io/retained-from"
 	PostgreSQLBootstrapClusterUIDAnnotation = "pgshard.io/bootstrap-cluster-uid"
 	PostgreSQLDataClusterUIDAnnotation      = "pgshard.io/data-cluster-uid"
+	PostgreSQLDataProtectionFinalizer       = "pgshard.io/postgresql-data-protection"
 	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 )
 
@@ -476,7 +477,9 @@ func PostgreSQLPrimaryDataPVCPrefix(cluster string, shard int32) string {
 // PostgreSQLAuthSecret returns one immutable shard bootstrap Secret. It starts
 // cluster-owned so a late create cannot outlive a failed bootstrap. The
 // controller checkpoints its API UID and detaches it before using that exact
-// Secret as the durable owner of outcome-unknown PVC creates.
+// Secret as the durable owner of outcome-unknown PVC creates. After the exact
+// PVC UID is checkpointed, ownership is inverted: the live PVC is protected
+// independently and the Secret becomes its dependent tombstone.
 func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, password []byte) *corev1.Secret {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
@@ -493,8 +496,10 @@ func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, 
 // PostgreSQLPrimaryDataPVC returns the standalone data volume for a singleton
 // primary. Size and storage class come from the checkpointed provisioning
 // contract. Every create is controlled by the exact detached credential Secret
-// UID, which remains as a durable creation-intent fence until cluster
-// finalization resolves the PVC outcome and deletes the fence.
+// UID. The controller adds its data-protection finalizer only after the API UID
+// is checkpointed, then detaches the live PVC and anchors the Secret tombstone
+// to it. Delayed create requests retain this initial owner and no finalizer, so
+// Kubernetes can garbage-collect them after the tombstone is deleted.
 func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageSize resource.Quantity, storageClassName *string, fenceName string, fenceUID types.UID) *corev1.PersistentVolumeClaim {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
 	controller := true

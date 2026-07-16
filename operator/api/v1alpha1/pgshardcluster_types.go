@@ -217,7 +217,9 @@ type PostgreSQLBootstrapSpecStatus struct {
 // after the API server confirms each child. PVCFenceDetached is checkpointed
 // only after the credential Secret has been detached from cluster garbage
 // collection, making that exact Secret UID a durable owner for any outcome-
-// unknown PVC create. A workload cannot consume an incomplete record.
+// unknown PVC create. After PVCUID is checkpointed, the controller protects and
+// detaches that exact live PVC and anchors the Secret tombstone back to its UID.
+// A workload cannot consume an incomplete or unstabilized record.
 type PostgreSQLBootstrapStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	Shard      int32     `json:"shard"`
