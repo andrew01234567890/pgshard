@@ -14,8 +14,14 @@ use serde::{Deserialize, Serialize};
 const FIRST_VERSION: Version = Version::new(0, 1, 0);
 const RELEASE_MARKER: &str = "crates/pgshard-release/RELEASE_START";
 const RELEASE_HELPER_SOURCE: &str = "crates/pgshard-release/src/main.rs";
-const CI_WAIT_TIMEOUT: Duration = Duration::from_mins(15);
-const CI_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const RELEASE_CHECK_WAIT_TIMEOUT: Duration = Duration::from_mins(15);
+const RELEASE_CHECK_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const REQUIRED_CODEQL_ANALYSES: [&str; 4] = [
+    "Analyze (actions)",
+    "Analyze (go)",
+    "Analyze (javascript-typescript)",
+    "Analyze (rust)",
+];
 const UNPRIVILEGED_DEPENDABOT_PATHS: [&str; 4] = [
     "operator/go.mod",
     "operator/go.sum",
@@ -456,7 +462,7 @@ fn publish_one(repository: &str, release: &PlannedRelease) -> Result<()> {
         return Ok(());
     }
 
-    ensure_ci_passed(repository, &release.sha)?;
+    ensure_release_checks_passed(repository, &release.sha)?;
 
     let tag = format!("v{}", release.version);
     if let Some(tag_sha) = tag_target(&tag)? {
@@ -500,7 +506,7 @@ fn publish_one(repository: &str, release: &PlannedRelease) -> Result<()> {
     Ok(())
 }
 
-fn ensure_ci_passed(repository: &str, sha: &str) -> Result<()> {
+fn ensure_release_checks_passed(repository: &str, sha: &str) -> Result<()> {
     let started = Instant::now();
     loop {
         let response = run(
@@ -509,25 +515,30 @@ fn ensure_ci_passed(repository: &str, sha: &str) -> Result<()> {
                 "api",
                 "-H",
                 "Accept: application/vnd.github+json",
-                &format!(
-                    "repos/{repository}/commits/{sha}/check-runs?check_name=CI%20aggregate&filter=latest&per_page=10"
-                ),
+                &format!("repos/{repository}/commits/{sha}/check-runs?filter=latest&per_page=100"),
             ],
         )?;
         let checks: CheckRuns = serde_json::from_str(&response)?;
-        match aggregate_state(&checks) {
-            AggregateState::Passed => return Ok(()),
-            AggregateState::Failed => {
-                bail!("commit {sha} has a failed exact-head CI aggregate check")
-            }
-            AggregateState::Pending if started.elapsed() >= CI_WAIT_TIMEOUT => {
-                bail!("timed out waiting for exact-head CI aggregate on commit {sha}")
-            }
-            AggregateState::Pending => {
-                println!("waiting for exact-head CI aggregate on ancestor {sha}");
-                thread::sleep(CI_POLL_INTERVAL);
-            }
+        ensure!(
+            checks.check_runs.len() < 100,
+            "release check-run lookup reached its page limit and is ambiguous"
+        );
+        let ci = aggregate_state(&checks);
+        let codeql = required_codeql_state(&checks);
+        if ci == AggregateState::Failed {
+            bail!("commit {sha} has a failed exact-head CI aggregate check");
         }
+        if codeql == AggregateState::Failed {
+            bail!("commit {sha} has a failed exact-head required CodeQL analysis");
+        }
+        if ci == AggregateState::Passed && codeql == AggregateState::Passed {
+            return Ok(());
+        }
+        if started.elapsed() >= RELEASE_CHECK_WAIT_TIMEOUT {
+            bail!("timed out waiting for exact-head CI and CodeQL checks on commit {sha}");
+        }
+        println!("waiting for exact-head CI and CodeQL checks on ancestor {sha}");
+        thread::sleep(RELEASE_CHECK_POLL_INTERVAL);
     }
 }
 
@@ -550,6 +561,30 @@ fn aggregate_state(checks: &CheckRuns) -> AggregateState {
         AggregateState::Pending
     } else {
         AggregateState::Failed
+    }
+}
+
+fn required_codeql_state(checks: &CheckRuns) -> AggregateState {
+    let mut pending = false;
+    for required_name in REQUIRED_CODEQL_ANALYSES {
+        let analyses = checks
+            .check_runs
+            .iter()
+            .filter(|check| check.name == required_name && check.app.slug == "github-actions")
+            .collect::<Vec<_>>();
+        if analyses.is_empty() || analyses.iter().any(|check| check.status != "completed") {
+            pending = true;
+        } else if analyses
+            .iter()
+            .any(|check| check.conclusion.as_deref() != Some("success"))
+        {
+            return AggregateState::Failed;
+        }
+    }
+    if pending {
+        AggregateState::Pending
+    } else {
+        AggregateState::Passed
     }
 }
 
@@ -1761,6 +1796,44 @@ mod tests {
             }),
             AggregateState::Pending
         );
+    }
+
+    #[test]
+    fn release_requires_every_successful_default_codeql_analysis() {
+        let successful_analysis = |name: &str| CheckRun {
+            name: name.to_owned(),
+            status: "completed".to_owned(),
+            conclusion: Some("success".to_owned()),
+            app: CheckApp {
+                slug: "github-actions".to_owned(),
+            },
+        };
+        let mut checks = CheckRuns {
+            check_runs: REQUIRED_CODEQL_ANALYSES
+                .iter()
+                .map(|name| successful_analysis(name))
+                .collect(),
+        };
+        assert_eq!(required_codeql_state(&checks), AggregateState::Passed);
+
+        let missing = checks.check_runs.pop().expect("required analysis");
+        assert_eq!(required_codeql_state(&checks), AggregateState::Pending);
+        checks.check_runs.push(missing);
+
+        checks.check_runs[0].status = "in_progress".to_owned();
+        checks.check_runs[0].conclusion = None;
+        assert_eq!(required_codeql_state(&checks), AggregateState::Pending);
+
+        checks.check_runs[0].status = "completed".to_owned();
+        checks.check_runs[0].conclusion = Some("failure".to_owned());
+        assert_eq!(required_codeql_state(&checks), AggregateState::Failed);
+
+        checks.check_runs[0].conclusion = Some("neutral".to_owned());
+        assert_eq!(required_codeql_state(&checks), AggregateState::Failed);
+
+        checks.check_runs[0] = successful_analysis(REQUIRED_CODEQL_ANALYSES[0]);
+        checks.check_runs[0].app.slug = "untrusted-check-app".to_owned();
+        assert_eq!(required_codeql_state(&checks), AggregateState::Pending);
     }
 
     #[test]

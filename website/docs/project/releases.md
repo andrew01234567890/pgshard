@@ -23,10 +23,12 @@ The release job is serialized and idempotent. Queue order is not trusted: each
 invocation finds the nearest SemVer tag on the selected commit's first-parent
 history and publishes every untagged first-parent commit oldest-first. A
 descendant job may therefore safely run before its ancestor's job. Before
-publishing, it waits for every planned ancestor's exact aggregate check to
-succeed and fails immediately if a completed aggregate failed; this covers
-GitHub's explicitly unordered concurrency scheduling without releasing an
-unchecked gap. It creates no version-bump commit, preventing release loops.
+publishing, it waits for every planned ancestor's exact aggregate check and the
+default CodeQL analyses for Actions, Go, JavaScript/TypeScript, and Rust to
+succeed. A completed failure aborts publication, while a missing or running
+check remains pending until the bounded release deadline; this covers GitHub's
+explicitly unordered concurrency scheduling without releasing an unchecked
+gap. It creates no version-bump commit, preventing release loops.
 Documentation-only and CI-only default-branch commits still receive patch
 releases.
 
