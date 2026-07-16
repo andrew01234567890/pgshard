@@ -572,13 +572,16 @@ fn required_codeql_state(checks: &CheckRuns) -> AggregateState {
             .iter()
             .filter(|check| check.name == required_name && check.app.slug == "github-actions")
             .collect::<Vec<_>>();
-        if analyses.is_empty() || analyses.iter().any(|check| check.status != "completed") {
-            pending = true;
-        } else if analyses
+        if analyses
             .iter()
-            .any(|check| check.conclusion.as_deref() != Some("success"))
+            .any(|check| {
+                check.status == "completed" && check.conclusion.as_deref() != Some("success")
+            })
         {
             return AggregateState::Failed;
+        }
+        if analyses.is_empty() || analyses.iter().any(|check| check.status != "completed") {
+            pending = true;
         }
     }
     if pending {
@@ -1827,6 +1830,18 @@ mod tests {
         checks.check_runs[0].status = "completed".to_owned();
         checks.check_runs[0].conclusion = Some("failure".to_owned());
         assert_eq!(required_codeql_state(&checks), AggregateState::Failed);
+
+        let pending_duplicate = CheckRun {
+            name: REQUIRED_CODEQL_ANALYSES[0].to_owned(),
+            status: "in_progress".to_owned(),
+            conclusion: None,
+            app: CheckApp {
+                slug: "github-actions".to_owned(),
+            },
+        };
+        checks.check_runs.push(pending_duplicate);
+        assert_eq!(required_codeql_state(&checks), AggregateState::Failed);
+        checks.check_runs.pop();
 
         checks.check_runs[0].conclusion = Some("neutral".to_owned());
         assert_eq!(required_codeql_state(&checks), AggregateState::Failed);
