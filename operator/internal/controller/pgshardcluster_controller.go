@@ -241,6 +241,9 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 		if bootstrap.PVCUID != "" && !bootstrap.PVCFenceDetached {
 			return fmt.Errorf("recorded PostgreSQL bootstrap for shard %d identifies data before its creation fence was detached", bootstrap.Shard)
 		}
+		if bootstrap.PVCCreationAbandoned && (bootstrap.SecretUID == "" || !bootstrap.PVCFenceDetached || bootstrap.PVCUID != "") {
+			return fmt.Errorf("recorded PostgreSQL bootstrap for shard %d has an invalid abandoned PVC creation outcome", bootstrap.Shard)
+		}
 		if _, duplicate := indices[bootstrap.Shard]; duplicate {
 			return fmt.Errorf("recorded PostgreSQL bootstrap for shard %d is duplicated", bootstrap.Shard)
 		}
@@ -1253,12 +1256,28 @@ func (r *PgShardClusterReconciler) retainPostgreSQLPVCs(ctx context.Context, clu
 		if bootstrap.PVCName == "" {
 			continue
 		}
-		claim, err := r.resolvePostgreSQLDataPVCForFinalization(ctx, cluster, *bootstrap, pgshardv1alpha1.DeletionRetain, storageSize)
+		claim, err := r.resolvePostgreSQLDataPVCForFinalization(ctx, cluster, *bootstrap)
 		if err != nil {
 			return false, err
 		}
 		if claim == nil {
+			if bootstrap.PVCUID == "" && bootstrap.SecretUID != "" && bootstrap.PVCFenceDetached && !bootstrap.PVCCreationAbandoned {
+				unavailable, unavailableErr := namespaceUnavailableForCreate(ctx, r.APIReader, cluster.Namespace)
+				if unavailableErr != nil {
+					return false, unavailableErr
+				}
+				if !unavailable {
+					bootstrap.PVCCreationAbandoned = true
+					if err := r.Status().Update(ctx, cluster); err != nil {
+						return false, fmt.Errorf("checkpoint abandoned PostgreSQL data creation for shard %d: %w", bootstrap.Shard, err)
+					}
+					return true, nil
+				}
+			}
 			continue
+		}
+		if bootstrap.PVCCreationAbandoned {
+			return r.deleteLatePostgreSQLDataPVC(ctx, cluster, *bootstrap, claim, storageSize)
 		}
 		if bootstrap.PVCUID != "" && claim.UID != bootstrap.PVCUID {
 			return r.deleteLatePostgreSQLDataPVC(ctx, cluster, *bootstrap, claim, storageSize)
@@ -1331,7 +1350,7 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPVCs(ctx context.Context, clu
 		if bootstrap.PVCName == "" {
 			continue
 		}
-		claim, err := r.resolvePostgreSQLDataPVCForFinalization(ctx, cluster, *bootstrap, pgshardv1alpha1.DeletionDelete, storageSize)
+		claim, err := r.resolvePostgreSQLDataPVCForFinalization(ctx, cluster, *bootstrap)
 		if err != nil {
 			return false, err
 		}
@@ -1398,7 +1417,7 @@ func (r *PgShardClusterReconciler) deleteLatePostgreSQLDataPVC(ctx context.Conte
 	return true, nil
 }
 
-func (r *PgShardClusterReconciler) resolvePostgreSQLDataPVCForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, deletionPolicy pgshardv1alpha1.StorageDeletionPolicy, storageSize resource.Quantity) (*corev1.PersistentVolumeClaim, error) {
+func (r *PgShardClusterReconciler) resolvePostgreSQLDataPVCForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) (*corev1.PersistentVolumeClaim, error) {
 	claim := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
 	err := r.APIReader.Get(ctx, key, claim)
@@ -1411,51 +1430,12 @@ func (r *PgShardClusterReconciler) resolvePostgreSQLDataPVCForFinalization(ctx c
 	if !apierrors.IsNotFound(err) {
 		return nil, fmt.Errorf("read PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
 	}
-	if bootstrap.SecretUID == "" || !bootstrap.PVCFenceDetached || bootstrap.PVCUID != "" {
-		// PVC creation is dispatched only after the detached-fence checkpoint. A
-		// missing checkpoint proves no PVC create was attempted; a recorded PVC
-		// UID proves the exact object has already disappeared.
-		return nil, nil
-	}
-	unavailable, err := namespaceUnavailableForCreate(ctx, r.APIReader, cluster.Namespace)
-	if err != nil {
-		return nil, err
-	}
-	if unavailable {
-		// Namespace absence or termination is an authoritative creation barrier.
-		return nil, nil
-	}
-	if _, err := r.readActivePostgreSQLCredentialFence(ctx, cluster, bootstrap); err != nil {
-		if deletionPolicy == pgshardv1alpha1.DeletionDelete && apierrors.IsNotFound(err) {
-			// Every possible late PVC create references the missing Secret UID and
-			// is therefore garbage-collected. No recreate is needed for Delete.
-			return nil, nil
-		}
-		return nil, fmt.Errorf("resolve PostgreSQL data creation fence for shard %d: %w", bootstrap.Shard, err)
-	}
-	claim, err = r.ensurePostgreSQLDataPVC(ctx, r.APIReader, cluster, bootstrap.Shard, bootstrap, storageSize)
-	if err != nil {
-		return nil, fmt.Errorf("resolve uncheckpointed PostgreSQL data creation intent for shard %d before finalization: %w", bootstrap.Shard, err)
-	}
-	return claim, nil
-}
-
-func (r *PgShardClusterReconciler) readActivePostgreSQLCredentialFence(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) (*corev1.Secret, error) {
-	secret := &corev1.Secret{}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}
-	if err := r.APIReader.Get(ctx, key, secret); err != nil {
-		return nil, err
-	}
-	if secret.UID != bootstrap.SecretUID {
-		return nil, fmt.Errorf("credential Secret %s has UID %s, expected recorded UID %s", bootstrap.SecretName, secret.UID, bootstrap.SecretUID)
-	}
-	if err := validatePostgreSQLAuthSecret(secret, cluster, bootstrap.Shard, bootstrap.SecretName); err != nil {
-		return nil, err
-	}
-	if len(secret.OwnerReferences) != 0 {
-		return nil, fmt.Errorf("credential Secret %s is not detached from cluster garbage collection", bootstrap.SecretName)
-	}
-	return secret, nil
+	// Finalization never creates storage. A visible uncheckpointed claim is
+	// resolved by its caller; an absent one is either known-gone or may still
+	// arrive carrying the detached Secret UID. Retain durably abandons that
+	// intent before deleting the Secret, and Delete relies on the same owner
+	// fence, so a delayed create cannot become replacement data.
+	return nil, nil
 }
 
 func (r *PgShardClusterReconciler) deletePostgreSQLCredentialFences(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, deletionPolicy pgshardv1alpha1.StorageDeletionPolicy) (bool, error) {
@@ -1470,7 +1450,7 @@ func (r *PgShardClusterReconciler) deletePostgreSQLCredentialFences(ctx context.
 		secret := &corev1.Secret{}
 		key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}
 		if err := r.APIReader.Get(ctx, key, secret); apierrors.IsNotFound(err) {
-			if deletionPolicy == pgshardv1alpha1.DeletionRetain && bootstrap.PVCFenceDetached && bootstrap.PVCUID == "" {
+			if deletionPolicy == pgshardv1alpha1.DeletionRetain && bootstrap.PVCFenceDetached && bootstrap.PVCUID == "" && !bootstrap.PVCCreationAbandoned {
 				unavailable, unavailableErr := namespaceUnavailableForCreate(ctx, r.APIReader, cluster.Namespace)
 				if unavailableErr != nil {
 					return false, unavailableErr
@@ -1517,7 +1497,7 @@ func (r *PgShardClusterReconciler) deletePostgreSQLCredentialFences(ctx context.
 			}
 			return true, nil
 		}
-		if bootstrap.PVCFenceDetached && bootstrap.PVCUID == "" {
+		if deletionPolicy == pgshardv1alpha1.DeletionRetain && bootstrap.PVCFenceDetached && bootstrap.PVCUID == "" && !bootstrap.PVCCreationAbandoned {
 			unavailable, unavailableErr := namespaceUnavailableForCreate(ctx, r.APIReader, cluster.Namespace)
 			if unavailableErr != nil {
 				return false, unavailableErr
@@ -2023,7 +2003,7 @@ func bootstrapSpecsEqual(left, right *pgshardv1alpha1.PostgreSQLBootstrapSpecSta
 }
 
 func postgreSQLBootstrapsEqual(left, right pgshardv1alpha1.PostgreSQLBootstrapStatus) bool {
-	return left.Shard == right.Shard && left.SecretName == right.SecretName && left.SecretUID == right.SecretUID && left.PVCFenceDetached == right.PVCFenceDetached && left.PVCName == right.PVCName && left.PVCUID == right.PVCUID && optionalStringsEqual(left.PVCStorageClassName, right.PVCStorageClassName)
+	return left.Shard == right.Shard && left.SecretName == right.SecretName && left.SecretUID == right.SecretUID && left.PVCFenceDetached == right.PVCFenceDetached && left.PVCName == right.PVCName && left.PVCUID == right.PVCUID && left.PVCCreationAbandoned == right.PVCCreationAbandoned && optionalStringsEqual(left.PVCStorageClassName, right.PVCStorageClassName)
 }
 
 func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error {

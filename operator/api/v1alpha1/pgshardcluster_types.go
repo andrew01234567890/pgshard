@@ -219,7 +219,9 @@ type PostgreSQLBootstrapSpecStatus struct {
 // collection, making that exact Secret UID a durable owner for any outcome-
 // unknown PVC create. After PVCUID is checkpointed, the controller protects and
 // detaches that exact live PVC and anchors the Secret tombstone back to its UID.
-// A workload cannot consume an incomplete or unstabilized record.
+// Retain finalization can instead record an absent uncheckpointed outcome as
+// abandoned, after which no later outcome is retained. A workload cannot
+// consume an incomplete, abandoned, or unstabilized record.
 type PostgreSQLBootstrapStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	Shard      int32     `json:"shard"`
@@ -230,6 +232,12 @@ type PostgreSQLBootstrapStatus struct {
 	PVCFenceDetached bool      `json:"pvcFenceDetached,omitempty"`
 	PVCName          string    `json:"pvcName,omitempty"`
 	PVCUID           types.UID `json:"pvcUID,omitempty"`
+	// PVCCreationAbandoned is set only during Retain finalization after an
+	// authoritative read finds no PVC before its UID was checkpointed. No
+	// workload can use an uncheckpointed claim. The controller never recreates
+	// or retains a later outcome from this creation intent; the detached Secret
+	// remains its garbage-collection fence until finalization removes it.
+	PVCCreationAbandoned bool `json:"pvcCreationAbandoned,omitempty"`
 	// PVCStorageClassName records the explicit or operator-resolved class before
 	// the PVC create is dispatched, including an explicitly empty class.
 	PVCStorageClassName *string `json:"pvcStorageClassName,omitempty"`

@@ -37,7 +37,10 @@ to current data, while deleting the protected PVC cascades to the credential
 tombstone and reserves the claim name until every mounting workload has been
 pruned. Original timed-out PVC creates carry the tombstone owner but never the
 data-protection finalizer, so deleting the tombstone garbage-collects any such
-create that arrives late. A missing or replaced
+create that arrives late. During Retain finalization, an authoritative absent
+read before the PVC UID checkpoint is recorded as an abandoned creation intent.
+The controller never manufactures replacement storage for that state and keeps
+any later outcome on the Secret owner fence for deletion. A missing or replaced
 UID-checkpointed child requires explicit recovery. A one-time upgrade path
 first aligns objects created by the earlier whole-object Update controller, preserving
 Service allocations and API defaults, then establishes the operator's Apply
@@ -115,19 +118,23 @@ retain those claims during scaling. On cluster deletion, both storage policies
 keep each live PostgreSQL PVC ownerless and independently protected, with its
 API-identified credential tombstone anchored back to that exact PVC. For
 `storage.deletionPolicy: Retain` (the default), the finalizer first prunes every
-mounting workload, resolves every late or outcome-unknown create, checkpoints
-its API-assigned UID, releases the controller's PVC protection, marks that
-exact PVC retained, and only then deletes the Secret tombstone. If the retained
-PVC is later explicitly deleted, an original request that arrives afterward
-still carries the deleted Secret UID and is garbage-collected. `Delete` also
+mounting workload. A visible outcome is validated against the provisioned
+snapshot and its API-assigned UID is checkpointed before that exact PVC is
+released and marked retained. If no outcome is visible before the UID
+checkpoint, status first records that creation intent as abandoned; no PVC is
+created during finalization, and any later outcome remains bound to the Secret
+tombstone for deletion. Only then is the tombstone removed. If a retained PVC
+is explicitly deleted, the controller releases only its own protection
+finalizer and waits for authoritative absence instead of replacing it. `Delete` also
 prunes workloads first, requests deletion only for the status-recorded PVC
 UIDs, releases the protection finalizer after deletion is accepted, and then
 deletes the same creation tombstones. A same-name claim cannot reach bootstrap
 while a workload exists. The CR finalizer
 uses the checkpointed creation-time policy and waits for the selected result to
-be observed through the uncached Kubernetes API reader. Finalization rebuilds
-and validates unresolved PVCs only from the checkpointed storage snapshot, not
-from a concurrently mutated live spec. `Retain` does not
+be observed through the uncached Kubernetes API reader. Finalization never
+creates replacement storage; every visible uncheckpointed outcome is validated
+against the checkpointed storage snapshot before it can be retained or deleted.
+`Retain` does not
 override an explicit PVC deletion and cannot preserve a namespaced PVC when its
 namespace is deleted. Automated
 defragmentation is not implemented. PostgreSQL
@@ -242,7 +249,8 @@ access only in `pgshard-system` for webhook certificate mutation. The
 reconciler also has cluster-wide Secret `get`, `create`, `update`, and `delete`
 because it generates one randomly named credential per shard in each resource
 namespace, inverts its owner after the data UID checkpoint, and removes the
-credential tombstone only after the storage outcome is resolved;
+credential tombstone only after the storage outcome is resolved or durably
+abandoned;
 Kubernetes RBAC cannot restrict that permission to names derived from arbitrary
 custom resources. It has no Secret list, watch, or patch permission, and the
 controller reads credentials through the uncached client

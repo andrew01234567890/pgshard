@@ -502,8 +502,18 @@ spec:
                     collection, making that exact Secret UID a durable owner for any outcome-
                     unknown PVC create. After PVCUID is checkpointed, the controller protects and
                     detaches that exact live PVC and anchors the Secret tombstone back to its UID.
-                    A workload cannot consume an incomplete or unstabilized record.
+                    Retain finalization can instead record an absent uncheckpointed outcome as
+                    abandoned, after which no later outcome is retained. A workload cannot
+                    consume an incomplete, abandoned, or unstabilized record.
                   properties:
+                    pvcCreationAbandoned:
+                      description: |-
+                        PVCCreationAbandoned is set only during Retain finalization after an
+                        authoritative read finds no PVC before its UID was checkpointed. No
+                        workload can use an uncheckpointed claim. The controller never recreates
+                        or retains a later outcome from this creation intent; the detached Secret
+                        remains its garbage-collection fence until finalization removes it.
+                      type: boolean
                     pvcFenceDetached:
                       description: |-
                         PVCFenceDetached proves the exact credential Secret is independent of the

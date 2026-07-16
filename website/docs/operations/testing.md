@@ -499,8 +499,12 @@ and durable-checkpoint restart integration, replay, and cross-shard stream tests
 are still absent. Targeted KIND tests verify operator PVC deletion and
 same-name recreation, survival of the ownerless protected live PVC when its
 anchored credential tombstone is deleted, garbage collection of a late PVC
-create carrying that deleted Secret owner fence, CRD-only rejection of unsupported topology and
-storage transitions, and server-side-apply field pruning after PostgreSQL
+create carrying that deleted Secret owner fence, and release of the exact
+protected PVC when an explicit delete precedes Retain cluster finalization.
+Fault-injection tests additionally fail the PVC UID checkpoint, delete that
+unprotected exact outcome, and prove Retain records abandonment without issuing
+a replacement create. CRD-only tests cover rejection of unsupported topology
+and storage transitions, and server-side-apply field pruning after PostgreSQL
 parameter, Service annotation, and OTEL configuration shrinkage. A delayed rollout keeps
 the old immutable PostgreSQL ConfigMap available until the workload reports the
 new revision, then proves it is pruned. The same suite covers both fresh creation
