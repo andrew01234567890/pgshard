@@ -643,7 +643,7 @@ jobs:
           PGSHARD_KIND_MANAGER_E2E: "true"
         run: >-
           go test -race -count=1
-          -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|ManagerReconcilesFailClosedDevelopmentCluster|ManagerRunsSingleMemberPostgreSQL18Primaries)$'
+          -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|ManagerReconcilesFailClosedDevelopmentCluster|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerDeletePolicyReleasesBoundPostgreSQLPVC)$'
           ./internal/controller
       - name: Capture manager diagnostics
         if: failure()

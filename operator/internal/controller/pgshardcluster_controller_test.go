@@ -412,6 +412,57 @@ func TestReconcileRefusesMissingOrReplacedPostgreSQLDataPVC(t *testing.T) {
 	}
 }
 
+func TestReconcileCheckpointsRetroactivelyDefaultedStorageClass(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Spec.Storage.StorageClassName = nil
+	fakeClient := newFakeClient(t, cluster)
+	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+
+	current := getCluster(t, ctx, fakeClient, cluster)
+	bootstrap := bootstrapForShard(t, current, 0)
+	if bootstrap.PVCUID == "" || bootstrap.PVCStorageClassName != nil {
+		t.Fatalf("initial PVC checkpoint = %#v", bootstrap)
+	}
+	claim := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+	if err := fakeClient.Get(ctx, key, claim); err != nil {
+		t.Fatal(err)
+	}
+	lateDefault := "late-default"
+	claim.Spec.StorageClassName = &lateDefault
+	if err := fakeClient.Update(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+
+	current = getCluster(t, ctx, fakeClient, cluster)
+	bootstrap = bootstrapForShard(t, current, 0)
+	if bootstrap.PVCStorageClassName == nil || *bootstrap.PVCStorageClassName != lateDefault {
+		t.Fatalf("retroactive storage-class checkpoint = %#v", bootstrap.PVCStorageClassName)
+	}
+	if err := fakeClient.Get(ctx, key, claim); err != nil {
+		t.Fatal(err)
+	}
+	replacement := "different-default"
+	claim.Spec.StorageClassName = &replacement
+	if err := fakeClient.Update(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "storage class differs from its recorded API value") {
+		t.Fatalf("second storage-class transition was not fenced: %v", err)
+	}
+}
+
 func TestDeletionPolicyRetainsPostgreSQLDataByDefault(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -499,12 +550,62 @@ func TestExplicitDeletePolicyDeletesPostgreSQLData(t *testing.T) {
 	if err := fakeClient.Delete(ctx, current); err != nil {
 		t.Fatal(err)
 	}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+	for range 4 {
+		if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+			t.Fatal(err)
+		}
+		if err := fakeClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}); apierrors.IsNotFound(err) {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fakeClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("explicit Delete policy retained PostgreSQL data: %v", err)
+	}
+}
+
+func TestDeletePolicyPrunesWorkloadBeforeDataClaim(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
+	base := newFakeClient(t, cluster)
+	if _, err := (&PgShardClusterReconciler{Client: base, APIReader: base}).Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	bootstrap := bootstrapForShard(t, current, 0)
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	writeClient := interceptedClient(t, base, interceptor.Funcs{
+		Delete: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.DeleteOption) error {
+			claim, ok := object.(*corev1.PersistentVolumeClaim)
+			if ok && claim.Name == bootstrap.PVCName {
+				// Model pvc-protection holding the exact data claim after a
+				// successful delete request.
+				return nil
+			}
+			return kubeClient.Delete(ctx, object, options...)
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
-	if err := fakeClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("explicit Delete policy retained PostgreSQL data: %v", err)
+	statefulSet := &appsv1.StatefulSet{}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	if err := base.Get(ctx, statefulSetKey, statefulSet); !apierrors.IsNotFound(err) {
+		t.Fatalf("Delete policy requested data deletion before pruning its StatefulSet: %v", err)
+	}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("pvc-protection fixture did not retain the data claim: %v", err)
 	}
 }
 

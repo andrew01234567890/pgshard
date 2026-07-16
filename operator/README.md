@@ -26,9 +26,10 @@ API. The controller now reconciles the safe supporting-resource slice:
 Planned supporting resources use server-side apply. Each generated PostgreSQL
 credential and standalone data PVC has a cryptographically random name. The
 name and API-assigned UID are checkpointed separately in status before any
-workload can reference that child. A crash after creation but before the status
-write leaves an unused orphan rather than an adoptable deterministic name; a
-missing or replaced recorded child requires explicit recovery. A one-time upgrade path
+workload can reference that child. The name is a durable creation intent, so a
+reconcile after an outcome-unknown create reads and validates that exact child
+before checkpointing its API-assigned UID. A missing or replaced UID-checkpointed
+child requires explicit recovery. A one-time upgrade path
 first aligns objects created by the earlier whole-object Update controller, preserving
 Service allocations and API defaults, then establishes the operator's Apply
 field set and removes the legacy Update co-owners. The completion annotation is
@@ -73,8 +74,10 @@ fencing integration, promotion, and recovery exist.
 
 Generated bootstrap credentials are unique per shard, immutable, and stable
 across reconciles. Each data PVC is likewise bound to its recorded name, UID,
-capacity, API-defaulted storage class, and creation-time deletion policy. Child
-names are checkpointed before either API create; API-assigned UIDs are
+capacity, API-defaulted storage class, and creation-time deletion policy. A
+same-UID nil-to-default StorageClass assignment made later by Kubernetes is
+checkpointed once; an explicit empty class or any later class change remains
+fenced. Child names are checkpointed before either API create; API-assigned UIDs are
 checkpointed before a workload can consume them. The controller periodically
 revalidates both identities and fails closed instead of silently replacing a
 credential or empty data volume. PostgreSQL initializes in a disposable staging
@@ -95,7 +98,9 @@ retain those claims during scaling. On cluster deletion,
 `storage.deletionPolicy: Retain` (the default) leaves PostgreSQL data PVCs
 ownerless from creation, then marks the exact status-recorded UIDs as retained
 before other owned resources are removed. `Delete` must be selected explicitly
-at creation to delete only those exact status-recorded UIDs. The CR finalizer
+at creation to prune the workloads first and then delete only those exact
+status-recorded UIDs, allowing pvc-protection to complete without deadlocking
+the finalizer. The CR finalizer
 uses the checkpointed creation-time policy and waits for the selected result to
 be observed through the uncached Kubernetes API reader. `Retain` does not
 override an explicit PVC deletion and cannot preserve a namespaced PVC when its

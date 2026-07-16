@@ -94,6 +94,16 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 				return ctrl.Result{Requeue: true}, nil
 			}
 		} else {
+			// A mounted PVC remains Terminating behind pvc-protection. Remove the
+			// workloads that can hold the exact data claims before requesting
+			// their deletion, otherwise finalization can deadlock on its own Pod.
+			remaining, err := r.prune(ctx, cluster, nil, true)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("prune resources before deleting PostgreSQL data: %w", err)
+			}
+			if remaining {
+				return ctrl.Result{RequeueAfter: retryDelay}, nil
+			}
 			deleting, err := r.deletePostgreSQLPVCs(ctx, cluster)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("delete PostgreSQL data during cluster deletion: %w", err)
@@ -102,12 +112,14 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 				return ctrl.Result{RequeueAfter: retryDelay}, nil
 			}
 		}
-		remaining, err := r.prune(ctx, cluster, nil, true)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("prune resources during cluster deletion: %w", err)
-		}
-		if remaining {
-			return ctrl.Result{RequeueAfter: retryDelay}, nil
+		if deletionPolicy == pgshardv1alpha1.DeletionRetain {
+			remaining, err := r.prune(ctx, cluster, nil, true)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("prune resources during cluster deletion: %w", err)
+			}
+			if remaining {
+				return ctrl.Result{RequeueAfter: retryDelay}, nil
+			}
 		}
 		controllerutil.RemoveFinalizer(cluster, resourceFinalizer)
 		if err := r.Update(ctx, cluster); err != nil {
@@ -304,6 +316,11 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				return fmt.Errorf("checkpoint PostgreSQL data identity for shard %d: %w", shard, err)
 			}
+		} else if shouldCheckpointRetroactiveStorageClass(cluster, *bootstrap, claim) {
+			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				return fmt.Errorf("checkpoint retroactively defaulted PostgreSQL storage class for shard %d: %w", shard, err)
+			}
 		}
 	}
 	return nil
@@ -434,13 +451,24 @@ func validatePostgreSQLDataPVC(claim *corev1.PersistentVolumeClaim, cluster *pgs
 	if !ok || requested.Cmp(cluster.Spec.Storage.Size) != 0 {
 		return fmt.Errorf("PostgreSQL data PVC %s capacity differs from the provisioned size", claim.Name)
 	}
-	if bootstrap.PVCUID != "" && !optionalStringsEqual(claim.Spec.StorageClassName, bootstrap.PVCStorageClassName) {
+	if bootstrap.PVCUID != "" && !optionalStringsEqual(claim.Spec.StorageClassName, bootstrap.PVCStorageClassName) && !shouldCheckpointRetroactiveStorageClass(cluster, bootstrap, claim) {
 		return fmt.Errorf("PostgreSQL data PVC %s storage class differs from its recorded API value", claim.Name)
 	}
 	if cluster.Spec.Storage.StorageClassName != nil && !optionalStringsEqual(claim.Spec.StorageClassName, cluster.Spec.Storage.StorageClassName) {
 		return fmt.Errorf("PostgreSQL data PVC %s storage class differs from the provisioned spec", claim.Name)
 	}
 	return nil
+}
+
+// Kubernetes may assign a newly installed default StorageClass to an existing
+// same-UID PVC whose class was nil at creation. This is the only post-checkpoint
+// class transition accepted; an explicit empty class and every non-nil change
+// remain fenced.
+func shouldCheckpointRetroactiveStorageClass(cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, claim *corev1.PersistentVolumeClaim) bool {
+	return bootstrap.PVCUID != "" &&
+		bootstrap.PVCStorageClassName == nil &&
+		cluster.Spec.Storage.StorageClassName == nil &&
+		claim.Spec.StorageClassName != nil
 }
 
 func copyOptionalString(value *string) *string {
@@ -1055,6 +1083,13 @@ func (r *PgShardClusterReconciler) retainPostgreSQLPVCs(ctx context.Context, clu
 			}
 			return true, nil
 		}
+		if shouldCheckpointRetroactiveStorageClass(cluster, *bootstrap, claim) {
+			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				return false, fmt.Errorf("checkpoint retained PostgreSQL storage class for shard %d: %w", bootstrap.Shard, err)
+			}
+			return true, nil
+		}
 		annotations := maps.Clone(claim.Annotations)
 		if annotations == nil {
 			annotations = make(map[string]string, 1)
@@ -1092,6 +1127,12 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPVCs(ctx context.Context, clu
 		if bootstrap.PVCUID != "" && claim.UID != bootstrap.PVCUID {
 			return false, fmt.Errorf("PostgreSQL data PVC %s has UID %s, expected recorded UID %s", bootstrap.PVCName, claim.UID, bootstrap.PVCUID)
 		}
+		if claim.DeletionTimestamp != nil {
+			// Deletion is already irreversible for the exact recorded object.
+			// Wait for pvc-protection or the storage controller to finish instead
+			// of rejecting the expected intermediate state.
+			return true, nil
+		}
 		if err := validatePostgreSQLDataPVC(claim, cluster, bootstrap.Shard, *bootstrap); err != nil {
 			return false, err
 		}
@@ -1100,6 +1141,13 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPVCs(ctx context.Context, clu
 			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				return false, fmt.Errorf("checkpoint deletable PostgreSQL data identity for shard %d: %w", bootstrap.Shard, err)
+			}
+			return true, nil
+		}
+		if shouldCheckpointRetroactiveStorageClass(cluster, *bootstrap, claim) {
+			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				return false, fmt.Errorf("checkpoint deletable PostgreSQL storage class for shard %d: %w", bootstrap.Shard, err)
 			}
 			return true, nil
 		}

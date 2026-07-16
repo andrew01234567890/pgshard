@@ -182,6 +182,78 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	}
 }
 
+func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
+	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
+		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against the installed admission manager")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+	kubeClient := newKINDClient(t)
+
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: fmt.Sprintf("pgshard-manager-delete-%d", os.Getpid()),
+		Labels: map[string]string{
+			"pod-security.kubernetes.io/enforce":         "restricted",
+			"pod-security.kubernetes.io/enforce-version": "latest",
+		},
+	}}
+	if err := kubeClient.Create(ctx, namespace); err != nil {
+		t.Fatal(err)
+	}
+	deleteNamespaceAtCleanup(t, kubeClient, namespace)
+
+	cluster := readSingleMemberSample(t)
+	cluster.Name = "delete-bound"
+	cluster.Namespace = namespace.Name
+	cluster.Spec.Shards = 1
+	cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
+	if err := kubeClient.Create(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	waitForSingleMemberPostgreSQL(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster))
+
+	current := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := bootstrapForShard(t, current, 0)
+	claimKey := types.NamespacedName{Namespace: namespace.Name, Name: bootstrap.PVCName}
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := kubeClient.Get(ctx, claimKey, claim); err != nil {
+		t.Fatal(err)
+	}
+	if claim.Status.Phase != corev1.ClaimBound || claim.UID != bootstrap.PVCUID {
+		t.Fatalf("PostgreSQL data claim was not bound to its checkpointed UID: phase=%s metadata=%#v checkpoint=%s", claim.Status.Phase, claim.ObjectMeta, bootstrap.PVCUID)
+	}
+	podKey := types.NamespacedName{Namespace: namespace.Name, Name: cluster.Name + "-shard-0000-primary-0"}
+	pod := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, podKey, pod); err != nil {
+		t.Fatal(err)
+	}
+	if pod.Status.Phase != corev1.PodRunning {
+		t.Fatalf("PostgreSQL Pod was not running against the bound claim: %#v", pod.Status)
+	}
+
+	if err := kubeClient.Delete(ctx, current, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), &pgshardv1alpha1.PgShardCluster{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatalf("Delete policy finalizer deadlocked on a bound PostgreSQL PVC: %v", err)
+	}
+	for description, object := range map[string]client.Object{
+		"PostgreSQL Pod":   &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podKey.Name, Namespace: podKey.Namespace}},
+		"PostgreSQL PVC":   &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: claimKey.Name, Namespace: claimKey.Namespace}},
+		"PostgreSQL state": &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
+	} {
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(object), object); !apierrors.IsNotFound(err) {
+			t.Fatalf("%s survived completed Delete-policy finalization: %v", description, err)
+		}
+	}
+}
+
 func runPostgreSQLServiceQuery(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, image, secret, host, query string) string {
 	t.Helper()
 	allowPrivilegeEscalation := false
