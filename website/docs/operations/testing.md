@@ -459,8 +459,36 @@ XIDs, nested/unmatched stream controls, every truncated prefix, tuple markers
 and lengths, replica identity, reserved flags, UTF-8, zero-copy iteration, and
 redaction. Complete transaction ordering, relation caching, feedback scheduling
 and durable-checkpoint restart integration, replay, and cross-shard stream tests
-are still absent. A targeted KIND test verifies operator PVC deletion and
-same-name recreation against real Kubernetes 1.36 controllers. A separate KIND
+are still absent. Targeted KIND tests verify operator PVC deletion and
+same-name recreation, server-side-apply field pruning after member, Service
+annotation, and OTEL configuration shrinkage, plus both fresh creation and a
+pre-SSA whole-object Update upgrade. The legacy fixture proves type-aware
+alignment prunes stale desired fields while preserving API-assigned Service
+cluster/IP-family fields exactly. An external Apply-manager annotation makes
+migration fail before a write and remains intact until that manager explicitly
+relinquishes it. The fixture also proves the crash-detectable managed-field
+migration then completes without an Update co-owner. A stale-cache conflict
+fixture proves that newly authoritative operator-owned marker-plus-Apply
+ownership stops the legacy Update path even when scale and external Apply
+managers are visible. A
+historical Create-plus-Apply fixture proves markerless operator Apply ownership
+does not bypass alignment: keys retained only by the create-time Update owner
+are removed before that owner is migrated away.
+Interrupted and completed upgrades from the earlier whole-Deployment HPA
+handoff are reconciled and reduce `pgshard-hpa-scale` ownership to
+`spec.replicas` only. Interrupted and completed handoffs whose CR returns to
+fixed scaling preserve the configured capacity and remove that manager and its
+legacy annotation entirely. Fixed-mode race tests inject both a late scale
+write before the first read and another after a relinquishment conflict; each
+must reestablish the configured value and operator ownership before removing
+the old manager. HPA handoff rereads the authoritative Deployment, uses UID and
+resource-version preconditions, preserves current capacity, and retries
+concurrent controller updates within a fixed bound. It owns only
+`spec.replicas` against the real Kubernetes 1.36 API server for both initial
+HPA configuration and fixed-to-HPA transitions. A full-Reconcile real-API
+fixture gives the client cache a false HPA absence while the uncached reader
+still sees it, and proves the HPA is deleted in a separate pass before fixed
+replicas are claimed. A separate KIND
 job builds local images, installs the real manager with self-managed admission
 certificates, proves the generated serving chain and injected CA bundles,
 observes semantic validation reject an unsafe synchronous singleton, waits for

@@ -16,6 +16,32 @@ API. The controller now reconciles the safe supporting-resource slice:
   outage diagnostics while application Services continue filtering them; and
 - controller ownership, update pruning, and finalizer-based deletion pruning.
 
+Supporting resources use server-side apply. A one-time upgrade path first
+aligns objects created by the earlier whole-object Update controller, preserving
+Service allocations and API defaults, then establishes the operator's Apply
+field set and removes the legacy Update co-owners. The completion annotation is
+written only by the final Apply, so a crash at any intermediate boundary safely
+repeats migration. Every alignment attempt uses an uncached read and stops the
+legacy Update path only when both its operator-owned durable marker and
+matching Apply ownership have appeared. Apply ownership without the marker can
+still coexist with create-time Update ownership that retains omitted stale
+fields. Because
+legacy whole-object ownership cannot identify fields
+added by another Apply manager, such an object fails migration without a write;
+that manager must relinquish its top-level field set before reconciliation can
+continue. The operator recognizes its own earlier `pgshard-hpa-scale` manager
+only on the pooler Deployment. HPA mode rewrites that release's possible
+whole-Deployment field set to `spec.replicas` alone. HPA-to-fixed transitions
+delete an authoritatively observed owned HPA and stop that reconciliation pass;
+only a later uncached absence observation permits fixed replica ownership.
+Fixed mode verifies the configured capacity and operator replica ownership on
+every authoritative read, resource-version-fenced reapplies them after a late
+scale write, then relinquishes the old HPA field set entirely. HPA scale
+handoff rereads the Deployment through the
+uncached API, checks its UID and resource version, retries concurrent updates
+within a fixed bound, and transfers only `spec.replicas` to a dedicated field
+manager.
+
 This is not a working PostgreSQL cluster. The controller intentionally creates
 no PostgreSQL Pods or data PVCs because bootstrap, replication, fencing
 integration, promotion, and recovery are not implemented. Application Services
