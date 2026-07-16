@@ -539,10 +539,11 @@ has no PostgreSQL workload or ready application endpoint. The same job creates
 a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard
 Service from an authorized restricted probe client using the destination-specific
-Secret, then restarts one primary StatefulSet and verifies its PVC-backed row
-survives. Foreground deletion of the cluster then proves the default-retained,
-ownerless PVCs keep their exact recorded UIDs. It does not claim uninterrupted
-traffic during that restart. A unit
+Secret, proves an omitted storage class was resolved and checkpointed before the
+Bound PVC was created, then restarts one primary StatefulSet and verifies its
+PVC-backed row survives. Foreground deletion of the cluster then proves the
+default-retained, ownerless PVCs keep their exact recorded UIDs. It does not
+claim uninterrupted traffic during that restart. A unit
 regression gives the informer cache a false absence while the authoritative API
 reader still sees an owned PVC, and proves that finalization continues waiting.
 Operator unit tests also prove deterministic common, primary, and per-standby

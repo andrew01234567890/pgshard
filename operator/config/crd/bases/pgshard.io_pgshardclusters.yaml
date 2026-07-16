@@ -503,8 +503,9 @@ spec:
                     pvcName:
                       type: string
                     pvcStorageClassName:
-                      description: PVCStorageClassName records API defaulting as well
-                        as explicit selection.
+                      description: |-
+                        PVCStorageClassName records the explicit or operator-resolved class before
+                        the PVC create is dispatched, including an explicitly empty class.
                       type: string
                     pvcUID:
                       description: |-

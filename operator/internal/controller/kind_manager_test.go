@@ -225,6 +225,9 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 	if claim.Status.Phase != corev1.ClaimBound || claim.UID != bootstrap.PVCUID {
 		t.Fatalf("PostgreSQL data claim was not bound to its checkpointed UID: phase=%s metadata=%#v checkpoint=%s", claim.Status.Phase, claim.ObjectMeta, bootstrap.PVCUID)
 	}
+	if bootstrap.PVCStorageClassName == nil || claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != *bootstrap.PVCStorageClassName {
+		t.Fatalf("PostgreSQL data claim storage class = %#v, checkpoint = %#v", claim.Spec.StorageClassName, bootstrap.PVCStorageClassName)
+	}
 	podKey := types.NamespacedName{Namespace: namespace.Name, Name: cluster.Name + "-shard-0000-primary-0"}
 	pod := &corev1.Pod{}
 	if err := kubeClient.Get(ctx, podKey, pod); err != nil {

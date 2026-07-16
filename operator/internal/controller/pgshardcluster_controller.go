@@ -55,8 +55,8 @@ const (
 type PgShardClusterReconciler struct {
 	client.Client
 	// APIReader bypasses the informer cache for ownership migration, HPA presence
-	// gates, replica handoff, deletion-finalizer absence proofs, and post-apply
-	// workload status.
+	// gates, storage-class selection, replica handoff, deletion-finalizer absence
+	// proofs, and post-apply workload status.
 	// Writes and plan reconciliation continue through Client.
 	APIReader client.Reader
 	Images    owned.Images
@@ -68,11 +68,12 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=list
 
 func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	cluster := &pgshardv1alpha1.PgShardCluster{}
@@ -221,12 +222,19 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 	}
 
 	reader := r.authoritativeReader()
+	storageClassName, err := resolvePostgreSQLStorageClass(ctx, reader, cluster)
+	if err != nil {
+		return err
+	}
 	indices := make(map[int32]int, len(cluster.Status.PostgreSQLBootstraps))
 	resourceNames := make(map[string]struct{}, 2*len(cluster.Status.PostgreSQLBootstraps))
 	resourceUIDs := make(map[types.UID]struct{}, 2*len(cluster.Status.PostgreSQLBootstraps))
 	for index, bootstrap := range cluster.Status.PostgreSQLBootstraps {
-		if bootstrap.Shard < 0 || bootstrap.Shard >= cluster.Spec.Shards || bootstrap.SecretName == "" || bootstrap.PVCName == "" {
+		if bootstrap.Shard < 0 || bootstrap.Shard >= cluster.Spec.Shards || bootstrap.SecretName == "" || bootstrap.PVCName == "" || bootstrap.PVCStorageClassName == nil {
 			return fmt.Errorf("recorded PostgreSQL bootstrap for shard %d is invalid", bootstrap.Shard)
+		}
+		if !optionalStringsEqual(bootstrap.PVCStorageClassName, storageClassName) {
+			return fmt.Errorf("recorded PostgreSQL storage class for shard %d differs from the provisioned creation intent", bootstrap.Shard)
 		}
 		if bootstrap.SecretUID == "" && bootstrap.PVCUID != "" {
 			return fmt.Errorf("recorded PostgreSQL bootstrap for shard %d identifies data before its credential", bootstrap.Shard)
@@ -264,7 +272,7 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 				return err
 			}
 			cluster.Status.PostgreSQLBootstraps = append(cluster.Status.PostgreSQLBootstraps, pgshardv1alpha1.PostgreSQLBootstrapStatus{
-				Shard: shard, SecretName: secretName, PVCName: pvcName,
+				Shard: shard, SecretName: secretName, PVCName: pvcName, PVCStorageClassName: copyOptionalString(storageClassName),
 			})
 			sort.Slice(cluster.Status.PostgreSQLBootstraps, func(left, right int) bool {
 				return cluster.Status.PostgreSQLBootstraps[left].Shard < cluster.Status.PostgreSQLBootstraps[right].Shard
@@ -314,21 +322,66 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 		}
 		if bootstrap.PVCUID == "" {
 			bootstrap.PVCUID = claim.UID
-			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				return fmt.Errorf("checkpoint PostgreSQL data identity for shard %d: %w", shard, err)
-			}
-		} else if isRetroactiveStorageClassCandidate(cluster, *bootstrap, claim) {
-			if err := verifyDefaultStorageClass(ctx, reader, claim); err != nil {
-				return fmt.Errorf("verify retroactively defaulted PostgreSQL storage class for shard %d: %w", shard, err)
-			}
-			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
-			if err := r.Status().Update(ctx, cluster); err != nil {
-				return fmt.Errorf("checkpoint retroactively defaulted PostgreSQL storage class for shard %d: %w", shard, err)
 			}
 		}
 	}
 	return nil
+}
+
+func resolvePostgreSQLStorageClass(ctx context.Context, reader client.Reader, cluster *pgshardv1alpha1.PgShardCluster) (*string, error) {
+	if cluster.Spec.Storage.StorageClassName != nil {
+		return copyOptionalString(cluster.Spec.Storage.StorageClassName), nil
+	}
+
+	var recorded *string
+	for _, bootstrap := range cluster.Status.PostgreSQLBootstraps {
+		if bootstrap.PVCStorageClassName == nil {
+			return nil, fmt.Errorf("recorded PostgreSQL bootstrap for shard %d has no resolved storage class", bootstrap.Shard)
+		}
+		if recorded == nil {
+			recorded = copyOptionalString(bootstrap.PVCStorageClassName)
+			continue
+		}
+		if !optionalStringsEqual(recorded, bootstrap.PVCStorageClassName) {
+			return nil, fmt.Errorf("recorded PostgreSQL bootstraps disagree on the resolved storage class")
+		}
+	}
+	if recorded != nil {
+		return recorded, nil
+	}
+
+	classes := &storagev1.StorageClassList{}
+	if err := reader.List(ctx, classes); err != nil {
+		return nil, fmt.Errorf("list StorageClasses before PostgreSQL data creation: %w", err)
+	}
+	defaults := make([]storagev1.StorageClass, 0, len(classes.Items))
+	for _, storageClass := range classes.Items {
+		if isDefaultStorageClass(storageClass.Annotations) {
+			defaults = append(defaults, storageClass)
+		}
+	}
+	if len(defaults) == 0 {
+		return nil, fmt.Errorf("no default StorageClass is available; set spec.storage.storageClassName explicitly")
+	}
+	// Match Kubernetes's persistent-volume controller: newest default wins,
+	// with ascending name as a deterministic tie-breaker.
+	sort.Slice(defaults, func(left, right int) bool {
+		leftCreated := defaults[left].CreationTimestamp.UnixNano()
+		rightCreated := defaults[right].CreationTimestamp.UnixNano()
+		if leftCreated == rightCreated {
+			return defaults[left].Name < defaults[right].Name
+		}
+		return leftCreated > rightCreated
+	})
+	selected := defaults[0].Name
+	return &selected, nil
+}
+
+func isDefaultStorageClass(annotations map[string]string) bool {
+	return annotations["storageclass.kubernetes.io/is-default-class"] == "true" ||
+		annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true"
 }
 
 func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) *pgshardv1alpha1.PostgreSQLBootstrapSpecStatus {
@@ -391,7 +444,7 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLDataPVC(ctx context.Context, 
 		return nil, fmt.Errorf("PostgreSQL data PVC %s with recorded UID %s is missing; restore is required", bootstrap.PVCName, bootstrap.PVCUID)
 	}
 
-	desired := owned.PostgreSQLPrimaryDataPVC(cluster, shard, bootstrap.PVCName)
+	desired := owned.PostgreSQLPrimaryDataPVC(cluster, shard, bootstrap.PVCName, bootstrap.PVCStorageClassName)
 	if err := r.Create(ctx, desired, client.FieldOwner(owned.ManagedByValue)); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return nil, fmt.Errorf("create PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
@@ -456,39 +509,11 @@ func validatePostgreSQLDataPVC(claim *corev1.PersistentVolumeClaim, cluster *pgs
 	if !ok || requested.Cmp(cluster.Spec.Storage.Size) != 0 {
 		return fmt.Errorf("PostgreSQL data PVC %s capacity differs from the provisioned size", claim.Name)
 	}
-	if bootstrap.PVCUID != "" && !optionalStringsEqual(claim.Spec.StorageClassName, bootstrap.PVCStorageClassName) && !isRetroactiveStorageClassCandidate(cluster, bootstrap, claim) {
+	if bootstrap.PVCStorageClassName == nil || !optionalStringsEqual(claim.Spec.StorageClassName, bootstrap.PVCStorageClassName) {
 		return fmt.Errorf("PostgreSQL data PVC %s storage class differs from its recorded API value", claim.Name)
 	}
 	if cluster.Spec.Storage.StorageClassName != nil && !optionalStringsEqual(claim.Spec.StorageClassName, cluster.Spec.Storage.StorageClassName) {
 		return fmt.Errorf("PostgreSQL data PVC %s storage class differs from the provisioned spec", claim.Name)
-	}
-	return nil
-}
-
-// Kubernetes may assign a newly installed default StorageClass to an existing
-// same-UID PVC whose class was nil at creation. This is the only post-checkpoint
-// class transition accepted; an explicit empty class and every non-nil change
-// remain fenced.
-func isRetroactiveStorageClassCandidate(cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, claim *corev1.PersistentVolumeClaim) bool {
-	return bootstrap.PVCUID != "" &&
-		bootstrap.PVCStorageClassName == nil &&
-		cluster.Spec.Storage.StorageClassName == nil &&
-		claim.Spec.StorageClassName != nil &&
-		*claim.Spec.StorageClassName != ""
-}
-
-func verifyDefaultStorageClass(ctx context.Context, reader client.Reader, claim *corev1.PersistentVolumeClaim) error {
-	name := claim.Spec.StorageClassName
-	if name == nil || *name == "" {
-		return fmt.Errorf("PostgreSQL data PVC %s has no non-empty StorageClass to verify", claim.Name)
-	}
-	storageClass := &storagev1.StorageClass{}
-	if err := reader.Get(ctx, types.NamespacedName{Name: *name}, storageClass); err != nil {
-		return fmt.Errorf("read StorageClass %s: %w", *name, err)
-	}
-	annotations := storageClass.GetAnnotations()
-	if annotations["storageclass.kubernetes.io/is-default-class"] != "true" && annotations["storageclass.beta.kubernetes.io/is-default-class"] != "true" {
-		return fmt.Errorf("StorageClass %s is not marked as a default StorageClass", *name)
 	}
 	return nil
 }
@@ -1099,19 +1124,8 @@ func (r *PgShardClusterReconciler) retainPostgreSQLPVCs(ctx context.Context, clu
 		}
 		if bootstrap.PVCUID == "" {
 			bootstrap.PVCUID = claim.UID
-			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				return false, fmt.Errorf("checkpoint retained PostgreSQL data identity for shard %d: %w", bootstrap.Shard, err)
-			}
-			return true, nil
-		}
-		if isRetroactiveStorageClassCandidate(cluster, *bootstrap, claim) {
-			if err := verifyDefaultStorageClass(ctx, r.APIReader, claim); err != nil {
-				return false, fmt.Errorf("verify retained PostgreSQL storage class for shard %d: %w", bootstrap.Shard, err)
-			}
-			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
-			if err := r.Status().Update(ctx, cluster); err != nil {
-				return false, fmt.Errorf("checkpoint retained PostgreSQL storage class for shard %d: %w", bootstrap.Shard, err)
 			}
 			return true, nil
 		}
@@ -1145,7 +1159,22 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPVCs(ctx context.Context, clu
 		claim := &corev1.PersistentVolumeClaim{}
 		key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
 		if err := r.APIReader.Get(ctx, key, claim); apierrors.IsNotFound(err) {
-			continue
+			if bootstrap.PVCUID != "" {
+				continue
+			}
+			terminating, err := namespaceUnavailableForCreate(ctx, r.APIReader, cluster.Namespace)
+			if err != nil {
+				return false, err
+			}
+			if terminating {
+				// Namespace deletion is an authoritative absence barrier: no
+				// ownerless PVC can survive it, including a delayed create.
+				continue
+			}
+			claim, err = r.ensurePostgreSQLDataPVC(ctx, r.APIReader, cluster, bootstrap.Shard, *bootstrap)
+			if err != nil {
+				return false, fmt.Errorf("resolve uncheckpointed PostgreSQL data creation intent for shard %d before deletion: %w", bootstrap.Shard, err)
+			}
 		} else if err != nil {
 			return false, fmt.Errorf("read PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
 		}
@@ -1163,19 +1192,8 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPVCs(ctx context.Context, clu
 		}
 		if bootstrap.PVCUID == "" {
 			bootstrap.PVCUID = claim.UID
-			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				return false, fmt.Errorf("checkpoint deletable PostgreSQL data identity for shard %d: %w", bootstrap.Shard, err)
-			}
-			return true, nil
-		}
-		if isRetroactiveStorageClassCandidate(cluster, *bootstrap, claim) {
-			if err := verifyDefaultStorageClass(ctx, r.APIReader, claim); err != nil {
-				return false, fmt.Errorf("verify deletable PostgreSQL storage class for shard %d: %w", bootstrap.Shard, err)
-			}
-			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
-			if err := r.Status().Update(ctx, cluster); err != nil {
-				return false, fmt.Errorf("checkpoint deletable PostgreSQL storage class for shard %d: %w", bootstrap.Shard, err)
 			}
 			return true, nil
 		}
@@ -1187,6 +1205,16 @@ func (r *PgShardClusterReconciler) deletePostgreSQLPVCs(ctx context.Context, clu
 		return true, nil
 	}
 	return false, nil
+}
+
+func namespaceUnavailableForCreate(ctx context.Context, reader client.Reader, name string) (bool, error) {
+	namespace := &corev1.Namespace{}
+	if err := reader.Get(ctx, types.NamespacedName{Name: name}, namespace); apierrors.IsNotFound(err) {
+		return true, nil
+	} else if err != nil {
+		return false, fmt.Errorf("read namespace %s before resolving PostgreSQL data creation intent: %w", name, err)
+	}
+	return namespace.DeletionTimestamp != nil, nil
 }
 
 func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object, includePVCs bool) (bool, error) {

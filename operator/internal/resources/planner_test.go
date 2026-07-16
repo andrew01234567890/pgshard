@@ -247,7 +247,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		t.Fatalf("PostgreSQL auth Secret = %#v", secret)
 	}
 	assertOwned(t, secret, cluster)
-	claim := PostgreSQLPrimaryDataPVC(cluster, 1, "demo-random-data")
+	claim := PostgreSQLPrimaryDataPVC(cluster, 1, "demo-random-data", cluster.Spec.Storage.StorageClassName)
 	if claim.Name != "demo-random-data" || claim.Labels[ShardLabel] != "0001" || claim.Spec.Resources.Requests.Storage().Cmp(cluster.Spec.Storage.Size) != 0 || claim.Annotations[ApplyOwnershipAnnotation] != "" {
 		t.Fatalf("PostgreSQL data PVC = %#v", claim)
 	}
@@ -475,6 +475,7 @@ func TestImagePullPolicyHandlesRegistryPortsAndDigests(t *testing.T) {
 
 func testCluster() *pgshardv1alpha1.PgShardCluster {
 	prometheus := true
+	storageClass := "test-storage"
 	return &pgshardv1alpha1.PgShardCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "database", UID: types.UID("cluster-uid"), Generation: 3},
 		Spec: pgshardv1alpha1.PgShardClusterSpec{
@@ -488,7 +489,7 @@ func testCluster() *pgshardv1alpha1.PgShardCluster {
 					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 				},
 			},
-			Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi"), DeletionPolicy: pgshardv1alpha1.DeletionRetain},
+			Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi"), StorageClassName: &storageClass, DeletionPolicy: pgshardv1alpha1.DeletionRetain},
 			Pooler: pgshardv1alpha1.PoolerSpec{Scaling: pgshardv1alpha1.PoolerScaling{
 				Mode: pgshardv1alpha1.ScalingHPA,
 				HPA:  &pgshardv1alpha1.HPAScaling{MinReplicas: 2, MaxReplicas: 6, TargetCPUUtilizationPercentage: 70},
@@ -545,10 +546,18 @@ func testPostgreSQLBootstraps(cluster *pgshardv1alpha1.PgShardCluster) []pgshard
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		bootstraps = append(bootstraps, pgshardv1alpha1.PostgreSQLBootstrapStatus{
 			Shard: shard, SecretName: fmt.Sprintf("test-secret-%04d", shard), SecretUID: types.UID(fmt.Sprintf("test-secret-uid-%04d", shard)),
-			PVCName: fmt.Sprintf("test-data-%04d", shard), PVCUID: types.UID(fmt.Sprintf("test-pvc-uid-%04d", shard)),
+			PVCName: fmt.Sprintf("test-data-%04d", shard), PVCUID: types.UID(fmt.Sprintf("test-pvc-uid-%04d", shard)), PVCStorageClassName: copyString(cluster.Spec.Storage.StorageClassName),
 		})
 	}
 	return bootstraps
+}
+
+func copyString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func assertOwned(t *testing.T, object client.Object, cluster *pgshardv1alpha1.PgShardCluster) {

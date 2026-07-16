@@ -28,6 +28,12 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - namespaces
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
   - secrets
   verbs:
   - create
@@ -110,4 +116,4 @@ rules:
   resources:
   - storageclasses
   verbs:
-  - get
+  - list

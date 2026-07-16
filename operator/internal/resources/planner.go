@@ -232,8 +232,8 @@ func postgresqlBootstraps(cluster *pgshardv1alpha1.PgShardCluster) (map[int32]pg
 		if bootstrap.Shard < 0 || bootstrap.Shard >= cluster.Spec.Shards {
 			return nil, fmt.Errorf("PostgreSQL bootstrap references invalid shard %d", bootstrap.Shard)
 		}
-		if bootstrap.SecretName == "" || bootstrap.SecretUID == "" || bootstrap.PVCName == "" || bootstrap.PVCUID == "" {
-			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is incomplete (credential name=%t UID=%t, PVC name=%t UID=%t)", bootstrap.Shard, bootstrap.SecretName != "", bootstrap.SecretUID != "", bootstrap.PVCName != "", bootstrap.PVCUID != "")
+		if bootstrap.SecretName == "" || bootstrap.SecretUID == "" || bootstrap.PVCName == "" || bootstrap.PVCUID == "" || bootstrap.PVCStorageClassName == nil {
+			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is incomplete (credential name=%t UID=%t, PVC name=%t UID=%t, storage class=%t)", bootstrap.Shard, bootstrap.SecretName != "", bootstrap.SecretUID != "", bootstrap.PVCName != "", bootstrap.PVCUID != "", bootstrap.PVCStorageClassName != nil)
 		}
 		if _, duplicate := bootstraps[bootstrap.Shard]; duplicate {
 			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is duplicated", bootstrap.Shard)
@@ -475,8 +475,10 @@ func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, 
 }
 
 // PostgreSQLPrimaryDataPVC returns the standalone data volume for a singleton
-// primary. It is created and API-identified before its StatefulSet is planned.
-func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string) *corev1.PersistentVolumeClaim {
+// primary. Its explicit or operator-resolved storage class is part of the
+// creation intent recorded before API create, and the claim is API-identified
+// before its StatefulSet is planned.
+func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageClassName *string) *corev1.PersistentVolumeClaim {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
 	// PostgreSQL data claims are deliberately outside Kubernetes cascading
 	// garbage collection. The controller binds them to the cluster UID in an
@@ -488,15 +490,15 @@ func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int
 	metadata.Labels[RoleLabel] = "primary"
 	metadata.Labels[MemberLabel] = "0000"
 	delete(metadata.Annotations, ApplyOwnershipAnnotation)
-	var storageClassName *string
-	if cluster.Spec.Storage.StorageClassName != nil {
-		storageClassName = ptr(*cluster.Spec.Storage.StorageClassName)
+	var selectedStorageClass *string
+	if storageClassName != nil {
+		selectedStorageClass = ptr(*storageClassName)
 	}
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metadata,
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-			StorageClassName: storageClassName,
+			StorageClassName: selectedStorageClass,
 			Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: cluster.Spec.Storage.Size.DeepCopy()}},
 		},
 	}

@@ -74,11 +74,12 @@ fencing integration, promotion, and recovery exist.
 
 Generated bootstrap credentials are unique per shard, immutable, and stable
 across reconciles. Each data PVC is likewise bound to its recorded name, UID,
-capacity, API-defaulted storage class, and creation-time deletion policy. A
-same-UID nil-to-default StorageClass assignment made later by Kubernetes is
-checkpointed once only after the exact referenced StorageClass is read from the
-API and verified as default; an explicit empty class, a non-default class, or any
-later class change remains fenced. Child names are checkpointed before either API create; API-assigned UIDs are
+capacity, storage class, and creation-time deletion policy. When the spec omits
+a class, the operator authoritatively selects the same default StorageClass
+Kubernetes would choose and checkpoints that exact class before it dispatches
+the PVC create. An explicit empty class is preserved for static provisioning;
+every later class change remains fenced. Child names and the resolved storage
+class are checkpointed before either API create; API-assigned UIDs are
 checkpointed before a workload can consume them. The controller periodically
 revalidates both identities and fails closed instead of silently replacing a
 credential or empty data volume. PostgreSQL initializes in a disposable staging

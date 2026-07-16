@@ -223,7 +223,8 @@ type PostgreSQLBootstrapStatus struct {
 	SecretUID  types.UID `json:"secretUID"`
 	PVCName    string    `json:"pvcName,omitempty"`
 	PVCUID     types.UID `json:"pvcUID,omitempty"`
-	// PVCStorageClassName records API defaulting as well as explicit selection.
+	// PVCStorageClassName records the explicit or operator-resolved class before
+	// the PVC create is dispatched, including an explicitly empty class.
 	PVCStorageClassName *string `json:"pvcStorageClassName,omitempty"`
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
@@ -234,7 +235,7 @@ func TestReconcileNeverAdoptsUnrecordedBootstrapChildren(t *testing.T) {
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	orphanSecret := owned.PostgreSQLAuthSecret(cluster, 0, owned.PostgreSQLAuthSecretPrefix(cluster.Name, 0)+"orphan", []byte(strings.Repeat("a", hex.EncodedLen(postgresqlPasswordBytes))))
 	orphanSecret.UID = "unrecorded-secret"
-	orphanClaim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, 0)+"orphan")
+	orphanClaim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, 0)+"orphan", cluster.Spec.Storage.StorageClassName)
 	orphanClaim.UID = "unrecorded-pvc"
 	fakeClient := newFakeClient(t, cluster, orphanSecret, orphanClaim)
 	reconciler := &PgShardClusterReconciler{Client: fakeClient}
@@ -399,7 +400,7 @@ func TestReconcileRefusesMissingOrReplacedPostgreSQLDataPVC(t *testing.T) {
 				t.Fatal(err)
 			}
 			if replace {
-				replacement := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName)
+				replacement := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, bootstrap.PVCStorageClassName)
 				replacement.UID = "replacement-pvc-uid"
 				if err := fakeClient.Create(ctx, replacement); err != nil {
 					t.Fatal(err)
@@ -413,7 +414,7 @@ func TestReconcileRefusesMissingOrReplacedPostgreSQLDataPVC(t *testing.T) {
 	}
 }
 
-func TestReconcileCheckpointsRetroactivelyDefaultedStorageClass(t *testing.T) {
+func TestReconcilePinsDefaultStorageClassBeforeCreateAndSurvivesRotation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	cluster := validCluster()
@@ -421,14 +422,21 @@ func TestReconcileCheckpointsRetroactivelyDefaultedStorageClass(t *testing.T) {
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	cluster.Spec.Storage.StorageClassName = nil
-	lateDefault := "late-default"
-	defaultClass := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{
-		Name: lateDefault,
+	olderDefault := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{
+		Name:              "older-default",
+		CreationTimestamp: metav1.NewTime(time.Unix(100, 0)),
 		Annotations: map[string]string{
 			"storageclass.kubernetes.io/is-default-class": "true",
 		},
 	}}
-	fakeClient := newFakeClient(t, cluster, defaultClass)
+	selectedDefault := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{
+		Name:              "selected-default",
+		CreationTimestamp: metav1.NewTime(time.Unix(200, 0)),
+		Annotations: map[string]string{
+			"storageclass.kubernetes.io/is-default-class": "true",
+		},
+	}}
+	fakeClient := newFakeClient(t, cluster, olderDefault, selectedDefault)
 	reconciler := &PgShardClusterReconciler{Client: fakeClient}
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
@@ -436,7 +444,7 @@ func TestReconcileCheckpointsRetroactivelyDefaultedStorageClass(t *testing.T) {
 
 	current := getCluster(t, ctx, fakeClient, cluster)
 	bootstrap := bootstrapForShard(t, current, 0)
-	if bootstrap.PVCUID == "" || bootstrap.PVCStorageClassName != nil {
+	if bootstrap.PVCUID == "" || bootstrap.PVCStorageClassName == nil || *bootstrap.PVCStorageClassName != selectedDefault.Name {
 		t.Fatalf("initial PVC checkpoint = %#v", bootstrap)
 	}
 	claim := &corev1.PersistentVolumeClaim{}
@@ -444,85 +452,88 @@ func TestReconcileCheckpointsRetroactivelyDefaultedStorageClass(t *testing.T) {
 	if err := fakeClient.Get(ctx, key, claim); err != nil {
 		t.Fatal(err)
 	}
-	claim.Spec.StorageClassName = &lateDefault
-	if err := fakeClient.Update(ctx, claim); err != nil {
+	if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != selectedDefault.Name {
+		t.Fatalf("PVC was not created with the resolved class: %#v", claim.Spec.StorageClassName)
+	}
+	// The durable creation intent, rather than current default annotations,
+	// remains authoritative after controller restart and class rotation.
+	if err := fakeClient.Delete(ctx, selectedDefault); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
-		t.Fatal(err)
+	if _, err := (&PgShardClusterReconciler{Client: fakeClient}).Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatalf("restart after default rotation failed: %v", err)
 	}
 
-	current = getCluster(t, ctx, fakeClient, cluster)
-	bootstrap = bootstrapForShard(t, current, 0)
-	if bootstrap.PVCStorageClassName == nil || *bootstrap.PVCStorageClassName != lateDefault {
-		t.Fatalf("retroactive storage-class checkpoint = %#v", bootstrap.PVCStorageClassName)
-	}
 	if err := fakeClient.Get(ctx, key, claim); err != nil {
 		t.Fatal(err)
 	}
-	replacement := "different-default"
+	replacement := "user-selected"
 	claim.Spec.StorageClassName = &replacement
 	if err := fakeClient.Update(ctx, claim); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "storage class differs from its recorded API value") {
-		t.Fatalf("second storage-class transition was not fenced: %v", err)
+		t.Fatalf("post-create storage-class transition was not fenced: %v", err)
 	}
 }
 
-func TestReconcileRejectsUnverifiedRetroactiveStorageClass(t *testing.T) {
+func TestReconcileRequiresDefaultOrExplicitStorageClassBeforeCreate(t *testing.T) {
 	t.Parallel()
-	for _, test := range []struct {
-		name         string
-		storageClass string
-		objects      []client.Object
-		wantError    string
-	}{
-		{
-			name:         "explicit empty class",
-			storageClass: "",
-			wantError:    "storage class differs from its recorded API value",
-		},
-		{
-			name:         "non-default class",
-			storageClass: "user-selected",
-			objects: []client.Object{&storagev1.StorageClass{
-				ObjectMeta: metav1.ObjectMeta{Name: "user-selected"},
-			}},
-			wantError: "is not marked as a default StorageClass",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			ctx := context.Background()
-			cluster := validCluster()
-			cluster.Spec.Shards = 1
-			cluster.Spec.MembersPerShard = 1
-			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
-			cluster.Spec.Storage.StorageClassName = nil
-			objects := append([]client.Object{cluster}, test.objects...)
-			fakeClient := newFakeClient(t, objects...)
-			reconciler := &PgShardClusterReconciler{Client: fakeClient}
-			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
-				t.Fatal(err)
-			}
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Spec.Storage.StorageClassName = nil
+	fakeClient := newFakeClient(t, cluster)
+	if _, err := (&PgShardClusterReconciler{Client: fakeClient}).Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "no default StorageClass is available") {
+		t.Fatalf("missing default StorageClass error = %v", err)
+	}
+	if current := getCluster(t, ctx, fakeClient, cluster); len(current.Status.PostgreSQLBootstraps) != 0 {
+		t.Fatalf("bootstrap intent was published without a resolved class: %#v", current.Status.PostgreSQLBootstraps)
+	}
 
-			current := getCluster(t, ctx, fakeClient, cluster)
-			bootstrap := bootstrapForShard(t, current, 0)
-			claim := &corev1.PersistentVolumeClaim{}
-			key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
-			if err := fakeClient.Get(ctx, key, claim); err != nil {
-				t.Fatal(err)
-			}
-			claim.Spec.StorageClassName = &test.storageClass
-			if err := fakeClient.Update(ctx, claim); err != nil {
-				t.Fatal(err)
-			}
+	explicit := validCluster()
+	explicit.Name = "explicit-empty"
+	explicit.UID = "explicit-empty-uid"
+	explicit.Spec.Shards = 1
+	explicit.Spec.MembersPerShard = 1
+	explicit.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	empty := ""
+	explicit.Spec.Storage.StorageClassName = &empty
+	explicitClient := newFakeClient(t, explicit)
+	if _, err := (&PgShardClusterReconciler{Client: explicitClient}).Reconcile(ctx, requestFor(explicit)); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := bootstrapForShard(t, getCluster(t, ctx, explicitClient, explicit), 0)
+	if bootstrap.PVCStorageClassName == nil || *bootstrap.PVCStorageClassName != "" {
+		t.Fatalf("explicit empty storage class intent = %#v", bootstrap.PVCStorageClassName)
+	}
+}
 
-			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), test.wantError) {
-				t.Fatalf("unverified storage-class transition error = %v, want %q", err, test.wantError)
-			}
-		})
+func TestResolvePostgreSQLStorageClassUsesKubernetesTieBreaker(t *testing.T) {
+	t.Parallel()
+	created := metav1.NewTime(time.Unix(100, 0))
+	cluster := validCluster()
+	cluster.Spec.Storage.StorageClassName = nil
+	reader := newFakeClient(t,
+		&storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{
+			Name:              "zeta",
+			CreationTimestamp: created,
+			Annotations:       map[string]string{"storageclass.kubernetes.io/is-default-class": "true"},
+		}},
+		&storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{
+			Name:              "alpha",
+			CreationTimestamp: created,
+			Annotations:       map[string]string{"storageclass.beta.kubernetes.io/is-default-class": "true"},
+		}},
+	)
+	selected, err := resolvePostgreSQLStorageClass(context.Background(), reader, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected == nil || *selected != "alpha" {
+		t.Fatalf("selected default StorageClass = %#v, want alpha", selected)
 	}
 }
 
@@ -626,6 +637,106 @@ func TestExplicitDeletePolicyDeletesPostgreSQLData(t *testing.T) {
 	}
 	if err := fakeClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("explicit Delete policy retained PostgreSQL data: %v", err)
+	}
+}
+
+func TestDeletePolicyResolvesDelayedPVCOutcomeBeforeFinalization(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}}
+	base := newFakeClient(t, cluster, namespace)
+	var delayed *corev1.PersistentVolumeClaim
+	createAttempts := 0
+	writeClient := interceptedClient(t, base, interceptor.Funcs{
+		Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			claim, isClaim := object.(*corev1.PersistentVolumeClaim)
+			if !isClaim {
+				return kubeClient.Create(ctx, object, options...)
+			}
+			createAttempts++
+			if createAttempts == 1 {
+				delayed = claim.DeepCopy()
+				return apierrors.NewTimeoutError("injected outcome-unknown PVC create", 1)
+			}
+			if createAttempts == 2 {
+				if delayed == nil {
+					t.Fatal("delayed PVC create was not captured")
+				}
+				if err := kubeClient.Create(ctx, delayed, options...); err != nil {
+					return err
+				}
+				return apierrors.NewAlreadyExists(schema.GroupResource{Resource: "persistentvolumeclaims"}, claim.Name)
+			}
+			return kubeClient.Create(ctx, object, options...)
+		},
+	})
+	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "outcome-unknown PVC create") {
+		t.Fatalf("initial create did not preserve its unknown outcome: %v", err)
+	}
+
+	current := getCluster(t, ctx, base, cluster)
+	bootstrap := bootstrapForShard(t, current, 0)
+	if bootstrap.PVCUID != "" {
+		t.Fatalf("unknown create was checkpointed as complete: %#v", bootstrap)
+	}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+	if err := base.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("delayed PVC became visible before deletion: %v", err)
+	}
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 8 {
+		if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+			t.Fatal(err)
+		}
+		if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+			break
+		}
+	}
+	if createAttempts != 2 {
+		t.Fatalf("PVC create attempts = %d, want delayed create plus idempotent resolution", createAttempts)
+	}
+	if err := base.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("delayed ownerless PVC survived Delete-policy finalization: %v", err)
+	}
+	if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("cluster did not finish deletion after resolving PVC create: %v", err)
+	}
+}
+
+func TestNamespaceUnavailableForCreateRecognizesAbsenceBarrier(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	active := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "active"}}
+	terminating := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name:              "terminating",
+		DeletionTimestamp: &metav1.Time{Time: time.Unix(100, 0)},
+		Finalizers:        []string{"test.example/finalizer"},
+	}}
+	reader := newFakeClient(t, active, terminating)
+	for _, test := range []struct {
+		name        string
+		unavailable bool
+	}{
+		{name: "active", unavailable: false},
+		{name: "terminating", unavailable: true},
+		{name: "absent", unavailable: true},
+	} {
+		unavailable, err := namespaceUnavailableForCreate(ctx, reader, test.name)
+		if err != nil {
+			t.Fatalf("namespace %s: %v", test.name, err)
+		}
+		if unavailable != test.unavailable {
+			t.Errorf("namespace %s unavailable = %t, want %t", test.name, unavailable, test.unavailable)
+		}
 	}
 }
 
@@ -2091,6 +2202,7 @@ func TestReconcileReportsPlanFailureWithoutAdvancingObservedGeneration(t *testin
 
 func validCluster() *pgshardv1alpha1.PgShardCluster {
 	prometheus := true
+	storageClass := "test-storage"
 	return &pgshardv1alpha1.PgShardCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: types.UID("example-uid"), Generation: 7},
 		Spec: pgshardv1alpha1.PgShardClusterSpec{
@@ -2104,7 +2216,7 @@ func validCluster() *pgshardv1alpha1.PgShardCluster {
 					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 				},
 			},
-			Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi"), DeletionPolicy: pgshardv1alpha1.DeletionRetain},
+			Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi"), StorageClassName: &storageClass, DeletionPolicy: pgshardv1alpha1.DeletionRetain},
 			Pooler: pgshardv1alpha1.PoolerSpec{Scaling: pgshardv1alpha1.PoolerScaling{Mode: pgshardv1alpha1.ScalingHPA, HPA: &pgshardv1alpha1.HPAScaling{
 				MinReplicas: 2, MaxReplicas: 10, TargetCPUUtilizationPercentage: 65,
 			}}},

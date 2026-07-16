@@ -10,7 +10,10 @@ There is no usable pgshard routing endpoint yet. The current operator can run a
 limited direct-PostgreSQL development slice: an explicit one-member
 asynchronous resource creates one PostgreSQL 18 primary and retained PVC per
 shard. Each shard receives a distinct immutable bootstrap Secret and a 4Gi
-minimum data claim. It has no standby, promotion, fencing, backup execution, `shardschema`
+minimum data claim. When `storage.storageClassName` is omitted, the operator
+resolves the current Kubernetes default and checkpoints that exact class before
+creating any claim; later default-class rotation does not change existing data
+intent. It has no standby, promotion, fencing, backup execution, `shardschema`
 bootstrap, or SQL pooler. Restarting a primary interrupts that shard even though
 its data survives. Three- and five-member resources continue to fail closed
 without PostgreSQL Pods.
