@@ -617,18 +617,21 @@ jobs:
           done
       - name: Create disposable Kubernetes cluster
         run: |
-          docker pull docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7
           go install sigs.k8s.io/kind@v0.32.0
           kind create cluster \
             --name pgshard-manager \
             --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
             --wait 90s
           test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"
+          # Pull the digest through the node's CRI. Importing this image from
+          # Docker's containerd store can leave KIND with a transient source
+          # alias that kubelet cannot resolve when it creates a container.
+          docker exec pgshard-manager-control-plane crictl pull \
+            docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7
           kind load docker-image \
             pgshard/operator:dev \
             pgshard/orchestrator:dev \
             pgshard/pooler:dev \
-            docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7 \
             --name pgshard-manager
       - name: Install the self-managed admission manager
         run: |
