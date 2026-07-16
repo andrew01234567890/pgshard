@@ -2080,18 +2080,17 @@ async fn complete_retirement_after_delayed_commit_response(
             release: commit_release,
         },
     })
-    .map_err(|_| io::Error::other("retirement fault proxy exited before it was armed"))?;
+    .map_err(|_| io::Error::other("retirement COMMIT proxy exited before it was armed"))?;
     timeout(CONNECTION_EXIT_TIMEOUT, armed)
         .await
         .map_err(|_| {
-            io::Error::other("retirement fault proxy arm acknowledgement exceeded the bound")
+            io::Error::other("retirement COMMIT proxy arm acknowledgement exceeded the bound")
         })?
         .map_err(|_| {
-            io::Error::other("retirement fault proxy exited before acknowledging its arm")
+            io::Error::other("retirement COMMIT proxy exited before acknowledging its arm")
         })?;
 
-    let operation_timeout = CatalogOperationTimeout::new(Duration::from_millis(300))?;
-    let started = Instant::now();
+    let operation_timeout = CatalogOperationTimeout::new(Duration::from_millis(400))?;
     let retiring_for_task = retiring.clone();
     let mut completion = AbortOnDropTask::new(tokio::spawn(async move {
         let mut absence = absence;
@@ -2107,7 +2106,11 @@ async fn complete_retirement_after_delayed_commit_response(
         .await
         .map_err(|_| io::Error::other("retirement COMMIT did not reach the response gate"))?
         .map_err(|_| io::Error::other("retirement COMMIT gate exited before observation"))?;
-    tokio::time::sleep_until(started + operation_timeout.get() + Duration::from_millis(100)).await;
+    let commit_observed_at = Instant::now();
+    tokio::time::sleep_until(
+        commit_observed_at + operation_timeout.get() + Duration::from_millis(100),
+    )
+    .await;
     assert!(
         !completion.task().is_finished(),
         "post-COMMIT fence verification must wait through the fresh tail"
@@ -2402,7 +2405,7 @@ async fn run_catalog_probe_fixture(
     Ok(())
 }
 
-async fn run_catalog_probe_fence_loss_fixture(
+async fn run_catalog_probe_delayed_commit_fixture(
     primary_database_url: String,
     standby_database_url: String,
     probe_target: ManagedSlotTarget,
@@ -4605,20 +4608,20 @@ async fn persists_the_exact_slot_sync_probe_lifecycle() -> TestResult {
 
 #[tokio::test]
 #[ignore = "requires the CI PostgreSQL 18 primary, streaming standby, catalog, and logical-slot settings"]
-async fn reports_unknown_when_catalog_commit_outlives_its_target_fence() -> TestResult {
+async fn delayed_retirement_commit_preserves_the_original_timeout() -> TestResult {
     let primary_database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
     let standby_database_url = std::env::var("PGSHARD_TEST_STANDBY_DATABASE_URL")?;
     let (cleanup, cleanup_connection) =
         tokio_postgres::connect(&primary_database_url, NoTls).await?;
     let cleanup_task = tokio::spawn(cleanup_connection);
-    let probe = target("pgshard_sync_probe_fence_loss")?;
+    let probe = target("pgshard_probe_commit_delay")?;
     let fixture_result = finish_bounded_fixture(
-        tokio::spawn(run_catalog_probe_fence_loss_fixture(
+        tokio::spawn(run_catalog_probe_delayed_commit_fixture(
             primary_database_url.clone(),
             standby_database_url.clone(),
             probe.clone(),
         )),
-        "slot-sync probe post-COMMIT fence-loss fixture",
+        "slot-sync probe delayed-COMMIT fixture",
     )
     .await;
     let cleanup_result = cleanup_catalog_probe_fixture(
