@@ -131,14 +131,18 @@ tombstone for deletion.
 
 After all storage outcomes are closed, the controller deletes and observes
 authoritative absence of every exact credential tombstone. It then lists Pods
-through the uncached API reader, deletes only an exact recorded shard
-StatefulSet Pod that still references a checkpointed PVC or live credential,
-and waits
-for authoritative Pod absence. A Pod committed before credential deletion is
-visible to that barrier; a later Pod cannot obtain the deleted bootstrap
-credential. Terminal credential-only clients are ignored because they cannot
-restart or mutate the retained database; Pods referencing the data PVC remain
-in the barrier regardless of phase. Only after both barriers does `Retain`
+through the uncached API reader and proves absence of every Pod that mounts a
+checkpointed data PVC. Each managed PostgreSQL Pod starts with a
+cluster-UID-bound termination finalizer. Before workload pruning, the controller
+requires that exact fence; after deletion it removes the finalizer only when
+kubelet reports `Succeeded` or `Failed`. A force-deleted Pod on a partitioned
+node therefore remains visible and keeps the PVC protected instead of turning
+API-object absence into a false process-termination proof. Credential-only
+clients do not own PGDATA and cannot keep a session after the PostgreSQL process
+has stopped, so they do not block this storage barrier. A Pod committed before
+credential deletion remains visible to the PVC barrier; a later managed Pod
+cannot obtain the deleted bootstrap credential. Only after the credential,
+terminal-process, and Pod-absence barriers does `Retain`
 release its own PVC protection finalizer and mark the data retained. If a
 retained PVC was explicitly deleted, the controller releases only its own
 protection finalizer and waits for authoritative absence instead of replacing
