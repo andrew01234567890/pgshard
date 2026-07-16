@@ -497,9 +497,12 @@ and lengths, replica identity, reserved flags, UTF-8, zero-copy iteration, and
 redaction. Complete transaction ordering, relation caching, feedback scheduling
 and durable-checkpoint restart integration, replay, and cross-shard stream tests
 are still absent. Targeted KIND tests verify operator PVC deletion and
-same-name recreation, server-side-apply field pruning after member, Service
-annotation, and OTEL configuration shrinkage, plus both fresh creation and a
-pre-SSA whole-object Update upgrade. The legacy fixture proves type-aware
+same-name recreation, CRD-only rejection of unsupported topology and storage
+transitions, and server-side-apply field pruning after PostgreSQL parameter,
+Service annotation, and OTEL configuration shrinkage. A delayed rollout keeps
+the old immutable PostgreSQL ConfigMap available until the workload reports the
+new revision, then proves it is pruned. The same suite covers both fresh creation
+and a pre-SSA whole-object Update upgrade. The legacy fixture proves type-aware
 alignment prunes stale desired fields while preserving API-assigned Service
 cluster/IP-family fields exactly. An external Apply-manager annotation makes
 migration fail before a write and remains intact until that manager explicitly
@@ -537,8 +540,9 @@ a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard
 Service from an authorized restricted probe client using the destination-specific
 Secret, then restarts one primary StatefulSet and verifies its PVC-backed row
-survives. It does not claim
-uninterrupted traffic during that restart. A unit
+survives. Foreground deletion of the cluster then proves the default-retained,
+ownerless PVCs keep their exact recorded UIDs. It does not claim uninterrupted
+traffic during that restart. A unit
 regression gives the informer cache a false absence while the authoritative API
 reader still sees an owned PVC, and proves that finalization continues waiting.
 Operator unit tests also prove deterministic common, primary, and per-standby

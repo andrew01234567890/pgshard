@@ -200,7 +200,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("PostgreSQL data volume = %#v", dataVolume)
 		}
 		pod := statefulSet.Spec.Template.Spec
-		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 0 || len(pod.Containers) != 1 {
+		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
 			t.Fatalf("PostgreSQL Pod boundary = %#v", pod)
 		}
 		if pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot == nil || !*pod.SecurityContext.RunAsNonRoot || pod.SecurityContext.RunAsUser == nil || *pod.SecurityContext.RunAsUser != 999 || pod.SecurityContext.FSGroup == nil || *pod.SecurityContext.FSGroup != 999 || pod.SecurityContext.FSGroupChangePolicy == nil || *pod.SecurityContext.FSGroupChangePolicy != corev1.FSGroupChangeOnRootMismatch {
@@ -216,6 +216,13 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		readinessProbe := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
 		if !reflect.DeepEqual(postgres.ReadinessProbe.Exec.Command, readinessProbe) {
 			t.Fatalf("PostgreSQL readiness probe = %#v", postgres.ReadinessProbe)
+		}
+		bootstrap := pod.InitContainers[0]
+		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) {
+			t.Fatalf("PostgreSQL atomic bootstrap contract = %#v", bootstrap)
+		}
+		if bootstrap.SecurityContext == nil || bootstrap.SecurityContext.ReadOnlyRootFilesystem == nil || !*bootstrap.SecurityContext.ReadOnlyRootFilesystem || bootstrap.Resources.Limits.Memory() == nil {
+			t.Fatalf("PostgreSQL bootstrap security/resources = %#v", bootstrap)
 		}
 		passwordReferences := 0
 		for _, variable := range postgres.Env {
@@ -244,7 +251,9 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	if claim.Name != "demo-random-data" || claim.Labels[ShardLabel] != "0001" || claim.Spec.Resources.Requests.Storage().Cmp(cluster.Spec.Storage.Size) != 0 || claim.Annotations[ApplyOwnershipAnnotation] != "" {
 		t.Fatalf("PostgreSQL data PVC = %#v", claim)
 	}
-	assertOwned(t, claim, cluster)
+	if len(claim.OwnerReferences) != 0 || claim.Annotations[PostgreSQLDataClusterUIDAnnotation] != string(cluster.UID) {
+		t.Fatalf("PostgreSQL data PVC garbage-collection boundary = %#v", claim.ObjectMeta)
+	}
 }
 
 func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {

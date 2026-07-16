@@ -11,6 +11,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
@@ -80,13 +81,25 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		if !controllerutil.ContainsFinalizer(cluster, resourceFinalizer) {
 			return ctrl.Result{}, nil
 		}
-		if storageDeletionPolicy(cluster) == pgshardv1alpha1.DeletionRetain {
+		deletionPolicy, err := provisionedStorageDeletionPolicy(cluster)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if deletionPolicy == pgshardv1alpha1.DeletionRetain {
 			retained, err := r.retainPostgreSQLPVCs(ctx, cluster)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("retain PostgreSQL data during cluster deletion: %w", err)
 			}
 			if retained {
 				return ctrl.Result{Requeue: true}, nil
+			}
+		} else {
+			deleting, err := r.deletePostgreSQLPVCs(ctx, cluster)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("delete PostgreSQL data during cluster deletion: %w", err)
+			}
+			if deleting {
+				return ctrl.Result{RequeueAfter: retryDelay}, nil
 			}
 		}
 		remaining, err := r.prune(ctx, cluster, nil, true)
@@ -198,19 +211,16 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 	resourceNames := make(map[string]struct{}, 2*len(cluster.Status.PostgreSQLBootstraps))
 	resourceUIDs := make(map[types.UID]struct{}, 2*len(cluster.Status.PostgreSQLBootstraps))
 	for index, bootstrap := range cluster.Status.PostgreSQLBootstraps {
-		if bootstrap.Shard < 0 || bootstrap.Shard >= cluster.Spec.Shards || bootstrap.SecretName == "" || bootstrap.SecretUID == "" {
+		if bootstrap.Shard < 0 || bootstrap.Shard >= cluster.Spec.Shards || bootstrap.SecretName == "" || bootstrap.PVCName == "" {
 			return fmt.Errorf("recorded PostgreSQL bootstrap for shard %d is invalid", bootstrap.Shard)
 		}
-		if (bootstrap.PVCName == "") != (bootstrap.PVCUID == "") {
-			return fmt.Errorf("recorded PostgreSQL data identity for shard %d is incomplete", bootstrap.Shard)
+		if bootstrap.SecretUID == "" && bootstrap.PVCUID != "" {
+			return fmt.Errorf("recorded PostgreSQL bootstrap for shard %d identifies data before its credential", bootstrap.Shard)
 		}
 		if _, duplicate := indices[bootstrap.Shard]; duplicate {
 			return fmt.Errorf("recorded PostgreSQL bootstrap for shard %d is duplicated", bootstrap.Shard)
 		}
 		for _, name := range []string{bootstrap.SecretName, bootstrap.PVCName} {
-			if name == "" {
-				continue
-			}
 			if _, duplicate := resourceNames[name]; duplicate {
 				return fmt.Errorf("recorded PostgreSQL bootstrap resource name %s is duplicated", name)
 			}
@@ -230,22 +240,24 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		index, exists := indices[shard]
-		var createdSecret *corev1.Secret
 		if !exists {
-			secret, err := r.createPostgreSQLAuthSecret(ctx, cluster, shard)
+			secretName, err := randomBootstrapName(owned.PostgreSQLAuthSecretPrefix(cluster.Name, shard))
+			if err != nil {
+				return err
+			}
+			pvcName, err := randomBootstrapName(owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, shard))
 			if err != nil {
 				return err
 			}
 			cluster.Status.PostgreSQLBootstraps = append(cluster.Status.PostgreSQLBootstraps, pgshardv1alpha1.PostgreSQLBootstrapStatus{
-				Shard: shard, SecretName: secret.Name, SecretUID: secret.UID,
+				Shard: shard, SecretName: secretName, PVCName: pvcName,
 			})
 			sort.Slice(cluster.Status.PostgreSQLBootstraps, func(left, right int) bool {
 				return cluster.Status.PostgreSQLBootstraps[left].Shard < cluster.Status.PostgreSQLBootstraps[right].Shard
 			})
 			if err := r.Status().Update(ctx, cluster); err != nil {
-				return fmt.Errorf("checkpoint PostgreSQL credential identity for shard %d: %w", shard, err)
+				return fmt.Errorf("checkpoint PostgreSQL bootstrap creation intent for shard %d: %w", shard, err)
 			}
-			createdSecret = secret
 			for candidate := range cluster.Status.PostgreSQLBootstraps {
 				if cluster.Status.PostgreSQLBootstraps[candidate].Shard == shard {
 					index = candidate
@@ -255,49 +267,43 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 		}
 
 		bootstrap := &cluster.Status.PostgreSQLBootstraps[index]
-		secret := createdSecret
-		if secret == nil {
-			secret = &corev1.Secret{}
-			secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}
-			if err := reader.Get(ctx, secretKey, secret); apierrors.IsNotFound(err) {
-				return fmt.Errorf("credential Secret %s with recorded UID %s is missing; explicit recovery is required", bootstrap.SecretName, bootstrap.SecretUID)
-			} else if err != nil {
-				return fmt.Errorf("read credential Secret %s: %w", bootstrap.SecretName, err)
-			}
+		secret, err := r.ensurePostgreSQLAuthSecret(ctx, reader, cluster, shard, *bootstrap)
+		if err != nil {
+			return err
 		}
-		if secret.UID != bootstrap.SecretUID {
+		if bootstrap.SecretUID != "" && secret.UID != bootstrap.SecretUID {
 			return fmt.Errorf("credential Secret %s has UID %s, expected recorded UID %s", bootstrap.SecretName, secret.UID, bootstrap.SecretUID)
 		}
 		if err := validatePostgreSQLAuthSecret(secret, cluster, shard, bootstrap.SecretName); err != nil {
 			return err
 		}
-
-		if bootstrap.PVCName == "" {
-			claim, err := r.createPostgreSQLDataPVC(ctx, cluster, shard)
-			if err != nil {
-				return err
+		if bootstrap.SecretUID == "" {
+			bootstrap.SecretUID = secret.UID
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				return fmt.Errorf("checkpoint PostgreSQL credential identity for shard %d: %w", shard, err)
 			}
-			bootstrap.PVCName = claim.Name
+			// Status updates decode the API response back into cluster and may
+			// replace the slice backing array. Never retain an element pointer
+			// across that boundary.
+			bootstrap = &cluster.Status.PostgreSQLBootstraps[index]
+		}
+
+		claim, err := r.ensurePostgreSQLDataPVC(ctx, reader, cluster, shard, *bootstrap)
+		if err != nil {
+			return err
+		}
+		if bootstrap.PVCUID != "" && claim.UID != bootstrap.PVCUID {
+			return fmt.Errorf("PostgreSQL data PVC %s has UID %s, expected recorded UID %s", bootstrap.PVCName, claim.UID, bootstrap.PVCUID)
+		}
+		if err := validatePostgreSQLDataPVC(claim, cluster, shard, *bootstrap); err != nil {
+			return err
+		}
+		if bootstrap.PVCUID == "" {
 			bootstrap.PVCUID = claim.UID
 			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				return fmt.Errorf("checkpoint PostgreSQL data identity for shard %d: %w", shard, err)
 			}
-			continue
-		}
-
-		claim := &corev1.PersistentVolumeClaim{}
-		claimKey := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
-		if err := reader.Get(ctx, claimKey, claim); apierrors.IsNotFound(err) {
-			return fmt.Errorf("PostgreSQL data PVC %s with recorded UID %s is missing; restore is required", bootstrap.PVCName, bootstrap.PVCUID)
-		} else if err != nil {
-			return fmt.Errorf("read PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
-		}
-		if claim.UID != bootstrap.PVCUID {
-			return fmt.Errorf("PostgreSQL data PVC %s has UID %s, expected recorded UID %s", bootstrap.PVCName, claim.UID, bootstrap.PVCUID)
-		}
-		if err := validatePostgreSQLDataPVC(claim, cluster, shard, *bootstrap); err != nil {
-			return err
 		}
 	}
 	return nil
@@ -306,63 +312,77 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) *pgshardv1alpha1.PostgreSQLBootstrapSpecStatus {
 	return &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
 		Shards: cluster.Spec.Shards, MembersPerShard: cluster.Spec.MembersPerShard, Durability: cluster.Spec.Durability,
-		StorageSize: cluster.Spec.Storage.Size.String(), StorageClassName: copyOptionalString(cluster.Spec.Storage.StorageClassName),
+		StorageSize: cluster.Spec.Storage.Size.String(), StorageClassName: copyOptionalString(cluster.Spec.Storage.StorageClassName), DeletionPolicy: storageDeletionPolicy(cluster),
 	}
 }
 
 func validateBootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) error {
 	recorded := cluster.Status.PostgreSQLBootstrapSpec
 	wanted := bootstrapSpecStatus(cluster)
-	if recorded.Shards != wanted.Shards || recorded.MembersPerShard != wanted.MembersPerShard || recorded.Durability != wanted.Durability || recorded.StorageSize != wanted.StorageSize || !optionalStringsEqual(recorded.StorageClassName, wanted.StorageClassName) {
+	if recorded.Shards != wanted.Shards || recorded.MembersPerShard != wanted.MembersPerShard || recorded.Durability != wanted.Durability || recorded.StorageSize != wanted.StorageSize || !optionalStringsEqual(recorded.StorageClassName, wanted.StorageClassName) || recorded.DeletionPolicy != wanted.DeletionPolicy {
 		return fmt.Errorf("current topology or storage differs from the provisioned PostgreSQL bootstrap spec; an explicit transition is required")
 	}
 	return nil
 }
 
-func (r *PgShardClusterReconciler) createPostgreSQLAuthSecret(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, shard int32) (*corev1.Secret, error) {
+func (r *PgShardClusterReconciler) ensurePostgreSQLAuthSecret(ctx context.Context, reader client.Reader, cluster *pgshardv1alpha1.PgShardCluster, shard int32, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}
+	if err := reader.Get(ctx, key, secret); err == nil {
+		return secret, nil
+	} else if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("read credential Secret %s: %w", bootstrap.SecretName, err)
+	} else if bootstrap.SecretUID != "" {
+		return nil, fmt.Errorf("credential Secret %s with recorded UID %s is missing; explicit recovery is required", bootstrap.SecretName, bootstrap.SecretUID)
+	}
+
 	random := make([]byte, postgresqlPasswordBytes)
 	if _, err := rand.Read(random); err != nil {
 		return nil, fmt.Errorf("generate PostgreSQL credential for shard %d: %w", shard, err)
 	}
 	password := make([]byte, hex.EncodedLen(len(random)))
 	hex.Encode(password, random)
-	for attempt := 0; attempt < 4; attempt++ {
-		name, err := randomBootstrapName(owned.PostgreSQLAuthSecretPrefix(cluster.Name, shard))
-		if err != nil {
-			return nil, err
+	desired := owned.PostgreSQLAuthSecret(cluster, shard, bootstrap.SecretName, password)
+	if err := r.Create(ctx, desired, client.FieldOwner(owned.ManagedByValue)); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return nil, fmt.Errorf("create credential Secret %s: %w", bootstrap.SecretName, err)
 		}
-		desired := owned.PostgreSQLAuthSecret(cluster, shard, name, password)
-		if err := r.Create(ctx, desired, client.FieldOwner(owned.ManagedByValue)); apierrors.IsAlreadyExists(err) {
-			continue
-		} else if err != nil {
-			return nil, fmt.Errorf("create credential Secret %s: %w", name, err)
+		if err := reader.Get(ctx, key, secret); err != nil {
+			return nil, fmt.Errorf("read concurrently created credential Secret %s: %w", bootstrap.SecretName, err)
 		}
-		if desired.UID == "" {
-			return nil, fmt.Errorf("created credential Secret %s has no API-assigned UID", name)
-		}
-		return desired, nil
+		return secret, nil
 	}
-	return nil, fmt.Errorf("allocate a collision-free credential Secret name for shard %d", shard)
+	if desired.UID == "" {
+		return nil, fmt.Errorf("created credential Secret %s has no API-assigned UID", bootstrap.SecretName)
+	}
+	return desired, nil
 }
 
-func (r *PgShardClusterReconciler) createPostgreSQLDataPVC(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, shard int32) (*corev1.PersistentVolumeClaim, error) {
-	for attempt := 0; attempt < 4; attempt++ {
-		name, err := randomBootstrapName(owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, shard))
-		if err != nil {
-			return nil, err
-		}
-		desired := owned.PostgreSQLPrimaryDataPVC(cluster, shard, name)
-		if err := r.Create(ctx, desired, client.FieldOwner(owned.ManagedByValue)); apierrors.IsAlreadyExists(err) {
-			continue
-		} else if err != nil {
-			return nil, fmt.Errorf("create PostgreSQL data PVC %s: %w", name, err)
-		}
-		if desired.UID == "" {
-			return nil, fmt.Errorf("created PostgreSQL data PVC %s has no API-assigned UID", name)
-		}
-		return desired, nil
+func (r *PgShardClusterReconciler) ensurePostgreSQLDataPVC(ctx context.Context, reader client.Reader, cluster *pgshardv1alpha1.PgShardCluster, shard int32, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) (*corev1.PersistentVolumeClaim, error) {
+	claim := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+	if err := reader.Get(ctx, key, claim); err == nil {
+		return claim, nil
+	} else if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("read PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
+	} else if bootstrap.PVCUID != "" {
+		return nil, fmt.Errorf("PostgreSQL data PVC %s with recorded UID %s is missing; restore is required", bootstrap.PVCName, bootstrap.PVCUID)
 	}
-	return nil, fmt.Errorf("allocate a collision-free PostgreSQL data PVC name for shard %d", shard)
+
+	desired := owned.PostgreSQLPrimaryDataPVC(cluster, shard, bootstrap.PVCName)
+	if err := r.Create(ctx, desired, client.FieldOwner(owned.ManagedByValue)); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return nil, fmt.Errorf("create PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
+		}
+		if err := reader.Get(ctx, key, claim); err != nil {
+			return nil, fmt.Errorf("read concurrently created PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
+		}
+		return claim, nil
+	}
+	if desired.UID == "" {
+		return nil, fmt.Errorf("created PostgreSQL data PVC %s has no API-assigned UID", bootstrap.PVCName)
+	}
+	return desired, nil
 }
 
 func randomBootstrapName(prefix string) (string, error) {
@@ -398,8 +418,8 @@ func validatePostgreSQLAuthSecret(secret *corev1.Secret, cluster *pgshardv1alpha
 }
 
 func validatePostgreSQLDataPVC(claim *corev1.PersistentVolumeClaim, cluster *pgshardv1alpha1.PgShardCluster, shard int32, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) error {
-	if !metav1.IsControlledBy(claim, cluster) {
-		return fmt.Errorf("PostgreSQL data PVC is not controlled by PgShardCluster UID %s", cluster.UID)
+	if len(claim.OwnerReferences) != 0 || claim.Annotations[owned.PostgreSQLDataClusterUIDAnnotation] != string(cluster.UID) {
+		return fmt.Errorf("PostgreSQL data PVC is not safely bound outside garbage collection to PgShardCluster UID %s", cluster.UID)
 	}
 	if claim.Name != bootstrap.PVCName || claim.DeletionTimestamp != nil || claim.Labels[owned.ClusterLabel] != cluster.Name || claim.Labels[owned.ComponentLabel] != "postgresql" || claim.Labels[owned.ShardLabel] != fmt.Sprintf("%04d", shard) || claim.Labels[owned.RoleLabel] != "primary" || claim.Labels[owned.MemberLabel] != "0000" {
 		return fmt.Errorf("PostgreSQL data PVC metadata does not match shard %d", shard)
@@ -414,7 +434,7 @@ func validatePostgreSQLDataPVC(claim *corev1.PersistentVolumeClaim, cluster *pgs
 	if !ok || requested.Cmp(cluster.Spec.Storage.Size) != 0 {
 		return fmt.Errorf("PostgreSQL data PVC %s capacity differs from the provisioned size", claim.Name)
 	}
-	if !optionalStringsEqual(claim.Spec.StorageClassName, bootstrap.PVCStorageClassName) {
+	if bootstrap.PVCUID != "" && !optionalStringsEqual(claim.Spec.StorageClassName, bootstrap.PVCStorageClassName) {
 		return fmt.Errorf("PostgreSQL data PVC %s storage class differs from its recorded API value", claim.Name)
 	}
 	if cluster.Spec.Storage.StorageClassName != nil && !optionalStringsEqual(claim.Spec.StorageClassName, cluster.Spec.Storage.StorageClassName) {
@@ -981,39 +1001,116 @@ func storageDeletionPolicy(cluster *pgshardv1alpha1.PgShardCluster) pgshardv1alp
 	return cluster.Spec.Storage.DeletionPolicy
 }
 
+func provisionedStorageDeletionPolicy(cluster *pgshardv1alpha1.PgShardCluster) (pgshardv1alpha1.StorageDeletionPolicy, error) {
+	if cluster.Status.PostgreSQLBootstrapSpec == nil {
+		// A delete can race the first post-finalizer reconcile. No PostgreSQL
+		// child exists before this snapshot, and retaining is the only safe
+		// default if admission was bypassed.
+		return pgshardv1alpha1.DeletionRetain, nil
+	}
+	policy := cluster.Status.PostgreSQLBootstrapSpec.DeletionPolicy
+	if policy != pgshardv1alpha1.DeletionRetain && policy != pgshardv1alpha1.DeletionDelete {
+		return "", fmt.Errorf("recorded PostgreSQL deletion policy %q is invalid", policy)
+	}
+	return policy, nil
+}
+
 func (r *PgShardClusterReconciler) retainPostgreSQLPVCs(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	if r.APIReader == nil {
 		return false, fmt.Errorf("authoritative API reader is required for data retention")
 	}
-	claims := &corev1.PersistentVolumeClaimList{}
-	if err := r.APIReader.List(ctx, claims, client.InNamespace(cluster.Namespace)); err != nil {
-		return false, fmt.Errorf("list PostgreSQL data PVCs: %w", err)
-	}
 	changed := false
-	for index := range claims.Items {
-		claim := &claims.Items[index]
-		if !metav1.IsControlledBy(claim, cluster) || claim.Labels[owned.ComponentLabel] != "postgresql" {
+	for index := range cluster.Status.PostgreSQLBootstraps {
+		bootstrap := &cluster.Status.PostgreSQLBootstraps[index]
+		if bootstrap.PVCName == "" {
 			continue
 		}
-		ownerReferences := make([]metav1.OwnerReference, 0, len(claim.OwnerReferences))
-		for _, reference := range claim.OwnerReferences {
-			if reference.UID != cluster.UID {
-				ownerReferences = append(ownerReferences, reference)
-			}
+		claim := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+		if err := r.APIReader.Get(ctx, key, claim); apierrors.IsNotFound(err) {
+			// Retain cannot resurrect a claim that was explicitly removed or
+			// preserve namespaced storage while its namespace is being deleted.
+			// Do not leave the cluster or namespace permanently finalizing after
+			// the exact recorded object is already gone.
+			continue
+		} else if err != nil {
+			return false, fmt.Errorf("read PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
 		}
-		claim.OwnerReferences = ownerReferences
+		if bootstrap.PVCUID != "" && claim.UID != bootstrap.PVCUID {
+			return false, fmt.Errorf("PostgreSQL data PVC %s has UID %s, expected recorded UID %s", bootstrap.PVCName, claim.UID, bootstrap.PVCUID)
+		}
+		if claim.DeletionTimestamp != nil {
+			// Kubernetes deletion is irreversible once accepted. In particular,
+			// an ownerless namespaced PVC is still deleted with its namespace.
+			continue
+		}
+		if err := validatePostgreSQLDataPVC(claim, cluster, bootstrap.Shard, *bootstrap); err != nil {
+			return false, err
+		}
+		if bootstrap.PVCUID == "" {
+			bootstrap.PVCUID = claim.UID
+			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				return false, fmt.Errorf("checkpoint retained PostgreSQL data identity for shard %d: %w", bootstrap.Shard, err)
+			}
+			return true, nil
+		}
 		annotations := maps.Clone(claim.Annotations)
 		if annotations == nil {
 			annotations = make(map[string]string, 1)
 		}
-		annotations[owned.RetainedFromAnnotation] = cluster.Namespace + "/" + cluster.Name
+		retainedFrom := cluster.Namespace + "/" + cluster.Name
+		if annotations[owned.RetainedFromAnnotation] == retainedFrom {
+			continue
+		}
+		annotations[owned.RetainedFromAnnotation] = retainedFrom
 		claim.Annotations = annotations
 		if err := r.Update(ctx, claim, client.FieldOwner(owned.ManagedByValue)); err != nil {
-			return false, fmt.Errorf("detach retained PostgreSQL data PVC %s: %w", claim.Name, err)
+			return false, fmt.Errorf("mark retained PostgreSQL data PVC %s: %w", claim.Name, err)
 		}
 		changed = true
 	}
 	return changed, nil
+}
+
+func (r *PgShardClusterReconciler) deletePostgreSQLPVCs(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	if r.APIReader == nil {
+		return false, fmt.Errorf("authoritative API reader is required for data deletion")
+	}
+	for index := range cluster.Status.PostgreSQLBootstraps {
+		bootstrap := &cluster.Status.PostgreSQLBootstraps[index]
+		if bootstrap.PVCName == "" {
+			continue
+		}
+		claim := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+		if err := r.APIReader.Get(ctx, key, claim); apierrors.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			return false, fmt.Errorf("read PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
+		}
+		if bootstrap.PVCUID != "" && claim.UID != bootstrap.PVCUID {
+			return false, fmt.Errorf("PostgreSQL data PVC %s has UID %s, expected recorded UID %s", bootstrap.PVCName, claim.UID, bootstrap.PVCUID)
+		}
+		if err := validatePostgreSQLDataPVC(claim, cluster, bootstrap.Shard, *bootstrap); err != nil {
+			return false, err
+		}
+		if bootstrap.PVCUID == "" {
+			bootstrap.PVCUID = claim.UID
+			bootstrap.PVCStorageClassName = copyOptionalString(claim.Spec.StorageClassName)
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				return false, fmt.Errorf("checkpoint deletable PostgreSQL data identity for shard %d: %w", bootstrap.Shard, err)
+			}
+			return true, nil
+		}
+		uid := bootstrap.PVCUID
+		resourceVersion := claim.ResourceVersion
+		if err := r.Delete(ctx, claim, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("delete PostgreSQL data PVC %s with recorded UID %s: %w", bootstrap.PVCName, bootstrap.PVCUID, err)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object, includePVCs bool) (bool, error) {
@@ -1056,6 +1153,9 @@ func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1
 			continue
 		}
 		if _, keep := desired[owned.Key(object)]; !keep {
+			if !includePVCs && retainPostgreSQLConfigurationDuringRollout(cluster, object, existing) {
+				continue
+			}
 			stale = append(stale, object)
 		}
 	}
@@ -1076,6 +1176,72 @@ func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1
 		}
 	}
 	return len(stale) > 0, nil
+}
+
+func retainPostgreSQLConfigurationDuringRollout(cluster *pgshardv1alpha1.PgShardCluster, object client.Object, existing []client.Object) bool {
+	configuration, ok := object.(*corev1.ConfigMap)
+	if !ok || !strings.HasPrefix(configuration.Name, cluster.Name+owned.PostgreSQLConfigSuffix+"-") {
+		return false
+	}
+	for _, candidate := range existing {
+		if !metav1.IsControlledBy(candidate, cluster) {
+			continue
+		}
+		switch workload := candidate.(type) {
+		case *appsv1.Deployment:
+			if !podSpecReferencesPostgreSQLConfiguration(workload.Spec.Template.Spec) {
+				continue
+			}
+			if podSpecReferencesConfigMap(workload.Spec.Template.Spec, configuration.Name) || !deploymentRolloutComplete(workload) {
+				return true
+			}
+		case *appsv1.StatefulSet:
+			if !podSpecReferencesPostgreSQLConfiguration(workload.Spec.Template.Spec) {
+				continue
+			}
+			if podSpecReferencesConfigMap(workload.Spec.Template.Spec, configuration.Name) || !statefulSetRolloutComplete(workload) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func podSpecReferencesPostgreSQLConfiguration(spec corev1.PodSpec) bool {
+	for _, volume := range spec.Volumes {
+		if volume.ConfigMap != nil && strings.Contains(volume.ConfigMap.Name, owned.PostgreSQLConfigSuffix+"-") {
+			return true
+		}
+	}
+	return false
+}
+
+func podSpecReferencesConfigMap(spec corev1.PodSpec, name string) bool {
+	for _, volume := range spec.Volumes {
+		if volume.ConfigMap != nil && volume.ConfigMap.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func deploymentRolloutComplete(deployment *appsv1.Deployment) bool {
+	desired := int32(1)
+	if deployment.Spec.Replicas != nil {
+		desired = *deployment.Spec.Replicas
+	}
+	return workloadGenerationObserved(deployment.Generation, deployment.Status.ObservedGeneration) &&
+		deployment.Status.Replicas == desired && deployment.Status.UpdatedReplicas == desired
+}
+
+func statefulSetRolloutComplete(statefulSet *appsv1.StatefulSet) bool {
+	desired := int32(1)
+	if statefulSet.Spec.Replicas != nil {
+		desired = *statefulSet.Spec.Replicas
+	}
+	return workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) &&
+		statefulSet.Status.Replicas == desired && statefulSet.Status.UpdatedReplicas == desired &&
+		statefulSet.Status.CurrentRevision != "" && statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
 }
 
 func listObjects(list client.ObjectList) []client.Object {
@@ -1385,7 +1551,7 @@ func bootstrapSpecsEqual(left, right *pgshardv1alpha1.PostgreSQLBootstrapSpecSta
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName)
+	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName) && left.DeletionPolicy == right.DeletionPolicy
 }
 
 func postgreSQLBootstrapsEqual(left, right pgshardv1alpha1.PostgreSQLBootstrapStatus) bool {

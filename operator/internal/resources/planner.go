@@ -55,11 +55,47 @@ const (
 	defaultEtcdImage       = "registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534"
 	defaultPostgreSQLImage = "docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7"
 
-	configHashAnnotation     = "pgshard.io/config-hash"
-	ApplyOwnershipAnnotation = "pgshard.io/apply-ownership"
-	ApplyOwnershipVersion    = "v1"
-	RetainedFromAnnotation   = "pgshard.io/retained-from"
+	configHashAnnotation               = "pgshard.io/config-hash"
+	ApplyOwnershipAnnotation           = "pgshard.io/apply-ownership"
+	ApplyOwnershipVersion              = "v1"
+	RetainedFromAnnotation             = "pgshard.io/retained-from"
+	PostgreSQLDataClusterUIDAnnotation = "pgshard.io/data-cluster-uid"
+	postgresqlBootstrapMarker          = ".pgshard-bootstrap-complete"
 )
+
+const postgresqlBootstrapScript = `set -Eeuo pipefail
+parent=/var/lib/postgresql/18
+final="$parent/docker"
+staging="$parent/.pgshard-init"
+marker="$final/.pgshard-bootstrap-complete"
+
+if [[ -f "$marker" && -f "$final/PG_VERSION" ]]; then
+  rm -rf -- "$staging"
+  exit 0
+fi
+if [[ -e "$final" ]]; then
+  echo "refusing to replace an incomplete or unmarked PostgreSQL data directory" >&2
+  exit 1
+fi
+
+rm -rf -- "$staging"
+mkdir -p -- "$staging"
+chmod 0700 "$staging"
+initdb \
+  --pgdata="$staging" \
+  --username=postgres \
+  --pwfile=/etc/pgshard/bootstrap/superuser-password \
+  --auth-local=trust \
+  --auth-host=scram-sha-256 \
+  --data-checksums \
+  --encoding=UTF8 \
+  --locale=C
+printf '\nhost all all all scram-sha-256\n' >> "$staging/pg_hba.conf"
+touch "$staging/.pgshard-bootstrap-complete"
+sync
+mv -- "$staging" "$final"
+sync
+`
 
 // Images contains the deployable images used by the supporting workloads.
 // Image references are controller configuration, not part of the cluster API,
@@ -197,7 +233,7 @@ func postgresqlBootstraps(cluster *pgshardv1alpha1.PgShardCluster) (map[int32]pg
 			return nil, fmt.Errorf("PostgreSQL bootstrap references invalid shard %d", bootstrap.Shard)
 		}
 		if bootstrap.SecretName == "" || bootstrap.SecretUID == "" || bootstrap.PVCName == "" || bootstrap.PVCUID == "" {
-			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is incomplete", bootstrap.Shard)
+			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is incomplete (credential name=%t UID=%t, PVC name=%t UID=%t)", bootstrap.Shard, bootstrap.SecretName != "", bootstrap.SecretUID != "", bootstrap.PVCName != "", bootstrap.PVCUID != "")
 		}
 		if _, duplicate := bootstraps[bootstrap.Shard]; duplicate {
 			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is duplicated", bootstrap.Shard)
@@ -442,6 +478,12 @@ func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, 
 // primary. It is created and API-identified before its StatefulSet is planned.
 func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string) *corev1.PersistentVolumeClaim {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
+	// PostgreSQL data claims are deliberately outside Kubernetes cascading
+	// garbage collection. The controller binds them to the cluster UID in an
+	// annotation and deletes the exact status-recorded UID only when the
+	// creation-time policy is Delete.
+	metadata.OwnerReferences = nil
+	metadata.Annotations[PostgreSQLDataClusterUIDAnnotation] = string(cluster.UID)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
 	metadata.Labels[RoleLabel] = "primary"
 	metadata.Labels[MemberLabel] = "0000"
@@ -516,6 +558,19 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql", ReadOnly: true},
 		},
 	}
+	bootstrap := corev1.Container{
+		Name:            "bootstrap-postgresql",
+		Image:           image,
+		ImagePullPolicy: imagePullPolicy(image),
+		Command:         []string{"bash", "-ceu", postgresqlBootstrapScript},
+		Resources:       cluster.Spec.PostgreSQL.Resources,
+		SecurityContext: postgresSecurity.DeepCopy(),
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "data", MountPath: "/var/lib/postgresql"},
+			{Name: "tmp", MountPath: "/tmp"},
+			{Name: "bootstrap-secret", MountPath: "/etc/pgshard/bootstrap", ReadOnly: true},
+		},
+	}
 	automount := false
 	enableServiceLinks := false
 	return &appsv1.StatefulSet{
@@ -542,12 +597,14 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 						FSGroupChangePolicy: &fsGroupChangePolicy,
 						SeccompProfile:      seccomp,
 					},
-					Containers: []corev1.Container{postgres},
+					InitContainers: []corev1.Container{bootstrap},
+					Containers:     []corev1.Container{postgres},
 					Volumes: []corev1.Volume{
 						{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName}}},
 						{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr(resource.MustParse("64Mi"))}}},
 						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("64Mi"))}}},
 						{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configurationName}}}},
+						{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName, DefaultMode: ptr(int32(0o440))}}},
 					},
 				},
 			},

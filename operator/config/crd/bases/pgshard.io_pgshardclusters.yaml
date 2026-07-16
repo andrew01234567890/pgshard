@@ -467,6 +467,8 @@ spec:
                   any PostgreSQL credential or data volume is created. It provides a
                   defensive fence when admission is unavailable or bypassed.
                 properties:
+                  deletionPolicy:
+                    type: string
                   durability:
                     type: string
                   membersPerShard:
@@ -480,6 +482,7 @@ spec:
                   storageSize:
                     type: string
                 required:
+                - deletionPolicy
                 - durability
                 - membersPerShard
                 - shards
@@ -493,8 +496,9 @@ spec:
                 items:
                   description: |-
                     PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified
-                    bootstrap resources. Names and UIDs are both required before a workload can
-                    consume either child.
+                    bootstrap resources. Names are durable creation intents; UIDs are filled only
+                    after the API server confirms each child. A workload cannot consume an
+                    incomplete record.
                   properties:
                     pvcName:
                       type: string

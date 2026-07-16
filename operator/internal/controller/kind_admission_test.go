@@ -17,7 +17,6 @@ import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -78,70 +77,6 @@ func TestKINDAdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec(t *testing.T) {
 		t.Fatalf("unsafe create error = %v", err)
 	}
 
-	transition := readDevelopmentSample(t)
-	transition.Name = "crd-transition-fence"
-	transition.Namespace = namespace.Name
-	if err := kubeClient.Create(ctx, transition); err != nil {
-		t.Fatal(err)
-	}
-	restoreWebhook := omitValidatingWebhookUpdates(t, ctx, kubeClient)
-	defer restoreWebhook()
-	for name, mutate := range map[string]func(*pgshardv1alpha1.PgShardCluster){
-		"shards": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Shards++ },
-		"membersPerShard": func(cluster *pgshardv1alpha1.PgShardCluster) {
-			cluster.Spec.MembersPerShard = 5
-		},
-		"storage size": func(cluster *pgshardv1alpha1.PgShardCluster) {
-			cluster.Spec.Storage.Size = resource.MustParse("8Gi")
-		},
-	} {
-		current := &pgshardv1alpha1.PgShardCluster{}
-		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(transition), current); err != nil {
-			t.Fatal(err)
-		}
-		before := current.DeepCopy()
-		mutate(current)
-		if err := kubeClient.Patch(ctx, current, client.MergeFrom(before)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
-			t.Fatalf("CRD admitted %s without the validating webhook: %v", name, err)
-		}
-	}
-}
-
-func omitValidatingWebhookUpdates(t *testing.T, ctx context.Context, kubeClient client.Client) func() {
-	t.Helper()
-	configuration := &admissionregistrationv1.ValidatingWebhookConfiguration{}
-	key := types.NamespacedName{Name: "pgshard-validating-webhook-configuration"}
-	if err := kubeClient.Get(ctx, key, configuration); err != nil {
-		t.Fatal(err)
-	}
-	original := configuration.DeepCopy()
-	for webhookIndex := range configuration.Webhooks {
-		for ruleIndex := range configuration.Webhooks[webhookIndex].Rules {
-			operations := configuration.Webhooks[webhookIndex].Rules[ruleIndex].Operations[:0]
-			for _, operation := range configuration.Webhooks[webhookIndex].Rules[ruleIndex].Operations {
-				if operation != admissionregistrationv1.Update {
-					operations = append(operations, operation)
-				}
-			}
-			configuration.Webhooks[webhookIndex].Rules[ruleIndex].Operations = operations
-		}
-	}
-	if err := kubeClient.Update(ctx, configuration); err != nil {
-		t.Fatal(err)
-	}
-	return func() {
-		restoreCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		current := &admissionregistrationv1.ValidatingWebhookConfiguration{}
-		if err := kubeClient.Get(restoreCtx, key, current); err != nil {
-			t.Errorf("read validating webhook for restore: %v", err)
-			return
-		}
-		current.Webhooks = original.Webhooks
-		if err := kubeClient.Update(restoreCtx, current); err != nil {
-			t.Errorf("restore validating webhook updates: %v", err)
-		}
-	}
 }
 
 func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient client.Client) {

@@ -73,9 +73,13 @@ fencing integration, promotion, and recovery exist.
 
 Generated bootstrap credentials are unique per shard, immutable, and stable
 across reconciles. Each data PVC is likewise bound to its recorded name, UID,
-capacity, and API-defaulted storage class. The controller periodically
+capacity, API-defaulted storage class, and creation-time deletion policy. Child
+names are checkpointed before either API create; API-assigned UIDs are
+checkpointed before a workload can consume them. The controller periodically
 revalidates both identities and fails closed instead of silently replacing a
-credential or empty data volume.
+credential or empty data volume. PostgreSQL initializes in a disposable staging
+directory and atomically renames only a complete, marked cluster into the final
+data path, so an interrupted `initdb` cannot publish a partial `PG_VERSION`.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
@@ -88,11 +92,14 @@ a bounded backend quota. Its default image is digest-pinned and the Pod command
 selects that image contract's `/usr/local/bin/etcd` executable explicitly;
 custom `--etcd-image` values must provide the same path. Scale transitions
 retain those claims during scaling. On cluster deletion,
-`storage.deletionPolicy: Retain` (the default) detaches PostgreSQL data PVCs
-from garbage collection before other owned resources and supporting PVCs are
-removed. `Delete` must be selected explicitly at creation to delete PostgreSQL
-data. The CR finalizer waits for the selected policy to be observed through the
-uncached Kubernetes API reader. Automated
+`storage.deletionPolicy: Retain` (the default) leaves PostgreSQL data PVCs
+ownerless from creation, then marks the exact status-recorded UIDs as retained
+before other owned resources are removed. `Delete` must be selected explicitly
+at creation to delete only those exact status-recorded UIDs. The CR finalizer
+uses the checkpointed creation-time policy and waits for the selected result to
+be observed through the uncached Kubernetes API reader. `Retain` does not
+override an explicit PVC deletion and cannot preserve a namespaced PVC when its
+namespace is deleted. Automated
 defragmentation is not implemented. PostgreSQL
 `archive_mode` remains off until a real archival pipeline is reconciled and
 verified, so the generated configuration cannot silently fill `pg_wal`.
@@ -149,8 +156,9 @@ readiness fail closed. Override the defaults with `--orchestrator-image`,
 exist. Image pull or runtime readiness is reported by the relevant observed
 workload condition, never inferred from planned objects. A custom PostgreSQL
 image must preserve the pinned official image contract: PostgreSQL 18,
-UID/GID 999, the Docker entrypoint environment, and the
-`/var/lib/postgresql/18/docker` data layout.
+UID/GID 999, `initdb` and `bash` on `PATH`, compatibility with the Docker
+entrypoint for the main process, and the `/var/lib/postgresql/18/docker` data
+layout.
 
 The module is pinned to Go 1.26.5, controller-runtime 0.24.1, and Kubernetes
 libraries 0.36.0. Only the Linux container deployment is supported.

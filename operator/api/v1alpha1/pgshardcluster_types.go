@@ -204,16 +204,18 @@ type PgShardClusterStatus struct {
 
 // PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract.
 type PostgreSQLBootstrapSpecStatus struct {
-	Shards           int32          `json:"shards"`
-	MembersPerShard  int32          `json:"membersPerShard"`
-	Durability       DurabilityMode `json:"durability"`
-	StorageSize      string         `json:"storageSize"`
-	StorageClassName *string        `json:"storageClassName,omitempty"`
+	Shards           int32                 `json:"shards"`
+	MembersPerShard  int32                 `json:"membersPerShard"`
+	Durability       DurabilityMode        `json:"durability"`
+	StorageSize      string                `json:"storageSize"`
+	StorageClassName *string               `json:"storageClassName,omitempty"`
+	DeletionPolicy   StorageDeletionPolicy `json:"deletionPolicy"`
 }
 
 // PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified
-// bootstrap resources. Names and UIDs are both required before a workload can
-// consume either child.
+// bootstrap resources. Names are durable creation intents; UIDs are filled only
+// after the API server confirms each child. A workload cannot consume an
+// incomplete record.
 type PostgreSQLBootstrapStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	Shard      int32     `json:"shard"`

@@ -105,12 +105,12 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 
 	shardZeroPod := cluster.Name + "-shard-0000-primary-0"
 	shardOnePod := cluster.Name + "-shard-0001-primary-0"
-	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", shardZeroPod, "--",
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
 		"SELECT current_setting('server_version_num')::integer / 10000, pg_is_in_recovery()")); got != "18|f" {
 		t.Fatalf("PostgreSQL identity = %q", got)
 	}
-	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", shardZeroPod, "--",
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
 		"CREATE TABLE live_marker (shard integer PRIMARY KEY, note text NOT NULL); INSERT INTO live_marker VALUES (0, 'kind-persistent');")
 	service := cluster.Name + "-shard-0000"
@@ -141,9 +141,44 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	runKubectl(t, ctx, "--namespace", namespace.Name, "rollout", "restart", "statefulset/"+statefulSet)
 	runKubectl(t, ctx, "--namespace", namespace.Name, "rollout", "status", "statefulset/"+statefulSet, "--timeout=120s")
 	waitForRecreatedReadyPod(t, ctx, kubeClient, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, before.UID)
-	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", shardZeroPod, "--",
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
 		t.Fatalf("query after StatefulSet restart = %q", got)
+	}
+
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err != nil {
+		t.Fatal(err)
+	}
+	bootstraps := append([]pgshardv1alpha1.PostgreSQLBootstrapStatus(nil), current.Status.PostgreSQLBootstraps...)
+	for _, bootstrap := range bootstraps {
+		claim := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Namespace: namespace.Name, Name: bootstrap.PVCName}
+		if err := kubeClient.Get(ctx, key, claim); err != nil {
+			t.Fatal(err)
+		}
+		if len(claim.OwnerReferences) != 0 || claim.UID != bootstrap.PVCUID {
+			t.Fatalf("PostgreSQL data PVC is not independently retained: metadata=%#v recordedUID=%s", claim.ObjectMeta, bootstrap.PVCUID)
+		}
+	}
+	if err := kubeClient.Delete(ctx, current, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
+		t.Fatal(err)
+	}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), &pgshardv1alpha1.PgShardCluster{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	})
+	if err != nil {
+		t.Fatalf("wait for foreground PgShardCluster deletion: %v", err)
+	}
+	for _, bootstrap := range bootstraps {
+		claim := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Namespace: namespace.Name, Name: bootstrap.PVCName}
+		if err := kubeClient.Get(ctx, key, claim); err != nil {
+			t.Fatalf("foreground deletion removed retained PostgreSQL data PVC %s: %v", bootstrap.PVCName, err)
+		}
+		if claim.UID != bootstrap.PVCUID || claim.Annotations[owned.RetainedFromAnnotation] != namespace.Name+"/"+cluster.Name {
+			t.Fatalf("retained PostgreSQL data PVC identity = %#v, want UID %s", claim.ObjectMeta, bootstrap.PVCUID)
+		}
 	}
 }
 
@@ -237,6 +272,26 @@ func deleteNamespaceAtCleanup(t *testing.T, kubeClient client.Client, namespace 
 		defer cancel()
 		if t.Failed() {
 			logNamespaceDiagnostics(t, ctx, namespace.Name)
+		}
+		clusters := &pgshardv1alpha1.PgShardClusterList{}
+		if err := kubeClient.List(ctx, clusters, client.InNamespace(namespace.Name)); err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("list test clusters in namespace %s: %v", namespace.Name, err)
+		} else {
+			for index := range clusters.Items {
+				cluster := &clusters.Items[index]
+				if cluster.DeletionTimestamp == nil {
+					if err := kubeClient.Delete(ctx, cluster, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
+						t.Errorf("delete test cluster %s/%s: %v", cluster.Namespace, cluster.Name, err)
+					}
+				}
+				key := client.ObjectKeyFromObject(cluster)
+				if err := wait.PollUntilContextTimeout(ctx, time.Second, 90*time.Second, true, func(ctx context.Context) (bool, error) {
+					err := kubeClient.Get(ctx, key, &pgshardv1alpha1.PgShardCluster{})
+					return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+				}); err != nil {
+					t.Errorf("wait for test cluster %s/%s deletion: %v", key.Namespace, key.Name, err)
+				}
+			}
 		}
 		if err := kubeClient.Delete(ctx, namespace); err != nil && !apierrors.IsNotFound(err) {
 			t.Errorf("delete test namespace %s: %v", namespace.Name, err)

@@ -17,10 +17,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,6 +33,55 @@ const legacyHPAScaleAnnotation = "pgshard.io/hpa-scale-handed-off"
 type hpaCacheMissClient struct {
 	client.Client
 	key client.ObjectKey
+}
+
+func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
+	if os.Getenv("PGSHARD_KIND_E2E") != "true" {
+		t.Skip("set PGSHARD_KIND_E2E=true against a disposable CRD-only KIND cluster")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgshardv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kubeClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pgshard-crd-fence-%d", os.Getpid())}}
+	if err := kubeClient.Create(ctx, namespace); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = kubeClient.Delete(context.Background(), namespace) })
+
+	transition := validCluster()
+	transition.Name = "crd-transition-fence"
+	transition.Namespace = namespace.Name
+	transition.UID = ""
+	transition.ResourceVersion = ""
+	transition.Generation = 0
+	if err := kubeClient.Create(ctx, transition); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*pgshardv1alpha1.PgShardCluster){
+		"shards":          func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Shards++ },
+		"membersPerShard": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.MembersPerShard = 5 },
+		"storage size":    func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Storage.Size = resource.MustParse("8Gi") },
+	} {
+		current := &pgshardv1alpha1.PgShardCluster{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(transition), current); err != nil {
+			t.Fatal(err)
+		}
+		before := current.DeepCopy()
+		mutate(current)
+		if err := kubeClient.Patch(ctx, current, client.MergeFrom(before)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
+			t.Fatalf("CRD admitted %s without any admission webhook installed: %v", name, err)
+		}
+	}
 }
 
 func (c hpaCacheMissClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
@@ -136,8 +187,8 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	if len(configuration.Data) != 11 || !strings.Contains(configuration.Data["postgresql.conf"], "log_statement = ddl\n") {
 		t.Fatalf("new PostgreSQL configuration was not published: %#v", configuration.Data)
 	}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldConfiguration), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("stale immutable PostgreSQL configuration was not pruned: %v", err)
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldConfiguration), &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("old PostgreSQL configuration was removed before the rollout completed: %v", err)
 	}
 	networkPolicy := &networkingv1.NetworkPolicy{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.EtcdSuffix}, networkPolicy); err != nil {
@@ -176,6 +227,54 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatalf("fixed-to-HPA handoff changed capacity: %#v", pooler.Spec.Replicas)
 	}
 	assertScaleOwnerOnlyClaimsReplicas(t, pooler)
+
+	// The test pooler deliberately never becomes Ready, so a real rolling
+	// update cannot complete. Remove the test HPA and scale to zero to let the
+	// Deployment controller prove no old Pod can still reference the immutable
+	// configuration before exercising the prune boundary.
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+	if err := kubeClient.Get(ctx, poolerKey, hpa); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Delete(ctx, hpa); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, poolerKey, &autoscalingv2.HorizontalPodAutoscaler{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(ctx, poolerKey, pooler); err != nil {
+		t.Fatal(err)
+	}
+	zero := int32(0)
+	pooler.Spec.Replicas = &zero
+	if err := kubeClient.Update(ctx, pooler); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		current := &appsv1.Deployment{}
+		if err := kubeClient.Get(ctx, poolerKey, current); err != nil {
+			return false, err
+		}
+		return deploymentRolloutComplete(current), nil
+	}); err != nil {
+		t.Fatalf("wait for zero-Pod pooler rollout proof: %v", err)
+	}
+	if err := kubeClient.Get(ctx, request.NamespacedName, current); err != nil {
+		t.Fatal(err)
+	}
+	currentPlan, err := owned.Plan(current, owned.DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.prune(ctx, current, currentPlan, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldConfiguration), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("stale immutable PostgreSQL configuration survived the completed zero-Pod rollout: %v", err)
+	}
 
 	initialHPA := validCluster()
 	initialHPA.Name = "initial-hpa"

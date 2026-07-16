@@ -40,7 +40,29 @@ func TestKINDDeletionWaitsForPVCBeforeSameNameRecreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = kubeClient.Delete(context.Background(), namespace)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		cleanupReconciler := &PgShardClusterReconciler{Client: kubeClient, APIReader: kubeClient}
+		request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace.Name, Name: "example"}}
+		current := &pgshardv1alpha1.PgShardCluster{}
+		if err := kubeClient.Get(cleanupCtx, request.NamespacedName, current); err == nil {
+			if err := kubeClient.Delete(cleanupCtx, current); err != nil && !apierrors.IsNotFound(err) {
+				t.Errorf("delete cleanup cluster: %v", err)
+			} else {
+				waitForClusterDeletion(t, cleanupCtx, kubeClient, cleanupReconciler, request)
+			}
+		} else if !apierrors.IsNotFound(err) {
+			t.Errorf("read cleanup cluster: %v", err)
+		}
+		if err := kubeClient.Delete(cleanupCtx, namespace); err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("delete cleanup namespace: %v", err)
+		}
+		if err := wait.PollUntilContextTimeout(cleanupCtx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+			err := kubeClient.Get(ctx, client.ObjectKeyFromObject(namespace), &corev1.Namespace{})
+			return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+		}); err != nil {
+			t.Errorf("wait for cleanup namespace deletion: %v", err)
+		}
 	})
 
 	cluster := validCluster()

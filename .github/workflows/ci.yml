@@ -575,7 +575,7 @@ jobs:
           PGSHARD_KIND_E2E: "true"
         run: >-
           go test -race -count=1
-          -run '^(TestKINDDeletionWaitsForPVCBeforeSameNameRecreate|TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership)$'
+          -run '^(TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks|TestKINDDeletionWaitsForPVCBeforeSameNameRecreate|TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership)$'
           ./internal/controller
       - name: Delete disposable Kubernetes cluster
         if: always()
