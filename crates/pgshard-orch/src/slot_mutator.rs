@@ -2036,13 +2036,15 @@ fn classify_drop_failure(
     receipt: ManagedLogicalSlotReceipt,
     source: LocalSlotMutationError,
 ) -> Result<ManagedLogicalSlotDropFence, ManagedLogicalSlotDropError> {
-    if source.outcome_is_unknown() {
-        Err(ManagedLogicalSlotDropError::OutcomeUnknown(source))
-    } else {
-        Err(ManagedLogicalSlotDropError::KnownRejected {
-            receipt: Box::new(receipt),
-            source,
-        })
+    match source {
+        source @ (LocalSlotMutationError::PreflightTimeout { .. }
+        | LocalSlotMutationError::DropRejected { .. }) => {
+            Err(ManagedLogicalSlotDropError::KnownRejected {
+                receipt: Box::new(receipt),
+                source,
+            })
+        }
+        source => Err(ManagedLogicalSlotDropError::OutcomeUnknown(source)),
     }
 }
 
@@ -4043,6 +4045,19 @@ mod tests {
             source,
             LocalSlotMutationError::PreflightTimeout { .. }
         ));
+    }
+
+    #[test]
+    fn unexpected_drop_failure_never_returns_retry_authority() {
+        let identity = identity(ManagedLogicalSlotRole::PrimaryFailoverAnchor);
+        let error = classify_drop_failure(
+            receipt(&identity),
+            LocalSlotMutationError::WrongEncoding("SQL_ASCII".to_owned()),
+        )
+        .expect_err("an unexpected dispatch-boundary failure must fail closed");
+
+        assert!(error.outcome_is_unknown());
+        assert!(error.into_retry_receipt().is_none());
     }
 
     #[test]

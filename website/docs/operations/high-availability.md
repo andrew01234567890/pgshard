@@ -162,10 +162,12 @@ The live fixture starts a same-name managed recreation after primary absence,
 observes it retrying the busy hidden target fence, commits permanent retirement
 while it remains blocked, releases the fence, and requires the waiter to reject
 the now retired durable generation even though its mutation connection targets
-another database. A separate fault case terminates the absence-fence backend
-while the retirement transaction is blocked immediately before COMMIT; the API
-reports outcome-unknown `TargetFenceLost`, and an exact reload confirms whether
-the retirement committed. Another fault case gates target-server preflight after a
+another database. A separate fault case buffers PostgreSQL's confirmed COMMIT
+response beyond the original retirement deadline while keeping the canonical
+fence backend alive. It releases that response inside the fresh post-COMMIT
+verification window, requires the original deadline outcome-unknown result to
+survive instead of becoming `TargetFenceLost`, and reloads the exact committed
+retirement. Another fault case gates target-server preflight after a
 pending create is durable, terminates the canonical catalog backend, proves
 catalog retirement stays fenced, then completes and cleans up the physical slot
 without producing a retired tombstone with a live name. The fixture also reconciles
@@ -181,7 +183,7 @@ a durability downgrade and must be surfaced as such.
 
 ## Primary fencing
 
-The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Both the orchestrator authority and receiving agent reject expired or overlong leases; configured TTL bounds are enforced by the state machines, not merely logged. Poolers route writes only to the primary identity and term currently authorized by the lease.
+The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Both the orchestrator authority and receiving agent reject expired or overlong leases; configured TTL bounds are enforced by the state machines, not merely logged. The in-process orchestrator retains Unix expiry only for request validation and reporting and uses a separate monotonic deadline for live ownership, so forward or backward wall-clock steps cannot shorten or extend a term. Poolers route writes only to the primary identity and term currently authorized by the lease.
 
 Promotion requires a candidate whose WAL and prepared-transaction state prove that all acknowledged commits are present. If no candidate satisfies that condition, pgshard stops writes instead of risking split brain or acknowledged-data loss.
 

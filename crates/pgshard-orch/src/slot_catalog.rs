@@ -110,6 +110,8 @@ const MIN_POSTGRES_VERSION_NUM: i32 = 180_000;
 const SERVER_STATEMENT_TIMEOUT_HEADROOM: Duration = Duration::from_millis(25);
 const SERVER_TRANSACTION_TIMEOUT_GRACE: Duration = Duration::from_millis(101);
 const PIN_SEARCH_PATH_SQL: &str = "SELECT pg_catalog.set_config('search_path', '', false)";
+const READ_SEARCH_PATH_SQL: &str =
+    "SELECT pg_catalog.current_setting('search_path')::pg_catalog.text";
 const SET_SESSION_TIMEOUTS_SQL: &str = "\
     SELECT pg_catalog.set_config('statement_timeout', $1, false), \
            pg_catalog.set_config('transaction_timeout', $2, false)";
@@ -314,6 +316,13 @@ impl SlotCatalogReader {
         let construction = async {
             client.batch_execute("DISCARD ALL").await?;
             client.query_one(PIN_SEARCH_PATH_SQL, &[]).await?;
+            let search_path: String = client
+                .query_one(READ_SEARCH_PATH_SQL, &[])
+                .await?
+                .try_get(0)?;
+            if !search_path.is_empty() {
+                return Err(SlotCatalogLoadError::UnsafeSearchPath(search_path));
+            }
             set_session_timeouts(&client, deadline).await?;
             let requirements = client.query_one(REQUIREMENTS_SQL, &[]).await?;
             client.batch_execute(RESET_SESSION_TIMEOUTS_SQL).await?;
@@ -851,6 +860,9 @@ pub enum SlotCatalogLoadError {
     /// A previous terminal failure closed the dedicated client.
     #[error("slot catalog reader is terminal after an earlier operation failure")]
     ReaderTerminated,
+    /// The dedicated reader did not retain the required empty namespace path.
+    #[error("slot catalog reader requires an empty search_path; observed {0:?}")]
+    UnsafeSearchPath(String),
     /// Server is older than the minimum supported release.
     #[error("slot catalog reader requires PostgreSQL 18 or newer; observed server_version_num {0}")]
     UnsupportedPostgresVersion(i32),

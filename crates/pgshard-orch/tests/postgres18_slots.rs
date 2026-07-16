@@ -30,9 +30,10 @@ use pgshard_orch::{
     },
     slot_probe_catalog::{
         CatalogSlotSyncProbe, SlotSyncProbeAllocation, SlotSyncProbeAllocationSource,
-        SlotSyncProbeCatalogError, SlotSyncProbeCatalogMutation, SlotSyncProbeState,
-        activate_slot_sync_probe, allocate_slot_sync_probe, begin_slot_sync_probe_retirement,
-        complete_slot_sync_probe_retirement, load_live_slot_sync_probe, load_slot_sync_probe,
+        SlotSyncProbeCatalogError, SlotSyncProbeCatalogMutation, SlotSyncProbeCatalogUnknownCause,
+        SlotSyncProbeState, activate_slot_sync_probe, allocate_slot_sync_probe,
+        begin_slot_sync_probe_retirement, complete_slot_sync_probe_retirement,
+        load_live_slot_sync_probe, load_slot_sync_probe,
     },
     standby_slots::{
         FailoverSlotSynchronization, LogicalSlotKind, LogicalSlotPlugin, LogicalWalLevel,
@@ -252,10 +253,23 @@ async fn finish_bounded_fixture(
     Err(io::Error::other(format!("{description} exceeded the test bound")).into())
 }
 
-struct CommitResponseLossProxy {
+struct CommitResponseProxy {
     database_url: String,
-    arm: oneshot::Sender<oneshot::Sender<()>>,
+    arm: oneshot::Sender<CommitResponseProxyArm>,
     task: JoinHandle<TestResult>,
+}
+
+struct CommitResponseProxyArm {
+    acknowledge: oneshot::Sender<()>,
+    behavior: CommitResponseBehavior,
+}
+
+enum CommitResponseBehavior {
+    Lose,
+    Gate {
+        committed: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
 }
 
 type TargetGateArm = (
@@ -486,9 +500,7 @@ async fn relay_until_target_gate_armed(
     }
 }
 
-async fn start_commit_response_loss_proxy(
-    database_url: &str,
-) -> TestResult<CommitResponseLossProxy> {
+async fn start_commit_response_proxy(database_url: &str) -> TestResult<CommitResponseProxy> {
     let mut url = Url::parse(database_url)?;
     let upstream_host = url
         .host_str()
@@ -516,24 +528,24 @@ async fn start_commit_response_loss_proxy(
         query.append_pair("sslmode", "disable");
     }
     let (arm, armed) = oneshot::channel();
-    let task = tokio::spawn(run_commit_response_loss_proxy(
+    let task = tokio::spawn(run_commit_response_proxy(
         listener,
         upstream_host,
         upstream_port,
         armed,
     ));
-    Ok(CommitResponseLossProxy {
+    Ok(CommitResponseProxy {
         database_url: url.into(),
         arm,
         task,
     })
 }
 
-async fn run_commit_response_loss_proxy(
+async fn run_commit_response_proxy(
     listener: TcpListener,
     upstream_host: String,
     upstream_port: u16,
-    armed: oneshot::Receiver<oneshot::Sender<()>>,
+    armed: oneshot::Receiver<CommitResponseProxyArm>,
 ) -> TestResult {
     let (downstream, _) = timeout(CONNECTION_EXIT_TIMEOUT, listener.accept())
         .await
@@ -548,7 +560,7 @@ async fn run_commit_response_loss_proxy(
     upstream.set_nodelay(true)?;
     let (mut downstream_read, mut downstream_write) = downstream.into_split();
     let (mut upstream_read, mut upstream_write) = upstream.into_split();
-    let acknowledge_armed = Box::pin(relay_until_proxy_armed(
+    let arm = Box::pin(relay_until_proxy_armed(
         &mut downstream_read,
         &mut downstream_write,
         &mut upstream_read,
@@ -556,7 +568,7 @@ async fn run_commit_response_loss_proxy(
         armed,
     ))
     .await?;
-    acknowledge_armed
+    arm.acknowledge
         .send(())
         .map_err(|()| io::Error::other("catalog fault proxy arm acknowledgement was dropped"))?;
     Box::pin(relay_until_commit(
@@ -564,6 +576,7 @@ async fn run_commit_response_loss_proxy(
         &mut downstream_write,
         &mut upstream_read,
         &mut upstream_write,
+        arm.behavior,
     ))
     .await
 }
@@ -573,8 +586,8 @@ async fn relay_until_proxy_armed(
     downstream_write: &mut tcp::OwnedWriteHalf,
     upstream_read: &mut tcp::OwnedReadHalf,
     upstream_write: &mut tcp::OwnedWriteHalf,
-    mut armed: oneshot::Receiver<oneshot::Sender<()>>,
-) -> TestResult<oneshot::Sender<()>> {
+    mut armed: oneshot::Receiver<CommitResponseProxyArm>,
+) -> TestResult<CommitResponseProxyArm> {
     let mut frontend = [0_u8; 8192];
     let mut backend = [0_u8; 8192];
     loop {
@@ -607,6 +620,7 @@ async fn relay_until_commit(
     downstream_write: &mut tcp::OwnedWriteHalf,
     upstream_read: &mut tcp::OwnedReadHalf,
     upstream_write: &mut tcp::OwnedWriteHalf,
+    behavior: CommitResponseBehavior,
 ) -> TestResult {
     let mut frontend_read = [0_u8; 8192];
     let mut backend_read = [0_u8; 8192];
@@ -621,10 +635,38 @@ async fn relay_until_commit(
                 frontend_frames.extend_from_slice(&frontend_read[..read]);
                 while let Some(frame) = take_protocol_frame(&mut frontend_frames)? {
                     if frame == COMMIT_QUERY_FRAME {
-                        downstream_write.shutdown().await?;
+                        if matches!(&behavior, CommitResponseBehavior::Lose) {
+                            downstream_write.shutdown().await?;
+                        }
                         upstream_write.write_all(&frame).await?;
                         upstream_write.flush().await?;
-                        return wait_for_committed_response(upstream_read).await;
+                        let response = read_committed_response(upstream_read).await?;
+                        return match behavior {
+                            CommitResponseBehavior::Lose => Ok(()),
+                            CommitResponseBehavior::Gate { committed, release } => {
+                                committed.send(()).map_err(|()| {
+                                    io::Error::other(
+                                        "catalog COMMIT gate observer was dropped",
+                                    )
+                                })?;
+                                release.await.map_err(|_| {
+                                    io::Error::other(
+                                        "catalog COMMIT gate release authority was dropped",
+                                    )
+                                })?;
+                                downstream_write.write_all(&response).await?;
+                                downstream_write.flush().await?;
+                                tokio::select! {
+                                    result = tokio::io::copy(downstream_read, upstream_write) => {
+                                        result?;
+                                    }
+                                    result = tokio::io::copy(upstream_read, downstream_write) => {
+                                        result?;
+                                    }
+                                }
+                                Ok(())
+                            }
+                        };
                     }
                     upstream_write.write_all(&frame).await?;
                     upstream_write.flush().await?;
@@ -661,10 +703,11 @@ fn take_protocol_frame(buffer: &mut Vec<u8>) -> TestResult<Option<Vec<u8>>> {
     Ok(Some(buffer.drain(..frame_length).collect()))
 }
 
-async fn wait_for_committed_response(upstream_read: &mut tcp::OwnedReadHalf) -> TestResult {
+async fn read_committed_response(upstream_read: &mut tcp::OwnedReadHalf) -> TestResult<Vec<u8>> {
     let deadline = Instant::now() + CONNECTION_EXIT_TIMEOUT;
     let mut read_buffer = [0_u8; 8192];
     let mut backend_frames = Vec::new();
+    let mut response = Vec::new();
     let mut commit_completed = false;
     loop {
         let read = timeout_at(deadline, upstream_read.read(&mut read_buffer))
@@ -673,6 +716,7 @@ async fn wait_for_committed_response(upstream_read: &mut tcp::OwnedReadHalf) -> 
         if read == 0 {
             return Err(io::Error::other("catalog server closed before confirming COMMIT").into());
         }
+        response.extend_from_slice(&read_buffer[..read]);
         backend_frames.extend_from_slice(&read_buffer[..read]);
         while let Some(frame) = take_protocol_frame(&mut backend_frames)? {
             match frame[0] {
@@ -682,7 +726,7 @@ async fn wait_for_committed_response(upstream_read: &mut tcp::OwnedReadHalf) -> 
                         io::Error::other("catalog server rejected the injected COMMIT").into(),
                     );
                 }
-                b'Z' if commit_completed => return Ok(()),
+                b'Z' if commit_completed => return Ok(response),
                 _ => {}
             }
         }
@@ -1818,21 +1862,13 @@ async fn activate_catalog_probe_with_commit_response_loss(
     probe: &CatalogSlotSyncProbe,
     receipt: &ManagedLogicalSlotReceipt,
 ) -> TestResult<CatalogSlotSyncProbe> {
-    let CommitResponseLossProxy {
+    let CommitResponseProxy {
         database_url: proxy_database_url,
         arm,
         mut task,
-    } = start_commit_response_loss_proxy(database_url).await?;
+    } = start_commit_response_proxy(database_url).await?;
     let (client, connection) = tokio_postgres::connect(&proxy_database_url, NoTls).await?;
-    let (armed_acknowledgement, armed) = oneshot::channel();
-    arm.send(armed_acknowledgement)
-        .map_err(|_| io::Error::other("catalog fault proxy exited before it was armed"))?;
-    timeout(CONNECTION_EXIT_TIMEOUT, armed)
-        .await
-        .map_err(|_| {
-            io::Error::other("catalog fault proxy arm acknowledgement exceeded the bound")
-        })?
-        .map_err(|_| io::Error::other("catalog fault proxy exited before acknowledging its arm"))?;
+    arm_commit_response_loss_proxy(arm).await?;
     let error = activate_slot_sync_probe(
         client,
         connection,
@@ -2022,21 +2058,29 @@ async fn complete_retirement_while_recreation_waits(
     Ok(retired)
 }
 
-async fn complete_retirement_after_catalog_fence_loss(
+async fn complete_retirement_after_delayed_commit_response(
     database_url: &str,
     retiring: &CatalogSlotSyncProbe,
-    mut absence: ManagedLogicalSlotDropFence,
-    proxy: CommitResponseLossProxy,
+    absence: ManagedLogicalSlotDropFence,
+    proxy: CommitResponseProxy,
 ) -> TestResult<CatalogSlotSyncProbe> {
     let expected_receipt_id = absence.receipt().receipt_id();
-    let CommitResponseLossProxy {
+    let CommitResponseProxy {
         database_url: _,
         arm,
         mut task,
     } = proxy;
     let (armed_acknowledgement, armed) = oneshot::channel();
-    arm.send(armed_acknowledgement)
-        .map_err(|_| io::Error::other("retirement fault proxy exited before it was armed"))?;
+    let (committed, commit_observed) = oneshot::channel();
+    let (release_commit, commit_release) = oneshot::channel();
+    arm.send(CommitResponseProxyArm {
+        acknowledge: armed_acknowledgement,
+        behavior: CommitResponseBehavior::Gate {
+            committed,
+            release: commit_release,
+        },
+    })
+    .map_err(|_| io::Error::other("retirement fault proxy exited before it was armed"))?;
     timeout(CONNECTION_EXIT_TIMEOUT, armed)
         .await
         .map_err(|_| {
@@ -2046,33 +2090,54 @@ async fn complete_retirement_after_catalog_fence_loss(
             io::Error::other("retirement fault proxy exited before acknowledging its arm")
         })?;
 
-    let error = complete_slot_sync_probe_retirement(
-        CatalogOperationTimeout::default(),
-        retiring,
-        &mut absence,
-    )
-    .await
-    .expect_err("losing the catalog COMMIT response must reject retirement success");
-    assert!(error.outcome_is_unknown());
+    let operation_timeout = CatalogOperationTimeout::new(Duration::from_millis(300))?;
+    let started = Instant::now();
+    let retiring_for_task = retiring.clone();
+    let mut completion = AbortOnDropTask::new(tokio::spawn(async move {
+        let mut absence = absence;
+        let result = complete_slot_sync_probe_retirement(
+            operation_timeout,
+            &retiring_for_task,
+            &mut absence,
+        )
+        .await;
+        (result, absence)
+    }));
+    timeout(CONNECTION_EXIT_TIMEOUT, commit_observed)
+        .await
+        .map_err(|_| io::Error::other("retirement COMMIT did not reach the response gate"))?
+        .map_err(|_| io::Error::other("retirement COMMIT gate exited before observation"))?;
+    tokio::time::sleep_until(started + operation_timeout.get() + Duration::from_millis(100)).await;
+    assert!(
+        !completion.task().is_finished(),
+        "post-COMMIT fence verification must wait through the fresh tail"
+    );
+    release_commit
+        .send(())
+        .map_err(|()| io::Error::other("retirement COMMIT gate exited before release"))?;
+    let (result, absence) = timeout(CONNECTION_EXIT_TIMEOUT, completion.task_mut())
+        .await
+        .map_err(|_| io::Error::other("retirement did not finish inside the fresh fence tail"))??;
+    let error = result.expect_err("the elapsed original deadline must remain outcome-unknown");
     assert!(matches!(
         error,
-        SlotSyncProbeCatalogError::TargetFenceLost { ref target, .. }
-            if target == retiring.target()
+        SlotSyncProbeCatalogError::OutcomeUnknown {
+            operation: SlotSyncProbeCatalogMutation::CompleteRetirement,
+            ref target,
+            source: SlotSyncProbeCatalogUnknownCause::Deadline { duration },
+        } if target == retiring.target() && duration == operation_timeout.get()
     ));
-    timeout(CONNECTION_EXIT_TIMEOUT, &mut task)
-        .await
-        .map_err(|_| {
-            io::Error::other("retirement fault proxy did not confirm COMMIT in time")
-        })???;
     let released = absence.release().await;
     assert_eq!(released.receipt_id(), expected_receipt_id);
+    timeout(CONNECTION_EXIT_TIMEOUT, &mut task)
+        .await
+        .map_err(|_| io::Error::other("retirement COMMIT gate did not exit after release"))???;
     let retired = load_exact_catalog_probe(database_url, retiring.target())
         .await?
-        .expect("the exact catalog generation committed before post-COMMIT fence verification");
+        .expect("the exact catalog generation committed before the delayed response was released");
     assert_eq!(retired.state(), SlotSyncProbeState::Retired);
     assert!(retired.creation_receipt_present());
     assert!(retired.cleanup_receipt_present());
-    reclaim_stale_target_fence(database_url, retiring.target()).await?;
     Ok(retired)
 }
 
@@ -2082,31 +2147,6 @@ async fn release_known_drop(fence: ManagedLogicalSlotDropFence) {
         ManagedLogicalSlotDropOutcome::Dropped
     );
     let _receipt = fence.release().await;
-}
-
-async fn reclaim_stale_target_fence(database_url: &str, target: &ManagedSlotTarget) -> TestResult {
-    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
-    let connection_task = tokio::spawn(connection);
-    let fence_id: String = client
-        .query_one(
-            "SELECT acquired_fence_id::pg_catalog.text \
-               FROM pgshard_catalog.acquire_managed_slot_target_fence($1::pg_catalog.text)",
-            &[&target.name().as_str()],
-        )
-        .await?
-        .try_get(0)?;
-    let released: bool = client
-        .query_one(
-            "SELECT pgshard_catalog.release_managed_slot_target_fence( \
-                        $1::pg_catalog.text, $2::pg_catalog.text::pg_catalog.uuid \
-                    )",
-            &[&target.name().as_str(), &fence_id],
-        )
-        .await?
-        .try_get(0)?;
-    assert!(released, "the stale target fence must be reclaimable");
-    drop(client);
-    finish_connection(connection_task).await
 }
 
 async fn release_known_drop_while_registry_row_is_blocked(
@@ -2380,7 +2420,7 @@ async fn run_catalog_probe_fence_loss_fixture(
     let active = activate_catalog_probe(&primary_database_url, &allocated, &receipt).await?;
     let retiring = begin_catalog_probe_retirement(&primary_database_url, &active, &receipt).await?;
 
-    let proxy = start_commit_response_loss_proxy(&primary_database_url).await?;
+    let proxy = start_commit_response_proxy(&primary_database_url).await?;
     let (catalog, catalog_connection) = tokio_postgres::connect(&proxy.database_url, NoTls).await?;
     let (primary, primary_connection) =
         tokio_postgres::connect(&primary_database_url, NoTls).await?;
@@ -2398,7 +2438,7 @@ async fn run_catalog_probe_fence_loss_fixture(
         ManagedLogicalSlotDropOutcome::Dropped
     );
     wait_for_synchronized_copy(&standby_database_url, &probe_target, false).await?;
-    let retired = complete_retirement_after_catalog_fence_loss(
+    let retired = complete_retirement_after_delayed_commit_response(
         &primary_database_url,
         &retiring,
         absence,
@@ -3092,10 +3132,15 @@ async fn assert_managed_consumer_active(
         .await
 }
 
-async fn arm_commit_response_loss_proxy(arm: oneshot::Sender<oneshot::Sender<()>>) -> TestResult {
+async fn arm_commit_response_loss_proxy(
+    arm: oneshot::Sender<CommitResponseProxyArm>,
+) -> TestResult {
     let (armed_acknowledgement, armed) = oneshot::channel();
-    arm.send(armed_acknowledgement)
-        .map_err(|_| io::Error::other("catalog fault proxy exited before it was armed"))?;
+    arm.send(CommitResponseProxyArm {
+        acknowledge: armed_acknowledgement,
+        behavior: CommitResponseBehavior::Lose,
+    })
+    .map_err(|_| io::Error::other("catalog fault proxy exited before it was armed"))?;
     timeout(CONNECTION_EXIT_TIMEOUT, armed)
         .await
         .map_err(|_| {
@@ -3111,11 +3156,11 @@ async fn activate_managed_consumer_with_commit_response_loss(
     receipt: &ManagedLogicalSlotReceipt,
     principal: &CatalogAdminTestPrincipal,
 ) -> TestResult {
-    let CommitResponseLossProxy {
+    let CommitResponseProxy {
         database_url: proxy_database_url,
         arm,
         task,
-    } = start_commit_response_loss_proxy(database_url).await?;
+    } = start_commit_response_proxy(database_url).await?;
     let mut proxy_task = AbortOnDropTask::new(task);
     let (client, connection) = principal
         .config(&proxy_database_url)?
