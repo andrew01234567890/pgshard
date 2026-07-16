@@ -190,8 +190,9 @@ this to 100,000. The tooling is pinned to `cargo-fuzz` 0.13.2,
 `libfuzzer-sys` 0.4.13, and `nightly-2026-06-24`.
 Pure orchestrator lease tests separate acquisition bookkeeping from execution
 authority. They inject descheduling after clock sampling, forward and backward
-wall steps, a backward step between the two wall samples, renewal, expiry, and
-higher-epoch replacement. An acquisition handle must revalidate the exact
+wall steps, a pause combined with a backward step between paired wall samples,
+mutex contention across expiry, renewal, expiry, and higher-epoch replacement.
+An acquisition handle must revalidate the exact
 installed term, process-local monotonic deadline, catalog epoch, and fencing
 epoch at dispatch; expired and superseded handles fail closed. The receiving
 target still has to enforce that epoch because the local guard is an

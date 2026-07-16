@@ -223,14 +223,26 @@ impl LeaseGrant {
         &self,
         execution: ExecutionPreconditions,
     ) -> Result<LeaseExecutionGuard<'_>, OrchError> {
-        self.validate_for_execution_at(execution, self.clock_origin.elapsed())
+        self.validate_for_execution_with_clock(execution, || self.clock_origin.elapsed())
     }
 
+    #[cfg(test)]
     fn validate_for_execution_at(
         &self,
         execution: ExecutionPreconditions,
         now_monotonic: Duration,
     ) -> Result<LeaseExecutionGuard<'_>, OrchError> {
+        self.validate_for_execution_with_clock(execution, || now_monotonic)
+    }
+
+    fn validate_for_execution_with_clock<F>(
+        &self,
+        execution: ExecutionPreconditions,
+        mut clock: F,
+    ) -> Result<LeaseExecutionGuard<'_>, OrchError>
+    where
+        F: FnMut() -> Duration,
+    {
         let inner = self
             .inner
             .lock()
@@ -249,7 +261,9 @@ impl LeaseGrant {
                 epoch: self.epoch,
             });
         }
-        if now_monotonic >= self.monotonic_deadline {
+        // Sample only after waiting for and inspecting shared state. Otherwise
+        // lock contention can carry a stale timestamp past the deadline.
+        if clock() >= self.monotonic_deadline {
             return Err(OrchError::LeaseGrantExpired {
                 shard_id: self.shard_id,
                 epoch: self.epoch,
@@ -266,6 +280,14 @@ impl LeaseGrant {
             });
         }
         validate_execution_epochs(operation, &self.operation_id, self.epoch, execution)?;
+        // Epoch validation is deliberately bracketed too: descheduling during
+        // those checks must not return a guard after the local deadline.
+        if clock() >= self.monotonic_deadline {
+            return Err(OrchError::LeaseGrantExpired {
+                shard_id: self.shard_id,
+                epoch: self.epoch,
+            });
+        }
         Ok(LeaseExecutionGuard { grant: self })
     }
 }
@@ -522,33 +544,27 @@ impl OrchState {
         now_unix_micros: u64,
         now_monotonic: Duration,
     ) -> Result<LeaseGrant, OrchError> {
-        self.acquire_lease_in_clock_window(
+        self.acquire_lease_with_sample(
             request,
             execution,
-            now_unix_micros,
-            now_unix_micros,
-            now_monotonic,
-            now_monotonic,
+            ClockSample {
+                wall_before_unix_micros: now_unix_micros,
+                wall_after_unix_micros: now_unix_micros,
+                monotonic_before_first_wall: now_monotonic,
+                monotonic_between_walls: now_monotonic,
+                monotonic_after: now_monotonic,
+            },
         )
     }
 
     #[cfg(test)]
-    fn acquire_lease_in_clock_window(
+    fn acquire_lease_with_sample(
         &self,
         request: LeaseRequest,
         execution: ExecutionPreconditions,
-        wall_before_unix_micros: u64,
-        wall_after_unix_micros: u64,
-        monotonic_before: Duration,
-        monotonic_after: Duration,
+        sample: ClockSample,
     ) -> Result<LeaseGrant, OrchError> {
-        self.acquire_lease_with_clock(request, execution, || {
-            Ok(ClockSample {
-                unix_micros: wall_before_unix_micros.max(wall_after_unix_micros),
-                monotonic_before,
-                monotonic_after,
-            })
-        })
+        self.acquire_lease_with_clock(request, execution, || Ok(sample))
     }
 
     fn acquire_lease_with_clock<F>(
@@ -583,11 +599,11 @@ impl OrchState {
             });
         }
         let now = clock()?;
-        let ttl_ms = validate_execution(
+        validate_execution(
             operation,
             &request,
             execution,
-            now.unix_micros,
+            now.conservative_unix_micros(),
             self.max_lease_ttl_ms,
         )?;
         if let Some((existing, existing_deadline)) =
@@ -603,10 +619,7 @@ impl OrchState {
             )?;
             return Ok(self.lease_grant(&request, outcome, monotonic_deadline));
         }
-        let monotonic_deadline = now
-            .monotonic_before
-            .checked_add(Duration::from_millis(ttl_ms))
-            .ok_or(OrchError::ClockUnavailable)?;
+        let monotonic_deadline = now.earliest_deadline(request.expires_at_unix_ms)?;
         validate_monotonic_ttl(
             now.monotonic_after,
             monotonic_deadline,
@@ -669,9 +682,39 @@ impl OrchState {
 
 #[derive(Clone, Copy, Debug)]
 struct ClockSample {
-    unix_micros: u64,
-    monotonic_before: Duration,
+    wall_before_unix_micros: u64,
+    wall_after_unix_micros: u64,
+    monotonic_before_first_wall: Duration,
+    monotonic_between_walls: Duration,
     monotonic_after: Duration,
+}
+
+impl ClockSample {
+    const fn conservative_unix_micros(self) -> u64 {
+        if self.wall_before_unix_micros >= self.wall_after_unix_micros {
+            self.wall_before_unix_micros
+        } else {
+            self.wall_after_unix_micros
+        }
+    }
+
+    fn earliest_deadline(self, expires_at_unix_ms: u64) -> Result<Duration, OrchError> {
+        let before = self
+            .monotonic_before_first_wall
+            .checked_add(Duration::from_millis(lease_ttl_ms(
+                expires_at_unix_ms,
+                self.wall_before_unix_micros,
+            )?))
+            .ok_or(OrchError::ClockUnavailable)?;
+        let after = self
+            .monotonic_between_walls
+            .checked_add(Duration::from_millis(lease_ttl_ms(
+                expires_at_unix_ms,
+                self.wall_after_unix_micros,
+            )?))
+            .ok_or(OrchError::ClockUnavailable)?;
+        Ok(before.min(after))
+    }
 }
 
 fn renew_live_lease(
@@ -757,7 +800,7 @@ fn validate_execution(
     execution: ExecutionPreconditions,
     now_unix_micros: u64,
     max_lease_ttl_ms: u64,
-) -> Result<u64, OrchError> {
+) -> Result<(), OrchError> {
     validate_execution_epochs(operation, &request.operation_id, request.epoch, execution)?;
     if now_unix_micros >= operation.spec.deadline_unix_micros {
         return Err(OrchError::OperationDeadlineExceeded {
@@ -774,18 +817,23 @@ fn validate_execution(
             requested_expiry_unix_ms: request.expires_at_unix_ms,
         });
     }
-    let now_unix_ms = now_unix_micros.div_ceil(1_000);
-    let Some(ttl_ms) = request.expires_at_unix_ms.checked_sub(now_unix_ms) else {
-        return Err(OrchError::InvalidLeaseRequest);
-    };
-    if ttl_ms == 0 {
-        return Err(OrchError::InvalidLeaseRequest);
-    }
+    let ttl_ms = lease_ttl_ms(request.expires_at_unix_ms, now_unix_micros)?;
     if ttl_ms > max_lease_ttl_ms {
         return Err(OrchError::LeaseTtlExceeded {
             requested_ms: ttl_ms,
             maximum_ms: max_lease_ttl_ms,
         });
+    }
+    Ok(())
+}
+
+fn lease_ttl_ms(expires_at_unix_ms: u64, now_unix_micros: u64) -> Result<u64, OrchError> {
+    let now_unix_ms = now_unix_micros.div_ceil(1_000);
+    let Some(ttl_ms) = expires_at_unix_ms.checked_sub(now_unix_ms) else {
+        return Err(OrchError::InvalidLeaseRequest);
+    };
+    if ttl_ms == 0 {
+        return Err(OrchError::InvalidLeaseRequest);
     }
     Ok(ttl_ms)
 }
@@ -817,18 +865,21 @@ fn validate_execution_epochs(
 }
 
 fn trusted_clock(origin: Instant) -> Result<ClockSample, OrchError> {
-    // Sample wall time on both sides of a monotonic anchor and conservatively
-    // use the greater wall value. A backward step inside this window therefore
-    // cannot inflate the requested TTL. Translation starts at that anchor,
-    // while admission uses the final monotonic sample; descheduling after the
-    // anchor can only shorten ownership.
-    let wall_before = unix_clock_micros()?;
-    let monotonic_before = origin.elapsed();
-    let wall_after = unix_clock_micros()?;
+    // Pair each wall read with a preceding monotonic sample. Admission uses the
+    // greater wall value, while deadline translation chooses the earlier of the
+    // two paired candidates. A pause plus a backward wall step therefore cannot
+    // add the pause to the lease term. The final monotonic sample rejects a term
+    // consumed anywhere in the sampling window.
+    let monotonic_before_first_wall = origin.elapsed();
+    let wall_before_unix_micros = unix_clock_micros()?;
+    let monotonic_between_walls = origin.elapsed();
+    let wall_after_unix_micros = unix_clock_micros()?;
     let monotonic_after = origin.elapsed();
     Ok(ClockSample {
-        unix_micros: wall_before.max(wall_after),
-        monotonic_before,
+        wall_before_unix_micros,
+        wall_after_unix_micros,
+        monotonic_before_first_wall,
+        monotonic_between_walls,
         monotonic_after,
     })
 }
@@ -1087,34 +1138,18 @@ mod tests {
         monotonic_after_ms: u64,
     ) -> Result<LeaseOutcome, OrchError> {
         state
-            .acquire_lease_in_clock_window(
+            .acquire_lease_with_sample(
                 request,
                 execution(fencing_epoch),
-                now_unix_ms * 1_000,
-                now_unix_ms * 1_000,
-                Duration::from_millis(monotonic_before_ms),
-                Duration::from_millis(monotonic_after_ms),
+                ClockSample {
+                    wall_before_unix_micros: now_unix_ms * 1_000,
+                    wall_after_unix_micros: now_unix_ms * 1_000,
+                    monotonic_before_first_wall: Duration::from_millis(monotonic_before_ms),
+                    monotonic_between_walls: Duration::from_millis(monotonic_before_ms),
+                    monotonic_after: Duration::from_millis(monotonic_after_ms),
+                },
             )
             .map(|grant| grant.outcome())
-    }
-
-    fn acquire_across_wall_step(
-        state: &OrchState,
-        request: LeaseRequest,
-        fencing_epoch: u64,
-        wall_before_unix_ms: u64,
-        wall_after_unix_ms: u64,
-        monotonic_before_ms: u64,
-        monotonic_after_ms: u64,
-    ) -> Result<LeaseGrant, OrchError> {
-        state.acquire_lease_in_clock_window(
-            request,
-            execution(fencing_epoch),
-            wall_before_unix_ms * 1_000,
-            wall_after_unix_ms * 1_000,
-            Duration::from_millis(monotonic_before_ms),
-            Duration::from_millis(monotonic_after_ms),
-        )
     }
 
     fn lease(id: &str, owner: &str, epoch: u64, expires: u64) -> LeaseRequest {
@@ -1382,21 +1417,96 @@ mod tests {
     }
 
     #[test]
-    fn backward_wall_step_inside_sampling_window_cannot_extend_new_term() {
+    fn dispatch_clock_is_sampled_while_state_is_locked() {
         let state = state();
         state
             .register_operation(operation("writer-1", 1, OperationKind::Failover))
             .expect("register writer");
-        let grant = acquire_across_wall_step(
-            &state,
-            lease("writer-1", "orch-0", 11, 200),
-            11,
-            100,
-            50,
-            100,
-            100,
-        )
-        .expect("use the conservative pre-step wall value");
+        let grant = state
+            .acquire_lease_at_clocks(
+                lease("writer-1", "orch-0", 11, 200),
+                execution(11),
+                100_000,
+                Duration::from_millis(100),
+            )
+            .expect("acquire grant");
+        let inner = Arc::clone(&grant.inner);
+
+        let _guard = grant
+            .validate_for_execution_with_clock(execution(11), || {
+                assert!(matches!(
+                    inner.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                Duration::from_millis(199)
+            })
+            .expect("clock read occurs after locking shared state");
+    }
+
+    #[test]
+    fn mutex_wait_cannot_revalidate_a_term_past_its_deadline() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register writer");
+        let grant = state
+            .acquire_lease_at_clocks(
+                lease("writer-1", "orch-0", 11, 200),
+                execution(11),
+                100_000,
+                Duration::from_millis(100),
+            )
+            .expect("acquire grant");
+        let now_ms = Arc::new(std::sync::atomic::AtomicU64::new(199));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let state_lock = state
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let validation_now = Arc::clone(&now_ms);
+            let validation = scope.spawn(move || {
+                started_tx.send(()).expect("announce validation attempt");
+                grant
+                    .validate_for_execution_with_clock(execution(11), || {
+                        Duration::from_millis(
+                            validation_now.load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                    })
+                    .map(|_| ())
+            });
+            started_rx.recv().expect("validation thread started");
+            std::thread::sleep(Duration::from_millis(20));
+            now_ms.store(200, std::sync::atomic::Ordering::SeqCst);
+            drop(state_lock);
+
+            assert!(matches!(
+                validation.join().expect("validation thread joins"),
+                Err(OrchError::LeaseGrantExpired { epoch: 11, .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn pause_and_backward_wall_step_cannot_extend_new_term() {
+        let state = state();
+        state
+            .register_operation(operation("writer-1", 1, OperationKind::Failover))
+            .expect("register writer");
+        let grant = state
+            .acquire_lease_with_sample(
+                lease("writer-1", "orch-0", 11, 200),
+                execution(11),
+                ClockSample {
+                    wall_before_unix_micros: 100_000,
+                    wall_after_unix_micros: 50_000,
+                    monotonic_before_first_wall: Duration::from_millis(100),
+                    monotonic_between_walls: Duration::from_millis(150),
+                    monotonic_after: Duration::from_millis(150),
+                },
+            )
+            .expect("use the earliest paired deadline");
 
         assert!(
             grant
