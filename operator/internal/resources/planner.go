@@ -544,6 +544,8 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 	selector[ShardLabel] = shardLabel(shard)
 	selector[RoleLabel] = "primary"
 	selector[MemberLabel] = "0000"
+	podLabels := maps.Clone(selector)
+	podLabels[ManagedByLabel] = ManagedByValue
 	allowPrivilegeEscalation := false
 	readOnlyRootFilesystem := true
 	runAsNonRoot := true
@@ -610,7 +612,7 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 			Selector:            &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: selector,
+					Labels: podLabels,
 					Annotations: map[string]string{
 						configHashAnnotation:              configurationHash,
 						PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
