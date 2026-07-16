@@ -346,7 +346,8 @@ CA encoding; the key bytes are never stored in resource annotations.
 The 90-day serving certificate is checked hourly and renewed 30
 days before expiry. Controller-runtime reloads a renewed key pair without a Pod
 restart, and readiness fails if the local certificate becomes untrusted,
-incorrectly named, or expires. Existing non-empty malformed Secrets,
+incorrectly named, or expires, or if the durable fencing-key Secret is missing
+or malformed. Existing non-empty malformed Secrets,
 foreign CA bundles, and incorrectly targeted webhook configurations stop
 startup instead of being overwritten.
 

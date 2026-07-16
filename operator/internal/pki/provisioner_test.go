@@ -137,6 +137,60 @@ func TestCheckerRejectsExpiredServingCertificate(t *testing.T) {
 	}
 }
 
+func TestCheckerRejectsMissingOrMalformedPodFencingKey(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		mutate func(context.Context, client.Client, *corev1.Secret) error
+		want   string
+	}{
+		{
+			name: "deleted",
+			mutate: func(ctx context.Context, kubeClient client.Client, secret *corev1.Secret) error {
+				return kubeClient.Delete(ctx, secret)
+			},
+			want: "get pre-created Pod fencing key Secret",
+		},
+		{
+			name: "malformed",
+			mutate: func(ctx context.Context, kubeClient client.Client, secret *corev1.Secret) error {
+				if err := kubeClient.Delete(ctx, secret); err != nil {
+					return err
+				}
+				immutable := true
+				return kubeClient.Create(ctx, &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: secret.Namespace,
+						Name:      secret.Name,
+						Labels:    map[string]string{ManagedByLabel: ManagedByValue},
+					},
+					Type:      corev1.SecretTypeOpaque,
+					Immutable: &immutable,
+					Data:      map[string][]byte{PodFencingKeyKey: make([]byte, podFencingKeyBytes-1)},
+				})
+			},
+			want: "exactly one 32-byte hmac.key",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			kubeClient := newTestClient(t, installObjects()...)
+			provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+			if err := provisioner.Bootstrap(ctx); err != nil {
+				t.Fatal(err)
+			}
+			secret := getSecret(t, kubeClient, testFencingKeySecretName)
+			if err := test.mutate(ctx, kubeClient, secret); err != nil {
+				t.Fatal(err)
+			}
+			if err := provisioner.Checker(nil); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Checker() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

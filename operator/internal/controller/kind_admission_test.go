@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,7 +32,7 @@ func TestKINDAdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
 		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against the installed admission manager")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -45,6 +47,7 @@ func TestKINDAdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec(t *testing.T) {
 	}
 
 	assertManagedAdmissionTLS(t, ctx, kubeClient)
+	assertFencingKeyLossFailsReadiness(t, ctx, kubeClient)
 	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pgshard-admission-smoke-%d", os.Getpid())}}
 	if err := kubeClient.Create(ctx, namespace); err != nil {
 		t.Fatal(err)
@@ -77,6 +80,86 @@ func TestKINDAdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec(t *testing.T) {
 		t.Fatalf("unsafe create error = %v", err)
 	}
 
+}
+
+func assertFencingKeyLossFailsReadiness(t *testing.T, ctx context.Context, kubeClient client.Client) {
+	t.Helper()
+	key := types.NamespacedName{Namespace: "pgshard-system", Name: "pgshard-webhook-fencing-key"}
+	original := &corev1.Secret{}
+	if err := kubeClient.Get(ctx, key, original); err != nil {
+		t.Fatal(err)
+	}
+	valid := func() *corev1.Secret {
+		immutable := true
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   key.Namespace,
+				Name:        key.Name,
+				Labels:      maps.Clone(original.Labels),
+				Annotations: maps.Clone(original.Annotations),
+			},
+			Type:      original.Type,
+			Immutable: &immutable,
+			Data:      map[string][]byte{pki.PodFencingKeyKey: bytes.Clone(original.Data[pki.PodFencingKeyKey])},
+		}
+	}
+	replace := func(secret *corev1.Secret) {
+		current := &corev1.Secret{}
+		err := kubeClient.Get(ctx, key, current)
+		if err == nil {
+			if err := kubeClient.Delete(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+		} else if !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+		if secret != nil {
+			if err := kubeClient.Create(ctx, secret); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	defer func() {
+		replace(valid())
+		waitForManagerReadiness(t, context.Background(), kubeClient, true)
+	}()
+
+	replace(nil)
+	waitForManagerReadiness(t, ctx, kubeClient, false)
+	replace(valid())
+	waitForManagerReadiness(t, ctx, kubeClient, true)
+
+	malformed := valid()
+	malformed.Data[pki.PodFencingKeyKey] = make([]byte, 31)
+	replace(malformed)
+	waitForManagerReadiness(t, ctx, kubeClient, false)
+	replace(valid())
+	waitForManagerReadiness(t, ctx, kubeClient, true)
+}
+
+func waitForManagerReadiness(t *testing.T, ctx context.Context, kubeClient client.Client, wanted bool) {
+	t.Helper()
+	pods := &corev1.PodList{}
+	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		pods = &corev1.PodList{}
+		if err := kubeClient.List(ctx, pods,
+			client.InNamespace("pgshard-system"),
+			client.MatchingLabels{"app.kubernetes.io/name": "pgshard-operator", "app.kubernetes.io/component": "controller-manager"},
+		); err != nil {
+			return false, err
+		}
+		if len(pods.Items) != 1 || len(pods.Items[0].Status.ContainerStatuses) != 1 {
+			return false, nil
+		}
+		status := pods.Items[0].Status.ContainerStatuses[0]
+		if status.RestartCount != 0 {
+			return false, fmt.Errorf("manager Pod %s restarted %d times", pods.Items[0].Name, status.RestartCount)
+		}
+		return status.Ready == wanted, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for manager readiness %t: %v; last Pods = %#v", wanted, err, pods.Items)
+	}
 }
 
 func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient client.Client) {

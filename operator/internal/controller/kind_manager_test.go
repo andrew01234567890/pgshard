@@ -17,8 +17,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -102,6 +104,10 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	}
 	waitForSingleMemberPostgreSQL(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster))
 	assertPostgreSQLStatusMetadataImmutable(t, ctx, kubeClient, types.NamespacedName{
+		Namespace: namespace.Name,
+		Name:      cluster.Name + "-shard-0000-primary-0",
+	})
+	assertPostgreSQLSpecImmutable(t, ctx, kubeClient, types.NamespacedName{
 		Namespace: namespace.Name,
 		Name:      cluster.Name + "-shard-0000-primary-0",
 	})
@@ -366,6 +372,66 @@ func assertPostgreSQLStatusMetadataImmutable(t *testing.T, ctx context.Context, 
 	}
 	if !podfence.IsManagedPostgreSQLPod(current) {
 		t.Fatalf("PostgreSQL Pod identity changed despite status webhook denials: %#v", current.ObjectMeta)
+	}
+}
+
+func assertPostgreSQLSpecImmutable(t *testing.T, ctx context.Context, kubeClient client.Client, key types.NamespacedName) {
+	t.Helper()
+	baseline := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, key, baseline); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		update func(*corev1.Pod) error
+	}{
+		{
+			name: "main resource",
+			update: func(pod *corev1.Pod) error {
+				pod.Spec.Containers[0].Image = "invalid.example/pgshard-denied:latest"
+				return kubeClient.Update(ctx, pod)
+			},
+		},
+		{
+			name: "ephemeralcontainers subresource",
+			update: func(pod *corev1.Pod) error {
+				pod.Spec.EphemeralContainers = append(pod.Spec.EphemeralContainers, corev1.EphemeralContainer{
+					EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+						Name:            "pgshard-denied-debug",
+						Image:           pod.Spec.Containers[0].Image,
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						Command:         []string{"sleep", "3600"},
+						SecurityContext: pod.Spec.Containers[0].SecurityContext.DeepCopy(),
+					},
+				})
+				return kubeClient.SubResource("ephemeralcontainers").Update(ctx, pod)
+			},
+		},
+		{
+			name: "resize subresource",
+			update: func(pod *corev1.Pod) error {
+				pod.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU] = resource.MustParse("300m")
+				return kubeClient.SubResource("resize").Update(ctx, pod)
+			},
+		},
+	} {
+		t.Run("spec is immutable through "+test.name, func(t *testing.T) {
+			current := &corev1.Pod{}
+			if err := kubeClient.Get(ctx, key, current); err != nil {
+				t.Fatal(err)
+			}
+			err := test.update(current)
+			if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "spec and generation are immutable") {
+				t.Fatalf("PostgreSQL Pod %s update error = %v, want webhook denial", test.name, err)
+			}
+			stored := &corev1.Pod{}
+			if err := kubeClient.Get(ctx, key, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Generation != baseline.Generation || !apiequality.Semantic.DeepEqual(stored.Spec, baseline.Spec) {
+				t.Fatalf("PostgreSQL Pod changed after denied %s update: generation %d -> %d", test.name, baseline.Generation, stored.Generation)
+			}
+		})
 	}
 }
 

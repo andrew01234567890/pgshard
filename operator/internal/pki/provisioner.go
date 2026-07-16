@@ -204,10 +204,18 @@ func (p *Provisioner) Start(ctx context.Context) error {
 
 func (*Provisioner) NeedLeaderElection() bool { return false }
 
-// Checker fails readiness when the local serving material is unusable. A valid
-// certificate remains ready inside its renewal window while maintenance
-// replaces it, avoiding an admission outage at the renewal threshold.
-func (p *Provisioner) Checker(_ *http.Request) error {
+// Checker fails readiness when the local serving material or the durable Pod
+// fencing key is unusable. A valid certificate remains ready inside its
+// renewal window while maintenance replaces it, avoiding an admission outage
+// at the renewal threshold.
+func (p *Provisioner) Checker(request *http.Request) error {
+	ctx := context.Background()
+	if request != nil {
+		ctx = request.Context()
+	}
+	if err := p.checkPodFencingKey(ctx); err != nil {
+		return err
+	}
 	authorityPEM, err := os.ReadFile(filepath.Join(p.certificateDirectory, CACertificateKey))
 	if err != nil {
 		return fmt.Errorf("read local CA certificate: %w", err)
@@ -261,18 +269,14 @@ func (p *Provisioner) ensureOnce(ctx context.Context) error {
 }
 
 func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
-	secret := &corev1.Secret{}
-	key := types.NamespacedName{Namespace: p.namespace, Name: p.fencingKeySecretName}
-	if err := p.client.Get(ctx, key, secret); err != nil {
-		return fmt.Errorf("get pre-created Pod fencing key Secret: %w", err)
-	}
-	if secret.Labels[ManagedByLabel] != ManagedByValue {
-		return fmt.Errorf("Secret %s/%s is not labeled as managed by %s", secret.Namespace, secret.Name, ManagedByValue)
-	}
-	if secret.Type != corev1.SecretTypeOpaque {
-		return fmt.Errorf("managed Secret %s/%s has type %q, want %q", secret.Namespace, secret.Name, secret.Type, corev1.SecretTypeOpaque)
+	secret, err := p.readPodFencingKey(ctx)
+	if err != nil {
+		return err
 	}
 	if len(secret.Data) == 0 {
+		if err := validatePodFencingKeyMetadata(secret); err != nil {
+			return err
+		}
 		if secret.Immutable != nil && *secret.Immutable {
 			return fmt.Errorf("empty Pod fencing key Secret %s/%s is immutable", secret.Namespace, secret.Name)
 		}
@@ -288,12 +292,46 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 		}
 		return nil
 	}
+	return validateInitializedPodFencingKey(secret)
+}
+
+func (p *Provisioner) checkPodFencingKey(ctx context.Context) error {
+	secret, err := p.readPodFencingKey(ctx)
+	if err != nil {
+		return err
+	}
+	return validateInitializedPodFencingKey(secret)
+}
+
+func (p *Provisioner) readPodFencingKey(ctx context.Context) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: p.namespace, Name: p.fencingKeySecretName}
+	if err := p.client.Get(ctx, key, secret); err != nil {
+		return nil, fmt.Errorf("get pre-created Pod fencing key Secret: %w", err)
+	}
+	return secret, nil
+}
+
+func validateInitializedPodFencingKey(secret *corev1.Secret) error {
+	if err := validatePodFencingKeyMetadata(secret); err != nil {
+		return err
+	}
 	value, exists := secret.Data[PodFencingKeyKey]
 	if len(secret.Data) != 1 || !exists || len(value) != podFencingKeyBytes {
 		return fmt.Errorf("managed Pod fencing key Secret must be empty or contain exactly one %d-byte %s", podFencingKeyBytes, PodFencingKeyKey)
 	}
 	if secret.Immutable == nil || !*secret.Immutable {
 		return fmt.Errorf("initialized Pod fencing key Secret %s/%s must be immutable", secret.Namespace, secret.Name)
+	}
+	return nil
+}
+
+func validatePodFencingKeyMetadata(secret *corev1.Secret) error {
+	if secret.Labels[ManagedByLabel] != ManagedByValue {
+		return fmt.Errorf("Secret %s/%s is not labeled as managed by %s", secret.Namespace, secret.Name, ManagedByValue)
+	}
+	if secret.Type != corev1.SecretTypeOpaque {
+		return fmt.Errorf("managed Secret %s/%s has type %q, want %q", secret.Namespace, secret.Name, secret.Type, corev1.SecretTypeOpaque)
 	}
 	return nil
 }
