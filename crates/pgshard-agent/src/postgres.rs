@@ -1,5 +1,6 @@
 //! Fail-closed `PostgreSQL` 18 data-directory and process supervision.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, Metadata};
 use std::future::Future;
@@ -17,9 +18,11 @@ use std::time::Duration;
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, CWD, FlockOperation, Mode, OFlags, StatxFlags, flock, open, statx};
 use rustix::process::{
-    Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, WaitIdStatus, geteuid, getpid,
-    kill_process_group, pidfd_open, pidfd_send_signal, waitid,
+    Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, WaitIdStatus, WaitOptions, geteuid, getpid,
+    kill_process_group, pidfd_open, pidfd_send_signal, wait, waitid,
 };
+#[cfg(not(test))]
+use rustix::process::{child_subreaper, set_child_subreaper};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::io::Interest;
@@ -191,11 +194,23 @@ struct SupervisorLock {
 }
 
 #[derive(Debug)]
+struct ChildSubreaper {
+    enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectChildProcess {
+    pid: Pid,
+    live: bool,
+}
+
+#[derive(Debug)]
 struct PostgresProcessFence {
     // Owning the Tokio handle lets Drop synchronously reap through try_wait
     // before the supervisor lock field is released.
     child: Child,
     process_group: Option<Pid>,
+    child_subreaper: ChildSubreaper,
     armed: bool,
     _supervisor_lock: SupervisorLock,
 }
@@ -326,11 +341,41 @@ impl SupervisorLock {
     }
 }
 
+impl ChildSubreaper {
+    #[cfg(not(test))]
+    fn claim() -> Result<Self, PostgresError> {
+        set_child_subreaper(Some(Pid::INIT))
+            .map_err(|source| PostgresError::ConfigureChildSubreaper(source.into()))?;
+        if child_subreaper()
+            .map_err(|source| PostgresError::InspectChildSubreaper(source.into()))?
+            .is_none()
+        {
+            return Err(PostgresError::ChildSubreaperNotEnabled);
+        }
+        if let Some(child) = direct_child_processes()?.first() {
+            return Err(PostgresError::ExistingChildProcess {
+                pid: child.pid.as_raw_pid(),
+            });
+        }
+        Ok(Self { enabled: true })
+    }
+
+    // Unit tests share one process and can run child-spawning cases in
+    // parallel. Process-level tests exercise the production subreaper path in
+    // an isolated agent process.
+    #[cfg(test)]
+    #[allow(clippy::unnecessary_wraps)]
+    fn claim() -> Result<Self, PostgresError> {
+        Ok(Self { enabled: false })
+    }
+}
+
 impl PostgresProcessFence {
-    fn new(child: Child, supervisor_lock: SupervisorLock) -> Self {
+    fn new(child: Child, child_subreaper: ChildSubreaper, supervisor_lock: SupervisorLock) -> Self {
         Self {
             child,
             process_group: None,
+            child_subreaper,
             armed: true,
             _supervisor_lock: supervisor_lock,
         }
@@ -350,7 +395,7 @@ impl PostgresProcessFence {
 impl Drop for PostgresProcessFence {
     fn drop(&mut self) {
         if self.armed {
-            fence_child_on_drop(&mut self.child, self.process_group);
+            fence_child_on_drop(&mut self.child, self.process_group, &self.child_subreaper);
         }
     }
 }
@@ -384,9 +429,11 @@ impl PreparedPostgres {
     /// `PostgreSQL` smart shutdown, then fast shutdown, then immediate shutdown,
     /// and finally a kernel kill if all bounded waits expire. Linux exit status
     /// is observed without reaping the group leader; the PID remains reserved
-    /// until descendant cleanup completes. Dropping this future after spawn
-    /// synchronously retains the PGDATA fence through the same process-group
-    /// kill proof.
+    /// until descendant cleanup completes. The dedicated agent is a Linux
+    /// child subreaper so `PostgreSQL` children that create their own sessions
+    /// are adopted, pidfd-killed, and reaped after the postmaster exits.
+    /// Dropping this future after spawn synchronously retains the PGDATA fence
+    /// through the same complete process-tree proof.
     ///
     /// # Errors
     ///
@@ -450,6 +497,7 @@ impl PreparedPostgres {
                     &mut process_group_fence.child,
                     Some(&pidfd),
                     Some(process_group),
+                    &process_group_fence.child_subreaper,
                     match status {
                         Ok(status) => PostgresError::UnexpectedExit(status),
                         Err(error) => error,
@@ -464,6 +512,7 @@ impl PreparedPostgres {
                     &mut process_group_fence.child,
                     &pidfd,
                     process_group,
+                    &process_group_fence.child_subreaper,
                     &shutdown_config,
                 ).await;
                 state.set_postgres_process(if result.is_ok() {
@@ -501,6 +550,13 @@ impl PreparedPostgres {
         self,
         state: &AgentState,
     ) -> Result<(PostgresProcessFence, AsyncFd<OwnedFd>, Pid), PostgresError> {
+        let child_subreaper = match ChildSubreaper::claim() {
+            Ok(child_subreaper) => child_subreaper,
+            Err(error) => {
+                state.set_postgres_process(PostgresProcessState::Failed);
+                return Err(error);
+            }
+        };
         let spawn_result = {
             #[cfg(test)]
             let _exec_handoff = test_exec_handoff_guard();
@@ -517,12 +573,14 @@ impl PreparedPostgres {
             }
         };
         state.set_postgres_process(PostgresProcessState::StartingQuarantined);
-        let mut process_group_fence = PostgresProcessFence::new(child, self.supervisor_lock);
+        let mut process_group_fence =
+            PostgresProcessFence::new(child, child_subreaper, self.supervisor_lock);
         let Some(child_id) = process_group_fence.child.id() else {
             return Err(cleanup_spawn_failure(
                 state,
                 &mut process_group_fence.child,
                 None,
+                &process_group_fence.child_subreaper,
                 PostgresError::MissingChildPid,
             )
             .await);
@@ -532,6 +590,7 @@ impl PreparedPostgres {
                 state,
                 &mut process_group_fence.child,
                 None,
+                &process_group_fence.child_subreaper,
                 PostgresError::InvalidChildPid,
             )
             .await);
@@ -541,6 +600,7 @@ impl PreparedPostgres {
                 state,
                 &mut process_group_fence.child,
                 None,
+                &process_group_fence.child_subreaper,
                 PostgresError::InvalidChildPid,
             )
             .await);
@@ -553,6 +613,7 @@ impl PreparedPostgres {
                     state,
                     &mut process_group_fence.child,
                     Some(pid),
+                    &process_group_fence.child_subreaper,
                     PostgresError::OpenPidfd {
                         pid: raw_pid,
                         source: source.into(),
@@ -570,6 +631,7 @@ impl PreparedPostgres {
                     state,
                     &mut process_group_fence.child,
                     Some(pid),
+                    &process_group_fence.child_subreaper,
                     PostgresError::MonitorPidfd {
                         pid: raw_pid,
                         source,
@@ -716,10 +778,11 @@ async fn cleanup_spawn_failure(
     state: &AgentState,
     child: &mut Child,
     process_group: Option<Pid>,
+    child_subreaper: &ChildSubreaper,
     error: PostgresError,
 ) -> PostgresError {
     state.set_postgres_process(PostgresProcessState::Stopping);
-    let error = cleanup_after_error(child, None, process_group, error).await;
+    let error = cleanup_after_error(child, None, process_group, child_subreaper, error).await;
     state.set_postgres_process(PostgresProcessState::Failed);
     error
 }
@@ -938,17 +1001,24 @@ async fn shutdown_child(
     child: &mut Child,
     pidfd: &AsyncFd<OwnedFd>,
     process_group: Pid,
+    child_subreaper: &ChildSubreaper,
     config: &PostgresConfig,
 ) -> Result<(), PostgresError> {
     let result = shutdown_child_inner(pidfd, config).await;
-    let had_live_descendants = process_group_has_live_members(process_group).unwrap_or(true);
-    let cleanup = kill_and_reap(child, Some(pidfd), Some(process_group)).await;
-    match (result, cleanup, had_live_descendants) {
-        (Ok(()), Ok(()), false) => Ok(()),
-        (Ok(()), Ok(()), true) => Err(PostgresError::DescendantsSurvivedShutdown),
-        (Err(error), Ok(()), _) => Err(error),
-        (Ok(()), Err(cleanup), _) => Err(cleanup),
-        (Err(error), Err(cleanup), _) => Err(PostgresError::CleanupFailed {
+    let cleanup = kill_and_reap(child, Some(pidfd), Some(process_group), child_subreaper).await;
+    combine_shutdown_result(result, cleanup)
+}
+
+fn combine_shutdown_result(
+    result: Result<(), PostgresError>,
+    cleanup: Result<ProcessTreeCleanup, PostgresError>,
+) -> Result<(), PostgresError> {
+    match (result, cleanup) {
+        (Ok(()), Ok(cleanup)) if !cleanup.observed_live_members => Ok(()),
+        (Ok(()), Ok(_)) => Err(PostgresError::DescendantsSurvivedShutdown),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(PostgresError::CleanupFailed {
             error: Box::new(error),
             cleanup: Box::new(cleanup),
         }),
@@ -1010,10 +1080,11 @@ async fn cleanup_after_error(
     child: &mut Child,
     pidfd: Option<&AsyncFd<OwnedFd>>,
     process_group: Option<Pid>,
+    child_subreaper: &ChildSubreaper,
     error: PostgresError,
 ) -> PostgresError {
-    match kill_and_reap(child, pidfd, process_group).await {
-        Ok(()) => error,
+    match kill_and_reap(child, pidfd, process_group, child_subreaper).await {
+        Ok(_) => error,
         Err(cleanup) => PostgresError::CleanupFailed {
             error: Box::new(error),
             cleanup: Box::new(cleanup),
@@ -1025,7 +1096,8 @@ async fn kill_and_reap(
     child: &mut Child,
     pidfd: Option<&AsyncFd<OwnedFd>>,
     process_group: Option<Pid>,
-) -> Result<(), PostgresError> {
+    child_subreaper: &ChildSubreaper,
+) -> Result<ProcessTreeCleanup, PostgresError> {
     let process_group_result = if let Some(process_group) = process_group {
         kill_process_group_until_dead(process_group).await
     } else {
@@ -1033,7 +1105,7 @@ async fn kill_and_reap(
             let _ = pidfd_send_signal(pidfd.get_ref(), Signal::KILL);
         }
         let _ = child.start_kill();
-        Ok(())
+        Ok(ProcessTreeCleanup::default())
     };
     let child_result = match timeout(KILL_REAP_TIMEOUT, child.wait()).await {
         Ok(result) => result.map(|_| ()).map_err(PostgresError::Wait),
@@ -1043,9 +1115,29 @@ async fn kill_and_reap(
             child.wait().await.map(|_| ()).map_err(PostgresError::Wait)
         }
     };
-    match (process_group_result, child_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+    let direct_cleanup = combine_cleanup_results(
+        process_group_result,
+        child_result.map(|()| ProcessTreeCleanup::default()),
+    );
+    let adopted_cleanup = kill_adopted_children_until_dead(child_subreaper).await;
+    combine_cleanup_results(direct_cleanup, adopted_cleanup)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProcessTreeCleanup {
+    observed_live_members: bool,
+}
+
+fn combine_cleanup_results(
+    primary: Result<ProcessTreeCleanup, PostgresError>,
+    cleanup: Result<ProcessTreeCleanup, PostgresError>,
+) -> Result<ProcessTreeCleanup, PostgresError> {
+    match (primary, cleanup) {
+        (Ok(mut primary), Ok(cleanup)) => {
+            primary.observed_live_members |= cleanup.observed_live_members;
+            Ok(primary)
+        }
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => Err(PostgresError::CleanupFailed {
             error: Box::new(error),
             cleanup: Box::new(cleanup),
@@ -1053,23 +1145,154 @@ async fn kill_and_reap(
     }
 }
 
-async fn kill_process_group_until_dead(process_group: Pid) -> Result<(), PostgresError> {
+async fn kill_adopted_children_until_dead(
+    child_subreaper: &ChildSubreaper,
+) -> Result<ProcessTreeCleanup, PostgresError> {
+    if !child_subreaper.enabled {
+        return Ok(ProcessTreeCleanup::default());
+    }
+
     let deadline = Instant::now() + KILL_REAP_TIMEOUT;
     let mut exceeded_bound = false;
     let mut logged_inspection_error = false;
-    let mut signal_error = None;
+    let mut logged_reap_error = false;
+    let mut first_error = None;
+    let mut cleanup = ProcessTreeCleanup::default();
+    let mut logged_pids = HashSet::new();
+
     loop {
-        match process_group_has_live_members(process_group) {
+        let reaping_complete = match reap_exited_adopted_children() {
+            Ok(()) => true,
+            Err(error) => {
+                if !logged_reap_error {
+                    tracing::warn!(%error, "cannot yet reap every adopted PostgreSQL descendant");
+                    logged_reap_error = true;
+                }
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                false
+            }
+        };
+        let children = match direct_child_processes() {
+            Ok(children) => children,
+            Err(error) => {
+                if !logged_inspection_error {
+                    tracing::warn!(%error, "cannot yet prove every adopted PostgreSQL descendant is dead");
+                    logged_inspection_error = true;
+                }
+                if Instant::now() >= deadline {
+                    exceeded_bound = true;
+                }
+                sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        if Instant::now() >= deadline {
+            exceeded_bound = true;
+        }
+        if reaping_complete && children.is_empty() {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            if exceeded_bound {
+                return Err(PostgresError::AdoptedChildCleanupTimeout(KILL_REAP_TIMEOUT));
+            }
+            return Ok(cleanup);
+        }
+
+        for child in children.into_iter().filter(|child| child.live) {
+            cleanup.observed_live_members = true;
+            if logged_pids.insert(child.pid.as_raw_pid()) {
+                tracing::warn!(
+                    pid = child.pid.as_raw_pid(),
+                    "killing adopted PostgreSQL descendant"
+                );
+            }
+            if let Err(error) = kill_adopted_child(child.pid)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            exceeded_bound = true;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn reap_exited_adopted_children() -> Result<(), PostgresError> {
+    loop {
+        match wait(WaitOptions::NOHANG) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(source) if source == rustix::io::Errno::CHILD => return Ok(()),
+            Err(source) if source == rustix::io::Errno::INTR => {}
+            Err(source) => return Err(PostgresError::ReapAdoptedChild(source.into())),
+        }
+    }
+}
+
+fn kill_adopted_child(pid: Pid) -> Result<(), PostgresError> {
+    let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(source) if source == rustix::io::Errno::SRCH => return Ok(()),
+        Err(source) => {
+            return Err(PostgresError::OpenAdoptedChildPidfd {
+                pid: pid.as_raw_pid(),
+                source: source.into(),
+            });
+        }
+    };
+    match pidfd_send_signal(&pidfd, Signal::KILL) {
+        Ok(()) => Ok(()),
+        Err(source) if source == rustix::io::Errno::SRCH => Ok(()),
+        Err(source) => Err(PostgresError::SignalAdoptedChild {
+            pid: pid.as_raw_pid(),
+            source: source.into(),
+        }),
+    }
+}
+
+async fn kill_process_group_until_dead(
+    process_group: Pid,
+) -> Result<ProcessTreeCleanup, PostgresError> {
+    kill_process_group_until_dead_with(
+        process_group,
+        process_group_has_live_members,
+        kill_process_group,
+        KILL_REAP_TIMEOUT,
+    )
+    .await
+}
+
+async fn kill_process_group_until_dead_with(
+    process_group: Pid,
+    mut inspect: impl FnMut(Pid) -> Result<bool, PostgresError>,
+    mut signal: impl FnMut(Pid, Signal) -> Result<(), rustix::io::Errno>,
+    cleanup_timeout: Duration,
+) -> Result<ProcessTreeCleanup, PostgresError> {
+    let deadline = Instant::now() + cleanup_timeout;
+    let mut exceeded_bound = false;
+    let mut logged_inspection_error = false;
+    let mut signal_error = None;
+    let mut cleanup = ProcessTreeCleanup::default();
+    loop {
+        match inspect(process_group) {
             Ok(false) => {
+                if Instant::now() >= deadline {
+                    exceeded_bound = true;
+                }
                 if let Some(source) = signal_error {
                     return Err(PostgresError::ProcessGroupSignal(source));
                 }
                 if exceeded_bound {
-                    return Err(PostgresError::ProcessGroupCleanupTimeout(KILL_REAP_TIMEOUT));
+                    return Err(PostgresError::ProcessGroupCleanupTimeout(cleanup_timeout));
                 }
-                return Ok(());
+                return Ok(cleanup);
             }
-            Ok(true) => {}
+            Ok(true) => cleanup.observed_live_members = true,
             Err(error) => {
                 if !logged_inspection_error {
                     tracing::warn!(%error, "cannot yet prove PostgreSQL process group is dead");
@@ -1077,7 +1300,7 @@ async fn kill_process_group_until_dead(process_group: Pid) -> Result<(), Postgre
                 }
             }
         }
-        if let Err(source) = kill_process_group(process_group, Signal::KILL)
+        if let Err(source) = signal(process_group, Signal::KILL)
             && source != rustix::io::Errno::SRCH
             && signal_error.is_none()
         {
@@ -1115,7 +1338,11 @@ fn fence_process_group_on_drop(process_group: Pid) {
     }
 }
 
-fn fence_child_on_drop(child: &mut Child, process_group: Option<Pid>) {
+fn fence_child_on_drop(
+    child: &mut Child,
+    process_group: Option<Pid>,
+    child_subreaper: &ChildSubreaper,
+) {
     if let Some(process_group) = process_group {
         fence_process_group_on_drop(process_group);
     }
@@ -1125,7 +1352,7 @@ fn fence_child_on_drop(child: &mut Child, process_group: Option<Pid>) {
     let mut logged_child_signal_error = false;
     loop {
         let child_may_be_running = match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => break,
             Ok(None) => true,
             Err(error) => {
                 if !logged_wait_error {
@@ -1154,6 +1381,145 @@ fn fence_child_on_drop(child: &mut Child, process_group: Option<Pid>) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+
+    fence_adopted_children_on_drop(child_subreaper);
+}
+
+fn fence_adopted_children_on_drop(child_subreaper: &ChildSubreaper) {
+    if !child_subreaper.enabled {
+        return;
+    }
+
+    let mut logged_inspection_error = false;
+    let mut logged_reap_error = false;
+    let mut logged_signal_error = false;
+    let mut logged_pids = HashSet::new();
+    loop {
+        let reaping_complete = match reap_exited_adopted_children() {
+            Ok(()) => true,
+            Err(error) => {
+                if !logged_reap_error {
+                    tracing::error!(%error, "holding PGDATA while cancellation cleanup cannot reap every adopted PostgreSQL descendant");
+                    logged_reap_error = true;
+                }
+                false
+            }
+        };
+        let children = match direct_child_processes() {
+            Ok(children) => children,
+            Err(error) => {
+                if !logged_inspection_error {
+                    tracing::error!(%error, "holding PGDATA while cancellation cleanup cannot prove every adopted PostgreSQL descendant is dead");
+                    logged_inspection_error = true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
+        if reaping_complete && children.is_empty() {
+            return;
+        }
+        for child in children.into_iter().filter(|child| child.live) {
+            if logged_pids.insert(child.pid.as_raw_pid()) {
+                tracing::warn!(
+                    pid = child.pid.as_raw_pid(),
+                    "killing adopted PostgreSQL descendant during cancellation cleanup"
+                );
+            }
+            if let Err(error) = kill_adopted_child(child.pid)
+                && !logged_signal_error
+            {
+                tracing::error!(%error, "holding PGDATA after cancellation cleanup could not kill an adopted PostgreSQL descendant");
+                logged_signal_error = true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn direct_child_processes() -> Result<Vec<DirectChildProcess>, PostgresError> {
+    let namespace_column = supervisor_pid_namespace_column()?;
+    let supervisor_pid = getpid();
+    let proc = Path::new("/proc");
+    let entries = fs::read_dir(proc).map_err(|source| PostgresError::ReadDirectory {
+        name: "Linux process table",
+        path: proc.to_owned(),
+        source,
+    })?;
+    let mut children = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| PostgresError::ReadDirectory {
+            name: "Linux process table",
+            path: proc.to_owned(),
+            source,
+        })?;
+        if entry
+            .file_name()
+            .as_bytes()
+            .iter()
+            .any(|byte| !byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let status_path = entry.path().join("status");
+        let status = match fs::read(&status_path) {
+            Ok(status) => status,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(PostgresError::Read {
+                    name: "Linux process status",
+                    path: status_path,
+                    source,
+                });
+            }
+        };
+        if let Some(child) =
+            direct_child_from_status(&status, &status_path, supervisor_pid, namespace_column)?
+        {
+            children.push(child);
+        }
+    }
+    children.sort_unstable_by_key(|child| child.pid.as_raw_pid());
+    Ok(children)
+}
+
+fn direct_child_from_status(
+    status: &[u8],
+    path: &Path,
+    supervisor_pid: Pid,
+    namespace_column: usize,
+) -> Result<Option<DirectChildProcess>, PostgresError> {
+    let parent = status_field(status, b"PPid:")
+        .and_then(parse_ascii_i32)
+        .ok_or_else(|| PostgresError::InvalidProcessStatus {
+            path: path.to_owned(),
+        })?;
+    if parent != supervisor_pid.as_raw_pid() {
+        return Ok(None);
+    }
+    let state = status_field(status, b"State:")
+        .and_then(|value| value.first().copied())
+        .ok_or_else(|| PostgresError::InvalidProcessStatus {
+            path: path.to_owned(),
+        })?;
+    let namespace_pids = status_field(status, b"NSpid:")
+        .and_then(parse_namespace_ids)
+        .ok_or_else(|| PostgresError::InvalidProcessStatus {
+            path: path.to_owned(),
+        })?;
+    let raw_pid = namespace_pids
+        .get(namespace_column)
+        .copied()
+        .ok_or_else(|| PostgresError::InvalidProcessStatus {
+            path: path.to_owned(),
+        })?;
+    let pid = Pid::from_raw(raw_pid).ok_or_else(|| PostgresError::InvalidProcessStatus {
+        path: path.to_owned(),
+    })?;
+    Ok(Some(DirectChildProcess {
+        pid,
+        live: state != b'Z',
+    }))
 }
 
 fn process_group_has_live_members(process_group: Pid) -> Result<bool, PostgresError> {
@@ -2494,6 +2860,23 @@ pub enum PostgresError {
         /// Operating-system error.
         source: std::io::Error,
     },
+    /// Linux could not make the dedicated agent a child subreaper.
+    #[error("configure the PostgreSQL agent as a Linux child subreaper: {0}")]
+    ConfigureChildSubreaper(#[source] std::io::Error),
+    /// Linux could not report the dedicated agent's child-subreaper state.
+    #[error("inspect the PostgreSQL agent Linux child-subreaper state: {0}")]
+    InspectChildSubreaper(#[source] std::io::Error),
+    /// Linux accepted the request but did not enable child-subreaper state.
+    #[error("Linux did not enable PostgreSQL child-subreaper supervision")]
+    ChildSubreaperNotEnabled,
+    /// Another direct child would make adopted-process ownership ambiguous.
+    #[error(
+        "PostgreSQL supervision requires a dedicated process, but direct child {pid} already exists"
+    )]
+    ExistingChildProcess {
+        /// Existing direct child PID in the agent namespace.
+        pid: i32,
+    },
     /// The child process did not expose a PID.
     #[error("spawned PostgreSQL process did not expose a PID")]
     MissingChildPid,
@@ -2553,6 +2936,30 @@ pub enum PostgresError {
         "PostgreSQL process group remained live beyond {0:?}; PGDATA stayed fenced until it died"
     )]
     ProcessGroupCleanupTimeout(Duration),
+    /// An adopted `PostgreSQL` child could not be reaped.
+    #[error("reap an adopted PostgreSQL descendant: {0}")]
+    ReapAdoptedChild(#[source] std::io::Error),
+    /// Linux could not create an identity-stable handle for an adopted child.
+    #[error("open pidfd for adopted PostgreSQL descendant {pid}: {source}")]
+    OpenAdoptedChildPidfd {
+        /// Adopted child PID in the agent namespace.
+        pid: i32,
+        /// Operating-system error.
+        source: std::io::Error,
+    },
+    /// Linux rejected a pidfd-targeted adopted-child kill.
+    #[error("kill adopted PostgreSQL descendant {pid}: {source}")]
+    SignalAdoptedChild {
+        /// Adopted child PID in the agent namespace.
+        pid: i32,
+        /// Operating-system error.
+        source: std::io::Error,
+    },
+    /// Adopted `PostgreSQL` children outlived the bounded cleanup interval.
+    #[error(
+        "adopted PostgreSQL descendants remained live beyond {0:?}; PGDATA stayed fenced until they died"
+    )]
+    AdoptedChildCleanupTimeout(Duration),
     /// Cleanup after another failure could not reap the child within its bound.
     #[error("{error}; PostgreSQL cleanup also failed: {cleanup}")]
     CleanupFailed {
@@ -2864,6 +3271,133 @@ mod tests {
                 .is_err()
         );
         assert!(current_pid_namespace_column(b"NSpid:\t700 8\n", path, 7).is_err());
+    }
+
+    #[test]
+    fn direct_child_status_uses_the_supervisor_namespace_and_zombie_state() {
+        let supervisor = Pid::from_raw(7).expect("positive supervisor PID");
+        let path = Path::new("/proc/42/status");
+        assert_eq!(
+            direct_child_from_status(
+                b"Name:\tbackend\xff\nState:\tT (stopped)\nPPid:\t7\nNSpid:\t700 42 9\n",
+                path,
+                supervisor,
+                1,
+            )
+            .expect("decode live direct child"),
+            Some(DirectChildProcess {
+                pid: Pid::from_raw(42).expect("positive child PID"),
+                live: true,
+            })
+        );
+        assert_eq!(
+            direct_child_from_status(
+                b"State:\tZ (zombie)\nPPid:\t7\nNSpid:\t700 42\n",
+                path,
+                supervisor,
+                1,
+            )
+            .expect("decode zombie direct child"),
+            Some(DirectChildProcess {
+                pid: Pid::from_raw(42).expect("positive child PID"),
+                live: false,
+            })
+        );
+        assert_eq!(
+            direct_child_from_status(
+                b"State:\tS (sleeping)\nPPid:\t8\nNSpid:\t700 42\n",
+                path,
+                supervisor,
+                1,
+            )
+            .expect("ignore another parent's child"),
+            None
+        );
+        assert!(
+            direct_child_from_status(
+                b"State:\tS (sleeping)\nPPid:\t7\nNSpid:\t700\n",
+                path,
+                supervisor,
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_process_inspection_error_is_not_a_live_descendant() {
+        let process_group = Pid::from_raw(42).expect("positive process group");
+        let mut observations = [
+            Err(PostgresError::ReadDirectory {
+                name: "Linux process table",
+                path: PathBuf::from("/proc"),
+                source: std::io::Error::other("transient fixture failure"),
+            }),
+            Ok(false),
+        ]
+        .into_iter();
+        let mut signals = 0;
+
+        let cleanup = kill_process_group_until_dead_with(
+            process_group,
+            |_| observations.next().expect("bounded observation fixture"),
+            |_, signal| {
+                assert_eq!(signal, Signal::KILL);
+                signals += 1;
+                Ok(())
+            },
+            KILL_REAP_TIMEOUT,
+        )
+        .await
+        .expect("later absence proof completes cleanup");
+
+        assert_eq!(cleanup, ProcessTreeCleanup::default());
+        assert_eq!(signals, 1);
+        assert!(combine_shutdown_result(Ok(()), Ok(cleanup)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn observed_live_process_survives_in_cleanup_result() {
+        let process_group = Pid::from_raw(42).expect("positive process group");
+        let mut observations = [Ok(true), Ok(false)].into_iter();
+
+        let cleanup = kill_process_group_until_dead_with(
+            process_group,
+            |_| observations.next().expect("bounded observation fixture"),
+            |_, _| Ok(()),
+            KILL_REAP_TIMEOUT,
+        )
+        .await
+        .expect("live member is killed and absence is proved");
+
+        assert!(cleanup.observed_live_members);
+        assert!(matches!(
+            combine_shutdown_result(Ok(()), Ok(cleanup)),
+            Err(PostgresError::DescendantsSurvivedShutdown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_absence_scan_crossing_cleanup_deadline_reports_timeout() {
+        let process_group = Pid::from_raw(42).expect("positive process group");
+        let cleanup_timeout = Duration::from_millis(10);
+
+        let result = kill_process_group_until_dead_with(
+            process_group,
+            |_| {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(false)
+            },
+            |_, _| Ok(()),
+            cleanup_timeout,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(PostgresError::ProcessGroupCleanupTimeout(value))
+                if value == cleanup_timeout
+        ));
     }
 
     #[test]
@@ -3727,9 +4261,15 @@ mod tests {
             Some(b'Z')
         );
 
-        kill_and_reap(&mut child, Some(&pidfd), Some(process_group))
-            .await
-            .expect("cleanup then reap fixture");
+        let child_subreaper = ChildSubreaper::claim().expect("create unit-test process fence");
+        kill_and_reap(
+            &mut child,
+            Some(&pidfd),
+            Some(process_group),
+            &child_subreaper,
+        )
+        .await
+        .expect("cleanup then reap fixture");
         assert!(child.id().is_none());
     }
 
