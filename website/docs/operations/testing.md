@@ -446,11 +446,15 @@ shared-memory/orphan fields. Separately, the PostgreSQL 18 source ordering
 establishes its data and socket locks before overwriting the external PID file.
 Shutdown tests exercise smart-to-fast escalation, forced reaping, a
 signal-ignoring postmaster descendant, nested PID-namespace group identifiers,
-a leader that exits before its
-descendant, unreaped pidfd observation, non-UTF-8 Linux process names, and
-cancellation of the supervision future; cancellation also reaps the direct
-child before the PGDATA fence can be reacquired, and the complete PostgreSQL
-process group must be dead.
+a leader that exits before its descendant, unreaped pidfd observation,
+non-UTF-8 Linux process names, and cancellation of the supervision future. A
+deterministic cleanup-state test injects a transient process-table inspection
+failure and requires a later absence proof not to be mislabeled as a surviving
+descendant. Cancellation also reaps the direct child before the PGDATA fence can
+be reacquired. An isolated production-binary test creates a stopped `setsid()`
+descendant outside the postmaster process group, crashes the postmaster, and
+requires the Linux child subreaper to pidfd-kill and reap the descendant before
+a replacement agent can acquire the same PGDATA.
 Linux subprocess coverage proves the control listener binds before child
 creation, reports the quarantined process state and metrics, remains unready
 without a lease, bounds HTTP drain even when a client holds partial headers,
@@ -460,7 +464,10 @@ standby, archive, incomplete base-backup, and missing-signal recovery control
 state before process creation,
 rejects directory mounts at both `pg_wal` and `base/1` plus a bind-mounted
 regular `PG_VERSION` file, and proves a configuration-file data-directory
-redirect cannot escape the validated path.
+redirect cannot escape the validated path. The real PostgreSQL 18 run also
+stops a normal child whose `NSpgid` proves it called `setsid()`, crashes the
+postmaster, and requires the agent log to identify that exact adopted child
+before the container exits.
 It also proves a second container cannot supervise the same PGDATA and that an
 external PID symlink is rejected while its target remains byte-identical.
 Destructive recovery settings are overridden, TCP is closed, and the private

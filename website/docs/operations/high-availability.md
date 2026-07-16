@@ -14,8 +14,9 @@ required PostgreSQL 18 files, supervise one direct postmaster child with client
 TCP and replication ingress disabled, propagate unexpected exit, and perform
 bounded smart/fast/immediate signal escalation and HTTP drain. Final cleanup is
 deliberately fail-closed rather than time-bounded: the PGDATA fence stays held
-until the direct child is reaped and its process group has no live descendant,
-including when supervision is cancelled. A filesystem-backed exclusive
+until the direct child is reaped, its original process group is empty, and the
+dedicated Linux child subreaper has reaped every adopted descendant, including
+when supervision is cancelled. A filesystem-backed exclusive
 supervisor lock prevents two pgshard agents that share PGDATA from starting
 concurrently; it does not replace the future operator lease and storage fencing
 needed before activation. The boundary rejects standby and archive-recovery
@@ -175,6 +176,50 @@ one deliberately lost catalog activation COMMIT response by exact reload and
 same-input retry. No controller yet runs that path continuously or recovers it
 after process loss, and the source-bound progress challenge is still absent.
 :::
+
+## Agent process-fence recovery
+
+The configured smart, fast, immediate, and kernel-kill phases are bounded, but
+releasing the PGDATA supervisor lock is not. PostgreSQL 18 children call
+`setsid()`, so the postmaster's original process group does not contain every
+backend and auxiliary process. Before spawn, the dedicated agent enables Linux
+child-subreaper mode and refuses to proceed if it already owns another direct
+child. After observing postmaster exit without reaping it, the agent first
+empties the original process group while the zombie leader keeps its PID and
+PGID reserved. It then reaps the postmaster and repeatedly adopts, pidfd-kills,
+and reaps each remaining process-tree root until no direct child remains.
+Killing one adopted root can reparent another generation to the agent, so the
+absence proof is repeated.
+
+A transient `/proc` inspection error is retried and is not reported as a
+surviving descendant unless a live member was actually observed. A persistent
+inspection or reap error deliberately leaves the Pod terminating and the volume
+fenced; another `SIGTERM` does not bypass that proof. Crossing the bounded
+cleanup interval is reported only after complete absence is eventually proven.
+
+If an agent logs that it cannot prove the PostgreSQL process tree is dead:
+
+1. Do not start or force-attach another PostgreSQL process to the same PGDATA.
+2. Cordon and fence the affected node, then restore `/proc` and container-runtime
+   visibility or stop the old container cgroup from outside the Pod.
+3. Verify that the old process group, adopted descendants, and every process
+   with the volume open are absent before force-deleting the Pod or moving the
+   volume.
+
+Sending `SIGKILL` to the agent or allowing Kubernetes' final kill releases the
+userspace flock without proving descendant death, so it is not a safe recovery
+shortcut. The Pod termination grace period must cover the configured shutdown
+budget and HTTP drain; a node-level fence is still required when the kernel can
+no longer supply process-table evidence.
+
+The agent installs its `SIGTERM` and `SIGINT` streams before reading
+configuration, walking PGDATA, binding HTTP, or spawning PostgreSQL. If signal
+registration fails, startup exits before it can own a postmaster. PGDATA is
+walked once during offline preparation and again immediately before spawn to
+close the preparation-to-exec mutation window. Each walk has a 30-second
+deadline and a timeout fails before process creation; operators should validate
+that their largest intended data directory and storage class meet this startup
+contract.
 
 The target default is one primary and two physical streaming replicas per shard,
 spread across failure domains. PostgreSQL will use `synchronous_commit=on` with
