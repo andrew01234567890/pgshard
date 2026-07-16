@@ -66,3 +66,12 @@ boundary in isolation. `cargo bench -p pgshard-planner --bench
 analyze_parameter_route` measures parsing, the catalog-bound template, and exact
 parameter-type resolution. Both are informational and are not
 pooler-throughput claims.
+
+Alongside the deterministic malformed-input corpus, randomized property tests
+exercise bounded arbitrary Unicode SQL and sample the supported route template
+across the full legal parameter-number range, both operand orientations, and
+redundant-parenthesis shapes. They also sample leading-zero and out-of-range
+placeholders and verify that those forms fail closed. Router properties vary
+the selected Bind position, including one-parameter messages, and cover both a
+single shared format code and per-parameter format codes. PostgreSQL 18 remains
+the authority for SQL semantics.
