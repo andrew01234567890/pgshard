@@ -137,6 +137,59 @@ fn postmaster_crash_aborts_a_held_http_request_within_the_process_bound() {
 }
 
 #[test]
+fn setsid_descendant_is_reaped_before_pgdata_can_be_reacquired() {
+    let fixture = AgentFixture::new("#!/bin/sh\nwhile :; do sleep 1; done\n");
+    let postmaster_marker = fixture.root.path().join("postmaster.pid");
+    let descendant_marker = fixture.root.path().join("setsid-descendant.pid");
+    fixture.replace_executable(&format!(
+        "#!/bin/sh\nprintf \"%s\\n\" \"$$\" > '{}'\n/usr/bin/setsid --fork /bin/sh -c 'trap \"\" TERM INT QUIT HUP; printf \"%s\\n\" \"$$\" > \"$1\"; kill -STOP \"$$\"; while :; do sleep 1; done' descendant '{}' &\nwhile :; do sleep 1; done\n",
+        postmaster_marker.display(),
+        descendant_marker.display()
+    ));
+    let address = reserve_address();
+    let mut first_agent = ChildGuard::new(fixture.spawn(address));
+    wait_for_quarantine(&mut first_agent, address);
+
+    let postmaster_pid = wait_for_pid_marker(&postmaster_marker);
+    let descendant_pid = wait_for_pid_marker(&descendant_marker);
+    assert_eq!(
+        namespace_status_id(descendant_pid, "NSpid:"),
+        descendant_pid,
+        "fixture PID must be read in the agent namespace"
+    );
+    assert_eq!(
+        namespace_status_id(descendant_pid, "NSpgid:"),
+        descendant_pid,
+        "fixture must escape the postmaster process group with setsid"
+    );
+    assert_ne!(descendant_pid, postmaster_pid);
+
+    let postmaster = Pid::from_raw(i32::try_from(postmaster_pid).expect("postmaster PID fits i32"))
+        .expect("positive postmaster PID");
+    kill_process(postmaster, Signal::KILL).expect("crash postmaster");
+    let status = first_agent.wait().expect("wait for terminal agent failure");
+    assert!(!status.success(), "postmaster crash unexpectedly succeeded");
+    assert!(
+        !Path::new(&format!("/proc/{descendant_pid}")).exists(),
+        "setsid descendant {descendant_pid} survived the PGDATA fence"
+    );
+    first_agent.disarm_after_descendants_are_gone();
+
+    fixture.replace_executable("#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do :; done\n");
+    let replacement_address = reserve_address();
+    let mut replacement = ChildGuard::new(fixture.spawn(replacement_address));
+    wait_for_quarantine(&mut replacement, replacement_address);
+    kill_process(Pid::from_child(replacement.child()), Signal::TERM)
+        .expect("stop replacement agent");
+    let replacement_status = replacement.wait().expect("wait for replacement agent");
+    assert!(
+        replacement_status.success(),
+        "PGDATA replacement agent failed after complete descendant cleanup: {replacement_status}"
+    );
+    replacement.disarm_after_descendants_are_gone();
+}
+
+#[test]
 fn occupied_http_listener_prevents_postmaster_spawn() {
     let fixture = AgentFixture::new("#!/bin/sh\nwhile :; do :; done\n");
     let marker = fixture.root.path().join("postmaster-started");
@@ -340,6 +393,34 @@ fn wait_for_only_child(parent_pid: u32) -> u32 {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn wait_for_pid_marker(path: &Path) -> u32 {
+    let started = Instant::now();
+    loop {
+        if let Ok(value) = fs::read_to_string(path)
+            && let Ok(pid) = value.trim().parse()
+        {
+            return pid;
+        }
+        assert!(
+            started.elapsed() < PROCESS_TIMEOUT,
+            "process marker {} was not populated",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn namespace_status_id(pid: u32, field: &str) -> u32 {
+    let status =
+        fs::read_to_string(format!("/proc/{pid}/status")).expect("read fixture process status");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|ids| ids.split_ascii_whitespace().next_back())
+        .and_then(|id| id.parse().ok())
+        .expect("read namespace process identifier")
 }
 
 fn read_children(parent_pid: u32) -> Vec<u32> {
