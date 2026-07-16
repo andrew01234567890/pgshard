@@ -110,6 +110,10 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"SELECT current_setting('server_version_num')::integer / 10000, pg_is_in_recovery()")); got != "18|f" {
 		t.Fatalf("PostgreSQL identity = %q", got)
 	}
+	if got, want := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"cat", "/var/lib/postgresql/18/docker/.pgshard-bootstrap-complete")), "cluster_uid="+string(current.UID)+"\nshard=0000"; got != want {
+		t.Fatalf("PostgreSQL bootstrap marker = %q, want %q", got, want)
+	}
 	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
 		"CREATE TABLE live_marker (shard integer PRIMARY KEY, note text NOT NULL); INSERT INTO live_marker VALUES (0, 'kind-persistent');")
@@ -224,6 +228,9 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 	}
 	if claim.Status.Phase != corev1.ClaimBound || claim.UID != bootstrap.PVCUID {
 		t.Fatalf("PostgreSQL data claim was not bound to its checkpointed UID: phase=%s metadata=%#v checkpoint=%s", claim.Status.Phase, claim.ObjectMeta, bootstrap.PVCUID)
+	}
+	if !postgresqlDataPVCIsCreationFenced(claim, current) {
+		t.Fatalf("Delete-policy PostgreSQL data claim lost its late-create GC fence: %#v", claim.OwnerReferences)
 	}
 	if bootstrap.PVCStorageClassName == nil || claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != *bootstrap.PVCStorageClassName {
 		t.Fatalf("PostgreSQL data claim storage class = %#v, checkpoint = %#v", claim.Spec.StorageClassName, bootstrap.PVCStorageClassName)

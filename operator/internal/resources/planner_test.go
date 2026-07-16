@@ -218,8 +218,11 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("PostgreSQL readiness probe = %#v", postgres.ReadinessProbe)
 		}
 		bootstrap := pod.InitContainers[0]
-		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) {
+		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) {
 			t.Fatalf("PostgreSQL atomic bootstrap contract = %#v", bootstrap)
+		}
+		if len(bootstrap.Env) != 2 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) {
+			t.Fatalf("PostgreSQL bootstrap identity = %#v", bootstrap.Env)
 		}
 		if bootstrap.SecurityContext == nil || bootstrap.SecurityContext.ReadOnlyRootFilesystem == nil || !*bootstrap.SecurityContext.ReadOnlyRootFilesystem || bootstrap.Resources.Limits.Memory() == nil {
 			t.Fatalf("PostgreSQL bootstrap security/resources = %#v", bootstrap)
@@ -228,13 +231,18 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		for _, variable := range postgres.Env {
 			if variable.Name == "POSTGRES_PASSWORD" {
 				passwordReferences++
-				if variable.ValueFrom == nil || variable.ValueFrom.SecretKeyRef == nil || variable.ValueFrom.SecretKeyRef.Name != cluster.Status.PostgreSQLBootstraps[shard].SecretName || variable.ValueFrom.SecretKeyRef.Key != PostgreSQLPasswordKey {
-					t.Fatalf("PostgreSQL password reference = %#v", variable)
-				}
+			}
+			if variable.ValueFrom != nil {
+				t.Fatalf("running PostgreSQL received a Secret-backed environment variable: %#v", variable)
 			}
 		}
-		if passwordReferences != 1 {
+		if passwordReferences != 0 || len(postgres.Env) != 1 || postgres.Env[0].Name != "PGDATA" {
 			t.Fatalf("PostgreSQL password reference count = %d", passwordReferences)
+		}
+		for _, mount := range postgres.VolumeMounts {
+			if mount.Name == "bootstrap-secret" {
+				t.Fatalf("running PostgreSQL mounts the bootstrap Secret: %#v", postgres.VolumeMounts)
+			}
 		}
 		budget := object[*policyv1.PodDisruptionBudget](t, plan, name)
 		if budget.Spec.MinAvailable == nil || budget.Spec.MinAvailable.IntVal != 1 || budget.Spec.Selector.MatchLabels[ShardLabel] != shardLabel(shard) || budget.Spec.Selector.MatchLabels[RoleLabel] != "primary" {
@@ -251,9 +259,16 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	if claim.Name != "demo-random-data" || claim.Labels[ShardLabel] != "0001" || claim.Spec.Resources.Requests.Storage().Cmp(cluster.Spec.Storage.Size) != 0 || claim.Annotations[ApplyOwnershipAnnotation] != "" {
 		t.Fatalf("PostgreSQL data PVC = %#v", claim)
 	}
-	if len(claim.OwnerReferences) != 0 || claim.Annotations[PostgreSQLDataClusterUIDAnnotation] != string(cluster.UID) {
+	if claim.Annotations[PostgreSQLDataClusterUIDAnnotation] != string(cluster.UID) {
 		t.Fatalf("PostgreSQL data PVC garbage-collection boundary = %#v", claim.ObjectMeta)
 	}
+	if len(claim.OwnerReferences) != 0 {
+		t.Fatalf("Retain-policy PostgreSQL data PVC is garbage-collection-owned: %#v", claim.OwnerReferences)
+	}
+	deleteCluster := cluster.DeepCopy()
+	deleteCluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
+	deleteClaim := PostgreSQLPrimaryDataPVC(deleteCluster, 1, "demo-delete-data", deleteCluster.Spec.Storage.StorageClassName)
+	assertOwned(t, deleteClaim, deleteCluster)
 }
 
 func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {

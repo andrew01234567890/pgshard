@@ -83,8 +83,10 @@ class are checkpointed before either API create; API-assigned UIDs are
 checkpointed before a workload can consume them. The controller periodically
 revalidates both identities and fails closed instead of silently replacing a
 credential or empty data volume. PostgreSQL initializes in a disposable staging
-directory and atomically renames only a complete, marked cluster into the final
-data path, so an interrupted `initdb` cannot publish a partial `PG_VERSION`.
+directory and atomically renames only a complete cluster into the final data
+path. Its durable marker records the exact PgShardCluster UID and shard, so an
+interrupted `initdb` cannot publish a partial `PG_VERSION` and a reused volume
+cannot silently start for another cluster or shard.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
@@ -97,10 +99,11 @@ a bounded backend quota. Its default image is digest-pinned and the Pod command
 selects that image contract's `/usr/local/bin/etcd` executable explicitly;
 custom `--etcd-image` values must provide the same path. Scale transitions
 retain those claims during scaling. On cluster deletion,
-`storage.deletionPolicy: Retain` (the default) leaves PostgreSQL data PVCs
-ownerless from creation, then marks the exact status-recorded UIDs as retained
-before other owned resources are removed. `Delete` must be selected explicitly
-at creation to prune the workloads first and then delete only those exact
+`storage.deletionPolicy: Retain` (the default) creates ownerless PostgreSQL data
+PVCs, resolves any late or outcome-unknown create, checkpoints its API-assigned
+UID, and marks that same exact UID as retained before other owned resources are
+removed. `Delete` claims instead carry a PgShardCluster owner as a late-create
+garbage-collection fence, prune the workloads first, and then delete only the
 status-recorded UIDs, allowing pvc-protection to complete without deadlocking
 the finalizer. The CR finalizer
 uses the checkpointed creation-time policy and waits for the selected result to

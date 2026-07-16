@@ -140,6 +140,9 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 		if claim.UID != bootstrap.PVCUID {
 			t.Fatalf("generated data PVC UID = %s, want %s", claim.UID, bootstrap.PVCUID)
 		}
+		if len(claim.OwnerReferences) != 0 {
+			t.Fatalf("Retain-policy data PVC remained garbage-collection-owned after UID checkpoint: %#v", claim.OwnerReferences)
+		}
 		if len(secret.Data[owned.PostgreSQLPasswordKey]) != hex.EncodedLen(postgresqlPasswordBytes) {
 			t.Fatalf("generated password length for shard %d = %d", shard, len(secret.Data[owned.PostgreSQLPasswordKey]))
 		}
@@ -332,6 +335,47 @@ func TestReconcileReusesCheckpointedBootstrapIntentAfterStatusFailure(t *testing
 				t.Fatalf("checkpoint recovery duplicated bootstrap children: secrets=%d PVCs=%d", len(secrets.Items), len(claims.Items))
 			}
 		})
+	}
+}
+
+func TestReconcilePersistsStorageClassBeforePVCCreate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Spec.Storage.StorageClassName = nil
+	storageClass := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{
+		Name:        "authoritative-default",
+		Annotations: map[string]string{"storageclass.kubernetes.io/is-default-class": "true"},
+	}}
+	base := newFakeClient(t, cluster, storageClass)
+	injected := errors.New("stop after checking PVC dispatch prerequisites")
+	observed := false
+	writeClient := interceptedClient(t, base, interceptor.Funcs{
+		Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			claim, ok := object.(*corev1.PersistentVolumeClaim)
+			if !ok {
+				return kubeClient.Create(ctx, object, options...)
+			}
+			persisted := getCluster(t, ctx, base, cluster)
+			bootstrap := bootstrapForShard(t, persisted, 0)
+			if bootstrap.SecretUID == "" || bootstrap.PVCUID != "" || bootstrap.PVCStorageClassName == nil || *bootstrap.PVCStorageClassName != storageClass.Name {
+				t.Fatalf("persisted state at PVC dispatch = %#v", bootstrap)
+			}
+			if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != storageClass.Name {
+				t.Fatalf("PVC class at dispatch = %#v", claim.Spec.StorageClassName)
+			}
+			observed = true
+			return injected
+		},
+	})
+	if _, err := (&PgShardClusterReconciler{Client: writeClient}).Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), injected.Error()) {
+		t.Fatalf("PVC dispatch interceptor was not reached: %v", err)
+	}
+	if !observed {
+		t.Fatal("PVC create was not observed after the durable storage-class checkpoint")
 	}
 }
 
@@ -621,6 +665,13 @@ func TestExplicitDeletePolicyDeletesPostgreSQLData(t *testing.T) {
 	}
 	current := getCluster(t, ctx, fakeClient, cluster)
 	bootstrap := bootstrapForShard(t, current, 0)
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, claim); err != nil {
+		t.Fatal(err)
+	}
+	if !postgresqlDataPVCIsCreationFenced(claim, cluster) {
+		t.Fatalf("Delete-policy data PVC lost its creation fence: %#v", claim.OwnerReferences)
+	}
 	if err := fakeClient.Delete(ctx, current); err != nil {
 		t.Fatal(err)
 	}
@@ -640,75 +691,138 @@ func TestExplicitDeletePolicyDeletesPostgreSQLData(t *testing.T) {
 	}
 }
 
-func TestDeletePolicyResolvesDelayedPVCOutcomeBeforeFinalization(t *testing.T) {
+func TestDeletionPoliciesResolveDelayedPVCOutcomeBeforeFinalization(t *testing.T) {
+	t.Parallel()
+	for _, policy := range []pgshardv1alpha1.StorageDeletionPolicy{pgshardv1alpha1.DeletionRetain, pgshardv1alpha1.DeletionDelete} {
+		policy := policy
+		t.Run(string(policy), func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			cluster.Spec.Storage.DeletionPolicy = policy
+			namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}}
+			base := newFakeClient(t, cluster, namespace)
+			var delayed *corev1.PersistentVolumeClaim
+			createAttempts := 0
+			writeClient := interceptedClient(t, base, interceptor.Funcs{
+				Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+					claim, isClaim := object.(*corev1.PersistentVolumeClaim)
+					if !isClaim {
+						return kubeClient.Create(ctx, object, options...)
+					}
+					createAttempts++
+					if createAttempts == 1 {
+						delayed = claim.DeepCopy()
+						return apierrors.NewTimeoutError("injected outcome-unknown PVC create", 1)
+					}
+					return kubeClient.Create(ctx, object, options...)
+				},
+			})
+			reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "outcome-unknown PVC create") {
+				t.Fatalf("initial create did not preserve its unknown outcome: %v", err)
+			}
+
+			current := getCluster(t, ctx, base, cluster)
+			bootstrap := bootstrapForShard(t, current, 0)
+			if bootstrap.PVCUID != "" {
+				t.Fatalf("unknown create was checkpointed as complete: %#v", bootstrap)
+			}
+			key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+			if err := base.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("delayed PVC became visible before deletion: %v", err)
+			}
+			if err := base.Delete(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+
+			for range 12 {
+				if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+					t.Fatal(err)
+				}
+				if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+					break
+				}
+			}
+			if createAttempts != 2 {
+				t.Fatalf("PVC create attempts = %d, want delayed create plus idempotent resolution", createAttempts)
+			}
+			if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("cluster did not finish deletion after resolving PVC create: %v", err)
+			}
+			if policy == pgshardv1alpha1.DeletionRetain {
+				retained := &corev1.PersistentVolumeClaim{}
+				if err := base.Get(ctx, key, retained); err != nil {
+					t.Fatalf("Retain policy lost the resolved PVC: %v", err)
+				}
+				if len(retained.OwnerReferences) != 0 || retained.Annotations[owned.RetainedFromAnnotation] != cluster.Namespace+"/"+cluster.Name {
+					t.Fatalf("resolved retained PVC = %#v", retained.ObjectMeta)
+				}
+				return
+			}
+			if err := base.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("resolved Delete-policy PVC survived finalization: %v", err)
+			}
+
+			// Model the original timed-out request reaching storage only after
+			// finalization. The fake client has no garbage collector, so assert the
+			// late object still carries the deleted cluster's exact GC fence.
+			if delayed == nil {
+				t.Fatal("delayed PVC create was not captured")
+			}
+			if err := base.Create(ctx, delayed); err != nil {
+				t.Fatalf("materialize original delayed create: %v", err)
+			}
+			late := &corev1.PersistentVolumeClaim{}
+			if err := base.Get(ctx, key, late); err != nil {
+				t.Fatal(err)
+			}
+			if !postgresqlDataPVCIsCreationFenced(late, cluster) {
+				t.Fatalf("late PVC create escaped the deleted-cluster GC fence: %#v", late.OwnerReferences)
+			}
+		})
+	}
+}
+
+func TestFinalizationDoesNotCreateDataBeforeCredentialCheckpoint(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	cluster := validCluster()
-	cluster.Spec.Shards = 1
-	cluster.Spec.MembersPerShard = 1
-	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
-	cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
-	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}}
-	base := newFakeClient(t, cluster, namespace)
-	var delayed *corev1.PersistentVolumeClaim
-	createAttempts := 0
-	writeClient := interceptedClient(t, base, interceptor.Funcs{
-		Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
-			claim, isClaim := object.(*corev1.PersistentVolumeClaim)
-			if !isClaim {
-				return kubeClient.Create(ctx, object, options...)
+	for _, policy := range []pgshardv1alpha1.StorageDeletionPolicy{pgshardv1alpha1.DeletionRetain, pgshardv1alpha1.DeletionDelete} {
+		policy := policy
+		t.Run(string(policy), func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			cluster.Spec.Storage.DeletionPolicy = policy
+			cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{{
+				Shard: 0, SecretName: "intent-secret", PVCName: "intent-data", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
+			}}
+			base := newFakeClient(t, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}})
+			createAttempts := 0
+			writeClient := interceptedClient(t, base, interceptor.Funcs{
+				Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+					if _, ok := object.(*corev1.PersistentVolumeClaim); ok {
+						createAttempts++
+					}
+					return kubeClient.Create(ctx, object, options...)
+				},
+			})
+			reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+			var err error
+			if policy == pgshardv1alpha1.DeletionRetain {
+				_, err = reconciler.retainPostgreSQLPVCs(ctx, cluster)
+			} else {
+				_, err = reconciler.deletePostgreSQLPVCs(ctx, cluster)
 			}
-			createAttempts++
-			if createAttempts == 1 {
-				delayed = claim.DeepCopy()
-				return apierrors.NewTimeoutError("injected outcome-unknown PVC create", 1)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if createAttempts == 2 {
-				if delayed == nil {
-					t.Fatal("delayed PVC create was not captured")
-				}
-				if err := kubeClient.Create(ctx, delayed, options...); err != nil {
-					return err
-				}
-				return apierrors.NewAlreadyExists(schema.GroupResource{Resource: "persistentvolumeclaims"}, claim.Name)
+			if createAttempts != 0 {
+				t.Fatalf("PVC creates before credential checkpoint = %d", createAttempts)
 			}
-			return kubeClient.Create(ctx, object, options...)
-		},
-	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
-	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "outcome-unknown PVC create") {
-		t.Fatalf("initial create did not preserve its unknown outcome: %v", err)
-	}
-
-	current := getCluster(t, ctx, base, cluster)
-	bootstrap := bootstrapForShard(t, current, 0)
-	if bootstrap.PVCUID != "" {
-		t.Fatalf("unknown create was checkpointed as complete: %#v", bootstrap)
-	}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
-	if err := base.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("delayed PVC became visible before deletion: %v", err)
-	}
-	if err := base.Delete(ctx, current); err != nil {
-		t.Fatal(err)
-	}
-
-	for range 8 {
-		if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
-			t.Fatal(err)
-		}
-		if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
-			break
-		}
-	}
-	if createAttempts != 2 {
-		t.Fatalf("PVC create attempts = %d, want delayed create plus idempotent resolution", createAttempts)
-	}
-	if err := base.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("delayed ownerless PVC survived Delete-policy finalization: %v", err)
-	}
-	if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("cluster did not finish deletion after resolving PVC create: %v", err)
+		})
 	}
 }
 

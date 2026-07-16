@@ -155,10 +155,13 @@ recovery, and rolling restarts are not implemented; see
 The operator's direct one-member development mode is intentionally outside the
 HA contract. It creates one writable PostgreSQL 18 Pod per shard and retains its
 PVC across a StatefulSet restart, but the shard is unavailable while that Pod
-restarts. `PostgreSQLPrimariesAvailable=True` reports process availability, not
-replication or failover. Zero-downtime restart evidence requires at least one
-eligible standby, a fenced switchover, pooler rerouting/buffering, and a
-continuous client probe with no failed or outcome-unknown transactions.
+restarts. Its init container binds the durable bootstrap marker to the exact
+cluster UID and shard, while the running PostgreSQL container does not receive
+or mount the bootstrap password. `PostgreSQLPrimariesAvailable=True` reports
+process availability, not replication or failover. Zero-downtime restart
+evidence requires at least one eligible standby, a fenced switchover, pooler
+rerouting/buffering, and a continuous client probe with no failed or
+outcome-unknown transactions.
 `pg_isready` is used only for readiness. Direct PostgreSQL Pods have no kubelet
 startup or liveness kill probe: PID 1 exit is handled by the container runtime,
 while slow startup or crash recovery remains unready without being repeatedly

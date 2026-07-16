@@ -68,8 +68,16 @@ parent=/var/lib/postgresql/18
 final="$parent/docker"
 staging="$parent/.pgshard-init"
 marker="$final/.pgshard-bootstrap-complete"
+expected=/tmp/pgshard-bootstrap-identity
+
+umask 077
+printf 'cluster_uid=%s\nshard=%s\n' "$PGSHARD_CLUSTER_UID" "$PGSHARD_SHARD_ID" > "$expected"
 
 if [[ -f "$marker" && -f "$final/PG_VERSION" ]]; then
+  if ! cmp -s -- "$marker" "$expected"; then
+    echo "refusing PostgreSQL data directory owned by another cluster or shard" >&2
+    exit 1
+  fi
   rm -rf -- "$staging"
   exit 0
 fi
@@ -91,7 +99,8 @@ initdb \
   --encoding=UTF8 \
   --locale=C
 printf '\nhost all all all scram-sha-256\n' >> "$staging/pg_hba.conf"
-touch "$staging/.pgshard-bootstrap-complete"
+cp -- "$expected" "$staging/.pgshard-bootstrap-complete"
+chmod 0600 "$staging/.pgshard-bootstrap-complete"
 sync
 mv -- "$staging" "$final"
 sync
@@ -477,14 +486,16 @@ func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, 
 // PostgreSQLPrimaryDataPVC returns the standalone data volume for a singleton
 // primary. Its explicit or operator-resolved storage class is part of the
 // creation intent recorded before API create, and the claim is API-identified
-// before its StatefulSet is planned.
+// before its StatefulSet is planned. Delete-policy claims carry a controller
+// owner as a creation-time fence so a delayed create cannot outlive the
+// cluster. Retain-policy claims are ownerless because foreground deletion can
+// garbage-collect even a finalizer-protected owner's dependants; their durable
+// intent is instead resolved and marked before cluster finalization.
 func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageClassName *string) *corev1.PersistentVolumeClaim {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
-	// PostgreSQL data claims are deliberately outside Kubernetes cascading
-	// garbage collection. The controller binds them to the cluster UID in an
-	// annotation and deletes the exact status-recorded UID only when the
-	// creation-time policy is Delete.
-	metadata.OwnerReferences = nil
+	if cluster.Spec.Storage.DeletionPolicy == "" || cluster.Spec.Storage.DeletionPolicy == pgshardv1alpha1.DeletionRetain {
+		metadata.OwnerReferences = nil
+	}
 	metadata.Annotations[PostgreSQLDataClusterUIDAnnotation] = string(cluster.UID)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
 	metadata.Labels[RoleLabel] = "primary"
@@ -533,17 +544,7 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 		Image:           image,
 		ImagePullPolicy: imagePullPolicy(image),
 		Args:            []string{"-c", "config_file=/etc/pgshard/postgresql/primary-0000.conf"},
-		Env: []corev1.EnvVar{
-			{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"},
-			{Name: "POSTGRES_DB", Value: "postgres"},
-			{Name: "POSTGRES_USER", Value: "postgres"},
-			{Name: "POSTGRES_HOST_AUTH_METHOD", Value: "scram-sha-256"},
-			{Name: "POSTGRES_INITDB_ARGS", Value: "--auth-local=trust --auth-host=scram-sha-256 --data-checksums --encoding=UTF8 --locale=C"},
-			{Name: "POSTGRES_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
-				Key:                  PostgreSQLPasswordKey,
-			}}},
-		},
+		Env:             []corev1.EnvVar{{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"}},
 		Ports:           []corev1.ContainerPort{{Name: "postgresql", ContainerPort: PostgreSQLPort, Protocol: corev1.ProtocolTCP}},
 		Resources:       cluster.Spec.PostgreSQL.Resources,
 		SecurityContext: postgresSecurity,
@@ -565,6 +566,10 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 		Image:           image,
 		ImagePullPolicy: imagePullPolicy(image),
 		Command:         []string{"bash", "-ceu", postgresqlBootstrapScript},
+		Env: []corev1.EnvVar{
+			{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
+			{Name: "PGSHARD_SHARD_ID", Value: shardLabel(shard)},
+		},
 		Resources:       cluster.Spec.PostgreSQL.Resources,
 		SecurityContext: postgresSecurity.DeepCopy(),
 		VolumeMounts: []corev1.VolumeMount{
