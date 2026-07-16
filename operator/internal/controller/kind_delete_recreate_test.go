@@ -46,6 +46,21 @@ func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
 	if cluster.UID == "" {
 		t.Fatal("API server did not assign a PgShardCluster UID")
 	}
+	fence := owned.PostgreSQLAuthSecret(cluster, 0, "late-postgresql-fence", []byte("test-only-password"))
+	if err := kubeClient.Create(ctx, fence); err != nil {
+		t.Fatal(err)
+	}
+	if fence.UID == "" {
+		t.Fatal("API server did not assign a credential-fence UID")
+	}
+	fence.OwnerReferences = nil
+	if err := kubeClient.Update(ctx, fence); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{
+		Shard: 0, SecretName: fence.Name, SecretUID: fence.UID, PVCFenceDetached: true,
+		PVCName: "late-postgresql-data", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
+	}
 	if err := kubeClient.Delete(ctx, cluster); err != nil {
 		t.Fatal(err)
 	}
@@ -57,9 +72,19 @@ func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
 		t.Fatalf("wait for owner deletion: %v", err)
 	}
 
-	late := owned.PostgreSQLPrimaryDataPVC(cluster, 0, "late-postgresql-data", cluster.Spec.Storage.StorageClassName)
-	if !postgresqlDataPVCIsCreationFenced(late, cluster) {
-		t.Fatalf("late PVC lacks the deleted cluster owner: %#v", late.OwnerReferences)
+	if err := kubeClient.Delete(ctx, fence); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, client.ObjectKeyFromObject(fence), &corev1.Secret{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatalf("wait for credential-fence deletion: %v", err)
+	}
+
+	late := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+	if !postgresqlDataPVCIsCreationFenced(late, bootstrap) {
+		t.Fatalf("late PVC lacks the deleted credential fence: %#v", late.OwnerReferences)
 	}
 	if err := kubeClient.Create(ctx, late); err != nil {
 		t.Fatal(err)

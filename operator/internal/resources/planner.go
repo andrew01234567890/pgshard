@@ -20,6 +20,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,12 +56,13 @@ const (
 	defaultEtcdImage       = "registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534"
 	defaultPostgreSQLImage = "docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7"
 
-	configHashAnnotation               = "pgshard.io/config-hash"
-	ApplyOwnershipAnnotation           = "pgshard.io/apply-ownership"
-	ApplyOwnershipVersion              = "v1"
-	RetainedFromAnnotation             = "pgshard.io/retained-from"
-	PostgreSQLDataClusterUIDAnnotation = "pgshard.io/data-cluster-uid"
-	postgresqlBootstrapMarker          = ".pgshard-bootstrap-complete"
+	configHashAnnotation                    = "pgshard.io/config-hash"
+	ApplyOwnershipAnnotation                = "pgshard.io/apply-ownership"
+	ApplyOwnershipVersion                   = "v1"
+	RetainedFromAnnotation                  = "pgshard.io/retained-from"
+	PostgreSQLBootstrapClusterUIDAnnotation = "pgshard.io/bootstrap-cluster-uid"
+	PostgreSQLDataClusterUIDAnnotation      = "pgshard.io/data-cluster-uid"
+	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 )
 
 const postgresqlBootstrapScript = `set -Eeuo pipefail
@@ -79,6 +81,8 @@ if [[ -f "$marker" && -f "$final/PG_VERSION" ]]; then
     exit 1
   fi
   rm -rf -- "$staging"
+  sync -f "$final"
+  sync -f "$parent"
   exit 0
 fi
 if [[ -e "$final" ]]; then
@@ -241,8 +245,8 @@ func postgresqlBootstraps(cluster *pgshardv1alpha1.PgShardCluster) (map[int32]pg
 		if bootstrap.Shard < 0 || bootstrap.Shard >= cluster.Spec.Shards {
 			return nil, fmt.Errorf("PostgreSQL bootstrap references invalid shard %d", bootstrap.Shard)
 		}
-		if bootstrap.SecretName == "" || bootstrap.SecretUID == "" || bootstrap.PVCName == "" || bootstrap.PVCUID == "" || bootstrap.PVCStorageClassName == nil {
-			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is incomplete (credential name=%t UID=%t, PVC name=%t UID=%t, storage class=%t)", bootstrap.Shard, bootstrap.SecretName != "", bootstrap.SecretUID != "", bootstrap.PVCName != "", bootstrap.PVCUID != "", bootstrap.PVCStorageClassName != nil)
+		if bootstrap.SecretName == "" || bootstrap.SecretUID == "" || !bootstrap.PVCFenceDetached || bootstrap.PVCName == "" || bootstrap.PVCUID == "" || bootstrap.PVCStorageClassName == nil {
+			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is incomplete (credential name=%t UID=%t, PVC fence detached=%t, PVC name=%t UID=%t, storage class=%t)", bootstrap.Shard, bootstrap.SecretName != "", bootstrap.SecretUID != "", bootstrap.PVCFenceDetached, bootstrap.PVCName != "", bootstrap.PVCUID != "", bootstrap.PVCStorageClassName != nil)
 		}
 		if _, duplicate := bootstraps[bootstrap.Shard]; duplicate {
 			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is duplicated", bootstrap.Shard)
@@ -469,11 +473,14 @@ func PostgreSQLPrimaryDataPVCPrefix(cluster string, shard int32) string {
 	return shardName(cluster, shard) + "-primary-data-"
 }
 
-// PostgreSQLAuthSecret returns one immutable operator-owned shard bootstrap
-// Secret. Credentials are never shared across shards.
+// PostgreSQLAuthSecret returns one immutable shard bootstrap Secret. It starts
+// cluster-owned so a late create cannot outlive a failed bootstrap. The
+// controller checkpoints its API UID and detaches it before using that exact
+// Secret as the durable owner of outcome-unknown PVC creates.
 func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, password []byte) *corev1.Secret {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
+	metadata.Annotations[PostgreSQLBootstrapClusterUIDAnnotation] = string(cluster.UID)
 	delete(metadata.Annotations, ApplyOwnershipAnnotation)
 	return &corev1.Secret{
 		ObjectMeta: metadata,
@@ -484,18 +491,22 @@ func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, 
 }
 
 // PostgreSQLPrimaryDataPVC returns the standalone data volume for a singleton
-// primary. Its explicit or operator-resolved storage class is part of the
-// creation intent recorded before API create, and the claim is API-identified
-// before its StatefulSet is planned. Delete-policy claims carry a controller
-// owner as a creation-time fence so a delayed create cannot outlive the
-// cluster. Retain-policy claims are ownerless because foreground deletion can
-// garbage-collect even a finalizer-protected owner's dependants; their durable
-// intent is instead resolved and marked before cluster finalization.
-func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageClassName *string) *corev1.PersistentVolumeClaim {
+// primary. Size and storage class come from the checkpointed provisioning
+// contract. Every create is controlled by the exact detached credential Secret
+// UID, which remains as a durable creation-intent fence until cluster
+// finalization resolves the PVC outcome and deletes the fence.
+func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageSize resource.Quantity, storageClassName *string, fenceName string, fenceUID types.UID) *corev1.PersistentVolumeClaim {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
-	if cluster.Spec.Storage.DeletionPolicy == "" || cluster.Spec.Storage.DeletionPolicy == pgshardv1alpha1.DeletionRetain {
-		metadata.OwnerReferences = nil
-	}
+	controller := true
+	blockDeletion := true
+	metadata.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion:         corev1.SchemeGroupVersion.String(),
+		Kind:               "Secret",
+		Name:               fenceName,
+		UID:                fenceUID,
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockDeletion,
+	}}
 	metadata.Annotations[PostgreSQLDataClusterUIDAnnotation] = string(cluster.UID)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
 	metadata.Labels[RoleLabel] = "primary"
@@ -510,7 +521,7 @@ func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			StorageClassName: selectedStorageClass,
-			Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: cluster.Spec.Storage.Size.DeepCopy()}},
+			Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: storageSize.DeepCopy()}},
 		},
 	}
 }

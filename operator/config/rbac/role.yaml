@@ -37,7 +37,9 @@ rules:
   - secrets
   verbs:
   - create
+  - delete
   - get
+  - update
 - apiGroups:
   - apps
   resources:

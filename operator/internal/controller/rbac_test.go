@@ -27,7 +27,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		{group: "", resource: "events", verbs: []string{"create", "patch"}},
 		{group: "", resource: "namespaces", verbs: []string{"get"}},
 		{group: "", resource: "persistentvolumeclaims", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
-		{group: "", resource: "secrets", verbs: []string{"create", "get"}},
+		{group: "", resource: "secrets", verbs: []string{"create", "delete", "get", "update"}},
 		{group: "storage.k8s.io", resource: "storageclasses", verbs: []string{"list"}},
 	} {
 		if !roleAllows(role, required.group, required.resource, required.verbs) {
@@ -37,7 +37,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 	if roleAllows(role, "coordination.k8s.io", "leases", []string{"get"}) {
 		t.Fatal("cluster-wide manager role must not grant leader-election Lease access")
 	}
-	for _, forbidden := range []string{"delete", "list", "patch", "update", "watch"} {
+	for _, forbidden := range []string{"list", "patch", "watch"} {
 		if roleAllows(role, "", "secrets", []string{forbidden}) {
 			t.Errorf("cluster-wide manager role grants forbidden Secret verb %q", forbidden)
 		}

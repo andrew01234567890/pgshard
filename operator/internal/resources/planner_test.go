@@ -2,6 +2,9 @@ package resources
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -218,7 +221,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("PostgreSQL readiness probe = %#v", postgres.ReadinessProbe)
 		}
 		bootstrap := pod.InitContainers[0]
-		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) {
+		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "sync -f \"$final\"") || !strings.Contains(bootstrap.Command[2], "sync -f \"$parent\"") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) {
 			t.Fatalf("PostgreSQL atomic bootstrap contract = %#v", bootstrap)
 		}
 		if len(bootstrap.Env) != 2 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) {
@@ -255,20 +258,59 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		t.Fatalf("PostgreSQL auth Secret = %#v", secret)
 	}
 	assertOwned(t, secret, cluster)
-	claim := PostgreSQLPrimaryDataPVC(cluster, 1, "demo-random-data", cluster.Spec.Storage.StorageClassName)
+	secret.UID = "demo-random-auth-uid"
+	claim := PostgreSQLPrimaryDataPVC(cluster, 1, "demo-random-data", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, secret.Name, secret.UID)
 	if claim.Name != "demo-random-data" || claim.Labels[ShardLabel] != "0001" || claim.Spec.Resources.Requests.Storage().Cmp(cluster.Spec.Storage.Size) != 0 || claim.Annotations[ApplyOwnershipAnnotation] != "" {
 		t.Fatalf("PostgreSQL data PVC = %#v", claim)
 	}
 	if claim.Annotations[PostgreSQLDataClusterUIDAnnotation] != string(cluster.UID) {
 		t.Fatalf("PostgreSQL data PVC garbage-collection boundary = %#v", claim.ObjectMeta)
 	}
-	if len(claim.OwnerReferences) != 0 {
-		t.Fatalf("Retain-policy PostgreSQL data PVC is garbage-collection-owned: %#v", claim.OwnerReferences)
+	if len(claim.OwnerReferences) != 1 || claim.OwnerReferences[0].Kind != "Secret" || claim.OwnerReferences[0].Name != secret.Name || claim.OwnerReferences[0].UID != secret.UID {
+		t.Fatalf("PostgreSQL data PVC creation fence = %#v", claim.OwnerReferences)
 	}
-	deleteCluster := cluster.DeepCopy()
-	deleteCluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
-	deleteClaim := PostgreSQLPrimaryDataPVC(deleteCluster, 1, "demo-delete-data", deleteCluster.Spec.Storage.StorageClassName)
-	assertOwned(t, deleteClaim, deleteCluster)
+}
+
+func TestPostgreSQLBootstrapRefusesMismatchedDurableIdentity(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		marker     string
+		clusterUID string
+		shard      string
+	}{
+		{name: "cluster", marker: "cluster_uid=old-cluster\nshard=0000\n", clusterUID: "new-cluster", shard: "0000"},
+		{name: "shard", marker: "cluster_uid=cluster-uid\nshard=0000\n", clusterUID: "cluster-uid", shard: "0001"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			parent := t.TempDir()
+			final := filepath.Join(parent, "docker")
+			if err := os.MkdirAll(final, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(final, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(final, postgresqlBootstrapMarker), []byte(test.marker), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			script := strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", fmt.Sprintf("parent=%q", parent), 1)
+			command := exec.Command("bash", "-c", script)
+			command.Env = append(os.Environ(), "PGSHARD_CLUSTER_UID="+test.clusterUID, "PGSHARD_SHARD_ID="+test.shard)
+			output, err := command.CombinedOutput()
+			if err == nil {
+				t.Fatal("bootstrap accepted a PostgreSQL data directory from a different identity")
+			}
+			if !strings.Contains(string(output), "refusing PostgreSQL data directory owned by another cluster or shard") {
+				t.Fatalf("bootstrap mismatch output = %q", output)
+			}
+			if _, err := os.Stat(filepath.Join(parent, ".pgshard-init")); !os.IsNotExist(err) {
+				t.Fatalf("bootstrap entered initialization after identity mismatch: %v", err)
+			}
+		})
+	}
 }
 
 func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
@@ -561,7 +603,7 @@ func testPostgreSQLBootstraps(cluster *pgshardv1alpha1.PgShardCluster) []pgshard
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		bootstraps = append(bootstraps, pgshardv1alpha1.PostgreSQLBootstrapStatus{
 			Shard: shard, SecretName: fmt.Sprintf("test-secret-%04d", shard), SecretUID: types.UID(fmt.Sprintf("test-secret-uid-%04d", shard)),
-			PVCName: fmt.Sprintf("test-data-%04d", shard), PVCUID: types.UID(fmt.Sprintf("test-pvc-uid-%04d", shard)), PVCStorageClassName: copyString(cluster.Spec.Storage.StorageClassName),
+			PVCFenceDetached: true, PVCName: fmt.Sprintf("test-data-%04d", shard), PVCUID: types.UID(fmt.Sprintf("test-pvc-uid-%04d", shard)), PVCStorageClassName: copyString(cluster.Spec.Storage.StorageClassName),
 		})
 	}
 	return bootstraps

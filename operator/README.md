@@ -26,10 +26,13 @@ API. The controller now reconciles the safe supporting-resource slice:
 Planned supporting resources use server-side apply. Each generated PostgreSQL
 credential and standalone data PVC has a cryptographically random name. The
 name and API-assigned UID are checkpointed separately in status before any
-workload can reference that child. The name is a durable creation intent, so a
-reconcile after an outcome-unknown create reads and validates that exact child
-before checkpointing its API-assigned UID. A missing or replaced UID-checkpointed
-child requires explicit recovery. A one-time upgrade path
+workload can reference that child. After the credential UID is checkpointed,
+the Secret is detached from cluster garbage collection and that transition is
+checkpointed before the first PVC create. Every PVC create is owned by that
+exact detached Secret UID. The Secret remains a durable creation intent until
+finalization resolves the PVC outcome; deleting it afterward garbage-collects
+any original timed-out create that arrives late. A missing or replaced
+UID-checkpointed child requires explicit recovery. A one-time upgrade path
 first aligns objects created by the earlier whole-object Update controller, preserving
 Service allocations and API defaults, then establishes the operator's Apply
 field set and removes the legacy Update co-owners. The completion annotation is
@@ -86,7 +89,10 @@ credential or empty data volume. PostgreSQL initializes in a disposable staging
 directory and atomically renames only a complete cluster into the final data
 path. Its durable marker records the exact PgShardCluster UID and shard, so an
 interrupted `initdb` cannot publish a partial `PG_VERSION` and a reused volume
-cannot silently start for another cluster or shard.
+cannot silently start for another cluster or shard. The validated restart path
+also synchronizes the data filesystem and its parent before PostgreSQL starts,
+so interruption after the atomic rename cannot skip the publication durability
+barrier on the next init pass.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
@@ -98,16 +104,21 @@ reports that gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` w
 a bounded backend quota. Its default image is digest-pinned and the Pod command
 selects that image contract's `/usr/local/bin/etcd` executable explicitly;
 custom `--etcd-image` values must provide the same path. Scale transitions
-retain those claims during scaling. On cluster deletion,
-`storage.deletionPolicy: Retain` (the default) creates ownerless PostgreSQL data
-PVCs, resolves any late or outcome-unknown create, checkpoints its API-assigned
-UID, and marks that same exact UID as retained before other owned resources are
-removed. `Delete` claims instead carry a PgShardCluster owner as a late-create
-garbage-collection fence, prune the workloads first, and then delete only the
-status-recorded UIDs, allowing pvc-protection to complete without deadlocking
-the finalizer. The CR finalizer
+retain those claims during scaling. On cluster deletion, both storage policies
+keep each PostgreSQL PVC controlled by its detached, API-identified credential
+Secret while the cluster is live. For `storage.deletionPolicy: Retain` (the
+default), the finalizer resolves every late or outcome-unknown create,
+checkpoints its API-assigned UID, atomically detaches and marks that exact PVC,
+and only then deletes the Secret tombstone. If the retained PVC is later
+explicitly deleted, an original request that arrives afterward still carries
+the deleted Secret UID and is garbage-collected. `Delete` prunes workloads
+first, deletes only the status-recorded PVC UIDs, and then deletes the same
+creation fences, allowing pvc-protection to complete without deadlocking the
+finalizer. The CR finalizer
 uses the checkpointed creation-time policy and waits for the selected result to
-be observed through the uncached Kubernetes API reader. `Retain` does not
+be observed through the uncached Kubernetes API reader. Finalization rebuilds
+and validates unresolved PVCs only from the checkpointed storage snapshot, not
+from a concurrently mutated live spec. `Retain` does not
 override an explicit PVC deletion and cannot preserve a namespaced PVC when its
 namespace is deleted. Automated
 defragmentation is not implemented. PostgreSQL

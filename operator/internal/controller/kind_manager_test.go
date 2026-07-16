@@ -160,8 +160,12 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		if err := kubeClient.Get(ctx, key, claim); err != nil {
 			t.Fatal(err)
 		}
-		if len(claim.OwnerReferences) != 0 || claim.UID != bootstrap.PVCUID {
-			t.Fatalf("PostgreSQL data PVC is not independently retained: metadata=%#v recordedUID=%s", claim.ObjectMeta, bootstrap.PVCUID)
+		secret := &corev1.Secret{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: bootstrap.SecretName}, secret); err != nil {
+			t.Fatal(err)
+		}
+		if len(secret.OwnerReferences) != 0 || secret.UID != bootstrap.SecretUID || !bootstrap.PVCFenceDetached || !postgresqlDataPVCIsCreationFenced(claim, bootstrap) || claim.UID != bootstrap.PVCUID {
+			t.Fatalf("PostgreSQL durable PVC creation fence: secret=%#v claim=%#v bootstrap=%#v", secret.ObjectMeta, claim.ObjectMeta, bootstrap)
 		}
 	}
 	if err := kubeClient.Delete(ctx, current, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
@@ -182,6 +186,12 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		}
 		if claim.UID != bootstrap.PVCUID || claim.Annotations[owned.RetainedFromAnnotation] != namespace.Name+"/"+cluster.Name {
 			t.Fatalf("retained PostgreSQL data PVC identity = %#v, want UID %s", claim.ObjectMeta, bootstrap.PVCUID)
+		}
+		if len(claim.OwnerReferences) != 0 {
+			t.Fatalf("retained PostgreSQL data PVC still has its creation fence: %#v", claim.OwnerReferences)
+		}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: bootstrap.SecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("credential creation fence survived Retain finalization: %v", err)
 		}
 	}
 }
@@ -229,7 +239,7 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 	if claim.Status.Phase != corev1.ClaimBound || claim.UID != bootstrap.PVCUID {
 		t.Fatalf("PostgreSQL data claim was not bound to its checkpointed UID: phase=%s metadata=%#v checkpoint=%s", claim.Status.Phase, claim.ObjectMeta, bootstrap.PVCUID)
 	}
-	if !postgresqlDataPVCIsCreationFenced(claim, current) {
+	if !postgresqlDataPVCIsCreationFenced(claim, bootstrap) {
 		t.Fatalf("Delete-policy PostgreSQL data claim lost its late-create GC fence: %#v", claim.OwnerReferences)
 	}
 	if bootstrap.PVCStorageClassName == nil || claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != *bootstrap.PVCStorageClassName {
@@ -264,9 +274,10 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 		t.Fatalf("Delete policy finalizer deadlocked on a bound PostgreSQL PVC: %v", err)
 	}
 	for description, object := range map[string]client.Object{
-		"PostgreSQL Pod":   &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podKey.Name, Namespace: podKey.Namespace}},
-		"PostgreSQL PVC":   &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: claimKey.Name, Namespace: claimKey.Namespace}},
-		"PostgreSQL state": &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
+		"PostgreSQL Pod":       &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podKey.Name, Namespace: podKey.Namespace}},
+		"PostgreSQL PVC":       &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: claimKey.Name, Namespace: claimKey.Namespace}},
+		"PostgreSQL state":     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
+		"credential PVC fence": &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: bootstrap.SecretName, Namespace: namespace.Name}},
 	} {
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(object), object); !apierrors.IsNotFound(err) {
 			t.Fatalf("%s survived completed Delete-policy finalization: %v", description, err)

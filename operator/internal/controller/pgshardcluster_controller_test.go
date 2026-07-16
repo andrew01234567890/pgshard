@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -140,8 +141,11 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 		if claim.UID != bootstrap.PVCUID {
 			t.Fatalf("generated data PVC UID = %s, want %s", claim.UID, bootstrap.PVCUID)
 		}
-		if len(claim.OwnerReferences) != 0 {
-			t.Fatalf("Retain-policy data PVC remained garbage-collection-owned after UID checkpoint: %#v", claim.OwnerReferences)
+		if len(secret.OwnerReferences) != 0 || !bootstrap.PVCFenceDetached {
+			t.Fatalf("credential Secret was not detached as a durable PVC fence: secret=%#v bootstrap=%#v", secret.OwnerReferences, bootstrap)
+		}
+		if !postgresqlDataPVCIsCreationFenced(claim, bootstrap) {
+			t.Fatalf("data PVC lost its credential creation fence: %#v", claim.OwnerReferences)
 		}
 		if len(secret.Data[owned.PostgreSQLPasswordKey]) != hex.EncodedLen(postgresqlPasswordBytes) {
 			t.Fatalf("generated password length for shard %d = %d", shard, len(secret.Data[owned.PostgreSQLPasswordKey]))
@@ -238,7 +242,7 @@ func TestReconcileNeverAdoptsUnrecordedBootstrapChildren(t *testing.T) {
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	orphanSecret := owned.PostgreSQLAuthSecret(cluster, 0, owned.PostgreSQLAuthSecretPrefix(cluster.Name, 0)+"orphan", []byte(strings.Repeat("a", hex.EncodedLen(postgresqlPasswordBytes))))
 	orphanSecret.UID = "unrecorded-secret"
-	orphanClaim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, 0)+"orphan", cluster.Spec.Storage.StorageClassName)
+	orphanClaim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, 0)+"orphan", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, orphanSecret.Name, orphanSecret.UID)
 	orphanClaim.UID = "unrecorded-pvc"
 	fakeClient := newFakeClient(t, cluster, orphanSecret, orphanClaim)
 	reconciler := &PgShardClusterReconciler{Client: fakeClient}
@@ -361,8 +365,15 @@ func TestReconcilePersistsStorageClassBeforePVCCreate(t *testing.T) {
 			}
 			persisted := getCluster(t, ctx, base, cluster)
 			bootstrap := bootstrapForShard(t, persisted, 0)
-			if bootstrap.SecretUID == "" || bootstrap.PVCUID != "" || bootstrap.PVCStorageClassName == nil || *bootstrap.PVCStorageClassName != storageClass.Name {
+			if bootstrap.SecretUID == "" || !bootstrap.PVCFenceDetached || bootstrap.PVCUID != "" || bootstrap.PVCStorageClassName == nil || *bootstrap.PVCStorageClassName != storageClass.Name {
 				t.Fatalf("persisted state at PVC dispatch = %#v", bootstrap)
+			}
+			secret := &corev1.Secret{}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}, secret); err != nil {
+				t.Fatal(err)
+			}
+			if secret.UID != bootstrap.SecretUID || len(secret.OwnerReferences) != 0 || !postgresqlDataPVCIsCreationFenced(claim, bootstrap) {
+				t.Fatalf("PVC dispatch was not ordered after durable fence detachment: secret=%#v claim=%#v", secret.ObjectMeta, claim.ObjectMeta)
 			}
 			if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != storageClass.Name {
 				t.Fatalf("PVC class at dispatch = %#v", claim.Spec.StorageClassName)
@@ -444,7 +455,7 @@ func TestReconcileRefusesMissingOrReplacedPostgreSQLDataPVC(t *testing.T) {
 				t.Fatal(err)
 			}
 			if replace {
-				replacement := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, bootstrap.PVCStorageClassName)
+				replacement := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
 				replacement.UID = "replacement-pvc-uid"
 				if err := fakeClient.Create(ctx, replacement); err != nil {
 					t.Fatal(err)
@@ -669,7 +680,7 @@ func TestExplicitDeletePolicyDeletesPostgreSQLData(t *testing.T) {
 	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, claim); err != nil {
 		t.Fatal(err)
 	}
-	if !postgresqlDataPVCIsCreationFenced(claim, cluster) {
+	if !postgresqlDataPVCIsCreationFenced(claim, bootstrap) {
 		t.Fatalf("Delete-policy data PVC lost its creation fence: %#v", claim.OwnerReferences)
 	}
 	if err := fakeClient.Delete(ctx, current); err != nil {
@@ -688,6 +699,80 @@ func TestExplicitDeletePolicyDeletesPostgreSQLData(t *testing.T) {
 	}
 	if err := fakeClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("explicit Delete policy retained PostgreSQL data: %v", err)
+	}
+}
+
+func TestDeletionPoliciesResolveUnknownCredentialCreateBeforeFinalization(t *testing.T) {
+	t.Parallel()
+	for _, policy := range []pgshardv1alpha1.StorageDeletionPolicy{pgshardv1alpha1.DeletionRetain, pgshardv1alpha1.DeletionDelete} {
+		for _, committed := range []bool{false, true} {
+			policy, committed := policy, committed
+			name := fmt.Sprintf("%s/committed=%t", policy, committed)
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				ctx := context.Background()
+				cluster := validCluster()
+				cluster.Spec.Shards = 1
+				cluster.Spec.MembersPerShard = 1
+				cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+				cluster.Spec.Storage.DeletionPolicy = policy
+				base := newFakeClient(t, cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}})
+				var delayed *corev1.Secret
+				pvcCreates := 0
+				writeClient := interceptedClient(t, base, interceptor.Funcs{
+					Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+						switch child := object.(type) {
+						case *corev1.Secret:
+							delayed = child.DeepCopy()
+							if committed {
+								if err := kubeClient.Create(ctx, object, options...); err != nil {
+									return err
+								}
+							}
+							return apierrors.NewTimeoutError("injected unknown credential create", 1)
+						case *corev1.PersistentVolumeClaim:
+							pvcCreates++
+						}
+						return kubeClient.Create(ctx, object, options...)
+					},
+				})
+				reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+				if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "unknown credential create") {
+					t.Fatalf("credential create outcome was not left unknown: %v", err)
+				}
+				current := getCluster(t, ctx, base, cluster)
+				bootstrap := bootstrapForShard(t, current, 0)
+				if bootstrap.SecretUID != "" || bootstrap.PVCFenceDetached || pvcCreates != 0 {
+					t.Fatalf("data creation advanced past unknown credential: bootstrap=%#v pvcCreates=%d", bootstrap, pvcCreates)
+				}
+				if err := base.Delete(ctx, current); err != nil {
+					t.Fatal(err)
+				}
+				for range 8 {
+					if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+						t.Fatal(err)
+					}
+					if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+						break
+					}
+				}
+				if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("cluster did not finalize unknown credential create: %v", err)
+				}
+				secretKey := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}
+				if err := base.Get(ctx, secretKey, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("credential survived finalization: %v", err)
+				}
+				if !committed {
+					if delayed == nil || !postgresqlCredentialIsClusterFenced(delayed, cluster) {
+						t.Fatalf("late credential create lacks the deleted cluster fence: %#v", delayed)
+					}
+					if err := base.Create(ctx, delayed); err != nil {
+						t.Fatalf("materialize late credential create: %v", err)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -761,15 +846,22 @@ func TestDeletionPoliciesResolveDelayedPVCOutcomeBeforeFinalization(t *testing.T
 				if len(retained.OwnerReferences) != 0 || retained.Annotations[owned.RetainedFromAnnotation] != cluster.Namespace+"/"+cluster.Name {
 					t.Fatalf("resolved retained PVC = %#v", retained.ObjectMeta)
 				}
-				return
-			}
-			if err := base.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+				// Delete the retained object before the original timed-out create is
+				// allowed to reach storage. The durable Secret tombstone must already
+				// be gone so the late object's owner UID is dangling and GC-bound.
+				if err := base.Delete(ctx, retained); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := base.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
 				t.Fatalf("resolved Delete-policy PVC survived finalization: %v", err)
+			}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("credential creation fence survived finalization: %v", err)
 			}
 
 			// Model the original timed-out request reaching storage only after
 			// finalization. The fake client has no garbage collector, so assert the
-			// late object still carries the deleted cluster's exact GC fence.
+			// late object still carries the deleted Secret's exact GC fence.
 			if delayed == nil {
 				t.Fatal("delayed PVC create was not captured")
 			}
@@ -780,8 +872,168 @@ func TestDeletionPoliciesResolveDelayedPVCOutcomeBeforeFinalization(t *testing.T
 			if err := base.Get(ctx, key, late); err != nil {
 				t.Fatal(err)
 			}
-			if !postgresqlDataPVCIsCreationFenced(late, cluster) {
-				t.Fatalf("late PVC create escaped the deleted-cluster GC fence: %#v", late.OwnerReferences)
+			if !postgresqlDataPVCIsCreationFenced(late, bootstrap) {
+				t.Fatalf("late PVC create escaped the deleted-Secret GC fence: %#v", late.OwnerReferences)
+			}
+		})
+	}
+}
+
+func TestDeletionPoliciesResolveCommittedPVCCreateWithLostResponse(t *testing.T) {
+	t.Parallel()
+	for _, policy := range []pgshardv1alpha1.StorageDeletionPolicy{pgshardv1alpha1.DeletionRetain, pgshardv1alpha1.DeletionDelete} {
+		policy := policy
+		t.Run(string(policy), func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			cluster.Spec.Storage.DeletionPolicy = policy
+			namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}}
+			base := newFakeClient(t, cluster, namespace)
+			createAttempts := 0
+			writeClient := interceptedClient(t, base, interceptor.Funcs{
+				Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+					if _, isClaim := object.(*corev1.PersistentVolumeClaim); !isClaim {
+						return kubeClient.Create(ctx, object, options...)
+					}
+					createAttempts++
+					if createAttempts == 1 {
+						if err := kubeClient.Create(ctx, object, options...); err != nil {
+							return err
+						}
+						return apierrors.NewTimeoutError("injected lost PVC create response", 1)
+					}
+					return kubeClient.Create(ctx, object, options...)
+				},
+			})
+			hideCommittedClaim := false
+			hiddenReads := 0
+			reader := interceptedClient(t, base, interceptor.Funcs{
+				Get: func(ctx context.Context, kubeClient client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+					if hideCommittedClaim && hiddenReads < 2 {
+						if _, isClaim := object.(*corev1.PersistentVolumeClaim); isClaim {
+							hiddenReads++
+							return apierrors.NewNotFound(schema.GroupResource{Resource: "persistentvolumeclaims"}, key.Name)
+						}
+					}
+					return kubeClient.Get(ctx, key, object, options...)
+				},
+			})
+			reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: reader}
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "lost PVC create response") {
+				t.Fatalf("committed create did not lose its response: %v", err)
+			}
+
+			current := getCluster(t, ctx, base, cluster)
+			bootstrap := bootstrapForShard(t, current, 0)
+			if bootstrap.PVCUID != "" {
+				t.Fatalf("lost response was checkpointed as complete: %#v", bootstrap)
+			}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, &corev1.PersistentVolumeClaim{}); err != nil {
+				t.Fatalf("committed PVC is not visible: %v", err)
+			}
+			if err := base.Delete(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			hideCommittedClaim = true
+			for range 12 {
+				if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+					t.Fatal(err)
+				}
+				if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+					break
+				}
+			}
+			if hiddenReads != 2 || createAttempts != 2 {
+				t.Fatalf("committed create resolution: hidden reads=%d attempts=%d, want two stale reads and AlreadyExists retry", hiddenReads, createAttempts)
+			}
+			if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("cluster did not finalize after committed-create resolution: %v", err)
+			}
+		})
+	}
+}
+
+func TestDeletionRecreatesOutcomeUnknownPVCFromProvisionedSnapshot(t *testing.T) {
+	t.Parallel()
+	for _, policy := range []pgshardv1alpha1.StorageDeletionPolicy{pgshardv1alpha1.DeletionRetain, pgshardv1alpha1.DeletionDelete} {
+		policy := policy
+		t.Run(string(policy), func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			cluster.Spec.Storage.DeletionPolicy = policy
+			provisionedSize := cluster.Spec.Storage.Size.DeepCopy()
+			provisionedClass := *cluster.Spec.Storage.StorageClassName
+			base := newFakeClient(t, cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}})
+			createAttempts := 0
+			writeClient := interceptedClient(t, base, interceptor.Funcs{
+				Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+					if _, isClaim := object.(*corev1.PersistentVolumeClaim); !isClaim {
+						return kubeClient.Create(ctx, object, options...)
+					}
+					createAttempts++
+					if createAttempts == 1 {
+						return apierrors.NewTimeoutError("injected unknown PVC outcome", 1)
+					}
+					return kubeClient.Create(ctx, object, options...)
+				},
+			})
+			reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "unknown PVC outcome") {
+				t.Fatalf("initial PVC outcome was not left unknown: %v", err)
+			}
+
+			current := getCluster(t, ctx, base, cluster)
+			bootstrap := bootstrapForShard(t, current, 0)
+			mutatedClass := "bypassed-class"
+			current.Spec.Storage.Size = resource.MustParse("20Gi")
+			current.Spec.Storage.StorageClassName = &mutatedClass
+			if policy == pgshardv1alpha1.DeletionRetain {
+				current.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
+			} else {
+				current.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionRetain
+			}
+			if err := base.Update(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			if err := base.Delete(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			for range 12 {
+				if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+					t.Fatal(err)
+				}
+				if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+					break
+				}
+			}
+			if createAttempts != 2 {
+				t.Fatalf("PVC create attempts = %d, want unknown create and snapshot retry", createAttempts)
+			}
+			key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+			if policy == pgshardv1alpha1.DeletionDelete {
+				if err := base.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("checkpointed Delete policy was replaced by live Retain mutation: %v", err)
+				}
+				return
+			}
+			claim := &corev1.PersistentVolumeClaim{}
+			if err := base.Get(ctx, key, claim); err != nil {
+				t.Fatalf("checkpointed Retain policy lost recreated data: %v", err)
+			}
+			requested := claim.Spec.Resources.Requests[corev1.ResourceStorage]
+			if requested.Cmp(provisionedSize) != 0 || claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != provisionedClass {
+				t.Fatalf("finalization PVC used mutable live storage: size=%s class=%v, want %s/%s", requested.String(), claim.Spec.StorageClassName, provisionedSize.String(), provisionedClass)
+			}
+			if len(claim.OwnerReferences) != 0 || claim.Annotations[owned.RetainedFromAnnotation] != cluster.Namespace+"/"+cluster.Name {
+				t.Fatalf("snapshot-recreated PVC was not retained: %#v", claim.ObjectMeta)
 			}
 		})
 	}
@@ -796,6 +1048,7 @@ func TestFinalizationDoesNotCreateDataBeforeCredentialCheckpoint(t *testing.T) {
 			t.Parallel()
 			cluster := validCluster()
 			cluster.Spec.Storage.DeletionPolicy = policy
+			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
 			cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{{
 				Shard: 0, SecretName: "intent-secret", PVCName: "intent-data", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
 			}}

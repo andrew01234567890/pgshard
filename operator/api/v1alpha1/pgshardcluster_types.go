@@ -214,15 +214,20 @@ type PostgreSQLBootstrapSpecStatus struct {
 
 // PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified
 // bootstrap resources. Names are durable creation intents; UIDs are filled only
-// after the API server confirms each child. A workload cannot consume an
-// incomplete record.
+// after the API server confirms each child. PVCFenceDetached is checkpointed
+// only after the credential Secret has been detached from cluster garbage
+// collection, making that exact Secret UID a durable owner for any outcome-
+// unknown PVC create. A workload cannot consume an incomplete record.
 type PostgreSQLBootstrapStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	Shard      int32     `json:"shard"`
 	SecretName string    `json:"secretName"`
 	SecretUID  types.UID `json:"secretUID"`
-	PVCName    string    `json:"pvcName,omitempty"`
-	PVCUID     types.UID `json:"pvcUID,omitempty"`
+	// PVCFenceDetached proves the exact credential Secret is independent of the
+	// cluster and may be used as the PVC's creation-intent owner.
+	PVCFenceDetached bool      `json:"pvcFenceDetached,omitempty"`
+	PVCName          string    `json:"pvcName,omitempty"`
+	PVCUID           types.UID `json:"pvcUID,omitempty"`
 	// PVCStorageClassName records the explicit or operator-resolved class before
 	// the PVC create is dispatched, including an explicitly empty class.
 	PVCStorageClassName *string `json:"pvcStorageClassName,omitempty"`

@@ -498,7 +498,7 @@ redaction. Complete transaction ordering, relation caching, feedback scheduling
 and durable-checkpoint restart integration, replay, and cross-shard stream tests
 are still absent. Targeted KIND tests verify operator PVC deletion and
 same-name recreation, garbage collection of a late PVC create carrying a
-deleted cluster's owner fence, CRD-only rejection of unsupported topology and
+deleted credential-Secret owner fence, CRD-only rejection of unsupported topology and
 storage transitions, and server-side-apply field pruning after PostgreSQL
 parameter, Service annotation, and OTEL configuration shrinkage. A delayed rollout keeps
 the old immutable PostgreSQL ConfigMap available until the workload reports the
@@ -543,11 +543,20 @@ Service from an authorized restricted probe client using the destination-specifi
 Secret, proves an omitted storage class was resolved and checkpointed on the
 resulting Bound PVC, then restarts one primary StatefulSet and verifies its
 PVC-backed row survives. A unit Create interceptor separately proves the
-credential UID and resolved storage class are durably checkpointed before PVC
-dispatch; the live test confirms the resulting Bound PVC exactly matches that
-checkpoint. It also reads the durable cluster-UID and shard identity marker
+credential UID, detached credential-Secret creation fence, and resolved storage
+class are durably checkpointed before PVC dispatch; the live test confirms the
+resulting Bound PVC exactly matches that checkpoint and is controlled by the
+exact detached Secret UID. Outcome-unknown tests cover both an uncommitted
+timeout and a committed create whose response is lost, including the
+`AlreadyExists` recovery path. They also mutate the live size, class, and policy
+after provisioning and prove finalization uses only the stored snapshot. It also
+reads the durable cluster-UID and shard identity marker
 from the running data directory. Foreground deletion of the cluster then proves
-the default-retained, ownerless PVCs keep their exact recorded UIDs. It does not
+the default-retained PVCs are detached, keep their exact recorded UIDs, and have
+their credential tombstones removed. A behavioral init test supplies a marker
+from another cluster or shard and proves bootstrap refuses it before entering
+initialization; the validated fast path repeats the filesystem durability
+barrier before exit. It does not
 claim uninterrupted traffic during that restart. A unit
 regression gives the informer cache a false absence while the authoritative API
 reader still sees an owned PVC, and proves that finalization continues waiting.
