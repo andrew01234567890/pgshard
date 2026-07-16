@@ -1331,6 +1331,7 @@ mod tests {
         ClusterId, DatabaseCatalog, DatabaseEpochs, RegisteredTable, RoutingHashConfig, ShardRoute,
     };
     use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
+    use proptest::prelude::*;
     use uuid::Uuid;
 
     use super::*;
@@ -1439,6 +1440,10 @@ mod tests {
         parse_one(sql)
             .expect("test SQL parses")
             .parameter_route_template(&snapshot, database_id)
+    }
+
+    fn property_result<T, E>(result: Result<T, E>) -> Result<T, TestCaseError> {
+        result.map_err(|_| TestCaseError::fail("valid generated planner input was rejected"))
     }
 
     fn resolve_route(
@@ -1697,6 +1702,64 @@ mod tests {
             if let Ok(statement) = parse_one(&sql) {
                 let _ = statement.parameter_route_template(&snapshot, database_id);
             }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2_048))]
+
+        #[test]
+        fn arbitrary_bounded_candidate_sql_is_total(
+            characters in prop::collection::vec(any::<char>(), 0..512),
+        ) {
+            let sql = characters.into_iter().collect::<String>();
+            if let Ok(statement) = parse_one(&sql) {
+                let (snapshot, database_id) = route_snapshot();
+                let _ = statement.parameter_route_template(&snapshot, database_id);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn canonical_parameter_route_is_orientation_and_parenthesis_invariant(
+            parameter_number in 1_u16..=u16::MAX,
+            reversed in any::<bool>(),
+            left_parentheses in 0_usize..8,
+            right_parentheses in 0_usize..8,
+        ) {
+            let parameter = format!("${parameter_number}");
+            let (left, right) = if reversed {
+                (parameter.as_str(), "tenant_id")
+            } else {
+                ("tenant_id", parameter.as_str())
+            };
+            let left = format!("{}{}{}", "(".repeat(left_parentheses), left, ")".repeat(left_parentheses));
+            let right = format!("{}{}{}", "(".repeat(right_parentheses), right, ")".repeat(right_parentheses));
+            let sql = format!("select * from public.events where {left} = {right}");
+            let template = property_result(analyze_route(&sql))?;
+            prop_assert_eq!(template.parameter_number().get(), parameter_number);
+            prop_assert_eq!(template.table_name().schema(), "public");
+            prop_assert_eq!(template.table_name().table(), "events");
+        }
+
+        #[test]
+        fn every_noncanonical_parameter_number_fails_closed(
+            placeholder in prop_oneof![
+                (0_u16..=u16::MAX).prop_map(|value| format!("$0{value}")),
+                (u32::from(u16::MAX) + 1..=1_000_000_u32).prop_map(|value| format!("${value}")),
+            ],
+            reversed in any::<bool>(),
+        ) {
+            let (left, right) = if reversed {
+                (placeholder.as_str(), "tenant_id")
+            } else {
+                ("tenant_id", placeholder.as_str())
+            };
+            let sql = format!("select * from public.events where {left} = {right}");
+            prop_assert_eq!(analyze_route(&sql), Err(RouteTemplateError::InvalidPlaceholder));
         }
     }
 

@@ -40,3 +40,9 @@ scaffolding. Exposing it and benchmarking the hot path must wait for a
 connection-owning physical-catalog reader that issues an opaque capability
 bound to the observed backend generations. The planned end-to-end comparison
 against PgBouncer remains separate.
+
+The unit suite includes randomized property coverage for canonical `bigint`,
+UUID, `bytea`, and UTF-8 text hashing; key-range selection; text/binary text
+equivalence; malformed fixed-width values; and resolved-Bind parameter
+selection. These tests exercise the private core only and are not evidence of
+an end-to-end SQL routing path.

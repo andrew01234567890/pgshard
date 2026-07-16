@@ -17,6 +17,7 @@ stacker.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 uuid.workspace = true

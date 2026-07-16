@@ -302,6 +302,7 @@ mod tests {
         PhysicalShardKeyProof, ResolvedParameterRoute, parse_one,
     };
     use pgshard_types::{KEYSPACE_END, KeyRange};
+    use proptest::prelude::*;
     use uuid::Uuid;
 
     use super::*;
@@ -363,6 +364,10 @@ mod tests {
 
     fn empty_search_path() -> CatalogOnlySearchPath {
         CatalogOnlySearchPath::require_empty("").expect("empty search path")
+    }
+
+    fn property_result<T, E>(result: Result<T, E>) -> Result<T, TestCaseError> {
+        result.map_err(|_| TestCaseError::fail("valid generated routing input was rejected"))
     }
 
     fn resolved_route(
@@ -671,6 +676,66 @@ mod tests {
     }
 
     #[test]
+    fn resolved_bind_routes_boundary_positions_in_both_format_layouts() {
+        let (snapshot, database_id, table) = snapshot(ShardKeyType::Int64);
+        let key = 42_i64.to_be_bytes();
+        let expected = route_bound_parameter(
+            &snapshot,
+            database_id,
+            &table,
+            utf8(),
+            ParameterFormat::Binary,
+            Some(&key),
+        )
+        .expect("direct route");
+
+        for (parameter_count, selected_index) in [(1, 0), (3, 0), (3, 1), (3, 2)] {
+            let mut parameter_type_oids = vec![25; parameter_count];
+            parameter_type_oids[selected_index] = 20;
+            let resolved = resolved_route(
+                &snapshot,
+                database_id,
+                &table,
+                &format!(
+                    "select * from public.events where tenant_id = ${}",
+                    selected_index + 1
+                ),
+                &parameter_type_oids,
+            );
+            let mut owned_values = vec![b"not-the-key".to_vec(); parameter_count];
+            owned_values[selected_index] = key.to_vec();
+            let values = owned_values
+                .iter()
+                .map(|bytes| Some(bytes.as_slice()))
+                .collect::<Vec<_>>();
+
+            for formats in [
+                vec![FormatCode::Binary],
+                (0..parameter_count)
+                    .map(|index| {
+                        if index == selected_index {
+                            FormatCode::Binary
+                        } else {
+                            FormatCode::Text
+                        }
+                    })
+                    .collect(),
+            ] {
+                let bytes = bind_frame(&formats, &values);
+                let actual = route_resolved_bind(
+                    &snapshot,
+                    &resolved,
+                    empty_search_path(),
+                    utf8(),
+                    bind_parameters(&bytes),
+                )
+                .expect("resolved Bind route");
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
     fn resolved_bind_requires_the_exact_snapshot_and_parameter_count() {
         let (snapshot, database_id, table) = snapshot(ShardKeyType::Int64);
         let resolved = resolved_route(
@@ -779,5 +844,179 @@ mod tests {
         let secret = std::str::from_utf8(secret).expect("ASCII sentinel");
         assert!(!format!("{error}").contains(secret));
         assert!(!format!("{error:?}").contains(secret));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn every_bigint_binary_route_matches_the_canonical_hash(seed in any::<u64>(), value in any::<i64>()) {
+            let (snapshot, database_id, table) = snapshot_with_seed(ShardKeyType::Int64, seed);
+            let bytes = value.to_be_bytes();
+            let plan = property_result(route_bound_parameter(
+                &snapshot,
+                database_id,
+                &table,
+                utf8(),
+                ParameterFormat::Binary,
+                Some(&bytes),
+            ))?;
+            let expected = RoutingHashV1::new(seed).hash(ShardKey::Integer(value));
+            prop_assert_eq!(plan.hash(), expected);
+            prop_assert_eq!(
+                plan.shard_id(),
+                if expected < (1_u64 << 63) { ShardId(0) } else { ShardId(1) }
+            );
+            prop_assert_eq!(plan.catalog_epoch(), CatalogEpoch(1));
+        }
+
+        #[test]
+        fn variable_binary_routes_match_uuid_and_bytea_hashes(
+            seed in any::<u64>(),
+            uuid in any::<[u8; 16]>(),
+            bytes in prop::collection::vec(any::<u8>(), 0..512),
+        ) {
+            let (uuid_snapshot, database_id, table) = snapshot_with_seed(ShardKeyType::Uuid, seed);
+            let uuid_plan = property_result(route_bound_parameter(
+                &uuid_snapshot,
+                database_id,
+                &table,
+                utf8(),
+                ParameterFormat::Binary,
+                Some(&uuid),
+            ))?;
+            prop_assert_eq!(uuid_plan.hash(), RoutingHashV1::new(seed).hash(ShardKey::Uuid(&uuid)));
+
+            let (bytes_snapshot, database_id, table) = snapshot_with_seed(ShardKeyType::Bytes, seed);
+            let bytes_plan = property_result(route_bound_parameter(
+                &bytes_snapshot,
+                database_id,
+                &table,
+                utf8(),
+                ParameterFormat::Binary,
+                Some(&bytes),
+            ))?;
+            prop_assert_eq!(bytes_plan.hash(), RoutingHashV1::new(seed).hash(ShardKey::Bytes(&bytes)));
+        }
+
+        #[test]
+        fn utf8_text_formats_are_route_equivalent(
+            seed in any::<u64>(),
+            characters in prop::collection::vec(any::<char>(), 0..128),
+        ) {
+            prop_assume!(!characters.contains(&'\0'));
+            let value = characters.into_iter().collect::<String>();
+            let (snapshot, database_id, table) = snapshot_with_seed(ShardKeyType::Text, seed);
+            let text = property_result(route_bound_parameter(
+                &snapshot,
+                database_id,
+                &table,
+                utf8(),
+                ParameterFormat::Text,
+                Some(value.as_bytes()),
+            ))?;
+            let binary = property_result(route_bound_parameter(
+                &snapshot,
+                database_id,
+                &table,
+                utf8(),
+                ParameterFormat::Binary,
+                Some(value.as_bytes()),
+            ))?;
+            let expected = RoutingHashV1::new(seed).hash(ShardKey::Text(&value));
+            prop_assert_eq!(text, binary);
+            prop_assert_eq!(text.hash(), expected);
+        }
+
+        #[test]
+        fn malformed_fixed_width_binary_keys_always_fail_closed(
+            int_bytes in prop::collection::vec(any::<u8>(), 0..32),
+            uuid_bytes in prop::collection::vec(any::<u8>(), 0..32),
+        ) {
+            prop_assume!(int_bytes.len() != 8 && uuid_bytes.len() != 16);
+            for (key_type, expected, value) in [
+                (ShardKeyType::Int64, 8, int_bytes.as_slice()),
+                (ShardKeyType::Uuid, 16, uuid_bytes.as_slice()),
+            ] {
+                let (snapshot, database_id, table) = snapshot(key_type);
+                prop_assert_eq!(
+                    route_bound_parameter(
+                        &snapshot,
+                        database_id,
+                        &table,
+                        utf8(),
+                        ParameterFormat::Binary,
+                        Some(value),
+                    ),
+                    Err(RouteError::InvalidLength {
+                        key_type,
+                        expected,
+                        actual: value.len(),
+                    })
+                );
+            }
+        }
+
+        #[test]
+        fn resolved_bind_routes_only_the_proven_parameter(
+            seed in any::<u64>(),
+            value in any::<i64>(),
+            (
+                parameter_count,
+                selected_index,
+                single_format,
+                mut owned_values,
+            ) in (1_usize..=32).prop_flat_map(|parameter_count| (
+                Just(parameter_count),
+                0..parameter_count,
+                any::<bool>(),
+                prop::collection::vec(
+                    prop::collection::vec(any::<u8>(), 0..128),
+                    parameter_count,
+                ),
+            )),
+        ) {
+            let (snapshot, database_id, table) = snapshot_with_seed(ShardKeyType::Int64, seed);
+            let mut parameter_type_oids = vec![25; parameter_count];
+            parameter_type_oids[selected_index] = 20;
+            let resolved = resolved_route(
+                &snapshot,
+                database_id,
+                &table,
+                &format!(
+                    "select * from public.events where tenant_id = ${}",
+                    selected_index + 1
+                ),
+                &parameter_type_oids,
+            );
+            let key = value.to_be_bytes();
+            owned_values[selected_index] = key.to_vec();
+            let values = owned_values
+                .iter()
+                .map(|bytes| Some(bytes.as_slice()))
+                .collect::<Vec<_>>();
+            let formats = if single_format {
+                vec![FormatCode::Binary]
+            } else {
+                (0..parameter_count)
+                    .map(|index| {
+                        if index == selected_index || index % 2 == 0 {
+                            FormatCode::Binary
+                        } else {
+                            FormatCode::Text
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let bytes = bind_frame(&formats, &values);
+            let plan = property_result(route_resolved_bind(
+                &snapshot,
+                &resolved,
+                empty_search_path(),
+                utf8(),
+                bind_parameters(&bytes),
+            ))?;
+            prop_assert_eq!(plan.hash(), RoutingHashV1::new(seed).hash(ShardKey::Integer(value)));
+        }
     }
 }

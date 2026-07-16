@@ -549,6 +549,13 @@ work; see
 
 One GitHub Actions workflow fans out into independent jobs and ends in one required aggregate result. Pull requests run focused checks; scheduled invocations expand Kubernetes versions, fault duration, fuzzing, and performance samples.
 
+The currently implemented planner and private router-core suites combine a
+fixed malformed-SQL corpus with randomized properties over bounded Unicode SQL,
+canonical parameter shapes, shard-key encodings, routing hashes, key-range
+selection, malformed widths, and resolved-Bind parameter selection. This is
+component coverage only; it does not make the absent SQL data plane an
+end-to-end routing implementation.
+
 The standard image job builds four Linux/amd64 Docker-compatible image archives
 without a registry output, loads each archive locally, and verifies its
 platform, build labels, numeric non-root identity, and binary entrypoint under
