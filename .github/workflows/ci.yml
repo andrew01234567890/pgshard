@@ -465,6 +465,42 @@ jobs:
           PGSHARD_PGWIRE_TEST_ADDRESS: 127.0.0.1:5432
         run: make pgwire-postgres-test
 
+  pgwire-fuzz:
+    name: Pgwire fuzz / ${{ matrix.target }}
+    needs: changes
+    if: needs.changes.outputs.pgwire == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - decode_startup
+          - decode_frontend
+          - decode_backend
+          - pgoutput_decoder
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install pinned fuzz toolchain
+        env:
+          FUZZ_TOOLCHAIN: nightly-2026-06-24
+        run: |
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Exercise bounded decoder
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_TOOLCHAIN: nightly-2026-06-24
+        working-directory: crates/pgshard-pgwire
+        run: |
+          runs=10000
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            runs=100000
+          fi
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run "$FUZZ_TARGET" -- \
+            -runs="$runs" -max_len=65536 -timeout=10
+
   protobuf:
     name: Protobuf contracts
     needs: changes
@@ -1276,6 +1312,7 @@ jobs:
       - catalog-postgres
       - orch-catalog-postgres
       - pgwire-postgres
+      - pgwire-fuzz
       - planner-postgres
       - protobuf
       - go-operator
@@ -1300,6 +1337,7 @@ jobs:
             catalog-postgres=${{ needs.catalog-postgres.result }}
             orch-catalog-postgres=${{ needs.orch-catalog-postgres.result }}
             pgwire-postgres=${{ needs.pgwire-postgres.result }}
+            pgwire-fuzz=${{ needs.pgwire-fuzz.result }}
             planner-postgres=${{ needs.planner-postgres.result }}
             protobuf=${{ needs.protobuf.result }}
             go-operator=${{ needs.go-operator.result }}

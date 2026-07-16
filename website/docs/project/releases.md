@@ -52,11 +52,12 @@ from the live `main` ref, so a lookalike tag cannot authorize an unmerged
 release. This uses GitHub's documented `workflow_dispatch` exception rather
 than a personal access token or repository secret.
 
-Unattended merging is limited to modified Go module files under `operator/`.
-npm updates still require a normal reviewed squash so their `main` push can pass
-the branch-restricted GitHub Pages deployment gate. Cargo and GitHub Actions
-updates also require manual review because the source-release job executes the
-Rust publisher and pinned actions with a write token after merge. All still
+Unattended merging is limited to two exact dependency-file pairs:
+`operator/go.mod` with `operator/go.sum`, and
+`crates/pgshard-pgwire/fuzz/Cargo.toml` with its colocated `Cargo.lock`. npm,
+root-workspace Cargo, other Cargo, and GitHub Actions updates still require a
+normal reviewed squash because default-branch workflows can deploy the website
+or execute the Rust publisher and pinned actions with a write token. All still
 receive Dependabot pull requests and CI. The allowlist also rejects renamed
 files and any unexpected bot-authored source or workflow change.
 

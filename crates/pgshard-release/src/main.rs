@@ -16,7 +16,12 @@ const RELEASE_MARKER: &str = "crates/pgshard-release/RELEASE_START";
 const RELEASE_HELPER_SOURCE: &str = "crates/pgshard-release/src/main.rs";
 const CI_WAIT_TIMEOUT: Duration = Duration::from_mins(15);
 const CI_POLL_INTERVAL: Duration = Duration::from_secs(10);
-const UNPRIVILEGED_DEPENDABOT_PATHS: [&str; 2] = ["operator/go.mod", "operator/go.sum"];
+const UNPRIVILEGED_DEPENDABOT_PATHS: [&str; 4] = [
+    "operator/go.mod",
+    "operator/go.sum",
+    "crates/pgshard-pgwire/fuzz/Cargo.toml",
+    "crates/pgshard-pgwire/fuzz/Cargo.lock",
+];
 const DEPENDABOT_MERGE_QUERY: &str = "query=mutation($id: ID!, $headline: String!, $oid: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, mergeMethod: SQUASH, commitHeadline: $headline, expectedHeadOid: $oid}) { pullRequest { state mergedAt mergeCommit { oid } } } }";
 
 #[derive(Debug, Parser)]
@@ -770,7 +775,7 @@ fn dependabot_automerge(repository: &str, requested_sha: &str) -> Result<()> {
     }
     if !dependabot_files_are_unprivileged(&files) {
         println!(
-            "Dependabot pull request #{} changes files outside the unattended Go-module allowlist and requires manual review",
+            "Dependabot pull request #{} changes files outside the unattended dependency-file allowlist and requires manual review",
             pull.number
         );
         return Ok(());
@@ -1614,6 +1619,10 @@ mod tests {
             file("operator/go.mod"),
             file("operator/go.sum"),
         ]));
+        assert!(dependabot_files_are_unprivileged(&[
+            file("crates/pgshard-pgwire/fuzz/Cargo.toml"),
+            file("crates/pgshard-pgwire/fuzz/Cargo.lock"),
+        ]));
         assert!(!dependabot_files_are_unprivileged(&[
             file("website/package.json"),
             file("website/package-lock.json"),
@@ -1622,6 +1631,9 @@ mod tests {
             ".github/workflows/ci.yml"
         )]));
         assert!(!dependabot_files_are_unprivileged(&[file("Cargo.lock")]));
+        assert!(!dependabot_files_are_unprivileged(&[file(
+            "crates/pgshard-pgwire/Cargo.toml"
+        )]));
         assert!(!dependabot_files_are_unprivileged(&[]));
 
         let renamed = PullFile {
@@ -1635,13 +1647,14 @@ mod tests {
     #[test]
     fn dependabot_version_updates_are_patch_only() {
         let configuration = include_str!("../../../.github/dependabot.yml");
+        assert!(configuration.contains("directory: /crates/pgshard-pgwire/fuzz"));
         assert_eq!(
             configuration.matches("version-update:semver-minor").count(),
-            4
+            5
         );
         assert_eq!(
             configuration.matches("version-update:semver-major").count(),
-            4
+            5
         );
     }
 

@@ -48,6 +48,7 @@ fn main() {
         };
         digest = digest.wrapping_add(u64::from(relation.relation_id()));
         for column in relation.columns() {
+            let column = column.expect("validated benchmark Relation column");
             digest = digest
                 .wrapping_add(u64::from(column.type_oid()))
                 .wrapping_add(column.name().len() as u64);

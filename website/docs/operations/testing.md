@@ -154,7 +154,8 @@ decoders. Unit and public-API tests round-trip fixed SSL/GSS requests, maximum
 regular startup packets, ordered duplicate and empty parameters, and
 protocol-proof-bound four- and 32-byte cancellation requests; reject invalid or
 oversized input without mutation; and redact parameter values and keys from
-errors. Separate unit tests enforce PostgreSQL 18's tighter SCRAM frame bound,
+errors. Separate unit tests require an encoder-issued phase proof before
+enforcing PostgreSQL 18's tighter SCRAM frame bound,
 decode absent, empty, truncated, negative, and trailing initial responses,
 redact all mechanism and exchange bytes, and round-trip the closed SCRAM
 advertisement plus continue/final encoders. Separate unit tests require minimal
@@ -175,6 +176,18 @@ zero-copy borrowing, debug redaction, and exact fixed-size Standby Status Update
 frames with ordered progress validation. All-or-nothing progress-state tests
 reject write, flush, and apply regression without mutating the last accepted
 sample.
+Four dependency-free decoder surfaces also run under `cargo-fuzz`: startup,
+all frontend phases and typed bodies, backend frames and typed bodies, and
+stateful `pgoutput` message sequences across protocol versions one through four,
+all twelve streaming/two-phase/logical-message behaviors, and both requested
+and persistent-slot two-phase provenance paths. Successful messages are
+traversed through their fallible borrowed iterators, and any decoded-message
+invariant error fails the fuzz run. Each target has a committed minimized valid
+corpus that keeps its deep typed-message and iterator paths reachable from a
+clean checkout. Pgwire-affecting pull requests and main-branch pushes run
+10,000 inputs per target in four parallel jobs; the scheduled workflow raises
+this to 100,000. The tooling is pinned to `cargo-fuzz` 0.13.2,
+`libfuzzer-sys` 0.4.13, and `nightly-2026-06-24`.
 Pure orchestrator tests exercise the standby-decoder attachment contract. They
 require non-nil catalog generations encoded in slot names and matched exactly,
 an opaque test-only replay floor bound to the exact source identity, the
@@ -524,7 +537,7 @@ The archives are discarded with the runner; CI does not upload or publish them.
 | Layer | Focus |
 |---|---|
 | Unit and property | Parser, hash/range coverage, routing, epochs, buffers, tuning, state machines |
-| Fuzz | PostgreSQL frames, SQL, bind messages, `pgoutput`, tuples, catalog snapshots, resume tokens |
+| Fuzz | Implemented for PostgreSQL startup, frontend/backend frames, typed bind bodies, stateful `pgoutput`, tuples and iterators; SQL, catalog snapshots and resume tokens remain planned |
 | Integration | PostgreSQL 18 replication, 2PC crash points, failover slots, pgBackRest, missed notifications |
 | KIND end-to-end | Bootstrap, services, scaling, failover, backup/restore, DDL, resharding, observability |
 | Jepsen and Elle | Histories under process failure, partitions, primary changes, and resharding |

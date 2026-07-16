@@ -47,6 +47,7 @@ fn main() {
         };
         digest = digest.wrapping_add(u64::from(inserted.relation_id()));
         for column in inserted.new_tuple().columns() {
+            let column = column.expect("validated benchmark tuple column");
             let length = match column {
                 PgOutputTupleColumn::Null | PgOutputTupleColumn::UnchangedToast => 0,
                 PgOutputTupleColumn::Text(value) => value.len(),

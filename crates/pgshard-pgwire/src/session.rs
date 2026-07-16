@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::{
     BackendKeyData, LATEST_PROTOCOL_MINOR, MIN_BACKEND_CANCEL_KEY_LENGTH, ProtocolNegotiation,
-    ProtocolVersion, StartupFrame, StartupParameters,
+    ProtocolVersion, StartupFrame, StartupParameters, ValidatedIteratorError,
 };
 
 const POSTGRES18_MODERN_CANCEL_KEY_LENGTH: usize = 32;
@@ -109,12 +109,19 @@ impl<'a> Postgres18StartupNegotiation<'a> {
         let mut expected_options = self
             .parameters
             .iter()
-            .filter_map(|(name, _)| name.starts_with(b"_pq_.").then_some(name));
+            .filter_map(|parameter| match parameter {
+                Ok((name, _)) if name.starts_with(b"_pq_.") => Some(Ok(name)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            });
         let mut actual_options = response.unsupported_options();
         let mut index = 0;
         loop {
             match (expected_options.next(), actual_options.next()) {
-                (Some(expected), Some(actual)) if expected == actual => index += 1,
+                (Some(Ok(expected)), Some(Ok(actual))) if expected == actual => index += 1,
+                (Some(Err(error)), _) | (_, Some(Err(error))) => {
+                    return Err(Postgres18StartupError::ValidatedIterator(error));
+                }
                 (None, None) => break,
                 _ => return Err(Postgres18StartupError::ProtocolOptionsMismatch(index)),
             }
@@ -148,7 +155,11 @@ impl<'a> Postgres18StartupNegotiation<'a> {
     fn protocol_option_count(&self) -> usize {
         self.parameters
             .iter()
-            .filter(|(name, _)| name.starts_with(b"_pq_."))
+            .filter(|parameter| {
+                parameter
+                    .as_ref()
+                    .is_ok_and(|(name, _)| name.starts_with(b"_pq_."))
+            })
             .count()
     }
 }
@@ -237,6 +248,9 @@ pub enum Postgres18StartupError {
     /// Unsupported option names differ at this zero-based request position.
     #[error("PostgreSQL 18 unsupported protocol options differ at index {0}")]
     ProtocolOptionsMismatch(usize),
+    /// A private validated-message iterator invariant was violated.
+    #[error(transparent)]
+    ValidatedIterator(ValidatedIteratorError),
     /// Authentication began before a required negotiation response arrived.
     #[error("PostgreSQL 18 omitted a required protocol negotiation response")]
     MissingNegotiation,

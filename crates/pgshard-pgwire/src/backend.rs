@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::messages::ParameterTypeIter;
 use crate::{
     Decode, DecodeError, MAX_CANCEL_KEY_LENGTH, MAX_LARGE_MESSAGE_LENGTH,
-    MIN_BACKEND_CANCEL_KEY_LENGTH, ProtocolVersion,
+    MIN_BACKEND_CANCEL_KEY_LENGTH, ProtocolVersion, ValidatedIteratorError,
 };
 
 /// `PostgreSQL` libpq's maximum length word for backend tags not classified as
@@ -346,30 +346,60 @@ impl fmt::Debug for SaslMechanismIter<'_> {
     }
 }
 
-impl<'a> Iterator for SaslMechanismIter<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.count == 0 {
-            return None;
-        }
-        let end = self
-            .remaining
-            .iter()
-            .position(|byte| *byte == 0)
-            .expect("SASL mechanism list was validated");
-        let mechanism = &self.remaining[..end];
-        self.remaining = &self.remaining[end + 1..];
-        self.count -= 1;
-        Some(mechanism)
+impl SaslMechanismIter<'_> {
+    /// Returns the number of validated mechanisms not yet consumed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.count
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.count, Some(self.count))
+    /// Whether no validated mechanisms remain.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }
 
-impl ExactSizeIterator for SaslMechanismIter<'_> {}
+impl<'a> Iterator for SaslMechanismIter<'a> {
+    type Item = Result<&'a [u8], ValidatedIteratorError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            if self.remaining.is_empty() {
+                return None;
+            }
+            self.remaining = &[];
+            return Some(Err(ValidatedIteratorError::new("SASL mechanism")));
+        }
+        let Some((mechanism, remaining)) = take_validated_cstring(self.remaining) else {
+            self.remaining = &[];
+            self.count = 0;
+            return Some(Err(ValidatedIteratorError::new("SASL mechanism")));
+        };
+        if mechanism.is_empty() {
+            self.remaining = &[];
+            self.count = 0;
+            return Some(Err(ValidatedIteratorError::new("SASL mechanism")));
+        }
+        self.remaining = remaining;
+        self.count -= 1;
+        Some(Ok(mechanism))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let upper = if self.count == 0 && self.remaining.is_empty() {
+            0
+        } else {
+            self.count.saturating_add(1)
+        };
+        (0, Some(upper))
+    }
+}
+
+fn take_validated_cstring(input: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = input.iter().position(|byte| *byte == 0)?;
+    Some((input.get(..end)?, input.get(end.checked_add(1)?..)?))
+}
 
 /// One validated backend protocol-negotiation response.
 #[derive(Clone)]
@@ -418,30 +448,55 @@ impl fmt::Debug for ProtocolOptionIter<'_> {
     }
 }
 
-impl<'a> Iterator for ProtocolOptionIter<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.count == 0 {
-            return None;
-        }
-        let end = self
-            .remaining
-            .iter()
-            .position(|byte| *byte == 0)
-            .expect("protocol option list was validated");
-        let option = &self.remaining[..end];
-        self.remaining = &self.remaining[end + 1..];
-        self.count -= 1;
-        Some(option)
+impl ProtocolOptionIter<'_> {
+    /// Returns the number of validated option names not yet consumed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.count
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.count, Some(self.count))
+    /// Whether no validated option names remain.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }
 
-impl ExactSizeIterator for ProtocolOptionIter<'_> {}
+impl<'a> Iterator for ProtocolOptionIter<'a> {
+    type Item = Result<&'a [u8], ValidatedIteratorError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            if self.remaining.is_empty() {
+                return None;
+            }
+            self.remaining = &[];
+            return Some(Err(ValidatedIteratorError::new("protocol option")));
+        }
+        let Some((option, remaining)) = take_validated_cstring(self.remaining) else {
+            self.remaining = &[];
+            self.count = 0;
+            return Some(Err(ValidatedIteratorError::new("protocol option")));
+        };
+        if !option.starts_with(b"_pq_.") {
+            self.remaining = &[];
+            self.count = 0;
+            return Some(Err(ValidatedIteratorError::new("protocol option")));
+        }
+        self.remaining = remaining;
+        self.count -= 1;
+        Some(Ok(option))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let upper = if self.count == 0 && self.remaining.is_empty() {
+            0
+        } else {
+            self.count.saturating_add(1)
+        };
+        (0, Some(upper))
+    }
+}
 
 /// Decodes one backend frame from the beginning of `input`.
 ///
@@ -1172,7 +1227,9 @@ mod tests {
         assert_eq!(mechanisms.len(), 3);
         assert_eq!(mechanisms.remaining.as_ptr(), packet[9..].as_ptr());
         assert_eq!(
-            mechanisms.collect::<Vec<_>>(),
+            mechanisms
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated mechanisms"),
             vec![
                 b"SCRAM-SHA-256-PLUS".as_slice(),
                 b"SCRAM-SHA-256".as_slice(),
@@ -1272,7 +1329,9 @@ mod tests {
         assert_eq!(options.len(), 2);
         assert_eq!(options.remaining.as_ptr(), packet[13..].as_ptr());
         assert_eq!(
-            options.collect::<Vec<_>>(),
+            options
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated protocol options"),
             vec![
                 b"_pq_.compression".as_slice(),
                 b"_pq_.pgshard_test".as_slice(),
@@ -1485,7 +1544,10 @@ mod tests {
         assert_eq!(description.parameter_type_count(), 3);
         assert_eq!(description.parameter_types().len(), 3);
         assert_eq!(
-            description.parameter_types().collect::<Vec<_>>(),
+            description
+                .parameter_types()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated parameter types"),
             vec![20, 2950, 17]
         );
         let first_oid_address = description.parameter_type_bytes.as_ptr();
@@ -1513,8 +1575,11 @@ mod tests {
         let description =
             decode_parameter_description(complete(&packet)).expect("maximum parameter count");
         assert_eq!(description.parameter_type_count(), usize::from(count));
-        assert_eq!(description.parameter_types().next(), Some(1));
-        assert_eq!(description.parameter_types().last(), Some(u32::from(count)));
+        assert_eq!(description.parameter_types().next(), Some(Ok(1)));
+        assert_eq!(
+            description.parameter_types().last(),
+            Some(Ok(u32::from(count)))
+        );
     }
 
     #[test]
@@ -1601,5 +1666,68 @@ mod tests {
                 .expect("parameter description")
         );
         assert!(parameter_debug.contains("parameter_type_count"));
+    }
+
+    #[test]
+    fn validated_cstring_iterators_fail_closed_if_internal_state_is_inconsistent() {
+        let mut mechanisms = SaslMechanismIter {
+            remaining: b"unterminated",
+            count: 1,
+        };
+        assert!(matches!(mechanisms.next(), Some(Err(_))));
+        assert_eq!(mechanisms.len(), 0);
+
+        let mut options = ProtocolOptionIter {
+            remaining: b"unterminated",
+            count: 1,
+        };
+        assert!(matches!(options.next(), Some(Err(_))));
+        assert_eq!(options.len(), 0);
+
+        let mut mechanisms = SaslMechanismIter {
+            remaining: b"trailing",
+            count: 0,
+        };
+        assert!(matches!(mechanisms.next(), Some(Err(_))));
+        assert_eq!(mechanisms.next(), None);
+
+        let mut options = ProtocolOptionIter {
+            remaining: b"trailing",
+            count: 0,
+        };
+        assert!(matches!(options.next(), Some(Err(_))));
+        assert_eq!(options.next(), None);
+
+        let mut empty_mechanism = SaslMechanismIter {
+            remaining: b"\0",
+            count: 1,
+        };
+        assert!(matches!(empty_mechanism.next(), Some(Err(_))));
+
+        let mut invalid_option = ProtocolOptionIter {
+            remaining: b"application_name\0",
+            count: 1,
+        };
+        assert!(matches!(invalid_option.next(), Some(Err(_))));
+
+        let mut mechanisms = SaslMechanismIter {
+            remaining: b"SCRAM-SHA-256\0trailing",
+            count: 1,
+        };
+        let upper = mechanisms.size_hint().1.expect("finite upper bound");
+        assert_eq!(mechanisms.next(), Some(Ok(b"SCRAM-SHA-256".as_slice())));
+        assert!(matches!(mechanisms.next(), Some(Err(_))));
+        assert_eq!(mechanisms.next(), None);
+        assert_eq!(upper, 2);
+
+        let mut options = ProtocolOptionIter {
+            remaining: b"_pq_.feature\0trailing",
+            count: 1,
+        };
+        let upper = options.size_hint().1.expect("finite upper bound");
+        assert_eq!(options.next(), Some(Ok(b"_pq_.feature".as_slice())));
+        assert!(matches!(options.next(), Some(Err(_))));
+        assert_eq!(options.next(), None);
+        assert_eq!(upper, 2);
     }
 }

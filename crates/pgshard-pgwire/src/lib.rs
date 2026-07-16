@@ -26,9 +26,9 @@ pub use backend::{
 };
 
 pub use encode::{
-    AUTHENTICATION_OK_FRAME_LENGTH, BackendEncodeError, ErrorResponseSeverity,
-    READY_FOR_QUERY_FRAME_LENGTH, ScramMechanisms, encode_authentication_ok,
-    encode_authentication_sasl, encode_authentication_sasl_continue,
+    AUTHENTICATION_OK_FRAME_LENGTH, BackendEncodeError, EncodedScramAdvertisement,
+    ErrorResponseSeverity, READY_FOR_QUERY_FRAME_LENGTH, ScramAuthenticationPhase, ScramMechanisms,
+    encode_authentication_ok, encode_authentication_sasl, encode_authentication_sasl_continue,
     encode_authentication_sasl_final, encode_backend_key_data, encode_error_response,
     encode_parameter_status, encode_protocol_negotiation, encode_ready_for_query,
 };
@@ -301,7 +301,33 @@ impl<'a> StartupParameters<'a> {
     }
 
     fn has_postgres18_protocol_option(self) -> bool {
-        self.iter().any(|(name, _)| name.starts_with(b"_pq_."))
+        self.iter().any(|parameter| match parameter {
+            Ok((name, _)) => name.starts_with(b"_pq_."),
+            Err(_) => true,
+        })
+    }
+}
+
+/// A validated-message iterator encountered inconsistent private state.
+///
+/// Public decoders validate an iterator's complete byte layout before they
+/// construct it. Receiving this error therefore identifies an internal
+/// invariant failure rather than malformed data that a caller can repair.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("validated {message_family} iterator state is inconsistent")]
+pub struct ValidatedIteratorError {
+    message_family: &'static str,
+}
+
+impl ValidatedIteratorError {
+    pub(crate) const fn new(message_family: &'static str) -> Self {
+        Self { message_family }
+    }
+
+    /// Returns the non-sensitive protocol family whose invariant failed.
+    #[must_use]
+    pub const fn message_family(self) -> &'static str {
+        self.message_family
     }
 }
 
@@ -311,8 +337,10 @@ pub struct StartupParameterIter<'a> {
     remaining: &'a [u8],
 }
 
+type StartupParameterParts<'a> = (&'a [u8], &'a [u8], &'a [u8]);
+
 impl<'a> Iterator for StartupParameterIter<'a> {
-    type Item = (&'a [u8], &'a [u8]);
+    type Item = Result<(&'a [u8], &'a [u8]), ValidatedIteratorError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == b"\0" {
@@ -322,20 +350,49 @@ impl<'a> Iterator for StartupParameterIter<'a> {
         if self.remaining.is_empty() {
             return None;
         }
+        match self.next_validated() {
+            Ok((name, value, remaining)) => {
+                self.remaining = remaining;
+                Some(Ok((name, value)))
+            }
+            Err(error) => {
+                self.remaining = &[];
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl<'a> StartupParameterIter<'a> {
+    fn next_validated(&self) -> Result<StartupParameterParts<'a>, ValidatedIteratorError> {
+        let invalid = || ValidatedIteratorError::new("startup parameter");
         let name_end = self
             .remaining
             .iter()
             .position(|byte| *byte == 0)
-            .expect("startup layout was validated");
-        let name = &self.remaining[..name_end];
-        let after_name = &self.remaining[name_end + 1..];
+            .ok_or_else(invalid)?;
+        let name = self.remaining.get(..name_end).ok_or_else(invalid)?;
+        if name.is_empty() {
+            return Err(invalid());
+        }
+        let after_name = self
+            .remaining
+            .get(name_end..)
+            .and_then(|remaining| remaining.get(1..))
+            .ok_or_else(invalid)?;
         let value_end = after_name
             .iter()
             .position(|byte| *byte == 0)
-            .expect("startup layout was validated");
-        let value = &after_name[..value_end];
-        self.remaining = &after_name[value_end + 1..];
-        Some((name, value))
+            .ok_or_else(invalid)?;
+        let value = after_name.get(..value_end).ok_or_else(invalid)?;
+        let remaining = after_name
+            .get(value_end..)
+            .and_then(|remaining| remaining.get(1..))
+            .ok_or_else(invalid)?;
+        if remaining.is_empty() {
+            return Err(invalid());
+        }
+        Ok((name, value, remaining))
     }
 }
 
@@ -379,7 +436,7 @@ pub enum FrontendPhase {
     Authentication,
     /// SCRAM authentication exchange with `PostgreSQL` 18's tighter 1,024-byte
     /// mechanism bound; only the overloaded `p` response is legal.
-    ScramAuthentication,
+    ScramAuthentication(ScramAuthenticationPhase),
     /// Ordinary post-authentication query protocol, including COPY messages
     /// that `PostgreSQL` accepts and ignores while resynchronizing after a
     /// failed COPY.
@@ -394,7 +451,7 @@ pub enum FrontendPhase {
 impl FrontendPhase {
     const fn allows(self, tag: FrontendTag) -> bool {
         match self {
-            Self::Authentication | Self::ScramAuthentication => {
+            Self::Authentication | Self::ScramAuthentication(_) => {
                 matches!(tag, FrontendTag::AuthenticationResponse)
             }
             Self::Regular => matches!(
@@ -470,6 +527,7 @@ impl FrontendTag {
 pub struct FrontendFrame<'a> {
     tag: FrontendTag,
     body: &'a [u8],
+    scram_bounded: bool,
 }
 
 impl fmt::Debug for FrontendFrame<'_> {
@@ -493,6 +551,10 @@ impl<'a> FrontendFrame<'a> {
     #[must_use]
     pub const fn body(self) -> &'a [u8] {
         self.body
+    }
+
+    pub(crate) const fn is_scram_bounded(self) -> bool {
+        self.scram_bounded
     }
 }
 
@@ -626,7 +688,7 @@ pub fn decode_frontend(
         });
     }
     let maximum = match (tag, phase) {
-        (FrontendTag::AuthenticationResponse, FrontendPhase::ScramAuthentication) => {
+        (FrontendTag::AuthenticationResponse, FrontendPhase::ScramAuthentication(_)) => {
             SCRAM_MESSAGE_LENGTH.min(maximum_large_message_length)
         }
         (tag, _) if tag.uses_small_limit() => {
@@ -653,6 +715,7 @@ pub fn decode_frontend(
         frame: FrontendFrame {
             tag,
             body: &input[5..consumed],
+            scram_bounded: matches!(phase, FrontendPhase::ScramAuthentication(_)),
         },
         consumed,
     })
@@ -790,6 +853,13 @@ pub enum DecodeError {
 mod tests {
     use super::*;
 
+    fn scram_phase() -> FrontendPhase {
+        let mut output = [0; 64];
+        let encoded = encode_authentication_sasl(ScramMechanisms::Sha256, &mut output)
+            .expect("test SCRAM advertisement");
+        FrontendPhase::ScramAuthentication(encoded.frontend_phase())
+    }
+
     fn startup(code: u32, body: &[u8]) -> Vec<u8> {
         let length = u32::try_from(8 + body.len()).expect("test packet length");
         let mut packet = Vec::with_capacity(length as usize);
@@ -828,7 +898,10 @@ mod tests {
         assert!(!protocol.version_requires_postgres18_negotiation());
         assert!(!frame.requires_postgres18_negotiation());
         assert_eq!(
-            parameters.iter().collect::<Vec<_>>(),
+            parameters
+                .iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated startup parameters"),
             vec![
                 (b"user".as_slice(), b"alice".as_slice()),
                 (b"database".as_slice(), b"app".as_slice())
@@ -1084,7 +1157,7 @@ mod tests {
             (b'S', FrontendPhase::Regular),
             (b'X', FrontendPhase::Regular),
             (b'p', FrontendPhase::Authentication),
-            (b'p', FrontendPhase::ScramAuthentication),
+            (b'p', scram_phase()),
             (b'd', FrontendPhase::CopyIn),
             (b'c', FrontendPhase::CopyIn),
             (b'f', FrontendPhase::CopyIn),
@@ -1219,7 +1292,7 @@ mod tests {
     fn phase_illegal_tags_fail_before_their_lengths_are_trusted() {
         for (tag, phase) in [
             (b'Q', FrontendPhase::Authentication),
-            (b'Q', FrontendPhase::ScramAuthentication),
+            (b'Q', scram_phase()),
             (b'Q', FrontendPhase::CopyIn),
             (b'B', FrontendPhase::CopyIn),
             (b'p', FrontendPhase::Regular),
@@ -1293,18 +1366,13 @@ mod tests {
 
         let exact_scram = frontend(b'p', &vec![0; SCRAM_MESSAGE_LENGTH.saturating_sub(4)]);
         assert!(
-            decode_frontend(
-                &exact_scram,
-                FrontendPhase::ScramAuthentication,
-                DEFAULT_LARGE_MESSAGE_LENGTH,
-            )
-            .is_ok()
+            decode_frontend(&exact_scram, scram_phase(), DEFAULT_LARGE_MESSAGE_LENGTH,).is_ok()
         );
         let oversized_scram = frontend(b'p', &vec![0; SCRAM_MESSAGE_LENGTH.saturating_sub(3)]);
         assert!(matches!(
             decode_frontend(
                 &oversized_scram,
-                FrontendPhase::ScramAuthentication,
+                scram_phase(),
                 DEFAULT_LARGE_MESSAGE_LENGTH,
             ),
             Err(DecodeError::FrameTooLarge {
@@ -1361,5 +1429,19 @@ mod tests {
         let frontend_debug = format!("{frontend_frame:?}");
         assert!(!frontend_debug.contains("do-not-log-this"));
         assert!(frontend_debug.contains("body_length"));
+    }
+
+    #[test]
+    fn startup_parameter_iterator_fails_closed_if_internal_state_is_inconsistent() {
+        for remaining in [
+            b"unterminated".as_slice(),
+            b"name\0unterminated".as_slice(),
+            b"name\0value\0".as_slice(),
+            b"\0value\0\0".as_slice(),
+        ] {
+            let mut parameters = StartupParameterIter { remaining };
+            assert!(matches!(parameters.next(), Some(Err(_))));
+            assert_eq!(parameters.next(), None);
+        }
     }
 }

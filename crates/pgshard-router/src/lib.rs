@@ -8,7 +8,7 @@
 #[cfg(test)]
 use pgshard_catalog::{CatalogSnapshot, DatabaseId, ShardKeyType, TableName};
 #[cfg(test)]
-use pgshard_pgwire::{BindParameters, ClientEncoding, FormatCode};
+use pgshard_pgwire::{BindParameters, ClientEncoding, FormatCode, ValidatedIteratorError};
 #[cfg(test)]
 use pgshard_planner::{CatalogOnlySearchPath, ResolvedParameterRoute};
 #[cfg(test)]
@@ -150,7 +150,7 @@ fn route_resolved_bind(
     let parameter = parameters
         .iter()
         .nth(parameter_index)
-        .ok_or(BindRouteError::ResolvedParameterMissing)?;
+        .ok_or(BindRouteError::ResolvedParameterMissing)??;
     let format = match parameter.format() {
         FormatCode::Text => ParameterFormat::Text,
         FormatCode::Binary => ParameterFormat::Binary,
@@ -279,6 +279,9 @@ enum BindRouteError {
     /// A private resolved-route invariant was inconsistent with the Bind count.
     #[error("resolved route parameter is absent from the validated Bind")]
     ResolvedParameterMissing,
+    /// A private validated Bind iterator invariant was violated.
+    #[error(transparent)]
+    ValidatedIterator(#[from] ValidatedIteratorError),
     /// The selected shard-key value cannot be routed exactly.
     #[error(transparent)]
     Route(RouteError),

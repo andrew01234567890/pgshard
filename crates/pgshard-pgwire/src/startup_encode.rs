@@ -292,7 +292,13 @@ mod tests {
             panic!("encoded a special startup request");
         };
         assert_eq!(protocol, ProtocolVersion::new(3, 99));
-        assert_eq!(decoded.iter().collect::<Vec<_>>(), parameters);
+        assert_eq!(
+            decoded
+                .iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated startup parameters"),
+            parameters
+        );
     }
 
     #[test]
@@ -322,7 +328,7 @@ mod tests {
         else {
             panic!("encoded a special startup request");
         };
-        assert_eq!(decoded.iter().next(), Some(parameters[0]));
+        assert_eq!(decoded.iter().next(), Some(Ok(parameters[0])));
     }
 
     #[test]
