@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -25,19 +26,59 @@ const (
 	NamespaceLabel      = "pgshard.io/pod-fencing"
 	NamespaceLabelValue = "enabled"
 
-	NodeUIDAnnotation    = "pgshard.io/postgresql-node-uid"
-	NodeBootIDAnnotation = "pgshard.io/postgresql-node-boot-id"
+	NodeUIDAnnotation            = "pgshard.io/postgresql-node-uid"
+	NodeBootIDAnnotation         = "pgshard.io/postgresql-node-boot-id"
+	HandshakeChallengeAnnotation = "pgshard.io/pod-fencing-challenge"
+	HandshakeReceiptAnnotation   = "pgshard.io/pod-fencing-admission"
 
 	TerminationConditionType corev1.PodConditionType = "pgshard.io/PostgreSQLProcessTerminated"
 	TerminationReason                                = "AuthenticatedKubelet"
 
-	BindingWebhookName  = "mpostgresqlpodbinding.pgshard.io"
-	BindingWebhookPath  = "/mutate-core-v1-postgresqlpodbinding"
-	StatusWebhookName   = "mpostgresqlpodstatus.pgshard.io"
-	StatusWebhookPath   = "/mutate-core-v1-postgresqlpodstatus"
-	MetadataWebhookName = "vpostgresqlpodmetadata.pgshard.io"
-	MetadataWebhookPath = "/validate-core-v1-postgresqlpodmetadata"
+	BindingWebhookName   = "mpostgresqlpodbinding.pgshard.io"
+	BindingWebhookPath   = "/mutate-core-v1-postgresqlpodbinding"
+	StatusWebhookName    = "mpostgresqlpodstatus.pgshard.io"
+	StatusWebhookPath    = "/mutate-core-v1-postgresqlpodstatus"
+	HandshakeWebhookName = "mpostgresqlfencinghandshake.pgshard.io"
+	HandshakeWebhookPath = "/mutate-pgshard-io-v1alpha1-postgresqlfencinghandshake"
+	MetadataWebhookName  = "vpostgresqlpodmetadata.pgshard.io"
+	MetadataWebhookPath  = "/validate-core-v1-postgresqlpodmetadata"
+	NamespaceWebhookName = "vpostgresqlfencingnamespace.pgshard.io"
+	NamespaceWebhookPath = "/validate-core-v1-postgresqlfencingnamespace"
 )
+
+type HandshakeAttestor struct {
+	decoder admission.Decoder
+}
+
+func NewHandshakeAttestor(scheme *runtime.Scheme) *HandshakeAttestor {
+	return &HandshakeAttestor{decoder: admission.NewDecoder(scheme)}
+}
+
+func (a *HandshakeAttestor) Handle(_ context.Context, request admission.Request) admission.Response {
+	if request.Operation != admissionv1.Update || request.SubResource != "" {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL fencing handshake request %s %q", request.Operation, request.SubResource))
+	}
+	cluster := &pgshardv1alpha1.PgShardCluster{}
+	if err := a.decoder.Decode(request, cluster); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode PgShardCluster fencing handshake: %w", err))
+	}
+	if cluster.Spec.MembersPerShard != 1 {
+		return admission.Allowed("cluster does not publish direct PostgreSQL Pods")
+	}
+	challenge := cluster.Annotations[HandshakeChallengeAnnotation]
+	if challenge == "" || cluster.Annotations[HandshakeReceiptAnnotation] == challenge {
+		return admission.Allowed("PostgreSQL Pod fencing handshake is unchanged")
+	}
+	if cluster.Annotations == nil {
+		cluster.Annotations = make(map[string]string, 1)
+	}
+	cluster.Annotations[HandshakeReceiptAnnotation] = challenge
+	marshaled, err := json.Marshal(cluster)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("encode PgShardCluster fencing handshake: %w", err))
+	}
+	return admission.PatchResponseFromRaw(request.Object.Raw, marshaled)
+}
 
 type BindingAttestor struct {
 	reader  client.Reader
@@ -108,10 +149,12 @@ func (a *StatusAttestor) Handle(ctx context.Context, request admission.Request) 
 	if response != nil {
 		return *response
 	}
-	if !IsManagedPostgreSQLPod(newPod) {
+	oldManaged := IsManagedPostgreSQLPod(oldPod)
+	newManaged := IsManagedPostgreSQLPod(newPod)
+	if !oldManaged && !newManaged {
 		return admission.Allowed("Pod is not a managed PostgreSQL member")
 	}
-	if !IsManagedPostgreSQLPod(oldPod) || !managedIdentityEqual(oldPod, newPod) {
+	if !oldManaged || !newManaged || !managedIdentityEqual(oldPod, newPod) {
 		return admission.Denied("managed PostgreSQL Pod identity changed during a status update")
 	}
 	oldAttestation, oldCount := terminationAttestation(oldPod)
@@ -258,6 +301,36 @@ type MetadataValidator struct {
 	decoder admission.Decoder
 }
 
+type NamespaceValidator struct {
+	decoder admission.Decoder
+}
+
+func NewNamespaceValidator(scheme *runtime.Scheme) *NamespaceValidator {
+	return &NamespaceValidator{decoder: admission.NewDecoder(scheme)}
+}
+
+func (v *NamespaceValidator) Handle(_ context.Context, request admission.Request) admission.Response {
+	if request.Operation != admissionv1.Update ||
+		request.SubResource != "" && request.SubResource != "status" && request.SubResource != "finalize" {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL fencing namespace request %s %q", request.Operation, request.SubResource))
+	}
+	oldNamespace := &corev1.Namespace{}
+	if err := v.decoder.DecodeRaw(request.OldObject, oldNamespace); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode old PostgreSQL fencing namespace: %w", err))
+	}
+	newNamespace := &corev1.Namespace{}
+	if err := v.decoder.Decode(request, newNamespace); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode new PostgreSQL fencing namespace: %w", err))
+	}
+	if oldNamespace.Labels[NamespaceLabel] != NamespaceLabelValue {
+		return admission.Allowed("namespace has not enabled PostgreSQL Pod fencing")
+	}
+	if newNamespace.Labels[NamespaceLabel] != NamespaceLabelValue {
+		return admission.Denied(fmt.Sprintf("namespace label %s=%s is immutable once PostgreSQL Pod fencing is enabled", NamespaceLabel, NamespaceLabelValue))
+	}
+	return admission.Allowed("namespace preserves PostgreSQL Pod fencing")
+}
+
 func NewMetadataValidator(scheme *runtime.Scheme) *MetadataValidator {
 	return &MetadataValidator{decoder: admission.NewDecoder(scheme)}
 }
@@ -365,4 +438,6 @@ func hasTerminalPhase(pod *corev1.Pod) bool {
 
 // +kubebuilder:webhook:path=/mutate-core-v1-postgresqlpodbinding,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/binding,verbs=create,versions=v1,name=mpostgresqlpodbinding.pgshard.io,admissionReviewVersions=v1
 // +kubebuilder:webhook:path=/mutate-core-v1-postgresqlpodstatus,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=mpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/mutate-pgshard-io-v1alpha1-postgresqlfencinghandshake,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=update,versions=v1alpha1,name=mpostgresqlfencinghandshake.pgshard.io,admissionReviewVersions=v1
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodmetadata,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods,verbs=update,versions=v1,name=vpostgresqlpodmetadata.pgshard.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlfencingnamespace,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=namespaces;namespaces/status;namespaces/finalize,verbs=update,versions=v1,name=vpostgresqlfencingnamespace.pgshard.io,admissionReviewVersions=v1

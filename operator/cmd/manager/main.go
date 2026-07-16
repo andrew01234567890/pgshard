@@ -133,8 +133,14 @@ func main() {
 		webhookServer.Register(podfence.StatusWebhookPath, &admission.Webhook{
 			Handler: podfence.NewStatusAttestor(manager.GetAPIReader(), scheme),
 		})
+		webhookServer.Register(podfence.HandshakeWebhookPath, &admission.Webhook{
+			Handler: podfence.NewHandshakeAttestor(scheme),
+		})
 		webhookServer.Register(podfence.MetadataWebhookPath, &admission.Webhook{
 			Handler: podfence.NewMetadataValidator(scheme),
+		})
+		webhookServer.Register(podfence.NamespaceWebhookPath, &admission.Webhook{
+			Handler: podfence.NewNamespaceValidator(scheme),
 		})
 	}
 	if err := manager.AddHealthzCheck("healthz", healthz.Ping); err != nil {

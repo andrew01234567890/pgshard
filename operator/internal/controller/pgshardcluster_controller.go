@@ -48,6 +48,7 @@ const (
 	bootstrapIntegrityInterval   = 30 * time.Second
 	postgresqlPasswordBytes      = 32
 	bootstrapNameRandomBytes     = 16
+	fencingChallengeRandomBytes  = 16
 )
 
 // PgShardClusterReconciler owns safe supporting resources and single-member
@@ -168,6 +169,14 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing is unavailable: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	fencingReady, err := r.ensurePostgreSQLPodFencingHandshake(ctx, cluster)
+	if err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing admission handshake failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if !fencingReady {
+		return ctrl.Result{Requeue: true}, nil
+	}
 	if !controllerutil.ContainsFinalizer(cluster, resourceFinalizer) {
 		controllerutil.AddFinalizer(cluster, resourceFinalizer)
 		if err := r.Update(ctx, cluster); err != nil {
@@ -249,6 +258,30 @@ func (r *PgShardClusterReconciler) verifyPostgreSQLPodFencingNamespace(ctx conte
 		return fmt.Errorf("namespace %s must be labelled %s=%s before PostgreSQL creation", cluster.Namespace, podfence.NamespaceLabel, podfence.NamespaceLabelValue)
 	}
 	return nil
+}
+
+func (r *PgShardClusterReconciler) ensurePostgreSQLPodFencingHandshake(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	if cluster.Spec.MembersPerShard != 1 {
+		return true, nil
+	}
+	challenge := cluster.Annotations[podfence.HandshakeChallengeAnnotation]
+	if challenge != "" && cluster.Annotations[podfence.HandshakeReceiptAnnotation] == challenge {
+		return true, nil
+	}
+	random := make([]byte, fencingChallengeRandomBytes)
+	if _, err := rand.Read(random); err != nil {
+		return false, fmt.Errorf("generate Pod fencing admission challenge: %w", err)
+	}
+	before := cluster.DeepCopy()
+	if cluster.Annotations == nil {
+		cluster.Annotations = make(map[string]string, 1)
+	}
+	cluster.Annotations[podfence.HandshakeChallengeAnnotation] = hex.EncodeToString(random)
+	delete(cluster.Annotations, podfence.HandshakeReceiptAnnotation)
+	if err := r.Patch(ctx, cluster, client.MergeFrom(before), client.FieldOwner(owned.ManagedByValue)); err != nil {
+		return false, fmt.Errorf("request Pod fencing admission handshake: %w", err)
+	}
+	return false, nil
 }
 
 func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
@@ -2125,7 +2158,20 @@ func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Cont
 		} else if err != nil {
 			return false, "", "", err
 		}
-		if workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) && statefulSet.Status.ReadyReplicas >= 1 && statefulSet.Status.AvailableReplicas >= 1 && statefulSet.Status.UpdatedReplicas >= 1 {
+		pod := &corev1.Pod{}
+		podKey := types.NamespacedName{Namespace: cluster.Namespace, Name: key.Name + "-0"}
+		if err := reader.Get(ctx, podKey, pod); apierrors.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			return false, "", "", err
+		}
+		if !podfence.IsManagedPostgreSQLPod(pod) {
+			return false, "PostgreSQLPodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod %s does not preserve its operator identity and termination finalizer", pod.Name), nil
+		}
+		if pod.Spec.NodeName != "" && (pod.Annotations[podfence.NodeUIDAnnotation] == "" || pod.Annotations[podfence.NodeBootIDAnnotation] == "") {
+			return false, "PostgreSQLPodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod %s was assigned without binding-time Node UID and boot ID; deletion remains fail closed", pod.Name), nil
+		}
+		if workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) && statefulSet.Status.ReadyReplicas >= 1 && statefulSet.Status.AvailableReplicas >= 1 && statefulSet.Status.UpdatedReplicas >= 1 && pod.Spec.NodeName != "" {
 			ready++
 		}
 	}

@@ -357,8 +357,8 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.mutatingConfigurationName}, mutating); err != nil {
 		return nil, fmt.Errorf("get mutating webhook configuration: %w", err)
 	}
-	if len(mutating.Webhooks) != 3 {
-		return nil, fmt.Errorf("mutating webhook configuration contains %d webhooks, want exactly three", len(mutating.Webhooks))
+	if len(mutating.Webhooks) != 4 {
+		return nil, fmt.Errorf("mutating webhook configuration contains %d webhooks, want exactly four", len(mutating.Webhooks))
 	}
 	for _, expected := range []struct {
 		name, path        string
@@ -368,6 +368,7 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 		{name: mutatingWebhookName, path: mutatingWebhookPath, rules: matchesPgShardClusterRules},
 		{name: podfence.BindingWebhookName, path: podfence.BindingWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.StatusWebhookName, path: podfence.StatusWebhookPath, rules: matchesPostgreSQLStatusRules, object: postgreSQLPodSelector()},
+		{name: podfence.HandshakeWebhookName, path: podfence.HandshakeWebhookPath, rules: matchesPostgreSQLHandshakeRules, namespace: podFencingNamespaceSelector()},
 	} {
 		webhook := findMutatingWebhook(mutating.Webhooks, expected.name)
 		if webhook == nil {
@@ -385,8 +386,8 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.validatingConfigurationName}, validating); err != nil {
 		return nil, fmt.Errorf("get validating webhook configuration: %w", err)
 	}
-	if len(validating.Webhooks) != 2 {
-		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly two", len(validating.Webhooks))
+	if len(validating.Webhooks) != 3 {
+		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly three", len(validating.Webhooks))
 	}
 	for _, expected := range []struct {
 		name, path string
@@ -395,6 +396,7 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	}{
 		{name: validatingWebhookName, path: validatingWebhookPath, rules: matchesPgShardClusterRules},
 		{name: podfence.MetadataWebhookName, path: podfence.MetadataWebhookPath, rules: matchesPostgreSQLMetadataRules, object: postgreSQLPodSelector()},
+		{name: podfence.NamespaceWebhookName, path: podfence.NamespaceWebhookPath, rules: matchesPostgreSQLNamespaceRules, object: podFencingNamespaceSelector()},
 	} {
 		webhook := findValidatingWebhook(validating.Webhooks, expected.name)
 		if webhook == nil {
@@ -462,8 +464,30 @@ func matchesPostgreSQLStatusRules(rules []admissionregistrationv1.RuleWithOperat
 	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}, "pods/status")
 }
 
+func matchesPostgreSQLHandshakeRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	rule := rules[0]
+	return slices.Equal(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}) &&
+		slices.Equal(rule.APIGroups, []string{"pgshard.io"}) && slices.Equal(rule.APIVersions, []string{"v1alpha1"}) &&
+		slices.Equal(rule.Resources, []string{"pgshardclusters"}) &&
+		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
 func matchesPostgreSQLMetadataRules(rules []admissionregistrationv1.RuleWithOperations) bool {
 	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}, "pods")
+}
+
+func matchesPostgreSQLNamespaceRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	rule := rules[0]
+	return slices.Equal(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}) &&
+		slices.Equal(rule.APIGroups, []string{""}) && slices.Equal(rule.APIVersions, []string{"v1"}) &&
+		slices.Equal(rule.Resources, []string{"namespaces", "namespaces/status", "namespaces/finalize"}) &&
+		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
 }
 
 func matchesCoreRules(rules []admissionregistrationv1.RuleWithOperations, operations []admissionregistrationv1.OperationType, resource string) bool {

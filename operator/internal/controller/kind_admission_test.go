@@ -119,7 +119,7 @@ func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient cli
 	if err := kubeClient.Get(ctx, types.NamespacedName{Name: "pgshard-validating-webhook-configuration"}, validating); err != nil {
 		t.Fatal(err)
 	}
-	if len(mutating.Webhooks) != 3 || len(validating.Webhooks) != 2 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 3 {
 		t.Fatalf("injected CA bundles = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
 	for _, webhook := range mutating.Webhooks {

@@ -62,7 +62,9 @@ missing and all-zero identity is rejected.
 subset used by the real-manager KIND smoke. After loading those `:dev` images
 into KIND, `kubectl apply -k operator/config/admission` installs the restricted
 self-managed admission manager. Direct PostgreSQL namespaces must carry the
-`pgshard.io/pod-fencing=enabled` label. `operator/config/development` retains a
+`pgshard.io/pod-fencing=enabled` label. The admission install makes that opt-in
+immutable until namespace deletion and acknowledges a cluster handshake before
+publishing PostgreSQL Pods. `operator/config/development` retains a
 certificate-free path only for supporting-controller debugging and must not
 manage direct PostgreSQL Pods. Neither path provides a routed database
 quickstart or production distribution.

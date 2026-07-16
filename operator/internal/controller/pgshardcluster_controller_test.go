@@ -195,6 +195,33 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 		if err := fakeClient.Status().Update(ctx, statefulSet); err != nil {
 			t.Fatal(err)
 		}
+		pod := &corev1.Pod{
+			ObjectMeta: *statefulSet.Spec.Template.ObjectMeta.DeepCopy(),
+			Spec:       *statefulSet.Spec.Template.Spec.DeepCopy(),
+		}
+		pod.Name = statefulSet.Name + "-0"
+		pod.Namespace = cluster.Namespace
+		pod.Spec.NodeName = "node-a"
+		if err := fakeClient.Create(ctx, pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	got = getCluster(t, ctx, fakeClient, cluster)
+	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLPodFencingUnavailable")
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		pod := &corev1.Pod{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard) + "-0"}
+		if err := fakeClient.Get(ctx, key, pod); err != nil {
+			t.Fatal(err)
+		}
+		pod.Annotations[podfence.NodeUIDAnnotation] = "node-uid-a"
+		pod.Annotations[podfence.NodeBootIDAnnotation] = "boot-a"
+		if err := fakeClient.Update(ctx, pod); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
@@ -621,6 +648,55 @@ func TestPostgreSQLDataFenceStabilizationRecoversLostUpdateResponses(t *testing.
 				t.Fatalf("%s recovery did not converge: claim=%#v secret=%#v bootstrap=%#v", stage, claim.ObjectMeta, secret.ObjectMeta, bootstrap)
 			}
 		})
+	}
+}
+
+func TestReconcileWaitsForPodFencingAdmissionHandshake(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	current := getCluster(t, ctx, base, cluster)
+	delete(current.Annotations, podfence.HandshakeChallengeAnnotation)
+	delete(current.Annotations, podfence.HandshakeReceiptAnnotation)
+	if err := base.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if current.Annotations[podfence.HandshakeChallengeAnnotation] == "" || current.Annotations[podfence.HandshakeReceiptAnnotation] != "" || contains(current.Finalizers, resourceFinalizer) {
+		t.Fatalf("unacknowledged fencing handshake crossed creation barrier: annotations=%#v finalizers=%#v", current.Annotations, current.Finalizers)
+	}
+
+	admitted := interceptedClient(t, base, interceptor.Funcs{Patch: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+		if candidate, ok := object.(*pgshardv1alpha1.PgShardCluster); ok {
+			challenge := candidate.Annotations[podfence.HandshakeChallengeAnnotation]
+			if challenge != "" {
+				candidate.Annotations[podfence.HandshakeReceiptAnnotation] = challenge
+			}
+		}
+		return kubeClient.Patch(ctx, object, patch, options...)
+	}})
+	reconciler = &PgShardClusterReconciler{Client: admitted, APIReader: base}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if challenge := current.Annotations[podfence.HandshakeChallengeAnnotation]; challenge == "" || current.Annotations[podfence.HandshakeReceiptAnnotation] != challenge || contains(current.Finalizers, resourceFinalizer) {
+		t.Fatalf("admission handshake was not durably acknowledged before requeue: annotations=%#v finalizers=%#v", current.Annotations, current.Finalizers)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if !contains(current.Finalizers, resourceFinalizer) {
+		t.Fatalf("acknowledged fencing handshake did not open creation barrier: %#v", current.Finalizers)
 	}
 }
 
@@ -3318,6 +3394,11 @@ func withPodFencingNamespaces(objects []client.Object) []client.Object {
 		if !ok {
 			continue
 		}
+		if cluster.Annotations == nil {
+			cluster.Annotations = make(map[string]string, 2)
+		}
+		cluster.Annotations[podfence.HandshakeChallengeAnnotation] = "test-admission-handshake"
+		cluster.Annotations[podfence.HandshakeReceiptAnnotation] = "test-admission-handshake"
 		namespace := namespaces[cluster.Namespace]
 		if namespace == nil {
 			namespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}}

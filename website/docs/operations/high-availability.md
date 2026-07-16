@@ -160,8 +160,12 @@ PVC UID with its own finalizer, makes the live PVC ownerless, and anchors the
 credential tombstone back to it. The exact claim name cannot be reused until
 the mounting workload is pruned, so a late empty claim cannot enter bootstrap.
 Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
-finalizer. Binding admission first copies the selected Node UID and boot ID into
-the Pod atomically with `spec.nodeName`. On deletion, status admission adds a
+finalizer. Before workload publication, a cluster challenge update proves that
+admission has observed the namespace's immutable fencing opt-in. Binding
+admission then copies the selected Node UID and boot ID into the Pod atomically
+with `spec.nodeName`. Status admission rejects attempts to remove the managed
+identity, binding identity, or finalizer through the status subresource. On
+deletion, it adds a
 durable process-terminated condition only to a terminal update from the
 authenticated kubelet for that same live Node incarnation. PodGC's
 control-plane-authored `Failed` phase cannot create this condition. An uncached

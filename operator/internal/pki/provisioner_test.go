@@ -196,7 +196,7 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 				configuration := objects[2].(*admissionregistrationv1.MutatingWebhookConfiguration)
 				configuration.Webhooks = append(configuration.Webhooks, configuration.Webhooks[0])
 			},
-			want: "want exactly three",
+			want: "want exactly four",
 		},
 	}
 	for _, test := range tests {
@@ -446,19 +446,34 @@ func installObjects() []client.Object {
 	bindingMutating.NamespaceSelector = podFencingNamespaceSelector()
 	statusMutating := mutatingWebhook(podfence.StatusWebhookName, podfence.StatusWebhookPath, coreRules(admissionregistrationv1.Update, "pods/status"))
 	statusMutating.ObjectSelector = postgreSQLPodSelector()
+	handshakeMutating := mutatingWebhook(podfence.HandshakeWebhookName, podfence.HandshakeWebhookPath, []admissionregistrationv1.RuleWithOperations{{
+		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
+		Rule: admissionregistrationv1.Rule{
+			APIGroups: []string{"pgshard.io"}, APIVersions: []string{"v1alpha1"}, Resources: []string{"pgshardclusters"}, Scope: &scope,
+		},
+	}})
+	handshakeMutating.NamespaceSelector = podFencingNamespaceSelector()
 	clusterValidating := validatingWebhook(validatingWebhookName, validatingWebhookPath, clusterRules())
 	metadataValidating := validatingWebhook(podfence.MetadataWebhookName, podfence.MetadataWebhookPath, coreRules(admissionregistrationv1.Update, "pods"))
 	metadataValidating.ObjectSelector = postgreSQLPodSelector()
+	namespaceValidating := validatingWebhook(podfence.NamespaceWebhookName, podfence.NamespaceWebhookPath, []admissionregistrationv1.RuleWithOperations{{
+		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
+		Rule: admissionregistrationv1.Rule{
+			APIGroups: []string{""}, APIVersions: []string{"v1"},
+			Resources: []string{"namespaces", "namespaces/status", "namespaces/finalize"}, Scope: &scope,
+		},
+	}})
+	namespaceValidating.ObjectSelector = podFencingNamespaceSelector()
 	return []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testCASecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testServingSecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
 		&admissionregistrationv1.MutatingWebhookConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: testMutatingConfigurationName},
-			Webhooks:   []admissionregistrationv1.MutatingWebhook{clusterMutating, bindingMutating, statusMutating},
+			Webhooks:   []admissionregistrationv1.MutatingWebhook{clusterMutating, bindingMutating, statusMutating, handshakeMutating},
 		},
 		&admissionregistrationv1.ValidatingWebhookConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: testValidatingConfigurationName},
-			Webhooks:   []admissionregistrationv1.ValidatingWebhook{clusterValidating, metadataValidating},
+			Webhooks:   []admissionregistrationv1.ValidatingWebhook{clusterValidating, metadataValidating, namespaceValidating},
 		},
 	}
 }
@@ -498,7 +513,7 @@ func assertInjectedBundles(t *testing.T, kubeClient client.Client, wanted []byte
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: testValidatingConfigurationName}, validating); err != nil {
 		t.Fatal(err)
 	}
-	if len(mutating.Webhooks) != 3 || len(validating.Webhooks) != 2 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 3 {
 		t.Fatalf("CA bundles were not injected: mutating=%#v validating=%#v", mutating.Webhooks, validating.Webhooks)
 	}
 	for _, webhook := range mutating.Webhooks {

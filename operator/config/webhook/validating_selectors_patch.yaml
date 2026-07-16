@@ -8,3 +8,7 @@ webhooks:
       matchLabels:
         app.kubernetes.io/component: postgresql
         app.kubernetes.io/managed-by: pgshard-operator
+  - name: vpostgresqlfencingnamespace.pgshard.io
+    objectSelector:
+      matchLabels:
+        pgshard.io/pod-fencing: enabled

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -46,6 +47,32 @@ func TestBindingAttestorPinsTheNodeIncarnationInTheBinding(t *testing.T) {
 	}
 	if got.Annotations[NodeUIDAnnotation] != string(node.UID) || got.Annotations[NodeBootIDAnnotation] != node.Status.NodeInfo.BootID {
 		t.Fatalf("binding identity = %#v", got.Annotations)
+	}
+}
+
+func TestHandshakeAttestorAcknowledgesTheCurrentChallenge(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	cluster := &pgshardv1alpha1.PgShardCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example", Namespace: "database",
+			Annotations: map[string]string{HandshakeChallengeAnnotation: "challenge-a"},
+		},
+		Spec: pgshardv1alpha1.PgShardClusterSpec{MembersPerShard: 1},
+	}
+	raw := marshalObject(t, cluster)
+	response := NewHandshakeAttestor(scheme).Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Operation: admissionv1.Update, Object: runtime.RawExtension{Raw: raw},
+	}})
+	if !response.Allowed {
+		t.Fatalf("fencing handshake denied: %#v", response.Result)
+	}
+	got := &pgshardv1alpha1.PgShardCluster{}
+	if err := json.Unmarshal(applyResponsePatch(t, raw, response), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Annotations[HandshakeReceiptAnnotation] != "challenge-a" {
+		t.Fatalf("fencing handshake receipt = %#v", got.Annotations)
 	}
 }
 
@@ -97,6 +124,68 @@ func TestStatusAttestorCanAttestAnExistingTerminalPhase(t *testing.T) {
 	}
 	if !HasTerminationAttestation(got) {
 		t.Fatalf("existing terminal status has no valid attestation: %#v", got.Status.Conditions)
+	}
+}
+
+func TestStatusAttestorAcceptsNeverStartedWaitingContainers(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	node := testNode("node-a", "node-uid-a", "boot-a")
+	oldPod := managedPod()
+	oldPod.Spec.InitContainers = []corev1.Container{{Name: "bootstrap-postgresql"}}
+	newPod := oldPod.DeepCopy()
+	newPod.Status.Phase = corev1.PodFailed
+	newPod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "bootstrap-postgresql", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+	}}
+	newPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "postgresql", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+	}}
+	handler := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build(), scheme)
+	request, raw := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
+	response := handler.Handle(context.Background(), request)
+	if !response.Allowed {
+		t.Fatalf("never-started terminal status denied: %#v", response.Result)
+	}
+	got := &corev1.Pod{}
+	if err := json.Unmarshal(applyResponsePatch(t, raw, response), got); err != nil {
+		t.Fatal(err)
+	}
+	if !HasTerminationAttestation(got) {
+		t.Fatalf("never-started terminal status has no valid attestation: %#v", got.Status.Conditions)
+	}
+}
+
+func TestStatusAttestorProtectsManagedMetadataOnTheStatusSubresource(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	tests := []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{name: "managed-by label", mutate: func(pod *corev1.Pod) { delete(pod.Labels, owned.ManagedByLabel) }},
+		{name: "component label", mutate: func(pod *corev1.Pod) { delete(pod.Labels, owned.ComponentLabel) }},
+		{name: "cluster label", mutate: func(pod *corev1.Pod) { delete(pod.Labels, owned.ClusterLabel) }},
+		{name: "shard label", mutate: func(pod *corev1.Pod) { delete(pod.Labels, owned.ShardLabel) }},
+		{name: "role label", mutate: func(pod *corev1.Pod) { delete(pod.Labels, owned.RoleLabel) }},
+		{name: "member label", mutate: func(pod *corev1.Pod) { delete(pod.Labels, owned.MemberLabel) }},
+		{name: "cluster UID annotation", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, owned.PostgreSQLPodClusterUIDAnnotation) }},
+		{name: "node UID annotation", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, NodeUIDAnnotation) }},
+		{name: "node boot ID annotation", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, NodeBootIDAnnotation) }},
+		{name: "termination finalizer", mutate: func(pod *corev1.Pod) { pod.Finalizers = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			oldPod := managedPod()
+			newPod := oldPod.DeepCopy()
+			test.mutate(newPod)
+			request, _ := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
+			response := NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).Build(), scheme).Handle(context.Background(), request)
+			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "identity changed") {
+				t.Fatalf("protected metadata removal response = %#v", response)
+			}
+		})
 	}
 }
 
@@ -242,6 +331,25 @@ func TestUnscheduledDeletingPodCanReleaseItsFence(t *testing.T) {
 	}
 }
 
+func TestNamespaceValidatorMakesTheFencingOptInStickyAcrossSubresources(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	oldNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: "database", Labels: map[string]string{NamespaceLabel: NamespaceLabelValue},
+	}}
+	for _, subresource := range []string{"", "status", "finalize"} {
+		t.Run(subresource, func(t *testing.T) {
+			t.Parallel()
+			newNamespace := oldNamespace.DeepCopy()
+			delete(newNamespace.Labels, NamespaceLabel)
+			response := NewNamespaceValidator(scheme).Handle(context.Background(), updateRequest(t, oldNamespace, newNamespace, subresource))
+			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "immutable") {
+				t.Fatalf("fencing label removal through %q response = %#v", subresource, response)
+			}
+		})
+	}
+}
+
 func managedPod() *corev1.Pod {
 	deletion := metav1.NewTime(time.Unix(100, 0))
 	return &corev1.Pod{
@@ -285,11 +393,11 @@ func statusRequest(t *testing.T, oldPod, newPod *corev1.Pod, username string, gr
 	}}, raw
 }
 
-func updateRequest(t *testing.T, oldPod, newPod *corev1.Pod, subresource string) admission.Request {
+func updateRequest(t *testing.T, oldObject, newObject any, subresource string) admission.Request {
 	t.Helper()
 	return admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
 		Operation: admissionv1.Update, SubResource: subresource,
-		Object: runtime.RawExtension{Raw: marshalObject(t, newPod)}, OldObject: runtime.RawExtension{Raw: marshalObject(t, oldPod)},
+		Object: runtime.RawExtension{Raw: marshalObject(t, newObject)}, OldObject: runtime.RawExtension{Raw: marshalObject(t, oldObject)},
 	}}
 }
 
@@ -323,6 +431,9 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgshardv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	return scheme

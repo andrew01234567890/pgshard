@@ -114,11 +114,13 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		t.Fatalf("webhook RBAC bindings = %#v / %#v", secretBinding, configurationBinding)
 	}
 	mutatingSelectors := readManifest[admissionregistrationv1.MutatingWebhookConfiguration](t, "../../config/webhook/mutating_selectors_patch.yaml")
-	if len(mutatingSelectors.Webhooks) != 2 || mutatingSelectors.Webhooks[0].Name != podfence.BindingWebhookName || mutatingSelectors.Webhooks[0].NamespaceSelector == nil || mutatingSelectors.Webhooks[0].NamespaceSelector.MatchLabels[podfence.NamespaceLabel] != podfence.NamespaceLabelValue || mutatingSelectors.Webhooks[1].Name != podfence.StatusWebhookName || !selectsManagedPostgreSQL(mutatingSelectors.Webhooks[1].ObjectSelector) {
+	if len(mutatingSelectors.Webhooks) != 3 || mutatingSelectors.Webhooks[0].Name != podfence.BindingWebhookName || mutatingSelectors.Webhooks[0].NamespaceSelector == nil || mutatingSelectors.Webhooks[0].NamespaceSelector.MatchLabels[podfence.NamespaceLabel] != podfence.NamespaceLabelValue || mutatingSelectors.Webhooks[1].Name != podfence.StatusWebhookName || !selectsManagedPostgreSQL(mutatingSelectors.Webhooks[1].ObjectSelector) || mutatingSelectors.Webhooks[2].Name != podfence.HandshakeWebhookName || !selectsFencingNamespace(mutatingSelectors.Webhooks[2].NamespaceSelector) {
 		t.Fatalf("mutating webhook selector patch = %#v", mutatingSelectors.Webhooks)
 	}
 	validatingSelectors := readManifest[admissionregistrationv1.ValidatingWebhookConfiguration](t, "../../config/webhook/validating_selectors_patch.yaml")
-	if len(validatingSelectors.Webhooks) != 1 || validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsManagedPostgreSQL(validatingSelectors.Webhooks[0].ObjectSelector) {
+	if len(validatingSelectors.Webhooks) != 2 ||
+		validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsManagedPostgreSQL(validatingSelectors.Webhooks[0].ObjectSelector) ||
+		validatingSelectors.Webhooks[1].Name != podfence.NamespaceWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[1].ObjectSelector) {
 		t.Fatalf("validating webhook selector patch = %#v", validatingSelectors.Webhooks)
 	}
 }
@@ -143,7 +145,7 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatalf("unexpected third webhook manifest: %v", err)
 	}
-	if len(mutating.Webhooks) != 3 || len(validating.Webhooks) != 2 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 3 {
 		t.Fatalf("generated webhooks = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
 	for _, webhook := range mutating.Webhooks {
@@ -163,4 +165,8 @@ func assertWebhookPolicy(t *testing.T, clientConfig admissionregistrationv1.Webh
 
 func selectsManagedPostgreSQL(selector *metav1.LabelSelector) bool {
 	return selector != nil && selector.MatchLabels[owned.ManagedByLabel] == owned.ManagedByValue && selector.MatchLabels[owned.ComponentLabel] == "postgresql" && len(selector.MatchLabels) == 2 && len(selector.MatchExpressions) == 0
+}
+
+func selectsFencingNamespace(selector *metav1.LabelSelector) bool {
+	return selector != nil && selector.MatchLabels[podfence.NamespaceLabel] == podfence.NamespaceLabelValue && len(selector.MatchLabels) == 1 && len(selector.MatchExpressions) == 0
 }

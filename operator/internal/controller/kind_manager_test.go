@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -92,6 +93,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	deleteNamespaceAtCleanup(t, kubeClient, namespace)
+	assertFencingNamespaceLabelImmutable(t, ctx, kubeClient, namespace.Name)
 
 	cluster := readSingleMemberSample(t)
 	cluster.Namespace = namespace.Name
@@ -99,9 +101,16 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForSingleMemberPostgreSQL(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster))
+	assertPostgreSQLStatusMetadataImmutable(t, ctx, kubeClient, types.NamespacedName{
+		Namespace: namespace.Name,
+		Name:      cluster.Name + "-shard-0000-primary-0",
+	})
 	current := &pgshardv1alpha1.PgShardCluster{}
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err != nil {
 		t.Fatal(err)
+	}
+	if challenge := current.Annotations[podfence.HandshakeChallengeAnnotation]; challenge == "" || current.Annotations[podfence.HandshakeReceiptAnnotation] != challenge {
+		t.Fatalf("PostgreSQL Pod fencing admission handshake = %#v", current.Annotations)
 	}
 	shardZeroBootstrap := bootstrapForShard(t, current, 0)
 	shardOneBootstrap := bootstrapForShard(t, current, 1)
@@ -275,6 +284,69 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: bootstrap.SecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 			t.Fatalf("credential creation fence survived Retain finalization: %v", err)
 		}
+	}
+}
+
+func assertFencingNamespaceLabelImmutable(t *testing.T, ctx context.Context, kubeClient client.Client, name string) {
+	t.Helper()
+	for _, test := range []struct {
+		name   string
+		update func(*corev1.Namespace) error
+	}{
+		{name: "main resource", update: func(namespace *corev1.Namespace) error { return kubeClient.Update(ctx, namespace) }},
+		{name: "status subresource", update: func(namespace *corev1.Namespace) error { return kubeClient.Status().Update(ctx, namespace) }},
+	} {
+		t.Run("namespace label is immutable through "+test.name, func(t *testing.T) {
+			current := &corev1.Namespace{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: name}, current); err != nil {
+				t.Fatal(err)
+			}
+			delete(current.Labels, podfence.NamespaceLabel)
+			err := test.update(current)
+			if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "immutable once PostgreSQL Pod fencing is enabled") {
+				t.Fatalf("fencing namespace label removal error = %v, want webhook denial", err)
+			}
+		})
+	}
+	current := &corev1.Namespace{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: name}, current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Labels[podfence.NamespaceLabel] != podfence.NamespaceLabelValue {
+		t.Fatalf("namespace fencing label changed despite webhook denials: %#v", current.Labels)
+	}
+}
+
+func assertPostgreSQLStatusMetadataImmutable(t *testing.T, ctx context.Context, kubeClient client.Client, key types.NamespacedName) {
+	t.Helper()
+	for _, test := range []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{name: "managed label", mutate: func(pod *corev1.Pod) { delete(pod.Labels, owned.ManagedByLabel) }},
+		{name: "cluster UID annotation", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, owned.PostgreSQLPodClusterUIDAnnotation) }},
+		{name: "termination finalizer", mutate: func(pod *corev1.Pod) { pod.Finalizers = nil }},
+	} {
+		t.Run("status protects "+test.name, func(t *testing.T) {
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				current := &corev1.Pod{}
+				if err := kubeClient.Get(ctx, key, current); err != nil {
+					return err
+				}
+				test.mutate(current)
+				return kubeClient.Status().Update(ctx, current)
+			})
+			if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "identity changed during a status update") {
+				t.Fatalf("protected PostgreSQL status metadata removal error = %v, want webhook denial", err)
+			}
+		})
+	}
+	current := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, key, current); err != nil {
+		t.Fatal(err)
+	}
+	if !podfence.IsManagedPostgreSQLPod(current) {
+		t.Fatalf("PostgreSQL Pod identity changed despite status webhook denials: %#v", current.ObjectMeta)
 	}
 }
 

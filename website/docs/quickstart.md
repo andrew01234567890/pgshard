@@ -104,10 +104,14 @@ kubectl exec --namespace pgshard-single-member \
 ```
 
 The `pgshard.io/pod-fencing=enabled` namespace label is mandatory for managed
-PostgreSQL Pods. It scopes binding admission so the selected Node UID and boot
-ID are copied into each Pod atomically with `spec.nodeName`; omitting it leaves
-deletion fail closed because no authenticated termination receipt can be
-created. This receipt is lifecycle evidence, not physical node fencing. Do not
+PostgreSQL Pods. Before publishing a workload, the controller completes an
+admission challenge through the same namespace selector used for Pod binding.
+The label then remains admission-immutable until the namespace is deleted.
+Binding admission copies the selected Node UID and boot ID into each Pod
+atomically with `spec.nodeName`; omitting the label prevents PostgreSQL
+creation. Status admission also rejects removal of the managed identity,
+binding identity, or termination finalizer. This receipt is lifecycle evidence,
+not physical node fencing. Do not
 reuse a Node name while its old machine may still run a bound Pod; externally
 fence that machine or its storage before recovery.
 

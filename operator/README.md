@@ -134,9 +134,15 @@ authoritative absence of every exact credential tombstone. It then lists Pods
 through the uncached API reader and proves absence of every Pod that mounts a
 checkpointed data PVC. Each managed PostgreSQL Pod starts with a
 cluster-UID-bound termination finalizer. In a namespace labelled
-`pgshard.io/pod-fencing=enabled`, the fail-closed binding webhook copies the
-selected Node UID and boot ID into the Pod in the same API update that assigns
-`spec.nodeName`. A second webhook permits an authenticated terminal status update to add
+`pgshard.io/pod-fencing=enabled`, the controller first completes a challenge
+and receipt update through a webhook carrying the same namespace selector as
+Pod binding. That handshake proves admission has observed the namespace label
+before any PostgreSQL workload is published. Admission then makes the enabled
+label immutable for the lifetime of the namespace. The fail-closed binding
+webhook copies the selected Node UID and boot ID into the Pod in the same API
+update that assigns `spec.nodeName`. A second webhook rejects status updates
+that remove managed identity, binding identity, or the termination finalizer,
+and permits an authenticated terminal status update to add
 the durable `pgshard.io/PostgreSQLProcessTerminated` condition only when the
 request is from `system:node:<spec.nodeName>` in `system:nodes` and the live Node
 still has that binding-time UID and boot ID. PodGC and other control-plane
@@ -279,10 +285,13 @@ so this sample must not be used as zero-downtime evidence.
 
 ## Self-managed admission manager
 
-`config/admission` extends the same local-image install with three generated
-mutating webhooks and two generated validating webhooks. The binding webhook is
-scoped to namespaces labelled `pgshard.io/pod-fencing=enabled`; the status and
-metadata webhooks are scoped to operator-managed PostgreSQL Pods. It pre-creates empty,
+`config/admission` extends the same local-image install with four generated
+mutating webhooks and three generated validating webhooks. The binding and
+cluster-handshake webhooks are scoped to namespaces labelled
+`pgshard.io/pod-fencing=enabled`; the status and metadata webhooks are scoped to
+operator-managed PostgreSQL Pods. Namespace admission makes the opt-in label
+sticky across ordinary, status, and finalize updates; delete the namespace to
+retire that admission boundary. It pre-creates empty,
 operator-labeled Secrets and grants the manager exact-name `get` and `update`
 access only in `pgshard-system` for webhook certificate mutation. The
 reconciler also has cluster-wide Secret `get`, `create`, `update`, and `delete`
