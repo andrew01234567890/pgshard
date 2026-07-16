@@ -893,10 +893,12 @@ name = "pgshard-orch"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "pgshard-catalog",
  "pgshard-types",
  "pgshard-version",
+ "postgres-protocol",
  "serde",
  "serde_json",
  "thiserror",

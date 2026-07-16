@@ -32,6 +32,7 @@ use tokio_postgres::{Client, Connection, IsolationLevel, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{
+    parse_lsn,
     postgres_connection::ConnectionTask,
     slot_catalog::valid_resource_name,
     slot_mutator::{
@@ -611,7 +612,7 @@ pub async fn complete_slot_sync_probe_retirement(
             source: SlotSyncProbeCatalogUnknownCause::Deadline { duration },
         })
     });
-    let fence_result = absence.verify_held_until(deadline, duration).await;
+    let fence_result = absence.verify_held_after_commit().await;
     match (result, fence_result) {
         (Ok(result), Ok(())) => Ok(expect_probe(result)),
         (Err(error), Ok(())) => Err(error),
@@ -1524,16 +1525,6 @@ fn positive_u32(row: &Row, field: &'static str) -> Result<u32, SlotSyncProbeCata
         return Err(SlotSyncProbeCatalogError::InvalidCatalogField(field));
     }
     Ok(value)
-}
-
-fn parse_lsn(value: &str) -> Option<PgLsn> {
-    let (high, low) = value.split_once('/')?;
-    if high.is_empty() || high.len() > 8 || low.is_empty() || low.len() > 8 {
-        return None;
-    }
-    let high = u32::from_str_radix(high, 16).ok()?;
-    let low = u32::from_str_radix(low, 16).ok()?;
-    Some(PgLsn((u64::from(high) << 32) | u64::from(low)))
 }
 
 fn lsn_text(lsn: PgLsn) -> String {

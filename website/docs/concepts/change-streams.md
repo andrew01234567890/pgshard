@@ -504,10 +504,11 @@ source identity before PostgreSQL mutation. Live PostgreSQL 18 coverage requires
 the continuously synchronized standby copy to appear and disappear, observes a
 cross-database same-name managed recreation blocked across final catalog COMMIT
 and then rejected from the retired durable generation, injects activation
-COMMIT response loss before reconciling the exact durable row, and terminates
-the absence-fence backend while retirement is blocked just before COMMIT. That
-last case must return `TargetFenceLost` as outcome-unknown even though an exact
-reload proves the catalog row committed as retired. The backend-loss case
+COMMIT response loss before reconciling the exact durable row, and buffers a
+confirmed retirement COMMIT response beyond the caller deadline while keeping
+the absence-fence backend alive. Releasing it within the fresh verification tail
+must preserve the original deadline outcome-unknown classification rather than
+replace it with `TargetFenceLost`; an exact reload proves the row retired. The backend-loss case
 deterministically commits a pending attempt, kills the canonical catalog backend
 before target dispatch, verifies the physical name is absent, and requires
 reconciliation of that exact receipt before the durable generation can advance.

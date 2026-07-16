@@ -188,7 +188,16 @@ clean checkout. Pgwire-affecting pull requests and main-branch pushes run
 10,000 inputs per target in four parallel jobs; the scheduled workflow raises
 this to 100,000. The tooling is pinned to `cargo-fuzz` 0.13.2,
 `libfuzzer-sys` 0.4.13, and `nightly-2026-06-24`.
-Pure orchestrator tests exercise the standby-decoder attachment contract. They
+Pure orchestrator lease tests separate acquisition bookkeeping from execution
+authority. They inject descheduling after clock sampling, forward and backward
+wall steps, a pause combined with a backward step between paired wall samples,
+mutex contention across expiry, renewal, expiry, and higher-epoch replacement.
+An acquisition handle must revalidate the exact
+installed term, process-local monotonic deadline, catalog epoch, and fencing
+epoch at dispatch; expired and superseded handles fail closed. The receiving
+target still has to enforce that epoch because the local guard is an
+instant-in-time observation rather than a duration guarantee.
+Pure orchestrator tests also exercise the standby-decoder attachment contract. They
 require non-nil catalog generations encoded in slot names and matched exactly,
 an opaque test-only replay floor bound to the exact source identity, the
 current enabled two-phase mode and activation boundaries; a bounded
@@ -214,7 +223,10 @@ oversized fence is rejected before dispatch. The primary fixture waits for the
 continuous worker to materialize the exact synchronized standby copy, then
 requires that copy to disappear after primary deletion. It also proves a
 PostgreSQL 17 pre-dispatch drop rejection returns the receipt before retrying
-cleanup on PostgreSQL 18. Unit tests cover the exposed known-versus-unknown classification,
+cleanup on PostgreSQL 18. The same fixture gates the drop after inactive-slot
+preflight, starts a real logical-replication session, and proves PostgreSQL 18's
+exact `object_in_use` rejection preserves that receipt until the stream exits
+and a later bounded drop succeeds. Unit tests cover the exposed known-versus-unknown classification,
 a blocked preflight and delayed CREATE preparation crossing proof expiry,
 expired proof and operation-deadline boundaries that never poll the dispatch callback,
 unsigned high-bit receiver timelines,
@@ -240,11 +252,12 @@ catalog COMMIT. Releasing the fence must let that task finish with a pre-dispatc
 rejection because its exact durable generation is now retired; the test reaps
 the task and proves the target remains absent. This cross-database case proves
 that all mutation databases share the canonical registry for cluster-wide slot
-names. A second fixture row-locks retirement immediately
-before COMMIT, terminates the absence-fence backend, releases the row lock, and
-requires outcome-unknown `TargetFenceLost`. It then reloads the exact generation
-and confirms the retirement committed, covering the post-COMMIT verification
-branch. A third fixture gates target-server preflight after the creation attempt
+names. A second fixture buffers the exact successful COMMIT response beyond the
+original retirement deadline without closing the absence-fence backend. It
+releases the response inside the fresh post-COMMIT verification window and
+requires the original deadline outcome-unknown result, rather than
+`TargetFenceLost`, before reloading the committed retirement. A third fixture
+gates target-server preflight after the creation attempt
 commits, terminates that catalog backend, and requires the permanent pending row
 to fence both shard and probe retirement. It then lets creation finish, activates
 the exact receipt, and removes both the primary slot and synchronized copy before
@@ -318,6 +331,10 @@ one repeatable-read transaction. It also proves another member cannot inherit
 the allocation, a committed ownership fence removes the policy from subsequent
 reads, exact singleton values are retained, and corrupt ready rows with an
 unfinished snapshot, seed ordinal, or missing attachment/slot fail closed. A
+dedicated login starts with hostile function shadows ahead of `pg_catalog` in
+its role-default `search_path`; the reader proves those shadows are initially
+effective, then resets the session, pins and verifies an empty path, reads the
+real PostgreSQL 18 requirements, and loads the real catalog policy. A
 delayed singleton lock followed by a still-held owner lock proves the remaining
 server timeout is recomputed against one absolute client deadline before each
 PostgreSQL statement. The test

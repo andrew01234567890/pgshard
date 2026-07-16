@@ -33,6 +33,7 @@ use tokio::{
 };
 use tokio_postgres::{Client, Connection, Row};
 
+use crate::parse_lsn;
 #[cfg(test)]
 use crate::postgres_connection::CONNECTION_CLEANUP_TIMEOUT;
 use crate::postgres_connection::{ConnectionTask, ConnectionTaskError};
@@ -1170,7 +1171,7 @@ fn parse_synchronized_slot_policy(
 
     let mut parsed = Vec::new();
     for raw_name in value.split(',') {
-        let name = ReplicationSlotName::new(raw_name)
+        let name = ReplicationSlotName::new(raw_name.trim_ascii())
             .map_err(|_| LocalSlotObservationError::UnsupportedSynchronizedStandbySlotsList)?;
         if parsed.contains(&name) {
             return Err(LocalSlotObservationError::UnsupportedSynchronizedStandbySlotsList);
@@ -1868,16 +1869,6 @@ fn positive_u32(value: i64, field: &'static str) -> Result<u32, LocalSlotObserva
         .ok_or(LocalSlotObservationError::InvalidPositiveInteger { field, value })
 }
 
-pub(crate) fn parse_lsn(value: &str) -> Option<PgLsn> {
-    let (high, low) = value.split_once('/')?;
-    if high.is_empty() || high.len() > 8 || low.is_empty() || low.len() > 8 {
-        return None;
-    }
-    let high = u32::from_str_radix(high, 16).ok()?;
-    let low = u32::from_str_radix(low, 16).ok()?;
-    Some(PgLsn((u64::from(high) << 32) | u64::from(low)))
-}
-
 /// Fail-closed local `PostgreSQL` logical-slot observation error.
 #[derive(Debug, Error)]
 pub enum LocalSlotObservationError {
@@ -2148,7 +2139,7 @@ mod tests {
             ),
             Err(PrimaryReplicationObservationRequestError::SlotNameCollision)
         );
-        let configured = "pgshard_member_0000,pgshard_member_0001";
+        let configured = "pgshard_member_0000, pgshard_member_0001";
         assert_eq!(
             parse_synchronized_slot_policy(
                 i64::try_from(configured.len()).expect("length"),
@@ -2172,9 +2163,17 @@ mod tests {
             .expect("other member"),
             FailoverSlotSynchronization::NotGated
         );
+        let padded = "\tpgshard_member_0000 ,  pgshard_member_0001\r\n";
+        assert_eq!(
+            parse_synchronized_slot_policy(
+                i64::try_from(padded.len()).expect("length"),
+                Some(padded.to_owned()),
+                &physical_slot,
+            )
+            .expect("PostgreSQL whitespace around list elements"),
+            FailoverSlotSynchronization::GatedOnPhysicalSlot
+        );
         for unsupported in [
-            " pgshard_member_0001",
-            "pgshard_member_0001 ",
             "\"pgshard_member_0001\"",
             "pgshard_member_0001,,pgshard_member_0002",
             "pgshard_member_0001,pgshard_member_0001",

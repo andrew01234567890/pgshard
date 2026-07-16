@@ -82,11 +82,16 @@ bounded feedback interval, `hot_standby_feedback=on`,
 `sync_replication_slots=on`, and the correlated slot-sync-worker generation.
 The proof expiry is also the create-preflight deadline and is rechecked at the
 dispatch boundary.
-Create/drop errors after dispatch are always outcome-unknown and must be
-observed rather than retried. Before target preflight, create persists a
-permanent pending attempt in `shardschema`, keyed by its opaque receipt and
-never-reused generation. The transaction locks catalog state before the target
-name and validates the exact source, role, restore, owner and lifecycle. A busy
+Create errors after dispatch are outcome-unknown and must be observed rather
+than retried. Drop has one narrower effect-free exception: PostgreSQL 18's exact
+`object_in_use` response from non-waiting replication-slot acquisition proves
+that an active slot was rejected before drop mutation began, so the unchanged
+receipt remains valid for a later bounded attempt. Every other received error,
+timeout, connection loss, or postflight failure after drop dispatch remains
+outcome-unknown. Before target preflight, create persists a permanent pending
+attempt in `shardschema`, keyed by its opaque receipt and never-reused
+generation. The transaction locks catalog state before the target name and
+validates the exact source, role, restore, owner and lifecycle. A busy
 database-enforced target fence fails fast so no writer retains global catalog
 state while queued; the Rust create path retries acquisition within its bounded
 preflight window. Each acquisition records a fresh opaque fence ID bound to the
@@ -122,9 +127,10 @@ drop path's live connection-bound catalog fence through COMMIT. Consumer
 finalization also presents the exact opaque creation capability and atomically
 retires the attempt and slot. Both paths present the exact opaque fence ID and
 verify the same canonical backend on both sides of that COMMIT before returning
-success. Known
-pre-dispatch drop failures return the receipt, and cleanup does not depend on a
-live receiver, its physical slot, healthy feedback or slot synchronization.
+success under a fresh bounded post-COMMIT fence check. Known pre-dispatch drop
+failures and the exact effect-free active-slot rejection return the receipt, and
+cleanup does not depend on a live receiver, its physical slot, healthy feedback
+or slot synchronization.
 Catalog triggers serialize allocation, activation, cleanup-start, and related
 parent lifecycle writes in the same lock namespace. Final retirement instead
 requires the typed path's live connection-bound absence fence. Permanent
@@ -156,10 +162,12 @@ The live fixture starts a same-name managed recreation after primary absence,
 observes it retrying the busy hidden target fence, commits permanent retirement
 while it remains blocked, releases the fence, and requires the waiter to reject
 the now retired durable generation even though its mutation connection targets
-another database. A separate fault case terminates the absence-fence backend
-while the retirement transaction is blocked immediately before COMMIT; the API
-reports outcome-unknown `TargetFenceLost`, and an exact reload confirms whether
-the retirement committed. Another fault case gates target-server preflight after a
+another database. A separate fault case buffers PostgreSQL's confirmed COMMIT
+response beyond the original retirement deadline while keeping the canonical
+fence backend alive. It releases that response inside the fresh post-COMMIT
+verification window, requires the original deadline outcome-unknown result to
+survive instead of becoming `TargetFenceLost`, and reloads the exact committed
+retirement. Another fault case gates target-server preflight after a
 pending create is durable, terminates the canonical catalog backend, proves
 catalog retirement stays fenced, then completes and cleans up the physical slot
 without producing a retired tombstone with a live name. The fixture also reconciles
@@ -175,7 +183,9 @@ a durability downgrade and must be surfaced as such.
 
 ## Primary fencing
 
-The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Both the orchestrator authority and receiving agent reject expired or overlong leases; configured TTL bounds are enforced by the state machines, not merely logged. Poolers route writes only to the primary identity and term currently authorized by the lease.
+The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Both the orchestrator authority and receiving agent reject expired or overlong leases; configured TTL bounds are enforced by the state machines, not merely logged. The in-process orchestrator retains Unix expiry only for request validation and reporting and uses a separate monotonic deadline for live ownership, so a wall-clock step after installation cannot change the local term. During acquisition it pairs two wall reads with preceding monotonic samples, uses the greater wall value for admission, installs the earlier of the two translated monotonic deadlines, and proves admission against a final monotonic sample. A pause combined with a backward step between the wall reads can therefore only shorten or reject the candidate term, never extend it. A renewal extends the installed monotonic deadline only by its requested Unix-expiry delta and cannot move that deadline beyond the current TTL policy.
+
+A lease-acquisition outcome reports an in-memory mutation; it is not execution authority. The returned grant must be revalidated against the exact installed term, monotonic deadline, catalog epoch, fencing epoch, and operation immediately before dispatch. The validation clock is sampled while holding the shared state lock after term inspection and again after epoch checks, so mutex contention or a pause during validation cannot carry a stale timestamp past expiry. Even that local guard is an instant-in-time check: every target operation must carry the epoch and atomically reject a stale epoch. Poolers route writes only to the primary identity and term currently authorized by those target-side fences.
 
 Promotion requires a candidate whose WAL and prepared-transaction state prove that all acknowledged commits are present. If no candidate satisfies that condition, pgshard stops writes instead of risking split brain or acknowledged-data loss.
 
