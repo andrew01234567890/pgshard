@@ -103,7 +103,7 @@ func assertFencingKeyLossFailsReadiness(t *testing.T, ctx context.Context, kubeC
 			Data:      map[string][]byte{pki.PodFencingKeyKey: bytes.Clone(original.Data[pki.PodFencingKeyKey])},
 		}
 	}
-	replace := func(secret *corev1.Secret) {
+	replace := func(ctx context.Context, secret *corev1.Secret) {
 		current := &corev1.Secret{}
 		err := kubeClient.Get(ctx, key, current)
 		if err == nil {
@@ -119,22 +119,29 @@ func assertFencingKeyLossFailsReadiness(t *testing.T, ctx context.Context, kubeC
 			}
 		}
 	}
+	cleanupNeeded := true
 	defer func() {
-		replace(valid())
-		waitForManagerReadiness(t, context.Background(), kubeClient, true)
+		if !cleanupNeeded {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cleanupCancel()
+		replace(cleanupCtx, valid())
+		waitForManagerReadiness(t, cleanupCtx, kubeClient, true)
 	}()
 
-	replace(nil)
+	replace(ctx, nil)
 	waitForManagerReadiness(t, ctx, kubeClient, false)
-	replace(valid())
+	replace(ctx, valid())
 	waitForManagerReadiness(t, ctx, kubeClient, true)
 
 	malformed := valid()
 	malformed.Data[pki.PodFencingKeyKey] = make([]byte, 31)
-	replace(malformed)
+	replace(ctx, malformed)
 	waitForManagerReadiness(t, ctx, kubeClient, false)
-	replace(valid())
+	replace(ctx, valid())
 	waitForManagerReadiness(t, ctx, kubeClient, true)
+	cleanupNeeded = false
 }
 
 func waitForManagerReadiness(t *testing.T, ctx context.Context, kubeClient client.Client, wanted bool) {
