@@ -180,6 +180,8 @@ webhooks:
     - UPDATE
     resources:
     - pods
+    - pods/ephemeralcontainers
+    - pods/resize
   sideEffects: None
   timeoutSeconds: 5
 - admissionReviewVersions:

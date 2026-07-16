@@ -1,5 +1,5 @@
 // Package pki provisions and maintains the operator admission webhook's
-// self-signed serving certificate.
+// self-signed serving certificate and durable receipt key.
 package pki
 
 import (
@@ -29,8 +29,9 @@ import (
 )
 
 const (
-	ManagedByLabel = "app.kubernetes.io/managed-by"
-	ManagedByValue = "pgshard-operator"
+	ManagedByLabel   = "app.kubernetes.io/managed-by"
+	ManagedByValue   = "pgshard-operator"
+	PodFencingKeyKey = "hmac.key"
 
 	defaultBootstrapTimeout    = 90 * time.Second
 	defaultMaintenanceInterval = time.Hour
@@ -41,6 +42,7 @@ const (
 	validatingWebhookPath      = "/validate-pgshard-io-v1alpha1-pgshardcluster"
 	webhookServicePort         = int32(443)
 	webhookTimeoutSeconds      = int32(5)
+	podFencingKeyBytes         = 32
 )
 
 type Config struct {
@@ -49,6 +51,7 @@ type Config struct {
 	ServiceName                 string
 	CASecretName                string
 	ServingSecretName           string
+	FencingKeySecretName        string
 	MutatingConfigurationName   string
 	ValidatingConfigurationName string
 	CertificateDirectory        string
@@ -65,6 +68,7 @@ type Provisioner struct {
 	serviceName                 string
 	caSecretName                string
 	servingSecretName           string
+	fencingKeySecretName        string
 	mutatingConfigurationName   string
 	validatingConfigurationName string
 	certificateDirectory        string
@@ -111,6 +115,7 @@ func New(config Config) (*Provisioner, error) {
 		{field: "service name", value: config.ServiceName},
 		{field: "CA Secret name", value: config.CASecretName},
 		{field: "serving Secret name", value: config.ServingSecretName},
+		{field: "fencing key Secret name", value: config.FencingKeySecretName},
 		{field: "mutating configuration name", value: config.MutatingConfigurationName},
 		{field: "validating configuration name", value: config.ValidatingConfigurationName},
 	} {
@@ -143,6 +148,7 @@ func New(config Config) (*Provisioner, error) {
 		serviceName:                 config.ServiceName,
 		caSecretName:                config.CASecretName,
 		servingSecretName:           config.ServingSecretName,
+		fencingKeySecretName:        config.FencingKeySecretName,
 		mutatingConfigurationName:   config.MutatingConfigurationName,
 		validatingConfigurationName: config.ValidatingConfigurationName,
 		certificateDirectory:        filepath.Clean(config.CertificateDirectory),
@@ -230,6 +236,9 @@ func (p *Provisioner) Checker(_ *http.Request) error {
 }
 
 func (p *Provisioner) ensureOnce(ctx context.Context) error {
+	if err := p.ensurePodFencingKey(ctx); err != nil {
+		return err
+	}
 	authority, err := p.ensureAuthority(ctx)
 	if err != nil {
 		return err
@@ -247,6 +256,44 @@ func (p *Provisioner) ensureOnce(ctx context.Context) error {
 	}
 	if err := p.injectCABundle(ctx, configs, authority.certificatePEM); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: p.namespace, Name: p.fencingKeySecretName}
+	if err := p.client.Get(ctx, key, secret); err != nil {
+		return fmt.Errorf("get pre-created Pod fencing key Secret: %w", err)
+	}
+	if secret.Labels[ManagedByLabel] != ManagedByValue {
+		return fmt.Errorf("Secret %s/%s is not labeled as managed by %s", secret.Namespace, secret.Name, ManagedByValue)
+	}
+	if secret.Type != corev1.SecretTypeOpaque {
+		return fmt.Errorf("managed Secret %s/%s has type %q, want %q", secret.Namespace, secret.Name, secret.Type, corev1.SecretTypeOpaque)
+	}
+	if len(secret.Data) == 0 {
+		if secret.Immutable != nil && *secret.Immutable {
+			return fmt.Errorf("empty Pod fencing key Secret %s/%s is immutable", secret.Namespace, secret.Name)
+		}
+		value := make([]byte, podFencingKeyBytes)
+		if _, err := io.ReadFull(p.random, value); err != nil {
+			return fmt.Errorf("generate Pod fencing key: %w", err)
+		}
+		secret.Data = map[string][]byte{PodFencingKeyKey: value}
+		immutable := true
+		secret.Immutable = &immutable
+		if err := p.client.Update(ctx, secret); err != nil {
+			return fmt.Errorf("initialize Pod fencing key Secret: %w", err)
+		}
+		return nil
+	}
+	value, exists := secret.Data[PodFencingKeyKey]
+	if len(secret.Data) != 1 || !exists || len(value) != podFencingKeyBytes {
+		return fmt.Errorf("managed Pod fencing key Secret must be empty or contain exactly one %d-byte %s", podFencingKeyBytes, PodFencingKeyKey)
+	}
+	if secret.Immutable == nil || !*secret.Immutable {
+		return fmt.Errorf("initialized Pod fencing key Secret %s/%s must be immutable", secret.Namespace, secret.Name)
 	}
 	return nil
 }
@@ -478,7 +525,7 @@ func matchesPostgreSQLHandshakeRules(rules []admissionregistrationv1.RuleWithOpe
 }
 
 func matchesPostgreSQLMetadataRules(rules []admissionregistrationv1.RuleWithOperations) bool {
-	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}, "pods")
+	return matchesCoreResourceRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}, []string{"pods", "pods/ephemeralcontainers", "pods/resize"})
 }
 
 func matchesPostgreSQLNamespaceRules(rules []admissionregistrationv1.RuleWithOperations) bool {
@@ -493,12 +540,16 @@ func matchesPostgreSQLNamespaceRules(rules []admissionregistrationv1.RuleWithOpe
 }
 
 func matchesCoreRules(rules []admissionregistrationv1.RuleWithOperations, operations []admissionregistrationv1.OperationType, resource string) bool {
+	return matchesCoreResourceRules(rules, operations, []string{resource})
+}
+
+func matchesCoreResourceRules(rules []admissionregistrationv1.RuleWithOperations, operations []admissionregistrationv1.OperationType, resources []string) bool {
 	if len(rules) != 1 {
 		return false
 	}
 	rule := rules[0]
 	return slices.Equal(rule.Operations, operations) && slices.Equal(rule.APIGroups, []string{""}) &&
-		slices.Equal(rule.APIVersions, []string{"v1"}) && slices.Equal(rule.Resources, []string{resource}) &&
+		slices.Equal(rule.APIVersions, []string{"v1"}) && slices.Equal(rule.Resources, resources) &&
 		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
 }
 

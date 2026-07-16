@@ -49,6 +49,7 @@ func TestAdmissionOverlayEnablesOnlyTheSelfManagedWebhookRuntime(t *testing.T) {
 		"--webhook-service-name=pgshard-webhook-service",
 		"--webhook-ca-secret-name=pgshard-webhook-ca",
 		"--webhook-serving-secret-name=pgshard-webhook-certificate",
+		"--webhook-fencing-key-secret-name=pgshard-webhook-fencing-key",
 		"--webhook-mutating-configuration-name=pgshard-mutating-webhook-configuration",
 		"--webhook-validating-configuration-name=pgshard-validating-webhook-configuration",
 		"--webhook-cert-dir=/run/pgshard/webhook",
@@ -79,7 +80,7 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		} `json:"patches"`
 	}
 	webhookConfig := readManifest[webhookKustomization](t, "../../config/webhook/kustomization.yaml")
-	if webhookConfig.APIVersion != "kustomize.config.k8s.io/v1beta1" || webhookConfig.Kind != "Kustomization" || len(webhookConfig.Resources) != 4 || len(webhookConfig.Patches) != 2 || webhookConfig.Patches[0].Path != "mutating_selectors_patch.yaml" || webhookConfig.Patches[1].Path != "validating_selectors_patch.yaml" {
+	if webhookConfig.APIVersion != "kustomize.config.k8s.io/v1beta1" || webhookConfig.Kind != "Kustomization" || len(webhookConfig.Resources) != 5 || len(webhookConfig.Patches) != 2 || webhookConfig.Patches[0].Path != "mutating_selectors_patch.yaml" || webhookConfig.Patches[1].Path != "validating_selectors_patch.yaml" {
 		t.Fatalf("webhook Kustomization patches = %#v", webhookConfig.Patches)
 	}
 	for _, item := range []struct {
@@ -89,6 +90,7 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 	}{
 		{path: "../../config/webhook/ca_secret.yaml", name: "webhook-ca", secretType: corev1.SecretTypeOpaque},
 		{path: "../../config/webhook/serving_secret.yaml", name: "webhook-certificate", secretType: corev1.SecretTypeOpaque},
+		{path: "../../config/webhook/fencing_key_secret.yaml", name: "webhook-fencing-key", secretType: corev1.SecretTypeOpaque},
 	} {
 		secret := readManifest[corev1.Secret](t, item.path)
 		if secret.Name != item.name || secret.Namespace != "system" || secret.Type != item.secretType || len(secret.Data) != 0 || secret.Labels["app.kubernetes.io/managed-by"] != "pgshard-operator" {
@@ -101,7 +103,7 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 	}
 
 	secretRole := readManifest[rbacv1.Role](t, "../../config/admission/rbac/certificate_role.yaml")
-	if secretRole.Namespace != "system" || len(secretRole.Rules) != 1 || !slices.Equal(secretRole.Rules[0].ResourceNames, []string{"pgshard-webhook-ca", "pgshard-webhook-certificate"}) || !slices.Equal(secretRole.Rules[0].Verbs, []string{"get", "update"}) {
+	if secretRole.Namespace != "system" || len(secretRole.Rules) != 1 || !slices.Equal(secretRole.Rules[0].ResourceNames, []string{"pgshard-webhook-ca", "pgshard-webhook-certificate", "pgshard-webhook-fencing-key"}) || !slices.Equal(secretRole.Rules[0].Verbs, []string{"get", "update"}) {
 		t.Fatalf("webhook Secret Role = %#v", secretRole)
 	}
 	configurationRole := readManifest[rbacv1.ClusterRole](t, "../../config/admission/rbac/configuration_role.yaml")

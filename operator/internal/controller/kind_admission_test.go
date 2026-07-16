@@ -89,8 +89,15 @@ func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient cli
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: "pgshard-system", Name: "pgshard-webhook-certificate"}, servingSecret); err != nil {
 		t.Fatal(err)
 	}
-	if caSecret.Labels[pki.ManagedByLabel] != pki.ManagedByValue || servingSecret.Labels[pki.ManagedByLabel] != pki.ManagedByValue {
-		t.Fatalf("webhook Secret ownership = %#v / %#v", caSecret.Labels, servingSecret.Labels)
+	fencingKeySecret := &corev1.Secret{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: "pgshard-system", Name: "pgshard-webhook-fencing-key"}, fencingKeySecret); err != nil {
+		t.Fatal(err)
+	}
+	if caSecret.Labels[pki.ManagedByLabel] != pki.ManagedByValue || servingSecret.Labels[pki.ManagedByLabel] != pki.ManagedByValue || fencingKeySecret.Labels[pki.ManagedByLabel] != pki.ManagedByValue {
+		t.Fatalf("webhook Secret ownership = %#v / %#v / %#v", caSecret.Labels, servingSecret.Labels, fencingKeySecret.Labels)
+	}
+	if fencingKeySecret.Immutable == nil || !*fencingKeySecret.Immutable || len(fencingKeySecret.Data) != 1 || len(fencingKeySecret.Data[pki.PodFencingKeyKey]) != 32 {
+		t.Fatalf("webhook Pod fencing key = %#v", fencingKeySecret)
 	}
 	if _, err := tls.X509KeyPair(servingSecret.Data[pki.TLSCertificateKey], servingSecret.Data[pki.TLSPrivateKeyKey]); err != nil {
 		t.Fatalf("serving key pair: %v", err)

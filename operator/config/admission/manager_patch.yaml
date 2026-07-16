@@ -18,6 +18,7 @@ spec:
             - --webhook-service-name=pgshard-webhook-service
             - --webhook-ca-secret-name=pgshard-webhook-ca
             - --webhook-serving-secret-name=pgshard-webhook-certificate
+            - --webhook-fencing-key-secret-name=pgshard-webhook-fencing-key
             - --webhook-mutating-configuration-name=pgshard-mutating-webhook-configuration
             - --webhook-validating-configuration-name=pgshard-validating-webhook-configuration
             - --webhook-cert-dir=/run/pgshard/webhook

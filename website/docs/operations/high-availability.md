@@ -174,7 +174,9 @@ through the status subresource. On deletion, it adds a durable HMAC-authenticate
 process-terminated condition only to a terminal update from the authenticated
 kubelet for that same live Node incarnation, and a final validator rechecks the
 post-mutation status. PodGC's control-plane-authored `Failed` phase and copied
-condition text cannot create this condition. An uncached
+condition text cannot create this condition. The managed Pod spec and generation
+are immutable across main-resource, ephemeral-container, and resize updates, so
+new process intent cannot be introduced after that proof. An uncached
 Pod read must then prove absence before PVC protection is released. If admission
 is unavailable, the Node is absent or rebooted, or the Node name now identifies
 another UID, deletion deliberately remains blocked and the PVC stays protected.

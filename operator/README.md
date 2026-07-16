@@ -156,7 +156,9 @@ still has that binding-time UID and boot ID. A final validating status webhook
 then verifies the post-mutation object. The condition carries an HMAC receipt
 bound to the exact Pod UID, generation, terminal phase, and binding-time Node
 incarnation. PodGC, another status writer, or copied condition text cannot
-create it. The controller cryptographically verifies the receipt before
+create it. Validating admission also makes the managed Pod spec and generation
+immutable across ordinary, ephemeral-container, and in-place-resize updates, so
+later mutation cannot invalidate or outgrow the terminal receipt. The controller cryptographically verifies the receipt before
 releasing the finalizer, or permits a deleting Pod that was never assigned;
 Kubernetes serializes binding against deletion for the latter case. A webhook
 outage, missing Node, reboot, or same-name replacement therefore leaves the Pod
@@ -305,7 +307,8 @@ evidence. Namespace admission makes the opt-in label
 sticky across ordinary, status, and finalize updates; delete the namespace to
 retire that admission boundary. It pre-creates empty,
 operator-labeled Secrets and grants the manager exact-name `get` and `update`
-access only in `pgshard-system` for webhook certificate mutation. The
+access only in `pgshard-system` for webhook certificate and fencing-key
+initialization. The
 reconciler also has cluster-wide Secret `get`, `create`, `update`, and `delete`
 because it generates one randomly named credential per shard in each resource
 namespace, inverts its owner after the data UID checkpoint, and removes the
@@ -333,11 +336,13 @@ configuration names. Kubernetes RBAC cannot restrict a patch to individual
 fields, so the provisioner validates the full Service target and existing
 trust state before changing only CA bundles.
 
-Before the webhook listener starts, each manager Pod creates an ECDSA P-256 CA
-and TLS 1.3 serving key pair in those Secrets, validates the Service references,
-injects the CA bundle, and writes the serving files into a private memory-backed
-`emptyDir`. The private CA key also authenticates cluster-handshake and Pod-
-termination receipts; the key bytes are never stored in resource annotations.
+Before the webhook listener starts, each manager Pod creates an ECDSA P-256 CA,
+a TLS 1.3 serving key pair, and a separate random 256-bit fencing key in those
+Secrets, validates the Service references, injects the CA bundle, and writes the
+serving files into a private memory-backed `emptyDir`. The fencing key Secret is
+made immutable by the same update that initializes it. It authenticates cluster-
+handshake and Pod-termination receipts independently of certificate renewal or
+CA encoding; the key bytes are never stored in resource annotations.
 The 90-day serving certificate is checked hourly and renewed 30
 days before expiry. Controller-runtime reloads a renewed key pair without a Pod
 restart, and readiness fails if the local certificate becomes untrusted,
@@ -349,7 +354,9 @@ Automatic CA rotation is not implemented. The generated CA is valid for about
 ten years, and startup fails once it can no longer safely issue a full 90-day
 leaf certificate. This explicit boundary avoids an unsafe one-step CA swap;
 overlapping trust and rollout proof are required before automated CA rotation
-is added.
+is added. Automatic fencing-key rotation is also not implemented; replacing its
+immutable Secret requires an explicit recovery boundary for outstanding
+termination receipts.
 
 After loading the three local images, install the admission path with:
 

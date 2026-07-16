@@ -69,7 +69,7 @@ func (c *HandshakeCodec) Receipt(ctx context.Context, cluster *pgshardv1alpha1.P
 
 func (c *HandshakeCodec) Verify(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	receipt := cluster.Annotations[HandshakeReceiptAnnotation]
-	if receipt == "" {
+	if receipt == "" || cluster.Annotations[HandshakeChallengeAnnotation] == "" {
 		return false, nil
 	}
 	expected, err := c.Receipt(ctx, cluster)

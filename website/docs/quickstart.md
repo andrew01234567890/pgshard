@@ -80,10 +80,12 @@ kubectl label namespace pgshard-development pgshard.io/pod-fencing=enabled
 kubectl apply --namespace pgshard-development -f operator/config/samples/pgshard_v1alpha1_development.yaml
 ```
 
-The admission overlay provisions an ECDSA serving chain into exact-name
-operator-managed Secrets, injects the CA bundle, and keeps semantic validation
-fail closed. Its leaf certificate renews without a Pod restart; automatic CA
-rotation is not yet implemented. Expect the sample to remain `Ready=False`, its
+The admission overlay provisions an ECDSA serving chain and a separate immutable
+256-bit fencing key into exact-name operator-managed Secrets, injects the CA
+bundle, and keeps semantic validation fail closed. Receipt verification is
+therefore independent of leaf renewal and CA encoding. The leaf certificate
+renews without a Pod restart; automatic CA or fencing-key rotation is not yet
+implemented. Expect the sample to remain `Ready=False`, its
 pooler and orchestrator Pods to remain unready, and its application Services to
 have no ready endpoints. This path is for source validation only.
 
@@ -119,6 +121,8 @@ the binding evidence is absent, including when binding admission was skipped;
 omitting the label therefore prevents PostgreSQL startup. Status admission also
 rejects removal of the managed identity, binding identity, or termination
 finalizer and cryptographically authenticates the durable terminal receipt.
+Managed Pod specs and generations are immutable through ordinary, ephemeral-
+container, and in-place-resize updates so that receipt cannot become stale.
 This receipt is lifecycle evidence,
 not physical node fencing. Do not
 reuse a Node name while its old machine may still run a bound Pod; externally

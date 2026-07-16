@@ -299,7 +299,7 @@ func TestPostgreSQLBootstrapRequiresBindingIdentityBeforeDataAccess(t *testing.T
 			parent := t.TempDir()
 			script := strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", fmt.Sprintf("parent=%q", parent), 1)
 			command := exec.Command("bash", "-c", script)
-			command.Env = append(os.Environ(), "PGSHARD_CLUSTER_UID=cluster-uid", "PGSHARD_SHARD_ID=0000")
+			command.Env = []string{"PGSHARD_CLUSTER_UID=cluster-uid", "PGSHARD_SHARD_ID=0000"}
 			command.Env = append(command.Env, test.env...)
 			output, err := command.CombinedOutput()
 			if err == nil || !strings.Contains(string(output), test.want) {

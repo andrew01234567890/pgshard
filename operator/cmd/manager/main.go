@@ -47,6 +47,7 @@ type webhookCommandOptions struct {
 	serviceName                 string
 	caSecretName                string
 	servingSecretName           string
+	fencingKeySecretName        string
 	mutatingConfigurationName   string
 	validatingConfigurationName string
 	certificateDirectory        string
@@ -59,10 +60,11 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.BoolVar(&options.leaderElection, "leader-elect", true, "enable Kubernetes leader election")
 	flags.BoolVar(&options.secureMetrics, "metrics-secure", true, "serve metrics over TLS")
 	flags.BoolVar(&options.webhookEnabled, "webhook-enabled", true, "register admission webhooks; serving certificates are required")
-	flags.StringVar(&options.webhook.namespace, "webhook-namespace", "pgshard-system", "namespace containing the webhook Service and certificate Secrets")
+	flags.StringVar(&options.webhook.namespace, "webhook-namespace", "pgshard-system", "namespace containing the webhook Service and managed Secrets")
 	flags.StringVar(&options.webhook.serviceName, "webhook-service-name", "pgshard-webhook-service", "webhook Service name")
 	flags.StringVar(&options.webhook.caSecretName, "webhook-ca-secret-name", "pgshard-webhook-ca", "pre-created webhook CA Secret name")
 	flags.StringVar(&options.webhook.servingSecretName, "webhook-serving-secret-name", "pgshard-webhook-certificate", "pre-created webhook serving Secret name")
+	flags.StringVar(&options.webhook.fencingKeySecretName, "webhook-fencing-key-secret-name", "pgshard-webhook-fencing-key", "pre-created immutable Pod fencing key Secret name")
 	flags.StringVar(&options.webhook.mutatingConfigurationName, "webhook-mutating-configuration-name", "pgshard-mutating-webhook-configuration", "mutating webhook configuration name")
 	flags.StringVar(&options.webhook.validatingConfigurationName, "webhook-validating-configuration-name", "pgshard-validating-webhook-configuration", "validating webhook configuration name")
 	flags.StringVar(&options.webhook.certificateDirectory, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "private directory for generated webhook certificate files")
@@ -115,8 +117,8 @@ func main() {
 		Client:              manager.GetClient(),
 		APIReader:           manager.GetAPIReader(),
 		Images:              options.images,
-		PodFencingKeySecret: client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
-		PodFencingKeyData:   pki.CAPrivateKeyKey,
+		PodFencingKeySecret: client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.fencingKeySecretName},
+		PodFencingKeyData:   pki.PodFencingKeyKey,
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
@@ -124,8 +126,8 @@ func main() {
 	if options.webhookEnabled {
 		handshakeCodec := podfence.NewSecretHandshakeCodec(
 			manager.GetAPIReader(),
-			client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
-			pki.CAPrivateKeyKey,
+			client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.fencingKeySecretName},
+			pki.PodFencingKeyKey,
 		)
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCluster{}).
 			WithDefaulter(&pgshardv1alpha1.PgShardClusterDefaulter{}).
@@ -178,6 +180,7 @@ func main() {
 			ServiceName:                 options.webhook.serviceName,
 			CASecretName:                options.webhook.caSecretName,
 			ServingSecretName:           options.webhook.servingSecretName,
+			FencingKeySecretName:        options.webhook.fencingKeySecretName,
 			MutatingConfigurationName:   options.webhook.mutatingConfigurationName,
 			ValidatingConfigurationName: options.webhook.validatingConfigurationName,
 			CertificateDirectory:        options.webhook.certificateDirectory,

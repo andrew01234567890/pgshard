@@ -581,7 +581,12 @@ passes a Binding and terminal status through their mutators and final validators
 then rejects conflicting later mutations. It also rejects PodGC-authored `Failed`, missing
 Nodes, same-name replacement Nodes, changed boot IDs, wrong kubelet identities,
 running-container terminal reports, copied or forged HMAC receipts, and receipt
-or binding metadata changes, including through the status subresource. It permits release
+or binding metadata changes, request-path namespace confusion, and partially
+stripped PostgreSQL identity, while allowing non-PostgreSQL pgshard Pods to bind.
+PKI tests prove leaf renewal leaves the separate immutable fencing key unchanged.
+Generation-history tests reject image, ephemeral-container, and resize changes
+after a terminal receipt, while malformed receipt-only cluster state rotates to
+a fresh challenge. It permits release
 only after the admitted condition (or when
 the Pod was never assigned) and refuses to prune a managed workload whose Pod
 lacks its finalizer. Fault injection separately places a late StatefulSet Pod

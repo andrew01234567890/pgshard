@@ -13,6 +13,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -43,7 +44,7 @@ func TestBindingAttestorPinsTheNodeIncarnationInTheBinding(t *testing.T) {
 	}
 	raw := marshalObject(t, binding)
 	response := handler.Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
-		Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: raw},
+		Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: raw},
 	}})
 	if !response.Allowed {
 		t.Fatalf("binding denied: %#v", response.Result)
@@ -65,7 +66,7 @@ func TestBindingAttestorPinsTheNodeIncarnationInTheBinding(t *testing.T) {
 		}
 	}
 	validationRequest := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
-		Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, got)},
+		Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, got)},
 	}}
 	validated := NewBindingValidator(reader, scheme).Handle(context.Background(), validationRequest)
 	if !validated.Allowed {
@@ -103,7 +104,7 @@ func TestBindingAdmissionRejectsPartiallyStrippedManagedPods(t *testing.T) {
 		Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
 	}
 	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
-		Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+		Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
 	}}
 	for name, handler := range map[string]admission.Handler{
 		"mutating":   NewBindingAttestor(reader, scheme),
@@ -115,6 +116,69 @@ func TestBindingAdmissionRejectsPartiallyStrippedManagedPods(t *testing.T) {
 				t.Fatalf("partially stripped Pod binding response = %#v", response)
 			}
 		})
+	}
+}
+
+func TestBindingAdmissionAllowsNonPostgreSQLPgShardPods(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	for _, component := range []string{"etcd", "orchestrator", "pooler"} {
+		component := component
+		t.Run(component, func(t *testing.T) {
+			t.Parallel()
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: "example-" + component, Namespace: "database", UID: types.UID("pod-uid-" + component),
+				Labels: map[string]string{
+					owned.ManagedByLabel: owned.ManagedByValue,
+					owned.ComponentLabel: component,
+					owned.ClusterLabel:   "example",
+				},
+			}}
+			reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+			binding := &corev1.Binding{
+				ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
+				Target:     corev1.ObjectReference{Kind: "Node", Name: "node-a"},
+			}
+			request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+				Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+			}}
+			for name, handler := range map[string]admission.Handler{
+				"mutating":   NewBindingAttestor(reader, scheme),
+				"validating": NewBindingValidator(reader, scheme),
+			} {
+				response := handler.Handle(context.Background(), request)
+				if !response.Allowed {
+					t.Fatalf("%s binding denied for non-PostgreSQL pgshard Pod: %#v", name, response.Result)
+				}
+			}
+		})
+	}
+}
+
+func TestBindingAdmissionRejectsPostMutationPathConfusion(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	managed := managedPod()
+	managed.Spec.NodeName = ""
+	managed.DeletionTimestamp = nil
+	unmanaged := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: managed.Name, Namespace: "redirected", UID: managed.UID}}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(managed, unmanaged).Build()
+	binding := &corev1.Binding{
+		ObjectMeta: metav1.ObjectMeta{Name: managed.Name, Namespace: unmanaged.Namespace, UID: managed.UID},
+		Target:     corev1.ObjectReference{Kind: "Node", Name: "node-a"},
+	}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: managed.Name, Namespace: managed.Namespace, Operation: admissionv1.Create, SubResource: "binding",
+		Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+	}}
+	for name, handler := range map[string]admission.Handler{
+		"mutating":   NewBindingAttestor(reader, scheme),
+		"validating": NewBindingValidator(reader, scheme),
+	} {
+		response := handler.Handle(context.Background(), request)
+		if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "does not match the admission request path") {
+			t.Fatalf("%s namespace-confused binding response = %#v", name, response)
+		}
 	}
 }
 
@@ -155,6 +219,15 @@ func TestHandshakeAttestorAcknowledgesTheCurrentChallenge(t *testing.T) {
 	}
 	if verified {
 		t.Fatal("fencing handshake receipt was replayable across cluster UIDs")
+	}
+	missingChallenge := got.DeepCopy()
+	delete(missingChallenge.Annotations, HandshakeChallengeAnnotation)
+	verified, err = codec.Verify(context.Background(), missingChallenge)
+	if err != nil {
+		t.Fatalf("receipt-only handshake verification: %v", err)
+	}
+	if verified {
+		t.Fatal("receipt-only handshake was authenticated without a challenge")
 	}
 }
 
@@ -324,7 +397,7 @@ func TestStatusValidatorAcceptsOnlyTheAttestorOutput(t *testing.T) {
 	stripped.Finalizers = nil
 	request, _ = statusRequest(t, oldPod, stripped, "system:node:node-a", []string{"system:nodes"})
 	validated = NewStatusValidator(reader, testCodec(), scheme).Handle(context.Background(), request)
-	if validated.Allowed || validated.Result == nil || !strings.Contains(validated.Result.Message, "identity changed during final status admission") {
+	if validated.Allowed || validated.Result == nil || !strings.Contains(validated.Result.Message, "identity changed during a status update") {
 		t.Fatalf("post-mutation finalizer stripping response = %#v", validated)
 	}
 }
@@ -438,6 +511,43 @@ func TestMetadataValidatorProtectsTheBindingIdentity(t *testing.T) {
 	response := NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, changed, ""))
 	if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "immutable") {
 		t.Fatalf("binding identity mutation response = %#v", response)
+	}
+}
+
+func TestMetadataValidatorProtectsAttestedPodGenerationAcrossSpecSubresources(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	oldPod := managedPod()
+	oldPod.Status.Phase = corev1.PodFailed
+	oldPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "postgresql", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+	}}
+	oldPod.Status.Conditions = append(oldPod.Status.Conditions, validAttestation(oldPod))
+	tests := []struct {
+		name        string
+		subresource string
+		mutate      func(*corev1.Pod)
+	}{
+		{name: "main image update", mutate: func(pod *corev1.Pod) { pod.Spec.Containers[0].Image = "replacement" }},
+		{name: "ephemeral container", subresource: "ephemeralcontainers", mutate: func(pod *corev1.Pod) {
+			pod.Spec.EphemeralContainers = append(pod.Spec.EphemeralContainers, corev1.EphemeralContainer{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", Image: "debug"}})
+		}},
+		{name: "in-place resize", subresource: "resize", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}
+		}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			changed := oldPod.DeepCopy()
+			changed.Generation++
+			test.mutate(changed)
+			response := NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, changed, test.subresource))
+			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "spec and generation are immutable") {
+				t.Fatalf("attested Pod %s mutation response = %#v", test.name, response)
+			}
+		})
 	}
 }
 

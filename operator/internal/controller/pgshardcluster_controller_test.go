@@ -706,6 +706,33 @@ func TestReconcileWaitsForPodFencingAdmissionHandshake(t *testing.T) {
 	}
 }
 
+func TestPodFencingHandshakeRecoversReceiptOnlyState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	current := getCluster(t, ctx, base, cluster)
+	delete(current.Annotations, podfence.HandshakeChallengeAnnotation)
+	current.Annotations[podfence.HandshakeReceiptAnnotation] = "v1.forged"
+	if err := base.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	ready, err := reconciler.ensurePostgreSQLPodFencingHandshake(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready {
+		t.Fatal("receipt-only Pod fencing state was accepted")
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if current.Annotations[podfence.HandshakeChallengeAnnotation] == "" || current.Annotations[podfence.HandshakeReceiptAnnotation] != "" {
+		t.Fatalf("receipt-only Pod fencing state was not rotated: %#v", current.Annotations)
+	}
+}
+
 func TestReconcilePinsDefaultStorageClassBeforeCreateAndSurvivesRotation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

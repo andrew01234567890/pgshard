@@ -25,6 +25,7 @@ const (
 	testServiceName                 = "pgshard-webhook-service"
 	testCASecretName                = "pgshard-webhook-ca"
 	testServingSecretName           = "pgshard-webhook-certificate"
+	testFencingKeySecretName        = "pgshard-webhook-fencing-key"
 	testMutatingConfigurationName   = "pgshard-mutating-webhook-configuration"
 	testValidatingConfigurationName = "pgshard-validating-webhook-configuration"
 )
@@ -40,8 +41,12 @@ func TestBootstrapCreatesValidIdempotentMaterial(t *testing.T) {
 	}
 	caSecret := getSecret(t, kubeClient, testCASecretName)
 	servingSecret := getSecret(t, kubeClient, testServingSecretName)
+	fencingKeySecret := getSecret(t, kubeClient, testFencingKeySecretName)
 	if servingSecret.Type != corev1.SecretTypeOpaque {
 		t.Fatalf("initialized serving Secret type = %q", servingSecret.Type)
+	}
+	if fencingKeySecret.Immutable == nil || !*fencingKeySecret.Immutable || len(fencingKeySecret.Data) != 1 || len(fencingKeySecret.Data[PodFencingKeyKey]) != podFencingKeyBytes {
+		t.Fatalf("initialized Pod fencing key Secret = %#v", fencingKeySecret)
 	}
 	authority, err := parseCertificateAuthority(caSecret.Data[CACertificateKey], caSecret.Data[CAPrivateKeyKey], now)
 	if err != nil {
@@ -67,13 +72,16 @@ func TestBootstrapCreatesValidIdempotentMaterial(t *testing.T) {
 
 	beforeCAResourceVersion := caSecret.ResourceVersion
 	beforeServingResourceVersion := servingSecret.ResourceVersion
+	beforeFencingKeyResourceVersion := fencingKeySecret.ResourceVersion
 	beforeCertificate := bytes.Clone(servingSecret.Data[TLSCertificateKey])
+	beforeFencingKey := bytes.Clone(fencingKeySecret.Data[PodFencingKeyKey])
 	if err := provisioner.Bootstrap(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	caSecret = getSecret(t, kubeClient, testCASecretName)
 	servingSecret = getSecret(t, kubeClient, testServingSecretName)
-	if caSecret.ResourceVersion != beforeCAResourceVersion || servingSecret.ResourceVersion != beforeServingResourceVersion || !bytes.Equal(servingSecret.Data[TLSCertificateKey], beforeCertificate) {
+	fencingKeySecret = getSecret(t, kubeClient, testFencingKeySecretName)
+	if caSecret.ResourceVersion != beforeCAResourceVersion || servingSecret.ResourceVersion != beforeServingResourceVersion || fencingKeySecret.ResourceVersion != beforeFencingKeyResourceVersion || !bytes.Equal(servingSecret.Data[TLSCertificateKey], beforeCertificate) || !bytes.Equal(fencingKeySecret.Data[PodFencingKeyKey], beforeFencingKey) {
 		t.Fatal("idempotent bootstrap rewrote valid certificate resources")
 	}
 }
@@ -88,6 +96,7 @@ func TestBootstrapRenewsOnlyTheServingCertificate(t *testing.T) {
 	}
 	oldCA := bytes.Clone(getSecret(t, kubeClient, testCASecretName).Data[CACertificateKey])
 	oldServing := bytes.Clone(getSecret(t, kubeClient, testServingSecretName).Data[TLSCertificateKey])
+	oldFencingKey := bytes.Clone(getSecret(t, kubeClient, testFencingKeySecretName).Data[PodFencingKeyKey])
 
 	now = now.Add(61 * 24 * time.Hour)
 	if err := provisioner.Checker(nil); err != nil {
@@ -98,11 +107,15 @@ func TestBootstrapRenewsOnlyTheServingCertificate(t *testing.T) {
 	}
 	newCA := getSecret(t, kubeClient, testCASecretName).Data[CACertificateKey]
 	newServing := getSecret(t, kubeClient, testServingSecretName).Data[TLSCertificateKey]
+	newFencingKey := getSecret(t, kubeClient, testFencingKeySecretName).Data[PodFencingKeyKey]
 	if !bytes.Equal(oldCA, newCA) {
 		t.Fatal("leaf renewal replaced the CA")
 	}
 	if bytes.Equal(oldServing, newServing) {
 		t.Fatal("near-expiry serving certificate was not renewed")
+	}
+	if !bytes.Equal(oldFencingKey, newFencingKey) {
+		t.Fatal("leaf renewal replaced the durable Pod fencing key")
 	}
 	assertInjectedBundles(t, kubeClient, oldCA)
 	if err := provisioner.Checker(nil); err != nil {
@@ -144,6 +157,13 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 				objects[0].(*corev1.Secret).Data = map[string][]byte{"unexpected": []byte("do not replace")}
 			},
 			want: "contain exactly",
+		},
+		{
+			name: "mutable initialized fencing key",
+			mutate: func(objects []client.Object) {
+				objects[4].(*corev1.Secret).Data = map[string][]byte{PodFencingKeyKey: make([]byte, podFencingKeyBytes)}
+			},
+			want: "must be immutable",
 		},
 		{
 			name: "foreign CA bundle",
@@ -344,6 +364,7 @@ func TestBootstrapTimesOutWaitingForInstallResources(t *testing.T) {
 		ServiceName:                 testServiceName,
 		CASecretName:                testCASecretName,
 		ServingSecretName:           testServingSecretName,
+		FencingKeySecretName:        testFencingKeySecretName,
 		MutatingConfigurationName:   testMutatingConfigurationName,
 		ValidatingConfigurationName: testValidatingConfigurationName,
 		CertificateDirectory:        t.TempDir(),
@@ -366,6 +387,7 @@ func TestNewRejectsUnsafeCertificateDirectory(t *testing.T) {
 		ServiceName:                 testServiceName,
 		CASecretName:                testCASecretName,
 		ServingSecretName:           testServingSecretName,
+		FencingKeySecretName:        testFencingKeySecretName,
 		MutatingConfigurationName:   testMutatingConfigurationName,
 		ValidatingConfigurationName: testValidatingConfigurationName,
 		CertificateDirectory:        "/",
@@ -383,6 +405,7 @@ func newTestProvisioner(t *testing.T, kubeClient client.Client, directory string
 		ServiceName:                 testServiceName,
 		CASecretName:                testCASecretName,
 		ServingSecretName:           testServingSecretName,
+		FencingKeySecretName:        testFencingKeySecretName,
 		MutatingConfigurationName:   testMutatingConfigurationName,
 		ValidatingConfigurationName: testValidatingConfigurationName,
 		CertificateDirectory:        directory,
@@ -418,11 +441,11 @@ func installObjects() []client.Object {
 			},
 		}}
 	}
-	coreRules := func(operation admissionregistrationv1.OperationType, resource string) []admissionregistrationv1.RuleWithOperations {
+	coreResourceRules := func(operation admissionregistrationv1.OperationType, resources ...string) []admissionregistrationv1.RuleWithOperations {
 		return []admissionregistrationv1.RuleWithOperations{{
 			Operations: []admissionregistrationv1.OperationType{operation},
 			Rule: admissionregistrationv1.Rule{
-				APIGroups: []string{""}, APIVersions: []string{"v1"}, Resources: []string{resource}, Scope: &scope,
+				APIGroups: []string{""}, APIVersions: []string{"v1"}, Resources: resources, Scope: &scope,
 			},
 		}}
 	}
@@ -442,9 +465,9 @@ func installObjects() []client.Object {
 		}
 	}
 	clusterMutating := mutatingWebhook(mutatingWebhookName, mutatingWebhookPath, clusterRules())
-	bindingMutating := mutatingWebhook(podfence.BindingWebhookName, podfence.BindingWebhookPath, coreRules(admissionregistrationv1.Create, "pods/binding"))
+	bindingMutating := mutatingWebhook(podfence.BindingWebhookName, podfence.BindingWebhookPath, coreResourceRules(admissionregistrationv1.Create, "pods/binding"))
 	bindingMutating.NamespaceSelector = podFencingNamespaceSelector()
-	statusMutating := mutatingWebhook(podfence.StatusWebhookName, podfence.StatusWebhookPath, coreRules(admissionregistrationv1.Update, "pods/status"))
+	statusMutating := mutatingWebhook(podfence.StatusWebhookName, podfence.StatusWebhookPath, coreResourceRules(admissionregistrationv1.Update, "pods/status"))
 	statusMutating.ObjectSelector = postgreSQLPodSelector()
 	handshakeMutating := mutatingWebhook(podfence.HandshakeWebhookName, podfence.HandshakeWebhookPath, []admissionregistrationv1.RuleWithOperations{{
 		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
@@ -454,7 +477,7 @@ func installObjects() []client.Object {
 	}})
 	handshakeMutating.NamespaceSelector = podFencingNamespaceSelector()
 	clusterValidating := validatingWebhook(validatingWebhookName, validatingWebhookPath, clusterRules())
-	metadataValidating := validatingWebhook(podfence.MetadataWebhookName, podfence.MetadataWebhookPath, coreRules(admissionregistrationv1.Update, "pods"))
+	metadataValidating := validatingWebhook(podfence.MetadataWebhookName, podfence.MetadataWebhookPath, coreResourceRules(admissionregistrationv1.Update, "pods", "pods/ephemeralcontainers", "pods/resize"))
 	metadataValidating.ObjectSelector = postgreSQLPodSelector()
 	namespaceValidating := validatingWebhook(podfence.NamespaceWebhookName, podfence.NamespaceWebhookPath, []admissionregistrationv1.RuleWithOperations{{
 		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
@@ -464,9 +487,9 @@ func installObjects() []client.Object {
 		},
 	}})
 	namespaceValidating.ObjectSelector = podFencingNamespaceSelector()
-	statusValidating := validatingWebhook(podfence.StatusValidationWebhookName, podfence.StatusValidationWebhookPath, coreRules(admissionregistrationv1.Update, "pods/status"))
+	statusValidating := validatingWebhook(podfence.StatusValidationWebhookName, podfence.StatusValidationWebhookPath, coreResourceRules(admissionregistrationv1.Update, "pods/status"))
 	statusValidating.ObjectSelector = postgreSQLPodSelector()
-	bindingValidating := validatingWebhook(podfence.BindingValidationWebhookName, podfence.BindingValidationWebhookPath, coreRules(admissionregistrationv1.Create, "pods/binding"))
+	bindingValidating := validatingWebhook(podfence.BindingValidationWebhookName, podfence.BindingValidationWebhookPath, coreResourceRules(admissionregistrationv1.Create, "pods/binding"))
 	bindingValidating.NamespaceSelector = podFencingNamespaceSelector()
 	return []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testCASecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
@@ -479,6 +502,7 @@ func installObjects() []client.Object {
 			ObjectMeta: metav1.ObjectMeta{Name: testValidatingConfigurationName},
 			Webhooks:   []admissionregistrationv1.ValidatingWebhook{clusterValidating, metadataValidating, namespaceValidating, statusValidating, bindingValidating},
 		},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testFencingKeySecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
 	}
 }
 

@@ -50,8 +50,8 @@ const (
 	bootstrapNameRandomBytes      = 16
 	fencingChallengeRandomBytes   = 16
 	defaultPodFencingKeyNamespace = "pgshard-system"
-	defaultPodFencingKeySecret    = "pgshard-webhook-ca"
-	defaultPodFencingKeyData      = "ca.key"
+	defaultPodFencingKeySecret    = "pgshard-webhook-fencing-key"
+	defaultPodFencingKeyData      = "hmac.key"
 )
 
 // PgShardClusterReconciler owns safe supporting resources and single-member
