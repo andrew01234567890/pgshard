@@ -181,6 +181,7 @@ struct WorkflowRuns {
 struct WorkflowRun {
     id: u64,
     workflow_id: u64,
+    run_number: u64,
     head_branch: String,
     head_sha: String,
     path: String,
@@ -629,6 +630,11 @@ fn exact_workflow_runs(repository: &str, workflow_id: u64, sha: &str) -> Result<
         |run| (run.id, run.run_attempt),
         "exact-SHA workflow runs",
     )?;
+    ensure_unique_by(
+        &runs,
+        |run| (run.run_number, run.run_attempt),
+        "exact-SHA workflow run numbers",
+    )?;
     ensure!(
         runs.iter()
             .all(|run| run.workflow_id == workflow_id && run.head_sha == sha),
@@ -730,7 +736,7 @@ fn latest_ci_run<'a>(
                 && ((run.event == "push" && run.head_branch == "main")
                     || run.event == "workflow_dispatch")
         })
-        .max_by_key(|run| (run.id, run.run_attempt))
+        .max_by_key(|run| (run.run_number, run.run_attempt))
 }
 
 fn latest_codeql_run<'a>(
@@ -746,7 +752,7 @@ fn latest_codeql_run<'a>(
                 && run.head_branch == "main"
                 && run.event == "dynamic"
         })
-        .max_by_key(|run| (run.id, run.run_attempt))
+        .max_by_key(|run| (run.run_number, run.run_attempt))
 }
 
 fn ci_run_state(run: &WorkflowRun, jobs: &[WorkflowJob]) -> AggregateState {
@@ -1610,6 +1616,7 @@ mod tests {
         WorkflowRun {
             id,
             workflow_id,
+            run_number: id,
             head_branch: head_branch.to_owned(),
             head_sha: "a".repeat(40),
             path: path.to_owned(),
@@ -2062,8 +2069,8 @@ mod tests {
     #[test]
     fn release_uses_only_the_latest_trusted_ci_run() {
         let sha = "a".repeat(40);
-        let old_success = test_workflow_run(
-            10,
+        let mut old_success = test_workflow_run(
+            90,
             7,
             CI_WORKFLOW_PATH,
             "main",
@@ -2071,6 +2078,7 @@ mod tests {
             "completed",
             Some("success"),
         );
+        old_success.run_number = 10;
         let newer_failure = test_workflow_run(
             11,
             7,
@@ -2090,6 +2098,8 @@ mod tests {
             Some("success"),
         );
         let runs = vec![old_success.clone(), newer_failure.clone(), impostor];
+        assert!(old_success.id > newer_failure.id);
+        assert!(old_success.run_number < newer_failure.run_number);
         let selected = latest_ci_run(&runs, 7, &sha).expect("trusted CI run");
         assert_eq!(selected.id, newer_failure.id);
         assert_eq!(
@@ -2134,8 +2144,8 @@ mod tests {
     #[test]
     fn release_requires_one_successful_codeql_job_set_from_the_latest_run() {
         let sha = "a".repeat(40);
-        let old_failure = test_workflow_run(
-            20,
+        let mut old_failure = test_workflow_run(
+            80,
             8,
             CODEQL_WORKFLOW_PATH,
             "main",
@@ -2143,6 +2153,7 @@ mod tests {
             "completed",
             Some("failure"),
         );
+        old_failure.run_number = 20;
         let newer_success = test_workflow_run(
             21,
             8,
@@ -2170,6 +2181,8 @@ mod tests {
             "completed",
             Some("success"),
         );
+        assert!(old_failure.id > newer_success.id);
+        assert!(old_failure.run_number < newer_success.run_number);
         let runs = vec![old_failure, newer_success.clone(), wrong_branch, wrong_path];
         let selected = latest_codeql_run(&runs, 8, &sha).expect("trusted CodeQL run");
         assert_eq!(selected.id, newer_success.id);
