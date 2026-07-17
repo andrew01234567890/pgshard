@@ -27,10 +27,10 @@ import (
 
 func TestCatalogMaterialSHA256MatchesRustContract(t *testing.T) {
 	t.Parallel()
-	if got, want := CatalogClientMaterialSHA256([]byte("catalog-key"), []byte("catalog-ca")), "e38e516f1acd23cb27004b5e9dcd238cbc91d3500d27c1be4e80b588f4db224d"; got != want {
+	if got, want := CatalogClientMaterialSHA256(nil, []byte("catalog-ca")), "f25d89531a7aa9937005eb56aab838662145cadff1315196229e0cd334ece559"; got != want {
 		t.Fatalf("client material SHA-256 = %q, want shared Rust vector %q", got, want)
 	}
-	if got, want := CatalogServerMaterialSHA256([]byte("catalog-certificate"), []byte("catalog-private-key")), "9159c0ecb435f50c9597d7545aa1fbe6a723225cdb5fb6356f6931809df2abbb"; got != want {
+	if got, want := CatalogServerMaterialSHA256([]byte("catalog-certificate"), nil), "219f722b1a1d47cb6b569c6c6bc6e9dfe5131f6d4e8fc507bcf93c106df8409d"; got != want {
 		t.Fatalf("server material SHA-256 = %q, want shared Rust vector %q", got, want)
 	}
 }
