@@ -1087,6 +1087,7 @@ func waitForStableManagerPod(t *testing.T, ctx context.Context, kubeClient clien
 func waitForManagerReplicas(t *testing.T, ctx context.Context, kubeClient client.Client, wanted int32) {
 	t.Helper()
 	deployment := &appsv1.Deployment{}
+	managerPods := &corev1.PodList{}
 	key := types.NamespacedName{Namespace: "pgshard-system", Name: "pgshard-controller-manager"}
 	err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		deployment = &appsv1.Deployment{}
@@ -1097,12 +1098,26 @@ func waitForManagerReplicas(t *testing.T, ctx context.Context, kubeClient client
 			return false, nil
 		}
 		if wanted == 0 {
-			return deployment.Status.Replicas == 0 && deployment.Status.ReadyReplicas == 0 && deployment.Status.AvailableReplicas == 0, nil
+			if deployment.Status.Replicas != 0 || deployment.Status.ReadyReplicas != 0 || deployment.Status.AvailableReplicas != 0 {
+				return false, nil
+			}
+			// Deployment replica counters exclude a terminating Pod before its
+			// preStop hook and webhook server have necessarily exited.  The
+			// outage fixture must wait for the process itself to disappear or a
+			// cached admission connection can still authenticate termination.
+			managerPods = &corev1.PodList{}
+			if err := kubeClient.List(ctx, managerPods,
+				client.InNamespace("pgshard-system"),
+				client.MatchingLabels{"app.kubernetes.io/name": "pgshard-operator", "app.kubernetes.io/component": "controller-manager"},
+			); err != nil {
+				return false, err
+			}
+			return len(managerPods.Items) == 0, nil
 		}
 		return deployment.Status.UpdatedReplicas == wanted && deployment.Status.ReadyReplicas == wanted && deployment.Status.AvailableReplicas == wanted, nil
 	})
 	if err != nil {
-		t.Fatalf("wait for manager replicas %d: %v; last status = %#v", wanted, err, deployment.Status)
+		t.Fatalf("wait for manager replicas %d: %v; last status = %#v; last pods = %#v", wanted, err, deployment.Status, managerPods.Items)
 	}
 }
 
