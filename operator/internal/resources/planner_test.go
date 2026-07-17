@@ -25,6 +25,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+func TestCatalogMaterialSHA256MatchesRustContract(t *testing.T) {
+	t.Parallel()
+	if got, want := CatalogClientMaterialSHA256([]byte("catalog-key"), []byte("catalog-ca")), "e38e516f1acd23cb27004b5e9dcd238cbc91d3500d27c1be4e80b588f4db224d"; got != want {
+		t.Fatalf("client material SHA-256 = %q, want shared Rust vector %q", got, want)
+	}
+	if got, want := CatalogServerMaterialSHA256([]byte("catalog-certificate"), []byte("catalog-private-key")), "9159c0ecb435f50c9597d7545aa1fbe6a723225cdb5fb6356f6931809df2abbb"; got != want {
+		t.Fatalf("server material SHA-256 = %q, want shared Rust vector %q", got, want)
+	}
+}
+
 func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
@@ -305,6 +315,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			!strings.Contains(bootstrap.Command[2], "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE") ||
 			!strings.Contains(bootstrap.Command[2], "roles.rolpassword LIKE 'SCRAM-SHA-256\\$4096:%'") ||
 			!strings.Contains(bootstrap.Command[2], "pgshard-scram-verifier") ||
+			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest") != 2 ||
 			!strings.Contains(bootstrap.Command[2], "SET rolpassword = $1, rolcanlogin = true") ||
 			strings.Contains(bootstrap.Command[2], "PASSWORD '$catalog_password'") ||
 			!strings.Contains(bootstrap.Command[2], "PGPASSWORD=\"$catalog_password\"") ||

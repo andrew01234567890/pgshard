@@ -25,6 +25,7 @@ RUN PGSHARD_BUILD_VERSION="${PGSHARD_BUILD_VERSION}" \
     PGSHARD_GIT_SHA="${PGSHARD_GIT_SHA}" \
     cargo build --locked --release --package pgshard-agent && \
     install -D -m 0755 target/release/pgshard-agent /out/pgshard-agent && \
+    install -D -m 0755 target/release/pgshard-catalog-material-digest /out/pgshard-catalog-material-digest && \
     install -D -m 0755 target/release/pgshard-scram-verifier /out/pgshard-scram-verifier
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:ce0d66bc0f64aae46e6a03add867b07f42cc7b8799c949c2e898057b7f75a151 AS runtime
@@ -61,6 +62,7 @@ LABEL org.opencontainers.image.source="https://github.com/andrew01234567890/pgsh
       org.opencontainers.image.revision="${PGSHARD_GIT_SHA}"
 
 COPY --from=postgres-agent-build --chown=0:0 /out/pgshard-agent /usr/local/bin/pgshard-agent
+COPY --from=postgres-agent-build --chown=0:0 /out/pgshard-catalog-material-digest /usr/local/bin/pgshard-catalog-material-digest
 COPY --from=postgres-agent-build --chown=0:0 /out/pgshard-scram-verifier /usr/local/bin/pgshard-scram-verifier
 RUN install -d -o 0 -g 0 -m 0755 /etc/pgshard /usr/share/pgshard/migrations
 COPY --chown=0:0 --chmod=0444 deploy/images/quarantine.pg_hba.conf /etc/pgshard/quarantine.pg_hba.conf
