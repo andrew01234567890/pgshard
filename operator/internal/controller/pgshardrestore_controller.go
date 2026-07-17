@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
@@ -109,7 +110,13 @@ func (r *PgShardRestoreReconciler) Reconcile(ctx context.Context, request ctrl.R
 		var destination *restorepreflight.InvalidDestinationError
 		switch {
 		case errors.As(err, &mismatch):
-			return ctrl.Result{}, r.reject(ctx, restore, "RestoreTopologyMismatch", mismatch.Error(), mismatch.ManifestSHA256, mismatch.ManifestTopologyFingerprint, "", keySecret.UID)
+			message := fmt.Sprintf(
+				"RestoreTopologyMismatch: requested destination topology differs from backup in %s (manifest=%s requested=%s)",
+				strings.Join(mismatch.Fields, ","),
+				mismatch.ManifestTopologyFingerprint,
+				mismatch.DestinationTopologyFingerprint,
+			)
+			return ctrl.Result{}, r.reject(ctx, restore, "RestoreTopologyMismatch", message, mismatch.ManifestSHA256, mismatch.ManifestTopologyFingerprint, "", keySecret.UID)
 		case errors.As(err, &signature):
 			return ctrl.Result{}, r.reject(ctx, restore, "BackupManifestSignatureInvalid", signature.Error(), "", "", "", keySecret.UID)
 		case errors.As(err, &manifest):

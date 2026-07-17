@@ -339,6 +339,6 @@ The Milestone 1 KIND and Docker Desktop suites must use MinIO and cover:
 Unit tests and the Kubernetes manager test now cover signed request verification
 up to the resolver-unavailable `Pending` state, five-to-three admission
 rejection, range/hash mismatch typing, and a no-target-mutation oracle. They do
-not prove resolver-backed exact preflight success. MinIO, pgBackRest,
+not prove live catalog-resolver-backed exact preflight success. MinIO, pgBackRest,
 materialization, activation, mobility, and failure-injection coverage remain to
 be implemented.
