@@ -197,18 +197,20 @@ mint replacement authority.
 An upgrade from the keyless default-branch release needs no manual key command,
 but it crosses an incompatible admission contract. Freeze `PgShardCluster`
 writes and do not opt a resource namespace into Pod fencing during that rollout.
-The webhook Service selects only `receipt-v1` manager Pods, deliberately
-excluding the keyless manager so it cannot receive a new receipt path or apply
-its older validation. Admission therefore fails closed, and clients may receive
-retryable webhook-unavailable errors until the new manager is Ready. Deployment
-process availability does not make the old process admission-compatible. Wait
-for rollout completion before retrying writes or enabling Pod fencing. A
-zero-rejection transition needs staged compatibility tooling and is not
-implemented. Later compatible rollouts have a 20-second total termination
-budget: the first five seconds drain stale Service endpoints before `SIGTERM`,
-leaving roughly 15 seconds for graceful shutdown. Do not restart the old image
-with the new command-line arguments. For a pre-release development install that
-already has an initialized unanchored key, record the current
+The webhook Service uses a dedicated `9444` client port and selects only
+`receipt-v1` manager Pods. The port change prevents the API server from reusing
+a cached connection to the keyless manager's `443` client, while the selector
+prevents new connections from reaching that manager. Admission therefore fails
+closed, and clients may receive retryable webhook-unavailable errors until the
+new manager is Ready. Deployment process availability does not make the old
+process admission-compatible. Wait for rollout completion before retrying
+writes or enabling Pod fencing. A zero-rejection transition needs staged
+compatibility tooling and is not implemented. Later compatible rollouts have a
+20-second total termination budget: the first five seconds drain stale Service
+endpoints before `SIGTERM`, leaving roughly 15 seconds for graceful shutdown. Do
+not restart the old image with the new command-line arguments. For a pre-release
+development install that already has an initialized unanchored key, record the
+current
 immutable key before changing the
 manager image. Run this while the old manager is healthy:
 
