@@ -202,6 +202,15 @@ installed term, process-local monotonic deadline, catalog epoch, and fencing
 epoch at dispatch; expired and superseded handles fail closed. The receiving
 target still has to enforce that epoch because the local guard is an
 instant-in-time observation rather than a duration guarantee.
+The coordination gateway tests separately use the pinned etcd 3.6.5 image.
+They prove exclusive process identity, reject a same-name cluster replacement
+with a different Kubernetes UID, replace an incarnation key with the same token
+under a different lease, then with a foreign token, and require readiness loss
+before another process takes ownership. Rebinding the persistent marker must
+terminate the new owner with a permanent conflict. Unit coverage ensures lease
+RPC headers pin cluster identity without treating follower-local revisions as
+global ordering evidence. A Linux process test stalls an endpoint request,
+sends `SIGTERM`, and requires cancellation and clean exit inside two seconds.
 Pure orchestrator tests also exercise the standby-decoder attachment contract. They
 require non-nil catalog generations encoded in slot names and matched exactly,
 an opaque test-only replay floor bound to the exact source identity, the
@@ -552,8 +561,11 @@ leader-elected reconciliation, observes a restart-free etcd quorum, keeps the
 rejection-only pooler unready, and requires all three persistence-free
 orchestrators to establish distinct cluster-UID-bound etcd incarnations without
 restarts. Their readiness proves only renewable process identity, not durable
-operations or shard-term authority. The job also proves the three-member sample
-has no PostgreSQL workload or ready application endpoint. The same job creates
+operations or shard-term authority. It then pauses manager reconciliation,
+removes etcd quorum, requires those exact Pod UIDs to become unready without a
+restart, restores quorum, and requires the same processes to recover before the
+manager resumes. The job also proves the three-member sample has no PostgreSQL
+workload or ready application endpoint. The same job creates
 a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard
 Service from an authorized restricted probe client using the destination-specific
