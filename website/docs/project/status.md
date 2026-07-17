@@ -54,7 +54,6 @@ phase is not implemented.
 | Online resharding | Design only | Planned |
 | Admin UI, Prometheus and OpenTelemetry | The pooler control executable serves catalog Prometheus exposition; scraping resources, SQL-path metrics, OpenTelemetry export, dashboards, UI, and Grafana/Tempo validation are absent | Partial |
 | KIND, Jepsen/Elle and PgBouncer comparison | Targeted operator deletion/recreate, admission/fail-closed manager, real Kubernetes Lease identity loss and rollout recovery, and two-shard single-member PostgreSQL startup, shard-0000-only catalog placement, exact shard/restore inventory, idempotent catalog restart, operator-provisioned TLS/SCRAM pooler catalog and relay readiness plus metrics, native-SCRAM SQL through the shard-zero compatibility Service, selectorless unsupported application Services, application-side `shardschema` rejection, graceful restart persistence, and binding-identity plus authenticated force-delete receipt recovery across a webhook outage KIND tests; HA traffic, history, resharding, backup and performance suites remain absent | Partial |
-
 The current database-topology foundation accepts immutable logical-database
 shard counts and ordered physical-cell mappings in
 `PgShardCluster.spec.databases`. Shard-zero bootstrap installs all declared
