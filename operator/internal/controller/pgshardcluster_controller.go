@@ -165,7 +165,7 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	}
 	images := r.Images
 	if images == (owned.Images{}) {
-		images = owned.DevelopmentImages()
+		images = owned.DefaultImages()
 	}
 	if err := pgshardv1alpha1.ValidateClusterForReconciliation(cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))

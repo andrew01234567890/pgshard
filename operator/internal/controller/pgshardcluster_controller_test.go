@@ -46,6 +46,14 @@ type createPodAfterListReader struct {
 	injected bool
 }
 
+func developmentReconciler(kubeClient client.Client, apiReader client.Reader) *PgShardClusterReconciler {
+	return &PgShardClusterReconciler{
+		Client:    kubeClient,
+		APIReader: apiReader,
+		Images:    owned.DevelopmentImages(),
+	}
+}
+
 func (r *createPodAfterListReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
 	if err := r.Reader.List(ctx, list, options...); err != nil {
 		return err
@@ -141,7 +149,7 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +279,7 @@ func TestReconcileRefusesSingleMemberPostgreSQLWithoutPodFencingNamespace(t *tes
 		t.Fatal(err)
 	}
 
-	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	reconciler := developmentReconciler(base, base)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "must be labelled pgshard.io/pod-fencing=enabled") {
 		t.Fatalf("unfenced namespace reconcile error = %v", err)
 	}
@@ -304,7 +312,7 @@ func TestReconcileRefusesToReplaceMissingCredentialAfterWorkloadCreation(t *test
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +346,7 @@ func TestReconcileNeverAdoptsUnrecordedBootstrapChildren(t *testing.T) {
 	orphanClaim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, 0)+"orphan", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, orphanSecret.Name, orphanSecret.UID)
 	orphanClaim.UID = "unrecorded-pvc"
 	fakeClient := newFakeClient(t, cluster, orphanSecret, orphanClaim)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +397,7 @@ func TestReconcileReusesCheckpointedBootstrapIntentAfterStatusFailure(t *testing
 					return kubeClient.SubResource(subresource).Update(ctx, object, options...)
 				},
 			})
-			if _, err := (&PgShardClusterReconciler{Client: failing}).Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), injected.Error()) {
+			if _, err := developmentReconciler(failing, nil).Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), injected.Error()) {
 				t.Fatalf("bootstrap checkpoint failure was not surfaced: %v", err)
 			}
 
@@ -413,7 +421,7 @@ func TestReconcileReusesCheckpointedBootstrapIntentAfterStatusFailure(t *testing
 				t.Fatalf("PVC was created before the credential UID checkpoint: %v", err)
 			}
 
-			if _, err := (&PgShardClusterReconciler{Client: base}).Reconcile(ctx, requestFor(cluster)); err != nil {
+			if _, err := developmentReconciler(base, nil).Reconcile(ctx, requestFor(cluster)); err != nil {
 				t.Fatal(err)
 			}
 			complete := bootstrapForShard(t, getCluster(t, ctx, base, cluster), 0)
@@ -475,7 +483,7 @@ func TestReconcilePersistsStorageClassBeforePVCCreate(t *testing.T) {
 			return injected
 		},
 	})
-	if _, err := (&PgShardClusterReconciler{Client: writeClient}).Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), injected.Error()) {
+	if _, err := developmentReconciler(writeClient, nil).Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), injected.Error()) {
 		t.Fatalf("PVC dispatch interceptor was not reached: %v", err)
 	}
 	if !observed {
@@ -505,7 +513,7 @@ func TestReconcileFencesBypassedProvisionedSpecMutation(t *testing.T) {
 			cluster.Spec.MembersPerShard = 1
 			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 			fakeClient := newFakeClient(t, cluster)
-			reconciler := &PgShardClusterReconciler{Client: fakeClient}
+			reconciler := developmentReconciler(fakeClient, nil)
 			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 				t.Fatal(err)
 			}
@@ -533,7 +541,7 @@ func TestReconcileRefusesMissingOrReplacedPostgreSQLDataPVC(t *testing.T) {
 			cluster.Spec.MembersPerShard = 1
 			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 			fakeClient := newFakeClient(t, cluster)
-			reconciler := &PgShardClusterReconciler{Client: fakeClient}
+			reconciler := developmentReconciler(fakeClient, nil)
 			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 				t.Fatal(err)
 			}
@@ -574,7 +582,7 @@ func TestProtectedPostgreSQLDataPVCReservesItsNameUntilWorkloadPruning(t *testin
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -640,7 +648,7 @@ func TestPostgreSQLDataFenceStabilizationRecoversLostUpdateResponses(t *testing.
 					return kubeClient.Update(ctx, object, options...)
 				},
 			})
-			reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+			reconciler := developmentReconciler(writeClient, base)
 			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "lost stabilization update response") {
 				t.Fatalf("%s update response was not lost: %v", stage, err)
 			}
@@ -686,7 +694,7 @@ func TestReconcileWaitsForPodFencingAdmissionHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	reconciler := developmentReconciler(base, base)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -706,7 +714,7 @@ func TestReconcileWaitsForPodFencingAdmissionHandshake(t *testing.T) {
 		}
 		return kubeClient.Patch(ctx, object, patch, options...)
 	}})
-	reconciler = &PgShardClusterReconciler{Client: admitted, APIReader: base}
+	reconciler = developmentReconciler(admitted, base)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -740,7 +748,7 @@ func TestPodFencingHandshakeRecoversReceiptOnlyState(t *testing.T) {
 	if err := base.Update(ctx, current); err != nil {
 		t.Fatal(err)
 	}
-	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	reconciler := developmentReconciler(base, base)
 	ready, err := reconciler.ensurePostgreSQLPodFencingHandshake(ctx, current)
 	if err != nil {
 		t.Fatal(err)
@@ -777,7 +785,7 @@ func TestReconcilePinsDefaultStorageClassBeforeCreateAndSurvivesRotation(t *test
 		},
 	}}
 	fakeClient := newFakeClient(t, cluster, olderDefault, selectedDefault)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -800,7 +808,7 @@ func TestReconcilePinsDefaultStorageClassBeforeCreateAndSurvivesRotation(t *test
 	if err := fakeClient.Delete(ctx, selectedDefault); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (&PgShardClusterReconciler{Client: fakeClient}).Reconcile(ctx, requestFor(cluster)); err != nil {
+	if _, err := developmentReconciler(fakeClient, nil).Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatalf("restart after default rotation failed: %v", err)
 	}
 
@@ -826,7 +834,7 @@ func TestReconcileRequiresDefaultOrExplicitStorageClassBeforeCreate(t *testing.T
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	cluster.Spec.Storage.StorageClassName = nil
 	fakeClient := newFakeClient(t, cluster)
-	if _, err := (&PgShardClusterReconciler{Client: fakeClient}).Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "no default StorageClass is available") {
+	if _, err := developmentReconciler(fakeClient, nil).Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "no default StorageClass is available") {
 		t.Fatalf("missing default StorageClass error = %v", err)
 	}
 	if current := getCluster(t, ctx, fakeClient, cluster); len(current.Status.PostgreSQLBootstraps) != 0 {
@@ -842,7 +850,7 @@ func TestReconcileRequiresDefaultOrExplicitStorageClassBeforeCreate(t *testing.T
 	empty := ""
 	explicit.Spec.Storage.StorageClassName = &empty
 	explicitClient := newFakeClient(t, explicit)
-	if _, err := (&PgShardClusterReconciler{Client: explicitClient}).Reconcile(ctx, requestFor(explicit)); err != nil {
+	if _, err := developmentReconciler(explicitClient, nil).Reconcile(ctx, requestFor(explicit)); err != nil {
 		t.Fatal(err)
 	}
 	bootstrap := bootstrapForShard(t, getCluster(t, ctx, explicitClient, explicit), 0)
@@ -885,7 +893,7 @@ func TestDeletionPolicyRetainsPostgreSQLDataByDefault(t *testing.T) {
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient}
+	reconciler := developmentReconciler(fakeClient, fakeClient)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -929,7 +937,7 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	base := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	reconciler := developmentReconciler(base, base)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -1105,7 +1113,7 @@ func TestPodCreatedAfterFinalAbsenceCannotBindDuringClusterDeletion(t *testing.T
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	base := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	reconciler := developmentReconciler(base, base)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -1131,7 +1139,7 @@ func TestPodCreatedAfterFinalAbsenceCannotBindDuringClusterDeletion(t *testing.T
 		Spec: *statefulSet.Spec.Template.Spec.DeepCopy(),
 	}
 	reader := &createPodAfterListReader{Reader: base, writer: base, pod: latePod}
-	if pending, err := (&PgShardClusterReconciler{Client: base, APIReader: reader}).deletePostgreSQLPodsForFinalization(ctx, deleting); err != nil {
+	if pending, err := developmentReconciler(base, reader).deletePostgreSQLPodsForFinalization(ctx, deleting); err != nil {
 		t.Fatal(err)
 	} else if pending {
 		t.Fatal("pre-injection Pod snapshot unexpectedly reported a pending Pod")
@@ -1215,7 +1223,7 @@ func TestPostgreSQLPodTerminationFenceRequiresAuthenticatedKubeletAttestation(t 
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 	base := newFakeClient(t, cluster, pod)
-	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	reconciler := developmentReconciler(base, base)
 
 	released, err := reconciler.releaseTerminatedPostgreSQLPodFences(ctx, cluster)
 	if err != nil {
@@ -1277,7 +1285,7 @@ func TestDeletionRefusesPostgreSQLPodWithoutTerminationFence(t *testing.T) {
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	base := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	reconciler := developmentReconciler(base, base)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -1333,7 +1341,7 @@ func TestFinalizationRefusesUncheckpointedDeletingPVCWithoutCredentialFence(t *t
 			claim.Finalizers = []string{owned.PostgreSQLDataProtectionFinalizer}
 			claim.DeletionTimestamp = &metav1.Time{Time: time.Unix(100, 0)}
 			base := newFakeClient(t, cluster, claim)
-			reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+			reconciler := developmentReconciler(base, base)
 			var err error
 			if policy == pgshardv1alpha1.DeletionRetain {
 				_, err = reconciler.retainPostgreSQLPVCs(ctx, cluster)
@@ -1365,7 +1373,7 @@ func TestRetainFinalizationReleasesExplicitlyDeletingPostgreSQLData(t *testing.T
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}},
 		cluster,
 	)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient}
+	reconciler := developmentReconciler(fakeClient, fakeClient)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -1411,7 +1419,7 @@ func TestExplicitDeletePolicyDeletesPostgreSQLData(t *testing.T) {
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient}
+	reconciler := developmentReconciler(fakeClient, fakeClient)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -1460,7 +1468,7 @@ func TestFinalizationDeletesLatePVCWithRecordedCredentialFence(t *testing.T) {
 			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 			cluster.Spec.Storage.DeletionPolicy = policy
 			base := newFakeClient(t, cluster)
-			reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+			reconciler := developmentReconciler(base, base)
 			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 				t.Fatal(err)
 			}
@@ -1512,7 +1520,7 @@ func TestFinalizationDeletesLateClusterOwnedCredential(t *testing.T) {
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	base := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	reconciler := developmentReconciler(base, base)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -1584,7 +1592,7 @@ func TestDeletionPoliciesResolveUnknownCredentialCreateBeforeFinalization(t *tes
 						return kubeClient.Create(ctx, object, options...)
 					},
 				})
-				reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+				reconciler := developmentReconciler(writeClient, base)
 				if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "unknown credential create") {
 					t.Fatalf("credential create outcome was not left unknown: %v", err)
 				}
@@ -1654,7 +1662,7 @@ func TestDeletionPoliciesFenceDelayedPVCOutcomeWithoutRecreating(t *testing.T) {
 					return kubeClient.Create(ctx, object, options...)
 				},
 			})
-			reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+			reconciler := developmentReconciler(writeClient, base)
 			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "outcome-unknown PVC create") {
 				t.Fatalf("initial create did not preserve its unknown outcome: %v", err)
 			}
@@ -1756,7 +1764,7 @@ func TestDeletionPoliciesDiscardLateCommittedPVCCreateAfterAbsentObservation(t *
 					return kubeClient.Get(ctx, key, object, options...)
 				},
 			})
-			reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: reader}
+			reconciler := developmentReconciler(writeClient, reader)
 			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "lost PVC create response") {
 				t.Fatalf("committed create did not lose its response: %v", err)
 			}
@@ -1830,7 +1838,7 @@ func TestRetainDoesNotRecreateExplicitlyDeletedPVCBeforeUIDCheckpoint(t *testing
 			return err
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+	reconciler := developmentReconciler(writeClient, base)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), injected.Error()) {
 		t.Fatalf("PVC UID checkpoint failure was not surfaced: %v", err)
 	}
@@ -1902,7 +1910,7 @@ func TestFinalizationDoesNotCreateDataBeforeCredentialCheckpoint(t *testing.T) {
 					return kubeClient.Create(ctx, object, options...)
 				},
 			})
-			reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+			reconciler := developmentReconciler(writeClient, base)
 			var err error
 			if policy == pgshardv1alpha1.DeletionRetain {
 				_, err = reconciler.retainPostgreSQLPVCs(ctx, cluster)
@@ -1956,7 +1964,7 @@ func TestDeletePolicyPrunesWorkloadBeforeDataClaim(t *testing.T) {
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
 	base := newFakeClient(t, cluster)
-	if _, err := (&PgShardClusterReconciler{Client: base, APIReader: base}).Reconcile(ctx, requestFor(cluster)); err != nil {
+	if _, err := developmentReconciler(base, base).Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
 	current := getCluster(t, ctx, base, cluster)
@@ -1976,7 +1984,7 @@ func TestDeletePolicyPrunesWorkloadBeforeDataClaim(t *testing.T) {
 			return kubeClient.Delete(ctx, object, options...)
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+	reconciler := developmentReconciler(writeClient, base)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -1999,7 +2007,7 @@ func TestDeletionUsesCheckpointedPolicyWhenAdmissionIsBypassed(t *testing.T) {
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionRetain
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient}
+	reconciler := developmentReconciler(fakeClient, fakeClient)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -2045,7 +2053,7 @@ func TestReconcileObservesSupportingAvailabilityWithoutClaimingDatabaseReady(t *
 	ctx := context.Background()
 	cluster := validCluster()
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -2110,7 +2118,7 @@ func TestReconcilePrunesResourcesRemovedByUpdate(t *testing.T) {
 	ctx := context.Background()
 	cluster := validCluster()
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -2172,7 +2180,7 @@ func TestFixedToHPAHandoffPreservesCurrentCapacity(t *testing.T) {
 	cluster := validCluster()
 	cluster.Spec.Pooler.Scaling = pgshardv1alpha1.PoolerScaling{Mode: pgshardv1alpha1.ScalingFixed, Fixed: &pgshardv1alpha1.FixedScaling{Replicas: 7}}
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	request := requestFor(cluster)
 	if _, err := reconciler.Reconcile(ctx, request); err != nil {
 		t.Fatal(err)
@@ -2252,7 +2260,7 @@ func TestHPAHandoffUsesAuthoritativeReplicas(t *testing.T) {
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	if err := reconciler.handoffPoolerReplicas(
 		ctx,
 		cluster,
@@ -2313,7 +2321,7 @@ func TestHPAHandoffCanonicalizesLegacyWholeDeploymentOwnership(t *testing.T) {
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: newFakeClient(t, current)}
+	reconciler := developmentReconciler(writeClient, newFakeClient(t, current))
 	if err := reconciler.handoffPoolerReplicas(
 		context.Background(),
 		cluster,
@@ -2395,7 +2403,7 @@ func TestHPAHandoffRejectsReplacedDeployment(t *testing.T) {
 	replacement := desired.DeepCopy()
 	replacement.UID = types.UID("replacement-uid")
 	authoritative := newFakeClient(t, replacement)
-	reconciler := &PgShardClusterReconciler{Client: newFakeClient(t), APIReader: authoritative}
+	reconciler := developmentReconciler(newFakeClient(t), authoritative)
 	err := reconciler.handoffPoolerReplicas(
 		context.Background(),
 		cluster,
@@ -2426,7 +2434,7 @@ func TestHPAHandoffBoundsConflicts(t *testing.T) {
 			return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("injected conflict"))
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	err := reconciler.handoffPoolerReplicas(
 		context.Background(),
 		cluster,
@@ -2485,7 +2493,7 @@ func TestFixedScaleHandoffRelinquishesAuthoritativeHPAOwnership(t *testing.T) {
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	if err := reconciler.relinquishPoolerScaleOwnership(
 		context.Background(), desired, current.UID, appsv1.SchemeGroupVersion.WithKind("Deployment"),
 	); err != nil {
@@ -2579,7 +2587,7 @@ func TestFixedScaleHandoffReclaimsLateScaleWriteBeforeRelinquishing(t *testing.T
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	if err := reconciler.relinquishPoolerScaleOwnership(context.Background(), desired, late.UID, appsv1.SchemeGroupVersion.WithKind("Deployment")); err != nil {
 		t.Fatal(err)
 	}
@@ -2659,7 +2667,7 @@ func TestFixedScaleHandoffReclaimsScaleWriteAfterRelinquishConflict(t *testing.T
 			}
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	if err := reconciler.relinquishPoolerScaleOwnership(context.Background(), desired, stable.UID, appsv1.SchemeGroupVersion.WithKind("Deployment")); err != nil {
 		t.Fatal(err)
 	}
@@ -2684,7 +2692,7 @@ func TestFixedScaleHandoffRejectsReplacementAndBoundsConflicts(t *testing.T) {
 
 	replacement := current.DeepCopy()
 	replacement.UID = types.UID("replacement-uid")
-	reconciler := &PgShardClusterReconciler{Client: newFakeClient(t), APIReader: newFakeClient(t, replacement)}
+	reconciler := developmentReconciler(newFakeClient(t), newFakeClient(t, replacement))
 	if err := reconciler.relinquishPoolerScaleOwnership(context.Background(), desired, current.UID, appsv1.SchemeGroupVersion.WithKind("Deployment")); err == nil || !strings.Contains(err.Error(), "replaced") {
 		t.Fatalf("replacement error = %v", err)
 	}
@@ -2696,7 +2704,7 @@ func TestFixedScaleHandoffRejectsReplacementAndBoundsConflicts(t *testing.T) {
 			return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("injected conflict"))
 		},
 	})
-	reconciler = &PgShardClusterReconciler{Client: writeClient, APIReader: newFakeClient(t, current)}
+	reconciler = developmentReconciler(writeClient, newFakeClient(t, current))
 	err := reconciler.relinquishPoolerScaleOwnership(context.Background(), desired, current.UID, appsv1.SchemeGroupVersion.WithKind("Deployment"))
 	if err == nil || !strings.Contains(err.Error(), "after 4 attempts") {
 		t.Fatalf("conflict exhaustion error = %v", err)
@@ -2772,7 +2780,7 @@ func TestLegacyAlignmentUsesAuthoritativeReplicas(t *testing.T) {
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	aligned, err := reconciler.alignLegacyOwnedFields(ctx, stale, desired, true)
 	if err != nil {
 		t.Fatal(err)
@@ -2840,7 +2848,7 @@ func TestLegacyAlignmentReclassifiesAuthoritativeApplyOwnershipAfterConflict(t *
 	desired.ResourceVersion = ""
 	desired.Spec.Replicas = nil
 	desired.ManagedFields = nil
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	aligned, err := reconciler.alignLegacyOwnedFields(context.Background(), stale, desired, true)
 	if err != nil {
 		t.Fatal(err)
@@ -2900,7 +2908,7 @@ func TestLegacyAlignmentDoesNotTrustApplyOwnershipWithoutMarker(t *testing.T) {
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: newFakeClient(t, current)}
+	reconciler := developmentReconciler(writeClient, newFakeClient(t, current))
 	if _, err := reconciler.alignLegacyOwnedFields(context.Background(), current, desired, false); err != nil {
 		t.Fatal(err)
 	}
@@ -2946,7 +2954,7 @@ func TestLegacyAlignmentAllowsOnlyInternalHPAOwnerForPooler(t *testing.T) {
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: newFakeClient(t, current)}
+	reconciler := developmentReconciler(writeClient, newFakeClient(t, current))
 	if _, err := reconciler.alignLegacyOwnedFields(context.Background(), current, desired, true); err != nil {
 		t.Fatal(err)
 	}
@@ -2968,7 +2976,7 @@ func TestLegacyAlignmentBoundsConflicts(t *testing.T) {
 			return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, object.GetName(), errors.New("injected conflict"))
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	_, err := reconciler.alignLegacyOwnedFields(context.Background(), current, desired, false)
 	if err == nil || !strings.Contains(err.Error(), "after 4 conflicts") {
 		t.Fatalf("conflict exhaustion error = %v", err)
@@ -3000,7 +3008,7 @@ func TestLegacyAlignmentRejectsReplacementAfterConflict(t *testing.T) {
 			return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, object.GetName(), errors.New("injected conflict"))
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	_, err := reconciler.alignLegacyOwnedFields(context.Background(), current, desired, false)
 	if err == nil || !strings.Contains(err.Error(), "replaced during") {
 		t.Fatalf("replacement error = %v", err)
@@ -3024,7 +3032,7 @@ func TestLegacyAlignmentRejectsUnrelatedApplyOwner(t *testing.T) {
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: authoritative}
+	reconciler := developmentReconciler(writeClient, authoritative)
 	_, err := reconciler.alignLegacyOwnedFields(context.Background(), current, current.DeepCopy(), false)
 	if err == nil || !strings.Contains(err.Error(), "another top-level Apply manager") {
 		t.Fatalf("unrelated owner error = %v", err)
@@ -3094,7 +3102,7 @@ func TestMigrateApplyOwnershipRetriesConflict(t *testing.T) {
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+	reconciler := developmentReconciler(writeClient, base)
 	migrated, err := reconciler.migrateApplyOwnership(ctx, legacy.DeepCopy())
 	if err != nil {
 		t.Fatal(err)
@@ -3120,7 +3128,7 @@ func TestMigrateApplyOwnershipBoundsConflicts(t *testing.T) {
 			return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, object.GetName(), errors.New("injected conflict"))
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+	reconciler := developmentReconciler(writeClient, base)
 	_, err := reconciler.migrateApplyOwnership(context.Background(), legacy.DeepCopy())
 	if err == nil || !strings.Contains(err.Error(), "after 4 conflicts") {
 		t.Fatalf("conflict exhaustion error = %v", err)
@@ -3140,7 +3148,7 @@ func TestMigrateApplyOwnershipRejectsReplacementAfterConflict(t *testing.T) {
 			return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, object.GetName(), errors.New("injected conflict"))
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient, APIReader: base}
+	reconciler := developmentReconciler(writeClient, base)
 	_, err := reconciler.migrateApplyOwnership(context.Background(), legacy)
 	if err == nil || !strings.Contains(err.Error(), "replaced") {
 		t.Fatalf("replacement error = %v", err)
@@ -3164,7 +3172,7 @@ func TestMigrateApplyOwnershipPreservesLaterUpdateManager(t *testing.T) {
 			return nil
 		},
 	})
-	reconciler := &PgShardClusterReconciler{Client: writeClient}
+	reconciler := developmentReconciler(writeClient, nil)
 	migrated, err := reconciler.migrateApplyOwnership(context.Background(), current)
 	if err != nil {
 		t.Fatal(err)
@@ -3183,7 +3191,7 @@ func TestReconcileRefusesToAdoptDeterministicNameCollision(t *testing.T) {
 		Data:       map[string]string{"belongs-to": "another-controller"},
 	}
 	fakeClient := newFakeClient(t, cluster, collision)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil {
 		t.Fatal("expected resource collision to fail reconciliation")
 	}
@@ -3215,7 +3223,7 @@ func TestReconcileLeavesHPAOwnedReplicasAndServiceAllocationsAlone(t *testing.T)
 	ctx := context.Background()
 	cluster := validCluster()
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	request := requestFor(cluster)
 	if _, err := reconciler.Reconcile(ctx, request); err != nil {
 		t.Fatal(err)
@@ -3272,7 +3280,7 @@ func TestPruneNeverDeletesMerelyLabelMatchedObjects(t *testing.T) {
 		},
 	}}
 	fakeClient := newFakeClient(t, cluster, unowned)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient}
+	reconciler := developmentReconciler(fakeClient, nil)
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
@@ -3352,7 +3360,7 @@ func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 	ctx := context.Background()
 	cluster := validCluster()
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient}
+	reconciler := developmentReconciler(fakeClient, fakeClient)
 	request := requestFor(cluster)
 	if _, err := reconciler.Reconcile(ctx, request); err != nil {
 		t.Fatal(err)
@@ -3440,6 +3448,7 @@ func TestDeletionFinalizerUsesAuthoritativeReaderWhenCacheMissesChild(t *testing
 	reconciler := &PgShardClusterReconciler{
 		Client:    staleCache,
 		APIReader: authoritative,
+		Images:    owned.DevelopmentImages(),
 	}
 	remaining, err := reconciler.prune(ctx, cluster, nil, true)
 	if err != nil {
@@ -3453,7 +3462,7 @@ func TestDeletionFinalizerUsesAuthoritativeReaderWhenCacheMissesChild(t *testing
 func TestDeletionFinalizerFailsClosedWithoutAuthoritativeReader(t *testing.T) {
 	t.Parallel()
 	cluster := validCluster()
-	reconciler := &PgShardClusterReconciler{Client: newFakeClient(t, cluster)}
+	reconciler := developmentReconciler(newFakeClient(t, cluster), nil)
 	remaining, err := reconciler.prune(context.Background(), cluster, nil, true)
 	if err == nil {
 		t.Fatal("deletion finalization succeeded without an authoritative API reader")
@@ -3487,9 +3496,11 @@ func TestReconcileReportsPlanFailureWithoutAdvancingObservedGeneration(t *testin
 func TestReconcileRejectsSingletonBootstrapImageBeforeDurableProvisioning(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		name  string
-		image string
+		name       string
+		image      string
+		zeroImages bool
 	}{
+		{name: "zero-value reconciler", zeroImages: true},
 		{name: "missing"},
 		{name: "mutable remote", image: "ghcr.io/andrew01234567890/pgshard-postgres-agent:main"},
 		{name: "invalid digest shaped", image: "registry.example/UPPER/postgres-agent@sha256:" + strings.Repeat("a", 64)},
@@ -3505,6 +3516,9 @@ func TestReconcileRejectsSingletonBootstrapImageBeforeDurableProvisioning(t *tes
 			images.PostgreSQLBootstrap = test.image
 			fakeClient := newFakeClient(t, cluster)
 			reconciler := &PgShardClusterReconciler{Client: fakeClient, Images: images}
+			if test.zeroImages {
+				reconciler.Images = owned.Images{}
+			}
 
 			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil {
 				t.Fatal("expected invalid PostgreSQL bootstrap image to fail")
