@@ -199,6 +199,31 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=shard
 	PostgreSQLBootstraps []PostgreSQLBootstrapStatus `json:"postgresqlBootstraps,omitempty"`
+	// CatalogAccess records the staged creation and API identity of the
+	// catalog-only credential and TLS Secret. The operator first creates an empty
+	// non-consumable Secret, checkpoints its UID, then atomically installs
+	// immutable material and checkpoints its digests. A missing or replaced
+	// checkpointed Secret requires explicit recovery.
+	CatalogAccess *CatalogAccessStatus `json:"catalogAccess,omitempty"`
+}
+
+// CatalogAccessStatus binds the cluster to one staged catalog access Secret.
+// Its name contains an unpredictable suffix. SecretUID is checkpointed while
+// the Secret is still empty; material digests appear only after the same UID is
+// made immutable. Workloads require all fields, so neither intermediate state
+// is consumable.
+type CatalogAccessStatus struct {
+	SecretName string `json:"secretName"`
+	// SecretUID is empty only before the empty Secret identity is observed.
+	SecretUID types.UID `json:"secretUID,omitempty"`
+	// ClientSHA256 binds the pooler's password and CA projection to the
+	// checkpointed creation result.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	ClientSHA256 string `json:"clientSHA256,omitempty"`
+	// ServerSHA256 binds the PostgreSQL serving certificate and private-key
+	// projection to the checkpointed creation result.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	ServerSHA256 string `json:"serverSHA256,omitempty"`
 }
 
 // PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract.

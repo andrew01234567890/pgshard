@@ -2,16 +2,19 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/operator/internal/pki"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -122,6 +125,9 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 	assertControllerOwner(t, getPostgreSQLConfigMap(t, ctx, fakeClient, cluster), cluster)
 
 	got := getCluster(t, ctx, fakeClient, cluster)
+	if got.Status.CatalogAccess != nil {
+		t.Fatalf("unsupported multi-member cluster received catalog access: %#v", got.Status.CatalogAccess)
+	}
 	if got.Status.Phase != "Reconciling" || got.Status.ObservedGeneration != cluster.Generation {
 		t.Fatalf("status = %#v", got.Status)
 	}
@@ -154,6 +160,23 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 		t.Fatal(err)
 	}
 	got := getCluster(t, ctx, fakeClient, cluster)
+	if got.Status.CatalogAccess == nil || !owned.CatalogAccessSecretNameIsValid(cluster.Name, got.Status.CatalogAccess.SecretName) || got.Status.CatalogAccess.SecretUID == "" || got.Status.CatalogAccess.ClientSHA256 == "" || got.Status.CatalogAccess.ServerSHA256 == "" {
+		t.Fatalf("catalog access checkpoint = %#v", got.Status.CatalogAccess)
+	}
+	catalogAccess := &corev1.Secret{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: got.Status.CatalogAccess.SecretName}, catalogAccess); err != nil {
+		t.Fatal(err)
+	}
+	if catalogAccess.UID != got.Status.CatalogAccess.SecretUID {
+		t.Fatalf("catalog access Secret UID = %s, want %s", catalogAccess.UID, got.Status.CatalogAccess.SecretUID)
+	}
+	if err := validateCatalogAccessSecret(catalogAccess, cluster, got.Status.CatalogAccess.SecretName); err != nil {
+		t.Fatalf("generated catalog access Secret is invalid: %v", err)
+	}
+	if observed := catalogAccessStatus(catalogAccess); observed.ClientSHA256 != got.Status.CatalogAccess.ClientSHA256 || observed.ServerSHA256 != got.Status.CatalogAccess.ServerSHA256 {
+		t.Fatalf("catalog access material checkpoint = %#v, want %#v", got.Status.CatalogAccess, observed)
+	}
+	catalogPassword := string(catalogAccess.Data[owned.CatalogPasswordKey])
 
 	passwords := make(map[int32]string, cluster.Spec.Shards)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
@@ -205,6 +228,13 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	}
 	got = getCluster(t, ctx, fakeClient, cluster)
 	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLPrimariesProgressing")
+	unchangedCatalogAccess := &corev1.Secret{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: got.Status.CatalogAccess.SecretName}, unchangedCatalogAccess); err != nil {
+		t.Fatal(err)
+	}
+	if unchangedCatalogAccess.UID != got.Status.CatalogAccess.SecretUID || string(unchangedCatalogAccess.Data[owned.CatalogPasswordKey]) != catalogPassword {
+		t.Fatal("steady-state reconciliation replaced or rotated catalog access material")
+	}
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		bootstrap := bootstrapForShard(t, got, shard)
 		unchanged := &corev1.Secret{}
@@ -260,6 +290,717 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "DataPlaneUnavailable")
 	if len(got.Status.PostgreSQLBootstraps) != int(cluster.Spec.Shards) {
 		t.Fatalf("recorded PostgreSQL bootstraps = %#v", got.Status.PostgreSQLBootstraps)
+	}
+}
+
+func TestCatalogAccessCreationIntentRecoversEveryWriteResponseWindow(t *testing.T) {
+	t.Parallel()
+	newCluster := func() *pgshardv1alpha1.PgShardCluster {
+		cluster := validCluster()
+		cluster.Spec.MembersPerShard = 1
+		cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+		return cluster
+	}
+	listCatalogSecrets := func(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) []corev1.Secret {
+		t.Helper()
+		secrets := &corev1.SecretList{}
+		if err := kubeClient.List(ctx, secrets, client.InNamespace(cluster.Namespace), client.MatchingLabels{
+			owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "shardschema",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return secrets.Items
+	}
+
+	t.Run("intent update rejected", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		cluster := newCluster()
+		base := newFakeClient(t, cluster)
+		injected := false
+		writeClient := interceptedClient(t, base, interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, kubeClient client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+				candidate, ok := object.(*pgshardv1alpha1.PgShardCluster)
+				if subresource == "status" && ok && candidate.Status.CatalogAccess != nil && candidate.Status.CatalogAccess.SecretUID == "" && !injected {
+					injected = true
+					return apierrors.NewTimeoutError("injected uncommitted catalog intent update", 1)
+				}
+				return kubeClient.SubResource(subresource).Update(ctx, object, options...)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(writeClient, base).ensureCatalogAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "uncommitted catalog intent update") {
+			t.Fatalf("intent update error = %v", err)
+		}
+		if secrets := listCatalogSecrets(t, ctx, base, cluster); len(secrets) != 0 {
+			t.Fatalf("catalog Secret was created before its intent: %d", len(secrets))
+		}
+		current = getCluster(t, ctx, base, cluster)
+		if current.Status.CatalogAccess != nil {
+			t.Fatalf("uncommitted intent became durable: %#v", current.Status.CatalogAccess)
+		}
+		if err := developmentReconciler(base, base).ensureCatalogAccess(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		current = getCluster(t, ctx, base, cluster)
+		if current.Status.CatalogAccess == nil || current.Status.CatalogAccess.SecretUID == "" || len(listCatalogSecrets(t, ctx, base, cluster)) != 1 {
+			t.Fatalf("retry did not create exactly one checkpointed Secret: %#v", current.Status.CatalogAccess)
+		}
+	})
+
+	t.Run("intent response lost after commit", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		cluster := newCluster()
+		base := newFakeClient(t, cluster)
+		injected := false
+		writeClient := interceptedClient(t, base, interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, kubeClient client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+				candidate, ok := object.(*pgshardv1alpha1.PgShardCluster)
+				if subresource == "status" && ok && candidate.Status.CatalogAccess != nil && candidate.Status.CatalogAccess.SecretUID == "" && !injected {
+					injected = true
+					if err := kubeClient.SubResource(subresource).Update(ctx, object, options...); err != nil {
+						return err
+					}
+					return apierrors.NewTimeoutError("injected lost catalog intent response", 1)
+				}
+				return kubeClient.SubResource(subresource).Update(ctx, object, options...)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(writeClient, base).ensureCatalogAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "lost catalog intent response") {
+			t.Fatalf("intent response error = %v", err)
+		}
+		persisted := getCluster(t, ctx, base, cluster)
+		if persisted.Status.CatalogAccess == nil || persisted.Status.CatalogAccess.SecretUID != "" || len(listCatalogSecrets(t, ctx, base, cluster)) != 0 {
+			t.Fatalf("lost intent response state = %#v", persisted.Status.CatalogAccess)
+		}
+		intentName := persisted.Status.CatalogAccess.SecretName
+		if err := developmentReconciler(base, base).ensureCatalogAccess(ctx, persisted); err != nil {
+			t.Fatal(err)
+		}
+		persisted = getCluster(t, ctx, base, cluster)
+		if persisted.Status.CatalogAccess.SecretUID == "" || persisted.Status.CatalogAccess.SecretName != intentName || len(listCatalogSecrets(t, ctx, base, cluster)) != 1 {
+			t.Fatalf("retry did not preserve the durable creation identity: %#v", persisted.Status.CatalogAccess)
+		}
+	})
+
+	t.Run("Secret create response lost after commit", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		cluster := newCluster()
+		base := newFakeClient(t, cluster)
+		createAttempts := 0
+		writeClient := interceptedClient(t, base, interceptor.Funcs{
+			Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if !ok || secret.Labels[owned.ComponentLabel] != "shardschema" {
+					return kubeClient.Create(ctx, object, options...)
+				}
+				createAttempts++
+				if err := kubeClient.Create(ctx, object, options...); err != nil {
+					return err
+				}
+				return apierrors.NewTimeoutError("injected lost catalog Secret create response", 1)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(writeClient, base).ensureCatalogAccess(ctx, current); err != nil {
+			t.Fatalf("committed Secret outcome was not recovered: %v", err)
+		}
+		current = getCluster(t, ctx, base, cluster)
+		if createAttempts != 1 || current.Status.CatalogAccess == nil || current.Status.CatalogAccess.SecretUID == "" || len(listCatalogSecrets(t, ctx, base, cluster)) != 1 {
+			t.Fatalf("lost create response duplicated or failed to checkpoint: attempts=%d status=%#v", createAttempts, current.Status.CatalogAccess)
+		}
+	})
+
+	t.Run("late empty Secret create is adopted before material exists", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		cluster := newCluster()
+		base := newFakeClient(t, cluster)
+		var delayed *corev1.Secret
+		firstClient := interceptedClient(t, base, interceptor.Funcs{
+			Create: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.CreateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if !ok || secret.Labels[owned.ComponentLabel] != "shardschema" {
+					return fmt.Errorf("unexpected create during delayed catalog test: %T", object)
+				}
+				delayed = secret.DeepCopy()
+				return apierrors.NewTimeoutError("injected outcome-unknown catalog Secret create", 1)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(firstClient, base).ensureCatalogAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "outcome-unknown catalog Secret create") {
+			t.Fatalf("initial create error = %v", err)
+		}
+		persisted := getCluster(t, ctx, base, cluster)
+		if delayed == nil || persisted.Status.CatalogAccess == nil || persisted.Status.CatalogAccess.SecretUID != "" || len(listCatalogSecrets(t, ctx, base, cluster)) != 0 {
+			t.Fatalf("outcome-unknown create state = status %#v delayed %#v", persisted.Status.CatalogAccess, delayed)
+		}
+		if len(delayed.Data) != 0 || delayed.Immutable != nil {
+			t.Fatalf("outcome-unknown Create carried key material: %#v", delayed)
+		}
+		intentName := persisted.Status.CatalogAccess.SecretName
+
+		injected := false
+		retryClient := interceptedClient(t, base, interceptor.Funcs{
+			Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if ok && secret.Labels[owned.ComponentLabel] == "shardschema" && !injected {
+					injected = true
+					if err := base.Create(ctx, delayed); err != nil {
+						return err
+					}
+				}
+				return kubeClient.Create(ctx, object, options...)
+			},
+		})
+		if err := developmentReconciler(retryClient, base).ensureCatalogAccess(ctx, persisted); err != nil {
+			t.Fatalf("late empty Create was not recovered: %v", err)
+		}
+		persisted = getCluster(t, ctx, base, cluster)
+		secrets := listCatalogSecrets(t, ctx, base, cluster)
+		if !injected || len(secrets) != 1 || secrets[0].Name != intentName || secrets[0].Immutable == nil || !*secrets[0].Immutable || len(secrets[0].Data) == 0 || persisted.Status.CatalogAccess.SecretName != intentName || persisted.Status.CatalogAccess.SecretUID == "" || persisted.Status.CatalogAccess.ClientSHA256 == "" || persisted.Status.CatalogAccess.ServerSHA256 == "" {
+			t.Fatalf("late create escaped the permanent identity: injected=%t status=%#v secrets=%#v", injected, persisted.Status.CatalogAccess, secrets)
+		}
+	})
+
+	t.Run("material update response lost after commit", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		cluster := newCluster()
+		base := newFakeClient(t, cluster)
+		updates := 0
+		writeClient := interceptedClient(t, base, interceptor.Funcs{
+			Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if !ok || secret.Labels[owned.ComponentLabel] != "shardschema" {
+					return kubeClient.Update(ctx, object, options...)
+				}
+				updates++
+				if err := kubeClient.Update(ctx, object, options...); err != nil {
+					return err
+				}
+				return apierrors.NewTimeoutError("injected lost catalog material update response", 1)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(writeClient, base).ensureCatalogAccess(ctx, current); err != nil {
+			t.Fatalf("committed material outcome was not recovered: %v", err)
+		}
+		current = getCluster(t, ctx, base, cluster)
+		if updates != 1 || current.Status.CatalogAccess == nil || current.Status.CatalogAccess.ClientSHA256 == "" || current.Status.CatalogAccess.ServerSHA256 == "" || len(listCatalogSecrets(t, ctx, base, cluster)) != 1 {
+			t.Fatalf("lost material response was not checkpointed: updates=%d status=%#v", updates, current.Status.CatalogAccess)
+		}
+	})
+
+	t.Run("material checkpoint rejected before commit", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		cluster := newCluster()
+		base := newFakeClient(t, cluster)
+		injected := false
+		writeClient := interceptedClient(t, base, interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, kubeClient client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+				candidate, ok := object.(*pgshardv1alpha1.PgShardCluster)
+				if subresource == "status" && ok && candidate.Status.CatalogAccess != nil && candidate.Status.CatalogAccess.ClientSHA256 != "" && !injected {
+					injected = true
+					return apierrors.NewTimeoutError("injected uncommitted catalog material checkpoint", 1)
+				}
+				return kubeClient.SubResource(subresource).Update(ctx, object, options...)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(writeClient, base).ensureCatalogAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "uncommitted catalog material checkpoint") {
+			t.Fatalf("material checkpoint error = %v", err)
+		}
+		persisted := getCluster(t, ctx, base, cluster)
+		secrets := listCatalogSecrets(t, ctx, base, cluster)
+		if persisted.Status.CatalogAccess == nil || persisted.Status.CatalogAccess.SecretUID == "" || persisted.Status.CatalogAccess.ClientSHA256 != "" || persisted.Status.CatalogAccess.ServerSHA256 != "" || len(secrets) != 1 || secrets[0].Immutable == nil || !*secrets[0].Immutable || len(secrets[0].Data) == 0 {
+			t.Fatalf("uncommitted material checkpoint state = status %#v secrets %#v", persisted.Status.CatalogAccess, secrets)
+		}
+		if err := developmentReconciler(base, base).ensureCatalogAccess(ctx, persisted); err != nil {
+			t.Fatalf("retry did not adopt installed material: %v", err)
+		}
+		persisted = getCluster(t, ctx, base, cluster)
+		if persisted.Status.CatalogAccess.ClientSHA256 == "" || persisted.Status.CatalogAccess.ServerSHA256 == "" || persisted.Status.CatalogAccess.SecretUID != secrets[0].UID {
+			t.Fatalf("retry did not checkpoint installed material: %#v", persisted.Status.CatalogAccess)
+		}
+	})
+
+	t.Run("material checkpoint response lost after commit", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		cluster := newCluster()
+		base := newFakeClient(t, cluster)
+		injected := false
+		writeClient := interceptedClient(t, base, interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, kubeClient client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+				candidate, ok := object.(*pgshardv1alpha1.PgShardCluster)
+				if subresource == "status" && ok && candidate.Status.CatalogAccess != nil && candidate.Status.CatalogAccess.ClientSHA256 != "" && !injected {
+					injected = true
+					if err := kubeClient.SubResource(subresource).Update(ctx, object, options...); err != nil {
+						return err
+					}
+					return apierrors.NewTimeoutError("injected lost catalog material checkpoint response", 1)
+				}
+				return kubeClient.SubResource(subresource).Update(ctx, object, options...)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(writeClient, base).ensureCatalogAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "lost catalog material checkpoint response") {
+			t.Fatalf("material checkpoint response error = %v", err)
+		}
+		persisted := getCluster(t, ctx, base, cluster)
+		secrets := listCatalogSecrets(t, ctx, base, cluster)
+		if persisted.Status.CatalogAccess == nil || persisted.Status.CatalogAccess.ClientSHA256 == "" || persisted.Status.CatalogAccess.ServerSHA256 == "" || len(secrets) != 1 {
+			t.Fatalf("lost material checkpoint was not durable: status %#v secrets %#v", persisted.Status.CatalogAccess, secrets)
+		}
+		if err := developmentReconciler(base, base).ensureCatalogAccess(ctx, persisted); err != nil {
+			t.Fatalf("retry did not validate committed material checkpoint: %v", err)
+		}
+		if got := getCluster(t, ctx, base, cluster).Status.CatalogAccess; !reflect.DeepEqual(got, persisted.Status.CatalogAccess) {
+			t.Fatalf("retry changed a committed material checkpoint: got %#v want %#v", got, persisted.Status.CatalogAccess)
+		}
+	})
+
+	t.Run("late material update loses by resource version or is adopted", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		cluster := newCluster()
+		base := newFakeClient(t, cluster)
+		var delayed *corev1.Secret
+		firstClient := interceptedClient(t, base, interceptor.Funcs{
+			Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if !ok || secret.Labels[owned.ComponentLabel] != "shardschema" {
+					return fmt.Errorf("unexpected update during delayed material test: %T", object)
+				}
+				delayed = secret.DeepCopy()
+				return apierrors.NewTimeoutError("injected outcome-unknown catalog material update", 1)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(firstClient, base).ensureCatalogAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "outcome-unknown catalog material update") {
+			t.Fatalf("initial material update error = %v", err)
+		}
+		persisted := getCluster(t, ctx, base, cluster)
+		secrets := listCatalogSecrets(t, ctx, base, cluster)
+		if delayed == nil || persisted.Status.CatalogAccess == nil || persisted.Status.CatalogAccess.SecretUID == "" || persisted.Status.CatalogAccess.ClientSHA256 != "" || len(secrets) != 1 || len(secrets[0].Data) != 0 {
+			t.Fatalf("outcome-unknown material state = status %#v delayed %#v secrets %#v", persisted.Status.CatalogAccess, delayed, secrets)
+		}
+
+		injected := false
+		retryClient := interceptedClient(t, base, interceptor.Funcs{
+			Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if ok && secret.Labels[owned.ComponentLabel] == "shardschema" && !injected {
+					injected = true
+					if err := base.Update(ctx, delayed); err != nil {
+						return err
+					}
+				}
+				return kubeClient.Update(ctx, object, options...)
+			},
+		})
+		if err := developmentReconciler(retryClient, base).ensureCatalogAccess(ctx, persisted); err != nil {
+			t.Fatalf("late material winner was not recovered: %v", err)
+		}
+		persisted = getCluster(t, ctx, base, cluster)
+		secrets = listCatalogSecrets(t, ctx, base, cluster)
+		if !injected || len(secrets) != 1 || secrets[0].UID != persisted.Status.CatalogAccess.SecretUID || persisted.Status.CatalogAccess.ClientSHA256 == "" || persisted.Status.CatalogAccess.ServerSHA256 == "" {
+			t.Fatalf("material update race escaped one UID: injected=%t status=%#v secrets=%#v", injected, persisted.Status.CatalogAccess, secrets)
+		}
+	})
+
+	t.Run("identity checkpoint response rejected", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		cluster := newCluster()
+		base := newFakeClient(t, cluster)
+		injected := false
+		writeClient := interceptedClient(t, base, interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, kubeClient client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+				candidate, ok := object.(*pgshardv1alpha1.PgShardCluster)
+				if subresource == "status" && ok && candidate.Status.CatalogAccess != nil && candidate.Status.CatalogAccess.SecretUID != "" && !injected {
+					injected = true
+					return apierrors.NewTimeoutError("injected uncommitted catalog identity checkpoint", 1)
+				}
+				return kubeClient.SubResource(subresource).Update(ctx, object, options...)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(writeClient, base).ensureCatalogAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "uncommitted catalog identity checkpoint") {
+			t.Fatalf("identity checkpoint error = %v", err)
+		}
+		persisted := getCluster(t, ctx, base, cluster)
+		secrets := listCatalogSecrets(t, ctx, base, cluster)
+		if persisted.Status.CatalogAccess == nil || persisted.Status.CatalogAccess.SecretUID != "" || len(secrets) != 1 || persisted.Status.CatalogAccess.SecretName != secrets[0].Name {
+			t.Fatalf("uncommitted checkpoint did not preserve one recoverable Secret: status=%#v secrets=%#v", persisted.Status.CatalogAccess, secrets)
+		}
+		if err := developmentReconciler(base, base).ensureCatalogAccess(ctx, persisted); err != nil {
+			t.Fatal(err)
+		}
+		persisted = getCluster(t, ctx, base, cluster)
+		if persisted.Status.CatalogAccess.SecretUID != secrets[0].UID || len(listCatalogSecrets(t, ctx, base, cluster)) != 1 {
+			t.Fatalf("retry did not checkpoint the existing Secret: %#v", persisted.Status.CatalogAccess)
+		}
+	})
+}
+
+func TestCatalogAccessIntentRejectsNoncanonicalMetadataBeforeMaterialUpdate(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		mutate func(*corev1.Secret)
+	}{
+		{
+			name: "extra annotation",
+			mutate: func(secret *corev1.Secret) {
+				secret.Annotations["reflector.v1.k8s.emberstack.com/reflection-allowed"] = "true"
+			},
+		},
+		{
+			name: "extra owner",
+			mutate: func(secret *corev1.Secret) {
+				secret.OwnerReferences = append(secret.OwnerReferences, metav1.OwnerReference{
+					APIVersion: "v1", Kind: "ConfigMap", Name: "foreign", UID: "foreign-uid",
+				})
+			},
+		},
+		{
+			name: "blocking finalizer",
+			mutate: func(secret *corev1.Secret) {
+				secret.Finalizers = []string{"foreign.example/block"}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			base := newFakeClient(t, cluster)
+			current := getCluster(t, ctx, base, cluster)
+			name := owned.CatalogAccessSecretPrefix(current.Name) + strings.Repeat("a", 32)
+			current.Status.CatalogAccess = &pgshardv1alpha1.CatalogAccessStatus{SecretName: name}
+			if err := base.Status().Update(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+
+			intent := owned.CatalogAccessIntentSecret(current, name)
+			intent.UID = types.UID("intent-" + strings.ReplaceAll(test.name, " ", "-"))
+			test.mutate(intent)
+			if err := base.Create(ctx, intent); err != nil {
+				t.Fatal(err)
+			}
+
+			secretUpdates := 0
+			writeClient := interceptedClient(t, base, interceptor.Funcs{
+				Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+					if _, ok := object.(*corev1.Secret); ok {
+						secretUpdates++
+					}
+					return kubeClient.Update(ctx, object, options...)
+				},
+			})
+			current = getCluster(t, ctx, base, cluster)
+			err := developmentReconciler(writeClient, base).ensureCatalogAccess(ctx, current)
+			if err == nil || !strings.Contains(err.Error(), "metadata is not bound to the exact PgShardCluster") {
+				t.Fatalf("noncanonical intent error = %v", err)
+			}
+			observed := &corev1.Secret{}
+			if err := base.Get(ctx, client.ObjectKeyFromObject(intent), observed); err != nil {
+				t.Fatal(err)
+			}
+			if secretUpdates != 0 || len(observed.Data) != 0 || observed.Immutable != nil {
+				t.Fatalf("noncanonical intent received material: updates=%d secret=%#v", secretUpdates, observed)
+			}
+		})
+	}
+}
+
+func TestCatalogAccessDeletionIsAnObservedFinalizerBarrier(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Finalizers = []string{resourceFinalizer}
+	base := newFakeClient(t, cluster)
+	current := getCluster(t, ctx, base, cluster)
+	if err := developmentReconciler(base, base).ensureCatalogAccess(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	recorded := current.Status.CatalogAccess
+	if recorded == nil || recorded.SecretUID == "" {
+		t.Fatalf("catalog access was not checkpointed: %#v", recorded)
+	}
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+	if err := base.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Finalizers = []string{"test.pgshard.io/hold"}
+	secret.Annotations["example.test/added-after-checkpoint"] = "mutable"
+	if err := base.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := developmentReconciler(base, base)
+	result, err := reconciler.Reconcile(ctx, requestFor(cluster))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != retryDelay {
+		t.Fatalf("catalog deletion barrier result = %#v", result)
+	}
+	deletingCluster := getCluster(t, ctx, base, cluster)
+	if !controllerutil.ContainsFinalizer(deletingCluster, resourceFinalizer) {
+		t.Fatal("cluster finalizer was released while catalog key material remained")
+	}
+	terminatingSecret := &corev1.Secret{}
+	if err := base.Get(ctx, key, terminatingSecret); err != nil || terminatingSecret.DeletionTimestamp == nil {
+		t.Fatalf("catalog Secret was not held deleting: secret=%#v error=%v", terminatingSecret.ObjectMeta, err)
+	}
+	terminatingSecret.Finalizers = nil
+	if err := base.Update(ctx, terminatingSecret); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	for range 6 {
+		if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+			t.Fatal(err)
+		}
+		if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+			break
+		}
+	}
+	if err := base.Get(ctx, key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("recorded catalog Secret survived finalization: %v", err)
+	}
+	if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("cluster finalized before catalog Secret absence: %v", err)
+	}
+}
+
+func TestCatalogAccessFinalizationCannotOrphanLateKeyMaterialBeforeUIDCheckpoint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	current := getCluster(t, ctx, base, cluster)
+	name := owned.CatalogAccessSecretPrefix(current.Name) + strings.Repeat("a", 32)
+	current.Status.CatalogAccess = &pgshardv1alpha1.CatalogAccessStatus{SecretName: name}
+	if err := base.Status().Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model an outcome-unknown Create that has not reached the API server when
+	// the authoritative finalization read proves the name absent.
+	absentReader := interceptedClient(t, base, interceptor.Funcs{
+		Get: func(ctx context.Context, kubeClient client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+			if _, ok := object.(*corev1.Secret); ok && key.Namespace == current.Namespace && key.Name == name {
+				return apierrors.NewNotFound(corev1.Resource("secrets"), name)
+			}
+			return kubeClient.Get(ctx, key, object, options...)
+		},
+	})
+	deleting, err := developmentReconciler(base, absentReader).deleteCatalogAccessForFinalization(ctx, current)
+	if err != nil || deleting {
+		t.Fatalf("absent pre-UID intent barrier = deleting %t, error %v", deleting, err)
+	}
+
+	// A delayed request can subsequently create only the owner-bound empty
+	// intent that was originally dispatched. No credential or private key has
+	// been generated yet, and material installation requires a checkpointed UID.
+	delayed := owned.CatalogAccessIntentSecret(current, name)
+	delayed.UID = "late-empty-intent-uid"
+	if err := base.Create(ctx, delayed); err != nil {
+		t.Fatal(err)
+	}
+	observed := &corev1.Secret{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(delayed), observed); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCatalogAccessIntentSecret(observed, current, name); err != nil {
+		t.Fatalf("late Create was not the empty intent: %v", err)
+	}
+	if len(observed.Data) != 0 || len(observed.StringData) != 0 || !metav1.IsControlledBy(observed, current) {
+		t.Fatalf("late Create carried material or escaped cluster GC: %#v", observed)
+	}
+	observed.Finalizers = []string{"test.pgshard.io/hold-late-intent"}
+	if err := base.Update(ctx, observed); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, observed); err != nil {
+		t.Fatal(err)
+	}
+	deleting, err = developmentReconciler(base, base).deleteCatalogAccessForFinalization(ctx, current)
+	if err != nil || !deleting {
+		t.Fatalf("already deleting late empty intent cleanup = deleting %t, error %v", deleting, err)
+	}
+}
+
+func TestCatalogAccessSecretLossReplacementAndMutationFailClosed(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, context.Context, client.Client, *pgshardv1alpha1.PgShardCluster, *corev1.Secret)
+		want   string
+	}{
+		{
+			name: "missing",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, _ *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret) {
+				t.Helper()
+				if err := kubeClient.Delete(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "is missing; explicit recovery is required",
+		},
+		{
+			name: "replacement",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret) {
+				t.Helper()
+				if err := kubeClient.Delete(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
+				material, err := newCatalogAccessMaterial(cluster)
+				if err != nil {
+					t.Fatal(err)
+				}
+				replacement := owned.CatalogAccessIntentSecret(cluster, secret.Name)
+				immutable := true
+				replacement.Immutable = &immutable
+				replacement.Data = material
+				replacement.UID = "replacement-catalog-access-uid"
+				if err := kubeClient.Create(ctx, replacement); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "expected recorded UID",
+		},
+		{
+			name: "unexpected key",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, _ *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret) {
+				t.Helper()
+				delete(secret.Data, owned.CatalogTLSPrivateKeyKey)
+				if err := kubeClient.Update(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "unexpected key set",
+		},
+		{
+			name: "changed material",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, _ *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret) {
+				t.Helper()
+				password := append([]byte(nil), secret.Data[owned.CatalogPasswordKey]...)
+				if password[0] == 'a' {
+					password[0] = 'b'
+				} else {
+					password[0] = 'a'
+				}
+				secret.Data[owned.CatalogPasswordKey] = password
+				if err := kubeClient.Update(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "material differs from the checkpointed creation result",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			kubeClient := newFakeClient(t, cluster)
+			reconciler := developmentReconciler(kubeClient, kubeClient)
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
+			}
+			current := getCluster(t, ctx, kubeClient, cluster)
+			if current.Status.CatalogAccess == nil {
+				t.Fatal("catalog access identity was not checkpointed")
+			}
+			recorded := *current.Status.CatalogAccess
+			secret := &corev1.Secret{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}, secret); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, ctx, kubeClient, current, secret)
+
+			_, err := reconciler.Reconcile(ctx, requestFor(cluster))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("reconcile error = %v, want %q", err, test.want)
+			}
+			after := getCluster(t, ctx, kubeClient, cluster)
+			if after.Status.CatalogAccess == nil || *after.Status.CatalogAccess != recorded {
+				t.Fatalf("failed reconciliation changed catalog access checkpoint: before=%#v after=%#v", recorded, after.Status.CatalogAccess)
+			}
+		})
+	}
+}
+
+func TestCatalogAccessNearExpiryDegradesReconciliationWithoutRotation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	kubeClient := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(kubeClient, kubeClient)
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, kubeClient, cluster)
+	recorded := current.Status.CatalogAccess
+	if recorded == nil {
+		t.Fatal("catalog access identity was not checkpointed")
+	}
+	secret := &corev1.Secret{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}, secret); err != nil {
+		t.Fatal(err)
+	}
+	issued := time.Now().UTC().Add(-(5*365*24*time.Hour - 179*24*time.Hour))
+	bundle, err := pki.GenerateStaticServerBundle(
+		issued,
+		rand.Reader,
+		"near-expiry catalog CA",
+		owned.CatalogTLSDNSNames(cluster.Name, cluster.Namespace),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret.Data[owned.CatalogCACertificateKey] = bundle.CACertificate
+	secret.Data[owned.CatalogTLSCertificateKey] = bundle.ServerCertificate
+	secret.Data[owned.CatalogTLSPrivateKeyKey] = bundle.ServerPrivateKey
+	if err := kubeClient.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	current.Status.CatalogAccess = catalogAccessStatus(secret)
+	if err := kubeClient.Status().Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = reconciler.Reconcile(ctx, requestFor(cluster))
+	if err == nil || !strings.Contains(err.Error(), "zero-downtime certificate rotation is not implemented") {
+		t.Fatalf("near-expiry reconciliation error = %v", err)
+	}
+	degraded := getCluster(t, ctx, kubeClient, cluster)
+	assertCondition(t, degraded, reconciledCondition, metav1.ConditionFalse, "CatalogAccessReconcileFailed")
+	if degraded.Status.CatalogAccess == nil || degraded.Status.CatalogAccess.SecretUID != recorded.SecretUID {
+		t.Fatalf("near-expiry reconciliation rotated catalog access: before=%#v after=%#v", recorded, degraded.Status.CatalogAccess)
 	}
 }
 

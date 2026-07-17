@@ -11,7 +11,7 @@ use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_postgres::NoTls;
 
-use crate::config::{PoolerConfig, SupervisedCatalogConfig};
+use crate::config::{CatalogConnector, PoolerConfig, SupervisedCatalogConfig};
 use crate::state::PoolerState;
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -25,6 +25,7 @@ pub struct PoolerRuntime {
 struct SupervisedCatalog {
     supervisor: CatalogSupervisor,
     config: tokio_postgres::Config,
+    connector: CatalogConnector,
 }
 
 impl PoolerRuntime {
@@ -34,6 +35,7 @@ impl PoolerRuntime {
         match config.into_runtime_parts() {
             Some(SupervisedCatalogConfig {
                 catalog,
+                connector,
                 supervisor,
             }) => {
                 let supervisor = CatalogSupervisor::new(Arc::new(CatalogCache::new()), supervisor);
@@ -42,6 +44,7 @@ impl PoolerRuntime {
                     catalog: Some(SupervisedCatalog {
                         supervisor,
                         config: catalog,
+                        connector,
                     }),
                     state,
                 }
@@ -64,7 +67,9 @@ impl PoolerRuntime {
     ///
     /// In local mode the connector is intentionally restricted by
     /// [`PoolerConfig`] to loopback IP literals or Unix sockets with
-    /// `sslmode=disable`. Bootstrap-unavailable mode starts no connector.
+    /// `sslmode=disable`. Operator mode requires TLS 1.3, exact private-CA DNS
+    /// verification, SCRAM channel binding, and a writer target.
+    /// Bootstrap-unavailable mode starts no connector.
     /// Dropping this future broadcasts shutdown to all child tasks.
     ///
     /// # Errors
@@ -86,16 +91,31 @@ impl PoolerRuntime {
 
         let catalog_shutdown = wait_for_stop(stop_receiver.clone());
         let catalog_task = match catalog {
-            Some(SupervisedCatalog { supervisor, config }) => {
-                tokio::spawn(supervisor.run_classified(
-                    move || {
-                        let config = config.clone();
-                        async move { config.connect(NoTls).await }
-                    },
-                    CatalogFailureKind::from,
-                    catalog_shutdown,
-                ))
-            }
+            Some(SupervisedCatalog {
+                supervisor,
+                config,
+                connector: CatalogConnector::LocalNoTls,
+            }) => tokio::spawn(supervisor.run_classified(
+                move || {
+                    let config = config.clone();
+                    async move { config.connect(NoTls).await }
+                },
+                CatalogFailureKind::from,
+                catalog_shutdown,
+            )),
+            Some(SupervisedCatalog {
+                supervisor,
+                config,
+                connector: CatalogConnector::OperatorTls(connector),
+            }) => tokio::spawn(supervisor.run_classified(
+                move || {
+                    let config = config.clone();
+                    let connector = connector.clone();
+                    async move { config.connect(connector).await }
+                },
+                CatalogFailureKind::from,
+                catalog_shutdown,
+            )),
             None => tokio::spawn(catalog_shutdown),
         };
         let http_task = tokio::spawn(crate::http::serve_listener(

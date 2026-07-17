@@ -41,12 +41,17 @@ const (
 	// PgShardCluster lifecycle that crossed the fencing handshake barrier.
 	ClusterResourceFinalizer = "pgshard.io/owned-resources"
 
-	PostgreSQLConfigSuffix = "-postgresql-config"
-	PostgreSQLPasswordKey  = "superuser-password"
-	TopologyConfigSuffix   = "-topology"
-	EtcdSuffix             = "-etcd"
-	OrchestratorSuffix     = "-orchestrator"
-	PoolerSuffix           = "-pooler"
+	PostgreSQLConfigSuffix   = "-postgresql-config"
+	PostgreSQLPasswordKey    = "superuser-password"
+	CatalogServiceSuffix     = "-shardschema"
+	CatalogPasswordKey       = "catalog-password"
+	CatalogCACertificateKey  = "ca.crt"
+	CatalogTLSCertificateKey = "tls.crt"
+	CatalogTLSPrivateKeyKey  = "tls.key"
+	TopologyConfigSuffix     = "-topology"
+	EtcdSuffix               = "-etcd"
+	OrchestratorSuffix       = "-orchestrator"
+	PoolerSuffix             = "-pooler"
 
 	PostgreSQLPort int32 = 5432
 	PoolerRWPort   int32 = 5432
@@ -66,6 +71,7 @@ const (
 	ApplyOwnershipVersion                   = "v1"
 	RetainedFromAnnotation                  = "pgshard.io/retained-from"
 	PostgreSQLBootstrapClusterUIDAnnotation = "pgshard.io/bootstrap-cluster-uid"
+	CatalogAccessClusterUIDAnnotation       = "pgshard.io/catalog-access-cluster-uid"
 	PostgreSQLDataClusterUIDAnnotation      = "pgshard.io/data-cluster-uid"
 	PostgreSQLDataProtectionFinalizer       = "pgshard.io/postgresql-data-protection"
 	PostgreSQLPodClusterUIDAnnotation       = "pgshard.io/postgresql-cluster-uid"
@@ -101,6 +107,7 @@ volume_root="${parent%/*}"
 final="$parent/docker"
 staging="$parent/.pgshard-init"
 marker="$final/.pgshard-bootstrap-complete"
+catalog_genesis_intent="$final/.pgshard-catalog-genesis-intent"
 expected="$(mktemp /tmp/pgshard-bootstrap-identity.XXXXXX)"
 cleanup_expected() {
   rm -f -- "$expected"
@@ -124,6 +131,31 @@ if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]]; then
   read -r observed_migration_sha _ < <(sha256sum -- "$PGSHARD_SHARDSCHEMA_MIGRATION")
   if [[ "$observed_migration_sha" != "$PGSHARD_SHARDSCHEMA_MIGRATION_SHA256" ]]; then
     echo "shardschema migration does not match the operator release" >&2
+    exit 1
+  fi
+  if [[ ! "$PGSHARD_CATALOG_CLIENT_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || [[ ! "$PGSHARD_CATALOG_SERVER_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "refusing invalid checkpointed shardschema material digests" >&2
+    exit 1
+  fi
+  catalog_password="$(</etc/pgshard/catalog-auth/catalog-password)"
+  if [[ ! "$catalog_password" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "refusing an invalid shardschema reader credential" >&2
+    exit 1
+  fi
+  read -r catalog_password_sha _ < <(sha256sum -- /etc/pgshard/catalog-auth/catalog-password)
+  read -r catalog_ca_sha _ < <(sha256sum -- /etc/pgshard/catalog-auth/ca.crt)
+  read -r catalog_server_certificate_sha _ < <(sha256sum -- /etc/pgshard/catalog-tls/tls.crt)
+  read -r catalog_server_private_key_sha _ < <(sha256sum -- /etc/pgshard/catalog-tls/tls.key)
+  read -r observed_catalog_client_sha _ < <(
+    printf 'pgshard-catalog-client-v1\n%s\n%s\n' "$catalog_password_sha" "$catalog_ca_sha" | sha256sum
+  )
+  read -r observed_catalog_server_sha _ < <(
+    printf 'pgshard-catalog-server-v1\n%s\n%s\n' "$catalog_server_certificate_sha" "$catalog_server_private_key_sha" | sha256sum
+  )
+  if [[ "$observed_catalog_client_sha" != "$PGSHARD_CATALOG_CLIENT_SHA256" ]] \
+    || [[ "$observed_catalog_server_sha" != "$PGSHARD_CATALOG_SERVER_SHA256" ]]; then
+    echo "refusing shardschema material that differs from the checkpointed creation result" >&2
     exit 1
   fi
 fi
@@ -167,12 +199,36 @@ else
   printf '\nhost all all all scram-sha-256\n' >> "$staging/pg_hba.conf"
   cp -- "$expected" "$staging/.pgshard-bootstrap-complete"
   chmod 0600 "$staging/.pgshard-bootstrap-complete"
+  if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]]; then
+    printf 'version=1\ncluster_uid=%s\nshard_count=%s\nmigration_sha256=%s\n' \
+      "$PGSHARD_CLUSTER_UID" \
+      "$PGSHARD_SHARD_COUNT" \
+      "$PGSHARD_SHARDSCHEMA_MIGRATION_SHA256" > "$staging/.pgshard-catalog-genesis-intent"
+    chmod 0600 "$staging/.pgshard-catalog-genesis-intent"
+    sync "$staging/.pgshard-catalog-genesis-intent"
+  fi
   # initdb has already persisted the new cluster. Flush only the files and
   # directory entries that this script added so another mounted filesystem
   # cannot delay PostgreSQL bootstrap or Pod termination.
   sync "$staging/pg_hba.conf" "$staging/.pgshard-bootstrap-complete" "$staging"
   mv -- "$staging" "$final"
   sync "$final" "$parent" "$volume_root"
+fi
+
+catalog_genesis_pending=false
+if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]]; then
+  printf 'version=1\ncluster_uid=%s\nshard_count=%s\nmigration_sha256=%s\n' \
+    "$PGSHARD_CLUSTER_UID" \
+    "$PGSHARD_SHARD_COUNT" \
+    "$PGSHARD_SHARDSCHEMA_MIGRATION_SHA256" > "$expected"
+  if [[ -e "$catalog_genesis_intent" || -L "$catalog_genesis_intent" ]]; then
+    if [[ ! -f "$catalog_genesis_intent" || -L "$catalog_genesis_intent" ]] \
+      || ! cmp -s -- "$catalog_genesis_intent" "$expected"; then
+      echo "refusing an invalid or foreign shardschema genesis intent" >&2
+      exit 1
+    fi
+    catalog_genesis_pending=true
+  fi
 fi
 
 cleanup_expected
@@ -217,7 +273,23 @@ if [[ -n "$tablespace_entry" ]]; then
   exit 1
 fi
 
+# pg_hba.conf is operator-owned state. Non-catalog shards have no restored
+# topology to preflight, so publish their canonical rules now. Shard zero must
+# defer this durable write until the complete catalog and credential checks
+# succeed; RestoreTopologyMismatch cannot alter catalog contents or publish a
+# new serving HBA. Starting PostgreSQL to inspect a physical backup can still
+# advance internal PGDATA state, so full restore no-mutation belongs to the
+# signed-manifest controller preflight before a target is provisioned.
 if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" != "true" ]]; then
+  hba_staging="$final/.pgshard-pg_hba.conf.next"
+  rm -f -- "$hba_staging"
+  printf '%s\n' \
+    'local all all trust' \
+    'host all all all scram-sha-256' > "$hba_staging"
+  chmod 0600 "$hba_staging"
+  sync "$hba_staging" "$final"
+  mv -- "$hba_staging" "$final/pg_hba.conf"
+  sync "$final/pg_hba.conf" "$final"
   exit 0
 fi
 
@@ -231,7 +303,7 @@ printf '%s\n' \
   'local all all reject' \
   'host all all 0.0.0.0/0 reject' \
   'host all all ::0/0 reject' > "$quarantine_hba"
-export PGOPTIONS='-c lock_timeout=5s -c statement_timeout=30s -c transaction_timeout=120s -c idle_in_transaction_session_timeout=30s -c search_path=pg_catalog -c quote_all_identifiers=off -c event_triggers=off -c session_replication_role=origin -c session_preload_libraries= -c local_preload_libraries= -c jit=off -c default_tablespace= -c temp_tablespaces= -c default_table_access_method=heap -c row_security=off'
+export PGOPTIONS='-c lock_timeout=5s -c statement_timeout=30s -c transaction_timeout=120s -c idle_in_transaction_session_timeout=30s -c search_path=pg_catalog -c quote_all_identifiers=off -c event_triggers=off -c session_replication_role=origin -c session_preload_libraries= -c local_preload_libraries= -c jit=off -c default_tablespace= -c temp_tablespaces= -c default_table_access_method=heap -c default_transaction_read_only=off -c row_security=off -c synchronous_commit=on -c zero_damaged_pages=off -c ignore_checksum_failure=off -c password_encryption=scram-sha-256 -c scram_iterations=4096 -c log_statement=none -c log_min_error_statement=panic -c log_min_duration_statement=-1 -c log_min_duration_sample=-1 -c log_statement_sample_rate=0 -c log_transaction_sample_rate=0 -c log_duration=off -c log_parameter_max_length=0 -c log_parameter_max_length_on_error=0 -c log_min_messages=warning -c debug_print_parse=off -c debug_print_rewritten=off -c debug_print_plan=off -c log_parser_stats=off -c log_planner_stats=off -c log_executor_stats=off -c log_statement_stats=off'
 cleanup_bootstrap_runtime() {
   rm -f -- "$quarantine_hba"
   rm -rf -- "$socket"
@@ -255,7 +327,52 @@ trap stop_temporary_postgres EXIT
 # callbacks and preload libraries are disabled, durability checks stay strict,
 # and only this container's private Unix socket can authenticate.
 pg_ctl -D "$final" -w -t 45 start \
-  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c data_directory='$final' -c hba_file='$quarantine_hba' -c external_pid_file=/tmp/pgshard-catalog-bootstrap.pid -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c unix_socket_group= -c port=5432 -c ssl=off -c restart_after_crash=off -c primary_conninfo= -c primary_slot_name= -c restore_command= -c archive_cleanup_command= -c recovery_end_command= -c archive_mode=on -c archive_command= -c archive_library= -c max_wal_senders=0 -c max_logical_replication_workers=0 -c sync_replication_slots=off -c wal_receiver_create_temp_slot=off -c idle_replication_slot_timeout=0 -c max_slot_wal_keep_size=-1 -c shared_preload_libraries= -c session_preload_libraries= -c local_preload_libraries= -c event_triggers=off -c jit=off -c fsync=on -c full_page_writes=on -c ignore_invalid_pages=off -c data_sync_retry=off -c ignore_checksum_failure=off -c zero_damaged_pages=off -c logging_collector=off"
+  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c data_directory='$final' -c hba_file='$quarantine_hba' -c external_pid_file=/tmp/pgshard-catalog-bootstrap.pid -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c unix_socket_group= -c port=5432 -c ssl=off -c restart_after_crash=off -c primary_conninfo= -c primary_slot_name= -c restore_command= -c archive_cleanup_command= -c recovery_end_command= -c archive_mode=on -c archive_command= -c archive_library= -c max_wal_senders=0 -c max_logical_replication_workers=0 -c sync_replication_slots=off -c wal_receiver_create_temp_slot=off -c idle_replication_slot_timeout=0 -c max_slot_wal_keep_size=-1 -c shared_preload_libraries= -c session_preload_libraries= -c local_preload_libraries= -c event_triggers=off -c jit=off -c fsync=on -c full_page_writes=on -c synchronous_commit=on -c ignore_invalid_pages=off -c data_sync_retry=off -c ignore_checksum_failure=off -c zero_damaged_pages=off -c password_encryption=scram-sha-256 -c scram_iterations=4096 -c logging_collector=off -c log_statement=none -c log_min_error_statement=panic -c log_min_duration_statement=-1 -c log_min_duration_sample=-1 -c log_statement_sample_rate=0 -c log_transaction_sample_rate=0 -c log_duration=off -c log_parameter_max_length=0 -c log_parameter_max_length_on_error=0"
+
+validate_bootstrap_session_policy() {
+  local database="$1"
+  session_policy="$(
+    psql -X --no-password --host="$socket" --username=postgres --dbname="$database" \
+      --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+        SELECT CASE WHEN
+          current_setting('search_path') = 'pg_catalog'
+          AND current_setting('quote_all_identifiers') = 'off'
+          AND current_setting('event_triggers') = 'off'
+          AND current_setting('session_replication_role') = 'origin'
+          AND current_setting('default_transaction_read_only') = 'off'
+          AND current_setting('row_security') = 'off'
+          AND current_setting('synchronous_commit') = 'on'
+          AND current_setting('zero_damaged_pages') = 'off'
+          AND current_setting('ignore_checksum_failure') = 'off'
+          AND current_setting('password_encryption') = 'scram-sha-256'
+          AND current_setting('scram_iterations') = '4096'
+          AND current_setting('log_statement') = 'none'
+          AND current_setting('log_min_error_statement') = 'panic'
+          AND current_setting('log_min_duration_statement') = '-1'
+          AND current_setting('log_min_duration_sample') = '-1'
+          AND current_setting('log_statement_sample_rate')::numeric = 0
+          AND current_setting('log_transaction_sample_rate')::numeric = 0
+          AND current_setting('log_duration') = 'off'
+          AND current_setting('log_parameter_max_length') = '0'
+          AND current_setting('log_parameter_max_length_on_error') = '0'
+          AND current_setting('debug_print_parse') = 'off'
+          AND current_setting('debug_print_rewritten') = 'off'
+          AND current_setting('debug_print_plan') = 'off'
+          AND current_setting('log_parser_stats') = 'off'
+          AND current_setting('log_planner_stats') = 'off'
+          AND current_setting('log_executor_stats') = 'off'
+          AND current_setting('log_statement_stats') = 'off'
+        THEN 1 ELSE 0 END"
+  )"
+  if [[ "$session_policy" != "1" ]]; then
+    echo "refusing to inspect shardschema without the enforced bootstrap session policy" >&2
+    return 1
+  fi
+}
+
+# Verify command-line and PGOPTIONS precedence before the first restored
+# catalog lookup. Database- and role-scoped settings are untrusted input.
+validate_bootstrap_session_policy postgres
 
 database_exists="$(
   psql -X --no-password --host="$socket" --username=postgres --dbname=postgres --no-align --tuples-only \
@@ -264,6 +381,10 @@ database_exists="$(
 case "$database_exists" in
   1) ;;
   "")
+    if [[ "$catalog_genesis_pending" != "true" ]]; then
+      echo "refusing pre-existing PGDATA without durable shardschema topology evidence" >&2
+      exit 1
+    fi
     createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
     ;;
   *)
@@ -271,6 +392,8 @@ case "$database_exists" in
     exit 1
     ;;
 esac
+
+validate_bootstrap_session_policy shardschema
 
 validate_cluster_configuration() {
   configuration_state="$(
@@ -287,45 +410,80 @@ validate_cluster_configuration() {
   fi
 }
 
+count_missing_shards() {
+  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 \
+    --no-align --tuples-only --command="
+      SELECT pg_catalog.count(*)
+        FROM pg_catalog.generate_series(0, $PGSHARD_SHARD_COUNT::bigint - 1) AS expected(shard_number)
+        LEFT JOIN pgshard_catalog.shards AS shards
+          ON shards.shard_id::text = 'shard-' || pg_catalog.lpad(expected.shard_number::text, 4, '0')
+         AND shards.shard_number = expected.shard_number
+       WHERE shards.shard_id IS NULL"
+}
+
 validate_shard_inventory() {
+  local allow_missing="${1:-false}"
   invalid_shards="$(
     psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
       --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
-        SELECT (
-                 SELECT pg_catalog.count(*)
-                   FROM pgshard_catalog.shards AS shards
-                  WHERE NOT (
-                    shards.shard_id::text = 'shard-' || pg_catalog.lpad(
-                      shards.shard_number::text,
-                      CASE
-                        WHEN pg_catalog.length(shards.shard_number::text) < 4 THEN 4
-                        ELSE pg_catalog.length(shards.shard_number::text)
-                      END,
-                      '0'
-                    )
-                    AND (
-                      (shards.shard_number < $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'active')
-                      OR (shards.shard_number >= $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'retired')
-                    )
-                  )
-               ) + (
-                 SELECT pg_catalog.count(*)
-                   FROM pg_catalog.generate_series(
-                          0,
-                          $PGSHARD_SHARD_COUNT::bigint - 1
-                        ) AS expected(shard_number)
-                   LEFT JOIN pgshard_catalog.shards AS shards
-                     ON shards.shard_id::text = 'shard-' || pg_catalog.lpad(
-                          expected.shard_number::text,
+        SELECT pg_catalog.count(*)
+          FROM pgshard_catalog.shards AS shards
+         WHERE NOT (
+           shards.shard_id::text = 'shard-' || pg_catalog.lpad(
+             shards.shard_number::text,
+             CASE
+               WHEN pg_catalog.length(shards.shard_number::text) < 4 THEN 4
+               ELSE pg_catalog.length(shards.shard_number::text)
+             END,
+             '0'
+           )
+           AND (
+             (shards.shard_number < $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'active')
+             OR (shards.shard_number >= $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'retired')
+           )
+         )"
+  )"
+  if [[ "$invalid_shards" != "0" ]]; then
+    echo "RestoreTopologyMismatch: shardschema inventory conflicts with the configured immutable shard topology" >&2
+    return 1
+  fi
+  if [[ "$allow_missing" != "true" ]] && [[ "$(count_missing_shards)" != "0" ]]; then
+    echo "RestoreTopologyMismatch: shardschema inventory conflicts with the configured immutable shard topology" >&2
+    return 1
+  fi
+}
+
+validate_genesis_inventory_reachable() {
+  genesis_inventory_state="$(
+    psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+        SELECT CASE WHEN
+          (
+            pg_catalog.count(*) = 1
+            AND pg_catalog.count(*) FILTER (
+                  WHERE shards.shard_id::text = 'shard-0000'
+                    AND shards.shard_number = 0
+                    AND shards.state = 'active'
+                ) = 1
+          ) OR (
+            pg_catalog.count(*) = $PGSHARD_SHARD_COUNT::bigint
+            AND pg_catalog.count(*) FILTER (
+                  WHERE shards.state = 'active'
+                    AND shards.shard_number >= 0
+                    AND shards.shard_number < $PGSHARD_SHARD_COUNT::bigint
+                    AND shards.shard_id::text = 'shard-' || pg_catalog.lpad(
+                          shards.shard_number::text,
                           4,
                           '0'
                         )
-                    AND shards.shard_number = expected.shard_number
-                  WHERE shards.shard_id IS NULL
-               )"
+                ) = $PGSHARD_SHARD_COUNT::bigint
+          )
+          THEN 1 ELSE 0 END
+          FROM pgshard_catalog.shards AS shards"
   )"
-  if [[ "$invalid_shards" != "0" ]]; then
-    echo "refusing shardschema inventory that conflicts with the configured immutable shards" >&2
+  if [[ "$genesis_inventory_state" != "1" ]]; then
+    echo "RestoreTopologyMismatch: shardschema inventory is not a reachable genesis state for the configured immutable shard topology" >&2
     return 1
   fi
 }
@@ -414,8 +572,12 @@ validate_catalog_sequence_progress() {
 }
 
 validate_catalog_inventory() {
+  local allow_missing="${1:-false}"
   validate_cluster_configuration
-  validate_shard_inventory
+  validate_shard_inventory "$allow_missing"
+  if [[ "$allow_missing" == "true" ]]; then
+    validate_genesis_inventory_reachable
+  fi
   validate_restore_lineage
   validate_catalog_sequence_progress
 }
@@ -732,6 +894,10 @@ case "$catalog_core_tables" in
       echo "refusing a non-empty pre-existing pgshard_catalog schema" >&2
       exit 1
     fi
+    if [[ "$catalog_genesis_pending" != "true" ]]; then
+      echo "refusing an empty pre-existing shardschema without durable genesis evidence" >&2
+      exit 1
+    fi
     catalog_requires_initial_inventory=true
     ;;
   "t|t|t")
@@ -744,8 +910,13 @@ case "$catalog_core_tables" in
         exit 1
         ;;
     esac
-    validate_catalog_inventory
-    catalog_requires_initial_inventory=false
+    if [[ "$catalog_genesis_pending" == "true" ]]; then
+      validate_catalog_inventory true
+      catalog_requires_initial_inventory=true
+    else
+      validate_catalog_inventory false
+      catalog_requires_initial_inventory=false
+    fi
     ;;
   *)
     echo "refusing a partial pre-existing shardschema catalog" >&2
@@ -756,22 +927,16 @@ esac
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
   --set=ON_ERROR_STOP=1 --file="$PGSHARD_SHARDSCHEMA_MIGRATION"
 
-count_missing_shards() {
-  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
-    --set=ON_ERROR_STOP=1 \
-    --no-align --tuples-only --command="
-      SELECT pg_catalog.count(*)
-        FROM pg_catalog.generate_series(0, $PGSHARD_SHARD_COUNT::bigint - 1) AS expected(shard_number)
-        LEFT JOIN pgshard_catalog.shards AS shards
-          ON shards.shard_id::text = 'shard-' || pg_catalog.lpad(expected.shard_number::text, 4, '0')
-         AND shards.shard_number = expected.shard_number
-       WHERE shards.shard_id IS NULL"
-}
+if [[ "$catalog_requires_initial_inventory" == "true" ]]; then
+  # A hard crash can leave either migration-created shard zero or the complete
+  # atomic inventory. No other subset can be produced by this bootstrap.
+  validate_catalog_inventory true
+fi
 
 missing_shards="$(count_missing_shards)"
 if [[ "$missing_shards" != "0" ]]; then
   if [[ "$catalog_requires_initial_inventory" != "true" ]]; then
-    echo "refusing shardschema inventory that conflicts with the configured immutable shards" >&2
+    echo "RestoreTopologyMismatch: shardschema inventory conflicts with the configured immutable shard topology" >&2
     exit 1
   fi
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
@@ -823,14 +988,274 @@ COMMIT;
 PGSHARD_SHARD_INVENTORY
 fi
 
-validate_catalog_inventory
+validate_catalog_inventory false
 
 if [[ "$(count_missing_shards)" != "0" ]]; then
   echo "refusing shardschema inventory with missing configured shards" >&2
   exit 1
 fi
 
+validate_bootstrap_session_policy shardschema
+
+read_catalog_role_state() {
+  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+      SELECT COALESCE((
+        SELECT CASE WHEN
+        NOT roles.rolsuper
+        AND roles.rolinherit
+        AND NOT roles.rolcreaterole
+        AND NOT roles.rolcreatedb
+        AND NOT roles.rolreplication
+        AND NOT roles.rolbypassrls
+        AND roles.rolconnlimit = -1
+        AND roles.rolvaliduntil IS NULL
+        AND (
+          NOT EXISTS (
+            SELECT
+              FROM pg_catalog.pg_db_role_setting AS settings
+             WHERE settings.setrole = roles.oid
+          )
+          OR EXISTS (
+            SELECT
+              FROM pg_catalog.pg_db_role_setting AS settings
+              JOIN pg_catalog.pg_database AS databases
+                ON databases.oid = settings.setdatabase
+             WHERE settings.setrole = roles.oid
+               AND databases.datname = 'shardschema'
+               AND settings.setconfig = ARRAY[
+                     'search_path=pg_catalog',
+                     'statement_timeout=30s',
+                     'lock_timeout=5s',
+                     'transaction_timeout=120s',
+                     'idle_in_transaction_session_timeout=30s',
+                     'default_transaction_read_only=off',
+                     'row_security=off',
+                     'synchronous_commit=on',
+                     'zero_damaged_pages=off',
+                     'ignore_checksum_failure=off',
+                     'jit=off'
+                   ]::text[]
+               AND NOT EXISTS (
+                     SELECT
+                       FROM pg_catalog.pg_db_role_setting AS other_settings
+                      WHERE other_settings.setrole = roles.oid
+                        AND (other_settings.setdatabase, other_settings.setrole)
+                            IS DISTINCT FROM (settings.setdatabase, settings.setrole)
+                   )
+          )
+        )
+        AND (
+          SELECT pg_catalog.count(*)
+            FROM pg_catalog.pg_auth_members AS memberships
+           WHERE memberships.member = roles.oid
+        ) = 1
+        AND EXISTS (
+          SELECT
+            FROM pg_catalog.pg_auth_members AS memberships
+           WHERE memberships.member = roles.oid
+             AND memberships.roleid = 'pgshard_catalog_reader'::pg_catalog.regrole
+             AND memberships.grantor = (
+               SELECT principals.oid
+                 FROM pg_catalog.pg_roles AS principals
+                WHERE principals.rolname = current_user
+             )
+             AND NOT memberships.admin_option
+             AND memberships.inherit_option
+             AND NOT memberships.set_option
+        )
+        AND NOT EXISTS (
+          SELECT
+            FROM pg_catalog.pg_auth_members AS memberships
+           WHERE memberships.roleid = roles.oid
+        )
+        AND NOT EXISTS (
+          SELECT
+            FROM pg_catalog.pg_database AS databases
+           WHERE databases.datdba = roles.oid
+        )
+        AND NOT EXISTS (
+          SELECT
+            FROM pg_catalog.pg_tablespace AS tablespaces
+           WHERE tablespaces.spcowner = roles.oid
+        )
+        THEN CASE
+          WHEN roles.rolcanlogin
+            AND roles.rolpassword LIKE 'SCRAM-SHA-256\$4096:%'
+            THEN 'safe'
+          WHEN NOT roles.rolcanlogin
+            AND roles.rolpassword IS NULL
+            THEN 'staging'
+          ELSE 'unsafe'
+        END
+        ELSE 'unsafe'
+      END
+        FROM pg_catalog.pg_authid AS roles
+       WHERE roles.rolname = 'pgshard_pooler_catalog'
+      ), 'absent')"
+}
+
+catalog_role_state="$(read_catalog_role_state)"
+case "$catalog_role_state" in
+  absent)
+    # Establish a harmless, crash-recoverable role shape first. It cannot log
+    # in until the verifier is installed by the parameterized catalog update.
+    psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 <<'PGSHARD_CATALOG_LOGIN_STAGING'
+BEGIN;
+CREATE ROLE pgshard_pooler_catalog
+  NOLOGIN NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION
+  NOBYPASSRLS CONNECTION LIMIT -1;
+GRANT pgshard_catalog_reader TO pgshard_pooler_catalog
+  WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
+COMMIT;
+PGSHARD_CATALOG_LOGIN_STAGING
+    catalog_role_state=staging
+    ;;
+  staging|safe) ;;
+  *)
+    echo "refusing an unsafe shardschema reader role" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$catalog_role_state" == "staging" ]]; then
+  # Generate the SCRAM verifier client-side. During verifier installation, the
+  # plaintext password is never part of SQL, argv, or environment, and the
+  # verifier is a bind value with error-parameter logging disabled rather than
+  # loggable query text.
+  catalog_scram_verifier="$(
+    pgshard-scram-verifier < /etc/pgshard/catalog-auth/catalog-password
+  )"
+  case "$catalog_scram_verifier" in
+    'SCRAM-SHA-256$4096:'*) ;;
+    *)
+      echo "refusing an invalid client-generated SCRAM verifier" >&2
+      exit 1
+      ;;
+  esac
+  catalog_login_update="$(
+    {
+      printf '%s\n' \
+        'UPDATE pg_catalog.pg_authid SET rolpassword = $1, rolcanlogin = true WHERE rolname = '\''pgshard_pooler_catalog'\'' AND NOT rolcanlogin AND rolpassword IS NULL AND NOT rolsuper AND rolinherit AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolreplication AND NOT rolbypassrls AND rolconnlimit = -1 AND rolvaliduntil IS NULL RETURNING 1'
+      printf '%s %s\n' '\bind' "'$catalog_scram_verifier'"
+      printf '%s\n' '\g'
+    } | psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 --quiet --no-align --tuples-only
+  )"
+  unset catalog_scram_verifier
+  if [[ "$catalog_login_update" != "1" ]]; then
+    echo "refusing a shardschema reader role that changed during credential installation" >&2
+    exit 1
+  fi
+fi
+
+catalog_role_state="$(read_catalog_role_state)"
+if [[ "$catalog_role_state" != "safe" ]]; then
+  echo "refusing an unsafe shardschema reader role" >&2
+  exit 1
+fi
+
+# The shardschema database and its fixed login are operator-owned. Only a login
+# with no per-role defaults or the exact canonical defaults reaches here. After
+# exact topology and catalog validation, remove database-wide defaults and
+# re-establish the fixed login defaults. Noncanonical per-role defaults fail
+# closed before this mutation. Otherwise settings such as
+# zero_damaged_pages, ignore_checksum_failure, or session_preload_libraries
+# can be applied by PostgreSQL at trusted database/role startup precedence and
+# silently survive into every production pooler session.
+psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+  --set=ON_ERROR_STOP=1 <<'PGSHARD_CATALOG_SESSION_DEFAULTS'
+BEGIN;
+ALTER DATABASE shardschema RESET ALL;
+ALTER ROLE pgshard_pooler_catalog RESET ALL;
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema RESET ALL;
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET search_path = pg_catalog;
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET statement_timeout = '30s';
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET lock_timeout = '5s';
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET transaction_timeout = '120s';
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET default_transaction_read_only = off;
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET row_security = off;
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET synchronous_commit = on;
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET zero_damaged_pages = off;
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET ignore_checksum_failure = off;
+ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET jit = off;
+COMMIT;
+PGSHARD_CATALOG_SESSION_DEFAULTS
+
+# Prove that the immutable Secret still matches PostgreSQL's SCRAM verifier
+# without ALTER ROLE churn. The temporary server remains Unix-socket-only.
+printf '%s\n' \
+  'local all postgres trust' \
+  'local shardschema pgshard_pooler_catalog scram-sha-256' \
+  'local all all reject' \
+  'host all all 0.0.0.0/0 reject' \
+  'host all all ::0/0 reject' > "$quarantine_hba"
+pg_ctl -D "$final" reload
+catalog_authentication="$(
+  # The catalog role is intentionally not a superuser, so it cannot inherit
+  # the bootstrap superuser's PGOPTIONS (for example event_triggers=off). This
+  # connection deliberately has no startup options: it proves the exact
+  # database-and-role defaults that production pooler sessions will inherit.
+  # The credential stays out of SQL and argv; the private temporary server and
+  # already-validated event-trigger set remain the boundary.
+  PGPASSWORD="$catalog_password" env -u PGOPTIONS \
+    psql -X --no-password --host="$socket" --username=pgshard_pooler_catalog --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+      SELECT CASE WHEN current_user = 'pgshard_pooler_catalog'
+                    AND current_setting('search_path') = 'pg_catalog'
+                    AND current_setting('statement_timeout')::interval = interval '30 seconds'
+                    AND current_setting('lock_timeout')::interval = interval '5 seconds'
+                    AND current_setting('transaction_timeout')::interval = interval '120 seconds'
+                    AND current_setting('idle_in_transaction_session_timeout')::interval = interval '30 seconds'
+                    AND current_setting('default_transaction_read_only') = 'off'
+                    AND current_setting('row_security') = 'off'
+                    AND current_setting('synchronous_commit') = 'on'
+                    AND current_setting('jit') = 'off'
+                    AND pg_catalog.pg_has_role(
+                          current_user,
+                          'pgshard_catalog_reader',
+                          'USAGE'
+                        )
+                    AND (SELECT pg_catalog.count(*) FROM pgshard_catalog.shards) >= 1
+                  THEN 1 ELSE 0 END"
+)"
+unset catalog_password
+if [[ "$catalog_authentication" != "1" ]]; then
+  echo "refusing a shardschema reader credential that does not authenticate" >&2
+  exit 1
+fi
+
+# Publish the serving HBA only after every restored-catalog, role, and
+# credential check has succeeded. The catalog login has no Unix-socket or
+# non-catalog-database escape hatch; its sole serving path is TLS to
+# shardschema with SCRAM channel binding enforced by the pooler.
+hba_staging="$final/.pgshard-pg_hba.conf.next"
+rm -f -- "$hba_staging"
+printf '%s\n' \
+  'local all postgres trust' \
+  'local all pgshard_pooler_catalog reject' \
+  'local all all trust' \
+  'hostnossl shardschema all all reject' \
+  'hostssl shardschema pgshard_pooler_catalog all scram-sha-256' \
+  'hostssl shardschema all all reject' \
+  'host all pgshard_pooler_catalog all reject' \
+  'host all all all scram-sha-256' > "$hba_staging"
+chmod 0600 "$hba_staging"
+sync "$hba_staging" "$final"
+mv -- "$hba_staging" "$final/pg_hba.conf"
+sync "$final/pg_hba.conf" "$final"
+
+# The genesis intent is the crash-recovery authority until PostgreSQL has
+# cleanly stopped with synchronous commit enforced. If shutdown fails or the
+# container is killed, the durable intent remains and the next attempt accepts
+# only the two states this bootstrap can actually produce.
 pg_ctl -D "$final" -w -t 45 stop -m fast
+if [[ "$catalog_genesis_pending" == "true" ]]; then
+  rm -- "$catalog_genesis_intent"
+  sync "$final"
+fi
 trap - EXIT
 cleanup_bootstrap_runtime
 sync "$final" "$parent" "$volume_root"
@@ -968,6 +1393,16 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	if err != nil {
 		return nil, err
 	}
+	var catalogAccess *pgshardv1alpha1.CatalogAccessStatus
+	if cluster.Spec.MembersPerShard == 1 {
+		catalogAccess = cluster.Status.CatalogAccess
+		if catalogAccess == nil || catalogAccess.SecretUID == "" ||
+			!CatalogAccessSecretNameIsValid(cluster.Name, catalogAccess.SecretName) ||
+			!validCatalogMaterialSHA256(catalogAccess.ClientSHA256) ||
+			!validCatalogMaterialSHA256(catalogAccess.ServerSHA256) {
+			return nil, fmt.Errorf("catalog access creation result is missing or invalid")
+		}
+	}
 
 	objects := make([]client.Object, 0, 16+3*cluster.Spec.Shards)
 	objects = append(objects,
@@ -981,12 +1416,15 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		poolerService(cluster),
 		etcdNetworkPolicy(cluster),
 	)
+	if cluster.Spec.MembersPerShard == 1 {
+		objects = append(objects, catalogService(cluster))
+	}
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		objects = append(objects, shardService(cluster, shard), postgresqlNetworkPolicy(cluster, shard))
 		if cluster.Spec.MembersPerShard == 1 {
 			bootstrap := bootstraps[shard]
 			objects = append(objects,
-				postgresqlPrimaryStatefulSet(cluster, shard, images.PostgreSQL, images.PostgreSQLBootstrap, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash),
+				postgresqlPrimaryStatefulSet(cluster, shard, images.PostgreSQL, images.PostgreSQLBootstrap, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess),
 				postgresqlPrimaryDisruptionBudget(cluster, shard),
 			)
 		}
@@ -995,7 +1433,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	objects = append(objects,
 		etcdStatefulSet(cluster, images.Etcd),
 		orchestratorDeployment(cluster, images.Orchestrator, topologyHash),
-		poolerDeployment(cluster, images.Pooler, topologyHash),
+		poolerDeployment(cluster, images.Pooler, topologyHash, catalogAccess),
 		podDisruptionBudget(cluster, "etcd", 1),
 		podDisruptionBudget(cluster, "orchestrator", 1),
 		podDisruptionBudget(cluster, "pooler", 1),
@@ -1223,6 +1661,97 @@ func shardService(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *corev1.
 	}
 }
 
+// CatalogServiceName returns the ready-only service that exposes the
+// authoritative shardschema database on shard zero.
+func CatalogServiceName(cluster string) string { return cluster + CatalogServiceSuffix }
+
+// CatalogAccessSecretPrefix returns a bounded, cluster-specific prefix for an
+// unpredictable client-generated Secret name. The controller appends 128 bits
+// of randomness, checkpoints a non-consumable creation intent, and then records
+// the resulting API identity before planning workloads.
+func CatalogAccessSecretPrefix(cluster string) string {
+	const maximumPrefixLength = 31 // leaves 32 hexadecimal characters in a DNS label
+	literal := cluster + "-catalog-"
+	if len(literal) <= maximumPrefixLength {
+		return literal
+	}
+	digest := sha256.Sum256([]byte(cluster))
+	encoded := hex.EncodeToString(digest[:6])
+	prefixLength := maximumPrefixLength - len("-cat-") - len(encoded) - 1
+	return cluster[:prefixLength] + "-cat-" + encoded + "-"
+}
+
+// CatalogAccessSecretNameIsValid verifies the checkpointed 128-bit random
+// suffix and bounded cluster-specific prefix.
+func CatalogAccessSecretNameIsValid(cluster, name string) bool {
+	prefix := CatalogAccessSecretPrefix(cluster)
+	if !strings.HasPrefix(name, prefix) || len(name) != len(prefix)+32 {
+		return false
+	}
+	suffix := name[len(prefix):]
+	decoded, err := hex.DecodeString(suffix)
+	return err == nil && len(decoded) == 16 && hex.EncodeToString(decoded) == suffix
+}
+
+// CatalogClientMaterialSHA256 binds the exact password and CA projection used
+// by the pooler and shard-zero bootstrap init container.
+func CatalogClientMaterialSHA256(password, caCertificate []byte) string {
+	return catalogMaterialSHA256("pgshard-catalog-client-v1", password, caCertificate)
+}
+
+// CatalogServerMaterialSHA256 binds the exact PostgreSQL serving certificate
+// and private-key projection validated before the postmaster starts.
+func CatalogServerMaterialSHA256(serverCertificate, serverPrivateKey []byte) string {
+	return catalogMaterialSHA256("pgshard-catalog-server-v1", serverCertificate, serverPrivateKey)
+}
+
+func catalogMaterialSHA256(domain string, values ...[]byte) string {
+	hash := sha256.New()
+	fmt.Fprintln(hash, domain)
+	for _, value := range values {
+		component := sha256.Sum256(value)
+		fmt.Fprintln(hash, hex.EncodeToString(component[:]))
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func validCatalogMaterialSHA256(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && hex.EncodeToString(decoded) == value
+}
+
+// CatalogTLSDNSNames returns the complete exact hostname set accepted by the
+// catalog server certificate.
+func CatalogTLSDNSNames(cluster, namespace string) []string {
+	service := CatalogServiceName(cluster)
+	return []string{
+		service,
+		service + "." + namespace,
+		service + "." + namespace + ".svc",
+		service + "." + namespace + ".svc.cluster.local",
+	}
+}
+
+func catalogService(cluster *pgshardv1alpha1.PgShardCluster) *corev1.Service {
+	selector := componentSelector(cluster, "postgresql")
+	selector[ShardLabel] = shardLabel(0)
+	selector[RoleLabel] = "primary"
+	selector[MemberLabel] = "0000"
+	return &corev1.Service{
+		ObjectMeta: ownedMeta(cluster, CatalogServiceName(cluster.Name), "shardschema", nil),
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: selector,
+			Ports: []corev1.ServicePort{{
+				Name:       "postgresql",
+				Protocol:   corev1.ProtocolTCP,
+				Port:       PostgreSQLPort,
+				TargetPort: intstr.FromString("postgresql"),
+			}},
+		},
+	}
+}
+
 // PostgreSQLAuthSecretPrefix is the readable portion of a randomly named
 // credential. The controller appends cryptographic randomness and records the
 // resulting name and API UID before any workload can reference it.
@@ -1280,6 +1809,21 @@ func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, 
 	}
 }
 
+// CatalogAccessIntentSecret is the stable, non-consumable identity created
+// before any catalog credential or private key exists. Once its API UID is
+// checkpointed, the controller updates this exact resource once with immutable
+// material. A delayed Create can therefore commit only an empty Secret. Serving
+// processes receive split projections; shard-zero bootstrap temporarily
+// receives both projections to validate retained material before PGDATA access.
+func CatalogAccessIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, name string) *corev1.Secret {
+	metadata := ownedMeta(cluster, name, "shardschema", nil)
+	metadata.Annotations[CatalogAccessClusterUIDAnnotation] = string(cluster.UID)
+	return &corev1.Secret{
+		ObjectMeta: metadata,
+		Type:       corev1.SecretTypeOpaque,
+	}
+}
+
 // PostgreSQLPrimaryDataPVC returns the standalone data volume for a singleton
 // primary. Size and storage class come from the checkpointed provisioning
 // contract. Every create is controlled by the exact detached credential Secret
@@ -1318,7 +1862,7 @@ func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int
 	}
 }
 
-func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image, bootstrapImage, secretName, pvcName, configurationName, configurationHash string) *appsv1.StatefulSet {
+func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image, bootstrapImage, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus) *appsv1.StatefulSet {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
@@ -1370,6 +1914,18 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql", ReadOnly: true},
 		},
 	}
+	if shard == 0 {
+		postgres.Args = append(postgres.Args,
+			"-c", "ssl=on",
+			"-c", "ssl_cert_file=/etc/pgshard/catalog-tls/tls.crt",
+			"-c", "ssl_key_file=/etc/pgshard/catalog-tls/tls.key",
+			"-c", "ssl_min_protocol_version=TLSv1.3",
+			"-c", "ssl_max_protocol_version=TLSv1.3",
+		)
+		postgres.VolumeMounts = append(postgres.VolumeMounts,
+			corev1.VolumeMount{Name: "catalog-server-tls", MountPath: "/etc/pgshard/catalog-tls", ReadOnly: true},
+		)
+	}
 	bootstrap := corev1.Container{
 		Name:            "bootstrap-postgresql",
 		Image:           bootstrapImage,
@@ -1396,6 +1952,19 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 			{Name: "bootstrap-secret", MountPath: "/etc/pgshard/bootstrap", ReadOnly: true},
 		},
 	}
+	if shard == 0 {
+		if catalogAccess == nil {
+			panic("validated single-member plan has no catalog access checkpoint")
+		}
+		bootstrap.VolumeMounts = append(bootstrap.VolumeMounts,
+			corev1.VolumeMount{Name: "catalog-bootstrap-auth", MountPath: "/etc/pgshard/catalog-auth", ReadOnly: true},
+			corev1.VolumeMount{Name: "catalog-server-tls", MountPath: "/etc/pgshard/catalog-tls", ReadOnly: true},
+		)
+		bootstrap.Env = append(bootstrap.Env,
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_CLIENT_SHA256", Value: catalogAccess.ClientSHA256},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_SERVER_SHA256", Value: catalogAccess.ServerSHA256},
+		)
+	}
 	automount := false
 	enableServiceLinks := false
 	podAnnotations := map[string]string{
@@ -1404,6 +1973,40 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 	}
 	if shard == 0 {
 		podAnnotations[shardschemaMigrationHashAnnotation] = shardschemaMigrationSHA256
+	}
+	volumes := []corev1.Volume{
+		{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName}}},
+		{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr(resource.MustParse("64Mi"))}}},
+		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("64Mi"))}}},
+		{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configurationName}}}},
+		{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName, DefaultMode: ptr(int32(0o440))}}},
+	}
+	if shard == 0 {
+		catalogSecret := catalogAccess.SecretName
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: "catalog-server-tls",
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName:  catalogSecret,
+					DefaultMode: ptr(int32(0o440)),
+					Items: []corev1.KeyToPath{
+						{Key: CatalogTLSCertificateKey, Path: "tls.crt"},
+						{Key: CatalogTLSPrivateKeyKey, Path: "tls.key"},
+					},
+				}},
+			},
+			corev1.Volume{
+				Name: "catalog-bootstrap-auth",
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName:  catalogSecret,
+					DefaultMode: ptr(int32(0o440)),
+					Items: []corev1.KeyToPath{
+						{Key: CatalogPasswordKey, Path: "catalog-password"},
+						{Key: CatalogCACertificateKey, Path: "ca.crt"},
+					},
+				}},
+			},
+		)
 	}
 	return &appsv1.StatefulSet{
 		ObjectMeta: ownedMeta(cluster, name, "postgresql", nil),
@@ -1438,13 +2041,7 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 					},
 					InitContainers: []corev1.Container{bootstrap},
 					Containers:     []corev1.Container{postgres},
-					Volumes: []corev1.Volume{
-						{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName}}},
-						{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr(resource.MustParse("64Mi"))}}},
-						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("64Mi"))}}},
-						{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configurationName}}}},
-						{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName, DefaultMode: ptr(int32(0o440))}}},
-					},
+					Volumes:        volumes,
 				},
 			},
 		},
@@ -1680,13 +2277,17 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 	return deployment
 }
 
-func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash string) *appsv1.Deployment {
+func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus) *appsv1.Deployment {
 	replicas := poolerReplicas(cluster)
 	var desiredReplicas *int32
 	if cluster.Spec.Pooler.Scaling.Mode == pgshardv1alpha1.ScalingFixed {
 		desiredReplicas = ptr(replicas)
 	}
 	selector := componentSelector(cluster, "pooler")
+	catalogMode := "bootstrap-unavailable"
+	if cluster.Spec.MembersPerShard == 1 {
+		catalogMode = "operator-tls"
+	}
 	env := []corev1.EnvVar{
 		{Name: "PGSHARD_CLUSTER_ID", Value: cluster.Name},
 		{Name: "PGSHARD_TOPOLOGY_FILE", Value: "/etc/pgshard/topology/cluster.json"},
@@ -1694,8 +2295,33 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 		{Name: "PGSHARD_RW_BIND", Value: "0.0.0.0:5432"},
 		{Name: "PGSHARD_RO_BIND", Value: "0.0.0.0:5433"},
 		{Name: "PGSHARD_R_BIND", Value: "0.0.0.0:5434"},
-		{Name: "PGSHARD_CATALOG_MODE", Value: "bootstrap-unavailable"},
+		{Name: "PGSHARD_CATALOG_MODE", Value: catalogMode},
 		{Name: "PGSHARD_ETCD_ENDPOINTS", Value: etcdEndpoints(cluster)},
+	}
+	volumeMounts := []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true}}
+	volumes := []corev1.Volume{{Name: "topology", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix}}}}}
+	if cluster.Spec.MembersPerShard == 1 {
+		if catalogAccess == nil {
+			panic("validated single-member plan has no catalog access checkpoint")
+		}
+		env = append(env,
+			corev1.EnvVar{Name: "PGSHARD_SHARDSCHEMA_HOST", Value: fmt.Sprintf("%s.%s.svc", CatalogServiceName(cluster.Name), cluster.Namespace)},
+			corev1.EnvVar{Name: "PGSHARD_SHARDSCHEMA_PASSWORD_FILE", Value: "/etc/pgshard/catalog/catalog-password"},
+			corev1.EnvVar{Name: "PGSHARD_SHARDSCHEMA_CA_FILE", Value: "/etc/pgshard/catalog/ca.crt"},
+			corev1.EnvVar{Name: "PGSHARD_SHARDSCHEMA_CLIENT_SHA256", Value: catalogAccess.ClientSHA256},
+		)
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "catalog-client", MountPath: "/etc/pgshard/catalog", ReadOnly: true})
+		volumes = append(volumes, corev1.Volume{
+			Name: "catalog-client",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName:  catalogAccess.SecretName,
+				DefaultMode: ptr(int32(0o440)),
+				Items: []corev1.KeyToPath{
+					{Key: CatalogPasswordKey, Path: "catalog-password"},
+					{Key: CatalogCACertificateKey, Path: "ca.crt"},
+				},
+			}},
+		})
 	}
 	if cluster.Spec.Observability.OpenTelemetryEndpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: cluster.Spec.Observability.OpenTelemetryEndpoint})
@@ -1715,10 +2341,10 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 		ReadinessProbe: httpReadinessProbe("/readyz", "http"),
 		LivenessProbe:  httpLivenessProbe("/healthz", "http"),
 		Lifecycle:      &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{Sleep: &corev1.SleepAction{Seconds: 10}}},
-		VolumeMounts:   []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true}},
+		VolumeMounts:   volumeMounts,
 	}})
 	podSpec.TerminationGracePeriodSeconds = ptr(int64(60))
-	podSpec.Volumes = []corev1.Volume{{Name: "topology", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix}}}}}
+	podSpec.Volumes = volumes
 	return &appsv1.Deployment{
 		ObjectMeta: ownedMeta(cluster, cluster.Name+PoolerSuffix, "pooler", nil),
 		Spec: appsv1.DeploymentSpec{

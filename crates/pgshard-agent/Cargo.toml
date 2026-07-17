@@ -15,6 +15,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
+postgres-protocol.workspace = true
 rustix.workspace = true
 serde.workspace = true
 tempfile = "3.27.0"

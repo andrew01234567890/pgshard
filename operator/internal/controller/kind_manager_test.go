@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
@@ -104,6 +105,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForSingleMemberPostgreSQL(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster))
+	waitForPoolerCatalogTLS(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertPostgreSQLStatusMetadataImmutable(t, ctx, kubeClient, types.NamespacedName{
 		Namespace: namespace.Name,
 		Name:      cluster.Name + "-shard-0000-primary-0",
@@ -146,6 +148,21 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	}
 	if len(initialShardZero.Status.InitContainerStatuses) != 1 || initialShardZero.Status.InitContainerStatuses[0].ImageID == "" || initialShardZero.Status.InitContainerStatuses[0].RestartCount != 0 || initialShardZero.Status.InitContainerStatuses[0].State.Terminated == nil || initialShardZero.Status.InitContainerStatuses[0].State.Terminated.ExitCode != 0 {
 		t.Fatalf("shard-0000 bootstrap completion = %#v", initialShardZero.Status.InitContainerStatuses)
+	}
+	if current.Status.CatalogAccess == nil || current.Status.CatalogAccess.SecretName == "" || current.Status.CatalogAccess.SecretUID == "" {
+		t.Fatalf("catalog access identity was not checkpointed: %#v", current.Status.CatalogAccess)
+	}
+	for _, rejection := range []struct {
+		name     string
+		database string
+		sslMode  string
+	}{
+		{name: "plaintext-catalog", database: "shardschema", sslMode: "disable"},
+		{name: "other-database", database: "postgres", sslMode: "require"},
+	} {
+		assertCatalogLoginRejected(t, ctx, kubeClient, namespace.Name, cluster.Name,
+			initialShardZero.Spec.Containers[0].Image, current.Status.CatalogAccess.SecretName,
+			owned.CatalogServiceName(cluster.Name), rejection.name, rejection.database, rejection.sslMode)
 	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
@@ -429,6 +446,74 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("credential creation fence survived Retain finalization: %v", err)
 		}
 	}
+}
+
+func waitForPoolerCatalogTLS(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) {
+	t.Helper()
+	type catalogStatus struct {
+		Phase                 string  `json:"phase"`
+		ConnectionUp          bool    `json:"connection_up"`
+		Ready                 bool    `json:"ready"`
+		ReadinessReason       string  `json:"readiness_reason"`
+		CatalogEpoch          *string `json:"catalog_epoch"`
+		SuccessfulConnections string  `json:"successful_connections"`
+		LastFailure           *string `json:"last_failure"`
+	}
+	type poolerStatus struct {
+		Ready   bool          `json:"ready"`
+		Catalog catalogStatus `json:"catalog"`
+	}
+	statusPath := fmt.Sprintf("/api/v1/namespaces/%s/services/http:%s-pooler:http/proxy/status", namespace, cluster)
+	metricsPath := fmt.Sprintf("/api/v1/namespaces/%s/services/http:%s-pooler:http/proxy/metrics", namespace, cluster)
+	readinessPath := fmt.Sprintf("/api/v1/namespaces/%s/services/http:%s-pooler:http/proxy/readyz", namespace, cluster)
+	var lastOutput string
+	var lastErr error
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		output, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
+		lastOutput, lastErr = string(output), err
+		if err != nil {
+			return false, nil
+		}
+		var status poolerStatus
+		if err := json.Unmarshal(output, &status); err != nil {
+			lastErr = err
+			return false, nil
+		}
+		if status.Ready || status.Catalog.Phase != "connected" || !status.Catalog.ConnectionUp || !status.Catalog.Ready || status.Catalog.ReadinessReason != "ready" || status.Catalog.CatalogEpoch == nil || status.Catalog.LastFailure != nil {
+			lastErr = fmt.Errorf("catalog status not ready: %#v", status)
+			return false, nil
+		}
+		catalogEpoch, epochErr := strconv.ParseUint(*status.Catalog.CatalogEpoch, 10, 64)
+		successfulConnections, connectionErr := strconv.ParseUint(status.Catalog.SuccessfulConnections, 10, 64)
+		if epochErr != nil || strconv.FormatUint(catalogEpoch, 10) != *status.Catalog.CatalogEpoch ||
+			connectionErr != nil || successfulConnections == 0 ||
+			strconv.FormatUint(successfulConnections, 10) != status.Catalog.SuccessfulConnections {
+			lastErr = fmt.Errorf("catalog status counters are not canonical: %#v", status.Catalog)
+			return false, nil
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for pooler authenticated catalog TLS: %v; last error = %v; last output = %q", err, lastErr, lastOutput)
+	}
+	metrics, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", metricsPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read pooler metrics through Service proxy: %v\n%s", err, metrics)
+	}
+	for _, sample := range []string{
+		"pgshard_pooler_ready 0",
+		"pgshard_pooler_catalog_ready 1",
+		"pgshard_pooler_catalog_connection_up 1",
+	} {
+		if !strings.Contains(string(metrics), sample) {
+			t.Fatalf("pooler metrics lack %q:\n%s", sample, metrics)
+		}
+	}
+	readiness, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", readinessPath).CombinedOutput()
+	if err == nil || (!strings.Contains(string(readiness), "data_plane_unavailable") && !strings.Contains(string(readiness), "ServiceUnavailable")) {
+		t.Fatalf("pooler /readyz = error %v, output %q; want HTTP 503 data_plane_unavailable", err, readiness)
+	}
+	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace, cluster)
 }
 
 func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, kubeClient client.Client, key types.NamespacedName) {
@@ -812,6 +897,41 @@ func assertPostgreSQLServiceQueryDenied(t *testing.T, ctx context.Context, kubeC
 	output := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
 	if !strings.Contains(output, "connection to server") || !strings.Contains(output, "timeout expired") {
 		t.Fatalf("denied PostgreSQL client failed for an unexpected reason: %q", output)
+	}
+}
+
+func assertCatalogLoginRejected(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, image, secret, host, suffix, database, sslMode string) {
+	t.Helper()
+	clientPod := postgreSQLClientPod(namespace, fmt.Sprintf("pgshard-catalog-client-%s-%d-%d", suffix, os.Getpid(), time.Now().UnixNano()), map[string]string{
+		owned.ClusterLabel:   cluster,
+		owned.ComponentLabel: "pooler",
+	}, image, secret, host, "SELECT 1")
+	container := &clientPod.Spec.Containers[0]
+	container.Args = []string{"-X", "-w", "-h", host, "-U", "pgshard_pooler_catalog", "-d", database, "-Atc", "SELECT 1"}
+	container.Env[1].ValueFrom.SecretKeyRef.Key = owned.CatalogPasswordKey
+	container.Env = append(container.Env, corev1.EnvVar{Name: "PGSSLMODE", Value: sslMode})
+	if err := kubeClient.Create(ctx, clientPod); err != nil {
+		t.Fatal(err)
+	}
+	current := &corev1.Pod{}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		current = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(clientPod), current); err != nil {
+			return false, err
+		}
+		if current.Status.Phase == corev1.PodSucceeded {
+			return false, fmt.Errorf("catalog login unexpectedly reached database %s with sslmode=%s", database, sslMode)
+		}
+		return current.Status.Phase == corev1.PodFailed, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for rejected catalog login Pod: %v; last status = %#v", err, current.Status)
+	}
+	output := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
+	if !strings.Contains(output, "pg_hba.conf rejects connection") ||
+		!strings.Contains(output, "user \"pgshard_pooler_catalog\"") ||
+		!strings.Contains(output, "database \""+database+"\"") {
+		t.Fatalf("catalog login was rejected for an unexpected reason: %q", output)
 	}
 }
 

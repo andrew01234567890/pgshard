@@ -13,11 +13,20 @@ pooler. It composes catalog state with four low-frequency HTTP endpoints:
 - `/metrics` publishes Prometheus text exposition with only bounded labels.
 
 Local catalog mode opens only a regular DSN file using nonblocking Linux flags,
-reads at most 16 KiB plus one byte, and applies bounded polling, staleness,
-reconnect, connection, and operation deadlines. The explicit
-`bootstrap-unavailable` mode accepts no DSN and performs no connection attempt;
-it exists only so an installation can expose liveness while catalog transport
-is not yet provisioned. Both modes shut the catalog task, HTTP server, and
+reads at most 16 KiB plus one byte, and is restricted to loopback or Unix-socket
+development endpoints. Operator mode constructs its PostgreSQL configuration
+without a DSN: it fixes the database, login, port, application name,
+`target_session_attrs=read-write`, and required SCRAM channel binding, then
+verifies the exact Service DNS name over TLS 1.3 against one projected private
+CA certificate. Its projected password must be exactly 64 lowercase hexadecimal
+bytes. Both files are bounded, nonblocking regular-file reads; Kubernetes
+Secret symlink projections are resolved and the opened target is checked again.
+
+The explicit `bootstrap-unavailable` mode accepts no DSN, host, password, or CA
+and performs no connection attempt. It exists for unsupported topologies that
+cannot yet provision a catalog endpoint. Every mode applies bounded polling,
+staleness, reconnect, connection, and operation deadlines. All modes shut the
+catalog task, HTTP server, and
 PostgreSQL handshake listener down together on `SIGINT` or `SIGTERM`. The
 control HTTP server
 limits accepted connections, header count and bytes, header time, total
@@ -61,15 +70,24 @@ cargo run --locked -p pgshard-pooler -- \
   --shardschema-dsn-file /run/secrets/shardschema-dsn
 ```
 
-This is not a deployable SQL pooler. Authentication, authenticated TLS, backend
+This is not a deployable SQL pooler. Client authentication, data-shard backend
 connections and pooling, SQL execution, OpenTelemetry export, accepted-session
-drain, and the read-only listener roles remain unimplemented. The operator does
-not yet create or mount the DSN file and cannot use the local-only catalog
-transport between Pods. It therefore selects `bootstrap-unavailable`: the Pod
-can remain alive and observable without credentials, but catalog and overall
-readiness stay false and application Services remain unusable. Moving to local
-or future authenticated remote supervision requires an explicit Deployment
-rollout.
+drain, and the read-only listener roles remain unimplemented. For the supported
+single-member development topology, the operator provisions an immutable
+catalog-only credential and CA projection and selects `operator-tls`; catalog
+readiness can become true while overall application readiness stays false. The
+catalog login is read-only and can connect only to `shardschema` over TLS.
+General PostgreSQL traffic and etcd are not made secure by this catalog-only
+path.
+
+The operator does not yet rotate this static PostgreSQL serving certificate or
+reload a replacement without interruption. It issues a five-year development
+certificate and degrades the cluster before resource planning when less than
+180 days remain; existing workloads continue, but the operator does not apply
+any part of the desired resource plan. This is an explicit MVP limitation, not
+a production certificate lifecycle.
+Missing, replaced, malformed, or near-expiry catalog access material requires
+an explicit recovery procedure and is never regenerated silently.
 
 Run its focused checks from the repository root:
 
