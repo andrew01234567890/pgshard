@@ -134,13 +134,18 @@ func (v *PgShardClusterValidator) ValidateUpdate(ctx context.Context, oldCluster
 	if !equalOptionalString(oldCluster.Spec.Storage.StorageClassName, newCluster.Spec.Storage.StorageClassName) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "storageClassName"), newCluster.Spec.Storage.StorageClassName, "storage class is immutable after cluster creation"))
 	}
-	if !oldCluster.Spec.Storage.Size.Equal(newCluster.Spec.Storage.Size) {
+	if !oldCluster.Spec.Storage.Size.Equal(newCluster.Spec.Storage.Size) && !legacyStorageUpgrade(oldCluster.Spec.Storage.Size, newCluster.Spec.Storage.Size) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "size"), newCluster.Spec.Storage.Size.String(), "storage size is immutable until explicit PVC expansion is implemented"))
 	}
 	if oldCluster.Spec.Storage.DeletionPolicy != newCluster.Spec.Storage.DeletionPolicy {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "deletionPolicy"), newCluster.Spec.Storage.DeletionPolicy, "deletion policy is immutable after cluster creation"))
 	}
 	return warningsFor(newCluster), invalidIfAny(newCluster.Name, allErrs)
+}
+
+func legacyStorageUpgrade(oldSize, newSize resource.Quantity) bool {
+	minimum := resource.MustParse("4Gi")
+	return oldSize.Cmp(minimum) < 0 && newSize.Cmp(minimum) >= 0
 }
 
 func equalOptionalString(left, right *string) bool {

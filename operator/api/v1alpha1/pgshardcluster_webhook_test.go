@@ -302,6 +302,18 @@ func TestValidationRejectsUnsafeStorageAndImmutableResize(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "immutable until explicit PVC expansion") {
 		t.Fatalf("unsupported storage resize was accepted: %v", err)
 	}
+
+	oldCluster = validCluster()
+	oldCluster.Spec.Storage.Size = resource.MustParse("2Gi")
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Spec.Storage.Size = resource.MustParse("4Gi")
+	if _, err = (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster); err != nil {
+		t.Fatalf("one-time legacy storage upgrade was rejected: %v", err)
+	}
+	newCluster.Spec.Storage.Size = resource.MustParse("3Gi")
+	if _, err = (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "at least 4Gi") {
+		t.Fatalf("undersized legacy storage update was accepted: %v", err)
+	}
 }
 
 func TestValidationRejectsUnsafeOpenTelemetryEndpoints(t *testing.T) {

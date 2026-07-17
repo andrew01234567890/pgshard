@@ -556,6 +556,13 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	if len(statefulSet.Name) > 63 || len(statefulSet.Name+"-0") > 63 {
 		t.Fatalf("maximum cluster name produced invalid StatefulSet or Pod name: %q", statefulSet.Name)
 	}
+	if statefulSet.Spec.ServiceName != shardName(cluster.Name, 0) {
+		t.Fatalf("bounded StatefulSet changed the existing shard Service identity: %q", statefulSet.Spec.ServiceName)
+	}
+	otherName := strings.Repeat("a", pgshardv1alpha1.MaximumClusterNameLength-1) + "b"
+	if PostgreSQLPrimaryStatefulSetName(cluster.Name, 0) == PostgreSQLPrimaryStatefulSetName(otherName, 0) {
+		t.Fatal("distinct maximum-length cluster names produced the same StatefulSet identity")
+	}
 }
 
 func TestImagePullPolicyHandlesRegistryPortsAndDigests(t *testing.T) {

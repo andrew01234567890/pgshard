@@ -353,9 +353,6 @@ spec:
                     description: Size is the capacity of each PostgreSQL data volume.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
-                    x-kubernetes-validations:
-                    - message: storage size must be at least 4Gi
-                      rule: quantity(self).compareTo(quantity('4Gi')) >= 0
                   storageClassName:
                     description: |-
                       StorageClassName is used for PostgreSQL data volumes and the supporting
@@ -365,9 +362,13 @@ spec:
                 - size
                 type: object
                 x-kubernetes-validations:
-                - message: storage size is immutable until explicit PVC expansion
-                    is implemented
-                  rule: quantity(self.size).compareTo(quantity(oldSelf.size)) == 0
+                - message: storage size is immutable except for a one-time upgrade
+                    from a legacy size below 4Gi to at least 4Gi
+                  optionalOldSelf: true
+                  rule: '!oldSelf.hasValue() ? quantity(self.size).compareTo(quantity(''4Gi''))
+                    >= 0 : quantity(self.size).compareTo(quantity(oldSelf.value().size))
+                    == 0 || (quantity(oldSelf.value().size).compareTo(quantity(''4Gi''))
+                    < 0 && quantity(self.size).compareTo(quantity(''4Gi'')) >= 0)'
                 - message: storage class is immutable after cluster creation
                   rule: has(self.storageClassName) == has(oldSelf.storageClassName)
                     && (!has(self.storageClassName) || self.storageClassName == oldSelf.storageClassName)

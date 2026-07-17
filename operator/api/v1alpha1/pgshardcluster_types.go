@@ -10,9 +10,9 @@ import (
 const (
 	PostgreSQLMajor18 = "18"
 	MaximumShards     = 128
-	// MaximumClusterNameLength leaves room for the longest generated
-	// StatefulSet identity while keeping its Pod identity a valid DNS label.
-	MaximumClusterNameLength = 42
+	// MaximumClusterNameLength preserves the public API limit from the first
+	// operator release. Longer workload identities are bounded independently.
+	MaximumClusterNameLength = 50
 
 	DurabilitySynchronous  DurabilityMode = "Synchronous"
 	DurabilityAsynchronous DurabilityMode = "Asynchronous"
@@ -83,12 +83,11 @@ type PostgreSQLSpec struct {
 	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
-// +kubebuilder:validation:XValidation:rule="quantity(self.size).compareTo(quantity(oldSelf.size)) == 0",message="storage size is immutable until explicit PVC expansion is implemented"
+// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() ? quantity(self.size).compareTo(quantity('4Gi')) >= 0 : quantity(self.size).compareTo(quantity(oldSelf.value().size)) == 0 || (quantity(oldSelf.value().size).compareTo(quantity('4Gi')) < 0 && quantity(self.size).compareTo(quantity('4Gi')) >= 0)",message="storage size is immutable except for a one-time upgrade from a legacy size below 4Gi to at least 4Gi",optionalOldSelf=true
 // +kubebuilder:validation:XValidation:rule="has(self.storageClassName) == has(oldSelf.storageClassName) && (!has(self.storageClassName) || self.storageClassName == oldSelf.storageClassName)",message="storage class is immutable after cluster creation"
 // +kubebuilder:validation:XValidation:rule="self.deletionPolicy == oldSelf.deletionPolicy",message="deletion policy is immutable after cluster creation"
 type StorageSpec struct {
 	// Size is the capacity of each PostgreSQL data volume.
-	// +kubebuilder:validation:XValidation:rule="quantity(self).compareTo(quantity('4Gi')) >= 0",message="storage size must be at least 4Gi"
 	Size resource.Quantity `json:"size"`
 	// StorageClassName is used for PostgreSQL data volumes and the supporting
 	// etcd quorum's independently sized volumes.

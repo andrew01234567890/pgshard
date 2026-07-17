@@ -16,12 +16,14 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -42,6 +44,9 @@ func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
 	defer cancel()
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	if err := pgshardv1alpha1.AddToScheme(scheme); err != nil {
@@ -111,6 +116,143 @@ func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
 	if err := kubeClient.Patch(ctx, currentAbsent, client.MergeFrom(beforeAbsent)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
 		t.Fatalf("CRD admitted an absent-to-present storage class transition without any admission webhook installed: %v", err)
 	}
+
+	crdKey := types.NamespacedName{Name: "pgshardclusters.pgshard.io"}
+	originalCRD := &apiextensionsv1.CustomResourceDefinition{}
+	if err := kubeClient.Get(ctx, crdKey, originalCRD); err != nil {
+		t.Fatal(err)
+	}
+	originalRules, err := storageValidationRules(originalCRD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoreCRD := func(ctx context.Context) error {
+		current := &apiextensionsv1.CustomResourceDefinition{}
+		if err := kubeClient.Get(ctx, crdKey, current); err != nil {
+			return err
+		}
+		if err := replaceStorageValidationRules(current, originalRules); err != nil {
+			return err
+		}
+		return kubeClient.Update(ctx, current)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if err := restoreCRD(cleanupCtx); err != nil {
+			t.Errorf("restore current PgShardCluster CRD validation: %v", err)
+		}
+	})
+	legacyCRD := originalCRD.DeepCopy()
+	legacyRules := slices.Clone(originalRules)
+	legacyRules[0] = apiextensionsv1.ValidationRule{
+		Rule:    "quantity(self.size).compareTo(quantity('1Gi')) >= 0",
+		Message: "storage size must be at least 1Gi",
+	}
+	if err := replaceStorageValidationRules(legacyCRD, legacyRules); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Update(ctx, legacyCRD); err != nil {
+		t.Fatal(err)
+	}
+	legacyStorage := validCluster()
+	legacyStorage.Name = "legacy-storage-upgrade"
+	legacyStorage.Namespace = namespace.Name
+	legacyStorage.UID = ""
+	legacyStorage.ResourceVersion = ""
+	legacyStorage.Generation = 0
+	legacyStorage.Spec.Storage.Size = resource.MustParse("2Gi")
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Create(ctx, legacyStorage)
+		if err == nil || apierrors.IsAlreadyExists(err) {
+			return true, nil
+		}
+		if apierrors.IsInvalid(err) {
+			return false, nil
+		}
+		return false, err
+	}); err != nil {
+		t.Fatalf("create object through legacy 1Gi storage contract: %v", err)
+	}
+	if err := restoreCRD(ctx); err != nil {
+		t.Fatal(err)
+	}
+	undersizedCreate := legacyStorage.DeepCopy()
+	undersizedCreate.Name = "new-undersized-storage"
+	undersizedCreate.ResourceVersion = ""
+	undersizedCreate.UID = ""
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Create(ctx, undersizedCreate)
+		if apierrors.IsInvalid(err) {
+			return true, nil
+		}
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return false, err
+		}
+		if err := kubeClient.Delete(ctx, undersizedCreate); err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+		undersizedCreate.ResourceVersion = ""
+		undersizedCreate.UID = ""
+		return false, nil
+	}); err != nil {
+		t.Fatalf("wait for restored 4Gi create-time contract: %v", err)
+	}
+	storedLegacy := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(legacyStorage), storedLegacy); err != nil {
+		t.Fatal(err)
+	}
+	beforeLegacy := storedLegacy.DeepCopy()
+	storedLegacy.Spec.Storage.Size = resource.MustParse("4Gi")
+	if err := kubeClient.Patch(ctx, storedLegacy, client.MergeFrom(beforeLegacy)); err != nil {
+		t.Fatalf("CRD rejected the one-time legacy storage upgrade: %v", err)
+	}
+	beforeUnsupported := storedLegacy.DeepCopy()
+	storedLegacy.Spec.Storage.Size = resource.MustParse("8Gi")
+	if err := kubeClient.Patch(ctx, storedLegacy, client.MergeFrom(beforeUnsupported)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("CRD admitted a later storage resize after legacy migration: %v", err)
+	}
+}
+
+func storageValidationRules(crd *apiextensionsv1.CustomResourceDefinition) ([]apiextensionsv1.ValidationRule, error) {
+	for index := range crd.Spec.Versions {
+		version := &crd.Spec.Versions[index]
+		if version.Name != pgshardv1alpha1.GroupVersion.Version || version.Schema == nil || version.Schema.OpenAPIV3Schema == nil {
+			continue
+		}
+		specSchema, found := version.Schema.OpenAPIV3Schema.Properties["spec"]
+		if !found {
+			break
+		}
+		storageSchema, found := specSchema.Properties["storage"]
+		if !found || len(storageSchema.XValidations) == 0 {
+			break
+		}
+		return slices.Clone(storageSchema.XValidations), nil
+	}
+	return nil, fmt.Errorf("PgShardCluster CRD has no storage validation rules")
+}
+
+func replaceStorageValidationRules(crd *apiextensionsv1.CustomResourceDefinition, rules []apiextensionsv1.ValidationRule) error {
+	for index := range crd.Spec.Versions {
+		version := &crd.Spec.Versions[index]
+		if version.Name != pgshardv1alpha1.GroupVersion.Version || version.Schema == nil || version.Schema.OpenAPIV3Schema == nil {
+			continue
+		}
+		specSchema, found := version.Schema.OpenAPIV3Schema.Properties["spec"]
+		if !found {
+			break
+		}
+		storageSchema, found := specSchema.Properties["storage"]
+		if !found {
+			break
+		}
+		storageSchema.XValidations = slices.Clone(rules)
+		specSchema.Properties["storage"] = storageSchema
+		version.Schema.OpenAPIV3Schema.Properties["spec"] = specSchema
+		return nil
+	}
+	return fmt.Errorf("PgShardCluster CRD has no storage schema")
 }
 
 func (c hpaCacheMissClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {

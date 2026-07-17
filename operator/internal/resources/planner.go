@@ -475,7 +475,23 @@ func PostgreSQLAuthSecretPrefix(cluster string, shard int32) string {
 // PostgreSQLPrimaryStatefulSetName returns the deterministic singleton primary
 // workload name for one shard.
 func PostgreSQLPrimaryStatefulSetName(cluster string, shard int32) string {
-	return shardName(cluster, shard) + "-primary"
+	return fmt.Sprintf("%s-shard-%04d-primary", boundedPostgreSQLWorkloadPrefix(cluster), shard)
+}
+
+// StatefulSet Pod names append an ordinal and must remain DNS labels. Preserve
+// the legacy cluster-name API limit by bounding only the new PostgreSQL
+// workload prefix, with a deterministic digest preventing truncation aliases.
+func boundedPostgreSQLWorkloadPrefix(cluster string) string {
+	const (
+		maximumPrefixLength = 42
+		digestBytes         = 8
+	)
+	if len(cluster) <= maximumPrefixLength {
+		return cluster
+	}
+	digest := sha256.Sum256([]byte(cluster))
+	suffix := hex.EncodeToString(digest[:digestBytes])
+	return cluster[:maximumPrefixLength-len(suffix)-1] + "-" + suffix
 }
 
 // PostgreSQLPrimaryDataPVCPrefix is the readable portion of a randomly named,
@@ -663,7 +679,7 @@ func postgresqlPrimaryDisruptionBudget(cluster *pgshardv1alpha1.PgShardCluster, 
 	selector[ShardLabel] = shardLabel(shard)
 	selector[RoleLabel] = "primary"
 	return &policyv1.PodDisruptionBudget{
-		ObjectMeta: ownedMeta(cluster, shardName(cluster.Name, shard)+"-primary", "postgresql", nil),
+		ObjectMeta: ownedMeta(cluster, PostgreSQLPrimaryStatefulSetName(cluster.Name, shard), "postgresql", nil),
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MinAvailable:               &minimum,
 			Selector:                   &metav1.LabelSelector{MatchLabels: selector},

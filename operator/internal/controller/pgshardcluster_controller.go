@@ -2212,7 +2212,7 @@ func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Cont
 	ready := int32(0)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		statefulSet := &appsv1.StatefulSet{}
-		key := types.NamespacedName{Namespace: cluster.Namespace, Name: fmt.Sprintf("%s-shard-%04d-primary", cluster.Name, shard)}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)}
 		if err := reader.Get(ctx, key, statefulSet); apierrors.IsNotFound(err) {
 			continue
 		} else if err != nil {
