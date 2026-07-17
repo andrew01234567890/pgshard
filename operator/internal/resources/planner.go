@@ -145,16 +145,16 @@ if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]]; then
     echo "refusing an invalid shardschema reader credential" >&2
     exit 1
   fi
-  read -r catalog_password_sha _ < <(sha256sum -- /etc/pgshard/catalog-auth/catalog-password)
-  read -r catalog_ca_sha _ < <(sha256sum -- /etc/pgshard/catalog-auth/ca.crt)
-  read -r catalog_server_certificate_sha _ < <(sha256sum -- /etc/pgshard/catalog-tls/tls.crt)
-  read -r catalog_server_private_key_sha _ < <(sha256sum -- /etc/pgshard/catalog-tls/tls.key)
-  read -r observed_catalog_client_sha _ < <(
-    printf 'pgshard-catalog-client-v1\n%s\n%s\n' "$catalog_password_sha" "$catalog_ca_sha" | sha256sum
-  )
-  read -r observed_catalog_server_sha _ < <(
-    printf 'pgshard-catalog-server-v1\n%s\n%s\n' "$catalog_server_certificate_sha" "$catalog_server_private_key_sha" | sha256sum
-  )
+  observed_catalog_client_sha="$(
+    pgshard-catalog-material-digest client \
+      /etc/pgshard/catalog-auth/catalog-password \
+      /etc/pgshard/catalog-auth/ca.crt
+  )"
+  observed_catalog_server_sha="$(
+    pgshard-catalog-material-digest server \
+      /etc/pgshard/catalog-tls/tls.key \
+      /etc/pgshard/catalog-tls/tls.crt
+  )"
   if [[ "$observed_catalog_client_sha" != "$PGSHARD_CATALOG_CLIENT_SHA256" ]] \
     || [[ "$observed_catalog_server_sha" != "$PGSHARD_CATALOG_SERVER_SHA256" ]]; then
     echo "refusing shardschema material that differs from the checkpointed creation result" >&2
