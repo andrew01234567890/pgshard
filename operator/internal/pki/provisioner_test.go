@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1023,6 +1024,15 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 			want: "references Service path",
 		},
 		{
+			name: "wrong restore webhook resource",
+			mutate: func(objects []client.Object) {
+				configuration := objects[3].(*admissionregistrationv1.ValidatingWebhookConfiguration)
+				webhook := findValidatingWebhook(configuration.Webhooks, restoreWebhookName)
+				webhook.Rules[0].Resources = []string{"pgshardclusters"}
+			},
+			want: `validating webhook "vpgshardrestore.kb.io": rules do not exactly cover`,
+		},
+		{
 			name: "wrong webhook port",
 			mutate: func(objects []client.Object) {
 				port := int32(8443)
@@ -1044,6 +1054,16 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 				configuration.Webhooks = append(configuration.Webhooks, configuration.Webhooks[0])
 			},
 			want: "want exactly four",
+		},
+		{
+			name: "missing restore webhook",
+			mutate: func(objects []client.Object) {
+				configuration := objects[3].(*admissionregistrationv1.ValidatingWebhookConfiguration)
+				configuration.Webhooks = slices.DeleteFunc(configuration.Webhooks, func(webhook admissionregistrationv1.ValidatingWebhook) bool {
+					return webhook.Name == restoreWebhookName
+				})
+			},
+			want: "want exactly six",
 		},
 	}
 	for _, test := range tests {
@@ -1304,6 +1324,12 @@ func installObjects() []client.Object {
 	}})
 	handshakeMutating.NamespaceSelector = podFencingNamespaceSelector()
 	clusterValidating := validatingWebhook(validatingWebhookName, validatingWebhookPath, clusterRules())
+	restoreValidating := validatingWebhook(restoreWebhookName, restoreWebhookPath, []admissionregistrationv1.RuleWithOperations{{
+		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
+		Rule: admissionregistrationv1.Rule{
+			APIGroups: []string{"pgshard.io"}, APIVersions: []string{"v1alpha1"}, Resources: []string{"pgshardrestores"}, Scope: &scope,
+		},
+	}})
 	metadataValidating := validatingWebhook(podfence.MetadataWebhookName, podfence.MetadataWebhookPath, coreResourceRules(admissionregistrationv1.Update, "pods", "pods/ephemeralcontainers", "pods/resize"))
 	metadataValidating.ObjectSelector = postgreSQLPodSelector()
 	namespaceValidating := validatingWebhook(podfence.NamespaceWebhookName, podfence.NamespaceWebhookPath, []admissionregistrationv1.RuleWithOperations{{
@@ -1327,7 +1353,7 @@ func installObjects() []client.Object {
 		},
 		&admissionregistrationv1.ValidatingWebhookConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: testValidatingConfigurationName},
-			Webhooks:   []admissionregistrationv1.ValidatingWebhook{clusterValidating, metadataValidating, namespaceValidating, statusValidating, bindingValidating},
+			Webhooks:   []admissionregistrationv1.ValidatingWebhook{clusterValidating, restoreValidating, metadataValidating, namespaceValidating, statusValidating, bindingValidating},
 		},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 			Namespace: testNamespace,
@@ -1499,7 +1525,7 @@ func assertInjectedBundles(t *testing.T, kubeClient client.Client, wanted []byte
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: testValidatingConfigurationName}, validating); err != nil {
 		t.Fatal(err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 5 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 6 {
 		t.Fatalf("CA bundles were not injected: mutating=%#v validating=%#v", mutating.Webhooks, validating.Webhooks)
 	}
 	for _, webhook := range mutating.Webhooks {
