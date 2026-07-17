@@ -290,6 +290,10 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 
 	cluster := readSingleMemberSample(t)
 	cluster.Namespace = namespace.Name
+	cluster.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{
+		{Name: "app", Shards: 2, Cells: []int32{0, 1}},
+		{Name: "analytics", Shards: 1, Cells: []int32{0}},
+	}
 	if err := kubeClient.Create(ctx, cluster); err != nil {
 		t.Fatal(err)
 	}
@@ -338,6 +342,19 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if len(initialShardZero.Status.InitContainerStatuses) != 1 || initialShardZero.Status.InitContainerStatuses[0].ImageID == "" || initialShardZero.Status.InitContainerStatuses[0].RestartCount != 0 || initialShardZero.Status.InitContainerStatuses[0].State.Terminated == nil || initialShardZero.Status.InitContainerStatuses[0].State.Terminated.ExitCode != 0 {
 		t.Fatalf("shard-0000 bootstrap completion = %#v", initialShardZero.Status.InitContainerStatuses)
 	}
+	databaseGenesisMounts := 0
+	for _, mount := range initialShardZero.Spec.InitContainers[0].VolumeMounts {
+		if mount.MountPath != "/etc/pgshard/database-genesis.sql" {
+			continue
+		}
+		databaseGenesisMounts++
+		if mount.Name != "postgresql-config" || mount.SubPath != "database-genesis.sql" || !mount.ReadOnly {
+			t.Fatalf("shard-0000 database genesis mount = %#v", mount)
+		}
+	}
+	if databaseGenesisMounts != 1 {
+		t.Fatalf("shard-0000 database genesis mounts = %d, want 1", databaseGenesisMounts)
+	}
 	if current.Status.CatalogAccess == nil || current.Status.CatalogAccess.SecretName == "" || current.Status.CatalogAccess.SecretUID == "" {
 		t.Fatalf("catalog access identity was not checkpointed: %#v", current.Status.CatalogAccess)
 	}
@@ -371,6 +388,18 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
 		"SELECT count(*) FROM pg_catalog.pg_database WHERE datname = 'shardschema'")); got != "0" {
 		t.Fatalf("non-home shard shardschema database count = %q", got)
+	}
+	databaseSnapshot := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
+		"SELECT string_agg(database_name::text || '=' || logical_database_id::text, ',' ORDER BY database_name) FROM pgshard_catalog.logical_databases"))
+	databaseSnapshotParts := strings.Split(databaseSnapshot, ",")
+	if len(databaseSnapshotParts) != 2 || !strings.HasPrefix(databaseSnapshotParts[0], "analytics=") || !strings.HasPrefix(databaseSnapshotParts[1], "app=") || strings.HasSuffix(databaseSnapshotParts[0], "=") || strings.HasSuffix(databaseSnapshotParts[1], "=") {
+		t.Fatalf("database genesis identity snapshot = %q", databaseSnapshot)
+	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
+		"SELECT string_agg(databases.database_name::text || ':' || ranges.range_start::text || ':' || shards.shard_number::text, ',' ORDER BY databases.database_name, ranges.range_start) FROM pgshard_catalog.logical_databases AS databases JOIN pgshard_catalog.active_routing_epochs AS active ON active.logical_database_id = databases.logical_database_id JOIN pgshard_catalog.routing_ranges AS ranges ON ranges.routing_epoch = active.routing_epoch JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id")); got != "analytics:0:0,app:0:0,app:9223372036854775808:1" {
+		t.Fatalf("database genesis routing = %q", got)
 	}
 	catalogSnapshot := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
@@ -506,6 +535,11 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
 		"SELECT state.catalog_epoch, string_agg(incarnations.shard_id::text || '=' || incarnations.restore_incarnation::text, ',' ORDER BY incarnations.shard_id) FROM pgshard_catalog.cluster_state AS state CROSS JOIN pgshard_catalog.shard_restore_incarnations AS incarnations WHERE state.singleton AND incarnations.state = 'active' GROUP BY state.catalog_epoch")); got != catalogSnapshot {
 		t.Fatalf("idempotent shardschema restart changed snapshot from %q to %q", catalogSnapshot, got)
+	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
+		"SELECT string_agg(database_name::text || '=' || logical_database_id::text, ',' ORDER BY database_name) FROM pgshard_catalog.logical_databases")); got != databaseSnapshot {
+		t.Fatalf("idempotent shard-zero restart changed database identities from %q to %q", databaseSnapshot, got)
 	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",

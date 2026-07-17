@@ -191,6 +191,12 @@ the bootstrap principal; it recreates the canonical functions and triggers in
 the same transaction. Fresh inventory is checked before that transaction can
 commit, so a suppressed insert cannot report success. Reapplying an unchanged
 migration and exact inventory does not advance the catalog epoch.
+The generated database-topology transaction remains in the immutable,
+content-addressed PostgreSQL ConfigMap, but shard-0000 receives that key through
+a dedicated read-only `subPath` file mount. Kubernetes ConfigMap directory
+projections use symlinks; the separate bind mount lets bootstrap retain its
+regular-file and no-symlink check without copying mutable SQL into the
+container filesystem.
 Shard-0000 bootstrap also creates one fixed `pgshard_pooler_catalog` login with
 only the catalog reader role, proves that the immutable Secret password matches
 its SCRAM verifier, and replaces restored or edited `pg_hba.conf` rules with an

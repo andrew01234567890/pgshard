@@ -80,6 +80,8 @@ const (
 	PostgreSQLPodTerminationFinalizer       = "pgshard.io/postgresql-termination"
 	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 	shardschemaMigrationPath                = "/usr/share/pgshard/migrations/0001_shardschema.sql"
+	databaseGenesisKey                      = "database-genesis.sql"
+	databaseGenesisPath                     = "/etc/pgshard/database-genesis.sql"
 	shardschemaMigrationSHA256              = "1512c1aee0e555c2208560f75e9b1c4261d8b0444d4505128e2db016d610d3d7"
 	shardschemaMigrationHashAnnotation      = "pgshard.io/shardschema-migration-sha256"
 )
@@ -999,7 +1001,7 @@ fi
 
 validate_bootstrap_session_policy shardschema
 
-database_genesis=/etc/pgshard/postgresql/database-genesis.sql
+database_genesis=/etc/pgshard/database-genesis.sql
 if [[ ! -f "$database_genesis" || -L "$database_genesis" ]]; then
   echo "database genesis topology is missing or not a regular file" >&2
   exit 1
@@ -1390,7 +1392,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		return nil, fmt.Errorf("resolve PostgreSQL settings: %w", err)
 	}
 	postgresqlConfig := renderPostgreSQLConfiguration(postgresql)
-	postgresqlConfig["database-genesis.sql"] = renderDatabaseGenesisSQL(cluster)
+	postgresqlConfig[databaseGenesisKey] = renderDatabaseGenesisSQL(cluster)
 	postgresqlHash := configMapDataHash(postgresqlConfig)
 	postgresqlConfigName := PostgreSQLConfigMapName(cluster.Name, postgresqlHash)
 	topologyConfig, err := renderTopology(cluster)
@@ -2038,6 +2040,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 			panic("validated single-member plan has no catalog access checkpoint")
 		}
 		bootstrap.VolumeMounts = append(bootstrap.VolumeMounts,
+			corev1.VolumeMount{Name: "postgresql-config", MountPath: databaseGenesisPath, SubPath: databaseGenesisKey, ReadOnly: true},
 			corev1.VolumeMount{Name: "catalog-bootstrap-auth", MountPath: "/etc/pgshard/catalog-auth", ReadOnly: true},
 			corev1.VolumeMount{Name: "catalog-server-tls", MountPath: "/etc/pgshard/catalog-tls", ReadOnly: true},
 		)

@@ -72,7 +72,7 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	if len(postgresConfig.Data) != 8 {
 		t.Fatalf("PostgreSQL configuration documents = %#v", postgresConfig.Data)
 	}
-	databaseGenesis := postgresConfig.Data["database-genesis.sql"]
+	databaseGenesis := postgresConfig.Data[databaseGenesisKey]
 	analytics := "install_database_genesis('analytics'::pgshard_catalog.sql_identifier, ARRAY[0,1]::bigint[])"
 	app := "install_database_genesis('app'::pgshard_catalog.sql_identifier, ARRAY[0,1]::bigint[])"
 	if !strings.Contains(databaseGenesis, analytics) || !strings.Contains(databaseGenesis, app) || strings.Index(databaseGenesis, analytics) > strings.Index(databaseGenesis, app) {
@@ -346,6 +346,26 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		}
 		if got := strings.Count(bootstrap.Command[2], "sync \"$final\" \"$parent\" \"$volume_root\""); got != 3 {
 			t.Fatalf("PostgreSQL final-data publication barriers = %d, want 3", got)
+		}
+		genesisMounts := 0
+		for _, mount := range bootstrap.VolumeMounts {
+			if mount.MountPath != databaseGenesisPath {
+				continue
+			}
+			genesisMounts++
+			if mount.Name != "postgresql-config" || mount.SubPath != databaseGenesisKey || !mount.ReadOnly {
+				t.Fatalf("PostgreSQL database genesis mount = %#v", mount)
+			}
+		}
+		if shard == 0 {
+			if !strings.Contains(bootstrap.Command[2], "database_genesis="+databaseGenesisPath) {
+				t.Fatal("PostgreSQL bootstrap does not read the regular-file genesis mount")
+			}
+			if genesisMounts != 1 {
+				t.Fatalf("PostgreSQL database genesis mounts = %d, want 1", genesisMounts)
+			}
+		} else if genesisMounts != 0 {
+			t.Fatalf("non-catalog shard has %d database genesis mounts", genesisMounts)
 		}
 		if !strings.Contains(bootstrap.Command[2], "catalog_schema_fingerprint") ||
 			!strings.Contains(bootstrap.Command[2], "ee17a64c8eec5e2e9a44f29d4764edac90680980f61df35bdb2284c01b57c4d9") ||
@@ -756,7 +776,7 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(
-		filepath.Join(configurationDirectory, "database-genesis.sql"),
+		filepath.Join(configurationDirectory, databaseGenesisKey),
 		[]byte(renderDatabaseGenesisSQL(&pgshardv1alpha1.PgShardCluster{})),
 		0o444,
 	); err != nil {
@@ -779,6 +799,7 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 			"--volume", catalogAuthDirectory + ":/etc/pgshard/catalog-auth:ro",
 			"--volume", catalogTLSDirectory + ":/etc/pgshard/catalog-tls:ro",
 			"--volume", configurationDirectory + ":/etc/pgshard/postgresql:ro",
+			"--volume", filepath.Join(configurationDirectory, databaseGenesisKey) + ":" + databaseGenesisPath + ":ro",
 			"--volume", legacyMigration + ":/tmp/v0_49_0_shardschema.sql:ro",
 			"--tmpfs", "/tmp:rw,uid=999,gid=999,mode=0700,size=67108864",
 			"--env", "PGDATA=" + dataParent + "/docker",
@@ -1066,7 +1087,7 @@ trap - EXIT
 			{Name: "analytics", Shards: 1, Cells: []int32{0}},
 		},
 	}}
-	genesisPath := filepath.Join(configurationDirectory, "database-genesis.sql")
+	genesisPath := filepath.Join(configurationDirectory, databaseGenesisKey)
 	replaceDatabaseGenesis := func(cluster *pgshardv1alpha1.PgShardCluster) {
 		t.Helper()
 		if err := os.Chmod(genesisPath, 0o644); err != nil {

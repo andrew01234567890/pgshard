@@ -637,6 +637,11 @@ are one transaction: a later conflicting database leaves an earlier new
 declaration absent and the active topology unchanged. API and planner tests
 cover deterministic defaults, shared and disjoint placements, out-of-range
 cells, duplicate cells, count mismatches, and immutable updates.
+Planner coverage also requires shard-0000 to mount the immutable generated SQL
+key as one read-only `subPath` regular file. The bootstrap continues to reject
+symlinks, including the symlink entries used by a whole-directory ConfigMap
+projection, so the Kubernetes mount contract is tested independently from the
+Docker regular-file fixture.
 A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the
