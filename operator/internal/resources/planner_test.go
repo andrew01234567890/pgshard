@@ -254,6 +254,12 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		if got := strings.Count(bootstrap.Command[2], "sync \"$final\" \"$parent\" \"$volume_root\""); got != 3 {
 			t.Fatalf("PostgreSQL final-data publication barriers = %d, want 3", got)
 		}
+		if !strings.Contains(bootstrap.Command[2], "catalog_schema_fingerprint") ||
+			!strings.Contains(bootstrap.Command[2], "9bcd876a113347bd5ce8f09223c62764f8dc718ae2c82f1a0927a79b540e8c47") ||
+			!strings.Contains(bootstrap.Command[2], "4ffbb7e2265874434df99e69bad693856e262b38b788ce3c8b35ef6b20ff4074") ||
+			!strings.Contains(bootstrap.Command[2], "6711de8bd95b456b384a9672de9b1c237f2df7db30bb9a9a58cc9431fc401373") {
+			t.Fatal("PostgreSQL bootstrap does not pin supported catalog shapes")
+		}
 		if len(bootstrap.Env) != 10 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
 			bootstrap.Env[2].Name != "PGSHARD_POSTGRESQL_MAJOR" || bootstrap.Env[2].Value != pgshardv1alpha1.PostgreSQLMajor18 ||
 			bootstrap.Env[3].Name != "PGSHARD_SHARD_COUNT" || bootstrap.Env[3].Value != fmt.Sprintf("%d", cluster.Spec.Shards) ||
@@ -781,10 +787,50 @@ PREPARE TRANSACTION 'pgshard_bootstrap_lock';
 
 	const emptyDataParent = "/var/lib/postgresql/18-empty"
 	if output, err := bootstrap(emptyDataParent, false, 2); err != nil {
-		t.Fatalf("initialize partial-catalog PGDATA: %v\n%s", err, output)
+		t.Fatalf("initialize malformed-catalog PGDATA: %v\n%s", err, output)
+	}
+	prepareMalformedCatalog := postgresHarness + `
+createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --file=/tmp/v0_49_0_shardschema.sql >/dev/null
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --command="ALTER TABLE pgshard_catalog.cluster_configuration DROP COLUMN cluster_id" >/dev/null
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(emptyDataParent, prepareMalformedCatalog); err != nil {
+		t.Fatalf("prepare malformed complete catalog: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing an unsupported or malformed pre-existing shardschema catalog") {
+		t.Fatalf("malformed complete catalog error = %v\n%s", err, output)
+	}
+	recreateEmptyCatalog := postgresHarness + `
+dropdb --no-password --host="$socket" --username=postgres shardschema
+psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+  --set=ON_ERROR_STOP=1 --command="DROP ROLE IF EXISTS pgshard_catalog_admin, pgshard_catalog_reader, pgshard_catalog_owner" >/dev/null
+createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(emptyDataParent, recreateEmptyCatalog); err != nil {
+		t.Fatalf("recreate catalog database after malformed shape: %v\n%s", err, output)
+	}
+	prepareReservedSchema := postgresHarness + `
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --command="CREATE SCHEMA pgshard_catalog; CREATE TABLE pgshard_catalog.unrelated(dummy integer)" >/dev/null
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(emptyDataParent, prepareReservedSchema); err != nil {
+		t.Fatalf("prepare occupied reserved schema: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing a non-empty pre-existing pgshard_catalog schema") {
+		t.Fatalf("occupied reserved schema error = %v\n%s", err, output)
+	}
+	if output, err := runContainer(emptyDataParent, recreateEmptyCatalog); err != nil {
+		t.Fatalf("recreate catalog database after occupied schema: %v\n%s", err, output)
 	}
 	preparePartialCatalog := postgresHarness + `
-createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
   --set=ON_ERROR_STOP=1 --command="CREATE SCHEMA pgshard_catalog; CREATE TABLE pgshard_catalog.cluster_configuration(dummy integer); CREATE TABLE pgshard_catalog.shards(dummy integer)" >/dev/null
 pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
@@ -796,17 +842,14 @@ trap - EXIT
 	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing a partial pre-existing shardschema catalog") {
 		t.Fatalf("two-of-three partial catalog error = %v\n%s", err, output)
 	}
-	recreateEmptyCatalog := postgresHarness + `
-dropdb --no-password --host="$socket" --username=postgres shardschema
-createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
-pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
-trap - EXIT
-`
 	if output, err := runContainer(emptyDataParent, recreateEmptyCatalog); err != nil {
 		t.Fatalf("recreate empty catalog database: %v\n%s", err, output)
 	}
 	if output, err := bootstrap(emptyDataParent, true, 2); err != nil {
 		t.Fatalf("recover empty catalog database: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(emptyDataParent, true, 2); err != nil {
+		t.Fatalf("revalidate freshly installed current catalog: %v\n%s", err, output)
 	}
 	if got := catalogSQL(emptyDataParent, "SELECT count(*) FILTER (WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active') FROM pgshard_catalog.shards"); got != "2|2" {
 		t.Fatalf("empty-database recovery inventory = %q", got)
