@@ -4,13 +4,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
 	PostgreSQLMajor18 = "18"
 	MaximumShards     = 128
-	// MaximumClusterNameLength leaves room for the longest generated Service
-	// suffix while keeping workload identities valid DNS labels.
+	// MaximumClusterNameLength preserves the public API limit from the first
+	// operator release. Longer workload identities are bounded independently.
 	MaximumClusterNameLength = 50
 
 	DurabilitySynchronous  DurabilityMode = "Synchronous"
@@ -21,13 +22,20 @@ const (
 
 	RepositoryS3         BackupRepositoryType = "S3"
 	RepositoryFilesystem BackupRepositoryType = "Filesystem"
+
+	DeletionRetain StorageDeletionPolicy = "Retain"
+	DeletionDelete StorageDeletionPolicy = "Delete"
 )
 
 type DurabilityMode string
 type PoolerScalingMode string
 type BackupRepositoryType string
+type StorageDeletionPolicy string
 
 // PgShardClusterSpec describes one namespaced pgshard installation.
+// +kubebuilder:validation:XValidation:rule="self.shards == oldSelf.shards",message="shards is immutable until online resharding is implemented"
+// +kubebuilder:validation:XValidation:rule="self.membersPerShard == oldSelf.membersPerShard",message="membersPerShard is immutable until membership transitions are implemented"
+// +kubebuilder:validation:XValidation:rule="self.durability == oldSelf.durability",message="durability is immutable until replication-mode transitions are implemented"
 type PgShardClusterSpec struct {
 	// Shards is the number of logical hash ranges. The catalog remains on shard-0000.
 	// +kubebuilder:validation:Minimum=1
@@ -75,13 +83,20 @@ type PostgreSQLSpec struct {
 	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() ? quantity(self.size).compareTo(quantity('4Gi')) >= 0 : quantity(self.size).compareTo(quantity(oldSelf.value().size)) == 0 || (quantity(oldSelf.value().size).compareTo(quantity('4Gi')) < 0 && quantity(self.size).compareTo(quantity('4Gi')) >= 0)",message="storage size is immutable except for a one-time upgrade from a legacy size below 4Gi to at least 4Gi",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="has(self.storageClassName) == has(oldSelf.storageClassName) && (!has(self.storageClassName) || self.storageClassName == oldSelf.storageClassName)",message="storage class is immutable after cluster creation"
+// +kubebuilder:validation:XValidation:rule="self.deletionPolicy == oldSelf.deletionPolicy",message="deletion policy is immutable after cluster creation"
 type StorageSpec struct {
 	// Size is the capacity of each PostgreSQL data volume.
-	// +kubebuilder:validation:XValidation:rule="quantity(self).compareTo(quantity('1Gi')) >= 0",message="storage size must be at least 1Gi"
 	Size resource.Quantity `json:"size"`
 	// StorageClassName is used for PostgreSQL data volumes and the supporting
 	// etcd quorum's independently sized volumes.
 	StorageClassName *string `json:"storageClassName,omitempty"`
+	// DeletionPolicy controls PostgreSQL data PVC handling when the cluster is
+	// deleted. Retain is the safe default; Delete must be selected explicitly.
+	// +kubebuilder:validation:Enum=Retain;Delete
+	// +kubebuilder:default=Retain
+	DeletionPolicy StorageDeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
 type DatabaseTemplate struct {
@@ -174,6 +189,57 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// PostgreSQLBootstrapSpec records the topology and storage contract before
+	// any PostgreSQL credential or data volume is created. It provides a
+	// defensive fence when admission is unavailable or bypassed.
+	PostgreSQLBootstrapSpec *PostgreSQLBootstrapSpecStatus `json:"postgresqlBootstrapSpec,omitempty"`
+	// PostgreSQLBootstraps records the API-assigned Secret and PVC identities for
+	// each shard. Missing or replaced children require an explicit recovery;
+	// the controller never silently adopts or regenerates them.
+	// +listType=map
+	// +listMapKey=shard
+	PostgreSQLBootstraps []PostgreSQLBootstrapStatus `json:"postgresqlBootstraps,omitempty"`
+}
+
+// PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract.
+type PostgreSQLBootstrapSpecStatus struct {
+	Shards           int32                 `json:"shards"`
+	MembersPerShard  int32                 `json:"membersPerShard"`
+	Durability       DurabilityMode        `json:"durability"`
+	StorageSize      string                `json:"storageSize"`
+	StorageClassName *string               `json:"storageClassName,omitempty"`
+	DeletionPolicy   StorageDeletionPolicy `json:"deletionPolicy"`
+}
+
+// PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified
+// bootstrap resources. Names are durable creation intents; UIDs are filled only
+// after the API server confirms each child. PVCFenceDetached is checkpointed
+// only after the credential Secret has been detached from cluster garbage
+// collection, making that exact Secret UID a durable owner for any outcome-
+// unknown PVC create. After PVCUID is checkpointed, the controller protects and
+// detaches that exact live PVC and anchors the Secret tombstone back to its UID.
+// Retain finalization can instead record an absent uncheckpointed outcome as
+// abandoned, after which no later outcome is retained. A workload cannot
+// consume an incomplete, abandoned, or unstabilized record.
+type PostgreSQLBootstrapStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	Shard      int32     `json:"shard"`
+	SecretName string    `json:"secretName"`
+	SecretUID  types.UID `json:"secretUID"`
+	// PVCFenceDetached proves the exact credential Secret is independent of the
+	// cluster and may be used as the PVC's creation-intent owner.
+	PVCFenceDetached bool      `json:"pvcFenceDetached,omitempty"`
+	PVCName          string    `json:"pvcName,omitempty"`
+	PVCUID           types.UID `json:"pvcUID,omitempty"`
+	// PVCCreationAbandoned is set only during Retain finalization after an
+	// authoritative read finds no PVC before its UID was checkpointed. No
+	// workload can use an uncheckpointed claim. The controller never recreates
+	// or retains a later outcome from this creation intent; the detached Secret
+	// remains its garbage-collection fence until finalization removes it.
+	PVCCreationAbandoned bool `json:"pvcCreationAbandoned,omitempty"`
+	// PVCStorageClassName records the explicit or operator-resolved class before
+	// the PVC create is dispatched, including an explicitly empty class.
+	PVCStorageClassName *string `json:"pvcStorageClassName,omitempty"`
 }
 
 // +kubebuilder:object:root=true

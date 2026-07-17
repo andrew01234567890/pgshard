@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,11 +16,14 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,6 +34,225 @@ const legacyHPAScaleAnnotation = "pgshard.io/hpa-scale-handed-off"
 type hpaCacheMissClient struct {
 	client.Client
 	key client.ObjectKey
+}
+
+func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
+	if os.Getenv("PGSHARD_KIND_E2E") != "true" {
+		t.Skip("set PGSHARD_KIND_E2E=true against a disposable CRD-only KIND cluster")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgshardv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kubeClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pgshard-crd-fence-%d", os.Getpid())}}
+	if err := kubeClient.Create(ctx, namespace); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = kubeClient.Delete(context.Background(), namespace) })
+
+	transition := validCluster()
+	transition.Name = "crd-transition-fence"
+	transition.Namespace = namespace.Name
+	transition.UID = ""
+	transition.ResourceVersion = ""
+	transition.Generation = 0
+	if err := kubeClient.Create(ctx, transition); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*pgshardv1alpha1.PgShardCluster){
+		"shards":          func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Shards++ },
+		"membersPerShard": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.MembersPerShard = 5 },
+		"durability": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+		},
+		"storage size": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Storage.Size = resource.MustParse("8Gi") },
+		"storage class value": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			value := "replacement"
+			cluster.Spec.Storage.StorageClassName = &value
+		},
+		"storage class removed": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Storage.StorageClassName = nil },
+		"deletion policy": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
+		},
+	} {
+		current := &pgshardv1alpha1.PgShardCluster{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(transition), current); err != nil {
+			t.Fatal(err)
+		}
+		before := current.DeepCopy()
+		mutate(current)
+		if err := kubeClient.Patch(ctx, current, client.MergeFrom(before)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
+			t.Fatalf("CRD admitted %s without any admission webhook installed: %v", name, err)
+		}
+	}
+
+	absentClass := transition.DeepCopy()
+	absentClass.Name = "crd-transition-absent-class"
+	absentClass.ResourceVersion = ""
+	absentClass.UID = ""
+	absentClass.Spec.Storage.StorageClassName = nil
+	if err := kubeClient.Create(ctx, absentClass); err != nil {
+		t.Fatal(err)
+	}
+	currentAbsent := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(absentClass), currentAbsent); err != nil {
+		t.Fatal(err)
+	}
+	beforeAbsent := currentAbsent.DeepCopy()
+	present := "standard"
+	currentAbsent.Spec.Storage.StorageClassName = &present
+	if err := kubeClient.Patch(ctx, currentAbsent, client.MergeFrom(beforeAbsent)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("CRD admitted an absent-to-present storage class transition without any admission webhook installed: %v", err)
+	}
+
+	crdKey := types.NamespacedName{Name: "pgshardclusters.pgshard.io"}
+	originalCRD := &apiextensionsv1.CustomResourceDefinition{}
+	if err := kubeClient.Get(ctx, crdKey, originalCRD); err != nil {
+		t.Fatal(err)
+	}
+	originalRules, err := storageValidationRules(originalCRD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoreCRD := func(ctx context.Context) error {
+		current := &apiextensionsv1.CustomResourceDefinition{}
+		if err := kubeClient.Get(ctx, crdKey, current); err != nil {
+			return err
+		}
+		if err := replaceStorageValidationRules(current, originalRules); err != nil {
+			return err
+		}
+		return kubeClient.Update(ctx, current)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if err := restoreCRD(cleanupCtx); err != nil {
+			t.Errorf("restore current PgShardCluster CRD validation: %v", err)
+		}
+	})
+	legacyCRD := originalCRD.DeepCopy()
+	legacyRules := slices.Clone(originalRules)
+	legacyRules[0] = apiextensionsv1.ValidationRule{
+		Rule:    "quantity(self.size).compareTo(quantity('1Gi')) >= 0",
+		Message: "storage size must be at least 1Gi",
+	}
+	if err := replaceStorageValidationRules(legacyCRD, legacyRules); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Update(ctx, legacyCRD); err != nil {
+		t.Fatal(err)
+	}
+	legacyStorage := validCluster()
+	legacyStorage.Name = "legacy-storage-upgrade"
+	legacyStorage.Namespace = namespace.Name
+	legacyStorage.UID = ""
+	legacyStorage.ResourceVersion = ""
+	legacyStorage.Generation = 0
+	legacyStorage.Spec.Storage.Size = resource.MustParse("2Gi")
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Create(ctx, legacyStorage)
+		if err == nil || apierrors.IsAlreadyExists(err) {
+			return true, nil
+		}
+		if apierrors.IsInvalid(err) {
+			return false, nil
+		}
+		return false, err
+	}); err != nil {
+		t.Fatalf("create object through legacy 1Gi storage contract: %v", err)
+	}
+	if err := restoreCRD(ctx); err != nil {
+		t.Fatal(err)
+	}
+	undersizedCreate := legacyStorage.DeepCopy()
+	undersizedCreate.Name = "new-undersized-storage"
+	undersizedCreate.ResourceVersion = ""
+	undersizedCreate.UID = ""
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Create(ctx, undersizedCreate)
+		if apierrors.IsInvalid(err) {
+			return true, nil
+		}
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return false, err
+		}
+		if err := kubeClient.Delete(ctx, undersizedCreate); err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+		undersizedCreate.ResourceVersion = ""
+		undersizedCreate.UID = ""
+		return false, nil
+	}); err != nil {
+		t.Fatalf("wait for restored 4Gi create-time contract: %v", err)
+	}
+	storedLegacy := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(legacyStorage), storedLegacy); err != nil {
+		t.Fatal(err)
+	}
+	beforeLegacy := storedLegacy.DeepCopy()
+	storedLegacy.Spec.Storage.Size = resource.MustParse("4Gi")
+	if err := kubeClient.Patch(ctx, storedLegacy, client.MergeFrom(beforeLegacy)); err != nil {
+		t.Fatalf("CRD rejected the one-time legacy storage upgrade: %v", err)
+	}
+	beforeUnsupported := storedLegacy.DeepCopy()
+	storedLegacy.Spec.Storage.Size = resource.MustParse("8Gi")
+	if err := kubeClient.Patch(ctx, storedLegacy, client.MergeFrom(beforeUnsupported)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("CRD admitted a later storage resize after legacy migration: %v", err)
+	}
+}
+
+func storageValidationRules(crd *apiextensionsv1.CustomResourceDefinition) ([]apiextensionsv1.ValidationRule, error) {
+	for index := range crd.Spec.Versions {
+		version := &crd.Spec.Versions[index]
+		if version.Name != pgshardv1alpha1.GroupVersion.Version || version.Schema == nil || version.Schema.OpenAPIV3Schema == nil {
+			continue
+		}
+		specSchema, found := version.Schema.OpenAPIV3Schema.Properties["spec"]
+		if !found {
+			break
+		}
+		storageSchema, found := specSchema.Properties["storage"]
+		if !found || len(storageSchema.XValidations) == 0 {
+			break
+		}
+		return slices.Clone(storageSchema.XValidations), nil
+	}
+	return nil, fmt.Errorf("PgShardCluster CRD has no storage validation rules")
+}
+
+func replaceStorageValidationRules(crd *apiextensionsv1.CustomResourceDefinition, rules []apiextensionsv1.ValidationRule) error {
+	for index := range crd.Spec.Versions {
+		version := &crd.Spec.Versions[index]
+		if version.Name != pgshardv1alpha1.GroupVersion.Version || version.Schema == nil || version.Schema.OpenAPIV3Schema == nil {
+			continue
+		}
+		specSchema, found := version.Schema.OpenAPIV3Schema.Properties["spec"]
+		if !found {
+			break
+		}
+		storageSchema, found := specSchema.Properties["storage"]
+		if !found {
+			break
+		}
+		storageSchema.XValidations = slices.Clone(rules)
+		specSchema.Properties["storage"] = storageSchema
+		version.Schema.OpenAPIV3Schema.Properties["spec"] = specSchema
+		return nil
+	}
+	return fmt.Errorf("PgShardCluster CRD has no storage schema")
 }
 
 func (c hpaCacheMissClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
@@ -108,7 +331,8 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	if err := kubeClient.Get(ctx, request.NamespacedName, current); err != nil {
 		t.Fatal(err)
 	}
-	current.Spec.MembersPerShard = 3
+	oldConfiguration := plannedPostgreSQLConfiguration(t, current)
+	current.Spec.PostgreSQL.Parameters = map[string]string{"log_statement": "ddl"}
 	current.Spec.Pooler.Scaling = pgshardv1alpha1.PoolerScaling{
 		Mode: pgshardv1alpha1.ScalingHPA,
 		HPA: &pgshardv1alpha1.HPAScaling{
@@ -124,19 +348,22 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	desiredConfiguration := plannedPostgreSQLConfiguration(t, current)
 	configuration := &corev1.ConfigMap{}
-	configurationKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PostgreSQLConfigSuffix}
+	configurationKey := client.ObjectKeyFromObject(desiredConfiguration)
 	if err := kubeClient.Get(ctx, configurationKey, configuration); err != nil {
 		t.Fatal(err)
 	}
 	assertApplyOwner(t, configuration)
-	if len(configuration.Data) != 7 {
-		t.Fatalf("shrunk PostgreSQL configuration retained stale members: %#v", configuration.Data)
+	if len(configuration.Data) != 11 || !strings.Contains(configuration.Data["postgresql.conf"], "log_statement = ddl\n") {
+		t.Fatalf("new PostgreSQL configuration was not published: %#v", configuration.Data)
 	}
-	for _, stale := range []string{"primary-0003.conf", "primary-0004.conf", "standby-0003.conf", "standby-0004.conf"} {
-		if _, exists := configuration.Data[stale]; exists {
-			t.Fatalf("stale configuration key %q survived server-side apply", stale)
-		}
+	// This test uses the deliberately unimplemented multi-member path, so no
+	// PostgreSQL workload mounts the immutable configuration. The old object is
+	// therefore safe to prune immediately; rollout retention is covered with
+	// explicit workload status in the controller unit tests.
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldConfiguration), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("unused old PostgreSQL configuration survived pruning: %v", err)
 	}
 	networkPolicy := &networkingv1.NetworkPolicy{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.EtcdSuffix}, networkPolicy); err != nil {
@@ -240,7 +467,7 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	}
 
 	legacyConfiguration := &corev1.ConfigMap{}
-	legacyConfigurationKey := types.NamespacedName{Namespace: legacy.Namespace, Name: legacy.Name + owned.PostgreSQLConfigSuffix}
+	legacyConfigurationKey := types.NamespacedName{Namespace: legacy.Namespace, Name: legacy.Name + owned.TopologyConfigSuffix}
 	if err := kubeClient.Get(ctx, legacyConfigurationKey, legacyConfiguration); err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +534,7 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	legacy.Spec.MembersPerShard = 3
+	legacy.Spec.PostgreSQL.Parameters = map[string]string{"log_statement": "ddl"}
 	legacy.Spec.Pooler.Scaling = pgshardv1alpha1.PoolerScaling{
 		Mode: pgshardv1alpha1.ScalingHPA,
 		HPA: &pgshardv1alpha1.HPAScaling{
@@ -334,13 +561,8 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertApplyOwner(t, legacyConfiguration)
-	if len(legacyConfiguration.Data) != 7 {
-		t.Fatalf("legacy configuration retained stale members: %#v", legacyConfiguration.Data)
-	}
-	for _, stale := range []string{"primary-0003.conf", "primary-0004.conf", "standby-0003.conf", "standby-0004.conf"} {
-		if _, exists := legacyConfiguration.Data[stale]; exists {
-			t.Fatalf("legacy configuration key %q survived migration", stale)
-		}
+	if strings.Contains(legacyConfiguration.Data["cluster.json"], "tempo.invalid") {
+		t.Fatalf("legacy topology retained removed OpenTelemetry endpoint: %#v", legacyConfiguration.Data)
 	}
 	legacyService := &corev1.Service{}
 	if err := kubeClient.Get(ctx, legacyServiceKey, legacyService); err != nil {
@@ -393,7 +615,8 @@ func exerciseCompletedLegacyApplyMigration(
 ) {
 	t.Helper()
 	cluster := createBareLegacyCluster(t, ctx, kubeClient, namespace, "legacy-completed", registerCleanup)
-	fullConfiguration := plannedPostgreSQLConfiguration(t, cluster)
+	fullConfiguration := plannedTopologyConfiguration(t, cluster)
+	fullConfiguration.Data["legacy-only"] = "remove during migration"
 	fullPooler := plannedPoolerDeployment(t, cluster)
 	removeApplyOwnershipMarker(fullConfiguration)
 	removeApplyOwnershipMarker(fullPooler)
@@ -406,7 +629,6 @@ func exerciseCompletedLegacyApplyMigration(
 	applyLegacyOperatorOwnership(t, ctx, kubeClient, fullConfiguration)
 	applyLegacyOperatorOwnership(t, ctx, kubeClient, fullPooler)
 
-	cluster.Spec.MembersPerShard = 3
 	cluster.Spec.Pooler.Scaling = pgshardv1alpha1.PoolerScaling{
 		Mode: pgshardv1alpha1.ScalingHPA,
 		HPA: &pgshardv1alpha1.HPAScaling{
@@ -416,7 +638,7 @@ func exerciseCompletedLegacyApplyMigration(
 	if err := kubeClient.Update(ctx, cluster); err != nil {
 		t.Fatal(err)
 	}
-	shrunkConfiguration := plannedPostgreSQLConfiguration(t, cluster)
+	shrunkConfiguration := plannedTopologyConfiguration(t, cluster)
 	applyLegacyOperatorOwnership(t, ctx, kubeClient, shrunkConfiguration)
 	applyLegacyWholeDeploymentHPAOwnership(t, ctx, kubeClient, cluster, 7)
 	desiredHPAPooler := plannedPoolerDeployment(t, cluster)
@@ -428,10 +650,8 @@ func exerciseCompletedLegacyApplyMigration(
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(shrunkConfiguration), configurationBefore); err != nil {
 		t.Fatal(err)
 	}
-	for _, stale := range []string{"primary-0003.conf", "primary-0004.conf", "standby-0003.conf", "standby-0004.conf"} {
-		if _, exists := configurationBefore.Data[stale]; !exists {
-			t.Fatalf("completed legacy Apply fixture did not retain Update-owned key %q: %#v", stale, configurationBefore.Data)
-		}
+	if _, exists := configurationBefore.Data["legacy-only"]; !exists {
+		t.Fatalf("completed legacy Apply fixture did not retain its Update-owned key: %#v", configurationBefore.Data)
 	}
 	if applyOwnershipMigrationComplete(configurationBefore) || !hasApplyOwnership(configurationBefore, owned.ManagedByValue) || !hasTopLevelUpdateOwnership(configurationBefore) {
 		t.Fatalf("completed legacy ConfigMap fixture has the wrong ownership boundary: annotations=%#v fields=%#v", configurationBefore.Annotations, configurationBefore.ManagedFields)
@@ -444,10 +664,8 @@ func exerciseCompletedLegacyApplyMigration(
 		t.Fatal(err)
 	}
 	assertApplyOwner(t, configurationAfter)
-	for _, stale := range []string{"primary-0003.conf", "primary-0004.conf", "standby-0003.conf", "standby-0004.conf"} {
-		if _, exists := configurationAfter.Data[stale]; exists {
-			t.Fatalf("Update-owned key %q survived completed legacy migration: %#v", stale, configurationAfter.Data)
-		}
+	if _, exists := configurationAfter.Data["legacy-only"]; exists {
+		t.Fatalf("Update-owned key survived completed legacy migration: %#v", configurationAfter.Data)
 	}
 
 	poolerBefore := &appsv1.Deployment{}
@@ -675,11 +893,27 @@ func plannedPostgreSQLConfiguration(t *testing.T, cluster *pgshardv1alpha1.PgSha
 	}
 	for _, object := range plan {
 		configuration, ok := object.(*corev1.ConfigMap)
-		if ok && configuration.Name == cluster.Name+owned.PostgreSQLConfigSuffix {
+		if ok && strings.HasPrefix(configuration.Name, cluster.Name+owned.PostgreSQLConfigSuffix+"-") {
 			return configuration
 		}
 	}
 	t.Fatal("planned PostgreSQL configuration is missing")
+	return nil
+}
+
+func plannedTopologyConfiguration(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster) *corev1.ConfigMap {
+	t.Helper()
+	plan, err := owned.Plan(cluster, owned.DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range plan {
+		configuration, ok := object.(*corev1.ConfigMap)
+		if ok && configuration.Name == cluster.Name+owned.TopologyConfigSuffix {
+			return configuration
+		}
+	}
+	t.Fatal("planned topology configuration is missing")
 	return nil
 }
 

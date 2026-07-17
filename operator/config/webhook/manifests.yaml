@@ -11,6 +11,7 @@ webhooks:
       name: webhook-service
       namespace: system
       path: /mutate-pgshard-io-v1alpha1-pgshardcluster
+      port: 9444
   failurePolicy: Fail
   matchPolicy: Equivalent
   name: mpgshardcluster.kb.io
@@ -26,6 +27,72 @@ webhooks:
     - pgshardclusters
   sideEffects: None
   timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /mutate-pgshard-io-v1alpha1-postgresqlfencinghandshake
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: mpostgresqlfencinghandshake.pgshard.io
+  rules:
+  - apiGroups:
+    - pgshard.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - UPDATE
+    resources:
+    - pgshardclusters
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /mutate-core-v1-postgresqlpodbinding
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: mpostgresqlpodbinding.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods/binding
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /mutate-core-v1-postgresqlpodstatus
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: mpostgresqlpodstatus.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - UPDATE
+    resources:
+    - pods/status
+  sideEffects: None
+  timeoutSeconds: 5
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
@@ -39,6 +106,7 @@ webhooks:
       name: webhook-service
       namespace: system
       path: /validate-pgshard-io-v1alpha1-pgshardcluster
+      port: 9444
   failurePolicy: Fail
   matchPolicy: Equivalent
   name: vpgshardcluster.kb.io
@@ -52,5 +120,97 @@ webhooks:
     - UPDATE
     resources:
     - pgshardclusters
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-core-v1-postgresqlfencingnamespace
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpostgresqlfencingnamespace.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - UPDATE
+    resources:
+    - namespaces
+    - namespaces/status
+    - namespaces/finalize
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-core-v1-postgresqlpodbinding
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpostgresqlpodbinding.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods/binding
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-core-v1-postgresqlpodmetadata
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpostgresqlpodmetadata.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - UPDATE
+    resources:
+    - pods
+    - pods/ephemeralcontainers
+    - pods/resize
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-core-v1-postgresqlpodstatus
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpostgresqlpodstatus.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - UPDATE
+    resources:
+    - pods/status
   sideEffects: None
   timeoutSeconds: 5

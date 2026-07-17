@@ -497,9 +497,23 @@ and lengths, replica identity, reserved flags, UTF-8, zero-copy iteration, and
 redaction. Complete transaction ordering, relation caching, feedback scheduling
 and durable-checkpoint restart integration, replay, and cross-shard stream tests
 are still absent. Targeted KIND tests verify operator PVC deletion and
-same-name recreation, server-side-apply field pruning after member, Service
-annotation, and OTEL configuration shrinkage, plus both fresh creation and a
-pre-SSA whole-object Update upgrade. The legacy fixture proves type-aware
+same-name recreation, survival of the ownerless protected live PVC when its
+anchored credential tombstone is deleted, garbage collection of a late PVC
+create carrying that deleted Secret owner fence, and release of the exact
+protected PVC when an explicit delete precedes Retain cluster finalization.
+Fault-injection tests additionally fail the PVC UID checkpoint, delete that
+unprotected exact outcome, and prove Retain records abandonment without issuing
+a replacement create. CRD-only tests cover rejection of unsupported topology,
+durability, deletion-policy, storage-size, and storage-class transitions,
+including absent-to-present storage-class mutation, and server-side-apply field
+pruning after PostgreSQL
+parameter, Service annotation, and OTEL configuration shrinkage. A delayed rollout keeps
+the old immutable PostgreSQL ConfigMap available until the workload reports the
+new revision, then proves it is pruned. The same suite covers both fresh creation
+and a pre-SSA whole-object Update upgrade. It also installs the earlier 1Gi
+storage rule, creates a 2Gi legacy object, restores the current rule, permits
+exactly one increase to at least 4Gi, then rejects a new undersized object and a
+later resize without relying on webhooks. The legacy fixture proves type-aware
 alignment prunes stale desired fields while preserving API-assigned Service
 cluster/IP-family fields exactly. An external Apply-manager annotation makes
 migration fail before a write and remains intact until that manager explicitly
@@ -531,8 +545,101 @@ certificates, proves the generated serving chain and injected CA bundles,
 observes semantic validation reject an unsafe synchronous singleton, waits for
 leader-elected reconciliation, observes a restart-free etcd quorum, keeps
 rejection-only pooler and persistence-free orchestrator containers running
-without restarts while they remain unready, proves application Services have no
-ready endpoints, and verifies no PostgreSQL workload exists. A unit
+without restarts while they remain unready, and proves the three-member sample
+has no PostgreSQL workload or ready application endpoint. The same job creates
+a restricted two-shard, one-member sample, waits for both PostgreSQL 18
+primaries, proves shard passwords differ, executes SQL across an internal shard
+Service from an authorized restricted probe client using the destination-specific
+Secret, rejects otherwise identical unlabeled and wrong-cluster clients through
+the live NetworkPolicy, proves an omitted storage class was resolved and
+checkpointed on the resulting Bound PVC, then restarts one primary StatefulSet
+and verifies its PVC-backed row survives. A unit Create interceptor separately proves the
+credential UID, detached credential-Secret creation fence, and resolved storage
+class are durably checkpointed before PVC dispatch; the live test confirms the
+resulting Bound PVC exactly matches that checkpoint, is ownerless with the
+operator's data-protection finalizer, and owns the credential tombstone by its
+exact UID before any workload is published. Lost-response tests cover each
+protection, detachment, and tombstone-anchoring update boundary. A delete request
+cannot free the same claim name while its workload still exists. Outcome-unknown
+tests cover both an uncommitted
+timeout and a committed create whose response is lost, including the
+`AlreadyExists` recovery path. They also mutate the live size, class, and policy
+after provisioning and prove finalization uses only the stored snapshot. It also
+reads the durable cluster-UID and shard identity marker
+from the running data directory. Foreground deletion of the cluster then proves
+the default-retained PVCs are detached, keep their exact recorded UIDs, and have
+their credential tombstones removed. Every managed PostgreSQL Pod carries a
+cluster-UID-bound termination finalizer. The live manager test stops the
+operator/webhook, force-deletes a primary with zero grace, proves its API object
+and PVC remain fenced without a terminal receipt, restarts the operator, and
+verifies the authenticated kubelet receipt permits a replacement Pod to read
+the persisted row. The same test proves the namespace opt-in cannot be removed
+through ordinary or status updates, the cluster admission challenge is
+cryptographically acknowledged before publication, binding admission preserved
+the exact managed identity and copied the exact Node UID and boot ID, and final
+status admission cannot strip managed identity, cluster identity, or the
+finalizer after mutation. The init-container contract is also exercised with
+missing binding annotations and must exit before touching PGDATA. Unit coverage
+passes a Binding and terminal status through their mutators and final validators,
+then rejects conflicting later mutations. It also rejects PodGC-authored `Failed`, missing
+Nodes, same-name replacement Nodes, changed boot IDs, wrong kubelet identities,
+running-container terminal reports, copied or forged HMAC receipts, and receipt
+or binding metadata changes, request-path namespace confusion, and partially
+stripped PostgreSQL identity, while allowing non-PostgreSQL pgshard Pods to bind.
+PKI tests prove leaf renewal leaves the separate immutable fencing key unchanged,
+fresh-install authority requires empty serving and webhook trust plus absence of
+cluster lifecycle, pending handshake, and managed-Pod evidence, and recreated
+authority Secrets cannot reuse that path. An origin/main keyless fixture proves
+its versioned request, existing serving material, both populated legacy webhook
+trust bundles, and empty newly introduced receipt webhook bundles authorize a
+two-phase first-key upgrade. Forged receipt-looking cluster and Pod metadata
+from that proven pre-signer release does not become continuity history, while
+loss of any upgrade proof leaves the key empty. An
+initialized unanchored legacy key is refused, and a pre-anchored key completes
+migration only after every established single-member cluster handshake and
+managed terminal receipt verifies. Invalid or incomplete pre-lifecycle cluster
+metadata remains repairable because no PostgreSQL child can precede the
+finalizer/status barrier; the same metadata after that barrier fails closed.
+Fault injection writes a mismatching receipt
+during the fresh anchor update and proves the completion marker remains absent;
+unrelated multi-member and unprovisioned clusters plus unmanaged or partially
+labelled Pods do not block startup. Users cannot establish, remove, or replace
+cluster receipt metadata. Only the controller service account can repair it,
+and only when the final HMAC receipt verifies; deletion-time metadata remains
+immutable. Later
+anchor loss remains failed closed, and metadata-only continuity state preserves
+the Secret shape accepted by the previous manager; it does not establish a safe
+manifest or image rollback. Empty,
+mutable, oversized, or different valid key replacements fail startup, readiness,
+receipt-authenticated webhook use, and controller verification. The KIND
+admission test deletes and replaces the shared key with malformed and different
+valid values, observes the manager become unready without restarting, then
+restores the original bytes. The same CI job restarts a `receipt-v1` manager
+while continuously submitting server-side dry-run cluster creates. It requires
+at least 100 admission successes, permits no failed request, proves the manager
+Pod UID changed without changing its image, and requires the replacement to be
+Ready with zero container restarts. This covers compatible rolling restarts. It
+does not claim uninterrupted admission for the one-time keyless-to-`receipt-v1`
+transition: the dedicated `9444` client port prevents reuse of cached legacy
+connections, while the contract-selected Service excludes the old manager and
+fails closed until the new endpoint is Ready. An automated
+keyless-upgrade-under-traffic test remains to be added.
+Generation-history tests reject image, ephemeral-container, and resize changes
+after a terminal receipt, while malformed receipt-only cluster state rotates to
+a fresh challenge. It permits release
+only after the admitted condition (or when
+the Pod was never assigned) and refuses to prune a managed workload whose Pod
+lacks its finalizer. Fault injection separately places a late StatefulSet Pod
+after controller pruning and proves Retain keeps the PVC protected until
+credential absence, authenticated process termination, and authoritative Pod
+absence have all been observed. Another ordered fault commits a Pod immediately
+after the final absence snapshot and proves both binding admission stages deny
+it because the exact owning cluster is deleting. Running and completed credential-only SQL clients do not
+block the PGDATA barrier. A behavioral init test supplies a marker
+from another cluster or shard and proves bootstrap refuses it before entering
+initialization; the validated fast path repeats the final-data and
+parent-directory publication barrier before exit. It does not
+claim uninterrupted traffic during that restart. A unit
 regression gives the informer cache a false absence while the authoritative API
 reader still sees an owned PVC, and proves that finalization continues waiting.
 Operator unit tests also prove deterministic common, primary, and per-standby

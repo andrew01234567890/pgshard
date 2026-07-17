@@ -17,7 +17,7 @@ func TestCommandFlagsKeepAdmissionSafeByDefault(t *testing.T) {
 	if options.images != owned.DefaultImages() {
 		t.Fatalf("default images = %#v", options.images)
 	}
-	if options.webhook.namespace != "pgshard-system" || options.webhook.serviceName != "pgshard-webhook-service" || options.webhook.caSecretName != "pgshard-webhook-ca" || options.webhook.servingSecretName != "pgshard-webhook-certificate" || options.webhook.mutatingConfigurationName != "pgshard-mutating-webhook-configuration" || options.webhook.validatingConfigurationName != "pgshard-validating-webhook-configuration" {
+	if options.webhook.namespace != "pgshard-system" || options.webhook.serviceName != "pgshard-webhook-service" || options.webhook.caSecretName != "pgshard-webhook-ca" || options.webhook.servingSecretName != "pgshard-webhook-certificate" || options.webhook.fencingKeySecretName != "pgshard-webhook-fencing-key" || options.webhook.mutatingConfigurationName != "pgshard-mutating-webhook-configuration" || options.webhook.validatingConfigurationName != "pgshard-validating-webhook-configuration" {
 		t.Fatalf("webhook install defaults = %#v", options.webhook)
 	}
 }
@@ -31,13 +31,14 @@ func TestCommandFlagsAllowExplicitCertificateFreeDevelopmentMode(t *testing.T) {
 		"--metrics-bind-address=0",
 		"--orchestrator-image=pgshard/orchestrator:dev",
 		"--pooler-image=pgshard/pooler:dev",
+		"--postgresql-image=postgres:18",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if options.webhookEnabled || options.metricsAddress != "0" {
 		t.Fatalf("development options = %#v", options)
 	}
-	if options.images.Orchestrator != "pgshard/orchestrator:dev" || options.images.Pooler != "pgshard/pooler:dev" {
+	if options.images.Orchestrator != "pgshard/orchestrator:dev" || options.images.Pooler != "pgshard/pooler:dev" || options.images.PostgreSQL != "postgres:18" {
 		t.Fatalf("development images = %#v", options.images)
 	}
 }

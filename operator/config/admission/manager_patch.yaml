@@ -6,7 +6,11 @@ metadata:
 spec:
   progressDeadlineSeconds: 180
   template:
+    metadata:
+      labels:
+        pgshard.io/webhook-contract: receipt-v1
     spec:
+      terminationGracePeriodSeconds: 20
       containers:
         - name: manager
           args:
@@ -18,11 +22,13 @@ spec:
             - --webhook-service-name=pgshard-webhook-service
             - --webhook-ca-secret-name=pgshard-webhook-ca
             - --webhook-serving-secret-name=pgshard-webhook-certificate
+            - --webhook-fencing-key-secret-name=pgshard-webhook-fencing-key
             - --webhook-mutating-configuration-name=pgshard-mutating-webhook-configuration
             - --webhook-validating-configuration-name=pgshard-validating-webhook-configuration
             - --webhook-cert-dir=/run/pgshard/webhook
             - --orchestrator-image=pgshard/orchestrator:dev
             - --pooler-image=pgshard/pooler:dev
+            - --postgresql-image=docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -32,6 +38,10 @@ spec:
             - name: webhook
               containerPort: 9443
               protocol: TCP
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           startupProbe:
             failureThreshold: 75
           volumeMounts:

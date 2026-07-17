@@ -3,6 +3,7 @@ package tuning
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -83,6 +84,7 @@ func TestCalculateDeterministicSafeSettings(t *testing.T) {
 		"full_page_writes":                "on",
 		"hot_standby":                     "on",
 		"idle_replication_slot_timeout":   "0",
+		"listen_addresses":                "'*'",
 		"synchronous_commit":              "on",
 	}
 	for key, value := range want {
@@ -308,5 +310,20 @@ func TestApplyOverridesAcceptsBoundedValues(t *testing.T) {
 	}
 	if err := ApplyOverrides(settings, overrides); err != nil {
 		t.Fatalf("bounded overrides rejected: %v", err)
+	}
+}
+
+func TestValidateStorageBoundsCheckpointWAL(t *testing.T) {
+	t.Parallel()
+	settings := map[string]string{"max_wal_size": "1GB"}
+	if err := ValidateStorage(settings, resource.MustParse("4Gi")); err != nil {
+		t.Fatalf("safe WAL budget rejected: %v", err)
+	}
+	if err := ValidateStorage(settings, resource.MustParse("2Gi")); err == nil || !strings.Contains(err.Error(), "at least 4Gi") {
+		t.Fatalf("undersized storage accepted: %v", err)
+	}
+	settings["max_wal_size"] = "2GB"
+	if err := ValidateStorage(settings, resource.MustParse("4Gi")); err == nil || !strings.Contains(err.Error(), "one quarter") {
+		t.Fatalf("oversized WAL budget accepted: %v", err)
 	}
 }

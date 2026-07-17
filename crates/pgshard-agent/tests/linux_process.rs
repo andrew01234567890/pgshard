@@ -16,18 +16,21 @@ use tempfile::TempDir;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const DIAGNOSTIC_LIMIT: usize = 8 * 1024;
 
 struct ChildGuard {
     child: Option<Child>,
     process_group: Option<Pid>,
+    stderr_path: PathBuf,
 }
 
 impl ChildGuard {
-    fn new(child: Child) -> Self {
+    fn new(child: Child, stderr_path: PathBuf) -> Self {
         let process_group = Pid::from_child(&child);
         Self {
             child: Some(child),
             process_group: Some(process_group),
+            stderr_path,
         }
     }
 
@@ -54,6 +57,16 @@ impl ChildGuard {
     fn disarm_after_descendants_are_gone(&mut self) {
         self.process_group = None;
         self.child.take();
+    }
+
+    fn diagnostics(&self) -> String {
+        match fs::read(&self.stderr_path) {
+            Ok(stderr) => {
+                let start = stderr.len().saturating_sub(DIAGNOSTIC_LIMIT);
+                String::from_utf8_lossy(&stderr[start..]).into_owned()
+            }
+            Err(error) => format!("<cannot read agent stderr: {error}>"),
+        }
     }
 }
 
@@ -88,8 +101,7 @@ fn poll_child(
 fn quarantine_process_status_and_sigterm_form_one_supervised_contract() {
     let fixture = AgentFixture::new("#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do :; done\n");
     let address = reserve_address();
-    let child = fixture.spawn(address);
-    let mut child = ChildGuard::new(child);
+    let mut child = fixture.spawn(address);
 
     wait_for_quarantine(&mut child, address);
 
@@ -104,7 +116,11 @@ fn quarantine_process_status_and_sigterm_form_one_supervised_contract() {
     kill_process(Pid::from_child(child.child()), Signal::TERM).expect("signal agent");
     assert_http_connection_closes(held_request);
     let status = child.wait().expect("wait for agent");
-    assert!(status.success(), "agent SIGTERM exit was {status}");
+    assert!(
+        status.success(),
+        "agent SIGTERM exit was {status}; stderr: {}",
+        child.diagnostics()
+    );
     assert!(
         !Path::new(&format!("/proc/{postgres_pid}")).exists(),
         "supervised postmaster process {postgres_pid} survived the agent"
@@ -116,8 +132,7 @@ fn quarantine_process_status_and_sigterm_form_one_supervised_contract() {
 fn postmaster_crash_aborts_a_held_http_request_within_the_process_bound() {
     let fixture = AgentFixture::new("#!/bin/sh\nwhile :; do :; done\n");
     let address = reserve_address();
-    let child = fixture.spawn(address);
-    let mut child = ChildGuard::new(child);
+    let mut child = fixture.spawn(address);
     wait_for_quarantine(&mut child, address);
 
     let postgres_pid = wait_for_only_child(child.child().id());
@@ -128,7 +143,11 @@ fn postmaster_crash_aborts_a_held_http_request_within_the_process_bound() {
     assert_http_connection_closes(held_request);
 
     let status = child.wait().expect("wait for terminal agent failure");
-    assert!(!status.success(), "postmaster crash unexpectedly succeeded");
+    assert!(
+        !status.success(),
+        "postmaster crash unexpectedly succeeded; stderr: {}",
+        child.diagnostics()
+    );
     assert!(
         !Path::new(&format!("/proc/{postgres_pid}")).exists(),
         "crashed postmaster process {postgres_pid} remained visible"
@@ -147,7 +166,7 @@ fn setsid_descendant_is_reaped_before_pgdata_can_be_reacquired() {
         descendant_marker.display()
     ));
     let address = reserve_address();
-    let mut first_agent = ChildGuard::new(fixture.spawn(address));
+    let mut first_agent = fixture.spawn(address);
     wait_for_quarantine(&mut first_agent, address);
 
     let postmaster_pid = wait_for_pid_marker(&postmaster_marker);
@@ -168,7 +187,11 @@ fn setsid_descendant_is_reaped_before_pgdata_can_be_reacquired() {
         .expect("positive postmaster PID");
     kill_process(postmaster, Signal::KILL).expect("crash postmaster");
     let status = first_agent.wait().expect("wait for terminal agent failure");
-    assert!(!status.success(), "postmaster crash unexpectedly succeeded");
+    assert!(
+        !status.success(),
+        "postmaster crash unexpectedly succeeded; stderr: {}",
+        first_agent.diagnostics()
+    );
     assert!(
         !Path::new(&format!("/proc/{descendant_pid}")).exists(),
         "setsid descendant {descendant_pid} survived the PGDATA fence"
@@ -177,14 +200,15 @@ fn setsid_descendant_is_reaped_before_pgdata_can_be_reacquired() {
 
     fixture.replace_executable("#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do :; done\n");
     let replacement_address = reserve_address();
-    let mut replacement = ChildGuard::new(fixture.spawn(replacement_address));
+    let mut replacement = fixture.spawn(replacement_address);
     wait_for_quarantine(&mut replacement, replacement_address);
     kill_process(Pid::from_child(replacement.child()), Signal::TERM)
         .expect("stop replacement agent");
     let replacement_status = replacement.wait().expect("wait for replacement agent");
     assert!(
         replacement_status.success(),
-        "PGDATA replacement agent failed after complete descendant cleanup: {replacement_status}"
+        "PGDATA replacement agent failed after complete descendant cleanup: {replacement_status}; stderr: {}",
+        replacement.diagnostics()
     );
     replacement.disarm_after_descendants_are_gone();
 }
@@ -199,9 +223,13 @@ fn occupied_http_listener_prevents_postmaster_spawn() {
     ));
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve occupied listener");
     let address = listener.local_addr().expect("read occupied address");
-    let mut child = ChildGuard::new(fixture.spawn(address));
+    let mut child = fixture.spawn(address);
     let status = child.wait().expect("wait for bind failure");
-    assert!(!status.success(), "occupied bind unexpectedly succeeded");
+    assert!(
+        !status.success(),
+        "occupied bind unexpectedly succeeded; stderr: {}",
+        child.diagnostics()
+    );
     assert!(
         !marker.exists(),
         "postmaster started even though the control listener could not bind"
@@ -261,8 +289,19 @@ impl AgentFixture {
             .expect("protect replacement postmaster fixture");
     }
 
-    fn spawn(&self, address: SocketAddr) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_pgshard-agent"))
+    fn spawn(&self, address: SocketAddr) -> ChildGuard {
+        let stderr_path = self
+            .root
+            .path()
+            .join(format!("agent-{}-stderr.log", address.port()));
+        let stderr = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&stderr_path)
+            .expect("create agent stderr capture");
+        let child = Command::new(env!("CARGO_BIN_EXE_pgshard-agent"))
             .env_clear()
             .env("PGSHARD_HTTP_BIND", address.to_string())
             .env("PGSHARD_CLUSTER_ID", "cluster-1")
@@ -278,10 +317,11 @@ impl AgentFixture {
             .env("PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS", "500")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .process_group(0)
             .spawn()
-            .expect("spawn agent")
+            .expect("spawn agent");
+        ChildGuard::new(child, stderr_path)
     }
 }
 

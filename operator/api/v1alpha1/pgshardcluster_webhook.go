@@ -17,7 +17,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-const maximumChangeStreams = 4
+const (
+	maximumChangeStreams = 4
+	// PodFencingChallengeAnnotation and PodFencingReceiptAnnotation are
+	// controller/admission-owned metadata for direct PostgreSQL Pod fencing.
+	PodFencingChallengeAnnotation = "pgshard.io/pod-fencing-challenge"
+	PodFencingReceiptAnnotation   = "pgshard.io/pod-fencing-admission"
+)
 
 // PgShardClusterDefaulter supplies safety-oriented defaults.
 type PgShardClusterDefaulter struct{}
@@ -34,6 +40,9 @@ func (*PgShardClusterDefaulter) Default(_ context.Context, cluster *PgShardClust
 	}
 	if cluster.Spec.PostgreSQL.Version == "" {
 		cluster.Spec.PostgreSQL.Version = PostgreSQLMajor18
+	}
+	if cluster.Spec.Storage.DeletionPolicy == "" {
+		cluster.Spec.Storage.DeletionPolicy = DeletionRetain
 	}
 	defaultScaling(&cluster.Spec.Pooler.Scaling)
 	defaultService(&cluster.Spec.Services.ReadWrite)
@@ -72,28 +81,71 @@ func defaultService(service *ServiceTemplate) {
 	}
 }
 
-// PgShardClusterValidator applies validation that cannot be represented safely
-// by OpenAPI alone.
-type PgShardClusterValidator struct{}
-
-func (v *PgShardClusterValidator) ValidateCreate(_ context.Context, cluster *PgShardCluster) (admission.Warnings, error) {
-	return warningsFor(cluster), validateCluster(cluster)
+// PodFencingReceiptVerifier authenticates the final cluster handshake after all
+// mutating admission has completed.
+// +kubebuilder:object:generate=false
+type PodFencingReceiptVerifier interface {
+	Verify(context.Context, *PgShardCluster) (bool, error)
 }
 
-func (v *PgShardClusterValidator) ValidateUpdate(_ context.Context, oldCluster, newCluster *PgShardCluster) (admission.Warnings, error) {
+// PgShardClusterValidator applies validation that cannot be represented safely
+// by OpenAPI alone.
+// +kubebuilder:object:generate=false
+type PgShardClusterValidator struct {
+	FencingReceiptVerifier    PodFencingReceiptVerifier
+	FencingControllerUsername string
+}
+
+func (v *PgShardClusterValidator) ValidateCreate(_ context.Context, cluster *PgShardCluster) (admission.Warnings, error) {
+	allErrs := validateClusterFields(cluster)
+	allErrs = append(allErrs, reservedPodFencingMetadataErrors(cluster)...)
+	return warningsFor(cluster), invalidIfAny(cluster.Name, allErrs)
+}
+
+func (v *PgShardClusterValidator) ValidateUpdate(ctx context.Context, oldCluster, newCluster *PgShardCluster) (admission.Warnings, error) {
+	metadataErrs, requiresAttestation := reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster)
+	if requiresAttestation {
+		attestationErrs, err := v.validatePodFencingMetadataAttestation(ctx, newCluster)
+		if err != nil {
+			return warningsFor(newCluster), err
+		}
+		metadataErrs = append(metadataErrs, attestationErrs...)
+	}
 	if !newCluster.DeletionTimestamp.IsZero() {
 		// A deleting object must always be able to shed finalizers, including if
-		// it predates validation that its stored spec no longer satisfies.
-		return warningsFor(newCluster), nil
+		// it predates validation that its stored spec no longer satisfies. The
+		// authenticated fencing history must still remain byte-for-byte intact.
+		return warningsFor(newCluster), invalidIfAny(newCluster.Name, metadataErrs)
 	}
 	allErrs := validateClusterFields(newCluster)
+	allErrs = append(allErrs, metadataErrs...)
 	if oldCluster.Spec.PostgreSQL.Version != newCluster.Spec.PostgreSQL.Version {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "postgresql", "version"), newCluster.Spec.PostgreSQL.Version, "PostgreSQL major is immutable"))
+	}
+	if oldCluster.Spec.Shards != newCluster.Spec.Shards {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "shards"), newCluster.Spec.Shards, "shards is immutable until online resharding is implemented"))
+	}
+	if oldCluster.Spec.MembersPerShard != newCluster.Spec.MembersPerShard {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "membersPerShard"), newCluster.Spec.MembersPerShard, "membersPerShard is immutable until membership transitions are implemented"))
+	}
+	if oldCluster.Spec.Durability != newCluster.Spec.Durability {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "durability"), newCluster.Spec.Durability, "durability is immutable until replication-mode transitions are implemented"))
 	}
 	if !equalOptionalString(oldCluster.Spec.Storage.StorageClassName, newCluster.Spec.Storage.StorageClassName) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "storageClassName"), newCluster.Spec.Storage.StorageClassName, "storage class is immutable after cluster creation"))
 	}
+	if !oldCluster.Spec.Storage.Size.Equal(newCluster.Spec.Storage.Size) && !legacyStorageUpgrade(oldCluster.Spec.Storage.Size, newCluster.Spec.Storage.Size) {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "size"), newCluster.Spec.Storage.Size.String(), "storage size is immutable until explicit PVC expansion is implemented"))
+	}
+	if oldCluster.Spec.Storage.DeletionPolicy != newCluster.Spec.Storage.DeletionPolicy {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "deletionPolicy"), newCluster.Spec.Storage.DeletionPolicy, "deletion policy is immutable after cluster creation"))
+	}
 	return warningsFor(newCluster), invalidIfAny(newCluster.Name, allErrs)
+}
+
+func legacyStorageUpgrade(oldSize, newSize resource.Quantity) bool {
+	minimum := resource.MustParse("4Gi")
+	return oldSize.Cmp(minimum) < 0 && newSize.Cmp(minimum) >= 0
 }
 
 func equalOptionalString(left, right *string) bool {
@@ -108,6 +160,9 @@ func (*PgShardClusterValidator) ValidateDelete(_ context.Context, _ *PgShardClus
 }
 
 func warningsFor(cluster *PgShardCluster) admission.Warnings {
+	if cluster.Spec.MembersPerShard == 1 {
+		return admission.Warnings{"single-member topology has no standby or failover, and restarting its primary interrupts the shard"}
+	}
 	if cluster.Spec.Durability == DurabilityAsynchronous {
 		return admission.Warnings{"asynchronous replication can lose acknowledged transactions during failover"}
 	}
@@ -160,13 +215,16 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 	if cluster.Spec.PostgreSQL.Version != PostgreSQLMajor18 {
 		allErrs = append(allErrs, field.NotSupported(specPath.Child("postgresql", "version"), cluster.Spec.PostgreSQL.Version, []string{PostgreSQLMajor18}))
 	}
-	if cluster.Spec.Storage.Size.Cmp(resource.MustParse("1Gi")) < 0 {
-		allErrs = append(allErrs, field.Invalid(specPath.Child("storage", "size"), cluster.Spec.Storage.Size.String(), "must be at least 1Gi"))
+	if cluster.Spec.Storage.Size.Cmp(resource.MustParse("4Gi")) < 0 {
+		allErrs = append(allErrs, field.Invalid(specPath.Child("storage", "size"), cluster.Spec.Storage.Size.String(), "must be at least 4Gi"))
 	}
 	if storageClass := cluster.Spec.Storage.StorageClassName; storageClass != nil && *storageClass != "" {
 		if err := ValidateObjectReferenceName(*storageClass); err != nil {
 			allErrs = append(allErrs, field.Invalid(specPath.Child("storage", "storageClassName"), *storageClass, err.Error()))
 		}
+	}
+	if cluster.Spec.Storage.DeletionPolicy != DeletionRetain && cluster.Spec.Storage.DeletionPolicy != DeletionDelete {
+		allErrs = append(allErrs, field.NotSupported(specPath.Child("storage", "deletionPolicy"), cluster.Spec.Storage.DeletionPolicy, []string{string(DeletionRetain), string(DeletionDelete)}))
 	}
 
 	poolerMax, scalingErrs := validateScaling(cluster.Spec.Pooler.Scaling, specPath.Child("pooler", "scaling"))
@@ -188,6 +246,10 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 	}
 	if err := tuning.ApplyOverrides(settingsForOverrides, cluster.Spec.PostgreSQL.Parameters); err != nil {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("postgresql", "parameters"), cluster.Spec.PostgreSQL.Parameters, err.Error()))
+	} else if _, tuningAvailable := settingsForOverrides["max_wal_size"]; tuningAvailable {
+		if err := tuning.ValidateStorage(settingsForOverrides, cluster.Spec.Storage.Size); err != nil {
+			allErrs = append(allErrs, field.Invalid(specPath.Child("postgresql", "parameters"), cluster.Spec.PostgreSQL.Parameters, err.Error()))
+		}
 	}
 
 	allErrs = append(allErrs, validateDatabases(cluster.Spec.Databases, specPath.Child("databases"))...)
@@ -202,6 +264,63 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 		}
 	}
 	return allErrs
+}
+
+func reservedPodFencingMetadataErrors(cluster *PgShardCluster) field.ErrorList {
+	annotationsPath := field.NewPath("metadata", "annotations")
+	var allErrs field.ErrorList
+	for _, key := range []string{PodFencingChallengeAnnotation, PodFencingReceiptAnnotation} {
+		if _, exists := cluster.Annotations[key]; exists {
+			allErrs = append(allErrs, field.Forbidden(annotationsPath.Key(key), "is reserved for the pgshard controller and admission webhook"))
+		}
+	}
+	return allErrs
+}
+
+func reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster *PgShardCluster) (field.ErrorList, bool) {
+	annotationsPath := field.NewPath("metadata", "annotations")
+	oldChallenge, oldHasChallenge := oldCluster.Annotations[PodFencingChallengeAnnotation]
+	oldReceipt, oldHasReceipt := oldCluster.Annotations[PodFencingReceiptAnnotation]
+	newChallenge, newHasChallenge := newCluster.Annotations[PodFencingChallengeAnnotation]
+	newReceipt, newHasReceipt := newCluster.Annotations[PodFencingReceiptAnnotation]
+	unchanged := oldHasChallenge == newHasChallenge && oldHasReceipt == newHasReceipt &&
+		oldChallenge == newChallenge && oldReceipt == newReceipt
+
+	if unchanged {
+		return nil, false
+	}
+	if !newCluster.DeletionTimestamp.IsZero() {
+		return field.ErrorList{field.Forbidden(annotationsPath, "controller-owned Pod fencing metadata is immutable during deletion")}, false
+	}
+	if newCluster.Spec.MembersPerShard != 1 {
+		return reservedPodFencingMetadataErrors(newCluster), false
+	}
+	if !newHasChallenge || !newHasReceipt || newChallenge == "" || newReceipt == "" {
+		return field.ErrorList{field.Forbidden(annotationsPath, "Pod fencing challenge and receipt must be preserved or replaced by a non-empty admission attestation")}, false
+	}
+	return nil, true
+}
+
+func (v *PgShardClusterValidator) validatePodFencingMetadataAttestation(ctx context.Context, cluster *PgShardCluster) (field.ErrorList, error) {
+	if v.FencingReceiptVerifier == nil || v.FencingControllerUsername == "" {
+		return nil, fmt.Errorf("Pod fencing metadata attestation is not configured")
+	}
+	request, err := admission.RequestFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read Pod fencing admission request identity: %w", err)
+	}
+	annotationsPath := field.NewPath("metadata", "annotations")
+	if request.UserInfo.Username != v.FencingControllerUsername {
+		return field.ErrorList{field.Forbidden(annotationsPath, "Pod fencing metadata may only be established or repaired by the pgshard controller")}, nil
+	}
+	verified, err := v.FencingReceiptVerifier.Verify(ctx, cluster)
+	if err != nil {
+		return nil, fmt.Errorf("verify final Pod fencing admission receipt: %w", err)
+	}
+	if !verified {
+		return field.ErrorList{field.Forbidden(annotationsPath, "Pod fencing metadata does not carry a valid final admission receipt")}, nil
+	}
+	return nil, nil
 }
 
 // ValidateOpenTelemetryEndpoint rejects endpoints that cannot be passed safely
@@ -428,6 +547,9 @@ func (cluster *PgShardCluster) ResolvedPostgreSQLConfiguration() (ResolvedPostgr
 	if err := tuning.ApplyOverrides(result.Settings, cluster.Spec.PostgreSQL.Parameters); err != nil {
 		return ResolvedPostgreSQLConfiguration{}, err
 	}
+	if err := tuning.ValidateStorage(result.Settings, cluster.Spec.Storage.Size); err != nil {
+		return ResolvedPostgreSQLConfiguration{}, err
+	}
 	primaries := make([]ResolvedPostgreSQLPrimary, 0, len(result.Primaries))
 	for _, primary := range result.Primaries {
 		primaries = append(primaries, ResolvedPostgreSQLPrimary{
@@ -462,5 +584,5 @@ func synchronousStandbys(durability DurabilityMode) int32 {
 	return 0
 }
 
-// +kubebuilder:webhook:path=/mutate-pgshard-io-v1alpha1-pgshardcluster,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=create;update,versions=v1alpha1,name=mpgshardcluster.kb.io,admissionReviewVersions=v1
-// +kubebuilder:webhook:path=/validate-pgshard-io-v1alpha1-pgshardcluster,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=create;update,versions=v1alpha1,name=vpgshardcluster.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/mutate-pgshard-io-v1alpha1-pgshardcluster,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=create;update,versions=v1alpha1,name=mpgshardcluster.kb.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-pgshard-io-v1alpha1-pgshardcluster,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=create;update,versions=v1alpha1,name=vpgshardcluster.kb.io,admissionReviewVersions=v1,servicePort=9444

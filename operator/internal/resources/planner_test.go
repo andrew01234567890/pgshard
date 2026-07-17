@@ -1,6 +1,10 @@
 package resources
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -37,9 +41,12 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 		t.Fatal("the same cluster produced different plans")
 	}
 
-	postgresConfig := object[*corev1.ConfigMap](t, first, "demo-postgresql-config")
+	postgresConfig := postgresqlConfigMap(t, first, cluster.Name)
+	if postgresConfig.Immutable == nil || !*postgresConfig.Immutable {
+		t.Fatal("PostgreSQL configuration is not immutable")
+	}
 	contents := postgresConfig.Data["postgresql.conf"]
-	if !strings.Contains(contents, "shared_buffers = 512MB\n") || !strings.Contains(contents, "fsync = on\n") || !strings.Contains(contents, "max_replication_slots = 20\n") {
+	if !strings.Contains(contents, "shared_buffers = 512MB\n") || !strings.Contains(contents, "fsync = on\n") || !strings.Contains(contents, "listen_addresses = '*'\n") || !strings.Contains(contents, "max_replication_slots = 20\n") {
 		t.Fatalf("resource-derived settings were not rendered:\n%s", contents)
 	}
 	if strings.Index(contents, "default_statistics_target") > strings.Index(contents, "log_statement") {
@@ -69,11 +76,11 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	}
 
 	pooler := object[*appsv1.Deployment](t, first, "demo-pooler")
-	if len(pooler.Spec.Template.Spec.Volumes) != 2 {
+	if len(pooler.Spec.Template.Spec.Volumes) != 1 || pooler.Spec.Template.Spec.Volumes[0].Name != "topology" {
 		t.Fatalf("pooler volumes = %#v", pooler.Spec.Template.Spec.Volumes)
 	}
 	if pooler.Spec.Template.Annotations[configHashAnnotation] == "" {
-		t.Fatal("pooler does not roll when generated configuration changes")
+		t.Fatal("pooler does not roll when topology configuration changes")
 	}
 	for _, suffix := range []string{"rw", "ro", "r"} {
 		service := object[*corev1.Service](t, first, "demo-"+suffix)
@@ -122,6 +129,230 @@ func TestConfigMapDataHashCoversNamesAndContentsDeterministically(t *testing.T) 
 	second["standby-0002.conf"] = "hot_standby_feedback = on\n"
 	if configMapDataHash(first) == configMapDataHash(second) {
 		t.Fatal("configuration hash ignored role-profile name")
+	}
+}
+
+func TestPostgreSQLConfigurationAndResourceLimitRollTogether(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	before, err := Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeConfiguration := postgresqlConfigMap(t, before, cluster.Name)
+	beforeStatefulSet := object[*appsv1.StatefulSet](t, before, PostgreSQLPrimaryStatefulSetName(cluster.Name, 0))
+	beforePooler := object[*appsv1.Deployment](t, before, cluster.Name+PoolerSuffix)
+
+	cluster.Spec.PostgreSQL.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("3Gi")
+	cluster.Spec.PostgreSQL.Resources.Limits[corev1.ResourceMemory] = resource.MustParse("6Gi")
+	after, err := Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterConfiguration := postgresqlConfigMap(t, after, cluster.Name)
+	afterStatefulSet := object[*appsv1.StatefulSet](t, after, PostgreSQLPrimaryStatefulSetName(cluster.Name, 0))
+	afterPooler := object[*appsv1.Deployment](t, after, cluster.Name+PoolerSuffix)
+	if beforeConfiguration.Name == afterConfiguration.Name {
+		t.Fatal("resource-derived PostgreSQL configuration name did not change")
+	}
+	if got := configMapVolumeName(t, beforeStatefulSet.Spec.Template.Spec.Volumes, "postgresql-config"); got != beforeConfiguration.Name {
+		t.Fatalf("old StatefulSet configuration = %q, want %q", got, beforeConfiguration.Name)
+	}
+	if got := configMapVolumeName(t, afterStatefulSet.Spec.Template.Spec.Volumes, "postgresql-config"); got != afterConfiguration.Name {
+		t.Fatalf("new StatefulSet configuration = %q, want %q", got, afterConfiguration.Name)
+	}
+	if got := afterStatefulSet.Spec.Template.Spec.Containers[0].Resources.Limits.Memory(); got == nil || got.Cmp(resource.MustParse("6Gi")) != 0 {
+		t.Fatalf("new StatefulSet memory limit = %v", got)
+	}
+	if !reflect.DeepEqual(beforePooler.Spec, afterPooler.Spec) {
+		t.Fatal("PostgreSQL-only configuration change rolled the pooler")
+	}
+}
+
+func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	plan, err := Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	configuration := postgresqlConfigMap(t, plan, cluster.Name)
+	primaryConfiguration := configuration.Data["primary-0000.conf"]
+	if !strings.HasPrefix(primaryConfiguration, "include = '/etc/pgshard/postgresql/postgresql.conf'\n") ||
+		!strings.Contains(primaryConfiguration, "synchronized_standby_slots = ''\n") ||
+		!strings.Contains(primaryConfiguration, "synchronous_standby_names = ''\n") {
+		t.Fatalf("single-member primary configuration = %q", primaryConfiguration)
+	}
+
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		name := shardName(cluster.Name, shard) + "-primary"
+		statefulSet := object[*appsv1.StatefulSet](t, plan, name)
+		if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != 1 || statefulSet.Spec.ServiceName != shardName(cluster.Name, shard) {
+			t.Fatalf("PostgreSQL StatefulSet identity = %#v", statefulSet.Spec)
+		}
+		if statefulSet.Spec.Template.Labels[ManagedByLabel] != ManagedByValue || statefulSet.Spec.Template.Labels[ShardLabel] != shardLabel(shard) || statefulSet.Spec.Template.Labels[RoleLabel] != "primary" || statefulSet.Spec.Template.Labels[MemberLabel] != "0000" {
+			t.Fatalf("PostgreSQL labels = %#v", statefulSet.Spec.Template.Labels)
+		}
+		if statefulSet.Spec.Template.Annotations[PostgreSQLPodClusterUIDAnnotation] != string(cluster.UID) || !reflect.DeepEqual(statefulSet.Spec.Template.Finalizers, []string{PostgreSQLPodTerminationFinalizer}) {
+			t.Fatalf("PostgreSQL termination fence = %#v", statefulSet.Spec.Template.ObjectMeta)
+		}
+		if len(statefulSet.Spec.VolumeClaimTemplates) != 0 {
+			t.Fatalf("PostgreSQL data must use a pre-identified standalone PVC: %#v", statefulSet.Spec.VolumeClaimTemplates)
+		}
+		dataVolume := statefulSet.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim
+		if dataVolume == nil || dataVolume.ClaimName != cluster.Status.PostgreSQLBootstraps[shard].PVCName {
+			t.Fatalf("PostgreSQL data volume = %#v", dataVolume)
+		}
+		pod := statefulSet.Spec.Template.Spec
+		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
+			t.Fatalf("PostgreSQL Pod boundary = %#v", pod)
+		}
+		if pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot == nil || !*pod.SecurityContext.RunAsNonRoot || pod.SecurityContext.RunAsUser == nil || *pod.SecurityContext.RunAsUser != 999 || pod.SecurityContext.FSGroup == nil || *pod.SecurityContext.FSGroup != 999 || pod.SecurityContext.FSGroupChangePolicy == nil || *pod.SecurityContext.FSGroupChangePolicy != corev1.FSGroupChangeOnRootMismatch {
+			t.Fatalf("PostgreSQL Pod security = %#v", pod.SecurityContext)
+		}
+		postgres := pod.Containers[0]
+		if postgres.Image != defaultPostgreSQLImage || postgres.ImagePullPolicy != corev1.PullIfNotPresent || postgres.SecurityContext == nil || postgres.SecurityContext.RunAsUser == nil || *postgres.SecurityContext.RunAsUser != 999 || postgres.SecurityContext.ReadOnlyRootFilesystem == nil || !*postgres.SecurityContext.ReadOnlyRootFilesystem {
+			t.Fatalf("PostgreSQL container boundary = %#v", postgres)
+		}
+		if !containsString(postgres.Args, "config_file=/etc/pgshard/postgresql/primary-0000.conf") || postgres.StartupProbe != nil || postgres.ReadinessProbe == nil || postgres.LivenessProbe != nil {
+			t.Fatalf("PostgreSQL startup contract = %#v", postgres)
+		}
+		readinessProbe := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
+		if !reflect.DeepEqual(postgres.ReadinessProbe.Exec.Command, readinessProbe) {
+			t.Fatalf("PostgreSQL readiness probe = %#v", postgres.ReadinessProbe)
+		}
+		bootstrap := pod.InitContainers[0]
+		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "sync \"$staging/pg_hba.conf\" \"$staging/.pgshard-bootstrap-complete\" \"$staging\"") || !strings.Contains(bootstrap.Command[2], "sync \"$final\" \"$parent\"") || strings.Contains(bootstrap.Command[2], "\nsync\n") || strings.Contains(bootstrap.Command[2], "sync -f") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) {
+			t.Fatalf("PostgreSQL atomic bootstrap contract = %#v", bootstrap)
+		}
+		if len(bootstrap.Env) != 4 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
+			bootstrap.Env[2].Name != "PGSHARD_NODE_UID" || bootstrap.Env[2].ValueFrom == nil || bootstrap.Env[2].ValueFrom.FieldRef == nil || bootstrap.Env[2].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-uid']" ||
+			bootstrap.Env[3].Name != "PGSHARD_NODE_BOOT_ID" || bootstrap.Env[3].ValueFrom == nil || bootstrap.Env[3].ValueFrom.FieldRef == nil || bootstrap.Env[3].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-boot-id']" {
+			t.Fatalf("PostgreSQL bootstrap identity = %#v", bootstrap.Env)
+		}
+		if bootstrap.SecurityContext == nil || bootstrap.SecurityContext.ReadOnlyRootFilesystem == nil || !*bootstrap.SecurityContext.ReadOnlyRootFilesystem || bootstrap.Resources.Limits.Memory() == nil {
+			t.Fatalf("PostgreSQL bootstrap security/resources = %#v", bootstrap)
+		}
+		passwordReferences := 0
+		for _, variable := range postgres.Env {
+			if variable.Name == "POSTGRES_PASSWORD" {
+				passwordReferences++
+			}
+			if variable.ValueFrom != nil {
+				t.Fatalf("running PostgreSQL received a Secret-backed environment variable: %#v", variable)
+			}
+		}
+		if passwordReferences != 0 || len(postgres.Env) != 1 || postgres.Env[0].Name != "PGDATA" {
+			t.Fatalf("PostgreSQL password reference count = %d", passwordReferences)
+		}
+		for _, mount := range postgres.VolumeMounts {
+			if mount.Name == "bootstrap-secret" {
+				t.Fatalf("running PostgreSQL mounts the bootstrap Secret: %#v", postgres.VolumeMounts)
+			}
+		}
+		budget := object[*policyv1.PodDisruptionBudget](t, plan, name)
+		if budget.Spec.MinAvailable == nil || budget.Spec.MinAvailable.IntVal != 1 || budget.Spec.Selector.MatchLabels[ShardLabel] != shardLabel(shard) || budget.Spec.Selector.MatchLabels[RoleLabel] != "primary" {
+			t.Fatalf("PostgreSQL PDB = %#v", budget.Spec)
+		}
+	}
+
+	secret := PostgreSQLAuthSecret(cluster, 1, "demo-random-auth", []byte("0123456789abcdef"))
+	if secret.Name != "demo-random-auth" || secret.Labels[ShardLabel] != "0001" || secret.Immutable == nil || !*secret.Immutable || string(secret.Data[PostgreSQLPasswordKey]) != "0123456789abcdef" || secret.Annotations[ApplyOwnershipAnnotation] != "" {
+		t.Fatalf("PostgreSQL auth Secret = %#v", secret)
+	}
+	assertOwned(t, secret, cluster)
+	secret.UID = "demo-random-auth-uid"
+	claim := PostgreSQLPrimaryDataPVC(cluster, 1, "demo-random-data", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, secret.Name, secret.UID)
+	if claim.Name != "demo-random-data" || claim.Labels[ShardLabel] != "0001" || claim.Spec.Resources.Requests.Storage().Cmp(cluster.Spec.Storage.Size) != 0 || claim.Annotations[ApplyOwnershipAnnotation] != "" {
+		t.Fatalf("PostgreSQL data PVC = %#v", claim)
+	}
+	if claim.Annotations[PostgreSQLDataClusterUIDAnnotation] != string(cluster.UID) {
+		t.Fatalf("PostgreSQL data PVC garbage-collection boundary = %#v", claim.ObjectMeta)
+	}
+	if len(claim.OwnerReferences) != 1 || claim.OwnerReferences[0].Kind != "Secret" || claim.OwnerReferences[0].Name != secret.Name || claim.OwnerReferences[0].UID != secret.UID {
+		t.Fatalf("PostgreSQL data PVC creation fence = %#v", claim.OwnerReferences)
+	}
+	if len(claim.Finalizers) != 0 {
+		t.Fatalf("creation-fenced PVC received protection before its API UID checkpoint: %#v", claim.Finalizers)
+	}
+}
+
+func TestPostgreSQLBootstrapRequiresBindingIdentityBeforeDataAccess(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{name: "node UID", env: []string{"PGSHARD_NODE_BOOT_ID=boot-a"}, want: "binding-time node UID is required"},
+		{name: "node boot ID", env: []string{"PGSHARD_NODE_UID=node-a"}, want: "binding-time node boot ID is required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			parent := t.TempDir()
+			script := strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", fmt.Sprintf("parent=%q", parent), 1)
+			command := exec.Command("bash", "-c", script)
+			command.Env = []string{"PGSHARD_CLUSTER_UID=cluster-uid", "PGSHARD_SHARD_ID=0000"}
+			command.Env = append(command.Env, test.env...)
+			output, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), test.want) {
+				t.Fatalf("bootstrap without %s error = %v, output = %q", test.name, err, output)
+			}
+			for _, path := range []string{filepath.Join(parent, ".pgshard-init"), filepath.Join(parent, "docker")} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("bootstrap touched PGDATA before binding identity validation: %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPostgreSQLBootstrapRefusesMismatchedDurableIdentity(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		marker     string
+		clusterUID string
+		shard      string
+	}{
+		{name: "cluster", marker: "cluster_uid=old-cluster\nshard=0000\n", clusterUID: "new-cluster", shard: "0000"},
+		{name: "shard", marker: "cluster_uid=cluster-uid\nshard=0000\n", clusterUID: "cluster-uid", shard: "0001"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			parent := t.TempDir()
+			final := filepath.Join(parent, "docker")
+			if err := os.MkdirAll(final, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(final, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(final, postgresqlBootstrapMarker), []byte(test.marker), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			script := strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", fmt.Sprintf("parent=%q", parent), 1)
+			command := exec.Command("bash", "-c", script)
+			command.Env = append(os.Environ(), "PGSHARD_CLUSTER_UID="+test.clusterUID, "PGSHARD_SHARD_ID="+test.shard, "PGSHARD_NODE_UID=node-a", "PGSHARD_NODE_BOOT_ID=boot-a")
+			output, err := command.CombinedOutput()
+			if err == nil {
+				t.Fatal("bootstrap accepted a PostgreSQL data directory from a different identity")
+			}
+			if !strings.Contains(string(output), "refusing PostgreSQL data directory owned by another cluster or shard") {
+				t.Fatalf("bootstrap mismatch output = %q", output)
+			}
+			if _, err := os.Stat(filepath.Join(parent, ".pgshard-init")); !os.IsNotExist(err) {
+				t.Fatalf("bootstrap entered initialization after identity mismatch: %v", err)
+			}
+		})
 	}
 }
 
@@ -208,6 +439,20 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if len(policy.Spec.Ingress) != 2 || policy.Spec.Ingress[0].Ports[0].Port.IntVal != EtcdClientPort || policy.Spec.Ingress[1].Ports[0].Port.IntVal != EtcdPeerPort {
 		t.Fatalf("etcd NetworkPolicy = %#v", policy.Spec)
 	}
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		postgresqlPolicy := object[*networkingv1.NetworkPolicy](t, plan, shardName(cluster.Name, shard)+"-ingress")
+		if postgresqlPolicy.Spec.PodSelector.MatchLabels[ShardLabel] != shardLabel(shard) || len(postgresqlPolicy.Spec.Ingress) != 2 || postgresqlPolicy.Spec.Ingress[0].Ports[0].Port.IntVal != PostgreSQLPort || postgresqlPolicy.Spec.Ingress[1].Ports[0].Port.IntVal != PostgreSQLPort {
+			t.Fatalf("PostgreSQL NetworkPolicy = %#v", postgresqlPolicy.Spec)
+		}
+		controlPeers := postgresqlPolicy.Spec.Ingress[0].From
+		if len(controlPeers) != 1 || controlPeers[0].PodSelector == nil || controlPeers[0].PodSelector.MatchLabels[ClusterLabel] != cluster.Name || len(controlPeers[0].PodSelector.MatchExpressions) != 1 || !reflect.DeepEqual(controlPeers[0].PodSelector.MatchExpressions[0].Values, []string{"orchestrator", "pooler"}) {
+			t.Fatalf("PostgreSQL control peers = %#v", controlPeers)
+		}
+		postgresqlPeers := postgresqlPolicy.Spec.Ingress[1].From
+		if len(postgresqlPeers) != 1 || postgresqlPeers[0].PodSelector == nil || postgresqlPeers[0].PodSelector.MatchLabels[ClusterLabel] != cluster.Name || postgresqlPeers[0].PodSelector.MatchLabels[ComponentLabel] != "postgresql" || postgresqlPeers[0].PodSelector.MatchLabels[ShardLabel] != shardLabel(shard) {
+			t.Fatalf("PostgreSQL same-shard peers = %#v", postgresqlPeers)
+		}
+	}
 }
 
 func TestFixedPoolerPlanOmitsHPA(t *testing.T) {
@@ -259,6 +504,11 @@ func TestPlanFailsClosedForUnsafeIdentityOrMissingImages(t *testing.T) {
 	if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), "images") {
 		t.Fatalf("expected image error, got %v", err)
 	}
+	images = DefaultImages()
+	images.PostgreSQL = ""
+	if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), "images") {
+		t.Fatalf("expected PostgreSQL image error, got %v", err)
+	}
 	cluster = testCluster()
 	cluster.Spec.Observability.OpenTelemetryEndpoint = "file:///tmp/collector"
 	if _, err := Plan(cluster, DefaultImages()); err == nil || !strings.Contains(strings.ToLower(err.Error()), "opentelemetry") {
@@ -295,6 +545,31 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	if identity.Name != "PGSHARD_ORCH_ID" || identity.ValueFrom == nil || identity.ValueFrom.FieldRef == nil || identity.ValueFrom.FieldRef.FieldPath != "metadata.uid" {
 		t.Fatalf("orchestrator identity = %#v", identity)
 	}
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	plan, err = Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	statefulSet := object[*appsv1.StatefulSet](t, plan, PostgreSQLPrimaryStatefulSetName(cluster.Name, 0))
+	if len(statefulSet.Name) > 63 || len(statefulSet.Name+"-0") > 63 {
+		t.Fatalf("maximum cluster name produced invalid StatefulSet or Pod name: %q", statefulSet.Name)
+	}
+	if statefulSet.Spec.ServiceName != shardName(cluster.Name, 0) {
+		t.Fatalf("bounded StatefulSet changed the existing shard Service identity: %q", statefulSet.Spec.ServiceName)
+	}
+	otherName := strings.Repeat("a", pgshardv1alpha1.MaximumClusterNameLength-1) + "b"
+	if PostgreSQLPrimaryStatefulSetName(cluster.Name, 0) == PostgreSQLPrimaryStatefulSetName(otherName, 0) {
+		t.Fatal("distinct maximum-length cluster names produced the same StatefulSet identity")
+	}
+	derivedAlias := boundedPostgreSQLWorkloadPrefix(cluster.Name)
+	if len(derivedAlias) != 42 {
+		t.Fatalf("bounded cluster prefix length = %d, want 42", len(derivedAlias))
+	}
+	if PostgreSQLPrimaryStatefulSetName(cluster.Name, 0) == PostgreSQLPrimaryStatefulSetName(derivedAlias, 0) {
+		t.Fatal("maximum-length cluster name aliased its valid derived 42-character prefix")
+	}
 }
 
 func TestImagePullPolicyHandlesRegistryPortsAndDigests(t *testing.T) {
@@ -314,6 +589,7 @@ func TestImagePullPolicyHandlesRegistryPortsAndDigests(t *testing.T) {
 
 func testCluster() *pgshardv1alpha1.PgShardCluster {
 	prometheus := true
+	storageClass := "test-storage"
 	return &pgshardv1alpha1.PgShardCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "database", UID: types.UID("cluster-uid"), Generation: 3},
 		Spec: pgshardv1alpha1.PgShardClusterSpec{
@@ -327,7 +603,7 @@ func testCluster() *pgshardv1alpha1.PgShardCluster {
 					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 				},
 			},
-			Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi")},
+			Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi"), StorageClassName: &storageClass, DeletionPolicy: pgshardv1alpha1.DeletionRetain},
 			Pooler: pgshardv1alpha1.PoolerSpec{Scaling: pgshardv1alpha1.PoolerScaling{
 				Mode: pgshardv1alpha1.ScalingHPA,
 				HPA:  &pgshardv1alpha1.HPAScaling{MinReplicas: 2, MaxReplicas: 6, TargetCPUUtilizationPercentage: 70},
@@ -359,6 +635,45 @@ func object[T client.Object](t *testing.T, plan []client.Object, name string) T 
 	return zero
 }
 
+func postgresqlConfigMap(t *testing.T, plan []client.Object, clusterName string) *corev1.ConfigMap {
+	t.Helper()
+	prefix := clusterName + PostgreSQLConfigSuffix + "-"
+	var configuration *corev1.ConfigMap
+	for _, item := range plan {
+		candidate, ok := item.(*corev1.ConfigMap)
+		if !ok || !strings.HasPrefix(candidate.Name, prefix) {
+			continue
+		}
+		if configuration != nil {
+			t.Fatalf("multiple PostgreSQL configurations found: %s and %s", configuration.Name, candidate.Name)
+		}
+		configuration = candidate
+	}
+	if configuration == nil {
+		t.Fatalf("PostgreSQL configuration with prefix %q not found", prefix)
+	}
+	return configuration
+}
+
+func testPostgreSQLBootstraps(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.PostgreSQLBootstrapStatus {
+	bootstraps := make([]pgshardv1alpha1.PostgreSQLBootstrapStatus, 0, cluster.Spec.Shards)
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		bootstraps = append(bootstraps, pgshardv1alpha1.PostgreSQLBootstrapStatus{
+			Shard: shard, SecretName: fmt.Sprintf("test-secret-%04d", shard), SecretUID: types.UID(fmt.Sprintf("test-secret-uid-%04d", shard)),
+			PVCFenceDetached: true, PVCName: fmt.Sprintf("test-data-%04d", shard), PVCUID: types.UID(fmt.Sprintf("test-pvc-uid-%04d", shard)), PVCStorageClassName: copyString(cluster.Spec.Storage.StorageClassName),
+		})
+	}
+	return bootstraps
+}
+
+func copyString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
 func assertOwned(t *testing.T, object client.Object, cluster *pgshardv1alpha1.PgShardCluster) {
 	t.Helper()
 	if object.GetLabels()[ManagedByLabel] != ManagedByValue || object.GetLabels()[ClusterLabel] != cluster.Name {
@@ -377,4 +692,15 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func configMapVolumeName(t *testing.T, volumes []corev1.Volume, name string) string {
+	t.Helper()
+	for _, volume := range volumes {
+		if volume.Name == name && volume.ConfigMap != nil {
+			return volume.ConfigMap.Name
+		}
+	}
+	t.Fatalf("ConfigMap volume %q not found: %#v", name, volumes)
+	return ""
 }

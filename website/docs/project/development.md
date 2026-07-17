@@ -48,7 +48,9 @@ Rust agent, orchestrator and pooler and the Go operator under
 `PGSHARD_IMAGE_TARGETS=postgres-agent make images` target builds the heavier
 PostgreSQL 18 lifecycle-test archive once where needed. The bake definition has no
 registry output or push target. The current images are test inputs, not an
-installable database cluster. The selected Buildx builder must support the
+installable sharding product; the operator image can bootstrap only the
+documented direct single-member PostgreSQL development slice. The selected
+Buildx builder must support the
 Docker exporter. Docker's default `docker` driver does not support this archive
 exporter; use a `docker-container`, Kubernetes, or remote builder. The command
 derives the full revision from `HEAD` and marks its development version `dirty`
@@ -59,10 +61,15 @@ missing and all-zero identity is rejected.
 `PGSHARD_IMAGE_TARGETS="operator orchestrator pooler" make images` builds the
 subset used by the real-manager KIND smoke. After loading those `:dev` images
 into KIND, `kubectl apply -k operator/config/admission` installs the restricted
-self-managed admission manager. `operator/config/development` retains a
-certificate-free path for controller debugging. Both reconcile only
-fail-closed supporting workloads; neither is a database quickstart or
-production distribution.
+self-managed admission manager. Direct PostgreSQL namespaces must carry the
+`pgshard.io/pod-fencing=enabled` label. The admission install makes that opt-in
+immutable until namespace deletion and authenticates a cluster handshake before
+publishing PostgreSQL Pods. Binding and status each have a mutator plus a final
+validator, and the PostgreSQL init container refuses PGDATA access without the
+binding-time Node evidence. `operator/config/development` retains a
+certificate-free path only for supporting-controller debugging and must not
+manage direct PostgreSQL Pods. Neither path provides a routed database
+quickstart or production distribution.
 
 ## Git identity and history
 

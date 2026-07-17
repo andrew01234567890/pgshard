@@ -8,6 +8,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/controller"
 	"github.com/andrew01234567890/pgshard/operator/internal/pki"
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -18,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 var (
@@ -45,6 +47,7 @@ type webhookCommandOptions struct {
 	serviceName                 string
 	caSecretName                string
 	servingSecretName           string
+	fencingKeySecretName        string
 	mutatingConfigurationName   string
 	validatingConfigurationName string
 	certificateDirectory        string
@@ -57,16 +60,18 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.BoolVar(&options.leaderElection, "leader-elect", true, "enable Kubernetes leader election")
 	flags.BoolVar(&options.secureMetrics, "metrics-secure", true, "serve metrics over TLS")
 	flags.BoolVar(&options.webhookEnabled, "webhook-enabled", true, "register admission webhooks; serving certificates are required")
-	flags.StringVar(&options.webhook.namespace, "webhook-namespace", "pgshard-system", "namespace containing the webhook Service and certificate Secrets")
+	flags.StringVar(&options.webhook.namespace, "webhook-namespace", "pgshard-system", "namespace containing the webhook Service and managed Secrets")
 	flags.StringVar(&options.webhook.serviceName, "webhook-service-name", "pgshard-webhook-service", "webhook Service name")
 	flags.StringVar(&options.webhook.caSecretName, "webhook-ca-secret-name", "pgshard-webhook-ca", "pre-created webhook CA Secret name")
 	flags.StringVar(&options.webhook.servingSecretName, "webhook-serving-secret-name", "pgshard-webhook-certificate", "pre-created webhook serving Secret name")
+	flags.StringVar(&options.webhook.fencingKeySecretName, "webhook-fencing-key-secret-name", "pgshard-webhook-fencing-key", "pre-created immutable Pod fencing key Secret name")
 	flags.StringVar(&options.webhook.mutatingConfigurationName, "webhook-mutating-configuration-name", "pgshard-mutating-webhook-configuration", "mutating webhook configuration name")
 	flags.StringVar(&options.webhook.validatingConfigurationName, "webhook-validating-configuration-name", "pgshard-validating-webhook-configuration", "validating webhook configuration name")
 	flags.StringVar(&options.webhook.certificateDirectory, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "private directory for generated webhook certificate files")
 	flags.StringVar(&options.images.Etcd, "etcd-image", options.images.Etcd, "etcd image reference")
 	flags.StringVar(&options.images.Orchestrator, "orchestrator-image", options.images.Orchestrator, "pgshard orchestrator image reference")
 	flags.StringVar(&options.images.Pooler, "pooler-image", options.images.Pooler, "pgshard pooler image reference")
+	flags.StringVar(&options.images.PostgreSQL, "postgresql-image", options.images.PostgreSQL, "PostgreSQL 18 image reference")
 	return options
 }
 
@@ -108,22 +113,54 @@ func main() {
 		os.Exit(1)
 	}
 
+	receiptKey := podfence.SecretReceiptKeyRef{
+		Secret:           client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.fencingKeySecretName},
+		DataKey:          pki.PodFencingKeyKey,
+		AnchorSecret:     client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
+		AnchorAnnotation: pki.PodFencingKeyFingerprintAnnotation,
+	}
 	if err := (&controller.PgShardClusterReconciler{
-		Client:    manager.GetClient(),
-		APIReader: manager.GetAPIReader(),
-		Images:    options.images,
+		Client:               manager.GetClient(),
+		APIReader:            manager.GetAPIReader(),
+		Images:               options.images,
+		PodFencingReceiptKey: receiptKey,
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
 	}
 	if options.webhookEnabled {
+		handshakeCodec := podfence.NewSecretHandshakeCodec(manager.GetAPIReader(), receiptKey)
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCluster{}).
 			WithDefaulter(&pgshardv1alpha1.PgShardClusterDefaulter{}).
-			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{}).
+			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{
+				FencingReceiptVerifier:    handshakeCodec,
+				FencingControllerUsername: "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+			}).
 			Complete(); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardCluster")
 			os.Exit(1)
 		}
+		webhookServer.Register(podfence.BindingWebhookPath, &admission.Webhook{
+			Handler: podfence.NewBindingAttestor(manager.GetAPIReader(), scheme),
+		})
+		webhookServer.Register(podfence.BindingValidationWebhookPath, &admission.Webhook{
+			Handler: podfence.NewBindingValidator(manager.GetAPIReader(), scheme),
+		})
+		webhookServer.Register(podfence.StatusWebhookPath, &admission.Webhook{
+			Handler: podfence.NewStatusAttestor(manager.GetAPIReader(), handshakeCodec, scheme),
+		})
+		webhookServer.Register(podfence.HandshakeWebhookPath, &admission.Webhook{
+			Handler: podfence.NewHandshakeAttestor(handshakeCodec, scheme),
+		})
+		webhookServer.Register(podfence.MetadataWebhookPath, &admission.Webhook{
+			Handler: podfence.NewMetadataValidator(handshakeCodec, scheme),
+		})
+		webhookServer.Register(podfence.StatusValidationWebhookPath, &admission.Webhook{
+			Handler: podfence.NewStatusValidator(manager.GetAPIReader(), handshakeCodec, scheme),
+		})
+		webhookServer.Register(podfence.NamespaceWebhookPath, &admission.Webhook{
+			Handler: podfence.NewNamespaceValidator(scheme),
+		})
 	}
 	if err := manager.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to add health check")
@@ -147,6 +184,7 @@ func main() {
 			ServiceName:                 options.webhook.serviceName,
 			CASecretName:                options.webhook.caSecretName,
 			ServingSecretName:           options.webhook.servingSecretName,
+			FencingKeySecretName:        options.webhook.fencingKeySecretName,
 			MutatingConfigurationName:   options.webhook.mutatingConfigurationName,
 			ValidatingConfigurationName: options.webhook.validatingConfigurationName,
 			CertificateDirectory:        options.webhook.certificateDirectory,

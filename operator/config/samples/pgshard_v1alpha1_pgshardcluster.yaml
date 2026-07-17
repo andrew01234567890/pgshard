@@ -17,6 +17,7 @@ spec:
         memory: 4Gi
   storage:
     size: 20Gi
+    deletionPolicy: Retain
   pooler:
     scaling:
       mode: HPA
