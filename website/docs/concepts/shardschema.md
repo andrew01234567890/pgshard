@@ -40,10 +40,10 @@ dedicated placement pool.
 
 The current internal `pgshard_catalog` migration records:
 
-- Databases, per-database topology generations, registered tables, shard-key
-  types, hash versions and seeds.
-- Physical-cell identities, permanent restore-incarnation history,
-  per-database shard placements, and non-overlapping half-open key ranges.
+- Logical databases, registered tables, shard-key types, and the fleet-wide
+  hash version and seed.
+- Cluster-wide shard identities and permanent restore-incarnation history,
+  plus per-database routing epochs and non-overlapping half-open key ranges.
 - Routing, schema, authorization, and catalog epochs.
 - Permanent logical-consumer identities and per-shard ownership fences.
 - Never-reused checkpoint, source-attachment, and managed-slot generations.
@@ -51,8 +51,10 @@ The current internal `pgshard_catalog` migration records:
   capabilities authorize exact activation and absence-fenced retirement.
 - Permanent fixed-size operation tombstones for idempotency.
 
-Durable DDL, reshard, backup/restore and delivered-change journals remain
-planned extensions; the current schema does not claim to store them. The
+Physical-cell identities, independent per-database shard sets and hash
+contracts, and database-to-cell placement generations are also target-schema
+work; the current migration does not contain them. Durable DDL, reshard,
+backup/restore and delivered-change journals remain planned extensions. The
 logical-consumer registry keys each stable per-shard fence by consumer,
 `logical_database_id`, and shard. Its source-attachment key adds an immutable
 shard restore-incarnation UUID, PostgreSQL system identifier, and database OID;
@@ -207,7 +209,14 @@ healthy connection is retained. Reconnect status preserves a bounded
 credential-safe cause category without retaining raw connector errors.
 
 The migration is transactional and idempotent, requires PostgreSQL 18 or newer,
-and must run in a pre-created UTF8 database named exactly `shardschema`. It
+and must run in a pre-created UTF8 database named exactly `shardschema`. The
+runner must prevent new connections and arbitrary concurrent schema DDL for the
+entire migration. The operator satisfies that contract with a private
+Unix-socket-only bootstrap postmaster; embedding `MIGRATION_SQL` against a
+serving database without an external connection gate is unsupported. The SQL
+pins its search path, trigger mode, table access method, tablespaces, and other
+bootstrap-sensitive session defaults, but a transaction cannot by itself lock
+an open PostgreSQL namespace against every possible new object class. It
 creates NOLOGIN reader/admin group roles, revokes public access and exposes
 activation through a dual compare-and-swap over the global catalog epoch and
 the prior active routing epoch. The administrator cannot update checkpoint
@@ -220,4 +229,8 @@ serialization error rather than publishing stale or incomplete coverage.
 
 ## Stable catalog host
 
-`shard-0000` remains the catalog host when data ranges are resharded. The identifier denotes the control-plane placement, not permanent ownership of a particular application key range. Moving `shardschema` is outside Milestone 1.
+Target architecture keeps `shardschema` on physical `cell-0000` when application
+data ranges are resharded. The current singleton operator labels that same
+catalog-bearing PostgreSQL placement `shard-0000` until physical-cell CRDs
+exist. Neither identifier promises permanent ownership of an application key
+range. Moving `shardschema` is outside Milestone 1.

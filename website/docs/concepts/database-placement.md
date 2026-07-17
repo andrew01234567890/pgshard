@@ -23,7 +23,9 @@ The target catalog separates these identities:
 
 - A logical database has a stable UUID, user-facing name, topology generation,
   hash algorithm/version and seed.
-- A database shard is one range in that database's active routing epoch.
+- A database shard has a stable identity scoped by its logical-database UUID
+  and owns one range in that database's active routing epoch. The same
+  human-readable shard identifier may therefore exist in both `A` and `B`.
 - A placement maps a database shard to a physical PostgreSQL cell.
 - A physical cell can host shards from multiple logical databases, or it can
   be reserved for one database.
@@ -50,8 +52,9 @@ The target `PgShardDatabase` API supports four explicit policies:
   This gives the highest density, but CPU, memory, I/O, failover, physical
   backup, and restore blast radius are shared.
 - `SharedNode`: use separate PostgreSQL cells and PVCs but schedule them on the
-  same Kubernetes Nodes as selected cells. Resource and backup isolation are
-  retained; node failure remains shared.
+  same Kubernetes Nodes as selected cells. PostgreSQL-process, volume, and
+  backup isolation are retained; node capacity, kernel, and node failure remain
+  shared.
 - `Dedicated`: create database-only cells with required pod and node
   anti-affinity. No other database is scheduled into those cells.
 - `Explicit`: map each database-shard ordinal to stable cell IDs. The operator
@@ -63,7 +66,10 @@ first three cells used by `A` records those exact stable cell IDs so later
 scaling or resharding cannot silently move `B`. Resource-derived PostgreSQL
 tuning uses the cell's total limits and reservations for every colocated
 database. Per-database connection, worker, memory, I/O, WAL-retention, and
-admission budgets prevent one tenant from consuming the whole cell.
+admission budgets bound operator-managed work, but they are not hard isolation:
+databases in one PostgreSQL process still share CPU scheduling, memory, WAL,
+checkpoint, autovacuum, I/O, failover, and superuser trust domains. Workloads
+that require hard process, volume, or failure isolation must use `Dedicated`.
 
 ## Routing and management scope
 
@@ -81,10 +87,14 @@ it does not expose one database's PostgreSQL roles to another database.
 ## Topology identity
 
 A database topology fingerprint covers PostgreSQL major, hash
-algorithm/version, hash seed, logical shard count, stable shard
-identities/ordinals, and every half-open range boundary. Physical cell IDs and
-Kubernetes Node names are placement, not logical topology, so an exact topology
-can be restored onto replacement hardware.
+algorithm/version, hash seed, logical shard count, ordered shard ordinals, and
+every half-open range boundary. It excludes logical-database, database-shard,
+and restore-incarnation UUIDs, physical cell IDs, and Kubernetes Node names.
+Restoring `A` as `B` allocates fresh database, database-shard, and restore
+identities while preserving the same ordinals and ranges. Source identities are
+recorded only as immutable provenance, so `A` and `B` can coexist without
+sharing durable identities. Physical placement may move to replacement
+hardware.
 
 Restore has no topology override. An absent destination is created from the
 backup fingerprint. A pre-created destination must be empty, non-serving, and
@@ -96,15 +106,23 @@ Changing topology is a separate
 [online database move or reshard](../operations/online-resharding.md) after the
 exact restore completes.
 
+The Milestone 1 restore engine initially materializes that exact topology on
+new `Dedicated` cells only. It rejects direct restore to `SharedCell`,
+`SharedNode`, or `Explicit` placement with `RestorePlacementUnsupported`.
+Sharing or explicit placement is a later online move after the dedicated copy
+has been validated and activated; restored physical bytes are never attached
+to an already-serving shared cell.
+
 ## Backup consequences of sharing
 
 pgBackRest is physical-cell scoped, not logical-database scoped. A backup of
 `A` therefore references every cell that stores an `A` shard. If one of those
 cells also stores `B`, the encrypted base backup necessarily contains `B`'s
 physical bytes. Restore starts those cells only inside a quarantined staging
-cluster, exposes no Services, materializes only the requested database into its
-destination, and destroys the staging volumes after verification. Unselected
-databases are never registered or made queryable in the destination.
+cluster, exposes no Services, logically imports only the requested database
+into fresh dedicated destination cells, and destroys the staging volumes after
+verification. Unselected databases are never registered, copied, or made
+queryable in the destination.
 
 Dedicated placement avoids that retention and restore coupling at the cost of
 more PostgreSQL cells and resources.

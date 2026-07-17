@@ -74,7 +74,7 @@ const (
 	PostgreSQLPodTerminationFinalizer       = "pgshard.io/postgresql-termination"
 	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 	shardschemaMigrationPath                = "/usr/share/pgshard/migrations/0001_shardschema.sql"
-	shardschemaMigrationSHA256              = "f337074ad36ac3741979d34083150803926434a49a4b6b655124028184a92084"
+	shardschemaMigrationSHA256              = "690aaf875666c5735e1fc0fc649d5746edcd9831e47a5ef155053c6e9d681333"
 	shardschemaMigrationHashAnnotation      = "pgshard.io/shardschema-migration-sha256"
 )
 
@@ -178,6 +178,45 @@ fi
 cleanup_expected
 trap - EXIT
 
+if [[ ! -f "$final/postgresql.auto.conf" || -L "$final/postgresql.auto.conf" ]]; then
+  echo "refusing an unsafe restored postgresql.auto.conf" >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]*[^#[:space:]]' "$final/postgresql.auto.conf"; then
+  echo "refusing active settings in restored postgresql.auto.conf" >&2
+  exit 1
+else
+  inspect_status=$?
+  if (( inspect_status != 1 )); then
+    echo "refusing postgresql.auto.conf that cannot be inspected safely" >&2
+    exit 1
+  fi
+fi
+for recovery_state in standby.signal recovery.signal; do
+  if [[ -e "$final/$recovery_state" || -L "$final/$recovery_state" ]]; then
+    echo "refusing PostgreSQL recovery state during primary bootstrap ($recovery_state)" >&2
+    exit 1
+  fi
+done
+if [[ -L "$final/pg_wal" || ! -d "$final/pg_wal" ]]; then
+  echo "refusing PostgreSQL WAL outside the managed PGDATA directory" >&2
+  exit 1
+fi
+if [[ -L "$final/pg_tblspc" || ! -d "$final/pg_tblspc" ]]; then
+  echo "refusing an unsafe PostgreSQL tablespace directory" >&2
+  exit 1
+fi
+if ! tablespace_entry="$(
+  find "$final/pg_tblspc" -mindepth 1 -maxdepth 1 -print -quit
+)"; then
+  echo "refusing a PostgreSQL tablespace directory that cannot be inspected safely" >&2
+  exit 1
+fi
+if [[ -n "$tablespace_entry" ]]; then
+  echo "refusing PostgreSQL tablespaces outside the managed PGDATA directory" >&2
+  exit 1
+fi
+
 if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" != "true" ]]; then
   exit 0
 fi
@@ -185,7 +224,18 @@ fi
 socket=/tmp/pgshard-catalog-bootstrap
 rm -rf -- "$socket"
 mkdir -m 0700 -- "$socket"
-export PGOPTIONS='-c lock_timeout=5s -c statement_timeout=30s -c transaction_timeout=120s -c idle_in_transaction_session_timeout=30s -c search_path=pg_catalog -c quote_all_identifiers=off'
+quarantine_hba="$(mktemp /tmp/pgshard-catalog-bootstrap-hba.XXXXXX)"
+chmod 0600 "$quarantine_hba"
+printf '%s\n' \
+  'local all postgres trust' \
+  'local all all reject' \
+  'host all all 0.0.0.0/0 reject' \
+  'host all all ::0/0 reject' > "$quarantine_hba"
+export PGOPTIONS='-c lock_timeout=5s -c statement_timeout=30s -c transaction_timeout=120s -c idle_in_transaction_session_timeout=30s -c search_path=pg_catalog -c quote_all_identifiers=off -c event_triggers=off -c session_replication_role=origin -c session_preload_libraries= -c local_preload_libraries= -c jit=off -c default_tablespace= -c temp_tablespaces= -c default_table_access_method=heap -c row_security=off'
+cleanup_bootstrap_runtime() {
+  rm -f -- "$quarantine_hba"
+  rm -rf -- "$socket"
+}
 stop_temporary_postgres() {
   result=$?
   trap - EXIT
@@ -194,12 +244,18 @@ stop_temporary_postgres() {
       result=1
     fi
   fi
+  cleanup_bootstrap_runtime
   exit "$result"
 }
 trap stop_temporary_postgres EXIT
 
+# Role and database defaults remain untrusted even after active restored
+# postgresql.auto.conf settings have been rejected. Mirror the agent's
+# quarantine launch boundary: command-line values override inherited settings,
+# callbacks and preload libraries are disabled, durability checks stay strict,
+# and only this container's private Unix socket can authenticate.
 pg_ctl -D "$final" -w -t 45 start \
-  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700"
+  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c data_directory='$final' -c hba_file='$quarantine_hba' -c external_pid_file=/tmp/pgshard-catalog-bootstrap.pid -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c unix_socket_group= -c port=5432 -c ssl=off -c restart_after_crash=off -c primary_conninfo= -c primary_slot_name= -c restore_command= -c archive_cleanup_command= -c recovery_end_command= -c archive_mode=on -c archive_command= -c archive_library= -c max_wal_senders=0 -c max_logical_replication_workers=0 -c sync_replication_slots=off -c wal_receiver_create_temp_slot=off -c idle_replication_slot_timeout=0 -c max_slot_wal_keep_size=-1 -c shared_preload_libraries= -c session_preload_libraries= -c local_preload_libraries= -c event_triggers=off -c jit=off -c fsync=on -c full_page_writes=on -c ignore_invalid_pages=off -c data_sync_retry=off -c ignore_checksum_failure=off -c zero_damaged_pages=off -c logging_collector=off"
 
 database_exists="$(
   psql -X --no-password --host="$socket" --username=postgres --dbname=postgres --no-align --tuples-only \
@@ -235,22 +291,38 @@ validate_shard_inventory() {
   invalid_shards="$(
     psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
       --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
-        SELECT pg_catalog.count(*)
-          FROM pgshard_catalog.shards AS shards
-         WHERE NOT (
-           shards.shard_id::text = 'shard-' || pg_catalog.lpad(
-             shards.shard_number::text,
-             CASE
-               WHEN pg_catalog.length(shards.shard_number::text) < 4 THEN 4
-               ELSE pg_catalog.length(shards.shard_number::text)
-             END,
-             '0'
-           )
-           AND (
-             (shards.shard_number < $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'active')
-             OR (shards.shard_number >= $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'retired')
-           )
-         )"
+        SELECT (
+                 SELECT pg_catalog.count(*)
+                   FROM pgshard_catalog.shards AS shards
+                  WHERE NOT (
+                    shards.shard_id::text = 'shard-' || pg_catalog.lpad(
+                      shards.shard_number::text,
+                      CASE
+                        WHEN pg_catalog.length(shards.shard_number::text) < 4 THEN 4
+                        ELSE pg_catalog.length(shards.shard_number::text)
+                      END,
+                      '0'
+                    )
+                    AND (
+                      (shards.shard_number < $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'active')
+                      OR (shards.shard_number >= $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'retired')
+                    )
+                  )
+               ) + (
+                 SELECT pg_catalog.count(*)
+                   FROM pg_catalog.generate_series(
+                          0,
+                          $PGSHARD_SHARD_COUNT::bigint - 1
+                        ) AS expected(shard_number)
+                   LEFT JOIN pgshard_catalog.shards AS shards
+                     ON shards.shard_id::text = 'shard-' || pg_catalog.lpad(
+                          expected.shard_number::text,
+                          4,
+                          '0'
+                        )
+                    AND shards.shard_number = expected.shard_number
+                  WHERE shards.shard_id IS NULL
+               )"
   )"
   if [[ "$invalid_shards" != "0" ]]; then
     echo "refusing shardschema inventory that conflicts with the configured immutable shards" >&2
@@ -262,18 +334,26 @@ validate_restore_lineage() {
   invalid_lineage="$(
     psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
       --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
-        SELECT pg_catalog.count(*)
-          FROM pgshard_catalog.shards AS shards
-         WHERE NOT EXISTS (
-                 SELECT
-                   FROM pgshard_catalog.shard_restore_incarnations AS history
-                  WHERE history.shard_id = shards.shard_id
-               )
-            OR (shards.state = 'active') IS DISTINCT FROM EXISTS (
-                 SELECT
+        SELECT (
+                 SELECT pg_catalog.count(*)
+                   FROM pgshard_catalog.shards AS shards
+                  WHERE NOT EXISTS (
+                          SELECT
+                            FROM pgshard_catalog.shard_restore_incarnations AS history
+                           WHERE history.shard_id = shards.shard_id
+                        )
+                     OR (shards.state = 'active') IS DISTINCT FROM EXISTS (
+                          SELECT
+                            FROM pgshard_catalog.shard_restore_incarnations AS incarnations
+                           WHERE incarnations.shard_id = shards.shard_id
+                             AND incarnations.state = 'active'
+                        )
+               ) + (
+                 SELECT pg_catalog.count(*)
                    FROM pgshard_catalog.shard_restore_incarnations AS incarnations
-                  WHERE incarnations.shard_id = shards.shard_id
-                    AND incarnations.state = 'active'
+                   LEFT JOIN pgshard_catalog.shards AS shards
+                     ON shards.shard_id = incarnations.shard_id
+                  WHERE shards.shard_id IS NULL
                )"
   )"
   if [[ "$invalid_lineage" != "0" ]]; then
@@ -282,10 +362,62 @@ validate_restore_lineage() {
   fi
 }
 
+validate_catalog_sequence_progress() {
+  unsafe_sequences="$(
+    psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+        SELECT pg_catalog.count(*)
+          FROM (
+            SELECT
+              CASE
+                WHEN sequence_state.is_called
+                  THEN sequence_state.last_value::numeric + 1
+                ELSE sequence_state.last_value::numeric
+              END AS next_value,
+              COALESCE(
+                (SELECT pg_catalog.max(routing_epoch)::numeric
+                   FROM pgshard_catalog.routing_epochs),
+                0
+              ) AS maximum_value,
+              (SELECT sequences.seqmax::numeric
+                 FROM pg_catalog.pg_sequence AS sequences
+                WHERE sequences.seqrelid =
+                      'pgshard_catalog.routing_epochs_routing_epoch_seq'::pg_catalog.regclass
+              ) AS maximum_generated_value
+              FROM pgshard_catalog.routing_epochs_routing_epoch_seq AS sequence_state
+            UNION ALL
+            SELECT
+              CASE
+                WHEN sequence_state.is_called
+                  THEN sequence_state.last_value::numeric + 1
+                ELSE sequence_state.last_value::numeric
+              END,
+              COALESCE(
+                (SELECT pg_catalog.max(registered_table_id)::numeric
+                   FROM pgshard_catalog.registered_tables),
+                0
+              ),
+              (SELECT sequences.seqmax::numeric
+                 FROM pg_catalog.pg_sequence AS sequences
+                WHERE sequences.seqrelid =
+                      'pgshard_catalog.registered_tables_registered_table_id_seq'::pg_catalog.regclass
+              )
+              FROM pgshard_catalog.registered_tables_registered_table_id_seq AS sequence_state
+          ) AS sequence_progress
+         WHERE sequence_progress.next_value <= sequence_progress.maximum_value
+            OR sequence_progress.next_value > sequence_progress.maximum_generated_value"
+  )"
+  if [[ "$unsafe_sequences" != "0" ]]; then
+    echo "refusing shardschema identity sequence progress that conflicts with catalog rows" >&2
+    return 1
+  fi
+}
+
 validate_catalog_inventory() {
   validate_cluster_configuration
   validate_shard_inventory
   validate_restore_lineage
+  validate_catalog_sequence_progress
 }
 
 # CREATE TABLE IF NOT EXISTS cannot repair a damaged pre-existing relation.
@@ -600,6 +732,7 @@ case "$catalog_core_tables" in
       echo "refusing a non-empty pre-existing pgshard_catalog schema" >&2
       exit 1
     fi
+    catalog_requires_initial_inventory=true
     ;;
   "t|t|t")
     case "$catalog_schema_fingerprint" in
@@ -612,6 +745,7 @@ case "$catalog_core_tables" in
         ;;
     esac
     validate_catalog_inventory
+    catalog_requires_initial_inventory=false
     ;;
   *)
     echo "refusing a partial pre-existing shardschema catalog" >&2
@@ -621,8 +755,6 @@ esac
 
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
   --set=ON_ERROR_STOP=1 --file="$PGSHARD_SHARDSCHEMA_MIGRATION"
-
-validate_catalog_inventory
 
 count_missing_shards() {
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
@@ -638,9 +770,14 @@ count_missing_shards() {
 
 missing_shards="$(count_missing_shards)"
 if [[ "$missing_shards" != "0" ]]; then
+  if [[ "$catalog_requires_initial_inventory" != "true" ]]; then
+    echo "refusing shardschema inventory that conflicts with the configured immutable shards" >&2
+    exit 1
+  fi
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
     --set=ON_ERROR_STOP=1 <<PGSHARD_SHARD_INVENTORY
 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET LOCAL session_replication_role = origin;
 INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state)
 SELECT (
          'shard-' || pg_catalog.lpad(expected.shard_number::text, 4, '0')
@@ -652,6 +789,36 @@ SELECT (
     ON shards.shard_id::text = 'shard-' || pg_catalog.lpad(expected.shard_number::text, 4, '0')
    AND shards.shard_number = expected.shard_number
  WHERE shards.shard_id IS NULL;
+DO \$pgshard_inventory_postcondition\$
+BEGIN
+  IF EXISTS (
+      SELECT
+        FROM pg_catalog.generate_series(
+               0,
+               $PGSHARD_SHARD_COUNT::bigint - 1
+             ) AS expected(shard_number)
+        LEFT JOIN pgshard_catalog.shards AS shards
+          ON shards.shard_id::text = 'shard-' || pg_catalog.lpad(
+               expected.shard_number::text,
+               4,
+               '0'
+             )
+         AND shards.shard_number = expected.shard_number
+       WHERE shards.shard_id IS NULL
+          OR shards.state <> 'active'
+          OR NOT EXISTS (
+               SELECT
+                 FROM pgshard_catalog.shard_restore_incarnations AS incarnations
+                WHERE incarnations.shard_id = shards.shard_id
+                  AND incarnations.state = 'active'
+             )
+  ) THEN
+    RAISE EXCEPTION USING
+      ERRCODE = '55000',
+      MESSAGE = 'initial shardschema inventory failed its transactional postcondition';
+  END IF;
+END
+\$pgshard_inventory_postcondition\$;
 COMMIT;
 PGSHARD_SHARD_INVENTORY
 fi
@@ -665,6 +832,7 @@ fi
 
 pg_ctl -D "$final" -w -t 45 stop -m fast
 trap - EXIT
+cleanup_bootstrap_runtime
 sync "$final" "$parent" "$volume_root"
 `
 
@@ -1184,7 +1352,7 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 		Name:            "postgresql",
 		Image:           image,
 		ImagePullPolicy: imagePullPolicy(image),
-		Args:            []string{"-c", "config_file=/etc/pgshard/postgresql/primary-0000.conf"},
+		Args:            []string{"-c", "config_file=/etc/pgshard/postgresql/primary-0000.conf", "-c", "allow_alter_system=off"},
 		Env:             []corev1.EnvVar{{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"}},
 		Ports:           []corev1.ContainerPort{{Name: "postgresql", ContainerPort: PostgreSQLPort, Protocol: corev1.ProtocolTCP}},
 		Resources:       cluster.Spec.PostgreSQL.Resources,

@@ -44,4 +44,9 @@ pub const SHARDSCHEMA_DATABASE: &str = "shardschema";
 pub const NOTIFY_CHANNEL: &str = "pgshard_catalog_changed";
 
 /// Idempotent `PostgreSQL` 18 catalog migration applied inside `shardschema`.
+///
+/// The caller must prevent new connections and arbitrary concurrent schema DDL
+/// for the complete migration. The operator provides that boundary with its
+/// private bootstrap postmaster; this constant is not a serving-database
+/// migration runner.
 pub const MIGRATION_SQL: &str = include_str!("../migrations/0001_shardschema.sql");
