@@ -1,5 +1,7 @@
 //! Core identifiers and deterministic routing primitives shared by pgshard.
 
+pub mod restore;
+
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};

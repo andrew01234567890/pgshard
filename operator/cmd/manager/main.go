@@ -129,6 +129,13 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
 	}
+	if err := (&controller.PgShardRestoreReconciler{
+		Client:    manager.GetClient(),
+		APIReader: manager.GetAPIReader(),
+	}).SetupWithManager(manager); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "PgShardRestore")
+		os.Exit(1)
+	}
 	if options.webhookEnabled {
 		handshakeCodec := podfence.NewSecretHandshakeCodec(manager.GetAPIReader(), receiptKey)
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCluster{}).
@@ -139,6 +146,12 @@ func main() {
 			}).
 			Complete(); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardCluster")
+			os.Exit(1)
+		}
+		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardRestore{}).
+			WithValidator(&pgshardv1alpha1.PgShardRestoreValidator{}).
+			Complete(); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardRestore")
 			os.Exit(1)
 		}
 		webhookServer.Register(podfence.BindingWebhookPath, &admission.Webhook{

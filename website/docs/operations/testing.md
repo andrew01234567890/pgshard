@@ -748,12 +748,19 @@ Jepsen/Elle check the guarantees actually offered: atomic final cross-shard outc
   shared-node cells, then on fully dedicated cells and Nodes. Routing, DDL,
   grants, backup barriers, and failure injection for one database must not
   advance another database's epochs.
-- Exact-topology restore preflight: five-to-five succeeds onto replacement
-  dedicated cells; five-to-three, changed range boundaries, changed hash
+- Exact-topology restore preflight: five-to-five request validation passes
+  without creating cells; future execution creates replacement dedicated
+  cells. Five-to-three, changed range boundaries, changed hash
   seed/version, duplicate shard ordinals, and non-empty destinations fail
   before any non-status mutation. The oracle compares all other Kubernetes
   objects, catalog rows and epochs, PV/PVC data identities, pgBackRest metadata,
   and MinIO object versions.
+  The implemented foundation covers signed manifest verification, canonical
+  range validation, typed count/range/hash mismatch errors, a status-only unit
+  mutation oracle, and live Kubernetes count and boundary API rejection. It
+  leaves the request `Pending/Ready=False` until an authoritative destination
+  catalog resolver exists; physical targets and repository access are not part
+  of this preflight slice.
 - Database-targeted recovery: restore `A` as `B` while the existing `A` stays
   available; restore `A` as `A` only when that name is absent; prove colocated
   database bytes in a physical backup never become registered or queryable.

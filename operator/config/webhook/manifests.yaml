@@ -128,6 +128,29 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-pgshard-io-v1alpha1-pgshardrestore
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpgshardrestore.kb.io
+  rules:
+  - apiGroups:
+    - pgshard.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - pgshardrestores
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-core-v1-postgresqlfencingnamespace
       port: 9444
   failurePolicy: Fail
