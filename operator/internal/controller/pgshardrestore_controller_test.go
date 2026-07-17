@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
@@ -253,6 +254,10 @@ func TestRequestedTopologyMismatchDoesNotClaimAuthoritativeFingerprint(t *testin
 		t.Fatal(err)
 	}
 	assertRestoreCondition(t, current, restorePreflightCondition, metav1.ConditionFalse, "RestoreTopologyMismatch")
+	condition := meta.FindStatusCondition(current.Status.Conditions, restorePreflightCondition)
+	if !strings.Contains(condition.Message, "requested=") || strings.Contains(condition.Message, "destination=") {
+		t.Fatalf("requested mismatch condition has ambiguous provenance: %q", condition.Message)
+	}
 	if current.Status.ManifestSHA256 == "" || current.Status.TopologySHA256 == "" || current.Status.DestinationTopologySHA256 != "" {
 		t.Fatalf("requested mismatch claimed authoritative destination evidence: %#v", current.Status)
 	}
