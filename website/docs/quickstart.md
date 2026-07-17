@@ -70,9 +70,12 @@ the operator additionally applies the same bytes before a managed shard-0000
 primary starts. Database creation is recoverable; the migration and shard
 inventory update each run in their own transaction. PostgreSQL remains
 unavailable until both succeed and the final catalog invariants pass. An empty
-database left before migration is safe to retry. A partial core catalog or
-conflicting home-shard, shard-state, or restore-lineage record is rejected
-before the migration can rewrite it.
+database left before migration and a released v0.49 catalog are safe to retry.
+Known missing core relations may be added by migration, but a restore-lineage
+table without a shard inventory, or a conflicting home-shard, shard-state, or
+restore-lineage record, is rejected before migration can rewrite it. Catalog
+clients use bounded lock and statement timeouts so a conflicting prepared lock
+fails the init pass for retry instead of hanging a Pod restart.
 
 ## Exercise the development manager
 
@@ -102,6 +105,8 @@ The local bootstrap tag is the only mutable reference accepted for this source
 workflow and its Pod pull policy is `Never`; a missing node-local image fails
 closed instead of consulting a registry. Non-development operator deployments
 must configure `--postgresql-bootstrap-image` with an immutable SHA-256 digest.
+At runtime the init process still verifies that image's `postgres` binary and
+both existing and newly initialized PGDATA report major 18 before publication.
 
 The admission overlay provisions an ECDSA serving chain and a separate immutable
 256-bit fencing key into exact-name operator-managed Secrets, injects the CA
@@ -183,5 +188,7 @@ or the repository's restricted-client KIND test. The `single-member-rw`, `-ro`,
 and `-r` Services still lead to the rejection-only pooler. PostgreSQL
 StatefulSets use `OnDelete`; desired image or configuration changes do not
 automatically restart every shard. Until staged upgrades exist, delete one Pod
-at a time and expect an outage for that single-member shard. Delete the
+at a time and expect an outage for that single-member shard. This includes
+singleton StatefulSets created before catalog bootstrap was added: their
+existing Pods do not run the new init container until explicitly replaced. Delete the
 disposable cluster with `kind delete cluster --name pgshard-development`.

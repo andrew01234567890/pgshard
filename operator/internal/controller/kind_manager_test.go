@@ -217,8 +217,71 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, before); err != nil {
 		t.Fatal(err)
 	}
+	oldShardZeroHash := before.Annotations[owned.ConfigHashAnnotation]
+	oldShardOneHash := shardOne.Annotations[owned.ConfigHashAnnotation]
+	if oldShardZeroHash == "" || oldShardOneHash == "" {
+		t.Fatalf("PostgreSQL Pods lack configuration hashes: shard-0000=%q shard-0001=%q", oldShardZeroHash, oldShardOneHash)
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &pgshardv1alpha1.PgShardCluster{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), latest); err != nil {
+			return err
+		}
+		latest.Spec.PostgreSQL.Parameters = maps.Clone(latest.Spec.PostgreSQL.Parameters)
+		if latest.Spec.PostgreSQL.Parameters == nil {
+			latest.Spec.PostgreSQL.Parameters = make(map[string]string, 1)
+		}
+		latest.Spec.PostgreSQL.Parameters["log_statement"] = "ddl"
+		return kubeClient.Update(ctx, latest)
+	}); err != nil {
+		t.Fatalf("publish desired PostgreSQL configuration: %v", err)
+	}
+	var desiredShardZeroHash, desiredShardOneHash string
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		shardZeroStatefulSet := &appsv1.StatefulSet{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}, shardZeroStatefulSet); err != nil {
+			return false, err
+		}
+		shardOneStatefulSet := &appsv1.StatefulSet{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 1)}, shardOneStatefulSet); err != nil {
+			return false, err
+		}
+		desiredShardZeroHash = shardZeroStatefulSet.Spec.Template.Annotations[owned.ConfigHashAnnotation]
+		desiredShardOneHash = shardOneStatefulSet.Spec.Template.Annotations[owned.ConfigHashAnnotation]
+		if desiredShardZeroHash == "" || desiredShardOneHash == "" || desiredShardZeroHash == oldShardZeroHash || desiredShardOneHash == oldShardOneHash {
+			return false, nil
+		}
+		currentShardZero := &corev1.Pod{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, currentShardZero); err != nil {
+			return false, err
+		}
+		currentShardOne := &corev1.Pod{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardOnePod}, currentShardOne); err != nil {
+			return false, err
+		}
+		if currentShardZero.UID != before.UID || currentShardOne.UID != shardOne.UID || currentShardZero.Annotations[owned.ConfigHashAnnotation] != oldShardZeroHash || currentShardOne.Annotations[owned.ConfigHashAnnotation] != oldShardOneHash {
+			return false, fmt.Errorf("OnDelete configuration publication restarted a PostgreSQL Pod: shard-0000=%s/%s shard-0001=%s/%s", currentShardZero.UID, currentShardZero.Annotations[owned.ConfigHashAnnotation], currentShardOne.UID, currentShardOne.Annotations[owned.ConfigHashAnnotation])
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("wait for inert OnDelete PostgreSQL template update: %v", err)
+	}
 	runKubectl(t, ctx, "--namespace", namespace.Name, "delete", "pod", shardZeroPod, "--wait=false")
 	waitForRecreatedReadyPod(t, ctx, kubeClient, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, before.UID)
+	recreatedShardZero := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, recreatedShardZero); err != nil {
+		t.Fatal(err)
+	}
+	untouchedShardOne := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardOnePod}, untouchedShardOne); err != nil {
+		t.Fatal(err)
+	}
+	if recreatedShardZero.UID == before.UID || recreatedShardZero.Annotations[owned.ConfigHashAnnotation] != desiredShardZeroHash {
+		t.Fatalf("explicit shard-0000 restart did not adopt desired template: UID=%s hash=%q, old UID=%s desired hash=%q", recreatedShardZero.UID, recreatedShardZero.Annotations[owned.ConfigHashAnnotation], before.UID, desiredShardZeroHash)
+	}
+	if untouchedShardOne.UID != shardOne.UID || untouchedShardOne.Annotations[owned.ConfigHashAnnotation] != oldShardOneHash || desiredShardOneHash == oldShardOneHash {
+		t.Fatalf("shard-0001 changed during shard-0000 rollout: UID=%s hash=%q, old UID=%s old hash=%q desired hash=%q", untouchedShardOne.UID, untouchedShardOne.Annotations[owned.ConfigHashAnnotation], shardOne.UID, oldShardOneHash, desiredShardOneHash)
+	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
 		t.Fatalf("query after StatefulSet restart = %q", got)

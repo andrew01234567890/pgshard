@@ -3470,12 +3470,67 @@ func TestReconcileReportsPlanFailureWithoutAdvancingObservedGeneration(t *testin
 	if got.Status.Phase != "Degraded" || got.Status.ObservedGeneration != 0 {
 		t.Fatalf("status = %#v", got.Status)
 	}
-	if !contains(got.Finalizers, resourceFinalizer) {
-		t.Fatalf("invalid plan did not retain its cleanup finalizer: %#v", got.Finalizers)
+	if contains(got.Finalizers, resourceFinalizer) {
+		t.Fatalf("invalid image configuration installed a cleanup finalizer: %#v", got.Finalizers)
 	}
 	assertCondition(t, got, reconciledCondition, metav1.ConditionFalse, "PlanInvalid")
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PlanInvalid")
 	assertCondition(t, got, transportSecurityCondition, metav1.ConditionUnknown, "TransportSecurityUnobserved")
+}
+
+func TestReconcileRejectsSingletonBootstrapImageBeforeDurableProvisioning(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		image string
+	}{
+		{name: "missing"},
+		{name: "mutable remote", image: "ghcr.io/andrew01234567890/pgshard-postgres-agent:main"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			images := owned.DefaultImages()
+			images.PostgreSQLBootstrap = test.image
+			fakeClient := newFakeClient(t, cluster)
+			reconciler := &PgShardClusterReconciler{Client: fakeClient, Images: images}
+
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil {
+				t.Fatal("expected invalid PostgreSQL bootstrap image to fail")
+			}
+			got := getCluster(t, ctx, fakeClient, cluster)
+			if got.Status.Phase != "Degraded" || got.Status.ObservedGeneration != 0 {
+				t.Fatalf("status = %#v", got.Status)
+			}
+			if contains(got.Finalizers, resourceFinalizer) {
+				t.Fatalf("invalid bootstrap image installed a cleanup finalizer: %#v", got.Finalizers)
+			}
+			if got.Status.PostgreSQLBootstrapSpec != nil || len(got.Status.PostgreSQLBootstraps) != 0 {
+				t.Fatalf("invalid bootstrap image recorded durable bootstrap state: %#v", got.Status)
+			}
+			assertCondition(t, got, reconciledCondition, metav1.ConditionFalse, "PlanInvalid")
+
+			secrets := &corev1.SecretList{}
+			if err := fakeClient.List(ctx, secrets, client.InNamespace(cluster.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			claims := &corev1.PersistentVolumeClaimList{}
+			if err := fakeClient.List(ctx, claims, client.InNamespace(cluster.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			statefulSets := &appsv1.StatefulSetList{}
+			if err := fakeClient.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if len(secrets.Items) != 0 || len(claims.Items) != 0 || len(statefulSets.Items) != 0 {
+				t.Fatalf("invalid bootstrap image provisioned resources: secrets=%d claims=%d StatefulSets=%d", len(secrets.Items), len(claims.Items), len(statefulSets.Items))
+			}
+		})
+	}
 }
 
 func validCluster() *pgshardv1alpha1.PgShardCluster {

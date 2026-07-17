@@ -561,11 +561,19 @@ transaction and inactive logical slot durable before recreation, proving the
 private init postmaster loads the managed logical-WAL and 2PC settings. It also
 proves an omitted storage class was resolved and
 checkpointed on the resulting Bound PVC, then explicitly deletes one
-`OnDelete` primary Pod
-and verifies its PVC-backed row survives. Against a separate Docker volume, the
-same job runs the exact init command from a pre-created empty database and a
-valid one-shard partial inventory, then injects an extra active shard and proves
-the pre-migration rejection preserves the catalog epoch and trigger identities.
+`OnDelete` primary Pod after first publishing a changed desired configuration.
+It proves neither primary restarts when the StatefulSet templates change, the
+selected replacement adopts the new template, the other shard remains on its
+original UID and configuration, and the PVC-backed row survives. Against a
+separate Docker volume, the same job upgrades the released v0.49 catalog,
+converges a one-shard inventory to two shards, accepts canonical five-digit
+retired shard IDs, and rejects wrong home-shard identity, missing active restore
+lineage, and malformed shard IDs without changing the catalog epoch or trigger
+identities. A prepared `ACCESS EXCLUSIVE` lock must fail within the bootstrap
+lock timeout; a second blocked init container is then killed with `SIGKILL`,
+after which retry on the same volume must recover. A second PGDATA fixture
+rejects restore lineage without shard inventory and then proves a recreated
+empty database is recoverable.
 A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the

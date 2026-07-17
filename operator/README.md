@@ -95,6 +95,9 @@ image, script, or generated-configuration change therefore updates the desired
 template without concurrently deleting every singleton primary. Until a
 readiness-gated shard-at-a-time upgrade controller exists, an operator must
 delete one selected Pod at a time and accept that shard's documented outage.
+This also applies to a singleton StatefulSet created by an earlier operator:
+publishing the catalog-aware init container does not run it against the
+existing Pod until that Pod is explicitly replaced.
 
 Generated bootstrap credentials are unique per shard, immutable, and stable
 across reconciles. Each data PVC is likewise bound to its recorded name, UID,
@@ -118,20 +121,30 @@ publication barrier before PostgreSQL starts, so interruption after the atomic
 rename cannot skip it on the next init pass. These flushes are limited to the
 cluster's data path; bootstrap never issues a node-wide filesystem sync that
 could couple Pod startup or termination to unrelated mounts.
+Before reading or creating PGDATA, the init process requires its `postgres`
+binary to report the operator's exact supported major, currently 18. It also
+checks an existing `PG_VERSION` and the staging directory produced by `initdb`.
+An immutable image digest identifies bytes; it is not accepted as evidence that
+those bytes contain PostgreSQL 18.
 On shard-0000 only, the same init boundary starts PostgreSQL with network
 listening disabled and a private mode-0700 Unix socket. It loads the same
 resource-derived primary configuration as the main server so durable logical
 slots and prepared transactions remain startable during the init pass. Before
 applying SQL, it creates the UTF8 `shardschema` database when absent and
-preflights any existing core catalog tables, home-shard identity, canonical
-shard state, and active restore lineage. It then applies the hash-verified
-migration embedded in the selected bootstrap image and inserts only missing
-canonical shard identities from the immutable CR count. The migration and
+schema-aware preflights any known core catalog tables that already exist. It
+checks home-shard identity, canonical shard state, and active restore lineage,
+allows the migration to add known missing relations, and rejects a restore-lineage
+table with no shard inventory. It then applies the hash-verified migration
+embedded in the selected bootstrap image and inserts only missing canonical
+shard identities from the immutable CR count. Every bootstrap SQL client has a
+five-second lock timeout and a 30-second statement timeout, so catalog locks
+fail the init pass for retry instead of hanging every restart. The migration and
 inventory update are separate transactions; the primary starts only after both
-succeed and the final invariants are rechecked. A partial core catalog,
-conflicting identity or lineage, failed migration, or failed inventory
-transaction keeps the primary unready. Reapplying an unchanged migration and
-inventory does not advance the catalog epoch.
+succeed and the final invariants are rechecked. A conflicting identity or
+lineage, malformed inventory, failed migration, or failed inventory transaction
+keeps the primary unready. A released v0.49 catalog and an empty database are
+both supported retry inputs. Reapplying an unchanged migration and inventory
+does not advance the catalog epoch.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
@@ -286,8 +299,8 @@ The separate bootstrap image must provide the same PostgreSQL 18 command-line
 tools as UID/GID 999 plus the source migration at
 `/usr/share/pgshard/migrations/0001_shardschema.sql`; it is never used as the
 main database process and receives the superuser Secret only while the init
-container runs. The operator compares those migration bytes with its
-release-coupled SHA-256 value before touching PGDATA.
+container runs. The operator verifies the binary's exact major and compares the
+migration bytes with its release-coupled SHA-256 value before touching PGDATA.
 
 The module is pinned to Go 1.26.5, controller-runtime 0.24.1, and Kubernetes
 libraries 0.36.0. Only the Linux container deployment is supported.
@@ -524,8 +537,9 @@ real Kubernetes controllers. Another builds and loads local images, installs
 the self-managed admission manager, proves semantic admission rejection and
 certificate trust, preserves the fail-closed three-member boundary, and starts
 two restricted single-member PostgreSQL 18 primaries. It exercises TCP through
-a shard Service from an authorized restricted probe client, deletes one primary
-Pod, and verifies its data, catalog snapshot, prepared transaction, and logical
-slot survive recreation.
+a shard Service from an authorized restricted probe client, publishes a changed
+PostgreSQL configuration without restarting either `OnDelete` Pod, deletes only
+shard-0000, proves shard-0001 remains untouched, and verifies shard-0000's data,
+catalog snapshot, prepared transaction, and logical slot survive recreation.
 The test does not claim uninterrupted traffic. These targeted tests are not yet
 the full Milestone 1 KIND suite.
