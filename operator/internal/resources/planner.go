@@ -172,7 +172,7 @@ else
   # cannot delay PostgreSQL bootstrap or Pod termination.
   sync "$staging/pg_hba.conf" "$staging/.pgshard-bootstrap-complete" "$staging"
   mv -- "$staging" "$final"
-  sync "$final" "$parent"
+  sync "$final" "$parent" "$volume_root"
 fi
 
 cleanup_expected
