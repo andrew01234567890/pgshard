@@ -176,8 +176,11 @@ func assertRestoreNamespaceHasNoTargets(t *testing.T, ctx context.Context, kubeC
 	if err := kubeClient.List(ctx, configMaps, client.InNamespace(namespace)); err != nil {
 		t.Fatal(err)
 	}
-	if len(configMaps.Items) != 1 || configMaps.Items[0].Name != sentinel.Name {
-		t.Fatalf("restore preflight created ConfigMaps: %#v", configMaps.Items)
+	for index := range configMaps.Items {
+		name := configMaps.Items[index].Name
+		if name != sentinel.Name && name != "kube-root-ca.crt" {
+			t.Fatalf("restore preflight created unexpected ConfigMap %q: %#v", name, configMaps.Items)
+		}
 	}
 	secrets := &corev1.SecretList{}
 	if err := kubeClient.List(ctx, secrets, client.InNamespace(namespace)); err != nil {
