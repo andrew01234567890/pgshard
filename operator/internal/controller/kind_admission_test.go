@@ -239,6 +239,8 @@ func waitForDefaultedDryRunCreate(
 
 func assertFencingKeyLossFailsReadiness(t *testing.T, ctx context.Context, kubeClient client.Client) {
 	t.Helper()
+	manager := waitForOnlyReadyManagerPod(t, ctx, kubeClient, "")
+	managerUID := manager.UID
 	key := types.NamespacedName{Namespace: "pgshard-system", Name: "pgshard-webhook-fencing-key"}
 	original := &corev1.Secret{}
 	if err := kubeClient.Get(ctx, key, original); err != nil {
@@ -282,36 +284,36 @@ func assertFencingKeyLossFailsReadiness(t *testing.T, ctx context.Context, kubeC
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cleanupCancel()
 		replace(cleanupCtx, valid())
-		waitForManagerReadiness(t, cleanupCtx, kubeClient, true)
+		waitForManagerReadiness(t, cleanupCtx, kubeClient, managerUID, true)
 	}()
 
 	dirty = true
 	replace(ctx, nil)
-	waitForManagerReadiness(t, ctx, kubeClient, false)
+	waitForManagerReadiness(t, ctx, kubeClient, managerUID, false)
 	replace(ctx, valid())
 	dirty = false
-	waitForManagerReadiness(t, ctx, kubeClient, true)
+	waitForManagerReadiness(t, ctx, kubeClient, managerUID, true)
 
 	malformed := valid()
 	malformed.Data[pki.PodFencingKeyKey] = make([]byte, podfence.SecretKeyBytes-1)
 	dirty = true
 	replace(ctx, malformed)
-	waitForManagerReadiness(t, ctx, kubeClient, false)
+	waitForManagerReadiness(t, ctx, kubeClient, managerUID, false)
 	replace(ctx, valid())
 	dirty = false
-	waitForManagerReadiness(t, ctx, kubeClient, true)
+	waitForManagerReadiness(t, ctx, kubeClient, managerUID, true)
 
 	different := valid()
 	different.Data[pki.PodFencingKeyKey][0] ^= 0xff
 	dirty = true
 	replace(ctx, different)
-	waitForManagerReadiness(t, ctx, kubeClient, false)
+	waitForManagerReadiness(t, ctx, kubeClient, managerUID, false)
 	replace(ctx, valid())
 	dirty = false
-	waitForManagerReadiness(t, ctx, kubeClient, true)
+	waitForManagerReadiness(t, ctx, kubeClient, managerUID, true)
 }
 
-func waitForManagerReadiness(t *testing.T, ctx context.Context, kubeClient client.Client, wanted bool) {
+func waitForManagerReadiness(t *testing.T, ctx context.Context, kubeClient client.Client, expectedUID types.UID, wanted bool) {
 	t.Helper()
 	pods := &corev1.PodList{}
 	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
@@ -322,12 +324,28 @@ func waitForManagerReadiness(t *testing.T, ctx context.Context, kubeClient clien
 		); err != nil {
 			return false, err
 		}
-		if len(pods.Items) != 1 || len(pods.Items[0].Status.ContainerStatuses) != 1 {
-			return false, nil
+		if len(pods.Items) != 1 {
+			return false, fmt.Errorf("manager Pod count changed from one to %d", len(pods.Items))
 		}
-		status := pods.Items[0].Status.ContainerStatuses[0]
+		pod := &pods.Items[0]
+		if pod.UID != expectedUID {
+			return false, fmt.Errorf("manager Pod changed from UID %s to %s", expectedUID, pod.UID)
+		}
+		if pod.DeletionTimestamp != nil {
+			return false, fmt.Errorf("manager Pod %s entered deletion", pod.Name)
+		}
+		if pod.Status.Phase != corev1.PodRunning {
+			return false, fmt.Errorf("manager Pod %s left Running phase for %s", pod.Name, pod.Status.Phase)
+		}
+		if len(pod.Status.ContainerStatuses) != 1 {
+			return false, fmt.Errorf("manager Pod %s has %d container statuses", pod.Name, len(pod.Status.ContainerStatuses))
+		}
+		status := pod.Status.ContainerStatuses[0]
 		if status.RestartCount != 0 {
-			return false, fmt.Errorf("manager Pod %s restarted %d times", pods.Items[0].Name, status.RestartCount)
+			return false, fmt.Errorf("manager Pod %s restarted %d times", pod.Name, status.RestartCount)
+		}
+		if status.State.Running == nil {
+			return false, fmt.Errorf("manager Pod %s container left Running state", pod.Name)
 		}
 		return status.Ready == wanted, nil
 	})
