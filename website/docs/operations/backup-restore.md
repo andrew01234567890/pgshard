@@ -176,7 +176,6 @@ signature. The first observed Secret UID is pinned in status and cannot be
 rebound by deleting and recreating the Secret; a replacement requires a new
 `PgShardRestore`. Manifest/topology SHA-256 digests are also checkpointed, and
 restore execution must revalidate them.
-
 The destination name must either be absent or reserved by an empty, non-serving
 `PgShardDatabase`. Restore does not overwrite an active database. Replacing an
 existing name is a later, explicit online database move.
