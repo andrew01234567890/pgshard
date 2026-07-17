@@ -93,7 +93,12 @@ initialized key without an anchor is refused and must be pinned while the old
 manager is healthy before the new image is rolled out. Established receipt
 history is then verified before a separate completion marker is written. See
 [High availability](operations/high-availability.md) for the pre-anchor
-development upgrade command. Startup, readiness,
+development upgrade command. That one-time keyless-to-`receipt-v1` transition
+is fail closed rather than zero rejection: freeze cluster writes, leave Pod
+fencing disabled in resource namespaces, and wait for the new manager rollout
+before retrying admission requests. Later compatible manager Pods drain stale
+Service endpoints for five seconds within a 20-second total termination budget.
+Startup, readiness,
 receipt-authenticated admission, and reconciliation reject an empty, mutable,
 incorrectly sized, or different replacement key. The leaf certificate renews without a Pod restart;
 automatic CA or fencing-key rotation is not yet implemented. Expect the sample to remain `Ready=False`, its

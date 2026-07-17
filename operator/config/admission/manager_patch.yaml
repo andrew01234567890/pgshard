@@ -6,6 +6,9 @@ metadata:
 spec:
   progressDeadlineSeconds: 180
   template:
+    metadata:
+      labels:
+        pgshard.io/webhook-contract: receipt-v1
     spec:
       terminationGracePeriodSeconds: 20
       containers:

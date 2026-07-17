@@ -298,9 +298,16 @@ so this sample must not be used as zero-downtime evidence.
 ## Self-managed admission manager
 
 `config/admission` extends the same local-image install with four generated
-mutating webhooks and five generated validating webhooks. A terminating manager
-continues serving for a five-second endpoint-propagation drain before it receives
-`SIGTERM`; the Pod then retains a further 15 seconds for graceful shutdown. The
+mutating webhooks and five generated validating webhooks. A manager Pod created
+by this overlay has a 20-second total termination budget. Its `preStop` hook
+uses the first five seconds as an endpoint-propagation drain before `SIGTERM`,
+leaving roughly 15 seconds for graceful shutdown. The webhook Service selects
+only Pods labelled for the `receipt-v1` admission contract, so the last keyless
+manager cannot serve newly introduced receipt paths or apply its older validator
+during the transition. This selector deliberately makes that one-time contract
+upgrade fail closed until a new manager is ready. Later `receipt-v1`-compatible
+rollouts retain an old compatible endpoint through the surge and drain it before
+termination. The
 binding mutator, binding final-state validator, and cluster-handshake webhook
 are scoped to namespaces labelled `pgshard.io/pod-fencing=enabled`; the status
 and metadata webhooks are scoped to
@@ -390,14 +397,20 @@ or malformed. Existing non-empty malformed Secrets,
 foreign CA bundles, and incorrectly targeted webhook configurations stop
 startup instead of being overwritten.
 
-The keyless release on the default branch needs no manual key command. Deploy
-the updated manifest and an immutable new manager image in one rollout; the
-manifest request Secret must exist before a new Pod starts, while the old Pod is
-kept available by the zero-unavailable Deployment strategy. Do not restart the
-old image with the new command-line arguments. For a pre-release development
-install that already has an initialized unanchored key, perform this explicit
-first phase while the old manager is still healthy, then roll out the new
-manager image:
+The keyless release on the default branch needs no manual key command, but its
+webhook contract is not availability-compatible with `receipt-v1`. Freeze
+`PgShardCluster` writes and leave every resource namespace without the
+`pgshard.io/pod-fencing=enabled` label while applying the updated manifest and
+immutable manager image. The Service contract selector excludes the old manager,
+so admission requests can fail with a retryable webhook-unavailable error until
+the new Pod is Ready. `maxUnavailable: 0` preserves the old process; it cannot
+make that process serve routes or validation it does not implement. Wait for the
+manager rollout before retrying writes or enabling Pod fencing. Do not restart
+the old image with the new command-line arguments. A zero-rejection upgrade
+between incompatible webhook contracts requires staged compatibility tooling
+that is not implemented. For a pre-release development install that already has
+an initialized unanchored key, perform this explicit first phase while the old
+manager is still healthy, then roll out the new manager image:
 
 ```console
 KEY_UID="$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.metadata.uid}')"

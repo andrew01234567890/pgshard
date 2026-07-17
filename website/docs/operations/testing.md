@@ -610,7 +610,15 @@ mutable, oversized, or different valid key replacements fail startup, readiness,
 receipt-authenticated webhook use, and controller verification. The KIND
 admission test deletes and replaces the shared key with malformed and different
 valid values, observes the manager become unready without restarting, then
-restores the original bytes.
+restores the original bytes. The same CI job restarts a `receipt-v1` manager
+while continuously submitting server-side dry-run cluster creates. It requires
+at least 100 admission successes, permits no failed request, proves the manager
+Pod UID changed without changing its image, and requires the replacement to be
+Ready with zero container restarts. This covers compatible rolling restarts. It
+does not claim uninterrupted admission for the one-time keyless-to-`receipt-v1`
+transition: the contract-selected Service intentionally excludes the old
+manager and fails closed until the new endpoint is Ready. An automated
+keyless-upgrade-under-traffic test remains to be added.
 Generation-history tests reject image, ephemeral-container, and resize changes
 after a terminal receipt, while malformed receipt-only cluster state rotates to
 a fresh challenge. It permits release

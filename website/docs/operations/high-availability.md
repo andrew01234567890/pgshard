@@ -194,14 +194,21 @@ receipt-authenticated admission, and controller key use require the exact key to
 match that anchor; recreating an empty or different key fails closed and does not
 mint replacement authority.
 
-An upgrade from the keyless default-branch release needs no manual key command.
-Deploy the updated manifest and an immutable new manager image in one rollout;
-the request Secret must exist before a new Pod starts, and the Deployment keeps
-the old Pod available. Once termination begins, the old manager continues
-serving for a five-second endpoint-propagation drain before receiving `SIGTERM`,
-with 15 seconds then remaining for graceful shutdown. Do not restart the old
-image with the new command-line arguments. For a pre-release development
-install that already has an initialized unanchored key, record the current
+An upgrade from the keyless default-branch release needs no manual key command,
+but it crosses an incompatible admission contract. Freeze `PgShardCluster`
+writes and do not opt a resource namespace into Pod fencing during that rollout.
+The webhook Service selects only `receipt-v1` manager Pods, deliberately
+excluding the keyless manager so it cannot receive a new receipt path or apply
+its older validation. Admission therefore fails closed, and clients may receive
+retryable webhook-unavailable errors until the new manager is Ready. Deployment
+process availability does not make the old process admission-compatible. Wait
+for rollout completion before retrying writes or enabling Pod fencing. A
+zero-rejection transition needs staged compatibility tooling and is not
+implemented. Later compatible rollouts have a 20-second total termination
+budget: the first five seconds drain stale Service endpoints before `SIGTERM`,
+leaving roughly 15 seconds for graceful shutdown. Do not restart the old image
+with the new command-line arguments. For a pre-release development install that
+already has an initialized unanchored key, record the current
 immutable key before changing the
 manager image. Run this while the old manager is healthy:
 

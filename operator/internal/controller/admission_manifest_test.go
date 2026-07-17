@@ -42,6 +42,9 @@ func TestAdmissionOverlayEnablesOnlyTheSelfManagedWebhookRuntime(t *testing.T) {
 	if patch.Spec.ProgressDeadlineSeconds == nil || *patch.Spec.ProgressDeadlineSeconds != 180 || patch.Spec.Template.Spec.TerminationGracePeriodSeconds == nil || *patch.Spec.Template.Spec.TerminationGracePeriodSeconds != 20 || len(patch.Spec.Template.Spec.Containers) != 1 {
 		t.Fatalf("admission manager patch = %#v", patch.Spec)
 	}
+	if patch.Spec.Template.Labels["pgshard.io/webhook-contract"] != "receipt-v1" {
+		t.Fatalf("admission manager webhook contract = %#v", patch.Spec.Template.Labels)
+	}
 	container := patch.Spec.Template.Spec.Containers[0]
 	for _, wanted := range []string{
 		"--webhook-enabled=true",
@@ -101,7 +104,7 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		}
 	}
 	service := readManifest[corev1.Service](t, "../../config/webhook/service.yaml")
-	if service.Name != "webhook-service" || service.Namespace != "system" || len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 443 || service.Spec.Ports[0].TargetPort != intstr.FromString("webhook") {
+	if service.Name != "webhook-service" || service.Namespace != "system" || len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 443 || service.Spec.Ports[0].TargetPort != intstr.FromString("webhook") || service.Spec.Selector["pgshard.io/webhook-contract"] != "receipt-v1" {
 		t.Fatalf("webhook Service = %#v", service)
 	}
 
