@@ -248,7 +248,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("PostgreSQL readiness probe = %#v", postgres.ReadinessProbe)
 		}
 		bootstrap := pod.InitContainers[0]
-		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != developmentPostgreSQLBootstrapImage || bootstrap.ImagePullPolicy != corev1.PullNever || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "sync \"$staging/pg_hba.conf\" \"$staging/.pgshard-bootstrap-complete\" \"$staging\"") || !strings.Contains(bootstrap.Command[2], "sync \"$final\" \"$parent\"") || strings.Contains(bootstrap.Command[2], "\nsync\n") || strings.Contains(bootstrap.Command[2], "sync -f") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) || !strings.Contains(bootstrap.Command[2], "config_file=/etc/pgshard/postgresql/primary-0000.conf") || !strings.Contains(bootstrap.Command[2], "listen_addresses=''") || !strings.Contains(bootstrap.Command[2], "validate_catalog_inventory") || !strings.Contains(bootstrap.Command[2], "INSERT INTO pgshard_catalog.shards") {
+		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != developmentPostgreSQLBootstrapImage || bootstrap.ImagePullPolicy != corev1.PullNever || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "sync \"$staging/pg_hba.conf\" \"$staging/.pgshard-bootstrap-complete\" \"$staging\"") || !strings.Contains(bootstrap.Command[2], "sync \"$final\" \"$parent\" \"$volume_root\"") || !strings.Contains(bootstrap.Command[2], "transaction_timeout=120s") || strings.Contains(bootstrap.Command[2], "\nsync\n") || strings.Contains(bootstrap.Command[2], "sync -f") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) || !strings.Contains(bootstrap.Command[2], "config_file=/etc/pgshard/postgresql/primary-0000.conf") || !strings.Contains(bootstrap.Command[2], "listen_addresses=''") || !strings.Contains(bootstrap.Command[2], "validate_catalog_inventory") || !strings.Contains(bootstrap.Command[2], "INSERT INTO pgshard_catalog.shards") {
 			t.Fatalf("PostgreSQL atomic bootstrap contract = %#v", bootstrap)
 		}
 		if len(bootstrap.Env) != 10 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
@@ -697,12 +697,15 @@ VALUES ('11111111-1111-1111-1111-111111111111', 'shard-0000', 'active');
 
 	catalogSQL(primaryDataParent, `
 ALTER TABLE pgshard_catalog.shards DISABLE TRIGGER USER;
-ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER USER;
 INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-10000', 10000, 'retired');
+ALTER TABLE pgshard_catalog.shards ENABLE TRIGGER USER;
+`)
+	assertRejectedWithoutMutation("refusing shardschema restore lineage")
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER USER;
 INSERT INTO pgshard_catalog.shard_restore_incarnations(restore_incarnation, shard_id, state, retired_at)
 VALUES ('22222222-2222-2222-2222-222222222222', 'shard-10000', 'retired', statement_timestamp());
 ALTER TABLE pgshard_catalog.shard_restore_incarnations ENABLE TRIGGER USER;
-ALTER TABLE pgshard_catalog.shards ENABLE TRIGGER USER;
 `)
 	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
 		t.Fatalf("canonical five-digit retired shard was rejected: %v\n%s", err, output)
@@ -738,13 +741,19 @@ PREPARE TRANSACTION 'pgshard_bootstrap_lock';
 	t.Cleanup(func() {
 		_, _ = runDocker("rm", "--force", crashContainer)
 	})
-	crashArguments := append([]string{"run", "--detach", "--name", crashContainer}, containerArguments(primaryDataParent, bootstrapScript(primaryDataParent), bootstrapEnvironment(true, 2)...)...)
+	crashBootstrapScript := strings.Replace(bootstrapScript(primaryDataParent), "lock_timeout=5s", "lock_timeout=30s", 1)
+	crashArguments := append([]string{"run", "--detach", "--name", crashContainer}, containerArguments(primaryDataParent, crashBootstrapScript, bootstrapEnvironment(true, 2)...)...)
 	if output, err := runDocker(crashArguments...); err != nil {
 		t.Fatalf("start crash-retry bootstrap container: %v\n%s", err, output)
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for {
-		if _, err := runDocker("exec", crashContainer, "test", "-s", primaryDataParent+"/docker/postmaster.pid"); err == nil {
+		lockWaiters, err := runDocker(
+			"exec", crashContainer,
+			"psql", "-X", "--no-password", "--host=/tmp/pgshard-catalog-bootstrap", "--username=postgres", "--dbname=shardschema", "--no-align", "--tuples-only",
+			"--command=SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity WHERE datname = 'shardschema' AND wait_event_type = 'Lock'",
+		)
+		if err == nil && strings.TrimSpace(lockWaiters) == "1" {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -774,15 +783,15 @@ PREPARE TRANSACTION 'pgshard_bootstrap_lock';
 	preparePartialCatalog := postgresHarness + `
 createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
-  --set=ON_ERROR_STOP=1 --command="CREATE SCHEMA pgshard_catalog; CREATE TABLE pgshard_catalog.shard_restore_incarnations(dummy integer)" >/dev/null
+  --set=ON_ERROR_STOP=1 --command="CREATE SCHEMA pgshard_catalog; CREATE TABLE pgshard_catalog.cluster_configuration(dummy integer); CREATE TABLE pgshard_catalog.shards(dummy integer)" >/dev/null
 pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
 trap - EXIT
 `
 	if output, err := runContainer(emptyDataParent, preparePartialCatalog); err != nil {
-		t.Fatalf("prepare lineage-only partial catalog: %v\n%s", err, output)
+		t.Fatalf("prepare two-of-three partial catalog: %v\n%s", err, output)
 	}
-	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing shardschema restore lineage without a shard inventory") {
-		t.Fatalf("lineage-only partial catalog error = %v\n%s", err, output)
+	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing a partial pre-existing shardschema catalog") {
+		t.Fatalf("two-of-three partial catalog error = %v\n%s", err, output)
 	}
 	recreateEmptyCatalog := postgresHarness + `
 dropdb --no-password --host="$socket" --username=postgres shardschema
@@ -995,6 +1004,8 @@ func TestPostgreSQLBootstrapImageRejectsMutableRemoteReferences(t *testing.T) {
 		"ghcr.io/andrew01234567890/pgshard-postgres-agent:main",
 		"ghcr.io/andrew01234567890/pgshard-postgres-agent@sha256:not-a-digest",
 		"pgshard/postgres-agent:other-local-tag",
+		"registry.example/UPPER/postgres-agent@sha256:" + strings.Repeat("a", 64),
+		"registry.example/pgshard//postgres-agent@sha256:" + strings.Repeat("a", 64),
 	} {
 		images := DefaultImages()
 		images.PostgreSQLBootstrap = image

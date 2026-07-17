@@ -3298,7 +3298,8 @@ func TestPostgreSQLConfigurationRetentionTracksStatefulSetRollout(t *testing.T) 
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cluster, pgshardv1alpha1.GroupVersion.WithKind("PgShardCluster"))},
 		},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas: &replicas,
+			Replicas:       &replicas,
+			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType},
 			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
 				Name: "postgresql-config",
 				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
@@ -3310,7 +3311,7 @@ func TestPostgreSQLConfigurationRetentionTracksStatefulSetRollout(t *testing.T) 
 			ObservedGeneration: 1,
 			Replicas:           1,
 			UpdatedReplicas:    1,
-			CurrentRevision:    "revision-new",
+			CurrentRevision:    "revision-old",
 			UpdateRevision:     "revision-new",
 		},
 	}
@@ -3323,6 +3324,11 @@ func TestPostgreSQLConfigurationRetentionTracksStatefulSetRollout(t *testing.T) 
 	complete.Status.ObservedGeneration = complete.Generation
 	if retainPostgreSQLConfigurationDuringRollout(cluster, oldConfiguration, []client.Object{complete}) {
 		t.Fatal("completed rollout retained an unreferenced PostgreSQL configuration")
+	}
+	partiallyUpdated := complete.DeepCopy()
+	partiallyUpdated.Status.UpdatedReplicas = 0
+	if !retainPostgreSQLConfigurationDuringRollout(cluster, oldConfiguration, []client.Object{partiallyUpdated}) {
+		t.Fatal("partial OnDelete rollout did not retain the previous PostgreSQL configuration")
 	}
 
 	stillReferenced := complete.DeepCopy()
@@ -3486,6 +3492,7 @@ func TestReconcileRejectsSingletonBootstrapImageBeforeDurableProvisioning(t *tes
 	}{
 		{name: "missing"},
 		{name: "mutable remote", image: "ghcr.io/andrew01234567890/pgshard-postgres-agent:main"},
+		{name: "invalid digest shaped", image: "registry.example/UPPER/postgres-agent@sha256:" + strings.Repeat("a", 64)},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	distreference "github.com/distribution/reference"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -96,6 +97,7 @@ case "$postgres_version" in
 esac
 
 parent=/var/lib/postgresql/18
+volume_root="${parent%/*}"
 final="$parent/docker"
 staging="$parent/.pgshard-init"
 marker="$final/.pgshard-bootstrap-complete"
@@ -140,7 +142,7 @@ if [[ -f "$marker" && -f "$final/PG_VERSION" ]]; then
     exit 1
   fi
   rm -rf -- "$staging"
-  sync "$final" "$parent"
+  sync "$final" "$parent" "$volume_root"
 elif [[ -e "$final" ]]; then
   echo "refusing to replace an incomplete or unmarked PostgreSQL data directory" >&2
   exit 1
@@ -183,7 +185,7 @@ fi
 socket=/tmp/pgshard-catalog-bootstrap
 rm -rf -- "$socket"
 mkdir -m 0700 -- "$socket"
-export PGOPTIONS='-c lock_timeout=5s -c statement_timeout=30s -c idle_in_transaction_session_timeout=30s'
+export PGOPTIONS='-c lock_timeout=5s -c statement_timeout=30s -c transaction_timeout=120s -c idle_in_transaction_session_timeout=30s'
 stop_temporary_postgres() {
   result=$?
   trap - EXIT
@@ -262,12 +264,17 @@ validate_restore_lineage() {
       --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
         SELECT pg_catalog.count(*)
           FROM pgshard_catalog.shards AS shards
-         WHERE (shards.state = 'active') IS DISTINCT FROM EXISTS (
-           SELECT
-             FROM pgshard_catalog.shard_restore_incarnations AS incarnations
-            WHERE incarnations.shard_id = shards.shard_id
-              AND incarnations.state = 'active'
-         )"
+         WHERE NOT EXISTS (
+                 SELECT
+                   FROM pgshard_catalog.shard_restore_incarnations AS history
+                  WHERE history.shard_id = shards.shard_id
+               )
+            OR (shards.state = 'active') IS DISTINCT FROM EXISTS (
+                 SELECT
+                   FROM pgshard_catalog.shard_restore_incarnations AS incarnations
+                  WHERE incarnations.shard_id = shards.shard_id
+                    AND incarnations.state = 'active'
+               )"
   )"
   if [[ "$invalid_lineage" != "0" ]]; then
     echo "refusing shardschema restore lineage that conflicts with shard state" >&2
@@ -289,20 +296,14 @@ catalog_core_tables="$(
         pg_catalog.to_regclass('pgshard_catalog.shards') IS NOT NULL,
         pg_catalog.to_regclass('pgshard_catalog.shard_restore_incarnations') IS NOT NULL"
 )"
-IFS='|' read -r has_cluster_configuration has_shards has_restore_lineage <<< "$catalog_core_tables"
-if [[ "$has_cluster_configuration" == "t" ]]; then
-  validate_cluster_configuration
-fi
-if [[ "$has_shards" == "t" ]]; then
-  validate_shard_inventory
-fi
-if [[ "$has_restore_lineage" == "t" ]]; then
-  if [[ "$has_shards" != "t" ]]; then
-    echo "refusing shardschema restore lineage without a shard inventory" >&2
+case "$catalog_core_tables" in
+  "f|f|f") ;;
+  "t|t|t") validate_catalog_inventory ;;
+  *)
+    echo "refusing a partial pre-existing shardschema catalog" >&2
     exit 1
-  fi
-  validate_restore_lineage
-fi
+    ;;
+esac
 
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
   --set=ON_ERROR_STOP=1 --file="$PGSHARD_SHARDSCHEMA_MIGRATION"
@@ -343,7 +344,7 @@ validate_catalog_inventory
 
 pg_ctl -D "$final" -w -t 45 stop -m fast
 trap - EXIT
-sync "$final" "$parent"
+sync "$final" "$parent" "$volume_root"
 `
 
 // Images contains the deployable images used by the supporting workloads.
@@ -383,14 +384,12 @@ func validatePostgreSQLBootstrapImage(image string) error {
 	if image == developmentPostgreSQLBootstrapImage {
 		return nil
 	}
-	const separator = "@sha256:"
-	separatorIndex := strings.LastIndex(image, separator)
-	if image == "" || strings.TrimSpace(image) != image || separatorIndex <= 0 || strings.Contains(image[:separatorIndex], "@") {
+	named, err := distreference.ParseNormalizedNamed(image)
+	if err != nil || strings.TrimSpace(image) != image {
 		return fmt.Errorf("PostgreSQL bootstrap image must use an immutable sha256 digest (the exact local %q image is development-only)", developmentPostgreSQLBootstrapImage)
 	}
-	digest := image[separatorIndex+len(separator):]
-	decoded, err := hex.DecodeString(digest)
-	if err != nil || len(decoded) != sha256.Size {
+	canonical, ok := named.(distreference.Canonical)
+	if !ok || canonical.Digest().Algorithm().String() != "sha256" {
 		return fmt.Errorf("PostgreSQL bootstrap image must use an immutable sha256 digest (the exact local %q image is development-only)", developmentPostgreSQLBootstrapImage)
 	}
 	return nil
