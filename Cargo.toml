@@ -29,18 +29,23 @@ bytes = "1.12.1"
 clap = { version = "4.5.41", features = ["derive"] }
 hyper = { version = "1.10.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
+hmac = "0.13.0"
 log = { version = "=0.4.33", features = ["max_level_off", "release_max_level_off"] }
 postgres-protocol = "0.6.12"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.15.0"
 semver = "1.0.26"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+sha2 = "0.11.0"
 sqlparser = { version = "=0.62.0", features = ["visitor"] }
 stacker = "=0.1.24"
 thiserror = "2.0.12"
 tokio = { version = "1.46.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-postgres = "0.7.15"
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }
 tower = { version = "0.5.2", features = ["util"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }

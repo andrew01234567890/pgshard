@@ -9,12 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/operator/internal/pki"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
@@ -157,6 +159,13 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 				return ctrl.Result{RequeueAfter: retryDelay}, nil
 			}
 		}
+		deletingCatalogAccess, err := r.deleteCatalogAccessForFinalization(ctx, cluster)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("delete shardschema access material during cluster deletion: %w", err)
+		}
+		if deletingCatalogAccess {
+			return ctrl.Result{RequeueAfter: retryDelay}, nil
+		}
 		controllerutil.RemoveFinalizer(cluster, resourceFinalizer)
 		if err := r.Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
@@ -168,6 +177,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		images = owned.DefaultImages()
 	}
 	if err := pgshardv1alpha1.ValidateClusterForReconciliation(cluster); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if err := owned.ValidateImagesForCluster(cluster, images); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
@@ -191,6 +204,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	}
 	if err := r.ensurePostgreSQLBootstrap(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "BootstrapReconcileFailed", fmt.Sprintf("PostgreSQL bootstrap reconciliation failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if err := r.ensureCatalogAccess(ctx, cluster); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "CatalogAccessReconcileFailed", fmt.Sprintf("shardschema access reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 	plan, err := owned.Plan(cluster, images)
@@ -482,6 +499,316 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 		}
 	}
 	return nil
+}
+
+func (r *PgShardClusterReconciler) ensureCatalogAccess(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	if cluster.Spec.MembersPerShard != 1 {
+		return nil
+	}
+	reader := r.authoritativeReader()
+	if cluster.Status.CatalogAccess == nil {
+		return r.createCatalogAccessIntent(ctx, cluster, reader)
+	}
+
+	recorded := cluster.Status.CatalogAccess
+	if !validCatalogAccessStatus(cluster.Name, recorded) {
+		return fmt.Errorf("recorded catalog access state is invalid")
+	}
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+	if err := reader.Get(ctx, key, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			if recorded.SecretUID == "" {
+				return r.createCatalogAccessIntent(ctx, cluster, reader)
+			}
+			return fmt.Errorf("catalog access Secret %s with recorded UID %s is missing; explicit recovery is required", recorded.SecretName, recorded.SecretUID)
+		}
+		return fmt.Errorf("read catalog access Secret %s: %w", recorded.SecretName, err)
+	}
+	if recorded.SecretUID == "" {
+		if err := validateCatalogAccessIntentSecret(secret, cluster, recorded.SecretName); err != nil {
+			return err
+		}
+		cluster.Status.CatalogAccess = &pgshardv1alpha1.CatalogAccessStatus{
+			SecretName: recorded.SecretName,
+			SecretUID:  secret.UID,
+		}
+		if secret.UID == "" {
+			return fmt.Errorf("catalog access intent Secret %s has no API-assigned UID", secret.Name)
+		}
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint catalog access Secret identity: %w", err)
+		}
+		recorded = cluster.Status.CatalogAccess
+	} else if secret.UID != recorded.SecretUID {
+		return fmt.Errorf("catalog access Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, secret.UID, recorded.SecretUID)
+	}
+	if recorded.ClientSHA256 == "" && recorded.ServerSHA256 == "" {
+		return r.materializeCatalogAccess(ctx, cluster, secret, recorded, reader)
+	}
+	return validateCheckpointedCatalogAccess(secret, cluster, recorded)
+}
+
+func (r *PgShardClusterReconciler) createCatalogAccessIntent(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, reader client.Reader) error {
+	recorded := cluster.Status.CatalogAccess
+	if recorded == nil {
+		name, err := randomBootstrapName(owned.CatalogAccessSecretPrefix(cluster.Name))
+		if err != nil {
+			return fmt.Errorf("generate catalog access Secret name: %w", err)
+		}
+		recorded = &pgshardv1alpha1.CatalogAccessStatus{SecretName: name}
+		cluster.Status.CatalogAccess = recorded
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint catalog access creation intent: %w", err)
+		}
+	} else if !validCatalogAccessStatus(cluster.Name, recorded) || recorded.SecretUID != "" {
+		return fmt.Errorf("cannot create catalog access intent from invalid or completed state")
+	}
+
+	name := recorded.SecretName
+	candidate := owned.CatalogAccessIntentSecret(cluster, name)
+	if createErr := r.Create(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); createErr != nil {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
+		if readErr := reader.Get(ctx, key, observed); readErr != nil {
+			if apierrors.IsNotFound(readErr) {
+				return fmt.Errorf("create catalog access Secret %s: %w", name, createErr)
+			}
+			return errors.Join(
+				fmt.Errorf("create catalog access Secret %s: %w", name, createErr),
+				fmt.Errorf("resolve catalog access Secret creation outcome: %w", readErr),
+			)
+		}
+		candidate = observed
+	}
+	if candidate.UID == "" {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
+		if err := reader.Get(ctx, key, observed); err != nil {
+			return fmt.Errorf("read created catalog access Secret %s: %w", name, err)
+		}
+		candidate = observed
+	}
+	if err := validateCatalogAccessIntentSecret(candidate, cluster, name); err != nil {
+		return err
+	}
+	cluster.Status.CatalogAccess = &pgshardv1alpha1.CatalogAccessStatus{
+		SecretName: name,
+		SecretUID:  candidate.UID,
+	}
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint catalog access Secret identity: %w", err)
+	}
+	return r.materializeCatalogAccess(ctx, cluster, candidate, cluster.Status.CatalogAccess, reader)
+}
+
+func (r *PgShardClusterReconciler) materializeCatalogAccess(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret, recorded *pgshardv1alpha1.CatalogAccessStatus, reader client.Reader) error {
+	if secret.UID != recorded.SecretUID || recorded.SecretUID == "" {
+		return fmt.Errorf("catalog access Secret %s identity changed before material installation", recorded.SecretName)
+	}
+	if err := validateCatalogAccessIntentSecret(secret, cluster, recorded.SecretName); err != nil {
+		// An earlier outcome-unknown update may already have installed complete
+		// immutable material. Adopt it only after exact validation below.
+		if completeErr := validateCatalogAccessSecret(secret, cluster, recorded.SecretName); completeErr != nil {
+			return errors.Join(err, completeErr)
+		}
+		return r.checkpointCatalogAccessMaterial(ctx, cluster, secret, recorded)
+	}
+
+	material, err := newCatalogAccessMaterial(cluster)
+	if err != nil {
+		return err
+	}
+	// Update the object returned by the API server instead of reconstructing
+	// its metadata. Kubernetes validates immutable server-assigned fields such
+	// as creationTimestamp on update, while resourceVersion and UID make the
+	// one-time material installation conditional on this exact empty Secret.
+	candidate := secret.DeepCopy()
+	canonical := owned.CatalogAccessIntentSecret(cluster, recorded.SecretName)
+	candidate.GenerateName = ""
+	candidate.Labels = maps.Clone(canonical.Labels)
+	candidate.Annotations = maps.Clone(canonical.Annotations)
+	candidate.OwnerReferences = append([]metav1.OwnerReference(nil), canonical.OwnerReferences...)
+	candidate.Finalizers = nil
+	candidate.Type = corev1.SecretTypeOpaque
+	immutable := true
+	candidate.Immutable = &immutable
+	candidate.Data = material
+	candidate.StringData = nil
+	if updateErr := r.Update(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); updateErr != nil {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+		if readErr := reader.Get(ctx, key, observed); readErr != nil {
+			return errors.Join(
+				fmt.Errorf("install immutable catalog access material in Secret %s: %w", recorded.SecretName, updateErr),
+				fmt.Errorf("resolve catalog access material update outcome: %w", readErr),
+			)
+		}
+		if observed.UID != recorded.SecretUID {
+			return fmt.Errorf("catalog access Secret %s has UID %s, expected recorded UID %s after material update; explicit recovery is required", recorded.SecretName, observed.UID, recorded.SecretUID)
+		}
+		if intentErr := validateCatalogAccessIntentSecret(observed, cluster, recorded.SecretName); intentErr == nil {
+			return fmt.Errorf("install immutable catalog access material in Secret %s: %w", recorded.SecretName, updateErr)
+		}
+		candidate = observed
+	}
+	return r.checkpointCatalogAccessMaterial(ctx, cluster, candidate, recorded)
+}
+
+func (r *PgShardClusterReconciler) checkpointCatalogAccessMaterial(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret, recorded *pgshardv1alpha1.CatalogAccessStatus) error {
+	if err := validateCatalogAccessSecret(secret, cluster, recorded.SecretName); err != nil {
+		return err
+	}
+	observed := catalogAccessStatus(secret)
+	if observed.SecretUID != recorded.SecretUID {
+		return fmt.Errorf("catalog access Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, observed.SecretUID, recorded.SecretUID)
+	}
+	cluster.Status.CatalogAccess = observed
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint catalog access material: %w", err)
+	}
+	return nil
+}
+
+func validateCheckpointedCatalogAccess(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.CatalogAccessStatus) error {
+	if err := validateCatalogAccessSecret(secret, cluster, recorded.SecretName); err != nil {
+		return err
+	}
+	observed := catalogAccessStatus(secret)
+	if observed.SecretUID != recorded.SecretUID {
+		return fmt.Errorf("catalog access Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, observed.SecretUID, recorded.SecretUID)
+	}
+	if observed.ClientSHA256 != recorded.ClientSHA256 || observed.ServerSHA256 != recorded.ServerSHA256 {
+		return fmt.Errorf("catalog access Secret %s material differs from the checkpointed creation result; explicit recovery is required", recorded.SecretName)
+	}
+	return nil
+}
+
+func validCatalogAccessStatus(cluster string, status *pgshardv1alpha1.CatalogAccessStatus) bool {
+	if status == nil || !owned.CatalogAccessSecretNameIsValid(cluster, status.SecretName) {
+		return false
+	}
+	if status.SecretUID == "" {
+		return status.ClientSHA256 == "" && status.ServerSHA256 == ""
+	}
+	if status.ClientSHA256 == "" || status.ServerSHA256 == "" {
+		return status.ClientSHA256 == "" && status.ServerSHA256 == ""
+	}
+	return validCatalogAccessDigest(status.ClientSHA256) && validCatalogAccessDigest(status.ServerSHA256)
+}
+
+func validCatalogAccessDigest(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32 && hex.EncodeToString(decoded) == value
+}
+
+// newCatalogAccessMaterial generates only Secret data. It deliberately cannot
+// construct a Kubernetes object: catalog material may be installed only by the
+// UID/resourceVersion-conditional Update of a checkpointed empty intent.
+func newCatalogAccessMaterial(cluster *pgshardv1alpha1.PgShardCluster) (map[string][]byte, error) {
+	randomPassword := make([]byte, postgresqlPasswordBytes)
+	if _, err := rand.Read(randomPassword); err != nil {
+		return nil, fmt.Errorf("generate shardschema reader credential: %w", err)
+	}
+	password := make([]byte, hex.EncodedLen(len(randomPassword)))
+	hex.Encode(password, randomPassword)
+	bundle, err := pki.GenerateStaticServerBundle(
+		time.Now().UTC(),
+		rand.Reader,
+		fmt.Sprintf("pgshard shardschema CA for %s/%s", cluster.Namespace, cluster.Name),
+		owned.CatalogTLSDNSNames(cluster.Name, cluster.Namespace),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("generate shardschema server certificate: %w", err)
+	}
+	return map[string][]byte{
+		owned.CatalogPasswordKey:       password,
+		owned.CatalogCACertificateKey:  bundle.CACertificate,
+		owned.CatalogTLSCertificateKey: bundle.ServerCertificate,
+		owned.CatalogTLSPrivateKeyKey:  bundle.ServerPrivateKey,
+	}, nil
+}
+
+func validateCatalogAccessSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string) error {
+	if !owned.CatalogAccessSecretNameIsValid(cluster.Name, expectedName) {
+		return fmt.Errorf("catalog access Secret name %s is not a valid unpredictable cluster-bound name", expectedName)
+	}
+	if secret.DeletionTimestamp != nil || !catalogAccessSecretMetadataIsBound(secret, cluster, expectedName) {
+		return fmt.Errorf("catalog access Secret %s metadata is not bound to the exact PgShardCluster", expectedName)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || secret.Immutable == nil || !*secret.Immutable {
+		return fmt.Errorf("catalog access Secret %s must be immutable and have type Opaque", expectedName)
+	}
+	wantedKeys := []string{
+		owned.CatalogPasswordKey,
+		owned.CatalogCACertificateKey,
+		owned.CatalogTLSCertificateKey,
+		owned.CatalogTLSPrivateKeyKey,
+	}
+	if len(secret.Data) != len(wantedKeys) {
+		return fmt.Errorf("catalog access Secret %s has an unexpected key set", expectedName)
+	}
+	for _, key := range wantedKeys {
+		if _, ok := secret.Data[key]; !ok {
+			return fmt.Errorf("catalog access Secret %s has an unexpected key set", expectedName)
+		}
+	}
+	password := secret.Data[owned.CatalogPasswordKey]
+	decoded := make([]byte, postgresqlPasswordBytes)
+	if len(password) != hex.EncodedLen(postgresqlPasswordBytes) {
+		return fmt.Errorf("catalog access Secret %s password has an invalid shape", expectedName)
+	}
+	if _, err := hex.Decode(decoded, password); err != nil || hex.EncodeToString(decoded) != string(password) {
+		return fmt.Errorf("catalog access Secret %s password is not canonical lowercase hexadecimal", expectedName)
+	}
+	bundle := &pki.StaticServerBundle{
+		CACertificate:     secret.Data[owned.CatalogCACertificateKey],
+		ServerCertificate: secret.Data[owned.CatalogTLSCertificateKey],
+		ServerPrivateKey:  secret.Data[owned.CatalogTLSPrivateKeyKey],
+	}
+	if err := pki.ValidateStaticServerBundle(bundle, owned.CatalogTLSDNSNames(cluster.Name, cluster.Namespace), time.Now().UTC()); err != nil {
+		return fmt.Errorf("catalog access Secret %s has invalid TLS material: %w", expectedName, err)
+	}
+	return nil
+}
+
+func validateCatalogAccessIntentSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string) error {
+	if !owned.CatalogAccessSecretNameIsValid(cluster.Name, expectedName) {
+		return fmt.Errorf("catalog access Secret name %s is not a valid unpredictable cluster-bound name", expectedName)
+	}
+	if secret.DeletionTimestamp != nil || !catalogAccessSecretMetadataIsBound(secret, cluster, expectedName) {
+		return fmt.Errorf("catalog access intent Secret %s metadata is not bound to the exact PgShardCluster", expectedName)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || (secret.Immutable != nil && *secret.Immutable) || len(secret.Data) != 0 || len(secret.StringData) != 0 {
+		return fmt.Errorf("catalog access intent Secret %s must be empty, mutable, and have type Opaque", expectedName)
+	}
+	return nil
+}
+
+func catalogAccessSecretMetadataIsBound(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string) bool {
+	return catalogAccessSecretMetadataMatches(secret, cluster, expectedName, false)
+}
+
+func catalogAccessSecretMetadataMatches(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string, allowFinalizers bool) bool {
+	canonical := owned.CatalogAccessIntentSecret(cluster, expectedName)
+	return secret.Name == canonical.Name && secret.Namespace == canonical.Namespace && secret.GenerateName == "" &&
+		maps.Equal(secret.Labels, canonical.Labels) && maps.Equal(secret.Annotations, canonical.Annotations) &&
+		reflect.DeepEqual(secret.OwnerReferences, canonical.OwnerReferences) && (allowFinalizers || len(secret.Finalizers) == 0)
+}
+
+func catalogAccessStatus(secret *corev1.Secret) *pgshardv1alpha1.CatalogAccessStatus {
+	return &pgshardv1alpha1.CatalogAccessStatus{
+		SecretName: secret.Name,
+		SecretUID:  secret.UID,
+		ClientSHA256: owned.CatalogClientMaterialSHA256(
+			secret.Data[owned.CatalogPasswordKey],
+			secret.Data[owned.CatalogCACertificateKey],
+		),
+		ServerSHA256: owned.CatalogServerMaterialSHA256(
+			secret.Data[owned.CatalogTLSCertificateKey],
+			secret.Data[owned.CatalogTLSPrivateKeyKey],
+		),
+	}
 }
 
 func resolvePostgreSQLStorageClass(ctx context.Context, reader client.Reader, cluster *pgshardv1alpha1.PgShardCluster) (*string, error) {
@@ -1759,6 +2086,85 @@ func (r *PgShardClusterReconciler) deletePostgreSQLCredentialFences(ctx context.
 	return false, nil
 }
 
+func (r *PgShardClusterReconciler) deleteCatalogAccessForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	if r.APIReader == nil {
+		return false, fmt.Errorf("authoritative API reader is required for catalog access deletion")
+	}
+	recorded := cluster.Status.CatalogAccess
+	if recorded == nil {
+		return false, nil
+	}
+	if !validCatalogAccessStatus(cluster.Name, recorded) {
+		return false, fmt.Errorf("recorded catalog access state is invalid")
+	}
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+	if err := r.APIReader.Get(ctx, key, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read catalog access Secret %s during finalization: %w", recorded.SecretName, err)
+	}
+	if err := validateCatalogAccessForDeletion(secret, cluster, recorded); err != nil {
+		return false, err
+	}
+	return r.deleteCatalogAccessSecret(ctx, secret)
+}
+
+func validateCatalogAccessForDeletion(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.CatalogAccessStatus) error {
+	if secret.Name != recorded.SecretName || secret.Namespace != cluster.Namespace {
+		return fmt.Errorf("catalog access Secret %s identity is not bound to the deleting PgShardCluster", recorded.SecretName)
+	}
+	if recorded.SecretUID != "" {
+		if secret.UID != recorded.SecretUID {
+			return fmt.Errorf("catalog access Secret %s has UID %s, expected recorded UID %s during finalization", recorded.SecretName, secret.UID, recorded.SecretUID)
+		}
+		// Once the API UID is checkpointed, mutable metadata must not make the
+		// exact key-bearing object undeletable. When material digests were also
+		// checkpointed, bind deletion to those raw bytes without relying on
+		// certificate freshness or other serving-time validation.
+		if recorded.ClientSHA256 != "" {
+			observed := catalogAccessStatus(secret)
+			if observed.ClientSHA256 != recorded.ClientSHA256 || observed.ServerSHA256 != recorded.ServerSHA256 {
+				return fmt.Errorf("catalog access Secret %s material differs from the checkpointed creation result during finalization", recorded.SecretName)
+			}
+		}
+		return nil
+	}
+	return validateCatalogAccessIntentForDeletion(secret, cluster, recorded.SecretName)
+}
+
+func validateCatalogAccessIntentForDeletion(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string) error {
+	if !owned.CatalogAccessSecretNameIsValid(cluster.Name, expectedName) {
+		return fmt.Errorf("catalog access Secret name %s is not a valid unpredictable cluster-bound name", expectedName)
+	}
+	// Before a UID is checkpointed, the exact canonical empty intent is the only
+	// safe name-bound deletion target. Ignore finalizers and deletionTimestamp so
+	// an already-started deletion can still satisfy the observed barrier.
+	if !catalogAccessSecretMetadataMatches(secret, cluster, expectedName, true) {
+		return fmt.Errorf("catalog access intent Secret %s metadata is not bound to the exact deleting PgShardCluster", expectedName)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || (secret.Immutable != nil && *secret.Immutable) || len(secret.Data) != 0 || len(secret.StringData) != 0 {
+		return fmt.Errorf("catalog access intent Secret %s must be empty, mutable, and have type Opaque during finalization", expectedName)
+	}
+	return nil
+}
+
+func (r *PgShardClusterReconciler) deleteCatalogAccessSecret(ctx context.Context, secret *corev1.Secret) (bool, error) {
+	if secret.DeletionTimestamp != nil {
+		return true, nil
+	}
+	uid := secret.UID
+	resourceVersion := secret.ResourceVersion
+	if uid == "" || resourceVersion == "" {
+		return false, fmt.Errorf("catalog access Secret %s has no stable API identity", secret.Name)
+	}
+	if err := r.Delete(ctx, secret, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("delete catalog access Secret %s with UID %s: %w", secret.Name, secret.UID, err)
+	}
+	return true, nil
+}
+
 // releaseTerminatedPostgreSQLPodFences removes the operator's Pod finalizer
 // only for a Pod that was never assigned or after admission has attached a
 // durable termination receipt to an authenticated terminal-phase update from
@@ -2109,9 +2515,12 @@ func statefulSetRolloutComplete(statefulSet *appsv1.StatefulSet) bool {
 	if statefulSet.Spec.Replicas != nil {
 		desired = *statefulSet.Spec.Replicas
 	}
-	return workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) &&
-		statefulSet.Status.Replicas == desired && statefulSet.Status.UpdatedReplicas == desired &&
-		statefulSet.Status.CurrentRevision != "" && statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
+	updated := workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) &&
+		statefulSet.Status.Replicas == desired && statefulSet.Status.UpdatedReplicas == desired
+	if statefulSet.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType {
+		return updated
+	}
+	return updated && statefulSet.Status.CurrentRevision != "" && statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
 }
 
 func listObjects(list client.ObjectList) []client.Object {
@@ -2419,7 +2828,7 @@ func (r *PgShardClusterReconciler) updateStatus(ctx context.Context, cluster *pg
 }
 
 func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
-	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) {
+	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) {
 		return false
 	}
 	for index := range left.Conditions {
@@ -2428,6 +2837,14 @@ func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
 		}
 	}
 	return true
+}
+
+func catalogAccessStatusesEqual(left, right *pgshardv1alpha1.CatalogAccessStatus) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.SecretName == right.SecretName && left.SecretUID == right.SecretUID &&
+		left.ClientSHA256 == right.ClientSHA256 && left.ServerSHA256 == right.ServerSHA256
 }
 
 func bootstrapSpecsEqual(left, right *pgshardv1alpha1.PostgreSQLBootstrapSpecStatus) bool {

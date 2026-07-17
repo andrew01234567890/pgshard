@@ -14,6 +14,7 @@ Nothing in the current repository should be treated as production-ready.
 - License: Apache-2.0
 - Runtime target: Linux containers on Kubernetes
 - PostgreSQL target: PostgreSQL 18
+- Scope and release gates: [Milestone 1 implementation plan](plan/milestone-1.md)
 - Compatibility and guarantees are documented in the
   [project documentation](https://andrew01234567890.github.io/pgshard/).
 

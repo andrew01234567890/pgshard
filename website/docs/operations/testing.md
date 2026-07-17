@@ -130,10 +130,15 @@ PostgreSQL startup, and exits cleanly on `SIGTERM`. PostgreSQL listener tests
 refuse sequential GSS and SSL requests, decode the bounded rejection, close
 cancellation without a response, time out an incomplete startup, and drain on
 shutdown. Configuration tests require exactly one explicit catalog path: local
-mode with a regular DSN file, or credential-free `bootstrap-unavailable` mode.
-They open DSN files nonblockingly, reject a FIFO without waiting for a writer,
-bound the read and timing values, reject remote plaintext or session-policy
-overrides, and prove invalid DSN contents do not escape through errors. A
+mode with a regular DSN file, operator mode with an exact DNS host plus
+password and CA projections, or credential-free `bootstrap-unavailable` mode.
+They open files nonblockingly, support Kubernetes Secret symlink projections,
+reject a FIFO without waiting for a writer, bound every read and timing value,
+reject remote plaintext or session-policy overrides, require one canonical CA
+certificate and a 64-byte lowercase hexadecimal password, and prove invalid
+contents do not escape through errors. Operator mode also fixes the database,
+login, port, application name, TLS 1.3 policy, hostname validation, channel
+binding, and writable-primary requirement without accepting a DSN. A
 separate raw-wire PostgreSQL 18 test creates every protocol 3.0, 3.2, and
 negotiated 3.99 outbound packet with the production startup encoder. It
 validates four-byte protocol 3.0 and
@@ -551,9 +556,56 @@ a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard
 Service from an authorized restricted probe client using the destination-specific
 Secret, rejects otherwise identical unlabeled and wrong-cluster clients through
-the live NetworkPolicy, proves an omitted storage class was resolved and
-checkpointed on the resulting Bound PVC, then restarts one primary StatefulSet
-and verifies its PVC-backed row survives. A unit Create interceptor separately proves the
+the live NetworkPolicy, and verifies that only shard-0000 contains the dedicated
+`shardschema` database. It reaches the pooler control Service through the
+Kubernetes API proxy and requires a successful operator-provisioned TLS 1.3 and
+SCRAM catalog load in both exact JSON status and Prometheus metrics while
+overall SQL readiness remains false. It hash-verifies and loads the exact migration shipped
+in the non-root PostgreSQL bootstrap image, observes both configured shard
+identities and one active restore incarnation per shard, records the complete
+epoch-and-incarnation snapshot, and requires a primary recreation to reapply
+the migration without changing that snapshot. The fixture leaves a prepared
+transaction and inactive logical slot durable before recreation, proving the
+private init postmaster loads the managed logical-WAL and 2PC settings. It also
+proves an omitted storage class was resolved and
+checkpointed on the resulting Bound PVC, then explicitly deletes one
+`OnDelete` primary Pod after first publishing a changed desired configuration.
+It proves neither primary restarts when the StatefulSet templates change, the
+selected replacement adopts the new template, the other shard remains on its
+original UID and configuration, and the PVC-backed row survives. Against a
+separate Docker volume, the same job upgrades the released v0.49 catalog,
+rejects a one-shard catalog under a requested two-shard configuration without
+changing catalog contents or the serving HBA, replays after an independently installed exact two-shard inventory,
+accepts canonical five-digit retired shard IDs, and rejects wrong home-shard
+identity, missing or orphaned restore lineage, malformed shard IDs, altered or
+rewound identity sequences, rewrite rules, event triggers, and disabled
+internal foreign-key triggers without changing catalog state. It also proves
+inherited search-path, identifier-quoting, replica session-role, disabled
+synchronous commit, damaged-page recovery, and ignored-checksum settings do not
+subvert bootstrap. Hostile restored database and role defaults cannot enable
+statement/parameter logging or alter the fixed SCRAM iteration count. The
+catalog password and generated verifier never enter PostgreSQL query text;
+active restored `postgresql.auto.conf` settings
+are rejected before PostgreSQL starts. The migration replaces an altered trigger
+function body without executing it. A prepared `ACCESS EXCLUSIVE` lock must
+fail within the bootstrap lock timeout; a second blocked init container is then killed with `SIGKILL`,
+after which retry on the same volume must recover. A second PGDATA fixture
+rejects a complete catalog with a missing column, an occupied reserved schema,
+and a two-of-three core catalog before migration can preserve an unsupported
+shape. Fresh shard-0000 fixtures force container and postmaster death
+immediately after the catalog migration commit, while the initial inventory
+transaction is open, and after the inventory commit is externally visible but
+the bootstrap phase has not returned. Each fixture first proves the exact
+genesis intent survived on disk. The first two retries use that intent to finish
+the missing or rolled-back inventory; the post-commit retry proves an
+outcome-unknown exact inventory is idempotent. Complete catalog, credential, and
+serving-HBA publication followed by a clean synchronous PostgreSQL stop removes
+the intent. A separately forged shard-0000-plus-shard-0002 subset under a
+three-shard genesis intent is rejected as crash-impossible rather than filled
+in. An absent or empty `shardschema` on
+pre-existing PGDATA without the intent is rejected instead of being seeded from
+the requested shard count.
+A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the
 resulting Bound PVC exactly matches that checkpoint, is ownerless with the
@@ -686,6 +738,36 @@ Jepsen/Elle check the guarantees actually offered: atomic final cross-shard outc
 ## Required end-to-end environments
 
 - MinIO for pgBackRest S3 backup and restore, including corruption and interruption cases.
+- Backup retention pins with pgBackRest automatic expiry disabled: concurrent
+  backups, tombstones, dependency sharing, required post-backup WAL, and crashes
+  at every pin/refcount/expiry boundary must never delete a retained restore
+  point. A database with no data shard on `cell-0000` must still carry and verify
+  its signed database-scoped catalog projection.
+- Per-database topology and placement fixtures: `A` uses five logical shards;
+  `B` uses three shards first on `A`'s first three shared cells, then on
+  shared-node cells, then on fully dedicated cells and Nodes. Routing, DDL,
+  grants, backup barriers, and failure injection for one database must not
+  advance another database's epochs.
+- Exact-topology restore preflight: five-to-five succeeds onto replacement
+  dedicated cells; five-to-three, changed range boundaries, changed hash
+  seed/version, duplicate shard ordinals, and non-empty destinations fail
+  before any non-status mutation. The oracle compares all other Kubernetes
+  objects, catalog rows and epochs, PV/PVC data identities, pgBackRest metadata,
+  and MinIO object versions.
+- Database-targeted recovery: restore `A` as `B` while the existing `A` stays
+  available; restore `A` as `A` only when that name is absent; prove colocated
+  database bytes in a physical backup never become registered or queryable.
+- Online database mobility under continuous load: move restored `B` back to
+  `A`, both with identical topology and with a separate five-to-three
+  reshard/placement change. Inject pooler, operator, source-cell,
+  destination-cell, and coordinator failure on both sides of the activation
+  record; every client request must complete or receive the documented
+  transaction retry outcome, never route to both generations after cutover.
+- Cutover fencing with paused and partitioned poolers, pre-existing idle sockets,
+  long-running transactions, and delayed writes or prepares. Source cells must
+  reject the retired generation, destinations must reject an unpublished or
+  unarmed generation, and buffered work must not be released until every
+  destination and pooler acknowledges the catalog generation.
 - Prometheus, OpenTelemetry Collector, Grafana, and Tempo for metric/trace assertions.
 - HPA and fixed pooler deployments.
 - PostgreSQL and orchestrator failures at every durable 2PC boundary.

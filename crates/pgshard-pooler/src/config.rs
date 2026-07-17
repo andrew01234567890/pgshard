@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
@@ -13,12 +14,23 @@ use pgshard_catalog::{
     CatalogPollIntervalError, CatalogSupervisorConfig, CatalogSupervisorConfigError,
     SHARDSCHEMA_DATABASE,
 };
+use pgshard_types::catalog_material::{CATALOG_CLIENT_DIGEST_DOMAIN, catalog_material_sha256};
 use rustix::fs::{Mode, OFlags};
+use rustls::{ClientConfig, RootCertStore};
+use rustls_pki_types::{
+    CertificateDer,
+    pem::{PemObject, SectionKind},
+};
 use thiserror::Error;
 use tokio_postgres::Config;
-use tokio_postgres::config::{Host, SslMode, TargetSessionAttrs};
+use tokio_postgres::config::{ChannelBinding, Host, SslMode, TargetSessionAttrs};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 const MAX_SHARDSCHEMA_DSN_BYTES: usize = 16 * 1024;
+const MAX_SHARDSCHEMA_CA_BYTES: usize = 64 * 1024;
+const SHARDSCHEMA_PASSWORD_BYTES: usize = 64;
+const SHARDSCHEMA_PORT: u16 = 5432;
+const CATALOG_LOGIN_ROLE: &str = "pgshard_pooler_catalog";
 const CATALOG_APPLICATION_NAME: &str = "pgshard-pooler-catalog";
 
 /// Validated configuration for the fail-closed pooler runtime.
@@ -30,12 +42,19 @@ pub struct PoolerConfig {
 
 pub(crate) struct SupervisedCatalogConfig {
     pub(crate) catalog: Config,
+    pub(crate) connector: CatalogConnector,
     pub(crate) supervisor: CatalogSupervisorConfig,
+}
+
+pub(crate) enum CatalogConnector {
+    LocalNoTls,
+    OperatorTls(MakeRustlsConnect),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum CatalogMode {
     Local,
+    OperatorTls,
     BootstrapUnavailable,
 }
 
@@ -54,7 +73,7 @@ struct RawConfig {
     #[arg(long, env = "PGSHARD_RW_BIND", default_value = "0.0.0.0:5432")]
     read_write_bind: SocketAddr,
 
-    /// Catalog runtime: local DSN supervision or explicit unavailable bootstrap.
+    /// Catalog runtime: local development, operator-authenticated TLS, or explicit unavailable bootstrap.
     #[arg(
         long,
         env = "PGSHARD_CATALOG_MODE",
@@ -66,6 +85,22 @@ struct RawConfig {
     /// File containing one local-only shardschema database DSN (maximum 16 KiB).
     #[arg(long, env = "PGSHARD_SHARDSCHEMA_DSN_FILE")]
     shardschema_dsn_file: Option<PathBuf>,
+
+    /// Exact lowercase DNS hostname of the operator-provisioned shardschema service.
+    #[arg(long, env = "PGSHARD_SHARDSCHEMA_HOST")]
+    shardschema_host: Option<String>,
+
+    /// File containing the operator-provisioned catalog login password (exactly 64 lowercase hexadecimal bytes).
+    #[arg(long, env = "PGSHARD_SHARDSCHEMA_PASSWORD_FILE")]
+    shardschema_password_file: Option<PathBuf>,
+
+    /// File containing exactly one operator-provisioned PEM CA certificate (maximum 64 KiB).
+    #[arg(long, env = "PGSHARD_SHARDSCHEMA_CA_FILE")]
+    shardschema_ca_file: Option<PathBuf>,
+
+    /// SHA-256 checkpoint binding the exact password and CA Secret projection.
+    #[arg(long, env = "PGSHARD_SHARDSCHEMA_CLIENT_SHA256")]
+    shardschema_client_sha256: Option<String>,
 
     /// Authoritative catalog polling interval in milliseconds (1,000..=300,000).
     #[arg(
@@ -136,12 +171,45 @@ impl PoolerConfig {
     {
         let raw = RawConfig::try_parse_from(arguments)?;
         let supervisor = catalog_supervisor(&raw)?;
-        let catalog = match (raw.catalog_mode, raw.shardschema_dsn_file.as_deref()) {
-            (CatalogMode::Local, Some(path)) => Some(supervised_catalog(path, supervisor)?),
-            (CatalogMode::Local, None) => return Err(PoolerConfigError::CatalogDsnRequired),
-            (CatalogMode::BootstrapUnavailable, None) => None,
-            (CatalogMode::BootstrapUnavailable, Some(_)) => {
-                return Err(PoolerConfigError::CatalogDsnForbiddenInBootstrapMode);
+        let operator_fields_present = raw.shardschema_host.is_some()
+            || raw.shardschema_password_file.is_some()
+            || raw.shardschema_ca_file.is_some()
+            || raw.shardschema_client_sha256.is_some();
+        let catalog = match raw.catalog_mode {
+            CatalogMode::Local => {
+                if operator_fields_present {
+                    return Err(PoolerConfigError::OperatorTlsFieldsForbiddenInLocalMode);
+                }
+                let Some(path) = raw.shardschema_dsn_file.as_deref() else {
+                    return Err(PoolerConfigError::CatalogDsnRequired);
+                };
+                Some(supervised_catalog(path, supervisor)?)
+            }
+            CatalogMode::OperatorTls => {
+                if raw.shardschema_dsn_file.is_some() {
+                    return Err(PoolerConfigError::CatalogDsnForbiddenInOperatorTlsMode);
+                }
+                let (Some(host), Some(password_path), Some(ca_path), Some(expected_sha256)) = (
+                    raw.shardschema_host.as_deref(),
+                    raw.shardschema_password_file.as_deref(),
+                    raw.shardschema_ca_file.as_deref(),
+                    raw.shardschema_client_sha256.as_deref(),
+                ) else {
+                    return Err(PoolerConfigError::OperatorTlsFieldsRequired);
+                };
+                Some(operator_tls_catalog(
+                    host,
+                    password_path,
+                    ca_path,
+                    expected_sha256,
+                    supervisor,
+                )?)
+            }
+            CatalogMode::BootstrapUnavailable => {
+                if raw.shardschema_dsn_file.is_some() || operator_fields_present {
+                    return Err(PoolerConfigError::CatalogCredentialsForbiddenInBootstrapMode);
+                }
+                None
             }
         };
 
@@ -180,6 +248,7 @@ impl PoolerConfig {
             read_write_bind,
             catalog: Some(SupervisedCatalogConfig {
                 catalog,
+                connector: CatalogConnector::LocalNoTls,
                 supervisor,
             }),
         }
@@ -209,8 +278,75 @@ fn supervised_catalog(
 
     Ok(SupervisedCatalogConfig {
         catalog,
+        connector: CatalogConnector::LocalNoTls,
         supervisor,
     })
+}
+
+fn operator_tls_catalog(
+    host: &str,
+    password_path: &Path,
+    ca_path: &Path,
+    expected_sha256: &str,
+    supervisor: CatalogSupervisorConfig,
+) -> Result<SupervisedCatalogConfig, PoolerConfigError> {
+    validate_catalog_dns_name(host)?;
+    let password = read_bounded_regular_file(
+        password_path,
+        SHARDSCHEMA_PASSWORD_BYTES,
+        "shardschema password file",
+    )?;
+    if password.len() != SHARDSCHEMA_PASSWORD_BYTES
+        || !password
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(PoolerConfigError::InvalidCatalogPassword);
+    }
+    let ca_contents =
+        read_bounded_regular_file(ca_path, MAX_SHARDSCHEMA_CA_BYTES, "shardschema CA file")?;
+    if !is_lower_hex_sha256(expected_sha256)
+        || catalog_material_sha256(CATALOG_CLIENT_DIGEST_DOMAIN, &password, [&ca_contents[..]])
+            != expected_sha256
+    {
+        return Err(PoolerConfigError::CatalogMaterialMismatch);
+    }
+    let ca_certificate = parse_single_ca_certificate(&ca_contents)?;
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(ca_certificate)
+        .map_err(|_| PoolerConfigError::InvalidCatalogCa)?;
+    let tls =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| PoolerConfigError::InvalidCatalogTlsConfiguration)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+    let mut catalog = Config::new();
+    catalog
+        .host(host)
+        .port(SHARDSCHEMA_PORT)
+        .user(CATALOG_LOGIN_ROLE)
+        .password(password)
+        .dbname(SHARDSCHEMA_DATABASE)
+        .ssl_mode(SslMode::Require)
+        .target_session_attrs(TargetSessionAttrs::ReadWrite)
+        .channel_binding(ChannelBinding::Require)
+        .application_name(CATALOG_APPLICATION_NAME);
+
+    Ok(SupervisedCatalogConfig {
+        catalog,
+        connector: CatalogConnector::OperatorTls(MakeRustlsConnect::new(tls)),
+        supervisor,
+    })
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn catalog_supervisor(raw: &RawConfig) -> Result<CatalogSupervisorConfig, PoolerConfigError> {
@@ -228,6 +364,95 @@ fn catalog_supervisor(raw: &RawConfig) -> Result<CatalogSupervisorConfig, Pooler
         Duration::from_millis(raw.catalog_connect_timeout_ms),
         operation_timeout,
     )?)
+}
+
+fn validate_catalog_dns_name(host: &str) -> Result<(), PoolerConfigError> {
+    if host.is_empty()
+        || host.len() > 253
+        || host.parse::<IpAddr>().is_ok()
+        || host.ends_with('.')
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    {
+        return Err(PoolerConfigError::InvalidCatalogDnsName);
+    }
+    Ok(())
+}
+
+fn read_bounded_regular_file(
+    path: &Path,
+    maximum: usize,
+    description: &'static str,
+) -> Result<Vec<u8>, PoolerConfigError> {
+    let metadata = fs::metadata(path).map_err(|source| PoolerConfigError::CatalogFile {
+        description,
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(PoolerConfigError::CatalogFileNotRegular { description });
+    }
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .map_err(|source| PoolerConfigError::CatalogFile {
+        description,
+        source: source.into(),
+    })?;
+    let file = fs::File::from(descriptor);
+    if !file
+        .metadata()
+        .map_err(|source| PoolerConfigError::CatalogFile {
+            description,
+            source,
+        })?
+        .file_type()
+        .is_file()
+    {
+        return Err(PoolerConfigError::CatalogFileNotRegular { description });
+    }
+    let mut contents = Vec::with_capacity(maximum.saturating_add(1));
+    file.take(maximum.saturating_add(1) as u64)
+        .read_to_end(&mut contents)
+        .map_err(|source| PoolerConfigError::CatalogFile {
+            description,
+            source,
+        })?;
+    if contents.len() > maximum {
+        return Err(PoolerConfigError::CatalogFileTooLarge {
+            description,
+            maximum,
+        });
+    }
+    Ok(contents)
+}
+
+fn parse_single_ca_certificate(
+    contents: &[u8],
+) -> Result<CertificateDer<'static>, PoolerConfigError> {
+    if !contents.starts_with(b"-----BEGIN CERTIFICATE-----\n") {
+        return Err(PoolerConfigError::InvalidCatalogCa);
+    }
+    let mut sections = <(SectionKind, Vec<u8>)>::pem_slice_iter(contents);
+    let Some(section) = sections.next() else {
+        return Err(PoolerConfigError::InvalidCatalogCa);
+    };
+    let section = section.map_err(|_| PoolerConfigError::InvalidCatalogCa)?;
+    if !sections.remainder().is_empty() {
+        return Err(PoolerConfigError::InvalidCatalogCa);
+    }
+    match section {
+        (SectionKind::Certificate, der) => Ok(CertificateDer::from(der)),
+        _ => Err(PoolerConfigError::InvalidCatalogCa),
+    }
 }
 
 fn read_shardschema_dsn(path: &Path) -> Result<String, PoolerConfigError> {
@@ -318,9 +543,60 @@ pub enum PoolerConfigError {
     /// Local supervision has no DSN file.
     #[error("shardschema DSN file is required in local catalog mode")]
     CatalogDsnRequired,
-    /// Bootstrap mode must not silently retain catalog credentials.
-    #[error("shardschema DSN file must be absent in bootstrap-unavailable catalog mode")]
-    CatalogDsnForbiddenInBootstrapMode,
+    /// Local development mode must not silently accept operator credentials.
+    #[error("operator TLS catalog fields must be absent in local catalog mode")]
+    OperatorTlsFieldsForbiddenInLocalMode,
+    /// Operator TLS mode builds its connection policy without a DSN.
+    #[error("shardschema DSN file must be absent in operator-tls catalog mode")]
+    CatalogDsnForbiddenInOperatorTlsMode,
+    /// Operator TLS requires all three explicit Secret projections.
+    #[error(
+        "shardschema host, password file, CA file, and client SHA-256 are required in operator-tls catalog mode"
+    )]
+    OperatorTlsFieldsRequired,
+    /// Bootstrap mode must not silently retain any catalog credentials.
+    #[error(
+        "all shardschema credential and connection fields must be absent in bootstrap-unavailable catalog mode"
+    )]
+    CatalogCredentialsForbiddenInBootstrapMode,
+    /// The operator endpoint must use an exact DNS hostname, never an IP.
+    #[error("shardschema host must be a lowercase DNS name without a trailing dot")]
+    InvalidCatalogDnsName,
+    /// A projected operator credential or CA file could not be read.
+    #[error("could not read the {description}: {source}")]
+    CatalogFile {
+        /// Non-sensitive file description.
+        description: &'static str,
+        /// Underlying file error; paths and contents are never included by us.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A projected operator credential or CA target is not a regular file.
+    #[error("the {description} must resolve to a regular file")]
+    CatalogFileNotRegular {
+        /// Non-sensitive file description.
+        description: &'static str,
+    },
+    /// A projected operator credential or CA exceeds its bounded read.
+    #[error("the {description} exceeds {maximum} bytes")]
+    CatalogFileTooLarge {
+        /// Non-sensitive file description.
+        description: &'static str,
+        /// Maximum accepted file size.
+        maximum: usize,
+    },
+    /// The catalog password must have the operator's canonical random shape.
+    #[error("shardschema password must contain exactly 64 lowercase hexadecimal bytes")]
+    InvalidCatalogPassword,
+    /// The CA projection must be one parseable certificate and nothing else.
+    #[error("shardschema CA file must contain exactly one PEM certificate")]
+    InvalidCatalogCa,
+    /// The projection no longer matches the operator's checkpointed material.
+    #[error("shardschema password or CA material differs from the checkpointed creation result")]
+    CatalogMaterialMismatch,
+    /// The explicit TLS 1.3 client policy could not be constructed.
+    #[error("could not construct the shardschema TLS 1.3 client policy")]
+    InvalidCatalogTlsConfiguration,
     /// The DSN path does not resolve to a regular file.
     #[error("shardschema DSN path must resolve to a regular file")]
     DsnNotRegularFile,
@@ -381,15 +657,83 @@ pub enum CatalogDsnPolicyError {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
     use std::time::Instant;
 
     use super::*;
     use clap::CommandFactory;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     struct TestDsnFile {
         _directory: TempDir,
         path: PathBuf,
+    }
+
+    struct TestOperatorFiles {
+        directory: TempDir,
+        password_path: PathBuf,
+        ca_path: PathBuf,
+        client_sha256: String,
+    }
+
+    impl TestOperatorFiles {
+        fn new(password: &[u8], ca: &[u8]) -> Self {
+            let directory = TempDir::new().expect("create operator catalog test directory");
+            let password_path = directory.path().join("catalog-password");
+            let ca_path = directory.path().join("ca.crt");
+            fs::write(&password_path, password).expect("write test catalog password");
+            fs::write(&ca_path, ca).expect("write test catalog CA");
+            Self {
+                directory,
+                password_path,
+                ca_path,
+                client_sha256: catalog_material_sha256(
+                    CATALOG_CLIENT_DIGEST_DOMAIN,
+                    password,
+                    [ca],
+                ),
+            }
+        }
+
+        fn arguments(&self) -> Vec<OsString> {
+            operator_arguments(
+                "demo-shardschema.default.svc",
+                &self.password_path,
+                &self.ca_path,
+                &self.client_sha256,
+            )
+        }
+    }
+
+    const TEST_CA: &[u8] = b"-----BEGIN CERTIFICATE-----\n\
+MIIBiTCCAS+gAwIBAgIUbJ8sOt0ubvJbxhBrRzotX+SslNEwCgYIKoZIzj0EAwIw\n\
+GjEYMBYGA1UEAwwPcGdzaGFyZC10ZXN0LWNhMB4XDTI2MDcxNzExMDE1OVoXDTM2\n\
+MDcxNDExMDE1OVowGjEYMBYGA1UEAwwPcGdzaGFyZC10ZXN0LWNhMFkwEwYHKoZI\n\
+zj0CAQYIKoZIzj0DAQcDQgAEFVjxj/1nOlW3UJlkBSa3fW/nF7sBBOToSP74N+wZ\n\
+JAXlBOJvMB80cluAfqVSGiaEe9ypJl/0yOBNW05CBO67aqNTMFEwHQYDVR0OBBYE\n\
+FAIHdwZc3gkqjK/SR9b8eTDjesx7MB8GA1UdIwQYMBaAFAIHdwZc3gkqjK/SR9b8\n\
+eTDjesx7MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgMPua5hVn\n\
+Q6DR1lrE26RxZR6piU+H0x2k8/8Abe0RyIACIQCQe2yRXSYi6Dau2hvPJ++YKspw\n\
+pqAiYB0dKbPxAXdiSQ==\n\
+-----END CERTIFICATE-----\n";
+
+    fn operator_arguments(
+        host: &str,
+        password_path: &Path,
+        ca_path: &Path,
+        client_sha256: &str,
+    ) -> Vec<OsString> {
+        vec![
+            OsString::from("pgshard-pooler"),
+            OsString::from("--catalog-mode=operator-tls"),
+            OsString::from(format!("--shardschema-host={host}")),
+            OsString::from("--shardschema-password-file"),
+            password_path.as_os_str().to_owned(),
+            OsString::from("--shardschema-ca-file"),
+            ca_path.as_os_str().to_owned(),
+            OsString::from(format!("--shardschema-client-sha256={client_sha256}")),
+        ]
     }
 
     impl TestDsnFile {
@@ -453,6 +797,10 @@ mod tests {
         ]
     }
 
+    fn test_catalog_password() -> Vec<u8> {
+        format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()).into_bytes()
+    }
+
     #[test]
     fn accepts_bounded_local_catalog_configuration() {
         let config = parse(format!("{VALID_DSN}\n").as_bytes()).expect("valid pooler config");
@@ -467,6 +815,7 @@ mod tests {
         let Some(SupervisedCatalogConfig {
             catalog,
             supervisor,
+            ..
         }) = &config.catalog
         else {
             panic!("local catalog configuration did not enable supervision");
@@ -480,6 +829,188 @@ mod tests {
             supervisor.operation_timeout().get(),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn accepts_operator_authenticated_tls_catalog_configuration() {
+        let password = test_catalog_password();
+        let files = TestOperatorFiles::new(&password, TEST_CA);
+        let config = PoolerConfig::try_parse_from(files.arguments()).expect("operator TLS config");
+        let Some(SupervisedCatalogConfig {
+            catalog,
+            connector: CatalogConnector::OperatorTls(_),
+            ..
+        }) = config.catalog
+        else {
+            panic!("operator TLS catalog configuration did not select rustls");
+        };
+        assert_eq!(
+            catalog.get_hosts(),
+            &[Host::Tcp("demo-shardschema.default.svc".into())]
+        );
+        assert_eq!(catalog.get_ports(), &[SHARDSCHEMA_PORT]);
+        assert_eq!(catalog.get_user(), Some(CATALOG_LOGIN_ROLE));
+        assert_eq!(catalog.get_dbname(), Some(SHARDSCHEMA_DATABASE));
+        assert_eq!(catalog.get_ssl_mode(), SslMode::Require);
+        assert_eq!(catalog.get_channel_binding(), ChannelBinding::Require);
+        assert_eq!(
+            catalog.get_target_session_attrs(),
+            TargetSessionAttrs::ReadWrite
+        );
+        assert_eq!(
+            catalog.get_application_name(),
+            Some(CATALOG_APPLICATION_NAME)
+        );
+        assert_eq!(catalog.get_password(), Some(password.as_slice()));
+        assert!(catalog.get_options().is_none());
+    }
+
+    #[test]
+    fn operator_tls_accepts_kubernetes_style_symlink_projections() {
+        let files = TestOperatorFiles::new(&test_catalog_password(), TEST_CA);
+        let projected_password = files.directory.path().join("projected-password");
+        let projected_ca = files.directory.path().join("projected-ca");
+        symlink(&files.password_path, &projected_password).expect("symlink password projection");
+        symlink(&files.ca_path, &projected_ca).expect("symlink CA projection");
+        PoolerConfig::try_parse_from(operator_arguments(
+            "demo-shardschema.default.svc",
+            &projected_password,
+            &projected_ca,
+            &files.client_sha256,
+        ))
+        .expect("symlinked Kubernetes Secret projections");
+    }
+
+    #[test]
+    fn operator_tls_rejects_incomplete_or_cross_mode_credentials() {
+        let files = TestOperatorFiles::new(&test_catalog_password(), TEST_CA);
+        assert!(matches!(
+            PoolerConfig::try_parse_from(["pgshard-pooler", "--catalog-mode=operator-tls"]),
+            Err(PoolerConfigError::OperatorTlsFieldsRequired)
+        ));
+
+        let dsn = TestDsnFile::new(VALID_DSN.as_bytes());
+        let mut local_arguments = dsn.arguments();
+        local_arguments.push(OsString::from(
+            "--shardschema-host=demo-shardschema.default.svc",
+        ));
+        assert!(matches!(
+            PoolerConfig::try_parse_from(local_arguments),
+            Err(PoolerConfigError::OperatorTlsFieldsForbiddenInLocalMode)
+        ));
+
+        let mut operator_with_dsn = files.arguments();
+        operator_with_dsn.push(OsString::from("--shardschema-dsn-file"));
+        operator_with_dsn.push(dsn.path.as_os_str().to_owned());
+        assert!(matches!(
+            PoolerConfig::try_parse_from(operator_with_dsn),
+            Err(PoolerConfigError::CatalogDsnForbiddenInOperatorTlsMode)
+        ));
+
+        let mut replaced_material = files.arguments();
+        let digest = replaced_material
+            .last_mut()
+            .expect("operator arguments include the material digest");
+        *digest = OsString::from(format!("--shardschema-client-sha256={}", "0".repeat(64)));
+        assert!(matches!(
+            PoolerConfig::try_parse_from(replaced_material),
+            Err(PoolerConfigError::CatalogMaterialMismatch)
+        ));
+
+        let mut bootstrap_with_credentials = bootstrap_arguments();
+        bootstrap_with_credentials.push(OsString::from(
+            "--shardschema-host=demo-shardschema.default.svc",
+        ));
+        assert!(matches!(
+            PoolerConfig::try_parse_from(bootstrap_with_credentials),
+            Err(PoolerConfigError::CatalogCredentialsForbiddenInBootstrapMode)
+        ));
+    }
+
+    #[test]
+    fn operator_tls_rejects_unsafe_dns_password_and_ca_shapes_without_leaking_contents() {
+        let valid_password = test_catalog_password();
+        let files = TestOperatorFiles::new(&valid_password, TEST_CA);
+        for host in [
+            "127.0.0.1",
+            "Demo-shardschema.default.svc",
+            "demo-shardschema.default.svc.",
+            "-demo.default.svc",
+            "demo..svc",
+        ] {
+            assert!(matches!(
+                PoolerConfig::try_parse_from(operator_arguments(
+                    host,
+                    &files.password_path,
+                    &files.ca_path,
+                    &files.client_sha256,
+                )),
+                Err(PoolerConfigError::InvalidCatalogDnsName)
+            ));
+        }
+
+        for password in [
+            b"short".as_slice(),
+            b"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF".as_slice(),
+            b"SENSITIVE_PASSWORD_MARKER_MUST_NOT_ESCAPE_0123456789abcdefghijkl".as_slice(),
+        ] {
+            let invalid = TestOperatorFiles::new(password, TEST_CA);
+            let error = PoolerConfig::try_parse_from(invalid.arguments())
+                .err()
+                .expect("invalid password must fail");
+            assert!(matches!(error, PoolerConfigError::InvalidCatalogPassword));
+            assert!(!format!("{error:?}").contains("SENSITIVE_PASSWORD_MARKER"));
+            assert!(!error.to_string().contains("SENSITIVE_PASSWORD_MARKER"));
+        }
+
+        for ca in [
+            b"not a certificate".as_slice(),
+            [TEST_CA, TEST_CA].concat().as_slice(),
+            [b"prefix".as_slice(), TEST_CA].concat().as_slice(),
+        ] {
+            let invalid = TestOperatorFiles::new(&valid_password, ca);
+            assert!(matches!(
+                PoolerConfig::try_parse_from(invalid.arguments()),
+                Err(PoolerConfigError::InvalidCatalogCa)
+            ));
+        }
+    }
+
+    #[test]
+    fn operator_tls_bounds_files_and_rejects_fifo_without_blocking() {
+        let directory = TempDir::new().expect("create operator file-bound directory");
+        let password_fifo = directory.path().join("catalog-password");
+        let ca_path = directory.path().join("ca.crt");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &password_fifo, Mode::RUSR | Mode::WUSR)
+            .expect("create password FIFO");
+        fs::write(&ca_path, TEST_CA).expect("write CA");
+        let started = Instant::now();
+        assert!(matches!(
+            PoolerConfig::try_parse_from(operator_arguments(
+                "demo-shardschema.default.svc",
+                &password_fifo,
+                &ca_path,
+                &"0".repeat(64),
+            )),
+            Err(PoolerConfigError::CatalogFileNotRegular { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let mut password = test_catalog_password();
+        password.push(b'a');
+        let oversized_password = TestOperatorFiles::new(&password, TEST_CA);
+        assert!(matches!(
+            PoolerConfig::try_parse_from(oversized_password.arguments()),
+            Err(PoolerConfigError::CatalogFileTooLarge { .. })
+        ));
+        let oversized_ca = TestOperatorFiles::new(
+            &test_catalog_password(),
+            &vec![b'x'; MAX_SHARDSCHEMA_CA_BYTES + 1],
+        );
+        assert!(matches!(
+            PoolerConfig::try_parse_from(oversized_ca.arguments()),
+            Err(PoolerConfigError::CatalogFileTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -499,7 +1030,7 @@ mod tests {
         arguments.push(file.path.as_os_str().to_owned());
         assert!(matches!(
             PoolerConfig::try_parse_from(arguments),
-            Err(PoolerConfigError::CatalogDsnForbiddenInBootstrapMode)
+            Err(PoolerConfigError::CatalogCredentialsForbiddenInBootstrapMode)
         ));
 
         let mut arguments = bootstrap_arguments();

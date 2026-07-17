@@ -1,5 +1,15 @@
 BEGIN;
 
+-- Pin every caller-settable part of the migration environment before the
+-- requirements check. A restored database or bootstrap role must not be able
+-- to shadow pg_catalog routines or select an executable table access method.
+SET LOCAL search_path = pg_catalog;
+SET LOCAL row_security = off;
+SET LOCAL check_function_bodies = on;
+SET LOCAL default_tablespace = '';
+SET LOCAL temp_tablespaces = '';
+SET LOCAL default_table_access_method = heap;
+
 -- Takeover validation uses statement snapshots.  Override a non-default
 -- session characteristic before the transaction takes its first snapshot.  An
 -- already-active stronger-isolation snapshot fails closed; an enclosing READ
@@ -45,6 +55,24 @@ BEGIN
 END
 $pgshard_requirements$;
 
+-- A restored dedicated catalog database must not contain database-wide DDL
+-- hooks. DO is not an event-trigger-supported command, so the requirements
+-- check can reject a non-superuser with the stable migration error before these
+-- privileged settings. Disable hooks and trigger suppression before the first
+-- supported DDL or catalog DML, then reject their persisted presence.
+SET LOCAL event_triggers = off;
+SET LOCAL session_replication_role = origin;
+
+DO $pgshard_reject_event_triggers$
+BEGIN
+    IF EXISTS (SELECT FROM pg_catalog.pg_event_trigger) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing shardschema contains an unsupported event trigger';
+    END IF;
+END
+$pgshard_reject_event_triggers$;
+
 -- Freeze every pre-existing trigger/FK-capable catalog relation before
 -- inspecting attached triggers or foreign keys.  CREATE TRIGGER and
 -- referential-constraint DDL require a conflicting relation lock.  Fail rather
@@ -84,7 +112,11 @@ DECLARE
     catalog_schema_owner_is_superuser boolean;
     dependent_membership record;
     owner_membership record;
+    expected_sequence record;
     mismatched_object text;
+    sequence_next_value numeric;
+    sequence_maximum_value numeric;
+    sequence_maximum_generated_value numeric;
 BEGIN
     SELECT namespaces.oid, owners.oid, owners.rolname, owners.rolsuper
       INTO catalog_schema_oid,
@@ -169,6 +201,187 @@ BEGIN
             ERRCODE = '42501',
             MESSAGE = 'pre-existing pgshard_catalog contains an unsupported schema object',
             DETAIL = mismatched_object;
+    END IF;
+
+    -- Rules depend on their target relation rather than directly on the
+    -- namespace. The catalog defines no rewrite rules, so reject every one
+    -- before trusted ownership or ACL transition.
+    SELECT pg_catalog.format(
+               'rule %I on pgshard_catalog.%I',
+               rewrite_rules.rulename,
+               relations.relname
+           )
+      INTO mismatched_object
+      FROM pg_catalog.pg_rewrite AS rewrite_rules
+      JOIN pg_catalog.pg_class AS relations
+        ON relations.oid = rewrite_rules.ev_class
+     WHERE relations.relnamespace = catalog_schema_oid
+     ORDER BY relations.oid, rewrite_rules.oid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains an unsupported rewrite rule',
+            DETAIL = mismatched_object;
+    END IF;
+
+    -- Both released identity sequences have fixed bigint parameters and
+    -- internal ownership dependencies. CREATE TABLE IF NOT EXISTS cannot
+    -- recreate or repair a damaged sequence on upgrade.
+    SELECT pg_catalog.format('sequence pgshard_catalog.%I', sequences.relname)
+      INTO mismatched_object
+      FROM pg_catalog.pg_sequence AS sequence_metadata
+      JOIN pg_catalog.pg_class AS sequences
+        ON sequences.oid = sequence_metadata.seqrelid
+      LEFT JOIN pg_catalog.pg_depend AS ownership
+        ON ownership.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+       AND ownership.objid = sequences.oid
+       AND ownership.objsubid = 0
+       AND ownership.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+       AND ownership.refobjsubid > 0
+       AND ownership.deptype IN ('a', 'i')
+      LEFT JOIN pg_catalog.pg_class AS owned_relations
+        ON owned_relations.oid = ownership.refobjid
+      LEFT JOIN pg_catalog.pg_attribute AS owned_attributes
+        ON owned_attributes.attrelid = ownership.refobjid
+       AND owned_attributes.attnum = ownership.refobjsubid
+     WHERE sequences.relnamespace = catalog_schema_oid
+       AND NOT (
+           (sequences.relname, owned_relations.relname, owned_attributes.attname) IN (
+               ('routing_epochs_routing_epoch_seq', 'routing_epochs', 'routing_epoch'),
+               ('registered_tables_registered_table_id_seq', 'registered_tables', 'registered_table_id')
+           )
+           AND sequence_metadata.seqtypid = 'pg_catalog.int8'::pg_catalog.regtype
+           AND sequence_metadata.seqstart = 1
+           AND sequence_metadata.seqincrement = 1
+           AND sequence_metadata.seqmax = 9223372036854775807
+           AND sequence_metadata.seqmin = 1
+           AND sequence_metadata.seqcache = 1
+           AND NOT sequence_metadata.seqcycle
+       )
+     ORDER BY sequences.oid
+     LIMIT 1;
+    IF FOUND OR NOT (
+        (
+            SELECT pg_catalog.count(*) = 2
+              FROM pg_catalog.pg_sequence AS sequence_metadata
+              JOIN pg_catalog.pg_class AS sequences
+                ON sequences.oid = sequence_metadata.seqrelid
+             WHERE sequences.relnamespace = catalog_schema_oid
+        )
+        OR (
+            NOT EXISTS (
+                SELECT
+                  FROM pg_catalog.pg_sequence AS sequence_metadata
+                  JOIN pg_catalog.pg_class AS sequences
+                    ON sequences.oid = sequence_metadata.seqrelid
+                 WHERE sequences.relnamespace = catalog_schema_oid
+            )
+            AND pg_catalog.to_regclass('pgshard_catalog.routing_epochs') IS NULL
+            AND pg_catalog.to_regclass('pgshard_catalog.registered_tables') IS NULL
+        )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains an unsupported identity sequence',
+            DETAIL = COALESCE(mismatched_object, 'expected both released identity sequences');
+    END IF;
+
+    -- Sequence calls are intentionally not transactional, so a restored or
+    -- manually rewound last_value can be structurally canonical while making
+    -- the next identity value collide with an existing row. Validate the
+    -- effective next values before any migration DDL or seed DML.
+    FOR expected_sequence IN
+        SELECT *
+          FROM (VALUES
+              (
+                  'routing_epochs_routing_epoch_seq'::pg_catalog.name,
+                  'routing_epochs'::pg_catalog.name,
+                  'routing_epoch'::pg_catalog.name
+              ),
+              (
+                  'registered_tables_registered_table_id_seq'::pg_catalog.name,
+                  'registered_tables'::pg_catalog.name,
+                  'registered_table_id'::pg_catalog.name
+              )
+          ) AS expected_sequence(sequence_name, relation_name, column_name)
+    LOOP
+        IF pg_catalog.to_regclass(
+               pg_catalog.format(
+                   'pgshard_catalog.%I',
+                   expected_sequence.sequence_name
+               )
+           ) IS NOT NULL THEN
+            EXECUTE pg_catalog.format(
+                'SELECT CASE WHEN is_called THEN last_value::numeric + 1 '
+                'ELSE last_value::numeric END '
+                'FROM pgshard_catalog.%I',
+                expected_sequence.sequence_name
+            ) INTO sequence_next_value;
+            EXECUTE pg_catalog.format(
+                'SELECT COALESCE(pg_catalog.max(%I)::numeric, 0) '
+                'FROM pgshard_catalog.%I',
+                expected_sequence.column_name,
+                expected_sequence.relation_name
+            ) INTO sequence_maximum_value;
+            SELECT sequences.seqmax::numeric
+              INTO sequence_maximum_generated_value
+              FROM pg_catalog.pg_sequence AS sequences
+             WHERE sequences.seqrelid = pg_catalog.to_regclass(
+                       pg_catalog.format(
+                           'pgshard_catalog.%I',
+                           expected_sequence.sequence_name
+                       )
+                   );
+            IF sequence_next_value <= sequence_maximum_value
+               OR sequence_next_value > sequence_maximum_generated_value THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '42501',
+                    MESSAGE = 'pre-existing pgshard_catalog contains unsafe identity sequence progress',
+                    DETAIL = pg_catalog.format(
+                        'sequence pgshard_catalog.%I would generate %s outside the safe range above existing maximum %s and at most %s',
+                        expected_sequence.sequence_name,
+                        sequence_next_value,
+                        sequence_maximum_value,
+                        sequence_maximum_generated_value
+                    );
+            END IF;
+        END IF;
+    END LOOP;
+
+    -- A disabled internal FK trigger can admit an incarnation for a shard
+    -- that does not exist. Validate both directions before replacing any
+    -- function body or running seed DML; the ordinary forward FK check alone
+    -- is not sufficient once restored bytes are treated as hostile input.
+    IF pg_catalog.to_regclass('pgshard_catalog.shards') IS NOT NULL
+       AND pg_catalog.to_regclass(
+               'pgshard_catalog.shard_restore_incarnations'
+           ) IS NOT NULL THEN
+        IF EXISTS (
+            SELECT 1
+              FROM pgshard_catalog.shards AS shards
+             WHERE NOT EXISTS (
+                       SELECT
+                         FROM pgshard_catalog.shard_restore_incarnations AS history
+                        WHERE history.shard_id = shards.shard_id
+                   )
+                OR (shards.state = 'active') IS DISTINCT FROM EXISTS (
+                       SELECT
+                         FROM pgshard_catalog.shard_restore_incarnations AS incarnations
+                        WHERE incarnations.shard_id = shards.shard_id
+                          AND incarnations.state = 'active'
+                   )
+            UNION ALL
+            SELECT 1
+              FROM pgshard_catalog.shard_restore_incarnations AS incarnations
+              LEFT JOIN pgshard_catalog.shards AS shards
+                ON shards.shard_id = incarnations.shard_id
+             WHERE shards.shard_id IS NULL
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = 'pre-existing pgshard_catalog contains invalid restore lineage';
+        END IF;
     END IF;
 
     -- A role with TRIGGER or REFERENCES can attach executable or referential
@@ -263,7 +476,8 @@ BEGIN
            OR (
                triggers.tgisinternal
                AND (
-                   routine_namespaces.nspname <> 'pg_catalog'
+                   triggers.tgenabled <> 'O'
+                   OR routine_namespaces.nspname <> 'pg_catalog'
                    OR pg_catalog.left(routines.proname, 8) <> 'RI_FKey_'
                    OR NOT EXISTS (
                        SELECT
@@ -815,6 +1029,32 @@ END
 $pgshard_owner_takeover$;
 
 SET LOCAL ROLE pgshard_catalog_owner;
+
+-- The supported input shape fixes every trigger identity and attribute, but
+-- function bodies are deliberately replaceable by this migration. Remove the
+-- validated user triggers before any seed DML so no pre-existing body can run
+-- with the bootstrap superuser's privileges. Foreign-key triggers remain and
+-- were validated above as enabled built-in RI triggers.
+DO $pgshard_drop_existing_user_triggers$
+DECLARE
+    attached_trigger record;
+BEGIN
+    FOR attached_trigger IN
+        SELECT relations.relname, triggers.tgname
+          FROM pg_catalog.pg_trigger AS triggers
+          JOIN pg_catalog.pg_class AS relations ON relations.oid = triggers.tgrelid
+         WHERE relations.relnamespace = 'pgshard_catalog'::pg_catalog.regnamespace
+           AND NOT triggers.tgisinternal
+         ORDER BY relations.oid, triggers.oid
+    LOOP
+        EXECUTE pg_catalog.format(
+            'DROP TRIGGER %I ON pgshard_catalog.%I',
+            attached_trigger.tgname,
+            attached_trigger.relname
+        );
+    END LOOP;
+END
+$pgshard_drop_existing_user_triggers$;
 
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_admin;
@@ -1525,15 +1765,6 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.operation_tombstones (
 
 COMMENT ON TABLE pgshard_catalog.operation_tombstones IS
     'Permanent idempotency records. Only fixed-size fingerprints are retained; request/result bodies and secrets are forbidden.';
-
--- Disable existing statement triggers before idempotent seed statements. PostgreSQL
--- fires AFTER STATEMENT triggers even when ON CONFLICT inserts zero rows.
-DROP TRIGGER IF EXISTS cluster_state_notify ON pgshard_catalog.cluster_state;
-DROP TRIGGER IF EXISTS logical_databases_touch_catalog ON pgshard_catalog.logical_databases;
-DROP TRIGGER IF EXISTS shards_touch_catalog ON pgshard_catalog.shards;
-DROP TRIGGER IF EXISTS registered_tables_touch_catalog ON pgshard_catalog.registered_tables;
-DROP TRIGGER IF EXISTS shard_restore_incarnations_touch_catalog
-    ON pgshard_catalog.shard_restore_incarnations;
 
 INSERT INTO pgshard_catalog.cluster_configuration(singleton)
 VALUES (true)

@@ -393,6 +393,35 @@ spec:
               PgShardClusterStatus never reports readiness until the operator has actually
               reconciled and observed the data plane.
             properties:
+              catalogAccess:
+                description: |-
+                  CatalogAccess records the staged creation and API identity of the
+                  catalog-only credential and TLS Secret. The operator first creates an empty
+                  non-consumable Secret, checkpoints its UID, then atomically installs
+                  immutable material and checkpoints its digests. A missing or replaced
+                  checkpointed Secret requires explicit recovery.
+                properties:
+                  clientSHA256:
+                    description: |-
+                      ClientSHA256 binds the pooler's password and CA projection to the
+                      checkpointed creation result.
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                  secretName:
+                    type: string
+                  secretUID:
+                    description: SecretUID is empty only before the empty Secret identity
+                      is observed.
+                    type: string
+                  serverSHA256:
+                    description: |-
+                      ServerSHA256 binds the PostgreSQL serving certificate and private-key
+                      projection to the checkpointed creation result.
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                required:
+                - secretName
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

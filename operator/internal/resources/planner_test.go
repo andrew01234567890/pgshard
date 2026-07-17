@@ -1,6 +1,9 @@
 package resources
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -20,6 +24,16 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+func TestCatalogMaterialSHA256MatchesRustContract(t *testing.T) {
+	t.Parallel()
+	if got, want := CatalogClientMaterialSHA256(nil, []byte("catalog-ca")), "f25d89531a7aa9937005eb56aab838662145cadff1315196229e0cd334ece559"; got != want {
+		t.Fatalf("client material SHA-256 = %q, want shared Rust vector %q", got, want)
+	}
+	if got, want := CatalogServerMaterialSHA256([]byte("catalog-certificate"), nil), "219f722b1a1d47cb6b569c6c6bc6e9dfe5131f6d4e8fc507bcf93c106df8409d"; got != want {
+		t.Fatalf("server material SHA-256 = %q, want shared Rust vector %q", got, want)
+	}
+}
 
 func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	t.Parallel()
@@ -79,7 +93,7 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	if len(pooler.Spec.Template.Spec.Volumes) != 1 || pooler.Spec.Template.Spec.Volumes[0].Name != "topology" {
 		t.Fatalf("pooler volumes = %#v", pooler.Spec.Template.Spec.Volumes)
 	}
-	if pooler.Spec.Template.Annotations[configHashAnnotation] == "" {
+	if pooler.Spec.Template.Annotations[ConfigHashAnnotation] == "" {
 		t.Fatal("pooler does not roll when topology configuration changes")
 	}
 	for _, suffix := range []string{"rw", "ro", "r"} {
@@ -132,13 +146,25 @@ func TestConfigMapDataHashCoversNamesAndContentsDeterministically(t *testing.T) 
 	}
 }
 
+func TestShardschemaMigrationHashMatchesCanonicalSource(t *testing.T) {
+	t.Parallel()
+	contents, err := os.ReadFile(filepath.Join("..", "..", "..", "crates", "pgshard-catalog", "migrations", "0001_shardschema.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	if got := hex.EncodeToString(digest[:]); got != shardschemaMigrationSHA256 {
+		t.Fatalf("shardschema migration digest = %s, want %s", got, shardschemaMigrationSHA256)
+	}
+}
+
 func TestPostgreSQLConfigurationAndResourceLimitRollTogether(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
-	before, err := Plan(cluster, DefaultImages())
+	before, err := Plan(cluster, singleMemberImages())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +174,7 @@ func TestPostgreSQLConfigurationAndResourceLimitRollTogether(t *testing.T) {
 
 	cluster.Spec.PostgreSQL.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("3Gi")
 	cluster.Spec.PostgreSQL.Resources.Limits[corev1.ResourceMemory] = resource.MustParse("6Gi")
-	after, err := Plan(cluster, DefaultImages())
+	after, err := Plan(cluster, singleMemberImages())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +204,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
-	plan, err := Plan(cluster, DefaultImages())
+	plan, err := Plan(cluster, singleMemberImages())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,11 +216,31 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		!strings.Contains(primaryConfiguration, "synchronous_standby_names = ''\n") {
 		t.Fatalf("single-member primary configuration = %q", primaryConfiguration)
 	}
+	catalogService := object[*corev1.Service](t, plan, CatalogServiceName(cluster.Name))
+	if catalogService.Spec.PublishNotReadyAddresses || catalogService.Spec.Selector[ShardLabel] != "0000" || catalogService.Spec.Selector[RoleLabel] != "primary" || catalogService.Spec.Selector[MemberLabel] != "0000" || len(catalogService.Spec.Ports) != 1 || catalogService.Spec.Ports[0].Port != PostgreSQLPort {
+		t.Fatalf("ready-only shardschema Service = %#v", catalogService.Spec)
+	}
+	pooler := object[*appsv1.Deployment](t, plan, cluster.Name+PoolerSuffix)
+	poolerContainer := pooler.Spec.Template.Spec.Containers[0]
+	if envValue(poolerContainer.Env, "PGSHARD_CATALOG_MODE") != "operator-tls" ||
+		envValue(poolerContainer.Env, "PGSHARD_SHARDSCHEMA_HOST") != "demo-shardschema.database.svc" ||
+		envValue(poolerContainer.Env, "PGSHARD_SHARDSCHEMA_PASSWORD_FILE") != "/etc/pgshard/catalog/catalog-password" ||
+		envValue(poolerContainer.Env, "PGSHARD_SHARDSCHEMA_CA_FILE") != "/etc/pgshard/catalog/ca.crt" ||
+		envValue(poolerContainer.Env, "PGSHARD_SHARDSCHEMA_CLIENT_SHA256") != cluster.Status.CatalogAccess.ClientSHA256 {
+		t.Fatalf("pooler catalog environment = %#v", poolerContainer.Env)
+	}
+	poolerCatalogVolume := volumeByName(t, pooler.Spec.Template.Spec.Volumes, "catalog-client")
+	if poolerCatalogVolume.Secret == nil || poolerCatalogVolume.Secret.SecretName != cluster.Status.CatalogAccess.SecretName || !reflect.DeepEqual(secretItemKeys(poolerCatalogVolume.Secret.Items), []string{CatalogPasswordKey, CatalogCACertificateKey}) {
+		t.Fatalf("pooler catalog Secret projection = %#v", poolerCatalogVolume.Secret)
+	}
+	if !containsVolumeMount(poolerContainer.VolumeMounts, "catalog-client", true) {
+		t.Fatalf("pooler catalog mount = %#v", poolerContainer.VolumeMounts)
+	}
 
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		name := shardName(cluster.Name, shard) + "-primary"
 		statefulSet := object[*appsv1.StatefulSet](t, plan, name)
-		if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != 1 || statefulSet.Spec.ServiceName != shardName(cluster.Name, shard) {
+		if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != 1 || statefulSet.Spec.ServiceName != shardName(cluster.Name, shard) || statefulSet.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType {
 			t.Fatalf("PostgreSQL StatefulSet identity = %#v", statefulSet.Spec)
 		}
 		if statefulSet.Spec.Template.Labels[ManagedByLabel] != ManagedByValue || statefulSet.Spec.Template.Labels[ShardLabel] != shardLabel(shard) || statefulSet.Spec.Template.Labels[RoleLabel] != "primary" || statefulSet.Spec.Template.Labels[MemberLabel] != "0000" {
@@ -202,6 +248,9 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		}
 		if statefulSet.Spec.Template.Annotations[PostgreSQLPodClusterUIDAnnotation] != string(cluster.UID) || !reflect.DeepEqual(statefulSet.Spec.Template.Finalizers, []string{PostgreSQLPodTerminationFinalizer}) {
 			t.Fatalf("PostgreSQL termination fence = %#v", statefulSet.Spec.Template.ObjectMeta)
+		}
+		if got := statefulSet.Spec.Template.Annotations[shardschemaMigrationHashAnnotation]; (shard == 0 && got != shardschemaMigrationSHA256) || (shard != 0 && got != "") {
+			t.Fatalf("shardschema migration annotation for shard %d = %q", shard, got)
 		}
 		if len(statefulSet.Spec.VolumeClaimTemplates) != 0 {
 			t.Fatalf("PostgreSQL data must use a pre-identified standalone PVC: %#v", statefulSet.Spec.VolumeClaimTemplates)
@@ -221,21 +270,100 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		if postgres.Image != defaultPostgreSQLImage || postgres.ImagePullPolicy != corev1.PullIfNotPresent || postgres.SecurityContext == nil || postgres.SecurityContext.RunAsUser == nil || *postgres.SecurityContext.RunAsUser != 999 || postgres.SecurityContext.ReadOnlyRootFilesystem == nil || !*postgres.SecurityContext.ReadOnlyRootFilesystem {
 			t.Fatalf("PostgreSQL container boundary = %#v", postgres)
 		}
-		if !containsString(postgres.Args, "config_file=/etc/pgshard/postgresql/primary-0000.conf") || postgres.StartupProbe != nil || postgres.ReadinessProbe == nil || postgres.LivenessProbe != nil {
+		if !containsString(postgres.Args, "config_file=/etc/pgshard/postgresql/primary-0000.conf") || !containsString(postgres.Args, "allow_alter_system=off") || postgres.StartupProbe != nil || postgres.ReadinessProbe == nil || postgres.LivenessProbe != nil {
 			t.Fatalf("PostgreSQL startup contract = %#v", postgres)
+		}
+		for _, setting := range []string{"ssl=on", "ssl_cert_file=/etc/pgshard/catalog-tls/tls.crt", "ssl_key_file=/etc/pgshard/catalog-tls/tls.key", "ssl_min_protocol_version=TLSv1.3", "ssl_max_protocol_version=TLSv1.3"} {
+			if containsString(postgres.Args, setting) != (shard == 0) {
+				t.Fatalf("PostgreSQL shard %d TLS setting %q in args %#v", shard, setting, postgres.Args)
+			}
 		}
 		readinessProbe := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
 		if !reflect.DeepEqual(postgres.ReadinessProbe.Exec.Command, readinessProbe) {
 			t.Fatalf("PostgreSQL readiness probe = %#v", postgres.ReadinessProbe)
 		}
 		bootstrap := pod.InitContainers[0]
-		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "sync \"$staging/pg_hba.conf\" \"$staging/.pgshard-bootstrap-complete\" \"$staging\"") || !strings.Contains(bootstrap.Command[2], "sync \"$final\" \"$parent\"") || strings.Contains(bootstrap.Command[2], "\nsync\n") || strings.Contains(bootstrap.Command[2], "sync -f") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) {
+		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != developmentPostgreSQLBootstrapImage || bootstrap.ImagePullPolicy != corev1.PullNever || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "sync \"$staging/pg_hba.conf\" \"$staging/.pgshard-bootstrap-complete\" \"$staging\"") || !strings.Contains(bootstrap.Command[2], "sync \"$final\" \"$parent\" \"$volume_root\"") || !strings.Contains(bootstrap.Command[2], "transaction_timeout=120s") || strings.Contains(bootstrap.Command[2], "\nsync\n") || strings.Contains(bootstrap.Command[2], "sync -f") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) || !strings.Contains(bootstrap.Command[2], "config_file=/etc/pgshard/postgresql/primary-0000.conf") || !strings.Contains(bootstrap.Command[2], "listen_addresses=''") || !strings.Contains(bootstrap.Command[2], "validate_catalog_inventory") || !strings.Contains(bootstrap.Command[2], "INSERT INTO pgshard_catalog.shards") {
 			t.Fatalf("PostgreSQL atomic bootstrap contract = %#v", bootstrap)
 		}
-		if len(bootstrap.Env) != 4 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
-			bootstrap.Env[2].Name != "PGSHARD_NODE_UID" || bootstrap.Env[2].ValueFrom == nil || bootstrap.Env[2].ValueFrom.FieldRef == nil || bootstrap.Env[2].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-uid']" ||
-			bootstrap.Env[3].Name != "PGSHARD_NODE_BOOT_ID" || bootstrap.Env[3].ValueFrom == nil || bootstrap.Env[3].ValueFrom.FieldRef == nil || bootstrap.Env[3].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-boot-id']" {
+		if got := strings.Count(bootstrap.Command[2], "sync \"$final\" \"$parent\" \"$volume_root\""); got != 3 {
+			t.Fatalf("PostgreSQL final-data publication barriers = %d, want 3", got)
+		}
+		if !strings.Contains(bootstrap.Command[2], "catalog_schema_fingerprint") ||
+			!strings.Contains(bootstrap.Command[2], "ee17a64c8eec5e2e9a44f29d4764edac90680980f61df35bdb2284c01b57c4d9") ||
+			!strings.Contains(bootstrap.Command[2], "2720fa78d0bc96c21311b1656eeaabbb3e745ea65fa9d1ea701ffb67cde1b1d9") ||
+			!strings.Contains(bootstrap.Command[2], "ceec4ff5d633d28afacf1e93fbc2547591017e57f172dc3a8072814bb6d3867a") ||
+			!strings.Contains(bootstrap.Command[2], "pg_catalog.pg_sequence") ||
+			!strings.Contains(bootstrap.Command[2], "pg_catalog.pg_rewrite") ||
+			!strings.Contains(bootstrap.Command[2], "internal-trigger|") ||
+			!strings.Contains(bootstrap.Command[2], "SET SESSION search_path = pg_catalog") ||
+			!strings.Contains(bootstrap.Command[2], "SET SESSION quote_all_identifiers = off") ||
+			!strings.Contains(bootstrap.Command[2], "sequence_state.is_called") ||
+			!strings.Contains(bootstrap.Command[2], "shards.shard_id = incarnations.shard_id") ||
+			!strings.Contains(bootstrap.Command[2], "catalog_requires_initial_inventory") ||
+			!strings.Contains(bootstrap.Command[2], "refusing active settings in restored postgresql.auto.conf") ||
+			!strings.Contains(bootstrap.Command[2], "hba_file='$quarantine_hba'") ||
+			!strings.Contains(bootstrap.Command[2], "shared_preload_libraries=") ||
+			!strings.Contains(bootstrap.Command[2], "event_triggers=off") ||
+			!strings.Contains(bootstrap.Command[2], "session_replication_role=origin") ||
+			!strings.Contains(bootstrap.Command[2], "default_table_access_method=heap") ||
+			!strings.Contains(bootstrap.Command[2], "initial shardschema inventory failed its transactional postcondition") ||
+			!strings.Contains(bootstrap.Command[2], "count_missing_shards") ||
+			!strings.Contains(bootstrap.Command[2], "validate_genesis_inventory_reachable") ||
+			!strings.Contains(bootstrap.Command[2], "refusing shardschema inventory with missing configured shards") ||
+			!strings.Contains(bootstrap.Command[2], "CREATE ROLE pgshard_pooler_catalog") ||
+			!strings.Contains(bootstrap.Command[2], "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE") ||
+			!strings.Contains(bootstrap.Command[2], "roles.rolpassword LIKE 'SCRAM-SHA-256\\$4096:%'") ||
+			!strings.Contains(bootstrap.Command[2], "pgshard-scram-verifier") ||
+			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest") != 2 ||
+			!strings.Contains(bootstrap.Command[2], "SET rolpassword = $1, rolcanlogin = true") ||
+			strings.Contains(bootstrap.Command[2], "PASSWORD '$catalog_password'") ||
+			!strings.Contains(bootstrap.Command[2], "PGPASSWORD=\"$catalog_password\"") ||
+			!strings.Contains(bootstrap.Command[2], "hostnossl shardschema all all reject") ||
+			!strings.Contains(bootstrap.Command[2], "hostssl shardschema pgshard_pooler_catalog all scram-sha-256") ||
+			!strings.Contains(bootstrap.Command[2], "hostssl shardschema all all reject") ||
+			!strings.Contains(bootstrap.Command[2], "host all pgshard_pooler_catalog all reject") ||
+			!strings.Contains(bootstrap.Command[2], "local all pgshard_pooler_catalog reject") ||
+			!strings.Contains(bootstrap.Command[2], "log_min_error_statement=panic") ||
+			!strings.Contains(bootstrap.Command[2], "refusing shardschema material that differs from the checkpointed creation result") {
+			t.Fatal("PostgreSQL bootstrap does not pin supported catalog shapes")
+		}
+		stopIndex := strings.LastIndex(bootstrap.Command[2], "pg_ctl -D \"$final\" -w -t 45 stop -m fast")
+		intentRemovalIndex := strings.LastIndex(bootstrap.Command[2], "rm -- \"$catalog_genesis_intent\"")
+		if stopIndex < 0 || intentRemovalIndex < 0 || stopIndex >= intentRemovalIndex {
+			t.Fatal("catalog genesis intent is removed before clean PostgreSQL shutdown")
+		}
+		expectedHBAOrder := "'local all postgres trust' \\\n" +
+			"  'local all pgshard_pooler_catalog reject' \\\n" +
+			"  'local all all trust' \\\n" +
+			"  'hostnossl shardschema all all reject' \\\n" +
+			"  'hostssl shardschema pgshard_pooler_catalog all scram-sha-256' \\\n" +
+			"  'hostssl shardschema all all reject' \\\n" +
+			"  'host all pgshard_pooler_catalog all reject' \\\n" +
+			"  'host all all all scram-sha-256'"
+		if !strings.Contains(bootstrap.Command[2], expectedHBAOrder) {
+			t.Fatal("catalog HBA rules are not ordered before the generic host grant")
+		}
+		expectedEnvironmentLength := 10
+		if shard == 0 {
+			expectedEnvironmentLength = 12
+		}
+		if len(bootstrap.Env) != expectedEnvironmentLength || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
+			bootstrap.Env[2].Name != "PGSHARD_POSTGRESQL_MAJOR" || bootstrap.Env[2].Value != pgshardv1alpha1.PostgreSQLMajor18 ||
+			bootstrap.Env[3].Name != "PGSHARD_SHARD_COUNT" || bootstrap.Env[3].Value != fmt.Sprintf("%d", cluster.Spec.Shards) ||
+			bootstrap.Env[4].Name != "PGSHARD_MAXIMUM_SHARDS" || bootstrap.Env[4].Value != fmt.Sprintf("%d", pgshardv1alpha1.MaximumShards) ||
+			bootstrap.Env[5].Name != "PGSHARD_BOOTSTRAP_SHARDSCHEMA" || bootstrap.Env[5].Value != fmt.Sprintf("%t", shard == 0) ||
+			bootstrap.Env[6].Name != "PGSHARD_SHARDSCHEMA_MIGRATION" || bootstrap.Env[6].Value != shardschemaMigrationPath ||
+			bootstrap.Env[7].Name != "PGSHARD_SHARDSCHEMA_MIGRATION_SHA256" || bootstrap.Env[7].Value != shardschemaMigrationSHA256 ||
+			bootstrap.Env[8].Name != "PGSHARD_NODE_UID" || bootstrap.Env[8].ValueFrom == nil || bootstrap.Env[8].ValueFrom.FieldRef == nil || bootstrap.Env[8].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-uid']" ||
+			bootstrap.Env[9].Name != "PGSHARD_NODE_BOOT_ID" || bootstrap.Env[9].ValueFrom == nil || bootstrap.Env[9].ValueFrom.FieldRef == nil || bootstrap.Env[9].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-boot-id']" {
 			t.Fatalf("PostgreSQL bootstrap identity = %#v", bootstrap.Env)
+		}
+		if shard == 0 && (bootstrap.Env[10].Name != "PGSHARD_CATALOG_CLIENT_SHA256" || bootstrap.Env[10].Value != cluster.Status.CatalogAccess.ClientSHA256 || bootstrap.Env[11].Name != "PGSHARD_CATALOG_SERVER_SHA256" || bootstrap.Env[11].Value != cluster.Status.CatalogAccess.ServerSHA256) {
+			t.Fatalf("PostgreSQL catalog material checkpoint = %#v", bootstrap.Env)
+		}
+		if configMapVolumeName(t, pod.Volumes, "postgresql-config") != configuration.Name || !containsVolumeMount(bootstrap.VolumeMounts, "postgresql-config", true) {
+			t.Fatalf("PostgreSQL bootstrap configuration mount = %#v", bootstrap.VolumeMounts)
 		}
 		if bootstrap.SecurityContext == nil || bootstrap.SecurityContext.ReadOnlyRootFilesystem == nil || !*bootstrap.SecurityContext.ReadOnlyRootFilesystem || bootstrap.Resources.Limits.Memory() == nil {
 			t.Fatalf("PostgreSQL bootstrap security/resources = %#v", bootstrap)
@@ -257,6 +385,25 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 				t.Fatalf("running PostgreSQL mounts the bootstrap Secret: %#v", postgres.VolumeMounts)
 			}
 		}
+		if shard == 0 {
+			serverTLS := volumeByName(t, pod.Volumes, "catalog-server-tls")
+			if serverTLS.Secret == nil || serverTLS.Secret.SecretName != cluster.Status.CatalogAccess.SecretName || !reflect.DeepEqual(secretItemKeys(serverTLS.Secret.Items), []string{CatalogTLSCertificateKey, CatalogTLSPrivateKeyKey}) {
+				t.Fatalf("PostgreSQL catalog TLS projection = %#v", serverTLS.Secret)
+			}
+			catalogAuth := volumeByName(t, pod.Volumes, "catalog-bootstrap-auth")
+			if catalogAuth.Secret == nil || catalogAuth.Secret.SecretName != cluster.Status.CatalogAccess.SecretName || !reflect.DeepEqual(secretItemKeys(catalogAuth.Secret.Items), []string{CatalogPasswordKey, CatalogCACertificateKey}) {
+				t.Fatalf("catalog bootstrap password projection = %#v", catalogAuth.Secret)
+			}
+			if !containsVolumeMount(postgres.VolumeMounts, "catalog-server-tls", true) || containsVolumeMount(postgres.VolumeMounts, "catalog-bootstrap-auth", true) || !containsVolumeMount(bootstrap.VolumeMounts, "catalog-bootstrap-auth", true) || !containsVolumeMount(bootstrap.VolumeMounts, "catalog-server-tls", true) {
+				t.Fatalf("catalog least-privilege mounts: PostgreSQL=%#v bootstrap=%#v", postgres.VolumeMounts, bootstrap.VolumeMounts)
+			}
+		} else {
+			for _, name := range []string{"catalog-server-tls", "catalog-bootstrap-auth"} {
+				if hasVolume(pod.Volumes, name) || containsVolumeMount(postgres.VolumeMounts, name, true) || containsVolumeMount(bootstrap.VolumeMounts, name, true) {
+					t.Fatalf("non-catalog shard %d received catalog material %q", shard, name)
+				}
+			}
+		}
 		budget := object[*policyv1.PodDisruptionBudget](t, plan, name)
 		if budget.Spec.MinAvailable == nil || budget.Spec.MinAvailable.IntVal != 1 || budget.Spec.Selector.MatchLabels[ShardLabel] != shardLabel(shard) || budget.Spec.Selector.MatchLabels[RoleLabel] != "primary" {
 			t.Fatalf("PostgreSQL PDB = %#v", budget.Spec)
@@ -268,6 +415,15 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		t.Fatalf("PostgreSQL auth Secret = %#v", secret)
 	}
 	assertOwned(t, secret, cluster)
+	catalogName := CatalogAccessSecretPrefix(cluster.Name) + strings.Repeat("a", 32)
+	catalogIntent := CatalogAccessIntentSecret(cluster, catalogName)
+	if catalogIntent.Name != catalogName || !CatalogAccessSecretNameIsValid(cluster.Name, catalogIntent.Name) || catalogIntent.Immutable != nil || len(catalogIntent.Data) != 0 || catalogIntent.Annotations[CatalogAccessClusterUIDAnnotation] != string(cluster.UID) {
+		t.Fatalf("catalog access intent Secret = %#v", catalogIntent)
+	}
+	assertOwned(t, catalogIntent, cluster)
+	if got, want := CatalogTLSDNSNames(cluster.Name, cluster.Namespace), []string{"demo-shardschema", "demo-shardschema.database", "demo-shardschema.database.svc", "demo-shardschema.database.svc.cluster.local"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("catalog TLS DNS names = %#v, want %#v", got, want)
+	}
 	secret.UID = "demo-random-auth-uid"
 	claim := PostgreSQLPrimaryDataPVC(cluster, 1, "demo-random-data", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, secret.Name, secret.UID)
 	if claim.Name != "demo-random-data" || claim.Labels[ShardLabel] != "0001" || claim.Spec.Resources.Requests.Storage().Cmp(cluster.Spec.Storage.Size) != 0 || claim.Annotations[ApplyOwnershipAnnotation] != "" {
@@ -314,6 +470,38 @@ func TestPostgreSQLBootstrapRequiresBindingIdentityBeforeDataAccess(t *testing.T
 	}
 }
 
+func TestPostgreSQLBootstrapVerifiesMigrationBeforeDataAccess(t *testing.T) {
+	t.Parallel()
+	parent := t.TempDir()
+	migration := filepath.Join(t.TempDir(), "0001_shardschema.sql")
+	if err := os.WriteFile(migration, []byte("SELECT 1;\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	script := strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", fmt.Sprintf("parent=%q", parent), 1)
+	command := exec.Command("bash", "-c", script)
+	command.Env = append(bootstrapVersionTestEnvironment(t, pgshardv1alpha1.PostgreSQLMajor18),
+		"PGSHARD_CLUSTER_UID=cluster-uid",
+		"PGSHARD_SHARD_ID=0000",
+		"PGSHARD_POSTGRESQL_MAJOR="+pgshardv1alpha1.PostgreSQLMajor18,
+		"PGSHARD_SHARD_COUNT=2",
+		fmt.Sprintf("PGSHARD_MAXIMUM_SHARDS=%d", pgshardv1alpha1.MaximumShards),
+		"PGSHARD_BOOTSTRAP_SHARDSCHEMA=true",
+		"PGSHARD_SHARDSCHEMA_MIGRATION="+migration,
+		"PGSHARD_SHARDSCHEMA_MIGRATION_SHA256="+strings.Repeat("0", sha256.Size*2),
+		"PGSHARD_NODE_UID=node-a",
+		"PGSHARD_NODE_BOOT_ID=boot-a",
+	)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "shardschema migration does not match the operator release") {
+		t.Fatalf("bootstrap migration mismatch error = %v, output = %q", err, output)
+	}
+	for _, path := range []string{filepath.Join(parent, ".pgshard-init"), filepath.Join(parent, "docker")} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("bootstrap touched PGDATA before migration validation: %s: %v", path, err)
+		}
+	}
+}
+
 func TestPostgreSQLBootstrapRefusesMismatchedDurableIdentity(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -341,7 +529,7 @@ func TestPostgreSQLBootstrapRefusesMismatchedDurableIdentity(t *testing.T) {
 			}
 			script := strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", fmt.Sprintf("parent=%q", parent), 1)
 			command := exec.Command("bash", "-c", script)
-			command.Env = append(os.Environ(), "PGSHARD_CLUSTER_UID="+test.clusterUID, "PGSHARD_SHARD_ID="+test.shard, "PGSHARD_NODE_UID=node-a", "PGSHARD_NODE_BOOT_ID=boot-a")
+			command.Env = append(bootstrapVersionTestEnvironment(t, pgshardv1alpha1.PostgreSQLMajor18), "PGSHARD_CLUSTER_UID="+test.clusterUID, "PGSHARD_SHARD_ID="+test.shard, "PGSHARD_POSTGRESQL_MAJOR="+pgshardv1alpha1.PostgreSQLMajor18, "PGSHARD_BOOTSTRAP_SHARDSCHEMA=false", "PGSHARD_NODE_UID=node-a", "PGSHARD_NODE_BOOT_ID=boot-a")
 			output, err := command.CombinedOutput()
 			if err == nil {
 				t.Fatal("bootstrap accepted a PostgreSQL data directory from a different identity")
@@ -353,6 +541,1224 @@ func TestPostgreSQLBootstrapRefusesMismatchedDurableIdentity(t *testing.T) {
 				t.Fatalf("bootstrap entered initialization after identity mismatch: %v", err)
 			}
 		})
+	}
+}
+
+func TestPostgreSQLBootstrapRejectsWrongMajorBeforeDataAccess(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name          string
+		binaryMajor   string
+		durableMajor  string
+		initdbMajor   string
+		want          string
+		createDurable bool
+	}{
+		{name: "bootstrap binary", binaryMajor: "17", want: "bootstrap image does not provide the operator's PostgreSQL major"},
+		{name: "durable data", binaryMajor: "18", durableMajor: "17", want: "refusing a PostgreSQL data directory from another major version", createDurable: true},
+		{name: "initialized staging data", binaryMajor: "18", initdbMajor: "17", want: "initialized PostgreSQL data does not match the operator major"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			parent := t.TempDir()
+			if test.createDurable {
+				final := filepath.Join(parent, "docker")
+				if err := os.MkdirAll(final, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(final, "PG_VERSION"), []byte(test.durableMajor+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			script := strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", fmt.Sprintf("parent=%q", parent), 1)
+			command := exec.Command("bash", "-c", script)
+			command.Env = append(bootstrapVersionTestEnvironment(t, test.binaryMajor, test.initdbMajor),
+				"PGSHARD_CLUSTER_UID=cluster-uid",
+				"PGSHARD_SHARD_ID=0000",
+				"PGSHARD_POSTGRESQL_MAJOR="+pgshardv1alpha1.PostgreSQLMajor18,
+				"PGSHARD_BOOTSTRAP_SHARDSCHEMA=false",
+				"PGSHARD_NODE_UID=node-a",
+				"PGSHARD_NODE_BOOT_ID=boot-a",
+			)
+			output, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), test.want) {
+				t.Fatalf("wrong-major bootstrap error = %v, output = %q", err, output)
+			}
+			if _, err := os.Stat(filepath.Join(parent, ".pgshard-init")); test.initdbMajor == "" && !os.IsNotExist(err) {
+				t.Fatalf("wrong-major bootstrap touched staging PGDATA: %v", err)
+			} else if test.initdbMajor != "" && err != nil {
+				t.Fatalf("wrong initdb major was not detected in staging PGDATA: %v", err)
+			}
+			if !test.createDurable {
+				if _, err := os.Stat(filepath.Join(parent, "docker")); !os.IsNotExist(err) {
+					t.Fatalf("wrong bootstrap binary published PGDATA: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
+	if os.Getenv("PGSHARD_POSTGRES_BOOTSTRAP_E2E") != "true" {
+		t.Skip("set PGSHARD_POSTGRES_BOOTSTRAP_E2E=true with the local PostgreSQL bootstrap image")
+	}
+	image := os.Getenv("PGSHARD_POSTGRES_BOOTSTRAP_IMAGE")
+	if image == "" {
+		t.Fatal("PGSHARD_POSTGRES_BOOTSTRAP_IMAGE is required")
+	}
+	volume := fmt.Sprintf("pgshard-bootstrap-%d-%d", os.Getpid(), time.Now().UnixNano())
+	runDocker := func(arguments ...string) (string, error) {
+		t.Helper()
+		output, err := exec.Command("docker", arguments...).CombinedOutput()
+		return string(output), err
+	}
+	if output, err := runDocker("volume", "create", volume); err != nil {
+		t.Fatalf("create Docker volume: %v\n%s", err, output)
+	}
+	t.Cleanup(func() {
+		if output, err := runDocker("volume", "rm", "--force", volume); err != nil {
+			t.Errorf("remove Docker volume: %v\n%s", err, output)
+		}
+	})
+	if output, err := runDocker(
+		"run", "--rm", "--user", "0:0",
+		"--volume", volume+":/var/lib/postgresql",
+		"--entrypoint", "chown", image, "999:999", "/var/lib/postgresql",
+	); err != nil {
+		t.Fatalf("prepare Docker volume ownership: %v\n%s", err, output)
+	}
+
+	newTraversableFixtureDirectory := func(prefix string) string {
+		t.Helper()
+		directory, err := os.MkdirTemp("", prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.RemoveAll(directory); err != nil {
+				t.Errorf("remove Docker fixture directory: %v", err)
+			}
+		})
+		return directory
+	}
+	secretDirectory := newTraversableFixtureDirectory("pgshard-bootstrap-secret-")
+	passwordPath := filepath.Join(secretDirectory, PostgreSQLPasswordKey)
+	if err := os.WriteFile(passwordPath, []byte("bootstrap-e2e-only-password\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	catalogAuthDirectory := newTraversableFixtureDirectory("pgshard-catalog-auth-")
+	const catalogPassword = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	catalogCA := []byte("bootstrap-e2e-catalog-ca\n")
+	if err := os.WriteFile(
+		filepath.Join(catalogAuthDirectory, CatalogPasswordKey),
+		[]byte(catalogPassword),
+		0o444,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(catalogAuthDirectory, CatalogCACertificateKey), catalogCA, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	catalogTLSDirectory := newTraversableFixtureDirectory("pgshard-catalog-tls-")
+	catalogServerCertificate := []byte("bootstrap-e2e-server-certificate\n")
+	catalogServerPrivateKey := []byte("bootstrap-e2e-server-private-key\n")
+	if err := os.WriteFile(filepath.Join(catalogTLSDirectory, CatalogTLSCertificateKey), catalogServerCertificate, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(catalogTLSDirectory, CatalogTLSPrivateKeyKey), catalogServerPrivateKey, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	catalogClientSHA256 := CatalogClientMaterialSHA256([]byte(catalogPassword), catalogCA)
+	catalogServerSHA256 := CatalogServerMaterialSHA256(catalogServerCertificate, catalogServerPrivateKey)
+	configurationDirectory := newTraversableFixtureDirectory("pgshard-bootstrap-config-")
+	if err := os.WriteFile(filepath.Join(configurationDirectory, "postgresql.conf"), []byte(strings.Join([]string{
+		"fsync = on",
+		"listen_addresses = '*'",
+		"max_prepared_transactions = 8",
+		"max_replication_slots = 20",
+		"max_wal_senders = 20",
+		"wal_level = logical",
+		"log_statement = all",
+		"log_min_error_statement = error",
+		"log_min_duration_statement = 0",
+		"",
+	}, "\n")), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configurationDirectory, "primary-0000.conf"), []byte("include = '/etc/pgshard/postgresql/postgresql.conf'\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	legacyMigration, err := filepath.Abs(filepath.Join("..", "..", "..", "crates", "pgshard-catalog", "tests", "fixtures", "v0_49_0_shardschema.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacyMigration); err != nil {
+		t.Fatalf("locate legacy shardschema fixture: %v", err)
+	}
+
+	containerArguments := func(dataParent, script string, environment ...string) []string {
+		t.Helper()
+		arguments := []string{
+			"--user", "999:999", "--network", "none", "--read-only",
+			"--volume", volume + ":/var/lib/postgresql",
+			"--volume", secretDirectory + ":/etc/pgshard/bootstrap:ro",
+			"--volume", catalogAuthDirectory + ":/etc/pgshard/catalog-auth:ro",
+			"--volume", catalogTLSDirectory + ":/etc/pgshard/catalog-tls:ro",
+			"--volume", configurationDirectory + ":/etc/pgshard/postgresql:ro",
+			"--volume", legacyMigration + ":/tmp/v0_49_0_shardschema.sql:ro",
+			"--tmpfs", "/tmp:rw,uid=999,gid=999,mode=0700,size=67108864",
+			"--env", "PGDATA=" + dataParent + "/docker",
+		}
+		for _, variable := range environment {
+			arguments = append(arguments, "--env", variable)
+		}
+		arguments = append(arguments, "--entrypoint", "bash", image, "-ceu", script)
+		return arguments
+	}
+	runContainer := func(dataParent, script string, environment ...string) (string, error) {
+		t.Helper()
+		arguments := append([]string{"run", "--rm"}, containerArguments(dataParent, script, environment...)...)
+		return runDocker(arguments...)
+	}
+	runContainerWithTimeout := func(name, dataParent, script string, timeout time.Duration, environment ...string) (string, error) {
+		t.Helper()
+		arguments := append([]string{"run", "--rm", "--name", name}, containerArguments(dataParent, script, environment...)...)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		output, err := exec.CommandContext(ctx, "docker", arguments...).CombinedOutput()
+		if ctx.Err() != nil {
+			_, _ = runDocker("rm", "--force", name)
+			return string(output), fmt.Errorf("Docker container %s exceeded %s: %w", name, timeout, ctx.Err())
+		}
+		return string(output), err
+	}
+	bootstrapEnvironment := func(installCatalog bool, shardCount int) []string {
+		return []string{
+			"PGSHARD_CLUSTER_UID=bootstrap-e2e-cluster",
+			"PGSHARD_SHARD_ID=0000",
+			"PGSHARD_POSTGRESQL_MAJOR=" + pgshardv1alpha1.PostgreSQLMajor18,
+			fmt.Sprintf("PGSHARD_SHARD_COUNT=%d", shardCount),
+			fmt.Sprintf("PGSHARD_MAXIMUM_SHARDS=%d", pgshardv1alpha1.MaximumShards),
+			fmt.Sprintf("PGSHARD_BOOTSTRAP_SHARDSCHEMA=%t", installCatalog),
+			"PGSHARD_SHARDSCHEMA_MIGRATION=" + shardschemaMigrationPath,
+			"PGSHARD_SHARDSCHEMA_MIGRATION_SHA256=" + shardschemaMigrationSHA256,
+			"PGSHARD_NODE_UID=bootstrap-e2e-node",
+			"PGSHARD_NODE_BOOT_ID=bootstrap-e2e-boot",
+			"PGSHARD_CATALOG_CLIENT_SHA256=" + catalogClientSHA256,
+			"PGSHARD_CATALOG_SERVER_SHA256=" + catalogServerSHA256,
+		}
+	}
+	bootstrapScript := func(dataParent string) string {
+		if dataParent == "/var/lib/postgresql/18" {
+			return postgresqlBootstrapScript
+		}
+		return strings.Replace(postgresqlBootstrapScript, "parent=/var/lib/postgresql/18", "parent="+dataParent, 1)
+	}
+	bootstrap := func(dataParent string, installCatalog bool, shardCount int) (string, error) {
+		t.Helper()
+		output, err := runContainer(dataParent, bootstrapScript(dataParent), bootstrapEnvironment(installCatalog, shardCount)...)
+		if strings.Contains(output, catalogPassword) {
+			t.Fatalf("PostgreSQL bootstrap logged the catalog password:\n%s", output)
+		}
+		return output, err
+	}
+	const primaryDataParent = "/var/lib/postgresql/18"
+	if output, err := bootstrap(primaryDataParent, false, 2); err != nil {
+		t.Fatalf("initialize PGDATA without catalog: %v\n%s", err, output)
+	}
+
+	const postgresHarness = `set -Eeuo pipefail
+socket=/tmp/pgshard-bootstrap-e2e
+mkdir -m 0700 "$socket"
+pg_ctl -D "$PGDATA" -w -t 45 start \
+  -l /tmp/postgres.log \
+  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c event_triggers=off" >/dev/null
+stop_postgres() {
+  result=$?
+  trap - EXIT
+  pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null || result=1
+  exit "$result"
+}
+trap stop_postgres EXIT
+`
+	prepareLegacyCatalog := postgresHarness + `
+createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --file=/tmp/v0_49_0_shardschema.sql >/dev/null
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(primaryDataParent, prepareLegacyCatalog); err != nil {
+		t.Fatalf("prepare v0.49.0 catalog database: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(primaryDataParent, true, 1); err != nil {
+		t.Fatalf("upgrade v0.49.0 catalog database: %v\n%s", err, output)
+	}
+	localCatalogLogin := postgresHarness + `
+if PGPASSWORD="$(</etc/pgshard/catalog-auth/catalog-password)" \
+  psql -X --no-password --host="$socket" --username=pgshard_pooler_catalog --dbname=postgres \
+    --set=ON_ERROR_STOP=1 --command='SELECT 1'; then
+  echo "catalog login unexpectedly escaped through a local socket" >&2
+  exit 1
+fi
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(primaryDataParent, localCatalogLogin); err != nil {
+		t.Fatalf("prove local-socket catalog login rejection: %v\n%s", err, output)
+	}
+
+	catalogSQL := func(dataParent, sql string) string {
+		t.Helper()
+		output, err := runContainer(dataParent, postgresHarness+`
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="$PGSHARD_TEST_SQL"
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`, "PGSHARD_TEST_SQL="+sql)
+		if err != nil {
+			t.Fatalf("query catalog fixture: %v\n%s", err, output)
+		}
+		return strings.TrimSpace(output)
+	}
+	catalogRoleSQL := func(dataParent, sql string) string {
+		t.Helper()
+		output, err := runContainer(dataParent, `set -Eeuo pipefail
+socket=/tmp/pgshard-catalog-role-e2e
+hba=/tmp/pgshard-catalog-role-hba
+mkdir -m 0700 "$socket"
+printf '%s\n' \
+  'local shardschema pgshard_pooler_catalog scram-sha-256' \
+  'local all all reject' \
+  'host all all all reject' > "$hba"
+pg_ctl -D "$PGDATA" -w -t 45 start \
+  -l /tmp/postgres.log \
+  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c hba_file='$hba' -c event_triggers=off" >/dev/null
+stop_postgres() {
+  result=$?
+  trap - EXIT
+  pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null || result=1
+  rm -f -- "$hba"
+  exit "$result"
+}
+trap stop_postgres EXIT
+PGPASSWORD="$(</etc/pgshard/catalog-auth/catalog-password)" \
+  psql -X --no-password --host="$socket" --username=pgshard_pooler_catalog --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="$PGSHARD_TEST_SQL"
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+rm -f -- "$hba"
+trap - EXIT
+`, "PGSHARD_TEST_SQL="+sql)
+		if err != nil {
+			t.Fatalf("query catalog as production reader role: %v\n%s", err, output)
+		}
+		return strings.TrimSpace(output)
+	}
+	fingerprint := func() string {
+		t.Helper()
+		output, err := runContainer(primaryDataParent, postgresHarness+`
+{
+  {
+  pg_dump --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --schema-only --quote-all-identifiers \
+    --restrict-key=pgshardCatalogSnapshot
+  pg_dump --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --data-only --quote-all-identifiers \
+    --restrict-key=pgshardCatalogSnapshot
+  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --no-align --tuples-only <<'PGSHARD_FINGERPRINT_SQL'
+SELECT pg_catalog.row_to_json(role_state)::text
+  FROM (
+    SELECT roles.rolname,
+           roles.rolsuper,
+           roles.rolinherit,
+           roles.rolcreaterole,
+           roles.rolcreatedb,
+           roles.rolcanlogin,
+           roles.rolreplication,
+	           roles.rolbypassrls,
+	           roles.rolconnlimit,
+	           roles.rolvaliduntil,
+	           roles.rolpassword AS password_verifier
+	      FROM pg_catalog.pg_authid AS roles
+	     WHERE pg_catalog.left(roles.rolname, 16) = 'pgshard_catalog_'
+	        OR roles.rolname = 'pgshard_pooler_catalog'
+     ORDER BY roles.rolname
+  ) AS role_state;
+SELECT pg_catalog.row_to_json(membership_state)::text
+  FROM (
+    SELECT granted_role.rolname AS granted_role,
+           member_role.rolname AS member_role,
+           grantor_role.rolname AS grantor_role,
+           memberships.admin_option,
+           memberships.inherit_option,
+           memberships.set_option
+      FROM pg_catalog.pg_auth_members AS memberships
+      JOIN pg_catalog.pg_roles AS granted_role
+        ON granted_role.oid = memberships.roleid
+      JOIN pg_catalog.pg_roles AS member_role
+        ON member_role.oid = memberships.member
+      JOIN pg_catalog.pg_roles AS grantor_role
+        ON grantor_role.oid = memberships.grantor
+     WHERE pg_catalog.left(granted_role.rolname, 16) = 'pgshard_catalog_'
+        OR pg_catalog.left(member_role.rolname, 16) = 'pgshard_catalog_'
+     ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+  ) AS membership_state;
+SELECT pg_catalog.row_to_json(database_state)::text
+  FROM (
+    SELECT databases.datname,
+           pg_catalog.pg_get_userbyid(databases.datdba) AS owner_name,
+           databases.encoding,
+           databases.datcollate,
+           databases.datctype,
+           databases.datlocprovider,
+           databases.datlocale,
+           databases.daticurules,
+           databases.datcollversion,
+           databases.datistemplate,
+           databases.datallowconn,
+           databases.datconnlimit,
+           databases.datacl
+      FROM pg_catalog.pg_database AS databases
+     WHERE databases.datname = 'shardschema'
+  ) AS database_state;
+SELECT pg_catalog.row_to_json(setting_state)::text
+  FROM (
+    SELECT COALESCE(databases.datname, '*') AS database_name,
+           COALESCE(roles.rolname, '*') AS role_name,
+           settings.setconfig
+      FROM pg_catalog.pg_db_role_setting AS settings
+      LEFT JOIN pg_catalog.pg_database AS databases
+        ON databases.oid = settings.setdatabase
+      LEFT JOIN pg_catalog.pg_roles AS roles
+        ON roles.oid = settings.setrole
+     WHERE settings.setdatabase = 0
+        OR databases.datname = 'shardschema'
+     ORDER BY database_name, role_name
+  ) AS setting_state;
+SELECT pg_catalog.row_to_json(event_trigger_state)::text
+  FROM (
+    SELECT triggers.evtname,
+           pg_catalog.pg_get_userbyid(triggers.evtowner) AS owner_name,
+           triggers.evtevent,
+           triggers.evtenabled,
+           triggers.evtfoid::pg_catalog.regprocedure::text AS function_name,
+           triggers.evttags
+      FROM pg_catalog.pg_event_trigger AS triggers
+     ORDER BY triggers.evtname
+  ) AS event_trigger_state;
+PGSHARD_FINGERPRINT_SQL
+  } | sha256sum
+  sha256sum "$PGDATA/pg_hba.conf"
+} | sha256sum
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`)
+		if err != nil {
+			t.Fatalf("fingerprint catalog fixture: %v\n%s", err, output)
+		}
+		fields := strings.Fields(output)
+		if len(fields) != 2 || fields[1] != "-" {
+			t.Fatalf("catalog and HBA fingerprint output = %q", output)
+		}
+		return fields[0]
+	}
+	assertRejectedWithoutCatalogOrHBAMutation := func(shardCount int, want string) {
+		t.Helper()
+		before := fingerprint()
+		output, err := bootstrap(primaryDataParent, true, shardCount)
+		if err == nil || !strings.Contains(output, want) {
+			t.Fatalf("conflicting catalog bootstrap error = %v, want %q\n%s", err, want, output)
+		}
+		if after := fingerprint(); after != before {
+			t.Fatalf("rejected catalog or serving HBA changed before=%q after=%q", before, after)
+		}
+	}
+
+	assertRejectedWithoutCatalogOrHBAMutation(2, "RestoreTopologyMismatch")
+	catalogSQL(primaryDataParent, "INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-0001', 1, 'active')")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("replay exact two-shard catalog inventory: %v\n%s", err, output)
+	}
+	if got := catalogSQL(primaryDataParent, "SELECT (SELECT string_agg(shard_id::text || ':' || shard_number::text || ':' || state, ',' ORDER BY shard_number) FROM pgshard_catalog.shards), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active'), (SELECT pg_catalog.pg_get_userbyid(nspowner) FROM pg_catalog.pg_namespace WHERE nspname = 'pgshard_catalog')"); got != "shard-0000:0:active,shard-0001:1:active|2|pgshard_catalog_owner" {
+		t.Fatalf("recovered catalog inventory = %q", got)
+	}
+	assertRejectedWithoutCatalogOrHBAMutation(1, "RestoreTopologyMismatch")
+
+	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 2 CYCLE")
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing an unsupported or malformed pre-existing shardschema catalog")
+	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 1 NO CYCLE")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical identity sequence was not restored: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, `
+INSERT INTO pgshard_catalog.logical_databases(logical_database_id, database_name)
+VALUES ('11111111-1111-1111-1111-111111111111', 'sequence_progress');
+INSERT INTO pgshard_catalog.routing_epochs(logical_database_id)
+VALUES ('11111111-1111-1111-1111-111111111111');
+INSERT INTO pgshard_catalog.registered_tables(
+  logical_database_id,
+  schema_name,
+  table_name,
+  shard_key_column,
+  shard_key_type
+)
+VALUES (
+  '11111111-1111-1111-1111-111111111111',
+  'public',
+  'sequence_progress',
+  'id',
+  'bigint'
+);
+SELECT pg_catalog.setval(
+  'pgshard_catalog.routing_epochs_routing_epoch_seq',
+  (SELECT pg_catalog.max(routing_epoch) FROM pgshard_catalog.routing_epochs),
+  false
+);
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing shardschema identity sequence progress that conflicts with catalog rows")
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.routing_epochs_routing_epoch_seq',
+  (SELECT pg_catalog.max(routing_epoch) FROM pgshard_catalog.routing_epochs),
+  true
+);
+SELECT pg_catalog.setval(
+  'pgshard_catalog.registered_tables_registered_table_id_seq',
+  (SELECT pg_catalog.max(registered_table_id) FROM pgshard_catalog.registered_tables),
+  false
+);
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing shardschema identity sequence progress that conflicts with catalog rows")
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.registered_tables_registered_table_id_seq',
+  (SELECT pg_catalog.max(registered_table_id) FROM pgshard_catalog.registered_tables),
+  true
+);
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("safe identity sequence progress was rejected: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.routing_epochs_routing_epoch_seq',
+  (SELECT sequences.seqmax
+     FROM pg_catalog.pg_sequence AS sequences
+    WHERE sequences.seqrelid =
+          'pgshard_catalog.routing_epochs_routing_epoch_seq'::pg_catalog.regclass),
+  true
+);
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing shardschema identity sequence progress that conflicts with catalog rows")
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.routing_epochs_routing_epoch_seq',
+  (SELECT pg_catalog.max(routing_epoch) + 1
+     FROM pgshard_catalog.routing_epochs),
+  false
+);
+SELECT pg_catalog.setval(
+  'pgshard_catalog.registered_tables_registered_table_id_seq',
+  (SELECT sequences.seqmax
+     FROM pg_catalog.pg_sequence AS sequences
+    WHERE sequences.seqrelid =
+          'pgshard_catalog.registered_tables_registered_table_id_seq'::pg_catalog.regclass),
+  true
+);
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing shardschema identity sequence progress that conflicts with catalog rows")
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.registered_tables_registered_table_id_seq',
+  (SELECT pg_catalog.max(registered_table_id) + 1
+     FROM pgshard_catalog.registered_tables),
+  false
+);
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("repaired exhausted identity sequences were rejected: %v\n%s", err, output)
+	}
+
+	catalogSQL(primaryDataParent, `
+CREATE FUNCTION public.pgshard_rejected_event_trigger()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+  NULL;
+END
+$function$;
+CREATE EVENT TRIGGER pgshard_rejected_event_trigger
+ON ddl_command_start
+EXECUTE FUNCTION public.pgshard_rejected_event_trigger();
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "pre-existing shardschema contains an unsupported event trigger")
+	catalogSQL(primaryDataParent, `
+DROP EVENT TRIGGER pgshard_rejected_event_trigger;
+DROP FUNCTION public.pgshard_rejected_event_trigger();
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical database-wide trigger set was rejected: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, `
+CREATE TABLE public.pgshard_login_observations(observed boolean NOT NULL);
+CREATE FUNCTION public.pgshard_rejected_login_trigger()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+  INSERT INTO public.pgshard_login_observations VALUES (true);
+END
+$function$;
+CREATE EVENT TRIGGER pgshard_rejected_login_trigger
+ON login
+EXECUTE FUNCTION public.pgshard_rejected_login_trigger();
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "pre-existing shardschema contains an unsupported event trigger")
+	if got := catalogSQL(primaryDataParent, "SELECT count(*) FROM public.pgshard_login_observations"); got != "0" {
+		t.Fatalf("login event trigger ran before catalog rejection: %q", got)
+	}
+	catalogSQL(primaryDataParent, `
+DROP EVENT TRIGGER pgshard_rejected_login_trigger;
+DROP FUNCTION public.pgshard_rejected_login_trigger();
+DROP TABLE public.pgshard_login_observations;
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical login-trigger set was rejected: %v\n%s", err, output)
+	}
+
+	catalogSQL(primaryDataParent, "CREATE RULE pgshard_rejected_rule AS ON INSERT TO pgshard_catalog.shards DO INSTEAD NOTHING")
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing an unsupported or malformed pre-existing shardschema catalog")
+	catalogSQL(primaryDataParent, "DROP RULE pgshard_rejected_rule ON pgshard_catalog.shards")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical rewrite-rule set was not restored: %v\n%s", err, output)
+	}
+
+	catalogSQL(primaryDataParent, `
+DO $pgshard_disable_internal_trigger$
+DECLARE
+  internal_trigger name;
+BEGIN
+  SELECT triggers.tgname
+    INTO STRICT internal_trigger
+    FROM pg_catalog.pg_trigger AS triggers
+   WHERE triggers.tgrelid = 'pgshard_catalog.routing_ranges'::pg_catalog.regclass
+     AND triggers.tgisinternal
+   ORDER BY triggers.oid
+   LIMIT 1;
+  EXECUTE pg_catalog.format(
+    'ALTER TABLE pgshard_catalog.routing_ranges DISABLE TRIGGER %I',
+    internal_trigger
+  );
+END
+$pgshard_disable_internal_trigger$;
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing an unsupported or malformed pre-existing shardschema catalog")
+	catalogSQL(primaryDataParent, "ALTER TABLE pgshard_catalog.routing_ranges ENABLE TRIGGER ALL")
+
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical catalog was not restored before GUC coverage: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, "ALTER DATABASE shardschema SET search_path TO pgshard_catalog, pg_catalog, public")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical catalog was rejected under a noncanonical database search_path: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, "ALTER DATABASE shardschema RESET search_path; ALTER ROLE postgres IN DATABASE shardschema SET quote_all_identifiers TO on")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical catalog was rejected under noncanonical role identifier quoting: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, "ALTER ROLE postgres IN DATABASE shardschema RESET quote_all_identifiers")
+
+	catalogSQL(primaryDataParent, `
+CREATE OR REPLACE FUNCTION pgshard_catalog.lock_catalog_state()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+  RAISE EXCEPTION 'pre-existing trigger function body executed';
+END
+$function$;
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("bootstrap executed a pre-existing trigger function body: %v\n%s", err, output)
+	}
+	if got := catalogSQL(primaryDataParent, "SELECT pg_catalog.strpos(pg_catalog.pg_get_functiondef('pgshard_catalog.lock_catalog_state()'::pg_catalog.regprocedure), 'pre-existing trigger function body executed')"); got != "0" {
+		t.Fatalf("bootstrap retained the pre-existing trigger function body: %q", got)
+	}
+
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.cluster_configuration DISABLE TRIGGER USER;
+UPDATE pgshard_catalog.cluster_configuration SET home_shard_id = 'shard-0001' WHERE singleton;
+ALTER TABLE pgshard_catalog.cluster_configuration ENABLE TRIGGER USER;
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing shardschema home-shard identity")
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.cluster_configuration DISABLE TRIGGER USER;
+UPDATE pgshard_catalog.cluster_configuration SET home_shard_id = 'shard-0000' WHERE singleton;
+ALTER TABLE pgshard_catalog.cluster_configuration ENABLE TRIGGER USER;
+`)
+
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER ALL;
+INSERT INTO pgshard_catalog.shard_restore_incarnations(
+  restore_incarnation,
+  shard_id,
+  state
+)
+VALUES ('33333333-3333-3333-3333-333333333333', 'ghost-shard', 'active');
+ALTER TABLE pgshard_catalog.shard_restore_incarnations ENABLE TRIGGER ALL;
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing shardschema restore lineage")
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER ALL;
+DELETE FROM pgshard_catalog.shard_restore_incarnations
+ WHERE restore_incarnation = '33333333-3333-3333-3333-333333333333';
+ALTER TABLE pgshard_catalog.shard_restore_incarnations ENABLE TRIGGER ALL;
+`)
+
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER USER;
+DELETE FROM pgshard_catalog.shard_restore_incarnations WHERE shard_id = 'shard-0000' AND state = 'active';
+ALTER TABLE pgshard_catalog.shard_restore_incarnations ENABLE TRIGGER USER;
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing shardschema restore lineage")
+	catalogSQL(primaryDataParent, `
+INSERT INTO pgshard_catalog.shard_restore_incarnations(restore_incarnation, shard_id, state)
+VALUES ('11111111-1111-1111-1111-111111111111', 'shard-0000', 'active');
+`)
+
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shards DISABLE TRIGGER USER;
+INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-10000', 10000, 'retired');
+ALTER TABLE pgshard_catalog.shards ENABLE TRIGGER USER;
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing shardschema restore lineage")
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER USER;
+INSERT INTO pgshard_catalog.shard_restore_incarnations(restore_incarnation, shard_id, state, retired_at)
+VALUES ('22222222-2222-2222-2222-222222222222', 'shard-10000', 'retired', statement_timestamp());
+ALTER TABLE pgshard_catalog.shard_restore_incarnations ENABLE TRIGGER USER;
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical five-digit retired shard was rejected: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shards DISABLE TRIGGER USER;
+INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-1000', 10001, 'retired');
+ALTER TABLE pgshard_catalog.shards ENABLE TRIGGER USER;
+`)
+	assertRejectedWithoutCatalogOrHBAMutation(2, "RestoreTopologyMismatch")
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shards DISABLE TRIGGER USER;
+DELETE FROM pgshard_catalog.shards WHERE shard_number = 10001;
+ALTER TABLE pgshard_catalog.shards ENABLE TRIGGER USER;
+`)
+
+	catalogSQL(primaryDataParent, `
+BEGIN;
+LOCK TABLE pgshard_catalog.shards IN ACCESS EXCLUSIVE MODE;
+PREPARE TRANSACTION 'pgshard_bootstrap_lock';
+`)
+	lockContainer := fmt.Sprintf("pgshard-bootstrap-lock-%d-%d", os.Getpid(), time.Now().UnixNano())
+	started := time.Now()
+	output, err := runContainerWithTimeout(lockContainer, primaryDataParent, bootstrapScript(primaryDataParent), 20*time.Second, bootstrapEnvironment(true, 2)...)
+	if err == nil || !strings.Contains(output, "canceling statement due to lock timeout") {
+		t.Fatalf("prepared catalog lock was not bounded by lock_timeout after %s: %v\n%s", time.Since(started), err, output)
+	}
+	if elapsed := time.Since(started); elapsed >= 20*time.Second {
+		t.Fatalf("prepared catalog lock exceeded bounded retry window: %s", elapsed)
+	}
+
+	crashContainer := fmt.Sprintf("pgshard-bootstrap-crash-%d-%d", os.Getpid(), time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = runDocker("rm", "--force", crashContainer)
+	})
+	crashBootstrapScript := strings.Replace(bootstrapScript(primaryDataParent), "lock_timeout=5s", "lock_timeout=30s", 1)
+	crashArguments := append([]string{"run", "--detach", "--name", crashContainer}, containerArguments(primaryDataParent, crashBootstrapScript, bootstrapEnvironment(true, 2)...)...)
+	if output, err := runDocker(crashArguments...); err != nil {
+		t.Fatalf("start crash-retry bootstrap container: %v\n%s", err, output)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		lockWaiters, err := runDocker(
+			"exec", crashContainer,
+			"psql", "-X", "--no-password", "--host=/tmp/pgshard-catalog-bootstrap", "--username=postgres", "--dbname=shardschema", "--no-align", "--tuples-only",
+			"--command=SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity WHERE datname = 'shardschema' AND wait_event_type = 'Lock'",
+		)
+		if err == nil && strings.TrimSpace(lockWaiters) == "1" {
+			break
+		}
+		if time.Now().After(deadline) {
+			logs, _ := runDocker("logs", crashContainer)
+			t.Fatalf("temporary postmaster did not start before crash injection:\n%s", logs)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if output, err := runDocker("kill", "--signal", "KILL", crashContainer); err != nil {
+		t.Fatalf("SIGKILL bootstrap container: %v\n%s", err, output)
+	}
+	if output, err := runDocker("rm", "--force", crashContainer); err != nil {
+		t.Fatalf("remove killed bootstrap container: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, "ROLLBACK PREPARED 'pgshard_bootstrap_lock'")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("bootstrap did not recover after forced container death: %v\n%s", err, output)
+	}
+	if got := catalogSQL(primaryDataParent, "SELECT count(*) FILTER (WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active'), count(*) FILTER (WHERE shard_id = 'shard-10000' AND shard_number = 10000 AND state = 'retired') FROM pgshard_catalog.shards"); got != "2|2|1" {
+		t.Fatalf("post-recovery catalog inventory = %q", got)
+	}
+
+	assertGenesisCrashRetry := func(dataParent, interruptedScript, probeSQL, wantProbe, boundary string) {
+		t.Helper()
+		containerName := fmt.Sprintf("pgshard-genesis-crash-%d-%d", os.Getpid(), time.Now().UnixNano())
+		t.Cleanup(func() {
+			_, _ = runDocker("rm", "--force", containerName)
+		})
+		arguments := append(
+			[]string{"run", "--detach", "--name", containerName},
+			containerArguments(dataParent, interruptedScript, bootstrapEnvironment(true, 2)...)...,
+		)
+		if output, err := runDocker(arguments...); err != nil {
+			t.Fatalf("start %s crash fixture: %v\n%s", boundary, err, output)
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			observed, err := runDocker(
+				"exec", containerName,
+				"psql", "-X", "--no-password", "--host=/tmp/pgshard-catalog-bootstrap", "--username=postgres", "--dbname=shardschema", "--no-align", "--tuples-only",
+				"--command="+probeSQL,
+			)
+			if err == nil && strings.TrimSpace(observed) == wantProbe {
+				break
+			}
+			if time.Now().After(deadline) {
+				logs, _ := runDocker("logs", containerName)
+				t.Fatalf("%s did not become externally durable before crash injection: last probe error=%v output=%q\n%s", boundary, err, observed, logs)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		logs, _ := runDocker("logs", containerName)
+		if strings.Contains(logs, catalogPassword) {
+			t.Fatalf("%s logged the catalog password before forced death:\n%s", boundary, logs)
+		}
+		if output, err := runDocker("kill", "--signal", "KILL", containerName); err != nil {
+			t.Fatalf("SIGKILL %s bootstrap container: %v\n%s", boundary, err, output)
+		}
+		if output, err := runDocker("rm", "--force", containerName); err != nil {
+			t.Fatalf("remove killed %s bootstrap container: %v\n%s", boundary, err, output)
+		}
+		if output, err := runContainer(dataParent, `set -Eeuo pipefail
+test -f "$PGDATA/.pgshard-catalog-genesis-intent"
+test ! -L "$PGDATA/.pgshard-catalog-genesis-intent"
+`); err != nil {
+			t.Fatalf("%s did not preserve the durable genesis intent before retry: %v\n%s", boundary, err, output)
+		}
+		if output, err := bootstrap(dataParent, true, 2); err != nil {
+			t.Fatalf("catalog genesis did not recover after forced death at %s: %v\n%s", boundary, err, output)
+		}
+		if got := catalogSQL(dataParent, "SELECT count(*) FILTER (WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active') FROM pgshard_catalog.shards"); got != "2|2" {
+			t.Fatalf("recovered genesis inventory = %q", got)
+		}
+		if output, err := runContainer(dataParent, `set -Eeuo pipefail
+test ! -e "$PGDATA/.pgshard-catalog-genesis-intent"
+`); err != nil {
+			t.Fatalf("completed genesis retained its intent: %v\n%s", err, output)
+		}
+	}
+	migrationCommand := `psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --file="$PGSHARD_SHARDSCHEMA_MIGRATION"
+`
+	const migrationBoundaryDataParent = "/var/lib/postgresql/18-genesis-migration-boundary"
+	migrationBoundaryScript := strings.Replace(
+		bootstrapScript(migrationBoundaryDataParent),
+		migrationCommand,
+		migrationCommand+"while :; do sleep 1; done\n",
+		1,
+	)
+	if migrationBoundaryScript == bootstrapScript(migrationBoundaryDataParent) {
+		t.Fatal("catalog migration boundary injection did not match the bootstrap script")
+	}
+	assertGenesisCrashRetry(
+		migrationBoundaryDataParent,
+		migrationBoundaryScript,
+		"SELECT pg_catalog.to_regclass('pgshard_catalog.shards') IS NOT NULL",
+		"t",
+		"catalog migration commit",
+	)
+
+	const unreachablePartialDataParent = "/var/lib/postgresql/18-genesis-unreachable-partial"
+	unreachablePartialScript := strings.Replace(
+		bootstrapScript(unreachablePartialDataParent),
+		migrationCommand,
+		migrationCommand+"while :; do sleep 1; done\n",
+		1,
+	)
+	if unreachablePartialScript == bootstrapScript(unreachablePartialDataParent) {
+		t.Fatal("unreachable partial genesis injection did not match the bootstrap script")
+	}
+	partialContainer := fmt.Sprintf("pgshard-genesis-partial-%d-%d", os.Getpid(), time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = runDocker("rm", "--force", partialContainer)
+	})
+	partialArguments := append(
+		[]string{"run", "--detach", "--name", partialContainer},
+		containerArguments(unreachablePartialDataParent, unreachablePartialScript, bootstrapEnvironment(true, 3)...)...,
+	)
+	if output, err := runDocker(partialArguments...); err != nil {
+		t.Fatalf("start unreachable partial genesis fixture: %v\n%s", err, output)
+	}
+	partialDeadline := time.Now().Add(30 * time.Second)
+	for {
+		observed, err := runDocker(
+			"exec", partialContainer,
+			"psql", "-X", "--no-password", "--host=/tmp/pgshard-catalog-bootstrap", "--username=postgres", "--dbname=shardschema", "--no-align", "--tuples-only",
+			"--command=SELECT pg_catalog.to_regclass('pgshard_catalog.shards') IS NOT NULL",
+		)
+		if err == nil && strings.TrimSpace(observed) == "t" {
+			break
+		}
+		if time.Now().After(partialDeadline) {
+			logs, _ := runDocker("logs", partialContainer)
+			t.Fatalf("unreachable partial fixture did not reach migration commit: last probe error=%v output=%q\n%s", err, observed, logs)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if output, err := runDocker("kill", "--signal", "KILL", partialContainer); err != nil {
+		t.Fatalf("SIGKILL unreachable partial fixture: %v\n%s", err, output)
+	}
+	if output, err := runDocker("rm", "--force", partialContainer); err != nil {
+		t.Fatalf("remove unreachable partial fixture: %v\n%s", err, output)
+	}
+	forgeUnreachablePartial := postgresHarness + `
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 \
+  --command="INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-0002', 2, 'active')" >/dev/null
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(unreachablePartialDataParent, forgeUnreachablePartial); err != nil {
+		t.Fatalf("forge unreachable two-of-three genesis inventory: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(unreachablePartialDataParent, true, 3); err == nil || !strings.Contains(output, "RestoreTopologyMismatch: shardschema inventory is not a reachable genesis state") {
+		t.Fatalf("unreachable two-of-three genesis error = %v\n%s", err, output)
+	}
+	if output, err := runContainer(unreachablePartialDataParent, `set -Eeuo pipefail
+test -f "$PGDATA/.pgshard-catalog-genesis-intent"
+test ! -L "$PGDATA/.pgshard-catalog-genesis-intent"
+`); err != nil {
+		t.Fatalf("rejected unreachable genesis removed its recovery intent: %v\n%s", err, output)
+	}
+
+	const inventoryTransactionDataParent = "/var/lib/postgresql/18-genesis-inventory-transaction"
+	inventoryTransactionScript := strings.Replace(
+		bootstrapScript(inventoryTransactionDataParent),
+		" WHERE shards.shard_id IS NULL;\nDO \\$pgshard_inventory_postcondition\\$",
+		" WHERE shards.shard_id IS NULL;\nSELECT pg_catalog.pg_sleep(600);\nDO \\$pgshard_inventory_postcondition\\$",
+		1,
+	)
+	if inventoryTransactionScript == bootstrapScript(inventoryTransactionDataParent) {
+		t.Fatal("catalog inventory transaction boundary injection did not match the bootstrap script")
+	}
+	assertGenesisCrashRetry(
+		inventoryTransactionDataParent,
+		inventoryTransactionScript,
+		"SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE datname = 'shardschema' AND wait_event = 'PgSleep' AND query = 'SELECT pg_catalog.pg_sleep(600);'",
+		"1",
+		"open catalog inventory transaction",
+	)
+
+	const inventoryBoundaryDataParent = "/var/lib/postgresql/18-genesis-inventory-boundary"
+	inventoryBoundaryScript := strings.Replace(
+		bootstrapScript(inventoryBoundaryDataParent),
+		"COMMIT;\nPGSHARD_SHARD_INVENTORY",
+		"COMMIT;\nSELECT pg_catalog.pg_sleep(600);\nPGSHARD_SHARD_INVENTORY",
+		1,
+	)
+	if inventoryBoundaryScript == bootstrapScript(inventoryBoundaryDataParent) {
+		t.Fatal("catalog inventory boundary injection did not match the bootstrap script")
+	}
+	assertGenesisCrashRetry(
+		inventoryBoundaryDataParent,
+		inventoryBoundaryScript,
+		"SELECT count(*) FILTER (WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active') FROM pgshard_catalog.shards",
+		"2|2",
+		"catalog inventory commit",
+	)
+
+	const emptyDataParent = "/var/lib/postgresql/18-empty"
+	if output, err := bootstrap(emptyDataParent, false, 2); err != nil {
+		t.Fatalf("initialize malformed-catalog PGDATA: %v\n%s", err, output)
+	}
+	prepareMalformedCatalog := postgresHarness + `
+createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --file=/tmp/v0_49_0_shardschema.sql >/dev/null
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --command="ALTER TABLE pgshard_catalog.cluster_configuration DROP COLUMN cluster_id" >/dev/null
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(emptyDataParent, prepareMalformedCatalog); err != nil {
+		t.Fatalf("prepare malformed complete catalog: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing an unsupported or malformed pre-existing shardschema catalog") {
+		t.Fatalf("malformed complete catalog error = %v\n%s", err, output)
+	}
+	recreateEmptyCatalog := postgresHarness + `
+dropdb --no-password --host="$socket" --username=postgres shardschema
+psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+  --set=ON_ERROR_STOP=1 --command="DROP ROLE IF EXISTS pgshard_catalog_admin, pgshard_catalog_reader, pgshard_catalog_owner" >/dev/null
+createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(emptyDataParent, recreateEmptyCatalog); err != nil {
+		t.Fatalf("recreate catalog database after malformed shape: %v\n%s", err, output)
+	}
+	prepareReservedSchema := postgresHarness + `
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --command="CREATE SCHEMA pgshard_catalog; CREATE TABLE pgshard_catalog.unrelated(dummy integer)" >/dev/null
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(emptyDataParent, prepareReservedSchema); err != nil {
+		t.Fatalf("prepare occupied reserved schema: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing a non-empty pre-existing pgshard_catalog schema") {
+		t.Fatalf("occupied reserved schema error = %v\n%s", err, output)
+	}
+	if output, err := runContainer(emptyDataParent, recreateEmptyCatalog); err != nil {
+		t.Fatalf("recreate catalog database after occupied schema: %v\n%s", err, output)
+	}
+	preparePartialCatalog := postgresHarness + `
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --command="CREATE SCHEMA pgshard_catalog; CREATE TABLE pgshard_catalog.cluster_configuration(dummy integer); CREATE TABLE pgshard_catalog.shards(dummy integer)" >/dev/null
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(emptyDataParent, preparePartialCatalog); err != nil {
+		t.Fatalf("prepare two-of-three partial catalog: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing a partial pre-existing shardschema catalog") {
+		t.Fatalf("two-of-three partial catalog error = %v\n%s", err, output)
+	}
+	if output, err := runContainer(emptyDataParent, recreateEmptyCatalog); err != nil {
+		t.Fatalf("recreate empty catalog database: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing an empty pre-existing shardschema without durable genesis evidence") {
+		t.Fatalf("empty pre-existing catalog error = %v\n%s", err, output)
+	}
+	dropCatalogDatabase := postgresHarness + `
+dropdb --no-password --host="$socket" --username=postgres shardschema
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(emptyDataParent, dropCatalogDatabase); err != nil {
+		t.Fatalf("drop empty catalog database: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(emptyDataParent, true, 2); err == nil || !strings.Contains(output, "refusing pre-existing PGDATA without durable shardschema topology evidence") {
+		t.Fatalf("absent restored catalog error = %v\n%s", err, output)
+	}
+
+	const replicaDefaultDataParent = "/var/lib/postgresql/18-replica-default"
+	if output, err := bootstrap(replicaDefaultDataParent, false, 2); err != nil {
+		t.Fatalf("initialize inherited-replica-role PGDATA: %v\n%s", err, output)
+	}
+	prepareReplicaRoleDefault := postgresHarness + `
+createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --file=/tmp/v0_49_0_shardschema.sql >/dev/null
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 \
+  --command="INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-0001', 1, 'active')" >/dev/null
+psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+  --set=ON_ERROR_STOP=1 \
+  --command="
+    ALTER DATABASE shardschema SET log_statement = 'all';
+    ALTER DATABASE shardschema SET log_min_error_statement = 'error';
+    ALTER DATABASE shardschema SET log_min_duration_statement = 0;
+    ALTER DATABASE shardschema SET log_min_duration_sample = 0;
+    ALTER DATABASE shardschema SET log_statement_sample_rate = 1;
+    ALTER DATABASE shardschema SET log_transaction_sample_rate = 1;
+    ALTER DATABASE shardschema SET log_duration = on;
+    ALTER DATABASE shardschema SET log_parameter_max_length = -1;
+    ALTER DATABASE shardschema SET log_parameter_max_length_on_error = -1;
+    ALTER DATABASE shardschema SET password_encryption = 'md5';
+    ALTER DATABASE shardschema SET scram_iterations = 1024;
+    ALTER DATABASE shardschema SET zero_damaged_pages = on;
+    ALTER DATABASE shardschema SET ignore_checksum_failure = on;
+    ALTER DATABASE shardschema SET session_preload_libraries = 'pgshard_missing_preload';
+    ALTER DATABASE shardschema SET local_preload_libraries = 'pgshard_missing_preload';
+    ALTER DATABASE shardschema SET default_transaction_read_only = on;
+    ALTER ROLE postgres IN DATABASE shardschema SET session_replication_role = replica;
+    ALTER ROLE postgres IN DATABASE shardschema SET synchronous_commit = off;
+    ALTER ROLE postgres IN DATABASE shardschema SET zero_damaged_pages = on;
+    ALTER ROLE postgres IN DATABASE shardschema SET ignore_checksum_failure = on;
+    ALTER ROLE postgres IN DATABASE shardschema SET debug_print_parse = on;
+    ALTER ROLE postgres IN DATABASE shardschema SET debug_print_rewritten = on;
+    ALTER ROLE postgres IN DATABASE shardschema SET debug_print_plan = on;
+    ALTER ROLE postgres IN DATABASE shardschema SET log_parser_stats = on;
+  " >/dev/null
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(replicaDefaultDataParent, prepareReplicaRoleDefault); err != nil {
+		t.Fatalf("prepare inherited replica session role: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(replicaDefaultDataParent, true, 2); err != nil {
+		t.Fatalf("bootstrap under inherited replica session role: %v\n%s", err, output)
+	}
+	if got := catalogSQL(replicaDefaultDataParent, "SELECT count(*) FILTER (WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active') FROM pgshard_catalog.shards"); got != "2|2" {
+		t.Fatalf("inherited replica role bypassed exact inventory validation: %q", got)
+	}
+	if got := catalogSQL(replicaDefaultDataParent, "SELECT rolpassword LIKE 'SCRAM-SHA-256$4096:%' FROM pg_catalog.pg_authid WHERE rolname = 'pgshard_pooler_catalog'"); got != "t" {
+		t.Fatalf("hostile restored password_encryption created a non-SCRAM catalog login: %q", got)
+	}
+	if got := catalogRoleSQL(replicaDefaultDataParent, `
+SELECT CASE WHEN
+  current_setting('search_path') = 'pg_catalog'
+  AND current_setting('default_transaction_read_only') = 'off'
+  AND current_setting('synchronous_commit') = 'on'
+  AND current_setting('row_security') = 'off'
+THEN 1 ELSE 0 END`); got != "1" {
+		t.Fatalf("production catalog role inherited hostile restored settings: %q", got)
+	}
+	if got := catalogSQL(replicaDefaultDataParent, `
+SELECT
+  pg_catalog.count(*) FILTER (
+    WHERE databases.datname = 'shardschema'
+      AND roles.rolname = 'pgshard_pooler_catalog'
+      AND settings.setconfig = ARRAY[
+            'search_path=pg_catalog',
+            'statement_timeout=30s',
+            'lock_timeout=5s',
+            'transaction_timeout=120s',
+            'idle_in_transaction_session_timeout=30s',
+            'default_transaction_read_only=off',
+            'row_security=off',
+            'synchronous_commit=on',
+            'zero_damaged_pages=off',
+            'ignore_checksum_failure=off',
+            'jit=off'
+          ]::text[]
+  ),
+  pg_catalog.count(*) FILTER (
+    WHERE (
+        (settings.setrole = 0 AND databases.datname = 'shardschema')
+        OR roles.rolname = 'pgshard_pooler_catalog'
+      )
+      AND NOT (
+        databases.datname = 'shardschema'
+        AND roles.rolname = 'pgshard_pooler_catalog'
+      )
+  )
+FROM pg_catalog.pg_db_role_setting AS settings
+LEFT JOIN pg_catalog.pg_database AS databases ON databases.oid = settings.setdatabase
+LEFT JOIN pg_catalog.pg_roles AS roles ON roles.oid = settings.setrole`); got != "1|0" {
+		t.Fatalf("catalog reader defaults were not canonicalized exactly: %q", got)
+	}
+
+	const hostileConfigDataParent = "/var/lib/postgresql/18-hostile-config"
+	if output, err := bootstrap(hostileConfigDataParent, true, 2); err != nil {
+		t.Fatalf("initialize hostile-config PGDATA: %v\n%s", err, output)
+	}
+	hostileBefore := catalogSQL(hostileConfigDataParent, "SELECT catalog_epoch, (SELECT count(*) FROM pgshard_catalog.shards), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations) FROM pgshard_catalog.cluster_state WHERE singleton")
+	prepareHostileAutoConfig := `set -Eeuo pipefail
+cp -- "$PGDATA/postgresql.auto.conf" "$PGDATA/postgresql.auto.conf.pgshard-test"
+printf '%s\n' \
+  "shared_preload_libraries = 'pgshard_missing_preload'" \
+  "session_preload_libraries = 'pgshard_missing_preload'" \
+  "local_preload_libraries = 'pgshard_missing_preload'" \
+  "archive_mode = 'on'" \
+  "archive_command = 'touch ` + hostileConfigDataParent + `/docker/pgshard-hostile-command-executed'" \
+  "archive_library = 'pgshard_missing_archive_library'" \
+  "restore_command = 'touch ` + hostileConfigDataParent + `/docker/pgshard-hostile-command-executed'" \
+  "recovery_end_command = 'touch ` + hostileConfigDataParent + `/docker/pgshard-hostile-command-executed'" \
+  "data_directory = '/tmp/pgshard-hostile-data'" \
+  "hba_file = '/tmp/pgshard-hostile-hba'" \
+  "listen_addresses = '*'" \
+  "fsync = 'off'" \
+  "full_page_writes = 'off'" \
+  "zero_damaged_pages = 'on'" \
+  >> "$PGDATA/postgresql.auto.conf"
+`
+	if output, err := runContainer(hostileConfigDataParent, prepareHostileAutoConfig); err != nil {
+		t.Fatalf("prepare hostile restored PostgreSQL settings: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(hostileConfigDataParent, true, 2); err == nil || !strings.Contains(output, "refusing active settings in restored postgresql.auto.conf") {
+		t.Fatalf("hostile restored PostgreSQL settings error = %v\n%s", err, output)
+	}
+	restoreSafeAutoConfig := `set -Eeuo pipefail
+test ! -e "$PGDATA/pgshard-hostile-command-executed"
+mv -- "$PGDATA/postgresql.auto.conf.pgshard-test" "$PGDATA/postgresql.auto.conf"
+`
+	if output, err := runContainer(hostileConfigDataParent, restoreSafeAutoConfig); err != nil {
+		t.Fatalf("hostile restored settings executed or could not be removed: %v\n%s", err, output)
+	}
+	assertUnsafeStorageRejected := func(prepare, restore, want string) {
+		t.Helper()
+		if output, err := runContainer(hostileConfigDataParent, "set -Eeuo pipefail\n"+prepare); err != nil {
+			t.Fatalf("prepare unsafe restored storage: %v\n%s", err, output)
+		}
+		bootstrapOutput, bootstrapErr := bootstrap(hostileConfigDataParent, true, 2)
+		if output, err := runContainer(hostileConfigDataParent, "set -Eeuo pipefail\n"+restore); err != nil {
+			t.Fatalf("restore safe storage fixture: %v\n%s", err, output)
+		}
+		if bootstrapErr == nil || !strings.Contains(bootstrapOutput, want) {
+			t.Fatalf("unsafe restored storage error = %v, want %q\n%s", bootstrapErr, want, bootstrapOutput)
+		}
+	}
+	assertUnsafeStorageRejected(
+		`mv -- "$PGDATA/postgresql.auto.conf" "$PGDATA/postgresql.auto.conf.pgshard-test"
+ln -s /tmp/pgshard-missing-auto-conf "$PGDATA/postgresql.auto.conf"
+`,
+		`rm -- "$PGDATA/postgresql.auto.conf"
+mv -- "$PGDATA/postgresql.auto.conf.pgshard-test" "$PGDATA/postgresql.auto.conf"
+`,
+		"refusing an unsafe restored postgresql.auto.conf",
+	)
+	assertUnsafeStorageRejected(
+		`chmod 000 "$PGDATA/postgresql.auto.conf"
+`,
+		`chmod 0600 "$PGDATA/postgresql.auto.conf"
+`,
+		"refusing postgresql.auto.conf that cannot be inspected safely",
+	)
+	assertUnsafeStorageRejected(
+		`ln -s /tmp/pgshard-missing-standby-signal "$PGDATA/standby.signal"
+`,
+		`rm -- "$PGDATA/standby.signal"
+`,
+		"refusing PostgreSQL recovery state during primary bootstrap (standby.signal)",
+	)
+	assertUnsafeStorageRejected(
+		`mv -- "$PGDATA/pg_tblspc" "$PGDATA/pg_tblspc.pgshard-test"
+ln -s pg_wal "$PGDATA/pg_tblspc"
+`,
+		`rm -- "$PGDATA/pg_tblspc"
+mv -- "$PGDATA/pg_tblspc.pgshard-test" "$PGDATA/pg_tblspc"
+`,
+		"refusing an unsafe PostgreSQL tablespace directory",
+	)
+	assertUnsafeStorageRejected(
+		`chmod 000 "$PGDATA/pg_tblspc"
+`,
+		`chmod 0700 "$PGDATA/pg_tblspc"
+`,
+		"refusing a PostgreSQL tablespace directory that cannot be inspected safely",
+	)
+	if output, err := bootstrap(hostileConfigDataParent, true, 2); err != nil {
+		t.Fatalf("safe storage was rejected after hostile fixtures: %v\n%s", err, output)
+	}
+	if hostileAfter := catalogSQL(hostileConfigDataParent, "SELECT catalog_epoch, (SELECT count(*) FROM pgshard_catalog.shards), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations) FROM pgshard_catalog.cluster_state WHERE singleton"); hostileAfter != hostileBefore {
+		t.Fatalf("rejected restored settings changed catalog: before=%q after=%q", hostileBefore, hostileAfter)
 	}
 }
 
@@ -509,6 +1915,14 @@ func TestPlanFailsClosedForUnsafeIdentityOrMissingImages(t *testing.T) {
 	if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), "images") {
 		t.Fatalf("expected PostgreSQL image error, got %v", err)
 	}
+	images = DefaultImages()
+	cluster = testCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), "bootstrap image") {
+		t.Fatalf("expected PostgreSQL bootstrap image error, got %v", err)
+	}
 	cluster = testCluster()
 	cluster.Spec.Observability.OpenTelemetryEndpoint = "file:///tmp/collector"
 	if _, err := Plan(cluster, DefaultImages()); err == nil || !strings.Contains(strings.ToLower(err.Error()), "opentelemetry") {
@@ -532,6 +1946,32 @@ func TestPlanFailsClosedForUnsafeIdentityOrMissingImages(t *testing.T) {
 	}
 }
 
+func TestPostgreSQLBootstrapImageRejectsMutableRemoteReferences(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	for _, image := range []string{
+		"ghcr.io/andrew01234567890/pgshard-postgres-agent:main",
+		"ghcr.io/andrew01234567890/pgshard-postgres-agent@sha256:not-a-digest",
+		"pgshard/postgres-agent:other-local-tag",
+		"registry.example/UPPER/postgres-agent@sha256:" + strings.Repeat("a", 64),
+		"registry.example/pgshard//postgres-agent@sha256:" + strings.Repeat("a", 64),
+	} {
+		images := DefaultImages()
+		images.PostgreSQLBootstrap = image
+		if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), "immutable sha256 digest") {
+			t.Fatalf("bootstrap image %q error = %v", image, err)
+		}
+	}
+	images := DefaultImages()
+	images.PostgreSQLBootstrap = "registry.example/pgshard-postgres-agent:v1@sha256:" + strings.Repeat("a", 64)
+	if _, err := Plan(cluster, images); err != nil {
+		t.Fatalf("digest-pinned bootstrap image was rejected: %v", err)
+	}
+}
+
 func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
@@ -548,7 +1988,7 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
-	plan, err = Plan(cluster, DefaultImages())
+	plan, err = Plan(cluster, singleMemberImages())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,6 +2096,12 @@ func postgresqlConfigMap(t *testing.T, plan []client.Object, clusterName string)
 }
 
 func testPostgreSQLBootstraps(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.PostgreSQLBootstrapStatus {
+	cluster.Status.CatalogAccess = &pgshardv1alpha1.CatalogAccessStatus{
+		SecretName:   CatalogAccessSecretPrefix(cluster.Name) + strings.Repeat("a", 32),
+		SecretUID:    "test-catalog-secret-uid",
+		ClientSHA256: strings.Repeat("b", 64),
+		ServerSHA256: strings.Repeat("c", 64),
+	}
 	bootstraps := make([]pgshardv1alpha1.PostgreSQLBootstrapStatus, 0, cluster.Spec.Shards)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		bootstraps = append(bootstraps, pgshardv1alpha1.PostgreSQLBootstrapStatus{
@@ -664,6 +2110,28 @@ func testPostgreSQLBootstraps(cluster *pgshardv1alpha1.PgShardCluster) []pgshard
 		})
 	}
 	return bootstraps
+}
+
+func singleMemberImages() Images {
+	return DevelopmentImages()
+}
+
+func bootstrapVersionTestEnvironment(t *testing.T, major string, initdbMajor ...string) []string {
+	t.Helper()
+	directory := t.TempDir()
+	postgres := filepath.Join(directory, "postgres")
+	contents := "#!/bin/sh\nprintf '%s\\n' 'postgres (PostgreSQL) " + major + ".0'\n"
+	if err := os.WriteFile(postgres, []byte(contents), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if len(initdbMajor) > 0 && initdbMajor[0] != "" {
+		initdb := filepath.Join(directory, "initdb")
+		contents := "#!/bin/sh\nset -eu\nfor argument do\n  case \"$argument\" in\n    --pgdata=*) pgdata=${argument#*=} ;;\n  esac\ndone\nmkdir -p \"$pgdata\"\nprintf '%s\\n' '" + initdbMajor[0] + "' > \"$pgdata/PG_VERSION\"\n"
+		if err := os.WriteFile(initdb, []byte(contents), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return append(os.Environ(), "PATH="+directory+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func copyString(value *string) *string {
@@ -688,6 +2156,52 @@ func assertOwned(t *testing.T, object client.Object, cluster *pgshardv1alpha1.Pg
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func envValue(variables []corev1.EnvVar, name string) string {
+	for _, variable := range variables {
+		if variable.Name == name {
+			return variable.Value
+		}
+	}
+	return ""
+}
+
+func volumeByName(t *testing.T, volumes []corev1.Volume, name string) corev1.VolumeSource {
+	t.Helper()
+	for _, volume := range volumes {
+		if volume.Name == name {
+			return volume.VolumeSource
+		}
+	}
+	t.Fatalf("volume %q not found in %#v", name, volumes)
+	return corev1.VolumeSource{}
+}
+
+func hasVolume(volumes []corev1.Volume, name string) bool {
+	for _, volume := range volumes {
+		if volume.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func secretItemKeys(items []corev1.KeyToPath) []string {
+	keys := make([]string, 0, len(items))
+	for _, item := range items {
+		keys = append(keys, item.Key)
+	}
+	return keys
+}
+
+func containsVolumeMount(mounts []corev1.VolumeMount, name string, readOnly bool) bool {
+	for _, mount := range mounts {
+		if mount.Name == name && mount.ReadOnly == readOnly {
 			return true
 		}
 	}

@@ -1,5 +1,7 @@
 //! Core identifiers and deterministic routing primitives shared by pgshard.
 
+pub mod catalog_material;
+
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};

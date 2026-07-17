@@ -3,10 +3,12 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -103,6 +105,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForSingleMemberPostgreSQL(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster))
+	waitForPoolerCatalogTLS(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertPostgreSQLStatusMetadataImmutable(t, ctx, kubeClient, types.NamespacedName{
 		Namespace: namespace.Name,
 		Name:      cluster.Name + "-shard-0000-primary-0",
@@ -136,6 +139,31 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 
 	shardZeroPod := cluster.Name + "-shard-0000-primary-0"
 	shardOnePod := cluster.Name + "-shard-0001-primary-0"
+	initialShardZero := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, initialShardZero); err != nil {
+		t.Fatal(err)
+	}
+	if len(initialShardZero.Spec.InitContainers) != 1 || initialShardZero.Spec.InitContainers[0].Image != "pgshard/postgres-agent:dev" || initialShardZero.Spec.InitContainers[0].ImagePullPolicy != corev1.PullNever || initialShardZero.Annotations["pgshard.io/shardschema-migration-sha256"] == "" {
+		t.Fatalf("shard-0000 bootstrap image contract = %#v", initialShardZero)
+	}
+	if len(initialShardZero.Status.InitContainerStatuses) != 1 || initialShardZero.Status.InitContainerStatuses[0].ImageID == "" || initialShardZero.Status.InitContainerStatuses[0].RestartCount != 0 || initialShardZero.Status.InitContainerStatuses[0].State.Terminated == nil || initialShardZero.Status.InitContainerStatuses[0].State.Terminated.ExitCode != 0 {
+		t.Fatalf("shard-0000 bootstrap completion = %#v", initialShardZero.Status.InitContainerStatuses)
+	}
+	if current.Status.CatalogAccess == nil || current.Status.CatalogAccess.SecretName == "" || current.Status.CatalogAccess.SecretUID == "" {
+		t.Fatalf("catalog access identity was not checkpointed: %#v", current.Status.CatalogAccess)
+	}
+	for _, rejection := range []struct {
+		name     string
+		database string
+		sslMode  string
+	}{
+		{name: "plaintext-catalog", database: "shardschema", sslMode: "disable"},
+		{name: "other-database", database: "postgres", sslMode: "require"},
+	} {
+		assertCatalogLoginRejected(t, ctx, kubeClient, namespace.Name, cluster.Name,
+			initialShardZero.Spec.Containers[0].Image, current.Status.CatalogAccess.SecretName,
+			owned.CatalogServiceName(cluster.Name), rejection.name, rejection.database, rejection.sslMode)
+	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
 		"SELECT current_setting('server_version_num')::integer / 10000, pg_is_in_recovery()")); got != "18|f" {
@@ -145,9 +173,35 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"cat", "/var/lib/postgresql/18/docker/.pgshard-bootstrap-complete")), "cluster_uid="+string(current.UID)+"\nshard=0000"; got != want {
 		t.Fatalf("PostgreSQL bootstrap marker = %q, want %q", got, want)
 	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
+		"SELECT (SELECT string_agg(shard_id::text || ':' || shard_number::text || ':' || state, ',' ORDER BY shard_number) FROM pgshard_catalog.shards), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active')")); got != "shard-0000:0:active,shard-0001:1:active|2" {
+		t.Fatalf("shardschema inventory = %q", got)
+	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardOnePod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
+		"SELECT count(*) FROM pg_catalog.pg_database WHERE datname = 'shardschema'")); got != "0" {
+		t.Fatalf("non-home shard shardschema database count = %q", got)
+	}
+	catalogSnapshot := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
+		"SELECT state.catalog_epoch, string_agg(incarnations.shard_id::text || '=' || incarnations.restore_incarnation::text, ',' ORDER BY incarnations.shard_id) FROM pgshard_catalog.cluster_state AS state CROSS JOIN pgshard_catalog.shard_restore_incarnations AS incarnations WHERE state.singleton AND incarnations.state = 'active' GROUP BY state.catalog_epoch"))
+	snapshotFields := strings.SplitN(catalogSnapshot, "|", 2)
+	if len(snapshotFields) != 2 || snapshotFields[1] == "" {
+		t.Fatalf("invalid pre-restart shardschema snapshot = %q", catalogSnapshot)
+	}
+	if epoch, err := strconv.ParseUint(snapshotFields[0], 10, 64); err != nil || epoch == 0 {
+		t.Fatalf("invalid pre-restart catalog epoch = %q: %v", snapshotFields[0], err)
+	}
 	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
 		"CREATE TABLE live_marker (shard integer PRIMARY KEY, note text NOT NULL); INSERT INTO live_marker VALUES (0, 'kind-persistent');")
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
+		"SELECT pg_catalog.pg_create_logical_replication_slot('pgshard_kind_restart', 'pgoutput');")
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
+		"BEGIN; INSERT INTO live_marker VALUES (99, 'prepared-restart'); PREPARE TRANSACTION 'pgshard_kind_restart';")
 	service := cluster.Name + "-shard-0000"
 	shardZeroSecret := &corev1.Secret{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroBootstrap.SecretName}, shardZeroSecret); err != nil {
@@ -180,14 +234,91 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, before); err != nil {
 		t.Fatal(err)
 	}
-	statefulSet := cluster.Name + "-shard-0000-primary"
-	runKubectl(t, ctx, "--namespace", namespace.Name, "rollout", "restart", "statefulset/"+statefulSet)
-	runKubectl(t, ctx, "--namespace", namespace.Name, "rollout", "status", "statefulset/"+statefulSet, "--timeout=120s")
+	oldShardZeroHash := before.Annotations[owned.ConfigHashAnnotation]
+	oldShardOneHash := shardOne.Annotations[owned.ConfigHashAnnotation]
+	if oldShardZeroHash == "" || oldShardOneHash == "" {
+		t.Fatalf("PostgreSQL Pods lack configuration hashes: shard-0000=%q shard-0001=%q", oldShardZeroHash, oldShardOneHash)
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &pgshardv1alpha1.PgShardCluster{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), latest); err != nil {
+			return err
+		}
+		latest.Spec.PostgreSQL.Parameters = maps.Clone(latest.Spec.PostgreSQL.Parameters)
+		if latest.Spec.PostgreSQL.Parameters == nil {
+			latest.Spec.PostgreSQL.Parameters = make(map[string]string, 1)
+		}
+		latest.Spec.PostgreSQL.Parameters["log_statement"] = "ddl"
+		return kubeClient.Update(ctx, latest)
+	}); err != nil {
+		t.Fatalf("publish desired PostgreSQL configuration: %v", err)
+	}
+	var desiredShardZeroHash, desiredShardOneHash string
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		shardZeroStatefulSet := &appsv1.StatefulSet{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}, shardZeroStatefulSet); err != nil {
+			return false, err
+		}
+		shardOneStatefulSet := &appsv1.StatefulSet{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 1)}, shardOneStatefulSet); err != nil {
+			return false, err
+		}
+		desiredShardZeroHash = shardZeroStatefulSet.Spec.Template.Annotations[owned.ConfigHashAnnotation]
+		desiredShardOneHash = shardOneStatefulSet.Spec.Template.Annotations[owned.ConfigHashAnnotation]
+		if desiredShardZeroHash == "" || desiredShardOneHash == "" || desiredShardZeroHash == oldShardZeroHash || desiredShardOneHash == oldShardOneHash {
+			return false, nil
+		}
+		currentShardZero := &corev1.Pod{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, currentShardZero); err != nil {
+			return false, err
+		}
+		currentShardOne := &corev1.Pod{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardOnePod}, currentShardOne); err != nil {
+			return false, err
+		}
+		if currentShardZero.UID != before.UID || currentShardOne.UID != shardOne.UID || currentShardZero.Annotations[owned.ConfigHashAnnotation] != oldShardZeroHash || currentShardOne.Annotations[owned.ConfigHashAnnotation] != oldShardOneHash {
+			return false, fmt.Errorf("OnDelete configuration publication restarted a PostgreSQL Pod: shard-0000=%s/%s shard-0001=%s/%s", currentShardZero.UID, currentShardZero.Annotations[owned.ConfigHashAnnotation], currentShardOne.UID, currentShardOne.Annotations[owned.ConfigHashAnnotation])
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("wait for inert OnDelete PostgreSQL template update: %v", err)
+	}
+	runKubectl(t, ctx, "--namespace", namespace.Name, "delete", "pod", shardZeroPod, "--wait=false")
 	waitForRecreatedReadyPod(t, ctx, kubeClient, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, before.UID)
+	recreatedShardZero := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, recreatedShardZero); err != nil {
+		t.Fatal(err)
+	}
+	untouchedShardOne := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardOnePod}, untouchedShardOne); err != nil {
+		t.Fatal(err)
+	}
+	if recreatedShardZero.UID == before.UID || recreatedShardZero.Annotations[owned.ConfigHashAnnotation] != desiredShardZeroHash {
+		t.Fatalf("explicit shard-0000 restart did not adopt desired template: UID=%s hash=%q, old UID=%s desired hash=%q", recreatedShardZero.UID, recreatedShardZero.Annotations[owned.ConfigHashAnnotation], before.UID, desiredShardZeroHash)
+	}
+	if untouchedShardOne.UID != shardOne.UID || untouchedShardOne.Annotations[owned.ConfigHashAnnotation] != oldShardOneHash || desiredShardOneHash == oldShardOneHash {
+		t.Fatalf("shard-0001 changed during shard-0000 rollout: UID=%s hash=%q, old UID=%s old hash=%q desired hash=%q", untouchedShardOne.UID, untouchedShardOne.Annotations[owned.ConfigHashAnnotation], shardOne.UID, oldShardOneHash, desiredShardOneHash)
+	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
 		t.Fatalf("query after StatefulSet restart = %q", got)
 	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
+		"SELECT state.catalog_epoch, string_agg(incarnations.shard_id::text || '=' || incarnations.restore_incarnation::text, ',' ORDER BY incarnations.shard_id) FROM pgshard_catalog.cluster_state AS state CROSS JOIN pgshard_catalog.shard_restore_incarnations AS incarnations WHERE state.singleton AND incarnations.state = 'active' GROUP BY state.catalog_epoch")); got != catalogSnapshot {
+		t.Fatalf("idempotent shardschema restart changed snapshot from %q to %q", catalogSnapshot, got)
+	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
+		"SELECT (SELECT count(*) FROM pg_catalog.pg_prepared_xacts WHERE gid = 'pgshard_kind_restart'), (SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'pgshard_kind_restart' AND slot_type = 'logical' AND NOT active)")); got != "1|1" {
+		t.Fatalf("restart lost prepared transaction or logical slot: %q", got)
+	}
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
+		"ROLLBACK PREPARED 'pgshard_kind_restart';")
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
+		"SELECT pg_catalog.pg_drop_replication_slot('pgshard_kind_restart');")
 
 	managerRestored := false
 	t.Cleanup(func() {
@@ -315,6 +446,74 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("credential creation fence survived Retain finalization: %v", err)
 		}
 	}
+}
+
+func waitForPoolerCatalogTLS(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) {
+	t.Helper()
+	type catalogStatus struct {
+		Phase                 string  `json:"phase"`
+		ConnectionUp          bool    `json:"connection_up"`
+		Ready                 bool    `json:"ready"`
+		ReadinessReason       string  `json:"readiness_reason"`
+		CatalogEpoch          *string `json:"catalog_epoch"`
+		SuccessfulConnections string  `json:"successful_connections"`
+		LastFailure           *string `json:"last_failure"`
+	}
+	type poolerStatus struct {
+		Ready   bool          `json:"ready"`
+		Catalog catalogStatus `json:"catalog"`
+	}
+	statusPath := fmt.Sprintf("/api/v1/namespaces/%s/services/http:%s-pooler:http/proxy/status", namespace, cluster)
+	metricsPath := fmt.Sprintf("/api/v1/namespaces/%s/services/http:%s-pooler:http/proxy/metrics", namespace, cluster)
+	readinessPath := fmt.Sprintf("/api/v1/namespaces/%s/services/http:%s-pooler:http/proxy/readyz", namespace, cluster)
+	var lastOutput string
+	var lastErr error
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		output, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
+		lastOutput, lastErr = string(output), err
+		if err != nil {
+			return false, nil
+		}
+		var status poolerStatus
+		if err := json.Unmarshal(output, &status); err != nil {
+			lastErr = err
+			return false, nil
+		}
+		if status.Ready || status.Catalog.Phase != "connected" || !status.Catalog.ConnectionUp || !status.Catalog.Ready || status.Catalog.ReadinessReason != "ready" || status.Catalog.CatalogEpoch == nil || status.Catalog.LastFailure != nil {
+			lastErr = fmt.Errorf("catalog status not ready: %#v", status)
+			return false, nil
+		}
+		catalogEpoch, epochErr := strconv.ParseUint(*status.Catalog.CatalogEpoch, 10, 64)
+		successfulConnections, connectionErr := strconv.ParseUint(status.Catalog.SuccessfulConnections, 10, 64)
+		if epochErr != nil || strconv.FormatUint(catalogEpoch, 10) != *status.Catalog.CatalogEpoch ||
+			connectionErr != nil || successfulConnections == 0 ||
+			strconv.FormatUint(successfulConnections, 10) != status.Catalog.SuccessfulConnections {
+			lastErr = fmt.Errorf("catalog status counters are not canonical: %#v", status.Catalog)
+			return false, nil
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for pooler authenticated catalog TLS: %v; last error = %v; last output = %q", err, lastErr, lastOutput)
+	}
+	metrics, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", metricsPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read pooler metrics through Service proxy: %v\n%s", err, metrics)
+	}
+	for _, sample := range []string{
+		"pgshard_pooler_ready 0",
+		"pgshard_pooler_catalog_ready 1",
+		"pgshard_pooler_catalog_connection_up 1",
+	} {
+		if !strings.Contains(string(metrics), sample) {
+			t.Fatalf("pooler metrics lack %q:\n%s", sample, metrics)
+		}
+	}
+	readiness, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", readinessPath).CombinedOutput()
+	if err == nil || (!strings.Contains(string(readiness), "data_plane_unavailable") && !strings.Contains(string(readiness), "ServiceUnavailable")) {
+		t.Fatalf("pooler /readyz = error %v, output %q; want HTTP 503 data_plane_unavailable", err, readiness)
+	}
+	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace, cluster)
 }
 
 func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, kubeClient client.Client, key types.NamespacedName) {
@@ -701,6 +900,41 @@ func assertPostgreSQLServiceQueryDenied(t *testing.T, ctx context.Context, kubeC
 	}
 }
 
+func assertCatalogLoginRejected(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, image, secret, host, suffix, database, sslMode string) {
+	t.Helper()
+	clientPod := postgreSQLClientPod(namespace, fmt.Sprintf("pgshard-catalog-client-%s-%d-%d", suffix, os.Getpid(), time.Now().UnixNano()), map[string]string{
+		owned.ClusterLabel:   cluster,
+		owned.ComponentLabel: "pooler",
+	}, image, secret, host, "SELECT 1")
+	container := &clientPod.Spec.Containers[0]
+	container.Args = []string{"-X", "-w", "-h", host, "-U", "pgshard_pooler_catalog", "-d", database, "-Atc", "SELECT 1"}
+	container.Env[1].ValueFrom.SecretKeyRef.Key = owned.CatalogPasswordKey
+	container.Env = append(container.Env, corev1.EnvVar{Name: "PGSSLMODE", Value: sslMode})
+	if err := kubeClient.Create(ctx, clientPod); err != nil {
+		t.Fatal(err)
+	}
+	current := &corev1.Pod{}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		current = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(clientPod), current); err != nil {
+			return false, err
+		}
+		if current.Status.Phase == corev1.PodSucceeded {
+			return false, fmt.Errorf("catalog login unexpectedly reached database %s with sslmode=%s", database, sslMode)
+		}
+		return current.Status.Phase == corev1.PodFailed, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for rejected catalog login Pod: %v; last status = %#v", err, current.Status)
+	}
+	output := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
+	if !strings.Contains(output, "pg_hba.conf rejects connection") ||
+		!strings.Contains(output, "user \"pgshard_pooler_catalog\"") ||
+		!strings.Contains(output, "database \""+database+"\"") {
+		t.Fatalf("catalog login was rejected for an unexpected reason: %q", output)
+	}
+}
+
 func postgreSQLClientPod(namespace, name string, labels map[string]string, image, secret, host, query string) *corev1.Pod {
 	allowPrivilegeEscalation := false
 	readOnlyRootFilesystem := true
@@ -973,6 +1207,7 @@ func waitForStableManagerPod(t *testing.T, ctx context.Context, kubeClient clien
 func waitForManagerReplicas(t *testing.T, ctx context.Context, kubeClient client.Client, wanted int32) {
 	t.Helper()
 	deployment := &appsv1.Deployment{}
+	managerPods := &corev1.PodList{}
 	key := types.NamespacedName{Namespace: "pgshard-system", Name: "pgshard-controller-manager"}
 	err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		deployment = &appsv1.Deployment{}
@@ -983,12 +1218,26 @@ func waitForManagerReplicas(t *testing.T, ctx context.Context, kubeClient client
 			return false, nil
 		}
 		if wanted == 0 {
-			return deployment.Status.Replicas == 0 && deployment.Status.ReadyReplicas == 0 && deployment.Status.AvailableReplicas == 0, nil
+			if deployment.Status.Replicas != 0 || deployment.Status.ReadyReplicas != 0 || deployment.Status.AvailableReplicas != 0 {
+				return false, nil
+			}
+			// Deployment replica counters exclude a terminating Pod before its
+			// preStop hook and webhook server have necessarily exited.  The
+			// outage fixture must wait for the process itself to disappear or a
+			// cached admission connection can still authenticate termination.
+			managerPods = &corev1.PodList{}
+			if err := kubeClient.List(ctx, managerPods,
+				client.InNamespace("pgshard-system"),
+				client.MatchingLabels{"app.kubernetes.io/name": "pgshard-operator", "app.kubernetes.io/component": "controller-manager"},
+			); err != nil {
+				return false, err
+			}
+			return len(managerPods.Items) == 0, nil
 		}
 		return deployment.Status.UpdatedReplicas == wanted && deployment.Status.ReadyReplicas == wanted && deployment.Status.AvailableReplicas == wanted, nil
 	})
 	if err != nil {
-		t.Fatalf("wait for manager replicas %d: %v; last status = %#v", wanted, err, deployment.Status)
+		t.Fatalf("wait for manager replicas %d: %v; last status = %#v; last pods = %#v", wanted, err, deployment.Status, managerPods.Items)
 	}
 }
 
