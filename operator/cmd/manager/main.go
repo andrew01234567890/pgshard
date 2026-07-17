@@ -72,7 +72,7 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.StringVar(&options.images.Orchestrator, "orchestrator-image", options.images.Orchestrator, "pgshard orchestrator image reference")
 	flags.StringVar(&options.images.Pooler, "pooler-image", options.images.Pooler, "pgshard pooler image reference")
 	flags.StringVar(&options.images.PostgreSQL, "postgresql-image", options.images.PostgreSQL, "PostgreSQL 18 image reference")
-	flags.StringVar(&options.images.PostgreSQLBootstrap, "postgresql-bootstrap-image", options.images.PostgreSQLBootstrap, "pgshard PostgreSQL 18 bootstrap image reference")
+	flags.StringVar(&options.images.PostgreSQLBootstrap, "postgresql-bootstrap-image", options.images.PostgreSQLBootstrap, "digest-pinned pgshard PostgreSQL 18 bootstrap image required for single-member clusters; pgshard/postgres-agent:dev is local-only")
 	return options
 }
 

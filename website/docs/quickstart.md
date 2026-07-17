@@ -55,7 +55,9 @@ shard-0000 catalog inventory and initial restore identities, proves the other
 shard has no `shardschema` database, queries one primary from an authorized
 restricted probe client using that destination shard's credential, restarts
 shard-0000, and verifies both application persistence and an unchanged catalog
-epoch. Neither test proves a
+epoch and restore-incarnation mapping. The restart fixture also leaves one
+prepared transaction and logical slot durable across the init pass. Neither
+test proves a
 sharding runtime. Follow
 [implementation status](./project/status.md) for the first version with a real
 cluster quickstart.
@@ -65,9 +67,12 @@ disposable PostgreSQL 18 `shardschema` database. See the
 [`pgshard-catalog` README](https://github.com/andrew01234567890/pgshard/tree/main/crates/pgshard-catalog)
 for its preconditions. CI runs that test with an ephemeral service database;
 the operator additionally applies the same bytes before a managed shard-0000
-primary starts. Database creation is recoverable and the migration plus shard
-inventory update are transactional; a failed init keeps PostgreSQL unready and
-the next init retries the complete migration.
+primary starts. Database creation is recoverable; the migration and shard
+inventory update each run in their own transaction. PostgreSQL remains
+unavailable until both succeed and the final catalog invariants pass. An empty
+database left before migration is safe to retry. A partial core catalog or
+conflicting home-shard, shard-state, or restore-lineage record is rejected
+before the migration can rewrite it.
 
 ## Exercise the development manager
 
@@ -92,6 +97,11 @@ kubectl create namespace pgshard-development
 kubectl label namespace pgshard-development pgshard.io/pod-fencing=enabled
 kubectl apply --namespace pgshard-development -f operator/config/samples/pgshard_v1alpha1_development.yaml
 ```
+
+The local bootstrap tag is the only mutable reference accepted for this source
+workflow and its Pod pull policy is `Never`; a missing node-local image fails
+closed instead of consulting a registry. Non-development operator deployments
+must configure `--postgresql-bootstrap-image` with an immutable SHA-256 digest.
 
 The admission overlay provisions an ECDSA serving chain and a separate immutable
 256-bit fencing key into exact-name operator-managed Secrets, injects the CA
@@ -170,5 +180,8 @@ Pods labelled for cluster `single-member` and component `pooler` or
 requires that shard's generated Secret. The operator does not yet distribute
 those credentials to applications, so use the in-Pod `kubectl exec` check above
 or the repository's restricted-client KIND test. The `single-member-rw`, `-ro`,
-and `-r` Services still lead to the rejection-only pooler. Delete the
+and `-r` Services still lead to the rejection-only pooler. PostgreSQL
+StatefulSets use `OnDelete`; desired image or configuration changes do not
+automatically restart every shard. Until staged upgrades exist, delete one Pod
+at a time and expect an outage for that single-member shard. Delete the
 disposable cluster with `kind delete cluster --name pgshard-development`.

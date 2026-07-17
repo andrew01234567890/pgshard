@@ -17,6 +17,9 @@ func TestCommandFlagsKeepAdmissionSafeByDefault(t *testing.T) {
 	if options.images != owned.DefaultImages() {
 		t.Fatalf("default images = %#v", options.images)
 	}
+	if options.images.PostgreSQLBootstrap != "" {
+		t.Fatalf("privileged bootstrap image has a mutable remote default: %q", options.images.PostgreSQLBootstrap)
+	}
 	if options.webhook.namespace != "pgshard-system" || options.webhook.serviceName != "pgshard-webhook-service" || options.webhook.caSecretName != "pgshard-webhook-ca" || options.webhook.servingSecretName != "pgshard-webhook-certificate" || options.webhook.fencingKeySecretName != "pgshard-webhook-fencing-key" || options.webhook.mutatingConfigurationName != "pgshard-mutating-webhook-configuration" || options.webhook.validatingConfigurationName != "pgshard-validating-webhook-configuration" {
 		t.Fatalf("webhook install defaults = %#v", options.webhook)
 	}

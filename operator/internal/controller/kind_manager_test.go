@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +137,16 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 
 	shardZeroPod := cluster.Name + "-shard-0000-primary-0"
 	shardOnePod := cluster.Name + "-shard-0001-primary-0"
+	initialShardZero := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, initialShardZero); err != nil {
+		t.Fatal(err)
+	}
+	if len(initialShardZero.Spec.InitContainers) != 1 || initialShardZero.Spec.InitContainers[0].Image != "pgshard/postgres-agent:dev" || initialShardZero.Spec.InitContainers[0].ImagePullPolicy != corev1.PullNever || initialShardZero.Annotations["pgshard.io/shardschema-migration-sha256"] == "" {
+		t.Fatalf("shard-0000 bootstrap image contract = %#v", initialShardZero)
+	}
+	if len(initialShardZero.Status.InitContainerStatuses) != 1 || initialShardZero.Status.InitContainerStatuses[0].ImageID == "" || initialShardZero.Status.InitContainerStatuses[0].RestartCount != 0 || initialShardZero.Status.InitContainerStatuses[0].State.Terminated == nil || initialShardZero.Status.InitContainerStatuses[0].State.Terminated.ExitCode != 0 {
+		t.Fatalf("shard-0000 bootstrap completion = %#v", initialShardZero.Status.InitContainerStatuses)
+	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
 		"SELECT current_setting('server_version_num')::integer / 10000, pg_is_in_recovery()")); got != "18|f" {
@@ -155,11 +166,25 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"SELECT count(*) FROM pg_catalog.pg_database WHERE datname = 'shardschema'")); got != "0" {
 		t.Fatalf("non-home shard shardschema database count = %q", got)
 	}
-	catalogEpoch := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
-		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc", "SELECT catalog_epoch FROM pgshard_catalog.cluster_state"))
+	catalogSnapshot := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
+		"SELECT state.catalog_epoch, string_agg(incarnations.shard_id::text || '=' || incarnations.restore_incarnation::text, ',' ORDER BY incarnations.shard_id) FROM pgshard_catalog.cluster_state AS state CROSS JOIN pgshard_catalog.shard_restore_incarnations AS incarnations WHERE state.singleton AND incarnations.state = 'active' GROUP BY state.catalog_epoch"))
+	snapshotFields := strings.SplitN(catalogSnapshot, "|", 2)
+	if len(snapshotFields) != 2 || snapshotFields[1] == "" {
+		t.Fatalf("invalid pre-restart shardschema snapshot = %q", catalogSnapshot)
+	}
+	if epoch, err := strconv.ParseUint(snapshotFields[0], 10, 64); err != nil || epoch == 0 {
+		t.Fatalf("invalid pre-restart catalog epoch = %q: %v", snapshotFields[0], err)
+	}
 	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
 		"CREATE TABLE live_marker (shard integer PRIMARY KEY, note text NOT NULL); INSERT INTO live_marker VALUES (0, 'kind-persistent');")
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
+		"SELECT pg_catalog.pg_create_logical_replication_slot('pgshard_kind_restart', 'pgoutput');")
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
+		"BEGIN; INSERT INTO live_marker VALUES (99, 'prepared-restart'); PREPARE TRANSACTION 'pgshard_kind_restart';")
 	service := cluster.Name + "-shard-0000"
 	shardZeroSecret := &corev1.Secret{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroBootstrap.SecretName}, shardZeroSecret); err != nil {
@@ -192,18 +217,28 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, before); err != nil {
 		t.Fatal(err)
 	}
-	statefulSet := cluster.Name + "-shard-0000-primary"
-	runKubectl(t, ctx, "--namespace", namespace.Name, "rollout", "restart", "statefulset/"+statefulSet)
-	runKubectl(t, ctx, "--namespace", namespace.Name, "rollout", "status", "statefulset/"+statefulSet, "--timeout=120s")
+	runKubectl(t, ctx, "--namespace", namespace.Name, "delete", "pod", shardZeroPod, "--wait=false")
 	waitForRecreatedReadyPod(t, ctx, kubeClient, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, before.UID)
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
 		t.Fatalf("query after StatefulSet restart = %q", got)
 	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
-		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc", "SELECT catalog_epoch FROM pgshard_catalog.cluster_state")); got != catalogEpoch {
-		t.Fatalf("idempotent shardschema restart changed catalog epoch from %q to %q", catalogEpoch, got)
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
+		"SELECT state.catalog_epoch, string_agg(incarnations.shard_id::text || '=' || incarnations.restore_incarnation::text, ',' ORDER BY incarnations.shard_id) FROM pgshard_catalog.cluster_state AS state CROSS JOIN pgshard_catalog.shard_restore_incarnations AS incarnations WHERE state.singleton AND incarnations.state = 'active' GROUP BY state.catalog_epoch")); got != catalogSnapshot {
+		t.Fatalf("idempotent shardschema restart changed snapshot from %q to %q", catalogSnapshot, got)
 	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
+		"SELECT (SELECT count(*) FROM pg_catalog.pg_prepared_xacts WHERE gid = 'pgshard_kind_restart'), (SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'pgshard_kind_restart' AND slot_type = 'logical' AND NOT active)")); got != "1|1" {
+		t.Fatalf("restart lost prepared transaction or logical slot: %q", got)
+	}
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
+		"ROLLBACK PREPARED 'pgshard_kind_restart';")
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
+		"SELECT pg_catalog.pg_drop_replication_slot('pgshard_kind_restart');")
 
 	managerRestored := false
 	t.Cleanup(func() {
