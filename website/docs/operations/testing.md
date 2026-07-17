@@ -572,8 +572,9 @@ lineage, and malformed shard IDs without changing the catalog epoch or trigger
 identities. A prepared `ACCESS EXCLUSIVE` lock must fail within the bootstrap
 lock timeout; a second blocked init container is then killed with `SIGKILL`,
 after which retry on the same volume must recover. A second PGDATA fixture
-rejects a two-of-three core catalog before migration can preserve a structurally
-incomplete schema, then proves a recreated empty database is recoverable.
+rejects a complete catalog with a missing column, an occupied reserved schema,
+and a two-of-three core catalog before migration can preserve an unsupported
+shape, then proves a recreated empty database is recoverable.
 A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the

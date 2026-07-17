@@ -288,6 +288,237 @@ validate_catalog_inventory() {
   validate_restore_lineage
 }
 
+# CREATE TABLE IF NOT EXISTS cannot repair a damaged pre-existing relation.
+# Fingerprint every namespaced object plus the behavior-bearing relation,
+# column, constraint, index, type, routine-signature, trigger, and policy
+# metadata. Only the released v0.49 shape and the current shape reached by a
+# fresh install or v0.49 upgrade are valid inputs. Function bodies are replaced
+# by the migration; their exact signatures and execution attributes still
+# participate in the shape.
+catalog_schema_fingerprint="$(
+  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+      WITH catalog_namespace AS (
+        SELECT namespaces.oid
+          FROM pg_catalog.pg_namespace AS namespaces
+         WHERE namespaces.nspname = 'pgshard_catalog'
+      ), catalog_objects AS (
+        SELECT pg_catalog.format(
+                   'namespace|%s',
+                   pg_catalog.pg_describe_object(
+                     dependencies.classid,
+                     dependencies.objid,
+                     dependencies.objsubid
+                   )
+               ) AS object
+          FROM pg_catalog.pg_depend AS dependencies
+         WHERE dependencies.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+           AND dependencies.refobjid = (SELECT oid FROM catalog_namespace)
+           AND dependencies.refobjsubid = 0
+           AND dependencies.deptype = 'n'
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'relation|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+                   relations.relname,
+                   relations.relkind,
+                   relations.relpersistence,
+                   relations.relreplident,
+                   relations.relrowsecurity,
+                   relations.relforcerowsecurity,
+                   relations.relispartition,
+                   COALESCE(access_methods.amname, ''),
+                   COALESCE(pg_catalog.array_to_string(relations.reloptions, ','), '')
+               )
+          FROM pg_catalog.pg_class AS relations
+          LEFT JOIN pg_catalog.pg_am AS access_methods
+            ON access_methods.oid = relations.relam
+         WHERE relations.relnamespace = (SELECT oid FROM catalog_namespace)
+           AND relations.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'inherits|%s|%s|%s',
+                   children.relname,
+                   parent_namespaces.nspname,
+                   parents.relname
+               )
+          FROM pg_catalog.pg_inherits AS inheritance
+          JOIN pg_catalog.pg_class AS children ON children.oid = inheritance.inhrelid
+          JOIN pg_catalog.pg_class AS parents ON parents.oid = inheritance.inhparent
+          JOIN pg_catalog.pg_namespace AS parent_namespaces
+            ON parent_namespaces.oid = parents.relnamespace
+         WHERE children.relnamespace = (SELECT oid FROM catalog_namespace)
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'column|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+                   relations.relname,
+                   attributes.attnum,
+                   attributes.attname,
+                   pg_catalog.format_type(attributes.atttypid, attributes.atttypmod),
+                   attributes.attnotnull,
+                   attributes.attidentity,
+                   attributes.attgenerated,
+                   attributes.attstorage,
+                   attributes.attcompression,
+                   CASE
+                     WHEN attributes.attcollation = 0 THEN ''
+                     ELSE pg_catalog.format(
+                       '%I.%I',
+                       collation_namespaces.nspname,
+                       collations.collname
+                     )
+                   END,
+                   COALESCE(
+                     pg_catalog.pg_get_expr(defaults.adbin, defaults.adrelid, true),
+                     ''
+                   )
+               )
+          FROM pg_catalog.pg_attribute AS attributes
+          JOIN pg_catalog.pg_class AS relations ON relations.oid = attributes.attrelid
+          LEFT JOIN pg_catalog.pg_attrdef AS defaults
+            ON defaults.adrelid = attributes.attrelid
+           AND defaults.adnum = attributes.attnum
+          LEFT JOIN pg_catalog.pg_collation AS collations
+            ON collations.oid = attributes.attcollation
+          LEFT JOIN pg_catalog.pg_namespace AS collation_namespaces
+            ON collation_namespaces.oid = collations.collnamespace
+         WHERE relations.relnamespace = (SELECT oid FROM catalog_namespace)
+           AND relations.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+           AND attributes.attnum > 0
+           AND NOT attributes.attisdropped
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'dropped-column|%s|%s',
+                   relations.relname,
+                   attributes.attnum
+               )
+          FROM pg_catalog.pg_attribute AS attributes
+          JOIN pg_catalog.pg_class AS relations ON relations.oid = attributes.attrelid
+         WHERE relations.relnamespace = (SELECT oid FROM catalog_namespace)
+           AND attributes.attnum > 0
+           AND attributes.attisdropped
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'constraint|%s|%s|%s|%s|%s|%s|%s',
+                   COALESCE(relations.relname, ''),
+                   constraints.conname,
+                   constraints.contype,
+                   constraints.condeferrable,
+                   constraints.condeferred,
+                   constraints.convalidated,
+                   pg_catalog.pg_get_constraintdef(constraints.oid, true)
+               )
+          FROM pg_catalog.pg_constraint AS constraints
+          LEFT JOIN pg_catalog.pg_class AS relations ON relations.oid = constraints.conrelid
+         WHERE constraints.connamespace = (SELECT oid FROM catalog_namespace)
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'index|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+                   tables.relname,
+                   indexes.relname,
+                   index_metadata.indisvalid,
+                   index_metadata.indisready,
+                   index_metadata.indisunique,
+                   index_metadata.indisprimary,
+                   index_metadata.indisexclusion,
+                   index_metadata.indisreplident,
+                   pg_catalog.pg_get_indexdef(indexes.oid)
+               )
+          FROM pg_catalog.pg_index AS index_metadata
+          JOIN pg_catalog.pg_class AS indexes ON indexes.oid = index_metadata.indexrelid
+          JOIN pg_catalog.pg_class AS tables ON tables.oid = index_metadata.indrelid
+         WHERE tables.relnamespace = (SELECT oid FROM catalog_namespace)
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'type|%s|%s|%s|%s|%s|%s',
+                   types.typname,
+                   types.typtype,
+                   pg_catalog.format_type(types.typbasetype, types.typtypmod),
+                   types.typnotnull,
+                   CASE
+                     WHEN types.typcollation = 0 THEN ''
+                     ELSE pg_catalog.format(
+                       '%I.%I',
+                       collation_namespaces.nspname,
+                       collations.collname
+                     )
+                   END,
+                   COALESCE(
+                     pg_catalog.pg_get_expr(types.typdefaultbin, 0, true),
+                     types.typdefault,
+                     ''
+                   )
+               )
+          FROM pg_catalog.pg_type AS types
+          LEFT JOIN pg_catalog.pg_collation AS collations ON collations.oid = types.typcollation
+          LEFT JOIN pg_catalog.pg_namespace AS collation_namespaces
+            ON collation_namespaces.oid = collations.collnamespace
+         WHERE types.typnamespace = (SELECT oid FROM catalog_namespace)
+           AND types.typtype IN ('d', 'e')
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'enum|%s|%s|%s',
+                   types.typname,
+                   enum_values.enumsortorder,
+                   enum_values.enumlabel
+               )
+          FROM pg_catalog.pg_enum AS enum_values
+          JOIN pg_catalog.pg_type AS types ON types.oid = enum_values.enumtypid
+         WHERE types.typnamespace = (SELECT oid FROM catalog_namespace)
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'routine|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+                   routines.proname,
+                   pg_catalog.pg_get_function_identity_arguments(routines.oid),
+                   pg_catalog.format_type(routines.prorettype, NULL),
+                   routines.prokind,
+                   routines.provolatile,
+                   routines.prosecdef,
+                   routines.proleakproof,
+                   routines.proparallel,
+                   routines.proisstrict,
+                   COALESCE(pg_catalog.array_to_string(routines.proconfig, ','), '')
+               )
+          FROM pg_catalog.pg_proc AS routines
+         WHERE routines.pronamespace = (SELECT oid FROM catalog_namespace)
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'trigger|%s|%s|%s',
+                   relations.relname,
+                   triggers.tgname,
+                   pg_catalog.pg_get_triggerdef(triggers.oid, true)
+               )
+          FROM pg_catalog.pg_trigger AS triggers
+          JOIN pg_catalog.pg_class AS relations ON relations.oid = triggers.tgrelid
+         WHERE relations.relnamespace = (SELECT oid FROM catalog_namespace)
+           AND NOT triggers.tgisinternal
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'policy|%s|%s|%s|%s|%s|%s|%s',
+                   relations.relname,
+                   policies.polname,
+                   policies.polcmd,
+                   policies.polpermissive,
+                   COALESCE(pg_catalog.array_to_string(policies.polroles, ','), ''),
+                   COALESCE(
+                     pg_catalog.pg_get_expr(policies.polqual, policies.polrelid, true),
+                     ''
+                   ),
+                   COALESCE(
+                     pg_catalog.pg_get_expr(policies.polwithcheck, policies.polrelid, true),
+                     ''
+                   )
+               )
+          FROM pg_catalog.pg_policy AS policies
+          JOIN pg_catalog.pg_class AS relations ON relations.oid = policies.polrelid
+         WHERE relations.relnamespace = (SELECT oid FROM catalog_namespace)
+      )
+      SELECT object
+        FROM catalog_objects
+       ORDER BY object COLLATE \"C\"" |
+    sha256sum
+)"
+catalog_schema_fingerprint="${catalog_schema_fingerprint%% *}"
+
 catalog_core_tables="$(
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
     --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
@@ -297,8 +528,24 @@ catalog_core_tables="$(
         pg_catalog.to_regclass('pgshard_catalog.shard_restore_incarnations') IS NOT NULL"
 )"
 case "$catalog_core_tables" in
-  "f|f|f") ;;
-  "t|t|t") validate_catalog_inventory ;;
+  "f|f|f")
+    if [[ "$catalog_schema_fingerprint" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]]; then
+      echo "refusing a non-empty pre-existing pgshard_catalog schema" >&2
+      exit 1
+    fi
+    ;;
+  "t|t|t")
+    case "$catalog_schema_fingerprint" in
+      "9bcd876a113347bd5ce8f09223c62764f8dc718ae2c82f1a0927a79b540e8c47"|\
+      "4ffbb7e2265874434df99e69bad693856e262b38b788ce3c8b35ef6b20ff4074"|\
+      "6711de8bd95b456b384a9672de9b1c237f2df7db30bb9a9a58cc9431fc401373") ;;
+      *)
+        echo "refusing an unsupported or malformed pre-existing shardschema catalog" >&2
+        exit 1
+        ;;
+    esac
+    validate_catalog_inventory
+    ;;
   *)
     echo "refusing a partial pre-existing shardschema catalog" >&2
     exit 1

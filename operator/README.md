@@ -130,23 +130,28 @@ On shard-0000 only, the same init boundary starts PostgreSQL with network
 listening disabled and a private mode-0700 Unix socket. It loads the same
 resource-derived primary configuration as the main server so durable logical
 slots and prepared transactions remain startable during the init pass. Before
-applying SQL, it creates the UTF8 `shardschema` database when absent and
-requires the three core catalog relations to be either all absent or all
-present. A partial set is rejected because `CREATE TABLE IF NOT EXISTS` cannot
-restore constraints removed with a missing relation. For a complete core it
-checks home-shard identity, canonical shard state, and permanent restore history
-with active lineage exactly matching active shards. It then applies the
+applying SQL, it creates the UTF8 `shardschema` database when absent. A fresh
+install requires the reserved `pgshard_catalog` schema to be absent or empty.
+An upgrade requires a complete supported object, column, constraint, index,
+type, routine-signature, trigger, and policy fingerprint: released v0.49,
+current-after-v0.49-upgrade, or current-fresh-install. A partial or structurally
+altered catalog is rejected because `IF NOT EXISTS` DDL cannot repair it. For a
+supported catalog
+it checks home-shard identity, canonical shard state, and permanent restore
+history with active lineage exactly matching active shards. It then applies the
 hash-verified migration embedded in the selected bootstrap image and inserts
 only missing canonical shard identities from the immutable CR count. Every
 bootstrap SQL client has a five-second lock timeout, a 30-second statement
 timeout, and a 120-second whole-transaction timeout, so catalog locks fail the
 init pass for retry instead of hanging every restart. The migration and
 inventory update are separate transactions; the primary starts only after both
-succeed and the final invariants are rechecked. A partial catalog, conflicting
-identity or lineage, malformed inventory, failed migration, or failed inventory
-transaction keeps the primary unready. A released v0.49 catalog and an empty
-database are both supported retry inputs. Reapplying an unchanged migration and
-inventory does not advance the catalog epoch.
+succeed and the final invariants are rechecked. An occupied reserved schema,
+unsupported catalog shape, conflicting identity or lineage, malformed
+inventory, failed migration, or failed inventory transaction keeps the primary
+unready. A
+released v0.49 catalog and an empty database are both supported retry inputs.
+Reapplying an unchanged migration and inventory does not advance the catalog
+epoch.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
