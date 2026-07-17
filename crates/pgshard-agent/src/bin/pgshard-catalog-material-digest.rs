@@ -8,6 +8,7 @@ use std::path::Path;
 use pgshard_types::catalog_material::{
     CATALOG_CLIENT_DIGEST_DOMAIN, CATALOG_SERVER_DIGEST_DOMAIN, catalog_material_sha256,
 };
+use rustix::fs::{Mode, OFlags};
 
 const MAXIMUM_KEY_BYTES: u64 = 64 * 1024;
 const MAXIMUM_VALUE_BYTES: u64 = 1024 * 1024;
@@ -63,12 +64,19 @@ fn read_bounded_file(
     description: &'static str,
     maximum: u64,
 ) -> Result<Vec<u8>, io::Error> {
-    let file = File::open(path).map_err(|error| {
+    let descriptor = rustix::fs::open(
+        path.as_ref(),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        let error = io::Error::from(error);
         io::Error::new(
             error.kind(),
             format!("could not open {description}: {error}"),
         )
     })?;
+    let file = File::from(descriptor);
     let metadata = file.metadata().map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -107,6 +115,8 @@ fn read_bounded_file(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     #[test]
@@ -119,5 +129,17 @@ mod tests {
         let oversized = directory.path().join("oversized");
         std::fs::write(&oversized, b"12345").expect("write oversized fixture");
         assert!(read_bounded_file(&oversized, "fixture", 4).is_err());
+    }
+
+    #[test]
+    fn bounded_reader_rejects_fifo_without_waiting_for_a_writer() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fifo = directory.path().join("fifo");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, Mode::RUSR | Mode::WUSR)
+            .expect("create FIFO fixture");
+        let started = Instant::now();
+        let error = read_bounded_file(&fifo, "fixture", 4).expect_err("FIFO must fail");
+        assert!(error.to_string().contains("regular file"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
