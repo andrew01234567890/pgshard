@@ -3185,6 +3185,66 @@ func TestPruneNeverDeletesMerelyLabelMatchedObjects(t *testing.T) {
 	}
 }
 
+func TestPostgreSQLConfigurationRetentionTracksStatefulSetRollout(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	oldConfiguration := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name:      cluster.Name + owned.PostgreSQLConfigSuffix + "-old",
+		Namespace: cluster.Namespace,
+	}}
+	newConfigurationName := cluster.Name + owned.PostgreSQLConfigSuffix + "-new"
+	replicas := int32(1)
+	workload := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "postgresql-primary",
+			Namespace:       cluster.Namespace,
+			Generation:      2,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cluster, pgshardv1alpha1.GroupVersion.WithKind("PgShardCluster"))},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "postgresql-config",
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: newConfigurationName},
+				}},
+			}}}},
+		},
+		Status: appsv1.StatefulSetStatus{
+			ObservedGeneration: 1,
+			Replicas:           1,
+			UpdatedReplicas:    1,
+			CurrentRevision:    "revision-new",
+			UpdateRevision:     "revision-new",
+		},
+	}
+
+	if !retainPostgreSQLConfigurationDuringRollout(cluster, oldConfiguration, []client.Object{workload}) {
+		t.Fatal("stale controller observation did not retain the previous PostgreSQL configuration")
+	}
+
+	complete := workload.DeepCopy()
+	complete.Status.ObservedGeneration = complete.Generation
+	if retainPostgreSQLConfigurationDuringRollout(cluster, oldConfiguration, []client.Object{complete}) {
+		t.Fatal("completed rollout retained an unreferenced PostgreSQL configuration")
+	}
+
+	stillReferenced := complete.DeepCopy()
+	stillReferenced.Spec.Template.Spec.Volumes[0].ConfigMap.Name = oldConfiguration.Name
+	if !retainPostgreSQLConfigurationDuringRollout(cluster, oldConfiguration, []client.Object{stillReferenced}) {
+		t.Fatal("completed workload template did not retain the PostgreSQL configuration it still references")
+	}
+
+	unowned := workload.DeepCopy()
+	unowned.OwnerReferences = nil
+	if retainPostgreSQLConfigurationDuringRollout(cluster, oldConfiguration, []client.Object{unowned}) {
+		t.Fatal("unowned workload delayed PostgreSQL configuration pruning")
+	}
+	if retainPostgreSQLConfigurationDuringRollout(cluster, oldConfiguration, nil) {
+		t.Fatal("unused PostgreSQL configuration was retained without a workload")
+	}
+}
+
 func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

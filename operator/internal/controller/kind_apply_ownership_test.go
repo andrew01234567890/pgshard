@@ -22,7 +22,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -217,8 +216,12 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	if len(configuration.Data) != 11 || !strings.Contains(configuration.Data["postgresql.conf"], "log_statement = ddl\n") {
 		t.Fatalf("new PostgreSQL configuration was not published: %#v", configuration.Data)
 	}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldConfiguration), &corev1.ConfigMap{}); err != nil {
-		t.Fatalf("old PostgreSQL configuration was removed before the rollout completed: %v", err)
+	// This test uses the deliberately unimplemented multi-member path, so no
+	// PostgreSQL workload mounts the immutable configuration. The old object is
+	// therefore safe to prune immediately; rollout retention is covered with
+	// explicit workload status in the controller unit tests.
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldConfiguration), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("unused old PostgreSQL configuration survived pruning: %v", err)
 	}
 	networkPolicy := &networkingv1.NetworkPolicy{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.EtcdSuffix}, networkPolicy); err != nil {
@@ -257,54 +260,6 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatalf("fixed-to-HPA handoff changed capacity: %#v", pooler.Spec.Replicas)
 	}
 	assertScaleOwnerOnlyClaimsReplicas(t, pooler)
-
-	// The test pooler deliberately never becomes Ready, so a real rolling
-	// update cannot complete. Remove the test HPA and scale to zero to let the
-	// Deployment controller prove no old Pod can still reference the immutable
-	// configuration before exercising the prune boundary.
-	hpa := &autoscalingv2.HorizontalPodAutoscaler{}
-	if err := kubeClient.Get(ctx, poolerKey, hpa); err != nil {
-		t.Fatal(err)
-	}
-	if err := kubeClient.Delete(ctx, hpa); err != nil {
-		t.Fatal(err)
-	}
-	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
-		err := kubeClient.Get(ctx, poolerKey, &autoscalingv2.HorizontalPodAutoscaler{})
-		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := kubeClient.Get(ctx, poolerKey, pooler); err != nil {
-		t.Fatal(err)
-	}
-	zero := int32(0)
-	pooler.Spec.Replicas = &zero
-	if err := kubeClient.Update(ctx, pooler); err != nil {
-		t.Fatal(err)
-	}
-	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		current := &appsv1.Deployment{}
-		if err := kubeClient.Get(ctx, poolerKey, current); err != nil {
-			return false, err
-		}
-		return deploymentRolloutComplete(current), nil
-	}); err != nil {
-		t.Fatalf("wait for zero-Pod pooler rollout proof: %v", err)
-	}
-	if err := kubeClient.Get(ctx, request.NamespacedName, current); err != nil {
-		t.Fatal(err)
-	}
-	currentPlan, err := owned.Plan(current, owned.DefaultImages())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reconciler.prune(ctx, current, currentPlan, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldConfiguration), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("stale immutable PostgreSQL configuration survived the completed zero-Pod rollout: %v", err)
-	}
 
 	initialHPA := validCluster()
 	initialHPA.Name = "initial-hpa"
