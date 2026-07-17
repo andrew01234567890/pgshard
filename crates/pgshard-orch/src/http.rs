@@ -75,9 +75,15 @@ async fn metrics(State(state): State<OrchState>) -> impl IntoResponse {
             "# HELP pgshard_orch_build_info Build identity for this process.\n",
             "# TYPE pgshard_orch_build_info gauge\n",
             "pgshard_orch_build_info{{version=\"{}\",git_sha=\"{}\"}} 1\n",
-            "# HELP pgshard_orch_ready Whether durable orchestration state and recovery are available.\n",
+            "# HELP pgshard_orch_ready Whether this process can observe the operator-owned Kubernetes Lease.\n",
             "# TYPE pgshard_orch_ready gauge\n",
             "pgshard_orch_ready {ready}\n",
+            "# HELP pgshard_orch_coordination_ready Whether the operator-owned Kubernetes Lease was observed within the local deadline.\n",
+            "# TYPE pgshard_orch_coordination_ready gauge\n",
+            "pgshard_orch_coordination_ready {coordination_ready}\n",
+            "# HELP pgshard_orch_leader Whether this process holds the orchestrator Kubernetes Lease.\n",
+            "# TYPE pgshard_orch_leader gauge\n",
+            "pgshard_orch_leader {leader}\n",
             "# HELP pgshard_orch_operations Registered idempotent operations.\n",
             "# TYPE pgshard_orch_operations gauge\n",
             "pgshard_orch_operations {}\n",
@@ -96,6 +102,8 @@ async fn metrics(State(state): State<OrchState>) -> impl IntoResponse {
         snapshot.operation_count,
         snapshot.leases.len(),
         ready = ready,
+        coordination_ready = u8::from(snapshot.coordination_ready),
+        leader = u8::from(snapshot.leader),
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }

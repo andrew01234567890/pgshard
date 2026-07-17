@@ -12,6 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let http_bind = config.http_bind();
     let read_write_bind = config.read_write_bind();
+    let read_write_relay_configured = config.read_write_relay_configured();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -22,9 +23,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_listener = tokio::net::TcpListener::bind(http_bind).await?;
     let read_write_listener = tokio::net::TcpListener::bind(read_write_bind).await?;
     let runtime = PoolerRuntime::new(config);
-    tracing::warn!(
-        "PostgreSQL sessions are rejected; client authentication, backend pooling, and OpenTelemetry export remain disabled"
-    );
+    if read_write_relay_configured {
+        tracing::warn!(
+            "shard-zero compatibility relay enabled; client TLS, pooler-owned authentication, backend pooling, routing, and OpenTelemetry export remain disabled"
+        );
+    } else {
+        tracing::warn!(
+            "PostgreSQL sessions are rejected; client authentication, backend pooling, and OpenTelemetry export remain disabled"
+        );
+    }
     tracing::info!(
         http_bind = %http_bind,
         read_write_bind = %read_write_bind,

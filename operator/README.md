@@ -7,21 +7,25 @@ API. The controller now reconciles the safe supporting-resource slice:
   PostgreSQL configuration ConfigMaps, including common plus primary and
   standby role profiles for every member;
 - CNPG-style `<cluster>-rw`, `<cluster>-ro`, and `<cluster>-r` application
-  Services, each targeting its own pooler listener;
+  Services. The current compatibility slice selects poolers only for `-rw`;
+  unsupported `-ro` and `-r` Services remain selectorless and publish no
+  endpoints until their listeners exist;
 - one internal headless Service per shard;
 - for an explicit one-member asynchronous topology, one digest-pinned
-  PostgreSQL 18 primary StatefulSet and retained data PVC per shard, with a
-  generated per-shard immutable bootstrap credential and restricted Pod
-  security;
+  PostgreSQL 18 StatefulSet and retained data PVC per shard, with a stable
+  role-neutral `<cluster>-shard-NNNN-0` Pod identity, mutable
+  `pgshard.io/role` and `pgshard.io/member` labels, a generated per-shard
+  immutable bootstrap credential, and restricted Pod security;
 - an idempotently migrated `shardschema` database on shard-0000 containing the
   complete immutable shard inventory and an initial restore incarnation for
   each shard;
 - a status-only `PgShardRestore` controller that verifies a signed PostgreSQL
   18 backup manifest and rejects any explicit destination shard-count, hash,
   ordinal, or range mismatch before creating restore targets;
-- etcd, orchestrator, and pooler workload specifications, topology spread,
-  security contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
-  etcd ingress NetworkPolicy;
+- orchestrator and pooler workload specifications, topology spread, security
+  contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
+  operator-owned Kubernetes Lease with exact-name, namespace-scoped RBAC for
+  orchestrator leadership;
 - same-cluster-only PostgreSQL ingress on port 5432 for pooler and orchestrator
   Pods, with PostgreSQL-to-PostgreSQL traffic restricted to the same shard;
 - an internal pooler HTTP Service plus fail-closed readiness and independent
@@ -101,6 +105,21 @@ delete one selected Pod at a time and accept that shard's documented outage.
 This also applies to a singleton StatefulSet created by an earlier operator:
 publishing the catalog-aware init container does not run it against the
 existing Pod until that Pod is explicitly replaced.
+
+New PostgreSQL StatefulSet, Pod, and PVC names do not encode `primary` or
+`replica`. A PVC checkpointed by an earlier release retains its immutable name
+until an explicit data-mobility workflow exists; it is not a routing identity.
+As in CloudNativePG, role is routing state rather than instance identity:
+Services select `pgshard.io/role`, while the StatefulSet ordinal and
+`pgshard.io/member` label identify the member. The current one-member slice
+labels member `0000` as `primary`; later promotion must change role labels and
+Service endpoints without renaming or recreating the promoted member.
+An upgrade from the earlier `*-primary` StatefulSet deliberately stops that
+singleton first. The controller foreground-deletes the exact owned workload,
+waits for its termination-fenced Pod to disappear through the uncached API,
+and only then creates the role-neutral controller over the recorded PVC. This
+one-time migration has the single-member mode's documented shard outage, but
+never publishes two StatefulSets that could run postmasters over one PGDATA.
 
 Generated bootstrap credentials are unique per shard, immutable, and stable
 across reconciles. Each data PVC is likewise bound to its recorded name, UID,
@@ -187,19 +206,28 @@ certificate; PostgreSQL receives only the serving certificate and key; the
 bootstrap init container temporarily receives both retained projections so it
 can verify their checkpointed SHA-256 values before touching PGDATA. The CA
 private key is discarded after issuance and is never stored in Kubernetes.
-Application Services still target the rejection-only pooler and must not be
-treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
-for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
-remains authoritative. Backup execution and ServiceMonitor reconciliation also
-remain unimplemented. The ingress NetworkPolicies allow only selected
+In the one-member development slice, the read-write Service exposes only the
+documented shard-zero compatibility relay; read-only, any-instance, HA routing,
+and general sharding remain unavailable. Multi-member topologies remain
+fail-closed. Backup execution and ServiceMonitor reconciliation also remain
+unimplemented. The ingress NetworkPolicies allow only selected
 same-cluster Pods. The pooler-to-`shardschema` path is TLS 1.3 plus SCRAM with
-required channel binding, but etcd client/peer and general PostgreSQL shard
-traffic still lack authenticated TLS; the independent
-`TransportSecurityReady=False` condition reports the remaining gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
-a bounded backend quota. Its default image is digest-pinned and the Pod command
-selects that image contract's `/usr/local/bin/etcd` executable explicitly;
-custom `--etcd-image` values must provide the same path. Scale transitions
-retain those claims during scaling. On cluster deletion, both storage policies
+required channel binding, but general PostgreSQL shard traffic still lacks
+authenticated TLS; the independent `TransportSecurityReady=False` condition
+reports that remaining gap. Orchestrator coordination goes only through the
+Kubernetes API server using its TLS service-account path. The operator creates
+the empty Lease envelope and owns no runtime Lease spec fields. A dedicated
+ServiceAccount may only `get` and `update` that exact Lease name; pooler and
+PostgreSQL Pods receive no Kubernetes API token through this path. Durable
+topology and operation state stays in PostgreSQL rather than the Lease. During
+an upgrade from the retired development etcd layout, normal pruning first
+removes the old StatefulSet. Uncached API reads must then prove that controller
+and all three exact Pods absent before the operator validates and deletes only
+`data-<cluster>-etcd-{0,1,2}` with UID and resource-version preconditions. These
+claims held coordination state, never PostgreSQL data; any ownership, label,
+capacity, or storage-contract mismatch stops the migration without deleting the
+claim. On
+cluster deletion, both storage policies
 keep each live PostgreSQL PVC ownerless and independently protected, with its
 API-identified credential tombstone anchored back to that exact PVC. The
 finalizer first prunes every mounting controller, then resolves each possible
@@ -340,8 +368,8 @@ insufficient certificate lifetime fail closed. Cluster finalization deletes the
 exact intent-recorded Secret with UID and resource-version preconditions, then
 observes its absence before releasing the cluster finalizer. Unsupported HA topologies still
 select credential-free `bootstrap-unavailable` and create no PostgreSQL data
-plane. Override the defaults with `--orchestrator-image`,
-`--pooler-image`, `--etcd-image`, and `--postgresql-image` when concrete images
+plane. Override the defaults with `--orchestrator-image`, `--pooler-image`, and
+`--postgresql-image` when concrete images
 exist. The privileged `--postgresql-bootstrap-image` deliberately has no remote
 default and is required for the single-member slice. Non-development values
 must carry an immutable `@sha256:` digest. The exact local
@@ -425,11 +453,23 @@ kubectl get --namespace pgshard-development pgshardcluster development
 ```
 
 The sample proves only real manager reconciliation and fail-closed supporting
-processes. Its pooler and orchestrator Pods run but remain unready, application
-Services have no ready endpoints, no PostgreSQL workload is created, and the
-cluster reports `Ready=False` with `PostgreSQLHAUnavailable`. The named
-backup PVC is only validated configuration; no backup job or repository is
-created.
+processes. Each orchestrator Pod becomes ready only after validating the exact
+operator-owned Kubernetes Lease through the API server. One process holds the
+Lease and reports `pgshard_orch_leader 1`; followers remain ready but never
+claim leadership. The pooler remains unready, application Services
+have no ready endpoints, no PostgreSQL workload is created, and the cluster
+reports `Ready=False` with `PostgreSQLHAUnavailable`. Orchestrator readiness is
+process-incarnation evidence only: durable operation records, shard-term
+authority, and automated failover are not implemented. The named backup PVC is
+only validated configuration; no backup job or repository is created.
+The manager end-to-end test also pauses reconciliation, deletes the Lease, and
+proves the same orchestrator Pod incarnations lose readiness without restarting.
+Because a recreated Lease has a new API UID, those processes stay fail closed;
+the test resumes reconciliation and performs a bounded orchestrator rollout
+before the replacement coordination universe becomes ready.
+Orchestrator `SIGTERM` clears readiness before cancellation, bounds best-effort
+lease revocation to one second and process drain to ten seconds, and runs under
+an explicit 30-second Pod termination grace.
 
 For direct PostgreSQL lifecycle development, first install `config/admission`,
 label the resource namespace `pgshard.io/pod-fencing=enabled`, and then apply

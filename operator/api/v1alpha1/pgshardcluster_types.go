@@ -89,8 +89,7 @@ type PostgreSQLSpec struct {
 type StorageSpec struct {
 	// Size is the capacity of each PostgreSQL data volume.
 	Size resource.Quantity `json:"size"`
-	// StorageClassName is used for PostgreSQL data volumes and the supporting
-	// etcd quorum's independently sized volumes.
+	// StorageClassName is used for PostgreSQL data volumes.
 	StorageClassName *string `json:"storageClassName,omitempty"`
 	// DeletionPolicy controls PostgreSQL data PVC handling when the cluster is
 	// deleted. Retain is the safe default; Delete must be selected explicitly.

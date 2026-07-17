@@ -1,7 +1,12 @@
 //! `pgshard-orch` Linux container entry point.
 
 use pgshard_orch::config::{ConfigError, OrchConfig};
+use pgshard_orch::coordination::{CoordinationConfig, supervise};
 use pgshard_orch::domain::OrchState;
+use std::time::Duration;
+use tokio::sync::watch;
+
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,17 +29,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(reason = telemetry.reason, "OpenTelemetry export disabled");
     }
 
+    let coordination = CoordinationConfig::new(
+        config.lease_namespace,
+        config.lease_name,
+        config.identity.clone(),
+        config.cluster_uid,
+        config.pod_uid,
+        config.kubernetes_lease_duration,
+        config.kubernetes_lease_retry_period,
+        config.kubernetes_request_timeout,
+    )?;
     let state = OrchState::with_identity(config.identity, config.lease_ttl_ms)?;
     tracing::info!(
         bind = %config.http_bind,
         lease_ttl_ms = config.lease_ttl_ms,
         version = pgshard_version::VERSION,
         git_sha = pgshard_version::GIT_SHA,
-        "starting orchestrator HTTP server; persistence and automated failover remain disabled"
+        "starting orchestrator HTTP server; durable operation persistence and automated failover remain disabled"
     );
-    pgshard_orch::http::serve(config.http_bind, state, shutdown_signal()).await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let coordination_future = supervise(coordination, state.clone(), shutdown_rx.clone());
+    let server_future = pgshard_orch::http::serve(
+        config.http_bind,
+        state.clone(),
+        wait_for_shutdown(shutdown_rx),
+    );
+    tokio::pin!(coordination_future);
+    tokio::pin!(server_future);
+
+    tokio::select! {
+        () = shutdown_signal() => {
+            state.begin_shutdown();
+            let _ = shutdown_tx.send(true);
+            match tokio::time::timeout(SHUTDOWN_GRACE, async {
+                tokio::join!(&mut coordination_future, &mut server_future)
+            }).await {
+                Ok((coordination_result, server_result)) => {
+                    coordination_result?;
+                    server_result?;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        grace_seconds = SHUTDOWN_GRACE.as_secs(),
+                        "orchestrator shutdown grace expired; dropping remaining work"
+                    );
+                }
+            }
+        }
+        coordination_result = &mut coordination_future => {
+            state.begin_shutdown();
+            let _ = shutdown_tx.send(true);
+            if let Ok(server_result) =
+                tokio::time::timeout(SHUTDOWN_GRACE, &mut server_future).await
+            {
+                server_result?;
+            } else {
+                tracing::warn!(
+                    grace_seconds = SHUTDOWN_GRACE.as_secs(),
+                    "orchestrator HTTP drain grace expired"
+                );
+            }
+            coordination_result?;
+            return Err("orchestrator coordination stopped before process shutdown".into());
+        }
+        server_result = &mut server_future => {
+            state.begin_shutdown();
+            let _ = shutdown_tx.send(true);
+            if let Ok(coordination_result) =
+                tokio::time::timeout(SHUTDOWN_GRACE, &mut coordination_future).await
+            {
+                coordination_result?;
+            } else {
+                tracing::warn!(
+                    grace_seconds = SHUTDOWN_GRACE.as_secs(),
+                    "orchestrator coordination shutdown grace expired"
+                );
+            }
+            server_result?;
+        }
+    }
     tracing::info!("orchestrator shutdown complete");
     Ok(())
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
 }
 
 async fn shutdown_signal() {

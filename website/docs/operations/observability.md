@@ -7,8 +7,11 @@ description: Prometheus metrics, OpenTelemetry traces, Grafana dashboards, and c
 
 :::info Milestone 1 design contract
 The pooler control executable now exposes health, independent catalog
-readiness, status, and Prometheus signals. Overall application readiness stays
-false until a SQL data plane exists. SQL-path metrics, OpenTelemetry export,
+readiness, status, and Prometheus signals. In the one-member development
+topology, overall readiness becomes true only when both the authenticated
+catalog is usable and an explicit shard-zero compatibility target is configured.
+This signal does not probe a new application backend socket.
+Unsupported topologies remain unready. SQL-path metrics, OpenTelemetry export,
 dashboards, scraping resources, and the Grafana/Tempo test stack remain planned; see
 [implementation status](../project/status.md).
 :::
@@ -31,10 +34,11 @@ successful initial loads, and safe bounded failure categories, including
 distinct `connect_timeout` and `operation_timeout` labels. Health remains live
 when catalog readiness fails so Kubernetes can distinguish a process crash from
 an unavailable or stale routing catalog. `pgshard_pooler_catalog_ready` reports
-catalog usability separately from `pgshard_pooler_ready`, which remains zero in
-the control-only executable. The supported single-member operator path attempts
-the fixed TLS 1.3 and SCRAM catalog connection and exposes its bounded outcome;
-it never reports overall data-plane readiness. Credential-free bootstrap mode
+catalog usability separately from `pgshard_pooler_ready`. The supported
+single-member operator path attempts the fixed TLS 1.3 and SCRAM catalog
+connection and reports overall readiness for its bounded shard-zero
+compatibility relay. This does not imply pooling or routing health, and no
+per-session or SQL-path metrics exist yet. Credential-free bootstrap mode
 is retained for unsupported topologies and reports phase `not_configured`,
 reason `catalog_not_configured`, zero connection attempts, and failure label
 `none`.

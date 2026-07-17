@@ -11,7 +11,9 @@ use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_postgres::NoTls;
 
-use crate::config::{CatalogConnector, PoolerConfig, SupervisedCatalogConfig};
+use crate::config::{
+    BackendTarget, CatalogConnector, PoolerConfig, PoolerRuntimeParts, SupervisedCatalogConfig,
+};
 use crate::state::PoolerState;
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -19,6 +21,7 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// One fail-closed pooler runtime.
 pub struct PoolerRuntime {
     catalog: Option<SupervisedCatalog>,
+    read_write_backend: Option<BackendTarget>,
     state: PoolerState,
 }
 
@@ -29,28 +32,35 @@ struct SupervisedCatalog {
 }
 
 impl PoolerRuntime {
-    /// Builds a fail-closed runtime that remains application-unready.
+    /// Builds a fail-closed runtime from validated catalog and relay policy.
     #[must_use]
     pub fn new(config: PoolerConfig) -> Self {
-        match config.into_runtime_parts() {
+        let PoolerRuntimeParts {
+            catalog,
+            read_write_backend,
+        } = config.into_runtime_parts();
+        let data_plane_ready = read_write_backend.is_some();
+        match catalog {
             Some(SupervisedCatalogConfig {
                 catalog,
                 connector,
                 supervisor,
             }) => {
                 let supervisor = CatalogSupervisor::new(Arc::new(CatalogCache::new()), supervisor);
-                let state = PoolerState::control_only(supervisor.status());
+                let state = PoolerState::supervised(supervisor.status(), data_plane_ready);
                 Self {
                     catalog: Some(SupervisedCatalog {
                         supervisor,
                         config: catalog,
                         connector,
                     }),
+                    read_write_backend,
                     state,
                 }
             }
             None => Self {
                 catalog: None,
+                read_write_backend,
                 state: PoolerState::bootstrap_unavailable(),
             },
         }
@@ -63,7 +73,7 @@ impl PoolerRuntime {
     }
 
     /// Runs optional catalog supervision, HTTP control, and the `PostgreSQL`
-    /// handshake boundary until shutdown.
+    /// compatibility boundary until shutdown.
     ///
     /// In local mode the connector is intentionally restricted by
     /// [`PoolerConfig`] to loopback IP literals or Unix sockets with
@@ -85,7 +95,11 @@ impl PoolerRuntime {
     where
         F: Future<Output = ()> + Send,
     {
-        let Self { catalog, state } = self;
+        let Self {
+            catalog,
+            read_write_backend,
+            state,
+        } = self;
         let (stop_sender, stop_receiver) = watch::channel(false);
         let stop_guard = StopOnDrop(stop_sender);
 
@@ -120,11 +134,13 @@ impl PoolerRuntime {
         };
         let http_task = tokio::spawn(crate::http::serve_listener(
             http_listener,
-            state,
+            state.clone(),
             wait_for_stop(stop_receiver.clone()),
         ));
         let frontend_task = tokio::spawn(crate::frontend::serve_listener(
             frontend_listener,
+            state,
+            read_write_backend,
             wait_for_stop(stop_receiver),
         ));
 

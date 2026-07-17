@@ -21,9 +21,11 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -33,8 +35,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 const (
@@ -56,6 +61,8 @@ const (
 	defaultPodFencingKeyData          = "hmac.key"
 	defaultPodFencingAnchorSecret     = "pgshard-webhook-ca"
 	defaultPodFencingAnchorAnnotation = "pgshard.io/pod-fencing-key-sha256"
+	legacyEtcdSuffix                  = "-etcd"
+	legacyEtcdPVCCount                = 3
 )
 
 // PgShardClusterReconciler owns safe supporting resources and single-member
@@ -76,7 +83,7 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
@@ -86,6 +93,8 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=list
 
 func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -210,6 +219,15 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "CatalogAccessReconcileFailed", fmt.Sprintf("shardschema access reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	migratingPostgreSQLIdentity, err := r.migrateLegacyPostgreSQLWorkloadNames(ctx, cluster)
+	if err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PostgreSQLIdentityMigrationFailed", fmt.Sprintf("PostgreSQL role-neutral identity migration failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if migratingPostgreSQLIdentity {
+		statusErr := r.reportFailure(ctx, cluster, "PostgreSQLIdentityMigration", "stopping the legacy role-named PostgreSQL workload before creating its role-neutral replacement")
+		return ctrl.Result{RequeueAfter: retryDelay}, statusErr
+	}
 	plan, err := owned.Plan(cluster, images)
 	if err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
@@ -240,6 +258,15 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "ReconcileFailed", fmt.Sprintf("owned resource reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	cleaningRetiredCoordinationStorage, err := r.cleanupRetiredEtcdStorage(ctx, cluster)
+	if err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "CoordinationMigrationFailed", fmt.Sprintf("retired etcd storage cleanup failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if cleaningRetiredCoordinationStorage {
+		statusErr := r.reportFailure(ctx, cluster, "CoordinationMigration", "removing retired etcd coordination storage after authoritative workload absence")
+		return ctrl.Result{RequeueAfter: retryDelay}, statusErr
+	}
 
 	available, message, err := r.supportingWorkloadsAvailable(ctx, cluster)
 	if err != nil {
@@ -264,6 +291,97 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		return ctrl.Result{RequeueAfter: bootstrapIntegrityInterval}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// cleanupRetiredEtcdStorage removes only the three fixed data claims created by
+// the pre-Lease control plane. The claims never held PostgreSQL data, but an
+// authoritative absence barrier is still required before deleting storage
+// that may be mounted by the retired StatefulSet.
+func (r *PgShardClusterReconciler) cleanupRetiredEtcdStorage(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	reader := r.authoritativeReader()
+	claims := make([]*corev1.PersistentVolumeClaim, 0, legacyEtcdPVCCount)
+	for ordinal := 0; ordinal < legacyEtcdPVCCount; ordinal++ {
+		claim := &corev1.PersistentVolumeClaim{}
+		name := fmt.Sprintf("data-%s%s-%d", cluster.Name, legacyEtcdSuffix, ordinal)
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, claim); apierrors.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			return false, fmt.Errorf("read retired etcd PVC %s: %w", name, err)
+		}
+		claims = append(claims, claim)
+	}
+	if len(claims) == 0 {
+		return false, nil
+	}
+	if r.APIReader == nil {
+		return false, fmt.Errorf("authoritative API reader is required before deleting retired etcd storage")
+	}
+
+	statefulSetName := cluster.Name + legacyEtcdSuffix
+	statefulSet := &appsv1.StatefulSet{}
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: statefulSetName}, statefulSet); err == nil {
+		if !metav1.IsControlledBy(statefulSet, cluster) {
+			return false, fmt.Errorf("StatefulSet %s blocks retired etcd storage cleanup because it is not controlled by PgShardCluster UID %s", statefulSetName, cluster.UID)
+		}
+		return true, nil
+	} else if !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("prove retired etcd StatefulSet %s absent: %w", statefulSetName, err)
+	}
+	pods := &corev1.PodList{}
+	if err := r.APIReader.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return false, fmt.Errorf("prove retired etcd PVC mounts absent: %w", err)
+	}
+	for podIndex := range pods.Items {
+		pod := &pods.Items[podIndex]
+		for _, claim := range claims {
+			if podSpecReferencesPVC(pod.Spec, claim.Name) {
+				return true, nil
+			}
+		}
+	}
+
+	for _, claim := range claims {
+		if err := validateRetiredEtcdPVC(claim, cluster); err != nil {
+			return false, err
+		}
+	}
+	for _, claim := range claims {
+		if claim.DeletionTimestamp != nil {
+			continue
+		}
+		uid := claim.UID
+		resourceVersion := claim.ResourceVersion
+		if err := r.Delete(ctx, claim, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("delete retired etcd PVC %s with UID %s: %w", claim.Name, claim.UID, err)
+		}
+	}
+	return true, nil
+}
+
+func validateRetiredEtcdPVC(claim *corev1.PersistentVolumeClaim, cluster *pgshardv1alpha1.PgShardCluster) error {
+	owner := metav1.GetControllerOf(claim)
+	if claim.Namespace != cluster.Namespace || claim.UID == "" || claim.ResourceVersion == "" ||
+		claim.Labels["app.kubernetes.io/name"] != "pgshard" ||
+		claim.Labels[owned.ManagedByLabel] != owned.ManagedByValue ||
+		claim.Labels[owned.InstanceLabel] != cluster.Name ||
+		claim.Labels[owned.ComponentLabel] != "etcd" ||
+		claim.Labels[owned.ClusterLabel] != cluster.Name ||
+		claim.Annotations[owned.ApplyOwnershipAnnotation] != owned.ApplyOwnershipVersion ||
+		len(claim.OwnerReferences) != 1 || owner == nil ||
+		owner.APIVersion != pgshardv1alpha1.GroupVersion.String() || owner.Kind != "PgShardCluster" ||
+		owner.Name != cluster.Name || owner.UID != cluster.UID || owner.BlockOwnerDeletion == nil || !*owner.BlockOwnerDeletion {
+		return fmt.Errorf("retired etcd PVC %s is not bound to the exact PgShardCluster API identity", claim.Name)
+	}
+	if len(claim.Spec.AccessModes) != 1 || claim.Spec.AccessModes[0] != corev1.ReadWriteOnce ||
+		claim.Spec.Selector != nil || claim.Spec.DataSource != nil || claim.Spec.DataSourceRef != nil ||
+		(claim.Spec.VolumeMode != nil && *claim.Spec.VolumeMode != corev1.PersistentVolumeFilesystem) {
+		return fmt.Errorf("retired etcd PVC %s has an unexpected storage contract", claim.Name)
+	}
+	requested, ok := claim.Spec.Resources.Requests[corev1.ResourceStorage]
+	if !ok || requested.Cmp(resource.MustParse("2Gi")) != 0 {
+		return fmt.Errorf("retired etcd PVC %s does not have the fixed legacy capacity", claim.Name)
+	}
+	return nil
 }
 
 func (r *PgShardClusterReconciler) verifyPostgreSQLPodFencingNamespace(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
@@ -408,7 +526,7 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 			if err != nil {
 				return err
 			}
-			pvcName, err := randomBootstrapName(owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, shard))
+			pvcName, err := randomBootstrapName(owned.PostgreSQLDataPVCPrefix(cluster.Name, shard))
 			if err != nil {
 				return err
 			}
@@ -931,7 +1049,7 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLDataPVC(ctx context.Context, 
 	if bootstrap.SecretUID == "" || !bootstrap.PVCFenceDetached {
 		return nil, fmt.Errorf("PostgreSQL data PVC %s cannot be created before its credential fence is detached", bootstrap.PVCName)
 	}
-	desired := owned.PostgreSQLPrimaryDataPVC(cluster, shard, bootstrap.PVCName, storageSize, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+	desired := owned.PostgreSQLDataPVC(cluster, shard, bootstrap.PVCName, storageSize, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
 	if err := r.Create(ctx, desired, client.FieldOwner(owned.ManagedByValue)); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return nil, fmt.Errorf("create PostgreSQL data PVC %s: %w", bootstrap.PVCName, err)
@@ -1248,6 +1366,128 @@ func (r *PgShardClusterReconciler) authoritativeReader() client.Reader {
 	return r.Client
 }
 
+// migrateLegacyPostgreSQLWorkloadNames establishes an authoritative absence
+// barrier between the old role-named StatefulSet and its role-neutral
+// replacement. Both controllers reference the same PVC, so creating the new
+// controller before the old Pod is proven gone could run two postmasters over
+// one PGDATA on storage that permits multiple mounts.
+func (r *PgShardClusterReconciler) migrateLegacyPostgreSQLWorkloadNames(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	if cluster.Spec.MembersPerShard != 1 || len(cluster.Status.PostgreSQLBootstraps) == 0 {
+		return false, nil
+	}
+	reader := r.authoritativeReader()
+	pods := &corev1.PodList{}
+	if err := reader.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return false, fmt.Errorf("list PostgreSQL Pods before role-neutral identity migration: %w", err)
+	}
+
+	for _, bootstrap := range cluster.Status.PostgreSQLBootstraps {
+		legacyName := owned.LegacyPostgreSQLPrimaryStatefulSetName(cluster.Name, bootstrap.Shard)
+		currentName := owned.PostgreSQLShardStatefulSetName(cluster.Name, bootstrap.Shard)
+		legacy := &appsv1.StatefulSet{}
+		legacyErr := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: legacyName}, legacy)
+		if legacyErr != nil && !apierrors.IsNotFound(legacyErr) {
+			return false, fmt.Errorf("read legacy PostgreSQL StatefulSet %s: %w", legacyName, legacyErr)
+		}
+		current := &appsv1.StatefulSet{}
+		currentErr := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: currentName}, current)
+		if currentErr != nil && !apierrors.IsNotFound(currentErr) {
+			return false, fmt.Errorf("read role-neutral PostgreSQL StatefulSet %s: %w", currentName, currentErr)
+		}
+		legacyExists := legacyErr == nil
+		currentExists := currentErr == nil
+		if legacyExists && currentExists {
+			return false, fmt.Errorf("legacy StatefulSet %s and role-neutral StatefulSet %s both exist; refusing an ambiguous shared-PVC migration", legacyName, currentName)
+		}
+		if legacyExists {
+			if err := validateLegacyPostgreSQLStatefulSetForMigration(legacy, cluster, bootstrap); err != nil {
+				return false, err
+			}
+		}
+
+		var legacyPod *corev1.Pod
+		for index := range pods.Items {
+			pod := &pods.Items[index]
+			if !podSpecReferencesPostgreSQLDataPVC(pod.Spec, bootstrap.PVCName) {
+				continue
+			}
+			switch pod.Name {
+			case legacyName + "-0":
+				legacyPod = pod
+			case currentName + "-0":
+				if !currentExists {
+					return false, fmt.Errorf("role-neutral PostgreSQL Pod %s exists without its authoritative StatefulSet", pod.Name)
+				}
+			default:
+				return false, fmt.Errorf("Pod %s mounts protected PostgreSQL data for shard %d but is not a recognized workload generation", pod.Name, bootstrap.Shard)
+			}
+		}
+
+		if !legacyExists && legacyPod == nil {
+			continue
+		}
+		if r.APIReader == nil {
+			return false, fmt.Errorf("authoritative API reader is required before migrating legacy PostgreSQL workload %s", legacyName)
+		}
+		if err := r.verifyPostgreSQLPodTerminationFences(ctx, cluster); err != nil {
+			return false, fmt.Errorf("verify PostgreSQL Pod termination fences before role-neutral identity migration: %w", err)
+		}
+		if legacyPod != nil {
+			owner := metav1.GetControllerOf(legacyPod)
+			if legacyExists && (owner == nil || owner.UID != legacy.UID) {
+				return false, fmt.Errorf("legacy PostgreSQL Pod %s is not controlled by StatefulSet UID %s", legacyPod.Name, legacy.UID)
+			}
+		}
+
+		if legacyExists {
+			if legacy.DeletionTimestamp == nil {
+				uid := legacy.UID
+				resourceVersion := legacy.ResourceVersion
+				if err := r.Delete(ctx, legacy,
+					client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+					client.PropagationPolicy(metav1.DeletePropagationForeground),
+				); err != nil && !apierrors.IsNotFound(err) {
+					return false, fmt.Errorf("delete legacy PostgreSQL StatefulSet %s with UID %s: %w", legacyName, legacy.UID, err)
+				}
+			}
+			return true, nil
+		}
+
+		if legacyPod.DeletionTimestamp == nil {
+			uid := legacyPod.UID
+			resourceVersion := legacyPod.ResourceVersion
+			if uid == "" || resourceVersion == "" {
+				return false, fmt.Errorf("orphaned legacy PostgreSQL Pod %s has no stable API identity", legacyPod.Name)
+			}
+			if err := r.Delete(ctx, legacyPod, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+				return false, fmt.Errorf("delete orphaned legacy PostgreSQL Pod %s with UID %s: %w", legacyPod.Name, legacyPod.UID, err)
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func validateLegacyPostgreSQLStatefulSetForMigration(statefulSet *appsv1.StatefulSet, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) error {
+	wantedName := owned.LegacyPostgreSQLPrimaryStatefulSetName(cluster.Name, bootstrap.Shard)
+	template := statefulSet.Spec.Template
+	if statefulSet.Name != wantedName || !metav1.IsControlledBy(statefulSet, cluster) ||
+		statefulSet.Labels[owned.ClusterLabel] != cluster.Name || statefulSet.Labels[owned.ComponentLabel] != "postgresql" ||
+		statefulSet.UID == "" || statefulSet.ResourceVersion == "" {
+		return fmt.Errorf("legacy PostgreSQL StatefulSet %s is not bound to the exact PgShardCluster API identity", wantedName)
+	}
+	if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != 1 ||
+		template.Labels[owned.ManagedByLabel] != owned.ManagedByValue ||
+		template.Labels[owned.ClusterLabel] != cluster.Name || template.Labels[owned.ComponentLabel] != "postgresql" ||
+		template.Labels[owned.ShardLabel] != fmt.Sprintf("%04d", bootstrap.Shard) || template.Labels[owned.RoleLabel] != "primary" || template.Labels[owned.MemberLabel] != "0000" ||
+		template.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != string(cluster.UID) ||
+		!slices.Contains(template.Finalizers, owned.PostgreSQLPodTerminationFinalizer) ||
+		!podSpecReferencesPostgreSQLDataPVC(template.Spec, bootstrap.PVCName) {
+		return fmt.Errorf("legacy PostgreSQL StatefulSet %s does not preserve the singleton PGDATA and termination-fence contract", wantedName)
+	}
+	return nil
+}
+
 func (r *PgShardClusterReconciler) alignLegacyOwnedFields(ctx context.Context, current, desired client.Object, allowLegacyHPAScale bool) (client.Object, error) {
 	const maxAttempts = 4
 	originalUID := current.GetUID()
@@ -1346,6 +1586,30 @@ func legacyAlignedObject(current, desired client.Object) (client.Object, error) 
 		got.Spec.Selector = maps.Clone(wanted.Spec.Selector)
 		got.Spec.Ports = ports
 		got.Spec.PublishNotReadyAddresses = wanted.Spec.PublishNotReadyAddresses
+	case *corev1.ServiceAccount:
+		got, ok := aligned.(*corev1.ServiceAccount)
+		if !ok {
+			return nil, fmt.Errorf("legacy object type %T does not match desired ServiceAccount", current)
+		}
+		got.AutomountServiceAccountToken = wanted.AutomountServiceAccountToken
+	case *rbacv1.Role:
+		got, ok := aligned.(*rbacv1.Role)
+		if !ok {
+			return nil, fmt.Errorf("legacy object type %T does not match desired Role", current)
+		}
+		got.Rules = append([]rbacv1.PolicyRule(nil), wanted.Rules...)
+	case *rbacv1.RoleBinding:
+		got, ok := aligned.(*rbacv1.RoleBinding)
+		if !ok {
+			return nil, fmt.Errorf("legacy object type %T does not match desired RoleBinding", current)
+		}
+		got.RoleRef = wanted.RoleRef
+		got.Subjects = append([]rbacv1.Subject(nil), wanted.Subjects...)
+	case *coordinationv1.Lease:
+		if _, ok := aligned.(*coordinationv1.Lease); !ok {
+			return nil, fmt.Errorf("legacy object type %T does not match desired Lease", current)
+		}
+		// Runtime Lease spec fields belong exclusively to orchestrator replicas.
 	case *appsv1.Deployment:
 		got, ok := aligned.(*appsv1.Deployment)
 		if !ok {
@@ -1646,6 +1910,14 @@ func objectGVK(object client.Object) (schema.GroupVersionKind, error) {
 		return corev1.SchemeGroupVersion.WithKind("ConfigMap"), nil
 	case *corev1.Service:
 		return corev1.SchemeGroupVersion.WithKind("Service"), nil
+	case *corev1.ServiceAccount:
+		return corev1.SchemeGroupVersion.WithKind("ServiceAccount"), nil
+	case *rbacv1.Role:
+		return rbacv1.SchemeGroupVersion.WithKind("Role"), nil
+	case *rbacv1.RoleBinding:
+		return rbacv1.SchemeGroupVersion.WithKind("RoleBinding"), nil
+	case *coordinationv1.Lease:
+		return coordinationv1.SchemeGroupVersion.WithKind("Lease"), nil
 	case *appsv1.Deployment:
 		return appsv1.SchemeGroupVersion.WithKind("Deployment"), nil
 	case *appsv1.StatefulSet:
@@ -2327,6 +2599,10 @@ func postgreSQLDataBootstrapIndexForPod(pod *corev1.Pod, cluster *pgshardv1alpha
 }
 
 func podSpecReferencesPostgreSQLDataPVC(spec corev1.PodSpec, pvcName string) bool {
+	return podSpecReferencesPVC(spec, pvcName)
+}
+
+func podSpecReferencesPVC(spec corev1.PodSpec, pvcName string) bool {
 	for _, volume := range spec.Volumes {
 		if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == pvcName {
 			return true
@@ -2347,16 +2623,19 @@ func (r *PgShardClusterReconciler) podHasSafeTerminationEvidence(ctx context.Con
 }
 
 func validatePostgreSQLFinalizationPod(pod *corev1.Pod, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) error {
-	expectedStatefulSet := owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, bootstrap.Shard)
+	expectedStatefulSet := owned.PostgreSQLShardStatefulSetName(cluster.Name, bootstrap.Shard)
+	legacyStatefulSet := owned.LegacyPostgreSQLPrimaryStatefulSetName(cluster.Name, bootstrap.Shard)
 	owner := metav1.GetControllerOf(pod)
-	if pod.Name != expectedStatefulSet+"-0" ||
+	expectedIdentity := (pod.Name == expectedStatefulSet+"-0" && owner != nil && owner.Name == expectedStatefulSet) ||
+		(pod.Name == legacyStatefulSet+"-0" && owner != nil && owner.Name == legacyStatefulSet)
+	if !expectedIdentity ||
 		pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != string(cluster.UID) ||
 		pod.Labels[owned.ClusterLabel] != cluster.Name ||
 		pod.Labels[owned.ComponentLabel] != "postgresql" ||
 		pod.Labels[owned.ShardLabel] != fmt.Sprintf("%04d", bootstrap.Shard) ||
 		pod.Labels[owned.RoleLabel] != "primary" ||
 		pod.Labels[owned.MemberLabel] != "0000" ||
-		owner == nil || owner.APIVersion != appsv1.SchemeGroupVersion.String() || owner.Kind != "StatefulSet" || owner.Name != expectedStatefulSet || owner.UID == "" {
+		owner.APIVersion != appsv1.SchemeGroupVersion.String() || owner.Kind != "StatefulSet" || owner.UID == "" {
 		return fmt.Errorf("Pod %s references protected PostgreSQL data but is not the exact shard %d StatefulSet Pod", pod.Name, bootstrap.Shard)
 	}
 	return nil
@@ -2390,6 +2669,10 @@ func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1
 	lists := []client.ObjectList{
 		&corev1.ConfigMapList{},
 		&corev1.ServiceList{},
+		&corev1.ServiceAccountList{},
+		&rbacv1.RoleList{},
+		&rbacv1.RoleBindingList{},
+		&coordinationv1.LeaseList{},
 		&appsv1.DeploymentList{},
 		&appsv1.StatefulSetList{},
 		&autoscalingv2.HorizontalPodAutoscalerList{},
@@ -2534,6 +2817,22 @@ func listObjects(list client.ObjectList) []client.Object {
 		for index := range list.Items {
 			result = append(result, &list.Items[index])
 		}
+	case *corev1.ServiceAccountList:
+		for index := range list.Items {
+			result = append(result, &list.Items[index])
+		}
+	case *rbacv1.RoleList:
+		for index := range list.Items {
+			result = append(result, &list.Items[index])
+		}
+	case *rbacv1.RoleBindingList:
+		for index := range list.Items {
+			result = append(result, &list.Items[index])
+		}
+	case *coordinationv1.LeaseList:
+		for index := range list.Items {
+			result = append(result, &list.Items[index])
+		}
 	case *corev1.PersistentVolumeClaimList:
 		for index := range list.Items {
 			result = append(result, &list.Items[index])
@@ -2567,9 +2866,12 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 	if r.APIReader != nil {
 		reader = r.APIReader
 	}
-	etcd := &appsv1.StatefulSet{}
-	if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.EtcdSuffix}, etcd); err != nil {
+	lease := &coordinationv1.Lease{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorLeaseSuffix}, lease); err != nil {
 		return false, "", err
+	}
+	if lease.DeletionTimestamp != nil || !metav1.IsControlledBy(lease, cluster) {
+		return false, "", fmt.Errorf("orchestrator Lease %s/%s is not controlled by PgShardCluster UID %s", lease.Namespace, lease.Name, cluster.UID)
 	}
 	orchestrator := &appsv1.Deployment{}
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorSuffix}, orchestrator); err != nil {
@@ -2580,10 +2882,6 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 		return false, "", err
 	}
 
-	etcdWanted := int32(0)
-	if etcd.Spec.Replicas != nil {
-		etcdWanted = *etcd.Spec.Replicas
-	}
 	orchestratorWanted := int32(0)
 	if orchestrator.Spec.Replicas != nil {
 		orchestratorWanted = *orchestrator.Spec.Replicas
@@ -2592,7 +2890,6 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 	if pooler.Spec.Replicas != nil && *pooler.Spec.Replicas > poolerWanted {
 		poolerWanted = *pooler.Spec.Replicas
 	}
-	etcdReady := workloadGenerationObserved(etcd.Generation, etcd.Status.ObservedGeneration) && etcd.Status.ReadyReplicas >= etcdWanted && etcd.Status.UpdatedReplicas >= etcdWanted
 	orchestratorReady := workloadGenerationObserved(orchestrator.Generation, orchestrator.Status.ObservedGeneration) && orchestrator.Status.AvailableReplicas >= orchestratorWanted && orchestrator.Status.UpdatedReplicas >= orchestratorWanted
 	poolerReady := workloadGenerationObserved(pooler.Generation, pooler.Status.ObservedGeneration) && pooler.Status.AvailableReplicas >= poolerWanted && pooler.Status.UpdatedReplicas >= poolerWanted
 	autoscalingReady := true
@@ -2606,8 +2903,8 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 		autoscalingReady = observed && hpaConditionTrue(hpa, autoscalingv2.AbleToScale) && hpaConditionTrue(hpa, autoscalingv2.ScalingActive)
 		autoscalingMessage = fmt.Sprintf("HPA active=%t", autoscalingReady)
 	}
-	message := fmt.Sprintf("etcd %d/%d, orchestrator %d/%d, pooler %d/%d replicas available; %s", etcd.Status.ReadyReplicas, etcdWanted, orchestrator.Status.AvailableReplicas, orchestratorWanted, pooler.Status.AvailableReplicas, poolerWanted, autoscalingMessage)
-	return etcdReady && orchestratorReady && poolerReady && autoscalingReady, message, nil
+	message := fmt.Sprintf("orchestrator Lease observed, orchestrator %d/%d, pooler %d/%d replicas available; %s", orchestrator.Status.AvailableReplicas, orchestratorWanted, pooler.Status.AvailableReplicas, poolerWanted, autoscalingMessage)
+	return orchestratorReady && poolerReady && autoscalingReady, message, nil
 }
 
 func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, string, string, error) {
@@ -2621,7 +2918,7 @@ func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Cont
 	ready := int32(0)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		statefulSet := &appsv1.StatefulSet{}
-		key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, shard)}
 		if err := reader.Get(ctx, key, statefulSet); apierrors.IsNotFound(err) {
 			continue
 		} else if err != nil {
@@ -2724,7 +3021,7 @@ func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *p
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: cluster.Generation,
 			Reason:             "TransportTLSUnavailable",
-			Message:            "etcd client/peer and PostgreSQL shard traffic lack authenticated TLS; ingress NetworkPolicies provide isolation only",
+			Message:            "PostgreSQL shard traffic lacks authenticated TLS; orchestrator coordination uses API-server TLS with namespace-scoped RBAC",
 		},
 	}
 	return r.updateStatus(ctx, cluster, cluster.Generation, phase, conditions)
@@ -2858,11 +3155,41 @@ func postgreSQLBootstrapsEqual(left, right pgshardv1alpha1.PostgreSQLBootstrapSt
 	return left.Shard == right.Shard && left.SecretName == right.SecretName && left.SecretUID == right.SecretUID && left.PVCFenceDetached == right.PVCFenceDetached && left.PVCName == right.PVCName && left.PVCUID == right.PVCUID && left.PVCCreationAbandoned == right.PVCCreationAbandoned && optionalStringsEqual(left.PVCStorageClassName, right.PVCStorageClassName)
 }
 
+// orchestratorLeaseEvents ignores the runtime-owned spec updates made during
+// every claim and renewal. Envelope drift, ownership changes, deletion, create,
+// and delete events still reconcile the owning cluster.
+func orchestratorLeaseEvents() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return true },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return true },
+		UpdateFunc: func(update event.UpdateEvent) bool {
+			oldLease, oldOK := update.ObjectOld.(*coordinationv1.Lease)
+			newLease, newOK := update.ObjectNew.(*coordinationv1.Lease)
+			if !oldOK || !newOK {
+				return true
+			}
+			oldMetadata := oldLease.ObjectMeta.DeepCopy()
+			newMetadata := newLease.ObjectMeta.DeepCopy()
+			for _, metadata := range []*metav1.ObjectMeta{oldMetadata, newMetadata} {
+				metadata.ResourceVersion = ""
+				metadata.Generation = 0
+				metadata.ManagedFields = nil
+			}
+			return !reflect.DeepEqual(oldMetadata, newMetadata)
+		},
+	}
+}
+
 func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(manager).
 		For(&pgshardv1alpha1.PgShardCluster{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.ServiceAccount{}).
+		Owns(&rbacv1.Role{}).
+		Owns(&rbacv1.RoleBinding{}).
+		Owns(&coordinationv1.Lease{}, builder.WithPredicates(orchestratorLeaseEvents())).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).

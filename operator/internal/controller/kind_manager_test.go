@@ -16,8 +16,10 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -37,6 +39,11 @@ import (
 // This exceeds the 5-second initial delay plus three 10-second liveness
 // periods, so a broken process cannot pass immediately before its first restart.
 const stableContainerObservation = 40 * time.Second
+
+func TestMain(m *testing.M) {
+	ctrl.SetLogger(logr.Discard())
+	os.Exit(m.Run())
+}
 
 func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
@@ -69,13 +76,12 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	assertCondition(t, current, transportSecurityCondition, metav1.ConditionFalse, "TransportTLSUnavailable")
 	assertPostgreSQLRoleProfiles(t, ctx, kubeClient, current)
 
-	waitForEtcdQuorum(t, ctx, kubeClient, namespace.Name, cluster.Name)
-	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "etcd", 3, true)
-	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "orchestrator", 3, false)
+	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "orchestrator", 3, true)
 	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "pooler", 1, false)
 	waitForStableManagerPod(t, ctx, kubeClient)
 	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertNoPostgreSQLWorkload(t, ctx, kubeClient, namespace.Name, cluster.Name)
+	assertOrchestratorReadinessTracksLeaseIdentity(t, ctx, kubeClient, namespace.Name, cluster.Name)
 }
 
 func TestKINDRestoreTopologyMismatchIsRejectedBeforeMutation(t *testing.T) {
@@ -291,11 +297,11 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	waitForPoolerCatalogTLS(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertPostgreSQLStatusMetadataImmutable(t, ctx, kubeClient, types.NamespacedName{
 		Namespace: namespace.Name,
-		Name:      cluster.Name + "-shard-0000-primary-0",
+		Name:      owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0",
 	})
 	assertPostgreSQLSpecImmutable(t, ctx, kubeClient, types.NamespacedName{
 		Namespace: namespace.Name,
-		Name:      cluster.Name + "-shard-0000-primary-0",
+		Name:      owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0",
 	})
 	current := &pgshardv1alpha1.PgShardCluster{}
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err != nil {
@@ -320,8 +326,8 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	shardZeroBootstrap := bootstrapForShard(t, current, 0)
 	shardOneBootstrap := bootstrapForShard(t, current, 1)
 
-	shardZeroPod := cluster.Name + "-shard-0000-primary-0"
-	shardOnePod := cluster.Name + "-shard-0001-primary-0"
+	shardZeroPod := owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0"
+	shardOnePod := owned.PostgreSQLShardStatefulSetName(cluster.Name, 1) + "-0"
 	initialShardZero := &corev1.Pod{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, initialShardZero); err != nil {
 		t.Fatal(err)
@@ -404,6 +410,12 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, service, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
 		t.Fatalf("cross-shard-service query = %q", got)
 	}
+	poolerService := cluster.Name + "-rw"
+	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, poolerService, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
+		t.Fatalf("shard-zero compatibility relay query = %q", got)
+	}
+	assertUnsupportedApplicationServicesHaveNoEndpoints(t, ctx, kubeClient, namespace.Name, cluster.Name)
+	assertPoolerCatalogDatabaseRejected(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, poolerService)
 	assertPostgreSQLServiceQueryDenied(t, ctx, kubeClient, namespace.Name, "unlabeled", nil, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, service)
 	assertPostgreSQLServiceQueryDenied(t, ctx, kubeClient, namespace.Name, "wrong-cluster", map[string]string{
 		owned.ClusterLabel:   "another-cluster",
@@ -439,11 +451,11 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	var desiredShardZeroHash, desiredShardOneHash string
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
 		shardZeroStatefulSet := &appsv1.StatefulSet{}
-		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}, shardZeroStatefulSet); err != nil {
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}, shardZeroStatefulSet); err != nil {
 			return false, err
 		}
 		shardOneStatefulSet := &appsv1.StatefulSet{}
-		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 1)}, shardOneStatefulSet); err != nil {
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 1)}, shardOneStatefulSet); err != nil {
 			return false, err
 		}
 		desiredShardZeroHash = shardZeroStatefulSet.Spec.Template.Annotations[owned.ConfigHashAnnotation]
@@ -485,6 +497,10 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
 		t.Fatalf("query after StatefulSet restart = %q", got)
+	}
+	waitForPoolerCatalogTLS(t, ctx, kubeClient, namespace.Name, cluster.Name)
+	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, poolerService, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
+		t.Fatalf("compatibility relay query after shard-zero restart = %q", got)
 	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
@@ -662,7 +678,7 @@ func waitForPoolerCatalogTLS(t *testing.T, ctx context.Context, kubeClient clien
 			lastErr = err
 			return false, nil
 		}
-		if status.Ready || status.Catalog.Phase != "connected" || !status.Catalog.ConnectionUp || !status.Catalog.Ready || status.Catalog.ReadinessReason != "ready" || status.Catalog.CatalogEpoch == nil || status.Catalog.LastFailure != nil {
+		if !status.Ready || status.Catalog.Phase != "connected" || !status.Catalog.ConnectionUp || !status.Catalog.Ready || status.Catalog.ReadinessReason != "ready" || status.Catalog.CatalogEpoch == nil || status.Catalog.LastFailure != nil {
 			lastErr = fmt.Errorf("catalog status not ready: %#v", status)
 			return false, nil
 		}
@@ -684,7 +700,7 @@ func waitForPoolerCatalogTLS(t *testing.T, ctx context.Context, kubeClient clien
 		t.Fatalf("read pooler metrics through Service proxy: %v\n%s", err, metrics)
 	}
 	for _, sample := range []string{
-		"pgshard_pooler_ready 0",
+		"pgshard_pooler_ready 1",
 		"pgshard_pooler_catalog_ready 1",
 		"pgshard_pooler_catalog_connection_up 1",
 	} {
@@ -693,10 +709,9 @@ func waitForPoolerCatalogTLS(t *testing.T, ctx context.Context, kubeClient clien
 		}
 	}
 	readiness, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", readinessPath).CombinedOutput()
-	if err == nil || (!strings.Contains(string(readiness), "data_plane_unavailable") && !strings.Contains(string(readiness), "ServiceUnavailable")) {
-		t.Fatalf("pooler /readyz = error %v, output %q; want HTTP 503 data_plane_unavailable", err, readiness)
+	if err != nil || strings.TrimSpace(string(readiness)) != `{"ready":true,"reason":"ready"}` {
+		t.Fatalf("pooler /readyz = error %v, output %q; want ready compatibility relay", err, readiness)
 	}
-	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace, cluster)
 }
 
 func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, kubeClient client.Client, key types.NamespacedName) {
@@ -914,7 +929,7 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 	if bootstrap.PVCStorageClassName == nil || claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != *bootstrap.PVCStorageClassName {
 		t.Fatalf("PostgreSQL data claim storage class = %#v, checkpoint = %#v", claim.Spec.StorageClassName, bootstrap.PVCStorageClassName)
 	}
-	podKey := types.NamespacedName{Namespace: namespace.Name, Name: cluster.Name + "-shard-0000-primary-0"}
+	podKey := types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0"}
 	pod := &corev1.Pod{}
 	if err := kubeClient.Get(ctx, podKey, pod); err != nil {
 		t.Fatal(err)
@@ -945,7 +960,7 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 	for description, object := range map[string]client.Object{
 		"PostgreSQL Pod":       &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podKey.Name, Namespace: podKey.Namespace}},
 		"PostgreSQL PVC":       &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: claimKey.Name, Namespace: claimKey.Namespace}},
-		"PostgreSQL state":     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
+		"PostgreSQL state":     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
 		"credential PVC fence": &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: bootstrap.SecretName, Namespace: namespace.Name}},
 	} {
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(object), object); !apierrors.IsNotFound(err) {
@@ -1021,9 +1036,9 @@ func TestKINDManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC(t *testi
 		t.Fatalf("Retain finalizer deadlocked behind an explicitly deleting PostgreSQL data PVC: %v", err)
 	}
 	for description, object := range map[string]client.Object{
-		"PostgreSQL Pod":       &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: cluster.Name + "-shard-0000-primary-0", Namespace: namespace.Name}},
+		"PostgreSQL Pod":       &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0", Namespace: namespace.Name}},
 		"PostgreSQL PVC":       &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: claimKey.Name, Namespace: claimKey.Namespace}},
-		"PostgreSQL state":     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
+		"PostgreSQL state":     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
 		"credential PVC fence": &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: bootstrap.SecretName, Namespace: namespace.Name}},
 	} {
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(object), object); !apierrors.IsNotFound(err) {
@@ -1115,6 +1130,36 @@ func assertCatalogLoginRejected(t *testing.T, ctx context.Context, kubeClient cl
 		!strings.Contains(output, "user \"pgshard_pooler_catalog\"") ||
 		!strings.Contains(output, "database \""+database+"\"") {
 		t.Fatalf("catalog login was rejected for an unexpected reason: %q", output)
+	}
+}
+
+func assertPoolerCatalogDatabaseRejected(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, image, secret, host string) {
+	t.Helper()
+	clientPod := postgreSQLClientPod(namespace, fmt.Sprintf("pgshard-pooler-catalog-client-%d-%d", os.Getpid(), time.Now().UnixNano()), map[string]string{
+		owned.ClusterLabel:   cluster,
+		owned.ComponentLabel: "pooler",
+	}, image, secret, host, "SELECT 1")
+	clientPod.Spec.Containers[0].Args = []string{"-X", "-w", "-h", host, "-U", "postgres", "-d", "shardschema", "-Atc", "SELECT 1"}
+	if err := kubeClient.Create(ctx, clientPod); err != nil {
+		t.Fatal(err)
+	}
+	current := &corev1.Pod{}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		current = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(clientPod), current); err != nil {
+			return false, err
+		}
+		if current.Status.Phase == corev1.PodSucceeded {
+			return false, fmt.Errorf("application pooler exposed shardschema")
+		}
+		return current.Status.Phase == corev1.PodFailed, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for pooler catalog rejection Pod: %v; last status = %#v", err, current.Status)
+	}
+	output := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
+	if !strings.Contains(output, "shardschema is not available through the application pooler") {
+		t.Fatalf("application pooler rejected shardschema for an unexpected reason: %q", output)
 	}
 }
 
@@ -1440,21 +1485,6 @@ func waitForManagerStatus(t *testing.T, ctx context.Context, kubeClient client.C
 	return current.DeepCopy()
 }
 
-func waitForEtcdQuorum(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) {
-	t.Helper()
-	statefulSet := &appsv1.StatefulSet{}
-	key := types.NamespacedName{Namespace: namespace, Name: cluster + owned.EtcdSuffix}
-	err := wait.PollUntilContextTimeout(ctx, time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
-		if err := kubeClient.Get(ctx, key, statefulSet); err != nil {
-			return false, client.IgnoreNotFound(err)
-		}
-		return statefulSet.Status.ObservedGeneration >= statefulSet.Generation && statefulSet.Status.ReadyReplicas == 3 && statefulSet.Status.UpdatedReplicas == 3, nil
-	})
-	if err != nil {
-		t.Fatalf("wait for etcd quorum: %v; last status = %#v", err, statefulSet.Status)
-	}
-}
-
 func waitForStablePods(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, component string, wanted int, wantReady bool) {
 	t.Helper()
 	pods := &corev1.PodList{}
@@ -1492,6 +1522,120 @@ func waitForStablePods(t *testing.T, ctx context.Context, kubeClient client.Clie
 	}
 }
 
+type podRuntimeIdentity struct {
+	uid       types.UID
+	startedAt time.Time
+}
+
+func assertOrchestratorReadinessTracksLeaseIdentity(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) {
+	t.Helper()
+	incarnations := capturePodRuntimeIdentities(t, ctx, kubeClient, namespace, cluster, "orchestrator", 3)
+	managerRestored := false
+	t.Cleanup(func() {
+		if managerRestored {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		commands := [][]string{
+			{"--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1"},
+			{"--namespace", "pgshard-system", "rollout", "status", "deployment/pgshard-controller-manager", "--timeout=120s"},
+		}
+		for _, arguments := range commands {
+			output, err := exec.CommandContext(cleanupCtx, "kubectl", arguments...).CombinedOutput()
+			if err != nil {
+				t.Errorf("restore quorum fixture with kubectl %s: %v\n%s", strings.Join(arguments, " "), err, output)
+			}
+		}
+	})
+
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=0")
+	waitForManagerReplicas(t, ctx, kubeClient, 0)
+	lease := &coordinationv1.Lease{}
+	leaseKey := types.NamespacedName{Namespace: namespace, Name: cluster + owned.OrchestratorLeaseSuffix}
+	if err := kubeClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatal(err)
+	}
+	oldLeaseUID := lease.UID
+	uid := lease.UID
+	resourceVersion := lease.ResourceVersion
+	if err := kubeClient.Delete(ctx, lease, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil {
+		t.Fatal(err)
+	}
+	waitForExistingPodReadiness(t, ctx, kubeClient, namespace, cluster, "orchestrator", incarnations, false)
+
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1")
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "rollout", "status", "deployment/pgshard-controller-manager", "--timeout=120s")
+	waitForManagerReplicas(t, ctx, kubeClient, 1)
+	managerRestored = true
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		current := &coordinationv1.Lease{}
+		if err := kubeClient.Get(ctx, leaseKey, current); err != nil {
+			return false, client.IgnoreNotFound(err)
+		}
+		return current.UID != "" && current.UID != oldLeaseUID, nil
+	}); err != nil {
+		t.Fatalf("wait for replacement orchestrator Lease: %v", err)
+	}
+	// A Lease UID change is a new coordination universe. Existing processes
+	// remain fail closed; a bounded rollout establishes new process identities.
+	runKubectl(t, ctx, "--namespace", namespace, "rollout", "restart", "deployment/"+cluster+owned.OrchestratorSuffix)
+	runKubectl(t, ctx, "--namespace", namespace, "rollout", "status", "deployment/"+cluster+owned.OrchestratorSuffix, "--timeout=180s")
+	waitForStablePods(t, ctx, kubeClient, namespace, cluster, "orchestrator", 3, true)
+}
+
+func capturePodRuntimeIdentities(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, component string, wanted int) map[string]podRuntimeIdentity {
+	t.Helper()
+	pods := &corev1.PodList{}
+	if err := kubeClient.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{owned.ClusterLabel: cluster, owned.ComponentLabel: component}); err != nil {
+		t.Fatal(err)
+	}
+	if len(pods.Items) != wanted {
+		t.Fatalf("capture %s runtime identities: got %d pods, want %d", component, len(pods.Items), wanted)
+	}
+	identities := make(map[string]podRuntimeIdentity, wanted)
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if len(pod.Status.ContainerStatuses) != 1 || pod.Status.ContainerStatuses[0].State.Running == nil {
+			t.Fatalf("capture %s runtime identity for %s: %#v", component, pod.Name, pod.Status)
+		}
+		identities[pod.Name] = podRuntimeIdentity{uid: pod.UID, startedAt: pod.Status.ContainerStatuses[0].State.Running.StartedAt.Time}
+	}
+	return identities
+}
+
+func waitForExistingPodReadiness(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, component string, identities map[string]podRuntimeIdentity, wanted bool) {
+	t.Helper()
+	pods := &corev1.PodList{}
+	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		pods = &corev1.PodList{}
+		if err := kubeClient.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{owned.ClusterLabel: cluster, owned.ComponentLabel: component}); err != nil {
+			return false, err
+		}
+		if len(pods.Items) != len(identities) {
+			return false, fmt.Errorf("%s pod count changed from %d to %d", component, len(identities), len(pods.Items))
+		}
+		for index := range pods.Items {
+			pod := &pods.Items[index]
+			identity, ok := identities[pod.Name]
+			if !ok || identity.uid != pod.UID || len(pod.Status.ContainerStatuses) != 1 {
+				return false, fmt.Errorf("%s pod incarnation changed: %#v", component, pod.ObjectMeta)
+			}
+			status := pod.Status.ContainerStatuses[0]
+			if status.RestartCount != 0 || status.State.Running == nil || !status.State.Running.StartedAt.Time.Equal(identity.startedAt) {
+				return false, fmt.Errorf("%s pod %s restarted during Lease transition: %#v", component, pod.Name, status)
+			}
+			if status.Ready != wanted {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for existing %s pods ready=%t: %v; last pods = %#v", component, wanted, err, pods.Items)
+	}
+}
+
 func assertFailClosedApplicationServices(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) {
 	t.Helper()
 	for _, suffix := range []string{"-rw", "-ro", "-r"} {
@@ -1517,13 +1661,36 @@ func assertFailClosedApplicationServices(t *testing.T, ctx context.Context, kube
 	}
 }
 
+func assertUnsupportedApplicationServicesHaveNoEndpoints(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) {
+	t.Helper()
+	for _, suffix := range []string{"-ro", "-r"} {
+		serviceName := cluster + suffix
+		service := &corev1.Service{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: serviceName}, service); err != nil {
+			t.Fatal(err)
+		}
+		if service.Spec.Selector != nil {
+			t.Fatalf("unsupported application Service %s has selector %#v", serviceName, service.Spec.Selector)
+		}
+		slices := &discoveryv1.EndpointSliceList{}
+		if err := kubeClient.List(ctx, slices, client.InNamespace(namespace), client.MatchingLabels{discoveryv1.LabelServiceName: serviceName}); err != nil {
+			t.Fatal(err)
+		}
+		for _, slice := range slices.Items {
+			if len(slice.Endpoints) != 0 {
+				t.Fatalf("unsupported application Service %s has endpoints %#v", serviceName, slice.Endpoints)
+			}
+		}
+	}
+}
+
 func assertNoPostgreSQLWorkload(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) {
 	t.Helper()
 	statefulSets := &appsv1.StatefulSetList{}
 	if err := kubeClient.List(ctx, statefulSets, client.InNamespace(namespace), client.MatchingLabels{owned.ClusterLabel: cluster}); err != nil {
 		t.Fatal(err)
 	}
-	if len(statefulSets.Items) != 1 || statefulSets.Items[0].Labels[owned.ComponentLabel] != "etcd" {
+	if len(statefulSets.Items) != 0 {
 		t.Fatalf("unexpected stateful workloads = %#v", statefulSets.Items)
 	}
 	pods := &corev1.PodList{}

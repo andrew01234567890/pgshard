@@ -7,8 +7,48 @@ description: Replication, leases, fencing, promotion, restarts, and buffering.
 
 :::info Milestone 1 design contract
 The Rust agent/orchestrator health surfaces and fail-closed in-memory fencing
-models exist. They bound authenticated lease lifetimes and atomically reject an
-operation unless its catalog epoch, fencing epoch and deadline match at
+models exist. The operator creates one empty `coordination.k8s.io/v1` Lease
+envelope for orchestrator leadership. A dedicated ServiceAccount is restricted
+to `get` and `update` on that exact Lease name; the Rust process connects through
+the Kubernetes API server's in-cluster TLS path and never connects directly to
+the control plane's private etcd. Claims and renewals are full
+resource-version-conditional replacements bound to the exact fleet owner UID,
+Lease UID, Pod UID, and process incarnation. `/readyz` succeeds after a current
+authoritative observation of that identity. All healthy replicas may be ready,
+but only the current holder reports `pgshard_orch_leader 1`.
+
+A follower does not trust the holder's wall clock. It can take over only after
+observing the same holder and renewal record unchanged for a complete locally
+measured Lease duration, following CloudNativePG's conservative observation
+pattern. A clean empty release can be claimed immediately. A monotonic local
+deadline is anchored before each conditional replacement is dispatched, so a
+delayed successful API response consumes rather than extends leadership.
+Readiness is removed after API loss or a process pause. Routine runtime Lease
+renewals do not enqueue a full cluster resource reconciliation; create, delete,
+ownership, deletion-transition, and operator-owned envelope changes still do.
+Recreating the Lease changes its UID, so existing processes remain fail closed
+until a bounded orchestrator rollout establishes a new coordination universe.
+This Lease proves only orchestrator availability and exclusive leadership. It
+does not persist operation or shard-term records, provide target-side
+PostgreSQL fencing, or enable automated failover.
+
+The pre-Lease development layout's three etcd data claims are retired
+automatically. The operator first prunes the old cluster-owned StatefulSet,
+uses an uncached namespace-wide Pod list to prove that no Pod of any identity
+references any retained claim, validates the exact owner, labels, 2 GiB storage
+contract, and fixed claim names, and then deletes those claims with UID and
+resource-version preconditions. A mismatch or mount blocks deletion. No
+PostgreSQL data claim participates in this migration.
+
+On `SIGTERM`, the process removes readiness before notifying its workers,
+cancels any in-flight Kubernetes API request, limits best-effort Lease release
+to one second, and limits HTTP plus coordination drain to ten
+seconds. The operator explicitly gives orchestrator Pods a 30-second Kubernetes
+termination grace. Lease expiry remains the cleanup backstop when revocation
+cannot complete.
+
+The in-memory models bound authenticated lease lifetimes and atomically reject
+an operation unless its catalog epoch, fencing epoch and deadline match at
 execution. An opt-in local lifecycle boundary can structurally preflight
 required PostgreSQL 18 files, supervise one direct postmaster child with client
 TCP and replication ingress disabled, propagate unexpected exit, and perform
@@ -344,7 +384,37 @@ a durability downgrade and must be surfaced as such.
 
 ## Primary fencing
 
-The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Both the orchestrator authority and receiving agent reject expired or overlong leases; configured TTL bounds are enforced by the state machines, not merely logged. The in-process orchestrator retains Unix expiry only for request validation and reporting and uses a separate monotonic deadline for live ownership, so a wall-clock step after installation cannot change the local term. During acquisition it pairs two wall reads with preceding monotonic samples, uses the greater wall value for admission, installs the earlier of the two translated monotonic deadlines, and proves admission against a final monotonic sample. A pause combined with a backward step between the wall reads can therefore only shorten or reject the candidate term, never extend it. A renewal extends the installed monotonic deadline only by its requested Unix-expiry delta and cannot move that deadline beyond the current TTL policy.
+The primary must eventually hold an operator-owned
+`coordination.k8s.io/v1` Lease for its physical cell. Components access that
+Lease through the Kubernetes API server; they never connect directly to the
+control plane's private etcd. The Lease record is short-lived coordination, not
+durable authority: topology, operations, fencing generations, and transaction
+decisions remain in PostgreSQL. This per-cell writable-term Lease and the local
+agent self-fencing needed before PostgreSQL can serve are not implemented. The
+implemented fleet-level orchestrator leadership Lease is deliberately not a
+shard/term Lease.
+
+As in CloudNativePG, a candidate observes a competing holder's Lease record
+locally and may take it over only after the same holder and renewal record stay
+unchanged for a full lease duration. Resource-version conditional updates pick
+one winner without trusting the old holder's wall clock. The current holder
+must still translate successful renewals into a monotonic local deadline and
+stop PostgreSQL before that deadline; a Kubernetes Lease alone cannot fence an
+isolated process.
+
+The existing in-memory state machines model the later boundary. Both the
+orchestrator authority and receiving agent reject expired or overlong leases;
+configured TTL bounds are enforced by the state machines, not merely logged.
+The in-process orchestrator retains Unix expiry only for request validation and
+reporting and uses a separate monotonic deadline for live ownership, so a
+wall-clock step after installation cannot change the local term. During
+acquisition it pairs two wall reads with preceding monotonic samples, uses the
+greater wall value for admission, installs the earlier of the two translated
+monotonic deadlines, and proves admission against a final monotonic sample. A
+pause combined with a backward step between the wall reads can therefore only
+shorten or reject the candidate term, never extend it. A renewal extends the
+installed monotonic deadline only by its requested Unix-expiry delta and cannot
+move that deadline beyond the current TTL policy.
 
 A lease-acquisition outcome reports an in-memory mutation; it is not execution authority. The returned grant must be revalidated against the exact installed term, monotonic deadline, catalog epoch, fencing epoch, and operation immediately before dispatch. The validation clock is sampled while holding the shared state lock after term inspection and again after epoch checks, so mutex contention or a pause during validation cannot carry a stale timestamp past expiry. Even that local guard is an instant-in-time check: every target operation must carry the epoch and atomically reject a stale epoch. Poolers route writes only to the primary identity and term currently authorized by those target-side fences.
 

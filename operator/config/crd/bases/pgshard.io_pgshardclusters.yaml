@@ -354,9 +354,7 @@ spec:
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
                   storageClassName:
-                    description: |-
-                      StorageClassName is used for PostgreSQL data volumes and the supporting
-                      etcd quorum's independently sized volumes.
+                    description: StorageClassName is used for PostgreSQL data volumes.
                     type: string
                 required:
                 - size

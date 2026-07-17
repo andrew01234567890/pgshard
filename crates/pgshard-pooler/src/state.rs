@@ -94,15 +94,15 @@ pub struct PoolerState {
 }
 
 impl PoolerState {
-    /// Creates control-only state backed by the live catalog supervisor.
+    /// Creates state backed by the live catalog supervisor.
     ///
-    /// Application readiness remains false even after the catalog becomes
-    /// usable because the current executable has no SQL data plane.
+    /// `data_plane_ready` means that a deliberately configured frontend mode
+    /// exists. Catalog readiness remains a separate mandatory gate.
     #[must_use]
-    pub fn control_only(catalog: CatalogSupervisorStatus) -> Self {
+    pub fn supervised(catalog: CatalogSupervisorStatus, data_plane_ready: bool) -> Self {
         Self {
             catalog_snapshot: Arc::new(move || catalog.snapshot().into()),
-            data_plane_ready: false,
+            data_plane_ready,
         }
     }
 
@@ -167,6 +167,17 @@ impl PoolerState {
             data_plane_ready,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_catalog_source(
+        catalog_snapshot: impl Fn() -> PoolerCatalogSnapshot + Send + Sync + 'static,
+        data_plane_ready: bool,
+    ) -> Self {
+        Self {
+            catalog_snapshot: Arc::new(catalog_snapshot),
+            data_plane_ready,
+        }
+    }
 }
 
 // Serde's `serialize_with` callback ABI passes the field by reference.
@@ -216,7 +227,7 @@ mod tests {
             Arc::new(CatalogCache::new()),
             CatalogSupervisorConfig::default(),
         );
-        let state = PoolerState::control_only(supervisor.status());
+        let state = PoolerState::supervised(supervisor.status(), false);
 
         let starting = state.snapshot();
         assert!(!starting.ready);

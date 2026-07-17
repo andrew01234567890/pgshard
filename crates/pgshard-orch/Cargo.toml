@@ -10,11 +10,15 @@ publish = false
 
 [dependencies]
 axum.workspace = true
+bytes.workspace = true
 clap = { workspace = true, features = ["env"] }
+k8s-openapi.workspace = true
+kube.workspace = true
 pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
@@ -24,9 +28,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-bytes.workspace = true
 postgres-protocol.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true
