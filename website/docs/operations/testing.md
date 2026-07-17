@@ -584,13 +584,18 @@ running-container terminal reports, copied or forged HMAC receipts, and receipt
 or binding metadata changes, request-path namespace confusion, and partially
 stripped PostgreSQL identity, while allowing non-PostgreSQL pgshard Pods to bind.
 PKI tests prove leaf renewal leaves the separate immutable fencing key unchanged,
-an existing install gains its continuity anchor only after all stored cluster
-and terminal receipts verify, later anchor loss remains failed closed, and the
-metadata-only anchor preserves previous-manager rollback. Empty, mutable,
-oversized, or different valid key replacements fail startup, readiness, webhook
-use, and controller verification. The KIND admission test deletes and
-replaces the shared key with malformed and different valid values, observes the
-manager become unready without restarting, then restores the original bytes.
+fresh-install authority cannot be recreated around an initialized key, an
+unanchored legacy key is refused, and a pre-anchored key completes migration only
+after established cluster and terminal receipts verify. Fault injection writes a
+mismatching established receipt during the fresh anchor update and proves the
+completion marker remains absent; unrelated multi-member, unprovisioned, and
+unmanaged markers do not block startup. Later anchor loss remains failed closed,
+and metadata-only continuity state preserves previous-manager rollback. Empty,
+mutable, oversized, or different valid key replacements fail startup, readiness,
+receipt-authenticated webhook use, and controller verification. The KIND
+admission test deletes and replaces the shared key with malformed and different
+valid values, observes the manager become unready without restarting, then
+restores the original bytes.
 Generation-history tests reject image, ephemeral-container, and resize changes
 after a terminal receipt, while malformed receipt-only cluster state rotates to
 a fresh challenge. It permits release

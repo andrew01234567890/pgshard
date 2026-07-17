@@ -113,26 +113,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	receiptKey := podfence.SecretReceiptKeyRef{
+		Secret:           client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.fencingKeySecretName},
+		DataKey:          pki.PodFencingKeyKey,
+		AnchorSecret:     client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
+		AnchorAnnotation: pki.PodFencingKeyFingerprintAnnotation,
+	}
 	if err := (&controller.PgShardClusterReconciler{
-		Client:                     manager.GetClient(),
-		APIReader:                  manager.GetAPIReader(),
-		Images:                     options.images,
-		PodFencingKeySecret:        client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.fencingKeySecretName},
-		PodFencingKeyData:          pki.PodFencingKeyKey,
-		PodFencingAnchorSecret:     client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
-		PodFencingAnchorAnnotation: pki.PodFencingKeyFingerprintAnnotation,
+		Client:               manager.GetClient(),
+		APIReader:            manager.GetAPIReader(),
+		Images:               options.images,
+		PodFencingReceiptKey: receiptKey,
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
 	}
 	if options.webhookEnabled {
-		handshakeCodec := podfence.NewSecretHandshakeCodec(
-			manager.GetAPIReader(),
-			client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.fencingKeySecretName},
-			pki.PodFencingKeyKey,
-			client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
-			pki.PodFencingKeyFingerprintAnnotation,
-		)
+		handshakeCodec := podfence.NewSecretHandshakeCodec(manager.GetAPIReader(), receiptKey)
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCluster{}).
 			WithDefaulter(&pgshardv1alpha1.PgShardClusterDefaulter{}).
 			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{}).

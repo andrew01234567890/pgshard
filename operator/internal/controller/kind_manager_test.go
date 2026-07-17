@@ -117,10 +117,12 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	}
 	verifiedHandshake, handshakeErr := podfence.NewSecretHandshakeCodec(
 		kubeClient,
-		types.NamespacedName{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingKeySecret},
-		defaultPodFencingKeyData,
-		types.NamespacedName{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingAnchorSecret},
-		defaultPodFencingAnchorAnnotation,
+		podfence.SecretReceiptKeyRef{
+			Secret:           types.NamespacedName{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingKeySecret},
+			DataKey:          defaultPodFencingKeyData,
+			AnchorSecret:     types.NamespacedName{Namespace: defaultPodFencingKeyNamespace, Name: defaultPodFencingAnchorSecret},
+			AnchorAnnotation: defaultPodFencingAnchorAnnotation,
+		},
 	).Verify(ctx, current)
 	if handshakeErr != nil {
 		t.Fatal(handshakeErr)

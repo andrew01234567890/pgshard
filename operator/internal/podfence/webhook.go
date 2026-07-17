@@ -29,8 +29,8 @@ const (
 
 	NodeUIDAnnotation            = owned.PostgreSQLNodeUIDAnnotation
 	NodeBootIDAnnotation         = owned.PostgreSQLNodeBootIDAnnotation
-	HandshakeChallengeAnnotation = "pgshard.io/pod-fencing-challenge"
-	HandshakeReceiptAnnotation   = "pgshard.io/pod-fencing-admission"
+	HandshakeChallengeAnnotation = pgshardv1alpha1.PodFencingChallengeAnnotation
+	HandshakeReceiptAnnotation   = pgshardv1alpha1.PodFencingReceiptAnnotation
 
 	TerminationConditionType corev1.PodConditionType = "pgshard.io/PostgreSQLProcessTerminated"
 	TerminationReason                                = "AuthenticatedKubelet"

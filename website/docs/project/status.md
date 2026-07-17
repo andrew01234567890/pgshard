@@ -16,10 +16,14 @@ Node evidence is absent. The namespace handshake proves the selected admission
 path handled a fresh challenge; it is not evidence that every API-server
 selector cache converged simultaneously. The independent immutable receipt key
 is continuity-anchored by a SHA-256 fingerprint in backward-compatible CA Secret
-metadata. First adoption verifies all stored cluster and terminal receipts, and
-a separate completion marker prevents later anchor loss from re-entering
-adoption. Startup, readiness, admission, and reconciliation reject key loss or
-replacement rather than silently invalidating outstanding receipts.
+metadata. Fresh-install authority is recorded before key generation. Existing initialized
+keys require an explicit pre-rollout fingerprint pin; automatic mixed-version
+adoption is deliberately refused because a resource listing is not a writer
+barrier. Established receipt history is verified before a separate completion
+marker is written. Startup, readiness, receipt-authenticated admission, and
+reconciliation reject key loss or replacement rather than silently invalidating
+outstanding receipts. Automated production tooling for the pre-anchor upgrade
+phase is not implemented.
 
 | Area | Current evidence | Status |
 |---|---|---|

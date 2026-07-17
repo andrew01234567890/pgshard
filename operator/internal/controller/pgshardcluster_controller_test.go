@@ -3442,15 +3442,17 @@ func withPodFencingNamespaces(t *testing.T, objects []client.Object) []client.Ob
 		if cluster.UID == "" {
 			cluster.UID = types.UID(utiluuid.NewUUID())
 		}
-		if cluster.Annotations == nil {
-			cluster.Annotations = make(map[string]string, 2)
+		if cluster.Spec.MembersPerShard == 1 {
+			if cluster.Annotations == nil {
+				cluster.Annotations = make(map[string]string, 2)
+			}
+			cluster.Annotations[podfence.HandshakeChallengeAnnotation] = "test-admission-handshake"
+			receipt, err := podfence.NewStaticHandshakeCodec([]byte(testPodFencingKey)).Receipt(context.Background(), cluster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cluster.Annotations[podfence.HandshakeReceiptAnnotation] = receipt
 		}
-		cluster.Annotations[podfence.HandshakeChallengeAnnotation] = "test-admission-handshake"
-		receipt, err := podfence.NewStaticHandshakeCodec([]byte(testPodFencingKey)).Receipt(context.Background(), cluster)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cluster.Annotations[podfence.HandshakeReceiptAnnotation] = receipt
 		namespace := namespaces[cluster.Namespace]
 		if namespace == nil {
 			namespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}}

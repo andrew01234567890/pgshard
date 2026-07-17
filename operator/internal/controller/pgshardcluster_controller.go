@@ -41,7 +41,7 @@ const (
 	supportingAvailableCondition      = "SupportingWorkloadsAvailable"
 	postgresqlAvailableCondition      = "PostgreSQLPrimariesAvailable"
 	transportSecurityCondition        = "TransportSecurityReady"
-	resourceFinalizer                 = "pgshard.io/owned-resources"
+	resourceFinalizer                 = owned.ClusterResourceFinalizer
 	hpaScaleFieldManager              = "pgshard-hpa-scale"
 	ownershipMigrationManager         = "pgshard-ownership-migration"
 	retryDelay                        = 15 * time.Second
@@ -66,12 +66,9 @@ type PgShardClusterReconciler struct {
 	// gates, storage-class selection, replica handoff, deletion-finalizer absence
 	// proofs, and post-apply workload status.
 	// Writes and plan reconciliation continue through Client.
-	APIReader                  client.Reader
-	Images                     owned.Images
-	PodFencingKeySecret        types.NamespacedName
-	PodFencingKeyData          string
-	PodFencingAnchorSecret     types.NamespacedName
-	PodFencingAnchorAnnotation string
+	APIReader            client.Reader
+	Images               owned.Images
+	PodFencingReceiptKey podfence.SecretReceiptKeyRef
 }
 
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
@@ -297,29 +294,32 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLPodFencingHandshake(ctx conte
 }
 
 func (r *PgShardClusterReconciler) podFencingHandshakeCodec() *podfence.HandshakeCodec {
-	secret := r.PodFencingKeySecret
+	ref := r.PodFencingReceiptKey
+	secret := ref.Secret
 	if secret.Namespace == "" {
 		secret.Namespace = defaultPodFencingKeyNamespace
 	}
 	if secret.Name == "" {
 		secret.Name = defaultPodFencingKeySecret
 	}
-	dataKey := r.PodFencingKeyData
+	dataKey := ref.DataKey
 	if dataKey == "" {
 		dataKey = defaultPodFencingKeyData
 	}
-	anchor := r.PodFencingAnchorSecret
+	anchor := ref.AnchorSecret
 	if anchor.Namespace == "" {
 		anchor.Namespace = defaultPodFencingKeyNamespace
 	}
 	if anchor.Name == "" {
 		anchor.Name = defaultPodFencingAnchorSecret
 	}
-	anchorAnnotation := r.PodFencingAnchorAnnotation
+	anchorAnnotation := ref.AnchorAnnotation
 	if anchorAnnotation == "" {
 		anchorAnnotation = defaultPodFencingAnchorAnnotation
 	}
-	return podfence.NewSecretHandshakeCodec(r.authoritativeReader(), secret, dataKey, anchor, anchorAnnotation)
+	return podfence.NewSecretHandshakeCodec(r.authoritativeReader(), podfence.SecretReceiptKeyRef{
+		Secret: secret, DataKey: dataKey, AnchorSecret: anchor, AnchorAnnotation: anchorAnnotation,
+	})
 }
 
 func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {

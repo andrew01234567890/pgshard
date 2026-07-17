@@ -166,11 +166,28 @@ opt-in and returns an HMAC receipt bound to the cluster UID and fresh challenge.
 This does not prove simultaneous selector-cache convergence across every API
 server. The receipt key is an independent immutable Secret whose SHA-256
 continuity fingerprint is anchored in backward-compatible CA Secret metadata.
-First adoption verifies every stored cluster and terminal receipt with the
-candidate key, and a separate completion marker prevents later anchor loss from
-re-entering adoption. Readiness, admission, and controller use all require the
-exact key to match that anchor; recreating an empty or different key fails closed
-and does not mint replacement authority.
+Fresh-install state is recorded only while both authority Secrets are empty.
+An existing initialized but unanchored key must be pinned while the old manager
+is healthy before a mixed-version rollout; the new manager refuses to infer
+continuity from receipt listings because those listings cannot fence an older
+signer. It then verifies receipts attached to controller-established PostgreSQL
+lifecycles before writing a separate completion marker. Readiness,
+receipt-authenticated admission, and controller key use require the exact key to
+match that anchor; recreating an empty or different key fails closed and does not
+mint replacement authority.
+
+For a pre-anchor development install, record the current immutable key before
+changing the manager image. Run this while the old manager is healthy:
+
+```console
+KEY_UID="$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.metadata.uid}')"
+KEY_SHA256="$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.data.hmac\.key}' | base64 -d | sha256sum | awk '{print $1}')"
+kubectl --namespace pgshard-system annotate --overwrite secret pgshard-webhook-ca "pgshard.io/pod-fencing-key-sha256=${KEY_SHA256}"
+test "$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.metadata.uid}')" = "${KEY_UID}"
+```
+
+If the UID check fails, do not roll out the new manager. This explicit
+development upgrade boundary has no automated production tooling yet.
 Binding admission copies the managed identity and selected Node UID and
 boot ID into the Pod atomically with `spec.nodeName`; a final validator checks
 the result after every mutator. The init container reads those annotations

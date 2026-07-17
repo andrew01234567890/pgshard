@@ -31,24 +31,33 @@ type HandshakeCodec struct {
 	key func(context.Context) ([]byte, error)
 }
 
-func NewSecretHandshakeCodec(reader client.Reader, secret types.NamespacedName, dataKey string, anchorSecret types.NamespacedName, anchorAnnotation string) *HandshakeCodec {
+// SecretReceiptKeyRef names the Secret data and independent continuity anchor
+// that together authorize receipt signing and verification.
+type SecretReceiptKeyRef struct {
+	Secret           types.NamespacedName
+	DataKey          string
+	AnchorSecret     types.NamespacedName
+	AnchorAnnotation string
+}
+
+func NewSecretHandshakeCodec(reader client.Reader, ref SecretReceiptKeyRef) *HandshakeCodec {
 	return &HandshakeCodec{key: func(ctx context.Context) ([]byte, error) {
 		if reader == nil {
 			return nil, fmt.Errorf("Pod fencing handshake Secret reader is required")
 		}
 		value := &corev1.Secret{}
-		if err := reader.Get(ctx, secret, value); err != nil {
-			return nil, fmt.Errorf("read Pod fencing handshake Secret %s: %w", secret, err)
+		if err := reader.Get(ctx, ref.Secret, value); err != nil {
+			return nil, fmt.Errorf("read Pod fencing handshake Secret %s: %w", ref.Secret, err)
 		}
-		key, err := ValidateSecretHandshakeKey(value, dataKey)
+		key, err := ValidateSecretHandshakeKey(value, ref.DataKey)
 		if err != nil {
 			return nil, err
 		}
 		anchor := &corev1.Secret{}
-		if err := reader.Get(ctx, anchorSecret, anchor); err != nil {
-			return nil, fmt.Errorf("read Pod fencing handshake anchor Secret %s: %w", anchorSecret, err)
+		if err := reader.Get(ctx, ref.AnchorSecret, anchor); err != nil {
+			return nil, fmt.Errorf("read Pod fencing handshake anchor Secret %s: %w", ref.AnchorSecret, err)
 		}
-		if err := ValidateSecretHandshakeKeyFingerprint(anchor, anchorAnnotation, key); err != nil {
+		if err := ValidateSecretHandshakeKeyFingerprint(anchor, ref.AnchorAnnotation, key); err != nil {
 			return nil, err
 		}
 		return key, nil
@@ -103,17 +112,17 @@ func SecretHandshakeKeyFingerprint(key []byte) string {
 
 // ValidateSecretHandshakeKeyFingerprint proves that key is the generation
 // anchored outside its replaceable key Secret.
-func ValidateSecretHandshakeKeyFingerprint(secret *corev1.Secret, dataKey string, key []byte) error {
+func ValidateSecretHandshakeKeyFingerprint(secret *corev1.Secret, annotationKey string, key []byte) error {
 	if len(key) != SecretKeyBytes {
 		return fmt.Errorf("Pod fencing handshake key must be exactly %d bytes", SecretKeyBytes)
 	}
 	if err := validateOwnedOpaqueSecret(secret); err != nil {
 		return err
 	}
-	encoded, exists := secret.Annotations[dataKey]
+	encoded, exists := secret.Annotations[annotationKey]
 	fingerprint, err := hex.DecodeString(encoded)
-	if dataKey == "" || !exists || err != nil || len(fingerprint) != sha256.Size || encoded != hex.EncodeToString(fingerprint) {
-		return fmt.Errorf("Pod fencing handshake anchor Secret %s/%s must contain a canonical SHA-256 annotation %s", secret.Namespace, secret.Name, dataKey)
+	if annotationKey == "" || !exists || err != nil || len(fingerprint) != sha256.Size || encoded != hex.EncodeToString(fingerprint) {
+		return fmt.Errorf("Pod fencing handshake anchor Secret %s/%s must contain a canonical SHA-256 annotation %s", secret.Namespace, secret.Name, annotationKey)
 	}
 	wanted := sha256.Sum256(key)
 	if !hmac.Equal(fingerprint, wanted[:]) {

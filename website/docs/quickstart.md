@@ -84,11 +84,14 @@ The admission overlay provisions an ECDSA serving chain and a separate immutable
 256-bit fencing key into exact-name operator-managed Secrets, injects the CA
 bundle, and anchors the key's SHA-256 continuity fingerprint in the independent
 CA Secret's metadata, preserving the Secret data shape accepted by the previous
-manager for rollback. First adoption verifies every stored cluster and terminal
-receipt with the candidate key and generates a new key only when no receipt
-exists. A separate completion marker prevents later anchor loss from re-entering
-adoption. Startup, readiness, admission, and reconciliation reject an empty,
-mutable, incorrectly sized, or different replacement key. The leaf certificate renews without a Pod restart;
+manager for rollback. Fresh-install authority is recorded while both Secrets are
+empty; an existing initialized key without an anchor is refused and must be
+pinned while the old manager is healthy before the new image is rolled out.
+Established receipt history is then verified before a separate completion marker
+is written. See [High availability](operations/high-availability.md) for the
+pre-anchor development upgrade command. Startup, readiness,
+receipt-authenticated admission, and reconciliation reject an empty, mutable,
+incorrectly sized, or different replacement key. The leaf certificate renews without a Pod restart;
 automatic CA or fencing-key rotation is not yet implemented. Expect the sample to remain `Ready=False`, its
 pooler and orchestrator Pods to remain unready, and its application Services to
 have no ready endpoints. This path is for source validation only.

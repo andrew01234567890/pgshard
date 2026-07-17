@@ -344,14 +344,17 @@ made immutable by the same update that initializes it. A SHA-256 continuity
 fingerprint annotation is stored separately on the CA Secret, followed by a
 completion annotation on the key Secret. These metadata-only additions preserve
 the data shapes accepted by the previous manager, so a rollout can be rolled
-back. On first adoption, every stored cluster-handshake and Pod-termination
-receipt must verify with the candidate key; an empty key is generated only when
-no receipt exists. Once complete, loss of the fingerprint fails closed instead
-of re-entering adoption. Startup, readiness, webhook admission, and controller
-reconciliation all require the exact immutable key to match that anchor, so an
-empty, mutable, oversized, or different replacement cannot silently invalidate
-outstanding receipts. Existing installs adopt their verified current key without
-rotating it.
+back. Automatic key generation is authorized only by state written while the CA
+and key Secrets are both empty on a fresh install. An existing initialized key
+without an anchor is never adopted during a mixed-version rollout: pin its
+fingerprint in the CA Secret while the old manager is healthy, before changing
+the manager image, or reinstall the pre-release development cluster. Once
+pre-anchored, every receipt attached to an established PostgreSQL lifecycle must
+verify before the completion marker is written. Once complete, loss of the
+fingerprint fails closed instead of re-entering adoption. Startup, readiness,
+receipt-authenticated admission paths, and controller reconciliation all require
+the exact immutable key to match that anchor, so an empty, mutable, oversized,
+or different replacement cannot silently invalidate outstanding receipts.
 The key authenticates cluster-handshake and Pod-termination receipts
 independently of certificate renewal or CA encoding; its bytes are never stored
 in resource annotations.
@@ -362,6 +365,21 @@ incorrectly named, or expires, or if the durable fencing-key Secret is missing
 or malformed. Existing non-empty malformed Secrets,
 foreign CA bundles, and incorrectly targeted webhook configurations stop
 startup instead of being overwritten.
+
+For a pre-anchor development install, perform this explicit first phase while
+the old manager is still healthy, then roll out the new manager image:
+
+```console
+KEY_UID="$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.metadata.uid}')"
+KEY_SHA256="$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.data.hmac\.key}' | base64 -d | sha256sum | awk '{print $1}')"
+kubectl --namespace pgshard-system annotate --overwrite secret pgshard-webhook-ca "pgshard.io/pod-fencing-key-sha256=${KEY_SHA256}"
+test "$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.metadata.uid}')" = "${KEY_UID}"
+```
+
+If the UID check fails, do not continue the rollout. The new manager verifies
+the pinned value and established receipts; it does not infer continuity from a
+live receipt scan. Automated production upgrade tooling for this pre-release
+boundary is not implemented.
 
 Automatic CA rotation is not implemented. The generated CA is valid for about
 ten years, and startup fails once it can no longer safely issue a full 90-day

@@ -146,7 +146,9 @@ func TestSecretHandshakeCodecValidatesAnchoredKeyState(t *testing.T) {
 				builder = builder.WithObjects(anchorSecret)
 			}
 			reader := builder.Build()
-			codec := NewSecretHandshakeCodec(reader, keyName, dataKey, anchorName, anchorAnnotation)
+			codec := NewSecretHandshakeCodec(reader, SecretReceiptKeyRef{
+				Secret: keyName, DataKey: dataKey, AnchorSecret: anchorName, AnchorAnnotation: anchorAnnotation,
+			})
 			cluster := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{
 				Namespace: "application", Name: "database", UID: "cluster-uid",
 				Annotations: map[string]string{HandshakeChallengeAnnotation: "challenge"},

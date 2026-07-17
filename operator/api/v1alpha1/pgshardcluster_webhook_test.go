@@ -172,6 +172,39 @@ func TestValidationAcceptsMaximumNameForSingleMemberPodIdentity(t *testing.T) {
 	}
 }
 
+func TestValidationRejectsUserSuppliedPodFencingMetadata(t *testing.T) {
+	t.Parallel()
+	validator := &PgShardClusterValidator{}
+	for _, members := range []int32{1, 3} {
+		cluster := validCluster()
+		cluster.Spec.MembersPerShard = members
+		cluster.Spec.Durability = DurabilityAsynchronous
+		cluster.Annotations = map[string]string{
+			PodFencingChallengeAnnotation: "forged",
+			PodFencingReceiptAnnotation:   "forged",
+		}
+		if _, err := validator.ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "reserved for the pgshard controller") {
+			t.Fatalf("membersPerShard=%d create error = %v", members, err)
+		}
+	}
+
+	oldCluster := validCluster()
+	newCluster := oldCluster.DeepCopy()
+	newCluster.Annotations = map[string]string{PodFencingReceiptAnnotation: "forged"}
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "reserved for the pgshard controller") {
+		t.Fatalf("multi-member update error = %v", err)
+	}
+
+	oldCluster = validCluster()
+	oldCluster.Spec.MembersPerShard = 1
+	oldCluster.Spec.Durability = DurabilityAsynchronous
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Annotations = map[string]string{PodFencingReceiptAnnotation: "forged"}
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "admission-attested together") {
+		t.Fatalf("receipt-only single-member update error = %v", err)
+	}
+}
+
 func TestValidationRejectsUnsafeStorageAndImmutableResize(t *testing.T) {
 	t.Parallel()
 	cluster := validCluster()

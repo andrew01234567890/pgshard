@@ -17,7 +17,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-const maximumChangeStreams = 4
+const (
+	maximumChangeStreams = 4
+	// PodFencingChallengeAnnotation and PodFencingReceiptAnnotation are
+	// controller/admission-owned metadata for direct PostgreSQL Pod fencing.
+	PodFencingChallengeAnnotation = "pgshard.io/pod-fencing-challenge"
+	PodFencingReceiptAnnotation   = "pgshard.io/pod-fencing-admission"
+)
 
 // PgShardClusterDefaulter supplies safety-oriented defaults.
 type PgShardClusterDefaulter struct{}
@@ -80,7 +86,9 @@ func defaultService(service *ServiceTemplate) {
 type PgShardClusterValidator struct{}
 
 func (v *PgShardClusterValidator) ValidateCreate(_ context.Context, cluster *PgShardCluster) (admission.Warnings, error) {
-	return warningsFor(cluster), validateCluster(cluster)
+	allErrs := validateClusterFields(cluster)
+	allErrs = append(allErrs, reservedPodFencingMetadataErrors(cluster)...)
+	return warningsFor(cluster), invalidIfAny(cluster.Name, allErrs)
 }
 
 func (v *PgShardClusterValidator) ValidateUpdate(_ context.Context, oldCluster, newCluster *PgShardCluster) (admission.Warnings, error) {
@@ -90,6 +98,15 @@ func (v *PgShardClusterValidator) ValidateUpdate(_ context.Context, oldCluster, 
 		return warningsFor(newCluster), nil
 	}
 	allErrs := validateClusterFields(newCluster)
+	if newCluster.Spec.MembersPerShard != 1 {
+		allErrs = append(allErrs, reservedPodFencingMetadataErrors(newCluster)...)
+	} else {
+		_, hasChallenge := newCluster.Annotations[PodFencingChallengeAnnotation]
+		_, hasReceipt := newCluster.Annotations[PodFencingReceiptAnnotation]
+		if hasChallenge != hasReceipt {
+			allErrs = append(allErrs, field.Forbidden(field.NewPath("metadata", "annotations"), "Pod fencing challenge and receipt must be absent or admission-attested together"))
+		}
+	}
 	if oldCluster.Spec.PostgreSQL.Version != newCluster.Spec.PostgreSQL.Version {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "postgresql", "version"), newCluster.Spec.PostgreSQL.Version, "PostgreSQL major is immutable"))
 	}
@@ -227,6 +244,17 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 	if endpoint := cluster.Spec.Observability.OpenTelemetryEndpoint; endpoint != "" {
 		if err := ValidateOpenTelemetryEndpoint(endpoint); err != nil {
 			allErrs = append(allErrs, field.Invalid(specPath.Child("observability", "openTelemetryEndpoint"), endpoint, err.Error()))
+		}
+	}
+	return allErrs
+}
+
+func reservedPodFencingMetadataErrors(cluster *PgShardCluster) field.ErrorList {
+	annotationsPath := field.NewPath("metadata", "annotations")
+	var allErrs field.ErrorList
+	for _, key := range []string{PodFencingChallengeAnnotation, PodFencingReceiptAnnotation} {
+		if _, exists := cluster.Annotations[key]; exists {
+			allErrs = append(allErrs, field.Forbidden(annotationsPath.Key(key), "is reserved for the pgshard controller and admission webhook"))
 		}
 	}
 	return allErrs

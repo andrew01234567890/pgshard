@@ -36,6 +36,9 @@ const (
 	MemberLabel    = "pgshard.io/member"
 
 	ManagedByValue = "pgshard-operator"
+	// ClusterResourceFinalizer protects operator-owned resources and marks a
+	// PgShardCluster lifecycle that crossed the fencing handshake barrier.
+	ClusterResourceFinalizer = "pgshard.io/owned-resources"
 
 	PostgreSQLConfigSuffix = "-postgresql-config"
 	PostgreSQLPasswordKey  = "superuser-password"
