@@ -54,22 +54,15 @@ mod tests {
 
     #[test]
     fn material_fingerprint_is_domain_separated_and_length_framed() {
-        let client = catalog_material_sha256(
-            CATALOG_CLIENT_DIGEST_DOMAIN,
-            b"catalog-key",
-            [&b"catalog-ca"[..]],
-        );
+        let client =
+            catalog_material_sha256(CATALOG_CLIENT_DIGEST_DOMAIN, b"", [&b"catalog-ca"[..]]);
         assert_eq!(
             client,
-            "e38e516f1acd23cb27004b5e9dcd238cbc91d3500d27c1be4e80b588f4db224d"
+            "f25d89531a7aa9937005eb56aab838662145cadff1315196229e0cd334ece559"
         );
         assert_ne!(
             client,
-            catalog_material_sha256(
-                CATALOG_SERVER_DIGEST_DOMAIN,
-                b"catalog-key",
-                [&b"catalog-ca"[..]],
-            )
+            catalog_material_sha256(CATALOG_SERVER_DIGEST_DOMAIN, b"", [&b"catalog-ca"[..]],)
         );
         assert_ne!(
             catalog_material_sha256("ab", b"key", [&b"c"[..]]),
