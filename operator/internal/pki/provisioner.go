@@ -378,13 +378,8 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 			}
 		}
 		if !continuityComplete {
-			if err := p.verifyExistingReceiptHistory(ctx, key); err != nil {
+			if err := p.verifyPodFencingKeyBootstrapBarrier(ctx, bootstrapState, key); err != nil {
 				return err
-			}
-			if bootstrapState.fresh() {
-				if err := p.verifyNoEstablishedPostgreSQLLifecycles(ctx); err != nil {
-					return err
-				}
 			}
 			if err := p.markPodFencingKeyContinuity(ctx, secret); err != nil {
 				return err
@@ -395,13 +390,8 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 	if !bootstrapState.pending() {
 		return fmt.Errorf("initialized Pod fencing key has no continuity anchor; pin its fingerprint before rolling out this manager or reinstall the pre-release development cluster")
 	}
-	if err := p.verifyExistingReceiptHistory(ctx, key); err != nil {
+	if err := p.verifyPodFencingKeyBootstrapBarrier(ctx, bootstrapState, key); err != nil {
 		return err
-	}
-	if bootstrapState.fresh() {
-		if err := p.verifyNoEstablishedPostgreSQLLifecycles(ctx); err != nil {
-			return err
-		}
 	}
 	if anchor.Annotations == nil {
 		anchor.Annotations = make(map[string]string, 1)
@@ -413,13 +403,8 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 	}
 	// Recheck after installing the anchor so a concurrently committed receipt
 	// cannot be skipped before the completion marker is written.
-	if err := p.verifyExistingReceiptHistory(ctx, key); err != nil {
+	if err := p.verifyPodFencingKeyBootstrapBarrier(ctx, bootstrapState, key); err != nil {
 		return err
-	}
-	if bootstrapState.fresh() {
-		if err := p.verifyNoEstablishedPostgreSQLLifecycles(ctx); err != nil {
-			return err
-		}
 	}
 	if err := p.markPodFencingKeyContinuity(ctx, secret); err != nil {
 		return err
@@ -457,6 +442,13 @@ func (p *Provisioner) markPodFencingKeyContinuity(ctx context.Context, secret *c
 	return nil
 }
 
+func (p *Provisioner) verifyPodFencingKeyBootstrapBarrier(ctx context.Context, bootstrapState podFencingKeyBootstrapState, key []byte) error {
+	if bootstrapState.fresh() {
+		return p.verifyNoEstablishedPostgreSQLLifecycles(ctx)
+	}
+	return p.verifyExistingReceiptHistory(ctx, key)
+}
+
 func (p *Provisioner) verifyNoEstablishedPostgreSQLLifecycles(ctx context.Context) error {
 	clusters := &pgshardv1alpha1.PgShardClusterList{}
 	if err := p.client.List(ctx, clusters); err != nil {
@@ -464,12 +456,17 @@ func (p *Provisioner) verifyNoEstablishedPostgreSQLLifecycles(ctx context.Contex
 	}
 	for index := range clusters.Items {
 		cluster := &clusters.Items[index]
-		if slices.Contains(cluster.Finalizers, owned.ClusterResourceFinalizer) || len(cluster.Status.PostgreSQLBootstraps) != 0 {
+		_, hasChallenge := cluster.Annotations[podfence.HandshakeChallengeAnnotation]
+		_, hasReceipt := cluster.Annotations[podfence.HandshakeReceiptAnnotation]
+		if slices.Contains(cluster.Finalizers, owned.ClusterResourceFinalizer) || len(cluster.Status.PostgreSQLBootstraps) != 0 || hasChallenge || hasReceipt {
 			return fmt.Errorf("fresh Pod fencing key bootstrap is unsafe while PgShardCluster %s/%s has an established PostgreSQL lifecycle", cluster.Namespace, cluster.Name)
 		}
 	}
 	pods := &corev1.PodList{}
-	if err := p.client.List(ctx, pods); err != nil {
+	if err := p.client.List(ctx, pods, client.MatchingLabels{
+		owned.ManagedByLabel: owned.ManagedByValue,
+		owned.ComponentLabel: "postgresql",
+	}); err != nil {
 		return fmt.Errorf("list Pods before fresh Pod fencing key bootstrap: %w", err)
 	}
 	for index := range pods.Items {
@@ -489,11 +486,13 @@ func (p *Provisioner) verifyExistingReceiptHistory(ctx context.Context, key []by
 	}
 	for index := range clusters.Items {
 		cluster := &clusters.Items[index]
-		if cluster.Spec.MembersPerShard != 1 ||
-			!slices.Contains(cluster.Finalizers, owned.ClusterResourceFinalizer) ||
-			len(cluster.Status.PostgreSQLBootstraps) == 0 ||
-			cluster.Annotations[podfence.HandshakeReceiptAnnotation] == "" {
+		challenge, hasChallenge := cluster.Annotations[podfence.HandshakeChallengeAnnotation]
+		receipt, hasReceipt := cluster.Annotations[podfence.HandshakeReceiptAnnotation]
+		if cluster.Spec.MembersPerShard != 1 || !hasChallenge && !hasReceipt {
 			continue
+		}
+		if !hasChallenge || !hasReceipt || challenge == "" || receipt == "" {
+			return fmt.Errorf("existing PgShardCluster %s/%s has incomplete Pod fencing handshake metadata", cluster.Namespace, cluster.Name)
 		}
 		verified, err := codec.Verify(ctx, cluster)
 		if err != nil {
@@ -504,7 +503,10 @@ func (p *Provisioner) verifyExistingReceiptHistory(ctx context.Context, key []by
 		}
 	}
 	pods := &corev1.PodList{}
-	if err := p.client.List(ctx, pods); err != nil {
+	if err := p.client.List(ctx, pods, client.MatchingLabels{
+		owned.ManagedByLabel: owned.ManagedByValue,
+		owned.ComponentLabel: "postgresql",
+	}); err != nil {
 		return fmt.Errorf("list Pods during Pod fencing key continuity migration: %w", err)
 	}
 	for index := range pods.Items {
@@ -739,6 +741,18 @@ func (p *Provisioner) authorizeLegacyKeylessUpgrade(ctx context.Context, anchor 
 		!bytes.Equal(legacyMutating.ClientConfig.CABundle, authority.certificatePEM) ||
 		!bytes.Equal(legacyValidating.ClientConfig.CABundle, authority.certificatePEM) {
 		return fmt.Errorf("keyless upgrade requires both existing PgShardCluster webhooks to trust the initialized CA")
+	}
+	for index := range configs.mutating.Webhooks {
+		webhook := &configs.mutating.Webhooks[index]
+		if webhook.Name != mutatingWebhookName && len(webhook.ClientConfig.CABundle) != 0 {
+			return fmt.Errorf("keyless upgrade requires newly introduced receipt webhooks to have empty trust bundles")
+		}
+	}
+	for index := range configs.validating.Webhooks {
+		webhook := &configs.validating.Webhooks[index]
+		if webhook.Name != validatingWebhookName && len(webhook.ClientConfig.CABundle) != 0 {
+			return fmt.Errorf("keyless upgrade requires newly introduced receipt webhooks to have empty trust bundles")
+		}
 	}
 	if anchor.Annotations == nil {
 		anchor.Annotations = make(map[string]string, 1)

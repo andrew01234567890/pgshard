@@ -463,6 +463,21 @@ func TestBootstrapRequiresIndependentProofForOriginMainKeylessUpgrade(t *testing
 			},
 			want: "both existing PgShardCluster webhooks",
 		},
+		{
+			name: "receipt-capable webhook trust",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client) {
+				caSecret := getSecret(t, kubeClient, testCASecretName)
+				mutating := &admissionregistrationv1.MutatingWebhookConfiguration{}
+				if err := kubeClient.Get(ctx, types.NamespacedName{Name: testMutatingConfigurationName}, mutating); err != nil {
+					t.Fatal(err)
+				}
+				findMutatingWebhook(mutating.Webhooks, podfence.HandshakeWebhookName).ClientConfig.CABundle = bytes.Clone(caSecret.Data[CACertificateKey])
+				if err := kubeClient.Update(ctx, mutating); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "newly introduced receipt webhooks",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -574,6 +589,20 @@ func TestFreshBootstrapRefusesEstablishedPostgreSQLLifecycles(t *testing.T) {
 			want: "has an established PostgreSQL lifecycle",
 		},
 		{
+			name: "pre-provisioning cluster handshake",
+			object: &pgshardv1alpha1.PgShardCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: testNamespace,
+					Name:      "pre-provisioning-handshake",
+					Annotations: map[string]string{
+						podfence.HandshakeChallengeAnnotation: "pending-challenge",
+					},
+				},
+				Spec: pgshardv1alpha1.PgShardClusterSpec{MembersPerShard: 1},
+			},
+			want: "has an established PostgreSQL lifecycle",
+		},
+		{
 			name:   "Pod",
 			object: podWithTerminationReceipt(t, bytes.Repeat([]byte{0xff}, podfence.SecretKeyBytes), "established-pod"),
 			want:   "managed PostgreSQL Pod",
@@ -648,7 +677,10 @@ func TestBootstrapRefusesPreAnchoredKeyThatCannotVerifyReceiptHistory(t *testing
 		want   string
 	}{
 		{name: "cluster", object: func(t *testing.T, key []byte) client.Object {
-			return clusterWithHandshakeReceipt(t, key, "mismatched-cluster")
+			cluster := clusterWithHandshakeReceipt(t, key, "mismatched-cluster")
+			cluster.Finalizers = nil
+			cluster.Status.PostgreSQLBootstraps = nil
+			return cluster
 		}, want: "handshake receipt does not match"},
 		{name: "Pod", object: func(t *testing.T, key []byte) client.Object {
 			return podWithTerminationReceipt(t, key, "mismatched-pod")
@@ -683,7 +715,53 @@ func TestBootstrapRefusesPreAnchoredKeyThatCannotVerifyReceiptHistory(t *testing
 	}
 }
 
-func TestBootstrapIgnoresReceiptsOutsideEstablishedPostgreSQLLifecycles(t *testing.T) {
+func TestBootstrapRefusesIncompletePreProvisioningHandshakeHistory(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name        string
+		annotations map[string]string
+	}{
+		{name: "challenge only", annotations: map[string]string{podfence.HandshakeChallengeAnnotation: "challenge"}},
+		{name: "receipt only", annotations: map[string]string{podfence.HandshakeReceiptAnnotation: "v1.receipt"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			kubeClient := newTestClient(t, installObjects()...)
+			provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+			if err := provisioner.Bootstrap(ctx); err != nil {
+				t.Fatal(err)
+			}
+			keySecret := getSecret(t, kubeClient, testFencingKeySecretName)
+			delete(keySecret.Annotations, podfence.SecretKeyContinuityAnnotation)
+			if err := kubeClient.Update(ctx, keySecret); err != nil {
+				t.Fatal(err)
+			}
+			clearFreshBootstrapState(t, ctx, kubeClient)
+			cluster := &pgshardv1alpha1.PgShardCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   testNamespace,
+					Name:        "incomplete-" + strings.ReplaceAll(test.name, " ", "-"),
+					Annotations: test.annotations,
+				},
+				Spec: pgshardv1alpha1.PgShardClusterSpec{MembersPerShard: 1},
+			}
+			if err := kubeClient.Create(ctx, cluster); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := provisioner.Bootstrap(ctx); err == nil || !strings.Contains(err.Error(), "incomplete Pod fencing handshake metadata") {
+				t.Fatalf("Bootstrap() error = %v", err)
+			}
+			keySecret = getSecret(t, kubeClient, testFencingKeySecretName)
+			if keySecret.Annotations[podfence.SecretKeyContinuityAnnotation] != "" {
+				t.Fatal("failed migration wrote the continuity completion marker")
+			}
+		})
+	}
+}
+
+func TestBootstrapIgnoresReceiptsOutsideManagedFencingIdentities(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	kubeClient := newTestClient(t, installObjects()...)
@@ -701,11 +779,6 @@ func TestBootstrapIgnoresReceiptsOutsideEstablishedPostgreSQLLifecycles(t *testi
 	multiMember := clusterWithHandshakeReceipt(t, differentKey, "unrelated-multi-member")
 	multiMember.Spec.MembersPerShard = 3
 	if err := kubeClient.Create(ctx, multiMember); err != nil {
-		t.Fatal(err)
-	}
-	unprovisioned := clusterWithHandshakeReceipt(t, differentKey, "unprovisioned-single-member")
-	unprovisioned.Status.PostgreSQLBootstraps = nil
-	if err := kubeClient.Create(ctx, unprovisioned); err != nil {
 		t.Fatal(err)
 	}
 	unmanagedPod := podWithTerminationReceipt(t, differentKey, "unmanaged-terminal-pod")
@@ -771,7 +844,7 @@ func TestBootstrapRechecksReceiptWrittenDuringFreshAnchorUpdate(t *testing.T) {
 	})
 	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
 	err := provisioner.Bootstrap(ctx)
-	if !injected || err == nil || !strings.Contains(err.Error(), "does not match the candidate Pod fencing key") {
+	if !injected || err == nil || !strings.Contains(err.Error(), "has an established PostgreSQL lifecycle") {
 		t.Fatalf("Bootstrap() injected = %t, error = %v", injected, err)
 	}
 	keySecret := getSecret(t, kubeClient, testFencingKeySecretName)

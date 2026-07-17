@@ -81,9 +81,20 @@ func defaultService(service *ServiceTemplate) {
 	}
 }
 
+// PodFencingReceiptVerifier authenticates the final cluster handshake after all
+// mutating admission has completed.
+// +kubebuilder:object:generate=false
+type PodFencingReceiptVerifier interface {
+	Verify(context.Context, *PgShardCluster) (bool, error)
+}
+
 // PgShardClusterValidator applies validation that cannot be represented safely
 // by OpenAPI alone.
-type PgShardClusterValidator struct{}
+// +kubebuilder:object:generate=false
+type PgShardClusterValidator struct {
+	FencingReceiptVerifier    PodFencingReceiptVerifier
+	FencingControllerUsername string
+}
 
 func (v *PgShardClusterValidator) ValidateCreate(_ context.Context, cluster *PgShardCluster) (admission.Warnings, error) {
 	allErrs := validateClusterFields(cluster)
@@ -91,8 +102,15 @@ func (v *PgShardClusterValidator) ValidateCreate(_ context.Context, cluster *PgS
 	return warningsFor(cluster), invalidIfAny(cluster.Name, allErrs)
 }
 
-func (v *PgShardClusterValidator) ValidateUpdate(_ context.Context, oldCluster, newCluster *PgShardCluster) (admission.Warnings, error) {
-	metadataErrs := reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster)
+func (v *PgShardClusterValidator) ValidateUpdate(ctx context.Context, oldCluster, newCluster *PgShardCluster) (admission.Warnings, error) {
+	metadataErrs, requiresAttestation := reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster)
+	if requiresAttestation {
+		attestationErrs, err := v.validatePodFencingMetadataAttestation(ctx, newCluster)
+		if err != nil {
+			return warningsFor(newCluster), err
+		}
+		metadataErrs = append(metadataErrs, attestationErrs...)
+	}
 	if !newCluster.DeletionTimestamp.IsZero() {
 		// A deleting object must always be able to shed finalizers, including if
 		// it predates validation that its stored spec no longer satisfies. The
@@ -254,7 +272,7 @@ func reservedPodFencingMetadataErrors(cluster *PgShardCluster) field.ErrorList {
 	return allErrs
 }
 
-func reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster *PgShardCluster) field.ErrorList {
+func reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster *PgShardCluster) (field.ErrorList, bool) {
 	annotationsPath := field.NewPath("metadata", "annotations")
 	oldChallenge, oldHasChallenge := oldCluster.Annotations[PodFencingChallengeAnnotation]
 	oldReceipt, oldHasReceipt := oldCluster.Annotations[PodFencingReceiptAnnotation]
@@ -263,31 +281,41 @@ func reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster *PgShardClust
 	unchanged := oldHasChallenge == newHasChallenge && oldHasReceipt == newHasReceipt &&
 		oldChallenge == newChallenge && oldReceipt == newReceipt
 
+	if unchanged {
+		return nil, false
+	}
 	if !newCluster.DeletionTimestamp.IsZero() {
-		if unchanged {
-			return nil
-		}
-		return field.ErrorList{field.Forbidden(annotationsPath, "controller-owned Pod fencing metadata is immutable during deletion")}
+		return field.ErrorList{field.Forbidden(annotationsPath, "controller-owned Pod fencing metadata is immutable during deletion")}, false
 	}
 	if newCluster.Spec.MembersPerShard != 1 {
-		return reservedPodFencingMetadataErrors(newCluster)
-	}
-	if oldHasChallenge != oldHasReceipt || oldHasChallenge && (oldChallenge == "" || oldReceipt == "") {
-		return field.ErrorList{field.Forbidden(annotationsPath, "stored Pod fencing challenge and receipt are incomplete")}
-	}
-	if oldHasChallenge {
-		if unchanged {
-			return nil
-		}
-		return field.ErrorList{field.Forbidden(annotationsPath, "controller-owned Pod fencing challenge and receipt are immutable once established")}
-	}
-	if !newHasChallenge && !newHasReceipt {
-		return nil
+		return reservedPodFencingMetadataErrors(newCluster), false
 	}
 	if !newHasChallenge || !newHasReceipt || newChallenge == "" || newReceipt == "" {
-		return field.ErrorList{field.Forbidden(annotationsPath, "Pod fencing challenge and receipt must be non-empty and admission-attested together")}
+		return field.ErrorList{field.Forbidden(annotationsPath, "Pod fencing challenge and receipt must be preserved or replaced by a non-empty admission attestation")}, false
 	}
-	return nil
+	return nil, true
+}
+
+func (v *PgShardClusterValidator) validatePodFencingMetadataAttestation(ctx context.Context, cluster *PgShardCluster) (field.ErrorList, error) {
+	if v.FencingReceiptVerifier == nil || v.FencingControllerUsername == "" {
+		return nil, fmt.Errorf("Pod fencing metadata attestation is not configured")
+	}
+	request, err := admission.RequestFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read Pod fencing admission request identity: %w", err)
+	}
+	annotationsPath := field.NewPath("metadata", "annotations")
+	if request.UserInfo.Username != v.FencingControllerUsername {
+		return field.ErrorList{field.Forbidden(annotationsPath, "Pod fencing metadata may only be established or repaired by the pgshard controller")}, nil
+	}
+	verified, err := v.FencingReceiptVerifier.Verify(ctx, cluster)
+	if err != nil {
+		return nil, fmt.Errorf("verify final Pod fencing admission receipt: %w", err)
+	}
+	if !verified {
+		return field.ErrorList{field.Forbidden(annotationsPath, "Pod fencing metadata does not carry a valid final admission receipt")}, nil
+	}
+	return nil, nil
 }
 
 // ValidateOpenTelemetryEndpoint rejects endpoints that cannot be passed safely

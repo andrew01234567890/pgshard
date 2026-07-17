@@ -17,12 +17,16 @@ path handled a fresh challenge; it is not evidence that every API-server
 selector cache converged simultaneously. The independent immutable receipt key
 is continuity-anchored by a SHA-256 fingerprint in backward-compatible CA Secret
 metadata. Fresh-install authority is recorded before key generation only after
-independent empty-install and lifecycle checks. The last keyless release has a
-two-phase first-key upgrade authorized by its existing CA, serving material, and
-legacy webhook trust. Existing initialized keys require an explicit pre-rollout
+independent empty-install, lifecycle, and pending-handshake checks. The last
+keyless release has a two-phase first-key upgrade authorized by its existing CA,
+serving material, populated legacy webhook trust, and empty receipt-webhook
+trust. Existing initialized keys require an explicit pre-rollout
 fingerprint pin; automatic mixed-version adoption is deliberately refused
 because a resource listing is not a writer barrier. Established receipt history
-is immutable and verified before a separate completion marker is written.
+and pre-provisioning handshakes are verified before a separate completion marker
+is written. Users cannot mutate handshake metadata; controller repair requires
+both its service-account identity and a valid final HMAC receipt, and deletion
+makes the pair immutable.
 Startup, readiness, receipt-authenticated admission, and
 reconciliation reject key loss or replacement rather than silently invalidating
 outstanding receipts. Automated production tooling for the pre-anchor upgrade

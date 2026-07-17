@@ -585,18 +585,22 @@ or binding metadata changes, request-path namespace confusion, and partially
 stripped PostgreSQL identity, while allowing non-PostgreSQL pgshard Pods to bind.
 PKI tests prove leaf renewal leaves the separate immutable fencing key unchanged,
 fresh-install authority requires empty serving and webhook trust plus absence of
-established clusters and managed Pods, and recreated authority Secrets cannot
-reuse that path. An origin/main keyless fixture proves its versioned request,
-existing serving material, and both legacy webhook trust bundles authorize a
+cluster lifecycle, pending handshake, and managed-Pod evidence, and recreated
+authority Secrets cannot reuse that path. An origin/main keyless fixture proves
+its versioned request, existing serving material, both populated legacy webhook
+trust bundles, and empty newly introduced receipt webhook bundles authorize a
 two-phase first-key upgrade, while loss of any proof leaves the key empty. An
 initialized unanchored legacy key is refused, and a pre-anchored key completes
-migration only after established cluster and terminal receipts verify. Fault injection writes a
-mismatching established receipt during the fresh anchor update and proves the
-completion marker remains absent; unrelated multi-member, unprovisioned, and
-unmanaged or partially labelled markers do not block startup. Established
-cluster receipt metadata cannot be removed or replaced, including during
-deletion. Later anchor loss remains failed closed,
-and metadata-only continuity state preserves previous-manager rollback. Empty,
+migration only after every single-member cluster handshake and managed terminal
+receipt verifies, including handshakes written before status or finalizers.
+Incomplete pairs fail closed. Fault injection writes a mismatching receipt
+during the fresh anchor update and proves the completion marker remains absent;
+unrelated multi-member clusters and unmanaged or partially labelled Pods do not
+block startup. Users cannot establish, remove, or replace cluster receipt
+metadata. Only the controller service account can repair it, and only when the
+final HMAC receipt verifies; deletion-time metadata remains immutable. Later
+anchor loss remains failed closed, and metadata-only continuity state preserves
+previous-manager rollback. Empty,
 mutable, oversized, or different valid key replacements fail startup, readiness,
 receipt-authenticated webhook use, and controller verification. The KIND
 admission test deletes and replaces the shared key with malformed and different

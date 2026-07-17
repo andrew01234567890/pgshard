@@ -322,6 +322,7 @@ func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, ku
 	for _, test := range []struct {
 		name   string
 		mutate func(*pgshardv1alpha1.PgShardCluster)
+		want   string
 	}{
 		{
 			name: "removal",
@@ -329,6 +330,7 @@ func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, ku
 				delete(cluster.Annotations, podfence.HandshakeChallengeAnnotation)
 				delete(cluster.Annotations, podfence.HandshakeReceiptAnnotation)
 			},
+			want: "preserved or replaced",
 		},
 		{
 			name: "replacement",
@@ -336,6 +338,7 @@ func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, ku
 				cluster.Annotations[podfence.HandshakeChallengeAnnotation] = "forged-challenge"
 				cluster.Annotations[podfence.HandshakeReceiptAnnotation] = "forged-receipt"
 			},
+			want: "only be established or repaired by the pgshard controller",
 		},
 	} {
 		t.Run("cluster fencing metadata "+test.name+" is denied", func(t *testing.T) {
@@ -345,7 +348,7 @@ func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, ku
 			}
 			test.mutate(cluster)
 			err := kubeClient.Update(ctx, cluster)
-			if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable once established") {
+			if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("fencing metadata %s error = %v, want webhook denial", test.name, err)
 			}
 		})

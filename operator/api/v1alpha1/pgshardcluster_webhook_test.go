@@ -2,14 +2,35 @@ package v1alpha1
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
+
+const testFencingControllerUsername = "system:serviceaccount:pgshard-system:pgshard-controller-manager"
+
+type fixedPodFencingReceiptVerifier struct {
+	verified bool
+	err      error
+}
+
+func (verifier fixedPodFencingReceiptVerifier) Verify(context.Context, *PgShardCluster) (bool, error) {
+	return verifier.verified, verifier.err
+}
+
+func podFencingAdmissionContext(username string) context.Context {
+	return admission.NewContextWithRequest(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		UserInfo: authenticationv1.UserInfo{Username: username},
+	}})
+}
 
 func validCluster() *PgShardCluster {
 	return &PgShardCluster{
@@ -174,7 +195,11 @@ func TestValidationAcceptsMaximumNameForSingleMemberPodIdentity(t *testing.T) {
 
 func TestValidationRejectsUserSuppliedPodFencingMetadata(t *testing.T) {
 	t.Parallel()
-	validator := &PgShardClusterValidator{}
+	validator := &PgShardClusterValidator{
+		FencingReceiptVerifier:    fixedPodFencingReceiptVerifier{verified: true},
+		FencingControllerUsername: testFencingControllerUsername,
+	}
+	controllerContext := podFencingAdmissionContext(testFencingControllerUsername)
 	for _, members := range []int32{1, 3} {
 		cluster := validCluster()
 		cluster.Spec.MembersPerShard = members
@@ -200,7 +225,7 @@ func TestValidationRejectsUserSuppliedPodFencingMetadata(t *testing.T) {
 	oldCluster.Spec.Durability = DurabilityAsynchronous
 	newCluster = oldCluster.DeepCopy()
 	newCluster.Annotations = map[string]string{PodFencingReceiptAnnotation: "forged"}
-	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "admission-attested together") {
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "preserved or replaced") {
 		t.Fatalf("receipt-only single-member update error = %v", err)
 	}
 
@@ -210,22 +235,34 @@ func TestValidationRejectsUserSuppliedPodFencingMetadata(t *testing.T) {
 		PodFencingChallengeAnnotation: "controller-challenge",
 		PodFencingReceiptAnnotation:   "admission-receipt",
 	}
-	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err != nil {
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err != nil {
 		t.Fatalf("initial admission-attested metadata was rejected: %v", err)
+	}
+	if _, err := validator.ValidateUpdate(podFencingAdmissionContext("example-user"), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "only be established or repaired by the pgshard controller") {
+		t.Fatalf("user-established metadata error = %v", err)
 	}
 
 	oldCluster = newCluster.DeepCopy()
 	newCluster = oldCluster.DeepCopy()
 	newCluster.Annotations = nil
-	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable once established") {
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "preserved or replaced") {
 		t.Fatalf("established metadata removal error = %v", err)
 	}
 	newCluster = oldCluster.DeepCopy()
 	newCluster.Annotations[PodFencingChallengeAnnotation] = "replacement-challenge"
 	newCluster.Annotations[PodFencingReceiptAnnotation] = "replacement-receipt"
-	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable once established") {
-		t.Fatalf("established metadata replacement error = %v", err)
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err != nil {
+		t.Fatalf("controller repair with a valid final receipt was rejected: %v", err)
 	}
+	validator.FencingReceiptVerifier = fixedPodFencingReceiptVerifier{verified: false}
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "valid final admission receipt") {
+		t.Fatalf("invalid controller repair error = %v", err)
+	}
+	validator.FencingReceiptVerifier = fixedPodFencingReceiptVerifier{err: errors.New("key unavailable")}
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "key unavailable") {
+		t.Fatalf("unverifiable controller repair error = %v", err)
+	}
+	validator.FencingReceiptVerifier = fixedPodFencingReceiptVerifier{verified: true}
 
 	deletionTime := metav1.Now()
 	oldCluster.DeletionTimestamp = &deletionTime

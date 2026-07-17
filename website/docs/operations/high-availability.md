@@ -167,19 +167,25 @@ This does not prove simultaneous selector-cache convergence across every API
 server. The receipt key is an independent immutable Secret whose SHA-256
 continuity fingerprint is anchored in backward-compatible CA Secret metadata.
 Fresh-install state is recorded only after the CA, serving, and key Secrets and
-webhook trust bundles are empty and no established PostgreSQL lifecycle exists.
-Recreating both authority Secrets cannot therefore masquerade as installation.
+webhook trust bundles are empty and no PostgreSQL lifecycle or pending cluster
+handshake metadata exists. Recreating both authority Secrets cannot therefore
+masquerade as installation.
 The last keyless release has a distinct two-phase upgrade: the applied manifest
 requests the first key in the new empty Secret, then the manager verifies the
-existing CA, serving material, and both legacy PgShardCluster webhook trust
-bundles before recording authorization on the CA. Only then can it generate and
-anchor the key. An existing initialized but unanchored key must instead be pinned
-while the old manager is healthy before a mixed-version rollout; the new manager
+existing CA and serving material, requires both legacy PgShardCluster webhook
+trust bundles to contain that CA, and requires every newly introduced receipt
+webhook trust bundle to remain empty before recording authorization on the CA.
+Only then can it generate and anchor the key. An existing initialized but
+unanchored key must instead be pinned while the old manager is healthy before a
+mixed-version rollout; the new manager
 refuses to infer continuity from receipt listings because those listings cannot
-fence an older signer. It then verifies receipts attached to
-controller-established PostgreSQL lifecycles before writing a separate
-completion marker. Established challenge and receipt metadata cannot be removed
-or replaced, including during deletion. Readiness,
+fence an older signer. It then verifies every complete single-member cluster
+handshake and managed terminal Pod receipt before writing a separate completion
+marker. Incomplete cluster handshake metadata blocks migration even before
+workload status or finalizers exist. Users cannot establish, remove, or replace
+the handshake. The controller may establish or repair it only when both its
+service-account identity and the final HMAC receipt verify; the pair is
+byte-for-byte immutable during deletion. Readiness,
 receipt-authenticated admission, and controller key use require the exact key to
 match that anchor; recreating an empty or different key fails closed and does not
 mint replacement authority.

@@ -345,23 +345,29 @@ fingerprint annotation is stored separately on the CA Secret, followed by a
 completion annotation on the key Secret. These metadata-only additions preserve
 the data shapes accepted by the previous manager, so a rollout can be rolled
 back. Fresh-install key generation requires empty CA, serving, and key Secrets,
-empty webhook trust bundles, and no controller-established PostgreSQL lifecycle;
-the CA records authorization before key bytes are generated. Recreating both
-authority Secrets around an existing install therefore fails closed.
+empty webhook trust bundles, and no PostgreSQL lifecycle or pending cluster
+handshake metadata; the CA records authorization before key bytes are
+generated. Recreating both authority Secrets around an existing install
+therefore fails closed.
 
 The last keyless admission release upgrades through a separate two-phase path.
 The new manifest creates an empty key Secret carrying a versioned request. The
-manager verifies the already initialized CA and serving material and requires
-both existing PgShardCluster webhooks to trust that CA. It then records pending
-upgrade authorization on the CA Secret before generating and anchoring the
-first key. An install that already has an initialized but unanchored key is not
-this keyless state and is never adopted during a mixed-version rollout: pin its
-fingerprint in the CA Secret while the old manager is healthy, before changing
-the manager image, or reinstall the pre-release development cluster. Once
-pre-anchored, every receipt attached to an established PostgreSQL lifecycle must
-verify before the completion marker is written. Receipt metadata is immutable
-once established, including while a cluster is deleting. Once complete, loss of
-the fingerprint fails closed instead of re-entering adoption. Startup, readiness,
+manager verifies the already initialized CA and serving material, requires the
+two legacy PgShardCluster webhooks to trust that CA, and requires every newly
+introduced receipt webhook trust bundle to remain empty. It then records
+pending upgrade authorization on the CA Secret before generating and anchoring
+the first key. An install that already has an initialized but unanchored key is
+not this keyless state and is never adopted during a mixed-version rollout: pin
+its fingerprint in the CA Secret while the old manager is healthy, before
+changing the manager image, or reinstall the pre-release development cluster.
+Once pre-anchored, every complete handshake on a single-member cluster and every
+managed terminal Pod receipt must verify before the completion marker is
+written; incomplete handshake metadata also blocks migration even if workload
+status and finalizers have not yet been published. Users cannot establish,
+remove, or replace cluster handshake metadata. The controller may establish or
+repair it only when its service-account identity and the final HMAC receipt both
+verify; during deletion the pair is byte-for-byte immutable. Once complete,
+loss of the fingerprint fails closed instead of re-entering adoption. Startup, readiness,
 receipt-authenticated admission paths, and controller reconciliation all require
 the exact immutable key to match that anchor, so an empty, mutable, oversized,
 or different replacement cannot silently invalidate outstanding receipts.

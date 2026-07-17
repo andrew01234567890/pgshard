@@ -132,7 +132,10 @@ func main() {
 		handshakeCodec := podfence.NewSecretHandshakeCodec(manager.GetAPIReader(), receiptKey)
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCluster{}).
 			WithDefaulter(&pgshardv1alpha1.PgShardClusterDefaulter{}).
-			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{}).
+			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{
+				FencingReceiptVerifier:    handshakeCodec,
+				FencingControllerUsername: "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+			}).
 			Complete(); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardCluster")
 			os.Exit(1)
