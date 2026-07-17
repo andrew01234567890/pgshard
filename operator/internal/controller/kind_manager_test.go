@@ -76,6 +76,7 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	waitForStableManagerPod(t, ctx, kubeClient)
 	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertNoPostgreSQLWorkload(t, ctx, kubeClient, namespace.Name, cluster.Name)
+	assertOrchestratorReadinessTracksEtcdQuorum(t, ctx, kubeClient, namespace.Name, cluster.Name)
 }
 
 func TestKINDRestoreTopologyMismatchIsRejectedBeforeMutation(t *testing.T) {
@@ -1489,6 +1490,116 @@ func waitForStablePods(t *testing.T, ctx context.Context, kubeClient client.Clie
 	})
 	if err != nil {
 		t.Fatalf("wait for stable %s pods: %v; last pods = %#v", component, err, pods.Items)
+	}
+}
+
+type podRuntimeIdentity struct {
+	uid       types.UID
+	startedAt time.Time
+}
+
+func assertOrchestratorReadinessTracksEtcdQuorum(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) {
+	t.Helper()
+	incarnations := capturePodRuntimeIdentities(t, ctx, kubeClient, namespace, cluster, "orchestrator", 3)
+	restored := false
+	t.Cleanup(func() {
+		if restored {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		commands := [][]string{
+			{"--namespace", namespace, "scale", "statefulset/" + cluster + owned.EtcdSuffix, "--replicas=3"},
+			{"--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1"},
+			{"--namespace", "pgshard-system", "rollout", "status", "deployment/pgshard-controller-manager", "--timeout=120s"},
+		}
+		for _, arguments := range commands {
+			output, err := exec.CommandContext(cleanupCtx, "kubectl", arguments...).CombinedOutput()
+			if err != nil {
+				t.Errorf("restore quorum fixture with kubectl %s: %v\n%s", strings.Join(arguments, " "), err, output)
+			}
+		}
+	})
+
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=0")
+	waitForManagerReplicas(t, ctx, kubeClient, 0)
+	runKubectl(t, ctx, "--namespace", namespace, "scale", "statefulset/"+cluster+owned.EtcdSuffix, "--replicas=1")
+	waitForEtcdPodCount(t, ctx, kubeClient, namespace, cluster, 1)
+	waitForExistingPodReadiness(t, ctx, kubeClient, namespace, cluster, "orchestrator", incarnations, false)
+
+	runKubectl(t, ctx, "--namespace", namespace, "scale", "statefulset/"+cluster+owned.EtcdSuffix, "--replicas=3")
+	waitForEtcdQuorum(t, ctx, kubeClient, namespace, cluster)
+	waitForExistingPodReadiness(t, ctx, kubeClient, namespace, cluster, "orchestrator", incarnations, true)
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1")
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "rollout", "status", "deployment/pgshard-controller-manager", "--timeout=120s")
+	waitForManagerReplicas(t, ctx, kubeClient, 1)
+	restored = true
+}
+
+func capturePodRuntimeIdentities(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, component string, wanted int) map[string]podRuntimeIdentity {
+	t.Helper()
+	pods := &corev1.PodList{}
+	if err := kubeClient.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{owned.ClusterLabel: cluster, owned.ComponentLabel: component}); err != nil {
+		t.Fatal(err)
+	}
+	if len(pods.Items) != wanted {
+		t.Fatalf("capture %s runtime identities: got %d pods, want %d", component, len(pods.Items), wanted)
+	}
+	identities := make(map[string]podRuntimeIdentity, wanted)
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if len(pod.Status.ContainerStatuses) != 1 || pod.Status.ContainerStatuses[0].State.Running == nil {
+			t.Fatalf("capture %s runtime identity for %s: %#v", component, pod.Name, pod.Status)
+		}
+		identities[pod.Name] = podRuntimeIdentity{uid: pod.UID, startedAt: pod.Status.ContainerStatuses[0].State.Running.StartedAt.Time}
+	}
+	return identities
+}
+
+func waitForEtcdPodCount(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string, wanted int) {
+	t.Helper()
+	pods := &corev1.PodList{}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		pods = &corev1.PodList{}
+		if err := kubeClient.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{owned.ClusterLabel: cluster, owned.ComponentLabel: "etcd"}); err != nil {
+			return false, err
+		}
+		return len(pods.Items) == wanted, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for %d etcd pods: %v; last pods = %#v", wanted, err, pods.Items)
+	}
+}
+
+func waitForExistingPodReadiness(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, component string, identities map[string]podRuntimeIdentity, wanted bool) {
+	t.Helper()
+	pods := &corev1.PodList{}
+	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		pods = &corev1.PodList{}
+		if err := kubeClient.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{owned.ClusterLabel: cluster, owned.ComponentLabel: component}); err != nil {
+			return false, err
+		}
+		if len(pods.Items) != len(identities) {
+			return false, fmt.Errorf("%s pod count changed from %d to %d", component, len(identities), len(pods.Items))
+		}
+		for index := range pods.Items {
+			pod := &pods.Items[index]
+			identity, ok := identities[pod.Name]
+			if !ok || identity.uid != pod.UID || len(pod.Status.ContainerStatuses) != 1 {
+				return false, fmt.Errorf("%s pod incarnation changed: %#v", component, pod.ObjectMeta)
+			}
+			status := pod.Status.ContainerStatuses[0]
+			if status.RestartCount != 0 || status.State.Running == nil || !status.State.Running.StartedAt.Time.Equal(identity.startedAt) {
+				return false, fmt.Errorf("%s pod %s restarted during quorum transition: %#v", component, pod.Name, status)
+			}
+			if status.Ready != wanted {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for existing %s pods ready=%t: %v; last pods = %#v", component, wanted, err, pods.Items)
 	}
 }
 
