@@ -172,8 +172,10 @@ The verification Secret must be immutable, type `Opaque`, and contain only
 encoding: fixed field order, big-endian integers, and big-endian
 u32-length-prefixed string bytes. Go and Rust golden vectors pin the same
 payload; the Go vector also pins the SHA-256 digest, public key, and Ed25519
-signature. The Secret UID and manifest/topology SHA-256 digests are
-checkpointed in status; restore execution must revalidate them.
+signature. The first observed Secret UID is pinned in status and cannot be
+rebound by deleting and recreating the Secret; a replacement requires a new
+`PgShardRestore`. Manifest/topology SHA-256 digests are also checkpointed, and
+restore execution must revalidate them.
 
 The destination name must either be absent or reserved by an empty, non-serving
 `PgShardDatabase`. Restore does not overwrite an active database. Replacing an
@@ -198,12 +200,14 @@ the manifest topology fingerprint with that result:
 - A pre-created destination must match PostgreSQL major, hash
   algorithm/version and seed, shard count, ordered shard ordinals, and every
   range boundary.
-- Any mismatch returns the permanent error code `RestoreTopologyMismatch`. A
-  controller-detected mismatch checkpoints the manifest digest plus manifest
-  and destination topology fingerprints in status, identifies each differing
-  field, and leaves the restore `Ready=False` with the same reason. There is no
-  target mutation. A five-shard backup cannot restore into a three-shard
-  destination, even if the destination is empty.
+- Any mismatch returns the permanent error code `RestoreTopologyMismatch`. An
+  authoritative-destination mismatch checkpoints the manifest digest plus the
+  manifest and authoritative destination topology fingerprints in status,
+  identifies each differing field, and leaves the restore `Ready=False` with
+  the same reason. A defensively detected caller-request mismatch leaves the
+  authoritative destination fingerprint empty. There is no target mutation. A
+  five-shard backup cannot restore into a three-shard destination, even if the
+  destination is empty.
 
 CRD validation rejects explicit PostgreSQL/hash/count differences, and the
 fail-closed validating webhook compares every ordered ordinal and boundary.
@@ -311,7 +315,7 @@ move/reshard `B` into a new three-shard `A` generation while traffic continues.
 
 ## Required end-to-end coverage
 
-The KIND and Docker Desktop suites use MinIO and must cover:
+The Milestone 1 KIND and Docker Desktop suites must use MinIO and cover:
 
 - standby backup selection, explicit primary fallback, interrupted uploads,
   missing or corrupt objects, incomplete WAL, and retry receipts;
@@ -332,7 +336,9 @@ The KIND and Docker Desktop suites use MinIO and must cover:
   every tombstone/refcount/expiry boundary, and proof that no retained backup
   or required WAL interval is deleted.
 
-Unit and Docker Desktop Kubernetes coverage now prove signed exact preflight,
-five-to-three API rejection, range/hash mismatch typing, and a Kubernetes
-no-target-mutation oracle. MinIO, pgBackRest, materialization, activation,
-mobility, and failure-injection coverage remain to be implemented.
+Unit tests and the Kubernetes manager test now cover signed request verification
+up to the resolver-unavailable `Pending` state, five-to-three admission
+rejection, range/hash mismatch typing, and a no-target-mutation oracle. They do
+not prove resolver-backed exact preflight success. MinIO, pgBackRest,
+materialization, activation, mobility, and failure-injection coverage remain to
+be implemented.
