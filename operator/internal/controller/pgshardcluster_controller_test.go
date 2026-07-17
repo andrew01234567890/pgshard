@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -4194,25 +4195,17 @@ func TestRetiredEtcdStorageCleanupWaitsForAuthoritativeStatefulSetAbsence(t *tes
 	}
 }
 
-func TestRetiredEtcdStorageCleanupWaitsForAuthoritativePodAbsence(t *testing.T) {
+func TestRetiredEtcdStorageCleanupWaitsForAnyAuthoritativePodMountAbsence(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	cluster := validCluster()
 	claim := retiredEtcdPVC(cluster, 0)
-	controller := true
-	blockDeletion := true
-	statefulSetName := cluster.Name + legacyEtcdSuffix
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: statefulSetName + "-0", Namespace: cluster.Namespace,
-			UID: types.UID("legacy-etcd-pod-uid"), ResourceVersion: "1",
-			Labels: map[string]string{owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "etcd"},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "StatefulSet", Name: statefulSetName,
-				UID: types.UID("deleted-legacy-statefulset-uid"), Controller: &controller, BlockOwnerDeletion: &blockDeletion,
-			}},
+			Name: "arbitrary-pvc-reader", Namespace: cluster.Namespace,
+			UID: types.UID("arbitrary-pod-uid"), ResourceVersion: "1",
 		},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "etcd", Image: "example.invalid/etcd"}}, Volumes: []corev1.Volume{{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "reader", Image: "example.invalid/reader"}}, Volumes: []corev1.Volume{{
 			Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim.Name}},
 		}}},
 	}
@@ -4224,7 +4217,7 @@ func TestRetiredEtcdStorageCleanupWaitsForAuthoritativePodAbsence(t *testing.T) 
 		t.Fatal(err)
 	}
 	if !cleaning {
-		t.Fatal("existing retired etcd Pod did not hold the storage absence barrier")
+		t.Fatal("arbitrary Pod mounting retired etcd storage did not hold the absence barrier")
 	}
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(claim), &corev1.PersistentVolumeClaim{}); err != nil {
 		t.Fatalf("retired etcd PVC was deleted while its Pod still existed: %v", err)
@@ -4304,6 +4297,53 @@ func TestRetiredEtcdStorageCleanupRequiresAuthoritativeReader(t *testing.T) {
 	}
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(claim), &corev1.PersistentVolumeClaim{}); err != nil {
 		t.Fatalf("PVC was deleted without authoritative evidence: %v", err)
+	}
+}
+
+func TestOrchestratorLeaseEventsFilterRenewalsButKeepEnvelopeLifecycle(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	holderIdentity := "orchestrator-a"
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            cluster.Name + owned.OrchestratorLeaseSuffix,
+			Namespace:       cluster.Namespace,
+			UID:             types.UID("lease-uid"),
+			ResourceVersion: "1",
+			Generation:      1,
+			Labels:          map[string]string{owned.ClusterLabel: cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cluster, pgshardv1alpha1.GroupVersion.WithKind("PgShardCluster"))},
+		},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holderIdentity},
+	}
+	renewed := lease.DeepCopy()
+	renewed.ResourceVersion = "2"
+	renewed.Generation = 2
+	renewTime := metav1.NowMicro()
+	renewed.Spec.RenewTime = &renewTime
+	predicates := orchestratorLeaseEvents()
+	if predicates.Update(event.UpdateEvent{ObjectOld: lease, ObjectNew: renewed}) {
+		t.Fatal("runtime Lease renewal enqueued a full cluster reconciliation")
+	}
+
+	envelopeChanged := renewed.DeepCopy()
+	envelopeChanged.Labels[owned.ComponentLabel] = "wrong"
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: envelopeChanged}) {
+		t.Fatal("Lease envelope drift was filtered")
+	}
+	ownershipChanged := renewed.DeepCopy()
+	ownershipChanged.OwnerReferences = nil
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: ownershipChanged}) {
+		t.Fatal("Lease ownership change was filtered")
+	}
+	deleting := renewed.DeepCopy()
+	deletionTimestamp := metav1.Now()
+	deleting.DeletionTimestamp = &deletionTimestamp
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: deleting}) {
+		t.Fatal("Lease deletion transition was filtered")
+	}
+	if !predicates.Create(event.CreateEvent{Object: lease}) || !predicates.Delete(event.DeleteEvent{Object: lease}) {
+		t.Fatal("Lease create or delete event was filtered")
 	}
 }
 

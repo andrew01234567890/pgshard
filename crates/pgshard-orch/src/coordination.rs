@@ -176,12 +176,11 @@ async fn supervise_with_store<S: LeaseStore>(
 
         let delay = match result {
             Ok(observation) => {
-                let deadline = Instant::now() + config.lease_duration;
                 if !state.record_coordination_ready(
                     &observation.lease_uid,
                     &observation.resource_version,
                     observation.leader,
-                    deadline,
+                    observation.valid_until,
                 ) {
                     state.record_coordination_unavailable();
                     return Err(CoordinationError::StateEvidenceRejected);
@@ -268,6 +267,7 @@ async fn reconcile_once<S: LeaseStore>(
             return Ok(CoordinationObservation::follower(
                 evidence,
                 config.retry_period,
+                config.lease_duration,
             ));
         }
     };
@@ -277,6 +277,7 @@ async fn reconcile_once<S: LeaseStore>(
         return Ok(CoordinationObservation::follower(
             evidence,
             cmp::min(config.retry_period, takeover_delay.saturating_sub(elapsed)),
+            config.lease_duration,
         ));
     }
 
@@ -311,6 +312,10 @@ async fn replace_as_holder<S: LeaseStore>(
     spec.renew_time = Some(now.clone());
     lease.spec = Some(spec);
 
+    // A committed replacement can be followed by an arbitrarily delayed API
+    // response. Anchor local authority before dispatch so response latency can
+    // consume, but never extend, the Lease validity window.
+    let valid_from = Instant::now();
     let updated = store.replace(&lease).await?;
     let evidence = validate_lease(&updated, config)?;
     let updated_spec = updated
@@ -334,6 +339,7 @@ async fn replace_as_holder<S: LeaseStore>(
         lease_uid: evidence.lease_uid,
         resource_version: evidence.resource_version,
         leader: true,
+        valid_until: valid_from + config.lease_duration,
         delay: config.lease_duration / 3,
     })
 }
@@ -375,15 +381,17 @@ struct CoordinationObservation {
     lease_uid: String,
     resource_version: String,
     leader: bool,
+    valid_until: Instant,
     delay: Duration,
 }
 
 impl CoordinationObservation {
-    fn follower(evidence: LeaseEvidence, delay: Duration) -> Self {
+    fn follower(evidence: LeaseEvidence, delay: Duration, validity: Duration) -> Self {
         Self {
             lease_uid: evidence.lease_uid,
             resource_version: evidence.resource_version,
             leader: false,
+            valid_until: Instant::now() + validity,
             delay,
         }
     }
@@ -719,6 +727,25 @@ mod tests {
         }
     }
 
+    struct DelayedReplaceResponseStore {
+        inner: MemoryStore,
+        response_delay: Duration,
+        committed_at: Mutex<Option<Instant>>,
+    }
+
+    impl LeaseStore for DelayedReplaceResponseStore {
+        async fn get(&self) -> Result<Lease, CoordinationError> {
+            self.inner.get().await
+        }
+
+        async fn replace(&self, lease: &Lease) -> Result<Lease, CoordinationError> {
+            let committed = self.inner.replace(lease).await?;
+            *self.committed_at.lock().expect("lock commit time") = Some(Instant::now());
+            tokio::time::sleep(self.response_delay).await;
+            Ok(committed)
+        }
+    }
+
     #[test]
     fn rejects_recreated_or_foreign_owned_lease() {
         let config = config();
@@ -782,6 +809,39 @@ mod tests {
 
         assert!(observation.leader);
         assert_eq!(observation.resource_version, "2");
+    }
+
+    #[tokio::test]
+    async fn delayed_committed_replace_response_cannot_extend_leadership() {
+        let config = config();
+        let store = DelayedReplaceResponseStore {
+            inner: MemoryStore::new(lease(&config)),
+            response_delay: Duration::from_millis(150),
+            committed_at: Mutex::new(None),
+        };
+        let holder = config.holder_identity();
+        let observation = reconcile_once(&store, &config, &holder, &mut None)
+            .await
+            .expect("receive delayed committed replacement");
+
+        assert!(observation.leader);
+        let committed_at = store
+            .committed_at
+            .lock()
+            .expect("lock commit time")
+            .expect("store recorded commit time");
+        assert!(
+            observation.valid_until <= committed_at + config.lease_duration,
+            "local leadership must not begin after the committed replacement"
+        );
+        let state = OrchState::with_identity(config.identity.clone(), 15_000).expect("valid state");
+        assert!(state.record_coordination_ready(
+            &observation.lease_uid,
+            &observation.resource_version,
+            observation.leader,
+            observation.valid_until,
+        ));
+        assert!(state.snapshot().leader);
     }
 
     #[tokio::test]

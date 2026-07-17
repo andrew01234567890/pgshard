@@ -21,19 +21,24 @@ A follower does not trust the holder's wall clock. It can take over only after
 observing the same holder and renewal record unchanged for a complete locally
 measured Lease duration, following CloudNativePG's conservative observation
 pattern. A clean empty release can be claimed immediately. A monotonic local
-deadline removes readiness after API loss or a process pause. Recreating the
-Lease changes its UID, so existing processes remain fail closed until a bounded
-orchestrator rollout establishes a new coordination universe. This Lease proves
-only orchestrator availability and exclusive leadership. It does not persist
-operation or shard-term records, provide target-side PostgreSQL fencing, or
-enable automated failover.
+deadline is anchored before each conditional replacement is dispatched, so a
+delayed successful API response consumes rather than extends leadership.
+Readiness is removed after API loss or a process pause. Routine runtime Lease
+renewals do not enqueue a full cluster resource reconciliation; create, delete,
+ownership, deletion-transition, and operator-owned envelope changes still do.
+Recreating the Lease changes its UID, so existing processes remain fail closed
+until a bounded orchestrator rollout establishes a new coordination universe.
+This Lease proves only orchestrator availability and exclusive leadership. It
+does not persist operation or shard-term records, provide target-side
+PostgreSQL fencing, or enable automated failover.
 
 The pre-Lease development layout's three etcd data claims are retired
 automatically. The operator first prunes the old cluster-owned StatefulSet,
-uses uncached API reads to prove it and all three exact Pods absent, validates
-the exact owner, labels, 2 GiB storage contract, and fixed claim names, and then
-deletes those claims with UID and resource-version preconditions. A mismatch
-fails closed. No PostgreSQL data claim participates in this migration.
+uses an uncached namespace-wide Pod list to prove that no Pod of any identity
+references any retained claim, validates the exact owner, labels, 2 GiB storage
+contract, and fixed claim names, and then deletes those claims with UID and
+resource-version preconditions. A mismatch or mount blocks deletion. No
+PostgreSQL data claim participates in this migration.
 
 On `SIGTERM`, the process removes readiness before notifying its workers,
 cancels any in-flight Kubernetes API request, limits best-effort Lease release

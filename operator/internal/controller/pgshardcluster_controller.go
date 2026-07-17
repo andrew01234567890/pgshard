@@ -35,8 +35,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 const (
@@ -324,23 +327,17 @@ func (r *PgShardClusterReconciler) cleanupRetiredEtcdStorage(ctx context.Context
 	} else if !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("prove retired etcd StatefulSet %s absent: %w", statefulSetName, err)
 	}
-	for ordinal := 0; ordinal < legacyEtcdPVCCount; ordinal++ {
-		podName := fmt.Sprintf("%s-%d", statefulSetName, ordinal)
-		pod := &corev1.Pod{}
-		if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: podName}, pod); apierrors.IsNotFound(err) {
-			continue
-		} else if err != nil {
-			return false, fmt.Errorf("prove retired etcd Pod %s absent: %w", podName, err)
+	pods := &corev1.PodList{}
+	if err := r.APIReader.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return false, fmt.Errorf("prove retired etcd PVC mounts absent: %w", err)
+	}
+	for podIndex := range pods.Items {
+		pod := &pods.Items[podIndex]
+		for _, claim := range claims {
+			if podSpecReferencesPVC(pod.Spec, claim.Name) {
+				return true, nil
+			}
 		}
-		owner := metav1.GetControllerOf(pod)
-		claimName := fmt.Sprintf("data-%s-%d", statefulSetName, ordinal)
-		if pod.Namespace != cluster.Namespace || pod.Labels[owned.ClusterLabel] != cluster.Name ||
-			pod.Labels[owned.ComponentLabel] != "etcd" || owner == nil ||
-			owner.APIVersion != appsv1.SchemeGroupVersion.String() || owner.Kind != "StatefulSet" ||
-			owner.Name != statefulSetName || owner.UID == "" || !podSpecReferencesPVC(pod.Spec, claimName) {
-			return false, fmt.Errorf("Pod %s blocks retired etcd storage cleanup because it does not match the legacy workload contract", podName)
-		}
-		return true, nil
 	}
 
 	for _, claim := range claims {
@@ -3158,6 +3155,32 @@ func postgreSQLBootstrapsEqual(left, right pgshardv1alpha1.PostgreSQLBootstrapSt
 	return left.Shard == right.Shard && left.SecretName == right.SecretName && left.SecretUID == right.SecretUID && left.PVCFenceDetached == right.PVCFenceDetached && left.PVCName == right.PVCName && left.PVCUID == right.PVCUID && left.PVCCreationAbandoned == right.PVCCreationAbandoned && optionalStringsEqual(left.PVCStorageClassName, right.PVCStorageClassName)
 }
 
+// orchestratorLeaseEvents ignores the runtime-owned spec updates made during
+// every claim and renewal. Envelope drift, ownership changes, deletion, create,
+// and delete events still reconcile the owning cluster.
+func orchestratorLeaseEvents() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return true },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return true },
+		UpdateFunc: func(update event.UpdateEvent) bool {
+			oldLease, oldOK := update.ObjectOld.(*coordinationv1.Lease)
+			newLease, newOK := update.ObjectNew.(*coordinationv1.Lease)
+			if !oldOK || !newOK {
+				return true
+			}
+			oldMetadata := oldLease.ObjectMeta.DeepCopy()
+			newMetadata := newLease.ObjectMeta.DeepCopy()
+			for _, metadata := range []*metav1.ObjectMeta{oldMetadata, newMetadata} {
+				metadata.ResourceVersion = ""
+				metadata.Generation = 0
+				metadata.ManagedFields = nil
+			}
+			return !reflect.DeepEqual(oldMetadata, newMetadata)
+		},
+	}
+}
+
 func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(manager).
 		For(&pgshardv1alpha1.PgShardCluster{}).
@@ -3166,7 +3189,7 @@ func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error 
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
-		Owns(&coordinationv1.Lease{}).
+		Owns(&coordinationv1.Lease{}, builder.WithPredicates(orchestratorLeaseEvents())).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).
