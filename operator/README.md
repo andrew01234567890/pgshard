@@ -77,7 +77,11 @@ has no kubelet startup or liveness kill probe: PID 1 exit is handled by the
 container runtime, while slow startup or crash recovery remains unready without
 being killed. Storage is at least 4Gi per shard, `max_wal_size` cannot exceed
 one quarter of that claim, and topology, durability, storage class, and size
-are immutable until their explicit transition workflows exist.
+are immutable until their explicit transition workflows exist. A resource
+stored by an earlier release may still specify between 1Gi and 4Gi. Because
+those releases created no PostgreSQL data claim, it has one safe migration:
+increase the value directly to at least 4Gi before this controller will plan
+new children. No later resize is accepted.
 `PostgreSQLPrimariesAvailable=True` means only that all of those single-member
 primaries have passed the StatefulSet's minimum-ready window. It does not claim standby
 replication, failover, routing, or zero-downtime restart. Three- and five-member
@@ -141,8 +145,10 @@ fresh random challenge; matching caller-supplied annotation text is not an
 acknowledgement. Admission then makes the enabled label immutable for the
 lifetime of the namespace. The fail-closed binding mutator copies the exact
 managed identity plus the selected Node UID and boot ID into the same API update
-that assigns `spec.nodeName`, and a final validating webhook rejects any later
-mutation of that evidence. The PostgreSQL init container consumes those Node
+that assigns `spec.nodeName`. Both the mutator and final validator use the
+uncached API reader to require the annotation's exact PgShardCluster UID to
+still exist and not be deleting; the validator also rejects any later mutation
+of the bound evidence. The PostgreSQL init container consumes those Node
 annotations through the Downward API and refuses to touch PGDATA when either is
 absent. This independent startup gate is the final data-path barrier if another
 API server has not yet observed the namespace selector; the cluster handshake
@@ -165,8 +171,9 @@ outage, missing Node, reboot, or same-name replacement therefore leaves the Pod
 and PVC fenced. Credential-only
 clients do not own PGDATA and cannot keep a session after the PostgreSQL process
 has stopped, so they do not block this storage barrier. A Pod committed before
-credential deletion remains visible to the PVC barrier; a later managed Pod
-cannot obtain the deleted bootstrap credential. Only after the credential,
+credential deletion remains visible to the PVC barrier. A Pod committed after
+the controller's final list cannot bind once the cluster is deleting, even if a
+kubelet still caches the immutable bootstrap Secret. Only after the credential,
 authenticated-process, and Pod-absence barriers does `Retain`
 release its own PVC protection finalizer and mark the data retained. If a
 retained PVC was explicitly deleted, the controller releases only its own
@@ -354,8 +361,9 @@ serving files into a private memory-backed `emptyDir`. The fencing key Secret is
 made immutable by the same update that initializes it. A SHA-256 continuity
 fingerprint annotation is stored separately on the CA Secret, followed by a
 completion annotation on the key Secret. These metadata-only additions preserve
-the data shapes accepted by the previous manager, so a rollout can be rolled
-back. Fresh-install key generation requires empty CA, serving, and key Secrets,
+the data shapes accepted by the previous manager. This is Secret-format
+compatibility only; it does not make the new manifest and image contract safe to
+roll back. Fresh-install key generation requires empty CA, serving, and key Secrets,
 empty webhook trust bundles, and no PostgreSQL lifecycle or pending cluster
 handshake metadata; the CA records authorization before key bytes are
 generated. Recreating both authority Secrets around an existing install

@@ -13,7 +13,10 @@ shard. Each shard receives a distinct immutable bootstrap Secret and a 4Gi
 minimum data claim. When `storage.storageClassName` is omitted, the operator
 resolves the current Kubernetes default and checkpoints that exact class before
 creating any claim; later default-class rotation does not change existing data
-intent. Admission records the selected Node UID and boot ID atomically with Pod
+intent. An object stored by an earlier release with a 1Gi-to-4Gi size must be
+updated once to at least 4Gi before new children are planned; those releases
+created no PostgreSQL data claim, and later resizing remains unsupported.
+Admission records the selected Node UID and boot ID atomically with Pod
 binding and validates the final Binding after all mutators run. The PostgreSQL
 init container refuses to touch PGDATA unless that evidence reaches the Pod.
 Admission then attaches an HMAC-authenticated process-stop condition only to a
@@ -84,7 +87,8 @@ The admission overlay provisions an ECDSA serving chain and a separate immutable
 256-bit fencing key into exact-name operator-managed Secrets, injects the CA
 bundle, and anchors the key's SHA-256 continuity fingerprint in the independent
 CA Secret's metadata, preserving the Secret data shape accepted by the previous
-manager for rollback. Fresh-install authority requires all three material
+manager. This is data-format compatibility, not a supported manifest or image
+rollback. Fresh-install authority requires all three material
 Secrets and webhook trust bundles to be empty and no established PostgreSQL
 lifecycle. The last keyless release upgrades automatically only after a
 versioned manifest request and independent proof of its existing CA, serving

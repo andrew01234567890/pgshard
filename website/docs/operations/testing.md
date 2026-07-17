@@ -510,7 +510,10 @@ pruning after PostgreSQL
 parameter, Service annotation, and OTEL configuration shrinkage. A delayed rollout keeps
 the old immutable PostgreSQL ConfigMap available until the workload reports the
 new revision, then proves it is pruned. The same suite covers both fresh creation
-and a pre-SSA whole-object Update upgrade. The legacy fixture proves type-aware
+and a pre-SSA whole-object Update upgrade. It also installs the earlier 1Gi
+storage rule, creates a 2Gi legacy object, restores the current rule, permits
+exactly one increase to at least 4Gi, then rejects a new undersized object and a
+later resize without relying on webhooks. The legacy fixture proves type-aware
 alignment prunes stale desired fields while preserving API-assigned Service
 cluster/IP-family fields exactly. An external Apply-manager annotation makes
 migration fail before a write and remains intact until that manager explicitly
@@ -616,8 +619,9 @@ at least 100 admission successes, permits no failed request, proves the manager
 Pod UID changed without changing its image, and requires the replacement to be
 Ready with zero container restarts. This covers compatible rolling restarts. It
 does not claim uninterrupted admission for the one-time keyless-to-`receipt-v1`
-transition: the contract-selected Service intentionally excludes the old
-manager and fails closed until the new endpoint is Ready. An automated
+transition: the dedicated `9444` client port prevents reuse of cached legacy
+connections, while the contract-selected Service excludes the old manager and
+fails closed until the new endpoint is Ready. An automated
 keyless-upgrade-under-traffic test remains to be added.
 Generation-history tests reject image, ephemeral-container, and resize changes
 after a terminal receipt, while malformed receipt-only cluster state rotates to
@@ -627,7 +631,9 @@ the Pod was never assigned) and refuses to prune a managed workload whose Pod
 lacks its finalizer. Fault injection separately places a late StatefulSet Pod
 after controller pruning and proves Retain keeps the PVC protected until
 credential absence, authenticated process termination, and authoritative Pod
-absence have all been observed. Running and completed credential-only SQL clients do not
+absence have all been observed. Another ordered fault commits a Pod immediately
+after the final absence snapshot and proves both binding admission stages deny
+it because the exact owning cluster is deleting. Running and completed credential-only SQL clients do not
 block the PGDATA barrier. A behavioral init test supplies a marker
 from another cluster or shard and proves bootstrap refuses it before entering
 initialization; the validated fast path repeats the final-data and

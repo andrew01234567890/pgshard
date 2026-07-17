@@ -224,8 +224,10 @@ test "$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-ke
 If the UID check fails, do not roll out the new manager. This explicit
 development upgrade boundary has no automated production tooling yet.
 Binding admission copies the managed identity and selected Node UID and
-boot ID into the Pod atomically with `spec.nodeName`; a final validator checks
-the result after every mutator. The init container reads those annotations
+boot ID into the Pod atomically with `spec.nodeName`. Both admission stages
+authoritatively require that identity's exact PgShardCluster UID to exist and
+not be deleting, and a final validator checks the result after every mutator.
+The init container reads those annotations
 through the Downward API and exits before touching PGDATA if either is absent,
 which independently closes a missed-binding-admission path. Status admission
 rejects attempts to remove the managed identity, binding identity, or finalizer
@@ -236,7 +238,9 @@ post-mutation status. PodGC's control-plane-authored `Failed` phase and copied
 condition text cannot create this condition. The managed Pod spec and generation
 are immutable across main-resource, ephemeral-container, and resize updates, so
 new process intent cannot be introduced after that proof. An uncached
-Pod read must then prove absence before PVC protection is released. If admission
+Pod read must then prove absence before PVC protection is released. A Pod that
+commits just after that read cannot bind while the cluster is deleting, even if
+the selected kubelet still caches an earlier immutable Secret. If admission
 is unavailable, the Node is absent or rebooted, or the Node name now identifies
 another UID, deletion deliberately remains blocked and the PVC stays protected.
 Manually removing the finalizer is not a storage-fencing operation and is
