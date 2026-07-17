@@ -548,9 +548,11 @@ replicas are claimed. A separate KIND
 job builds local images, installs the real manager with self-managed admission
 certificates, proves the generated serving chain and injected CA bundles,
 observes semantic validation reject an unsafe synchronous singleton, waits for
-leader-elected reconciliation, observes a restart-free etcd quorum, keeps
-rejection-only pooler and persistence-free orchestrator containers running
-without restarts while they remain unready, and proves the three-member sample
+leader-elected reconciliation, observes a restart-free etcd quorum, keeps the
+rejection-only pooler unready, and requires all three persistence-free
+orchestrators to establish distinct cluster-UID-bound etcd incarnations without
+restarts. Their readiness proves only renewable process identity, not durable
+operations or shard-term authority. The job also proves the three-member sample
 has no PostgreSQL workload or ready application endpoint. The same job creates
 a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard

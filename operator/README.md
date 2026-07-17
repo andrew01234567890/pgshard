@@ -425,11 +425,13 @@ kubectl get --namespace pgshard-development pgshardcluster development
 ```
 
 The sample proves only real manager reconciliation and fail-closed supporting
-processes. Its pooler and orchestrator Pods run but remain unready, application
-Services have no ready endpoints, no PostgreSQL workload is created, and the
-cluster reports `Ready=False` with `PostgreSQLHAUnavailable`. The named
-backup PVC is only validated configuration; no backup job or repository is
-created.
+processes. Each orchestrator Pod becomes ready only while it owns a unique,
+cluster-UID-bound etcd lease; the pooler remains unready, application Services
+have no ready endpoints, no PostgreSQL workload is created, and the cluster
+reports `Ready=False` with `PostgreSQLHAUnavailable`. Orchestrator readiness is
+process-incarnation evidence only: durable operation records, shard-term
+authority, and automated failover are not implemented. The named backup PVC is
+only validated configuration; no backup job or repository is created.
 
 For direct PostgreSQL lifecycle development, first install `config/admission`,
 label the resource namespace `pgshard.io/pod-fencing=enabled`, and then apply

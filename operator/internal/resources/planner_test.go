@@ -1796,6 +1796,9 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if len(etcdContainer.Command) != 1 || etcdContainer.Command[0] != etcdExecutable || etcdContainer.Image != defaultEtcdImage || etcdContainer.ImagePullPolicy != corev1.PullIfNotPresent {
 		t.Fatalf("etcd executable/image contract = %#v", etcdContainer)
 	}
+	if !strings.Contains(strings.Join(etcdContainer.Args, "\n"), "--enable-grpc-gateway=true") {
+		t.Fatalf("etcd v3 HTTP gateway is not pinned on: %#v", etcdContainer.Args)
+	}
 	if etcdContainer.ReadinessProbe.FailureThreshold != 1 || etcdContainer.LivenessProbe.FailureThreshold != 3 {
 		t.Fatalf("etcd probe thresholds = readiness %d, liveness %d", etcdContainer.ReadinessProbe.FailureThreshold, etcdContainer.LivenessProbe.FailureThreshold)
 	}
@@ -1804,8 +1807,12 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if *orchestrator.Spec.Replicas != 3 || orchestrator.Spec.Template.Spec.Containers[0].ReadinessProbe.HTTPGet.Path != "/readyz" || orchestrator.Spec.Template.Spec.Containers[0].ReadinessProbe.FailureThreshold != 1 {
 		t.Fatalf("orchestrator spec = %#v", orchestrator.Spec)
 	}
-	if orchestrator.Spec.Template.Spec.Containers[0].Env[1].ValueFrom.FieldRef.FieldPath != "metadata.uid" {
-		t.Fatalf("orchestrator identity is not a bounded Pod UID: %#v", orchestrator.Spec.Template.Spec.Containers[0].Env[1])
+	orchestratorEnv := orchestrator.Spec.Template.Spec.Containers[0].Env
+	if orchestratorEnv[1].Name != "PGSHARD_CLUSTER_UID" || orchestratorEnv[1].Value != string(cluster.UID) {
+		t.Fatalf("orchestrator cluster incarnation is not UID-bound: %#v", orchestratorEnv[1])
+	}
+	if orchestratorEnv[2].ValueFrom.FieldRef.FieldPath != "metadata.uid" {
+		t.Fatalf("orchestrator identity is not a bounded Pod UID: %#v", orchestratorEnv[2])
 	}
 	pooler := object[*appsv1.Deployment](t, plan, "demo-pooler")
 	poolerContainer := pooler.Spec.Template.Spec.Containers[0]
@@ -1981,7 +1988,7 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	orchestrator := object[*appsv1.Deployment](t, plan, cluster.Name+OrchestratorSuffix)
-	identity := orchestrator.Spec.Template.Spec.Containers[0].Env[1]
+	identity := orchestrator.Spec.Template.Spec.Containers[0].Env[2]
 	if identity.Name != "PGSHARD_ORCH_ID" || identity.ValueFrom == nil || identity.ValueFrom.FieldRef == nil || identity.ValueFrom.FieldRef.FieldPath != "metadata.uid" {
 		t.Fatalf("orchestrator identity = %#v", identity)
 	}

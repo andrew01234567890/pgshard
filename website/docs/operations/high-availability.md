@@ -7,8 +7,18 @@ description: Replication, leases, fencing, promotion, restarts, and buffering.
 
 :::info Milestone 1 design contract
 The Rust agent/orchestrator health surfaces and fail-closed in-memory fencing
-models exist. They bound authenticated lease lifetimes and atomically reject an
-operation unless its catalog epoch, fencing epoch and deadline match at
+models exist. The orchestrator runtime also maintains a persistent
+cluster-name/UID marker plus one exclusive Pod-incarnation key using bounded,
+leader-required requests to the etcd v3 HTTP gateway. `/readyz` succeeds only
+while that lease is renewed; its monotonic local deadline independently removes
+readiness after a process pause. This proves live process identity only. It does
+not persist operation or shard-lease records, choose a transaction coordinator,
+provide target-side fencing, or enable automated failover. The current operator
+uses plaintext HTTP within its label-restricted etcd NetworkPolicy; authenticated
+TLS transport remains required before production use.
+
+The in-memory models bound authenticated lease lifetimes and atomically reject
+an operation unless its catalog epoch, fencing epoch and deadline match at
 execution. An opt-in local lifecycle boundary can structurally preflight
 required PostgreSQL 18 files, supervise one direct postmaster child with client
 TCP and replication ingress disabled, propagate unexpected exit, and perform
@@ -344,7 +354,24 @@ a durability downgrade and must be surfaced as such.
 
 ## Primary fencing
 
-The primary must hold a renewable shard/term lease in the three-member etcd cluster. The local agent self-fences PostgreSQL before it can outlive an unsafe lease. Both the orchestrator authority and receiving agent reject expired or overlong leases; configured TTL bounds are enforced by the state machines, not merely logged. The in-process orchestrator retains Unix expiry only for request validation and reporting and uses a separate monotonic deadline for live ownership, so a wall-clock step after installation cannot change the local term. During acquisition it pairs two wall reads with preceding monotonic samples, uses the greater wall value for admission, installs the earlier of the two translated monotonic deadlines, and proves admission against a final monotonic sample. A pause combined with a backward step between the wall reads can therefore only shorten or reject the candidate term, never extend it. A renewal extends the installed monotonic deadline only by its requested Unix-expiry delta and cannot move that deadline beyond the current TTL policy.
+The primary must eventually hold a renewable shard/term lease in the
+three-member etcd cluster. That durable lease and the local agent self-fencing
+needed before PostgreSQL can serve are not implemented. The process-incarnation
+lease described above is deliberately not a shard/term lease.
+
+The existing in-memory state machines model the later boundary. Both the
+orchestrator authority and receiving agent reject expired or overlong leases;
+configured TTL bounds are enforced by the state machines, not merely logged.
+The in-process orchestrator retains Unix expiry only for request validation and
+reporting and uses a separate monotonic deadline for live ownership, so a
+wall-clock step after installation cannot change the local term. During
+acquisition it pairs two wall reads with preceding monotonic samples, uses the
+greater wall value for admission, installs the earlier of the two translated
+monotonic deadlines, and proves admission against a final monotonic sample. A
+pause combined with a backward step between the wall reads can therefore only
+shorten or reject the candidate term, never extend it. A renewal extends the
+installed monotonic deadline only by its requested Unix-expiry delta and cannot
+move that deadline beyond the current TTL policy.
 
 A lease-acquisition outcome reports an in-memory mutation; it is not execution authority. The returned grant must be revalidated against the exact installed term, monotonic deadline, catalog epoch, fencing epoch, and operation immediately before dispatch. The validation clock is sampled while holding the shared state lock after term inspection and again after epoch checks, so mutex contention or a pause during validation cannot carry a stale timestamp past expiry. Even that local guard is an instant-in-time check: every target operation must carry the epoch and atomically reject a stale epoch. Poolers route writes only to the primary identity and term currently authorized by those target-side fences.
 

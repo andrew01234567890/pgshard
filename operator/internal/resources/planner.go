@@ -2214,6 +2214,7 @@ func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image string) *app
 						"--max-snapshots=2",
 						"--auto-compaction-mode=periodic",
 						"--auto-compaction-retention=1h",
+						"--enable-grpc-gateway=true",
 					},
 					Env: []corev1.EnvVar{{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}},
 					Ports: []corev1.ContainerPort{
@@ -2243,6 +2244,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 	selector := componentSelector(cluster, "orchestrator")
 	env := []corev1.EnvVar{
 		{Name: "PGSHARD_CLUSTER_ID", Value: cluster.Name},
+		{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
 		{Name: "PGSHARD_ORCH_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
 		{Name: "PGSHARD_ETCD_ENDPOINTS", Value: etcdEndpoints(cluster)},
 	}

@@ -101,6 +101,13 @@ Acceptance:
   containers and disable unsupported `ALTER SYSTEM` overrides.
 - Implement agent/orchestrator leases, Node-incarnation fencing, promotion
   proofs, split-brain prevention, and bounded recovery.
+  - Implemented foundation: each orchestrator owns a unique Pod-incarnation key
+    under a persistent cluster-name/UID marker through bounded leader-required
+    etcd gateway requests. Cluster identity and revision are pinned, and a
+    monotonic lease deadline controls readiness across process pauses.
+  - Remaining: authenticated etcd transport, durable operation and shard-term
+    records, coordinator assignment, target-side epoch enforcement, agent
+    self-fencing, promotion proofs, and automated recovery.
 - Provide CNPG-style Services for writer/read-write, read-only, and any-instance
   access with selectors or operator-owned EndpointSlices that reflect proven
   roles.

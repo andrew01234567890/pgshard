@@ -75,9 +75,12 @@ async fn metrics(State(state): State<OrchState>) -> impl IntoResponse {
             "# HELP pgshard_orch_build_info Build identity for this process.\n",
             "# TYPE pgshard_orch_build_info gauge\n",
             "pgshard_orch_build_info{{version=\"{}\",git_sha=\"{}\"}} 1\n",
-            "# HELP pgshard_orch_ready Whether durable orchestration state and recovery are available.\n",
+            "# HELP pgshard_orch_ready Whether this process owns a renewable etcd coordination incarnation.\n",
             "# TYPE pgshard_orch_ready gauge\n",
             "pgshard_orch_ready {ready}\n",
+            "# HELP pgshard_orch_coordination_ready Whether the etcd-backed process incarnation is currently renewed.\n",
+            "# TYPE pgshard_orch_coordination_ready gauge\n",
+            "pgshard_orch_coordination_ready {coordination_ready}\n",
             "# HELP pgshard_orch_operations Registered idempotent operations.\n",
             "# TYPE pgshard_orch_operations gauge\n",
             "pgshard_orch_operations {}\n",
@@ -96,6 +99,7 @@ async fn metrics(State(state): State<OrchState>) -> impl IntoResponse {
         snapshot.operation_count,
         snapshot.leases.len(),
         ready = ready,
+        coordination_ready = u8::from(snapshot.coordination_ready),
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
