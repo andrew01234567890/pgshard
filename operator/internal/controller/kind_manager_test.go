@@ -424,6 +424,188 @@ func assertRestoreNamespaceHasNoTargets(t *testing.T, ctx context.Context, kubeC
 	}
 }
 
+func TestKINDRestoreTopologyMismatchIsRejectedBeforeMutation(t *testing.T) {
+	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
+		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against the installed admission manager")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	kubeClient := newKINDClient(t)
+
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pgshard-restore-preflight-%d", os.Getpid())}}
+	if err := kubeClient.Create(ctx, namespace); err != nil {
+		t.Fatal(err)
+	}
+	deleteNamespaceAtCleanup(t, kubeClient, namespace)
+	sentinel := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "no-mutation-sentinel", Namespace: namespace.Name}, Data: map[string]string{"value": "unchanged"}}
+	if err := kubeClient.Create(ctx, sentinel); err != nil {
+		t.Fatal(err)
+	}
+
+	mismatch, _ := signedRestore(t, restoreTestTopology(5), restoreTestTopology(3))
+	prepareLiveRestore(mismatch, namespace.Name)
+	err := kubeClient.Create(ctx, mismatch)
+	if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "RestoreTopologyMismatch") {
+		t.Fatalf("five-to-three create error = %T %v, want API Invalid RestoreTopologyMismatch", err, err)
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(mismatch), &pgshardv1alpha1.PgShardRestore{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("mismatched restore persisted: %v", err)
+	}
+	assertRestoreNamespaceHasNoTargets(t, ctx, kubeClient, namespace.Name, sentinel, 0)
+
+	boundaryMismatch, _ := signedRestore(t, restoreTestTopology(5), restoreTestTopology(5))
+	prepareLiveRestore(boundaryMismatch, namespace.Name)
+	boundaryMismatch.Name = "restore-boundary-mismatch"
+	boundaryMismatch.Spec.DestinationTopology.Shards[0].End = "3689348814741910322"
+	boundaryMismatch.Spec.DestinationTopology.Shards[1].Start = "3689348814741910322"
+	err = kubeClient.Create(ctx, boundaryMismatch)
+	if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "RestoreTopologyMismatch") {
+		t.Fatalf("same-count boundary mismatch create error = %T %v, want API Invalid RestoreTopologyMismatch", err, err)
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(boundaryMismatch), &pgshardv1alpha1.PgShardRestore{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("boundary-mismatched restore persisted: %v", err)
+	}
+	assertRestoreNamespaceHasNoTargets(t, ctx, kubeClient, namespace.Name, sentinel, 0)
+
+	exact, keySecret := signedRestore(t, restoreTestTopology(5), restoreTestTopology(5))
+	prepareLiveRestore(exact, namespace.Name)
+	keySecret.Namespace = namespace.Name
+	keySecret.UID = ""
+	keySecret.ResourceVersion = ""
+	if err := kubeClient.Create(ctx, keySecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Create(ctx, exact); err != nil {
+		t.Fatal(err)
+	}
+	current := &pgshardv1alpha1.PgShardRestore{}
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(exact), current); err != nil {
+			return false, err
+		}
+		condition := meta.FindStatusCondition(current.Status.Conditions, restorePreflightCondition)
+		return condition != nil && condition.Status == metav1.ConditionUnknown && condition.Reason == "DestinationTopologyResolverUnavailable", nil
+	}); err != nil {
+		t.Fatalf("wait for request validation without destination evidence: %v; status=%#v", err, current.Status)
+	}
+	assertRestoreCondition(t, current, restoreReadyCondition, metav1.ConditionFalse, "DestinationTopologyResolverUnavailable")
+	if current.Status.Phase != pgshardv1alpha1.RestorePhasePending || current.Status.VerificationKeyUID != keySecret.UID || current.Status.ManifestSHA256 == "" || current.Status.TopologySHA256 == "" || current.Status.DestinationTopologySHA256 != "" {
+		t.Fatalf("unresolved live preflight status = %#v", current.Status)
+	}
+
+	reordered := current.DeepCopy()
+	reordered.Spec.Manifest.Topology.Shards[0], reordered.Spec.Manifest.Topology.Shards[1] = reordered.Spec.Manifest.Topology.Shards[1], reordered.Spec.Manifest.Topology.Shards[0]
+	reordered.Spec.DestinationTopology.Shards[0], reordered.Spec.DestinationTopology.Shards[1] = reordered.Spec.DestinationTopology.Shards[1], reordered.Spec.DestinationTopology.Shards[0]
+	if err := kubeClient.Update(ctx, reordered); !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "restore specification is immutable") {
+		t.Fatalf("signed shard reorder update error = %T %v, want immutable API rejection", err, err)
+	}
+	pinnedKeyUID := current.Status.VerificationKeyUID
+	if err := kubeClient.Delete(ctx, keySecret); err != nil {
+		t.Fatal(err)
+	}
+	triggerRestoreReconcile(t, ctx, kubeClient, client.ObjectKeyFromObject(exact), "verification-key-missing")
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(exact), current); err != nil {
+			return false, err
+		}
+		condition := meta.FindStatusCondition(current.Status.Conditions, restorePreflightCondition)
+		return condition != nil && condition.Status == metav1.ConditionUnknown && condition.Reason == "VerificationKeyUnavailable", nil
+	}); err != nil {
+		t.Fatalf("wait for missing pinned verification key: %v; status=%#v", err, current.Status)
+	}
+	if current.Status.VerificationKeyUID != pinnedKeyUID {
+		t.Fatalf("missing verification key cleared pinned UID: %#v", current.Status)
+	}
+	replacementKey := keySecret.DeepCopy()
+	replacementKey.UID = ""
+	replacementKey.ResourceVersion = ""
+	if err := kubeClient.Create(ctx, replacementKey); err != nil {
+		t.Fatal(err)
+	}
+	if replacementKey.UID == pinnedKeyUID {
+		t.Fatalf("replacement verification key reused UID %q", pinnedKeyUID)
+	}
+	triggerRestoreReconcile(t, ctx, kubeClient, client.ObjectKeyFromObject(exact), "verification-key-replaced")
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(exact), current); err != nil {
+			return false, err
+		}
+		condition := meta.FindStatusCondition(current.Status.Conditions, restorePreflightCondition)
+		return condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "VerificationKeyReplaced", nil
+	}); err != nil {
+		t.Fatalf("wait for replacement verification key rejection: %v; status=%#v", err, current.Status)
+	}
+	if current.Status.Phase != pgshardv1alpha1.RestorePhaseRejected || current.Status.VerificationKeyUID != pinnedKeyUID {
+		t.Fatalf("replacement verification key rebound live restore: %#v", current.Status)
+	}
+	assertRestoreNamespaceHasNoTargets(t, ctx, kubeClient, namespace.Name, sentinel, 1)
+}
+
+func triggerRestoreReconcile(t *testing.T, ctx context.Context, kubeClient client.Client, key client.ObjectKey, value string) {
+	t.Helper()
+	restore := &pgshardv1alpha1.PgShardRestore{}
+	if err := kubeClient.Get(ctx, key, restore); err != nil {
+		t.Fatal(err)
+	}
+	if restore.Annotations == nil {
+		restore.Annotations = make(map[string]string, 1)
+	}
+	restore.Annotations["test.pgshard.io/reconcile"] = value
+	if err := kubeClient.Update(ctx, restore); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func prepareLiveRestore(restore *pgshardv1alpha1.PgShardRestore, namespace string) {
+	restore.Namespace = namespace
+	restore.UID = ""
+	restore.ResourceVersion = ""
+	restore.Generation = 0
+}
+
+func assertRestoreNamespaceHasNoTargets(t *testing.T, ctx context.Context, kubeClient client.Client, namespace string, sentinel *corev1.ConfigMap, expectedSecrets int) {
+	t.Helper()
+	currentSentinel := &corev1.ConfigMap{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(sentinel), currentSentinel); err != nil {
+		t.Fatal(err)
+	}
+	if !apiequality.Semantic.DeepEqual(currentSentinel.Data, sentinel.Data) {
+		t.Fatalf("restore preflight changed sentinel data: %#v", currentSentinel.Data)
+	}
+	configMaps := &corev1.ConfigMapList{}
+	if err := kubeClient.List(ctx, configMaps, client.InNamespace(namespace)); err != nil {
+		t.Fatal(err)
+	}
+	for index := range configMaps.Items {
+		name := configMaps.Items[index].Name
+		if name != sentinel.Name && name != "kube-root-ca.crt" {
+			t.Fatalf("restore preflight created unexpected ConfigMap %q: %#v", name, configMaps.Items)
+		}
+	}
+	secrets := &corev1.SecretList{}
+	if err := kubeClient.List(ctx, secrets, client.InNamespace(namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(secrets.Items) != expectedSecrets {
+		t.Fatalf("restore preflight Secrets = %d, want caller-created %d: %#v", len(secrets.Items), expectedSecrets, secrets.Items)
+	}
+	for description, list := range map[string]client.ObjectList{
+		"Clusters":     &pgshardv1alpha1.PgShardClusterList{},
+		"PVCs":         &corev1.PersistentVolumeClaimList{},
+		"Services":     &corev1.ServiceList{},
+		"Jobs":         &batchv1.JobList{},
+		"Deployments":  &appsv1.DeploymentList{},
+		"StatefulSets": &appsv1.StatefulSetList{},
+	} {
+		if err := kubeClient.List(ctx, list, client.InNamespace(namespace)); err != nil {
+			t.Fatal(err)
+		}
+		if meta.LenList(list) != 0 {
+			t.Fatalf("restore preflight created %s: %#v", description, list)
+		}
+	}
+}
+
 func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
 		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against the installed admission manager")
