@@ -205,7 +205,10 @@ instant-in-time observation rather than a duration guarantee.
 The Kubernetes Lease coordination tests use an in-memory compare-and-swap
 store. They prove exclusive empty-Lease claims, conditional renewal and release,
 exact fleet owner and Lease UID pinning, local unchanged-record takeover timing,
-and cancellation of a stalled API operation during shutdown. The manager KIND
+that a delayed post-commit replacement response cannot extend local leadership,
+and cancellation of a stalled API operation during shutdown. Operator tests
+also prove an arbitrary Pod name and owner still blocks retired etcd PVC
+deletion when it references the claim. The manager KIND
 suite exercises the real Kubernetes API: it verifies exact-name `get`/`update`
 RBAC, removes the operator-owned Lease while reconciliation is paused, requires
 the same orchestrator Pod incarnations to lose readiness without restarting,
