@@ -318,11 +318,9 @@ jobs:
           ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
         ports:
           - 2379:2379
-        options: >-
-          --health-cmd "etcdctl --endpoints=http://127.0.0.1:2379 endpoint health"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
+        # The pinned image is distroless, so Docker's CMD-SHELL health check
+        # cannot execute. The live coordination test below retries startup and
+        # requires a leader-backed transaction before it can pass.
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
