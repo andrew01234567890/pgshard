@@ -2113,9 +2113,12 @@ func statefulSetRolloutComplete(statefulSet *appsv1.StatefulSet) bool {
 	if statefulSet.Spec.Replicas != nil {
 		desired = *statefulSet.Spec.Replicas
 	}
-	return workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) &&
-		statefulSet.Status.Replicas == desired && statefulSet.Status.UpdatedReplicas == desired &&
-		statefulSet.Status.CurrentRevision != "" && statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
+	updated := workloadGenerationObserved(statefulSet.Generation, statefulSet.Status.ObservedGeneration) &&
+		statefulSet.Status.Replicas == desired && statefulSet.Status.UpdatedReplicas == desired
+	if statefulSet.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType {
+		return updated
+	}
+	return updated && statefulSet.Status.CurrentRevision != "" && statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
 }
 
 func listObjects(list client.ObjectList) []client.Object {

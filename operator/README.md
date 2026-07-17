@@ -115,12 +115,12 @@ directory and atomically renames only a complete cluster into the final data
 path. Its durable marker records the exact PgShardCluster UID and shard, so an
 interrupted `initdb` cannot publish a partial `PG_VERSION` and a reused volume
 cannot silently start for another cluster or shard. Initial publication flushes
-the changed marker, access configuration, and staging and parent directory
-entries. The validated restart path repeats the final-data and parent-directory
-publication barrier before PostgreSQL starts, so interruption after the atomic
-rename cannot skip it on the next init pass. These flushes are limited to the
-cluster's data path; bootstrap never issues a node-wide filesystem sync that
-could couple Pod startup or termination to unrelated mounts.
+the changed marker, access configuration, and staging, parent, and volume-root
+directory entries. The validated restart path repeats that complete publication
+barrier before PostgreSQL starts, so interruption after the atomic rename cannot
+skip it on the next init pass. These flushes are limited to the cluster's data
+path; bootstrap never issues a node-wide filesystem sync that could couple Pod
+startup or termination to unrelated mounts.
 Before reading or creating PGDATA, the init process requires its `postgres`
 binary to report the operator's exact supported major, currently 18. It also
 checks an existing `PG_VERSION` and the staging directory produced by `initdb`.
@@ -131,20 +131,22 @@ listening disabled and a private mode-0700 Unix socket. It loads the same
 resource-derived primary configuration as the main server so durable logical
 slots and prepared transactions remain startable during the init pass. Before
 applying SQL, it creates the UTF8 `shardschema` database when absent and
-schema-aware preflights any known core catalog tables that already exist. It
-checks home-shard identity, canonical shard state, and active restore lineage,
-allows the migration to add known missing relations, and rejects a restore-lineage
-table with no shard inventory. It then applies the hash-verified migration
-embedded in the selected bootstrap image and inserts only missing canonical
-shard identities from the immutable CR count. Every bootstrap SQL client has a
-five-second lock timeout and a 30-second statement timeout, so catalog locks
-fail the init pass for retry instead of hanging every restart. The migration and
+requires the three core catalog relations to be either all absent or all
+present. A partial set is rejected because `CREATE TABLE IF NOT EXISTS` cannot
+restore constraints removed with a missing relation. For a complete core it
+checks home-shard identity, canonical shard state, and permanent restore history
+with active lineage exactly matching active shards. It then applies the
+hash-verified migration embedded in the selected bootstrap image and inserts
+only missing canonical shard identities from the immutable CR count. Every
+bootstrap SQL client has a five-second lock timeout, a 30-second statement
+timeout, and a 120-second whole-transaction timeout, so catalog locks fail the
+init pass for retry instead of hanging every restart. The migration and
 inventory update are separate transactions; the primary starts only after both
-succeed and the final invariants are rechecked. A conflicting identity or
-lineage, malformed inventory, failed migration, or failed inventory transaction
-keeps the primary unready. A released v0.49 catalog and an empty database are
-both supported retry inputs. Reapplying an unchanged migration and inventory
-does not advance the catalog epoch.
+succeed and the final invariants are rechecked. A partial catalog, conflicting
+identity or lineage, malformed inventory, failed migration, or failed inventory
+transaction keeps the primary unready. A released v0.49 catalog and an empty
+database are both supported retry inputs. Reapplying an unchanged migration and
+inventory does not advance the catalog epoch.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
@@ -289,7 +291,10 @@ exist. The privileged `--postgresql-bootstrap-image` deliberately has no remote
 default and is required for the single-member slice. Non-development values
 must carry an immutable `@sha256:` digest. The exact local
 `pgshard/postgres-agent:dev` exception uses `imagePullPolicy: Never` and must be
-loaded into every node before creating a cluster. Image pull or runtime readiness is reported by the relevant observed
+loaded into every node before creating a cluster. The complete non-development
+reference is parsed using the container-distribution grammar before durable
+bootstrap state is created; a digest-shaped suffix cannot make an invalid image
+name safe. Image pull or runtime readiness is reported by the relevant observed
 workload condition, never inferred from planned objects. A custom PostgreSQL
 image must preserve the pinned official image contract: PostgreSQL 18,
 UID/GID 999, `initdb` and `bash` on `PATH`, compatibility with the Docker

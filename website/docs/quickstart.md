@@ -71,11 +71,13 @@ primary starts. Database creation is recoverable; the migration and shard
 inventory update each run in their own transaction. PostgreSQL remains
 unavailable until both succeed and the final catalog invariants pass. An empty
 database left before migration and a released v0.49 catalog are safe to retry.
-Known missing core relations may be added by migration, but a restore-lineage
-table without a shard inventory, or a conflicting home-shard, shard-state, or
-restore-lineage record, is rejected before migration can rewrite it. Catalog
-clients use bounded lock and statement timeouts so a conflicting prepared lock
-fails the init pass for retry instead of hanging a Pod restart.
+The three core relations must be all absent or all present because migration
+cannot recreate constraints lost with a partially removed catalog. A partial
+set, conflicting home-shard or shard-state identity, or missing or conflicting
+permanent restore lineage is rejected before migration can rewrite it. Catalog
+clients use bounded lock, statement, and whole-transaction timeouts so a
+conflicting prepared lock fails the init pass for retry instead of hanging a
+Pod restart.
 
 ## Exercise the development manager
 
@@ -105,8 +107,10 @@ The local bootstrap tag is the only mutable reference accepted for this source
 workflow and its Pod pull policy is `Never`; a missing node-local image fails
 closed instead of consulting a registry. Non-development operator deployments
 must configure `--postgresql-bootstrap-image` with an immutable SHA-256 digest.
-At runtime the init process still verifies that image's `postgres` binary and
-both existing and newly initialized PGDATA report major 18 before publication.
+The operator parses the complete digest-pinned reference before creating
+bootstrap credentials or storage. At runtime the init process still verifies
+that image's `postgres` binary and both existing and newly initialized PGDATA
+report major 18 before publication.
 
 The admission overlay provisions an ECDSA serving chain and a separate immutable
 256-bit fencing key into exact-name operator-managed Secrets, injects the CA
