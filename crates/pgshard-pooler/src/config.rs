@@ -9,19 +9,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use hmac::{Hmac, KeyInit, Mac};
 use pgshard_catalog::{
     CatalogOperationTimeout, CatalogOperationTimeoutError, CatalogPollInterval,
     CatalogPollIntervalError, CatalogSupervisorConfig, CatalogSupervisorConfigError,
     SHARDSCHEMA_DATABASE,
 };
+use pgshard_types::catalog_material::{CATALOG_CLIENT_DIGEST_DOMAIN, catalog_material_sha256};
 use rustix::fs::{Mode, OFlags};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::{
     CertificateDer,
     pem::{PemObject, SectionKind},
 };
-use sha2::Sha256;
 use thiserror::Error;
 use tokio_postgres::Config;
 use tokio_postgres::config::{ChannelBinding, Host, SslMode, TargetSessionAttrs};
@@ -33,7 +32,6 @@ const SHARDSCHEMA_PASSWORD_BYTES: usize = 64;
 const SHARDSCHEMA_PORT: u16 = 5432;
 const CATALOG_LOGIN_ROLE: &str = "pgshard_pooler_catalog";
 const CATALOG_APPLICATION_NAME: &str = "pgshard-pooler-catalog";
-const CATALOG_CLIENT_DIGEST_DOMAIN: &str = "pgshard-catalog-client-v1";
 
 /// Validated configuration for the fail-closed pooler runtime.
 pub struct PoolerConfig {
@@ -342,38 +340,6 @@ fn operator_tls_catalog(
         connector: CatalogConnector::OperatorTls(MakeRustlsConnect::new(tls)),
         supervisor,
     })
-}
-
-fn catalog_material_sha256<'a>(
-    domain: &str,
-    key: &[u8],
-    values: impl IntoIterator<Item = &'a [u8]>,
-) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
-    update_catalog_material_mac(&mut mac, domain.as_bytes());
-    for component in values {
-        update_catalog_material_mac(&mut mac, component);
-    }
-    lower_hex(&mac.finalize().into_bytes())
-}
-
-fn update_catalog_material_mac(mac: &mut Hmac<Sha256>, component: &[u8]) {
-    mac.update(
-        &u64::try_from(component.len())
-            .expect("catalog material component length fits u64")
-            .to_be_bytes(),
-    );
-    mac.update(component);
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-    }
-    encoded
 }
 
 fn is_lower_hex_sha256(value: &str) -> bool {
