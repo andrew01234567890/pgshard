@@ -171,6 +171,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	if err := owned.ValidateImagesForCluster(cluster, images); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	if err := r.verifyPostgreSQLPodFencingNamespace(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing is unavailable: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)

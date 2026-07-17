@@ -614,6 +614,9 @@ jobs:
           make images
           for component in operator orchestrator pooler postgres-agent; do
             docker load --input "artifacts/images/pgshard-${component}.tar"
+            image="pgshard/${component}:dev"
+            test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$image")" = "$PGSHARD_GIT_SHA"
+            test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.version\" }}' "$image")" = "$PGSHARD_BUILD_VERSION"
           done
       - name: Create disposable Kubernetes cluster
         run: |
