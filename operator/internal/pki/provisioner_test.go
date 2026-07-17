@@ -741,6 +741,7 @@ func TestBootstrapClassifiesIncompleteHandshakeHistoryByLifecycle(t *testing.T) 
 	}{
 		{name: "challenge only", annotations: map[string]string{podfence.HandshakeChallengeAnnotation: "challenge"}},
 		{name: "receipt only", annotations: map[string]string{podfence.HandshakeReceiptAnnotation: "v1.receipt"}},
+		{name: "established without metadata", established: true},
 		{name: "established challenge only", annotations: map[string]string{podfence.HandshakeChallengeAnnotation: "challenge"}, established: true},
 		{name: "established receipt only", annotations: map[string]string{podfence.HandshakeReceiptAnnotation: "v1.receipt"}, established: true},
 	} {

@@ -29,7 +29,8 @@ func TestBindingAttestorPinsTheNodeIncarnationInTheBinding(t *testing.T) {
 	pod.Spec.NodeName = ""
 	pod.DeletionTimestamp = nil
 	node := testNode("node-a", "node-uid-a", "boot-a")
-	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node).Build()
+	cluster := managedClusterForPod(pod)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node, cluster).Build()
 	handler := NewBindingAttestor(reader, scheme)
 	binding := &corev1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
@@ -87,6 +88,60 @@ func TestBindingAttestorPinsTheNodeIncarnationInTheBinding(t *testing.T) {
 	validated = NewBindingValidator(reader, scheme).Handle(context.Background(), validationRequest)
 	if validated.Allowed || validated.Result == nil || !strings.Contains(validated.Result.Message, "Node incarnation") {
 		t.Fatalf("post-mutation conflicting Node identity response = %#v", validated)
+	}
+}
+
+func TestBindingAdmissionRequiresTheLiveOwningCluster(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		cluster func(*corev1.Pod) *pgshardv1alpha1.PgShardCluster
+		want    string
+	}{
+		{name: "missing", want: "no longer exists"},
+		{name: "replacement UID", cluster: func(pod *corev1.Pod) *pgshardv1alpha1.PgShardCluster {
+			cluster := managedClusterForPod(pod)
+			cluster.UID = "replacement-cluster-uid"
+			return cluster
+		}, want: "live PgShardCluster UID"},
+		{name: "deleting", cluster: func(pod *corev1.Pod) *pgshardv1alpha1.PgShardCluster {
+			cluster := managedClusterForPod(pod)
+			deleted := metav1.Now()
+			cluster.DeletionTimestamp = &deleted
+			cluster.Finalizers = []string{owned.ClusterResourceFinalizer}
+			return cluster
+		}, want: "PgShardCluster is deleting"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			scheme := testScheme(t)
+			pod := managedPod()
+			pod.Spec.NodeName = ""
+			pod.DeletionTimestamp = nil
+			node := testNode("node-a", "node-uid-a", "boot-a")
+			objects := []client.Object{pod, node}
+			if test.cluster != nil {
+				objects = append(objects, test.cluster(pod))
+			}
+			reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+			binding := &corev1.Binding{
+				ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
+				Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+			}
+			request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+				Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+			}}
+			for name, handler := range map[string]admission.Handler{
+				"mutating":   NewBindingAttestor(reader, scheme),
+				"validating": NewBindingValidator(reader, scheme),
+			} {
+				response := handler.Handle(context.Background(), request)
+				if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, test.want) {
+					t.Fatalf("%s binding response = %#v", name, response)
+				}
+			}
+		})
 	}
 }
 
@@ -605,6 +660,14 @@ func managedPod() *corev1.Pod {
 		Spec:   corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{Name: "postgresql"}}},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
+}
+
+func managedClusterForPod(pod *corev1.Pod) *pgshardv1alpha1.PgShardCluster {
+	return &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{
+		Name:      pod.Labels[owned.ClusterLabel],
+		Namespace: pod.Namespace,
+		UID:       types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]),
+	}}
 }
 
 func testNode(name string, uid types.UID, bootID string) *corev1.Node {

@@ -199,6 +199,24 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		response := admission.Denied("managed PostgreSQL Pod binding must carry the exact Pod UID")
 		return nil, &response
 	}
+	clusterName := pod.Labels[owned.ClusterLabel]
+	cluster := &pgshardv1alpha1.PgShardCluster{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: clusterName}, cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			response := admission.Denied("managed PostgreSQL Pod's owning PgShardCluster no longer exists")
+			return nil, &response
+		}
+		response := admission.Errored(http.StatusInternalServerError, fmt.Errorf("read PgShardCluster selected for PostgreSQL Pod binding: %w", err))
+		return nil, &response
+	}
+	if cluster.UID == "" || cluster.UID != types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]) {
+		response := admission.Denied("managed PostgreSQL Pod does not belong to the live PgShardCluster UID")
+		return nil, &response
+	}
+	if cluster.DeletionTimestamp != nil {
+		response := admission.Denied("managed PostgreSQL Pod cannot bind while its PgShardCluster is deleting")
+		return nil, &response
+	}
 	if binding.Target.Kind != "Node" || binding.Target.Name == "" {
 		response := admission.Denied("managed PostgreSQL Pod binding must select a named Node")
 		return nil, &response

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -13,6 +14,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
+	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -34,7 +36,26 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
+
+type createPodAfterListReader struct {
+	client.Reader
+	writer   client.Client
+	pod      *corev1.Pod
+	injected bool
+}
+
+func (r *createPodAfterListReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	if err := r.Reader.List(ctx, list, options...); err != nil {
+		return err
+	}
+	if _, ok := list.(*corev1.PodList); !ok || r.injected {
+		return nil
+	}
+	r.injected = true
+	return r.writer.Create(ctx, r.pod)
+}
 
 func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 	t.Parallel()
@@ -1072,6 +1093,81 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	for _, credentialPod := range []*corev1.Pod{credentialOnlyPod, activeCredentialPod} {
 		if err := base.Get(ctx, client.ObjectKeyFromObject(credentialPod), &corev1.Pod{}); err != nil {
 			t.Fatalf("credential-only Pod %s blocked or was removed by completed finalization: %v", credentialPod.Name, err)
+		}
+	}
+}
+
+func TestPodCreatedAfterFinalAbsenceCannotBindDuringClusterDeletion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	reconciler := &PgShardClusterReconciler{Client: base, APIReader: base}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	statefulSet := &appsv1.StatefulSet{}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	deleting := getCluster(t, ctx, base, cluster)
+	latePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            statefulSet.Name + "-0",
+			Namespace:       cluster.Namespace,
+			Labels:          maps.Clone(statefulSet.Spec.Template.Labels),
+			Annotations:     maps.Clone(statefulSet.Spec.Template.Annotations),
+			Finalizers:      append([]string(nil), statefulSet.Spec.Template.Finalizers...),
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
+		},
+		Spec: *statefulSet.Spec.Template.Spec.DeepCopy(),
+	}
+	reader := &createPodAfterListReader{Reader: base, writer: base, pod: latePod}
+	if pending, err := (&PgShardClusterReconciler{Client: base, APIReader: reader}).deletePostgreSQLPodsForFinalization(ctx, deleting); err != nil {
+		t.Fatal(err)
+	} else if pending {
+		t.Fatal("pre-injection Pod snapshot unexpectedly reported a pending Pod")
+	}
+	if !reader.injected {
+		t.Fatal("late Pod was not committed after the authoritative absence snapshot")
+	}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", UID: "node-uid-a"}, Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{BootID: "boot-a"}}}
+	if err := base.Create(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	binding := &corev1.Binding{
+		ObjectMeta: metav1.ObjectMeta{Name: latePod.Name, Namespace: latePod.Namespace, UID: latePod.UID},
+		Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+	}
+	raw, err := json.Marshal(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgshardv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: latePod.Name, Namespace: latePod.Namespace, Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: raw},
+	}}
+	for name, handler := range map[string]admission.Handler{
+		"mutating":   podfence.NewBindingAttestor(base, scheme),
+		"validating": podfence.NewBindingValidator(base, scheme),
+	} {
+		response := handler.Handle(ctx, request)
+		if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "PgShardCluster is deleting") {
+			t.Fatalf("%s binding admitted a Pod committed after the deletion absence snapshot: %#v", name, response)
 		}
 	}
 }

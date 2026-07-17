@@ -499,10 +499,13 @@ func (p *Provisioner) verifyExistingReceiptHistory(ctx context.Context, key []by
 		cluster := &clusters.Items[index]
 		challenge, hasChallenge := cluster.Annotations[podfence.HandshakeChallengeAnnotation]
 		receipt, hasReceipt := cluster.Annotations[podfence.HandshakeReceiptAnnotation]
-		if cluster.Spec.MembersPerShard != 1 || !hasChallenge && !hasReceipt {
+		if cluster.Spec.MembersPerShard != 1 {
 			continue
 		}
 		established := slices.Contains(cluster.Finalizers, owned.ClusterResourceFinalizer) || len(cluster.Status.PostgreSQLBootstraps) != 0
+		if !hasChallenge && !hasReceipt && !established {
+			continue
+		}
 		if !hasChallenge || !hasReceipt || challenge == "" || receipt == "" {
 			if established {
 				return fmt.Errorf("existing PgShardCluster %s/%s has incomplete Pod fencing handshake metadata", cluster.Namespace, cluster.Name)
