@@ -2251,6 +2251,20 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 	if cluster.Spec.Observability.OpenTelemetryEndpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: cluster.Spec.Observability.OpenTelemetryEndpoint})
 	}
+	podSpec := securePodSpec(selector, []corev1.Container{{
+		Name:            "orchestrator",
+		Image:           image,
+		ImagePullPolicy: imagePullPolicy(image),
+		Env:             env,
+		Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: HTTPPort, Protocol: corev1.ProtocolTCP}},
+		Resources:       resources("100m", "128Mi", "1", "512Mi"),
+		ReadinessProbe:  httpReadinessProbe("/readyz", "http"),
+		LivenessProbe:   httpLivenessProbe("/healthz", "http"),
+		VolumeMounts:    []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard", ReadOnly: true}},
+	}})
+	// The process clears readiness before a cancellation-aware, ten-second
+	// shutdown drain. Keep the kubelet's hard deadline explicit and larger.
+	podSpec.TerminationGracePeriodSeconds = ptr(int64(30))
 	deployment := &appsv1.Deployment{
 		ObjectMeta: ownedMeta(cluster, cluster.Name+OrchestratorSuffix, "orchestrator", nil),
 		Spec: appsv1.DeploymentSpec{
@@ -2259,17 +2273,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType, RollingUpdate: &appsv1.RollingUpdateDeployment{MaxUnavailable: intOrStringPtr(intstr.FromInt32(1)), MaxSurge: intOrStringPtr(intstr.FromInt32(1))}},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: map[string]string{ConfigHashAnnotation: hash}},
-				Spec: securePodSpec(selector, []corev1.Container{{
-					Name:            "orchestrator",
-					Image:           image,
-					ImagePullPolicy: imagePullPolicy(image),
-					Env:             env,
-					Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: HTTPPort, Protocol: corev1.ProtocolTCP}},
-					Resources:       resources("100m", "128Mi", "1", "512Mi"),
-					ReadinessProbe:  httpReadinessProbe("/readyz", "http"),
-					LivenessProbe:   httpLivenessProbe("/healthz", "http"),
-					VolumeMounts:    []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard", ReadOnly: true}},
-				}}),
+				Spec:       podSpec,
 			},
 		},
 	}

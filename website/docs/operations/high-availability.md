@@ -10,12 +10,24 @@ The Rust agent/orchestrator health surfaces and fail-closed in-memory fencing
 models exist. The orchestrator runtime also maintains a persistent
 cluster-name/UID marker plus one exclusive Pod-incarnation key using bounded,
 leader-required requests to the etcd v3 HTTP gateway. `/readyz` succeeds only
-while that lease is renewed; its monotonic local deadline independently removes
-readiness after a process pause. This proves live process identity only. It does
-not persist operation or shard-lease records, choose a transaction coordinator,
+after a successful lease renewal is followed by one linearizable transaction
+that matches the exact cluster marker, process token, and lease attachment. Only
+that transaction's KV revision advances readiness; follower-local lease-response
+revisions are not ordering evidence. A monotonic local deadline independently
+removes readiness after a process pause. An external session or marker mutation
+is detected by the next renewal proof, not synchronously at the instant of the
+administrative write. This proves renewable process identity only. It does not
+persist operation or shard-lease records, choose a transaction coordinator,
 provide target-side fencing, or enable automated failover. The current operator
 uses plaintext HTTP within its label-restricted etcd NetworkPolicy; authenticated
 TLS transport remains required before production use.
+
+On `SIGTERM`, the process removes readiness before notifying its workers,
+cancels any in-flight multi-endpoint coordination cycle, limits best-effort
+lease revocation to one second, and limits HTTP plus coordination drain to ten
+seconds. The operator explicitly gives orchestrator Pods a 30-second Kubernetes
+termination grace. Lease expiry remains the cleanup backstop when revocation
+cannot complete.
 
 The in-memory models bound authenticated lease lifetimes and atomically reject
 an operation unless its catalog epoch, fencing epoch and deadline match at

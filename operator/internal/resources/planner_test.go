@@ -1979,6 +1979,19 @@ func TestPostgreSQLBootstrapImageRejectsMutableRemoteReferences(t *testing.T) {
 	}
 }
 
+func TestOrchestratorHasExplicitShutdownBudget(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	plan, err := Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator := object[*appsv1.Deployment](t, plan, cluster.Name+OrchestratorSuffix)
+	if got := orchestrator.Spec.Template.Spec.TerminationGracePeriodSeconds; got == nil || *got != 30 {
+		t.Fatalf("orchestrator termination grace = %v, want 30 seconds", got)
+	}
+}
+
 func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()

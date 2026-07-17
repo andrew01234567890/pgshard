@@ -504,6 +504,11 @@ impl OrchState {
             .coordination_ready = false;
     }
 
+    /// Removes externally visible readiness before process shutdown begins.
+    pub fn begin_shutdown(&self) {
+        self.record_coordination_unavailable();
+    }
+
     /// Returns a consistent reportable snapshot.
     #[must_use]
     pub fn snapshot(&self) -> OrchSnapshot {
