@@ -579,5 +579,5 @@ func synchronousStandbys(durability DurabilityMode) int32 {
 	return 0
 }
 
-// +kubebuilder:webhook:path=/mutate-pgshard-io-v1alpha1-pgshardcluster,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=create;update,versions=v1alpha1,name=mpgshardcluster.kb.io,admissionReviewVersions=v1
-// +kubebuilder:webhook:path=/validate-pgshard-io-v1alpha1-pgshardcluster,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=create;update,versions=v1alpha1,name=vpgshardcluster.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/mutate-pgshard-io-v1alpha1-pgshardcluster,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=create;update,versions=v1alpha1,name=mpgshardcluster.kb.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-pgshard-io-v1alpha1-pgshardcluster,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=create;update,versions=v1alpha1,name=vpgshardcluster.kb.io,admissionReviewVersions=v1,servicePort=9444

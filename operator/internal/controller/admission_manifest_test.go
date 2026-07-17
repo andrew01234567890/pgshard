@@ -104,7 +104,7 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		}
 	}
 	service := readManifest[corev1.Service](t, "../../config/webhook/service.yaml")
-	if service.Name != "webhook-service" || service.Namespace != "system" || len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 443 || service.Spec.Ports[0].TargetPort != intstr.FromString("webhook") || service.Spec.Selector["pgshard.io/webhook-contract"] != "receipt-v1" {
+	if service.Name != "webhook-service" || service.Namespace != "system" || len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 9444 || service.Spec.Ports[0].TargetPort != intstr.FromString("webhook") || service.Spec.Selector["pgshard.io/webhook-contract"] != "receipt-v1" {
 		t.Fatalf("webhook Service = %#v", service)
 	}
 
@@ -168,7 +168,7 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 
 func assertWebhookPolicy(t *testing.T, clientConfig admissionregistrationv1.WebhookClientConfig, failurePolicy *admissionregistrationv1.FailurePolicyType, matchPolicy *admissionregistrationv1.MatchPolicyType, timeout *int32) {
 	t.Helper()
-	if clientConfig.Service == nil || clientConfig.Service.Name != "webhook-service" || clientConfig.Service.Namespace != "system" || failurePolicy == nil || *failurePolicy != admissionregistrationv1.Fail || matchPolicy == nil || *matchPolicy != admissionregistrationv1.Equivalent || timeout == nil || *timeout != 5 {
+	if clientConfig.Service == nil || clientConfig.Service.Name != "webhook-service" || clientConfig.Service.Namespace != "system" || clientConfig.Service.Port == nil || *clientConfig.Service.Port != 9444 || failurePolicy == nil || *failurePolicy != admissionregistrationv1.Fail || matchPolicy == nil || *matchPolicy != admissionregistrationv1.Equivalent || timeout == nil || *timeout != 5 {
 		t.Fatalf("webhook policy = client %#v failure %#v match %#v timeout %#v", clientConfig, failurePolicy, matchPolicy, timeout)
 	}
 }

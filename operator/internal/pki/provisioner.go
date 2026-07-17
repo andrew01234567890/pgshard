@@ -60,7 +60,7 @@ const (
 	validatingWebhookName      = "vpgshardcluster.kb.io"
 	mutatingWebhookPath        = "/mutate-pgshard-io-v1alpha1-pgshardcluster"
 	validatingWebhookPath      = "/validate-pgshard-io-v1alpha1-pgshardcluster"
-	webhookServicePort         = int32(443)
+	webhookServicePort         = int32(9444)
 	webhookTimeoutSeconds      = int32(5)
 )
 
@@ -1061,7 +1061,10 @@ func (p *Provisioner) validateClientConfig(config admissionregistrationv1.Webhoo
 	if *config.Service.Path != wantedPath {
 		return fmt.Errorf("references Service path %q, want %q", *config.Service.Path, wantedPath)
 	}
-	if config.Service.Port != nil && *config.Service.Port != webhookServicePort {
+	if config.Service.Port == nil {
+		return fmt.Errorf("does not specify Service port %d", webhookServicePort)
+	}
+	if *config.Service.Port != webhookServicePort {
 		return fmt.Errorf("references Service port %d, want %d", *config.Service.Port, webhookServicePort)
 	}
 	if len(config.CABundle) != 0 && !bytes.Equal(config.CABundle, caBundle) {

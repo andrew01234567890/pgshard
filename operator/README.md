@@ -301,14 +301,15 @@ so this sample must not be used as zero-downtime evidence.
 mutating webhooks and five generated validating webhooks. A manager Pod created
 by this overlay has a 20-second total termination budget. Its `preStop` hook
 uses the first five seconds as an endpoint-propagation drain before `SIGTERM`,
-leaving roughly 15 seconds for graceful shutdown. The webhook Service selects
-only Pods labelled for the `receipt-v1` admission contract, so the last keyless
-manager cannot serve newly introduced receipt paths or apply its older validator
-during the transition. This selector deliberately makes that one-time contract
-upgrade fail closed until a new manager is ready. Later `receipt-v1`-compatible
-rollouts retain an old compatible endpoint through the surge and drain it before
-termination. The
-binding mutator, binding final-state validator, and cluster-handshake webhook
+leaving roughly 15 seconds for graceful shutdown. The webhook Service uses the
+dedicated `9444` contract port and selects only Pods labelled for the
+`receipt-v1` admission contract. Changing the client port prevents the API
+server from reusing a cached connection to the last keyless manager, while the
+selector prevents new connections from reaching it. Together they make that
+one-time contract upgrade fail closed until a new manager is ready. Later
+`receipt-v1`-compatible rollouts retain an old compatible endpoint through the
+surge and drain it before termination. The binding mutator, binding final-state
+validator, and cluster-handshake webhook
 are scoped to namespaces labelled `pgshard.io/pod-fencing=enabled`; the status
 and metadata webhooks are scoped to
 operator-managed PostgreSQL Pods. Both binding and status use final validating
@@ -401,9 +402,11 @@ The keyless release on the default branch needs no manual key command, but its
 webhook contract is not availability-compatible with `receipt-v1`. Freeze
 `PgShardCluster` writes and leave every resource namespace without the
 `pgshard.io/pod-fencing=enabled` label while applying the updated manifest and
-immutable manager image. The Service contract selector excludes the old manager,
-so admission requests can fail with a retryable webhook-unavailable error until
-the new Pod is Ready. `maxUnavailable: 0` preserves the old process; it cannot
+immutable manager image. The dedicated Service port gives the API server a new
+webhook client identity, and the Service contract selector excludes the old
+manager. Admission requests can therefore fail with a retryable
+webhook-unavailable error until the new Pod is Ready. `maxUnavailable: 0`
+preserves the old process; it cannot
 make that process serve routes or validation it does not implement. Wait for the
 manager rollout before retrying writes or enabling Pod fencing. Do not restart
 the old image with the new command-line arguments. A zero-rejection upgrade

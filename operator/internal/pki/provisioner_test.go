@@ -1030,6 +1030,13 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 			want: "references Service port",
 		},
 		{
+			name: "missing webhook port",
+			mutate: func(objects []client.Object) {
+				objects[3].(*admissionregistrationv1.ValidatingWebhookConfiguration).Webhooks[0].ClientConfig.Service.Port = nil
+			},
+			want: "does not specify Service port",
+		},
+		{
 			name: "extra webhook",
 			mutate: func(objects []client.Object) {
 				configuration := objects[2].(*admissionregistrationv1.MutatingWebhookConfiguration)
@@ -1243,7 +1250,7 @@ func installObjects() []client.Object {
 	matchPolicy := admissionregistrationv1.Equivalent
 	sideEffects := admissionregistrationv1.SideEffectClassNone
 	timeoutSeconds := int32(5)
-	servicePort := int32(443)
+	servicePort := webhookServicePort
 	scope := admissionregistrationv1.AllScopes
 	reinvocationPolicy := admissionregistrationv1.NeverReinvocationPolicy
 	serviceReference := func(path string) admissionregistrationv1.WebhookClientConfig {
