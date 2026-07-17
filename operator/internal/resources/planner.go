@@ -4,7 +4,9 @@
 package resources
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1702,15 +1704,16 @@ func CatalogClientMaterialSHA256(password, caCertificate []byte) string {
 // CatalogServerMaterialSHA256 binds the exact PostgreSQL serving certificate
 // and private-key projection validated before the postmaster starts.
 func CatalogServerMaterialSHA256(serverCertificate, serverPrivateKey []byte) string {
-	return catalogMaterialSHA256("pgshard-catalog-server-v1", serverCertificate, serverPrivateKey)
+	return catalogMaterialSHA256("pgshard-catalog-server-v1", serverPrivateKey, serverCertificate)
 }
 
-func catalogMaterialSHA256(domain string, values ...[]byte) string {
-	hash := sha256.New()
-	fmt.Fprintln(hash, domain)
-	for _, value := range values {
-		component := sha256.Sum256(value)
-		fmt.Fprintln(hash, hex.EncodeToString(component[:]))
+func catalogMaterialSHA256(domain string, key []byte, values ...[]byte) string {
+	hash := hmac.New(sha256.New, key)
+	for _, value := range append([][]byte{[]byte(domain)}, values...) {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write(value)
 	}
 	return hex.EncodeToString(hash.Sum(nil))
 }
