@@ -177,7 +177,7 @@ func TestBindingAdmissionRejectsPartiallyStrippedManagedPods(t *testing.T) {
 func TestBindingAdmissionAllowsNonPostgreSQLPgShardPods(t *testing.T) {
 	t.Parallel()
 	scheme := testScheme(t)
-	for _, component := range []string{"etcd", "orchestrator", "pooler"} {
+	for _, component := range []string{"orchestrator", "pooler"} {
 		component := component
 		t.Run(component, func(t *testing.T) {
 			t.Parallel()

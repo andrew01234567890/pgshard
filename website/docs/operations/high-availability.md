@@ -7,24 +7,37 @@ description: Replication, leases, fencing, promotion, restarts, and buffering.
 
 :::info Milestone 1 design contract
 The Rust agent/orchestrator health surfaces and fail-closed in-memory fencing
-models exist. The orchestrator runtime also maintains a persistent
-cluster-name/UID marker plus one exclusive Pod-incarnation key using bounded,
-leader-required requests to the etcd v3 HTTP gateway. `/readyz` succeeds only
-after a successful lease renewal is followed by one linearizable transaction
-that matches the exact cluster marker, process token, and lease attachment. Only
-that transaction's KV revision advances readiness; follower-local lease-response
-revisions are not ordering evidence. A monotonic local deadline independently
-removes readiness after a process pause. An external session or marker mutation
-is detected by the next renewal proof, not synchronously at the instant of the
-administrative write. This proves renewable process identity only. It does not
-persist operation or shard-lease records, choose a transaction coordinator,
-provide target-side fencing, or enable automated failover. The current operator
-uses plaintext HTTP within its label-restricted etcd NetworkPolicy; authenticated
-TLS transport remains required before production use.
+models exist. The operator creates one empty `coordination.k8s.io/v1` Lease
+envelope for orchestrator leadership. A dedicated ServiceAccount is restricted
+to `get` and `update` on that exact Lease name; the Rust process connects through
+the Kubernetes API server's in-cluster TLS path and never connects directly to
+the control plane's private etcd. Claims and renewals are full
+resource-version-conditional replacements bound to the exact fleet owner UID,
+Lease UID, Pod UID, and process incarnation. `/readyz` succeeds after a current
+authoritative observation of that identity. All healthy replicas may be ready,
+but only the current holder reports `pgshard_orch_leader 1`.
+
+A follower does not trust the holder's wall clock. It can take over only after
+observing the same holder and renewal record unchanged for a complete locally
+measured Lease duration, following CloudNativePG's conservative observation
+pattern. A clean empty release can be claimed immediately. A monotonic local
+deadline removes readiness after API loss or a process pause. Recreating the
+Lease changes its UID, so existing processes remain fail closed until a bounded
+orchestrator rollout establishes a new coordination universe. This Lease proves
+only orchestrator availability and exclusive leadership. It does not persist
+operation or shard-term records, provide target-side PostgreSQL fencing, or
+enable automated failover.
+
+The pre-Lease development layout's three etcd data claims are retired
+automatically. The operator first prunes the old cluster-owned StatefulSet,
+uses uncached API reads to prove it and all three exact Pods absent, validates
+the exact owner, labels, 2 GiB storage contract, and fixed claim names, and then
+deletes those claims with UID and resource-version preconditions. A mismatch
+fails closed. No PostgreSQL data claim participates in this migration.
 
 On `SIGTERM`, the process removes readiness before notifying its workers,
-cancels any in-flight multi-endpoint coordination cycle, limits best-effort
-lease revocation to one second, and limits HTTP plus coordination drain to ten
+cancels any in-flight Kubernetes API request, limits best-effort Lease release
+to one second, and limits HTTP plus coordination drain to ten
 seconds. The operator explicitly gives orchestrator Pods a 30-second Kubernetes
 termination grace. Lease expiry remains the cleanup backstop when revocation
 cannot complete.
@@ -371,10 +384,10 @@ The primary must eventually hold an operator-owned
 Lease through the Kubernetes API server; they never connect directly to the
 control plane's private etcd. The Lease record is short-lived coordination, not
 durable authority: topology, operations, fencing generations, and transaction
-decisions remain in PostgreSQL. This writable-term Lease and the local agent
-self-fencing needed before PostgreSQL can serve are not implemented. The
-current dedicated-etcd process-incarnation lease is transitional and is
-deliberately not a shard/term lease.
+decisions remain in PostgreSQL. This per-cell writable-term Lease and the local
+agent self-fencing needed before PostgreSQL can serve are not implemented. The
+implemented fleet-level orchestrator leadership Lease is deliberately not a
+shard/term Lease.
 
 As in CloudNativePG, a candidate observes a competing holder's Lease record
 locally and may take it over only after the same holder and renewal record stay

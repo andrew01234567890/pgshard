@@ -86,8 +86,9 @@ and points the compatibility relay at the ready-only shard-zero Service.
 Catalog readiness can then make overall readiness true. The catalog login is
 read-only and can connect only to `shardschema` over TLS; application
 credentials pass unchanged to PostgreSQL for its native SCRAM exchange.
-Application relay traffic and etcd are not made secure by this catalog-only
-path.
+Application relay traffic is not made secure by this catalog-only path.
+Kubernetes Lease coordination belongs to the orchestrator and is not exposed
+through the pooler.
 
 The operator does not yet rotate this static PostgreSQL serving certificate or
 reload a replacement without interruption. It issues a five-year development

@@ -10,12 +10,10 @@ publish = false
 
 [dependencies]
 axum.workspace = true
-base64.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["env"] }
-http-body-util.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
 pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
@@ -31,7 +29,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 postgres-protocol.workspace = true
-tempfile = "3.27.0"
 
 [lints]
 workspace = true

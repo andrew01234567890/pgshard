@@ -4,7 +4,7 @@ This non-publishable crate contains the PostgreSQL 18 `shardschema` migration,
 transactional snapshot loader, validated immutable Rust snapshot model, and
 lock-free multi-epoch cache.
 `shardschema` is authoritative and is hosted on stable shard 0000 in Milestone
-1. Etcd is not a topology store.
+1. Kubernetes Lease objects are not topology stores.
 
 The migration also stores permanent shard restore-incarnation history,
 logical-consumer identities, per-shard ownership fences, never-reused

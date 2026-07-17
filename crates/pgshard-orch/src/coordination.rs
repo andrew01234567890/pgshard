@@ -1,41 +1,36 @@
-//! Renewable etcd-backed orchestrator incarnation and readiness supervision.
+//! Kubernetes Lease-backed orchestrator availability and leadership.
 
-use std::future::Future;
+use std::cmp;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full, Limited};
-use hyper::header::{CONTENT_TYPE, HeaderValue};
-use hyper::{Request, StatusCode, Uri};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
-use pgshard_version::{GIT_SHA, VERSION};
-use serde_json::{Value, json};
+use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
+use k8s_openapi::jiff::Timestamp;
+use kube::api::{Api, PostParams};
+use kube::{Client, Config};
 use thiserror::Error;
 use tokio::sync::watch;
-use url::Url;
 use uuid::Uuid;
 
 use crate::domain::{OrchState, OrchestratorIdentity};
 
-const RESPONSE_LIMIT_BYTES: usize = 16 * 1024;
 const INITIAL_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(5);
-const REVOKE_TIMEOUT: Duration = Duration::from_secs(1);
-const CONTENT_TYPE_JSON: HeaderValue = HeaderValue::from_static("application/json");
-const REQUIRE_LEADER: HeaderValue = HeaderValue::from_static("true");
-const REQUIRE_LEADER_HEADER: &str = "grpc-metadata-hasleader";
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+const RELEASED_LEASE_DURATION_SECONDS: i32 = 1;
+const OWNER_API_VERSION: &str = "pgshard.io/v1alpha1";
+const OWNER_KIND: &str = "PgShardCluster";
 
 /// Fully validated settings for one orchestrator coordination supervisor.
 #[derive(Clone, Debug)]
 pub struct CoordinationConfig {
-    endpoints: Vec<Url>,
+    namespace: String,
+    lease_name: String,
     identity: OrchestratorIdentity,
     cluster_uid: String,
-    session_ttl: Duration,
+    pod_uid: String,
+    lease_duration: Duration,
+    retry_period: Duration,
     request_timeout: Duration,
 }
 
@@ -45,799 +40,506 @@ impl CoordinationConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty endpoint set, an unrepresentable TTL, or
-    /// timing that could spend more than one third of a lease cycling endpoints.
+    /// Returns an error for unsafe identities or timing.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        endpoints: Vec<Url>,
+        namespace: String,
+        lease_name: String,
         identity: OrchestratorIdentity,
         cluster_uid: String,
-        session_ttl: Duration,
+        pod_uid: String,
+        lease_duration: Duration,
+        retry_period: Duration,
         request_timeout: Duration,
     ) -> Result<Self, CoordinationError> {
-        let ttl_seconds = session_ttl.as_secs();
-        let request_millis = u64::try_from(request_timeout.as_millis()).unwrap_or(u64::MAX);
-        let endpoint_count = u64::try_from(endpoints.len()).unwrap_or(u64::MAX);
-        let endpoints_are_safe = (1..=9).contains(&endpoints.len())
-            && endpoints.iter().enumerate().all(|(index, endpoint)| {
-                endpoint.scheme() == "http"
-                    && endpoint.host_str().is_some()
-                    && endpoint.port().is_some()
-                    && endpoint.username().is_empty()
-                    && endpoint.password().is_none()
-                    && endpoint.path() == "/"
-                    && endpoint.query().is_none()
-                    && endpoint.fragment().is_none()
-                    && !endpoints[..index].contains(endpoint)
-            });
-        let identity_is_safe = [
-            &identity.cluster_id,
-            &identity.orchestrator_id,
-            &cluster_uid,
-        ]
-        .into_iter()
-        .all(|value| {
+        let dns_label = |value: &str| {
             !value.is_empty()
                 && value.len() <= 63
                 && value
                     .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && value
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && value
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        };
+        let uid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        });
-        if !endpoints_are_safe
-            || !identity_is_safe
-            || session_ttl.subsec_nanos() != 0
-            || !request_timeout.subsec_nanos().is_multiple_of(1_000_000)
-            || !(6..=300).contains(&ttl_seconds)
+        };
+        let lease_seconds = lease_duration.as_secs();
+        let request_millis = u64::try_from(request_timeout.as_millis()).unwrap_or(u64::MAX);
+        let retry_millis = u64::try_from(retry_period.as_millis()).unwrap_or(u64::MAX);
+        if !dns_label(&namespace)
+            || !dns_label(&lease_name)
+            || !dns_label(&identity.cluster_id)
+            || !dns_label(&identity.orchestrator_id)
+            || !uid(&cluster_uid)
+            || !uid(&pod_uid)
+            || lease_duration.subsec_nanos() != 0
+            || !(6..=300).contains(&lease_seconds)
             || !(100..=5_000).contains(&request_millis)
-            || request_millis.saturating_mul(endpoint_count) > ttl_seconds.saturating_mul(1_000) / 3
+            || !(100..=30_000).contains(&retry_millis)
+            || request_millis > lease_seconds.saturating_mul(1_000) / 3
+            || retry_millis > lease_seconds.saturating_mul(1_000) / 3
         {
             return Err(CoordinationError::InvalidSettings);
         }
         Ok(Self {
-            endpoints,
+            namespace,
+            lease_name,
             identity,
             cluster_uid,
-            session_ttl,
+            pod_uid,
+            lease_duration,
+            retry_period,
             request_timeout,
         })
     }
+
+    fn holder_identity(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.identity.orchestrator_id,
+            self.pod_uid,
+            Uuid::new_v4()
+        )
+    }
+
+    fn lease_duration_seconds(&self) -> i32 {
+        i32::try_from(self.lease_duration.as_secs())
+            .expect("validated Kubernetes Lease duration fits i32")
+    }
 }
 
-/// Maintains an exclusive, lease-backed key for one orchestrator incarnation.
+/// Maintains API availability and exclusive orchestrator leadership through an
+/// operator-owned `coordination.k8s.io/v1` Lease.
 ///
-/// The persistent cluster marker prevents an endpoint set from silently
-/// changing logical pgshard clusters. The ephemeral incarnation key is attached
-/// to an etcd lease and refreshed through the v3 HTTP gateway. Readiness is
-/// removed immediately after any failed refresh; it never depends on the HTTP
-/// probe changing an in-memory boolean itself.
+/// Every process becomes ready after an authoritative API read of the exact
+/// cluster-owned Lease. Only the holder records leadership. A candidate never
+/// compares the holder's wall clock: it takes an occupied Lease only after the
+/// holder and renewal record remain byte-for-byte unchanged for a full locally
+/// measured Lease duration. Every claim and renewal is a resource-version
+/// conditional replacement.
 ///
 /// # Errors
 ///
-/// Returns only for a permanent protocol/evidence violation or after shutdown.
+/// Returns only for a permanent configuration, identity, protocol, or evidence
+/// violation, or after shutdown.
 pub async fn supervise(
     config: CoordinationConfig,
+    state: OrchState,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), CoordinationError> {
+    let store = KubernetesLeaseStore::new(&config)?;
+    supervise_with_store(&store, &config, state, shutdown).await
+}
+
+async fn supervise_with_store<S: LeaseStore>(
+    store: &S,
+    config: &CoordinationConfig,
     state: OrchState,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CoordinationError> {
     state.record_coordination_unavailable();
-    let token = session_value(&config.identity, &config.cluster_uid, Uuid::new_v4());
-    let mut gateway = EtcdGateway::new(&config.endpoints, config.request_timeout);
+    let holder_identity = config.holder_identity();
+    let mut observed_holder = None;
     let mut retry = INITIAL_RETRY;
+    let mut previously_leader = false;
 
-    while !stopping(&shutdown) {
-        let mut pending_lease = None;
-        let Some(result) = run_or_stop(
-            &mut shutdown,
-            establish_session(&mut gateway, &config, &token, &mut pending_lease),
-        )
-        .await
-        else {
-            state.record_coordination_unavailable();
-            retire_lease(&mut gateway, pending_lease).await;
-            return Ok(());
-        };
-        match result {
-            Ok(session) => {
-                if stopping(&shutdown) {
-                    state.record_coordination_unavailable();
-                    retire_lease(&mut gateway, Some(session.lease_id)).await;
-                    return Ok(());
+    loop {
+        if stopping(&shutdown) {
+            break;
+        }
+        let result = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
                 }
+                continue;
+            }
+            result = reconcile_once(
+                store,
+                config,
+                &holder_identity,
+                &mut observed_holder,
+            ) => result,
+        };
+
+        let delay = match result {
+            Ok(observation) => {
+                let deadline = Instant::now() + config.lease_duration;
                 if !state.record_coordination_ready(
-                    session.cluster_id,
-                    session.revision,
-                    session.deadline,
+                    &observation.lease_uid,
+                    &observation.resource_version,
+                    observation.leader,
+                    deadline,
                 ) {
                     state.record_coordination_unavailable();
-                    retire_lease(&mut gateway, Some(session.lease_id)).await;
                     return Err(CoordinationError::StateEvidenceRejected);
                 }
-                tracing::info!(
-                    etcd_cluster_id = session.cluster_id,
-                    etcd_revision = session.revision,
-                    "orchestrator coordination incarnation established"
-                );
-                retry = INITIAL_RETRY;
-                if maintain_session(
-                    &mut gateway,
-                    &config,
-                    &token,
-                    &state,
-                    &mut shutdown,
-                    session.lease_id,
-                )
-                .await?
-                    == SessionOutcome::Shutdown
-                {
-                    return Ok(());
+                if observation.leader && !previously_leader {
+                    tracing::info!(
+                        lease = %config.lease_name,
+                        namespace = %config.namespace,
+                        "orchestrator leadership acquired"
+                    );
+                } else if !observation.leader && previously_leader {
+                    tracing::warn!(
+                        lease = %config.lease_name,
+                        namespace = %config.namespace,
+                        "orchestrator leadership lost"
+                    );
                 }
+                previously_leader = observation.leader;
+                retry = INITIAL_RETRY;
+                observation.delay
             }
             Err(error) if !error.is_permanent() => {
                 state.record_coordination_unavailable();
-                retire_lease(&mut gateway, pending_lease.take()).await;
-                tracing::warn!(reason = %error, "orchestrator coordination unavailable");
+                previously_leader = false;
+                tracing::warn!(reason = %error, "Kubernetes Lease coordination unavailable");
+                let delay = retry;
+                retry = retry.saturating_mul(2).min(MAX_RETRY);
+                delay
             }
             Err(error) => {
                 state.record_coordination_unavailable();
-                retire_lease(&mut gateway, pending_lease.take()).await;
                 return Err(error);
             }
-        }
+        };
 
-        if wait_or_stop(&mut shutdown, retry).await {
-            state.record_coordination_unavailable();
-            return Ok(());
+        if wait_or_stop(&mut shutdown, delay).await {
+            break;
         }
-        retry = retry.saturating_mul(2).min(MAX_RETRY);
     }
 
     state.record_coordination_unavailable();
+    best_effort_release(store, config, &holder_identity).await;
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SessionOutcome {
-    Retry,
-    Shutdown,
-}
-
-async fn maintain_session(
-    gateway: &mut EtcdGateway,
+async fn reconcile_once<S: LeaseStore>(
+    store: &S,
     config: &CoordinationConfig,
-    token: &[u8],
-    state: &OrchState,
-    shutdown: &mut watch::Receiver<bool>,
-    lease_id: i64,
-) -> Result<SessionOutcome, CoordinationError> {
-    loop {
-        if wait_or_stop(shutdown, config.session_ttl / 3).await {
-            state.record_coordination_unavailable();
-            retire_lease(gateway, Some(lease_id)).await;
-            return Ok(SessionOutcome::Shutdown);
-        }
-        let renewal = async {
-            let renewal = gateway.keep_alive(lease_id, config.session_ttl).await?;
-            let observation = gateway
-                .verify_session(&config.identity, &config.cluster_uid, token, lease_id)
-                .await?;
-            Ok::<_, CoordinationError>((renewal, observation))
-        };
-        let Some(result) = run_or_stop(shutdown, renewal).await else {
-            state.record_coordination_unavailable();
-            retire_lease(gateway, Some(lease_id)).await;
-            return Ok(SessionOutcome::Shutdown);
-        };
-        match result {
-            Ok((renewal, observation)) => {
-                if !state.record_coordination_ready(
-                    observation.cluster_id,
-                    observation.revision,
-                    renewal.deadline,
-                ) {
-                    state.record_coordination_unavailable();
-                    retire_lease(gateway, Some(lease_id)).await;
-                    return Err(CoordinationError::StateEvidenceRejected);
-                }
-            }
-            Err(error) if !error.is_permanent() => {
-                state.record_coordination_unavailable();
-                tracing::warn!(reason = %error, "orchestrator coordination lost");
-                retire_lease(gateway, Some(lease_id)).await;
-                return Ok(SessionOutcome::Retry);
-            }
-            Err(error) => {
-                state.record_coordination_unavailable();
-                retire_lease(gateway, Some(lease_id)).await;
-                return Err(error);
-            }
-        }
+    holder_identity: &str,
+    observed_holder: &mut Option<ObservedHolder>,
+) -> Result<CoordinationObservation, CoordinationError> {
+    let lease = store.get().await?;
+    let evidence = validate_lease(&lease, config)?;
+    let spec = lease.spec.clone().unwrap_or_default();
+    let current_holder = spec
+        .holder_identity
+        .as_deref()
+        .filter(|holder| !holder.is_empty());
+
+    if current_holder == Some(holder_identity) {
+        *observed_holder = None;
+        return replace_as_holder(store, config, lease, evidence, holder_identity, false).await;
     }
+
+    if current_holder.is_none() {
+        *observed_holder = None;
+        return replace_as_holder(store, config, lease, evidence, holder_identity, true).await;
+    }
+
+    let occupied_duration = occupied_lease_duration(&spec)?;
+    let record = HolderRecord {
+        identity: current_holder.expect("occupied holder checked").to_owned(),
+        renew_time: spec.renew_time,
+        lease_duration_seconds: spec.lease_duration_seconds,
+    };
+    let now = Instant::now();
+    let unchanged_since = match observed_holder {
+        Some(observed) if observed.record == record => observed.unchanged_since,
+        _ => {
+            *observed_holder = Some(ObservedHolder {
+                record,
+                unchanged_since: now,
+            });
+            return Ok(CoordinationObservation::follower(
+                evidence,
+                config.retry_period,
+            ));
+        }
+    };
+    let takeover_delay = cmp::max(config.lease_duration, occupied_duration);
+    let elapsed = now.saturating_duration_since(unchanged_since);
+    if elapsed < takeover_delay {
+        return Ok(CoordinationObservation::follower(
+            evidence,
+            cmp::min(config.retry_period, takeover_delay.saturating_sub(elapsed)),
+        ));
+    }
+
+    *observed_holder = None;
+    replace_as_holder(store, config, lease, evidence, holder_identity, true).await
 }
 
-async fn establish_session(
-    gateway: &mut EtcdGateway,
+async fn replace_as_holder<S: LeaseStore>(
+    store: &S,
     config: &CoordinationConfig,
-    token: &[u8],
-    pending_lease: &mut Option<i64>,
-) -> Result<Session, CoordinationError> {
-    gateway
-        .ensure_cluster_marker(&config.identity.cluster_id, &config.cluster_uid)
-        .await?;
-    let lease_id = gateway.grant(config.session_ttl).await?;
-    *pending_lease = Some(lease_id);
-    let key = session_key(&config.identity, &config.cluster_uid);
-    match gateway
-        .put_if_absent_or_get(&key, token, Some(lease_id))
-        .await?
+    mut lease: Lease,
+    previous: LeaseEvidence,
+    holder_identity: &str,
+    transition: bool,
+) -> Result<CoordinationObservation, CoordinationError> {
+    let now = MicroTime(Timestamp::now());
+    let mut spec = lease.spec.take().unwrap_or_default();
+    if spec.preferred_holder.is_some() || spec.strategy.is_some() {
+        return Err(CoordinationError::UnsupportedCoordinatedElection);
+    }
+    let transitions = validated_transitions(spec.lease_transitions)?;
+    if transition {
+        spec.acquire_time = Some(now.clone());
+        spec.lease_transitions = Some(
+            transitions
+                .checked_add(1)
+                .ok_or(CoordinationError::LeaseTransitionOverflow)?,
+        );
+    }
+    spec.holder_identity = Some(holder_identity.to_owned());
+    spec.lease_duration_seconds = Some(config.lease_duration_seconds());
+    spec.renew_time = Some(now.clone());
+    lease.spec = Some(spec);
+
+    let updated = store.replace(&lease).await?;
+    let evidence = validate_lease(&updated, config)?;
+    let updated_spec = updated
+        .spec
+        .as_ref()
+        .ok_or(CoordinationError::InvalidLeaseSpec)?;
+    if evidence.lease_uid != previous.lease_uid
+        || evidence.resource_version == previous.resource_version
+        || updated_spec.holder_identity.as_deref() != Some(holder_identity)
+        || updated_spec.lease_duration_seconds != Some(config.lease_duration_seconds())
+        // Kubernetes stores Lease timestamps at microsecond precision. The
+        // API server may therefore normalize the value sent by this process;
+        // exact equality with `now` would reject a successful CAS update.
+        // The returned UID, new resource version, process-unique holder, and
+        // populated renewal record are the authoritative write evidence.
+        || updated_spec.renew_time.is_none()
     {
-        (true, _, _) => {}
-        (false, Some(existing), _) if existing == token => {
-            if gateway
-                .replace_exact(&key, token, lease_id)
-                .await?
-                .is_none()
-            {
-                return Err(CoordinationError::SessionOwned);
-            }
-        }
-        (false, _, _) => return Err(CoordinationError::SessionOwned),
+        return Err(CoordinationError::StateEvidenceRejected);
     }
-    let renewal = gateway.keep_alive(lease_id, config.session_ttl).await?;
-    let observation = gateway
-        .verify_session(&config.identity, &config.cluster_uid, token, lease_id)
-        .await?;
-    Ok(Session {
-        lease_id,
-        cluster_id: observation.cluster_id,
-        revision: observation.revision,
-        deadline: renewal.deadline,
+    Ok(CoordinationObservation {
+        lease_uid: evidence.lease_uid,
+        resource_version: evidence.resource_version,
+        leader: true,
+        delay: config.lease_duration / 3,
     })
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Observation {
-    cluster_id: u64,
-    revision: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Renewal {
-    deadline: Instant,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Session {
-    lease_id: i64,
-    cluster_id: u64,
-    revision: u64,
-    deadline: Instant,
-}
-
-type HttpClient = Client<HttpConnector, Full<Bytes>>;
-
-struct EtcdGateway {
-    client: HttpClient,
-    endpoints: Vec<Url>,
-    request_timeout: Duration,
-    next_endpoint: usize,
-    cluster_id: Option<u64>,
-    highest_revision: u64,
-}
-
-impl EtcdGateway {
-    fn new(endpoints: &[Url], request_timeout: Duration) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.enforce_http(true);
-        connector.set_connect_timeout(Some(request_timeout));
-        let client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build(connector);
-        Self {
-            client,
-            endpoints: endpoints.to_vec(),
-            request_timeout,
-            next_endpoint: 0,
-            cluster_id: None,
-            highest_revision: 0,
-        }
+fn occupied_lease_duration(spec: &LeaseSpec) -> Result<Duration, CoordinationError> {
+    let seconds = spec
+        .lease_duration_seconds
+        .ok_or(CoordinationError::InvalidLeaseSpec)?;
+    if !(1..=300).contains(&seconds) || spec.renew_time.is_none() {
+        return Err(CoordinationError::InvalidLeaseSpec);
     }
-
-    async fn ensure_cluster_marker(
-        &mut self,
-        logical_cluster: &str,
-        cluster_incarnation: &str,
-    ) -> Result<Observation, CoordinationError> {
-        let key = cluster_marker_key(logical_cluster);
-        let value = cluster_marker_value(logical_cluster, cluster_incarnation);
-        let (created, existing, observation) =
-            self.put_if_absent_or_get(&key, &value, None).await?;
-        if !created && existing.as_deref() != Some(value.as_slice()) {
-            return Err(CoordinationError::ClusterMarkerConflict);
-        }
-        Ok(observation)
-    }
-
-    async fn grant(&mut self, ttl: Duration) -> Result<i64, CoordinationError> {
-        let ttl = i64::try_from(ttl.as_secs()).map_err(|_| CoordinationError::InvalidSettings)?;
-        let value = self
-            .post("v3/lease/grant", &json!({"TTL": ttl.to_string()}))
-            .await?;
-        self.observe_cluster_header(&value)?;
-        let lease_id = parse_i64_string(&value, "ID")?;
-        let granted_ttl = parse_i64_string(&value, "TTL")?;
-        if lease_id <= 0 || granted_ttl < ttl {
-            return Err(CoordinationError::InvalidResponse("unsafe lease grant"));
-        }
-        Ok(lease_id)
-    }
-
-    async fn keep_alive(
-        &mut self,
-        lease_id: i64,
-        minimum_ttl: Duration,
-    ) -> Result<Renewal, CoordinationError> {
-        let requested_at = Instant::now();
-        let value = self
-            .post("v3/lease/keepalive", &json!({"ID": lease_id.to_string()}))
-            .await?;
-        let result = value.get("result").ok_or(CoordinationError::LeaseExpired)?;
-        let returned_id =
-            parse_i64_string(result, "ID").map_err(|_| CoordinationError::LeaseExpired)?;
-        let ttl = parse_i64_string(result, "TTL").map_err(|_| CoordinationError::LeaseExpired)?;
-        if returned_id != lease_id || ttl < i64::try_from(minimum_ttl.as_secs()).unwrap_or(i64::MAX)
-        {
-            return Err(CoordinationError::LeaseExpired);
-        }
-        let deadline = requested_at
-            .checked_add(Duration::from_secs(u64::try_from(ttl).unwrap_or(u64::MAX)))
-            .ok_or(CoordinationError::LeaseExpired)?;
-        if Instant::now() >= deadline {
-            return Err(CoordinationError::LeaseExpired);
-        }
-        self.observe_cluster_header(result)?;
-        Ok(Renewal { deadline })
-    }
-
-    async fn revoke(&mut self, lease_id: i64) -> Result<(), CoordinationError> {
-        let value = self
-            .post("v3/lease/revoke", &json!({"ID": lease_id.to_string()}))
-            .await?;
-        self.observe_cluster_header(&value)?;
-        Ok(())
-    }
-
-    async fn verify_session(
-        &mut self,
-        identity: &OrchestratorIdentity,
-        cluster_uid: &str,
-        token: &[u8],
-        lease_id: i64,
-    ) -> Result<Observation, CoordinationError> {
-        let marker_key = BASE64.encode(cluster_marker_key(&identity.cluster_id));
-        let marker_value = BASE64.encode(cluster_marker_value(&identity.cluster_id, cluster_uid));
-        let session_key = BASE64.encode(session_key(identity, cluster_uid));
-        let session_value = BASE64.encode(token);
-        let response = self
-            .post(
-                "v3/kv/txn",
-                &json!({
-                    "compare": [
-                        {
-                            "result": "EQUAL",
-                            "target": "VALUE",
-                            "key": marker_key,
-                            "value": marker_value
-                        },
-                        {
-                            "result": "EQUAL",
-                            "target": "VALUE",
-                            "key": session_key,
-                            "value": session_value
-                        },
-                        {
-                            "result": "EQUAL",
-                            "target": "LEASE",
-                            "key": session_key,
-                            "lease": lease_id.to_string()
-                        }
-                    ],
-                    // A non-serializable range makes this read-only transaction
-                    // pass through etcd's linearizable read barrier.
-                    "success": [{"request_range": {"key": session_key}}],
-                    "failure": [
-                        {"request_range": {"key": marker_key}},
-                        {"request_range": {"key": session_key}}
-                    ]
-                }),
-            )
-            .await?;
-        let observation = self.observe_header(&response)?;
-        let succeeded = response
-            .get("succeeded")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !succeeded {
-            validate_range_responses(&response, 2)?;
-            return Err(CoordinationError::SessionEvidenceLost);
-        }
-        validate_session_range(&response, &session_key, &session_value, lease_id)?;
-        Ok(observation)
-    }
-
-    async fn put_if_absent_or_get(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        lease_id: Option<i64>,
-    ) -> Result<(bool, Option<Vec<u8>>, Observation), CoordinationError> {
-        let key = BASE64.encode(key);
-        let value = BASE64.encode(value);
-        let mut request_put = json!({"key": key, "value": value});
-        if let Some(lease_id) = lease_id {
-            request_put["lease"] = Value::String(lease_id.to_string());
-        }
-        let response = self
-            .post(
-                "v3/kv/txn",
-                &json!({
-                    "compare": [{
-                        "result": "EQUAL",
-                        "target": "CREATE",
-                        "key": key,
-                        "create_revision": "0"
-                    }],
-                    "success": [{"request_put": request_put}],
-                    "failure": [{"request_range": {"key": key}}]
-                }),
-            )
-            .await?;
-        let observation = self.observe_header(&response)?;
-        // ProtoJSON omits the default `false` value, so absence is the
-        // compare-failed branch rather than malformed evidence.
-        let succeeded = response
-            .get("succeeded")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if succeeded {
-            validate_single_response(&response, "response_put")?;
-            return Ok((true, None, observation));
-        }
-        let existing = transaction_range_value(&response)?;
-        Ok((false, Some(existing), observation))
-    }
-
-    async fn replace_exact(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        lease_id: i64,
-    ) -> Result<Option<Observation>, CoordinationError> {
-        let key = BASE64.encode(key);
-        let value = BASE64.encode(value);
-        let response = self
-            .post(
-                "v3/kv/txn",
-                &json!({
-                    "compare": [{
-                        "result": "EQUAL",
-                        "target": "VALUE",
-                        "key": key,
-                        "value": value
-                    }],
-                    "success": [{"request_put": {
-                        "key": key,
-                        "value": value,
-                        "lease": lease_id.to_string()
-                    }}],
-                    "failure": [{"request_range": {"key": key}}]
-                }),
-            )
-            .await?;
-        let observation = self.observe_header(&response)?;
-        let succeeded = response
-            .get("succeeded")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if succeeded {
-            validate_single_response(&response, "response_put")?;
-            Ok(Some(observation))
-        } else {
-            let _ = transaction_optional_range_value(&response)?;
-            Ok(None)
-        }
-    }
-
-    async fn post(&mut self, path: &str, value: &Value) -> Result<Value, CoordinationError> {
-        let body = serde_json::to_vec(value)
-            .map_err(|_| CoordinationError::InvalidResponse("request encoding failed"))?;
-        for offset in 0..self.endpoints.len() {
-            let index = (self.next_endpoint + offset) % self.endpoints.len();
-            match self.post_one(index, path, body.clone()).await {
-                Ok(value) => {
-                    self.next_endpoint = (index + 1) % self.endpoints.len();
-                    return Ok(value);
-                }
-                Err(error) => tracing::debug!(
-                    endpoint = %self.endpoints[index],
-                    reason = %error,
-                    "etcd gateway endpoint attempt failed"
-                ),
-            }
-        }
-        Err(CoordinationError::GatewayUnavailable)
-    }
-
-    async fn post_one(
-        &self,
-        index: usize,
-        path: &str,
-        body: Vec<u8>,
-    ) -> Result<Value, EndpointError> {
-        let endpoint = self.endpoints[index]
-            .join(path)
-            .map_err(|_| EndpointError::InvalidUri)?;
-        let uri: Uri = endpoint
-            .as_str()
-            .parse()
-            .map_err(|_| EndpointError::InvalidUri)?;
-        let request = Request::post(uri)
-            .header(CONTENT_TYPE, CONTENT_TYPE_JSON)
-            // grpc-gateway only forwards non-IANA request metadata through
-            // this prefix. etcd's server interceptor consumes `hasleader`.
-            .header(REQUIRE_LEADER_HEADER, REQUIRE_LEADER)
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|_| EndpointError::InvalidRequest)?;
-        let (status, content_type_is_json, bytes) =
-            tokio::time::timeout(self.request_timeout, async {
-                let response = self
-                    .client
-                    .request(request)
-                    .await
-                    .map_err(|_| EndpointError::Transport)?;
-                let status = response.status();
-                let content_type_is_json = response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value.starts_with("application/json"));
-                let bytes = Limited::new(response.into_body(), RESPONSE_LIMIT_BYTES)
-                    .collect()
-                    .await
-                    .map_err(|_| EndpointError::Body)?
-                    .to_bytes();
-                Ok::<_, EndpointError>((status, content_type_is_json, bytes))
-            })
-            .await
-            .map_err(|_| EndpointError::Timeout)??;
-        if !status.is_success() {
-            return Err(EndpointError::Status(status));
-        }
-        if !content_type_is_json {
-            return Err(EndpointError::ContentType);
-        }
-        serde_json::from_slice(&bytes).map_err(|_| EndpointError::Json)
-    }
-
-    fn observe_header(&mut self, value: &Value) -> Result<Observation, CoordinationError> {
-        let header = value
-            .get("header")
-            .ok_or(CoordinationError::InvalidResponse(
-                "missing response header",
-            ))?;
-        let cluster_id = parse_u64_string(header, "cluster_id")?;
-        let revision = parse_u64_string(header, "revision")?;
-        if cluster_id == 0 || revision == 0 {
-            return Err(CoordinationError::InvalidResponse(
-                "zero cluster identity or revision",
-            ));
-        }
-        if self.cluster_id.is_some_and(|current| current != cluster_id) {
-            return Err(CoordinationError::ClusterIdentityChanged);
-        }
-        if revision < self.highest_revision {
-            return Err(CoordinationError::RevisionRegressed);
-        }
-        self.cluster_id = Some(cluster_id);
-        self.highest_revision = revision;
-        Ok(Observation {
-            cluster_id,
-            revision,
-        })
-    }
-
-    fn observe_cluster_header(&mut self, value: &Value) -> Result<u64, CoordinationError> {
-        let header = value
-            .get("header")
-            .ok_or(CoordinationError::InvalidResponse(
-                "missing response header",
-            ))?;
-        let cluster_id = parse_u64_string(header, "cluster_id")?;
-        if cluster_id == 0 {
-            return Err(CoordinationError::InvalidResponse("zero cluster identity"));
-        }
-        if self.cluster_id.is_some_and(|current| current != cluster_id) {
-            return Err(CoordinationError::ClusterIdentityChanged);
-        }
-        self.cluster_id = Some(cluster_id);
-        Ok(cluster_id)
-    }
-}
-
-fn parse_u64_string(value: &Value, field: &'static str) -> Result<u64, CoordinationError> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse().ok())
-        .ok_or(CoordinationError::InvalidResponse(field))
-}
-
-fn parse_i64_string(value: &Value, field: &'static str) -> Result<i64, CoordinationError> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse().ok())
-        .ok_or(CoordinationError::InvalidResponse(field))
-}
-
-fn validate_single_response(
-    response: &Value,
-    expected: &'static str,
-) -> Result<(), CoordinationError> {
-    let responses = response.get("responses").and_then(Value::as_array).ok_or(
-        CoordinationError::InvalidResponse("missing transaction responses"),
-    )?;
-    if responses.len() != 1 || responses[0].get(expected).is_none() {
-        return Err(CoordinationError::InvalidResponse(
-            "unexpected transaction response",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_range_responses(response: &Value, expected: usize) -> Result<(), CoordinationError> {
-    let responses = response.get("responses").and_then(Value::as_array).ok_or(
-        CoordinationError::InvalidResponse("missing transaction responses"),
-    )?;
-    if responses.len() != expected
-        || responses
-            .iter()
-            .any(|response| response.get("response_range").is_none())
-    {
-        return Err(CoordinationError::InvalidResponse(
-            "unexpected transaction range responses",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_session_range(
-    response: &Value,
-    expected_key: &str,
-    expected_value: &str,
-    expected_lease: i64,
-) -> Result<(), CoordinationError> {
-    validate_single_response(response, "response_range")?;
-    let kvs = response["responses"][0]["response_range"]
-        .get("kvs")
-        .and_then(Value::as_array)
-        .ok_or(CoordinationError::InvalidResponse(
-            "missing verified session range",
-        ))?;
-    if kvs.len() != 1 {
-        return Err(CoordinationError::InvalidResponse(
-            "verified session range was not singular",
-        ));
-    }
-    let kv = &kvs[0];
-    if kv.get("key").and_then(Value::as_str) != Some(expected_key)
-        || kv.get("value").and_then(Value::as_str) != Some(expected_value)
-        || parse_i64_string(kv, "lease")? != expected_lease
-    {
-        return Err(CoordinationError::InvalidResponse(
-            "verified session evidence changed",
-        ));
-    }
-    Ok(())
-}
-
-fn transaction_range_value(response: &Value) -> Result<Vec<u8>, CoordinationError> {
-    transaction_optional_range_value(response)?.ok_or(CoordinationError::InvalidResponse(
-        "transaction range was empty",
+    Ok(Duration::from_secs(
+        u64::try_from(seconds).map_err(|_| CoordinationError::InvalidLeaseSpec)?,
     ))
 }
 
-fn transaction_optional_range_value(
-    response: &Value,
-) -> Result<Option<Vec<u8>>, CoordinationError> {
-    validate_single_response(response, "response_range")?;
-    let kvs = response["responses"][0]["response_range"]
-        .get("kvs")
-        .and_then(Value::as_array)
-        .ok_or(CoordinationError::InvalidResponse(
-            "missing transaction range",
-        ))?;
-    if kvs.len() > 1 {
-        return Err(CoordinationError::InvalidResponse(
-            "transaction range was not singular",
-        ));
+fn validated_transitions(transitions: Option<i32>) -> Result<i32, CoordinationError> {
+    let transitions = transitions.unwrap_or_default();
+    if transitions < 0 {
+        return Err(CoordinationError::InvalidLeaseSpec);
     }
-    let Some(kv) = kvs.first() else {
-        return Ok(None);
+    Ok(transitions)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HolderRecord {
+    identity: String,
+    renew_time: Option<MicroTime>,
+    lease_duration_seconds: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
+struct ObservedHolder {
+    record: HolderRecord,
+    unchanged_since: Instant,
+}
+
+struct CoordinationObservation {
+    lease_uid: String,
+    resource_version: String,
+    leader: bool,
+    delay: Duration,
+}
+
+impl CoordinationObservation {
+    fn follower(evidence: LeaseEvidence, delay: Duration) -> Self {
+        Self {
+            lease_uid: evidence.lease_uid,
+            resource_version: evidence.resource_version,
+            leader: false,
+            delay,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LeaseEvidence {
+    lease_uid: String,
+    resource_version: String,
+}
+
+fn validate_lease(
+    lease: &Lease,
+    config: &CoordinationConfig,
+) -> Result<LeaseEvidence, CoordinationError> {
+    if lease.metadata.name.as_deref() != Some(&config.lease_name)
+        || lease.metadata.namespace.as_deref() != Some(&config.namespace)
+        || lease.metadata.deletion_timestamp.is_some()
+    {
+        return Err(CoordinationError::LeaseIdentityMismatch);
+    }
+    let lease_uid = lease
+        .metadata
+        .uid
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or(CoordinationError::LeaseIdentityMismatch)?;
+    let resource_version = lease
+        .metadata
+        .resource_version
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or(CoordinationError::LeaseIdentityMismatch)?;
+    let controllers: Vec<_> = lease
+        .metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .filter(|owner| owner.controller == Some(true))
+        .collect();
+    if controllers.len() != 1 {
+        return Err(CoordinationError::LeaseOwnershipMismatch);
+    }
+    let owner = controllers[0];
+    if owner.api_version != OWNER_API_VERSION
+        || owner.kind != OWNER_KIND
+        || owner.name != config.identity.cluster_id
+        || owner.uid != config.cluster_uid
+    {
+        return Err(CoordinationError::LeaseOwnershipMismatch);
+    }
+    if lease
+        .spec
+        .as_ref()
+        .is_some_and(|spec| spec.preferred_holder.is_some() || spec.strategy.is_some())
+    {
+        return Err(CoordinationError::UnsupportedCoordinatedElection);
+    }
+    Ok(LeaseEvidence {
+        lease_uid,
+        resource_version,
+    })
+}
+
+async fn best_effort_release<S: LeaseStore>(
+    store: &S,
+    config: &CoordinationConfig,
+    holder_identity: &str,
+) {
+    let release = async {
+        let mut lease = store.get().await?;
+        validate_lease(&lease, config)?;
+        let mut spec = lease.spec.take().unwrap_or_default();
+        if spec.holder_identity.as_deref() != Some(holder_identity) {
+            return Ok::<(), CoordinationError>(());
+        }
+        let now = MicroTime(Timestamp::now());
+        spec.holder_identity = None;
+        spec.lease_duration_seconds = Some(RELEASED_LEASE_DURATION_SECONDS);
+        spec.acquire_time = Some(now.clone());
+        spec.renew_time = Some(now);
+        lease.spec = Some(spec);
+        store.replace(&lease).await?;
+        Ok(())
     };
-    let encoded =
-        kv.get("value")
-            .and_then(Value::as_str)
-            .ok_or(CoordinationError::InvalidResponse(
-                "missing transaction value",
-            ))?;
-    BASE64
-        .decode(encoded)
-        .map(Some)
-        .map_err(|_| CoordinationError::InvalidResponse("invalid transaction value"))
+    match tokio::time::timeout(RELEASE_TIMEOUT, release).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(reason = %error, "could not release Kubernetes Lease during shutdown");
+        }
+        Err(_) => tracing::warn!("Kubernetes Lease release exceeded shutdown bound"),
+    }
 }
 
-fn cluster_marker_key(logical_cluster: &str) -> Vec<u8> {
-    format!("/pgshard/v1/clusters/{logical_cluster}/identity").into_bytes()
+trait LeaseStore: Send + Sync {
+    async fn get(&self) -> Result<Lease, CoordinationError>;
+    async fn replace(&self, lease: &Lease) -> Result<Lease, CoordinationError>;
 }
 
-fn cluster_marker_value(logical_cluster: &str, cluster_uid: &str) -> Vec<u8> {
-    format!("pgshard-orchestrator-coordination-v1\0{logical_cluster}\0{cluster_uid}").into_bytes()
+struct KubernetesLeaseStore {
+    api: Api<Lease>,
+    name: String,
+    request_timeout: Duration,
 }
 
-fn session_key(identity: &OrchestratorIdentity, cluster_uid: &str) -> Vec<u8> {
-    format!(
-        "/pgshard/v1/clusters/{}/incarnations/{cluster_uid}/orchestrators/{}",
-        identity.cluster_id, identity.orchestrator_id,
-    )
-    .into_bytes()
+impl KubernetesLeaseStore {
+    fn new(config: &CoordinationConfig) -> Result<Self, CoordinationError> {
+        let mut client_config = Config::incluster()
+            .map_err(|error| CoordinationError::InClusterConfiguration(error.to_string()))?;
+        client_config.connect_timeout = Some(config.request_timeout);
+        client_config.read_timeout = Some(config.request_timeout);
+        client_config.write_timeout = Some(config.request_timeout);
+        client_config.default_retry = false;
+        let client = Client::try_from(client_config)
+            .map_err(|error| CoordinationError::KubernetesClient(error.to_string()))?;
+        Ok(Self {
+            api: Api::namespaced(client, &config.namespace),
+            name: config.lease_name.clone(),
+            request_timeout: config.request_timeout,
+        })
+    }
 }
 
-fn session_value(identity: &OrchestratorIdentity, cluster_uid: &str, incarnation: Uuid) -> Vec<u8> {
-    format!(
-        "pgshard-orchestrator-incarnation-v1\0{}\0{}\0{cluster_uid}\0{}\0{}\0{}",
-        identity.cluster_id, identity.orchestrator_id, incarnation, VERSION, GIT_SHA,
-    )
-    .into_bytes()
+impl LeaseStore for KubernetesLeaseStore {
+    async fn get(&self) -> Result<Lease, CoordinationError> {
+        match tokio::time::timeout(self.request_timeout, self.api.get(&self.name)).await {
+            Ok(Ok(lease)) => Ok(lease),
+            Ok(Err(source)) => Err(CoordinationError::Kubernetes {
+                operation: "read Lease",
+                source: Box::new(source),
+            }),
+            Err(_) => Err(CoordinationError::RequestTimedOut("read Lease")),
+        }
+    }
+
+    async fn replace(&self, lease: &Lease) -> Result<Lease, CoordinationError> {
+        match tokio::time::timeout(
+            self.request_timeout,
+            self.api.replace(&self.name, &PostParams::default(), lease),
+        )
+        .await
+        {
+            Ok(Ok(updated)) => Ok(updated),
+            Ok(Err(source)) => Err(CoordinationError::Kubernetes {
+                operation: "replace Lease",
+                source: Box::new(source),
+            }),
+            Err(_) => Err(CoordinationError::RequestTimedOut("replace Lease")),
+        }
+    }
 }
 
 fn stopping(shutdown: &watch::Receiver<bool>) -> bool {
     *shutdown.borrow()
-}
-
-async fn run_or_stop<T>(
-    shutdown: &mut watch::Receiver<bool>,
-    future: impl Future<Output = T>,
-) -> Option<T> {
-    if stopping(shutdown) {
-        return None;
-    }
-    tokio::select! {
-        biased;
-        () = wait_for_stop(shutdown) => None,
-        value = future => Some(value),
-    }
-}
-
-async fn wait_for_stop(shutdown: &mut watch::Receiver<bool>) {
-    while !stopping(shutdown) {
-        if shutdown.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
-async fn retire_lease(gateway: &mut EtcdGateway, lease_id: Option<i64>) {
-    let Some(lease_id) = lease_id else {
-        return;
-    };
-    match tokio::time::timeout(REVOKE_TIMEOUT, gateway.revoke(lease_id)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::debug!(%error, lease_id, "best-effort etcd lease revoke failed");
-        }
-        Err(_) => {
-            tracing::debug!(lease_id, "best-effort etcd lease revoke timed out");
-        }
-    }
 }
 
 async fn wait_or_stop(shutdown: &mut watch::Receiver<bool>, duration: Duration) -> bool {
@@ -846,250 +548,322 @@ async fn wait_or_stop(shutdown: &mut watch::Receiver<bool>, duration: Duration) 
     }
     tokio::select! {
         () = tokio::time::sleep(duration) => false,
-        changed = shutdown.changed() => changed.is_err() || stopping(shutdown),
+        result = shutdown.changed() => result.is_err() || stopping(shutdown),
     }
 }
 
+/// Kubernetes Lease coordination failure.
 #[derive(Debug, Error)]
-enum EndpointError {
-    #[error("invalid endpoint URI")]
-    InvalidUri,
-    #[error("invalid HTTP request")]
-    InvalidRequest,
-    #[error("request timed out")]
-    Timeout,
-    #[error("transport failed")]
-    Transport,
-    #[error("response body failed or exceeded its bound")]
-    Body,
-    #[error("unexpected HTTP status {0}")]
-    Status(StatusCode),
-    #[error("response is not JSON")]
-    ContentType,
-    #[error("response JSON is invalid")]
-    Json,
-}
-
-/// Coordination setup, transport, or evidence failure.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CoordinationError {
-    /// Standalone settings do not satisfy the bounded lease timing contract.
-    #[error("invalid orchestrator coordination settings")]
+    /// Standalone configuration bypassed validated bounds.
+    #[error("invalid Kubernetes Lease coordination settings")]
     InvalidSettings,
-    /// No configured endpoint completed a bounded v3 gateway request.
-    #[error("all etcd coordination endpoints are unavailable")]
-    GatewayUnavailable,
-    /// Another process still owns the same operator-assigned identity.
-    #[error("the orchestrator identity already has a live etcd incarnation")]
-    SessionOwned,
-    /// The lease expired or did not renew to its configured safe TTL.
-    #[error("the etcd coordination lease is expired or under-length")]
-    LeaseExpired,
-    /// The linearizable ownership proof no longer binds the expected marker,
-    /// process token, and lease.
-    #[error("the orchestrator incarnation lost its exact etcd session evidence")]
-    SessionEvidenceLost,
-    /// A persistent marker belongs to another logical cluster contract.
-    #[error("the persistent etcd cluster marker conflicts with this pgshard cluster")]
-    ClusterMarkerConflict,
-    /// Configured endpoints changed etcd cluster identity within one process.
-    #[error("the configured etcd endpoints disagree on cluster identity")]
-    ClusterIdentityChanged,
-    /// A sequential response moved backward in the pinned etcd revision.
-    #[error("the pinned etcd revision regressed")]
-    RevisionRegressed,
-    /// The response omitted or malformed required bounded evidence.
-    #[error("invalid etcd gateway response: {0}")]
-    InvalidResponse(&'static str),
-    /// The in-process readiness guard rejected cluster or revision evidence.
-    #[error("orchestrator state rejected coordination evidence")]
+    /// The in-cluster service-account configuration is unavailable.
+    #[error("in-cluster Kubernetes configuration is unavailable: {0}")]
+    InClusterConfiguration(String),
+    /// The authenticated Kubernetes client could not be constructed.
+    #[error("Kubernetes client initialization failed: {0}")]
+    KubernetesClient(String),
+    /// A bounded API request exceeded its deadline.
+    #[error("Kubernetes API request timed out while attempting to {0}")]
+    RequestTimedOut(&'static str),
+    /// Kubernetes rejected or could not serve one API request.
+    #[error("Kubernetes API could not {operation}: {source}")]
+    Kubernetes {
+        /// Bounded operation name.
+        operation: &'static str,
+        /// Typed client failure.
+        #[source]
+        source: Box<kube::Error>,
+    },
+    /// The Lease name, namespace, UID, resource version, or lifecycle is invalid.
+    #[error("Kubernetes Lease API identity does not match the configured object")]
+    LeaseIdentityMismatch,
+    /// The Lease is not controlled by the exact `PgShardCluster` UID.
+    #[error("Kubernetes Lease is not owned by the configured PgShardCluster UID")]
+    LeaseOwnershipMismatch,
+    /// The Lease spec cannot support safe local observation.
+    #[error("Kubernetes Lease has an invalid holder, duration, renewal, or transition record")]
+    InvalidLeaseSpec,
+    /// Coordinated leader-election fields would change the ownership protocol.
+    #[error("Kubernetes coordinated leader-election fields are not supported")]
+    UnsupportedCoordinatedElection,
+    /// The transition counter cannot advance without wrapping.
+    #[error("Kubernetes Lease transition counter is exhausted")]
+    LeaseTransitionOverflow,
+    /// The API response contradicted the exact resource-version write.
+    #[error("Kubernetes Lease update response rejected local coordination evidence")]
     StateEvidenceRejected,
 }
 
 impl CoordinationError {
-    const fn is_permanent(&self) -> bool {
-        !matches!(
-            self,
-            Self::GatewayUnavailable
-                | Self::SessionOwned
-                | Self::LeaseExpired
-                | Self::SessionEvidenceLost
-        )
+    fn is_permanent(&self) -> bool {
+        match self {
+            Self::Kubernetes { source, .. } => matches!(
+                source.as_ref(),
+                kube::Error::Api(status) if matches!(status.code, 400 | 401 | 403 | 405 | 422)
+            ),
+            Self::RequestTimedOut(_) => false,
+            Self::InvalidSettings
+            | Self::InClusterConfiguration(_)
+            | Self::KubernetesClient(_)
+            | Self::LeaseIdentityMismatch
+            | Self::LeaseOwnershipMismatch
+            | Self::InvalidLeaseSpec
+            | Self::UnsupportedCoordinatedElection
+            | Self::LeaseTransitionOverflow
+            | Self::StateEvidenceRejected => true,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
+
     use super::*;
-    use tokio::io::AsyncWriteExt as _;
 
-    fn identity() -> OrchestratorIdentity {
-        OrchestratorIdentity {
-            cluster_id: "cluster-1".to_owned(),
-            orchestrator_id: "orch-1".to_owned(),
+    fn config() -> CoordinationConfig {
+        CoordinationConfig::new(
+            "database".to_owned(),
+            "demo-orchestrator-leader".to_owned(),
+            OrchestratorIdentity {
+                cluster_id: "demo".to_owned(),
+                orchestrator_id: "demo-orchestrator-abc12".to_owned(),
+            },
+            "11111111-2222-3333-4444-555555555555".to_owned(),
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
+            Duration::from_secs(6),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid coordination config")
+    }
+
+    fn lease(config: &CoordinationConfig) -> Lease {
+        Lease {
+            metadata: ObjectMeta {
+                name: Some(config.lease_name.clone()),
+                namespace: Some(config.namespace.clone()),
+                uid: Some("lease-uid-1".to_owned()),
+                resource_version: Some("1".to_owned()),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: OWNER_API_VERSION.to_owned(),
+                    kind: OWNER_KIND.to_owned(),
+                    name: config.identity.cluster_id.clone(),
+                    uid: config.cluster_uid.clone(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                }]),
+                ..ObjectMeta::default()
+            },
+            spec: None,
+        }
+    }
+
+    struct MemoryStore {
+        lease: Mutex<Lease>,
+        normalize_renew_time: bool,
+    }
+
+    impl MemoryStore {
+        fn new(lease: Lease) -> Self {
+            Self {
+                lease: Mutex::new(lease),
+                normalize_renew_time: false,
+            }
+        }
+
+        fn normalizing_renew_time(lease: Lease) -> Self {
+            Self {
+                lease: Mutex::new(lease),
+                normalize_renew_time: true,
+            }
+        }
+    }
+
+    impl LeaseStore for MemoryStore {
+        async fn get(&self) -> Result<Lease, CoordinationError> {
+            Ok(self.lease.lock().expect("lock").clone())
+        }
+
+        async fn replace(&self, lease: &Lease) -> Result<Lease, CoordinationError> {
+            let mut current = self.lease.lock().expect("lock");
+            if current.metadata.resource_version != lease.metadata.resource_version {
+                return Err(CoordinationError::StateEvidenceRejected);
+            }
+            let next = current
+                .metadata
+                .resource_version
+                .as_deref()
+                .expect("resource version")
+                .parse::<u64>()
+                .expect("numeric test resource version")
+                + 1;
+            *current = lease.clone();
+            current.metadata.resource_version = Some(next.to_string());
+            if self.normalize_renew_time {
+                current
+                    .spec
+                    .as_mut()
+                    .expect("replacement has a spec")
+                    .renew_time = Some(MicroTime(
+                    "2026-01-01T00:00:00.123456Z"
+                        .parse()
+                        .expect("fixed Kubernetes MicroTime"),
+                ));
+            }
+            Ok(current.clone())
         }
     }
 
     #[test]
-    fn session_paths_and_values_are_domain_separated() {
-        assert_eq!(
-            cluster_marker_key("cluster-1"),
-            b"/pgshard/v1/clusters/cluster-1/identity"
-        );
-        assert_eq!(
-            cluster_marker_value("cluster-1", "cluster-uid"),
-            b"pgshard-orchestrator-coordination-v1\0cluster-1\0cluster-uid"
-        );
-        assert_eq!(
-            session_key(&identity(), "cluster-uid"),
-            b"/pgshard/v1/clusters/cluster-1/incarnations/cluster-uid/orchestrators/orch-1"
-        );
-        let value = session_value(&identity(), "cluster-uid", Uuid::nil());
-        assert!(
-            value.starts_with(
-                b"pgshard-orchestrator-incarnation-v1\0cluster-1\0orch-1\0cluster-uid\0"
-            )
-        );
-        assert!(!value.windows(2).any(|window| window == b"//"));
-    }
+    fn rejects_recreated_or_foreign_owned_lease() {
+        let config = config();
+        let mut candidate = lease(&config);
+        assert!(validate_lease(&candidate, &config).is_ok());
 
-    #[test]
-    fn transaction_range_requires_one_bounded_base64_value() {
-        let response = json!({
-            "responses": [{"response_range": {"kvs": [{"value": "dmFsdWU="}]}}]
-        });
-        assert_eq!(transaction_range_value(&response).expect("value"), b"value");
-        assert!(transaction_range_value(&json!({"responses": []})).is_err());
-        assert!(
-            transaction_range_value(&json!({
-                "responses": [{"response_range": {"kvs": []}}]
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn standalone_timing_preserves_two_thirds_of_the_lease() {
-        let endpoints = vec![
-            Url::parse("http://127.0.0.1:2379").expect("url"),
-            Url::parse("http://127.0.0.2:2379").expect("url"),
-            Url::parse("http://127.0.0.3:2379").expect("url"),
-        ];
-        assert!(
-            CoordinationConfig::new(
-                endpoints.clone(),
-                identity(),
-                "cluster-uid".to_owned(),
-                Duration::from_secs(15),
-                Duration::from_secs(1),
-            )
-            .is_ok()
-        );
+        candidate
+            .metadata
+            .owner_references
+            .as_mut()
+            .expect("owner references")[0]
+            .uid = "different".to_owned();
         assert!(matches!(
-            CoordinationConfig::new(
-                endpoints,
-                identity(),
-                "cluster-uid".to_owned(),
-                Duration::from_secs(6),
-                Duration::from_secs(1),
-            ),
-            Err(CoordinationError::InvalidSettings)
+            validate_lease(&candidate, &config),
+            Err(CoordinationError::LeaseOwnershipMismatch)
         ));
-
-        let ten_endpoints = (1..=10)
-            .map(|last_octet| {
-                Url::parse(&format!("http://127.0.0.{last_octet}:2379")).expect("url")
-            })
-            .collect();
+        candidate = lease(&config);
+        candidate.metadata.deletion_timestamp = Some(Time(Timestamp::now()));
         assert!(matches!(
-            CoordinationConfig::new(
-                ten_endpoints,
-                identity(),
-                "cluster-uid".to_owned(),
-                Duration::from_mins(5),
-                Duration::from_millis(100),
-            ),
-            Err(CoordinationError::InvalidSettings)
+            validate_lease(&candidate, &config),
+            Err(CoordinationError::LeaseIdentityMismatch)
         ));
-        for (ttl, timeout) in [
-            (Duration::new(15, 1), Duration::from_millis(100)),
-            (Duration::from_secs(15), Duration::from_micros(100_001)),
-        ] {
-            assert!(matches!(
-                CoordinationConfig::new(
-                    vec![Url::parse("http://127.0.0.1:2379").expect("url")],
-                    identity(),
-                    "cluster-uid".to_owned(),
-                    ttl,
-                    timeout,
-                ),
-                Err(CoordinationError::InvalidSettings)
-            ));
-        }
-    }
-
-    #[test]
-    fn lease_headers_pin_only_cluster_identity() {
-        let endpoint = Url::parse("http://127.0.0.1:2379").expect("url");
-        let mut gateway = EtcdGateway::new(&[endpoint], Duration::from_millis(100));
-        gateway.cluster_id = Some(7);
-        gateway.highest_revision = 10;
-
-        assert_eq!(
-            gateway
-                .observe_cluster_header(&json!({
-                    "header": {"cluster_id": "7", "revision": "1"}
-                }))
-                .expect("same etcd cluster"),
-            7
-        );
-        assert_eq!(gateway.highest_revision, 10);
-        assert!(matches!(
-            gateway.observe_cluster_header(&json!({
-                "header": {"cluster_id": "8", "revision": "11"}
-            })),
-            Err(CoordinationError::ClusterIdentityChanged)
-        ));
-    }
-
-    #[test]
-    fn verified_session_range_binds_key_value_and_lease() {
-        let key = BASE64.encode(b"session-key");
-        let value = BASE64.encode(b"session-token");
-        let response = json!({
-            "responses": [{"response_range": {"kvs": [{
-                "key": key,
-                "value": value,
-                "lease": "42"
-            }]}}]
-        });
-        validate_session_range(&response, &key, &value, 42).expect("exact evidence");
-        assert!(validate_session_range(&response, &key, &value, 43).is_err());
     }
 
     #[tokio::test]
-    async fn request_timeout_includes_a_stalled_response_body() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    async fn empty_lease_is_claimed_with_resource_version_cas() {
+        let config = config();
+        let store = MemoryStore::new(lease(&config));
+        let holder = config.holder_identity();
+        let observation = reconcile_once(&store, &config, &holder, &mut None)
             .await
-            .expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept request");
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n",
-                )
-                .await
-                .expect("write response headers");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        });
-        let endpoint = Url::parse(&format!("http://{address}")).expect("valid local test endpoint");
-        let gateway = EtcdGateway::new(&[endpoint], Duration::from_millis(50));
+            .expect("claim Lease");
+        assert!(observation.leader);
+        assert_eq!(observation.resource_version, "2");
+        let current = store.get().await.expect("read claimed Lease");
+        assert_eq!(
+            current
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.holder_identity.as_deref()),
+            Some(holder.as_str())
+        );
+        assert_eq!(
+            current
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.lease_transitions),
+            Some(1)
+        );
+    }
 
-        assert!(matches!(
-            gateway.post_one(0, "v3/kv/range", Vec::new()).await,
-            Err(EndpointError::Timeout)
-        ));
-        server.abort();
+    #[tokio::test]
+    async fn accepts_api_server_microtime_normalization_after_cas() {
+        let config = config();
+        let store = MemoryStore::normalizing_renew_time(lease(&config));
+        let holder = config.holder_identity();
+
+        let observation = reconcile_once(&store, &config, &holder, &mut None)
+            .await
+            .expect("accept normalized API response");
+
+        assert!(observation.leader);
+        assert_eq!(observation.resource_version, "2");
+    }
+
+    #[tokio::test]
+    async fn foreign_holder_requires_unchanged_local_observation_window() {
+        let config = config();
+        let mut occupied = lease(&config);
+        occupied.spec = Some(LeaseSpec {
+            holder_identity: Some("foreign/pod/process".to_owned()),
+            lease_duration_seconds: Some(1),
+            renew_time: Some(MicroTime(Timestamp::now())),
+            lease_transitions: Some(7),
+            ..LeaseSpec::default()
+        });
+        let store = MemoryStore::new(occupied);
+        let holder = config.holder_identity();
+        let mut observed = None;
+
+        let first = reconcile_once(&store, &config, &holder, &mut observed)
+            .await
+            .expect("observe foreign holder");
+        assert!(!first.leader);
+        observed.as_mut().expect("observation").unchanged_since = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("test Instant supports a five-second subtraction");
+        let second = reconcile_once(&store, &config, &holder, &mut observed)
+            .await
+            .expect("continue observing foreign holder");
+        assert!(!second.leader, "local six-second duration must be honored");
+
+        observed.as_mut().expect("observation").unchanged_since = Instant::now()
+            .checked_sub(Duration::from_secs(6))
+            .expect("test Instant supports a six-second subtraction");
+        let claimed = reconcile_once(&store, &config, &holder, &mut observed)
+            .await
+            .expect("claim expired foreign holder");
+        assert!(claimed.leader);
+    }
+
+    #[tokio::test]
+    async fn shutdown_release_clears_only_our_holder() {
+        let config = config();
+        let store = MemoryStore::new(lease(&config));
+        let holder = config.holder_identity();
+        reconcile_once(&store, &config, &holder, &mut None)
+            .await
+            .expect("claim Lease");
+        best_effort_release(&store, &config, &holder).await;
+        let released = store.get().await.expect("read released Lease");
+        let spec = released.spec.expect("released spec");
+        assert!(spec.holder_identity.is_none());
+        assert_eq!(
+            spec.lease_duration_seconds,
+            Some(RELEASED_LEASE_DURATION_SECONDS)
+        );
+    }
+
+    struct PendingStore;
+
+    impl LeaseStore for PendingStore {
+        async fn get(&self) -> Result<Lease, CoordinationError> {
+            std::future::pending().await
+        }
+
+        async fn replace(&self, _lease: &Lease) -> Result<Lease, CoordinationError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_stalled_api_operation() {
+        let config = config();
+        let state = OrchState::with_identity(config.identity.clone(), 15_000).expect("valid state");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let supervisor = tokio::spawn(async move {
+            supervise_with_store(&PendingStore, &config, state, shutdown_rx).await
+        });
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).expect("send shutdown");
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("bounded shutdown")
+            .expect("supervisor task")
+            .expect("clean shutdown");
     }
 }

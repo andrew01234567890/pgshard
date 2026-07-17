@@ -30,11 +30,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let coordination = CoordinationConfig::new(
-        config.etcd_endpoints,
+        config.lease_namespace,
+        config.lease_name,
         config.identity.clone(),
         config.cluster_uid,
-        config.etcd_session_ttl,
-        config.etcd_request_timeout,
+        config.pod_uid,
+        config.kubernetes_lease_duration,
+        config.kubernetes_lease_retry_period,
+        config.kubernetes_request_timeout,
     )?;
     let state = OrchState::with_identity(config.identity, config.lease_ttl_ms)?;
     tracing::info!(

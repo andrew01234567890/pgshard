@@ -22,9 +22,10 @@ API. The controller now reconciles the safe supporting-resource slice:
 - a status-only `PgShardRestore` controller that verifies a signed PostgreSQL
   18 backup manifest and rejects any explicit destination shard-count, hash,
   ordinal, or range mismatch before creating restore targets;
-- etcd, orchestrator, and pooler workload specifications, topology spread,
-  security contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
-  etcd ingress NetworkPolicy;
+- orchestrator and pooler workload specifications, topology spread, security
+  contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
+  operator-owned Kubernetes Lease with exact-name, namespace-scoped RBAC for
+  orchestrator leadership;
 - same-cluster-only PostgreSQL ingress on port 5432 for pooler and orchestrator
   Pods, with PostgreSQL-to-PostgreSQL traffic restricted to the same shard;
 - an internal pooler HTTP Service plus fail-closed readiness and independent
@@ -211,20 +212,22 @@ and general sharding remain unavailable. Multi-member topologies remain
 fail-closed. Backup execution and ServiceMonitor reconciliation also remain
 unimplemented. The ingress NetworkPolicies allow only selected
 same-cluster Pods. The pooler-to-`shardschema` path is TLS 1.3 plus SCRAM with
-required channel binding, but etcd client/peer and general PostgreSQL shard
-traffic still lack authenticated TLS; the independent
-`TransportSecurityReady=False` condition reports the remaining gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
-a bounded backend quota. Its process-owned data directory is a private child of
-the PVC mount, so permissive provisioner root modes do not expose etcd data or
-produce a startup permission warning. Before etcd starts, a non-root Rust init
-container replays a same-filesystem, crash-safe migration of an earlier
-`/var/lib/etcd/member` directory into that private child; ambiguous or
-symlinked layouts fail closed. This protects upgrades while the dedicated etcd
-workload remains transitional and does not make it part of the Milestone 1
-architecture. Its default image is digest-pinned and the Pod command
-selects that image contract's `/usr/local/bin/etcd` executable explicitly;
-custom `--etcd-image` values must provide the same path. Scale transitions
-retain those claims during scaling. On cluster deletion, both storage policies
+required channel binding, but general PostgreSQL shard traffic still lacks
+authenticated TLS; the independent `TransportSecurityReady=False` condition
+reports that remaining gap. Orchestrator coordination goes only through the
+Kubernetes API server using its TLS service-account path. The operator creates
+the empty Lease envelope and owns no runtime Lease spec fields. A dedicated
+ServiceAccount may only `get` and `update` that exact Lease name; pooler and
+PostgreSQL Pods receive no Kubernetes API token through this path. Durable
+topology and operation state stays in PostgreSQL rather than the Lease. During
+an upgrade from the retired development etcd layout, normal pruning first
+removes the old StatefulSet. Uncached API reads must then prove that controller
+and all three exact Pods absent before the operator validates and deletes only
+`data-<cluster>-etcd-{0,1,2}` with UID and resource-version preconditions. These
+claims held coordination state, never PostgreSQL data; any ownership, label,
+capacity, or storage-contract mismatch stops the migration without deleting the
+claim. On
+cluster deletion, both storage policies
 keep each live PostgreSQL PVC ownerless and independently protected, with its
 API-identified credential tombstone anchored back to that exact PVC. The
 finalizer first prunes every mounting controller, then resolves each possible
@@ -365,8 +368,8 @@ insufficient certificate lifetime fail closed. Cluster finalization deletes the
 exact intent-recorded Secret with UID and resource-version preconditions, then
 observes its absence before releasing the cluster finalizer. Unsupported HA topologies still
 select credential-free `bootstrap-unavailable` and create no PostgreSQL data
-plane. Override the defaults with `--orchestrator-image`,
-`--pooler-image`, `--etcd-image`, and `--postgresql-image` when concrete images
+plane. Override the defaults with `--orchestrator-image`, `--pooler-image`, and
+`--postgresql-image` when concrete images
 exist. The privileged `--postgresql-bootstrap-image` deliberately has no remote
 default and is required for the single-member slice. Non-development values
 must carry an immutable `@sha256:` digest. The exact local
@@ -450,17 +453,20 @@ kubectl get --namespace pgshard-development pgshardcluster development
 ```
 
 The sample proves only real manager reconciliation and fail-closed supporting
-processes. Each orchestrator Pod becomes ready only after a linearizable etcd
-transaction matches its cluster-UID marker, unique process token, and exact
-lease attachment after renewal; the pooler remains unready, application Services
+processes. Each orchestrator Pod becomes ready only after validating the exact
+operator-owned Kubernetes Lease through the API server. One process holds the
+Lease and reports `pgshard_orch_leader 1`; followers remain ready but never
+claim leadership. The pooler remains unready, application Services
 have no ready endpoints, no PostgreSQL workload is created, and the cluster
 reports `Ready=False` with `PostgreSQLHAUnavailable`. Orchestrator readiness is
 process-incarnation evidence only: durable operation records, shard-term
 authority, and automated failover are not implemented. The named backup PVC is
 only validated configuration; no backup job or repository is created.
-The manager end-to-end test also pauses reconciliation, removes etcd quorum,
-and proves the same orchestrator Pod incarnations lose and regain readiness
-without restarting.
+The manager end-to-end test also pauses reconciliation, deletes the Lease, and
+proves the same orchestrator Pod incarnations lose readiness without restarting.
+Because a recreated Lease has a new API UID, those processes stay fail closed;
+the test resumes reconciliation and performs a bounded orchestrator rollout
+before the replacement coordination universe becomes ready.
 Orchestrator `SIGTERM` clears readiness before cancellation, bounds best-effort
 lease revocation to one second and process drain to ten seconds, and runs under
 an explicit 30-second Pod termination grace.

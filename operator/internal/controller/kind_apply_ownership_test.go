@@ -14,8 +14,8 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -365,11 +365,11 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldConfiguration), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("unused old PostgreSQL configuration survived pruning: %v", err)
 	}
-	networkPolicy := &networkingv1.NetworkPolicy{}
-	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.EtcdSuffix}, networkPolicy); err != nil {
+	lease := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorLeaseSuffix}, lease); err != nil {
 		t.Fatal(err)
 	}
-	assertApplyOwner(t, networkPolicy)
+	assertApplyOwner(t, lease)
 	service := &corev1.Service{}
 	serviceKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + "-rw"}
 	if err := kubeClient.Get(ctx, serviceKey, service); err != nil {

@@ -17,7 +17,6 @@ RUN PGSHARD_BUILD_VERSION="${PGSHARD_BUILD_VERSION}" \
       --package pgshard-pooler && \
     install -D -m 0755 target/release/pgshard-agent /out/pgshard-agent && \
     install -D -m 0755 target/release/pgshard-orch /out/pgshard-orch && \
-    install -D -m 0755 target/release/pgshard-etcd-data-migrate /out/pgshard-etcd-data-migrate && \
     install -D -m 0755 target/release/pgshard-pooler /out/pgshard-pooler
 
 FROM build-base AS postgres-agent-build
@@ -47,7 +46,6 @@ ENTRYPOINT ["/usr/local/bin/pgshard-agent"]
 
 FROM runtime AS orchestrator
 COPY --from=build /out/pgshard-orch /usr/local/bin/pgshard-orch
-COPY --from=build /out/pgshard-etcd-data-migrate /usr/local/bin/pgshard-etcd-data-migrate
 ENTRYPOINT ["/usr/local/bin/pgshard-orch"]
 
 FROM runtime AS pooler

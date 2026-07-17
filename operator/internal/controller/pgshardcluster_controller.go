@@ -21,9 +21,11 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -56,6 +58,8 @@ const (
 	defaultPodFencingKeyData          = "hmac.key"
 	defaultPodFencingAnchorSecret     = "pgshard-webhook-ca"
 	defaultPodFencingAnchorAnnotation = "pgshard.io/pod-fencing-key-sha256"
+	legacyEtcdSuffix                  = "-etcd"
+	legacyEtcdPVCCount                = 3
 )
 
 // PgShardClusterReconciler owns safe supporting resources and single-member
@@ -76,7 +80,7 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
@@ -86,6 +90,8 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=list
 
 func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -249,6 +255,15 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "ReconcileFailed", fmt.Sprintf("owned resource reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	cleaningRetiredCoordinationStorage, err := r.cleanupRetiredEtcdStorage(ctx, cluster)
+	if err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "CoordinationMigrationFailed", fmt.Sprintf("retired etcd storage cleanup failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if cleaningRetiredCoordinationStorage {
+		statusErr := r.reportFailure(ctx, cluster, "CoordinationMigration", "removing retired etcd coordination storage after authoritative workload absence")
+		return ctrl.Result{RequeueAfter: retryDelay}, statusErr
+	}
 
 	available, message, err := r.supportingWorkloadsAvailable(ctx, cluster)
 	if err != nil {
@@ -273,6 +288,103 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		return ctrl.Result{RequeueAfter: bootstrapIntegrityInterval}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// cleanupRetiredEtcdStorage removes only the three fixed data claims created by
+// the pre-Lease control plane. The claims never held PostgreSQL data, but an
+// authoritative absence barrier is still required before deleting storage
+// that may be mounted by the retired StatefulSet.
+func (r *PgShardClusterReconciler) cleanupRetiredEtcdStorage(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	reader := r.authoritativeReader()
+	claims := make([]*corev1.PersistentVolumeClaim, 0, legacyEtcdPVCCount)
+	for ordinal := 0; ordinal < legacyEtcdPVCCount; ordinal++ {
+		claim := &corev1.PersistentVolumeClaim{}
+		name := fmt.Sprintf("data-%s%s-%d", cluster.Name, legacyEtcdSuffix, ordinal)
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, claim); apierrors.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			return false, fmt.Errorf("read retired etcd PVC %s: %w", name, err)
+		}
+		claims = append(claims, claim)
+	}
+	if len(claims) == 0 {
+		return false, nil
+	}
+	if r.APIReader == nil {
+		return false, fmt.Errorf("authoritative API reader is required before deleting retired etcd storage")
+	}
+
+	statefulSetName := cluster.Name + legacyEtcdSuffix
+	statefulSet := &appsv1.StatefulSet{}
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: statefulSetName}, statefulSet); err == nil {
+		if !metav1.IsControlledBy(statefulSet, cluster) {
+			return false, fmt.Errorf("StatefulSet %s blocks retired etcd storage cleanup because it is not controlled by PgShardCluster UID %s", statefulSetName, cluster.UID)
+		}
+		return true, nil
+	} else if !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("prove retired etcd StatefulSet %s absent: %w", statefulSetName, err)
+	}
+	for ordinal := 0; ordinal < legacyEtcdPVCCount; ordinal++ {
+		podName := fmt.Sprintf("%s-%d", statefulSetName, ordinal)
+		pod := &corev1.Pod{}
+		if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: podName}, pod); apierrors.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			return false, fmt.Errorf("prove retired etcd Pod %s absent: %w", podName, err)
+		}
+		owner := metav1.GetControllerOf(pod)
+		claimName := fmt.Sprintf("data-%s-%d", statefulSetName, ordinal)
+		if pod.Namespace != cluster.Namespace || pod.Labels[owned.ClusterLabel] != cluster.Name ||
+			pod.Labels[owned.ComponentLabel] != "etcd" || owner == nil ||
+			owner.APIVersion != appsv1.SchemeGroupVersion.String() || owner.Kind != "StatefulSet" ||
+			owner.Name != statefulSetName || owner.UID == "" || !podSpecReferencesPVC(pod.Spec, claimName) {
+			return false, fmt.Errorf("Pod %s blocks retired etcd storage cleanup because it does not match the legacy workload contract", podName)
+		}
+		return true, nil
+	}
+
+	for _, claim := range claims {
+		if err := validateRetiredEtcdPVC(claim, cluster); err != nil {
+			return false, err
+		}
+	}
+	for _, claim := range claims {
+		if claim.DeletionTimestamp != nil {
+			continue
+		}
+		uid := claim.UID
+		resourceVersion := claim.ResourceVersion
+		if err := r.Delete(ctx, claim, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("delete retired etcd PVC %s with UID %s: %w", claim.Name, claim.UID, err)
+		}
+	}
+	return true, nil
+}
+
+func validateRetiredEtcdPVC(claim *corev1.PersistentVolumeClaim, cluster *pgshardv1alpha1.PgShardCluster) error {
+	owner := metav1.GetControllerOf(claim)
+	if claim.Namespace != cluster.Namespace || claim.UID == "" || claim.ResourceVersion == "" ||
+		claim.Labels["app.kubernetes.io/name"] != "pgshard" ||
+		claim.Labels[owned.ManagedByLabel] != owned.ManagedByValue ||
+		claim.Labels[owned.InstanceLabel] != cluster.Name ||
+		claim.Labels[owned.ComponentLabel] != "etcd" ||
+		claim.Labels[owned.ClusterLabel] != cluster.Name ||
+		claim.Annotations[owned.ApplyOwnershipAnnotation] != owned.ApplyOwnershipVersion ||
+		len(claim.OwnerReferences) != 1 || owner == nil ||
+		owner.APIVersion != pgshardv1alpha1.GroupVersion.String() || owner.Kind != "PgShardCluster" ||
+		owner.Name != cluster.Name || owner.UID != cluster.UID || owner.BlockOwnerDeletion == nil || !*owner.BlockOwnerDeletion {
+		return fmt.Errorf("retired etcd PVC %s is not bound to the exact PgShardCluster API identity", claim.Name)
+	}
+	if len(claim.Spec.AccessModes) != 1 || claim.Spec.AccessModes[0] != corev1.ReadWriteOnce ||
+		claim.Spec.Selector != nil || claim.Spec.DataSource != nil || claim.Spec.DataSourceRef != nil ||
+		(claim.Spec.VolumeMode != nil && *claim.Spec.VolumeMode != corev1.PersistentVolumeFilesystem) {
+		return fmt.Errorf("retired etcd PVC %s has an unexpected storage contract", claim.Name)
+	}
+	requested, ok := claim.Spec.Resources.Requests[corev1.ResourceStorage]
+	if !ok || requested.Cmp(resource.MustParse("2Gi")) != 0 {
+		return fmt.Errorf("retired etcd PVC %s does not have the fixed legacy capacity", claim.Name)
+	}
+	return nil
 }
 
 func (r *PgShardClusterReconciler) verifyPostgreSQLPodFencingNamespace(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
@@ -1477,6 +1589,30 @@ func legacyAlignedObject(current, desired client.Object) (client.Object, error) 
 		got.Spec.Selector = maps.Clone(wanted.Spec.Selector)
 		got.Spec.Ports = ports
 		got.Spec.PublishNotReadyAddresses = wanted.Spec.PublishNotReadyAddresses
+	case *corev1.ServiceAccount:
+		got, ok := aligned.(*corev1.ServiceAccount)
+		if !ok {
+			return nil, fmt.Errorf("legacy object type %T does not match desired ServiceAccount", current)
+		}
+		got.AutomountServiceAccountToken = wanted.AutomountServiceAccountToken
+	case *rbacv1.Role:
+		got, ok := aligned.(*rbacv1.Role)
+		if !ok {
+			return nil, fmt.Errorf("legacy object type %T does not match desired Role", current)
+		}
+		got.Rules = append([]rbacv1.PolicyRule(nil), wanted.Rules...)
+	case *rbacv1.RoleBinding:
+		got, ok := aligned.(*rbacv1.RoleBinding)
+		if !ok {
+			return nil, fmt.Errorf("legacy object type %T does not match desired RoleBinding", current)
+		}
+		got.RoleRef = wanted.RoleRef
+		got.Subjects = append([]rbacv1.Subject(nil), wanted.Subjects...)
+	case *coordinationv1.Lease:
+		if _, ok := aligned.(*coordinationv1.Lease); !ok {
+			return nil, fmt.Errorf("legacy object type %T does not match desired Lease", current)
+		}
+		// Runtime Lease spec fields belong exclusively to orchestrator replicas.
 	case *appsv1.Deployment:
 		got, ok := aligned.(*appsv1.Deployment)
 		if !ok {
@@ -1777,6 +1913,14 @@ func objectGVK(object client.Object) (schema.GroupVersionKind, error) {
 		return corev1.SchemeGroupVersion.WithKind("ConfigMap"), nil
 	case *corev1.Service:
 		return corev1.SchemeGroupVersion.WithKind("Service"), nil
+	case *corev1.ServiceAccount:
+		return corev1.SchemeGroupVersion.WithKind("ServiceAccount"), nil
+	case *rbacv1.Role:
+		return rbacv1.SchemeGroupVersion.WithKind("Role"), nil
+	case *rbacv1.RoleBinding:
+		return rbacv1.SchemeGroupVersion.WithKind("RoleBinding"), nil
+	case *coordinationv1.Lease:
+		return coordinationv1.SchemeGroupVersion.WithKind("Lease"), nil
 	case *appsv1.Deployment:
 		return appsv1.SchemeGroupVersion.WithKind("Deployment"), nil
 	case *appsv1.StatefulSet:
@@ -2458,6 +2602,10 @@ func postgreSQLDataBootstrapIndexForPod(pod *corev1.Pod, cluster *pgshardv1alpha
 }
 
 func podSpecReferencesPostgreSQLDataPVC(spec corev1.PodSpec, pvcName string) bool {
+	return podSpecReferencesPVC(spec, pvcName)
+}
+
+func podSpecReferencesPVC(spec corev1.PodSpec, pvcName string) bool {
 	for _, volume := range spec.Volumes {
 		if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == pvcName {
 			return true
@@ -2524,6 +2672,10 @@ func (r *PgShardClusterReconciler) prune(ctx context.Context, cluster *pgshardv1
 	lists := []client.ObjectList{
 		&corev1.ConfigMapList{},
 		&corev1.ServiceList{},
+		&corev1.ServiceAccountList{},
+		&rbacv1.RoleList{},
+		&rbacv1.RoleBindingList{},
+		&coordinationv1.LeaseList{},
 		&appsv1.DeploymentList{},
 		&appsv1.StatefulSetList{},
 		&autoscalingv2.HorizontalPodAutoscalerList{},
@@ -2668,6 +2820,22 @@ func listObjects(list client.ObjectList) []client.Object {
 		for index := range list.Items {
 			result = append(result, &list.Items[index])
 		}
+	case *corev1.ServiceAccountList:
+		for index := range list.Items {
+			result = append(result, &list.Items[index])
+		}
+	case *rbacv1.RoleList:
+		for index := range list.Items {
+			result = append(result, &list.Items[index])
+		}
+	case *rbacv1.RoleBindingList:
+		for index := range list.Items {
+			result = append(result, &list.Items[index])
+		}
+	case *coordinationv1.LeaseList:
+		for index := range list.Items {
+			result = append(result, &list.Items[index])
+		}
 	case *corev1.PersistentVolumeClaimList:
 		for index := range list.Items {
 			result = append(result, &list.Items[index])
@@ -2701,9 +2869,12 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 	if r.APIReader != nil {
 		reader = r.APIReader
 	}
-	etcd := &appsv1.StatefulSet{}
-	if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.EtcdSuffix}, etcd); err != nil {
+	lease := &coordinationv1.Lease{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorLeaseSuffix}, lease); err != nil {
 		return false, "", err
+	}
+	if lease.DeletionTimestamp != nil || !metav1.IsControlledBy(lease, cluster) {
+		return false, "", fmt.Errorf("orchestrator Lease %s/%s is not controlled by PgShardCluster UID %s", lease.Namespace, lease.Name, cluster.UID)
 	}
 	orchestrator := &appsv1.Deployment{}
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorSuffix}, orchestrator); err != nil {
@@ -2714,10 +2885,6 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 		return false, "", err
 	}
 
-	etcdWanted := int32(0)
-	if etcd.Spec.Replicas != nil {
-		etcdWanted = *etcd.Spec.Replicas
-	}
 	orchestratorWanted := int32(0)
 	if orchestrator.Spec.Replicas != nil {
 		orchestratorWanted = *orchestrator.Spec.Replicas
@@ -2726,7 +2893,6 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 	if pooler.Spec.Replicas != nil && *pooler.Spec.Replicas > poolerWanted {
 		poolerWanted = *pooler.Spec.Replicas
 	}
-	etcdReady := workloadGenerationObserved(etcd.Generation, etcd.Status.ObservedGeneration) && etcd.Status.ReadyReplicas >= etcdWanted && etcd.Status.UpdatedReplicas >= etcdWanted
 	orchestratorReady := workloadGenerationObserved(orchestrator.Generation, orchestrator.Status.ObservedGeneration) && orchestrator.Status.AvailableReplicas >= orchestratorWanted && orchestrator.Status.UpdatedReplicas >= orchestratorWanted
 	poolerReady := workloadGenerationObserved(pooler.Generation, pooler.Status.ObservedGeneration) && pooler.Status.AvailableReplicas >= poolerWanted && pooler.Status.UpdatedReplicas >= poolerWanted
 	autoscalingReady := true
@@ -2740,8 +2906,8 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 		autoscalingReady = observed && hpaConditionTrue(hpa, autoscalingv2.AbleToScale) && hpaConditionTrue(hpa, autoscalingv2.ScalingActive)
 		autoscalingMessage = fmt.Sprintf("HPA active=%t", autoscalingReady)
 	}
-	message := fmt.Sprintf("etcd %d/%d, orchestrator %d/%d, pooler %d/%d replicas available; %s", etcd.Status.ReadyReplicas, etcdWanted, orchestrator.Status.AvailableReplicas, orchestratorWanted, pooler.Status.AvailableReplicas, poolerWanted, autoscalingMessage)
-	return etcdReady && orchestratorReady && poolerReady && autoscalingReady, message, nil
+	message := fmt.Sprintf("orchestrator Lease observed, orchestrator %d/%d, pooler %d/%d replicas available; %s", orchestrator.Status.AvailableReplicas, orchestratorWanted, pooler.Status.AvailableReplicas, poolerWanted, autoscalingMessage)
+	return orchestratorReady && poolerReady && autoscalingReady, message, nil
 }
 
 func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, string, string, error) {
@@ -2858,7 +3024,7 @@ func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *p
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: cluster.Generation,
 			Reason:             "TransportTLSUnavailable",
-			Message:            "etcd client/peer and PostgreSQL shard traffic lack authenticated TLS; ingress NetworkPolicies provide isolation only",
+			Message:            "PostgreSQL shard traffic lacks authenticated TLS; orchestrator coordination uses API-server TLS with namespace-scoped RBAC",
 		},
 	}
 	return r.updateStatus(ctx, cluster, cluster.Generation, phase, conditions)
@@ -2997,6 +3163,10 @@ func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error 
 		For(&pgshardv1alpha1.PgShardCluster{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.ServiceAccount{}).
+		Owns(&rbacv1.Role{}).
+		Owns(&rbacv1.RoleBinding{}).
+		Owns(&coordinationv1.Lease{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).

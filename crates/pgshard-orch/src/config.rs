@@ -20,14 +20,20 @@ pub struct OrchConfig {
     pub identity: OrchestratorIdentity,
     /// Immutable operator-assigned logical cluster incarnation.
     pub cluster_uid: String,
-    /// Default requested lease duration.
+    /// Immutable Kubernetes Pod incarnation.
+    pub pod_uid: String,
+    /// Namespace containing the operator-owned leadership Lease.
+    pub lease_namespace: String,
+    /// Name of the operator-owned leadership Lease.
+    pub lease_name: String,
+    /// Default requested operation-lease duration.
     pub lease_ttl_ms: u64,
-    /// Ordered, bounded etcd v3 HTTP gateway endpoints.
-    pub etcd_endpoints: Vec<Url>,
-    /// TTL of the renewable orchestrator-incarnation key.
-    pub etcd_session_ttl: Duration,
-    /// Per-endpoint coordination request timeout.
-    pub etcd_request_timeout: Duration,
+    /// Duration written into the Kubernetes leadership Lease.
+    pub kubernetes_lease_duration: Duration,
+    /// Candidate observation and retry cadence.
+    pub kubernetes_lease_retry_period: Duration,
+    /// Bound for one Kubernetes API request.
+    pub kubernetes_request_timeout: Duration,
     /// OpenTelemetry configuration placeholder.
     pub telemetry: TelemetryConfig,
 }
@@ -47,23 +53,38 @@ struct RawConfig {
     #[arg(long, env = "PGSHARD_ORCH_ID")]
     orchestrator_id: String,
 
+    #[arg(long, env = "PGSHARD_POD_UID")]
+    pod_uid: String,
+
+    #[arg(long, env = "PGSHARD_LEASE_NAMESPACE")]
+    lease_namespace: String,
+
+    #[arg(long, env = "PGSHARD_LEASE_NAME")]
+    lease_name: String,
+
     #[arg(long, env = "PGSHARD_LEASE_TTL_MS", default_value_t = 15_000)]
     lease_ttl_ms: u64,
 
     #[arg(
         long,
-        env = "PGSHARD_ETCD_ENDPOINTS",
-        required = true,
-        value_delimiter = ',',
-        num_args = 1..=9
+        env = "PGSHARD_KUBERNETES_LEASE_DURATION_SECONDS",
+        default_value_t = 15
     )]
-    etcd_endpoints: Vec<String>,
+    kubernetes_lease_duration_seconds: u64,
 
-    #[arg(long, env = "PGSHARD_ETCD_SESSION_TTL_SECONDS", default_value_t = 15)]
-    etcd_session_ttl_seconds: u64,
+    #[arg(
+        long,
+        env = "PGSHARD_KUBERNETES_LEASE_RETRY_MS",
+        default_value_t = 2_000
+    )]
+    kubernetes_lease_retry_ms: u64,
 
-    #[arg(long, env = "PGSHARD_ETCD_REQUEST_TIMEOUT_MS", default_value_t = 1_000)]
-    etcd_request_timeout_ms: u64,
+    #[arg(
+        long,
+        env = "PGSHARD_KUBERNETES_REQUEST_TIMEOUT_MS",
+        default_value_t = 1_000
+    )]
+    kubernetes_request_timeout_ms: u64,
 
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
@@ -90,31 +111,38 @@ impl OrchConfig {
         T: Into<OsString> + Clone,
     {
         let raw = RawConfig::try_parse_from(args)?;
-        validate_identifier("cluster ID", &raw.cluster_id)?;
-        validate_identifier("cluster UID", &raw.cluster_uid)?;
-        validate_identifier("orchestrator ID", &raw.orchestrator_id)?;
+        validate_dns_label("cluster ID", &raw.cluster_id)?;
+        validate_dns_label("orchestrator ID", &raw.orchestrator_id)?;
+        validate_dns_label("Lease namespace", &raw.lease_namespace)?;
+        validate_dns_label("Lease name", &raw.lease_name)?;
+        validate_uid("cluster UID", &raw.cluster_uid)?;
+        validate_uid("Pod UID", &raw.pod_uid)?;
         if !(1_000..=300_000).contains(&raw.lease_ttl_ms) {
             return Err(ConfigError::InvalidLeaseTtl(raw.lease_ttl_ms));
         }
-        if !(6..=300).contains(&raw.etcd_session_ttl_seconds) {
-            return Err(ConfigError::InvalidEtcdSessionTtl(
-                raw.etcd_session_ttl_seconds,
+        if !(6..=300).contains(&raw.kubernetes_lease_duration_seconds) {
+            return Err(ConfigError::InvalidKubernetesLeaseDuration(
+                raw.kubernetes_lease_duration_seconds,
             ));
         }
-        if !(100..=5_000).contains(&raw.etcd_request_timeout_ms) {
-            return Err(ConfigError::InvalidEtcdRequestTimeout(
-                raw.etcd_request_timeout_ms,
+        if !(100..=5_000).contains(&raw.kubernetes_request_timeout_ms) {
+            return Err(ConfigError::InvalidKubernetesRequestTimeout(
+                raw.kubernetes_request_timeout_ms,
             ));
         }
-        let etcd_endpoints = validate_etcd_endpoints(raw.etcd_endpoints)?;
-        let full_cycle_ms = raw
-            .etcd_request_timeout_ms
-            .saturating_mul(u64::try_from(etcd_endpoints.len()).unwrap_or(u64::MAX));
-        if full_cycle_ms > raw.etcd_session_ttl_seconds.saturating_mul(1_000) / 3 {
-            return Err(ConfigError::UnsafeEtcdTiming {
-                endpoint_count: etcd_endpoints.len(),
-                request_timeout_ms: raw.etcd_request_timeout_ms,
-                session_ttl_seconds: raw.etcd_session_ttl_seconds,
+        if !(100..=30_000).contains(&raw.kubernetes_lease_retry_ms) {
+            return Err(ConfigError::InvalidKubernetesLeaseRetry(
+                raw.kubernetes_lease_retry_ms,
+            ));
+        }
+        let lease_duration_ms = raw.kubernetes_lease_duration_seconds.saturating_mul(1_000);
+        if raw.kubernetes_request_timeout_ms > lease_duration_ms / 3
+            || raw.kubernetes_lease_retry_ms > lease_duration_ms / 3
+        {
+            return Err(ConfigError::UnsafeKubernetesLeaseTiming {
+                request_timeout_ms: raw.kubernetes_request_timeout_ms,
+                retry_period_ms: raw.kubernetes_lease_retry_ms,
+                lease_duration_seconds: raw.kubernetes_lease_duration_seconds,
             });
         }
         let otlp_endpoint = raw
@@ -129,53 +157,49 @@ impl OrchConfig {
                 orchestrator_id: raw.orchestrator_id,
             },
             cluster_uid: raw.cluster_uid,
+            pod_uid: raw.pod_uid,
+            lease_namespace: raw.lease_namespace,
+            lease_name: raw.lease_name,
             lease_ttl_ms: raw.lease_ttl_ms,
-            etcd_endpoints,
-            etcd_session_ttl: Duration::from_secs(raw.etcd_session_ttl_seconds),
-            etcd_request_timeout: Duration::from_millis(raw.etcd_request_timeout_ms),
+            kubernetes_lease_duration: Duration::from_secs(raw.kubernetes_lease_duration_seconds),
+            kubernetes_lease_retry_period: Duration::from_millis(raw.kubernetes_lease_retry_ms),
+            kubernetes_request_timeout: Duration::from_millis(raw.kubernetes_request_timeout_ms),
             telemetry: TelemetryConfig { otlp_endpoint },
         })
     }
 }
 
-fn validate_etcd_endpoints(values: Vec<String>) -> Result<Vec<Url>, ConfigError> {
-    let mut endpoints = Vec::with_capacity(values.len());
-    for value in values {
-        if value.trim() != value {
-            return Err(ConfigError::UnsafeEtcdEndpoint(value));
-        }
-        let endpoint = Url::parse(&value)
-            .map_err(|source| ConfigError::InvalidEtcdEndpoint { value, source })?;
-        if endpoint.scheme() != "http"
-            || endpoint.host_str().is_none()
-            || endpoint.port().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.path() != "/"
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(ConfigError::UnsafeEtcdEndpoint(endpoint.into()));
-        }
-        if endpoints.contains(&endpoint) {
-            return Err(ConfigError::DuplicateEtcdEndpoint(endpoint.into()));
-        }
-        endpoints.push(endpoint);
+fn validate_dns_label(name: &'static str, value: &str) -> Result<(), ConfigError> {
+    let valid = !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if !valid {
+        return Err(ConfigError::InvalidDnsLabel {
+            name,
+            value: value.to_owned(),
+        });
     }
-    if endpoints.is_empty() {
-        return Err(ConfigError::EtcdEndpointsMissing);
-    }
-    Ok(endpoints)
+    Ok(())
 }
 
-fn validate_identifier(name: &'static str, value: &str) -> Result<(), ConfigError> {
+fn validate_uid(name: &'static str, value: &str) -> Result<(), ConfigError> {
     if value.is_empty()
-        || value.len() > 63
+        || value.len() > 128
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
-        return Err(ConfigError::InvalidIdentifier {
+        return Err(ConfigError::InvalidUid {
             name,
             value: value.to_owned(),
         });
@@ -209,53 +233,45 @@ pub enum ConfigError {
     /// Command-line parsing failed.
     #[error(transparent)]
     Arguments(#[from] clap::Error),
-    /// An identifier is empty, too long, or contains unsafe characters.
-    #[error("{name} {value:?} must be 1-63 ASCII letters, digits, '.', '_', or '-'")]
-    InvalidIdentifier {
+    /// A Kubernetes object name is not a DNS label.
+    #[error("{name} {value:?} must be a 1-63 byte lowercase DNS label")]
+    InvalidDnsLabel {
         /// Identifier field.
         name: &'static str,
         /// Rejected value.
         value: String,
     },
-    /// Lease TTL is outside the bounded safety range.
-    #[error("lease TTL {0} ms must be between 1000 and 300000 ms")]
-    InvalidLeaseTtl(u64),
-    /// No coordination endpoint was supplied.
-    #[error("at least one etcd endpoint is required")]
-    EtcdEndpointsMissing,
-    /// An etcd endpoint is not a URL.
-    #[error("invalid etcd endpoint {value:?}: {source}")]
-    InvalidEtcdEndpoint {
+    /// An API UID is empty, oversized, or contains unsafe characters.
+    #[error("{name} {value:?} must be a bounded Kubernetes UID")]
+    InvalidUid {
+        /// UID field.
+        name: &'static str,
         /// Rejected value.
         value: String,
-        /// URL parsing error.
-        source: url::ParseError,
     },
-    /// An endpoint escapes the current in-cluster plaintext boundary.
+    /// Operation lease TTL is outside the bounded safety range.
+    #[error("lease TTL {0} ms must be between 1000 and 300000 ms")]
+    InvalidLeaseTtl(u64),
+    /// Kubernetes leadership Lease duration is outside the bounded range.
+    #[error("Kubernetes Lease duration {0} seconds must be between 6 and 300")]
+    InvalidKubernetesLeaseDuration(u64),
+    /// One Kubernetes API request is outside the supported bound.
+    #[error("Kubernetes request timeout {0} ms must be between 100 and 5000")]
+    InvalidKubernetesRequestTimeout(u64),
+    /// Candidate polling is outside the supported bound.
+    #[error("Kubernetes Lease retry period {0} ms must be between 100 and 30000")]
+    InvalidKubernetesLeaseRetry(u64),
+    /// Request and retry timing cannot safely fit within the Lease duration.
     #[error(
-        "etcd endpoint {0:?} must be an explicit-port HTTP URL without credentials, path, query, or fragment"
+        "Kubernetes request timeout {request_timeout_ms} ms and retry period {retry_period_ms} ms must each fit within one third of the {lease_duration_seconds} second Lease duration"
     )]
-    UnsafeEtcdEndpoint(String),
-    /// Repeating an endpoint does not provide an independent failover target.
-    #[error("duplicate etcd endpoint {0:?}")]
-    DuplicateEtcdEndpoint(String),
-    /// Session TTL cannot safely cover bounded failover.
-    #[error("etcd session TTL {0} seconds must be between 6 and 300")]
-    InvalidEtcdSessionTtl(u64),
-    /// One endpoint attempt is outside the supported bound.
-    #[error("etcd request timeout {0} ms must be between 100 and 5000")]
-    InvalidEtcdRequestTimeout(u64),
-    /// Trying every endpoint could consume too much of the session TTL.
-    #[error(
-        "{endpoint_count} etcd endpoints at {request_timeout_ms} ms each exceed one third of the {session_ttl_seconds} second session TTL"
-    )]
-    UnsafeEtcdTiming {
-        /// Number of configured endpoints.
-        endpoint_count: usize,
-        /// Per-endpoint request timeout.
+    UnsafeKubernetesLeaseTiming {
+        /// Per-request timeout.
         request_timeout_ms: u64,
-        /// Session TTL.
-        session_ttl_seconds: u64,
+        /// Candidate retry period.
+        retry_period_ms: u64,
+        /// Leadership Lease duration.
+        lease_duration_seconds: u64,
     },
     /// Endpoint URL parsing failed.
     #[error("invalid OTLP endpoint {value:?}: {source}")]
@@ -282,62 +298,64 @@ mod tests {
             "--cluster-uid",
             "11111111-2222-3333-4444-555555555555",
             "--orchestrator-id",
-            "orch-0",
-            "--etcd-endpoints",
-            "http://127.0.0.1:2379",
+            "cluster-1-orchestrator-abc12",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--lease-namespace",
+            "database",
+            "--lease-name",
+            "cluster-1-orchestrator-leader",
         ]
     }
 
     #[test]
-    fn accepts_bounded_default_ttl() {
+    fn accepts_bounded_kubernetes_lease_defaults() {
         let config = OrchConfig::try_parse_from(args()).expect("valid config");
         assert_eq!(config.lease_ttl_ms, 15_000);
+        assert_eq!(config.kubernetes_lease_duration, Duration::from_secs(15));
+        assert_eq!(config.kubernetes_lease_retry_period, Duration::from_secs(2));
+        assert_eq!(config.kubernetes_request_timeout, Duration::from_secs(1));
     }
 
     #[test]
-    fn rejects_dangerously_short_ttl() {
-        let mut args = args();
-        args.extend(["--lease-ttl-ms", "10"]);
+    fn rejects_dangerously_short_operation_ttl() {
+        let mut values = args();
+        values.extend(["--lease-ttl-ms", "10"]);
         assert!(matches!(
-            OrchConfig::try_parse_from(args),
+            OrchConfig::try_parse_from(values),
             Err(ConfigError::InvalidLeaseTtl(10))
         ));
     }
 
     #[test]
     fn rejects_unknown_arguments() {
-        let mut args = args();
-        args.push("--unsafe-promote");
+        let mut values = args();
+        values.push("--unsafe-promote");
         assert!(matches!(
-            OrchConfig::try_parse_from(args),
+            OrchConfig::try_parse_from(values),
             Err(ConfigError::Arguments(_))
         ));
     }
 
     #[test]
-    fn parses_bounded_distinct_etcd_endpoints() {
-        let mut values = args();
-        let last = values.len() - 1;
-        values[last] = "http://127.0.0.1:2379,http://127.0.0.2:2379";
-        let config = OrchConfig::try_parse_from(values).expect("valid endpoints");
-        assert_eq!(config.etcd_endpoints.len(), 2);
-        assert_eq!(config.etcd_session_ttl, Duration::from_secs(15));
-        assert_eq!(config.etcd_request_timeout, Duration::from_secs(1));
-    }
-
-    #[test]
-    fn rejects_unsafe_or_duplicate_etcd_endpoints() {
-        for endpoints in [
-            "https://127.0.0.1:2379",
-            "http://user@127.0.0.1:2379",
-            "http://127.0.0.1:2379/path",
-            "http://127.0.0.1:2379?query=value",
-            "http://127.0.0.1:2379,http://127.0.0.1:2379",
+    fn rejects_non_dns_object_names_and_missing_uids() {
+        for (flag, value) in [
+            ("--cluster-id", "Cluster_1"),
+            ("--lease-namespace", "database."),
+            ("--lease-name", "-leader"),
+            ("--pod-uid", ""),
         ] {
             let mut values = args();
-            let last = values.len() - 1;
-            values[last] = endpoints;
-            assert!(OrchConfig::try_parse_from(values).is_err(), "{endpoints}");
+            let index = values
+                .iter()
+                .position(|argument| *argument == flag)
+                .unwrap()
+                + 1;
+            values[index] = value;
+            assert!(
+                OrchConfig::try_parse_from(values).is_err(),
+                "{flag}={value}"
+            );
         }
     }
 
@@ -345,16 +363,14 @@ mod tests {
     fn rejects_coordination_timing_that_can_exhaust_the_lease() {
         let mut values = args();
         values.extend([
-            "--etcd-session-ttl-seconds",
+            "--kubernetes-lease-duration-seconds",
             "6",
-            "--etcd-request-timeout-ms",
-            "1000",
+            "--kubernetes-request-timeout-ms",
+            "3000",
         ]);
-        let last = values.len() - 5;
-        values[last] = "http://127.0.0.1:2379,http://127.0.0.2:2379,http://127.0.0.3:2379";
         assert!(matches!(
             OrchConfig::try_parse_from(values),
-            Err(ConfigError::UnsafeEtcdTiming { .. })
+            Err(ConfigError::UnsafeKubernetesLeaseTiming { .. })
         ));
     }
 

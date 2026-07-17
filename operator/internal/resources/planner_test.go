@@ -16,9 +16,11 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -1789,49 +1791,26 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	etcd := object[*appsv1.StatefulSet](t, plan, "demo-etcd")
-	if *etcd.Spec.Replicas != 3 || etcd.Spec.ServiceName != "demo-etcd" || len(etcd.Spec.VolumeClaimTemplates) != 1 {
-		t.Fatalf("etcd spec = %#v", etcd.Spec)
+	serviceAccount := object[*corev1.ServiceAccount](t, plan, "demo-orchestrator")
+	if serviceAccount.AutomountServiceAccountToken == nil || *serviceAccount.AutomountServiceAccountToken {
+		t.Fatalf("orchestrator ServiceAccount token policy = %#v", serviceAccount.AutomountServiceAccountToken)
 	}
-	if !containsString(etcd.Spec.Template.Spec.Containers[0].Args, "--quota-backend-bytes=805306368") || !containsString(etcd.Spec.Template.Spec.Containers[0].Args, "--max-wals=2") {
-		t.Fatalf("etcd quota/retention does not leave storage margin: %#v", etcd.Spec.Template.Spec.Containers[0].Args)
+	role := object[*rbacv1.Role](t, plan, "demo-orchestrator")
+	if len(role.Rules) != 1 || !reflect.DeepEqual(role.Rules[0].APIGroups, []string{"coordination.k8s.io"}) || !reflect.DeepEqual(role.Rules[0].Resources, []string{"leases"}) || !reflect.DeepEqual(role.Rules[0].ResourceNames, []string{"demo-orch-lease"}) || !reflect.DeepEqual(role.Rules[0].Verbs, []string{"get", "update"}) {
+		t.Fatalf("orchestrator Lease Role is broader than required: %#v", role.Rules)
 	}
-	claim := etcd.Spec.VolumeClaimTemplates[0]
-	if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != storageClass || claim.Spec.Resources.Requests.Storage().String() != "2Gi" {
-		t.Fatalf("etcd PVC = %#v", claim.Spec)
+	roleBinding := object[*rbacv1.RoleBinding](t, plan, "demo-orchestrator")
+	if roleBinding.RoleRef.APIGroup != rbacv1.GroupName || roleBinding.RoleRef.Kind != "Role" || roleBinding.RoleRef.Name != role.Name || len(roleBinding.Subjects) != 1 || roleBinding.Subjects[0].Kind != "ServiceAccount" || roleBinding.Subjects[0].Name != serviceAccount.Name || roleBinding.Subjects[0].Namespace != cluster.Namespace {
+		t.Fatalf("orchestrator Lease RoleBinding = %#v", roleBinding)
 	}
-	if claim.Namespace != "" || !metav1.IsControlledBy(&claim, cluster) {
-		t.Fatalf("etcd PVC template is not directly UID-owned by the cluster: %#v", claim.ObjectMeta)
+	lease := object[*coordinationv1.Lease](t, plan, "demo-orch-lease")
+	if !metav1.IsControlledBy(lease, cluster) || lease.Spec.HolderIdentity != nil || lease.Spec.RenewTime != nil || lease.Spec.LeaseDurationSeconds != nil {
+		t.Fatalf("operator must own only the empty Lease envelope: %#v", lease)
 	}
-	if etcd.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType || etcd.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
-		t.Fatalf("etcd PVC retention is destructive: %#v", etcd.Spec.PersistentVolumeClaimRetentionPolicy)
-	}
-	if etcd.Spec.Template.Spec.SecurityContext == nil || etcd.Spec.Template.Spec.SecurityContext.SeccompProfile == nil || len(etcd.Spec.Template.Spec.TopologySpreadConstraints) != 2 {
-		t.Fatalf("etcd pod hardening/spread is incomplete: %#v", etcd.Spec.Template.Spec)
-	}
-	etcdContainer := etcd.Spec.Template.Spec.Containers[0]
-	if len(etcdContainer.Command) != 1 || etcdContainer.Command[0] != etcdExecutable || etcdContainer.Image != defaultEtcdImage || etcdContainer.ImagePullPolicy != corev1.PullIfNotPresent {
-		t.Fatalf("etcd executable/image contract = %#v", etcdContainer)
-	}
-	etcdArgs := strings.Join(etcdContainer.Args, "\n")
-	if !strings.Contains(etcdArgs, "--enable-grpc-gateway=true") {
-		t.Fatalf("etcd v3 HTTP gateway is not pinned on: %#v", etcdContainer.Args)
-	}
-	if !strings.Contains(etcdArgs, "--data-dir=/var/lib/etcd/data") || len(etcdContainer.VolumeMounts) != 1 || etcdContainer.VolumeMounts[0].MountPath != "/var/lib/etcd" {
-		t.Fatalf("etcd data directory does not isolate its private child inside the PVC: %#v", etcdContainer)
-	}
-	if len(etcd.Spec.Template.Spec.InitContainers) != 1 {
-		t.Fatalf("etcd data migration init containers = %#v", etcd.Spec.Template.Spec.InitContainers)
-	}
-	migration := etcd.Spec.Template.Spec.InitContainers[0]
-	if migration.Name != "prepare-data" || migration.Image != DefaultImages().Orchestrator || len(migration.Command) != 1 || migration.Command[0] != etcdDataMigrationExecutable || len(migration.VolumeMounts) != 1 || migration.VolumeMounts[0].MountPath != "/var/lib/etcd" {
-		t.Fatalf("etcd data migration contract = %#v", migration)
-	}
-	if migration.SecurityContext == nil || migration.SecurityContext.RunAsUser == nil || *migration.SecurityContext.RunAsUser != 10001 || migration.SecurityContext.ReadOnlyRootFilesystem == nil || !*migration.SecurityContext.ReadOnlyRootFilesystem || migration.SecurityContext.AllowPrivilegeEscalation == nil || *migration.SecurityContext.AllowPrivilegeEscalation || migration.SecurityContext.Capabilities == nil || len(migration.SecurityContext.Capabilities.Drop) != 1 || migration.SecurityContext.Capabilities.Drop[0] != "ALL" {
-		t.Fatalf("etcd data migration hardening = %#v", migration.SecurityContext)
-	}
-	if etcdContainer.ReadinessProbe.FailureThreshold != 1 || etcdContainer.LivenessProbe.FailureThreshold != 3 {
-		t.Fatalf("etcd probe thresholds = readiness %d, liveness %d", etcdContainer.ReadinessProbe.FailureThreshold, etcdContainer.LivenessProbe.FailureThreshold)
+	for _, planned := range plan {
+		if planned.GetLabels()[ComponentLabel] == "etcd" || strings.Contains(planned.GetName(), "-etcd") {
+			t.Fatalf("dedicated etcd resource remains in plan: %T %s", planned, planned.GetName())
+		}
 	}
 
 	orchestrator := object[*appsv1.Deployment](t, plan, "demo-orchestrator")
@@ -1842,11 +1821,30 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if orchestratorEnv[1].Name != "PGSHARD_CLUSTER_UID" || orchestratorEnv[1].Value != string(cluster.UID) {
 		t.Fatalf("orchestrator cluster incarnation is not UID-bound: %#v", orchestratorEnv[1])
 	}
-	if orchestratorEnv[2].ValueFrom.FieldRef.FieldPath != "metadata.uid" {
-		t.Fatalf("orchestrator identity is not a bounded Pod UID: %#v", orchestratorEnv[2])
+	if orchestrator.Spec.Template.Spec.ServiceAccountName != serviceAccount.Name || orchestrator.Spec.Template.Spec.AutomountServiceAccountToken == nil || !*orchestrator.Spec.Template.Spec.AutomountServiceAccountToken {
+		t.Fatalf("orchestrator API identity = %#v", orchestrator.Spec.Template.Spec)
+	}
+	wantedFields := map[string]string{
+		"PGSHARD_ORCH_ID":         "metadata.name",
+		"PGSHARD_POD_UID":         "metadata.uid",
+		"PGSHARD_LEASE_NAMESPACE": "metadata.namespace",
+	}
+	for _, variable := range orchestratorEnv {
+		if field, wanted := wantedFields[variable.Name]; wanted {
+			if variable.ValueFrom == nil || variable.ValueFrom.FieldRef == nil || variable.ValueFrom.FieldRef.FieldPath != field {
+				t.Fatalf("orchestrator %s identity = %#v", variable.Name, variable)
+			}
+			delete(wantedFields, variable.Name)
+		}
+	}
+	if len(wantedFields) != 0 || envValue(orchestratorEnv, "PGSHARD_LEASE_NAME") != lease.Name {
+		t.Fatalf("orchestrator Lease environment is incomplete: missing=%#v env=%#v", wantedFields, orchestratorEnv)
 	}
 	pooler := object[*appsv1.Deployment](t, plan, "demo-pooler")
 	poolerContainer := pooler.Spec.Template.Spec.Containers[0]
+	if pooler.Spec.Template.Spec.AutomountServiceAccountToken == nil || *pooler.Spec.Template.Spec.AutomountServiceAccountToken {
+		t.Fatalf("pooler unexpectedly receives a Kubernetes API token: %#v", pooler.Spec.Template.Spec.AutomountServiceAccountToken)
+	}
 	if pooler.Spec.Replicas != nil || len(poolerContainer.Ports) != 4 || poolerContainer.ReadinessProbe.HTTPGet.Path != "/readyz" || poolerContainer.ReadinessProbe.FailureThreshold != 1 || poolerContainer.LivenessProbe.HTTPGet.Path != "/healthz" || poolerContainer.LivenessProbe.FailureThreshold != 3 {
 		t.Fatalf("pooler spec = %#v", pooler.Spec)
 	}
@@ -1869,7 +1867,7 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if *hpa.Spec.MinReplicas != 2 || hpa.Spec.MaxReplicas != 6 || *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization != 70 {
 		t.Fatalf("HPA spec = %#v", hpa.Spec)
 	}
-	for _, component := range []string{"etcd", "orchestrator", "pooler"} {
+	for _, component := range []string{"orchestrator", "pooler"} {
 		pdb := object[*policyv1.PodDisruptionBudget](t, plan, "demo-"+component)
 		if component == "pooler" {
 			if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntVal != 1 {
@@ -1878,10 +1876,6 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		} else if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntVal != 1 {
 			t.Fatalf("%s PDB = %#v", component, pdb.Spec)
 		}
-	}
-	policy := object[*networkingv1.NetworkPolicy](t, plan, "demo-etcd")
-	if len(policy.Spec.Ingress) != 2 || policy.Spec.Ingress[0].Ports[0].Port.IntVal != EtcdClientPort || policy.Spec.Ingress[1].Ports[0].Port.IntVal != EtcdPeerPort {
-		t.Fatalf("etcd NetworkPolicy = %#v", policy.Spec)
 	}
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		postgresqlPolicy := object[*networkingv1.NetworkPolicy](t, plan, shardName(cluster.Name, shard)+"-ingress")
@@ -2033,8 +2027,12 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	}
 	orchestrator := object[*appsv1.Deployment](t, plan, cluster.Name+OrchestratorSuffix)
 	identity := orchestrator.Spec.Template.Spec.Containers[0].Env[2]
-	if identity.Name != "PGSHARD_ORCH_ID" || identity.ValueFrom == nil || identity.ValueFrom.FieldRef == nil || identity.ValueFrom.FieldRef.FieldPath != "metadata.uid" {
+	if identity.Name != "PGSHARD_ORCH_ID" || identity.ValueFrom == nil || identity.ValueFrom.FieldRef == nil || identity.ValueFrom.FieldRef.FieldPath != "metadata.name" {
 		t.Fatalf("orchestrator identity = %#v", identity)
+	}
+	lease := object[*coordinationv1.Lease](t, plan, cluster.Name+OrchestratorLeaseSuffix)
+	if len(lease.Name) > 63 {
+		t.Fatalf("maximum cluster name produced invalid Lease name: %q", lease.Name)
 	}
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous

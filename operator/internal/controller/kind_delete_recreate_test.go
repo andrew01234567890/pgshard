@@ -9,6 +9,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -142,7 +143,7 @@ func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
 	}
 }
 
-func TestKINDDeletionWaitsForPVCBeforeSameNameRecreate(t *testing.T) {
+func TestKINDDeletionWaitsForOwnedResourcesBeforeSameNameRecreate(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_E2E") != "true" {
 		t.Skip("set PGSHARD_KIND_E2E=true against a disposable KIND cluster")
 	}
@@ -206,19 +207,19 @@ func TestKINDDeletionWaitsForPVCBeforeSameNameRecreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldClusterUID := current.UID
-	oldPVC := waitForEtcdPVC(t, ctx, kubeClient, cluster.Namespace, cluster.Name)
-	if !metav1.IsControlledBy(oldPVC, current) {
-		t.Fatalf("PVC owner = %#v, want cluster UID %s", oldPVC.OwnerReferences, current.UID)
+	oldLease := waitForOrchestratorLease(t, ctx, kubeClient, cluster.Namespace, cluster.Name)
+	if !metav1.IsControlledBy(oldLease, current) {
+		t.Fatalf("Lease owner = %#v, want cluster UID %s", oldLease.OwnerReferences, current.UID)
 	}
-	oldPVCUID := oldPVC.UID
+	oldLeaseUID := oldLease.UID
 
 	if err := kubeClient.Delete(ctx, current); err != nil {
 		t.Fatal(err)
 	}
 	waitForClusterDeletion(t, ctx, kubeClient, reconciler, request)
-	missing := &corev1.PersistentVolumeClaim{}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldPVC), missing); !apierrors.IsNotFound(err) {
-		t.Fatalf("old PVC still exists after finalizer completion: %v", err)
+	missing := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(oldLease), missing); !apierrors.IsNotFound(err) {
+		t.Fatalf("old Lease still exists after finalizer completion: %v", err)
 	}
 
 	replacement := validCluster()
@@ -238,30 +239,30 @@ func TestKINDDeletionWaitsForPVCBeforeSameNameRecreate(t *testing.T) {
 	if replacement.UID == oldClusterUID {
 		t.Fatalf("replacement reused cluster UID %s", replacement.UID)
 	}
-	newPVC := waitForEtcdPVC(t, ctx, kubeClient, replacement.Namespace, replacement.Name)
-	if newPVC.UID == oldPVCUID {
-		t.Fatalf("replacement reused stale PVC UID %s", newPVC.UID)
+	newLease := waitForOrchestratorLease(t, ctx, kubeClient, replacement.Namespace, replacement.Name)
+	if newLease.UID == oldLeaseUID {
+		t.Fatalf("replacement reused stale Lease UID %s", newLease.UID)
 	}
-	if !metav1.IsControlledBy(newPVC, replacement) {
-		t.Fatalf("replacement PVC owner = %#v, want cluster UID %s", newPVC.OwnerReferences, replacement.UID)
+	if !metav1.IsControlledBy(newLease, replacement) {
+		t.Fatalf("replacement Lease owner = %#v, want cluster UID %s", newLease.OwnerReferences, replacement.UID)
 	}
 }
 
-func waitForEtcdPVC(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) *corev1.PersistentVolumeClaim {
+func waitForOrchestratorLease(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) *coordinationv1.Lease {
 	t.Helper()
-	key := types.NamespacedName{Namespace: namespace, Name: "data-" + cluster + "-etcd-0"}
-	claim := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{Namespace: namespace, Name: cluster + owned.OrchestratorLeaseSuffix}
+	lease := &coordinationv1.Lease{}
 	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		err := kubeClient.Get(ctx, key, claim)
+		err := kubeClient.Get(ctx, key, lease)
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
 		return err == nil, err
 	})
 	if err != nil {
-		t.Fatalf("wait for etcd PVC %s: %v", key, err)
+		t.Fatalf("wait for orchestrator Lease %s: %v", key, err)
 	}
-	return claim
+	return lease
 }
 
 func waitForClusterDeletion(

@@ -161,9 +161,10 @@ incorrectly sized, or different replacement key. The leaf certificate renews wit
 automatic CA or fencing-key rotation is not yet implemented. Expect the sample
 to remain `Ready=False`, its pooler to remain unready, and its application
 Services to have no ready endpoints. The three orchestrator Pods become ready
-only while their unique cluster-UID-bound etcd incarnations are renewed; this
-does not enable durable operations, shard-term authority, or failover. This path
-is for source validation only.
+only while they can validate the exact cluster-UID-owned Kubernetes Lease
+through the API server; only one holds leadership. This does not enable durable
+operations, shard-term authority, or failover. This path is for source
+validation only.
 
 To exercise the direct PostgreSQL slice in the same cluster:
 

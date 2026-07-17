@@ -202,21 +202,16 @@ installed term, process-local monotonic deadline, catalog epoch, and fencing
 epoch at dispatch; expired and superseded handles fail closed. The receiving
 target still has to enforce that epoch because the local guard is an
 instant-in-time observation rather than a duration guarantee.
-The coordination gateway tests separately use the pinned etcd 3.6.5 image.
-They prove exclusive process identity, reject a same-name cluster replacement
-with a different Kubernetes UID, replace an incarnation key with the same token
-under a different lease, then with a foreign token, and require readiness loss
-before another process takes ownership. Rebinding the persistent marker must
-terminate the new owner with a permanent conflict. Unit coverage ensures lease
-RPC headers pin cluster identity without treating follower-local revisions as
-global ordering evidence. A Linux process test stalls an endpoint request,
-sends `SIGTERM`, and requires cancellation and clean exit inside two seconds.
-The manager KIND suite also initializes a real PVC with the legacy etcd
-`member/` layout, stops that process, runs the non-root Rust migration init
-container, starts etcd from the private `data/` child, and reads back a sentinel
-written before the restart. Unit tests replay every migration crash boundary
-and reject ambiguous or symlinked layouts. A separate controller upgrade test
-holds a checkpointed PostgreSQL PVC behind the legacy role-named StatefulSet
+The Kubernetes Lease coordination tests use an in-memory compare-and-swap
+store. They prove exclusive empty-Lease claims, conditional renewal and release,
+exact fleet owner and Lease UID pinning, local unchanged-record takeover timing,
+and cancellation of a stalled API operation during shutdown. The manager KIND
+suite exercises the real Kubernetes API: it verifies exact-name `get`/`update`
+RBAC, removes the operator-owned Lease while reconciliation is paused, requires
+the same orchestrator Pod incarnations to lose readiness without restarting,
+and then rolls them after the operator creates a replacement Lease with a new
+UID. A separate controller upgrade test holds a checkpointed PostgreSQL PVC
+behind the legacy role-named StatefulSet
 and Pod, then proves the role-neutral controller appears only after both old
 objects are absent.
 Pure orchestrator tests also exercise the standby-decoder attachment contract. They
@@ -565,14 +560,14 @@ replicas are claimed. A separate KIND
 job builds local images, installs the real manager with self-managed admission
 certificates, proves the generated serving chain and injected CA bundles,
 observes semantic validation reject an unsafe synchronous singleton, waits for
-leader-elected reconciliation, observes a restart-free etcd quorum, keeps the
-bootstrap-unavailable pooler unready, and requires all three persistence-free
-orchestrators to establish distinct cluster-UID-bound etcd incarnations without
-restarts. Their readiness proves only renewable process identity, not durable
-operations or shard-term authority. It then pauses manager reconciliation,
-removes etcd quorum, requires those exact Pod UIDs to become unready without a
-restart, restores quorum, and requires the same processes to recover before the
-manager resumes. The job also proves the three-member sample has no PostgreSQL
+leader-elected reconciliation, keeps the bootstrap-unavailable pooler unready,
+and requires all three persistence-free orchestrators to validate the exact
+operator-owned Lease without restarts while only one reports leadership. Their
+readiness proves only current API-backed coordination, not durable operations
+or shard-term authority. It then pauses manager reconciliation, deletes the
+Lease, requires those exact Pod UIDs to become unready without a restart,
+resumes the manager, and requires a bounded orchestrator rollout before the new
+Lease UID becomes ready. The job also proves the three-member sample has no PostgreSQL
 workload or ready application endpoint. The same job creates
 a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard

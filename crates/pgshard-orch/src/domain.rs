@@ -334,6 +334,7 @@ impl LeaseExecutionGuard<'_> {
 }
 
 /// Externally reportable orchestrator status.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OrchSnapshot {
     /// Stable identity, absent until configuration is established.
@@ -346,12 +347,14 @@ pub struct OrchSnapshot {
     pub failover_automation_enabled: bool,
     /// Whether operation and lease records survive process restart.
     pub persistence_enabled: bool,
-    /// Whether this process currently owns a renewable etcd incarnation.
+    /// Whether this process recently observed the exact operator-owned Lease.
     pub coordination_ready: bool,
-    /// Pinned etcd cluster identity, encoded exactly as a decimal string.
-    pub coordination_cluster_id: Option<String>,
-    /// Highest acknowledged etcd revision, encoded exactly as a decimal string.
-    pub coordination_revision: String,
+    /// Whether this process currently holds the Kubernetes leadership Lease.
+    pub leader: bool,
+    /// Pinned Kubernetes Lease object incarnation.
+    pub coordination_lease_uid: Option<String>,
+    /// Resource version returned by the latest authoritative Lease operation.
+    pub coordination_resource_version: Option<String>,
 }
 
 /// Machine-readable reason the orchestrator is not yet safe to serve control
@@ -359,11 +362,11 @@ pub struct OrchSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchReadinessReason {
-    /// The process owns a live etcd-backed coordination incarnation.
+    /// The process can observe the exact operator-owned Kubernetes Lease.
     Ready,
     /// No stable operator-assigned identity exists.
     IdentityMissing,
-    /// No renewable etcd-backed process incarnation is currently proven.
+    /// No recent authoritative Kubernetes Lease observation is proven.
     CoordinationUnavailable,
 }
 
@@ -387,8 +390,9 @@ struct OrchInner {
     lease_deadlines: HashMap<ShardId, Duration>,
     last_epochs: HashMap<ShardId, u64>,
     coordination_ready: bool,
-    coordination_cluster_id: Option<u64>,
-    coordination_revision: u64,
+    leader: bool,
+    coordination_lease_uid: Option<String>,
+    coordination_resource_version: Option<String>,
     coordination_deadline: Option<Instant>,
 }
 
@@ -452,6 +456,7 @@ impl OrchState {
                 .is_some_and(|deadline| Instant::now() < deadline);
         if !coordination_live {
             inner.coordination_ready = false;
+            inner.leader = false;
             return OrchReadiness {
                 ready: false,
                 reason: OrchReadinessReason::CoordinationUnavailable,
@@ -463,45 +468,53 @@ impl OrchState {
         }
     }
 
-    /// Installs one acknowledged etcd cluster/revision observation.
+    /// Installs one acknowledged Kubernetes Lease observation.
     ///
-    /// Cluster identity is pinned for the process lifetime and revisions may
-    /// only advance. A false result leaves readiness disabled.
+    /// The Lease UID is pinned for the process lifetime. Kubernetes resource
+    /// versions are opaque and therefore recorded but never numerically ordered.
+    /// A false result leaves readiness and leadership disabled.
     #[must_use]
     pub(crate) fn record_coordination_ready(
         &self,
-        cluster_id: u64,
-        revision: u64,
+        lease_uid: &str,
+        resource_version: &str,
+        leader: bool,
         deadline: Instant,
     ) -> bool {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let valid = cluster_id != 0
-            && revision != 0
+        let valid = !lease_uid.is_empty()
+            && lease_uid.len() <= 128
+            && !resource_version.is_empty()
+            && resource_version.len() <= 128
             && inner
-                .coordination_cluster_id
-                .is_none_or(|current| current == cluster_id)
-            && revision >= inner.coordination_revision
+                .coordination_lease_uid
+                .as_deref()
+                .is_none_or(|current| current == lease_uid)
             && Instant::now() < deadline;
         if !valid {
             inner.coordination_ready = false;
+            inner.leader = false;
             return false;
         }
-        inner.coordination_cluster_id = Some(cluster_id);
-        inner.coordination_revision = revision;
+        inner.coordination_lease_uid = Some(lease_uid.to_owned());
+        inner.coordination_resource_version = Some(resource_version.to_owned());
         inner.coordination_deadline = Some(deadline);
         inner.coordination_ready = true;
+        inner.leader = leader;
         true
     }
 
     /// Removes readiness without discarding pinned anti-regression evidence.
     pub(crate) fn record_coordination_unavailable(&self) {
-        self.inner
+        let mut inner = self
+            .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .coordination_ready = false;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.coordination_ready = false;
+        inner.leader = false;
     }
 
     /// Removes externally visible readiness before process shutdown begins.
@@ -522,6 +535,7 @@ impl OrchState {
                 .is_some_and(|deadline| Instant::now() < deadline);
         if !coordination_ready {
             inner.coordination_ready = false;
+            inner.leader = false;
         }
         let mut leases: Vec<_> = inner.leases.values().cloned().collect();
         leases.sort_by_key(|lease| lease.shard_id);
@@ -532,8 +546,9 @@ impl OrchState {
             failover_automation_enabled: false,
             persistence_enabled: false,
             coordination_ready,
-            coordination_cluster_id: inner.coordination_cluster_id.map(|value| value.to_string()),
-            coordination_revision: inner.coordination_revision.to_string(),
+            leader: inner.leader,
+            coordination_lease_uid: inner.coordination_lease_uid.clone(),
+            coordination_resource_version: inner.coordination_resource_version.clone(),
         }
     }
 
@@ -1258,7 +1273,12 @@ mod tests {
         );
 
         let state = state();
-        assert!(state.record_coordination_ready(7, 11, Instant::now() + Duration::from_secs(1)));
+        assert!(state.record_coordination_ready(
+            "lease-uid-1",
+            "11",
+            true,
+            Instant::now() + Duration::from_secs(1)
+        ));
         assert_eq!(
             state.readiness(),
             OrchReadiness {
@@ -1266,21 +1286,44 @@ mod tests {
                 reason: OrchReadinessReason::Ready,
             }
         );
+        assert!(state.snapshot().leader);
         state.record_coordination_unavailable();
         assert!(!state.readiness().ready);
-        assert!(!state.record_coordination_ready(8, 12, Instant::now() + Duration::from_secs(1)));
-        assert!(!state.record_coordination_ready(7, 10, Instant::now() + Duration::from_secs(1)));
-        assert!(state.record_coordination_ready(7, 12, Instant::now() + Duration::from_secs(1)));
+        assert!(!state.snapshot().leader);
+        assert!(!state.record_coordination_ready(
+            "lease-uid-2",
+            "12",
+            false,
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(state.record_coordination_ready(
+            "lease-uid-1",
+            "10",
+            false,
+            Instant::now() + Duration::from_secs(1)
+        ));
         let snapshot = state.snapshot();
-        assert_eq!(snapshot.coordination_cluster_id.as_deref(), Some("7"));
-        assert_eq!(snapshot.coordination_revision, "12");
+        assert_eq!(
+            snapshot.coordination_lease_uid.as_deref(),
+            Some("lease-uid-1")
+        );
+        assert_eq!(
+            snapshot.coordination_resource_version.as_deref(),
+            Some("10")
+        );
+        assert!(!snapshot.leader);
 
         let expired = OrchState::with_identity(identity(), 100).expect("valid lease policy");
-        assert!(!expired.record_coordination_ready(7, 1, Instant::now()));
+        assert!(!expired.record_coordination_ready("lease-uid-1", "1", true, Instant::now()));
         assert!(!expired.readiness().ready);
 
         let paused = OrchState::with_identity(identity(), 100).expect("valid lease policy");
-        assert!(paused.record_coordination_ready(7, 1, Instant::now() + Duration::from_millis(10)));
+        assert!(paused.record_coordination_ready(
+            "lease-uid-1",
+            "1",
+            true,
+            Instant::now() + Duration::from_millis(10)
+        ));
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(
             paused.readiness().reason,

@@ -68,6 +68,10 @@ current evidence is maintained in
   Slow coordination uses `coordination.k8s.io` Lease objects through the API
   server. Durable topology, operation journals, fencing generations, and 2PC
   decisions remain in PostgreSQL, never in Kubernetes Lease records.
+- Upgrade cleanup removes the retired three-member etcd StatefulSet before
+  uncached controller-and-Pod absence proofs permit deletion of only its three
+  exact, validated, UID-fenced 2 GiB coordination claims. PostgreSQL data claims
+  are outside this migration.
 - Runtime images are test artifacts in Milestone 1. CI builds them but does not
   push images to a registry.
 
@@ -109,13 +113,13 @@ Acceptance:
   containers and disable unsupported `ALTER SYSTEM` overrides.
 - Implement agent/orchestrator Kubernetes Leases, Node-incarnation fencing,
   promotion proofs, split-brain prevention, and bounded recovery.
-  - Current transitional foundation: each orchestrator owns a unique
-    Pod-incarnation key through a dedicated etcd workload. This proves bounded
-    process identity only and must be replaced before the Milestone 1 gate.
-    While that workload still exists, an idempotent non-root init step preserves
-    legacy `member/` state when moving it below the private `data/` directory;
-    a real-PVC KIND restart test verifies the stored member data survives.
-  - Create one operator-owned orchestrator leadership Lease per fleet and one
+  - Current foundation: the operator creates one empty orchestrator leadership
+    Lease envelope, a dedicated ServiceAccount, and an exact-name Role with only
+    `get` and `update`. Rust orchestrators use in-cluster API-server TLS, pin the
+    Lease and fleet UIDs, update with resource-version compare-and-swap, expose
+    leader state separately from readiness, and fail closed on missing or
+    recreated identity. No dedicated etcd workload is deployed.
+  - Add one
     operator-owned writable-term Lease per physical cell. Lease holder identity
     includes the stable member name and Pod UID; every update is
     resource-version conditional and ownership is bound to the fleet UID.
