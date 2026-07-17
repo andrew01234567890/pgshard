@@ -73,7 +73,12 @@ debugging and must not manage PostgreSQL Pods. Automatic
 CA rotation is not implemented. A one-member asynchronous resource creates one
 PostgreSQL 18 primary and retained PVC per shard; a three- or five-member
 resource still creates none. Shard-0000 also owns the migrated catalog and the
-configured shard identities; that metadata does not yet drive SQL traffic. The pooler accepts no SQL session and has no
+configured shard identities; that metadata does not yet drive SQL traffic. The
+privileged bootstrap image has no remote default: releases require an immutable
+digest, while the source-only `:dev` exception is never pulled and verifies the
+migration hash before PGDATA access. PostgreSQL StatefulSets use `OnDelete`, so
+template changes remain inert until a future staged upgrade controller or an
+explicit one-Pod-at-a-time development restart. The pooler accepts no SQL session and has no
 connection pool, so application Services are not usable endpoints. The direct
 primary path has no HA and restarts interrupt its shard. No sharding,
 availability, backup, restore, resharding, DDL, or performance guarantee is

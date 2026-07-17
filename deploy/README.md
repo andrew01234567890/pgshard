@@ -61,12 +61,19 @@ The files are written under `artifacts/images/`. The `postgres-agent` archive
 contains PostgreSQL 18, the Rust agent, and the read-only source catalog
 migration so initialization and lifecycle tests can exercise the real
 postmaster without publishing an image. The bake definition has no
-registry output or push target. CI builds the standard archives together and
-independently rebuilds the PostgreSQL image for its lifecycle and manager
-tests, loads them into local Docker daemons, checks their platform, build
+registry output or push target. The generic CI image job builds the four
+unprivileged/supporting archives, while the lifecycle and manager jobs each
+build the PostgreSQL image for their independent contracts. They load images
+into local Docker daemons, check their platform, build
 labels, non-root identity, migration bytes, and entrypoints under a read-only
-root filesystem, then discards them with the ephemeral runners. CI does not
+root filesystem, then discard them with the ephemeral runners. CI does not
 upload or publish the archives.
+
+The operator has no remote default for this privileged bootstrap image.
+Non-development deployments must configure an immutable digest reference. The
+repository's exact `pgshard/postgres-agent:dev` exception is node-local only;
+its Pod pull policy is `Never`, and the operator verifies the embedded migration
+SHA-256 before it touches PGDATA.
 
 These images contain the current incomplete runtimes. The operator can create
 only the documented direct single-member development cluster, and no image is

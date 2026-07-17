@@ -55,10 +55,10 @@ const (
 	EtcdPeerPort   int32 = 2380
 	HTTPPort       int32 = 8080
 
-	etcdExecutable                  = "/usr/local/bin/etcd"
-	defaultEtcdImage                = "registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534"
-	defaultPostgreSQLImage          = "docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7"
-	defaultPostgreSQLBootstrapImage = "ghcr.io/andrew01234567890/pgshard-postgres-agent:main"
+	etcdExecutable                      = "/usr/local/bin/etcd"
+	defaultEtcdImage                    = "registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534"
+	defaultPostgreSQLImage              = "docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7"
+	developmentPostgreSQLBootstrapImage = "pgshard/postgres-agent:dev"
 
 	configHashAnnotation                    = "pgshard.io/config-hash"
 	ApplyOwnershipAnnotation                = "pgshard.io/apply-ownership"
@@ -73,6 +73,8 @@ const (
 	PostgreSQLPodTerminationFinalizer       = "pgshard.io/postgresql-termination"
 	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 	shardschemaMigrationPath                = "/usr/share/pgshard/migrations/0001_shardschema.sql"
+	shardschemaMigrationSHA256              = "df8cf333c840add50e584ba7d968648ef6c740d447cc66a108fb82aba1751fb9"
+	shardschemaMigrationHashAnnotation      = "pgshard.io/shardschema-migration-sha256"
 )
 
 const postgresqlBootstrapScript = `set -Eeuo pipefail
@@ -87,6 +89,24 @@ expected=/tmp/pgshard-bootstrap-identity
 
 umask 077
 printf 'cluster_uid=%s\nshard=%s\n' "$PGSHARD_CLUSTER_UID" "$PGSHARD_SHARD_ID" > "$expected"
+
+if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]]; then
+  if [[ ! "$PGSHARD_SHARD_COUNT" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "$PGSHARD_MAXIMUM_SHARDS" =~ ^[1-9][0-9]*$ ]] \
+    || (( PGSHARD_SHARD_COUNT > PGSHARD_MAXIMUM_SHARDS )); then
+    echo "refusing invalid shardschema shard count" >&2
+    exit 1
+  fi
+  if [[ ! -f "$PGSHARD_SHARDSCHEMA_MIGRATION" ]]; then
+    echo "shardschema migration is missing from the bootstrap image" >&2
+    exit 1
+  fi
+  read -r observed_migration_sha _ < <(sha256sum -- "$PGSHARD_SHARDSCHEMA_MIGRATION")
+  if [[ "$observed_migration_sha" != "$PGSHARD_SHARDSCHEMA_MIGRATION_SHA256" ]]; then
+    echo "shardschema migration does not match the operator release" >&2
+    exit 1
+  fi
+fi
 
 if [[ -f "$marker" && -f "$final/PG_VERSION" ]]; then
   if ! cmp -s -- "$marker" "$expected"; then
@@ -125,16 +145,6 @@ fi
 if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" != "true" ]]; then
   exit 0
 fi
-if [[ ! "$PGSHARD_SHARD_COUNT" =~ ^[1-9][0-9]*$ ]] \
-  || [[ ! "$PGSHARD_MAXIMUM_SHARDS" =~ ^[1-9][0-9]*$ ]] \
-  || (( PGSHARD_SHARD_COUNT > PGSHARD_MAXIMUM_SHARDS )); then
-  echo "refusing invalid shardschema shard count" >&2
-  exit 1
-fi
-if [[ ! -f "$PGSHARD_SHARDSCHEMA_MIGRATION" ]]; then
-  echo "shardschema migration is missing from the bootstrap image" >&2
-  exit 1
-fi
 
 socket=/tmp/pgshard-catalog-bootstrap
 rm -rf -- "$socket"
@@ -143,7 +153,7 @@ stop_temporary_postgres() {
   result=$?
   trap - EXIT
   if pg_ctl -D "$final" status >/dev/null 2>&1; then
-    if ! pg_ctl -D "$final" -w -t 60 stop -m fast; then
+    if ! pg_ctl -D "$final" -w -t 45 stop -m fast; then
       result=1
     fi
   fi
@@ -151,8 +161,8 @@ stop_temporary_postgres() {
 }
 trap stop_temporary_postgres EXIT
 
-pg_ctl -D "$final" -w -t 60 start \
-  -o "-c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700"
+pg_ctl -D "$final" -w -t 45 start \
+  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700"
 
 database_exists="$(
   psql -X --no-password --host="$socket" --username=postgres --dbname=postgres --no-align --tuples-only \
@@ -169,26 +179,69 @@ case "$database_exists" in
     ;;
 esac
 
-psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
-  --set=ON_ERROR_STOP=1 --file="$PGSHARD_SHARDSCHEMA_MIGRATION"
+validate_catalog_inventory() {
+  inventory_state="$(
+    psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+        SELECT
+          (
+            SELECT pg_catalog.count(*)
+              FROM pgshard_catalog.shards AS shards
+             WHERE NOT (
+               shards.shard_id::text = 'shard-' || pg_catalog.lpad(shards.shard_number::text, 4, '0')
+               AND (
+                 (shards.shard_number < $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'active')
+                 OR (shards.shard_number >= $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'retired')
+               )
+             )
+          ),
+          (
+            SELECT pg_catalog.count(*)
+              FROM pgshard_catalog.cluster_configuration AS configuration
+             WHERE configuration.singleton
+               AND configuration.home_shard_id::text = 'shard-0000'
+          ),
+          (
+            SELECT pg_catalog.count(*)
+              FROM pgshard_catalog.shards AS shards
+             WHERE (shards.state = 'active') IS DISTINCT FROM EXISTS (
+               SELECT
+                 FROM pgshard_catalog.shard_restore_incarnations AS incarnations
+                WHERE incarnations.shard_id = shards.shard_id
+                  AND incarnations.state = 'active'
+             )
+          )"
+  )"
+  if [[ "$inventory_state" != "0|1|0" ]]; then
+    echo "refusing shardschema identity, inventory, or restore lineage that conflicts with the configured immutable shards" >&2
+    return 1
+  fi
+}
 
-invalid_shards="$(
+catalog_core_tables="$(
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
     --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
       SELECT pg_catalog.count(*)
-        FROM pgshard_catalog.shards AS shards
-       WHERE NOT (
-         shards.shard_id::text = 'shard-' || pg_catalog.lpad(shards.shard_number::text, 4, '0')
-         AND (
-           (shards.shard_number < $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'active')
-           OR (shards.shard_number >= $PGSHARD_SHARD_COUNT::bigint AND shards.state = 'retired')
-         )
-       )"
+        FROM (VALUES
+          ('pgshard_catalog.cluster_configuration'),
+          ('pgshard_catalog.shards'),
+          ('pgshard_catalog.shard_restore_incarnations')
+        ) AS expected(relation_name)
+       WHERE pg_catalog.to_regclass(expected.relation_name) IS NOT NULL"
 )"
-if [[ "$invalid_shards" != "0" ]]; then
-  echo "refusing shardschema inventory that conflicts with the configured immutable shards" >&2
-  exit 1
-fi
+case "$catalog_core_tables" in
+  0) ;;
+  3) validate_catalog_inventory ;;
+  *)
+    echo "refusing a partial pre-existing shardschema catalog" >&2
+    exit 1
+    ;;
+esac
+
+psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+  --set=ON_ERROR_STOP=1 --file="$PGSHARD_SHARDSCHEMA_MIGRATION"
+
+validate_catalog_inventory
 
 missing_shards="$(
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
@@ -220,7 +273,9 @@ COMMIT;
 PGSHARD_SHARD_INVENTORY
 fi
 
-pg_ctl -D "$final" -w -t 60 stop -m fast
+validate_catalog_inventory
+
+pg_ctl -D "$final" -w -t 45 stop -m fast
 trap - EXIT
 sync "$final" "$parent"
 `
@@ -236,16 +291,43 @@ type Images struct {
 	PostgreSQLBootstrap string
 }
 
-// DefaultImages are development-channel references. The controller never uses
-// their availability as evidence that PostgreSQL lifecycle or HA is complete.
+// DefaultImages are safe supporting-runtime defaults. The privileged
+// PostgreSQL bootstrap image intentionally has no remote default: a deployment
+// must select an immutable digest, or the exact never-pulled local development
+// image used by the repository manifests.
 func DefaultImages() Images {
 	return Images{
-		Etcd:                defaultEtcdImage,
-		Orchestrator:        "ghcr.io/andrew01234567890/pgshard-orch:main",
-		Pooler:              "ghcr.io/andrew01234567890/pgshard-pooler:main",
-		PostgreSQL:          defaultPostgreSQLImage,
-		PostgreSQLBootstrap: defaultPostgreSQLBootstrapImage,
+		Etcd:         defaultEtcdImage,
+		Orchestrator: "ghcr.io/andrew01234567890/pgshard-orch:main",
+		Pooler:       "ghcr.io/andrew01234567890/pgshard-pooler:main",
+		PostgreSQL:   defaultPostgreSQLImage,
 	}
+}
+
+// DevelopmentImages selects the exact local bootstrap tag used by the
+// repository manifests. Its Pod pull policy is Never, so Kubernetes cannot
+// resolve that privileged image from a registry.
+func DevelopmentImages() Images {
+	images := DefaultImages()
+	images.PostgreSQLBootstrap = developmentPostgreSQLBootstrapImage
+	return images
+}
+
+func validatePostgreSQLBootstrapImage(image string) error {
+	if image == developmentPostgreSQLBootstrapImage {
+		return nil
+	}
+	const separator = "@sha256:"
+	separatorIndex := strings.LastIndex(image, separator)
+	if image == "" || strings.TrimSpace(image) != image || separatorIndex <= 0 || strings.Contains(image[:separatorIndex], "@") {
+		return fmt.Errorf("PostgreSQL bootstrap image must use an immutable sha256 digest (the exact local %q image is development-only)", developmentPostgreSQLBootstrapImage)
+	}
+	digest := image[separatorIndex+len(separator):]
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != sha256.Size {
+		return fmt.Errorf("PostgreSQL bootstrap image must use an immutable sha256 digest (the exact local %q image is development-only)", developmentPostgreSQLBootstrapImage)
+	}
+	return nil
 }
 
 // Plan returns the complete set of safe-to-create resources for cluster.
@@ -271,11 +353,16 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	if cluster.Spec.Shards < 1 || cluster.Spec.Shards > pgshardv1alpha1.MaximumShards {
 		return nil, fmt.Errorf("shards must be between 1 and %d", pgshardv1alpha1.MaximumShards)
 	}
-	if strings.TrimSpace(images.Etcd) == "" || strings.TrimSpace(images.Orchestrator) == "" || strings.TrimSpace(images.Pooler) == "" || strings.TrimSpace(images.PostgreSQL) == "" || strings.TrimSpace(images.PostgreSQLBootstrap) == "" {
-		return nil, fmt.Errorf("etcd, orchestrator, pooler, PostgreSQL, and PostgreSQL bootstrap images must all be configured")
+	if strings.TrimSpace(images.Etcd) == "" || strings.TrimSpace(images.Orchestrator) == "" || strings.TrimSpace(images.Pooler) == "" || strings.TrimSpace(images.PostgreSQL) == "" {
+		return nil, fmt.Errorf("etcd, orchestrator, pooler, and PostgreSQL images must all be configured")
 	}
 	if err := pgshardv1alpha1.ValidateClusterForReconciliation(cluster); err != nil {
 		return nil, fmt.Errorf("cluster fails safety validation: %w", err)
+	}
+	if cluster.Spec.MembersPerShard == 1 {
+		if err := validatePostgreSQLBootstrapImage(images.PostgreSQLBootstrap); err != nil {
+			return nil, err
+		}
 	}
 	if endpoint := cluster.Spec.Observability.OpenTelemetryEndpoint; endpoint != "" {
 		if err := pgshardv1alpha1.ValidateOpenTelemetryEndpoint(endpoint); err != nil {
@@ -690,6 +777,10 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
 	readinessProbeCommand := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
+	bootstrapPullPolicy := imagePullPolicy(bootstrapImage)
+	if bootstrapImage == developmentPostgreSQLBootstrapImage {
+		bootstrapPullPolicy = corev1.PullNever
+	}
 	postgres := corev1.Container{
 		Name:            "postgresql",
 		Image:           image,
@@ -715,7 +806,7 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 	bootstrap := corev1.Container{
 		Name:            "bootstrap-postgresql",
 		Image:           bootstrapImage,
-		ImagePullPolicy: imagePullPolicy(bootstrapImage),
+		ImagePullPolicy: bootstrapPullPolicy,
 		Command:         []string{"bash", "-ceu", postgresqlBootstrapScript},
 		Env: []corev1.EnvVar{
 			{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
@@ -724,6 +815,7 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 			{Name: "PGSHARD_MAXIMUM_SHARDS", Value: fmt.Sprintf("%d", pgshardv1alpha1.MaximumShards)},
 			{Name: "PGSHARD_BOOTSTRAP_SHARDSCHEMA", Value: fmt.Sprintf("%t", shard == 0)},
 			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION", Value: shardschemaMigrationPath},
+			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION_SHA256", Value: shardschemaMigrationSHA256},
 			{Name: "PGSHARD_NODE_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeUIDAnnotation)}}},
 			{Name: "PGSHARD_NODE_BOOT_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeBootIDAnnotation)}}},
 		},
@@ -732,11 +824,19 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "data", MountPath: "/var/lib/postgresql"},
 			{Name: "tmp", MountPath: "/tmp"},
+			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql", ReadOnly: true},
 			{Name: "bootstrap-secret", MountPath: "/etc/pgshard/bootstrap", ReadOnly: true},
 		},
 	}
 	automount := false
 	enableServiceLinks := false
+	podAnnotations := map[string]string{
+		configHashAnnotation:              configurationHash,
+		PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
+	}
+	if shard == 0 {
+		podAnnotations[shardschemaMigrationHashAnnotation] = shardschemaMigrationSHA256
+	}
 	return &appsv1.StatefulSet{
 		ObjectMeta: ownedMeta(cluster, name, "postgresql", nil),
 		Spec: appsv1.StatefulSetSpec{
@@ -744,16 +844,16 @@ func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard
 			ServiceName:         shardName(cluster.Name, shard),
 			PodManagementPolicy: appsv1.OrderedReadyPodManagement,
 			MinReadySeconds:     5,
-			UpdateStrategy:      appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
-			Selector:            &metav1.LabelSelector{MatchLabels: selector},
+			// Singleton primaries cannot be rolled concurrently without taking every
+			// shard down. Keep template updates inert until the future staged upgrade
+			// coordinator deletes one safely selected Pod at a time.
+			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType},
+			Selector:       &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: podLabels,
-					Annotations: map[string]string{
-						configHashAnnotation:              configurationHash,
-						PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
-					},
-					Finalizers: []string{PostgreSQLPodTerminationFinalizer},
+					Labels:      podLabels,
+					Annotations: podAnnotations,
+					Finalizers:  []string{PostgreSQLPodTerminationFinalizer},
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken:  &automount,

@@ -122,7 +122,7 @@ jobs:
           exists_at_head_or_base benchmarks/Cargo.toml && performance_exists=true
 
           emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^contracts/replication-slot-names\.json$|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
-          emit_component postgres_agent "$postgres_agent_exists" '^crates/(pgshard-agent|pgshard-types|pgshard-version)/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^\.cargo/|^\.dockerignore$|^deploy/(docker-bake\.hcl|images/rust\.Dockerfile|images/quarantine\.pg_hba\.conf)$|^Makefile$|^\.github/workflows/ci\.yml$'
+          emit_component postgres_agent "$postgres_agent_exists" '^crates/(pgshard-agent|pgshard-types|pgshard-version)/|^crates/pgshard-catalog/migrations/0001_shardschema\.sql$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^\.cargo/|^\.dockerignore$|^deploy/(docker-bake\.hcl|images/rust\.Dockerfile|images/quarantine\.pg_hba\.conf)$|^Makefile$|^\.github/workflows/ci\.yml$'
           emit_component catalog "$catalog_exists" '^crates/pgshard-catalog/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component orch_catalog "$orch_catalog_exists" '^crates/(pgshard-orch|pgshard-catalog|pgshard-types)/|^operator/internal/tuning/|^contracts/replication-slot-names\.json$|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component pgwire "$pgwire_exists" '^crates/pgshard-pgwire/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
@@ -645,10 +645,15 @@ jobs:
         working-directory: operator
         env:
           PGSHARD_KIND_MANAGER_E2E: "true"
-        run: >-
-          go test -race -count=1 -timeout=30m
-          -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC)$'
-          ./internal/controller
+          PGSHARD_POSTGRES_BOOTSTRAP_E2E: "true"
+          PGSHARD_POSTGRES_BOOTSTRAP_IMAGE: pgshard/postgres-agent:dev
+        run: |
+          go test -race -count=1 -timeout=30m \
+            -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC)$' \
+            ./internal/controller
+          go test -race -count=1 -timeout=10m \
+            -run '^TestPostgreSQLBootstrapDockerRecoveryAndConflict$' \
+            ./internal/resources
       - name: Capture manager diagnostics
         if: failure()
         run: |
@@ -747,6 +752,7 @@ jobs:
           PGSHARD_GIT_SHA: ${{ github.sha }}
           PGSHARD_IMAGE_OUTPUT: artifacts/images
           PGSHARD_IMAGE_TAG: ci
+          PGSHARD_IMAGE_TARGETS: agent operator orchestrator pooler
         run: make images
       - name: Verify non-root image entrypoints
         env:

@@ -552,13 +552,21 @@ primaries, proves shard passwords differ, executes SQL across an internal shard
 Service from an authorized restricted probe client using the destination-specific
 Secret, rejects otherwise identical unlabeled and wrong-cluster clients through
 the live NetworkPolicy, and verifies that only shard-0000 contains the dedicated
-`shardschema` database. It loads the exact migration shipped in the non-root
-PostgreSQL bootstrap image, observes both configured shard identities and one
-active restore incarnation per shard, records the catalog epoch, and requires a
-primary restart to reapply the migration without changing that epoch. It also
+`shardschema` database. It hash-verifies and loads the exact migration shipped
+in the non-root PostgreSQL bootstrap image, observes both configured shard
+identities and one active restore incarnation per shard, records the complete
+epoch-and-incarnation snapshot, and requires a primary recreation to reapply
+the migration without changing that snapshot. The fixture leaves a prepared
+transaction and inactive logical slot durable before recreation, proving the
+private init postmaster loads the managed logical-WAL and 2PC settings. It also
 proves an omitted storage class was resolved and
-checkpointed on the resulting Bound PVC, then restarts one primary StatefulSet
-and verifies its PVC-backed row survives. A unit Create interceptor separately proves the
+checkpointed on the resulting Bound PVC, then explicitly deletes one
+`OnDelete` primary Pod
+and verifies its PVC-backed row survives. Against a separate Docker volume, the
+same job runs the exact init command from a pre-created empty database and a
+valid one-shard partial inventory, then injects an extra active shard and proves
+the pre-migration rejection preserves the catalog epoch and trigger identities.
+A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the
 resulting Bound PVC exactly matches that checkpoint, is ownerless with the
