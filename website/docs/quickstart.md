@@ -6,8 +6,8 @@ description: Validate the current pgshard foundation source.
 
 # Quickstart
 
-There is no usable pgshard routing endpoint yet. The current operator can run a
-limited direct-PostgreSQL development slice: an explicit one-member
+There is no usable sharded routing endpoint yet. The current operator can run a
+limited PostgreSQL development slice: an explicit one-member
 asynchronous resource creates one PostgreSQL 18 primary and retained PVC per
 shard. Each shard receives a distinct immutable bootstrap Secret and a 4Gi
 minimum data claim. Before the shard-0000 server is allowed to start, its init
@@ -28,15 +28,18 @@ terminal status update from that exact authenticated kubelet, and validates the
 final status after all mutators run. PodGC, copied annotation or condition text,
 a missing or recreated Node, and a webhook outage cannot produce that receipt,
 so cluster deletion fails closed with the PVC protected. This is lifecycle protection, not
-HA takeover or physical node fencing. It has no standby, promotion,
-backup execution or SQL pooler. The pooler can supervise `shardschema` over an
-operator-provisioned TLS 1.3 and SCRAM connection, but still rejects every
-client session. Restarting a primary interrupts that shard even though
+HA takeover or physical node fencing. It has no standby, promotion, backup
+execution, or connection pool. The pooler supervises `shardschema` over an
+operator-provisioned TLS 1.3 and SCRAM connection and, while that catalog is
+ready, the `-rw` Service relays raw PostgreSQL sessions to the singleton
+shard-0000 writer. PostgreSQL performs the application SCRAM exchange end to
+end. This path is plaintext, has no routing, and deliberately blocks the
+`shardschema` database and replication connections. Restarting a primary interrupts that shard even though
 its data survives. Three- and five-member resources continue to fail closed
 without PostgreSQL Pods.
 
 The source also includes the Go custom-resource API, fail-closed Rust
-agent/orchestrator foundations, a rejection-only pooler, and local-only test
+agent/orchestrator foundations, a bounded shard-zero compatibility relay, and local-only test
 image builds. The single-member path is useful for operator and storage testing;
 it is not a sharded database installation or zero-downtime evidence.
 
@@ -55,9 +58,10 @@ local-only lifecycle image with a disposable PostgreSQL 18 data directory. The
 operator KIND job also starts two single-member primaries, verifies the
 shard-0000 catalog inventory and initial restore identities, proves the other
 shard has no `shardschema` database, observes the pooler's authenticated catalog
-connection through `/status` and `/metrics`, queries one primary from an authorized
-restricted probe client using that destination shard's credential, restarts
-shard-0000, and verifies both application persistence and an unchanged catalog
+connection through `/status` and `/metrics`, queries one primary directly and
+through the read-write compatibility Service from an authorized restricted
+probe client using shard-0000's credential, proves that Service blocks
+`shardschema`, restarts shard-0000, and verifies both application persistence and an unchanged catalog
 epoch and restore-incarnation mapping. The restart fixture also leaves one
 prepared transaction and logical slot durable across the init pass. Neither
 test proves a
@@ -154,9 +158,13 @@ Service endpoints for five seconds within a 20-second total termination budget.
 Startup, readiness,
 receipt-authenticated admission, and reconciliation reject an empty, mutable,
 incorrectly sized, or different replacement key. The leaf certificate renews without a Pod restart;
-automatic CA or fencing-key rotation is not yet implemented. Expect the sample to remain `Ready=False`, its
-pooler and orchestrator Pods to remain unready, and its application Services to
-have no ready endpoints. This path is for source validation only.
+automatic CA or fencing-key rotation is not yet implemented. Expect the sample
+to remain `Ready=False`, its pooler to remain unready, and its application
+Services to have no ready endpoints. The three orchestrator Pods become ready
+only while they can validate the exact cluster-UID-owned Kubernetes Lease
+through the API server; only one holds leadership. This does not enable durable
+operations, shard-term authority, or failover. This path is for source
+validation only.
 
 To exercise the direct PostgreSQL slice in the same cluster:
 
@@ -169,17 +177,49 @@ kubectl label namespace pgshard-single-member \
 kubectl apply --namespace pgshard-single-member \
   -f operator/config/samples/pgshard_v1alpha1_single_member.yaml
 kubectl wait --namespace pgshard-single-member --for=condition=Ready \
-  pod/single-member-shard-0000-primary-0 \
-  pod/single-member-shard-0001-primary-0 --timeout=180s
+  pod/single-member-shard-0000-0 \
+  pod/single-member-shard-0001-0 --timeout=180s
 kubectl exec --namespace pgshard-single-member \
-  single-member-shard-0000-primary-0 -- \
+  single-member-shard-0000-0 -- \
   psql -X -U postgres -d postgres -c \
   "SELECT current_setting('server_version'), pg_is_in_recovery();"
 kubectl exec --namespace pgshard-single-member \
-  single-member-shard-0000-primary-0 -- \
+  single-member-shard-0000-0 -- \
   psql -X -U postgres -d shardschema -c \
   "SELECT shard_id, shard_number, state FROM pgshard_catalog.shards ORDER BY shard_number;"
 ```
+
+The one-member development resource also exposes the shard-zero compatibility
+relay through `single-member-rw`. Wait for the pooler and port-forward the
+Service:
+
+```console
+kubectl rollout status --namespace pgshard-single-member \
+  deployment/single-member-pooler --timeout=180s
+kubectl port-forward --namespace pgshard-single-member \
+  service/single-member-rw 15432:5432
+```
+
+In another terminal that has `psql`:
+
+```console
+SHARD_ZERO_SECRET="$(kubectl get --namespace pgshard-single-member \
+  pgshardcluster/single-member \
+  -o jsonpath='{.status.postgresqlBootstraps[?(@.shard==0)].secretName}')"
+SHARD_ZERO_PASSWORD="$(kubectl get --namespace pgshard-single-member \
+  secret/"${SHARD_ZERO_SECRET}" -o jsonpath='{.data.password}' | base64 --decode)"
+PGPASSWORD="${SHARD_ZERO_PASSWORD}" PGSSLMODE=disable \
+  psql -X -h 127.0.0.1 -p 15432 -U postgres -d postgres \
+  -c "SELECT current_setting('server_version'), pg_is_in_recovery();"
+```
+
+This proves only native PostgreSQL authentication and session relay to
+shard-0000. It does not select a shard from SQL, pool connections, or provide
+HA. The relay closes sessions after observed catalog-readiness loss but does not
+fence each query against a catalog epoch or replay work. The generated
+shard-zero credential is a PostgreSQL superuser credential, so this development
+path is not safe for untrusted clients even though catalog and replication
+startup modes are blocked.
 
 The `pgshard.io/pod-fencing=enabled` namespace label is mandatory for managed
 PostgreSQL Pods. Before publishing a workload, the controller completes an
@@ -207,9 +247,10 @@ open application endpoints. Their NetworkPolicies admit only same-namespace
 Pods labelled for cluster `single-member` and component `pooler` or
 `orchestrator` (plus the matching PostgreSQL shard), and remote SCRAM also
 requires that shard's generated Secret. The operator does not yet distribute
-those credentials to applications, so use the in-Pod `kubectl exec` check above
-or the repository's restricted-client KIND test. The `single-member-rw`, `-ro`,
-and `-r` Services still lead to the rejection-only pooler. PostgreSQL
+those credentials to applications. Use the in-Pod `kubectl exec`, local
+port-forward, or repository restricted-client KIND checks above.
+`single-member-rw` relays only to shard-0000; `single-member-ro` and
+`single-member-r` have no listener and no ready endpoint. PostgreSQL
 StatefulSets use `OnDelete`; desired image or configuration changes do not
 automatically restart every shard. Until staged upgrades exist, delete one Pod
 at a time and expect an outage for that single-member shard. This includes

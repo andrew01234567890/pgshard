@@ -30,14 +30,15 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		{group: "", resource: "persistentvolumeclaims", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "", resource: "pods", verbs: []string{"delete", "get", "list", "patch"}},
 		{group: "", resource: "secrets", verbs: []string{"create", "delete", "get", "update"}},
+		{group: "", resource: "serviceaccounts", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
+		{group: "coordination.k8s.io", resource: "leases", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
+		{group: "rbac.authorization.k8s.io", resource: "roles", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
+		{group: "rbac.authorization.k8s.io", resource: "rolebindings", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "storage.k8s.io", resource: "storageclasses", verbs: []string{"list"}},
 	} {
 		if !roleAllows(role, required.group, required.resource, required.verbs) {
 			t.Errorf("manager role does not authorize %q %q with verbs %v", required.group, required.resource, required.verbs)
 		}
-	}
-	if roleAllows(role, "coordination.k8s.io", "leases", []string{"get"}) {
-		t.Fatal("cluster-wide manager role must not grant leader-election Lease access")
 	}
 	for _, forbidden := range []string{"list", "patch", "watch"} {
 		if roleAllows(role, "", "secrets", []string{forbidden}) {

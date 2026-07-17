@@ -1,6 +1,6 @@
 [package]
 name = "pgshard-pooler"
-description = "Fail-closed pooler runtime control-plane foundations for pgshard"
+description = "Fail-closed pooler runtime and shard-zero compatibility relay for pgshard"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 axum.workspace = true
 clap = { workspace = true, features = ["env"] }
+hickory-resolver.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }

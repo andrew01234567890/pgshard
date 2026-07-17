@@ -20,9 +20,10 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -39,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -83,7 +85,7 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 		t.Fatalf("requeue = %#v", result)
 	}
 
-	for _, name := range []string{"example-rw", "example-ro", "example-r", "example-shard-0000", "example-shard-0001", "example-etcd", "example-orchestrator", "example-pooler"} {
+	for _, name := range []string{"example-rw", "example-ro", "example-r", "example-shard-0000", "example-shard-0001", "example-orchestrator", "example-pooler"} {
 		service := &corev1.Service{}
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, service); err != nil {
 			t.Fatalf("get Service %s: %v", name, err)
@@ -109,11 +111,13 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 	}
 	for _, object := range []client.Object{
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "example-topology", Namespace: cluster.Namespace}},
-		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "example-etcd", Namespace: cluster.Namespace}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "example-orchestrator", Namespace: cluster.Namespace}},
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: "example-orchestrator", Namespace: cluster.Namespace}},
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "example-orchestrator", Namespace: cluster.Namespace}},
+		&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: "example-orch-lease", Namespace: cluster.Namespace}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "example-orchestrator", Namespace: cluster.Namespace}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "example-pooler", Namespace: cluster.Namespace}},
 		&autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: "example-pooler", Namespace: cluster.Namespace}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "example-etcd", Namespace: cluster.Namespace}},
 		&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "example-pooler", Namespace: cluster.Namespace}},
 	} {
 		key := client.ObjectKeyFromObject(object)
@@ -207,7 +211,7 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 		}
 		passwords[shard] = string(secret.Data[owned.PostgreSQLPasswordKey])
 		statefulSet := &appsv1.StatefulSet{}
-		name := owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)
+		name := owned.PostgreSQLShardStatefulSetName(cluster.Name, shard)
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet); err != nil {
 			t.Fatalf("get PostgreSQL StatefulSet %s: %v", name, err)
 		}
@@ -246,7 +250,7 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 			t.Fatalf("steady-state reconciliation rotated shard %d PostgreSQL credential", shard)
 		}
 		statefulSet := &appsv1.StatefulSet{}
-		name := owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)
+		name := owned.PostgreSQLShardStatefulSetName(cluster.Name, shard)
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet); err != nil {
 			t.Fatal(err)
 		}
@@ -272,7 +276,7 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLPodFencingUnavailable")
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		pod := &corev1.Pod{}
-		key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard) + "-0"}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, shard) + "-0"}
 		if err := fakeClient.Get(ctx, key, pod); err != nil {
 			t.Fatal(err)
 		}
@@ -290,6 +294,87 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "DataPlaneUnavailable")
 	if len(got.Status.PostgreSQLBootstraps) != int(cluster.Spec.Shards) {
 		t.Fatalf("recorded PostgreSQL bootstraps = %#v", got.Status.PostgreSQLBootstraps)
+	}
+}
+
+func TestRoleNeutralPostgreSQLIdentityMigrationNeverPublishesTwoControllers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+
+	currentCluster := getCluster(t, ctx, base, cluster)
+	bootstrap := bootstrapForShard(t, currentCluster, 0)
+	currentName := owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)
+	legacyName := owned.LegacyPostgreSQLPrimaryStatefulSetName(cluster.Name, 0)
+	current := &appsv1.StatefulSet{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: currentName}, current); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := current.DeepCopy()
+	legacy.Name = legacyName
+	legacy.UID = "legacy-statefulset-uid"
+	legacy.ResourceVersion = ""
+	legacy.CreationTimestamp = metav1.Time{}
+	legacy.ManagedFields = nil
+	legacy.Status = appsv1.StatefulSetStatus{}
+	if err := base.Create(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacyPod := &corev1.Pod{
+		ObjectMeta: *legacy.Spec.Template.ObjectMeta.DeepCopy(),
+		Spec:       *legacy.Spec.Template.Spec.DeepCopy(),
+	}
+	legacyPod.Name = legacyName + "-0"
+	legacyPod.Namespace = cluster.Namespace
+	legacyPod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(legacy, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))}
+	if !podSpecReferencesPostgreSQLDataPVC(legacyPod.Spec, bootstrap.PVCName) {
+		t.Fatalf("legacy upgrade fixture does not mount checkpointed PVC %s", bootstrap.PVCName)
+	}
+	if err := base.Create(ctx, legacyPod); err != nil {
+		t.Fatal(err)
+	}
+
+	assertNoDualControllers := func() bool {
+		t.Helper()
+		legacyFound := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: legacyName}, &appsv1.StatefulSet{}) == nil
+		currentFound := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: currentName}, &appsv1.StatefulSet{}) == nil
+		if legacyFound && currentFound {
+			t.Fatal("legacy and role-neutral PostgreSQL StatefulSets simultaneously reference one PGDATA")
+		}
+		return currentFound
+	}
+
+	roleNeutralCreated := false
+	for attempt := 0; attempt < 6; attempt++ {
+		result, err := reconciler.Reconcile(ctx, requestFor(cluster))
+		if err != nil {
+			t.Fatalf("migration reconcile %d: %v", attempt, err)
+		}
+		roleNeutralCreated = assertNoDualControllers()
+		if roleNeutralCreated {
+			break
+		}
+		if !result.Requeue && result.RequeueAfter == 0 {
+			t.Fatalf("migration reconcile %d stopped before role-neutral workload creation", attempt)
+		}
+	}
+	if !roleNeutralCreated {
+		t.Fatal("role-neutral PostgreSQL StatefulSet was not created after the legacy Pod absence barrier")
+	}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: legacyPod.Name}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("legacy PostgreSQL Pod remains after migration: %v", err)
 	}
 }
 
@@ -1084,7 +1169,7 @@ func TestReconcileNeverAdoptsUnrecordedBootstrapChildren(t *testing.T) {
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	orphanSecret := owned.PostgreSQLAuthSecret(cluster, 0, owned.PostgreSQLAuthSecretPrefix(cluster.Name, 0)+"orphan", []byte(strings.Repeat("a", hex.EncodedLen(postgresqlPasswordBytes))))
 	orphanSecret.UID = "unrecorded-secret"
-	orphanClaim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, 0)+"orphan", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, orphanSecret.Name, orphanSecret.UID)
+	orphanClaim := owned.PostgreSQLDataPVC(cluster, 0, owned.PostgreSQLDataPVCPrefix(cluster.Name, 0)+"orphan", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, orphanSecret.Name, orphanSecret.UID)
 	orphanClaim.UID = "unrecorded-pvc"
 	fakeClient := newFakeClient(t, cluster, orphanSecret, orphanClaim)
 	reconciler := developmentReconciler(fakeClient, nil)
@@ -1097,7 +1182,7 @@ func TestReconcileNeverAdoptsUnrecordedBootstrapChildren(t *testing.T) {
 		t.Fatalf("unrecorded bootstrap child was adopted: %#v", bootstrap)
 	}
 	statefulSet := &appsv1.StatefulSet{}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := fakeClient.Get(ctx, key, statefulSet); err != nil {
 		t.Fatal(err)
 	}
@@ -1301,7 +1386,7 @@ func TestReconcileRefusesMissingOrReplacedPostgreSQLDataPVC(t *testing.T) {
 				t.Fatal(err)
 			}
 			if replace {
-				replacement := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+				replacement := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
 				replacement.UID = "replacement-pvc-uid"
 				if err := fakeClient.Create(ctx, replacement); err != nil {
 					t.Fatal(err)
@@ -1344,7 +1429,7 @@ func TestProtectedPostgreSQLDataPVCReservesItsNameUntilWorkloadPruning(t *testin
 	if err := fakeClient.Get(ctx, key, terminating); err != nil || terminating.DeletionTimestamp == nil || terminating.UID != bootstrap.PVCUID {
 		t.Fatalf("protected PVC did not reserve its exact name after deletion: claim=%#v error=%v", terminating.ObjectMeta, err)
 	}
-	replacement := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+	replacement := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
 	if err := fakeClient.Create(ctx, replacement); !apierrors.IsAlreadyExists(err) {
 		t.Fatalf("same-name replacement bypassed protected PVC: %v", err)
 	}
@@ -1397,7 +1482,7 @@ func TestPostgreSQLDataFenceStabilizationRecoversLostUpdateResponses(t *testing.
 				t.Fatalf("%s stabilization update was not reached", stage)
 			}
 			statefulSet := &appsv1.StatefulSet{}
-			statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+			statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 			if err := base.Get(ctx, statefulSetKey, statefulSet); !apierrors.IsNotFound(err) {
 				t.Fatalf("workload was published before %s stabilization became certain: %v", stage, err)
 			}
@@ -1685,7 +1770,7 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	current := getCluster(t, ctx, base, cluster)
 	bootstrap := bootstrapForShard(t, current, 0)
 	statefulSet := &appsv1.StatefulSet{}
-	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
 		t.Fatal(err)
 	}
@@ -1860,7 +1945,7 @@ func TestPodCreatedAfterFinalAbsenceCannotBindDuringClusterDeletion(t *testing.T
 	}
 	current := getCluster(t, ctx, base, cluster)
 	statefulSet := &appsv1.StatefulSet{}
-	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
 		t.Fatal(err)
 	}
@@ -1936,7 +2021,7 @@ func TestPostgreSQLPodTerminationFenceRequiresAuthenticatedKubeletAttestation(t 
 	}
 	cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{bootstrap}
 	statefulSet := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
-		Name:      owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0),
+		Name:      owned.PostgreSQLShardStatefulSetName(cluster.Name, 0),
 		Namespace: cluster.Namespace,
 		UID:       "statefulset-uid",
 	}}
@@ -2033,7 +2118,7 @@ func TestDeletionRefusesPostgreSQLPodWithoutTerminationFence(t *testing.T) {
 	current := getCluster(t, ctx, base, cluster)
 	bootstrap := bootstrapForShard(t, current, 0)
 	statefulSet := &appsv1.StatefulSet{}
-	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
 		t.Fatal(err)
 	}
@@ -2077,7 +2162,7 @@ func TestFinalizationRefusesUncheckpointedDeletingPVCWithoutCredentialFence(t *t
 				PVCName: "deleting-collision", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
 			}
 			cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{bootstrap}
-			claim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, "foreign-secret", "foreign-secret-uid")
+			claim := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, "foreign-secret", "foreign-secret-uid")
 			claim.UID = "collision-uid"
 			claim.Finalizers = []string{owned.PostgreSQLDataProtectionFinalizer}
 			claim.DeletionTimestamp = &metav1.Time{Time: time.Unix(100, 0)}
@@ -2227,7 +2312,7 @@ func TestFinalizationDeletesLatePVCWithRecordedCredentialFence(t *testing.T) {
 			if err := base.Delete(ctx, original); err != nil {
 				t.Fatal(err)
 			}
-			late := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+			late := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
 			late.UID = "late-pvc-uid"
 			if err := base.Create(ctx, late); err != nil {
 				t.Fatal(err)
@@ -2730,7 +2815,7 @@ func TestDeletePolicyPrunesWorkloadBeforeDataClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	statefulSet := &appsv1.StatefulSet{}
-	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := base.Get(ctx, statefulSetKey, statefulSet); !apierrors.IsNotFound(err) {
 		t.Fatalf("Delete policy requested data deletion before pruning its StatefulSet: %v", err)
 	}
@@ -2799,17 +2884,6 @@ func TestReconcileObservesSupportingAvailabilityWithoutClaimingDatabaseReady(t *
 		t.Fatal(err)
 	}
 
-	etcd := &appsv1.StatefulSet{}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: "example-etcd"}
-	if err := fakeClient.Get(ctx, key, etcd); err != nil {
-		t.Fatal(err)
-	}
-	etcd.Status.ObservedGeneration = etcd.Generation
-	etcd.Status.ReadyReplicas = 3
-	etcd.Status.UpdatedReplicas = 3
-	if err := fakeClient.Status().Update(ctx, etcd); err != nil {
-		t.Fatal(err)
-	}
 	for name, replicas := range map[string]int32{"example-orchestrator": 3, "example-pooler": 2} {
 		deployment := &appsv1.Deployment{}
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, deployment); err != nil {
@@ -4096,6 +4170,183 @@ func TestPostgreSQLConfigurationRetentionTracksStatefulSetRollout(t *testing.T) 
 	}
 }
 
+func TestRetiredEtcdStorageCleanupWaitsForAuthoritativeStatefulSetAbsence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	claim := retiredEtcdPVC(cluster, 0)
+	statefulSet := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: cluster.Name + legacyEtcdSuffix, Namespace: cluster.Namespace,
+		UID: types.UID("legacy-etcd-statefulset-uid"), ResourceVersion: "1",
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cluster, pgshardv1alpha1.GroupVersion.WithKind("PgShardCluster"))},
+	}}
+	kubeClient := newFakeClient(t, cluster, claim, statefulSet)
+	reconciler := developmentReconciler(kubeClient, kubeClient)
+
+	cleaning, err := reconciler.cleanupRetiredEtcdStorage(ctx, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleaning {
+		t.Fatal("existing retired StatefulSet did not hold the storage absence barrier")
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(claim), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("retired etcd PVC was deleted while its StatefulSet still existed: %v", err)
+	}
+}
+
+func TestRetiredEtcdStorageCleanupWaitsForAnyAuthoritativePodMountAbsence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	claim := retiredEtcdPVC(cluster, 0)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "arbitrary-pvc-reader", Namespace: cluster.Namespace,
+			UID: types.UID("arbitrary-pod-uid"), ResourceVersion: "1",
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "reader", Image: "example.invalid/reader"}}, Volumes: []corev1.Volume{{
+			Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim.Name}},
+		}}},
+	}
+	kubeClient := newFakeClient(t, cluster, claim, pod)
+	reconciler := developmentReconciler(kubeClient, kubeClient)
+
+	cleaning, err := reconciler.cleanupRetiredEtcdStorage(ctx, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleaning {
+		t.Fatal("arbitrary Pod mounting retired etcd storage did not hold the absence barrier")
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(claim), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("retired etcd PVC was deleted while its Pod still existed: %v", err)
+	}
+}
+
+func TestRetiredEtcdStorageCleanupDeletesOnlyValidatedLegacyClaims(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	claims := []client.Object{cluster}
+	for ordinal := 0; ordinal < legacyEtcdPVCCount; ordinal++ {
+		claims = append(claims, retiredEtcdPVC(cluster, ordinal))
+	}
+	lookalike := retiredEtcdPVC(cluster, legacyEtcdPVCCount)
+	claims = append(claims, lookalike)
+	kubeClient := newFakeClient(t, claims...)
+	reconciler := developmentReconciler(kubeClient, kubeClient)
+
+	cleaning, err := reconciler.cleanupRetiredEtcdStorage(ctx, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleaning {
+		t.Fatal("deleted retired etcd storage was reported absent in the same observation pass")
+	}
+	for ordinal := 0; ordinal < legacyEtcdPVCCount; ordinal++ {
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: fmt.Sprintf("data-%s%s-%d", cluster.Name, legacyEtcdSuffix, ordinal)}
+		if err := kubeClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("retired etcd PVC %s survived cleanup: %v", key.Name, err)
+		}
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(lookalike), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("out-of-contract PVC was deleted: %v", err)
+	}
+	cleaning, err = reconciler.cleanupRetiredEtcdStorage(ctx, cluster)
+	if err != nil || cleaning {
+		t.Fatalf("observed cleanup completion = (%t, %v), want (false, nil)", cleaning, err)
+	}
+}
+
+func TestRetiredEtcdStorageCleanupFailsClosedOnMetadataMismatch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	claim := retiredEtcdPVC(cluster, 0)
+	claim.Labels[owned.ComponentLabel] = "postgresql"
+	kubeClient := newFakeClient(t, cluster, claim)
+	reconciler := developmentReconciler(kubeClient, kubeClient)
+
+	cleaning, err := reconciler.cleanupRetiredEtcdStorage(ctx, cluster)
+	if err == nil || !strings.Contains(err.Error(), "not bound to the exact") {
+		t.Fatalf("metadata mismatch error = %v", err)
+	}
+	if cleaning {
+		t.Fatal("rejected retired etcd PVC was reported as an active cleanup")
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(claim), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("metadata-mismatched PVC was deleted: %v", err)
+	}
+}
+
+func TestRetiredEtcdStorageCleanupRequiresAuthoritativeReader(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	claim := retiredEtcdPVC(cluster, 0)
+	kubeClient := newFakeClient(t, cluster, claim)
+	reconciler := developmentReconciler(kubeClient, nil)
+
+	cleaning, err := reconciler.cleanupRetiredEtcdStorage(ctx, cluster)
+	if err == nil || !strings.Contains(err.Error(), "authoritative API reader") {
+		t.Fatalf("missing authoritative reader error = %v", err)
+	}
+	if cleaning {
+		t.Fatal("failed cleanup reported work in progress")
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(claim), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("PVC was deleted without authoritative evidence: %v", err)
+	}
+}
+
+func TestOrchestratorLeaseEventsFilterRenewalsButKeepEnvelopeLifecycle(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	holderIdentity := "orchestrator-a"
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            cluster.Name + owned.OrchestratorLeaseSuffix,
+			Namespace:       cluster.Namespace,
+			UID:             types.UID("lease-uid"),
+			ResourceVersion: "1",
+			Generation:      1,
+			Labels:          map[string]string{owned.ClusterLabel: cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cluster, pgshardv1alpha1.GroupVersion.WithKind("PgShardCluster"))},
+		},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holderIdentity},
+	}
+	renewed := lease.DeepCopy()
+	renewed.ResourceVersion = "2"
+	renewed.Generation = 2
+	renewTime := metav1.NowMicro()
+	renewed.Spec.RenewTime = &renewTime
+	predicates := orchestratorLeaseEvents()
+	if predicates.Update(event.UpdateEvent{ObjectOld: lease, ObjectNew: renewed}) {
+		t.Fatal("runtime Lease renewal enqueued a full cluster reconciliation")
+	}
+
+	envelopeChanged := renewed.DeepCopy()
+	envelopeChanged.Labels[owned.ComponentLabel] = "wrong"
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: envelopeChanged}) {
+		t.Fatal("Lease envelope drift was filtered")
+	}
+	ownershipChanged := renewed.DeepCopy()
+	ownershipChanged.OwnerReferences = nil
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: ownershipChanged}) {
+		t.Fatal("Lease ownership change was filtered")
+	}
+	deleting := renewed.DeepCopy()
+	deletionTimestamp := metav1.Now()
+	deleting.DeletionTimestamp = &deletionTimestamp
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: deleting}) {
+		t.Fatal("Lease deletion transition was filtered")
+	}
+	if !predicates.Create(event.CreateEvent{Object: lease}) || !predicates.Delete(event.DeleteEvent{Object: lease}) {
+		t.Fatal("Lease create or delete event was filtered")
+	}
+}
+
 func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -4113,7 +4364,7 @@ func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 	controller := true
 	blockDeletion := true
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name:      "data-example-etcd-0",
+		Name:      "stale-control-plane-data",
 		Namespace: cluster.Namespace,
 		UID:       types.UID("old-pvc-uid"),
 		OwnerReferences: []metav1.OwnerReference{{
@@ -4134,8 +4385,8 @@ func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 	if result.RequeueAfter != retryDelay {
 		t.Fatalf("deletion did not wait for observed child absence: %#v", result)
 	}
-	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: "example-etcd"}, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("owned StatefulSet survived finalization: %v", err)
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: "example-orch-lease"}, &coordinationv1.Lease{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned Lease survived finalization: %v", err)
 	}
 	if err := fakeClient.Get(ctx, client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("owned PVC survived supervised cleanup: %v", err)
@@ -4159,8 +4410,8 @@ func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 	if _, err := reconciler.Reconcile(ctx, requestFor(replacement)); err != nil {
 		t.Fatal(err)
 	}
-	recreated := &appsv1.StatefulSet{}
-	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: replacement.Namespace, Name: "example-etcd"}, recreated); err != nil {
+	recreated := &coordinationv1.Lease{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: replacement.Namespace, Name: "example-orch-lease"}, recreated); err != nil {
 		t.Fatal(err)
 	}
 	assertControllerOwner(t, recreated, replacement)
@@ -4172,7 +4423,7 @@ func TestDeletionFinalizerUsesAuthoritativeReaderWhenCacheMissesChild(t *testing
 	cluster := validCluster()
 	controller := true
 	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name:      "data-example-etcd-0",
+		Name:      "stale-control-plane-data",
 		Namespace: cluster.Namespace,
 		UID:       types.UID("authoritative-pvc-uid"),
 		OwnerReferences: []metav1.OwnerReference{{
@@ -4218,7 +4469,7 @@ func TestReconcileReportsPlanFailureWithoutAdvancingObservedGeneration(t *testin
 	ctx := context.Background()
 	cluster := validCluster()
 	fakeClient := newFakeClient(t, cluster)
-	reconciler := &PgShardClusterReconciler{Client: fakeClient, Images: owned.Images{Etcd: "etcd-only"}}
+	reconciler := &PgShardClusterReconciler{Client: fakeClient, Images: owned.Images{Orchestrator: "orchestrator-only"}}
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil {
 		t.Fatal("expected planning failure")
 	}
@@ -4325,6 +4576,34 @@ func validCluster() *pgshardv1alpha1.PgShardCluster {
 				Filesystem: &pgshardv1alpha1.FilesystemRepository{PersistentVolumeClaimName: "backups"},
 			}},
 			Observability: pgshardv1alpha1.ObservabilitySpec{Prometheus: &prometheus},
+		},
+	}
+}
+
+func retiredEtcdPVC(cluster *pgshardv1alpha1.PgShardCluster, ordinal int) *corev1.PersistentVolumeClaim {
+	volumeMode := corev1.PersistentVolumeFilesystem
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            fmt.Sprintf("data-%s%s-%d", cluster.Name, legacyEtcdSuffix, ordinal),
+			Namespace:       cluster.Namespace,
+			UID:             types.UID(fmt.Sprintf("legacy-etcd-pvc-%d", ordinal)),
+			ResourceVersion: "1",
+			Labels: map[string]string{
+				"app.kubernetes.io/name": "pgshard",
+				owned.ManagedByLabel:     owned.ManagedByValue,
+				owned.InstanceLabel:      cluster.Name,
+				owned.ComponentLabel:     "etcd",
+				owned.ClusterLabel:       cluster.Name,
+			},
+			Annotations:     map[string]string{owned.ApplyOwnershipAnnotation: owned.ApplyOwnershipVersion},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cluster, pgshardv1alpha1.GroupVersion.WithKind("PgShardCluster"))},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("2Gi"),
+			}},
+			VolumeMode: &volumeMode,
 		},
 	}
 }

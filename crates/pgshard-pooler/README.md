@@ -4,10 +4,10 @@ This crate contains the first fail-closed Linux runtime for the future Rust
 pooler. It composes catalog state with four low-frequency HTTP endpoints:
 
 - `/healthz` reports process liveness independently of routing readiness;
-- `/readyz` reports overall application readiness and therefore remains HTTP
-  503 in this incomplete executable. Local supervision reports
-  `data_plane_unavailable` after the catalog becomes usable; explicit bootstrap
-  mode reports `catalog_not_configured`;
+- `/readyz` reports overall application readiness. It becomes HTTP 200 only
+  when the catalog is usable and an explicit compatibility backend is
+  configured; it does not probe a new backend socket. Catalog-only supervision reports `data_plane_unavailable`;
+  explicit bootstrap mode reports `catalog_not_configured`;
 - `/status` publishes build, overall readiness, and independent catalog state,
   with 64-bit counters and epochs encoded as decimal strings; and
 - `/metrics` publishes Prometheus text exposition with only bounded labels.
@@ -26,8 +26,8 @@ The explicit `bootstrap-unavailable` mode accepts no DSN, host, password, or CA
 and performs no connection attempt. It exists for unsupported topologies that
 cannot yet provision a catalog endpoint. Every mode applies bounded polling,
 staleness, reconnect, connection, and operation deadlines. All modes shut the
-catalog task, HTTP server, and
-PostgreSQL handshake listener down together on `SIGINT` or `SIGTERM`. The
+catalog task, HTTP server, and PostgreSQL compatibility listener down together
+on `SIGINT` or `SIGTERM`. The
 control HTTP server
 limits accepted connections, header count and bytes, header time, total
 connection lifetime, and shutdown drain time. Transient accept errors retry,
@@ -45,10 +45,15 @@ that still does not stop.
 at most 1,024 startup handshakes, caps each packet at PostgreSQL 18's 10,004-byte
 limit, applies a five-second startup deadline, and drains for at most two
 seconds. It refuses GSS and SSL negotiation with PostgreSQL's single-byte `N`,
-closes malformed and cancellation requests without reflecting their contents,
-and returns a minimal `FATAL`/`57P03` response to every regular startup. The
-listener is only a tested transport boundary; it never authenticates or accepts
-a session, and overall readiness remains false.
+closes malformed requests without reflecting their contents, and returns a
+minimal `FATAL`/`57P03` response when no ready compatibility target exists.
+With `PGSHARD_RW_BACKEND_HOST` configured and the catalog ready, it relays one
+raw client connection to that target, preserving PostgreSQL authentication and
+subsequent session bytes end to end. Cancellation requests are forwarded to the
+same singleton target. Direct `shardschema` and replication startups are
+rejected before backend contact. The relay is not a connection pool or router;
+it closes established sessions shortly after catalog readiness is observed
+lost but does not epoch-fence individual queries.
 
 The temporary local-mode `NoTls` connector accepts only loopback IP literals or
 Unix sockets, requires the database name `shardschema` and
@@ -67,18 +72,23 @@ Then run:
 ```console
 cargo run --locked -p pgshard-pooler -- \
   --read-write-bind 127.0.0.1:6432 \
+  --read-write-backend-host 127.0.0.1 \
+  --read-write-backend-port 5432 \
   --shardschema-dsn-file /run/secrets/shardschema-dsn
 ```
 
-This is not a deployable SQL pooler. Client authentication, data-shard backend
-connections and pooling, SQL execution, OpenTelemetry export, accepted-session
-drain, and the read-only listener roles remain unimplemented. For the supported
-single-member development topology, the operator provisions an immutable
-catalog-only credential and CA projection and selects `operator-tls`; catalog
-readiness can become true while overall application readiness stays false. The
-catalog login is read-only and can connect only to `shardschema` over TLS.
-General PostgreSQL traffic and etcd are not made secure by this catalog-only
-path.
+This is not a deployable SQL pooler. Client-facing TLS, pooler-owned
+authentication policy, backend pooling, SQL parsing and routing, OpenTelemetry
+export, and the read-only listener roles remain unimplemented. For the
+supported single-member development topology, the operator provisions an
+immutable catalog-only credential and CA projection, selects `operator-tls`,
+and points the compatibility relay at the ready-only shard-zero Service.
+Catalog readiness can then make overall readiness true. The catalog login is
+read-only and can connect only to `shardschema` over TLS; application
+credentials pass unchanged to PostgreSQL for its native SCRAM exchange.
+Application relay traffic is not made secure by this catalog-only path.
+Kubernetes Lease coordination belongs to the orchestrator and is not exposed
+through the pooler.
 
 The operator does not yet rotate this static PostgreSQL serving certificate or
 reload a replacement without interruption. It issues a five-year development

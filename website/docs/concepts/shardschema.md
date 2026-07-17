@@ -17,22 +17,26 @@ operator-provisioned TLS 1.3 plus SCRAM catalog access, and coordinated
 shutdown. Its control HTTP resources and drain are bounded, and its temporary
 plaintext connector rejects non-local endpoints. An explicit credential-free
 bootstrap mode exposes liveness while reporting the catalog unconfigured and
-making no connection attempt for unsupported topologies. Overall application
-readiness stays false because
-there is no SQL data plane. The migration now also contains the permanent
+making no connection attempt for unsupported topologies. In the one-member
+development topology, catalog readiness also gates a raw read-write
+compatibility relay to the singleton shard-0000 writer. That relay blocks
+`shardschema` and replication startup and is not a pool, router, or general
+data-shard transport. Unsupported topologies remain application-unready. The
+migration now also contains the permanent
 logical-consumer, checkpoint-generation, source-attachment, and managed-slot
 allocation registry described below. Its live PostgreSQL 18 test exercises the
 fenced lifecycle and tombstones. Bounded Rust primitives now authorize exact
 slot creation, activation, deletion, and final retirement; no long-running
-consumer reconciler owns those records yet. General data-shard transport,
-certificate rotation, and the SQL data plane are not wired yet; see
+consumer reconciler owns those records yet. General data-shard routing,
+certificate rotation, and the routed SQL data plane are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
 `shardschema` is a dedicated PostgreSQL database on stable bootstrap
 `cell-0000`. Physical streaming replication will protect it with the rest of
 that cell. It is authoritative for the fleet's logical-database topologies and
-physical-cell placements; etcd is used only for ephemeral leases and fencing.
+physical-cell placements; Kubernetes Lease objects are used only for ephemeral
+coordination and are never durable topology authority.
 Application databases do not share one mandatory shard count. A database's
 active routing epoch may use any validated subset of shared cells or a
 dedicated placement pool.
@@ -203,7 +207,7 @@ absent or already canonical per-role login defaults, and re-establishes one
 exact safe session policy for this fixed login. Noncanonical login defaults are
 rejected before mutation; the login itself verifies the policy before the
 serving HBA is published. This secures the catalog
-path, not general data-shard or etcd traffic.
+path, not general data-shard or Kubernetes API traffic.
 
 `bootstrap-unavailable` is a separate fail-closed installation state, not an
 empty catalog or a stale-cache policy. It accepts no DSN, reports phase

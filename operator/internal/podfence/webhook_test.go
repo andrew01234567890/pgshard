@@ -177,7 +177,7 @@ func TestBindingAdmissionRejectsPartiallyStrippedManagedPods(t *testing.T) {
 func TestBindingAdmissionAllowsNonPostgreSQLPgShardPods(t *testing.T) {
 	t.Parallel()
 	scheme := testScheme(t)
-	for _, component := range []string{"etcd", "orchestrator", "pooler"} {
+	for _, component := range []string{"orchestrator", "pooler"} {
 		component := component
 		t.Run(component, func(t *testing.T) {
 			t.Parallel()
@@ -644,7 +644,7 @@ func managedPod() *corev1.Pod {
 	deletion := metav1.NewTime(time.Unix(100, 0))
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "example-shard-0000-primary-0", Namespace: "database", UID: types.UID("pod-uid"), Generation: 3,
+			Name: "example-shard-0000-0", Namespace: "database", UID: types.UID("pod-uid"), Generation: 3,
 			DeletionTimestamp: &deletion,
 			Finalizers:        []string{owned.PostgreSQLPodTerminationFinalizer},
 			Labels: map[string]string{

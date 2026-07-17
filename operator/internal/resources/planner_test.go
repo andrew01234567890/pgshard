@@ -16,9 +16,11 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -101,6 +103,12 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 		if service.Spec.Ports[0].Port != PostgreSQLPort || service.Spec.Ports[0].TargetPort.StrVal != "pooler-"+suffix {
 			t.Fatalf("%s service port = %#v", suffix, service.Spec.Ports[0])
 		}
+		if suffix == "rw" && !reflect.DeepEqual(service.Spec.Selector, componentSelector(cluster, "pooler")) {
+			t.Fatalf("read-write Service selector = %#v", service.Spec.Selector)
+		}
+		if suffix != "rw" && service.Spec.Selector != nil {
+			t.Fatalf("unsupported %s Service unexpectedly selects ready poolers: %#v", suffix, service.Spec.Selector)
+		}
 		assertOwned(t, service, cluster)
 	}
 	poolerControl := object[*corev1.Service](t, first, "demo-pooler")
@@ -169,7 +177,7 @@ func TestPostgreSQLConfigurationAndResourceLimitRollTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	beforeConfiguration := postgresqlConfigMap(t, before, cluster.Name)
-	beforeStatefulSet := object[*appsv1.StatefulSet](t, before, PostgreSQLPrimaryStatefulSetName(cluster.Name, 0))
+	beforeStatefulSet := object[*appsv1.StatefulSet](t, before, PostgreSQLShardStatefulSetName(cluster.Name, 0))
 	beforePooler := object[*appsv1.Deployment](t, before, cluster.Name+PoolerSuffix)
 
 	cluster.Spec.PostgreSQL.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("3Gi")
@@ -179,7 +187,7 @@ func TestPostgreSQLConfigurationAndResourceLimitRollTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	afterConfiguration := postgresqlConfigMap(t, after, cluster.Name)
-	afterStatefulSet := object[*appsv1.StatefulSet](t, after, PostgreSQLPrimaryStatefulSetName(cluster.Name, 0))
+	afterStatefulSet := object[*appsv1.StatefulSet](t, after, PostgreSQLShardStatefulSetName(cluster.Name, 0))
 	afterPooler := object[*appsv1.Deployment](t, after, cluster.Name+PoolerSuffix)
 	if beforeConfiguration.Name == afterConfiguration.Name {
 		t.Fatal("resource-derived PostgreSQL configuration name did not change")
@@ -217,7 +225,8 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		t.Fatalf("single-member primary configuration = %q", primaryConfiguration)
 	}
 	catalogService := object[*corev1.Service](t, plan, CatalogServiceName(cluster.Name))
-	if catalogService.Spec.PublishNotReadyAddresses || catalogService.Spec.Selector[ShardLabel] != "0000" || catalogService.Spec.Selector[RoleLabel] != "primary" || catalogService.Spec.Selector[MemberLabel] != "0000" || len(catalogService.Spec.Ports) != 1 || catalogService.Spec.Ports[0].Port != PostgreSQLPort {
+	_, selectsFixedMember := catalogService.Spec.Selector[MemberLabel]
+	if catalogService.Spec.PublishNotReadyAddresses || catalogService.Spec.Selector[ShardLabel] != "0000" || catalogService.Spec.Selector[RoleLabel] != "primary" || selectsFixedMember || len(catalogService.Spec.Ports) != 1 || catalogService.Spec.Ports[0].Port != PostgreSQLPort {
 		t.Fatalf("ready-only shardschema Service = %#v", catalogService.Spec)
 	}
 	pooler := object[*appsv1.Deployment](t, plan, cluster.Name+PoolerSuffix)
@@ -226,7 +235,8 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		envValue(poolerContainer.Env, "PGSHARD_SHARDSCHEMA_HOST") != "demo-shardschema.database.svc" ||
 		envValue(poolerContainer.Env, "PGSHARD_SHARDSCHEMA_PASSWORD_FILE") != "/etc/pgshard/catalog/catalog-password" ||
 		envValue(poolerContainer.Env, "PGSHARD_SHARDSCHEMA_CA_FILE") != "/etc/pgshard/catalog/ca.crt" ||
-		envValue(poolerContainer.Env, "PGSHARD_SHARDSCHEMA_CLIENT_SHA256") != cluster.Status.CatalogAccess.ClientSHA256 {
+		envValue(poolerContainer.Env, "PGSHARD_SHARDSCHEMA_CLIENT_SHA256") != cluster.Status.CatalogAccess.ClientSHA256 ||
+		envValue(poolerContainer.Env, "PGSHARD_RW_BACKEND_HOST") != "demo-shardschema.database.svc" {
 		t.Fatalf("pooler catalog environment = %#v", poolerContainer.Env)
 	}
 	poolerCatalogVolume := volumeByName(t, pooler.Spec.Template.Spec.Volumes, "catalog-client")
@@ -238,10 +248,16 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	}
 
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
-		name := shardName(cluster.Name, shard) + "-primary"
+		name := PostgreSQLShardStatefulSetName(cluster.Name, shard)
 		statefulSet := object[*appsv1.StatefulSet](t, plan, name)
+		if strings.Contains(statefulSet.Name, "primary") || strings.Contains(statefulSet.Name, "replica") {
+			t.Fatalf("PostgreSQL StatefulSet identity contains a mutable role: %q", statefulSet.Name)
+		}
 		if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != 1 || statefulSet.Spec.ServiceName != shardName(cluster.Name, shard) || statefulSet.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType {
 			t.Fatalf("PostgreSQL StatefulSet identity = %#v", statefulSet.Spec)
+		}
+		if _, selectsMutableRole := statefulSet.Spec.Selector.MatchLabels[RoleLabel]; selectsMutableRole || statefulSet.Spec.Template.Labels[RoleLabel] != "primary" || statefulSet.Spec.Selector.MatchLabels[MemberLabel] != "0000" {
+			t.Fatalf("PostgreSQL StatefulSet selector is not stable across promotion: selector=%#v labels=%#v", statefulSet.Spec.Selector.MatchLabels, statefulSet.Spec.Template.Labels)
 		}
 		if statefulSet.Spec.Template.Labels[ManagedByLabel] != ManagedByValue || statefulSet.Spec.Template.Labels[ShardLabel] != shardLabel(shard) || statefulSet.Spec.Template.Labels[RoleLabel] != "primary" || statefulSet.Spec.Template.Labels[MemberLabel] != "0000" {
 			t.Fatalf("PostgreSQL labels = %#v", statefulSet.Spec.Template.Labels)
@@ -425,7 +441,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		t.Fatalf("catalog TLS DNS names = %#v, want %#v", got, want)
 	}
 	secret.UID = "demo-random-auth-uid"
-	claim := PostgreSQLPrimaryDataPVC(cluster, 1, "demo-random-data", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, secret.Name, secret.UID)
+	claim := PostgreSQLDataPVC(cluster, 1, "demo-random-data", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, secret.Name, secret.UID)
 	if claim.Name != "demo-random-data" || claim.Labels[ShardLabel] != "0001" || claim.Spec.Resources.Requests.Storage().Cmp(cluster.Spec.Storage.Size) != 0 || claim.Annotations[ApplyOwnershipAnnotation] != "" {
 		t.Fatalf("PostgreSQL data PVC = %#v", claim)
 	}
@@ -437,6 +453,9 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	}
 	if len(claim.Finalizers) != 0 {
 		t.Fatalf("creation-fenced PVC received protection before its API UID checkpoint: %#v", claim.Finalizers)
+	}
+	if got := PostgreSQLDataPVCPrefix(cluster.Name, 1); got != "demo-shard-0001-data-" || strings.Contains(got, "primary") || strings.Contains(got, "replica") {
+		t.Fatalf("PostgreSQL data PVC prefix is not role-neutral: %q", got)
 	}
 }
 
@@ -1772,43 +1791,60 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	etcd := object[*appsv1.StatefulSet](t, plan, "demo-etcd")
-	if *etcd.Spec.Replicas != 3 || etcd.Spec.ServiceName != "demo-etcd" || len(etcd.Spec.VolumeClaimTemplates) != 1 {
-		t.Fatalf("etcd spec = %#v", etcd.Spec)
+	serviceAccount := object[*corev1.ServiceAccount](t, plan, "demo-orchestrator")
+	if serviceAccount.AutomountServiceAccountToken == nil || *serviceAccount.AutomountServiceAccountToken {
+		t.Fatalf("orchestrator ServiceAccount token policy = %#v", serviceAccount.AutomountServiceAccountToken)
 	}
-	if !containsString(etcd.Spec.Template.Spec.Containers[0].Args, "--quota-backend-bytes=805306368") || !containsString(etcd.Spec.Template.Spec.Containers[0].Args, "--max-wals=2") {
-		t.Fatalf("etcd quota/retention does not leave storage margin: %#v", etcd.Spec.Template.Spec.Containers[0].Args)
+	role := object[*rbacv1.Role](t, plan, "demo-orchestrator")
+	if len(role.Rules) != 1 || !reflect.DeepEqual(role.Rules[0].APIGroups, []string{"coordination.k8s.io"}) || !reflect.DeepEqual(role.Rules[0].Resources, []string{"leases"}) || !reflect.DeepEqual(role.Rules[0].ResourceNames, []string{"demo-orch-lease"}) || !reflect.DeepEqual(role.Rules[0].Verbs, []string{"get", "update"}) {
+		t.Fatalf("orchestrator Lease Role is broader than required: %#v", role.Rules)
 	}
-	claim := etcd.Spec.VolumeClaimTemplates[0]
-	if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != storageClass || claim.Spec.Resources.Requests.Storage().String() != "2Gi" {
-		t.Fatalf("etcd PVC = %#v", claim.Spec)
+	roleBinding := object[*rbacv1.RoleBinding](t, plan, "demo-orchestrator")
+	if roleBinding.RoleRef.APIGroup != rbacv1.GroupName || roleBinding.RoleRef.Kind != "Role" || roleBinding.RoleRef.Name != role.Name || len(roleBinding.Subjects) != 1 || roleBinding.Subjects[0].Kind != "ServiceAccount" || roleBinding.Subjects[0].Name != serviceAccount.Name || roleBinding.Subjects[0].Namespace != cluster.Namespace {
+		t.Fatalf("orchestrator Lease RoleBinding = %#v", roleBinding)
 	}
-	if claim.Namespace != "" || !metav1.IsControlledBy(&claim, cluster) {
-		t.Fatalf("etcd PVC template is not directly UID-owned by the cluster: %#v", claim.ObjectMeta)
+	lease := object[*coordinationv1.Lease](t, plan, "demo-orch-lease")
+	if !metav1.IsControlledBy(lease, cluster) || lease.Spec.HolderIdentity != nil || lease.Spec.RenewTime != nil || lease.Spec.LeaseDurationSeconds != nil {
+		t.Fatalf("operator must own only the empty Lease envelope: %#v", lease)
 	}
-	if etcd.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType || etcd.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
-		t.Fatalf("etcd PVC retention is destructive: %#v", etcd.Spec.PersistentVolumeClaimRetentionPolicy)
-	}
-	if etcd.Spec.Template.Spec.SecurityContext == nil || etcd.Spec.Template.Spec.SecurityContext.SeccompProfile == nil || len(etcd.Spec.Template.Spec.TopologySpreadConstraints) != 2 {
-		t.Fatalf("etcd pod hardening/spread is incomplete: %#v", etcd.Spec.Template.Spec)
-	}
-	etcdContainer := etcd.Spec.Template.Spec.Containers[0]
-	if len(etcdContainer.Command) != 1 || etcdContainer.Command[0] != etcdExecutable || etcdContainer.Image != defaultEtcdImage || etcdContainer.ImagePullPolicy != corev1.PullIfNotPresent {
-		t.Fatalf("etcd executable/image contract = %#v", etcdContainer)
-	}
-	if etcdContainer.ReadinessProbe.FailureThreshold != 1 || etcdContainer.LivenessProbe.FailureThreshold != 3 {
-		t.Fatalf("etcd probe thresholds = readiness %d, liveness %d", etcdContainer.ReadinessProbe.FailureThreshold, etcdContainer.LivenessProbe.FailureThreshold)
+	for _, planned := range plan {
+		if planned.GetLabels()[ComponentLabel] == "etcd" || strings.Contains(planned.GetName(), "-etcd") {
+			t.Fatalf("dedicated etcd resource remains in plan: %T %s", planned, planned.GetName())
+		}
 	}
 
 	orchestrator := object[*appsv1.Deployment](t, plan, "demo-orchestrator")
 	if *orchestrator.Spec.Replicas != 3 || orchestrator.Spec.Template.Spec.Containers[0].ReadinessProbe.HTTPGet.Path != "/readyz" || orchestrator.Spec.Template.Spec.Containers[0].ReadinessProbe.FailureThreshold != 1 {
 		t.Fatalf("orchestrator spec = %#v", orchestrator.Spec)
 	}
-	if orchestrator.Spec.Template.Spec.Containers[0].Env[1].ValueFrom.FieldRef.FieldPath != "metadata.uid" {
-		t.Fatalf("orchestrator identity is not a bounded Pod UID: %#v", orchestrator.Spec.Template.Spec.Containers[0].Env[1])
+	orchestratorEnv := orchestrator.Spec.Template.Spec.Containers[0].Env
+	if orchestratorEnv[1].Name != "PGSHARD_CLUSTER_UID" || orchestratorEnv[1].Value != string(cluster.UID) {
+		t.Fatalf("orchestrator cluster incarnation is not UID-bound: %#v", orchestratorEnv[1])
+	}
+	if orchestrator.Spec.Template.Spec.ServiceAccountName != serviceAccount.Name || orchestrator.Spec.Template.Spec.AutomountServiceAccountToken == nil || !*orchestrator.Spec.Template.Spec.AutomountServiceAccountToken {
+		t.Fatalf("orchestrator API identity = %#v", orchestrator.Spec.Template.Spec)
+	}
+	wantedFields := map[string]string{
+		"PGSHARD_ORCH_ID":         "metadata.name",
+		"PGSHARD_POD_UID":         "metadata.uid",
+		"PGSHARD_LEASE_NAMESPACE": "metadata.namespace",
+	}
+	for _, variable := range orchestratorEnv {
+		if field, wanted := wantedFields[variable.Name]; wanted {
+			if variable.ValueFrom == nil || variable.ValueFrom.FieldRef == nil || variable.ValueFrom.FieldRef.FieldPath != field {
+				t.Fatalf("orchestrator %s identity = %#v", variable.Name, variable)
+			}
+			delete(wantedFields, variable.Name)
+		}
+	}
+	if len(wantedFields) != 0 || envValue(orchestratorEnv, "PGSHARD_LEASE_NAME") != lease.Name {
+		t.Fatalf("orchestrator Lease environment is incomplete: missing=%#v env=%#v", wantedFields, orchestratorEnv)
 	}
 	pooler := object[*appsv1.Deployment](t, plan, "demo-pooler")
 	poolerContainer := pooler.Spec.Template.Spec.Containers[0]
+	if pooler.Spec.Template.Spec.AutomountServiceAccountToken == nil || *pooler.Spec.Template.Spec.AutomountServiceAccountToken {
+		t.Fatalf("pooler unexpectedly receives a Kubernetes API token: %#v", pooler.Spec.Template.Spec.AutomountServiceAccountToken)
+	}
 	if pooler.Spec.Replicas != nil || len(poolerContainer.Ports) != 4 || poolerContainer.ReadinessProbe.HTTPGet.Path != "/readyz" || poolerContainer.ReadinessProbe.FailureThreshold != 1 || poolerContainer.LivenessProbe.HTTPGet.Path != "/healthz" || poolerContainer.LivenessProbe.FailureThreshold != 3 {
 		t.Fatalf("pooler spec = %#v", pooler.Spec)
 	}
@@ -1820,8 +1856,8 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 			if variable.Value != "bootstrap-unavailable" {
 				t.Fatalf("pooler catalog mode = %q, want bootstrap-unavailable", variable.Value)
 			}
-		case "PGSHARD_SHARDSCHEMA_DSN_FILE":
-			t.Fatal("pooler unexpectedly has a shardschema DSN file")
+		case "PGSHARD_SHARDSCHEMA_DSN_FILE", "PGSHARD_RW_BACKEND_HOST":
+			t.Fatalf("bootstrap pooler unexpectedly has %s", variable.Name)
 		}
 	}
 	if catalogModeCount != 1 {
@@ -1831,7 +1867,7 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if *hpa.Spec.MinReplicas != 2 || hpa.Spec.MaxReplicas != 6 || *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization != 70 {
 		t.Fatalf("HPA spec = %#v", hpa.Spec)
 	}
-	for _, component := range []string{"etcd", "orchestrator", "pooler"} {
+	for _, component := range []string{"orchestrator", "pooler"} {
 		pdb := object[*policyv1.PodDisruptionBudget](t, plan, "demo-"+component)
 		if component == "pooler" {
 			if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntVal != 1 {
@@ -1840,10 +1876,6 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		} else if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntVal != 1 {
 			t.Fatalf("%s PDB = %#v", component, pdb.Spec)
 		}
-	}
-	policy := object[*networkingv1.NetworkPolicy](t, plan, "demo-etcd")
-	if len(policy.Spec.Ingress) != 2 || policy.Spec.Ingress[0].Ports[0].Port.IntVal != EtcdClientPort || policy.Spec.Ingress[1].Ports[0].Port.IntVal != EtcdPeerPort {
-		t.Fatalf("etcd NetworkPolicy = %#v", policy.Spec)
 	}
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		postgresqlPolicy := object[*networkingv1.NetworkPolicy](t, plan, shardName(cluster.Name, shard)+"-ingress")
@@ -1972,6 +2004,19 @@ func TestPostgreSQLBootstrapImageRejectsMutableRemoteReferences(t *testing.T) {
 	}
 }
 
+func TestOrchestratorHasExplicitShutdownBudget(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	plan, err := Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator := object[*appsv1.Deployment](t, plan, cluster.Name+OrchestratorSuffix)
+	if got := orchestrator.Spec.Template.Spec.TerminationGracePeriodSeconds; got == nil || *got != 30 {
+		t.Fatalf("orchestrator termination grace = %v, want 30 seconds", got)
+	}
+}
+
 func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
@@ -1981,9 +2026,13 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	orchestrator := object[*appsv1.Deployment](t, plan, cluster.Name+OrchestratorSuffix)
-	identity := orchestrator.Spec.Template.Spec.Containers[0].Env[1]
-	if identity.Name != "PGSHARD_ORCH_ID" || identity.ValueFrom == nil || identity.ValueFrom.FieldRef == nil || identity.ValueFrom.FieldRef.FieldPath != "metadata.uid" {
+	identity := orchestrator.Spec.Template.Spec.Containers[0].Env[2]
+	if identity.Name != "PGSHARD_ORCH_ID" || identity.ValueFrom == nil || identity.ValueFrom.FieldRef == nil || identity.ValueFrom.FieldRef.FieldPath != "metadata.name" {
 		t.Fatalf("orchestrator identity = %#v", identity)
+	}
+	lease := object[*coordinationv1.Lease](t, plan, cluster.Name+OrchestratorLeaseSuffix)
+	if len(lease.Name) > 63 {
+		t.Fatalf("maximum cluster name produced invalid Lease name: %q", lease.Name)
 	}
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
@@ -1992,22 +2041,25 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	statefulSet := object[*appsv1.StatefulSet](t, plan, PostgreSQLPrimaryStatefulSetName(cluster.Name, 0))
+	statefulSet := object[*appsv1.StatefulSet](t, plan, PostgreSQLShardStatefulSetName(cluster.Name, 0))
 	if len(statefulSet.Name) > 63 || len(statefulSet.Name+"-0") > 63 {
 		t.Fatalf("maximum cluster name produced invalid StatefulSet or Pod name: %q", statefulSet.Name)
+	}
+	if strings.Contains(statefulSet.Name, "primary") || strings.Contains(statefulSet.Name, "replica") {
+		t.Fatalf("PostgreSQL StatefulSet identity contains a mutable role: %q", statefulSet.Name)
 	}
 	if statefulSet.Spec.ServiceName != shardName(cluster.Name, 0) {
 		t.Fatalf("bounded StatefulSet changed the existing shard Service identity: %q", statefulSet.Spec.ServiceName)
 	}
 	otherName := strings.Repeat("a", pgshardv1alpha1.MaximumClusterNameLength-1) + "b"
-	if PostgreSQLPrimaryStatefulSetName(cluster.Name, 0) == PostgreSQLPrimaryStatefulSetName(otherName, 0) {
+	if PostgreSQLShardStatefulSetName(cluster.Name, 0) == PostgreSQLShardStatefulSetName(otherName, 0) {
 		t.Fatal("distinct maximum-length cluster names produced the same StatefulSet identity")
 	}
 	derivedAlias := boundedPostgreSQLWorkloadPrefix(cluster.Name)
 	if len(derivedAlias) != 42 {
 		t.Fatalf("bounded cluster prefix length = %d, want 42", len(derivedAlias))
 	}
-	if PostgreSQLPrimaryStatefulSetName(cluster.Name, 0) == PostgreSQLPrimaryStatefulSetName(derivedAlias, 0) {
+	if PostgreSQLShardStatefulSetName(cluster.Name, 0) == PostgreSQLShardStatefulSetName(derivedAlias, 0) {
 		t.Fatal("maximum-length cluster name aliased its valid derived 42-character prefix")
 	}
 }

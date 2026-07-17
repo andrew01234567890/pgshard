@@ -202,6 +202,21 @@ installed term, process-local monotonic deadline, catalog epoch, and fencing
 epoch at dispatch; expired and superseded handles fail closed. The receiving
 target still has to enforce that epoch because the local guard is an
 instant-in-time observation rather than a duration guarantee.
+The Kubernetes Lease coordination tests use an in-memory compare-and-swap
+store. They prove exclusive empty-Lease claims, conditional renewal and release,
+exact fleet owner and Lease UID pinning, local unchanged-record takeover timing,
+that a delayed post-commit replacement response cannot extend local leadership,
+and cancellation of a stalled API operation during shutdown. Operator tests
+also prove an arbitrary Pod name and owner still blocks retired etcd PVC
+deletion when it references the claim. The manager KIND
+suite exercises the real Kubernetes API: it verifies exact-name `get`/`update`
+RBAC, removes the operator-owned Lease while reconciliation is paused, requires
+the same orchestrator Pod incarnations to lose readiness without restarting,
+and then rolls them after the operator creates a replacement Lease with a new
+UID. A separate controller upgrade test holds a checkpointed PostgreSQL PVC
+behind the legacy role-named StatefulSet
+and Pod, then proves the role-neutral controller appears only after both old
+objects are absent.
 Pure orchestrator tests also exercise the standby-decoder attachment contract. They
 require non-nil catalog generations encoded in slot names and matched exactly,
 an opaque test-only replay floor bound to the exact source identity, the
@@ -548,10 +563,15 @@ replicas are claimed. A separate KIND
 job builds local images, installs the real manager with self-managed admission
 certificates, proves the generated serving chain and injected CA bundles,
 observes semantic validation reject an unsafe synchronous singleton, waits for
-leader-elected reconciliation, observes a restart-free etcd quorum, keeps
-rejection-only pooler and persistence-free orchestrator containers running
-without restarts while they remain unready, and proves the three-member sample
-has no PostgreSQL workload or ready application endpoint. The same job creates
+leader-elected reconciliation, keeps the bootstrap-unavailable pooler unready,
+and requires all three persistence-free orchestrators to validate the exact
+operator-owned Lease without restarts while only one reports leadership. Their
+readiness proves only current API-backed coordination, not durable operations
+or shard-term authority. It then pauses manager reconciliation, deletes the
+Lease, requires those exact Pod UIDs to become unready without a restart,
+resumes the manager, and requires a bounded orchestrator rollout before the new
+Lease UID becomes ready. The job also proves the three-member sample has no PostgreSQL
+workload or ready application endpoint. The same job creates
 a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard
 Service from an authorized restricted probe client using the destination-specific
@@ -559,8 +579,10 @@ Secret, rejects otherwise identical unlabeled and wrong-cluster clients through
 the live NetworkPolicy, and verifies that only shard-0000 contains the dedicated
 `shardschema` database. It reaches the pooler control Service through the
 Kubernetes API proxy and requires a successful operator-provisioned TLS 1.3 and
-SCRAM catalog load in both exact JSON status and Prometheus metrics while
-overall SQL readiness remains false. It hash-verifies and loads the exact migration shipped
+SCRAM catalog load in both exact JSON status and Prometheus metrics, requires
+the read-write compatibility relay to become ready, executes a native-SCRAM
+query through it to shard-0000, and proves an application startup for
+`shardschema` is rejected by the pooler before backend contact. It hash-verifies and loads the exact migration shipped
 in the non-root PostgreSQL bootstrap image, observes both configured shard
 identities and one active restore incarnation per shard, records the complete
 epoch-and-incarnation snapshot, and requires a primary recreation to reapply
@@ -568,8 +590,10 @@ the migration without changing that snapshot. The fixture leaves a prepared
 transaction and inactive logical slot durable before recreation, proving the
 private init postmaster loads the managed logical-WAL and 2PC settings. It also
 proves an omitted storage class was resolved and
-checkpointed on the resulting Bound PVC, then explicitly deletes one
-`OnDelete` primary Pod after first publishing a changed desired configuration.
+checkpointed on the resulting Bound PVC, proves PostgreSQL workload and PVC
+names are role-neutral while `pgshard.io/role=primary` selects the writer, then
+explicitly deletes one `OnDelete` PostgreSQL member Pod after first publishing
+a changed desired configuration.
 It proves neither primary restarts when the StatefulSet templates change, the
 selected replacement adopts the new template, the other shard remains on its
 original UID and configuration, and the PVC-backed row survives. Against a

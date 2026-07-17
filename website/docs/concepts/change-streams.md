@@ -195,7 +195,7 @@ an emergency primary fallback is explicit, observable and never automatic.
 ## Ownership transfer
 
 The durable per-shard ownership generation in `shardschema` is the fencing
-authority; an etcd lease is only its short-lived liveness guard. Every worker
+authority; a Kubernetes Lease is only its short-lived liveness guard. Every worker
 arms a local monotonic deadline no later than its lease expiry.
 
 No stream connection may create a slot, run `START_REPLICATION`, begin or import

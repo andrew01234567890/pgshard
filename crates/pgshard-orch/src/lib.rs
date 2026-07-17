@@ -4,6 +4,7 @@
 //! does not select `PostgreSQL` promotion candidates or claim failover safety.
 
 pub mod config;
+pub mod coordination;
 pub mod domain;
 pub mod http;
 mod postgres_connection;

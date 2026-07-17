@@ -26,6 +26,7 @@ jobs:
       catalog: ${{ steps.detect.outputs.catalog }}
       orch_catalog: ${{ steps.detect.outputs.orch_catalog }}
       pgwire: ${{ steps.detect.outputs.pgwire }}
+      pooler_postgres: ${{ steps.detect.outputs.pooler_postgres }}
       planner: ${{ steps.detect.outputs.planner }}
       proto: ${{ steps.detect.outputs.proto }}
       go: ${{ steps.detect.outputs.go }}
@@ -96,6 +97,7 @@ jobs:
           catalog_exists=false
           orch_catalog_exists=false
           pgwire_exists=false
+          pooler_postgres_exists=false
           planner_exists=false
           proto_exists=false
           go_exists=false
@@ -111,6 +113,7 @@ jobs:
           exists_at_head_or_base crates/pgshard-catalog/Cargo.toml && catalog_exists=true
           exists_at_head_or_base crates/pgshard-orch/Cargo.toml && orch_catalog_exists=true
           exists_at_head_or_base crates/pgshard-pgwire/Cargo.toml && pgwire_exists=true
+          exists_at_head_or_base crates/pgshard-pooler/Cargo.toml && pooler_postgres_exists=true
           exists_at_head_or_base crates/pgshard-planner/Cargo.toml && planner_exists=true
           exists_at_head_or_base buf.yaml && proto_exists=true
           exists_at_head_or_base operator/go.mod && go_exists=true
@@ -126,6 +129,7 @@ jobs:
           emit_component catalog "$catalog_exists" '^crates/pgshard-catalog/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component orch_catalog "$orch_catalog_exists" '^crates/(pgshard-orch|pgshard-catalog|pgshard-types)/|^operator/internal/tuning/|^contracts/replication-slot-names\.json$|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component pgwire "$pgwire_exists" '^crates/pgshard-pgwire/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
+          emit_component pooler_postgres "$pooler_postgres_exists" '^crates/(pgshard-pooler|pgshard-pgwire|pgshard-catalog|pgshard-types|pgshard-version)/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component planner "$planner_exists" '^crates/pgshard-planner/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^Makefile$|^\.github/workflows/'
           emit_component go "$go_exists" '^operator/|^proto/|^contracts/replication-slot-names\.json$|^Makefile$|^\.github/workflows/'
@@ -438,9 +442,9 @@ jobs:
         run: make planner-postgres-test
 
   pgwire-postgres:
-    name: Pgwire / PostgreSQL 18
+    name: PostgreSQL wire / PostgreSQL 18
     needs: changes
-    if: needs.changes.outputs.pgwire == 'true'
+    if: needs.changes.outputs.pgwire == 'true' || needs.changes.outputs.pooler_postgres == 'true'
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -461,9 +465,15 @@ jobs:
       - name: Select repository Rust toolchain
         run: rustup show active-toolchain
       - name: Decode real PostgreSQL 18 wire and persistent-slot controls
+        if: needs.changes.outputs.pgwire == 'true'
         env:
           PGSHARD_PGWIRE_TEST_ADDRESS: 127.0.0.1:5432
         run: make pgwire-postgres-test
+      - name: Relay a live PostgreSQL 18 session through the pooler
+        if: needs.changes.outputs.pooler_postgres == 'true'
+        env:
+          PGSHARD_POOLER_TEST_ADDRESS: 127.0.0.1:5432
+        run: make pooler-postgres-test
 
   pgwire-fuzz:
     name: Pgwire fuzz / ${{ matrix.target }}
@@ -660,7 +670,7 @@ jobs:
       - name: Capture manager diagnostics
         if: failure()
         run: |
-          kubectl get pods,deployments,statefulsets --all-namespaces --show-labels
+          kubectl get pods,deployments,statefulsets,leases --all-namespaces --show-labels
           kubectl logs --namespace pgshard-system deployment/pgshard-controller-manager --all-containers --tail=200 || true
       - name: Delete disposable Kubernetes cluster
         if: always()

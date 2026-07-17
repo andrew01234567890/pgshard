@@ -68,7 +68,6 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.StringVar(&options.webhook.mutatingConfigurationName, "webhook-mutating-configuration-name", "pgshard-mutating-webhook-configuration", "mutating webhook configuration name")
 	flags.StringVar(&options.webhook.validatingConfigurationName, "webhook-validating-configuration-name", "pgshard-validating-webhook-configuration", "validating webhook configuration name")
 	flags.StringVar(&options.webhook.certificateDirectory, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "private directory for generated webhook certificate files")
-	flags.StringVar(&options.images.Etcd, "etcd-image", options.images.Etcd, "etcd image reference")
 	flags.StringVar(&options.images.Orchestrator, "orchestrator-image", options.images.Orchestrator, "pgshard orchestrator image reference")
 	flags.StringVar(&options.images.Pooler, "pooler-image", options.images.Pooler, "pgshard pooler image reference")
 	flags.StringVar(&options.images.PostgreSQL, "postgresql-image", options.images.PostgreSQL, "PostgreSQL 18 image reference")
