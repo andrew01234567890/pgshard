@@ -1019,6 +1019,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "hmac",
  "hyper",
  "hyper-util",
  "pgshard-catalog",
@@ -1038,6 +1039,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

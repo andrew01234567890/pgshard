@@ -13,6 +13,7 @@ axum.workspace = true
 clap = { workspace = true, features = ["env"] }
 hyper.workspace = true
 hyper-util.workspace = true
+hmac.workspace = true
 pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-pgwire = { path = "../pgshard-pgwire", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
@@ -32,6 +33,7 @@ tracing-subscriber.workspace = true
 serde_json.workspace = true
 tempfile = "3.27.0"
 tower.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
