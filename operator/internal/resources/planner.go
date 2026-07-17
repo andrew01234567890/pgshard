@@ -484,9 +484,11 @@ func PostgreSQLPrimaryStatefulSetName(cluster string, shard int32) string {
 func boundedPostgreSQLWorkloadPrefix(cluster string) string {
 	const (
 		maximumPrefixLength = 42
-		digestBytes         = 8
+		digestBytes         = 12
 	)
-	if len(cluster) <= maximumPrefixLength {
+	// Hash names at the boundary too: otherwise a longer name's bounded output
+	// could alias an accepted, literal 42-character cluster name.
+	if len(cluster) < maximumPrefixLength {
 		return cluster
 	}
 	digest := sha256.Sum256([]byte(cluster))

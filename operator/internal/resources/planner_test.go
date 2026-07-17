@@ -563,6 +563,13 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	if PostgreSQLPrimaryStatefulSetName(cluster.Name, 0) == PostgreSQLPrimaryStatefulSetName(otherName, 0) {
 		t.Fatal("distinct maximum-length cluster names produced the same StatefulSet identity")
 	}
+	derivedAlias := boundedPostgreSQLWorkloadPrefix(cluster.Name)
+	if len(derivedAlias) != 42 {
+		t.Fatalf("bounded cluster prefix length = %d, want 42", len(derivedAlias))
+	}
+	if PostgreSQLPrimaryStatefulSetName(cluster.Name, 0) == PostgreSQLPrimaryStatefulSetName(derivedAlias, 0) {
+		t.Fatal("maximum-length cluster name aliased its valid derived 42-character prefix")
+	}
 }
 
 func TestImagePullPolicyHandlesRegistryPortsAndDigests(t *testing.T) {
