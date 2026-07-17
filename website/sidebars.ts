@@ -10,6 +10,7 @@ const sidebars: SidebarsConfig = {
       collapsed: false,
       items: [
         'concepts/architecture',
+        'concepts/database-placement',
         'concepts/shardschema',
         'concepts/distributed-transactions',
         'concepts/change-streams',

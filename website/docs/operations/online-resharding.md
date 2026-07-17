@@ -11,7 +11,9 @@ foundation release; see [implementation status](../project/status.md).
 :::
 
 Online resharding will change equal ranges in pgshard's versioned 64-bit hash
-space while applications continue to use the old routing epoch.
+space for one logical database while applications continue to use its old
+routing epoch. Other databases sharing the same fleet or physical cells retain
+their own routing epochs and continue serving.
 
 ```mermaid
 flowchart LR
@@ -49,4 +51,26 @@ same start point.
 
 Failures before activation leave serving routes untouched and allow target cleanup or resume. After activation, old shards are read-fenced and quarantined for 24 hours. Milestone 1 has no automatic reverse-replication rollback.
 
-The same engine is used when a backup created with one shard count is restored into an empty cluster requesting another count: first restore the source topology privately, then reshard before publishing services.
+## Online database move
+
+The same snapshot, `pgoutput`, validation, fencing, and activation engine moves
+a logical database between shared cells, shared-node cells, and dedicated
+placement pools. It can preserve the shard map or reshard while copying. The
+source database remains writable during snapshot and catch-up. At the final
+barrier, poolers buffer eligible requests, drain old-generation transactions,
+apply the final per-shard LSN vector, and atomically activate one new
+name/topology/placement generation in `shardschema` before releasing buffered
+traffic. Physical PostgreSQL database names remain opaque UUID-derived names;
+the move never attempts non-atomic `ALTER DATABASE ... RENAME` on every shard.
+
+A restored database may therefore be validated as `B` and then moved online to
+the user-facing name `A`. Replacing an existing `A` requires an explicit
+replace policy and retains the old generation read-fenced in quarantine. The
+cutover selects the restored history; writes committed only to the replaced
+generation after the backup are not silently merged into that history.
+
+Restore itself never invokes this engine implicitly. It recreates the exact
+logical topology in the backup manifest. A request to restore a five-shard
+backup into a three-shard destination fails before target mutation. The caller
+must restore to an absent or empty exact five-shard database, then request a
+separate online move/reshard.

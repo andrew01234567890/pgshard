@@ -73,9 +73,12 @@ unavailable until both succeed and the final catalog invariants pass. An empty
 database left before migration and a released v0.49 catalog are safe to retry.
 A fresh install requires the reserved catalog schema to be absent or empty.
 Upgrade accepts only the exact structural fingerprint of the released v0.49
-catalog or a current catalog produced by a fresh install or v0.49 upgrade,
-because migration cannot recreate arbitrary columns or constraints lost from
-an existing relation. An occupied reserved schema, partial or altered catalog,
+catalog or a current catalog produced by a fresh install or v0.49 upgrade. The
+fingerprint includes identity-sequence parameters and ownership, rewrite rules,
+and enabled internal foreign-key triggers under canonical rendering settings,
+because migration cannot recreate arbitrary behavior, columns, or constraints
+lost from an existing relation. An occupied reserved schema, partial or altered
+catalog,
 conflicting home-shard or shard-state
 identity, or missing or conflicting permanent restore lineage is rejected
 before migration can rewrite it. Catalog clients use bounded lock, statement,

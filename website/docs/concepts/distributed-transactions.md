@@ -11,10 +11,11 @@ recovery are not implemented in the foundation release; see [implementation
 status](../project/status.md).
 :::
 
-When one client transaction writes to multiple shards, the Milestone 1 design
-uses PostgreSQL prepared transactions. The client-facing pooler drives the
-protocol, but the lowest-ID participating shard is the durable transaction
-coordinator.
+When one client transaction writes to multiple shards of one logical database,
+the Milestone 1 design uses PostgreSQL prepared transactions. The client-facing
+pooler drives the protocol, but the lowest-ID participating physical cell is
+the durable transaction coordinator. A transaction cannot enlist a shard from
+another logical database, even when both databases share the same cell.
 
 ```mermaid
 sequenceDiagram

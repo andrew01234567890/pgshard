@@ -28,18 +28,22 @@ transport, and operator-provisioned credentials are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
-`shardschema` is a dedicated PostgreSQL database on stable `shard-0000`.
-Physical streaming replication will protect it with the rest of that shard. It
-is authoritative for logical topology; etcd is used only for ephemeral
-leases and fencing.
+`shardschema` is a dedicated PostgreSQL database on stable bootstrap
+`cell-0000`. Physical streaming replication will protect it with the rest of
+that cell. It is authoritative for the fleet's logical-database topologies and
+physical-cell placements; etcd is used only for ephemeral leases and fencing.
+Application databases do not share one mandatory shard count. A database's
+active routing epoch may use any validated subset of shared cells or a
+dedicated placement pool.
 
 ## Catalog contents
 
 The current internal `pgshard_catalog` migration records:
 
-- Databases, registered tables, shard-key types and hash versions.
-- Shard identities, permanent restore-incarnation history, and non-overlapping
-  half-open key ranges.
+- Databases, per-database topology generations, registered tables, shard-key
+  types, hash versions and seeds.
+- Physical-cell identities, permanent restore-incarnation history,
+  per-database shard placements, and non-overlapping half-open key ranges.
 - Routing, schema, authorization, and catalog epochs.
 - Permanent logical-consumer identities and per-shard ownership fences.
 - Never-reused checkpoint, source-attachment, and managed-slot generations.

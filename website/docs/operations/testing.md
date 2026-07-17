@@ -568,9 +568,12 @@ original UID and configuration, and the PVC-backed row survives. Against a
 separate Docker volume, the same job upgrades the released v0.49 catalog,
 converges a one-shard inventory to two shards, accepts canonical five-digit
 retired shard IDs, and rejects wrong home-shard identity, missing active restore
-lineage, and malformed shard IDs without changing the catalog epoch or trigger
-identities. A prepared `ACCESS EXCLUSIVE` lock must fail within the bootstrap
-lock timeout; a second blocked init container is then killed with `SIGKILL`,
+lineage, malformed shard IDs, altered identity-sequence parameters, rewrite
+rules, and disabled internal foreign-key triggers without changing catalog
+state. It also proves inherited search-path and identifier-quoting settings do
+not change the fingerprint, and that migration replaces an altered trigger
+function body without executing it. A prepared `ACCESS EXCLUSIVE` lock must
+fail within the bootstrap lock timeout; a second blocked init container is then killed with `SIGKILL`,
 after which retry on the same volume must recover. A second PGDATA fixture
 rejects a complete catalog with a missing column, an occupied reserved schema,
 and a two-of-three core catalog before migration can preserve an unsupported
@@ -708,6 +711,24 @@ Jepsen/Elle check the guarantees actually offered: atomic final cross-shard outc
 ## Required end-to-end environments
 
 - MinIO for pgBackRest S3 backup and restore, including corruption and interruption cases.
+- Per-database topology and placement fixtures: `A` uses five logical shards;
+  `B` uses three shards first on `A`'s first three shared cells, then on
+  shared-node cells, then on fully dedicated cells and Nodes. Routing, DDL,
+  grants, backup barriers, and failure injection for one database must not
+  advance another database's epochs.
+- Exact-topology restore preflight: five-to-five succeeds onto replacement
+  shared or dedicated cells; five-to-three, changed range boundaries, changed
+  hash seed/version, duplicate shard identities, and non-empty destinations
+  fail before any Secret, PVC, Pod, Job, pgBackRest, or MinIO mutation.
+- Database-targeted recovery: restore `A` as `B` while the existing `A` stays
+  available; restore `A` as `A` only when that name is absent; prove colocated
+  database bytes in a physical backup never become registered or queryable.
+- Online database mobility under continuous load: move restored `B` back to
+  `A`, both with identical topology and with a separate three-to-five
+  reshard/placement change. Inject pooler, operator, source-cell,
+  destination-cell, and coordinator failure on both sides of the activation
+  record; every client request must complete or receive the documented
+  transaction retry outcome, never route to both generations after cutover.
 - Prometheus, OpenTelemetry Collector, Grafana, and Tempo for metric/trace assertions.
 - HPA and fixed pooler deployments.
 - PostgreSQL and orchestrator failures at every durable 2PC boundary.
