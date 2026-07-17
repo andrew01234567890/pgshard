@@ -31,6 +31,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 postgres-protocol.workspace = true
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

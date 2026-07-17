@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
+use hickory_resolver::TokioResolver;
 use pgshard_catalog::{
     CatalogOperationTimeout, CatalogOperationTimeoutError, CatalogPollInterval,
     CatalogPollIntervalError, CatalogSupervisorConfig, CatalogSupervisorConfigError,
@@ -32,12 +33,134 @@ const SHARDSCHEMA_PASSWORD_BYTES: usize = 64;
 const SHARDSCHEMA_PORT: u16 = 5432;
 const CATALOG_LOGIN_ROLE: &str = "pgshard_pooler_catalog";
 const CATALOG_APPLICATION_NAME: &str = "pgshard-pooler-catalog";
+const MIN_BACKEND_CONNECT_TIMEOUT_MILLISECONDS: u64 = 100;
+const MAX_BACKEND_CONNECT_TIMEOUT_MILLISECONDS: u64 = 30_000;
+const MAX_BACKEND_DNS_CACHE_ENTRIES: u64 = 64;
+const MAX_BACKEND_ADDRESSES: usize = 16;
 
 /// Validated configuration for the fail-closed pooler runtime.
 pub struct PoolerConfig {
     http_bind: SocketAddr,
     read_write_bind: SocketAddr,
     catalog: Option<SupervisedCatalogConfig>,
+    read_write_backend: Option<BackendTarget>,
+}
+
+pub(crate) struct PoolerRuntimeParts {
+    pub(crate) catalog: Option<SupervisedCatalogConfig>,
+    pub(crate) read_write_backend: Option<BackendTarget>,
+}
+
+/// One non-secret `PostgreSQL` backend endpoint for the bounded compatibility
+/// relay. The endpoint carries no authentication material: `PostgreSQL`'s native
+/// authentication exchange remains end to end between the client and server.
+#[derive(Clone)]
+pub(crate) struct BackendTarget {
+    host: Arc<str>,
+    port: u16,
+    connect_timeout: Duration,
+    resolver: BackendResolver,
+}
+
+#[derive(Clone)]
+enum BackendResolver {
+    Literal(IpAddr),
+    Dns(Arc<TokioResolver>),
+    #[cfg(test)]
+    Pending,
+}
+
+impl BackendTarget {
+    #[cfg(test)]
+    pub(crate) fn new(host: &str, port: u16, connect_timeout: Duration) -> Self {
+        let address = host
+            .parse()
+            .expect("test backend target must be an IP literal");
+        Self {
+            host: Arc::from(host),
+            port,
+            connect_timeout,
+            resolver: BackendResolver::Literal(address),
+        }
+    }
+
+    fn from_validated_host(
+        host: &str,
+        port: u16,
+        connect_timeout: Duration,
+    ) -> Result<Self, PoolerConfigError> {
+        let resolver = if let Ok(address) = host.parse() {
+            BackendResolver::Literal(address)
+        } else {
+            let mut builder = TokioResolver::builder_tokio()
+                .map_err(|_| PoolerConfigError::BackendResolverUnavailable)?;
+            builder.options_mut().attempts = 1;
+            builder.options_mut().cache_size = MAX_BACKEND_DNS_CACHE_ENTRIES;
+            builder.options_mut().timeout = connect_timeout;
+            BackendResolver::Dns(Arc::new(
+                builder
+                    .build()
+                    .map_err(|_| PoolerConfigError::BackendResolverUnavailable)?,
+            ))
+        };
+        Ok(Self {
+            host: Arc::from(host),
+            port,
+            connect_timeout,
+            resolver,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn address(&self) -> (&str, u16) {
+        (&self.host, self.port)
+    }
+
+    pub(crate) const fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub(crate) async fn connect(&self) -> std::io::Result<tokio::net::TcpStream> {
+        match &self.resolver {
+            BackendResolver::Literal(address) => {
+                tokio::net::TcpStream::connect(SocketAddr::new(*address, self.port)).await
+            }
+            BackendResolver::Dns(resolver) => {
+                let addresses = resolver.lookup_ip(self.host.as_ref()).await.map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "backend DNS lookup failed",
+                    )
+                })?;
+                let mut last_error = None;
+                for address in addresses.iter().take(MAX_BACKEND_ADDRESSES) {
+                    match tokio::net::TcpStream::connect(SocketAddr::new(address, self.port)).await
+                    {
+                        Ok(stream) => return Ok(stream),
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "backend DNS lookup returned no addresses",
+                    )
+                }))
+            }
+            #[cfg(test)]
+            BackendResolver::Pending => std::future::pending().await,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(connect_timeout: Duration) -> Self {
+        Self {
+            host: Arc::from("pending.invalid"),
+            port: 5432,
+            connect_timeout,
+            resolver: BackendResolver::Pending,
+        }
+    }
 }
 
 pub(crate) struct SupervisedCatalogConfig {
@@ -61,7 +184,7 @@ enum CatalogMode {
 #[derive(Debug, Parser)]
 #[command(
     name = "pgshard-pooler",
-    about = "Fail-closed pgshard catalog runtime and PostgreSQL handshake boundary",
+    about = "Fail-closed pgshard catalog runtime and PostgreSQL compatibility boundary",
     disable_help_subcommand = true
 )]
 struct RawConfig {
@@ -69,9 +192,25 @@ struct RawConfig {
     #[arg(long, env = "PGSHARD_HTTP_BIND", default_value = "0.0.0.0:8080")]
     http_bind: SocketAddr,
 
-    /// Read-write `PostgreSQL` listen address; connections are rejected until the data plane exists.
+    /// Read-write `PostgreSQL` listen address; sessions require a ready catalog and explicit backend.
     #[arg(long, env = "PGSHARD_RW_BIND", default_value = "0.0.0.0:5432")]
     read_write_bind: SocketAddr,
+
+    /// Optional shard-zero writer hostname for the bounded compatibility relay.
+    #[arg(long, env = "PGSHARD_RW_BACKEND_HOST")]
+    read_write_backend_host: Option<String>,
+
+    /// `PostgreSQL` port for the compatibility relay target.
+    #[arg(long, env = "PGSHARD_RW_BACKEND_PORT", default_value_t = 5432)]
+    read_write_backend_port: u16,
+
+    /// Complete DNS resolution and TCP connection deadline for one relay session.
+    #[arg(
+        long,
+        env = "PGSHARD_BACKEND_CONNECT_TIMEOUT_MS",
+        default_value_t = 3_000
+    )]
+    backend_connect_timeout_ms: u64,
 
     /// Catalog runtime: local development, operator-authenticated TLS, or explicit unavailable bootstrap.
     #[arg(
@@ -171,6 +310,7 @@ impl PoolerConfig {
     {
         let raw = RawConfig::try_parse_from(arguments)?;
         let supervisor = catalog_supervisor(&raw)?;
+        let read_write_backend = read_write_backend(&raw)?;
         let operator_fields_present = raw.shardschema_host.is_some()
             || raw.shardschema_password_file.is_some()
             || raw.shardschema_ca_file.is_some()
@@ -217,6 +357,7 @@ impl PoolerConfig {
             http_bind: raw.http_bind,
             read_write_bind: raw.read_write_bind,
             catalog,
+            read_write_backend,
         })
     }
 
@@ -232,8 +373,17 @@ impl PoolerConfig {
         self.read_write_bind
     }
 
-    pub(crate) fn into_runtime_parts(self) -> Option<SupervisedCatalogConfig> {
-        self.catalog
+    /// Reports whether the bounded shard-zero compatibility relay is enabled.
+    #[must_use]
+    pub fn read_write_relay_configured(&self) -> bool {
+        self.read_write_backend.is_some()
+    }
+
+    pub(crate) fn into_runtime_parts(self) -> PoolerRuntimeParts {
+        PoolerRuntimeParts {
+            catalog: self.catalog,
+            read_write_backend: self.read_write_backend,
+        }
     }
 
     #[cfg(test)]
@@ -251,6 +401,7 @@ impl PoolerConfig {
                 connector: CatalogConnector::LocalNoTls,
                 supervisor,
             }),
+            read_write_backend: None,
         }
     }
 
@@ -263,8 +414,34 @@ impl PoolerConfig {
             http_bind,
             read_write_bind,
             catalog: None,
+            read_write_backend: None,
         }
     }
+}
+
+fn read_write_backend(raw: &RawConfig) -> Result<Option<BackendTarget>, PoolerConfigError> {
+    if !(MIN_BACKEND_CONNECT_TIMEOUT_MILLISECONDS..=MAX_BACKEND_CONNECT_TIMEOUT_MILLISECONDS)
+        .contains(&raw.backend_connect_timeout_ms)
+    {
+        return Err(PoolerConfigError::InvalidBackendConnectTimeout {
+            actual: raw.backend_connect_timeout_ms,
+        });
+    }
+    let Some(host) = raw.read_write_backend_host.as_deref() else {
+        return Ok(None);
+    };
+    if raw.catalog_mode == CatalogMode::BootstrapUnavailable {
+        return Err(PoolerConfigError::BackendForbiddenInBootstrapMode);
+    }
+    validate_backend_host(host)?;
+    if raw.read_write_backend_port == 0 {
+        return Err(PoolerConfigError::InvalidBackendPort);
+    }
+    Ok(Some(BackendTarget::from_validated_host(
+        host,
+        raw.read_write_backend_port,
+        Duration::from_millis(raw.backend_connect_timeout_ms),
+    )?))
 }
 
 fn supervised_catalog(
@@ -367,23 +544,32 @@ fn catalog_supervisor(raw: &RawConfig) -> Result<CatalogSupervisorConfig, Pooler
 }
 
 fn validate_catalog_dns_name(host: &str) -> Result<(), PoolerConfigError> {
-    if host.is_empty()
-        || host.len() > 253
-        || host.parse::<IpAddr>().is_ok()
-        || host.ends_with('.')
-        || host.split('.').any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || label.starts_with('-')
-                || label.ends_with('-')
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
-    {
+    if host.parse::<IpAddr>().is_ok() || !is_lowercase_dns_name(host) {
         return Err(PoolerConfigError::InvalidCatalogDnsName);
     }
     Ok(())
+}
+
+fn validate_backend_host(host: &str) -> Result<(), PoolerConfigError> {
+    if host.parse::<IpAddr>().is_err() && !is_lowercase_dns_name(host) {
+        return Err(PoolerConfigError::InvalidBackendHost);
+    }
+    Ok(())
+}
+
+fn is_lowercase_dns_name(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.ends_with('.')
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
 }
 
 fn read_bounded_regular_file(
@@ -559,6 +745,26 @@ pub enum PoolerConfigError {
         "all shardschema credential and connection fields must be absent in bootstrap-unavailable catalog mode"
     )]
     CatalogCredentialsForbiddenInBootstrapMode,
+    /// A backend target cannot bypass the deliberately unavailable catalog.
+    #[error("read-write backend must be absent in bootstrap-unavailable catalog mode")]
+    BackendForbiddenInBootstrapMode,
+    /// Backend names are either IP literals or canonical lowercase DNS names.
+    #[error(
+        "read-write backend host must be an IP literal or lowercase DNS name without a trailing dot"
+    )]
+    InvalidBackendHost,
+    /// TCP port zero is never a usable `PostgreSQL` endpoint.
+    #[error("read-write backend port must be between 1 and 65535")]
+    InvalidBackendPort,
+    /// Backend DNS resolution and connection attempts have a hard bound.
+    #[error("backend connect timeout {actual}ms must be between 100ms and 30000ms")]
+    InvalidBackendConnectTimeout {
+        /// Rejected timeout in milliseconds.
+        actual: u64,
+    },
+    /// The process could not build a bounded async resolver from system DNS configuration.
+    #[error("could not initialize the asynchronous backend DNS resolver")]
+    BackendResolverUnavailable,
     /// The operator endpoint must use an exact DNS hostname, never an IP.
     #[error("shardschema host must be a lowercase DNS name without a trailing dot")]
     InvalidCatalogDnsName,
@@ -632,7 +838,7 @@ pub enum PoolerConfigError {
     Supervisor(#[from] CatalogSupervisorConfigError),
 }
 
-/// Temporary transport-policy rejection for the control-only executable.
+/// Temporary transport-policy rejection for the local catalog connector.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CatalogDsnPolicyError {
     /// The dedicated database name is absent or wrong.
@@ -829,6 +1035,83 @@ pqAiYB0dKbPxAXdiSQ==\n\
             supervisor.operation_timeout().get(),
             Duration::from_secs(30)
         );
+        assert!(config.read_write_backend.is_none());
+    }
+
+    #[test]
+    fn accepts_one_bounded_read_write_backend() {
+        let file = TestDsnFile::new(VALID_DSN.as_bytes());
+        let mut arguments = file.arguments();
+        arguments.extend([
+            OsString::from("--read-write-backend-host=demo-shard-0.default.svc"),
+            OsString::from("--read-write-backend-port=6432"),
+            OsString::from("--backend-connect-timeout-ms=750"),
+        ]);
+        let config = PoolerConfig::try_parse_from(arguments).expect("read-write backend config");
+        assert!(config.read_write_relay_configured());
+        assert!(config.read_write_backend.is_some());
+        let target = config
+            .read_write_backend
+            .as_ref()
+            .expect("configured read-write target");
+        assert_eq!(target.address(), ("demo-shard-0.default.svc", 6432));
+        assert_eq!(target.connect_timeout(), Duration::from_millis(750));
+
+        let file = TestDsnFile::new(VALID_DSN.as_bytes());
+        let mut ip_arguments = file.arguments();
+        ip_arguments.push(OsString::from("--read-write-backend-host=127.0.0.1"));
+        PoolerConfig::try_parse_from(ip_arguments).expect("IP backend target");
+    }
+
+    #[test]
+    fn rejects_unsafe_or_unbounded_read_write_backend_configuration() {
+        for host in [
+            "",
+            "Demo-shard-0.default.svc",
+            "demo-shard-0.default.svc.",
+            "-demo.default.svc",
+            "demo..svc",
+        ] {
+            let file = TestDsnFile::new(VALID_DSN.as_bytes());
+            let mut arguments = file.arguments();
+            arguments.push(OsString::from(format!("--read-write-backend-host={host}")));
+            assert!(matches!(
+                PoolerConfig::try_parse_from(arguments),
+                Err(PoolerConfigError::InvalidBackendHost)
+            ));
+        }
+
+        let file = TestDsnFile::new(VALID_DSN.as_bytes());
+        let mut zero_port = file.arguments();
+        zero_port.extend([
+            OsString::from("--read-write-backend-host=127.0.0.1"),
+            OsString::from("--read-write-backend-port=0"),
+        ]);
+        assert!(matches!(
+            PoolerConfig::try_parse_from(zero_port),
+            Err(PoolerConfigError::InvalidBackendPort)
+        ));
+
+        for timeout in [99, 30_001] {
+            let file = TestDsnFile::new(VALID_DSN.as_bytes());
+            let mut arguments = file.arguments();
+            arguments.extend([
+                OsString::from("--read-write-backend-host=127.0.0.1"),
+                OsString::from(format!("--backend-connect-timeout-ms={timeout}")),
+            ]);
+            assert!(matches!(
+                PoolerConfig::try_parse_from(arguments),
+                Err(PoolerConfigError::InvalidBackendConnectTimeout { actual })
+                    if actual == timeout
+            ));
+        }
+
+        let mut bootstrap = bootstrap_arguments();
+        bootstrap.push(OsString::from("--read-write-backend-host=127.0.0.1"));
+        assert!(matches!(
+            PoolerConfig::try_parse_from(bootstrap),
+            Err(PoolerConfigError::BackendForbiddenInBootstrapMode)
+        ));
     }
 
     #[test]
@@ -1117,8 +1400,9 @@ pqAiYB0dKbPxAXdiSQ==\n\
     fn generated_help_explains_units_bounds_and_dsn_policy() {
         let help = RawConfig::command().render_long_help().to_string();
         for expected in [
-            "PostgreSQL handshake boundary",
-            "connections are rejected until the data plane exists",
+            "PostgreSQL compatibility boundary",
+            "sessions require a ready catalog and explicit backend",
+            "bounded compatibility relay",
             "explicit unavailable bootstrap",
             "bootstrap-unavailable",
             "maximum 16 KiB",

@@ -60,6 +60,14 @@ current evidence is maintained in
   controls and query buffering reduce restart and cutover interruption, but
   transaction/session semantics that cannot be replayed receive an explicit
   retry or disconnect outcome.
+- PostgreSQL member identities are role-neutral. StatefulSet, Pod, and PVC
+  names encode the physical cell and stable member ordinal, never `primary` or
+  `replica`; mutable role labels drive writer/read-only Service membership.
+- Milestone 1 does not deploy a separate etcd cluster and never connects
+  application components directly to Kubernetes' private control-plane etcd.
+  Slow coordination uses `coordination.k8s.io` Lease objects through the API
+  server. Durable topology, operation journals, fencing generations, and 2PC
+  decisions remain in PostgreSQL, never in Kubernetes Lease records.
 - Runtime images are test artifacts in Milestone 1. CI builds them but does not
   push images to a registry.
 
@@ -99,18 +107,36 @@ Acceptance:
 - Reject unsupported persisted server configuration and recovery state before
   a managed primary starts. Keep bootstrap credentials outside running
   containers and disable unsupported `ALTER SYSTEM` overrides.
-- Implement agent/orchestrator leases, Node-incarnation fencing, promotion
-  proofs, split-brain prevention, and bounded recovery.
-  - Implemented foundation: each orchestrator owns a unique Pod-incarnation key
-    under a persistent cluster-name/UID marker through bounded leader-required
-    etcd gateway requests. Cluster identity and revision are pinned, and a
-    monotonic lease deadline controls readiness across process pauses.
-  - Remaining: authenticated etcd transport, durable operation and shard-term
-    records, coordinator assignment, target-side epoch enforcement, agent
-    self-fencing, promotion proofs, and automated recovery.
+- Implement agent/orchestrator Kubernetes Leases, Node-incarnation fencing,
+  promotion proofs, split-brain prevention, and bounded recovery.
+  - Current transitional foundation: each orchestrator owns a unique
+    Pod-incarnation key through a dedicated etcd workload. This proves bounded
+    process identity only and must be replaced before the Milestone 1 gate.
+    While that workload still exists, an idempotent non-root init step preserves
+    legacy `member/` state when moving it below the private `data/` directory;
+    a real-PVC KIND restart test verifies the stored member data survives.
+  - Create one operator-owned orchestrator leadership Lease per fleet and one
+    operator-owned writable-term Lease per physical cell. Lease holder identity
+    includes the stable member name and Pod UID; every update is
+    resource-version conditional and ownership is bound to the fleet UID.
+  - Candidates do not trust another member's wall clock. They may take over an
+    unreleased Lease only after observing the same holder and renewal record
+    unchanged for a full lease duration, following CNPG's local observation
+    pattern. A clean release can be claimed immediately.
+  - The local agent converts each successful renewal into a monotonic deadline,
+    removes readiness before expiry, and stops PostgreSQL before it can serve
+    beyond that deadline. API-server loss therefore fails closed; a Kubernetes
+    Lease is not target-side fencing by itself.
+  - Keep lease renewals out of query and 2PC paths. Remaining work includes
+    target-side generation enforcement, promotion proofs, operation recovery,
+    API-partition behavior, and automated failover.
 - Provide CNPG-style Services for writer/read-write, read-only, and any-instance
   access with selectors or operator-owned EndpointSlices that reflect proven
   roles.
+- Migrate the earlier singleton `*-primary` controller to its role-neutral name
+  behind an uncached foreground-deletion and Pod-absence barrier. The current
+  singleton incurs one documented outage; two controllers must never mount the
+  same checkpointed PGDATA.
 - Implement staged rolling restart and configuration rollout. Drain poolers,
   fail over or replace one cell member at a time, preserve quorum, and prove
   application endpoints remain available where topology permits.
@@ -124,6 +150,13 @@ Acceptance:
   specified outcome.
 
 ### 3. Rust pooler and SQL routing
+
+Current foundation: the one-member development topology can expose a bounded,
+catalog-gated read-write compatibility relay to the singleton shard-0000
+writer. PostgreSQL authentication and cancellation remain end to end;
+`shardschema`, replication startup, client TLS/GSS, pooling, routing, buffering,
+and HA selection remain closed. This increment is test scaffolding for the
+public socket and does not satisfy the acceptance criteria below.
 
 - Complete PostgreSQL startup/authentication, TLS, SCRAM, backend connection
   pools, cancellation routing, session state, simple and extended query cycles,
@@ -275,7 +308,7 @@ Acceptance:
 
 - Default and validate every supported setting; reject unsafe partial
   configurations before durable resource creation.
-- Autotune PostgreSQL, etcd, orchestrator, pooler pools, stream workers,
+- Autotune PostgreSQL, Kubernetes Lease timings, orchestrator, pooler pools, stream workers,
   buffering, HPA targets, PDBs, probes, and timeouts from resource requests,
   limits, topology, and workload policy. Expose overrides only for a documented
   safe allowlist.
@@ -306,6 +339,10 @@ Acceptance:
   OpenTelemetry Collector, Grafana, and Tempo; exercise create/load, scale,
   rolling restart, failover, backup/restore, exact mismatch, online move,
   online reshard, DDL, HPA/fixed poolers, and cleanup.
+- Lease tests partition agents and orchestrators from the API server, race
+  candidates on resource-version conflicts, delay and replay updates, restart
+  holders and observers, skew wall clocks, and prove a stale member self-fences
+  before a replacement can become writable.
 - Load tests record a continuous operation history and explicit retry outcomes
   through shard-count increase and rolling restart. Tests must prove the actual
   generation/fence invariants rather than infer zero downtime from Pod

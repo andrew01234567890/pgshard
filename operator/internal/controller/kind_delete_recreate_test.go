@@ -62,7 +62,7 @@ func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
 		Shard: 0, SecretName: fence.Name, SecretUID: fence.UID, PVCFenceDetached: true,
 		PVCName: "current-postgresql-data", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
 	}
-	current := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+	current := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
 	if err := kubeClient.Create(ctx, current); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
 	lateBootstrap := bootstrap
 	lateBootstrap.PVCName = "late-postgresql-data"
 	lateBootstrap.PVCUID = ""
-	late := owned.PostgreSQLPrimaryDataPVC(cluster, 0, lateBootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, lateBootstrap.SecretName, lateBootstrap.SecretUID)
+	late := owned.PostgreSQLDataPVC(cluster, 0, lateBootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, lateBootstrap.SecretName, lateBootstrap.SecretUID)
 	if !postgresqlDataPVCIsCreationFenced(late, lateBootstrap) {
 		t.Fatalf("late PVC lacks the deleted credential fence: %#v", late.OwnerReferences)
 	}

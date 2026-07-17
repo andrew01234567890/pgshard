@@ -45,8 +45,9 @@ flowchart LR
   orch --> r00
   orch --> r10
   orch --> stream
-  orch <--> etcd[(etcd leases)]
+  orch <--> leases[(Kubernetes Lease API)]
   operator[Go operator] --> orch
+  operator --> leases
 ```
 
 ## Component responsibilities
@@ -56,8 +57,14 @@ flowchart LR
 | Pooler Pod | Separately credentialed query/router and stream-worker modes of the same Rust binary: PostgreSQL protocol, pooling, routing, scatter reads, 2PC driving, bounded failover buffering, stream API, snapshots, per-shard `pgoutput` workers, cross-shard merge and resume vectors | None locally; validated routing epochs and acknowledged stream positions live in `shardschema` |
 | Agent | PostgreSQL lifecycle, pgBackRest, role, LSN and slot-health reporting, quarantine and local mutation hooks | PostgreSQL and local volume state |
 | Orchestrator | Fencing, promotion, operation state machines, abandoned 2PC recovery | PostgreSQL operation records |
-| Operator | Kubernetes resources, defaults, resource-derived tuning, status | Kubernetes API desired state |
-| etcd | Short-lived leadership and fencing leases | No durable topology |
+| Operator | Kubernetes resources, defaults, resource-derived tuning, status, and owned Lease creation | Kubernetes API desired state |
+| Kubernetes Lease API | Short-lived orchestrator leadership and per-cell writable-term coordination; accessed through the API server, never by connecting to control-plane etcd | No durable topology, operation, or transaction state |
+
+PostgreSQL members have stable role-neutral names such as
+`<cluster>-shard-0000-0`. Mutable `pgshard.io/role` labels select writer and
+read-only endpoints, so promotion changes routing metadata rather than instance
+identity. This follows CloudNativePG's stable instance plus `instanceRole`
+pattern.
 
 ## Request path
 
@@ -135,6 +142,6 @@ EndpointSlices containing, respectively, only healthy named query ports and
 only healthy named stream ports from non-terminating pooler Pods. Sidecar
 failure can remove a stream endpoint without removing a healthy SQL endpoint;
 query failure still removes SQL before it can receive a new connection.
-PostgreSQL, etcd, agents, orchestration RPCs, metrics, and native replication
+PostgreSQL, Kubernetes Lease operations, agents, orchestration RPCs, metrics, and native replication
 endpoints are protected by dedicated Services, container-specific credentials,
 TLS identities, RBAC, and NetworkPolicies.

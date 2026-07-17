@@ -5,11 +5,27 @@ description: Supported and rejected PostgreSQL behavior in Milestone 1.
 
 # SQL compatibility
 
-:::warning Planned compatibility, not current support
-No usable pooler endpoint or complete semantic statement planner exists yet.
-The read-write socket currently terminates only a bounded startup handshake and
-rejects every regular session with `FATAL`/`57P03`; it does not authenticate or
-route queries. The source has a
+:::warning Compatibility relay, not sharding support
+No complete semantic statement planner or sharded routing endpoint exists yet.
+For the operator's one-member development topology only, the read-write Service
+provides a bounded compatibility relay to the shard-0000 writer. The relay
+refuses client TLS and GSS, passes PostgreSQL authentication and all subsequent
+session bytes through unchanged, and forwards cancellation requests to that
+same singleton target. It accepts a new session only while the authenticated
+`shardschema` supervisor is ready. It blocks the `shardschema` database and
+replication startup, and closes an established compatibility session shortly
+after catalog readiness is observed lost. It does not pool, parse, route,
+buffer, retry, or epoch-fence individual queries. The read-only and any-instance
+Services are not implemented. Unsupported topologies continue to reject regular
+startup with `FATAL`/`57P03`.
+
+This development relay is not a hostile-client security boundary. The generated
+shard bootstrap credential is a PostgreSQL superuser credential, and the relay
+does not inspect SQL after startup. Blocking `shardschema` and replication
+startup prevents accidental direct use of those connection modes; it does not
+make untrusted use of the bootstrap credential safe.
+
+The source also has a
 byte/token/AST/stack-bounded permissive candidate parser configured with a
 PostgreSQL dialect, a fail-closed core that routes an already-resolved, non-NULL
 shard-key bind parameter against one immutable catalog snapshot, and a bounded
@@ -60,8 +76,9 @@ resolved router composition therefore remains private test scaffolding until a
 connection-owning physical-catalog reader can issue an opaque capability bound
 to the observed backend generations.
 A successful syntax parse or template extraction alone is not PostgreSQL
-semantic validation or permission to route. The source does not yet
-authenticate or execute clients. The
+semantic validation or permission to route. The routed session layer does not
+yet authenticate or execute clients; the compatibility relay merely lets the
+selected PostgreSQL server perform those operations without interpreting them. The
 table below is the Milestone 1 acceptance contract; see
 [implementation status](../project/status.md).
 :::
@@ -133,13 +150,15 @@ tags it does not classify as long, and the configured ceiling only to long
 row/COPY/error/notice families. These checks happen from the backend header
 before an upstream body is buffered.
 PostgreSQL 18 separately accepts one-to-256-byte keys in incoming
-`CancelRequest` packets. The future session layer must match the complete
+`CancelRequest` packets. The compatibility relay forwards the complete request
+to its single configured writer, which is valid only while that target is a
+singleton. The future pooled session layer must instead match the complete
 opaque key to the selected backend connection and enforce the effective
 protocol version. A completed PostgreSQL 18 startup proof now requires the
 server's exact four-byte backend key before protocol 3.2 or its exact 32-byte
 key at protocol 3.2. The cancellation encoder requires that proof and decoded
 `BackendKeyData` before producing a request, but the proof and key are not yet
-bound to a live pooled socket or exposed through cancellation routing.
+bound to a live pooled socket or exposed through pooled cancellation routing.
 Typed zero-copy decoders expose the process identifier and opaque key without
 rendering the key in debug output, and validate `ParameterStatus` as exactly
 two terminated UTF-8 strings. A reported `client_encoding` is authoritative
@@ -185,10 +204,12 @@ fixture requires non-SASL startup-control output other than `ErrorResponse` to
 equal live server bytes; the SCRAM and error primitives currently have
 source-aligned unit coverage only. No ordered session writer, SCRAM
 cryptographic state machine, or client-facing startup exchange exists yet.
-The transport layer, which is not implemented yet, must handle PostgreSQL 18
+The routed transport layer, which is not implemented yet, must handle PostgreSQL 18
 direct TLS and ALPN before startup framing. It must also preserve a pipelined
 TLS ClientHello after an SSL request for an accepted handshake, while rejecting
-buffered bytes if encryption is refused.
+buffered bytes if encryption is refused. The development compatibility relay
+always refuses SSL and GSS negotiation, so its SQL traffic is plaintext between
+the client and pooler and between the pooler and shard-0000.
 An explicit replication-streaming phase admits only the CopyData, CopyDone, and
 Terminate frontend frames accepted by PostgreSQL 18's WAL sender. Server
 CopyData bodies decode as exact borrowed XLogData or keepalive envelopes. A

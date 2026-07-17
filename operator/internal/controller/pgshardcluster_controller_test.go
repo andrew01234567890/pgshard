@@ -207,7 +207,7 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 		}
 		passwords[shard] = string(secret.Data[owned.PostgreSQLPasswordKey])
 		statefulSet := &appsv1.StatefulSet{}
-		name := owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)
+		name := owned.PostgreSQLShardStatefulSetName(cluster.Name, shard)
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet); err != nil {
 			t.Fatalf("get PostgreSQL StatefulSet %s: %v", name, err)
 		}
@@ -246,7 +246,7 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 			t.Fatalf("steady-state reconciliation rotated shard %d PostgreSQL credential", shard)
 		}
 		statefulSet := &appsv1.StatefulSet{}
-		name := owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)
+		name := owned.PostgreSQLShardStatefulSetName(cluster.Name, shard)
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet); err != nil {
 			t.Fatal(err)
 		}
@@ -272,7 +272,7 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLPodFencingUnavailable")
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		pod := &corev1.Pod{}
-		key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, shard) + "-0"}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, shard) + "-0"}
 		if err := fakeClient.Get(ctx, key, pod); err != nil {
 			t.Fatal(err)
 		}
@@ -290,6 +290,87 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "DataPlaneUnavailable")
 	if len(got.Status.PostgreSQLBootstraps) != int(cluster.Spec.Shards) {
 		t.Fatalf("recorded PostgreSQL bootstraps = %#v", got.Status.PostgreSQLBootstraps)
+	}
+}
+
+func TestRoleNeutralPostgreSQLIdentityMigrationNeverPublishesTwoControllers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+
+	currentCluster := getCluster(t, ctx, base, cluster)
+	bootstrap := bootstrapForShard(t, currentCluster, 0)
+	currentName := owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)
+	legacyName := owned.LegacyPostgreSQLPrimaryStatefulSetName(cluster.Name, 0)
+	current := &appsv1.StatefulSet{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: currentName}, current); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := current.DeepCopy()
+	legacy.Name = legacyName
+	legacy.UID = "legacy-statefulset-uid"
+	legacy.ResourceVersion = ""
+	legacy.CreationTimestamp = metav1.Time{}
+	legacy.ManagedFields = nil
+	legacy.Status = appsv1.StatefulSetStatus{}
+	if err := base.Create(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacyPod := &corev1.Pod{
+		ObjectMeta: *legacy.Spec.Template.ObjectMeta.DeepCopy(),
+		Spec:       *legacy.Spec.Template.Spec.DeepCopy(),
+	}
+	legacyPod.Name = legacyName + "-0"
+	legacyPod.Namespace = cluster.Namespace
+	legacyPod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(legacy, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))}
+	if !podSpecReferencesPostgreSQLDataPVC(legacyPod.Spec, bootstrap.PVCName) {
+		t.Fatalf("legacy upgrade fixture does not mount checkpointed PVC %s", bootstrap.PVCName)
+	}
+	if err := base.Create(ctx, legacyPod); err != nil {
+		t.Fatal(err)
+	}
+
+	assertNoDualControllers := func() bool {
+		t.Helper()
+		legacyFound := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: legacyName}, &appsv1.StatefulSet{}) == nil
+		currentFound := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: currentName}, &appsv1.StatefulSet{}) == nil
+		if legacyFound && currentFound {
+			t.Fatal("legacy and role-neutral PostgreSQL StatefulSets simultaneously reference one PGDATA")
+		}
+		return currentFound
+	}
+
+	roleNeutralCreated := false
+	for attempt := 0; attempt < 6; attempt++ {
+		result, err := reconciler.Reconcile(ctx, requestFor(cluster))
+		if err != nil {
+			t.Fatalf("migration reconcile %d: %v", attempt, err)
+		}
+		roleNeutralCreated = assertNoDualControllers()
+		if roleNeutralCreated {
+			break
+		}
+		if !result.Requeue && result.RequeueAfter == 0 {
+			t.Fatalf("migration reconcile %d stopped before role-neutral workload creation", attempt)
+		}
+	}
+	if !roleNeutralCreated {
+		t.Fatal("role-neutral PostgreSQL StatefulSet was not created after the legacy Pod absence barrier")
+	}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: legacyPod.Name}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("legacy PostgreSQL Pod remains after migration: %v", err)
 	}
 }
 
@@ -1084,7 +1165,7 @@ func TestReconcileNeverAdoptsUnrecordedBootstrapChildren(t *testing.T) {
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	orphanSecret := owned.PostgreSQLAuthSecret(cluster, 0, owned.PostgreSQLAuthSecretPrefix(cluster.Name, 0)+"orphan", []byte(strings.Repeat("a", hex.EncodedLen(postgresqlPasswordBytes))))
 	orphanSecret.UID = "unrecorded-secret"
-	orphanClaim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, owned.PostgreSQLPrimaryDataPVCPrefix(cluster.Name, 0)+"orphan", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, orphanSecret.Name, orphanSecret.UID)
+	orphanClaim := owned.PostgreSQLDataPVC(cluster, 0, owned.PostgreSQLDataPVCPrefix(cluster.Name, 0)+"orphan", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, orphanSecret.Name, orphanSecret.UID)
 	orphanClaim.UID = "unrecorded-pvc"
 	fakeClient := newFakeClient(t, cluster, orphanSecret, orphanClaim)
 	reconciler := developmentReconciler(fakeClient, nil)
@@ -1097,7 +1178,7 @@ func TestReconcileNeverAdoptsUnrecordedBootstrapChildren(t *testing.T) {
 		t.Fatalf("unrecorded bootstrap child was adopted: %#v", bootstrap)
 	}
 	statefulSet := &appsv1.StatefulSet{}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := fakeClient.Get(ctx, key, statefulSet); err != nil {
 		t.Fatal(err)
 	}
@@ -1301,7 +1382,7 @@ func TestReconcileRefusesMissingOrReplacedPostgreSQLDataPVC(t *testing.T) {
 				t.Fatal(err)
 			}
 			if replace {
-				replacement := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+				replacement := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
 				replacement.UID = "replacement-pvc-uid"
 				if err := fakeClient.Create(ctx, replacement); err != nil {
 					t.Fatal(err)
@@ -1344,7 +1425,7 @@ func TestProtectedPostgreSQLDataPVCReservesItsNameUntilWorkloadPruning(t *testin
 	if err := fakeClient.Get(ctx, key, terminating); err != nil || terminating.DeletionTimestamp == nil || terminating.UID != bootstrap.PVCUID {
 		t.Fatalf("protected PVC did not reserve its exact name after deletion: claim=%#v error=%v", terminating.ObjectMeta, err)
 	}
-	replacement := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+	replacement := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
 	if err := fakeClient.Create(ctx, replacement); !apierrors.IsAlreadyExists(err) {
 		t.Fatalf("same-name replacement bypassed protected PVC: %v", err)
 	}
@@ -1397,7 +1478,7 @@ func TestPostgreSQLDataFenceStabilizationRecoversLostUpdateResponses(t *testing.
 				t.Fatalf("%s stabilization update was not reached", stage)
 			}
 			statefulSet := &appsv1.StatefulSet{}
-			statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+			statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 			if err := base.Get(ctx, statefulSetKey, statefulSet); !apierrors.IsNotFound(err) {
 				t.Fatalf("workload was published before %s stabilization became certain: %v", stage, err)
 			}
@@ -1685,7 +1766,7 @@ func TestRetainWaitsForLatePostgreSQLPodBeforeReleasingData(t *testing.T) {
 	current := getCluster(t, ctx, base, cluster)
 	bootstrap := bootstrapForShard(t, current, 0)
 	statefulSet := &appsv1.StatefulSet{}
-	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
 		t.Fatal(err)
 	}
@@ -1860,7 +1941,7 @@ func TestPodCreatedAfterFinalAbsenceCannotBindDuringClusterDeletion(t *testing.T
 	}
 	current := getCluster(t, ctx, base, cluster)
 	statefulSet := &appsv1.StatefulSet{}
-	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
 		t.Fatal(err)
 	}
@@ -1936,7 +2017,7 @@ func TestPostgreSQLPodTerminationFenceRequiresAuthenticatedKubeletAttestation(t 
 	}
 	cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{bootstrap}
 	statefulSet := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
-		Name:      owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0),
+		Name:      owned.PostgreSQLShardStatefulSetName(cluster.Name, 0),
 		Namespace: cluster.Namespace,
 		UID:       "statefulset-uid",
 	}}
@@ -2033,7 +2114,7 @@ func TestDeletionRefusesPostgreSQLPodWithoutTerminationFence(t *testing.T) {
 	current := getCluster(t, ctx, base, cluster)
 	bootstrap := bootstrapForShard(t, current, 0)
 	statefulSet := &appsv1.StatefulSet{}
-	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
 		t.Fatal(err)
 	}
@@ -2077,7 +2158,7 @@ func TestFinalizationRefusesUncheckpointedDeletingPVCWithoutCredentialFence(t *t
 				PVCName: "deleting-collision", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
 			}
 			cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{bootstrap}
-			claim := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, "foreign-secret", "foreign-secret-uid")
+			claim := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, "foreign-secret", "foreign-secret-uid")
 			claim.UID = "collision-uid"
 			claim.Finalizers = []string{owned.PostgreSQLDataProtectionFinalizer}
 			claim.DeletionTimestamp = &metav1.Time{Time: time.Unix(100, 0)}
@@ -2227,7 +2308,7 @@ func TestFinalizationDeletesLatePVCWithRecordedCredentialFence(t *testing.T) {
 			if err := base.Delete(ctx, original); err != nil {
 				t.Fatal(err)
 			}
-			late := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+			late := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
 			late.UID = "late-pvc-uid"
 			if err := base.Create(ctx, late); err != nil {
 				t.Fatal(err)
@@ -2730,7 +2811,7 @@ func TestDeletePolicyPrunesWorkloadBeforeDataClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	statefulSet := &appsv1.StatefulSet{}
-	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
 	if err := base.Get(ctx, statefulSetKey, statefulSet); !apierrors.IsNotFound(err) {
 		t.Fatalf("Delete policy requested data deletion before pruning its StatefulSet: %v", err)
 	}

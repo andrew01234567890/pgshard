@@ -211,6 +211,14 @@ terminate the new owner with a permanent conflict. Unit coverage ensures lease
 RPC headers pin cluster identity without treating follower-local revisions as
 global ordering evidence. A Linux process test stalls an endpoint request,
 sends `SIGTERM`, and requires cancellation and clean exit inside two seconds.
+The manager KIND suite also initializes a real PVC with the legacy etcd
+`member/` layout, stops that process, runs the non-root Rust migration init
+container, starts etcd from the private `data/` child, and reads back a sentinel
+written before the restart. Unit tests replay every migration crash boundary
+and reject ambiguous or symlinked layouts. A separate controller upgrade test
+holds a checkpointed PostgreSQL PVC behind the legacy role-named StatefulSet
+and Pod, then proves the role-neutral controller appears only after both old
+objects are absent.
 Pure orchestrator tests also exercise the standby-decoder attachment contract. They
 require non-nil catalog generations encoded in slot names and matched exactly,
 an opaque test-only replay floor bound to the exact source identity, the
@@ -558,7 +566,7 @@ job builds local images, installs the real manager with self-managed admission
 certificates, proves the generated serving chain and injected CA bundles,
 observes semantic validation reject an unsafe synchronous singleton, waits for
 leader-elected reconciliation, observes a restart-free etcd quorum, keeps the
-rejection-only pooler unready, and requires all three persistence-free
+bootstrap-unavailable pooler unready, and requires all three persistence-free
 orchestrators to establish distinct cluster-UID-bound etcd incarnations without
 restarts. Their readiness proves only renewable process identity, not durable
 operations or shard-term authority. It then pauses manager reconciliation,
@@ -573,8 +581,10 @@ Secret, rejects otherwise identical unlabeled and wrong-cluster clients through
 the live NetworkPolicy, and verifies that only shard-0000 contains the dedicated
 `shardschema` database. It reaches the pooler control Service through the
 Kubernetes API proxy and requires a successful operator-provisioned TLS 1.3 and
-SCRAM catalog load in both exact JSON status and Prometheus metrics while
-overall SQL readiness remains false. It hash-verifies and loads the exact migration shipped
+SCRAM catalog load in both exact JSON status and Prometheus metrics, requires
+the read-write compatibility relay to become ready, executes a native-SCRAM
+query through it to shard-0000, and proves an application startup for
+`shardschema` is rejected by the pooler before backend contact. It hash-verifies and loads the exact migration shipped
 in the non-root PostgreSQL bootstrap image, observes both configured shard
 identities and one active restore incarnation per shard, records the complete
 epoch-and-incarnation snapshot, and requires a primary recreation to reapply
@@ -582,8 +592,10 @@ the migration without changing that snapshot. The fixture leaves a prepared
 transaction and inactive logical slot durable before recreation, proving the
 private init postmaster loads the managed logical-WAL and 2PC settings. It also
 proves an omitted storage class was resolved and
-checkpointed on the resulting Bound PVC, then explicitly deletes one
-`OnDelete` primary Pod after first publishing a changed desired configuration.
+checkpointed on the resulting Bound PVC, proves PostgreSQL workload and PVC
+names are role-neutral while `pgshard.io/role=primary` selects the writer, then
+explicitly deletes one `OnDelete` PostgreSQL member Pod after first publishing
+a changed desired configuration.
 It proves neither primary restarts when the StatefulSet templates change, the
 selected replacement adopts the new template, the other shard remains on its
 original UID and configuration, and the PVC-backed row survives. Against a

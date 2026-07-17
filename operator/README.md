@@ -7,12 +7,15 @@ API. The controller now reconciles the safe supporting-resource slice:
   PostgreSQL configuration ConfigMaps, including common plus primary and
   standby role profiles for every member;
 - CNPG-style `<cluster>-rw`, `<cluster>-ro`, and `<cluster>-r` application
-  Services, each targeting its own pooler listener;
+  Services. The current compatibility slice selects poolers only for `-rw`;
+  unsupported `-ro` and `-r` Services remain selectorless and publish no
+  endpoints until their listeners exist;
 - one internal headless Service per shard;
 - for an explicit one-member asynchronous topology, one digest-pinned
-  PostgreSQL 18 primary StatefulSet and retained data PVC per shard, with a
-  generated per-shard immutable bootstrap credential and restricted Pod
-  security;
+  PostgreSQL 18 StatefulSet and retained data PVC per shard, with a stable
+  role-neutral `<cluster>-shard-NNNN-0` Pod identity, mutable
+  `pgshard.io/role` and `pgshard.io/member` labels, a generated per-shard
+  immutable bootstrap credential, and restricted Pod security;
 - an idempotently migrated `shardschema` database on shard-0000 containing the
   complete immutable shard inventory and an initial restore incarnation for
   each shard;
@@ -102,6 +105,21 @@ This also applies to a singleton StatefulSet created by an earlier operator:
 publishing the catalog-aware init container does not run it against the
 existing Pod until that Pod is explicitly replaced.
 
+New PostgreSQL StatefulSet, Pod, and PVC names do not encode `primary` or
+`replica`. A PVC checkpointed by an earlier release retains its immutable name
+until an explicit data-mobility workflow exists; it is not a routing identity.
+As in CloudNativePG, role is routing state rather than instance identity:
+Services select `pgshard.io/role`, while the StatefulSet ordinal and
+`pgshard.io/member` label identify the member. The current one-member slice
+labels member `0000` as `primary`; later promotion must change role labels and
+Service endpoints without renaming or recreating the promoted member.
+An upgrade from the earlier `*-primary` StatefulSet deliberately stops that
+singleton first. The controller foreground-deletes the exact owned workload,
+waits for its termination-fenced Pod to disappear through the uncached API,
+and only then creates the role-neutral controller over the recorded PVC. This
+one-time migration has the single-member mode's documented shard outage, but
+never publishes two StatefulSets that could run postmasters over one PGDATA.
+
 Generated bootstrap credentials are unique per shard, immutable, and stable
 across reconciles. Each data PVC is likewise bound to its recorded name, UID,
 capacity, storage class, and creation-time deletion policy. When the spec omits
@@ -187,16 +205,23 @@ certificate; PostgreSQL receives only the serving certificate and key; the
 bootstrap init container temporarily receives both retained projections so it
 can verify their checkpointed SHA-256 values before touching PGDATA. The CA
 private key is discarded after issuance and is never stored in Kubernetes.
-Application Services still target the rejection-only pooler and must not be
-treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
-for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
-remains authoritative. Backup execution and ServiceMonitor reconciliation also
-remain unimplemented. The ingress NetworkPolicies allow only selected
+In the one-member development slice, the read-write Service exposes only the
+documented shard-zero compatibility relay; read-only, any-instance, HA routing,
+and general sharding remain unavailable. Multi-member topologies remain
+fail-closed. Backup execution and ServiceMonitor reconciliation also remain
+unimplemented. The ingress NetworkPolicies allow only selected
 same-cluster Pods. The pooler-to-`shardschema` path is TLS 1.3 plus SCRAM with
 required channel binding, but etcd client/peer and general PostgreSQL shard
 traffic still lack authenticated TLS; the independent
 `TransportSecurityReady=False` condition reports the remaining gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
-a bounded backend quota. Its default image is digest-pinned and the Pod command
+a bounded backend quota. Its process-owned data directory is a private child of
+the PVC mount, so permissive provisioner root modes do not expose etcd data or
+produce a startup permission warning. Before etcd starts, a non-root Rust init
+container replays a same-filesystem, crash-safe migration of an earlier
+`/var/lib/etcd/member` directory into that private child; ambiguous or
+symlinked layouts fail closed. This protects upgrades while the dedicated etcd
+workload remains transitional and does not make it part of the Milestone 1
+architecture. Its default image is digest-pinned and the Pod command
 selects that image contract's `/usr/local/bin/etcd` executable explicitly;
 custom `--etcd-image` values must provide the same path. Scale transitions
 retain those claims during scaling. On cluster deletion, both storage policies

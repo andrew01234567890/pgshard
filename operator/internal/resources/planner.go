@@ -64,6 +64,7 @@ const (
 	HTTPPort       int32 = 8080
 
 	etcdExecutable                      = "/usr/local/bin/etcd"
+	etcdDataMigrationExecutable         = "/usr/local/bin/pgshard-etcd-data-migrate"
 	defaultEtcdImage                    = "registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534"
 	defaultPostgreSQLImage              = "docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7"
 	developmentPostgreSQLBootstrapImage = "pgshard/postgres-agent:dev"
@@ -1426,14 +1427,14 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		if cluster.Spec.MembersPerShard == 1 {
 			bootstrap := bootstraps[shard]
 			objects = append(objects,
-				postgresqlPrimaryStatefulSet(cluster, shard, images.PostgreSQL, images.PostgreSQLBootstrap, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess),
+				postgresqlShardStatefulSet(cluster, shard, images.PostgreSQL, images.PostgreSQLBootstrap, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess),
 				postgresqlPrimaryDisruptionBudget(cluster, shard),
 			)
 		}
 	}
 
 	objects = append(objects,
-		etcdStatefulSet(cluster, images.Etcd),
+		etcdStatefulSet(cluster, images.Etcd, images.Orchestrator),
 		orchestratorDeployment(cluster, images.Orchestrator, topologyHash),
 		poolerDeployment(cluster, images.Pooler, topologyHash, catalogAccess),
 		podDisruptionBudget(cluster, "etcd", 1),
@@ -1630,11 +1631,15 @@ func immutableConfigMap(cluster *pgshardv1alpha1.PgShardCluster, name string, da
 
 func applicationService(cluster *pgshardv1alpha1.PgShardCluster, mode string, template pgshardv1alpha1.ServiceTemplate, targetPort int32) *corev1.Service {
 	appProtocol := "postgresql"
+	var selector map[string]string
+	if mode == "rw" {
+		selector = componentSelector(cluster, "pooler")
+	}
 	return &corev1.Service{
 		ObjectMeta: ownedMeta(cluster, cluster.Name+"-"+mode, "pooler", template.Annotations),
 		Spec: corev1.ServiceSpec{
 			Type:     template.Type,
-			Selector: componentSelector(cluster, "pooler"),
+			Selector: selector,
 			Ports: []corev1.ServicePort{{
 				Name:        "postgresql",
 				Protocol:    corev1.ProtocolTCP,
@@ -1739,7 +1744,6 @@ func catalogService(cluster *pgshardv1alpha1.PgShardCluster) *corev1.Service {
 	selector := componentSelector(cluster, "postgresql")
 	selector[ShardLabel] = shardLabel(0)
 	selector[RoleLabel] = "primary"
-	selector[MemberLabel] = "0000"
 	return &corev1.Service{
 		ObjectMeta: ownedMeta(cluster, CatalogServiceName(cluster.Name), "shardschema", nil),
 		Spec: corev1.ServiceSpec{
@@ -1762,9 +1766,17 @@ func PostgreSQLAuthSecretPrefix(cluster string, shard int32) string {
 	return shardName(cluster, shard) + "-auth-"
 }
 
-// PostgreSQLPrimaryStatefulSetName returns the deterministic singleton primary
-// workload name for one shard.
-func PostgreSQLPrimaryStatefulSetName(cluster string, shard int32) string {
+// PostgreSQLShardStatefulSetName returns the deterministic, role-neutral
+// PostgreSQL workload name for one shard. The StatefulSet ordinal is the stable
+// member identity; primary and replica roles belong in mutable labels.
+func PostgreSQLShardStatefulSetName(cluster string, shard int32) string {
+	return fmt.Sprintf("%s-shard-%04d", boundedPostgreSQLWorkloadPrefix(cluster), shard)
+}
+
+// LegacyPostgreSQLPrimaryStatefulSetName identifies the pre-role-neutral
+// singleton workload during the one-way controller migration. It must not be
+// used when planning new resources.
+func LegacyPostgreSQLPrimaryStatefulSetName(cluster string, shard int32) string {
 	return fmt.Sprintf("%s-shard-%04d-primary", boundedPostgreSQLWorkloadPrefix(cluster), shard)
 }
 
@@ -1786,11 +1798,11 @@ func boundedPostgreSQLWorkloadPrefix(cluster string) string {
 	return cluster[:maximumPrefixLength-len(suffix)-1] + "-" + suffix
 }
 
-// PostgreSQLPrimaryDataPVCPrefix is the readable portion of a randomly named,
-// pre-created data volume. Workloads only reference a name and UID checkpointed
-// in PgShardCluster status.
-func PostgreSQLPrimaryDataPVCPrefix(cluster string, shard int32) string {
-	return shardName(cluster, shard) + "-primary-data-"
+// PostgreSQLDataPVCPrefix is the readable, role-neutral portion of a randomly
+// named, pre-created data volume. Workloads only reference a name and UID
+// checkpointed in PgShardCluster status.
+func PostgreSQLDataPVCPrefix(cluster string, shard int32) string {
+	return shardName(cluster, shard) + "-data-"
 }
 
 // PostgreSQLAuthSecret returns one immutable shard bootstrap Secret. It starts
@@ -1827,14 +1839,15 @@ func CatalogAccessIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, name str
 	}
 }
 
-// PostgreSQLPrimaryDataPVC returns the standalone data volume for a singleton
-// primary. Size and storage class come from the checkpointed provisioning
-// contract. Every create is controlled by the exact detached credential Secret
-// UID. The controller adds its data-protection finalizer only after the API UID
-// is checkpointed, then detaches the live PVC and anchors the Secret tombstone
-// to it. Delayed create requests retain this initial owner and no finalizer, so
-// Kubernetes can garbage-collect them after the tombstone is deleted.
-func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageSize resource.Quantity, storageClassName *string, fenceName string, fenceUID types.UID) *corev1.PersistentVolumeClaim {
+// PostgreSQLDataPVC returns the standalone data volume for the stable member
+// currently bootstrapped for a shard. Size and storage class come from the
+// checkpointed provisioning contract. Every create is controlled by the exact
+// detached credential Secret UID. The controller adds its data-protection
+// finalizer only after the API UID is checkpointed, then detaches the live PVC
+// and anchors the Secret tombstone to it. Delayed create requests retain this
+// initial owner and no finalizer, so Kubernetes can garbage-collect them after
+// the tombstone is deleted.
+func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageSize resource.Quantity, storageClassName *string, fenceName string, fenceUID types.UID) *corev1.PersistentVolumeClaim {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
 	controller := true
 	blockDeletion := true
@@ -1865,17 +1878,17 @@ func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int
 	}
 }
 
-func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image, bootstrapImage, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus) *appsv1.StatefulSet {
+func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image, bootstrapImage, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus) *appsv1.StatefulSet {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
 	)
-	name := PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)
+	name := PostgreSQLShardStatefulSetName(cluster.Name, shard)
 	selector := componentSelector(cluster, "postgresql")
 	selector[ShardLabel] = shardLabel(shard)
-	selector[RoleLabel] = "primary"
 	selector[MemberLabel] = "0000"
 	podLabels := maps.Clone(selector)
+	podLabels[RoleLabel] = "primary"
 	podLabels[ManagedByLabel] = ManagedByValue
 	allowPrivilegeEscalation := false
 	readOnlyRootFilesystem := true
@@ -2057,7 +2070,7 @@ func postgresqlPrimaryDisruptionBudget(cluster *pgshardv1alpha1.PgShardCluster, 
 	selector[ShardLabel] = shardLabel(shard)
 	selector[RoleLabel] = "primary"
 	return &policyv1.PodDisruptionBudget{
-		ObjectMeta: ownedMeta(cluster, PostgreSQLPrimaryStatefulSetName(cluster.Name, shard), "postgresql", nil),
+		ObjectMeta: ownedMeta(cluster, PostgreSQLShardStatefulSetName(cluster.Name, shard), "postgresql", nil),
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MinAvailable:               &minimum,
 			Selector:                   &metav1.LabelSelector{MatchLabels: selector},
@@ -2162,7 +2175,7 @@ func postgresqlNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster, shard int3
 	}
 }
 
-func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image string) *appsv1.StatefulSet {
+func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image, migrationImage string) *appsv1.StatefulSet {
 	const replicas int32 = 3
 	var storageClassName *string
 	if cluster.Spec.Storage.StorageClassName != nil {
@@ -2180,6 +2193,47 @@ func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image string) *app
 		pod := fmt.Sprintf("%s-%d", name, ordinal)
 		initialCluster = append(initialCluster, fmt.Sprintf("%s=http://%s.%s.%s.svc:%d", pod, pod, name, cluster.Namespace, EtcdPeerPort))
 	}
+	podSpec := securePodSpec(selector, []corev1.Container{{
+		Name:            "etcd",
+		Image:           image,
+		ImagePullPolicy: imagePullPolicy(image),
+		Command:         []string{etcdExecutable},
+		Args: []string{
+			"--name=$(POD_NAME)",
+			"--data-dir=/var/lib/etcd/data",
+			"--listen-client-urls=http://0.0.0.0:2379",
+			"--advertise-client-urls=http://$(POD_NAME)." + name + "." + cluster.Namespace + ".svc:2379",
+			"--listen-peer-urls=http://0.0.0.0:2380",
+			"--initial-advertise-peer-urls=http://$(POD_NAME)." + name + "." + cluster.Namespace + ".svc:2380",
+			"--initial-cluster=" + strings.Join(initialCluster, ","),
+			"--initial-cluster-state=new",
+			"--initial-cluster-token=" + cluster.Name,
+			"--quota-backend-bytes=805306368",
+			"--max-wals=2",
+			"--max-snapshots=2",
+			"--auto-compaction-mode=periodic",
+			"--auto-compaction-retention=1h",
+			"--enable-grpc-gateway=true",
+		},
+		Env: []corev1.EnvVar{{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}},
+		Ports: []corev1.ContainerPort{
+			{Name: "client", ContainerPort: EtcdClientPort, Protocol: corev1.ProtocolTCP},
+			{Name: "peer", ContainerPort: EtcdPeerPort, Protocol: corev1.ProtocolTCP},
+		},
+		Resources:      resources("100m", "128Mi", "1", "512Mi"),
+		ReadinessProbe: httpReadinessProbe("/readyz", "client"),
+		LivenessProbe:  httpLivenessProbe("/livez", "client"),
+		VolumeMounts:   []corev1.VolumeMount{{Name: "data", MountPath: "/var/lib/etcd"}},
+	}})
+	podSpec.InitContainers = []corev1.Container{{
+		Name:            "prepare-data",
+		Image:           migrationImage,
+		ImagePullPolicy: imagePullPolicy(migrationImage),
+		Command:         []string{etcdDataMigrationExecutable},
+		Resources:       resources("10m", "16Mi", "100m", "64Mi"),
+		SecurityContext: secureContainerSecurityContext(),
+		VolumeMounts:    []corev1.VolumeMount{{Name: "data", MountPath: "/var/lib/etcd"}},
+	}}
 	return &appsv1.StatefulSet{
 		ObjectMeta: ownedMeta(cluster, name, "etcd", nil),
 		Spec: appsv1.StatefulSetSpec{
@@ -2194,38 +2248,7 @@ func etcdStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, image string) *app
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: selector},
-				Spec: securePodSpec(selector, []corev1.Container{{
-					Name:            "etcd",
-					Image:           image,
-					ImagePullPolicy: imagePullPolicy(image),
-					Command:         []string{etcdExecutable},
-					Args: []string{
-						"--name=$(POD_NAME)",
-						"--data-dir=/var/lib/etcd",
-						"--listen-client-urls=http://0.0.0.0:2379",
-						"--advertise-client-urls=http://$(POD_NAME)." + name + "." + cluster.Namespace + ".svc:2379",
-						"--listen-peer-urls=http://0.0.0.0:2380",
-						"--initial-advertise-peer-urls=http://$(POD_NAME)." + name + "." + cluster.Namespace + ".svc:2380",
-						"--initial-cluster=" + strings.Join(initialCluster, ","),
-						"--initial-cluster-state=new",
-						"--initial-cluster-token=" + cluster.Name,
-						"--quota-backend-bytes=805306368",
-						"--max-wals=2",
-						"--max-snapshots=2",
-						"--auto-compaction-mode=periodic",
-						"--auto-compaction-retention=1h",
-						"--enable-grpc-gateway=true",
-					},
-					Env: []corev1.EnvVar{{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}},
-					Ports: []corev1.ContainerPort{
-						{Name: "client", ContainerPort: EtcdClientPort, Protocol: corev1.ProtocolTCP},
-						{Name: "peer", ContainerPort: EtcdPeerPort, Protocol: corev1.ProtocolTCP},
-					},
-					Resources:      resources("100m", "128Mi", "1", "512Mi"),
-					ReadinessProbe: httpReadinessProbe("/readyz", "client"),
-					LivenessProbe:  httpLivenessProbe("/livez", "client"),
-					VolumeMounts:   []corev1.VolumeMount{{Name: "data", MountPath: "/var/lib/etcd"}},
-				}}),
+				Spec:       podSpec,
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
 				ObjectMeta: claimMetadata,
@@ -2318,6 +2341,7 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 			corev1.EnvVar{Name: "PGSHARD_SHARDSCHEMA_PASSWORD_FILE", Value: "/etc/pgshard/catalog/catalog-password"},
 			corev1.EnvVar{Name: "PGSHARD_SHARDSCHEMA_CA_FILE", Value: "/etc/pgshard/catalog/ca.crt"},
 			corev1.EnvVar{Name: "PGSHARD_SHARDSCHEMA_CLIENT_SHA256", Value: catalogAccess.ClientSHA256},
+			corev1.EnvVar{Name: "PGSHARD_RW_BACKEND_HOST", Value: fmt.Sprintf("%s.%s.svc", CatalogServiceName(cluster.Name), cluster.Namespace)},
 		)
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "catalog-client", MountPath: "/etc/pgshard/catalog", ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{
@@ -2413,14 +2437,7 @@ func securePodSpec(selector map[string]string, containers []corev1.Container) co
 	fsGroupChangePolicy := corev1.FSGroupChangeOnRootMismatch
 	seccomp := corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
 	for index := range containers {
-		containers[index].SecurityContext = &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr(false),
-			ReadOnlyRootFilesystem:   ptr(true),
-			RunAsNonRoot:             &runAsNonRoot,
-			RunAsUser:                &runAsUser,
-			RunAsGroup:               &runAsGroup,
-			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-		}
+		containers[index].SecurityContext = secureContainerSecurityContext()
 	}
 	automount := false
 	enableServiceLinks := false
@@ -2440,6 +2457,20 @@ func securePodSpec(selector map[string]string, containers []corev1.Container) co
 			{MaxSkew: 1, TopologyKey: corev1.LabelHostname, WhenUnsatisfiable: corev1.ScheduleAnyway, LabelSelector: &metav1.LabelSelector{MatchLabels: selector}},
 			{MaxSkew: 1, TopologyKey: corev1.LabelTopologyZone, WhenUnsatisfiable: corev1.ScheduleAnyway, LabelSelector: &metav1.LabelSelector{MatchLabels: selector}},
 		},
+	}
+}
+
+func secureContainerSecurityContext() *corev1.SecurityContext {
+	runAsNonRoot := true
+	runAsUser := int64(10001)
+	runAsGroup := int64(10001)
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptr(false),
+		ReadOnlyRootFilesystem:   ptr(true),
+		RunAsNonRoot:             &runAsNonRoot,
+		RunAsUser:                &runAsUser,
+		RunAsGroup:               &runAsGroup,
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
 }
 

@@ -366,10 +366,23 @@ a durability downgrade and must be surfaced as such.
 
 ## Primary fencing
 
-The primary must eventually hold a renewable shard/term lease in the
-three-member etcd cluster. That durable lease and the local agent self-fencing
-needed before PostgreSQL can serve are not implemented. The process-incarnation
-lease described above is deliberately not a shard/term lease.
+The primary must eventually hold an operator-owned
+`coordination.k8s.io/v1` Lease for its physical cell. Components access that
+Lease through the Kubernetes API server; they never connect directly to the
+control plane's private etcd. The Lease record is short-lived coordination, not
+durable authority: topology, operations, fencing generations, and transaction
+decisions remain in PostgreSQL. This writable-term Lease and the local agent
+self-fencing needed before PostgreSQL can serve are not implemented. The
+current dedicated-etcd process-incarnation lease is transitional and is
+deliberately not a shard/term lease.
+
+As in CloudNativePG, a candidate observes a competing holder's Lease record
+locally and may take it over only after the same holder and renewal record stay
+unchanged for a full lease duration. Resource-version conditional updates pick
+one winner without trusting the old holder's wall clock. The current holder
+must still translate successful renewals into a monotonic local deadline and
+stop PostgreSQL before that deadline; a Kubernetes Lease alone cannot fence an
+isolated process.
 
 The existing in-memory state machines model the later boundary. Both the
 orchestrator authority and receiving agent reject expired or overlong leases;

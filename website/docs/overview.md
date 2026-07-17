@@ -42,8 +42,11 @@ status](./project/status.md) before using any command or guarantee.
   share physical PostgreSQL cells with another database or use dedicated
   cells, volumes, and Nodes.
 - Durable database topology and physical-cell metadata lives in the
-  `shardschema` database on bootstrap `cell-0000`; etcd contains leases, not the
-  authoritative shard map.
+  `shardschema` database on bootstrap `cell-0000`. Short-lived coordination uses
+  Kubernetes Lease objects through the API server; pgshard never accesses the
+  control plane's private etcd or stores durable shard state in a Lease.
+- PostgreSQL member names and volume identities are role-neutral. Mutable role
+  labels, not `primary` or `replica` in a Pod name, drive Service endpoints.
 - Applications connect through pooler services and do not receive a direct PostgreSQL Service.
 - Change-stream workers run inside `pgshard-pooler` and normally consume
   `pgoutput` only from independently decoded standby-local slots.

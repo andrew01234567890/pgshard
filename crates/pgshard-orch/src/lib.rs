@@ -6,6 +6,7 @@
 pub mod config;
 pub mod coordination;
 pub mod domain;
+pub mod etcd_data;
 pub mod http;
 mod postgres_connection;
 pub mod slot_catalog;

@@ -16,6 +16,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +38,11 @@ import (
 // This exceeds the 5-second initial delay plus three 10-second liveness
 // periods, so a broken process cannot pass immediately before its first restart.
 const stableContainerObservation = 40 * time.Second
+
+func TestMain(m *testing.M) {
+	ctrl.SetLogger(logr.Discard())
+	os.Exit(m.Run())
+}
 
 func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
@@ -77,6 +83,163 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertNoPostgreSQLWorkload(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertOrchestratorReadinessTracksEtcdQuorum(t, ctx, kubeClient, namespace.Name, cluster.Name)
+}
+
+func TestKINDEtcdDataDirectoryMigrationPreservesExistingPVC(t *testing.T) {
+	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
+		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against the installed development manager")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	kubeClient := newKINDClient(t)
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: fmt.Sprintf("pgshard-etcd-migration-%d", os.Getpid()),
+		Labels: map[string]string{
+			"pod-security.kubernetes.io/enforce":         "restricted",
+			"pod-security.kubernetes.io/enforce-version": "latest",
+		},
+	}}
+	if err := kubeClient.Create(ctx, namespace); err != nil {
+		t.Fatal(err)
+	}
+	deleteNamespaceAtCleanup(t, kubeClient, namespace)
+	claim := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd-data", Namespace: namespace.Name},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("256Mi"),
+			}},
+		},
+	}
+	if err := kubeClient.Create(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := etcdDataMigrationPod(namespace.Name, "legacy-etcd", claim.Name, "/var/lib/etcd", false)
+	if err := kubeClient.Create(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	waitForReadyEtcdMigrationPod(t, ctx, kubeClient, client.ObjectKeyFromObject(legacy))
+	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", legacy.Name, "--container", "etcd", "--",
+		"/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "put", "pgshard-migration-sentinel", "preserved")
+	if err := kubeClient.Delete(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, client.ObjectKeyFromObject(legacy), &corev1.Pod{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatalf("wait for legacy etcd Pod deletion: %v", err)
+	}
+
+	migrated := etcdDataMigrationPod(namespace.Name, "migrated-etcd", claim.Name, "/var/lib/etcd/data", true)
+	if err := kubeClient.Create(ctx, migrated); err != nil {
+		t.Fatal(err)
+	}
+	current := waitForReadyEtcdMigrationPod(t, ctx, kubeClient, client.ObjectKeyFromObject(migrated))
+	if len(current.Status.InitContainerStatuses) != 1 || current.Status.InitContainerStatuses[0].RestartCount != 0 || current.Status.InitContainerStatuses[0].State.Terminated == nil || current.Status.InitContainerStatuses[0].State.Terminated.ExitCode != 0 {
+		t.Fatalf("etcd migration init completion = %#v", current.Status.InitContainerStatuses)
+	}
+	value := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", migrated.Name, "--container", "etcd", "--",
+		"/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "get", "pgshard-migration-sentinel", "--print-value-only"))
+	if value != "preserved" {
+		t.Fatalf("migrated etcd value = %q, want preserved", value)
+	}
+	logs := runKubectl(t, ctx, "--namespace", namespace.Name, "logs", migrated.Name, "--container", "etcd")
+	if strings.Contains(logs, `"msg":"check file permission"`) || strings.Contains(logs, `directory \"/var/lib/etcd/data\" exist, but the permission`) {
+		t.Fatalf("migrated etcd reported an insecure data-directory permission: %s", logs)
+	}
+}
+
+func etcdDataMigrationPod(namespace, name, claim, dataDirectory string, migrate bool) *corev1.Pod {
+	runAsNonRoot := true
+	runAsUser := int64(10001)
+	runAsGroup := int64(10001)
+	readOnlyRoot := true
+	allowPrivilegeEscalation := false
+	automount := false
+	enableServiceLinks := false
+	fsGroupChangePolicy := corev1.FSGroupChangeOnRootMismatch
+	containerSecurity := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+		ReadOnlyRootFilesystem:   &readOnlyRoot,
+		RunAsNonRoot:             &runAsNonRoot,
+		RunAsUser:                &runAsUser,
+		RunAsGroup:               &runAsGroup,
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken: &automount,
+			EnableServiceLinks:           &enableServiceLinks,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot:        &runAsNonRoot,
+				RunAsUser:           &runAsUser,
+				RunAsGroup:          &runAsGroup,
+				FSGroup:             &runAsGroup,
+				FSGroupChangePolicy: &fsGroupChangePolicy,
+				SeccompProfile:      &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
+			Containers: []corev1.Container{{
+				Name:            "etcd",
+				Image:           owned.DefaultImages().Etcd,
+				ImagePullPolicy: corev1.PullIfNotPresent,
+				Command:         []string{"/usr/local/bin/etcd"},
+				Args: []string{
+					"--name=legacy",
+					"--data-dir=" + dataDirectory,
+					"--listen-client-urls=http://0.0.0.0:2379",
+					"--advertise-client-urls=http://127.0.0.1:2379",
+					"--listen-peer-urls=http://127.0.0.1:2380",
+					"--initial-advertise-peer-urls=http://127.0.0.1:2380",
+					"--initial-cluster=legacy=http://127.0.0.1:2380",
+					"--initial-cluster-state=new",
+					"--initial-cluster-token=pgshard-kind-etcd-migration",
+				},
+				Env:             []corev1.EnvVar{{Name: "ETCDCTL_API", Value: "3"}},
+				SecurityContext: containerSecurity.DeepCopy(),
+				VolumeMounts:    []corev1.VolumeMount{{Name: "data", MountPath: "/var/lib/etcd"}},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{
+						"/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health",
+					}}},
+					PeriodSeconds: 1, TimeoutSeconds: 2, FailureThreshold: 30,
+				},
+			}},
+			Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim}}}},
+		},
+	}
+	if migrate {
+		pod.Spec.InitContainers = []corev1.Container{{
+			Name:            "prepare-data",
+			Image:           owned.DevelopmentImages().Orchestrator,
+			ImagePullPolicy: corev1.PullNever,
+			Command:         []string{"/usr/local/bin/pgshard-etcd-data-migrate"},
+			SecurityContext: containerSecurity.DeepCopy(),
+			VolumeMounts:    []corev1.VolumeMount{{Name: "data", MountPath: "/var/lib/etcd"}},
+		}}
+	}
+	return pod
+}
+
+func waitForReadyEtcdMigrationPod(t *testing.T, ctx context.Context, kubeClient client.Client, key client.ObjectKey) *corev1.Pod {
+	t.Helper()
+	current := &corev1.Pod{}
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		current = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, key, current); err != nil {
+			return false, err
+		}
+		if current.Status.Phase == corev1.PodFailed {
+			return false, fmt.Errorf("etcd migration Pod failed: %#v", current.Status)
+		}
+		return len(current.Status.ContainerStatuses) == 1 && current.Status.ContainerStatuses[0].Ready, nil
+	}); err != nil {
+		t.Fatalf("wait for etcd migration Pod %s: %v; last status=%#v", key, err, current.Status)
+	}
+	return current
 }
 
 func TestKINDRestoreTopologyMismatchIsRejectedBeforeMutation(t *testing.T) {
@@ -290,13 +453,20 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	}
 	waitForSingleMemberPostgreSQL(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster))
 	waitForPoolerCatalogTLS(t, ctx, kubeClient, namespace.Name, cluster.Name)
+	for ordinal := 0; ordinal < 3; ordinal++ {
+		pod := fmt.Sprintf("%s-etcd-%d", cluster.Name, ordinal)
+		logs := runKubectl(t, ctx, "--namespace", namespace.Name, "logs", pod, "--container", "etcd")
+		if strings.Contains(logs, `"msg":"check file permission"`) || strings.Contains(logs, `directory \"/var/lib/etcd/data\" exist, but the permission`) {
+			t.Fatalf("etcd %s reported an insecure data-directory permission: %s", pod, logs)
+		}
+	}
 	assertPostgreSQLStatusMetadataImmutable(t, ctx, kubeClient, types.NamespacedName{
 		Namespace: namespace.Name,
-		Name:      cluster.Name + "-shard-0000-primary-0",
+		Name:      owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0",
 	})
 	assertPostgreSQLSpecImmutable(t, ctx, kubeClient, types.NamespacedName{
 		Namespace: namespace.Name,
-		Name:      cluster.Name + "-shard-0000-primary-0",
+		Name:      owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0",
 	})
 	current := &pgshardv1alpha1.PgShardCluster{}
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err != nil {
@@ -321,8 +491,8 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	shardZeroBootstrap := bootstrapForShard(t, current, 0)
 	shardOneBootstrap := bootstrapForShard(t, current, 1)
 
-	shardZeroPod := cluster.Name + "-shard-0000-primary-0"
-	shardOnePod := cluster.Name + "-shard-0001-primary-0"
+	shardZeroPod := owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0"
+	shardOnePod := owned.PostgreSQLShardStatefulSetName(cluster.Name, 1) + "-0"
 	initialShardZero := &corev1.Pod{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, initialShardZero); err != nil {
 		t.Fatal(err)
@@ -405,6 +575,12 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, service, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
 		t.Fatalf("cross-shard-service query = %q", got)
 	}
+	poolerService := cluster.Name + "-rw"
+	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, poolerService, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
+		t.Fatalf("shard-zero compatibility relay query = %q", got)
+	}
+	assertUnsupportedApplicationServicesHaveNoEndpoints(t, ctx, kubeClient, namespace.Name, cluster.Name)
+	assertPoolerCatalogDatabaseRejected(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, poolerService)
 	assertPostgreSQLServiceQueryDenied(t, ctx, kubeClient, namespace.Name, "unlabeled", nil, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, service)
 	assertPostgreSQLServiceQueryDenied(t, ctx, kubeClient, namespace.Name, "wrong-cluster", map[string]string{
 		owned.ClusterLabel:   "another-cluster",
@@ -440,11 +616,11 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	var desiredShardZeroHash, desiredShardOneHash string
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
 		shardZeroStatefulSet := &appsv1.StatefulSet{}
-		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0)}, shardZeroStatefulSet); err != nil {
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}, shardZeroStatefulSet); err != nil {
 			return false, err
 		}
 		shardOneStatefulSet := &appsv1.StatefulSet{}
-		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 1)}, shardOneStatefulSet); err != nil {
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 1)}, shardOneStatefulSet); err != nil {
 			return false, err
 		}
 		desiredShardZeroHash = shardZeroStatefulSet.Spec.Template.Annotations[owned.ConfigHashAnnotation]
@@ -486,6 +662,10 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
 		t.Fatalf("query after StatefulSet restart = %q", got)
+	}
+	waitForPoolerCatalogTLS(t, ctx, kubeClient, namespace.Name, cluster.Name)
+	if got := runPostgreSQLServiceQuery(t, ctx, kubeClient, namespace.Name, cluster.Name, shardOne.Spec.Containers[0].Image, shardZeroBootstrap.SecretName, poolerService, "SELECT note FROM live_marker WHERE shard = 0"); got != "kind-persistent" {
+		t.Fatalf("compatibility relay query after shard-zero restart = %q", got)
 	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
@@ -663,7 +843,7 @@ func waitForPoolerCatalogTLS(t *testing.T, ctx context.Context, kubeClient clien
 			lastErr = err
 			return false, nil
 		}
-		if status.Ready || status.Catalog.Phase != "connected" || !status.Catalog.ConnectionUp || !status.Catalog.Ready || status.Catalog.ReadinessReason != "ready" || status.Catalog.CatalogEpoch == nil || status.Catalog.LastFailure != nil {
+		if !status.Ready || status.Catalog.Phase != "connected" || !status.Catalog.ConnectionUp || !status.Catalog.Ready || status.Catalog.ReadinessReason != "ready" || status.Catalog.CatalogEpoch == nil || status.Catalog.LastFailure != nil {
 			lastErr = fmt.Errorf("catalog status not ready: %#v", status)
 			return false, nil
 		}
@@ -685,7 +865,7 @@ func waitForPoolerCatalogTLS(t *testing.T, ctx context.Context, kubeClient clien
 		t.Fatalf("read pooler metrics through Service proxy: %v\n%s", err, metrics)
 	}
 	for _, sample := range []string{
-		"pgshard_pooler_ready 0",
+		"pgshard_pooler_ready 1",
 		"pgshard_pooler_catalog_ready 1",
 		"pgshard_pooler_catalog_connection_up 1",
 	} {
@@ -694,10 +874,9 @@ func waitForPoolerCatalogTLS(t *testing.T, ctx context.Context, kubeClient clien
 		}
 	}
 	readiness, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", readinessPath).CombinedOutput()
-	if err == nil || (!strings.Contains(string(readiness), "data_plane_unavailable") && !strings.Contains(string(readiness), "ServiceUnavailable")) {
-		t.Fatalf("pooler /readyz = error %v, output %q; want HTTP 503 data_plane_unavailable", err, readiness)
+	if err != nil || strings.TrimSpace(string(readiness)) != `{"ready":true,"reason":"ready"}` {
+		t.Fatalf("pooler /readyz = error %v, output %q; want ready compatibility relay", err, readiness)
 	}
-	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace, cluster)
 }
 
 func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, kubeClient client.Client, key types.NamespacedName) {
@@ -915,7 +1094,7 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 	if bootstrap.PVCStorageClassName == nil || claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != *bootstrap.PVCStorageClassName {
 		t.Fatalf("PostgreSQL data claim storage class = %#v, checkpoint = %#v", claim.Spec.StorageClassName, bootstrap.PVCStorageClassName)
 	}
-	podKey := types.NamespacedName{Namespace: namespace.Name, Name: cluster.Name + "-shard-0000-primary-0"}
+	podKey := types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0"}
 	pod := &corev1.Pod{}
 	if err := kubeClient.Get(ctx, podKey, pod); err != nil {
 		t.Fatal(err)
@@ -946,7 +1125,7 @@ func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
 	for description, object := range map[string]client.Object{
 		"PostgreSQL Pod":       &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podKey.Name, Namespace: podKey.Namespace}},
 		"PostgreSQL PVC":       &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: claimKey.Name, Namespace: claimKey.Namespace}},
-		"PostgreSQL state":     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
+		"PostgreSQL state":     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
 		"credential PVC fence": &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: bootstrap.SecretName, Namespace: namespace.Name}},
 	} {
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(object), object); !apierrors.IsNotFound(err) {
@@ -1022,9 +1201,9 @@ func TestKINDManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC(t *testi
 		t.Fatalf("Retain finalizer deadlocked behind an explicitly deleting PostgreSQL data PVC: %v", err)
 	}
 	for description, object := range map[string]client.Object{
-		"PostgreSQL Pod":       &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: cluster.Name + "-shard-0000-primary-0", Namespace: namespace.Name}},
+		"PostgreSQL Pod":       &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0", Namespace: namespace.Name}},
 		"PostgreSQL PVC":       &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: claimKey.Name, Namespace: claimKey.Namespace}},
-		"PostgreSQL state":     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLPrimaryStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
+		"PostgreSQL state":     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0), Namespace: namespace.Name}},
 		"credential PVC fence": &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: bootstrap.SecretName, Namespace: namespace.Name}},
 	} {
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(object), object); !apierrors.IsNotFound(err) {
@@ -1116,6 +1295,36 @@ func assertCatalogLoginRejected(t *testing.T, ctx context.Context, kubeClient cl
 		!strings.Contains(output, "user \"pgshard_pooler_catalog\"") ||
 		!strings.Contains(output, "database \""+database+"\"") {
 		t.Fatalf("catalog login was rejected for an unexpected reason: %q", output)
+	}
+}
+
+func assertPoolerCatalogDatabaseRejected(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster, image, secret, host string) {
+	t.Helper()
+	clientPod := postgreSQLClientPod(namespace, fmt.Sprintf("pgshard-pooler-catalog-client-%d-%d", os.Getpid(), time.Now().UnixNano()), map[string]string{
+		owned.ClusterLabel:   cluster,
+		owned.ComponentLabel: "pooler",
+	}, image, secret, host, "SELECT 1")
+	clientPod.Spec.Containers[0].Args = []string{"-X", "-w", "-h", host, "-U", "postgres", "-d", "shardschema", "-Atc", "SELECT 1"}
+	if err := kubeClient.Create(ctx, clientPod); err != nil {
+		t.Fatal(err)
+	}
+	current := &corev1.Pod{}
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		current = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(clientPod), current); err != nil {
+			return false, err
+		}
+		if current.Status.Phase == corev1.PodSucceeded {
+			return false, fmt.Errorf("application pooler exposed shardschema")
+		}
+		return current.Status.Phase == corev1.PodFailed, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for pooler catalog rejection Pod: %v; last status = %#v", err, current.Status)
+	}
+	output := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
+	if !strings.Contains(output, "shardschema is not available through the application pooler") {
+		t.Fatalf("application pooler rejected shardschema for an unexpected reason: %q", output)
 	}
 }
 
@@ -1623,6 +1832,29 @@ func assertFailClosedApplicationServices(t *testing.T, ctx context.Context, kube
 				if endpoint.Conditions.Ready == nil || *endpoint.Conditions.Ready {
 					t.Fatalf("application Service %s has ready endpoint %v", serviceName, endpoint.Addresses)
 				}
+			}
+		}
+	}
+}
+
+func assertUnsupportedApplicationServicesHaveNoEndpoints(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, cluster string) {
+	t.Helper()
+	for _, suffix := range []string{"-ro", "-r"} {
+		serviceName := cluster + suffix
+		service := &corev1.Service{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: serviceName}, service); err != nil {
+			t.Fatal(err)
+		}
+		if service.Spec.Selector != nil {
+			t.Fatalf("unsupported application Service %s has selector %#v", serviceName, service.Spec.Selector)
+		}
+		slices := &discoveryv1.EndpointSliceList{}
+		if err := kubeClient.List(ctx, slices, client.InNamespace(namespace), client.MatchingLabels{discoveryv1.LabelServiceName: serviceName}); err != nil {
+			t.Fatal(err)
+		}
+		for _, slice := range slices.Items {
+			if len(slice.Endpoints) != 0 {
+				t.Fatalf("unsupported application Service %s has endpoints %#v", serviceName, slice.Endpoints)
 			}
 		}
 	}
