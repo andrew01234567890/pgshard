@@ -566,12 +566,15 @@ It proves neither primary restarts when the StatefulSet templates change, the
 selected replacement adopts the new template, the other shard remains on its
 original UID and configuration, and the PVC-backed row survives. Against a
 separate Docker volume, the same job upgrades the released v0.49 catalog,
-converges a one-shard inventory to two shards, accepts canonical five-digit
-retired shard IDs, and rejects wrong home-shard identity, missing active restore
-lineage, malformed shard IDs, altered identity-sequence parameters, rewrite
-rules, and disabled internal foreign-key triggers without changing catalog
-state. It also proves inherited search-path and identifier-quoting settings do
-not change the fingerprint, and that migration replaces an altered trigger
+rejects a one-shard catalog under a requested two-shard configuration without
+mutation, replays after an independently installed exact two-shard inventory,
+accepts canonical five-digit retired shard IDs, and rejects wrong home-shard
+identity, missing or orphaned restore lineage, malformed shard IDs, altered or
+rewound identity sequences, rewrite rules, event triggers, and disabled
+internal foreign-key triggers without changing catalog state. It also proves
+inherited search-path, identifier-quoting, and replica session-role settings do
+not subvert bootstrap; active restored `postgresql.auto.conf` settings are
+rejected before PostgreSQL starts. The migration replaces an altered trigger
 function body without executing it. A prepared `ACCESS EXCLUSIVE` lock must
 fail within the bootstrap lock timeout; a second blocked init container is then killed with `SIGKILL`,
 after which retry on the same volume must recover. A second PGDATA fixture
@@ -711,24 +714,36 @@ Jepsen/Elle check the guarantees actually offered: atomic final cross-shard outc
 ## Required end-to-end environments
 
 - MinIO for pgBackRest S3 backup and restore, including corruption and interruption cases.
+- Backup retention pins with pgBackRest automatic expiry disabled: concurrent
+  backups, tombstones, dependency sharing, required post-backup WAL, and crashes
+  at every pin/refcount/expiry boundary must never delete a retained restore
+  point. A database with no data shard on `cell-0000` must still carry and verify
+  its signed database-scoped catalog projection.
 - Per-database topology and placement fixtures: `A` uses five logical shards;
   `B` uses three shards first on `A`'s first three shared cells, then on
   shared-node cells, then on fully dedicated cells and Nodes. Routing, DDL,
   grants, backup barriers, and failure injection for one database must not
   advance another database's epochs.
 - Exact-topology restore preflight: five-to-five succeeds onto replacement
-  shared or dedicated cells; five-to-three, changed range boundaries, changed
-  hash seed/version, duplicate shard identities, and non-empty destinations
-  fail before any Secret, PVC, Pod, Job, pgBackRest, or MinIO mutation.
+  dedicated cells; five-to-three, changed range boundaries, changed hash
+  seed/version, duplicate shard ordinals, and non-empty destinations fail
+  before any non-status mutation. The oracle compares all other Kubernetes
+  objects, catalog rows and epochs, PV/PVC data identities, pgBackRest metadata,
+  and MinIO object versions.
 - Database-targeted recovery: restore `A` as `B` while the existing `A` stays
   available; restore `A` as `A` only when that name is absent; prove colocated
   database bytes in a physical backup never become registered or queryable.
 - Online database mobility under continuous load: move restored `B` back to
-  `A`, both with identical topology and with a separate three-to-five
+  `A`, both with identical topology and with a separate five-to-three
   reshard/placement change. Inject pooler, operator, source-cell,
   destination-cell, and coordinator failure on both sides of the activation
   record; every client request must complete or receive the documented
   transaction retry outcome, never route to both generations after cutover.
+- Cutover fencing with paused and partitioned poolers, pre-existing idle sockets,
+  long-running transactions, and delayed writes or prepares. Source cells must
+  reject the retired generation, destinations must reject an unpublished or
+  unarmed generation, and buffered work must not be released until every
+  destination and pooler acknowledges the catalog generation.
 - Prometheus, OpenTelemetry Collector, Grafana, and Tempo for metric/trace assertions.
 - HPA and fixed pooler deployments.
 - PostgreSQL and orchestrator failures at every durable 2PC boundary.

@@ -75,15 +75,24 @@ A fresh install requires the reserved catalog schema to be absent or empty.
 Upgrade accepts only the exact structural fingerprint of the released v0.49
 catalog or a current catalog produced by a fresh install or v0.49 upgrade. The
 fingerprint includes identity-sequence parameters and ownership, rewrite rules,
-and enabled internal foreign-key triggers under canonical rendering settings,
-because migration cannot recreate arbitrary behavior, columns, or constraints
-lost from an existing relation. An occupied reserved schema, partial or altered
-catalog,
-conflicting home-shard or shard-state
-identity, or missing or conflicting permanent restore lineage is rejected
+row-security metadata, and enabled internal foreign-key triggers under
+canonical rendering settings. Bootstrap separately rejects database-wide event
+triggers and unsafe effective identity-sequence progress because migration
+cannot recreate arbitrary behavior, columns, or constraints lost from an
+existing relation. An occupied reserved schema, partial or altered
+catalog, conflicting home-shard or shard-state identity, a configured shard
+count that does not exactly match a pre-existing catalog, or missing, orphaned,
+or conflicting permanent restore lineage is rejected
 before migration can rewrite it. Catalog clients use bounded lock, statement,
 and whole-transaction timeouts so a conflicting prepared lock fails the init
 pass for retry instead of hanging a Pod restart.
+
+Before that private postmaster starts, bootstrap also rejects active settings in
+restored `postgresql.auto.conf`, recovery signals, external WAL, and user
+tablespaces. The temporary server pins safe callbacks, preload libraries,
+durability settings, search path, trigger mode, and table access method; the
+normal server disables `ALTER SYSTEM` so unsupported persistent overrides
+cannot appear between restarts.
 
 ## Exercise the development manager
 

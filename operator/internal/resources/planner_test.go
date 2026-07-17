@@ -240,7 +240,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		if postgres.Image != defaultPostgreSQLImage || postgres.ImagePullPolicy != corev1.PullIfNotPresent || postgres.SecurityContext == nil || postgres.SecurityContext.RunAsUser == nil || *postgres.SecurityContext.RunAsUser != 999 || postgres.SecurityContext.ReadOnlyRootFilesystem == nil || !*postgres.SecurityContext.ReadOnlyRootFilesystem {
 			t.Fatalf("PostgreSQL container boundary = %#v", postgres)
 		}
-		if !containsString(postgres.Args, "config_file=/etc/pgshard/postgresql/primary-0000.conf") || postgres.StartupProbe != nil || postgres.ReadinessProbe == nil || postgres.LivenessProbe != nil {
+		if !containsString(postgres.Args, "config_file=/etc/pgshard/postgresql/primary-0000.conf") || !containsString(postgres.Args, "allow_alter_system=off") || postgres.StartupProbe != nil || postgres.ReadinessProbe == nil || postgres.LivenessProbe != nil {
 			t.Fatalf("PostgreSQL startup contract = %#v", postgres)
 		}
 		readinessProbe := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
@@ -263,6 +263,16 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			!strings.Contains(bootstrap.Command[2], "internal-trigger|") ||
 			!strings.Contains(bootstrap.Command[2], "SET SESSION search_path = pg_catalog") ||
 			!strings.Contains(bootstrap.Command[2], "SET SESSION quote_all_identifiers = off") ||
+			!strings.Contains(bootstrap.Command[2], "sequence_state.is_called") ||
+			!strings.Contains(bootstrap.Command[2], "shards.shard_id = incarnations.shard_id") ||
+			!strings.Contains(bootstrap.Command[2], "catalog_requires_initial_inventory") ||
+			!strings.Contains(bootstrap.Command[2], "refusing active settings in restored postgresql.auto.conf") ||
+			!strings.Contains(bootstrap.Command[2], "hba_file='$quarantine_hba'") ||
+			!strings.Contains(bootstrap.Command[2], "shared_preload_libraries=") ||
+			!strings.Contains(bootstrap.Command[2], "event_triggers=off") ||
+			!strings.Contains(bootstrap.Command[2], "session_replication_role=origin") ||
+			!strings.Contains(bootstrap.Command[2], "default_table_access_method=heap") ||
+			!strings.Contains(bootstrap.Command[2], "initial shardschema inventory failed its transactional postcondition") ||
 			!strings.Contains(bootstrap.Command[2], "count_missing_shards") ||
 			!strings.Contains(bootstrap.Command[2], "refusing shardschema inventory with missing configured shards") {
 			t.Fatal("PostgreSQL bootstrap does not pin supported catalog shapes")
@@ -629,7 +639,7 @@ socket=/tmp/pgshard-bootstrap-e2e
 mkdir -m 0700 "$socket"
 pg_ctl -D "$PGDATA" -w -t 45 start \
   -l /tmp/postgres.log \
-  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700" >/dev/null
+  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c event_triggers=off" >/dev/null
 stop_postgres() {
   result=$?
   trap - EXIT
@@ -651,9 +661,6 @@ trap - EXIT
 	if output, err := bootstrap(primaryDataParent, true, 1); err != nil {
 		t.Fatalf("upgrade v0.49.0 catalog database: %v\n%s", err, output)
 	}
-	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
-		t.Fatalf("recover partial catalog inventory: %v\n%s", err, output)
-	}
 
 	catalogSQL := func(dataParent, sql string) string {
 		t.Helper()
@@ -668,18 +675,115 @@ trap - EXIT
 		}
 		return strings.TrimSpace(output)
 	}
-	if got := catalogSQL(primaryDataParent, "SELECT (SELECT string_agg(shard_id::text || ':' || shard_number::text || ':' || state, ',' ORDER BY shard_number) FROM pgshard_catalog.shards), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active'), (SELECT pg_catalog.pg_get_userbyid(nspowner) FROM pg_catalog.pg_namespace WHERE nspname = 'pgshard_catalog')"); got != "shard-0000:0:active,shard-0001:1:active|2|pgshard_catalog_owner" {
-		t.Fatalf("recovered catalog inventory = %q", got)
-	}
-
 	fingerprint := func() string {
 		t.Helper()
-		return catalogSQL(primaryDataParent, "SELECT (SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton), (SELECT string_agg(triggers.oid::text || ':' || triggers.tgenabled::text, ',' ORDER BY triggers.tgname) FROM pg_catalog.pg_trigger AS triggers JOIN pg_catalog.pg_class AS relations ON relations.oid = triggers.tgrelid JOIN pg_catalog.pg_namespace AS namespaces ON namespaces.oid = relations.relnamespace WHERE namespaces.nspname = 'pgshard_catalog'), (SELECT string_agg(sequences.seqrelid::pg_catalog.regclass::text || ':' || sequences.seqincrement::text || ':' || sequences.seqcycle::text, ',' ORDER BY sequences.seqrelid) FROM pg_catalog.pg_sequence AS sequences JOIN pg_catalog.pg_class AS relations ON relations.oid = sequences.seqrelid JOIN pg_catalog.pg_namespace AS namespaces ON namespaces.oid = relations.relnamespace WHERE namespaces.nspname = 'pgshard_catalog'), (SELECT string_agg(rewrite_rules.rulename, ',' ORDER BY rewrite_rules.oid) FROM pg_catalog.pg_rewrite AS rewrite_rules JOIN pg_catalog.pg_class AS relations ON relations.oid = rewrite_rules.ev_class JOIN pg_catalog.pg_namespace AS namespaces ON namespaces.oid = relations.relnamespace WHERE namespaces.nspname = 'pgshard_catalog')")
+		output, err := runContainer(primaryDataParent, postgresHarness+`
+{
+  pg_dump --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --schema-only --quote-all-identifiers \
+    --restrict-key=pgshardCatalogSnapshot
+  pg_dump --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --data-only --quote-all-identifiers \
+    --restrict-key=pgshardCatalogSnapshot
+  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --no-align --tuples-only <<'PGSHARD_FINGERPRINT_SQL'
+SELECT pg_catalog.row_to_json(role_state)::text
+  FROM (
+    SELECT roles.rolname,
+           roles.rolsuper,
+           roles.rolinherit,
+           roles.rolcreaterole,
+           roles.rolcreatedb,
+           roles.rolcanlogin,
+           roles.rolreplication,
+           roles.rolbypassrls,
+           roles.rolconnlimit,
+           roles.rolvaliduntil,
+           roles.rolpassword IS NULL AS password_is_null
+      FROM pg_catalog.pg_authid AS roles
+     WHERE pg_catalog.left(roles.rolname, 16) = 'pgshard_catalog_'
+     ORDER BY roles.rolname
+  ) AS role_state;
+SELECT pg_catalog.row_to_json(membership_state)::text
+  FROM (
+    SELECT granted_role.rolname AS granted_role,
+           member_role.rolname AS member_role,
+           grantor_role.rolname AS grantor_role,
+           memberships.admin_option,
+           memberships.inherit_option,
+           memberships.set_option
+      FROM pg_catalog.pg_auth_members AS memberships
+      JOIN pg_catalog.pg_roles AS granted_role
+        ON granted_role.oid = memberships.roleid
+      JOIN pg_catalog.pg_roles AS member_role
+        ON member_role.oid = memberships.member
+      JOIN pg_catalog.pg_roles AS grantor_role
+        ON grantor_role.oid = memberships.grantor
+     WHERE pg_catalog.left(granted_role.rolname, 16) = 'pgshard_catalog_'
+        OR pg_catalog.left(member_role.rolname, 16) = 'pgshard_catalog_'
+     ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+  ) AS membership_state;
+SELECT pg_catalog.row_to_json(database_state)::text
+  FROM (
+    SELECT databases.datname,
+           pg_catalog.pg_get_userbyid(databases.datdba) AS owner_name,
+           databases.encoding,
+           databases.datcollate,
+           databases.datctype,
+           databases.datlocprovider,
+           databases.datlocale,
+           databases.daticurules,
+           databases.datcollversion,
+           databases.datistemplate,
+           databases.datallowconn,
+           databases.datconnlimit,
+           databases.datacl
+      FROM pg_catalog.pg_database AS databases
+     WHERE databases.datname = 'shardschema'
+  ) AS database_state;
+SELECT pg_catalog.row_to_json(setting_state)::text
+  FROM (
+    SELECT COALESCE(databases.datname, '*') AS database_name,
+           COALESCE(roles.rolname, '*') AS role_name,
+           settings.setconfig
+      FROM pg_catalog.pg_db_role_setting AS settings
+      LEFT JOIN pg_catalog.pg_database AS databases
+        ON databases.oid = settings.setdatabase
+      LEFT JOIN pg_catalog.pg_roles AS roles
+        ON roles.oid = settings.setrole
+     WHERE settings.setdatabase = 0
+        OR databases.datname = 'shardschema'
+     ORDER BY database_name, role_name
+  ) AS setting_state;
+SELECT pg_catalog.row_to_json(event_trigger_state)::text
+  FROM (
+    SELECT triggers.evtname,
+           pg_catalog.pg_get_userbyid(triggers.evtowner) AS owner_name,
+           triggers.evtevent,
+           triggers.evtenabled,
+           triggers.evtfoid::pg_catalog.regprocedure::text AS function_name,
+           triggers.evttags
+      FROM pg_catalog.pg_event_trigger AS triggers
+     ORDER BY triggers.evtname
+  ) AS event_trigger_state;
+PGSHARD_FINGERPRINT_SQL
+} | sha256sum
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`)
+		if err != nil {
+			t.Fatalf("fingerprint catalog fixture: %v\n%s", err, output)
+		}
+		fields := strings.Fields(output)
+		if len(fields) != 2 || fields[1] != "-" {
+			t.Fatalf("catalog fingerprint output = %q", output)
+		}
+		return fields[0]
 	}
-	assertRejectedWithoutMutation := func(want string) {
+	assertRejectedWithoutMutation := func(shardCount int, want string) {
 		t.Helper()
 		before := fingerprint()
-		output, err := bootstrap(primaryDataParent, true, 2)
+		output, err := bootstrap(primaryDataParent, true, shardCount)
 		if err == nil || !strings.Contains(output, want) {
 			t.Fatalf("conflicting catalog bootstrap error = %v, want %q\n%s", err, want, output)
 		}
@@ -688,15 +792,161 @@ trap - EXIT
 		}
 	}
 
+	assertRejectedWithoutMutation(2, "refusing shardschema inventory that conflicts with the configured immutable shards")
+	catalogSQL(primaryDataParent, "INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-0001', 1, 'active')")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("replay exact two-shard catalog inventory: %v\n%s", err, output)
+	}
+	if got := catalogSQL(primaryDataParent, "SELECT (SELECT string_agg(shard_id::text || ':' || shard_number::text || ':' || state, ',' ORDER BY shard_number) FROM pgshard_catalog.shards), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active'), (SELECT pg_catalog.pg_get_userbyid(nspowner) FROM pg_catalog.pg_namespace WHERE nspname = 'pgshard_catalog')"); got != "shard-0000:0:active,shard-0001:1:active|2|pgshard_catalog_owner" {
+		t.Fatalf("recovered catalog inventory = %q", got)
+	}
+	assertRejectedWithoutMutation(1, "refusing shardschema inventory that conflicts with the configured immutable shards")
+
 	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 2 CYCLE")
-	assertRejectedWithoutMutation("refusing an unsupported or malformed pre-existing shardschema catalog")
+	assertRejectedWithoutMutation(2, "refusing an unsupported or malformed pre-existing shardschema catalog")
 	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 1 NO CYCLE")
 	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
 		t.Fatalf("canonical identity sequence was not restored: %v\n%s", err, output)
 	}
+	catalogSQL(primaryDataParent, `
+INSERT INTO pgshard_catalog.logical_databases(logical_database_id, database_name)
+VALUES ('11111111-1111-1111-1111-111111111111', 'sequence_progress');
+INSERT INTO pgshard_catalog.routing_epochs(logical_database_id)
+VALUES ('11111111-1111-1111-1111-111111111111');
+INSERT INTO pgshard_catalog.registered_tables(
+  logical_database_id,
+  schema_name,
+  table_name,
+  shard_key_column,
+  shard_key_type
+)
+VALUES (
+  '11111111-1111-1111-1111-111111111111',
+  'public',
+  'sequence_progress',
+  'id',
+  'bigint'
+);
+SELECT pg_catalog.setval(
+  'pgshard_catalog.routing_epochs_routing_epoch_seq',
+  (SELECT pg_catalog.max(routing_epoch) FROM pgshard_catalog.routing_epochs),
+  false
+);
+`)
+	assertRejectedWithoutMutation(2, "refusing shardschema identity sequence progress that conflicts with catalog rows")
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.routing_epochs_routing_epoch_seq',
+  (SELECT pg_catalog.max(routing_epoch) FROM pgshard_catalog.routing_epochs),
+  true
+);
+SELECT pg_catalog.setval(
+  'pgshard_catalog.registered_tables_registered_table_id_seq',
+  (SELECT pg_catalog.max(registered_table_id) FROM pgshard_catalog.registered_tables),
+  false
+);
+`)
+	assertRejectedWithoutMutation(2, "refusing shardschema identity sequence progress that conflicts with catalog rows")
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.registered_tables_registered_table_id_seq',
+  (SELECT pg_catalog.max(registered_table_id) FROM pgshard_catalog.registered_tables),
+  true
+);
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("safe identity sequence progress was rejected: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.routing_epochs_routing_epoch_seq',
+  (SELECT sequences.seqmax
+     FROM pg_catalog.pg_sequence AS sequences
+    WHERE sequences.seqrelid =
+          'pgshard_catalog.routing_epochs_routing_epoch_seq'::pg_catalog.regclass),
+  true
+);
+`)
+	assertRejectedWithoutMutation(2, "refusing shardschema identity sequence progress that conflicts with catalog rows")
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.routing_epochs_routing_epoch_seq',
+  (SELECT pg_catalog.max(routing_epoch) + 1
+     FROM pgshard_catalog.routing_epochs),
+  false
+);
+SELECT pg_catalog.setval(
+  'pgshard_catalog.registered_tables_registered_table_id_seq',
+  (SELECT sequences.seqmax
+     FROM pg_catalog.pg_sequence AS sequences
+    WHERE sequences.seqrelid =
+          'pgshard_catalog.registered_tables_registered_table_id_seq'::pg_catalog.regclass),
+  true
+);
+`)
+	assertRejectedWithoutMutation(2, "refusing shardschema identity sequence progress that conflicts with catalog rows")
+	catalogSQL(primaryDataParent, `
+SELECT pg_catalog.setval(
+  'pgshard_catalog.registered_tables_registered_table_id_seq',
+  (SELECT pg_catalog.max(registered_table_id) + 1
+     FROM pgshard_catalog.registered_tables),
+  false
+);
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("repaired exhausted identity sequences were rejected: %v\n%s", err, output)
+	}
+
+	catalogSQL(primaryDataParent, `
+CREATE FUNCTION public.pgshard_rejected_event_trigger()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+  NULL;
+END
+$function$;
+CREATE EVENT TRIGGER pgshard_rejected_event_trigger
+ON ddl_command_start
+EXECUTE FUNCTION public.pgshard_rejected_event_trigger();
+`)
+	assertRejectedWithoutMutation(2, "pre-existing shardschema contains an unsupported event trigger")
+	catalogSQL(primaryDataParent, `
+DROP EVENT TRIGGER pgshard_rejected_event_trigger;
+DROP FUNCTION public.pgshard_rejected_event_trigger();
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical database-wide trigger set was rejected: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, `
+CREATE TABLE public.pgshard_login_observations(observed boolean NOT NULL);
+CREATE FUNCTION public.pgshard_rejected_login_trigger()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+  INSERT INTO public.pgshard_login_observations VALUES (true);
+END
+$function$;
+CREATE EVENT TRIGGER pgshard_rejected_login_trigger
+ON login
+EXECUTE FUNCTION public.pgshard_rejected_login_trigger();
+`)
+	assertRejectedWithoutMutation(2, "pre-existing shardschema contains an unsupported event trigger")
+	if got := catalogSQL(primaryDataParent, "SELECT count(*) FROM public.pgshard_login_observations"); got != "0" {
+		t.Fatalf("login event trigger ran before catalog rejection: %q", got)
+	}
+	catalogSQL(primaryDataParent, `
+DROP EVENT TRIGGER pgshard_rejected_login_trigger;
+DROP FUNCTION public.pgshard_rejected_login_trigger();
+DROP TABLE public.pgshard_login_observations;
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical login-trigger set was rejected: %v\n%s", err, output)
+	}
 
 	catalogSQL(primaryDataParent, "CREATE RULE pgshard_rejected_rule AS ON INSERT TO pgshard_catalog.shards DO INSTEAD NOTHING")
-	assertRejectedWithoutMutation("refusing an unsupported or malformed pre-existing shardschema catalog")
+	assertRejectedWithoutMutation(2, "refusing an unsupported or malformed pre-existing shardschema catalog")
 	catalogSQL(primaryDataParent, "DROP RULE pgshard_rejected_rule ON pgshard_catalog.shards")
 	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
 		t.Fatalf("canonical rewrite-rule set was not restored: %v\n%s", err, output)
@@ -721,7 +971,7 @@ BEGIN
 END
 $pgshard_disable_internal_trigger$;
 `)
-	assertRejectedWithoutMutation("refusing an unsupported or malformed pre-existing shardschema catalog")
+	assertRejectedWithoutMutation(2, "refusing an unsupported or malformed pre-existing shardschema catalog")
 	catalogSQL(primaryDataParent, "ALTER TABLE pgshard_catalog.routing_ranges ENABLE TRIGGER ALL")
 
 	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
@@ -761,7 +1011,7 @@ ALTER TABLE pgshard_catalog.cluster_configuration DISABLE TRIGGER USER;
 UPDATE pgshard_catalog.cluster_configuration SET home_shard_id = 'shard-0001' WHERE singleton;
 ALTER TABLE pgshard_catalog.cluster_configuration ENABLE TRIGGER USER;
 `)
-	assertRejectedWithoutMutation("refusing shardschema home-shard identity")
+	assertRejectedWithoutMutation(2, "refusing shardschema home-shard identity")
 	catalogSQL(primaryDataParent, `
 ALTER TABLE pgshard_catalog.cluster_configuration DISABLE TRIGGER USER;
 UPDATE pgshard_catalog.cluster_configuration SET home_shard_id = 'shard-0000' WHERE singleton;
@@ -769,11 +1019,29 @@ ALTER TABLE pgshard_catalog.cluster_configuration ENABLE TRIGGER USER;
 `)
 
 	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER ALL;
+INSERT INTO pgshard_catalog.shard_restore_incarnations(
+  restore_incarnation,
+  shard_id,
+  state
+)
+VALUES ('33333333-3333-3333-3333-333333333333', 'ghost-shard', 'active');
+ALTER TABLE pgshard_catalog.shard_restore_incarnations ENABLE TRIGGER ALL;
+`)
+	assertRejectedWithoutMutation(2, "refusing shardschema restore lineage")
+	catalogSQL(primaryDataParent, `
+ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER ALL;
+DELETE FROM pgshard_catalog.shard_restore_incarnations
+ WHERE restore_incarnation = '33333333-3333-3333-3333-333333333333';
+ALTER TABLE pgshard_catalog.shard_restore_incarnations ENABLE TRIGGER ALL;
+`)
+
+	catalogSQL(primaryDataParent, `
 ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER USER;
 DELETE FROM pgshard_catalog.shard_restore_incarnations WHERE shard_id = 'shard-0000' AND state = 'active';
 ALTER TABLE pgshard_catalog.shard_restore_incarnations ENABLE TRIGGER USER;
 `)
-	assertRejectedWithoutMutation("refusing shardschema restore lineage")
+	assertRejectedWithoutMutation(2, "refusing shardschema restore lineage")
 	catalogSQL(primaryDataParent, `
 INSERT INTO pgshard_catalog.shard_restore_incarnations(restore_incarnation, shard_id, state)
 VALUES ('11111111-1111-1111-1111-111111111111', 'shard-0000', 'active');
@@ -784,7 +1052,7 @@ ALTER TABLE pgshard_catalog.shards DISABLE TRIGGER USER;
 INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-10000', 10000, 'retired');
 ALTER TABLE pgshard_catalog.shards ENABLE TRIGGER USER;
 `)
-	assertRejectedWithoutMutation("refusing shardschema restore lineage")
+	assertRejectedWithoutMutation(2, "refusing shardschema restore lineage")
 	catalogSQL(primaryDataParent, `
 ALTER TABLE pgshard_catalog.shard_restore_incarnations DISABLE TRIGGER USER;
 INSERT INTO pgshard_catalog.shard_restore_incarnations(restore_incarnation, shard_id, state, retired_at)
@@ -799,7 +1067,7 @@ ALTER TABLE pgshard_catalog.shards DISABLE TRIGGER USER;
 INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-1000', 10001, 'retired');
 ALTER TABLE pgshard_catalog.shards ENABLE TRIGGER USER;
 `)
-	assertRejectedWithoutMutation("refusing shardschema inventory")
+	assertRejectedWithoutMutation(2, "refusing shardschema inventory")
 	catalogSQL(primaryDataParent, `
 ALTER TABLE pgshard_catalog.shards DISABLE TRIGGER USER;
 DELETE FROM pgshard_catalog.shards WHERE shard_number = 10001;
@@ -928,6 +1196,124 @@ trap - EXIT
 	}
 	if got := catalogSQL(emptyDataParent, "SELECT count(*) FILTER (WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active') FROM pgshard_catalog.shards"); got != "2|2" {
 		t.Fatalf("empty-database recovery inventory = %q", got)
+	}
+
+	const replicaDefaultDataParent = "/var/lib/postgresql/18-replica-default"
+	if output, err := bootstrap(replicaDefaultDataParent, false, 2); err != nil {
+		t.Fatalf("initialize inherited-replica-role PGDATA: %v\n%s", err, output)
+	}
+	prepareReplicaRoleDefault := postgresHarness + `
+createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
+psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+  --set=ON_ERROR_STOP=1 \
+  --command="ALTER ROLE postgres IN DATABASE shardschema SET session_replication_role = replica" >/dev/null
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`
+	if output, err := runContainer(replicaDefaultDataParent, prepareReplicaRoleDefault); err != nil {
+		t.Fatalf("prepare inherited replica session role: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(replicaDefaultDataParent, true, 2); err != nil {
+		t.Fatalf("bootstrap under inherited replica session role: %v\n%s", err, output)
+	}
+	if got := catalogSQL(replicaDefaultDataParent, "SELECT count(*) FILTER (WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active') FROM pgshard_catalog.shards"); got != "2|2" {
+		t.Fatalf("inherited replica role suppressed initial lineage: %q", got)
+	}
+
+	const hostileConfigDataParent = "/var/lib/postgresql/18-hostile-config"
+	if output, err := bootstrap(hostileConfigDataParent, true, 2); err != nil {
+		t.Fatalf("initialize hostile-config PGDATA: %v\n%s", err, output)
+	}
+	hostileBefore := catalogSQL(hostileConfigDataParent, "SELECT catalog_epoch, (SELECT count(*) FROM pgshard_catalog.shards), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations) FROM pgshard_catalog.cluster_state WHERE singleton")
+	prepareHostileAutoConfig := `set -Eeuo pipefail
+cp -- "$PGDATA/postgresql.auto.conf" "$PGDATA/postgresql.auto.conf.pgshard-test"
+printf '%s\n' \
+  "shared_preload_libraries = 'pgshard_missing_preload'" \
+  "session_preload_libraries = 'pgshard_missing_preload'" \
+  "local_preload_libraries = 'pgshard_missing_preload'" \
+  "archive_mode = 'on'" \
+  "archive_command = 'touch ` + hostileConfigDataParent + `/docker/pgshard-hostile-command-executed'" \
+  "archive_library = 'pgshard_missing_archive_library'" \
+  "restore_command = 'touch ` + hostileConfigDataParent + `/docker/pgshard-hostile-command-executed'" \
+  "recovery_end_command = 'touch ` + hostileConfigDataParent + `/docker/pgshard-hostile-command-executed'" \
+  "data_directory = '/tmp/pgshard-hostile-data'" \
+  "hba_file = '/tmp/pgshard-hostile-hba'" \
+  "listen_addresses = '*'" \
+  "fsync = 'off'" \
+  "full_page_writes = 'off'" \
+  "zero_damaged_pages = 'on'" \
+  >> "$PGDATA/postgresql.auto.conf"
+`
+	if output, err := runContainer(hostileConfigDataParent, prepareHostileAutoConfig); err != nil {
+		t.Fatalf("prepare hostile restored PostgreSQL settings: %v\n%s", err, output)
+	}
+	if output, err := bootstrap(hostileConfigDataParent, true, 2); err == nil || !strings.Contains(output, "refusing active settings in restored postgresql.auto.conf") {
+		t.Fatalf("hostile restored PostgreSQL settings error = %v\n%s", err, output)
+	}
+	restoreSafeAutoConfig := `set -Eeuo pipefail
+test ! -e "$PGDATA/pgshard-hostile-command-executed"
+mv -- "$PGDATA/postgresql.auto.conf.pgshard-test" "$PGDATA/postgresql.auto.conf"
+`
+	if output, err := runContainer(hostileConfigDataParent, restoreSafeAutoConfig); err != nil {
+		t.Fatalf("hostile restored settings executed or could not be removed: %v\n%s", err, output)
+	}
+	assertUnsafeStorageRejected := func(prepare, restore, want string) {
+		t.Helper()
+		if output, err := runContainer(hostileConfigDataParent, "set -Eeuo pipefail\n"+prepare); err != nil {
+			t.Fatalf("prepare unsafe restored storage: %v\n%s", err, output)
+		}
+		bootstrapOutput, bootstrapErr := bootstrap(hostileConfigDataParent, true, 2)
+		if output, err := runContainer(hostileConfigDataParent, "set -Eeuo pipefail\n"+restore); err != nil {
+			t.Fatalf("restore safe storage fixture: %v\n%s", err, output)
+		}
+		if bootstrapErr == nil || !strings.Contains(bootstrapOutput, want) {
+			t.Fatalf("unsafe restored storage error = %v, want %q\n%s", bootstrapErr, want, bootstrapOutput)
+		}
+	}
+	assertUnsafeStorageRejected(
+		`mv -- "$PGDATA/postgresql.auto.conf" "$PGDATA/postgresql.auto.conf.pgshard-test"
+ln -s /tmp/pgshard-missing-auto-conf "$PGDATA/postgresql.auto.conf"
+`,
+		`rm -- "$PGDATA/postgresql.auto.conf"
+mv -- "$PGDATA/postgresql.auto.conf.pgshard-test" "$PGDATA/postgresql.auto.conf"
+`,
+		"refusing an unsafe restored postgresql.auto.conf",
+	)
+	assertUnsafeStorageRejected(
+		`chmod 000 "$PGDATA/postgresql.auto.conf"
+`,
+		`chmod 0600 "$PGDATA/postgresql.auto.conf"
+`,
+		"refusing postgresql.auto.conf that cannot be inspected safely",
+	)
+	assertUnsafeStorageRejected(
+		`ln -s /tmp/pgshard-missing-standby-signal "$PGDATA/standby.signal"
+`,
+		`rm -- "$PGDATA/standby.signal"
+`,
+		"refusing PostgreSQL recovery state during primary bootstrap (standby.signal)",
+	)
+	assertUnsafeStorageRejected(
+		`mv -- "$PGDATA/pg_tblspc" "$PGDATA/pg_tblspc.pgshard-test"
+ln -s pg_wal "$PGDATA/pg_tblspc"
+`,
+		`rm -- "$PGDATA/pg_tblspc"
+mv -- "$PGDATA/pg_tblspc.pgshard-test" "$PGDATA/pg_tblspc"
+`,
+		"refusing an unsafe PostgreSQL tablespace directory",
+	)
+	assertUnsafeStorageRejected(
+		`chmod 000 "$PGDATA/pg_tblspc"
+`,
+		`chmod 0700 "$PGDATA/pg_tblspc"
+`,
+		"refusing a PostgreSQL tablespace directory that cannot be inspected safely",
+	)
+	if output, err := bootstrap(hostileConfigDataParent, true, 2); err != nil {
+		t.Fatalf("safe storage was rejected after hostile fixtures: %v\n%s", err, output)
+	}
+	if hostileAfter := catalogSQL(hostileConfigDataParent, "SELECT catalog_epoch, (SELECT count(*) FROM pgshard_catalog.shards), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations) FROM pgshard_catalog.cluster_state WHERE singleton"); hostileAfter != hostileBefore {
+		t.Fatalf("rejected restored settings changed catalog: before=%q after=%q", hostileBefore, hostileAfter)
 	}
 }
 
