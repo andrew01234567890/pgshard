@@ -82,6 +82,10 @@ func (state podFencingKeyBootstrapState) fresh() bool {
 	return state == podFencingKeyBootstrapFreshPending || state == podFencingKeyBootstrapFreshAnchored
 }
 
+func (state podFencingKeyBootstrapState) provenKeyless() bool {
+	return state == podFencingKeyBootstrapLegacyPending || state == podFencingKeyBootstrapLegacyAnchored
+}
+
 func (state podFencingKeyBootstrapState) complete(anchor *corev1.Secret) {
 	switch state {
 	case podFencingKeyBootstrapFreshPending:
@@ -445,6 +449,13 @@ func (p *Provisioner) markPodFencingKeyContinuity(ctx context.Context, secret *c
 func (p *Provisioner) verifyPodFencingKeyBootstrapBarrier(ctx context.Context, bootstrapState podFencingKeyBootstrapState, key []byte) error {
 	if bootstrapState.fresh() {
 		return p.verifyNoEstablishedPostgreSQLLifecycles(ctx)
+	}
+	// The independently proven origin/main state predates every receipt signer,
+	// so receipt-looking resource annotations cannot be continuity evidence.
+	// Receipt-capable pre-anchored releases do not carry this state and remain
+	// subject to the full history scan below.
+	if bootstrapState.provenKeyless() {
+		return nil
 	}
 	return p.verifyExistingReceiptHistory(ctx, key)
 }

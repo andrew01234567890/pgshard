@@ -589,7 +589,9 @@ cluster lifecycle, pending handshake, and managed-Pod evidence, and recreated
 authority Secrets cannot reuse that path. An origin/main keyless fixture proves
 its versioned request, existing serving material, both populated legacy webhook
 trust bundles, and empty newly introduced receipt webhook bundles authorize a
-two-phase first-key upgrade, while loss of any proof leaves the key empty. An
+two-phase first-key upgrade. Forged receipt-looking cluster and Pod metadata
+from that proven pre-signer release does not become continuity history, while
+loss of any upgrade proof leaves the key empty. An
 initialized unanchored legacy key is refused, and a pre-anchored key completes
 migration only after every single-member cluster handshake and managed terminal
 receipt verifies, including handshakes written before status or finalizers.

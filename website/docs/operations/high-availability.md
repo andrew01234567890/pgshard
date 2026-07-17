@@ -175,7 +175,9 @@ requests the first key in the new empty Secret, then the manager verifies the
 existing CA and serving material, requires both legacy PgShardCluster webhook
 trust bundles to contain that CA, and requires every newly introduced receipt
 webhook trust bundle to remain empty before recording authorization on the CA.
-Only then can it generate and anchor the key. An existing initialized but
+Only then can it generate and anchor the key. The same proof establishes that
+receipt-looking annotations stored by that keyless release were never
+authenticated and are not continuity history. An existing initialized but
 unanchored key must instead be pinned while the old manager is healthy before a
 mixed-version rollout; the new manager
 refuses to infer continuity from receipt listings because those listings cannot

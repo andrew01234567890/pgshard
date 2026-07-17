@@ -392,6 +392,13 @@ func TestBootstrapUpgradesOriginMainKeylessAdmissionStateInTwoPhases(t *testing.
 		t.Fatal(err)
 	}
 	resetToOriginMainKeylessState(t, ctx, kubeClient)
+	legacyMetadataKey := bytes.Repeat([]byte{0xff}, podfence.SecretKeyBytes)
+	if err := kubeClient.Create(ctx, clusterWithHandshakeReceipt(t, legacyMetadataKey, "unsigned-keyless-cluster")); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Create(ctx, podWithTerminationReceipt(t, legacyMetadataKey, "unsigned-keyless-pod")); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := provisioner.ensureAuthority(ctx); err != nil {
 		t.Fatal(err)

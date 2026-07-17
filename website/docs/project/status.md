@@ -20,9 +20,10 @@ metadata. Fresh-install authority is recorded before key generation only after
 independent empty-install, lifecycle, and pending-handshake checks. The last
 keyless release has a two-phase first-key upgrade authorized by its existing CA,
 serving material, populated legacy webhook trust, and empty receipt-webhook
-trust. Existing initialized keys require an explicit pre-rollout
-fingerprint pin; automatic mixed-version adoption is deliberately refused
-because a resource listing is not a writer barrier. Established receipt history
+trust. Receipt-looking metadata from that proven pre-signer release is not
+treated as continuity history. Existing initialized keys require an explicit
+pre-rollout fingerprint pin; automatic mixed-version adoption is deliberately
+refused because a resource listing is not a writer barrier. Established receipt history
 and pre-provisioning handshakes are verified before a separate completion marker
 is written. Users cannot mutate handshake metadata; controller repair requires
 both its service-account identity and a valid final HMAC receipt, and deletion

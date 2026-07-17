@@ -356,10 +356,13 @@ manager verifies the already initialized CA and serving material, requires the
 two legacy PgShardCluster webhooks to trust that CA, and requires every newly
 introduced receipt webhook trust bundle to remain empty. It then records
 pending upgrade authorization on the CA Secret before generating and anchoring
-the first key. An install that already has an initialized but unanchored key is
-not this keyless state and is never adopted during a mixed-version rollout: pin
-its fingerprint in the CA Secret while the old manager is healthy, before
-changing the manager image, or reinstall the pre-release development cluster.
+the first key. That proof also establishes that receipt-looking annotations
+stored by the keyless release were never authenticated, so they are not treated
+as continuity history. An install that already has an initialized but
+unanchored key is not this keyless state and is never adopted during a
+mixed-version rollout: pin its fingerprint in the CA Secret while the old
+manager is healthy, before changing the manager image, or reinstall the
+pre-release development cluster.
 Once pre-anchored, every complete handshake on a single-member cluster and every
 managed terminal Pod receipt must verify before the completion marker is
 written; incomplete handshake metadata also blocks migration even if workload
