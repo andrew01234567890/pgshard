@@ -1,0 +1,357 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgshardrestores.pgshard.io
+spec:
+  group: pgshard.io
+  names:
+    kind: PgShardRestore
+    listKind: PgShardRestoreList
+    plural: pgshardrestores
+    shortNames:
+    - pgsr
+    singular: pgshardrestore
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.destinationDatabase
+      name: Destination
+      type: string
+    - jsonPath: .spec.manifest.topology.shardCount
+      name: Shards
+      type: integer
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              PgShardRestoreSpec is immutable because every field is part of one restore
+              attempt. ManifestSignature authenticates only Manifest; the destination and
+              verification-key reference are immutable request inputs, not signed fields.
+            properties:
+              destinationDatabase:
+                description: |-
+                  DestinationDatabase is the configurable restore name. The execution slice
+                  will require it to be absent or reserved but non-serving.
+                maxLength: 63
+                minLength: 1
+                type: string
+              destinationTopology:
+                description: |-
+                  DestinationTopology is an optional caller expectation. Omission never
+                  proves that the destination is absent. Before a restore may proceed, the
+                  controller must independently prove from authoritative catalog state that
+                  the destination is absent or has exactly the manifest topology.
+                properties:
+                  hashSeed:
+                    description: |-
+                      HashSeed is canonical unsigned decimal so the full u64 domain survives
+                      Kubernetes JSON and JavaScript clients without precision loss.
+                    maxLength: 20
+                    pattern: ^(0|[1-9][0-9]{0,19})$
+                    type: string
+                  hashVersion:
+                    enum:
+                    - 1
+                    format: int32
+                    type: integer
+                  postgresqlMajor:
+                    enum:
+                    - "18"
+                    type: string
+                  shardCount:
+                    format: int32
+                    maximum: 128
+                    minimum: 1
+                    type: integer
+                  shards:
+                    description: Order is signed and semantically significant.
+                    items:
+                      properties:
+                        end:
+                          maxLength: 20
+                          pattern: ^(0|[1-9][0-9]{0,19})$
+                          type: string
+                        ordinal:
+                          format: int32
+                          maximum: 127
+                          minimum: 0
+                          type: integer
+                        start:
+                          description: |-
+                            Start and End are canonical unsigned decimal half-open boundaries. End may
+                            equal 2^64 for the final range.
+                          maxLength: 20
+                          pattern: ^(0|[1-9][0-9]{0,19})$
+                          type: string
+                      required:
+                      - end
+                      - ordinal
+                      - start
+                      type: object
+                    maxItems: 128
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                required:
+                - hashSeed
+                - hashVersion
+                - postgresqlMajor
+                - shardCount
+                - shards
+                type: object
+              manifest:
+                description: |-
+                  Manifest is the immutable, signed backup-set projection. Restore execution
+                  will fetch this projection from repository metadata; the preflight API keeps
+                  its fields as a strongly typed object and signs their versioned canonical
+                  binary encoding.
+                properties:
+                  backupSetID:
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  manifestVersion:
+                    enum:
+                    - 1
+                    format: int32
+                    type: integer
+                  sourceDatabase:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  topology:
+                    description: |-
+                      RestoreTopology is the complete logical topology identity. Placement,
+                      database UUIDs, physical cells, and Kubernetes Nodes are deliberately absent.
+                    properties:
+                      hashSeed:
+                        description: |-
+                          HashSeed is canonical unsigned decimal so the full u64 domain survives
+                          Kubernetes JSON and JavaScript clients without precision loss.
+                        maxLength: 20
+                        pattern: ^(0|[1-9][0-9]{0,19})$
+                        type: string
+                      hashVersion:
+                        enum:
+                        - 1
+                        format: int32
+                        type: integer
+                      postgresqlMajor:
+                        enum:
+                        - "18"
+                        type: string
+                      shardCount:
+                        format: int32
+                        maximum: 128
+                        minimum: 1
+                        type: integer
+                      shards:
+                        description: Order is signed and semantically significant.
+                        items:
+                          properties:
+                            end:
+                              maxLength: 20
+                              pattern: ^(0|[1-9][0-9]{0,19})$
+                              type: string
+                            ordinal:
+                              format: int32
+                              maximum: 127
+                              minimum: 0
+                              type: integer
+                            start:
+                              description: |-
+                                Start and End are canonical unsigned decimal half-open boundaries. End may
+                                equal 2^64 for the final range.
+                              maxLength: 20
+                              pattern: ^(0|[1-9][0-9]{0,19})$
+                              type: string
+                          required:
+                          - end
+                          - ordinal
+                          - start
+                          type: object
+                        maxItems: 128
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    required:
+                    - hashSeed
+                    - hashVersion
+                    - postgresqlMajor
+                    - shardCount
+                    - shards
+                    type: object
+                required:
+                - backupSetID
+                - manifestVersion
+                - sourceDatabase
+                - topology
+                type: object
+              manifestSignature:
+                description: |-
+                  ManifestSignature is canonical RFC 4648 base64 containing one Ed25519
+                  signature over the version-1 canonical binary encoding of Manifest.
+                maxLength: 88
+                minLength: 88
+                type: string
+              verificationKeySecretRef:
+                description: |-
+                  VerificationKeySecretRef names an immutable Opaque Secret in this
+                  namespace whose only key is ed25519.pub containing exactly 32 raw bytes.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+            required:
+            - destinationDatabase
+            - manifest
+            - manifestSignature
+            - verificationKeySecretRef
+            type: object
+            x-kubernetes-validations:
+            - message: restore specification is immutable
+              rule: self == oldSelf
+            - message: 'RestoreTopologyMismatch: requested destination PostgreSQL,
+                hash, and shard-count configuration must match the backup manifest'
+              rule: '!has(self.destinationTopology) || (self.destinationTopology.postgresqlMajor
+                == self.manifest.topology.postgresqlMajor && self.destinationTopology.hashVersion
+                == self.manifest.topology.hashVersion && self.destinationTopology.hashSeed
+                == self.manifest.topology.hashSeed && self.destinationTopology.shardCount
+                == self.manifest.topology.shardCount && self.destinationTopology.shards.size()
+                == self.manifest.topology.shards.size())'
+          status:
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              destinationTopologySHA256:
+                description: |-
+                  DestinationTopologySHA256 records the authoritative destination topology
+                  compared during preflight. It is empty when absence has been proven or no
+                  authoritative destination comparison has completed.
+                pattern: ^[0-9a-f]{64}$
+                type: string
+              manifestSHA256:
+                description: ManifestSHA256 binds status to the verified canonical
+                  manifest.
+                pattern: ^[0-9a-f]{64}$
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                enum:
+                - Pending
+                - Rejected
+                - PreflightPassed
+                type: string
+              topologySHA256:
+                description: TopologySHA256 is the exact logical topology fingerprint.
+                pattern: ^[0-9a-f]{64}$
+                type: string
+              verificationKeyUID:
+                description: |-
+                  VerificationKeyUID binds preflight to the exact immutable public-key
+                  Secret. Execution must revalidate this identity before any mutation.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

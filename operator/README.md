@@ -16,6 +16,9 @@ API. The controller now reconciles the safe supporting-resource slice:
 - an idempotently migrated `shardschema` database on shard-0000 containing the
   complete immutable shard inventory and an initial restore incarnation for
   each shard;
+- a status-only `PgShardRestore` controller that verifies a signed PostgreSQL
+  18 backup manifest and rejects any explicit destination shard-count, hash,
+  ordinal, or range mismatch before creating restore targets;
 - etcd, orchestrator, and pooler workload specifications, topology spread,
   security contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
   etcd ingress NetworkPolicy;
@@ -376,6 +379,21 @@ not implemented. Near expiry marks the cluster degraded and stops the entire
 resource plan/apply reconciliation before it can silently rotate or publish
 new workloads; already-running workloads are not stopped. Use an explicit
 recovery procedure rather than expecting silent regeneration.
+
+`PgShardRestore` is currently a mutation-free preflight. Its v1 manifest is a
+versioned binary signed projection containing the source database, backup-set identity,
+PostgreSQL major, routing hash version and seed, shard count, ordered ordinals,
+and complete half-open key ranges. The verification key must be the only value
+in an immutable Opaque Secret and is bound into status by API UID. An omitted
+destination topology proves nothing; an explicit caller expectation must
+match. CRD validation rejects five-to-three, and the fail-closed validating
+webhook rejects same-count boundary drift with `RestoreTopologyMismatch`, while
+the controller independently verifies every boundary after signature
+validation. Because the controller does not yet load
+authoritative destination catalog state, a valid request stays
+`Pending/Ready=False` with `DestinationTopologyResolverUnavailable`: no
+pgBackRest restore, PVC, Job, catalog mutation, or serving endpoint is created
+by this slice.
 
 The module is pinned to Go 1.26.5, controller-runtime 0.24.1, and Kubernetes
 libraries 0.36.0. Only the Linux container deployment is supported.

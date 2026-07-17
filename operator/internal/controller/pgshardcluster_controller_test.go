@@ -4387,7 +4387,7 @@ func newFakeClient(t *testing.T, objects ...client.Object) client.Client {
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithReturnManagedFields().
-		WithStatusSubresource(&pgshardv1alpha1.PgShardCluster{}, &appsv1.Deployment{}, &appsv1.StatefulSet{}, &autoscalingv2.HorizontalPodAutoscaler{}, &policyv1.PodDisruptionBudget{}).
+		WithStatusSubresource(&pgshardv1alpha1.PgShardCluster{}, &pgshardv1alpha1.PgShardRestore{}, &appsv1.Deployment{}, &appsv1.StatefulSet{}, &autoscalingv2.HorizontalPodAutoscaler{}, &policyv1.PodDisruptionBudget{}).
 		WithObjects(objects...).
 		WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
 			if object.GetUID() == "" {

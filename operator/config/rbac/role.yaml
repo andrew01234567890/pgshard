@@ -107,10 +107,19 @@ rules:
   - pgshard.io
   resources:
   - pgshardclusters/status
+  - pgshardrestores/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - pgshard.io
+  resources:
+  - pgshardrestores
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - policy
   resources:
