@@ -229,6 +229,14 @@ Acceptance:
 - Preflight restore before target mutation. Compare the complete logical
   topology fingerprint. `RestoreTopologyMismatch` is permanent and may update
   only restore status and Events.
+  - Implemented foundation: `PgShardRestore` CRD validation rejects explicit
+    PostgreSQL/hash/shard-count differences, its fail-closed validating webhook
+    rejects ordered ordinal/range differences, and its status-only controller
+    verifies an immutable Ed25519 key Secret plus the versioned signed manifest
+    before repeating the comparison. It does not treat an omitted caller
+    topology as absence; the request stays `Pending/Ready=False` until an
+    authoritative destination catalog resolver is implemented. Repository
+    ingestion and all materialization steps below remain pending.
 - Restore physical cell backups into private quarantined staging, validate the
   signed catalog projection, and logically import only the selected database
   into fresh dedicated cells using PostgreSQL 18 `pg_dump`/`pg_restore` TOC

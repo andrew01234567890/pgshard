@@ -155,7 +155,7 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatalf("unexpected third webhook manifest: %v", err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 5 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 6 {
 		t.Fatalf("generated webhooks = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
 	for _, webhook := range mutating.Webhooks {

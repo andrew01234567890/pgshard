@@ -5,9 +5,14 @@ description: Database-targeted coordinated backups, exact-topology restores, and
 
 # Backup, restore, and database recovery
 
-:::info Milestone 1 design contract
-This page specifies the required behavior. Coordinated backup, restore, and
-database moves are not implemented in the foundation release; see
+:::info Preflight implemented; execution remains a design contract
+`PgShardRestore` now verifies an immutable Ed25519 key Secret, a signed
+PostgreSQL 18 backup-manifest projection, canonical full-keyspace ranges, and
+any caller-supplied topology expectation without creating restore targets. It
+does not yet read authoritative destination catalog state, so it remains
+`Pending` rather than claiming that the destination is absent or compatible.
+Coordinated backup publication, physical materialization, logical import,
+activation, and database moves are not implemented; see
 [implementation status](../project/status.md).
 :::
 
@@ -123,17 +128,54 @@ database-shard UUIDs, and fresh restore incarnations; the source database and
 shard UUIDs remain immutable provenance and are never rebound to the new
 destination.
 
-The target API records, at minimum:
+The current preflight API records the signed projection directly. Repository
+ingestion will replace that transport without changing the signed manifest or
+topology contract:
 
 ```yaml
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardRestore
+metadata:
+  name: restore-a-as-b
 spec:
-  backupSetRef: backup-a-2026-07-16
-  sourceDatabase: A
+  manifest:
+    manifestVersion: 1
+    backupSetID: backup-a-2026-07-16
+    sourceDatabase: A
+    topology:
+      postgresqlMajor: "18"
+      hashVersion: 1
+      hashSeed: "7"
+      shardCount: 1
+      shards:
+        - ordinal: 0
+          start: "0"
+          end: "18446744073709551616"
+  manifestSignature: <canonical-base64-ed25519-signature>
+  verificationKeySecretRef:
+    name: fleet-backup-verification-key
   destinationDatabase: B
-  placement:
-    mode: Dedicated
+  destinationTopology: # optional caller expectation; omission proves nothing
+    postgresqlMajor: "18"
+    hashVersion: 1
+    hashSeed: "7"
+    shardCount: 1
+    shards:
+      - ordinal: 0
+        start: "0"
+        end: "18446744073709551616"
 ```
 
+The verification Secret must be immutable, type `Opaque`, and contain only
+`ed25519.pub` with the raw 32-byte public key. The signature is canonical RFC
+4648 base64 for the Ed25519 signature over the version-1 binary manifest
+encoding: fixed field order, big-endian integers, and big-endian
+u32-length-prefixed string bytes. Go and Rust golden vectors pin the same
+payload; the Go vector also pins the SHA-256 digest, public key, and Ed25519
+signature. The first observed Secret UID is pinned in status and cannot be
+rebound by deleting and recreating the Secret; a replacement requires a new
+`PgShardRestore`. Manifest/topology SHA-256 digests are also checkpointed, and
+restore execution must revalidate them.
 The destination name must either be absent or reserved by an empty, non-serving
 `PgShardDatabase`. Restore does not overwrite an active database. Replacing an
 existing name is a later, explicit online database move.
@@ -149,32 +191,52 @@ well-defined logical import boundary.
 ### Exact-topology preflight
 
 Restore never performs implicit resharding. Before creating Secrets, PVCs,
-PostgreSQL cells, Jobs, or repository writes, the controller compares the
-manifest topology fingerprint with the destination topology:
+PostgreSQL cells, Jobs, or repository writes, the completed controller must
+resolve the destination through authoritative `shardschema` state and compare
+the manifest topology fingerprint with that result:
 
 - An absent destination is created with the exact fingerprint from the backup.
 - A pre-created destination must match PostgreSQL major, hash
   algorithm/version and seed, shard count, ordered shard ordinals, and every
   range boundary.
-- Any mismatch returns the permanent error code `RestoreTopologyMismatch`,
-  identifies the manifest fingerprint and each differing topology field, and
-  leaves the restore `Ready=False` with the same reason. There is no target
-  mutation. A five-shard backup cannot restore into a three-shard destination,
-  even if the destination is empty.
+- Any mismatch returns the permanent error code `RestoreTopologyMismatch`. An
+  authoritative-destination mismatch checkpoints the manifest digest plus the
+  manifest and authoritative destination topology fingerprints in status,
+  identifies each differing field, and leaves the restore `Ready=False` with
+  the same reason. A defensively detected caller-request mismatch leaves the
+  authoritative destination fingerprint empty. There is no target mutation. A
+  five-shard backup cannot restore into a three-shard destination, even if the
+  destination is empty.
+
+CRD validation rejects explicit PostgreSQL/hash/count differences, and the
+fail-closed validating webhook compares every ordered ordinal and boundary.
+Either admission rejection returns Kubernetes API `Invalid` with
+`RestoreTopologyMismatch`; no `PgShardRestore` exists, so there is no status or
+fingerprint record. The webhook-disabled development overlay retains the cheap
+CRD checks, while the controller defensively repeats the complete comparison
+for any persisted request after it verifies the signature.
+It currently cannot prove destination absence or load a live destination
+topology, so a valid request remains `Pending` with
+`DestinationTopologyResolverUnavailable` and `Ready=False`. Once the catalog
+resolver is implemented, only proven absence or an exact live topology may set
+`PreflightPassed=True`; restore execution will still remain unavailable until
+the materialization slice exists.
 
 Physical cell IDs and Kubernetes Node names are placement rather than logical
-topology. The exact five database shards are initially materialized into five
-replacement dedicated cells. They use fresh database-shard UUIDs while
-retaining the backup's five ordinals and ranges beneath the destination's fresh
-database UUID. A later online move may consolidate them onto compatible shared
-cells without changing what restore accepted.
+topology. Future execution will initially materialize the exact five database
+shards into five replacement dedicated cells. They will use fresh
+database-shard UUIDs while retaining the backup's five ordinals and ranges
+beneath the destination's fresh database UUID. A later online move may
+consolidate them onto compatible shared cells without changing what restore
+accepted.
 
-The mismatch no-mutation oracle permits only the `PgShardRestore` status and
-Kubernetes Events to change. Tests snapshot and compare every other namespaced
-and operator-owned cluster-scoped Kubernetes object, live catalog row and epoch,
-PVC/PV data identity, pgBackRest metadata, and MinIO object version. Repository
-reads are allowed; creating credentials, reservations, Jobs, cells, catalog
-rows, or object-store writes is not.
+The implemented unit oracle intercepts controller writes and permits only the
+`PgShardRestore` status update. The live Kubernetes test also checks selected
+namespaced resource kinds and a sentinel ConfigMap. The full Milestone 1 oracle
+must additionally snapshot operator-owned cluster-scoped objects, live catalog
+rows and epochs, PV data identity, pgBackRest metadata, and MinIO object
+versions. Repository reads may be allowed; creating credentials, reservations,
+Jobs, cells, catalog rows, or object-store writes must not be.
 
 ### Restore execution
 
@@ -252,7 +314,7 @@ move/reshard `B` into a new three-shard `A` generation while traffic continues.
 
 ## Required end-to-end coverage
 
-The KIND and Docker Desktop suites use MinIO and must cover:
+The Milestone 1 KIND and Docker Desktop suites must use MinIO and cover:
 
 - standby backup selection, explicit primary fallback, interrupted uploads,
   missing or corrupt objects, incomplete WAL, and retry receipts;
@@ -273,4 +335,9 @@ The KIND and Docker Desktop suites use MinIO and must cover:
   every tombstone/refcount/expiry boundary, and proof that no retained backup
   or required WAL interval is deleted.
 
-This coverage is not present in the foundation release.
+Unit tests and the Kubernetes manager test now cover signed request verification
+up to the resolver-unavailable `Pending` state, five-to-three admission
+rejection, range/hash mismatch typing, and a no-target-mutation oracle. They do
+not prove live catalog-resolver-backed exact preflight success. MinIO, pgBackRest,
+materialization, activation, mobility, and failure-injection coverage remain to
+be implemented.
