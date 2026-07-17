@@ -29,6 +29,7 @@ bytes = "1.12.1"
 clap = { version = "4.5.41", features = ["derive"] }
 hyper = { version = "1.10.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
+hmac = "0.13.0"
 log = { version = "=0.4.33", features = ["max_level_off", "release_max_level_off"] }
 postgres-protocol = "0.6.12"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }

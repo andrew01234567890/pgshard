@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
+use hmac::{Hmac, KeyInit, Mac};
 use pgshard_catalog::{
     CatalogOperationTimeout, CatalogOperationTimeoutError, CatalogPollInterval,
     CatalogPollIntervalError, CatalogSupervisorConfig, CatalogSupervisorConfigError,
@@ -20,7 +21,7 @@ use rustls_pki_types::{
     CertificateDer,
     pem::{PemObject, SectionKind},
 };
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use thiserror::Error;
 use tokio_postgres::Config;
 use tokio_postgres::config::{ChannelBinding, Host, SslMode, TargetSessionAttrs};
@@ -307,10 +308,8 @@ fn operator_tls_catalog(
     let ca_contents =
         read_bounded_regular_file(ca_path, MAX_SHARDSCHEMA_CA_BYTES, "shardschema CA file")?;
     if !is_lower_hex_sha256(expected_sha256)
-        || catalog_material_sha256(
-            CATALOG_CLIENT_DIGEST_DOMAIN,
-            [&password[..], &ca_contents[..]],
-        ) != expected_sha256
+        || catalog_material_sha256(CATALOG_CLIENT_DIGEST_DOMAIN, &password, [&ca_contents[..]])
+            != expected_sha256
     {
         return Err(PoolerConfigError::CatalogMaterialMismatch);
     }
@@ -345,16 +344,26 @@ fn operator_tls_catalog(
     })
 }
 
-fn catalog_material_sha256<'a>(domain: &str, values: impl IntoIterator<Item = &'a [u8]>) -> String {
-    let mut hash = Sha256::new();
-    hash.update(domain.as_bytes());
-    hash.update(b"\n");
-    for value in values {
-        let component = Sha256::digest(value);
-        hash.update(lower_hex(&component).as_bytes());
-        hash.update(b"\n");
+fn catalog_material_sha256<'a>(
+    domain: &str,
+    key: &[u8],
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    update_catalog_material_mac(&mut mac, domain.as_bytes());
+    for component in values {
+        update_catalog_material_mac(&mut mac, component);
     }
-    lower_hex(&hash.finalize())
+    lower_hex(&mac.finalize().into_bytes())
+}
+
+fn update_catalog_material_mac(mac: &mut Hmac<Sha256>, component: &[u8]) {
+    mac.update(
+        &u64::try_from(component.len())
+            .expect("catalog material component length fits u64")
+            .to_be_bytes(),
+    );
+    mac.update(component);
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -688,6 +697,7 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     struct TestDsnFile {
         _directory: TempDir,
@@ -714,7 +724,8 @@ mod tests {
                 ca_path,
                 client_sha256: catalog_material_sha256(
                     CATALOG_CLIENT_DIGEST_DOMAIN,
-                    [password, ca],
+                    password,
+                    [ca],
                 ),
             }
         }
@@ -820,6 +831,10 @@ pqAiYB0dKbPxAXdiSQ==\n\
         ]
     }
 
+    fn test_catalog_password() -> Vec<u8> {
+        format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()).into_bytes()
+    }
+
     #[test]
     fn accepts_bounded_local_catalog_configuration() {
         let config = parse(format!("{VALID_DSN}\n").as_bytes()).expect("valid pooler config");
@@ -852,10 +867,8 @@ pqAiYB0dKbPxAXdiSQ==\n\
 
     #[test]
     fn accepts_operator_authenticated_tls_catalog_configuration() {
-        let files = TestOperatorFiles::new(
-            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            TEST_CA,
-        );
+        let password = test_catalog_password();
+        let files = TestOperatorFiles::new(&password, TEST_CA);
         let config = PoolerConfig::try_parse_from(files.arguments()).expect("operator TLS config");
         let Some(SupervisedCatalogConfig {
             catalog,
@@ -882,19 +895,13 @@ pqAiYB0dKbPxAXdiSQ==\n\
             catalog.get_application_name(),
             Some(CATALOG_APPLICATION_NAME)
         );
-        assert_eq!(
-            catalog.get_password(),
-            Some(&b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"[..])
-        );
+        assert_eq!(catalog.get_password(), Some(password.as_slice()));
         assert!(catalog.get_options().is_none());
     }
 
     #[test]
     fn operator_tls_accepts_kubernetes_style_symlink_projections() {
-        let files = TestOperatorFiles::new(
-            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            TEST_CA,
-        );
+        let files = TestOperatorFiles::new(&test_catalog_password(), TEST_CA);
         let projected_password = files.directory.path().join("projected-password");
         let projected_ca = files.directory.path().join("projected-ca");
         symlink(&files.password_path, &projected_password).expect("symlink password projection");
@@ -910,10 +917,7 @@ pqAiYB0dKbPxAXdiSQ==\n\
 
     #[test]
     fn operator_tls_rejects_incomplete_or_cross_mode_credentials() {
-        let files = TestOperatorFiles::new(
-            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            TEST_CA,
-        );
+        let files = TestOperatorFiles::new(&test_catalog_password(), TEST_CA);
         assert!(matches!(
             PoolerConfig::try_parse_from(["pgshard-pooler", "--catalog-mode=operator-tls"]),
             Err(PoolerConfigError::OperatorTlsFieldsRequired)
@@ -959,8 +963,8 @@ pqAiYB0dKbPxAXdiSQ==\n\
 
     #[test]
     fn operator_tls_rejects_unsafe_dns_password_and_ca_shapes_without_leaking_contents() {
-        let valid_password = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let files = TestOperatorFiles::new(valid_password, TEST_CA);
+        let valid_password = test_catalog_password();
+        let files = TestOperatorFiles::new(&valid_password, TEST_CA);
         for host in [
             "127.0.0.1",
             "Demo-shardschema.default.svc",
@@ -998,7 +1002,7 @@ pqAiYB0dKbPxAXdiSQ==\n\
             [TEST_CA, TEST_CA].concat().as_slice(),
             [b"prefix".as_slice(), TEST_CA].concat().as_slice(),
         ] {
-            let invalid = TestOperatorFiles::new(valid_password, ca);
+            let invalid = TestOperatorFiles::new(&valid_password, ca);
             assert!(matches!(
                 PoolerConfig::try_parse_from(invalid.arguments()),
                 Err(PoolerConfigError::InvalidCatalogCa)
@@ -1026,14 +1030,15 @@ pqAiYB0dKbPxAXdiSQ==\n\
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
 
-        let oversized_password =
-            TestOperatorFiles::new(&[b'a'; SHARDSCHEMA_PASSWORD_BYTES + 1], TEST_CA);
+        let mut password = test_catalog_password();
+        password.push(b'a');
+        let oversized_password = TestOperatorFiles::new(&password, TEST_CA);
         assert!(matches!(
             PoolerConfig::try_parse_from(oversized_password.arguments()),
             Err(PoolerConfigError::CatalogFileTooLarge { .. })
         ));
         let oversized_ca = TestOperatorFiles::new(
-            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &test_catalog_password(),
             &vec![b'x'; MAX_SHARDSCHEMA_CA_BYTES + 1],
         );
         assert!(matches!(
