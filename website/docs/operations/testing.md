@@ -551,7 +551,12 @@ a restricted two-shard, one-member sample, waits for both PostgreSQL 18
 primaries, proves shard passwords differ, executes SQL across an internal shard
 Service from an authorized restricted probe client using the destination-specific
 Secret, rejects otherwise identical unlabeled and wrong-cluster clients through
-the live NetworkPolicy, proves an omitted storage class was resolved and
+the live NetworkPolicy, and verifies that only shard-0000 contains the dedicated
+`shardschema` database. It loads the exact migration shipped in the non-root
+PostgreSQL bootstrap image, observes both configured shard identities and one
+active restore incarnation per shard, records the catalog epoch, and requires a
+primary restart to reapply the migration without changing that epoch. It also
+proves an omitted storage class was resolved and
 checkpointed on the resulting Bound PVC, then restarts one primary StatefulSet
 and verifies its PVC-backed row survives. A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage

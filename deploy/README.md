@@ -1,8 +1,8 @@
 # Local deployment artifacts
 
 The deployment build produces Linux/amd64 Docker-compatible image archives for
-the Rust agent, orchestrator and pooler and the Go operator. A separate target
-builds the PostgreSQL 18 agent lifecycle-test image. Builder and runtime images are
+the Rust agent, orchestrator and pooler, the Go operator, and the PostgreSQL 18
+bootstrap/agent image. Builder and runtime images are
 digest-pinned. The supporting runtimes use numeric user and group `10001`; the
 PostgreSQL image uses the image's numeric `999:999` database identity. Every
 image has a direct binary entrypoint and is tested with a read-only root
@@ -35,7 +35,7 @@ and can be abandoned on shutdown before process creation. Shutdown signal
 phases are bounded, but final process-tree cleanup deliberately holds the
 PGDATA fence without a time bound when the kernel cannot prove termination.
 
-Build the four standard archives from the repository root:
+Build the five standard archives from the repository root:
 
 ```console
 make images
@@ -43,9 +43,9 @@ make images
 
 Set `PGSHARD_IMAGE_TARGETS` to a space-separated Bake target list when a local
 test needs only a subset. For example, the manager KIND smoke builds
-`operator orchestrator pooler`. Build the heavier lifecycle-only image with
-`PGSHARD_IMAGE_TARGETS=postgres-agent make images`; it is intentionally outside
-the default `ci` group so parallel CI does not build it twice.
+`operator orchestrator pooler postgres-agent`. The PostgreSQL image is both the
+short-lived catalog/bootstrap init image and the input for separate lifecycle
+tests.
 
 The selected Buildx builder must support the Docker exporter. Docker's default
 `docker` driver does not support this archive exporter; use a
@@ -57,17 +57,20 @@ untracked source changes are present. Source archives must provide
 `PGSHARD_GIT_SHA` explicitly. Direct Bake invocations must provide both build
 identity variables; the Bake definition rejects missing and all-zero identity.
 
-The files are written under `artifacts/images/`. The optional `postgres-agent` archive
-contains PostgreSQL 18 and the Rust agent so lifecycle tests can exercise the
-real postmaster without publishing an image. The bake definition has no
+The files are written under `artifacts/images/`. The `postgres-agent` archive
+contains PostgreSQL 18, the Rust agent, and the read-only source catalog
+migration so initialization and lifecycle tests can exercise the real
+postmaster without publishing an image. The bake definition has no
 registry output or push target. CI builds the standard archives together and
-the PostgreSQL image once in its lifecycle job, loads them into its local Docker
-daemon, checks their platform, build labels, non-root identity and entrypoints
-under a read-only root filesystem, then discards them with the ephemeral runner.
-CI does not upload or publish the archives.
+independently rebuilds the PostgreSQL image for its lifecycle and manager
+tests, loads them into local Docker daemons, checks their platform, build
+labels, non-root identity, migration bytes, and entrypoints under a read-only
+root filesystem, then discards them with the ephemeral runners. CI does not
+upload or publish the archives.
 
-These images contain the current incomplete runtimes. They do not create a
-PostgreSQL cluster, and no image is published by the Milestone 1 release job.
+These images contain the current incomplete runtimes. The operator can create
+only the documented direct single-member development cluster, and no image is
+published by the Milestone 1 release job.
 The Kustomizations under `operator/config/development` and
 `operator/config/admission` consume local `:dev` images after they are loaded
 into KIND. The latter adds self-managed webhook certificates and fail-closed

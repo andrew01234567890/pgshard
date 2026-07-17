@@ -607,12 +607,12 @@ jobs:
           PGSHARD_GIT_SHA: ${{ github.sha }}
           PGSHARD_IMAGE_OUTPUT: artifacts/images
           PGSHARD_IMAGE_TAG: dev
-          PGSHARD_IMAGE_TARGETS: operator orchestrator pooler
+          PGSHARD_IMAGE_TARGETS: operator orchestrator pooler postgres-agent
         shell: bash
         run: |
           set -euo pipefail
           make images
-          for component in operator orchestrator pooler; do
+          for component in operator orchestrator pooler postgres-agent; do
             docker load --input "artifacts/images/pgshard-${component}.tar"
           done
       - name: Create disposable Kubernetes cluster
@@ -632,6 +632,7 @@ jobs:
             pgshard/operator:dev \
             pgshard/orchestrator:dev \
             pgshard/pooler:dev \
+            pgshard/postgres-agent:dev \
             --name pgshard-manager
       - name: Install the self-managed admission manager
         run: |
@@ -801,6 +802,12 @@ jobs:
           test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$PGSHARD_BUILD_VERSION"
           test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$PGSHARD_GIT_SHA"
           test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" | sed -n 's/^PG_MAJOR=//p')" = "18"
+          expected_migration_sha="$(sha256sum crates/pgshard-catalog/migrations/0001_shardschema.sql | awk '{print $1}')"
+          image_migration_sha="$(docker run --rm --platform linux/amd64 --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint sha256sum "$image" \
+            /usr/share/pgshard/migrations/0001_shardschema.sql | awk '{print $1}')"
+          test "$image_migration_sha" = "$expected_migration_sha"
           docker run --rm --platform linux/amd64 --network none --read-only \
             --cap-drop ALL --security-opt no-new-privileges \
             "$image" --help >/dev/null

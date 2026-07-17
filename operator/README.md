@@ -13,6 +13,9 @@ API. The controller now reconciles the safe supporting-resource slice:
   PostgreSQL 18 primary StatefulSet and retained data PVC per shard, with a
   generated per-shard immutable bootstrap credential and restricted Pod
   security;
+- an idempotently migrated `shardschema` database on shard-0000 containing the
+  complete immutable shard inventory and an initial restore incarnation for
+  each shard;
 - etcd, orchestrator, and pooler workload specifications, topology spread,
   security contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
   etcd ingress NetworkPolicy;
@@ -110,6 +113,14 @@ publication barrier before PostgreSQL starts, so interruption after the atomic
 rename cannot skip it on the next init pass. These flushes are limited to the
 cluster's data path; bootstrap never issues a node-wide filesystem sync that
 could couple Pod startup or termination to unrelated mounts.
+On shard-0000 only, the same init boundary starts PostgreSQL with network
+listening disabled and a private mode-0700 Unix socket, creates the UTF8
+`shardschema` database when absent, and applies the exact migration embedded in
+the versioned bootstrap image. It then inserts only missing canonical shard
+identities from the immutable CR count. A conflicting non-retired inventory,
+failed migration, or failed inventory transaction keeps the primary unready;
+the next init safely retries. Reapplying an unchanged migration and inventory
+does not advance the catalog epoch.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
@@ -244,18 +255,23 @@ rejection-only PostgreSQL read-write handshake listener. It accepts no SQL
 session, has no connection pool, and deliberately remains application-unready
 even when its catalog is usable. Its catalog connector is
 deliberately local-only until authenticated TLS exists, while this operator
-does not yet provision a catalog DSN Secret or a compatible local shardschema
-endpoint. The operator therefore selects the pooler's explicit
+does not yet provision a catalog DSN Secret or authenticated remote catalog
+transport. The operator therefore selects the pooler's explicit
 `bootstrap-unavailable` mode: the process exposes liveness and bounded status
 without a credential or connection attempt, while catalog and application
 readiness fail closed. Override the defaults with `--orchestrator-image`,
-`--pooler-image`, `--etcd-image`, and `--postgresql-image` when concrete images
-exist. Image pull or runtime readiness is reported by the relevant observed
+`--pooler-image`, `--etcd-image`, `--postgresql-image`, and
+`--postgresql-bootstrap-image` when concrete images exist. Image pull or runtime readiness is reported by the relevant observed
 workload condition, never inferred from planned objects. A custom PostgreSQL
 image must preserve the pinned official image contract: PostgreSQL 18,
 UID/GID 999, `initdb` and `bash` on `PATH`, compatibility with the Docker
 entrypoint for the main process, and the `/var/lib/postgresql/18/docker` data
 layout.
+The separate bootstrap image must provide the same PostgreSQL 18 command-line
+tools as UID/GID 999 plus the source migration at
+`/usr/share/pgshard/migrations/0001_shardschema.sql`; it is never used as the
+main database process and receives the superuser Secret only while the init
+container runs.
 
 The module is pinned to Go 1.26.5, controller-runtime 0.24.1, and Kubernetes
 libraries 0.36.0. Only the Linux container deployment is supported.
