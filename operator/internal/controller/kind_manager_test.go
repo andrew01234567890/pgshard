@@ -71,7 +71,7 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 
 	waitForEtcdQuorum(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "etcd", 3, true)
-	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "orchestrator", 3, false)
+	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "orchestrator", 3, true)
 	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "pooler", 1, false)
 	waitForStableManagerPod(t, ctx, kubeClient)
 	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace.Name, cluster.Name)

@@ -346,6 +346,12 @@ pub struct OrchSnapshot {
     pub failover_automation_enabled: bool,
     /// Whether operation and lease records survive process restart.
     pub persistence_enabled: bool,
+    /// Whether this process currently owns a renewable etcd incarnation.
+    pub coordination_ready: bool,
+    /// Pinned etcd cluster identity, encoded exactly as a decimal string.
+    pub coordination_cluster_id: Option<String>,
+    /// Highest acknowledged etcd revision, encoded exactly as a decimal string.
+    pub coordination_revision: String,
 }
 
 /// Machine-readable reason the orchestrator is not yet safe to serve control
@@ -353,16 +359,18 @@ pub struct OrchSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchReadinessReason {
+    /// The process owns a live etcd-backed coordination incarnation.
+    Ready,
     /// No stable operator-assigned identity exists.
     IdentityMissing,
-    /// Operations and fencing epochs are currently in memory only.
-    PersistenceUnavailable,
+    /// No renewable etcd-backed process incarnation is currently proven.
+    CoordinationUnavailable,
 }
 
 /// Fail-closed orchestrator readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct OrchReadiness {
-    /// Always false until durable state and recovery are wired.
+    /// True only while the process owns a renewable coordination incarnation.
     pub ready: bool,
     /// Exact reason control operations are unavailable.
     pub reason: OrchReadinessReason,
@@ -378,6 +386,10 @@ struct OrchInner {
     // steps never decide whether the current process still owns the term.
     lease_deadlines: HashMap<ShardId, Duration>,
     last_epochs: HashMap<ShardId, u64>,
+    coordination_ready: bool,
+    coordination_cluster_id: Option<u64>,
+    coordination_revision: u64,
+    coordination_deadline: Option<Instant>,
 }
 
 /// Thread-safe registry for operation IDs and shard leases.
@@ -424,29 +436,88 @@ impl OrchState {
     /// Returns whether the runtime can safely serve control operations.
     #[must_use]
     pub fn readiness(&self) -> OrchReadiness {
-        let has_identity = self
+        let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .identity
-            .is_some();
-        OrchReadiness {
-            ready: false,
-            reason: if has_identity {
-                OrchReadinessReason::PersistenceUnavailable
-            } else {
-                OrchReadinessReason::IdentityMissing
-            },
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.identity.is_none() {
+            return OrchReadiness {
+                ready: false,
+                reason: OrchReadinessReason::IdentityMissing,
+            };
         }
+        let coordination_live = inner.coordination_ready
+            && inner
+                .coordination_deadline
+                .is_some_and(|deadline| Instant::now() < deadline);
+        if !coordination_live {
+            inner.coordination_ready = false;
+            return OrchReadiness {
+                ready: false,
+                reason: OrchReadinessReason::CoordinationUnavailable,
+            };
+        }
+        OrchReadiness {
+            ready: true,
+            reason: OrchReadinessReason::Ready,
+        }
+    }
+
+    /// Installs one acknowledged etcd cluster/revision observation.
+    ///
+    /// Cluster identity is pinned for the process lifetime and revisions may
+    /// only advance. A false result leaves readiness disabled.
+    #[must_use]
+    pub(crate) fn record_coordination_ready(
+        &self,
+        cluster_id: u64,
+        revision: u64,
+        deadline: Instant,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let valid = cluster_id != 0
+            && revision != 0
+            && inner
+                .coordination_cluster_id
+                .is_none_or(|current| current == cluster_id)
+            && revision >= inner.coordination_revision
+            && Instant::now() < deadline;
+        if !valid {
+            inner.coordination_ready = false;
+            return false;
+        }
+        inner.coordination_cluster_id = Some(cluster_id);
+        inner.coordination_revision = revision;
+        inner.coordination_deadline = Some(deadline);
+        inner.coordination_ready = true;
+        true
+    }
+
+    /// Removes readiness without discarding pinned anti-regression evidence.
+    pub(crate) fn record_coordination_unavailable(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .coordination_ready = false;
     }
 
     /// Returns a consistent reportable snapshot.
     #[must_use]
     pub fn snapshot(&self) -> OrchSnapshot {
-        let inner = self
+        let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let coordination_ready = inner.coordination_ready
+            && inner
+                .coordination_deadline
+                .is_some_and(|deadline| Instant::now() < deadline);
+        if !coordination_ready {
+            inner.coordination_ready = false;
+        }
         let mut leases: Vec<_> = inner.leases.values().cloned().collect();
         leases.sort_by_key(|lease| lease.shard_id);
         OrchSnapshot {
@@ -455,6 +526,9 @@ impl OrchState {
             leases,
             failover_automation_enabled: false,
             persistence_enabled: false,
+            coordination_ready,
+            coordination_cluster_id: inner.coordination_cluster_id.map(|value| value.to_string()),
+            coordination_revision: inner.coordination_revision.to_string(),
         }
     }
 
@@ -1163,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_requires_identity() {
+    fn readiness_requires_identity_and_live_coordination() {
         let unconfigured = OrchState::default();
         assert_eq!(
             unconfigured.readiness().reason,
@@ -1174,8 +1248,38 @@ mod tests {
             state().readiness(),
             OrchReadiness {
                 ready: false,
-                reason: OrchReadinessReason::PersistenceUnavailable,
+                reason: OrchReadinessReason::CoordinationUnavailable,
             }
+        );
+
+        let state = state();
+        assert!(state.record_coordination_ready(7, 11, Instant::now() + Duration::from_secs(1)));
+        assert_eq!(
+            state.readiness(),
+            OrchReadiness {
+                ready: true,
+                reason: OrchReadinessReason::Ready,
+            }
+        );
+        state.record_coordination_unavailable();
+        assert!(!state.readiness().ready);
+        assert!(!state.record_coordination_ready(8, 12, Instant::now() + Duration::from_secs(1)));
+        assert!(!state.record_coordination_ready(7, 10, Instant::now() + Duration::from_secs(1)));
+        assert!(state.record_coordination_ready(7, 12, Instant::now() + Duration::from_secs(1)));
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.coordination_cluster_id.as_deref(), Some("7"));
+        assert_eq!(snapshot.coordination_revision, "12");
+
+        let expired = OrchState::with_identity(identity(), 100).expect("valid lease policy");
+        assert!(!expired.record_coordination_ready(7, 1, Instant::now()));
+        assert!(!expired.readiness().ready);
+
+        let paused = OrchState::with_identity(identity(), 100).expect("valid lease policy");
+        assert!(paused.record_coordination_ready(7, 1, Instant::now() + Duration::from_millis(10)));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            paused.readiness().reason,
+            OrchReadinessReason::CoordinationUnavailable
         );
     }
 

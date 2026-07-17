@@ -154,9 +154,12 @@ Service endpoints for five seconds within a 20-second total termination budget.
 Startup, readiness,
 receipt-authenticated admission, and reconciliation reject an empty, mutable,
 incorrectly sized, or different replacement key. The leaf certificate renews without a Pod restart;
-automatic CA or fencing-key rotation is not yet implemented. Expect the sample to remain `Ready=False`, its
-pooler and orchestrator Pods to remain unready, and its application Services to
-have no ready endpoints. This path is for source validation only.
+automatic CA or fencing-key rotation is not yet implemented. Expect the sample
+to remain `Ready=False`, its pooler to remain unready, and its application
+Services to have no ready endpoints. The three orchestrator Pods become ready
+only while their unique cluster-UID-bound etcd incarnations are renewed; this
+does not enable durable operations, shard-term authority, or failover. This path
+is for source validation only.
 
 To exercise the direct PostgreSQL slice in the same cluster:
 

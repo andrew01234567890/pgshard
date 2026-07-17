@@ -311,11 +311,29 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      etcd:
+        image: registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+        ports:
+          - 2379:2379
+        options: >-
+          --health-cmd "etcdctl --endpoints=http://127.0.0.1:2379 endpoint health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Select repository Rust toolchain
         run: rustup show active-toolchain
+      - name: Verify exclusive etcd coordination recovery
+        env:
+          PGSHARD_TEST_ETCD_ENDPOINTS: http://127.0.0.1:2379
+        run: >-
+          cargo test --locked -p pgshard-orch
+          --test etcd_coordination -- --ignored --test-threads=1
       - name: Load one fenced standby attachment policy
         env:
           PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/shardschema
