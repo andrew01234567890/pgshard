@@ -10,7 +10,11 @@ There is no usable pgshard routing endpoint yet. The current operator can run a
 limited direct-PostgreSQL development slice: an explicit one-member
 asynchronous resource creates one PostgreSQL 18 primary and retained PVC per
 shard. Each shard receives a distinct immutable bootstrap Secret and a 4Gi
-minimum data claim. When `storage.storageClassName` is omitted, the operator
+minimum data claim. Before the shard-0000 server is allowed to start, its init
+container creates the dedicated `shardschema` database over a private Unix
+socket, applies the transactional catalog migration, and records every
+configured shard plus its initial restore incarnation. No other shard receives
+that database. When `storage.storageClassName` is omitted, the operator
 resolves the current Kubernetes default and checkpoints that exact class before
 creating any claim; later default-class rotation does not change existing data
 intent. An object stored by an earlier release with a 1Gi-to-4Gi size must be
@@ -25,8 +29,7 @@ final status after all mutators run. PodGC, copied annotation or condition text,
 a missing or recreated Node, and a webhook outage cannot produce that receipt,
 so cluster deletion fails closed with the PVC protected. This is lifecycle protection, not
 HA takeover or physical node fencing. It has no standby, promotion,
-backup execution, `shardschema`
-bootstrap, or SQL pooler. Restarting a primary interrupts that shard even though
+backup execution, remote catalog transport, or SQL pooler. Restarting a primary interrupts that shard even though
 its data survives. Three- and five-member resources continue to fail closed
 without PostgreSQL Pods.
 
@@ -47,9 +50,12 @@ make check
 This validates contracts, core and runtime foundations, generated Kubernetes
 resources, release policy and documentation. CI separately exercises the
 local-only lifecycle image with a disposable PostgreSQL 18 data directory. The
-operator KIND job also starts two single-member primaries, queries one from an
-authorized restricted probe client using that destination shard's credential, restarts it, and
-verifies persistence. Neither test proves a
+operator KIND job also starts two single-member primaries, verifies the
+shard-0000 catalog inventory and initial restore identities, proves the other
+shard has no `shardschema` database, queries one primary from an authorized
+restricted probe client using that destination shard's credential, restarts
+shard-0000, and verifies both application persistence and an unchanged catalog
+epoch. Neither test proves a
 sharding runtime. Follow
 [implementation status](./project/status.md) for the first version with a real
 cluster quickstart.
@@ -58,24 +64,28 @@ The catalog migration has a separate opt-in live contract test against a
 disposable PostgreSQL 18 `shardschema` database. See the
 [`pgshard-catalog` README](https://github.com/andrew01234567890/pgshard/tree/main/crates/pgshard-catalog)
 for its preconditions. CI runs that test with an ephemeral service database;
-the operator does not bootstrap it yet.
+the operator additionally applies the same bytes before a managed shard-0000
+primary starts. Database creation is recoverable and the migration plus shard
+inventory update are transactional; a failed init keeps PostgreSQL unready and
+the next init retries the complete migration.
 
 ## Exercise the development manager
 
 Build the local-only images with an archive-capable Buildx builder, load the
-operator, orchestrator, and pooler `:dev` images into a disposable KIND cluster,
+operator, orchestrator, pooler, and PostgreSQL bootstrap `:dev` images into a disposable KIND cluster,
 then install the manager:
 
 ```console
-PGSHARD_IMAGE_TARGETS="operator orchestrator pooler" make images
+PGSHARD_IMAGE_TARGETS="operator orchestrator pooler postgres-agent" make images
 docker load --input artifacts/images/pgshard-operator.tar
 docker load --input artifacts/images/pgshard-orchestrator.tar
 docker load --input artifacts/images/pgshard-pooler.tar
+docker load --input artifacts/images/pgshard-postgres-agent.tar
 kind create cluster --name pgshard-development \
   --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
   --wait 90s
 kind load docker-image pgshard/operator:dev pgshard/orchestrator:dev \
-  pgshard/pooler:dev --name pgshard-development
+  pgshard/pooler:dev pgshard/postgres-agent:dev --name pgshard-development
 kubectl apply -k operator/config/admission
 kubectl rollout status --namespace pgshard-system deployment/pgshard-controller-manager
 kubectl create namespace pgshard-development
@@ -126,6 +136,10 @@ kubectl exec --namespace pgshard-single-member \
   single-member-shard-0000-primary-0 -- \
   psql -X -U postgres -d postgres -c \
   "SELECT current_setting('server_version'), pg_is_in_recovery();"
+kubectl exec --namespace pgshard-single-member \
+  single-member-shard-0000-primary-0 -- \
+  psql -X -U postgres -d shardschema -c \
+  "SELECT shard_id, shard_number, state FROM pgshard_catalog.shards ORDER BY shard_number;"
 ```
 
 The `pgshard.io/pod-fencing=enabled` namespace label is mandatory for managed

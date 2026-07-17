@@ -32,13 +32,14 @@ func TestCommandFlagsAllowExplicitCertificateFreeDevelopmentMode(t *testing.T) {
 		"--orchestrator-image=pgshard/orchestrator:dev",
 		"--pooler-image=pgshard/pooler:dev",
 		"--postgresql-image=postgres:18",
+		"--postgresql-bootstrap-image=pgshard/postgres-agent:dev",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if options.webhookEnabled || options.metricsAddress != "0" {
 		t.Fatalf("development options = %#v", options)
 	}
-	if options.images.Orchestrator != "pgshard/orchestrator:dev" || options.images.Pooler != "pgshard/pooler:dev" || options.images.PostgreSQL != "postgres:18" {
+	if options.images.Orchestrator != "pgshard/orchestrator:dev" || options.images.Pooler != "pgshard/pooler:dev" || options.images.PostgreSQL != "postgres:18" || options.images.PostgreSQLBootstrap != "pgshard/postgres-agent:dev" {
 		t.Fatalf("development images = %#v", options.images)
 	}
 }

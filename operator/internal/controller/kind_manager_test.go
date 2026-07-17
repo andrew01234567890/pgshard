@@ -145,6 +145,18 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"cat", "/var/lib/postgresql/18/docker/.pgshard-bootstrap-complete")), "cluster_uid="+string(current.UID)+"\nshard=0000"; got != want {
 		t.Fatalf("PostgreSQL bootstrap marker = %q, want %q", got, want)
 	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
+		"SELECT (SELECT string_agg(shard_id::text || ':' || shard_number::text || ':' || state, ',' ORDER BY shard_number) FROM pgshard_catalog.shards), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active')")); got != "shard-0000:0:active,shard-0001:1:active|2" {
+		t.Fatalf("shardschema inventory = %q", got)
+	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardOnePod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc",
+		"SELECT count(*) FROM pg_catalog.pg_database WHERE datname = 'shardschema'")); got != "0" {
+		t.Fatalf("non-home shard shardschema database count = %q", got)
+	}
+	catalogEpoch := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc", "SELECT catalog_epoch FROM pgshard_catalog.cluster_state"))
 	runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c",
 		"CREATE TABLE live_marker (shard integer PRIMARY KEY, note text NOT NULL); INSERT INTO live_marker VALUES (0, 'kind-persistent');")
@@ -187,6 +199,10 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "postgres", "-Atc", "SELECT note FROM live_marker WHERE shard = 0")); got != "kind-persistent" {
 		t.Fatalf("query after StatefulSet restart = %q", got)
+	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc", "SELECT catalog_epoch FROM pgshard_catalog.cluster_state")); got != catalogEpoch {
+		t.Fatalf("idempotent shardschema restart changed catalog epoch from %q to %q", catalogEpoch, got)
 	}
 
 	managerRestored := false

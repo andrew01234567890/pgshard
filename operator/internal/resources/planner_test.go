@@ -229,12 +229,16 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("PostgreSQL readiness probe = %#v", postgres.ReadinessProbe)
 		}
 		bootstrap := pod.InitContainers[0]
-		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "sync \"$staging/pg_hba.conf\" \"$staging/.pgshard-bootstrap-complete\" \"$staging\"") || !strings.Contains(bootstrap.Command[2], "sync \"$final\" \"$parent\"") || strings.Contains(bootstrap.Command[2], "\nsync\n") || strings.Contains(bootstrap.Command[2], "sync -f") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) {
+		if bootstrap.Name != "bootstrap-postgresql" || bootstrap.Image != defaultPostgreSQLBootstrapImage || len(bootstrap.Command) != 3 || !strings.Contains(bootstrap.Command[2], "staging=\"$parent/.pgshard-init\"") || !strings.Contains(bootstrap.Command[2], "host all all all scram-sha-256") || !strings.Contains(bootstrap.Command[2], "cmp -s -- \"$marker\" \"$expected\"") || !strings.Contains(bootstrap.Command[2], "sync \"$staging/pg_hba.conf\" \"$staging/.pgshard-bootstrap-complete\" \"$staging\"") || !strings.Contains(bootstrap.Command[2], "sync \"$final\" \"$parent\"") || strings.Contains(bootstrap.Command[2], "\nsync\n") || strings.Contains(bootstrap.Command[2], "sync -f") || !strings.Contains(bootstrap.Command[2], "cp -- \"$expected\" \"$staging/.pgshard-bootstrap-complete\"") || !strings.Contains(bootstrap.Command[2], "mv -- \"$staging\" \"$final\"") || !strings.Contains(bootstrap.Command[2], postgresqlBootstrapMarker) || !strings.Contains(bootstrap.Command[2], "listen_addresses=''") || !strings.Contains(bootstrap.Command[2], "INSERT INTO pgshard_catalog.shards") {
 			t.Fatalf("PostgreSQL atomic bootstrap contract = %#v", bootstrap)
 		}
-		if len(bootstrap.Env) != 4 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
-			bootstrap.Env[2].Name != "PGSHARD_NODE_UID" || bootstrap.Env[2].ValueFrom == nil || bootstrap.Env[2].ValueFrom.FieldRef == nil || bootstrap.Env[2].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-uid']" ||
-			bootstrap.Env[3].Name != "PGSHARD_NODE_BOOT_ID" || bootstrap.Env[3].ValueFrom == nil || bootstrap.Env[3].ValueFrom.FieldRef == nil || bootstrap.Env[3].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-boot-id']" {
+		if len(bootstrap.Env) != 8 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
+			bootstrap.Env[2].Name != "PGSHARD_SHARD_COUNT" || bootstrap.Env[2].Value != fmt.Sprintf("%d", cluster.Spec.Shards) ||
+			bootstrap.Env[3].Name != "PGSHARD_MAXIMUM_SHARDS" || bootstrap.Env[3].Value != fmt.Sprintf("%d", pgshardv1alpha1.MaximumShards) ||
+			bootstrap.Env[4].Name != "PGSHARD_BOOTSTRAP_SHARDSCHEMA" || bootstrap.Env[4].Value != fmt.Sprintf("%t", shard == 0) ||
+			bootstrap.Env[5].Name != "PGSHARD_SHARDSCHEMA_MIGRATION" || bootstrap.Env[5].Value != shardschemaMigrationPath ||
+			bootstrap.Env[6].Name != "PGSHARD_NODE_UID" || bootstrap.Env[6].ValueFrom == nil || bootstrap.Env[6].ValueFrom.FieldRef == nil || bootstrap.Env[6].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-uid']" ||
+			bootstrap.Env[7].Name != "PGSHARD_NODE_BOOT_ID" || bootstrap.Env[7].ValueFrom == nil || bootstrap.Env[7].ValueFrom.FieldRef == nil || bootstrap.Env[7].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-boot-id']" {
 			t.Fatalf("PostgreSQL bootstrap identity = %#v", bootstrap.Env)
 		}
 		if bootstrap.SecurityContext == nil || bootstrap.SecurityContext.ReadOnlyRootFilesystem == nil || !*bootstrap.SecurityContext.ReadOnlyRootFilesystem || bootstrap.Resources.Limits.Memory() == nil {
@@ -508,6 +512,11 @@ func TestPlanFailsClosedForUnsafeIdentityOrMissingImages(t *testing.T) {
 	images.PostgreSQL = ""
 	if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), "images") {
 		t.Fatalf("expected PostgreSQL image error, got %v", err)
+	}
+	images = DefaultImages()
+	images.PostgreSQLBootstrap = ""
+	if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), "images") {
+		t.Fatalf("expected PostgreSQL bootstrap image error, got %v", err)
 	}
 	cluster = testCluster()
 	cluster.Spec.Observability.OpenTelemetryEndpoint = "file:///tmp/collector"

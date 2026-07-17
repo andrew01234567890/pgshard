@@ -43,10 +43,8 @@ make images
 ```
 
 This builds digest-pinned Linux/amd64 Docker-compatible image archives for the
-Rust agent, orchestrator and pooler and the Go operator under
-`artifacts/images/`. The separate
-`PGSHARD_IMAGE_TARGETS=postgres-agent make images` target builds the heavier
-PostgreSQL 18 lifecycle-test archive once where needed. The bake definition has no
+Rust agent, orchestrator and pooler, the Go operator, and the PostgreSQL 18
+bootstrap/agent image under `artifacts/images/`. The bake definition has no
 registry output or push target. The current images are test inputs, not an
 installable sharding product; the operator image can bootstrap only the
 documented direct single-member PostgreSQL development slice. The selected
@@ -58,7 +56,7 @@ when the worktree differs. Source archives must provide `PGSHARD_GIT_SHA`
 explicitly. Direct Bake invocations must provide both build identity variables;
 missing and all-zero identity is rejected.
 
-`PGSHARD_IMAGE_TARGETS="operator orchestrator pooler" make images` builds the
+`PGSHARD_IMAGE_TARGETS="operator orchestrator pooler postgres-agent" make images` builds the
 subset used by the real-manager KIND smoke. After loading those `:dev` images
 into KIND, `kubectl apply -k operator/config/admission` installs the restricted
 self-managed admission manager. Direct PostgreSQL namespaces must carry the

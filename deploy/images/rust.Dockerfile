@@ -60,8 +60,9 @@ LABEL org.opencontainers.image.source="https://github.com/andrew01234567890/pgsh
       org.opencontainers.image.revision="${PGSHARD_GIT_SHA}"
 
 COPY --from=postgres-agent-build --chown=0:0 /out/pgshard-agent /usr/local/bin/pgshard-agent
-RUN install -d -o 0 -g 0 -m 0755 /etc/pgshard
+RUN install -d -o 0 -g 0 -m 0755 /etc/pgshard /usr/share/pgshard/migrations
 COPY --chown=0:0 --chmod=0444 deploy/images/quarantine.pg_hba.conf /etc/pgshard/quarantine.pg_hba.conf
+COPY --chown=0:0 --chmod=0444 crates/pgshard-catalog/migrations/0001_shardschema.sql /usr/share/pgshard/migrations/0001_shardschema.sql
 
 USER 999:999
 STOPSIGNAL SIGTERM
