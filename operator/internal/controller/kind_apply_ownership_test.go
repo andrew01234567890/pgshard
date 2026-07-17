@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -355,7 +356,7 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertApplyOwner(t, configuration)
-	if len(configuration.Data) != 11 || !strings.Contains(configuration.Data["postgresql.conf"], "log_statement = ddl\n") {
+	if !maps.Equal(configuration.Data, desiredConfiguration.Data) {
 		t.Fatalf("new PostgreSQL configuration was not published: %#v", configuration.Data)
 	}
 	// This test uses the deliberately unimplemented multi-member path, so no
