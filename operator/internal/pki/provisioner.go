@@ -58,8 +58,10 @@ const (
 	retryInterval              = 250 * time.Millisecond
 	mutatingWebhookName        = "mpgshardcluster.kb.io"
 	validatingWebhookName      = "vpgshardcluster.kb.io"
+	restoreWebhookName         = "vpgshardrestore.kb.io"
 	mutatingWebhookPath        = "/mutate-pgshard-io-v1alpha1-pgshardcluster"
 	validatingWebhookPath      = "/validate-pgshard-io-v1alpha1-pgshardcluster"
+	restoreWebhookPath         = "/validate-pgshard-io-v1alpha1-pgshardrestore"
 	webhookServicePort         = int32(9444)
 	webhookTimeoutSeconds      = int32(5)
 )
@@ -882,8 +884,8 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.validatingConfigurationName}, validating); err != nil {
 		return nil, fmt.Errorf("get validating webhook configuration: %w", err)
 	}
-	if len(validating.Webhooks) != 5 {
-		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly five", len(validating.Webhooks))
+	if len(validating.Webhooks) != 6 {
+		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly six", len(validating.Webhooks))
 	}
 	for _, expected := range []struct {
 		name, path        string
@@ -891,6 +893,7 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 		namespace, object *metav1.LabelSelector
 	}{
 		{name: validatingWebhookName, path: validatingWebhookPath, rules: matchesPgShardClusterRules},
+		{name: restoreWebhookName, path: restoreWebhookPath, rules: matchesPgShardRestoreRules},
 		{name: podfence.MetadataWebhookName, path: podfence.MetadataWebhookPath, rules: matchesPostgreSQLMetadataRules, object: postgreSQLPodSelector()},
 		{name: podfence.NamespaceWebhookName, path: podfence.NamespaceWebhookPath, rules: matchesPostgreSQLNamespaceRules, object: podFencingNamespaceSelector()},
 		{name: podfence.StatusValidationWebhookName, path: podfence.StatusValidationWebhookPath, rules: matchesPostgreSQLStatusRules, object: postgreSQLPodSelector()},
@@ -951,6 +954,18 @@ func matchesPgShardClusterRules(rules []admissionregistrationv1.RuleWithOperatio
 		slices.Equal(rule.APIGroups, []string{"pgshard.io"}) &&
 		slices.Equal(rule.APIVersions, []string{"v1alpha1"}) &&
 		slices.Equal(rule.Resources, []string{"pgshardclusters"}) &&
+		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+func matchesPgShardRestoreRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	rule := rules[0]
+	return slices.Equal(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update}) &&
+		slices.Equal(rule.APIGroups, []string{"pgshard.io"}) &&
+		slices.Equal(rule.APIVersions, []string{"v1alpha1"}) &&
+		slices.Equal(rule.Resources, []string{"pgshardrestores"}) &&
 		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
 }
 

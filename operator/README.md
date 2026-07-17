@@ -443,7 +443,7 @@ so this sample must not be used as zero-downtime evidence.
 ## Self-managed admission manager
 
 `config/admission` extends the same local-image install with four generated
-mutating webhooks and five generated validating webhooks. A manager Pod created
+mutating webhooks and six generated validating webhooks. A manager Pod created
 by this overlay has a 20-second total termination budget. Its `preStop` hook
 uses the first five seconds as an endpoint-propagation drain before `SIGTERM`,
 leaving roughly 15 seconds for graceful shutdown. The webhook Service uses the
