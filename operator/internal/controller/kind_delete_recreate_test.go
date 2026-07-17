@@ -165,7 +165,7 @@ func TestKINDDeletionWaitsForPVCBeforeSameNameRecreate(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		cleanupReconciler := &PgShardClusterReconciler{Client: kubeClient, APIReader: kubeClient}
+		cleanupReconciler := developmentReconciler(kubeClient, kubeClient)
 		request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace.Name, Name: "example"}}
 		current := &pgshardv1alpha1.PgShardCluster{}
 		if err := kubeClient.Get(cleanupCtx, request.NamespacedName, current); err == nil {
@@ -197,7 +197,7 @@ func TestKINDDeletionWaitsForPVCBeforeSameNameRecreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}}
-	reconciler := &PgShardClusterReconciler{Client: kubeClient, APIReader: kubeClient}
+	reconciler := developmentReconciler(kubeClient, kubeClient)
 	if _, err := reconciler.Reconcile(ctx, request); err != nil {
 		t.Fatal(err)
 	}

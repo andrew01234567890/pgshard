@@ -304,7 +304,7 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	}
 
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}}
-	reconciler := &PgShardClusterReconciler{Client: kubeClient, APIReader: kubeClient}
+	reconciler := developmentReconciler(kubeClient, kubeClient)
 	registerCleanup := func(request ctrl.Request) {
 		t.Helper()
 		t.Cleanup(func() {
@@ -789,7 +789,7 @@ func exerciseFullReconcileHPAtoFixedWithCachedMiss(
 	}
 	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cluster)}
 	registerCleanup(request)
-	reconciler := &PgShardClusterReconciler{Client: kubeClient, APIReader: kubeClient}
+	reconciler := developmentReconciler(kubeClient, kubeClient)
 	if _, err := reconciler.Reconcile(ctx, request); err != nil {
 		t.Fatal(err)
 	}
@@ -821,7 +821,7 @@ func exerciseFullReconcileHPAtoFixedWithCachedMiss(
 	}
 
 	staleCache := hpaCacheMissClient{Client: kubeClient, key: hpaKey}
-	staleReconciler := &PgShardClusterReconciler{Client: staleCache, APIReader: kubeClient}
+	staleReconciler := developmentReconciler(staleCache, kubeClient)
 	result, err := staleReconciler.Reconcile(ctx, request)
 	if err != nil {
 		t.Fatal(err)
