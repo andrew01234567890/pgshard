@@ -92,21 +92,15 @@ func (v *PgShardClusterValidator) ValidateCreate(_ context.Context, cluster *PgS
 }
 
 func (v *PgShardClusterValidator) ValidateUpdate(_ context.Context, oldCluster, newCluster *PgShardCluster) (admission.Warnings, error) {
+	metadataErrs := reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster)
 	if !newCluster.DeletionTimestamp.IsZero() {
 		// A deleting object must always be able to shed finalizers, including if
-		// it predates validation that its stored spec no longer satisfies.
-		return warningsFor(newCluster), nil
+		// it predates validation that its stored spec no longer satisfies. The
+		// authenticated fencing history must still remain byte-for-byte intact.
+		return warningsFor(newCluster), invalidIfAny(newCluster.Name, metadataErrs)
 	}
 	allErrs := validateClusterFields(newCluster)
-	if newCluster.Spec.MembersPerShard != 1 {
-		allErrs = append(allErrs, reservedPodFencingMetadataErrors(newCluster)...)
-	} else {
-		_, hasChallenge := newCluster.Annotations[PodFencingChallengeAnnotation]
-		_, hasReceipt := newCluster.Annotations[PodFencingReceiptAnnotation]
-		if hasChallenge != hasReceipt {
-			allErrs = append(allErrs, field.Forbidden(field.NewPath("metadata", "annotations"), "Pod fencing challenge and receipt must be absent or admission-attested together"))
-		}
-	}
+	allErrs = append(allErrs, metadataErrs...)
 	if oldCluster.Spec.PostgreSQL.Version != newCluster.Spec.PostgreSQL.Version {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "postgresql", "version"), newCluster.Spec.PostgreSQL.Version, "PostgreSQL major is immutable"))
 	}
@@ -258,6 +252,42 @@ func reservedPodFencingMetadataErrors(cluster *PgShardCluster) field.ErrorList {
 		}
 	}
 	return allErrs
+}
+
+func reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster *PgShardCluster) field.ErrorList {
+	annotationsPath := field.NewPath("metadata", "annotations")
+	oldChallenge, oldHasChallenge := oldCluster.Annotations[PodFencingChallengeAnnotation]
+	oldReceipt, oldHasReceipt := oldCluster.Annotations[PodFencingReceiptAnnotation]
+	newChallenge, newHasChallenge := newCluster.Annotations[PodFencingChallengeAnnotation]
+	newReceipt, newHasReceipt := newCluster.Annotations[PodFencingReceiptAnnotation]
+	unchanged := oldHasChallenge == newHasChallenge && oldHasReceipt == newHasReceipt &&
+		oldChallenge == newChallenge && oldReceipt == newReceipt
+
+	if !newCluster.DeletionTimestamp.IsZero() {
+		if unchanged {
+			return nil
+		}
+		return field.ErrorList{field.Forbidden(annotationsPath, "controller-owned Pod fencing metadata is immutable during deletion")}
+	}
+	if newCluster.Spec.MembersPerShard != 1 {
+		return reservedPodFencingMetadataErrors(newCluster)
+	}
+	if oldHasChallenge != oldHasReceipt || oldHasChallenge && (oldChallenge == "" || oldReceipt == "") {
+		return field.ErrorList{field.Forbidden(annotationsPath, "stored Pod fencing challenge and receipt are incomplete")}
+	}
+	if oldHasChallenge {
+		if unchanged {
+			return nil
+		}
+		return field.ErrorList{field.Forbidden(annotationsPath, "controller-owned Pod fencing challenge and receipt are immutable once established")}
+	}
+	if !newHasChallenge && !newHasReceipt {
+		return nil
+	}
+	if !newHasChallenge || !newHasReceipt || newChallenge == "" || newReceipt == "" {
+		return field.ErrorList{field.Forbidden(annotationsPath, "Pod fencing challenge and receipt must be non-empty and admission-attested together")}
+	}
+	return nil
 }
 
 // ValidateOpenTelemetryEndpoint rejects endpoints that cannot be passed safely

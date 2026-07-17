@@ -43,6 +43,15 @@ const (
 	PodFencingKeyFreshBootstrapAnnotation = "pgshard.io/pod-fencing-key-fresh-bootstrap"
 	PodFencingKeyFreshBootstrapPending    = "pending"
 	PodFencingKeyFreshBootstrapAnchored   = "anchored"
+	// PodFencingKeyLegacyUpgradeAnnotation records the two-phase transition
+	// from the last keyless admission release. The request itself lives on the
+	// newly introduced key Secret, while this state is persisted independently
+	// on the already initialized CA before any key bytes are generated.
+	PodFencingKeyLegacyUpgradeAnnotation  = "pgshard.io/pod-fencing-key-keyless-upgrade"
+	PodFencingKeyLegacyUpgradePending     = "pending"
+	PodFencingKeyLegacyUpgradeAnchored    = "anchored"
+	PodFencingKeyUpgradeRequestAnnotation = "pgshard.io/pod-fencing-keyless-upgrade-request"
+	PodFencingKeyUpgradeRequestValue      = "v1"
 
 	defaultBootstrapTimeout    = 90 * time.Second
 	defaultMaintenanceInterval = time.Hour
@@ -54,6 +63,33 @@ const (
 	webhookServicePort         = int32(443)
 	webhookTimeoutSeconds      = int32(5)
 )
+
+type podFencingKeyBootstrapState int
+
+const (
+	podFencingKeyBootstrapNone podFencingKeyBootstrapState = iota
+	podFencingKeyBootstrapFreshPending
+	podFencingKeyBootstrapFreshAnchored
+	podFencingKeyBootstrapLegacyPending
+	podFencingKeyBootstrapLegacyAnchored
+)
+
+func (state podFencingKeyBootstrapState) pending() bool {
+	return state == podFencingKeyBootstrapFreshPending || state == podFencingKeyBootstrapLegacyPending
+}
+
+func (state podFencingKeyBootstrapState) fresh() bool {
+	return state == podFencingKeyBootstrapFreshPending || state == podFencingKeyBootstrapFreshAnchored
+}
+
+func (state podFencingKeyBootstrapState) complete(anchor *corev1.Secret) {
+	switch state {
+	case podFencingKeyBootstrapFreshPending:
+		anchor.Annotations[PodFencingKeyFreshBootstrapAnnotation] = PodFencingKeyFreshBootstrapAnchored
+	case podFencingKeyBootstrapLegacyPending:
+		anchor.Annotations[PodFencingKeyLegacyUpgradeAnnotation] = PodFencingKeyLegacyUpgradeAnchored
+	}
+}
 
 type Config struct {
 	Client                      client.Client
@@ -283,11 +319,10 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	anchor, anchored, err := p.readPodFencingKeyAnchor(ctx)
+	anchor, anchored, bootstrapState, err := p.readPodFencingKeyAnchor(ctx)
 	if err != nil {
 		return err
 	}
-	freshBootstrap := anchor.Annotations[PodFencingKeyFreshBootstrapAnnotation]
 	marker := secret.Annotations[podfence.SecretKeyContinuityAnnotation]
 	if marker != "" && marker != podfence.SecretKeyContinuityValue {
 		return fmt.Errorf("Pod fencing key Secret has unsupported continuity marker %q", marker)
@@ -295,6 +330,11 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 	continuityComplete := marker == podfence.SecretKeyContinuityValue
 	if continuityComplete && !anchored {
 		return fmt.Errorf("Pod fencing key continuity marker exists but its fingerprint anchor is missing; restore the anchor or perform explicit fencing recovery")
+	}
+	if bootstrapState.fresh() && !continuityComplete {
+		if err := p.verifyNoEstablishedPostgreSQLLifecycles(ctx); err != nil {
+			return err
+		}
 	}
 	if len(secret.Data) == 0 {
 		if err := validatePodFencingKeyMetadata(secret); err != nil {
@@ -306,8 +346,11 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 		if anchored || continuityComplete {
 			return fmt.Errorf("Pod fencing key Secret is empty but a continuity fingerprint exists; restore the original key or perform explicit fencing recovery")
 		}
-		if freshBootstrap != PodFencingKeyFreshBootstrapPending {
-			return fmt.Errorf("empty Pod fencing key Secret is not part of a fresh bootstrap; restore the original key or perform explicit fencing recovery")
+		if !bootstrapState.pending() {
+			return fmt.Errorf("empty Pod fencing key Secret has no authorized bootstrap; restore the original key or perform explicit fencing recovery")
+		}
+		if bootstrapState == podFencingKeyBootstrapLegacyPending && secret.Annotations[PodFencingKeyUpgradeRequestAnnotation] != PodFencingKeyUpgradeRequestValue {
+			return fmt.Errorf("keyless upgrade authorization requires Pod fencing key request %s=%s", PodFencingKeyUpgradeRequestAnnotation, PodFencingKeyUpgradeRequestValue)
 		}
 		value := make([]byte, podfence.SecretKeyBytes)
 		if _, err := io.ReadFull(p.random, value); err != nil {
@@ -328,15 +371,20 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 		if err := podfence.ValidateSecretHandshakeKeyFingerprint(anchor, PodFencingKeyFingerprintAnnotation, key); err != nil {
 			return err
 		}
-		if freshBootstrap == PodFencingKeyFreshBootstrapPending {
-			anchor.Annotations[PodFencingKeyFreshBootstrapAnnotation] = PodFencingKeyFreshBootstrapAnchored
+		if bootstrapState.pending() {
+			bootstrapState.complete(anchor)
 			if err := p.client.Update(ctx, anchor); err != nil {
-				return fmt.Errorf("complete fresh Pod fencing key anchor: %w", err)
+				return fmt.Errorf("complete Pod fencing key bootstrap anchor: %w", err)
 			}
 		}
 		if !continuityComplete {
 			if err := p.verifyExistingReceiptHistory(ctx, key); err != nil {
 				return err
+			}
+			if bootstrapState.fresh() {
+				if err := p.verifyNoEstablishedPostgreSQLLifecycles(ctx); err != nil {
+					return err
+				}
 			}
 			if err := p.markPodFencingKeyContinuity(ctx, secret); err != nil {
 				return err
@@ -344,17 +392,22 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 		}
 		return p.checkPodFencingKey(ctx)
 	}
-	if freshBootstrap != PodFencingKeyFreshBootstrapPending {
+	if !bootstrapState.pending() {
 		return fmt.Errorf("initialized Pod fencing key has no continuity anchor; pin its fingerprint before rolling out this manager or reinstall the pre-release development cluster")
 	}
 	if err := p.verifyExistingReceiptHistory(ctx, key); err != nil {
 		return err
 	}
+	if bootstrapState.fresh() {
+		if err := p.verifyNoEstablishedPostgreSQLLifecycles(ctx); err != nil {
+			return err
+		}
+	}
 	if anchor.Annotations == nil {
 		anchor.Annotations = make(map[string]string, 1)
 	}
 	anchor.Annotations[PodFencingKeyFingerprintAnnotation] = podfence.SecretHandshakeKeyFingerprint(key)
-	anchor.Annotations[PodFencingKeyFreshBootstrapAnnotation] = PodFencingKeyFreshBootstrapAnchored
+	bootstrapState.complete(anchor)
 	if err := p.client.Update(ctx, anchor); err != nil {
 		return fmt.Errorf("anchor Pod fencing key fingerprint: %w", err)
 	}
@@ -362,6 +415,11 @@ func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
 	// cannot be skipped before the completion marker is written.
 	if err := p.verifyExistingReceiptHistory(ctx, key); err != nil {
 		return err
+	}
+	if bootstrapState.fresh() {
+		if err := p.verifyNoEstablishedPostgreSQLLifecycles(ctx); err != nil {
+			return err
+		}
 	}
 	if err := p.markPodFencingKeyContinuity(ctx, secret); err != nil {
 		return err
@@ -378,7 +436,7 @@ func (p *Provisioner) checkPodFencingKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	anchor, anchored, err := p.readPodFencingKeyAnchor(ctx)
+	anchor, anchored, _, err := p.readPodFencingKeyAnchor(ctx)
 	if err != nil {
 		return err
 	}
@@ -395,6 +453,30 @@ func (p *Provisioner) markPodFencingKeyContinuity(ctx context.Context, secret *c
 	secret.Annotations[podfence.SecretKeyContinuityAnnotation] = podfence.SecretKeyContinuityValue
 	if err := p.client.Update(ctx, secret); err != nil {
 		return fmt.Errorf("mark Pod fencing key continuity: %w", err)
+	}
+	return nil
+}
+
+func (p *Provisioner) verifyNoEstablishedPostgreSQLLifecycles(ctx context.Context) error {
+	clusters := &pgshardv1alpha1.PgShardClusterList{}
+	if err := p.client.List(ctx, clusters); err != nil {
+		return fmt.Errorf("list PgShardClusters before fresh Pod fencing key bootstrap: %w", err)
+	}
+	for index := range clusters.Items {
+		cluster := &clusters.Items[index]
+		if slices.Contains(cluster.Finalizers, owned.ClusterResourceFinalizer) || len(cluster.Status.PostgreSQLBootstraps) != 0 {
+			return fmt.Errorf("fresh Pod fencing key bootstrap is unsafe while PgShardCluster %s/%s has an established PostgreSQL lifecycle", cluster.Namespace, cluster.Name)
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := p.client.List(ctx, pods); err != nil {
+		return fmt.Errorf("list Pods before fresh Pod fencing key bootstrap: %w", err)
+	}
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if podfence.IsManagedPostgreSQLPod(pod) {
+			return fmt.Errorf("fresh Pod fencing key bootstrap is unsafe while managed PostgreSQL Pod %s/%s exists", pod.Namespace, pod.Name)
+		}
 	}
 	return nil
 }
@@ -452,13 +534,10 @@ func (p *Provisioner) verifyExistingReceiptHistory(ctx context.Context, key []by
 }
 
 func receiptBearingPostgreSQLPod(pod *corev1.Pod) bool {
-	return pod.Labels[owned.ManagedByLabel] == owned.ManagedByValue &&
-		pod.Labels[owned.ComponentLabel] == "postgresql" &&
-		pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != "" &&
+	return podfence.IsManagedPostgreSQLPod(pod) &&
 		pod.Annotations[podfence.NodeUIDAnnotation] != "" &&
 		pod.Annotations[podfence.NodeBootIDAnnotation] != "" &&
 		pod.Spec.NodeName != "" &&
-		slices.Contains(pod.Finalizers, owned.PostgreSQLPodTerminationFinalizer) &&
 		(pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed)
 }
 
@@ -471,24 +550,48 @@ func (p *Provisioner) readPodFencingKey(ctx context.Context) (*corev1.Secret, er
 	return secret, nil
 }
 
-func (p *Provisioner) readPodFencingKeyAnchor(ctx context.Context) (*corev1.Secret, bool, error) {
+func (p *Provisioner) readPodFencingKeyAnchor(ctx context.Context) (*corev1.Secret, bool, podFencingKeyBootstrapState, error) {
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: p.namespace, Name: p.caSecretName}
 	if err := p.client.Get(ctx, key, secret); err != nil {
-		return nil, false, fmt.Errorf("get Pod fencing key anchor Secret: %w", err)
+		return nil, false, podFencingKeyBootstrapNone, fmt.Errorf("get Pod fencing key anchor Secret: %w", err)
 	}
 	if err := validateManagedSecret(secret, corev1.SecretTypeOpaque); err != nil {
-		return nil, false, err
+		return nil, false, podFencingKeyBootstrapNone, err
 	}
 	_, exists := secret.Annotations[PodFencingKeyFingerprintAnnotation]
-	bootstrapState := secret.Annotations[PodFencingKeyFreshBootstrapAnnotation]
-	if bootstrapState != "" && bootstrapState != PodFencingKeyFreshBootstrapPending && bootstrapState != PodFencingKeyFreshBootstrapAnchored {
-		return nil, false, fmt.Errorf("Pod fencing key CA Secret has unsupported fresh-bootstrap state %q", bootstrapState)
+	bootstrapState, err := podFencingKeyBootstrapStateFor(secret)
+	if err != nil {
+		return nil, false, podFencingKeyBootstrapNone, err
 	}
-	if bootstrapState == PodFencingKeyFreshBootstrapAnchored && !exists {
-		return nil, false, fmt.Errorf("Pod fencing key fresh bootstrap was completed but its fingerprint anchor is missing; restore the anchor or perform explicit fencing recovery")
+	if (bootstrapState == podFencingKeyBootstrapFreshAnchored || bootstrapState == podFencingKeyBootstrapLegacyAnchored) && !exists {
+		return nil, false, podFencingKeyBootstrapNone, fmt.Errorf("Pod fencing key bootstrap was completed but its fingerprint anchor is missing; restore the anchor or perform explicit fencing recovery")
 	}
-	return secret, exists, nil
+	return secret, exists, bootstrapState, nil
+}
+
+func podFencingKeyBootstrapStateFor(secret *corev1.Secret) (podFencingKeyBootstrapState, error) {
+	fresh := secret.Annotations[PodFencingKeyFreshBootstrapAnnotation]
+	legacy := secret.Annotations[PodFencingKeyLegacyUpgradeAnnotation]
+	if fresh != "" && legacy != "" {
+		return podFencingKeyBootstrapNone, fmt.Errorf("Pod fencing key CA Secret has both fresh-install and keyless-upgrade bootstrap state")
+	}
+	switch {
+	case fresh == "" && legacy == "":
+		return podFencingKeyBootstrapNone, nil
+	case fresh == PodFencingKeyFreshBootstrapPending:
+		return podFencingKeyBootstrapFreshPending, nil
+	case fresh == PodFencingKeyFreshBootstrapAnchored:
+		return podFencingKeyBootstrapFreshAnchored, nil
+	case fresh != "":
+		return podFencingKeyBootstrapNone, fmt.Errorf("Pod fencing key CA Secret has unsupported fresh-bootstrap state %q", fresh)
+	case legacy == PodFencingKeyLegacyUpgradePending:
+		return podFencingKeyBootstrapLegacyPending, nil
+	case legacy == PodFencingKeyLegacyUpgradeAnchored:
+		return podFencingKeyBootstrapLegacyAnchored, nil
+	default:
+		return podFencingKeyBootstrapNone, fmt.Errorf("Pod fencing key CA Secret has unsupported keyless-upgrade state %q", legacy)
+	}
 }
 
 func validatePodFencingKeyMetadata(secret *corev1.Secret) error {
@@ -497,6 +600,9 @@ func validatePodFencingKeyMetadata(secret *corev1.Secret) error {
 	}
 	if secret.Type != corev1.SecretTypeOpaque {
 		return fmt.Errorf("managed Secret %s/%s has type %q, want %q", secret.Namespace, secret.Name, secret.Type, corev1.SecretTypeOpaque)
+	}
+	if request := secret.Annotations[PodFencingKeyUpgradeRequestAnnotation]; request != "" && request != PodFencingKeyUpgradeRequestValue {
+		return fmt.Errorf("managed Secret %s/%s has unsupported keyless-upgrade request %q", secret.Namespace, secret.Name, request)
 	}
 	return nil
 }
@@ -527,6 +633,9 @@ func (p *Provisioner) ensureAuthority(ctx context.Context) (*certificateAuthorit
 		if fencingKey.Immutable != nil || fencingKey.Annotations[podfence.SecretKeyContinuityAnnotation] != "" {
 			return nil, fmt.Errorf("empty CA Secret cannot authorize a fresh Pod fencing key bootstrap while the fencing key Secret is already initialized")
 		}
+		if err := p.verifyFreshBootstrapPrerequisites(ctx); err != nil {
+			return nil, err
+		}
 		authority, err := generateCertificateAuthority(p.now(), p.random, p.serviceName+"."+p.namespace+".svc")
 		if err != nil {
 			return nil, err
@@ -553,7 +662,92 @@ func (p *Provisioner) ensureAuthority(ctx context.Context) (*certificateAuthorit
 	if err != nil {
 		return nil, fmt.Errorf("validate managed CA Secret: %w", err)
 	}
+	if err := p.authorizeLegacyKeylessUpgrade(ctx, secret, authority); err != nil {
+		return nil, err
+	}
 	return authority, nil
+}
+
+func (p *Provisioner) verifyFreshBootstrapPrerequisites(ctx context.Context) error {
+	serving := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: p.namespace, Name: p.servingSecretName}
+	if err := p.client.Get(ctx, key, serving); err != nil {
+		return fmt.Errorf("get pre-created serving Secret before fresh bootstrap: %w", err)
+	}
+	if err := validateManagedServingSecret(serving); err != nil {
+		return err
+	}
+	if len(serving.Data) != 0 {
+		return fmt.Errorf("empty CA Secret cannot authorize a fresh bootstrap while the serving Secret is already initialized")
+	}
+	if _, err := p.readConfigurations(ctx, nil); err != nil {
+		return fmt.Errorf("validate empty webhook trust before fresh bootstrap: %w", err)
+	}
+	return p.verifyNoEstablishedPostgreSQLLifecycles(ctx)
+}
+
+func (p *Provisioner) authorizeLegacyKeylessUpgrade(ctx context.Context, anchor *corev1.Secret, authority *certificateAuthority) error {
+	_, anchored := anchor.Annotations[PodFencingKeyFingerprintAnnotation]
+	bootstrapState, err := podFencingKeyBootstrapStateFor(anchor)
+	if err != nil {
+		return err
+	}
+	if anchored || bootstrapState != podFencingKeyBootstrapNone {
+		return nil
+	}
+	fencingKey, err := p.readPodFencingKey(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validatePodFencingKeyMetadata(fencingKey); err != nil {
+		return err
+	}
+	if len(fencingKey.Data) != 0 || fencingKey.Immutable != nil || fencingKey.Annotations[podfence.SecretKeyContinuityAnnotation] != "" {
+		return nil
+	}
+	request := fencingKey.Annotations[PodFencingKeyUpgradeRequestAnnotation]
+	if request == "" {
+		return nil
+	}
+	if request != PodFencingKeyUpgradeRequestValue {
+		return fmt.Errorf("Pod fencing key Secret has unsupported keyless-upgrade request %q", request)
+	}
+	serving := &corev1.Secret{}
+	servingKey := types.NamespacedName{Namespace: p.namespace, Name: p.servingSecretName}
+	if err := p.client.Get(ctx, servingKey, serving); err != nil {
+		return fmt.Errorf("get serving Secret during keyless upgrade authorization: %w", err)
+	}
+	if err := validateManagedServingSecret(serving); err != nil {
+		return err
+	}
+	servingCA, hasServingCA := serving.Data[CACertificateKey]
+	servingCertificate, hasServingCertificate := serving.Data[TLSCertificateKey]
+	servingPrivateKey, hasServingPrivateKey := serving.Data[TLSPrivateKeyKey]
+	if len(serving.Data) != 3 || !hasServingCA || !hasServingCertificate || !hasServingPrivateKey || !bytes.Equal(servingCA, authority.certificatePEM) {
+		return fmt.Errorf("keyless upgrade requires serving material initialized by the existing CA")
+	}
+	if _, err := parseServingCertificate(servingCertificate, servingPrivateKey); err != nil {
+		return fmt.Errorf("validate serving material during keyless upgrade authorization: %w", err)
+	}
+	configs, err := p.readConfigurations(ctx, authority.certificatePEM)
+	if err != nil {
+		return fmt.Errorf("validate webhook trust during keyless upgrade authorization: %w", err)
+	}
+	legacyMutating := findMutatingWebhook(configs.mutating.Webhooks, mutatingWebhookName)
+	legacyValidating := findValidatingWebhook(configs.validating.Webhooks, validatingWebhookName)
+	if legacyMutating == nil || legacyValidating == nil ||
+		!bytes.Equal(legacyMutating.ClientConfig.CABundle, authority.certificatePEM) ||
+		!bytes.Equal(legacyValidating.ClientConfig.CABundle, authority.certificatePEM) {
+		return fmt.Errorf("keyless upgrade requires both existing PgShardCluster webhooks to trust the initialized CA")
+	}
+	if anchor.Annotations == nil {
+		anchor.Annotations = make(map[string]string, 1)
+	}
+	anchor.Annotations[PodFencingKeyLegacyUpgradeAnnotation] = PodFencingKeyLegacyUpgradePending
+	if err := p.client.Update(ctx, anchor); err != nil {
+		return fmt.Errorf("authorize keyless Pod fencing key upgrade: %w", err)
+	}
+	return nil
 }
 
 func (p *Provisioner) ensureServingCertificate(ctx context.Context, authority *certificateAuthority) (*servingCertificate, error) {

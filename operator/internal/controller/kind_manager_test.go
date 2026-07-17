@@ -130,6 +130,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if !verifiedHandshake {
 		t.Fatalf("PostgreSQL Pod fencing admission handshake = %#v", current.Annotations)
 	}
+	assertClusterFencingMetadataImmutable(t, ctx, kubeClient, client.ObjectKeyFromObject(current))
 	shardZeroBootstrap := bootstrapForShard(t, current, 0)
 	shardOneBootstrap := bootstrapForShard(t, current, 1)
 
@@ -313,6 +314,41 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: bootstrap.SecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 			t.Fatalf("credential creation fence survived Retain finalization: %v", err)
 		}
+	}
+}
+
+func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, kubeClient client.Client, key types.NamespacedName) {
+	t.Helper()
+	for _, test := range []struct {
+		name   string
+		mutate func(*pgshardv1alpha1.PgShardCluster)
+	}{
+		{
+			name: "removal",
+			mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+				delete(cluster.Annotations, podfence.HandshakeChallengeAnnotation)
+				delete(cluster.Annotations, podfence.HandshakeReceiptAnnotation)
+			},
+		},
+		{
+			name: "replacement",
+			mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+				cluster.Annotations[podfence.HandshakeChallengeAnnotation] = "forged-challenge"
+				cluster.Annotations[podfence.HandshakeReceiptAnnotation] = "forged-receipt"
+			},
+		},
+	} {
+		t.Run("cluster fencing metadata "+test.name+" is denied", func(t *testing.T) {
+			cluster := &pgshardv1alpha1.PgShardCluster{}
+			if err := kubeClient.Get(ctx, key, cluster); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(cluster)
+			err := kubeClient.Update(ctx, cluster)
+			if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable once established") {
+				t.Fatalf("fencing metadata %s error = %v, want webhook denial", test.name, err)
+			}
+		})
 	}
 }
 

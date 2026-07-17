@@ -203,6 +203,43 @@ func TestValidationRejectsUserSuppliedPodFencingMetadata(t *testing.T) {
 	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "admission-attested together") {
 		t.Fatalf("receipt-only single-member update error = %v", err)
 	}
+
+	oldCluster.Annotations = nil
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Annotations = map[string]string{
+		PodFencingChallengeAnnotation: "controller-challenge",
+		PodFencingReceiptAnnotation:   "admission-receipt",
+	}
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err != nil {
+		t.Fatalf("initial admission-attested metadata was rejected: %v", err)
+	}
+
+	oldCluster = newCluster.DeepCopy()
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Annotations = nil
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable once established") {
+		t.Fatalf("established metadata removal error = %v", err)
+	}
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Annotations[PodFencingChallengeAnnotation] = "replacement-challenge"
+	newCluster.Annotations[PodFencingReceiptAnnotation] = "replacement-receipt"
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable once established") {
+		t.Fatalf("established metadata replacement error = %v", err)
+	}
+
+	deletionTime := metav1.Now()
+	oldCluster.DeletionTimestamp = &deletionTime
+	oldCluster.Finalizers = []string{"pgshard.io/test-finalizer"}
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Finalizers = nil
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err != nil {
+		t.Fatalf("deletion-time finalizer removal with preserved metadata was rejected: %v", err)
+	}
+	newCluster = oldCluster.DeepCopy()
+	delete(newCluster.Annotations, PodFencingChallengeAnnotation)
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable during deletion") {
+		t.Fatalf("deletion-time metadata removal error = %v", err)
+	}
 }
 
 func TestValidationRejectsUnsafeStorageAndImmutableResize(t *testing.T) {

@@ -166,18 +166,31 @@ opt-in and returns an HMAC receipt bound to the cluster UID and fresh challenge.
 This does not prove simultaneous selector-cache convergence across every API
 server. The receipt key is an independent immutable Secret whose SHA-256
 continuity fingerprint is anchored in backward-compatible CA Secret metadata.
-Fresh-install state is recorded only while both authority Secrets are empty.
-An existing initialized but unanchored key must be pinned while the old manager
-is healthy before a mixed-version rollout; the new manager refuses to infer
-continuity from receipt listings because those listings cannot fence an older
-signer. It then verifies receipts attached to controller-established PostgreSQL
-lifecycles before writing a separate completion marker. Readiness,
+Fresh-install state is recorded only after the CA, serving, and key Secrets and
+webhook trust bundles are empty and no established PostgreSQL lifecycle exists.
+Recreating both authority Secrets cannot therefore masquerade as installation.
+The last keyless release has a distinct two-phase upgrade: the applied manifest
+requests the first key in the new empty Secret, then the manager verifies the
+existing CA, serving material, and both legacy PgShardCluster webhook trust
+bundles before recording authorization on the CA. Only then can it generate and
+anchor the key. An existing initialized but unanchored key must instead be pinned
+while the old manager is healthy before a mixed-version rollout; the new manager
+refuses to infer continuity from receipt listings because those listings cannot
+fence an older signer. It then verifies receipts attached to
+controller-established PostgreSQL lifecycles before writing a separate
+completion marker. Established challenge and receipt metadata cannot be removed
+or replaced, including during deletion. Readiness,
 receipt-authenticated admission, and controller key use require the exact key to
 match that anchor; recreating an empty or different key fails closed and does not
 mint replacement authority.
 
-For a pre-anchor development install, record the current immutable key before
-changing the manager image. Run this while the old manager is healthy:
+An upgrade from the keyless default-branch release needs no manual key command.
+Deploy the updated manifest and an immutable new manager image in one rollout;
+the request Secret must exist before a new Pod starts, and the Deployment keeps
+the old Pod available. Do not restart the old image with the new command-line
+arguments. For a pre-release development install that already has an
+initialized unanchored key, record the current immutable key before changing the
+manager image. Run this while the old manager is healthy:
 
 ```console
 KEY_UID="$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.metadata.uid}')"

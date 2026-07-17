@@ -344,14 +344,24 @@ made immutable by the same update that initializes it. A SHA-256 continuity
 fingerprint annotation is stored separately on the CA Secret, followed by a
 completion annotation on the key Secret. These metadata-only additions preserve
 the data shapes accepted by the previous manager, so a rollout can be rolled
-back. Automatic key generation is authorized only by state written while the CA
-and key Secrets are both empty on a fresh install. An existing initialized key
-without an anchor is never adopted during a mixed-version rollout: pin its
+back. Fresh-install key generation requires empty CA, serving, and key Secrets,
+empty webhook trust bundles, and no controller-established PostgreSQL lifecycle;
+the CA records authorization before key bytes are generated. Recreating both
+authority Secrets around an existing install therefore fails closed.
+
+The last keyless admission release upgrades through a separate two-phase path.
+The new manifest creates an empty key Secret carrying a versioned request. The
+manager verifies the already initialized CA and serving material and requires
+both existing PgShardCluster webhooks to trust that CA. It then records pending
+upgrade authorization on the CA Secret before generating and anchoring the
+first key. An install that already has an initialized but unanchored key is not
+this keyless state and is never adopted during a mixed-version rollout: pin its
 fingerprint in the CA Secret while the old manager is healthy, before changing
 the manager image, or reinstall the pre-release development cluster. Once
 pre-anchored, every receipt attached to an established PostgreSQL lifecycle must
-verify before the completion marker is written. Once complete, loss of the
-fingerprint fails closed instead of re-entering adoption. Startup, readiness,
+verify before the completion marker is written. Receipt metadata is immutable
+once established, including while a cluster is deleting. Once complete, loss of
+the fingerprint fails closed instead of re-entering adoption. Startup, readiness,
 receipt-authenticated admission paths, and controller reconciliation all require
 the exact immutable key to match that anchor, so an empty, mutable, oversized,
 or different replacement cannot silently invalidate outstanding receipts.
@@ -366,8 +376,14 @@ or malformed. Existing non-empty malformed Secrets,
 foreign CA bundles, and incorrectly targeted webhook configurations stop
 startup instead of being overwritten.
 
-For a pre-anchor development install, perform this explicit first phase while
-the old manager is still healthy, then roll out the new manager image:
+The keyless release on the default branch needs no manual key command. Deploy
+the updated manifest and an immutable new manager image in one rollout; the
+manifest request Secret must exist before a new Pod starts, while the old Pod is
+kept available by the zero-unavailable Deployment strategy. Do not restart the
+old image with the new command-line arguments. For a pre-release development
+install that already has an initialized unanchored key, perform this explicit
+first phase while the old manager is still healthy, then roll out the new
+manager image:
 
 ```console
 KEY_UID="$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.metadata.uid}')"

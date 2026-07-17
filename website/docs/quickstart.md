@@ -84,12 +84,16 @@ The admission overlay provisions an ECDSA serving chain and a separate immutable
 256-bit fencing key into exact-name operator-managed Secrets, injects the CA
 bundle, and anchors the key's SHA-256 continuity fingerprint in the independent
 CA Secret's metadata, preserving the Secret data shape accepted by the previous
-manager for rollback. Fresh-install authority is recorded while both Secrets are
-empty; an existing initialized key without an anchor is refused and must be
-pinned while the old manager is healthy before the new image is rolled out.
-Established receipt history is then verified before a separate completion marker
-is written. See [High availability](operations/high-availability.md) for the
-pre-anchor development upgrade command. Startup, readiness,
+manager for rollback. Fresh-install authority requires all three material
+Secrets and webhook trust bundles to be empty and no established PostgreSQL
+lifecycle. The last keyless release upgrades automatically only after a
+versioned manifest request and independent proof of its existing CA, serving
+material, and legacy webhook trust are recorded in a first phase. An existing
+initialized key without an anchor is refused and must be pinned while the old
+manager is healthy before the new image is rolled out. Established receipt
+history is then verified before a separate completion marker is written. See
+[High availability](operations/high-availability.md) for the pre-anchor
+development upgrade command. Startup, readiness,
 receipt-authenticated admission, and reconciliation reject an empty, mutable,
 incorrectly sized, or different replacement key. The leaf certificate renews without a Pod restart;
 automatic CA or fencing-key rotation is not yet implemented. Expect the sample to remain `Ready=False`, its

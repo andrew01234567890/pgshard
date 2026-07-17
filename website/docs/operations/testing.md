@@ -584,12 +584,18 @@ running-container terminal reports, copied or forged HMAC receipts, and receipt
 or binding metadata changes, request-path namespace confusion, and partially
 stripped PostgreSQL identity, while allowing non-PostgreSQL pgshard Pods to bind.
 PKI tests prove leaf renewal leaves the separate immutable fencing key unchanged,
-fresh-install authority cannot be recreated around an initialized key, an
-unanchored legacy key is refused, and a pre-anchored key completes migration only
-after established cluster and terminal receipts verify. Fault injection writes a
+fresh-install authority requires empty serving and webhook trust plus absence of
+established clusters and managed Pods, and recreated authority Secrets cannot
+reuse that path. An origin/main keyless fixture proves its versioned request,
+existing serving material, and both legacy webhook trust bundles authorize a
+two-phase first-key upgrade, while loss of any proof leaves the key empty. An
+initialized unanchored legacy key is refused, and a pre-anchored key completes
+migration only after established cluster and terminal receipts verify. Fault injection writes a
 mismatching established receipt during the fresh anchor update and proves the
 completion marker remains absent; unrelated multi-member, unprovisioned, and
-unmanaged markers do not block startup. Later anchor loss remains failed closed,
+unmanaged or partially labelled markers do not block startup. Established
+cluster receipt metadata cannot be removed or replaced, including during
+deletion. Later anchor loss remains failed closed,
 and metadata-only continuity state preserves previous-manager rollback. Empty,
 mutable, oversized, or different valid key replacements fail startup, readiness,
 receipt-authenticated webhook use, and controller verification. The KIND

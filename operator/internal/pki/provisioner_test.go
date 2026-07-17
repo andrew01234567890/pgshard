@@ -339,7 +339,7 @@ func TestBootstrapRefusesAutomaticLegacyKeyAdoption(t *testing.T) {
 		want  string
 	}{
 		{name: "initialized key", want: "pin its fingerprint before rolling out this manager"},
-		{name: "empty key", empty: true, want: "is not part of a fresh bootstrap"},
+		{name: "empty key", empty: true, want: "has no authorized bootstrap"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -383,6 +383,108 @@ func TestBootstrapRefusesAutomaticLegacyKeyAdoption(t *testing.T) {
 	}
 }
 
+func TestBootstrapUpgradesOriginMainKeylessAdmissionStateInTwoPhases(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	kubeClient := newTestClient(t, installObjects()...)
+	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resetToOriginMainKeylessState(t, ctx, kubeClient)
+
+	if _, err := provisioner.ensureAuthority(ctx); err != nil {
+		t.Fatal(err)
+	}
+	caSecret := getSecret(t, kubeClient, testCASecretName)
+	keySecret := getSecret(t, kubeClient, testFencingKeySecretName)
+	if caSecret.Annotations[PodFencingKeyLegacyUpgradeAnnotation] != PodFencingKeyLegacyUpgradePending {
+		t.Fatal("origin/main upgrade did not persist authorization before key generation")
+	}
+	if len(keySecret.Data) != 0 || keySecret.Immutable != nil {
+		t.Fatal("origin/main upgrade generated key material during its authorization phase")
+	}
+
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	caSecret = getSecret(t, kubeClient, testCASecretName)
+	keySecret = getSecret(t, kubeClient, testFencingKeySecretName)
+	if caSecret.Annotations[PodFencingKeyLegacyUpgradeAnnotation] != PodFencingKeyLegacyUpgradeAnchored ||
+		caSecret.Annotations[PodFencingKeyFingerprintAnnotation] != podfence.SecretHandshakeKeyFingerprint(keySecret.Data[PodFencingKeyKey]) ||
+		keySecret.Annotations[podfence.SecretKeyContinuityAnnotation] != podfence.SecretKeyContinuityValue {
+		t.Fatalf("origin/main keyless upgrade did not complete: CA=%#v key=%#v", caSecret.Annotations, keySecret.Annotations)
+	}
+	if len(caSecret.Data) != 2 || len(keySecret.Data) != 1 || keySecret.Immutable == nil || !*keySecret.Immutable {
+		t.Fatal("origin/main keyless upgrade changed rollback data shapes or left the key mutable")
+	}
+}
+
+func TestBootstrapRequiresIndependentProofForOriginMainKeylessUpgrade(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, context.Context, client.Client)
+		want   string
+	}{
+		{
+			name: "manifest request",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client) {
+				keySecret := getSecret(t, kubeClient, testFencingKeySecretName)
+				delete(keySecret.Annotations, PodFencingKeyUpgradeRequestAnnotation)
+				if err := kubeClient.Update(ctx, keySecret); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "has no authorized bootstrap",
+		},
+		{
+			name: "serving material",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client) {
+				serving := getSecret(t, kubeClient, testServingSecretName)
+				serving.Data = nil
+				if err := kubeClient.Update(ctx, serving); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "requires serving material initialized by the existing CA",
+		},
+		{
+			name: "webhook trust",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client) {
+				mutating := &admissionregistrationv1.MutatingWebhookConfiguration{}
+				if err := kubeClient.Get(ctx, types.NamespacedName{Name: testMutatingConfigurationName}, mutating); err != nil {
+					t.Fatal(err)
+				}
+				findMutatingWebhook(mutating.Webhooks, mutatingWebhookName).ClientConfig.CABundle = nil
+				if err := kubeClient.Update(ctx, mutating); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "both existing PgShardCluster webhooks",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			kubeClient := newTestClient(t, installObjects()...)
+			provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+			if err := provisioner.Bootstrap(ctx); err != nil {
+				t.Fatal(err)
+			}
+			resetToOriginMainKeylessState(t, ctx, kubeClient)
+			test.mutate(t, ctx, kubeClient)
+			if err := provisioner.Bootstrap(ctx); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Bootstrap() error = %v, want %q", err, test.want)
+			}
+			keySecret := getSecret(t, kubeClient, testFencingKeySecretName)
+			if len(keySecret.Data) != 0 {
+				t.Fatal("failed keyless-upgrade proof generated key material")
+			}
+		})
+	}
+}
+
 func TestBootstrapDoesNotTreatRecreatedCAAsFreshInstall(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -408,6 +510,91 @@ func TestBootstrapDoesNotTreatRecreatedCAAsFreshInstall(t *testing.T) {
 	caSecret = getSecret(t, kubeClient, testCASecretName)
 	if caSecret.Annotations[PodFencingKeyFreshBootstrapAnnotation] != "" || len(caSecret.Data) != 0 {
 		t.Fatal("recreated CA Secret was granted fresh-install authority")
+	}
+}
+
+func TestBootstrapDoesNotTreatRecreatedAuthoritySecretsAsFreshInstall(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	kubeClient := newTestClient(t, installObjects()...)
+	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+	if err := provisioner.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{testCASecretName, testFencingKeySecretName} {
+		if err := kubeClient.Delete(ctx, getSecret(t, kubeClient, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	managedLabels := map[string]string{ManagedByLabel: ManagedByValue}
+	if err := kubeClient.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testCASecretName, Labels: managedLabels},
+		Type:       corev1.SecretTypeOpaque,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNamespace,
+			Name:      testFencingKeySecretName,
+			Labels:    managedLabels,
+			Annotations: map[string]string{
+				PodFencingKeyUpgradeRequestAnnotation: PodFencingKeyUpgradeRequestValue,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := provisioner.Bootstrap(ctx); err == nil || !strings.Contains(err.Error(), "serving Secret is already initialized") {
+		t.Fatalf("Bootstrap() error = %v", err)
+	}
+	if caSecret := getSecret(t, kubeClient, testCASecretName); len(caSecret.Data) != 0 || len(caSecret.Annotations) != 0 {
+		t.Fatal("recreated authority Secrets were granted fresh-install authority")
+	}
+}
+
+func TestFreshBootstrapRefusesEstablishedPostgreSQLLifecycles(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		object client.Object
+		want   string
+	}{
+		{
+			name: "cluster",
+			object: &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{
+				Namespace: testNamespace,
+				Name:      "established-cluster",
+				Finalizers: []string{
+					owned.ClusterResourceFinalizer,
+				},
+			}},
+			want: "has an established PostgreSQL lifecycle",
+		},
+		{
+			name:   "Pod",
+			object: podWithTerminationReceipt(t, bytes.Repeat([]byte{0xff}, podfence.SecretKeyBytes), "established-pod"),
+			want:   "managed PostgreSQL Pod",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			objects := installObjects()
+			objects = append(objects, test.object.DeepCopyObject().(client.Object))
+			kubeClient := newTestClient(t, objects...)
+			provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+			if err := provisioner.Bootstrap(ctx); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Bootstrap() error = %v, want %q", err, test.want)
+			}
+			caSecret := getSecret(t, kubeClient, testCASecretName)
+			keySecret := getSecret(t, kubeClient, testFencingKeySecretName)
+			if len(caSecret.Data) != 0 || len(keySecret.Data) != 0 {
+				t.Fatal("unsafe fresh bootstrap mutated authority material")
+			}
+		})
 	}
 }
 
@@ -480,6 +667,7 @@ func TestBootstrapRefusesPreAnchoredKeyThatCannotVerifyReceiptHistory(t *testing
 			if err := kubeClient.Update(ctx, keySecret); err != nil {
 				t.Fatal(err)
 			}
+			clearFreshBootstrapState(t, ctx, kubeClient)
 			differentKey := bytes.Repeat([]byte{0xff}, podfence.SecretKeyBytes)
 			if err := kubeClient.Create(ctx, test.object(t, differentKey)); err != nil {
 				t.Fatal(err)
@@ -508,6 +696,7 @@ func TestBootstrapIgnoresReceiptsOutsideEstablishedPostgreSQLLifecycles(t *testi
 	if err := kubeClient.Update(ctx, keySecret); err != nil {
 		t.Fatal(err)
 	}
+	clearFreshBootstrapState(t, ctx, kubeClient)
 	differentKey := bytes.Repeat([]byte{0xff}, podfence.SecretKeyBytes)
 	multiMember := clusterWithHandshakeReceipt(t, differentKey, "unrelated-multi-member")
 	multiMember.Spec.MembersPerShard = 3
@@ -523,6 +712,11 @@ func TestBootstrapIgnoresReceiptsOutsideEstablishedPostgreSQLLifecycles(t *testi
 	unmanagedPod.Labels = nil
 	unmanagedPod.Finalizers = nil
 	if err := kubeClient.Create(ctx, unmanagedPod); err != nil {
+		t.Fatal(err)
+	}
+	partiallyManagedPod := podWithTerminationReceipt(t, differentKey, "partially-managed-terminal-pod")
+	delete(partiallyManagedPod.Labels, owned.ClusterLabel)
+	if err := kubeClient.Create(ctx, partiallyManagedPod); err != nil {
 		t.Fatal(err)
 	}
 
@@ -603,6 +797,7 @@ func TestBootstrapCompletesInterruptedAnchoredMigration(t *testing.T) {
 	if err := kubeClient.Update(ctx, keySecret); err != nil {
 		t.Fatal(err)
 	}
+	clearFreshBootstrapState(t, ctx, kubeClient)
 	key := keySecret.Data[PodFencingKeyKey]
 	if err := kubeClient.Create(ctx, clusterWithHandshakeReceipt(t, key, "interrupted-cluster")); err != nil {
 		t.Fatal(err)
@@ -777,7 +972,7 @@ func TestBootstrapRefusesIncompleteServingSecret(t *testing.T) {
 	kubeClient := newTestClient(t, objects...)
 	provisioner := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
 	err := provisioner.Bootstrap(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "must be empty or contain exactly") {
+	if err == nil || !strings.Contains(err.Error(), "serving Secret is already initialized") {
 		t.Fatalf("Bootstrap() error = %v", err)
 	}
 	got := getSecret(t, kubeClient, testServingSecretName)
@@ -1013,7 +1208,14 @@ func installObjects() []client.Object {
 			ObjectMeta: metav1.ObjectMeta{Name: testValidatingConfigurationName},
 			Webhooks:   []admissionregistrationv1.ValidatingWebhook{clusterValidating, metadataValidating, namespaceValidating, statusValidating, bindingValidating},
 		},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testFencingKeySecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNamespace,
+			Name:      testFencingKeySecretName,
+			Labels:    managedLabels,
+			Annotations: map[string]string{
+				PodFencingKeyUpgradeRequestAnnotation: PodFencingKeyUpgradeRequestValue,
+			},
+		}, Type: corev1.SecretTypeOpaque},
 	}
 }
 
@@ -1067,6 +1269,10 @@ func podWithTerminationReceipt(t *testing.T, key []byte, name string) *corev1.Po
 			Labels: map[string]string{
 				owned.ManagedByLabel: owned.ManagedByValue,
 				owned.ComponentLabel: "postgresql",
+				owned.ClusterLabel:   "example",
+				owned.ShardLabel:     "0",
+				owned.RoleLabel:      "primary",
+				owned.MemberLabel:    "0",
 			},
 			Annotations: map[string]string{
 				owned.PostgreSQLPodClusterUIDAnnotation: "cluster-uid",
@@ -1098,6 +1304,68 @@ func getSecret(t *testing.T, kubeClient client.Client, name string) *corev1.Secr
 		t.Fatal(err)
 	}
 	return secret
+}
+
+func resetToOriginMainKeylessState(t *testing.T, ctx context.Context, kubeClient client.Client) {
+	t.Helper()
+	caSecret := getSecret(t, kubeClient, testCASecretName)
+	delete(caSecret.Annotations, PodFencingKeyFingerprintAnnotation)
+	delete(caSecret.Annotations, PodFencingKeyFreshBootstrapAnnotation)
+	delete(caSecret.Annotations, PodFencingKeyLegacyUpgradeAnnotation)
+	if err := kubeClient.Update(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
+	keySecret := getSecret(t, kubeClient, testFencingKeySecretName)
+	if err := kubeClient.Delete(ctx, keySecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNamespace,
+			Name:      testFencingKeySecretName,
+			Labels:    map[string]string{ManagedByLabel: ManagedByValue},
+			Annotations: map[string]string{
+				PodFencingKeyUpgradeRequestAnnotation: PodFencingKeyUpgradeRequestValue,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mutating := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: testMutatingConfigurationName}, mutating); err != nil {
+		t.Fatal(err)
+	}
+	for index := range mutating.Webhooks {
+		if mutating.Webhooks[index].Name != mutatingWebhookName {
+			mutating.Webhooks[index].ClientConfig.CABundle = nil
+		}
+	}
+	if err := kubeClient.Update(ctx, mutating); err != nil {
+		t.Fatal(err)
+	}
+	validating := &admissionregistrationv1.ValidatingWebhookConfiguration{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: testValidatingConfigurationName}, validating); err != nil {
+		t.Fatal(err)
+	}
+	for index := range validating.Webhooks {
+		if validating.Webhooks[index].Name != validatingWebhookName {
+			validating.Webhooks[index].ClientConfig.CABundle = nil
+		}
+	}
+	if err := kubeClient.Update(ctx, validating); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func clearFreshBootstrapState(t *testing.T, ctx context.Context, kubeClient client.Client) {
+	t.Helper()
+	caSecret := getSecret(t, kubeClient, testCASecretName)
+	delete(caSecret.Annotations, PodFencingKeyFreshBootstrapAnnotation)
+	if err := kubeClient.Update(ctx, caSecret); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertInjectedBundles(t *testing.T, kubeClient client.Client, wanted []byte) {

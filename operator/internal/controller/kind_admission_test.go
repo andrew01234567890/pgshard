@@ -64,9 +64,7 @@ func TestKINDAdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec(t *testing.T) {
 	valid.Spec.Pooler = pgshardv1alpha1.PoolerSpec{}
 	valid.Spec.Services = pgshardv1alpha1.ServiceSet{}
 	valid.Spec.Observability.Prometheus = nil
-	if err := kubeClient.Create(ctx, valid, &client.CreateOptions{DryRun: []string{metav1.DryRunAll}}); err != nil {
-		t.Fatalf("dry-run defaulted create: %v", err)
-	}
+	valid = waitForDefaultedDryRunCreate(t, ctx, kubeClient, valid)
 	if valid.Spec.Shards != 1 || valid.Spec.MembersPerShard != 3 || valid.Spec.Durability != pgshardv1alpha1.DurabilitySynchronous || valid.Spec.PostgreSQL.Version != pgshardv1alpha1.PostgreSQLMajor18 || valid.Spec.Storage.DeletionPolicy != pgshardv1alpha1.DeletionRetain || valid.Spec.Pooler.Scaling.Mode != pgshardv1alpha1.ScalingHPA || valid.Spec.Observability.Prometheus == nil || !*valid.Spec.Observability.Prometheus {
 		t.Fatalf("admission defaults = %#v", valid.Spec)
 	}
@@ -81,6 +79,39 @@ func TestKINDAdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec(t *testing.T) {
 		t.Fatalf("unsafe create error = %v", err)
 	}
 
+}
+
+func waitForDefaultedDryRunCreate(
+	t *testing.T,
+	ctx context.Context,
+	kubeClient client.Client,
+	original *pgshardv1alpha1.PgShardCluster,
+) *pgshardv1alpha1.PgShardCluster {
+	t.Helper()
+	var (
+		created *pgshardv1alpha1.PgShardCluster
+		lastErr error
+	)
+	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		candidate := original.DeepCopy()
+		lastErr = kubeClient.Create(ctx, candidate, &client.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+		if lastErr != nil {
+			// Pod readiness can recover just before the API server observes the
+			// Service endpoint again. Retry only control-plane availability errors;
+			// deterministic admission denials must still fail immediately.
+			if apierrors.IsInternalError(lastErr) || apierrors.IsServiceUnavailable(lastErr) ||
+				apierrors.IsTimeout(lastErr) || apierrors.IsServerTimeout(lastErr) || apierrors.IsTooManyRequests(lastErr) {
+				return false, nil
+			}
+			return false, lastErr
+		}
+		created = candidate
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for defaulted dry-run create after webhook readiness recovery: %v (last create error: %v)", err, lastErr)
+	}
+	return created
 }
 
 func assertFencingKeyLossFailsReadiness(t *testing.T, ctx context.Context, kubeClient client.Client) {
