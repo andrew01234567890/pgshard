@@ -153,7 +153,61 @@ func TestKINDRestoreTopologyMismatchIsRejectedBeforeMutation(t *testing.T) {
 	if err := kubeClient.Update(ctx, reordered); !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "restore specification is immutable") {
 		t.Fatalf("signed shard reorder update error = %T %v, want immutable API rejection", err, err)
 	}
+	pinnedKeyUID := current.Status.VerificationKeyUID
+	if err := kubeClient.Delete(ctx, keySecret); err != nil {
+		t.Fatal(err)
+	}
+	triggerRestoreReconcile(t, ctx, kubeClient, client.ObjectKeyFromObject(exact), "verification-key-missing")
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(exact), current); err != nil {
+			return false, err
+		}
+		condition := meta.FindStatusCondition(current.Status.Conditions, restorePreflightCondition)
+		return condition != nil && condition.Status == metav1.ConditionUnknown && condition.Reason == "VerificationKeyUnavailable", nil
+	}); err != nil {
+		t.Fatalf("wait for missing pinned verification key: %v; status=%#v", err, current.Status)
+	}
+	if current.Status.VerificationKeyUID != pinnedKeyUID {
+		t.Fatalf("missing verification key cleared pinned UID: %#v", current.Status)
+	}
+	replacementKey := keySecret.DeepCopy()
+	replacementKey.UID = ""
+	replacementKey.ResourceVersion = ""
+	if err := kubeClient.Create(ctx, replacementKey); err != nil {
+		t.Fatal(err)
+	}
+	if replacementKey.UID == pinnedKeyUID {
+		t.Fatalf("replacement verification key reused UID %q", pinnedKeyUID)
+	}
+	triggerRestoreReconcile(t, ctx, kubeClient, client.ObjectKeyFromObject(exact), "verification-key-replaced")
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(exact), current); err != nil {
+			return false, err
+		}
+		condition := meta.FindStatusCondition(current.Status.Conditions, restorePreflightCondition)
+		return condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "VerificationKeyReplaced", nil
+	}); err != nil {
+		t.Fatalf("wait for replacement verification key rejection: %v; status=%#v", err, current.Status)
+	}
+	if current.Status.Phase != pgshardv1alpha1.RestorePhaseRejected || current.Status.VerificationKeyUID != pinnedKeyUID {
+		t.Fatalf("replacement verification key rebound live restore: %#v", current.Status)
+	}
 	assertRestoreNamespaceHasNoTargets(t, ctx, kubeClient, namespace.Name, sentinel, 1)
+}
+
+func triggerRestoreReconcile(t *testing.T, ctx context.Context, kubeClient client.Client, key client.ObjectKey, value string) {
+	t.Helper()
+	restore := &pgshardv1alpha1.PgShardRestore{}
+	if err := kubeClient.Get(ctx, key, restore); err != nil {
+		t.Fatal(err)
+	}
+	if restore.Annotations == nil {
+		restore.Annotations = make(map[string]string, 1)
+	}
+	restore.Annotations["test.pgshard.io/reconcile"] = value
+	if err := kubeClient.Update(ctx, restore); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func prepareLiveRestore(restore *pgshardv1alpha1.PgShardRestore, namespace string) {
