@@ -74,7 +74,7 @@ const (
 	PostgreSQLPodTerminationFinalizer       = "pgshard.io/postgresql-termination"
 	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 	shardschemaMigrationPath                = "/usr/share/pgshard/migrations/0001_shardschema.sql"
-	shardschemaMigrationSHA256              = "df8cf333c840add50e584ba7d968648ef6c740d447cc66a108fb82aba1751fb9"
+	shardschemaMigrationSHA256              = "f337074ad36ac3741979d34083150803926434a49a4b6b655124028184a92084"
 	shardschemaMigrationHashAnnotation      = "pgshard.io/shardschema-migration-sha256"
 )
 
@@ -185,7 +185,7 @@ fi
 socket=/tmp/pgshard-catalog-bootstrap
 rm -rf -- "$socket"
 mkdir -m 0700 -- "$socket"
-export PGOPTIONS='-c lock_timeout=5s -c statement_timeout=30s -c transaction_timeout=120s -c idle_in_transaction_session_timeout=30s'
+export PGOPTIONS='-c lock_timeout=5s -c statement_timeout=30s -c transaction_timeout=120s -c idle_in_transaction_session_timeout=30s -c search_path=pg_catalog -c quote_all_identifiers=off'
 stop_temporary_postgres() {
   result=$?
   trap - EXIT
@@ -290,15 +290,17 @@ validate_catalog_inventory() {
 
 # CREATE TABLE IF NOT EXISTS cannot repair a damaged pre-existing relation.
 # Fingerprint every namespaced object plus the behavior-bearing relation,
-# column, constraint, index, type, routine-signature, trigger, and policy
-# metadata. Only the released v0.49 shape and the current shape reached by a
-# fresh install or v0.49 upgrade are valid inputs. Function bodies are replaced
-# by the migration; their exact signatures and execution attributes still
-# participate in the shape.
+# sequence, column, constraint, index, type, routine-signature, rule, trigger,
+# and policy metadata. Only the released v0.49 shape and the current shape
+# reached by a fresh install or v0.49 upgrade are valid inputs. Function bodies
+# are replaced by the migration; their exact signatures and execution
+# attributes still participate in the shape.
 catalog_schema_fingerprint="$(
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
-    --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
-      WITH catalog_namespace AS (
+    --set=ON_ERROR_STOP=1 --quiet --no-align --tuples-only --command="
+      SET SESSION search_path = pg_catalog;
+      SET SESSION quote_all_identifiers = off;
+      WITH catalog_namespace AS MATERIALIZED (
         SELECT namespaces.oid
           FROM pg_catalog.pg_namespace AS namespaces
          WHERE namespaces.nspname = 'pgshard_catalog'
@@ -334,6 +336,36 @@ catalog_schema_fingerprint="$(
             ON access_methods.oid = relations.relam
          WHERE relations.relnamespace = (SELECT oid FROM catalog_namespace)
            AND relations.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'sequence|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+                   sequences.relname,
+                   pg_catalog.format_type(sequence_metadata.seqtypid, NULL),
+                   sequence_metadata.seqstart,
+                   sequence_metadata.seqincrement,
+                   sequence_metadata.seqmax,
+                   sequence_metadata.seqmin,
+                   sequence_metadata.seqcache,
+                   sequence_metadata.seqcycle,
+                   COALESCE(owned_relations.relname, ''),
+                   COALESCE(owned_attributes.attname, '')
+               )
+          FROM pg_catalog.pg_sequence AS sequence_metadata
+          JOIN pg_catalog.pg_class AS sequences
+            ON sequences.oid = sequence_metadata.seqrelid
+          LEFT JOIN pg_catalog.pg_depend AS ownership
+            ON ownership.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+           AND ownership.objid = sequences.oid
+           AND ownership.objsubid = 0
+           AND ownership.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+           AND ownership.refobjsubid > 0
+           AND ownership.deptype IN ('a', 'i')
+          LEFT JOIN pg_catalog.pg_class AS owned_relations
+            ON owned_relations.oid = ownership.refobjid
+          LEFT JOIN pg_catalog.pg_attribute AS owned_attributes
+            ON owned_attributes.attrelid = ownership.refobjid
+           AND owned_attributes.attnum = ownership.refobjsubid
+         WHERE sequences.relnamespace = (SELECT oid FROM catalog_namespace)
         UNION ALL
         SELECT pg_catalog.format(
                    'inherits|%s|%s|%s',
@@ -478,19 +510,54 @@ catalog_schema_fingerprint="$(
                    routines.proisstrict,
                    COALESCE(pg_catalog.array_to_string(routines.proconfig, ','), '')
                )
-          FROM pg_catalog.pg_proc AS routines
+         FROM pg_catalog.pg_proc AS routines
          WHERE routines.pronamespace = (SELECT oid FROM catalog_namespace)
         UNION ALL
         SELECT pg_catalog.format(
-                   'trigger|%s|%s|%s',
+                   'rule|%s|%s|%s|%s|%s|%s',
+                   relations.relname,
+                   rewrite_rules.rulename,
+                   rewrite_rules.ev_type,
+                   rewrite_rules.ev_enabled,
+                   rewrite_rules.is_instead,
+                   pg_catalog.pg_get_ruledef(rewrite_rules.oid, true)
+               )
+          FROM pg_catalog.pg_rewrite AS rewrite_rules
+          JOIN pg_catalog.pg_class AS relations ON relations.oid = rewrite_rules.ev_class
+         WHERE relations.relnamespace = (SELECT oid FROM catalog_namespace)
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'trigger|%s|%s|%s|%s',
                    relations.relname,
                    triggers.tgname,
+                   triggers.tgenabled,
                    pg_catalog.pg_get_triggerdef(triggers.oid, true)
                )
           FROM pg_catalog.pg_trigger AS triggers
           JOIN pg_catalog.pg_class AS relations ON relations.oid = triggers.tgrelid
          WHERE relations.relnamespace = (SELECT oid FROM catalog_namespace)
            AND NOT triggers.tgisinternal
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'internal-trigger|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+                   relations.relname,
+                   constraints.conname,
+                   routines.proname,
+                   triggers.tgtype,
+                   triggers.tgenabled,
+                   triggers.tgdeferrable,
+                   triggers.tginitdeferred,
+                   triggers.tgnargs,
+                   pg_catalog.octet_length(triggers.tgargs),
+                   triggers.tgattr,
+                   triggers.tgqual IS NULL AND triggers.tgparentid = 0
+               )
+          FROM pg_catalog.pg_trigger AS triggers
+          JOIN pg_catalog.pg_class AS relations ON relations.oid = triggers.tgrelid
+          JOIN pg_catalog.pg_constraint AS constraints ON constraints.oid = triggers.tgconstraint
+          JOIN pg_catalog.pg_proc AS routines ON routines.oid = triggers.tgfoid
+         WHERE relations.relnamespace = (SELECT oid FROM catalog_namespace)
+           AND triggers.tgisinternal
         UNION ALL
         SELECT pg_catalog.format(
                    'policy|%s|%s|%s|%s|%s|%s|%s',
@@ -536,11 +603,11 @@ case "$catalog_core_tables" in
     ;;
   "t|t|t")
     case "$catalog_schema_fingerprint" in
-      "9bcd876a113347bd5ce8f09223c62764f8dc718ae2c82f1a0927a79b540e8c47"|\
-      "4ffbb7e2265874434df99e69bad693856e262b38b788ce3c8b35ef6b20ff4074"|\
-      "6711de8bd95b456b384a9672de9b1c237f2df7db30bb9a9a58cc9431fc401373") ;;
+      "ee17a64c8eec5e2e9a44f29d4764edac90680980f61df35bdb2284c01b57c4d9"|\
+      "2720fa78d0bc96c21311b1656eeaabbb3e745ea65fa9d1ea701ffb67cde1b1d9"|\
+      "ceec4ff5d633d28afacf1e93fbc2547591017e57f172dc3a8072814bb6d3867a") ;;
       *)
-        echo "refusing an unsupported or malformed pre-existing shardschema catalog" >&2
+        echo "refusing an unsupported or malformed pre-existing shardschema catalog ($catalog_schema_fingerprint)" >&2
         exit 1
         ;;
     esac
@@ -557,7 +624,7 @@ psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema 
 
 validate_catalog_inventory
 
-missing_shards="$(
+count_missing_shards() {
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
     --set=ON_ERROR_STOP=1 \
     --no-align --tuples-only --command="
@@ -567,7 +634,9 @@ missing_shards="$(
           ON shards.shard_id::text = 'shard-' || pg_catalog.lpad(expected.shard_number::text, 4, '0')
          AND shards.shard_number = expected.shard_number
        WHERE shards.shard_id IS NULL"
-)"
+}
+
+missing_shards="$(count_missing_shards)"
 if [[ "$missing_shards" != "0" ]]; then
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
     --set=ON_ERROR_STOP=1 <<PGSHARD_SHARD_INVENTORY
@@ -588,6 +657,11 @@ PGSHARD_SHARD_INVENTORY
 fi
 
 validate_catalog_inventory
+
+if [[ "$(count_missing_shards)" != "0" ]]; then
+  echo "refusing shardschema inventory with missing configured shards" >&2
+  exit 1
+fi
 
 pg_ctl -D "$final" -w -t 45 stop -m fast
 trap - EXIT

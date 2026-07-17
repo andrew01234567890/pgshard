@@ -132,11 +132,12 @@ resource-derived primary configuration as the main server so durable logical
 slots and prepared transactions remain startable during the init pass. Before
 applying SQL, it creates the UTF8 `shardschema` database when absent. A fresh
 install requires the reserved `pgshard_catalog` schema to be absent or empty.
-An upgrade requires a complete supported object, column, constraint, index,
-type, routine-signature, trigger, and policy fingerprint: released v0.49,
-current-after-v0.49-upgrade, or current-fresh-install. A partial or structurally
-altered catalog is rejected because `IF NOT EXISTS` DDL cannot repair it. For a
-supported catalog
+An upgrade requires a complete supported object, sequence, column, constraint,
+index, type, routine-signature, rewrite-rule, user-trigger, internal-FK-trigger,
+and policy fingerprint: released v0.49, current-after-v0.49-upgrade, or
+current-fresh-install. Fingerprint rendering pins the session search path and
+identifier-quoting mode. A partial or structurally altered catalog is rejected
+because `IF NOT EXISTS` DDL cannot repair it. For a supported catalog
 it checks home-shard identity, canonical shard state, and permanent restore
 history with active lineage exactly matching active shards. It then applies the
 hash-verified migration embedded in the selected bootstrap image and inserts
@@ -150,6 +151,11 @@ unsupported catalog shape, conflicting identity or lineage, malformed
 inventory, failed migration, or failed inventory transaction keeps the primary
 unready. A
 released v0.49 catalog and an empty database are both supported retry inputs.
+Before its first seed statement, the migration drops every validated user
+trigger so a replaceable pre-existing trigger-function body cannot execute as
+the bootstrap principal; it recreates the canonical functions and triggers in
+the same transaction. After inserting missing shard identities, bootstrap
+recounts the requested inventory so a suppressed insert cannot report success.
 Reapplying an unchanged migration and inventory does not advance the catalog
 epoch.
 Application Services still target the rejection-only pooler and must not be
