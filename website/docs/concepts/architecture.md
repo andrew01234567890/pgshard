@@ -11,9 +11,11 @@ in [implementation status](../project/status.md) currently exist.
 :::
 
 The target architecture separates the latency-sensitive data path from
-declarative Kubernetes reconciliation. Rust components will route queries,
-manage PostgreSQL instances, decode WAL, and recover distributed operations. The
-Go operator will translate custom resources into cluster resources and
+declarative Kubernetes reconciliation. A `PgShardCluster` is a routing and
+control-plane fleet containing independently placed logical databases, not one
+cluster-wide database shard map. Rust components will route queries, manage
+PostgreSQL cells, decode WAL, and recover distributed operations. The Go
+operator will translate custom resources into cluster resources and
 configuration. Change-stream serving is an internal `pgshard-pooler` subsystem,
 not a separate deployment.
 
@@ -28,15 +30,16 @@ flowchart LR
   end
   svc --> query
   cdc[Change-stream client] -->|ChangeStream API| stream
-  query -->|SQL queries| p0[(Shard 0000 primary)]
-  query -->|SQL queries| p1[(Shard 0001 primary)]
-  p0 -->|physical WAL + anchor sync| r00[(Shard 0000 standby)]
-  p1 -->|physical WAL + anchor sync| r10[(Shard 0001 standby)]
+  query -->|A0 and B0| p0[(Cell 0000 primary)]
+  query -->|A1 and B1| p1[(Cell 0001 primary)]
+  query -->|A2 or dedicated B cells| pn[(Additional cell primaries)]
+  p0 -->|physical WAL + anchor sync| r00[(Cell 0000 standby)]
+  p1 -->|physical WAL + anchor sync| r10[(Cell 0001 standby)]
   query -->|read-only SQL| r00
   query -->|read-only SQL| r10
   r00 -.->|pgoutput change data| stream
   r10 -.->|pgoutput change data| stream
-  p0 --- schema[(shardschema)]
+  p0 --- schema[(fleet shardschema)]
   orch[pgshard-orch] --> p0
   orch --> p1
   orch --> r00
@@ -58,7 +61,14 @@ flowchart LR
 
 ## Request path
 
-The pooler hashes a registered table's shard-key value into a versioned unsigned 64-bit keyspace and routes it using a cached catalog epoch. Single-shard transactions stay on one backend. A transaction that enlists more than one shard uses [two-phase commit](./distributed-transactions.md).
+The startup database selects a stable logical-database identity. The pooler
+then hashes a registered table's shard-key value into that database's versioned
+unsigned 64-bit keyspace, resolves its routing epoch to a physical cell, and
+routes using the cached catalog snapshot. `A` may use five cells while `B` uses
+three shared or dedicated cells. Single-shard transactions stay on one backend.
+A transaction that enlists more than one shard of the same database uses
+[two-phase commit](./distributed-transactions.md). Cross-database transactions
+are outside Milestone 1.
 
 ## Embedded stream runtime
 
