@@ -12,34 +12,39 @@ LISTEN-before-initial-load primitive, bounded notification and polling driver,
 bounded reconnect and stale-readiness supervisor, metrics-ready state, and live
 database contract test exist in source. A Linux control executable composes
 the supervisor with pooler HTTP/readiness/status and Prometheus publication,
-bounded runtime settings, a file-backed DSN, and coordinated shutdown. Its
-control HTTP resources and drain are bounded, and its temporary plaintext
-connector rejects non-local endpoints. An explicit credential-free bootstrap
-mode exposes liveness while reporting the catalog unconfigured and making no
-connection attempt. The operator selects that mode until it can provision a
-safe catalog transport. Overall application readiness stays false because
+bounded runtime settings, local file-backed development configuration,
+operator-provisioned TLS 1.3 plus SCRAM catalog access, and coordinated
+shutdown. Its control HTTP resources and drain are bounded, and its temporary
+plaintext connector rejects non-local endpoints. An explicit credential-free
+bootstrap mode exposes liveness while reporting the catalog unconfigured and
+making no connection attempt for unsupported topologies. Overall application
+readiness stays false because
 there is no SQL data plane. The migration now also contains the permanent
 logical-consumer, checkpoint-generation, source-attachment, and managed-slot
 allocation registry described below. Its live PostgreSQL 18 test exercises the
 fenced lifecycle and tombstones. Bounded Rust primitives now authorize exact
 slot creation, activation, deletion, and final retirement; no long-running
-consumer reconciler owns those records yet. Authenticated TLS, remote catalog
-transport, and operator-provisioned credentials are not wired yet; see
+consumer reconciler owns those records yet. General data-shard transport,
+certificate rotation, and the SQL data plane are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
-`shardschema` is a dedicated PostgreSQL database on stable `shard-0000`.
-Physical streaming replication will protect it with the rest of that shard. It
-is authoritative for logical topology; etcd is used only for ephemeral
-leases and fencing.
+`shardschema` is a dedicated PostgreSQL database on stable bootstrap
+`cell-0000`. Physical streaming replication will protect it with the rest of
+that cell. It is authoritative for the fleet's logical-database topologies and
+physical-cell placements; etcd is used only for ephemeral leases and fencing.
+Application databases do not share one mandatory shard count. A database's
+active routing epoch may use any validated subset of shared cells or a
+dedicated placement pool.
 
 ## Catalog contents
 
 The current internal `pgshard_catalog` migration records:
 
-- Databases, registered tables, shard-key types and hash versions.
-- Shard identities, permanent restore-incarnation history, and non-overlapping
-  half-open key ranges.
+- Logical databases, registered tables, shard-key types, and the fleet-wide
+  hash version and seed.
+- Cluster-wide shard identities and permanent restore-incarnation history,
+  plus per-database routing epochs and non-overlapping half-open key ranges.
 - Routing, schema, authorization, and catalog epochs.
 - Permanent logical-consumer identities and per-shard ownership fences.
 - Never-reused checkpoint, source-attachment, and managed-slot generations.
@@ -47,8 +52,10 @@ The current internal `pgshard_catalog` migration records:
   capabilities authorize exact activation and absence-fenced retirement.
 - Permanent fixed-size operation tombstones for idempotency.
 
-Durable DDL, reshard, backup/restore and delivered-change journals remain
-planned extensions; the current schema does not claim to store them. The
+Physical-cell identities, independent per-database shard sets and hash
+contracts, and database-to-cell placement generations are also target-schema
+work; the current migration does not contain them. Durable DDL, reshard,
+backup/restore and delivered-change journals remain planned extensions. The
 logical-consumer registry keys each stable per-shard fence by consumer,
 `logical_database_id`, and shard. Its source-attachment key adds an immutable
 shard restore-incarnation UUID, PostgreSQL system identifier, and database OID;
@@ -165,19 +172,52 @@ reports connection phase, attempts,
 connections completing their initial authoritative load, and credential-safe
 failure categories including separate connection and operation timeouts. The
 pooler control executable publishes that catalog usability independently in
-exact JSON status and bounded-label Prometheus metrics. Its overall readiness remains false with reason
-`data_plane_unavailable`, even when the catalog is ready. It opens one regular
-DSN file nonblockingly, performs a bounded read, and accepts only loopback IP
-literals or Unix sockets with `sslmode=disable`, the exact `shardschema`
-database, `target_session_attrs=read-write`, and no startup options. That
-development bridge is not a substitute for authenticated TLS or operator
-credential distribution.
+exact JSON status and bounded-label Prometheus metrics. Its overall readiness
+remains false with reason `data_plane_unavailable`, even when the catalog is
+ready. Local development mode opens one regular DSN file nonblockingly,
+performs a bounded read, and accepts only loopback IP literals or Unix sockets
+with `sslmode=disable`, the exact `shardschema` database,
+`target_session_attrs=read-write`, and no startup options.
+
+The single-member operator path instead builds the connection without a DSN.
+It fixes the `pgshard_pooler_catalog` login, database, Service port,
+application name, and writable-primary requirement; requires SCRAM channel
+binding; and verifies the exact Service DNS name over TLS 1.3 against one
+operator-provisioned CA. Before Secret creation, the operator durably records a
+non-consumable intent containing an unpredictable name. It creates an empty
+mutable Secret, checkpoints that resource's API UID, and only then installs the
+credential and TLS keypair in one resource-version-conditional update that also
+makes the Secret immutable. Separate client and server material digests are
+checkpointed afterward. It uses the exact staged identity to resolve lost
+create, update, or status responses before any workload projection.
+Poolers receive only its password and CA
+certificate. Shard-0000 PostgreSQL receives only the serving keypair; its
+bootstrap init temporarily receives both retained projections so replacement
+material is rejected before PGDATA is touched. The CA private key is discarded
+after issuance. Finalization deletes the exact intent-recorded Secret with UID
+and resource-version preconditions and observes absence before the cluster
+finalizer is released. The login can read the catalog only through TLS and cannot
+connect to other databases or through a Unix socket. After topology validation,
+bootstrap transactionally removes restored database-wide defaults, accepts only
+absent or already canonical per-role login defaults, and re-establishes one
+exact safe session policy for this fixed login. Noncanonical login defaults are
+rejected before mutation; the login itself verifies the policy before the
+serving HBA is published. This secures the catalog
+path, not general data-shard or etcd traffic.
 
 `bootstrap-unavailable` is a separate fail-closed installation state, not an
 empty catalog or a stale-cache policy. It accepts no DSN, reports phase
 `not_configured` and readiness reason `catalog_not_configured`, keeps all
 connection counters at zero, and requires a process rollout to enter supervised
 catalog mode.
+
+Static catalog certificate rotation is not implemented. The development leaf
+is issued for five years and validation fails when less than 180 days remain;
+missing, replaced, malformed, or near-expiry material requires explicit
+recovery. Near expiry stops the whole resource plan/apply reconciliation and
+marks the cluster degraded while already-running workloads remain in place.
+This lifetime is not a production rotation design and does not claim
+zero-downtime renewal.
 
 The empty installed catalog begins at epoch zero. A reader fails closed before
 publishing metadata above the current process limits: 1,024 logical databases,
@@ -203,7 +243,14 @@ healthy connection is retained. Reconnect status preserves a bounded
 credential-safe cause category without retaining raw connector errors.
 
 The migration is transactional and idempotent, requires PostgreSQL 18 or newer,
-and must run in a pre-created UTF8 database named exactly `shardschema`. It
+and must run in a pre-created UTF8 database named exactly `shardschema`. The
+runner must prevent new connections and arbitrary concurrent schema DDL for the
+entire migration. The operator satisfies that contract with a private
+Unix-socket-only bootstrap postmaster; embedding `MIGRATION_SQL` against a
+serving database without an external connection gate is unsupported. The SQL
+pins its search path, trigger mode, table access method, tablespaces, and other
+bootstrap-sensitive session defaults, but a transaction cannot by itself lock
+an open PostgreSQL namespace against every possible new object class. It
 creates NOLOGIN reader/admin group roles, revokes public access and exposes
 activation through a dual compare-and-swap over the global catalog epoch and
 the prior active routing epoch. The administrator cannot update checkpoint
@@ -216,4 +263,8 @@ serialization error rather than publishing stale or incomplete coverage.
 
 ## Stable catalog host
 
-`shard-0000` remains the catalog host when data ranges are resharded. The identifier denotes the control-plane placement, not permanent ownership of a particular application key range. Moving `shardschema` is outside Milestone 1.
+Target architecture keeps `shardschema` on physical `cell-0000` when application
+data ranges are resharded. The current singleton operator labels that same
+catalog-bearing PostgreSQL placement `shard-0000` until physical-cell CRDs
+exist. Neither identifier promises permanent ownership of an application key
+range. Moving `shardschema` is outside Milestone 1.

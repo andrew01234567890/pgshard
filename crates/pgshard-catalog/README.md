@@ -62,8 +62,13 @@ fail before it can reinterpret durable WAL progress.
 The Rust routing snapshot intentionally does not load this registry yet;
 catalog records do not authorize a live replication session.
 
-The migration expects a pre-created UTF8 database and a short-lived superuser
-bootstrap principal. Superuser authority is required to create a dedicated
+The migration expects a pre-created UTF8 database, a short-lived superuser
+bootstrap principal, and an external connection gate that prevents new
+sessions and arbitrary concurrent schema DDL until commit. The operator runs a
+private Unix-socket-only postmaster for this purpose. Applying the SQL directly
+to a serving database is unsupported: relation `NOWAIT` locks fence attachment
+DDL, but PostgreSQL has no transaction-level SQL lock that excludes every new
+namespace object class. Superuser authority is required to create a dedicated
 `pgshard_catalog_owner` NOLOGIN role plus the fixed reader and administrator
 NOLOGIN group roles, reject unsafe pre-existing attributes or delegable role
 memberships, and grant only the owner `pg_read_all_stats` so security-definer
@@ -80,9 +85,9 @@ pre-existing trigger/FK-capable catalog relation through transaction end. It
 explicitly uses `READ COMMITTED` even when the session default is stronger.
 The requirements pass verifies the live transaction setting before takeover,
 so removing or bypassing that override fails closed.
-Every relation lock uses `NOWAIT`: concurrent catalog activity returns `55P03`
-and the caller must retry the complete migration after catalog traffic is
-quiesced instead of waiting with a partial lock set that can deadlock normal
+Every relation lock uses `NOWAIT`: conflicting catalog activity returns `55P03`
+and the caller must retry the complete migration after exclusive access is
+re-established instead of waiting with a partial lock set that can deadlock normal
 target-table then `cluster_state` DML. Existing non-internal triggers must match
 the released relation, name, function, event, timing, level, enabled mode,
 predicate, argument, transition-table, parent, and constraint shape. Internal

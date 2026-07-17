@@ -1,73 +1,276 @@
 ---
-title: Backup and restore
-description: Coordinated multi-shard backup sets with pgBackRest and restore across shard counts.
+title: Backup, restore, and database recovery
+description: Database-targeted coordinated backups, exact-topology restores, and online return moves.
 ---
 
-# Backup and restore
+# Backup, restore, and database recovery
 
 :::info Milestone 1 design contract
-This page specifies the required behavior. Coordinated backup and restore are not
-implemented in the foundation release; see [implementation status](../project/status.md).
+This page specifies the required behavior. Coordinated backup, restore, and
+database moves are not implemented in the foundation release; see
+[implementation status](../project/status.md).
 :::
 
-The Milestone 1 design uses pgBackRest with a separate stanza and repository
-prefix for each shard. One physical backup per shard protects its primary and
-replicas because they share physical history.
+Milestone 1 backups target one logical database. That database may have a shard
+count and placement entirely different from every other database in the same
+fleet. pgBackRest still operates at physical PostgreSQL-cell granularity: the
+backup set references one physical backup for every cell containing a shard of
+the selected database.
 
-The preferred source is the healthiest, most caught-up secondary. pgBackRest's standby backup still coordinates with the primary. If no safe secondary exists, pgshard falls back to the primary and records that decision in status, events, and metrics.
+The preferred source is the healthiest, most caught-up secondary. pgBackRest's
+standby backup still coordinates with the primary. If no safe secondary exists,
+pgshard falls back to the primary and records that decision in status, events,
+metrics, and the immutable manifest.
 
-## Coordinated backup set
+## Coordinated database backup set
 
 ```mermaid
 flowchart LR
-  B[Back up every shard concurrently] --> V[Verify base backups]
-  V --> G[Cluster mutation barrier]
-  G --> D[Drain distributed transactions]
-  D --> L[Record restore LSN and timeline per shard]
-  L --> W[Verify required WAL archived]
-  W --> M[Publish immutable cluster manifest]
+  T[Select database and active topology] --> B[Back up every referenced cell concurrently]
+  B --> V[Verify base backups]
+  V --> G[Database mutation barrier]
+  G --> D[Drain that database's distributed transactions]
+  D --> C[Capture signed database catalog projection]
+  C --> L[Record restore LSN and timeline per database shard]
+  L --> W[Verify required WAL and dependency closure]
+  W --> P[Persist cross-stanza retention pins]
+  P --> M[Publish immutable database manifest]
 ```
 
-The barrier is acquired through a monotonically fenced `shardschema` operation.
-Poolers stop new application writes and drain 2PC. The DDL, role/grant, reshard,
-backup/restore, topology and operator reconcilers stop starting or activating
-mutations at the same barrier. A safety failover invalidates the attempt and
-forces a fresh backup set rather than silently changing its timeline.
+The monotonically fenced operation lives in `shardschema`. Poolers stop new
+writes only for the selected logical database and drain its 2PC transactions.
+Its DDL, role/grant, reshard, restore, move, and topology reconcilers stop
+starting or activating mutations at the same barrier. Other databases may keep
+serving, including databases colocated in the same physical cells. A safety
+failover of any referenced cell invalidates the attempt and forces a fresh
+backup set rather than silently changing timeline.
 
-While the barrier is held, the coordinator records frozen catalog, routing,
-schema, authorization, topology and fencing epochs before capturing each
-shard's restore LSN and timeline. Those epoch values and the complete mutation
-barrier identity are part of the immutable manifest.
+The drain is complete only after every transaction admitted before the barrier
+has committed or aborted, every durable 2PC decision has been applied on every
+immutable participant database shard, no matching GID remains in
+`pg_prepared_xacts`, and the coordinator-recovery backlog for the database is
+empty. The coordinator is the lowest-ID participating database shard; its row
+is stored in that shard's current physical cell. A merely durable `COMMIT`
+decision with participants still prepared is not a backup boundary.
 
-The manifest also identifies the cluster, PostgreSQL major, source topology,
-every shard's source restore incarnation and PostgreSQL system identifier,
-database OIDs, every pgBackRest backup ID, checksums, and backup source role. A
-backup is usable only when every shard backup, required WAL object, and the final
-manifest exist. Retention treats the complete set as one unit.
+While the barrier is held, the controller records the database's frozen
+routing, schema, authorization, topology, placement, and fencing epochs before
+capturing each shard's restore LSN and timeline. It also reads a repeatable-read,
+database-scoped catalog projection from live `shardschema` on `cell-0000`, even
+when the selected database has no data shard in that cell. The canonical
+projection and final manifest are content-hashed and signed by the fleet backup
+key; a restore must be configured to trust that key. A physical base backup of
+the catalog cell is therefore not silently implied by every database backup.
 
-:::caution Recovery point boundary
-Milestone 1 restores coordinated backup-set points. Arbitrary wall-clock cross-shard PITR is not supported because a distributed commit can straddle a timestamp.
+The manifest includes:
+
+- source fleet and logical-database UUID, source name, PostgreSQL major, schema
+  epoch, role/grant epoch, and backup barrier identity;
+- a topology fingerprint covering hash algorithm/version and seed, shard count,
+  ordered shard ordinals, and every range boundary;
+- the physical cell and database OID for each database shard, its source restore
+  database-shard UUID and restore incarnation as provenance, PostgreSQL system
+  identifier, timeline, and selected backup source role;
+- the signed database-scoped catalog projection and its object-store version;
+- every pgBackRest cell stanza, repository and backup ID, the complete
+  full/differential/incremental reference closure, checksums, and the required
+  WAL interval.
+
+A backup is usable only when every referenced cell backup, catalog projection,
+WAL object, retention pin, and the final signed manifest exist. Retention treats
+the complete set as one unit.
+
+### Cross-stanza retention
+
+[pgBackRest retention](https://pgbackrest.org/command.html) is stanza-local,
+while one database backup set can depend on several stanzas. pgshard therefore
+disables pgBackRest's automatic expire after backup and is the only component
+allowed to invoke repository expiry. A durable pin graph in `shardschema`,
+mirrored by the signed manifest in MinIO, maps each published backup set to every
+referenced backup chain and WAL interval. Publication occurs only after all pins
+are durable.
+
+Deletion is two phase. The controller first tombstones the database backup set,
+then recomputes reference counts and safe per-stanza backup and archive floors
+from every non-released manifest. Only unreferenced dependency closures may be
+offered to pgBackRest expiry. The controller re-reads pgBackRest metadata and
+MinIO object versions before releasing the tombstone. A crash at any point is
+reconciled from the pin graph. Missing metadata, an unknown dependency, a
+concurrent backup, or any proposed deletion intersecting a live pin stops
+reclamation and raises an alert; it never guesses. Direct user-initiated
+`expire` against an operator-managed repository is unsupported.
+
+:::caution Physical backup scope
+If `A` and `B` share a PostgreSQL cell, a physical backup needed by `A`
+necessarily contains `B`'s bytes too. Repository encryption and authorization
+remain cell-scoped. Restore quarantines those bytes and exposes only the
+requested logical database. Dedicated placement avoids this coupling.
 :::
 
-## Restore
+:::caution Recovery point boundary
+Milestone 1 restores coordinated backup-set points. Arbitrary wall-clock
+cross-shard PITR is not supported because a distributed commit can straddle a
+timestamp.
+:::
 
-Restore accepts an empty target only:
+## Database-targeted restore
 
-1. Validate the manifest, PostgreSQL 18 compatibility, backup objects, checksums, and required WAL before changing the target.
-2. Restore the original source topology to the recorded per-shard positions.
-3. Restore `shard-0000`, including `shardschema`, before validating the catalog.
-4. While every workload remains non-serving, use one `shardschema` transaction
-   to install a fresh restore-incarnation UUID for each restored shard, advance
-   every affected logical-consumer checkpoint generation, and require a new
-   snapshot. Never reuse the incarnation copied from the backup, even when
-   system identifier and database OID are unchanged; an old resume token must
-   fail before it can advance checkpoint or slot state.
-5. Keep application Services non-serving until all shards, roles, grants,
-   identities, and epochs validate.
-6. If the requested shard count differs, provision non-serving targets and run
-   the normal reshard workflow.
-7. Publish services only after validation succeeds.
+A restore names one source database from the manifest and one destination
+database name. For example, source `A` may restore as `B` while the current `A`
+continues serving. If `A` does not exist at restore time, the destination may be
+`A`. Every destination receives a fresh logical-database UUID, fresh
+database-shard UUIDs, and fresh restore incarnations; the source database and
+shard UUIDs remain immutable provenance and are never rebound to the new
+destination.
 
-The required KIND suite will use an S3-compatible MinIO deployment and cover
-standby selection, primary fallback, interrupted uploads, missing objects, and
-same/different-count restore. It is not present in the foundation release.
+The target API records, at minimum:
+
+```yaml
+spec:
+  backupSetRef: backup-a-2026-07-16
+  sourceDatabase: A
+  destinationDatabase: B
+  placement:
+    mode: Dedicated
+```
+
+The destination name must either be absent or reserved by an empty, non-serving
+`PgShardDatabase`. Restore does not overwrite an active database. Replacing an
+existing name is a later, explicit online database move.
+
+Milestone 1 restore materialization accepts `Dedicated` placement only. A
+restore request using `SharedCell`, `SharedNode`, or `Explicit` returns the
+permanent `RestorePlacementUnsupported` reason before target mutation. Once the
+exact dedicated restore is serving, the separate online move engine may place
+it onto shared cells or shared Nodes. This keeps physical staging bytes out of
+already-serving PostgreSQL cells and gives the first implementation one
+well-defined logical import boundary.
+
+### Exact-topology preflight
+
+Restore never performs implicit resharding. Before creating Secrets, PVCs,
+PostgreSQL cells, Jobs, or repository writes, the controller compares the
+manifest topology fingerprint with the destination topology:
+
+- An absent destination is created with the exact fingerprint from the backup.
+- A pre-created destination must match PostgreSQL major, hash
+  algorithm/version and seed, shard count, ordered shard ordinals, and every
+  range boundary.
+- Any mismatch returns the permanent error code `RestoreTopologyMismatch`,
+  identifies the manifest fingerprint and each differing topology field, and
+  leaves the restore `Ready=False` with the same reason. There is no target
+  mutation. A five-shard backup cannot restore into a three-shard destination,
+  even if the destination is empty.
+
+Physical cell IDs and Kubernetes Node names are placement rather than logical
+topology. The exact five database shards are initially materialized into five
+replacement dedicated cells. They use fresh database-shard UUIDs while
+retaining the backup's five ordinals and ranges beneath the destination's fresh
+database UUID. A later online move may consolidate them onto compatible shared
+cells without changing what restore accepted.
+
+The mismatch no-mutation oracle permits only the `PgShardRestore` status and
+Kubernetes Events to change. Tests snapshot and compare every other namespaced
+and operator-owned cluster-scoped Kubernetes object, live catalog row and epoch,
+PVC/PV data identity, pgBackRest metadata, and MinIO object version. Repository
+reads are allowed; creating credentials, reservations, Jobs, cells, catalog
+rows, or object-store writes is not.
+
+### Restore execution
+
+1. Verify the manifest signature, catalog projection, exact destination
+   topology, PostgreSQL 18 compatibility, backup dependency closure, checksums,
+   and required WAL before target mutation.
+2. Create a private, non-serving staging cluster with the exact source database
+   shard configuration and one restored cell for every referenced physical
+   backup.
+3. Restore every physical data cell with pgBackRest to its recorded target LSN
+   and timeline with archiving disabled. No staging Service, pooler endpoint,
+   or application credential is published. The live fleet's `shardschema` is
+   never overwritten by a restored physical catalog.
+4. Cross-check the signed catalog projection against the recovered system
+   identifiers, database OIDs, timelines, shard ordinals, ranges, and row-level
+   validation queries.
+5. Create one empty, non-serving dedicated PostgreSQL 18 destination cell per
+   database shard. Physical database names are UUID-derived and do not reuse
+   the source name or OID.
+6. Run the PostgreSQL 18 logical importer from each quarantined source database
+   to its corresponding destination. The importer uses `pg_dump`/`pg_restore`
+   TOC data plus bounded parallel `COPY`, but accepts only the documented
+   extension and object allowlist. It copies schemas, tables and partitions,
+   sequence value plus `is_called`, large objects, comments, declarative
+   ownership/ACL mappings, and only database or role settings present in a
+   versioned inert-GUC allowlist. Unknown settings fail preflight. Preload or
+   callback libraries, archive/recovery commands, `role`, session authorization
+   or replication role, search/library/file paths, access methods, and default
+   or temporary tablespaces are always denied before destination mutation.
+   Tablespaces, foreign servers, unapproved extensions, cluster-global objects,
+   and executable restore hooks also fail closed. The importer generates its
+   own canonical DDL; it never replays raw `ALTER DATABASE` or `ALTER ROLE`
+   settings and never asks pgBackRest to merge one physical cluster into
+   another.
+7. Persist per-object and per-chunk checksums and resumable copy receipts, then
+   validate schema, roles, grants, row counts, sequences, large objects, and
+   complete range coverage on all destination shards.
+8. In one live-`shardschema` transaction, allocate the destination's fresh
+   logical-database UUID, fresh database-shard UUIDs and restore incarnations,
+   initial topology and placement generation, and new consumer checkpoint
+   generations. Source UUIDs remain immutable provenance; old resume tokens
+   cannot authorize the copy.
+9. Arm the destination generation fences, publish the destination catalog
+   generation, wait for every pooler to acknowledge it, and only then release
+   serving. Destroy quarantined staging and all unselected physical bytes after
+   the durable cleanup receipt.
+
+Interruption is resumable from durable per-cell restore and per-database copy
+receipts. A retry with the same operation ID and canonical request resumes; a
+changed destination, topology, placement, backup ID, or source database is a
+conflict rather than a new interpretation of the old receipt.
+
+## Returning `B` to `A` online
+
+After validation, `B` can move back to the user-facing name `A` using the
+[online database move](./online-resharding.md#online-database-move). The move
+keeps the source generation serving during snapshot and `pgoutput` catch-up.
+At the final barrier, poolers buffer eligible queries, drain old-generation
+transactions, fence the old generation in every source PostgreSQL cell, apply
+the final LSN vector, publish the new name/topology/placement generation in
+`shardschema`, arm it in every destination cell, and release buffered traffic
+only after all poolers and destination cells acknowledge the same generation.
+Existing backend sessions remain pinned to their original generation; after a
+fence they receive the documented retry/disconnect outcome and must reconnect,
+never silently continue on another history.
+
+If `A` still exists, replacement must be explicit. The old `A` generation is
+read-fenced and quarantined rather than destroyed at cutover. Selecting an
+older restored history intentionally does not merge post-backup writes from the
+replaced generation; the operation records that discard boundary for audit.
+
+A topology change is allowed in this separate online move. It is never folded
+into restore. For example, restore five-shard `A` as exact five-shard `B`, then
+move/reshard `B` into a new three-shard `A` generation while traffic continues.
+
+## Required end-to-end coverage
+
+The KIND and Docker Desktop suites use MinIO and must cover:
+
+- standby backup selection, explicit primary fallback, interrupted uploads,
+  missing or corrupt objects, incomplete WAL, and retry receipts;
+- `A` with five shards restored as absent `B` with five shards on dedicated
+  cells, followed by separate online moves onto shared cells and shared Nodes;
+- `A` restored as `A` only when that name is absent;
+- rejection of five-to-three restore before any non-status mutation, including
+  count-equal but range/hash-seed mismatches, with the stable
+  `RestoreTopologyMismatch` error and condition reason and the complete
+  Kubernetes/catalog/PV/pgBackRest/MinIO no-mutation oracle;
+- a physical backup from a cell shared by `A` and `B`, proving only `A` is
+  registered or queryable after restore;
+- continuous load while restored `B` moves back to `A`, including process,
+  primary, pooler, and operator failures before and after the atomic cutover;
+- a separate online move that changes shard count and placement after exact
+  restore, with old cells quarantined and no failed client request.
+- retention-pin races, concurrent backup and expiry, controller crashes at
+  every tombstone/refcount/expiry boundary, and proof that no retained backup
+  or required WAL interval is deleted.
+
+This coverage is not present in the foundation release.

@@ -22,11 +22,25 @@ const (
 	TLSCertificateKey = "tls.crt"
 	TLSPrivateKeyKey  = "tls.key"
 
-	caValidity      = 10 * 365 * 24 * time.Hour
-	leafValidity    = 90 * 24 * time.Hour
-	renewBefore     = 30 * 24 * time.Hour
-	certificateSkew = 5 * time.Minute
+	caValidity   = 10 * 365 * 24 * time.Hour
+	leafValidity = 90 * 24 * time.Hour
+	renewBefore  = 30 * 24 * time.Hour
+	// Static server certificates are intentionally longer lived than admission
+	// certificates. PostgreSQL does not yet have a Secret-to-writable-file
+	// reload sidecar, so the operator fails closed well before this material
+	// expires instead of pretending it can rotate it without a restart.
+	staticServerValidity = 5 * 365 * 24 * time.Hour
+	staticRenewBefore    = 180 * 24 * time.Hour
+	certificateSkew      = 5 * time.Minute
 )
+
+// StaticServerBundle contains one self-signed CA certificate and its issued
+// server keypair. The CA private key is discarded after issuance.
+type StaticServerBundle struct {
+	CACertificate     []byte
+	ServerCertificate []byte
+	ServerPrivateKey  []byte
+}
 
 type certificateAuthority struct {
 	certificate    *x509.Certificate
@@ -82,16 +96,30 @@ func generateCertificateAuthority(now time.Time, random io.Reader, commonName st
 }
 
 func parseCertificateAuthority(certificatePEM, privateKeyPEM []byte, now time.Time) (*certificateAuthority, error) {
+	return parseCertificateAuthorityWithMinimumLifetime(certificatePEM, privateKeyPEM, now, leafValidity)
+}
+
+func parseCertificateAuthorityWithMinimumLifetime(certificatePEM, privateKeyPEM []byte, now time.Time, minimumRemaining time.Duration) (*certificateAuthority, error) {
 	if _, err := tls.X509KeyPair(certificatePEM, privateKeyPEM); err != nil {
 		return nil, fmt.Errorf("CA certificate and private key do not form a key pair: %w", err)
 	}
-	certificate, err := parseCertificate(certificatePEM)
+	authority, err := parseCertificateAuthorityCertificate(certificatePEM, now, minimumRemaining)
 	if err != nil {
-		return nil, fmt.Errorf("parse CA certificate: %w", err)
+		return nil, err
 	}
 	privateKey, err := parseECDSAPrivateKey(privateKeyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("parse CA private key: %w", err)
+	}
+	authority.privateKey = privateKey
+	authority.privateKeyPEM = slices.Clone(privateKeyPEM)
+	return authority, nil
+}
+
+func parseCertificateAuthorityCertificate(certificatePEM []byte, now time.Time, minimumRemaining time.Duration) (*certificateAuthority, error) {
+	certificate, err := parseCertificate(certificatePEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse CA certificate: %w", err)
 	}
 	if !certificate.BasicConstraintsValid || !certificate.IsCA || certificate.KeyUsage&x509.KeyUsageCertSign == 0 {
 		return nil, fmt.Errorf("CA certificate does not permit certificate signing")
@@ -102,21 +130,26 @@ func parseCertificateAuthority(certificatePEM, privateKeyPEM []byte, now time.Ti
 	if now.Before(certificate.NotBefore) {
 		return nil, fmt.Errorf("CA certificate is not valid before %s", certificate.NotBefore.UTC().Format(time.RFC3339))
 	}
-	if !certificate.NotAfter.After(now.Add(leafValidity)) {
+	if !certificate.NotAfter.After(now.Add(minimumRemaining)) {
 		return nil, fmt.Errorf("CA certificate expires too soon at %s; automated CA rotation is not implemented", certificate.NotAfter.UTC().Format(time.RFC3339))
 	}
 	return &certificateAuthority{
 		certificate:    certificate,
-		privateKey:     privateKey,
 		certificatePEM: slices.Clone(certificatePEM),
-		privateKeyPEM:  slices.Clone(privateKeyPEM),
 	}, nil
 }
 
 func generateServingCertificate(now time.Time, random io.Reader, authority *certificateAuthority, dnsNames []string) (*servingCertificate, error) {
+	return generateServingCertificateWithValidity(now, random, authority, dnsNames, leafValidity)
+}
+
+func generateServingCertificateWithValidity(now time.Time, random io.Reader, authority *certificateAuthority, dnsNames []string, validity time.Duration) (*servingCertificate, error) {
 	names := normalizedDNSNames(dnsNames)
 	if len(names) == 0 {
 		return nil, fmt.Errorf("at least one serving DNS name is required")
+	}
+	if validity <= 0 {
+		return nil, fmt.Errorf("serving certificate validity must be positive")
 	}
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), random)
 	if err != nil {
@@ -131,7 +164,7 @@ func generateServingCertificate(now time.Time, random io.Reader, authority *cert
 		Subject:               pkix.Name{CommonName: names[0], Organization: []string{"pgshard"}},
 		DNSNames:              names,
 		NotBefore:             now.Add(-certificateSkew),
-		NotAfter:              now.Add(leafValidity),
+		NotAfter:              now.Add(validity),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
@@ -156,6 +189,54 @@ func generateServingCertificate(now time.Time, random io.Reader, authority *cert
 		certificatePEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
 		privateKeyPEM:  pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER}),
 	}, nil
+}
+
+// GenerateStaticServerBundle creates a long-lived self-signed CA and one
+// exact-DNS server certificate for a PostgreSQL endpoint.
+func GenerateStaticServerBundle(now time.Time, random io.Reader, commonName string, dnsNames []string) (*StaticServerBundle, error) {
+	if random == nil {
+		return nil, fmt.Errorf("certificate randomness source is required")
+	}
+	if strings.TrimSpace(commonName) == "" {
+		return nil, fmt.Errorf("CA common name is required")
+	}
+	authority, err := generateCertificateAuthority(now, random, commonName)
+	if err != nil {
+		return nil, err
+	}
+	server, err := generateServingCertificateWithValidity(now, random, authority, dnsNames, staticServerValidity)
+	if err != nil {
+		return nil, err
+	}
+	return &StaticServerBundle{
+		CACertificate:     slices.Clone(authority.certificatePEM),
+		ServerCertificate: slices.Clone(server.certificatePEM),
+		ServerPrivateKey:  slices.Clone(server.privateKeyPEM),
+	}, nil
+}
+
+// ValidateStaticServerBundle verifies the self-signed CA, server key pairing,
+// exact DNS names, server-auth chain, and sufficient remaining lifetime. The
+// CA private key is deliberately discarded after issuance and is not required.
+func ValidateStaticServerBundle(bundle *StaticServerBundle, dnsNames []string, now time.Time) error {
+	if bundle == nil {
+		return fmt.Errorf("static server certificate bundle is required")
+	}
+	authority, err := parseCertificateAuthorityCertificate(bundle.CACertificate, now, staticRenewBefore)
+	if err != nil {
+		return err
+	}
+	server, err := parseServingCertificate(bundle.ServerCertificate, bundle.ServerPrivateKey)
+	if err != nil {
+		return err
+	}
+	if !servingCertificateIsUsable(server, authority, dnsNames, now) {
+		return fmt.Errorf("server certificate is not valid for the exact configured DNS names and CA")
+	}
+	if !server.certificate.NotAfter.After(now.Add(staticRenewBefore)) {
+		return fmt.Errorf("server certificate expires too soon at %s; zero-downtime certificate rotation is not implemented", server.certificate.NotAfter.UTC().Format(time.RFC3339))
+	}
+	return nil
 }
 
 func parseServingCertificate(certificatePEM, privateKeyPEM []byte) (*servingCertificate, error) {

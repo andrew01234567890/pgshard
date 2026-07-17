@@ -13,6 +13,9 @@ API. The controller now reconciles the safe supporting-resource slice:
   PostgreSQL 18 primary StatefulSet and retained data PVC per shard, with a
   generated per-shard immutable bootstrap credential and restricted Pod
   security;
+- an idempotently migrated `shardschema` database on shard-0000 containing the
+  complete immutable shard inventory and an initial restore incarnation for
+  each shard;
 - etcd, orchestrator, and pooler workload specifications, topology spread,
   security contexts, PodDisruptionBudgets, HPA or fixed pooler scaling, and an
   etcd ingress NetworkPolicy;
@@ -87,6 +90,14 @@ primaries have passed the StatefulSet's minimum-ready window. It does not claim 
 replication, failover, routing, or zero-downtime restart. Three- and five-member
 resources continue to create no PostgreSQL Pods until bootstrap, replication,
 fencing integration, promotion, and recovery exist.
+PostgreSQL StatefulSets use `OnDelete` updates. A controller image, bootstrap
+image, script, or generated-configuration change therefore updates the desired
+template without concurrently deleting every singleton primary. Until a
+readiness-gated shard-at-a-time upgrade controller exists, an operator must
+delete one selected Pod at a time and accept that shard's documented outage.
+This also applies to a singleton StatefulSet created by an earlier operator:
+publishing the catalog-aware init container does not run it against the
+existing Pod until that Pod is explicitly replaced.
 
 Generated bootstrap credentials are unique per shard, immutable, and stable
 across reconciles. Each data PVC is likewise bound to its recorded name, UID,
@@ -104,20 +115,84 @@ directory and atomically renames only a complete cluster into the final data
 path. Its durable marker records the exact PgShardCluster UID and shard, so an
 interrupted `initdb` cannot publish a partial `PG_VERSION` and a reused volume
 cannot silently start for another cluster or shard. Initial publication flushes
-the changed marker, access configuration, and staging and parent directory
-entries. The validated restart path repeats the final-data and parent-directory
-publication barrier before PostgreSQL starts, so interruption after the atomic
-rename cannot skip it on the next init pass. These flushes are limited to the
-cluster's data path; bootstrap never issues a node-wide filesystem sync that
-could couple Pod startup or termination to unrelated mounts.
+the changed marker, access configuration, and staging, parent, and volume-root
+directory entries. The validated restart path repeats that complete publication
+barrier before PostgreSQL starts, so interruption after the atomic rename cannot
+skip it on the next init pass. These flushes are limited to the cluster's data
+path; bootstrap never issues a node-wide filesystem sync that could couple Pod
+startup or termination to unrelated mounts.
+Before reading or creating PGDATA, the init process requires its `postgres`
+binary to report the operator's exact supported major, currently 18. It also
+checks an existing `PG_VERSION` and the staging directory produced by `initdb`.
+An immutable image digest identifies bytes; it is not accepted as evidence that
+those bytes contain PostgreSQL 18.
+On shard-0000 only, the same init boundary starts PostgreSQL with network
+listening disabled and a private mode-0700 Unix socket. It loads the same
+resource-derived primary configuration as the main server so durable logical
+slots and prepared transactions remain startable during the init pass. Before
+applying SQL, it creates the UTF8 `shardschema` database when absent only when
+PGDATA carries the exact durable catalog-genesis intent written before the
+fresh data directory was atomically published. That intent binds the cluster
+UID, configured shard count, and migration digest. A fresh install requires the
+reserved `pgshard_catalog` schema to be absent or empty.
+An upgrade requires a complete supported object, sequence, column, constraint,
+index, type, routine-signature, rewrite-rule, user-trigger, internal-FK-trigger,
+and policy fingerprint: released v0.49, current-after-v0.49-upgrade, or
+current-fresh-install. Fingerprint rendering pins the session search path and
+identifier-quoting mode. A partial or structurally altered catalog is rejected
+because `IF NOT EXISTS` DDL cannot repair it. For a supported pre-existing
+catalog it checks home-shard identity, canonical shard state, permanent restore
+history, and an exact immutable-CR shard inventory before migration. Missing or
+extra active shards are a configuration conflict and are never repaired by
+bootstrap. Only a catalog carrying that exact genesis intent receives the
+complete canonical shard inventory, with one active restore incarnation per
+shard, in a transaction that checks its own postcondition. The intent remains
+durable across a crash after migration or during inventory. Retry accepts only
+the migration-created shard-0000 row or the complete atomic inventory; any
+other partial subset is a permanent topology conflict. The intent is removed
+only after the final catalog and credential checks, serving-HBA publication,
+and a clean temporary PostgreSQL stop with synchronous commit forced on. An absent
+or empty catalog on any other pre-existing PGDATA is rejected rather than
+inferred from the requested shard count. Every bootstrap SQL client has a five-second lock
+timeout, a 30-second statement timeout, and a 120-second whole-transaction
+timeout, so catalog locks fail the init pass for retry instead of hanging every
+restart. The primary starts only after the applicable migration and
+fresh-inventory transaction succeed. An
+occupied reserved schema, unsupported catalog shape, conflicting identity or
+lineage, malformed inventory, failed migration, or failed inventory transaction
+keeps the primary unready. A released v0.49 catalog with an already exact shard
+inventory and an interrupted genesis carrying its exact intent are supported
+retry inputs.
+Before its first seed statement, the migration drops every validated user
+trigger so a replaceable pre-existing trigger-function body cannot execute as
+the bootstrap principal; it recreates the canonical functions and triggers in
+the same transaction. Fresh inventory is checked before that transaction can
+commit, so a suppressed insert cannot report success. Reapplying an unchanged
+migration and exact inventory does not advance the catalog epoch.
+Shard-0000 bootstrap also creates one fixed `pgshard_pooler_catalog` login with
+only the catalog reader role, proves that the immutable Secret password matches
+its SCRAM verifier, and replaces restored or edited `pg_hba.conf` rules with an
+operator-owned order that rejects plaintext catalog access and every other use
+of that login. The verifier is generated in the bootstrap image from bounded
+stdin and installed as an extended-protocol bind value; neither the plaintext
+password nor verifier appears in PostgreSQL query text. Bootstrap sessions also
+force and verify `synchronous_commit=on`, `zero_damaged_pages=off`, and
+`ignore_checksum_failure=off` above restored database and role defaults before
+the first catalog scan. The running shard-0000 PostgreSQL process serves the ready-only
+catalog Service over TLS 1.3. Poolers receive only the password and CA
+certificate; PostgreSQL receives only the serving certificate and key; the
+bootstrap init container temporarily receives both retained projections so it
+can verify their checkpointed SHA-256 values before touching PGDATA. The CA
+private key is discarded after issuance and is never stored in Kubernetes.
 Application Services still target the rejection-only pooler and must not be
 treated as usable endpoints. `Ready=False` with reason `DataPlaneUnavailable`
 for the single-member slice, or `PostgreSQLHAUnavailable` for an HA topology,
 remains authoritative. Backup execution and ServiceMonitor reconciliation also
 remain unimplemented. The ingress NetworkPolicies allow only selected
-same-cluster Pods, but etcd client/peer and PostgreSQL shard traffic still lack
-authenticated TLS; the independent `TransportSecurityReady=False` condition
-reports that gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
+same-cluster Pods. The pooler-to-`shardschema` path is TLS 1.3 plus SCRAM with
+required channel binding, but etcd client/peer and general PostgreSQL shard
+traffic still lack authenticated TLS; the independent
+`TransportSecurityReady=False` condition reports the remaining gap. Etcd uses independent 2Gi PVCs on `storage.storageClassName` with
 a bounded backend quota. Its default image is digest-pinned and the Pod command
 selects that image contract's `/usr/local/bin/etcd` executable explicitly;
 custom `--etcd-image` values must provide the same path. Scale transitions
@@ -242,20 +317,65 @@ channel names, not a publication guarantee. The Rust pooler has a control-only
 executable that composes catalog state with its HTTP endpoints and a
 rejection-only PostgreSQL read-write handshake listener. It accepts no SQL
 session, has no connection pool, and deliberately remains application-unready
-even when its catalog is usable. Its catalog connector is
-deliberately local-only until authenticated TLS exists, while this operator
-does not yet provision a catalog DSN Secret or a compatible local shardschema
-endpoint. The operator therefore selects the pooler's explicit
-`bootstrap-unavailable` mode: the process exposes liveness and bounded status
-without a credential or connection attempt, while catalog and application
-readiness fail closed. Override the defaults with `--orchestrator-image`,
+even when its catalog is usable. For a supported single-member topology, the
+operator first checkpoints a non-consumable creation intent containing an
+unpredictable permanent Secret name. It creates only an empty mutable Secret at
+that name, checkpoints the API-assigned UID, then conditionally updates that
+exact resource once with immutable credential and TLS material. Separate client
+and server digests are checkpointed after the material update. A lost Create
+response is resolved by the permanent name while the Secret is still empty.
+Each lost status-checkpoint response is resolved by rereading durable status.
+A lost material-Update response is resolved by rereading the exact UID and
+validating the resulting immutable material; the original update remains
+conditional on the previously observed resource version. The operator selects
+`operator-tls` only after status holds the exact UID and both material digests.
+The connector constructs a fixed catalog connection,
+requires TLS 1.3 hostname validation, SCRAM channel binding, and a writable
+primary, and never accepts a remote DSN. Missing or replaced Secret identity,
+unexpected keys, unsafe role state, wrong credentials, wrong certificates, or
+insufficient certificate lifetime fail closed. Cluster finalization deletes the
+exact intent-recorded Secret with UID and resource-version preconditions, then
+observes its absence before releasing the cluster finalizer. Unsupported HA topologies still
+select credential-free `bootstrap-unavailable` and create no PostgreSQL data
+plane. Override the defaults with `--orchestrator-image`,
 `--pooler-image`, `--etcd-image`, and `--postgresql-image` when concrete images
-exist. Image pull or runtime readiness is reported by the relevant observed
+exist. The privileged `--postgresql-bootstrap-image` deliberately has no remote
+default and is required for the single-member slice. Non-development values
+must carry an immutable `@sha256:` digest. The exact local
+`pgshard/postgres-agent:dev` exception uses `imagePullPolicy: Never` and must be
+loaded into every node before creating a cluster. The complete non-development
+reference is parsed using the container-distribution grammar before durable
+bootstrap state is created; a digest-shaped suffix cannot make an invalid image
+name safe. Image pull or runtime readiness is reported by the relevant observed
 workload condition, never inferred from planned objects. A custom PostgreSQL
 image must preserve the pinned official image contract: PostgreSQL 18,
 UID/GID 999, `initdb` and `bash` on `PATH`, compatibility with the Docker
 entrypoint for the main process, and the `/var/lib/postgresql/18/docker` data
 layout.
+The separate bootstrap image must provide the same PostgreSQL 18 command-line
+tools as UID/GID 999 plus the source migration at
+`/usr/share/pgshard/migrations/0001_shardschema.sql`; it is never used as the
+main database process and receives the superuser Secret only while the init
+container runs. The operator verifies the binary's exact major and compares the
+migration bytes with its release-coupled SHA-256 value before touching PGDATA.
+On every managed PGDATA it rejects active `postgresql.auto.conf` settings,
+recovery signals, external WAL, and tablespaces before the main server starts.
+Catalog bootstrap then uses a private quarantined postmaster. A pre-existing
+catalog must match the configured shard inventory exactly; missing shards are
+seeded only while the exact durable first-boot genesis intent remains. An
+absent or empty catalog without that intent is rejected. The running primary receives
+`allow_alter_system=off`, so authoritative operator configuration cannot be
+bypassed by a persistent `ALTER SYSTEM` override.
+
+The catalog serving certificate is deliberately static in this development
+slice. It is valid for five years and is rejected once less than 180 days
+remain. PostgreSQL cannot consume a rotated Secret directly with the required
+private-key ownership and mode, and no writable-file rotation sidecar plus
+reload controller exists yet. Zero-downtime certificate rotation is therefore
+not implemented. Near expiry marks the cluster degraded and stops the entire
+resource plan/apply reconciliation before it can silently rotate or publish
+new workloads; already-running workloads are not stopped. Use an explicit
+recovery procedure rather than expecting silent regeneration.
 
 The module is pinned to Go 1.26.5, controller-runtime 0.24.1, and Kubernetes
 libraries 0.36.0. Only the Linux container deployment is supported.
@@ -492,7 +612,12 @@ real Kubernetes controllers. Another builds and loads local images, installs
 the self-managed admission manager, proves semantic admission rejection and
 certificate trust, preserves the fail-closed three-member boundary, and starts
 two restricted single-member PostgreSQL 18 primaries. It exercises TCP through
-a shard Service from an authorized restricted probe client, restarts a primary
-StatefulSet, and verifies its data survives.
+a shard Service from an authorized restricted probe client, publishes a changed
+PostgreSQL configuration without restarting either `OnDelete` Pod, deletes only
+shard-0000, proves shard-0001 remains untouched, and verifies shard-0000's data,
+catalog snapshot, prepared transaction, and logical slot survive recreation. It
+also requires the pooler's operator-provisioned TLS 1.3 and SCRAM catalog
+connection to publish a ready catalog in exact status and Prometheus metrics
+while overall application readiness remains false.
 The test does not claim uninterrupted traffic. These targeted tests are not yet
 the full Milestone 1 KIND suite.

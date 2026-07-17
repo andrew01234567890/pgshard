@@ -26,7 +26,7 @@ variable "PGSHARD_IMAGE_TAG" {
 }
 
 group "ci" {
-  targets = ["agent", "operator", "orchestrator", "pooler"]
+  targets = ["agent", "operator", "orchestrator", "pooler", "postgres-agent"]
 }
 
 target "rust-runtime" {

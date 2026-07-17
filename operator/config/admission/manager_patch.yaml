@@ -29,6 +29,7 @@ spec:
             - --orchestrator-image=pgshard/orchestrator:dev
             - --pooler-image=pgshard/pooler:dev
             - --postgresql-image=docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7
+            - --postgresql-bootstrap-image=pgshard/postgres-agent:dev
           env:
             - name: POD_NAMESPACE
               valueFrom:

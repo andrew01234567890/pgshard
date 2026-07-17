@@ -39,6 +39,7 @@ func TestDevelopmentManagerManifestIsLocalOnlyAndRestricted(t *testing.T) {
 		"--webhook-enabled=false",
 		"--orchestrator-image=pgshard/orchestrator:dev",
 		"--pooler-image=pgshard/pooler:dev",
+		"--postgresql-bootstrap-image=pgshard/postgres-agent:dev",
 	} {
 		if !slices.Contains(container.Args, required) {
 			t.Errorf("manager args %q do not contain %q", container.Args, required)

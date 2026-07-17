@@ -11,7 +11,9 @@ foundation release; see [implementation status](../project/status.md).
 :::
 
 Online resharding will change equal ranges in pgshard's versioned 64-bit hash
-space while applications continue to use the old routing epoch.
+space for one logical database while applications continue to use its old
+routing epoch. Other databases sharing the same fleet or physical cells retain
+their own routing epochs and continue serving.
 
 ```mermaid
 flowchart LR
@@ -47,6 +49,55 @@ same start point.
 - No old-epoch request is accepted after activation.
 - CDC consumers cross the topology through a durable reshard journal.
 
+Pooler acknowledgement alone is not the fence. Every physical database stores
+the accepted logical-database generation, and a PostgreSQL extension checks the
+authenticated internal generation at transaction start, before every write,
+and again before guarded `PREPARE TRANSACTION`. Application SQL cannot set that
+generation. A stale or partitioned pooler therefore cannot continue writing to
+an old source after the source fence advances, even if it retained an existing
+socket and an old catalog snapshot.
+
+Cutover first buffers eligible new requests and drains active old-generation
+transactions. It then advances the source-side generation fence, captures the
+final LSN vector, and catches up destinations. One `shardschema` CAS publishes
+the new routing/name/placement generation. Destination cells arm exactly that
+generation, and poolers release buffered work only after all destination and
+pooler acknowledgements agree. The interval between the catalog CAS and the
+last destination acknowledgement is deliberately non-serving, not partially
+serving. A paused pooler can use neither side: sources reject its old generation
+and destinations reject requests until it reloads the published generation.
+
+Long-lived sessions stay pinned to the generation on which they authenticated.
+The controller waits a bounded time for active transactions to finish, then
+terminates remaining old-generation backends with the documented retry or
+connection-failure result. An idle old socket is closed before its next
+transaction; it is never silently rebound to the new history. Only requests
+that have not begun a transaction and satisfy the pooler's replay policy may be
+buffered and retried transparently.
+
 Failures before activation leave serving routes untouched and allow target cleanup or resume. After activation, old shards are read-fenced and quarantined for 24 hours. Milestone 1 has no automatic reverse-replication rollback.
 
-The same engine is used when a backup created with one shard count is restored into an empty cluster requesting another count: first restore the source topology privately, then reshard before publishing services.
+## Online database move
+
+The same snapshot, `pgoutput`, validation, fencing, and activation engine moves
+a logical database between shared cells, shared-node cells, and dedicated
+placement pools. It can preserve the shard map or reshard while copying. The
+source database remains writable during snapshot and catch-up. At the final
+barrier, poolers buffer eligible requests, drain and fence old-generation
+transactions, apply the final per-shard LSN vector, publish one new
+name/topology/placement generation in `shardschema`, arm it on every
+destination, and release buffered traffic only after all acknowledgements
+agree. Physical PostgreSQL database names remain opaque UUID-derived names; the
+move never attempts non-atomic `ALTER DATABASE ... RENAME` on every shard.
+
+A restored database may therefore be validated as `B` and then moved online to
+the user-facing name `A`. Replacing an existing `A` requires an explicit
+replace policy and retains the old generation read-fenced in quarantine. The
+cutover selects the restored history; writes committed only to the replaced
+generation after the backup are not silently merged into that history.
+
+Restore itself never invokes this engine implicitly. It recreates the exact
+logical topology in the backup manifest. A request to restore a five-shard
+backup into a three-shard destination fails before target mutation. The caller
+must restore to an absent or empty exact five-shard database, then request a
+separate online move/reshard.

@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let read_write_listener = tokio::net::TcpListener::bind(read_write_bind).await?;
     let runtime = PoolerRuntime::new(config);
     tracing::warn!(
-        "PostgreSQL sessions are rejected; authentication, backend pooling, remote catalog transport, and OpenTelemetry export remain disabled"
+        "PostgreSQL sessions are rejected; client authentication, backend pooling, and OpenTelemetry export remain disabled"
     );
     tracing::info!(
         http_bind = %http_bind,

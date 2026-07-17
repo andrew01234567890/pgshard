@@ -772,8 +772,12 @@ async fn assert_squatted_catalog_role_is_rejected(client: &Client) -> TestResult
 }
 
 async fn assert_installation_contract(client: &Client, database_url: &str) -> TestResult {
-    assert_pre_receipt_probe_upgrade(client).await?;
-    assert_pre_creation_attempt_consumer_upgrade(client).await?;
+    assert_pre_receipt_probe_upgrade(client)
+        .await
+        .map_err(|error| format!("pre-receipt probe upgrade: {error}"))?;
+    assert_pre_creation_attempt_consumer_upgrade(client)
+        .await
+        .map_err(|error| format!("pre-creation-attempt consumer upgrade: {error}"))?;
     let epoch_after_first_migration = catalog_epoch(client).await?;
     client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
     assert_eq!(
@@ -781,8 +785,15 @@ async fn assert_installation_contract(client: &Client, database_url: &str) -> Te
         epoch_after_first_migration,
         "reapplying the migration must not mutate catalog state"
     );
-    assert_legacy_catalog_owner_upgrade(client, database_url).await?;
-    assert_catalog_role_bootstrap_rejections(client).await?;
+    assert_legacy_catalog_owner_upgrade(client, database_url)
+        .await
+        .map_err(|error| format!("legacy catalog-owner upgrade: {error}"))?;
+    assert_catalog_role_bootstrap_rejections(client)
+        .await
+        .map_err(|error| format!("catalog role bootstrap rejection: {error}"))?;
+    assert_migration_pins_search_path(client)
+        .await
+        .map_err(|error| format!("migration search-path pin: {error}"))?;
 
     let database_name: String = client
         .query_one("SELECT current_database()", &[])
@@ -972,10 +983,262 @@ async fn assert_external_catalog_trigger_rejections(
     client: &Client,
     database_url: &str,
 ) -> TestResult {
+    assert_database_event_trigger_is_rejected(client).await?;
+    assert_catalog_rewrite_rule_is_rejected(client).await?;
+    assert_altered_identity_sequence_is_rejected(client).await?;
+    assert_rewound_identity_sequences_are_rejected(client).await?;
+    assert_orphaned_restore_lineage_is_rejected(client).await?;
+    assert_disabled_internal_trigger_is_rejected(client).await?;
     assert_same_identity_altered_trigger_is_rejected(client).await?;
     assert_external_executable_trigger_is_rejected(client).await?;
     assert_external_reference_trigger_is_rejected(client).await?;
     assert_concurrent_external_trigger_is_rejected(client, database_url).await
+}
+
+async fn assert_migration_pins_search_path(client: &Client) -> TestResult {
+    let schema = format!("pgshard_hostile_path_{}", Uuid::new_v4().simple());
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema}; \
+             CREATE FUNCTION {schema}.current_setting(text) RETURNS text \
+                 LANGUAGE plpgsql AS \
+                 'BEGIN RAISE EXCEPTION ''hostile search_path routine executed''; END'; \
+             SET search_path = {schema}, pg_catalog"
+        ))
+        .await?;
+
+    let migration = client.batch_execute(pgshard_catalog::MIGRATION_SQL).await;
+    if migration.is_err() {
+        let _ = client.batch_execute("ROLLBACK").await;
+    }
+    let cleanup = client
+        .batch_execute(&format!("RESET search_path; DROP SCHEMA {schema} CASCADE"))
+        .await;
+    migration?;
+    cleanup?;
+    Ok(())
+}
+
+async fn assert_database_event_trigger_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "CREATE FUNCTION public.pgshard_rejected_event_trigger() \
+             RETURNS event_trigger LANGUAGE plpgsql AS \
+             'BEGIN NULL; END'; \
+         CREATE EVENT TRIGGER pgshard_rejected_event_trigger \
+             ON ddl_command_start \
+             EXECUTE FUNCTION public.pgshard_rejected_event_trigger()",
+        "pre-existing shardschema contains an unsupported event trigger",
+        &[],
+    )
+    .await
+}
+
+async fn assert_catalog_rewrite_rule_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "CREATE RULE pgshard_rejected_rule AS \
+             ON INSERT TO pgshard_catalog.shards DO INSTEAD NOTHING",
+        "pre-existing pgshard_catalog contains an unsupported rewrite rule",
+        &[],
+    )
+    .await
+}
+
+async fn assert_altered_identity_sequence_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq \
+             INCREMENT BY 2 CYCLE",
+        "pre-existing pgshard_catalog contains an unsupported identity sequence",
+        &[],
+    )
+    .await
+}
+
+async fn assert_rewound_identity_sequences_are_rejected(client: &Client) -> TestResult {
+    let routing_database = Uuid::new_v4();
+    let routing_result = assert_catalog_migration_rejection(
+        client,
+        &format!(
+            "INSERT INTO pgshard_catalog.logical_databases( \
+                 logical_database_id, database_name \
+             ) VALUES ('{routing_database}', 'rewound_routing_{}'); \
+             INSERT INTO pgshard_catalog.routing_epochs(logical_database_id) \
+             VALUES ('{routing_database}'); \
+             SELECT pg_catalog.setval( \
+                 'pgshard_catalog.routing_epochs_routing_epoch_seq', \
+                 (SELECT pg_catalog.max(routing_epoch) \
+                    FROM pgshard_catalog.routing_epochs), \
+                 false \
+             )",
+            routing_database.simple()
+        ),
+        "pre-existing pgshard_catalog contains unsafe identity sequence progress",
+        &[],
+    )
+    .await;
+    let routing_repair = client
+        .batch_execute(
+            "SELECT pg_catalog.setval( \
+                 'pgshard_catalog.routing_epochs_routing_epoch_seq', \
+                 GREATEST( \
+                     COALESCE( \
+                         (SELECT pg_catalog.max(routing_epoch) \
+                            FROM pgshard_catalog.routing_epochs), \
+                         0 \
+                     ) + 1, \
+                     1 \
+                 ), \
+                 false \
+             )",
+        )
+        .await;
+    routing_result?;
+    routing_repair?;
+
+    let table_database = Uuid::new_v4();
+    let table_result = assert_catalog_migration_rejection(
+        client,
+        &format!(
+            "INSERT INTO pgshard_catalog.logical_databases( \
+                 logical_database_id, database_name \
+             ) VALUES ('{table_database}', 'rewound_table_{}'); \
+             INSERT INTO pgshard_catalog.registered_tables( \
+                 logical_database_id, schema_name, table_name, \
+                 shard_key_column, shard_key_type \
+             ) VALUES ( \
+                 '{table_database}', 'public', 'rewound_table', 'id', 'bigint' \
+             ); \
+             SELECT pg_catalog.setval( \
+                 'pgshard_catalog.registered_tables_registered_table_id_seq', \
+                 (SELECT pg_catalog.max(registered_table_id) \
+                    FROM pgshard_catalog.registered_tables), \
+                 false \
+             )",
+            table_database.simple()
+        ),
+        "pre-existing pgshard_catalog contains unsafe identity sequence progress",
+        &[],
+    )
+    .await;
+    let table_repair = client
+        .batch_execute(
+            "SELECT pg_catalog.setval( \
+                 'pgshard_catalog.registered_tables_registered_table_id_seq', \
+                 GREATEST( \
+                     COALESCE( \
+                         (SELECT pg_catalog.max(registered_table_id) \
+                            FROM pgshard_catalog.registered_tables), \
+                         0 \
+                     ) + 1, \
+                     1 \
+                 ), \
+                 false \
+             )",
+        )
+        .await;
+    table_result?;
+    table_repair?;
+    assert_exhausted_identity_sequences_are_rejected(client).await
+}
+
+async fn assert_exhausted_identity_sequences_are_rejected(client: &Client) -> TestResult {
+    for (sequence_name, relation_name, column_name) in [
+        (
+            "routing_epochs_routing_epoch_seq",
+            "routing_epochs",
+            "routing_epoch",
+        ),
+        (
+            "registered_tables_registered_table_id_seq",
+            "registered_tables",
+            "registered_table_id",
+        ),
+    ] {
+        let exhausted_result = assert_catalog_migration_rejection(
+            client,
+            &format!(
+                "SELECT pg_catalog.setval( \
+                     'pgshard_catalog.{sequence_name}', \
+                     (SELECT sequences.seqmax \
+                        FROM pg_catalog.pg_sequence AS sequences \
+                       WHERE sequences.seqrelid = \
+                             'pgshard_catalog.{sequence_name}'::pg_catalog.regclass), \
+                     true \
+                 )"
+            ),
+            "pre-existing pgshard_catalog contains unsafe identity sequence progress",
+            &[],
+        )
+        .await;
+        let exhausted_repair = client
+            .batch_execute(&format!(
+                "SELECT pg_catalog.setval( \
+                     'pgshard_catalog.{sequence_name}', \
+                     GREATEST( \
+                         COALESCE( \
+                             (SELECT pg_catalog.max({column_name}) \
+                                FROM pgshard_catalog.{relation_name}), \
+                             0 \
+                         ) + 1, \
+                         1 \
+                     ), \
+                     false \
+                 )"
+            ))
+            .await;
+        exhausted_result?;
+        exhausted_repair?;
+    }
+    Ok(())
+}
+
+async fn assert_orphaned_restore_lineage_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "ALTER TABLE pgshard_catalog.shard_restore_incarnations \
+             DISABLE TRIGGER ALL; \
+         INSERT INTO pgshard_catalog.shard_restore_incarnations( \
+             restore_incarnation, shard_id, state \
+         ) VALUES ( \
+             '30000000-0000-0000-0000-000000000001', \
+             'orphaned-restore-shard', \
+             'active' \
+         ); \
+         ALTER TABLE pgshard_catalog.shard_restore_incarnations \
+             ENABLE TRIGGER ALL",
+        "pre-existing pgshard_catalog contains invalid restore lineage",
+        &[],
+    )
+    .await
+}
+
+async fn assert_disabled_internal_trigger_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "DO $pgshard_disable_internal_trigger$ \
+         DECLARE \
+             internal_trigger name; \
+         BEGIN \
+             SELECT triggers.tgname \
+               INTO STRICT internal_trigger \
+               FROM pg_catalog.pg_trigger AS triggers \
+               JOIN pg_catalog.pg_class AS relations ON relations.oid = triggers.tgrelid \
+              WHERE relations.oid = 'pgshard_catalog.routing_ranges'::pg_catalog.regclass \
+                AND triggers.tgisinternal \
+              ORDER BY triggers.oid \
+              LIMIT 1; \
+             EXECUTE pg_catalog.format( \
+                 'ALTER TABLE pgshard_catalog.routing_ranges DISABLE TRIGGER %I', \
+                 internal_trigger \
+             ); \
+         END \
+         $pgshard_disable_internal_trigger$",
+        "pre-existing pgshard_catalog contains an unsupported attached trigger",
+        &[],
+    )
+    .await
 }
 
 async fn assert_same_identity_altered_trigger_is_rejected(client: &Client) -> TestResult {
@@ -2522,7 +2785,7 @@ async fn assert_slot_sync_probe_contract(client: &Client, fixture: &Fixture) -> 
     assert_slot_sync_probe_retirement(client, fixture, &probe).await
 }
 
-async fn assert_migration_does_not_resurrect_retired_restore(
+async fn assert_migration_rejects_active_shard_without_restore(
     client: &Client,
     nonce: u128,
 ) -> TestResult {
@@ -2559,11 +2822,20 @@ async fn assert_migration_does_not_resurrect_retired_restore(
         )
         .await?;
     let epoch_before_replay = catalog_epoch(client).await?;
-    client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
+    let replay = client
+        .batch_execute(pgshard_catalog::MIGRATION_SQL)
+        .await
+        .expect_err("an active shard without an active restore must block migration replay");
+    client.batch_execute("ROLLBACK").await?;
+    assert_sqlstate(&replay, "42501");
+    assert_database_message(
+        &replay,
+        "pre-existing pgshard_catalog contains invalid restore lineage",
+    );
     assert_eq!(
         catalog_epoch(client).await?,
         epoch_before_replay,
-        "migration replay mutated catalog state after restore retirement"
+        "rejected migration replay mutated catalog state after restore retirement"
     );
     let row = client
         .query_one(
@@ -2581,9 +2853,20 @@ async fn assert_migration_does_not_resurrect_retired_restore(
     let retired_count: i64 = row.get(1);
     assert_eq!(
         active_count, 0,
-        "migration replay resurrected retired WAL history"
+        "rejected migration replay resurrected retired WAL history"
     );
-    assert_eq!(retired_count, 1, "migration replay rewrote restore history");
+    assert_eq!(
+        retired_count, 1,
+        "rejected migration replay rewrote restore history"
+    );
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.shard_restore_incarnations( \
+                 restore_incarnation, shard_id \
+             ) VALUES (gen_random_uuid(), $1::text)",
+            &[&shard_id],
+        )
+        .await?;
     Ok(())
 }
 
@@ -7036,7 +7319,7 @@ async fn run_migration_and_activation_contract(
     assert_target_registry_lock_is_fail_fast(client, database_url).await?;
     assert_admin_write_path(client).await?;
     let fixture = create_fixture(client).await?;
-    assert_migration_does_not_resurrect_retired_restore(client, fixture.nonce).await?;
+    assert_migration_rejects_active_shard_without_restore(client, fixture.nonce).await?;
     assert_slot_sync_probe_contract(client, &fixture).await?;
     assert_identity_history_contract(client, &fixture).await?;
     assert_registered_table_contract(client, &fixture).await?;

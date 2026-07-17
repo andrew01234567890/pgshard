@@ -11,16 +11,19 @@ recovery are not implemented in the foundation release; see [implementation
 status](../project/status.md).
 :::
 
-When one client transaction writes to multiple shards, the Milestone 1 design
-uses PostgreSQL prepared transactions. The client-facing pooler drives the
-protocol, but the lowest-ID participating shard is the durable transaction
-coordinator.
+When one client transaction writes to multiple shards of one logical database,
+the Milestone 1 design uses PostgreSQL prepared transactions. The client-facing
+pooler drives the protocol, but the lowest-ID participating database shard is
+the durable transaction coordinator. Its coordinator row is stored in that
+shard's current physical cell and replicated with that cell. A transaction
+cannot enlist a shard from another logical database, even when both databases
+share the same cell.
 
 ```mermaid
 sequenceDiagram
   participant C as Client
   participant P as Pooler
-  participant M as Coordinator shard
+  participant M as Coordinator database shard
   participant S as Participant shard
   C->>P: COMMIT
   P->>M: Record PREPARING
@@ -33,9 +36,10 @@ sequenceDiagram
 ```
 
 Before any participant prepares, the pooler durably creates one coordinator row
-containing the complete, immutable participant set, state `PREPARING`, an owner
-lease deadline, and a fencing generation. The lowest-ID participating shard owns
-that row.
+containing the logical-database UUID, complete immutable database-shard
+participant set, state `PREPARING`, an owner lease deadline, and a fencing
+generation. The lowest-ID participating database shard owns that row in its
+current physical cell.
 
 ## Prepare-command fencing
 
@@ -104,7 +108,9 @@ During phase-two commit, a concurrent reader can temporarily observe the committ
 - After the durable `COMMIT` decision, recovery must commit every participant.
 - A stale live pooler's guarded prepare is rejected after participant fencing;
   losing the decision CAS then stops it from contradicting the winner.
-- If the coordinator shard is unavailable, participants remain prepared and retain locks. pgshard stops affected progress rather than guessing.
+- If the coordinator database shard's physical cell is unavailable,
+  participants remain prepared and retain locks. pgshard stops affected
+  progress rather than guessing.
 - Alerts expose old prepared transactions and recovery backlog.
 
 ## Unsupported transaction features
