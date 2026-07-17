@@ -608,7 +608,8 @@ cluster receipt metadata. Only the controller service account can repair it,
 and only when the final HMAC receipt verifies; deletion-time metadata remains
 immutable. Later
 anchor loss remains failed closed, and metadata-only continuity state preserves
-previous-manager rollback. Empty,
+the Secret shape accepted by the previous manager; it does not establish a safe
+manifest or image rollback. Empty,
 mutable, oversized, or different valid key replacements fail startup, readiness,
 receipt-authenticated webhook use, and controller verification. The KIND
 admission test deletes and replaces the shared key with malformed and different
