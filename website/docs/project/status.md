@@ -23,10 +23,12 @@ serving material, populated legacy webhook trust, and empty receipt-webhook
 trust. Receipt-looking metadata from that proven pre-signer release is not
 treated as continuity history. Existing initialized keys require an explicit
 pre-rollout fingerprint pin; automatic mixed-version adoption is deliberately
-refused because a resource listing is not a writer barrier. Established receipt history
-and pre-provisioning handshakes are verified before a separate completion marker
-is written. Users cannot mutate handshake metadata; controller repair requires
-both its service-account identity and a valid final HMAC receipt, and deletion
+refused because a resource listing is not a writer barrier. Established receipt
+history is verified before a separate completion marker is written.
+Pre-lifecycle invalid or incomplete cluster metadata remains repairable because
+no PostgreSQL child can precede the finalizer/status barrier. Users cannot
+mutate handshake metadata; controller repair requires both its service-account
+identity and a valid final HMAC receipt, and deletion
 makes the pair immutable.
 Startup, readiness, receipt-authenticated admission, and
 reconciliation reject key loss or replacement rather than silently invalidating

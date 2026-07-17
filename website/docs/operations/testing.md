@@ -593,14 +593,17 @@ two-phase first-key upgrade. Forged receipt-looking cluster and Pod metadata
 from that proven pre-signer release does not become continuity history, while
 loss of any upgrade proof leaves the key empty. An
 initialized unanchored legacy key is refused, and a pre-anchored key completes
-migration only after every single-member cluster handshake and managed terminal
-receipt verifies, including handshakes written before status or finalizers.
-Incomplete pairs fail closed. Fault injection writes a mismatching receipt
+migration only after every established single-member cluster handshake and
+managed terminal receipt verifies. Invalid or incomplete pre-lifecycle cluster
+metadata remains repairable because no PostgreSQL child can precede the
+finalizer/status barrier; the same metadata after that barrier fails closed.
+Fault injection writes a mismatching receipt
 during the fresh anchor update and proves the completion marker remains absent;
-unrelated multi-member clusters and unmanaged or partially labelled Pods do not
-block startup. Users cannot establish, remove, or replace cluster receipt
-metadata. Only the controller service account can repair it, and only when the
-final HMAC receipt verifies; deletion-time metadata remains immutable. Later
+unrelated multi-member and unprovisioned clusters plus unmanaged or partially
+labelled Pods do not block startup. Users cannot establish, remove, or replace
+cluster receipt metadata. Only the controller service account can repair it,
+and only when the final HMAC receipt verifies; deletion-time metadata remains
+immutable. Later
 anchor loss remains failed closed, and metadata-only continuity state preserves
 previous-manager rollback. Empty,
 mutable, oversized, or different valid key replacements fail startup, readiness,

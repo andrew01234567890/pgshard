@@ -425,6 +425,19 @@ func TestBootstrapUpgradesOriginMainKeylessAdmissionStateInTwoPhases(t *testing.
 	if len(caSecret.Data) != 2 || len(keySecret.Data) != 1 || keySecret.Immutable == nil || !*keySecret.Immutable {
 		t.Fatal("origin/main keyless upgrade changed rollback data shapes or left the key mutable")
 	}
+	keyBeforeRestart := bytes.Clone(keySecret.Data[PodFencingKeyKey])
+	delete(keySecret.Annotations, podfence.SecretKeyContinuityAnnotation)
+	if err := kubeClient.Update(ctx, keySecret); err != nil {
+		t.Fatal(err)
+	}
+	restarted := newTestProvisioner(t, kubeClient, t.TempDir(), time.Now)
+	if err := restarted.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keySecret = getSecret(t, kubeClient, testFencingKeySecretName)
+	if !bytes.Equal(keySecret.Data[PodFencingKeyKey], keyBeforeRestart) || keySecret.Annotations[podfence.SecretKeyContinuityAnnotation] != podfence.SecretKeyContinuityValue {
+		t.Fatal("legacy-anchored restart did not preserve and complete the generated key")
+	}
 }
 
 func TestBootstrapRequiresIndependentProofForOriginMainKeylessUpgrade(t *testing.T) {
@@ -684,10 +697,7 @@ func TestBootstrapRefusesPreAnchoredKeyThatCannotVerifyReceiptHistory(t *testing
 		want   string
 	}{
 		{name: "cluster", object: func(t *testing.T, key []byte) client.Object {
-			cluster := clusterWithHandshakeReceipt(t, key, "mismatched-cluster")
-			cluster.Finalizers = nil
-			cluster.Status.PostgreSQLBootstraps = nil
-			return cluster
+			return clusterWithHandshakeReceipt(t, key, "mismatched-cluster")
 		}, want: "handshake receipt does not match"},
 		{name: "Pod", object: func(t *testing.T, key []byte) client.Object {
 			return podWithTerminationReceipt(t, key, "mismatched-pod")
@@ -722,14 +732,17 @@ func TestBootstrapRefusesPreAnchoredKeyThatCannotVerifyReceiptHistory(t *testing
 	}
 }
 
-func TestBootstrapRefusesIncompletePreProvisioningHandshakeHistory(t *testing.T) {
+func TestBootstrapClassifiesIncompleteHandshakeHistoryByLifecycle(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
 		name        string
 		annotations map[string]string
+		established bool
 	}{
 		{name: "challenge only", annotations: map[string]string{podfence.HandshakeChallengeAnnotation: "challenge"}},
 		{name: "receipt only", annotations: map[string]string{podfence.HandshakeReceiptAnnotation: "v1.receipt"}},
+		{name: "established challenge only", annotations: map[string]string{podfence.HandshakeChallengeAnnotation: "challenge"}, established: true},
+		{name: "established receipt only", annotations: map[string]string{podfence.HandshakeReceiptAnnotation: "v1.receipt"}, established: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -753,16 +766,30 @@ func TestBootstrapRefusesIncompletePreProvisioningHandshakeHistory(t *testing.T)
 				},
 				Spec: pgshardv1alpha1.PgShardClusterSpec{MembersPerShard: 1},
 			}
+			if test.established {
+				cluster.Finalizers = []string{owned.ClusterResourceFinalizer}
+				cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{{Shard: 0}}
+			}
 			if err := kubeClient.Create(ctx, cluster); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := provisioner.Bootstrap(ctx); err == nil || !strings.Contains(err.Error(), "incomplete Pod fencing handshake metadata") {
-				t.Fatalf("Bootstrap() error = %v", err)
-			}
+			err := provisioner.Bootstrap(ctx)
 			keySecret = getSecret(t, kubeClient, testFencingKeySecretName)
-			if keySecret.Annotations[podfence.SecretKeyContinuityAnnotation] != "" {
-				t.Fatal("failed migration wrote the continuity completion marker")
+			if test.established {
+				if err == nil || !strings.Contains(err.Error(), "incomplete Pod fencing handshake metadata") {
+					t.Fatalf("Bootstrap() error = %v", err)
+				}
+				if keySecret.Annotations[podfence.SecretKeyContinuityAnnotation] != "" {
+					t.Fatal("failed migration wrote the continuity completion marker")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if keySecret.Annotations[podfence.SecretKeyContinuityAnnotation] != podfence.SecretKeyContinuityValue {
+				t.Fatal("repairable pre-provisioning metadata blocked continuity completion")
 			}
 		})
 	}
@@ -786,6 +813,12 @@ func TestBootstrapIgnoresReceiptsOutsideManagedFencingIdentities(t *testing.T) {
 	multiMember := clusterWithHandshakeReceipt(t, differentKey, "unrelated-multi-member")
 	multiMember.Spec.MembersPerShard = 3
 	if err := kubeClient.Create(ctx, multiMember); err != nil {
+		t.Fatal(err)
+	}
+	unprovisioned := clusterWithHandshakeReceipt(t, differentKey, "unprovisioned-single-member")
+	unprovisioned.Finalizers = nil
+	unprovisioned.Status.PostgreSQLBootstraps = nil
+	if err := kubeClient.Create(ctx, unprovisioned); err != nil {
 		t.Fatal(err)
 	}
 	unmanagedPod := podWithTerminationReceipt(t, differentKey, "unmanaged-terminal-pod")

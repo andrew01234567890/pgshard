@@ -181,11 +181,13 @@ authenticated and are not continuity history. An existing initialized but
 unanchored key must instead be pinned while the old manager is healthy before a
 mixed-version rollout; the new manager
 refuses to infer continuity from receipt listings because those listings cannot
-fence an older signer. It then verifies every complete single-member cluster
-handshake and managed terminal Pod receipt before writing a separate completion
-marker. Incomplete cluster handshake metadata blocks migration even before
-workload status or finalizers exist. Users cannot establish, remove, or replace
-the handshake. The controller may establish or repair it only when both its
+fence an older signer. It inspects every single-member cluster handshake and
+requires every established cluster handshake and managed terminal Pod receipt
+to verify before writing a separate completion marker. Invalid or incomplete
+cluster metadata remains repairable only before the lifecycle finalizer or
+PostgreSQL bootstrap status exists; PostgreSQL storage and workloads cannot
+precede that barrier. Users cannot establish, remove, or replace the handshake.
+The controller may establish or repair it only when both its
 service-account identity and the final HMAC receipt verify; the pair is
 byte-for-byte immutable during deletion. Readiness,
 receipt-authenticated admission, and controller key use require the exact key to
@@ -195,9 +197,12 @@ mint replacement authority.
 An upgrade from the keyless default-branch release needs no manual key command.
 Deploy the updated manifest and an immutable new manager image in one rollout;
 the request Secret must exist before a new Pod starts, and the Deployment keeps
-the old Pod available. Do not restart the old image with the new command-line
-arguments. For a pre-release development install that already has an
-initialized unanchored key, record the current immutable key before changing the
+the old Pod available. Once termination begins, the old manager continues
+serving for a five-second endpoint-propagation drain before receiving `SIGTERM`,
+with 15 seconds then remaining for graceful shutdown. Do not restart the old
+image with the new command-line arguments. For a pre-release development
+install that already has an initialized unanchored key, record the current
+immutable key before changing the
 manager image. Run this while the old manager is healthy:
 
 ```console

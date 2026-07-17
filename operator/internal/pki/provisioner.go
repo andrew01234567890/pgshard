@@ -502,14 +502,18 @@ func (p *Provisioner) verifyExistingReceiptHistory(ctx context.Context, key []by
 		if cluster.Spec.MembersPerShard != 1 || !hasChallenge && !hasReceipt {
 			continue
 		}
+		established := slices.Contains(cluster.Finalizers, owned.ClusterResourceFinalizer) || len(cluster.Status.PostgreSQLBootstraps) != 0
 		if !hasChallenge || !hasReceipt || challenge == "" || receipt == "" {
-			return fmt.Errorf("existing PgShardCluster %s/%s has incomplete Pod fencing handshake metadata", cluster.Namespace, cluster.Name)
+			if established {
+				return fmt.Errorf("existing PgShardCluster %s/%s has incomplete Pod fencing handshake metadata", cluster.Namespace, cluster.Name)
+			}
+			continue
 		}
 		verified, err := codec.Verify(ctx, cluster)
 		if err != nil {
 			return fmt.Errorf("verify existing PgShardCluster %s/%s handshake receipt: %w", cluster.Namespace, cluster.Name, err)
 		}
-		if !verified {
+		if !verified && established {
 			return fmt.Errorf("existing PgShardCluster %s/%s handshake receipt does not match the candidate Pod fencing key", cluster.Namespace, cluster.Name)
 		}
 	}

@@ -39,7 +39,7 @@ func TestAdmissionOverlayEnablesOnlyTheSelfManagedWebhookRuntime(t *testing.T) {
 	}
 
 	patch := readManifest[appsv1.Deployment](t, "../../config/admission/manager_patch.yaml")
-	if patch.Spec.ProgressDeadlineSeconds == nil || *patch.Spec.ProgressDeadlineSeconds != 180 || len(patch.Spec.Template.Spec.Containers) != 1 {
+	if patch.Spec.ProgressDeadlineSeconds == nil || *patch.Spec.ProgressDeadlineSeconds != 180 || patch.Spec.Template.Spec.TerminationGracePeriodSeconds == nil || *patch.Spec.Template.Spec.TerminationGracePeriodSeconds != 20 || len(patch.Spec.Template.Spec.Containers) != 1 {
 		t.Fatalf("admission manager patch = %#v", patch.Spec)
 	}
 	container := patch.Spec.Template.Spec.Containers[0]
@@ -63,6 +63,9 @@ func TestAdmissionOverlayEnablesOnlyTheSelfManagedWebhookRuntime(t *testing.T) {
 	}
 	if len(container.Ports) != 1 || container.Ports[0].Name != "webhook" || container.Ports[0].ContainerPort != 9443 || container.StartupProbe == nil || container.StartupProbe.FailureThreshold != 75 {
 		t.Fatalf("admission manager listener/probe = %#v / %#v", container.Ports, container.StartupProbe)
+	}
+	if container.Lifecycle == nil || container.Lifecycle.PreStop == nil || container.Lifecycle.PreStop.Sleep == nil || container.Lifecycle.PreStop.Sleep.Seconds != 5 {
+		t.Fatalf("admission manager termination drain = %#v", container.Lifecycle)
 	}
 	if len(container.VolumeMounts) != 1 || container.VolumeMounts[0].Name != "webhook-certificates" || container.VolumeMounts[0].MountPath != "/run/pgshard" || len(patch.Spec.Template.Spec.Volumes) != 1 || patch.Spec.Template.Spec.Volumes[0].EmptyDir == nil || patch.Spec.Template.Spec.Volumes[0].EmptyDir.Medium != corev1.StorageMediumMemory || patch.Spec.Template.Spec.Volumes[0].EmptyDir.SizeLimit == nil || patch.Spec.Template.Spec.Volumes[0].EmptyDir.SizeLimit.String() != "16Mi" {
 		t.Fatalf("admission certificate volume = %#v / %#v", container.VolumeMounts, patch.Spec.Template.Spec.Volumes)

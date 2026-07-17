@@ -298,9 +298,12 @@ so this sample must not be used as zero-downtime evidence.
 ## Self-managed admission manager
 
 `config/admission` extends the same local-image install with four generated
-mutating webhooks and five generated validating webhooks. The binding mutator,
-binding final-state validator, and cluster-handshake webhook are scoped to namespaces labelled
-`pgshard.io/pod-fencing=enabled`; the status and metadata webhooks are scoped to
+mutating webhooks and five generated validating webhooks. A terminating manager
+continues serving for a five-second endpoint-propagation drain before it receives
+`SIGTERM`; the Pod then retains a further 15 seconds for graceful shutdown. The
+binding mutator, binding final-state validator, and cluster-handshake webhook
+are scoped to namespaces labelled `pgshard.io/pod-fencing=enabled`; the status
+and metadata webhooks are scoped to
 operator-managed PostgreSQL Pods. Both binding and status use final validating
 webhooks so a later mutator cannot remove or replace their authenticated
 evidence. Namespace admission makes the opt-in label
@@ -363,10 +366,12 @@ unanchored key is not this keyless state and is never adopted during a
 mixed-version rollout: pin its fingerprint in the CA Secret while the old
 manager is healthy, before changing the manager image, or reinstall the
 pre-release development cluster.
-Once pre-anchored, every complete handshake on a single-member cluster and every
-managed terminal Pod receipt must verify before the completion marker is
-written; incomplete handshake metadata also blocks migration even if workload
-status and finalizers have not yet been published. Users cannot establish,
+Once pre-anchored, every handshake on a single-member cluster is inspected and
+every established cluster handshake and managed terminal Pod receipt must
+verify before the completion marker is written. Invalid or incomplete cluster
+metadata remains repairable only until the controller has published its
+lifecycle finalizer or PostgreSQL bootstrap status; no PostgreSQL storage or
+workload can precede that barrier. Users cannot establish,
 remove, or replace cluster handshake metadata. The controller may establish or
 repair it only when its service-account identity and the final HMAC receipt both
 verify; during deletion the pair is byte-for-byte immutable. Once complete,
