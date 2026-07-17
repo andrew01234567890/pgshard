@@ -13,8 +13,12 @@ shard. Each shard receives a distinct immutable bootstrap Secret and a 4Gi
 minimum data claim. Before the shard-0000 server is allowed to start, its init
 container creates the dedicated `shardschema` database over a private Unix
 socket, applies the transactional catalog migration, and records every
-configured shard plus its initial restore incarnation. No other shard receives
-that database. When `storage.storageClassName` is omitted, the operator
+configured physical cell plus its initial restore incarnation. If
+`spec.databases` is present, the same bootstrap atomically installs each
+database's immutable genesis shard count, ordered cell mapping, and equal hash
+ranges. This is catalog metadata only: it does not create application databases
+or provide a routed endpoint. No other cell receives `shardschema`. When
+`storage.storageClassName` is omitted, the operator
 resolves the current Kubernetes default and checkpoints that exact class before
 creating any claim; later default-class rotation does not change existing data
 intent. An object stored by an earlier release with a 1Gi-to-4Gi size must be
@@ -95,6 +99,13 @@ or conflicting permanent restore lineage is rejected
 before migration can rewrite it. Catalog clients use bounded lock, statement,
 and whole-transaction timeouts so a conflicting prepared lock fails the init
 pass for retry instead of hanging a Pod restart.
+
+Database genesis runs only after that physical-cell inventory is exact. All
+declared databases are installed in one transaction, exact replay leaves the
+catalog epoch unchanged, and a changed mapping, unavailable cell, or
+undeclared active logical database aborts startup without a partial topology.
+See [Database topology and placement](concepts/database-placement.md) for the
+current fields and their limits.
 
 Before that private postmaster starts, bootstrap also rejects active settings in
 restored `postgresql.auto.conf`, recovery signals, external WAL, and user

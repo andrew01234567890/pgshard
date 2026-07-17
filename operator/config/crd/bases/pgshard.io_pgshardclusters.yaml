@@ -110,16 +110,42 @@ spec:
                 type: object
               databases:
                 description: |-
-                  Databases reserves the shared-topology database names. Database lifecycle
-                  will move to PgShardDatabase without changing the cluster topology.
+                  Databases declares immutable genesis database topologies. Database
+                  lifecycle will move to PgShardDatabase without changing this placement
+                  contract.
                 items:
                   properties:
+                    cells:
+                      description: |-
+                        Cells maps logical shard ordinal i to one exact physical cell ordinal.
+                        Omitting it selects the first Shards cells. Reusing cells across different
+                        databases is explicit shared-cell placement; cells within one database
+                        must be unique.
+                      items:
+                        format: int32
+                        maximum: 127
+                        minimum: 0
+                        type: integer
+                      maxItems: 128
+                      minItems: 1
+                      type: array
                     name:
+                      maxLength: 63
                       minLength: 1
                       type: string
+                    shards:
+                      description: |-
+                        Shards is this database's logical shard count. Zero is defaulted to the
+                        number of explicitly selected cells, or to every cluster cell when cells
+                        is also omitted.
+                      format: int32
+                      maximum: 128
+                      minimum: 1
+                      type: integer
                   required:
                   - name
                   type: object
+                maxItems: 1024
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
@@ -329,8 +355,10 @@ spec:
                 type: object
               shards:
                 default: 1
-                description: Shards is the number of logical hash ranges. The catalog
-                  remains on shard-0000.
+                description: |-
+                  Shards is the number of physical PostgreSQL cells in the foundation API.
+                  Each logical database maps its independently ordered hash ranges onto a
+                  subset of these cells. The catalog remains on physical cell zero.
                 format: int32
                 maximum: 128
                 minimum: 1
@@ -378,7 +406,7 @@ spec:
             - storage
             type: object
             x-kubernetes-validations:
-            - message: shards is immutable until online resharding is implemented
+            - message: shards is immutable until physical cell transitions are implemented
               rule: self.shards == oldSelf.shards
             - message: membersPerShard is immutable until membership transitions are
                 implemented
@@ -386,6 +414,10 @@ spec:
             - message: durability is immutable until replication-mode transitions
                 are implemented
               rule: self.durability == oldSelf.durability
+            - message: databases is immutable until database lifecycle and online
+                resharding are implemented
+              rule: '!has(oldSelf.databases) ? !has(self.databases) || size(self.databases)
+                == 0 : has(self.databases) && self.databases == oldSelf.databases'
           status:
             description: |-
               PgShardClusterStatus never reports readiness until the operator has actually

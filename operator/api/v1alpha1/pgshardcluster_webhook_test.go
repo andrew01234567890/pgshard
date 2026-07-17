@@ -91,6 +91,101 @@ func TestDefaultsAreSafetyOriented(t *testing.T) {
 	}
 }
 
+func TestDatabaseTopologyDefaultsAreExplicitAndDeterministic(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Spec.Shards = 8
+	cluster.Spec.Databases = []DatabaseTemplate{
+		{Name: "all-cells"},
+		{Name: "first-three", Shards: 3},
+		{Name: "dedicated", Cells: []int32{5, 6, 7}},
+	}
+	if err := (&PgShardClusterDefaulter{}).Default(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	want := []DatabaseTemplate{
+		{Name: "all-cells", Shards: 8, Cells: []int32{0, 1, 2, 3, 4, 5, 6, 7}},
+		{Name: "first-three", Shards: 3, Cells: []int32{0, 1, 2}},
+		{Name: "dedicated", Shards: 3, Cells: []int32{5, 6, 7}},
+	}
+	if !databaseTemplatesEqual(cluster.Spec.Databases, want, 8, 8) {
+		t.Fatalf("database topology defaults = %#v, want %#v", cluster.Spec.Databases, want)
+	}
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
+		t.Fatalf("defaulted topology was rejected: %v", err)
+	}
+}
+
+func TestDatabaseTopologyValidationAllowsSharedAndDisjointCells(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Spec.Shards = 8
+	cluster.Spec.Databases = []DatabaseTemplate{
+		{Name: "a", Shards: 5, Cells: []int32{0, 1, 2, 3, 4}},
+		{Name: "b-shared", Shards: 3, Cells: []int32{0, 1, 2}},
+		{Name: "b-dedicated", Shards: 3, Cells: []int32{5, 6, 7}},
+	}
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDatabaseTopologyValidationRejectsAmbiguousPlacement(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		database DatabaseTemplate
+		field    string
+	}{
+		"count mismatch":  {database: DatabaseTemplate{Name: "app", Shards: 2, Cells: []int32{0}}, field: "cells"},
+		"duplicate cell":  {database: DatabaseTemplate{Name: "app", Shards: 2, Cells: []int32{0, 0}}, field: "cells[1]"},
+		"outside cluster": {database: DatabaseTemplate{Name: "app", Shards: 2, Cells: []int32{0, 2}}, field: "cells[1]"},
+		"too many shards": {database: DatabaseTemplate{Name: "app", Shards: 3, Cells: []int32{0, 1, 2}}, field: "shards"},
+	}
+	for name, test := range tests {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			cluster.Spec.Databases = []DatabaseTemplate{test.database}
+			_, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster)
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("invalid database placement was admitted: %v", err)
+			}
+		})
+	}
+}
+
+func TestDatabaseTopologyIsImmutableUntilLifecycleControllerExists(t *testing.T) {
+	t.Parallel()
+	oldCluster := validCluster()
+	oldCluster.Spec.Databases = []DatabaseTemplate{
+		{Name: "a", Shards: 2, Cells: []int32{0, 1}},
+		{Name: "b", Shards: 1, Cells: []int32{0}},
+	}
+
+	reordered := oldCluster.DeepCopy()
+	reordered.Spec.Databases[0], reordered.Spec.Databases[1] = reordered.Spec.Databases[1], reordered.Spec.Databases[0]
+	if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, reordered); err != nil {
+		t.Fatalf("map-list reordering changed database topology: %v", err)
+	}
+
+	materializedDefaults := validCluster()
+	materializedDefaults.Spec.Databases = []DatabaseTemplate{{Name: "a"}}
+	defaulted := materializedDefaults.DeepCopy()
+	if err := (&PgShardClusterDefaulter{}).Default(context.Background(), defaulted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), materializedDefaults, defaulted); err != nil {
+		t.Fatalf("materializing equivalent defaults changed database topology: %v", err)
+	}
+
+	mutated := oldCluster.DeepCopy()
+	mutated.Spec.Databases[1].Cells[0] = 1
+	if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, mutated); err == nil || !strings.Contains(err.Error(), "databases is immutable") {
+		t.Fatalf("database placement mutation was admitted: %v", err)
+	}
+}
+
 func TestValidationAcceptsSafeClusterAndResolvesTuning(t *testing.T) {
 	t.Parallel()
 	cluster := validCluster()

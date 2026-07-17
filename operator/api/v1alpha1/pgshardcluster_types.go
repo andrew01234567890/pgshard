@@ -10,6 +10,7 @@ import (
 const (
 	PostgreSQLMajor18 = "18"
 	MaximumShards     = 128
+	MaximumDatabases  = 1024
 	// MaximumClusterNameLength preserves the public API limit from the first
 	// operator release. Longer workload identities are bounded independently.
 	MaximumClusterNameLength = 50
@@ -33,11 +34,14 @@ type BackupRepositoryType string
 type StorageDeletionPolicy string
 
 // PgShardClusterSpec describes one namespaced pgshard installation.
-// +kubebuilder:validation:XValidation:rule="self.shards == oldSelf.shards",message="shards is immutable until online resharding is implemented"
+// +kubebuilder:validation:XValidation:rule="self.shards == oldSelf.shards",message="shards is immutable until physical cell transitions are implemented"
 // +kubebuilder:validation:XValidation:rule="self.membersPerShard == oldSelf.membersPerShard",message="membersPerShard is immutable until membership transitions are implemented"
 // +kubebuilder:validation:XValidation:rule="self.durability == oldSelf.durability",message="durability is immutable until replication-mode transitions are implemented"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.databases) ? !has(self.databases) || size(self.databases) == 0 : has(self.databases) && self.databases == oldSelf.databases",message="databases is immutable until database lifecycle and online resharding are implemented"
 type PgShardClusterSpec struct {
-	// Shards is the number of logical hash ranges. The catalog remains on shard-0000.
+	// Shards is the number of physical PostgreSQL cells in the foundation API.
+	// Each logical database maps its independently ordered hash ranges onto a
+	// subset of these cells. The catalog remains on physical cell zero.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=128
 	// +kubebuilder:default=1
@@ -62,8 +66,10 @@ type PgShardClusterSpec struct {
 	Backup        BackupSpec        `json:"backup"`
 	Observability ObservabilitySpec `json:"observability,omitempty"`
 
-	// Databases reserves the shared-topology database names. Database lifecycle
-	// will move to PgShardDatabase without changing the cluster topology.
+	// Databases declares immutable genesis database topologies. Database
+	// lifecycle will move to PgShardDatabase without changing this placement
+	// contract.
+	// +kubebuilder:validation:MaxItems=1024
 	// +listType=map
 	// +listMapKey=name
 	Databases []DatabaseTemplate `json:"databases,omitempty"`
@@ -100,7 +106,54 @@ type StorageSpec struct {
 
 type DatabaseTemplate struct {
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
+
+	// Shards is this database's logical shard count. Zero is defaulted to the
+	// number of explicitly selected cells, or to every cluster cell when cells
+	// is also omitted.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=128
+	Shards int32 `json:"shards,omitempty"`
+
+	// Cells maps logical shard ordinal i to one exact physical cell ordinal.
+	// Omitting it selects the first Shards cells. Reusing cells across different
+	// databases is explicit shared-cell placement; cells within one database
+	// must be unique.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=128
+	// +kubebuilder:validation:items:Minimum=0
+	// +kubebuilder:validation:items:Maximum=127
+	Cells []int32 `json:"cells,omitempty"`
+}
+
+// ResolvedShardCount returns the database shard count after applying the
+// admission default contract. Validation must still prove it is in range.
+func (database DatabaseTemplate) ResolvedShardCount(clusterCells int32) int32 {
+	if database.Shards != 0 {
+		return database.Shards
+	}
+	if len(database.Cells) != 0 {
+		return int32(len(database.Cells))
+	}
+	return clusterCells
+}
+
+// ResolvedCells returns an owned copy of the exact physical-cell placement
+// after applying the admission default contract.
+func (database DatabaseTemplate) ResolvedCells(clusterCells int32) []int32 {
+	if len(database.Cells) != 0 {
+		return append([]int32(nil), database.Cells...)
+	}
+	count := database.ResolvedShardCount(clusterCells)
+	if count <= 0 || count > MaximumShards {
+		return nil
+	}
+	cells := make([]int32, count)
+	for ordinal := range cells {
+		cells[ordinal] = int32(ordinal)
+	}
+	return cells
 }
 
 type PoolerSpec struct {

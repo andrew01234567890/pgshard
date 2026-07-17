@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -68,8 +69,14 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	if strings.Index(contents, "default_statistics_target") > strings.Index(contents, "log_statement") {
 		t.Fatal("PostgreSQL parameters are not sorted")
 	}
-	if len(postgresConfig.Data) != 7 {
+	if len(postgresConfig.Data) != 8 {
 		t.Fatalf("PostgreSQL configuration documents = %#v", postgresConfig.Data)
+	}
+	databaseGenesis := postgresConfig.Data["database-genesis.sql"]
+	analytics := "install_database_genesis('analytics'::pgshard_catalog.sql_identifier, ARRAY[0,1]::bigint[])"
+	app := "install_database_genesis('app'::pgshard_catalog.sql_identifier, ARRAY[0,1]::bigint[])"
+	if !strings.Contains(databaseGenesis, analytics) || !strings.Contains(databaseGenesis, app) || strings.Index(databaseGenesis, analytics) > strings.Index(databaseGenesis, app) {
+		t.Fatalf("database genesis is not canonical:\n%s", databaseGenesis)
 	}
 	primary := postgresConfig.Data["primary-0000.conf"]
 	if !strings.Contains(primary, "synchronized_standby_slots = 'pgshard_member_0001,pgshard_member_0002'\n") || !strings.Contains(primary, "synchronous_standby_names = 'ANY 1 (pgshard_member_0001,pgshard_member_0002)'\n") {
@@ -127,6 +134,41 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 			t.Fatal("planner must not create PostgreSQL Pods before safe lifecycle and HA exist")
 		}
 		assertOwned(t, item, cluster)
+	}
+}
+
+func TestTopologyDocumentKeepsIndependentDatabasePlacements(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.Shards = 8
+	cluster.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{
+		{Name: "b-dedicated", Shards: 3, Cells: []int32{5, 6, 7}},
+		{Name: "a", Shards: 5, Cells: []int32{0, 1, 2, 3, 4}},
+		{Name: "b-shared", Shards: 3, Cells: []int32{0, 1, 2}},
+	}
+	plan, err := Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	topology := object[*corev1.ConfigMap](t, plan, cluster.Name+TopologyConfigSuffix)
+	var document topologyDocument
+	if err := json.Unmarshal([]byte(topology.Data["cluster.json"]), &document); err != nil {
+		t.Fatal(err)
+	}
+	want := []topologyDatabase{
+		{Name: "a", Shards: 5, Cells: []int32{0, 1, 2, 3, 4}},
+		{Name: "b-dedicated", Shards: 3, Cells: []int32{5, 6, 7}},
+		{Name: "b-shared", Shards: 3, Cells: []int32{0, 1, 2}},
+	}
+	if !reflect.DeepEqual(document.Databases, want) {
+		t.Fatalf("database topology document = %#v, want %#v", document.Databases, want)
+	}
+}
+
+func TestDatabaseGenesisSQLQuotesIdentifiersAsData(t *testing.T) {
+	t.Parallel()
+	if got, want := postgresqlStringLiteral("customer's-db"), "'customer''s-db'"; got != want {
+		t.Fatalf("PostgreSQL string literal = %q, want %q", got, want)
 	}
 }
 
@@ -327,6 +369,8 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			!strings.Contains(bootstrap.Command[2], "count_missing_shards") ||
 			!strings.Contains(bootstrap.Command[2], "validate_genesis_inventory_reachable") ||
 			!strings.Contains(bootstrap.Command[2], "refusing shardschema inventory with missing configured shards") ||
+			!strings.Contains(bootstrap.Command[2], "--file=\"$database_genesis\"") ||
+			!strings.Contains(bootstrap.Command[2], "database genesis topology is missing or not a regular file") ||
 			!strings.Contains(bootstrap.Command[2], "CREATE ROLE pgshard_pooler_catalog") ||
 			!strings.Contains(bootstrap.Command[2], "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE") ||
 			!strings.Contains(bootstrap.Command[2], "roles.rolpassword LIKE 'SCRAM-SHA-256\\$4096:%'") ||
@@ -711,6 +755,13 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(configurationDirectory, "primary-0000.conf"), []byte("include = '/etc/pgshard/postgresql/postgresql.conf'\n"), 0o444); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(
+		filepath.Join(configurationDirectory, "database-genesis.sql"),
+		[]byte(renderDatabaseGenesisSQL(&pgshardv1alpha1.PgShardCluster{})),
+		0o444,
+	); err != nil {
+		t.Fatal(err)
+	}
 	legacyMigration, err := filepath.Abs(filepath.Join("..", "..", "..", "crates", "pgshard-catalog", "tests", "fixtures", "v0_49_0_shardschema.sql"))
 	if err != nil {
 		t.Fatal(err)
@@ -1008,6 +1059,90 @@ trap - EXIT
 	}
 	assertRejectedWithoutCatalogOrHBAMutation(1, "RestoreTopologyMismatch")
 
+	genesisCluster := &pgshardv1alpha1.PgShardCluster{Spec: pgshardv1alpha1.PgShardClusterSpec{
+		Shards: 2,
+		Databases: []pgshardv1alpha1.DatabaseTemplate{
+			{Name: "app", Shards: 2, Cells: []int32{0, 1}},
+			{Name: "analytics", Shards: 1, Cells: []int32{0}},
+		},
+	}}
+	genesisPath := filepath.Join(configurationDirectory, "database-genesis.sql")
+	replaceDatabaseGenesis := func(cluster *pgshardv1alpha1.PgShardCluster) {
+		t.Helper()
+		if err := os.Chmod(genesisPath, 0o644); err != nil {
+			t.Fatalf("make database genesis fixture writable: %v", err)
+		}
+		if err := os.WriteFile(genesisPath, []byte(renderDatabaseGenesisSQL(cluster)), 0o644); err != nil {
+			t.Fatalf("write database genesis fixture: %v", err)
+		}
+		if err := os.Chmod(genesisPath, 0o444); err != nil {
+			t.Fatalf("make database genesis fixture read-only: %v", err)
+		}
+	}
+	replaceDatabaseGenesis(genesisCluster)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("install declared database genesis: %v\n%s", err, output)
+	}
+	if got := catalogSQL(primaryDataParent, `
+SELECT pg_catalog.string_agg(
+         databases.database_name::text || ':' || ranges.range_start::text || ':' || shards.shard_number::text,
+         ',' ORDER BY databases.database_name, ranges.range_start
+       )
+  FROM pgshard_catalog.logical_databases AS databases
+  JOIN pgshard_catalog.active_routing_epochs AS active
+	ON active.logical_database_id = databases.logical_database_id
+  JOIN pgshard_catalog.routing_ranges AS ranges
+	ON ranges.routing_epoch = active.routing_epoch
+  JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id`); got != "analytics:0:0,app:0:0,app:9223372036854775808:1" {
+		t.Fatalf("installed database genesis topology = %q", got)
+	}
+	genesisEpoch := catalogSQL(primaryDataParent, "SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("replay exact database genesis: %v\n%s", err, output)
+	}
+	if replayedEpoch := catalogSQL(primaryDataParent, "SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton"); replayedEpoch != genesisEpoch {
+		t.Fatalf("idempotent database genesis changed catalog epoch: before=%q after=%q", genesisEpoch, replayedEpoch)
+	}
+	conflictingGenesis := genesisCluster.DeepCopy()
+	conflictingGenesis.Spec.Databases = append(
+		conflictingGenesis.Spec.Databases,
+		pgshardv1alpha1.DatabaseTemplate{Name: "aardvark", Shards: 1, Cells: []int32{0}},
+	)
+	conflictingGenesis.Spec.Databases[0].Cells = []int32{1, 0}
+	replaceDatabaseGenesis(conflictingGenesis)
+	topologySnapshot := func() string {
+		t.Helper()
+		return catalogSQL(primaryDataParent, `
+SELECT state.catalog_epoch,
+       (SELECT pg_catalog.string_agg(
+                 databases.database_name::text || ':' || active.routing_epoch::text || ':' ||
+                 ranges.range_start::text || ':' || ranges.range_end::text || ':' || ranges.shard_id::text,
+                 ',' ORDER BY databases.database_name, ranges.range_start
+               )
+          FROM pgshard_catalog.logical_databases AS databases
+          JOIN pgshard_catalog.active_routing_epochs AS active
+            ON active.logical_database_id = databases.logical_database_id
+          JOIN pgshard_catalog.routing_ranges AS ranges
+            ON ranges.routing_epoch = active.routing_epoch),
+       (SELECT pg_catalog.count(*) FROM pgshard_catalog.logical_databases),
+       (SELECT pg_catalog.count(*) FROM pgshard_catalog.routing_epochs),
+       (SELECT pg_catalog.count(*) FROM pgshard_catalog.routing_ranges)
+  FROM pgshard_catalog.cluster_state AS state
+ WHERE state.singleton`)
+	}
+	beforeConflict := topologySnapshot()
+	conflictOutput, conflictErr := bootstrap(primaryDataParent, true, 2)
+	if conflictErr == nil || !strings.Contains(conflictOutput, "logical database genesis topology does not match active routing") {
+		t.Fatalf("conflicting multi-database genesis error = %v\n%s", conflictErr, conflictOutput)
+	}
+	if afterConflict := topologySnapshot(); afterConflict != beforeConflict {
+		t.Fatalf("failed multi-database genesis changed catalog topology: before=%q after=%q", beforeConflict, afterConflict)
+	}
+	if got := catalogSQL(primaryDataParent, "SELECT count(*) FROM pgshard_catalog.logical_databases WHERE database_name = 'aardvark'"); got != "0" {
+		t.Fatalf("failed multi-database genesis partially installed an earlier declaration: %q", got)
+	}
+	replaceDatabaseGenesis(genesisCluster)
+
 	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 2 CYCLE")
 	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing an unsupported or malformed pre-existing shardschema catalog")
 	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 1 NO CYCLE")
@@ -1015,10 +1150,6 @@ trap - EXIT
 		t.Fatalf("canonical identity sequence was not restored: %v\n%s", err, output)
 	}
 	catalogSQL(primaryDataParent, `
-INSERT INTO pgshard_catalog.logical_databases(logical_database_id, database_name)
-VALUES ('11111111-1111-1111-1111-111111111111', 'sequence_progress');
-INSERT INTO pgshard_catalog.routing_epochs(logical_database_id)
-VALUES ('11111111-1111-1111-1111-111111111111');
 INSERT INTO pgshard_catalog.registered_tables(
   logical_database_id,
   schema_name,
@@ -1026,13 +1157,14 @@ INSERT INTO pgshard_catalog.registered_tables(
   shard_key_column,
   shard_key_type
 )
-VALUES (
-  '11111111-1111-1111-1111-111111111111',
+SELECT
+  logical_database_id,
   'public',
   'sequence_progress',
   'id',
   'bigint'
-);
+FROM pgshard_catalog.logical_databases
+WHERE database_name = 'app';
 SELECT pg_catalog.setval(
   'pgshard_catalog.routing_epochs_routing_epoch_seq',
   (SELECT pg_catalog.max(routing_epoch) FROM pgshard_catalog.routing_epochs),

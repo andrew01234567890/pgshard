@@ -626,6 +626,14 @@ three-shard genesis intent is rejected as crash-impossible rather than filled
 in. An absent or empty `shardschema` on
 pre-existing PGDATA without the intent is rejected instead of being seeded from
 the requested shard count.
+The same PostgreSQL 18 fixture installs two declared logical databases with
+different shard counts and shared cell mappings, proves exact replay preserves
+database IDs, routing epochs, and the catalog epoch, and rejects reordered or
+duplicate placements. The operator bootstrap fixture proves all declarations
+are one transaction: a later conflicting database leaves an earlier new
+declaration absent and the active topology unchanged. API and planner tests
+cover deterministic defaults, shared and disjoint placements, out-of-range
+cells, duplicate cells, count mismatches, and immutable updates.
 A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the

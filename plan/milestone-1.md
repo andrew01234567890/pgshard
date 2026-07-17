@@ -79,6 +79,14 @@ current evidence is maintained in
 
 ### 1. Catalog and per-database topology
 
+Current foundation slice: `PgShardCluster.spec.databases` records immutable
+genesis shard counts and ordered physical-cell mappings. Shard-zero bootstrap
+atomically installs equal full-keyspace ranges for those declarations in
+`shardschema`, makes exact replays no-ops, and rejects conflicting or
+undeclared active topology. Physical application databases, database-scoped
+shard identities, placement reservations, routing, moves, and resharding remain
+work in this workstream.
+
 - Define physical cells, logical databases, database-scoped shards, placements,
   topology generations, routing generations, database generation fences,
   backup sets, retention pins, restore operations, move journals, DDL journals,

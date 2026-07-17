@@ -785,6 +785,7 @@ async fn assert_installation_contract(client: &Client, database_url: &str) -> Te
         epoch_after_first_migration,
         "reapplying the migration must not mutate catalog state"
     );
+    assert_database_genesis_contract(client).await?;
     assert_legacy_catalog_owner_upgrade(client, database_url)
         .await
         .map_err(|error| format!("legacy catalog-owner upgrade: {error}"))?;
@@ -857,6 +858,169 @@ async fn assert_installation_contract(client: &Client, database_url: &str) -> Te
         .await
         .expect_err("64-byte identifiers must be rejected");
     assert_sqlstate(&error, "23514");
+    Ok(())
+}
+
+async fn assert_database_genesis_contract(client: &Client) -> TestResult {
+    client
+        .batch_execute("BEGIN; SET LOCAL ROLE pgshard_catalog_admin")
+        .await?;
+    let result: TestResult = async {
+        let fixture = install_database_genesis_fixture(client).await?;
+        assert_database_genesis_rejections(client, &fixture).await?;
+        Ok(())
+    }
+    .await;
+    let rollback = client.batch_execute("ROLLBACK").await;
+    result?;
+    rollback?;
+    Ok(())
+}
+
+struct DatabaseGenesisFixture {
+    nonce: u128,
+    first_name: String,
+    next_cell: i64,
+    catalog_epoch: i64,
+}
+
+async fn install_database_genesis_fixture(client: &Client) -> TestResult<DatabaseGenesisFixture> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let first_name = format!("genesis_a_{nonce}");
+    let second_name = format!("genesis_b_{nonce}");
+    let next_cell: i64 = client
+        .query_one(
+            "SELECT coalesce(max(shard_number), 0) + 1 FROM pgshard_catalog.shards",
+            &[],
+        )
+        .await?
+        .get(0);
+    let next_shard = format!("genesis-{nonce}");
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.shards(shard_id, shard_number) VALUES ($1::text, $2)",
+            &[&next_shard, &next_cell],
+        )
+        .await?;
+
+    let shared_cells = vec![0_i64, next_cell];
+    let installed = client
+        .query_one(
+            "SELECT logical_database_id::text, routing_epoch, installed \
+               FROM pgshard_catalog.install_database_genesis( \
+                   $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+               )",
+            &[&first_name, &shared_cells],
+        )
+        .await?;
+    let database_id: String = installed.get(0);
+    let routing_epoch: i64 = installed.get(1);
+    assert!(installed.get::<_, bool>(2));
+    let epoch_after_install = catalog_epoch(client).await?;
+    let retried = client
+        .query_one(
+            "SELECT logical_database_id::text, routing_epoch, installed \
+               FROM pgshard_catalog.install_database_genesis( \
+                   $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+               )",
+            &[&first_name, &shared_cells],
+        )
+        .await?;
+    assert_eq!(retried.get::<_, String>(0), database_id);
+    assert_eq!(retried.get::<_, i64>(1), routing_epoch);
+    assert!(!retried.get::<_, bool>(2));
+    assert_eq!(catalog_epoch(client).await?, epoch_after_install);
+
+    let dedicated_cells = vec![next_cell];
+    client
+        .query_one(
+            "SELECT installed FROM pgshard_catalog.install_database_genesis( \
+                 $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+             )",
+            &[&second_name, &dedicated_cells],
+        )
+        .await?;
+    let catalog_epoch = catalog_epoch(client).await?;
+    let placements: Vec<(String, i64)> = client
+        .query(
+            "SELECT databases.database_name::text, shards.shard_number \
+               FROM pgshard_catalog.logical_databases AS databases \
+               JOIN pgshard_catalog.active_routing_epochs AS active \
+                 ON active.logical_database_id = databases.logical_database_id \
+               JOIN pgshard_catalog.routing_ranges AS ranges \
+                 ON ranges.routing_epoch = active.routing_epoch \
+               JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id \
+              WHERE databases.database_name::text IN ($1, $2) \
+              ORDER BY databases.database_name, ranges.range_start",
+            &[&first_name, &second_name],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        placements,
+        vec![
+            (first_name.clone(), 0),
+            (first_name.clone(), next_cell),
+            (second_name, next_cell),
+        ]
+    );
+    Ok(DatabaseGenesisFixture {
+        nonce,
+        first_name,
+        next_cell,
+        catalog_epoch,
+    })
+}
+
+async fn assert_database_genesis_rejections(
+    client: &Client,
+    fixture: &DatabaseGenesisFixture,
+) -> TestResult {
+    client
+        .batch_execute("SAVEPOINT conflicting_genesis")
+        .await?;
+    let conflicting_cells = vec![fixture.next_cell, 0_i64];
+    let error = client
+        .query_one(
+            "SELECT * FROM pgshard_catalog.install_database_genesis( \
+                 $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+             )",
+            &[&fixture.first_name, &conflicting_cells],
+        )
+        .await
+        .expect_err("a conflicting database topology must fail closed");
+    assert_sqlstate(&error, "22023");
+    assert_database_message(
+        &error,
+        "logical database genesis topology does not match active routing",
+    );
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT conflicting_genesis")
+        .await?;
+    assert_eq!(catalog_epoch(client).await?, fixture.catalog_epoch);
+
+    client.batch_execute("SAVEPOINT duplicate_cells").await?;
+    let duplicate_cells = vec![0_i64, 0_i64];
+    let duplicate_name = format!("genesis_duplicate_{}", fixture.nonce);
+    let error = client
+        .query_one(
+            "SELECT * FROM pgshard_catalog.install_database_genesis( \
+                 $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+             )",
+            &[&duplicate_name, &duplicate_cells],
+        )
+        .await
+        .expect_err("duplicate cell placement must fail closed");
+    assert_sqlstate(&error, "22023");
+    assert_database_message(
+        &error,
+        "logical database genesis contains a duplicate cell ordinal",
+    );
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT duplicate_cells")
+        .await?;
     Ok(())
 }
 

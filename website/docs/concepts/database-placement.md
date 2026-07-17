@@ -6,10 +6,13 @@ description: Independent per-database shard maps with shared or isolated Postgre
 # Database topology and placement
 
 :::info Milestone 1 design contract
-The per-database CRDs, placement scheduler, database move runtime, and restore
-workflow described here are not implemented in the foundation release. The
-current operator still provisions one cluster-wide set of single-member
-PostgreSQL cells; see [implementation status](../project/status.md).
+The foundation API now accepts immutable per-database genesis shard counts and
+exact cell ordinals, then installs their initial equal hash ranges atomically in
+`shardschema`. It does not yet create physical application databases, reserve
+cells, route SQL, or implement the `PgShardDatabase`, placement scheduler,
+database move, restore, or resharding runtimes described below. The operator
+still provisions one cluster-wide set of single-member PostgreSQL cells; see
+[implementation status](../project/status.md).
 :::
 
 Milestone 1 treats a `PgShardCluster` as one routing and control-plane fleet,
@@ -43,6 +46,41 @@ failure domains while retaining the fleet's shared catalog, operator, and
 pooler control plane. `shardschema` remains on the fleet's bootstrap anchor,
 `cell-0000`, for Milestone 1; that cell is a physical catalog placement and is
 not a promise that every database routes application shard zero there.
+
+## Foundation genesis API
+
+The current `PgShardCluster` API can record the two mappings independently:
+
+```yaml
+spec:
+  # The foundation API calls the fleet's physical cell count `shards`.
+  shards: 8
+  databases:
+    - name: a
+      shards: 5
+      cells: [0, 1, 2, 3, 4]
+    - name: b-shared
+      shards: 3
+      cells: [0, 1, 2]
+    - name: b-dedicated
+      shards: 3
+      cells: [5, 6, 7]
+```
+
+`cells[i]` is the physical cell for logical shard ordinal `i`. Reusing an
+ordinal across different databases records shared-cell placement. Repeating a
+cell within one database, naming a cell outside the fleet, or supplying a cell
+count different from `shards` is rejected before reconciliation. Omitting
+`cells` selects the first `shards` cells; omitting both fields selects every
+fleet cell. Admission materializes those defaults, and the genesis list is
+immutable until the database lifecycle and online-resharding controllers exist.
+
+On `cell-0000`, bootstrap installs every declaration in one PostgreSQL
+transaction. A replay of the identical declarations is a no-op. A changed
+placement, an unavailable cell, or an undeclared non-retired catalog database
+aborts the whole transaction. This is catalog topology only: the three entries
+above do not yet create application databases or make the pooler a shard-aware
+router.
 
 ## Placement policies
 
