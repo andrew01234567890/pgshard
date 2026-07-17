@@ -972,10 +972,62 @@ async fn assert_external_catalog_trigger_rejections(
     client: &Client,
     database_url: &str,
 ) -> TestResult {
+    assert_catalog_rewrite_rule_is_rejected(client).await?;
+    assert_altered_identity_sequence_is_rejected(client).await?;
+    assert_disabled_internal_trigger_is_rejected(client).await?;
     assert_same_identity_altered_trigger_is_rejected(client).await?;
     assert_external_executable_trigger_is_rejected(client).await?;
     assert_external_reference_trigger_is_rejected(client).await?;
     assert_concurrent_external_trigger_is_rejected(client, database_url).await
+}
+
+async fn assert_catalog_rewrite_rule_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "CREATE RULE pgshard_rejected_rule AS \
+             ON INSERT TO pgshard_catalog.shards DO INSTEAD NOTHING",
+        "pre-existing pgshard_catalog contains an unsupported rewrite rule",
+        &[],
+    )
+    .await
+}
+
+async fn assert_altered_identity_sequence_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq \
+             INCREMENT BY 2 CYCLE",
+        "pre-existing pgshard_catalog contains an unsupported identity sequence",
+        &[],
+    )
+    .await
+}
+
+async fn assert_disabled_internal_trigger_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "DO $pgshard_disable_internal_trigger$ \
+         DECLARE \
+             internal_trigger name; \
+         BEGIN \
+             SELECT triggers.tgname \
+               INTO STRICT internal_trigger \
+               FROM pg_catalog.pg_trigger AS triggers \
+               JOIN pg_catalog.pg_class AS relations ON relations.oid = triggers.tgrelid \
+              WHERE relations.oid = 'pgshard_catalog.routing_ranges'::pg_catalog.regclass \
+                AND triggers.tgisinternal \
+              ORDER BY triggers.oid \
+              LIMIT 1; \
+             EXECUTE pg_catalog.format( \
+                 'ALTER TABLE pgshard_catalog.routing_ranges DISABLE TRIGGER %I', \
+                 internal_trigger \
+             ); \
+         END \
+         $pgshard_disable_internal_trigger$",
+        "pre-existing pgshard_catalog contains an unsupported attached trigger",
+        &[],
+    )
+    .await
 }
 
 async fn assert_same_identity_altered_trigger_is_rejected(client: &Client) -> TestResult {

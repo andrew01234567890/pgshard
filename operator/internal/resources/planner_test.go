@@ -255,9 +255,16 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("PostgreSQL final-data publication barriers = %d, want 3", got)
 		}
 		if !strings.Contains(bootstrap.Command[2], "catalog_schema_fingerprint") ||
-			!strings.Contains(bootstrap.Command[2], "9bcd876a113347bd5ce8f09223c62764f8dc718ae2c82f1a0927a79b540e8c47") ||
-			!strings.Contains(bootstrap.Command[2], "4ffbb7e2265874434df99e69bad693856e262b38b788ce3c8b35ef6b20ff4074") ||
-			!strings.Contains(bootstrap.Command[2], "6711de8bd95b456b384a9672de9b1c237f2df7db30bb9a9a58cc9431fc401373") {
+			!strings.Contains(bootstrap.Command[2], "ee17a64c8eec5e2e9a44f29d4764edac90680980f61df35bdb2284c01b57c4d9") ||
+			!strings.Contains(bootstrap.Command[2], "2720fa78d0bc96c21311b1656eeaabbb3e745ea65fa9d1ea701ffb67cde1b1d9") ||
+			!strings.Contains(bootstrap.Command[2], "ceec4ff5d633d28afacf1e93fbc2547591017e57f172dc3a8072814bb6d3867a") ||
+			!strings.Contains(bootstrap.Command[2], "pg_catalog.pg_sequence") ||
+			!strings.Contains(bootstrap.Command[2], "pg_catalog.pg_rewrite") ||
+			!strings.Contains(bootstrap.Command[2], "internal-trigger|") ||
+			!strings.Contains(bootstrap.Command[2], "SET SESSION search_path = pg_catalog") ||
+			!strings.Contains(bootstrap.Command[2], "SET SESSION quote_all_identifiers = off") ||
+			!strings.Contains(bootstrap.Command[2], "count_missing_shards") ||
+			!strings.Contains(bootstrap.Command[2], "refusing shardschema inventory with missing configured shards") {
 			t.Fatal("PostgreSQL bootstrap does not pin supported catalog shapes")
 		}
 		if len(bootstrap.Env) != 10 || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
@@ -667,7 +674,7 @@ trap - EXIT
 
 	fingerprint := func() string {
 		t.Helper()
-		return catalogSQL(primaryDataParent, "SELECT (SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton), (SELECT string_agg(triggers.oid::text, ',' ORDER BY triggers.tgname) FROM pg_catalog.pg_trigger AS triggers JOIN pg_catalog.pg_class AS relations ON relations.oid = triggers.tgrelid JOIN pg_catalog.pg_namespace AS namespaces ON namespaces.oid = relations.relnamespace WHERE namespaces.nspname = 'pgshard_catalog')")
+		return catalogSQL(primaryDataParent, "SELECT (SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton), (SELECT string_agg(triggers.oid::text || ':' || triggers.tgenabled::text, ',' ORDER BY triggers.tgname) FROM pg_catalog.pg_trigger AS triggers JOIN pg_catalog.pg_class AS relations ON relations.oid = triggers.tgrelid JOIN pg_catalog.pg_namespace AS namespaces ON namespaces.oid = relations.relnamespace WHERE namespaces.nspname = 'pgshard_catalog'), (SELECT string_agg(sequences.seqrelid::pg_catalog.regclass::text || ':' || sequences.seqincrement::text || ':' || sequences.seqcycle::text, ',' ORDER BY sequences.seqrelid) FROM pg_catalog.pg_sequence AS sequences JOIN pg_catalog.pg_class AS relations ON relations.oid = sequences.seqrelid JOIN pg_catalog.pg_namespace AS namespaces ON namespaces.oid = relations.relnamespace WHERE namespaces.nspname = 'pgshard_catalog'), (SELECT string_agg(rewrite_rules.rulename, ',' ORDER BY rewrite_rules.oid) FROM pg_catalog.pg_rewrite AS rewrite_rules JOIN pg_catalog.pg_class AS relations ON relations.oid = rewrite_rules.ev_class JOIN pg_catalog.pg_namespace AS namespaces ON namespaces.oid = relations.relnamespace WHERE namespaces.nspname = 'pgshard_catalog')")
 	}
 	assertRejectedWithoutMutation := func(want string) {
 		t.Helper()
@@ -679,6 +686,74 @@ trap - EXIT
 		if after := fingerprint(); after != before {
 			t.Fatalf("rejected catalog changed before=%q after=%q", before, after)
 		}
+	}
+
+	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 2 CYCLE")
+	assertRejectedWithoutMutation("refusing an unsupported or malformed pre-existing shardschema catalog")
+	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 1 NO CYCLE")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical identity sequence was not restored: %v\n%s", err, output)
+	}
+
+	catalogSQL(primaryDataParent, "CREATE RULE pgshard_rejected_rule AS ON INSERT TO pgshard_catalog.shards DO INSTEAD NOTHING")
+	assertRejectedWithoutMutation("refusing an unsupported or malformed pre-existing shardschema catalog")
+	catalogSQL(primaryDataParent, "DROP RULE pgshard_rejected_rule ON pgshard_catalog.shards")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical rewrite-rule set was not restored: %v\n%s", err, output)
+	}
+
+	catalogSQL(primaryDataParent, `
+DO $pgshard_disable_internal_trigger$
+DECLARE
+  internal_trigger name;
+BEGIN
+  SELECT triggers.tgname
+    INTO STRICT internal_trigger
+    FROM pg_catalog.pg_trigger AS triggers
+   WHERE triggers.tgrelid = 'pgshard_catalog.routing_ranges'::pg_catalog.regclass
+     AND triggers.tgisinternal
+   ORDER BY triggers.oid
+   LIMIT 1;
+  EXECUTE pg_catalog.format(
+    'ALTER TABLE pgshard_catalog.routing_ranges DISABLE TRIGGER %I',
+    internal_trigger
+  );
+END
+$pgshard_disable_internal_trigger$;
+`)
+	assertRejectedWithoutMutation("refusing an unsupported or malformed pre-existing shardschema catalog")
+	catalogSQL(primaryDataParent, "ALTER TABLE pgshard_catalog.routing_ranges ENABLE TRIGGER ALL")
+
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical catalog was not restored before GUC coverage: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, "ALTER DATABASE shardschema SET search_path TO pgshard_catalog, pg_catalog, public")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical catalog was rejected under a noncanonical database search_path: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, "ALTER DATABASE shardschema RESET search_path; ALTER ROLE postgres IN DATABASE shardschema SET quote_all_identifiers TO on")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical catalog was rejected under noncanonical role identifier quoting: %v\n%s", err, output)
+	}
+	catalogSQL(primaryDataParent, "ALTER ROLE postgres IN DATABASE shardschema RESET quote_all_identifiers")
+
+	catalogSQL(primaryDataParent, `
+CREATE OR REPLACE FUNCTION pgshard_catalog.lock_catalog_state()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+  RAISE EXCEPTION 'pre-existing trigger function body executed';
+END
+$function$;
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("bootstrap executed a pre-existing trigger function body: %v\n%s", err, output)
+	}
+	if got := catalogSQL(primaryDataParent, "SELECT pg_catalog.strpos(pg_catalog.pg_get_functiondef('pgshard_catalog.lock_catalog_state()'::pg_catalog.regprocedure), 'pre-existing trigger function body executed')"); got != "0" {
+		t.Fatalf("bootstrap retained the pre-existing trigger function body: %q", got)
 	}
 
 	catalogSQL(primaryDataParent, `
