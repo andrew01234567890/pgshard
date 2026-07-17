@@ -78,9 +78,21 @@ func (r *PgShardRestoreReconciler) Reconcile(ctx context.Context, request ctrl.R
 		}
 		return ctrl.Result{}, fmt.Errorf("read restore verification key Secret %s: %w", secretName, err)
 	}
+	if pinnedUID := restore.Status.VerificationKeyUID; pinnedUID != "" && keySecret.UID != pinnedUID {
+		return ctrl.Result{}, r.reject(
+			ctx,
+			restore,
+			"VerificationKeyReplaced",
+			"verification key Secret identity changed; create a new PgShardRestore request",
+			restore.Status.ManifestSHA256,
+			restore.Status.TopologySHA256,
+			restore.Status.DestinationTopologySHA256,
+			pinnedUID,
+		)
+	}
 	publicKey, err := restoreVerificationKey(keySecret)
 	if err != nil {
-		return ctrl.Result{}, r.reject(ctx, restore, "VerificationKeyInvalid", err.Error(), "", "", "", "")
+		return ctrl.Result{}, r.reject(ctx, restore, "VerificationKeyInvalid", err.Error(), "", "", "", keySecret.UID)
 	}
 
 	result, err := restorepreflight.Preflight(
@@ -97,7 +109,7 @@ func (r *PgShardRestoreReconciler) Reconcile(ctx context.Context, request ctrl.R
 		var destination *restorepreflight.InvalidDestinationError
 		switch {
 		case errors.As(err, &mismatch):
-			return ctrl.Result{}, r.reject(ctx, restore, "RestoreTopologyMismatch", mismatch.Error(), mismatch.ManifestSHA256, mismatch.ManifestTopologyFingerprint, mismatch.DestinationTopologyFingerprint, keySecret.UID)
+			return ctrl.Result{}, r.reject(ctx, restore, "RestoreTopologyMismatch", mismatch.Error(), mismatch.ManifestSHA256, mismatch.ManifestTopologyFingerprint, "", keySecret.UID)
 		case errors.As(err, &signature):
 			return ctrl.Result{}, r.reject(ctx, restore, "BackupManifestSignatureInvalid", signature.Error(), "", "", "", keySecret.UID)
 		case errors.As(err, &manifest):
@@ -148,20 +160,16 @@ func restoreVerificationKey(secret *corev1.Secret) ([]byte, error) {
 }
 
 func (r *PgShardRestoreReconciler) waiting(ctx context.Context, restore *pgshardv1alpha1.PgShardRestore, reason, message string) error {
-	status := restore.Status
+	status := copyRestoreStatus(restore)
 	status.ObservedGeneration = restore.Generation
 	status.Phase = pgshardv1alpha1.RestorePhasePending
-	status.ManifestSHA256 = ""
-	status.TopologySHA256 = ""
-	status.DestinationTopologySHA256 = ""
-	status.VerificationKeyUID = ""
 	setRestoreCondition(&status.Conditions, restorePreflightCondition, metav1.ConditionUnknown, reason, message, restore.Generation)
 	setRestoreCondition(&status.Conditions, restoreReadyCondition, metav1.ConditionFalse, reason, message, restore.Generation)
 	return r.updateRestoreStatus(ctx, restore, status)
 }
 
 func (r *PgShardRestoreReconciler) reject(ctx context.Context, restore *pgshardv1alpha1.PgShardRestore, reason, message, manifestSHA256, topologySHA256, destinationTopologySHA256 string, keyUID types.UID) error {
-	status := restore.Status
+	status := copyRestoreStatus(restore)
 	status.ObservedGeneration = restore.Generation
 	status.Phase = pgshardv1alpha1.RestorePhaseRejected
 	status.ManifestSHA256 = manifestSHA256
@@ -174,7 +182,7 @@ func (r *PgShardRestoreReconciler) reject(ctx context.Context, restore *pgshardv
 }
 
 func (r *PgShardRestoreReconciler) destinationUnverified(ctx context.Context, restore *pgshardv1alpha1.PgShardRestore, result *restorepreflight.PreflightResult, keyUID types.UID, reason, message string) error {
-	status := restore.Status
+	status := copyRestoreStatus(restore)
 	status.ObservedGeneration = restore.Generation
 	status.Phase = pgshardv1alpha1.RestorePhasePending
 	status.ManifestSHA256 = result.ManifestSHA256
@@ -187,7 +195,7 @@ func (r *PgShardRestoreReconciler) destinationUnverified(ctx context.Context, re
 }
 
 func (r *PgShardRestoreReconciler) preflightPassed(ctx context.Context, restore *pgshardv1alpha1.PgShardRestore, result *restorepreflight.PreflightResult, destinationTopologySHA256 string, keyUID types.UID) error {
-	status := restore.Status
+	status := copyRestoreStatus(restore)
 	status.ObservedGeneration = restore.Generation
 	status.Phase = pgshardv1alpha1.RestorePhasePreflightPassed
 	status.ManifestSHA256 = result.ManifestSHA256
@@ -197,6 +205,12 @@ func (r *PgShardRestoreReconciler) preflightPassed(ctx context.Context, restore 
 	setRestoreCondition(&status.Conditions, restorePreflightCondition, metav1.ConditionTrue, "AuthoritativeDestinationVerified", "signed backup manifest and authoritative destination state are verified", restore.Generation)
 	setRestoreCondition(&status.Conditions, restoreReadyCondition, metav1.ConditionFalse, "RestoreExecutionUnavailable", "restore materialization is not implemented", restore.Generation)
 	return r.updateRestoreStatus(ctx, restore, status)
+}
+
+func copyRestoreStatus(restore *pgshardv1alpha1.PgShardRestore) pgshardv1alpha1.PgShardRestoreStatus {
+	status := restore.Status
+	status.Conditions = append([]metav1.Condition(nil), restore.Status.Conditions...)
+	return status
 }
 
 func setRestoreCondition(conditions *[]metav1.Condition, conditionType string, status metav1.ConditionStatus, reason, message string, generation int64) {

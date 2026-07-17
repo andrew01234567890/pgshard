@@ -11,6 +11,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	restorepreflight "github.com/andrew01234567890/pgshard/operator/internal/restore"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -182,6 +183,78 @@ func TestRestorePreflightWaitsForAuthoritativeDestinationEvidence(t *testing.T) 
 	assertRestoreCondition(t, got, restoreReadyCondition, metav1.ConditionFalse, "DestinationTopologyResolverUnavailable")
 	if got.Status.Phase != pgshardv1alpha1.RestorePhasePending || got.Status.ManifestSHA256 == "" || got.Status.TopologySHA256 == "" || got.Status.DestinationTopologySHA256 != "" || got.Status.VerificationKeyUID != keySecret.UID {
 		t.Fatalf("unresolved destination status = %#v", got.Status)
+	}
+}
+
+func TestRestoreVerificationKeyUIDCannotBeRebound(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	restore, keySecret := signedRestore(t, restoreTestTopology(1), restoreTestTopology(1))
+	base := newFakeClient(t, restore, keySecret)
+	reconciler := &PgShardRestoreReconciler{Client: base, APIReader: base}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(restore)}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+
+	current := &pgshardv1alpha1.PgShardRestore{}
+	if err := base.Get(ctx, request.NamespacedName, current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.VerificationKeyUID != keySecret.UID {
+		t.Fatalf("initial verification key UID = %q, want %q", current.Status.VerificationKeyUID, keySecret.UID)
+	}
+	if err := base.Delete(ctx, keySecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(keySecret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("verification key still exists after deletion: %v", err)
+	}
+	if result, err := reconciler.Reconcile(ctx, request); err != nil || result.RequeueAfter != restoreKeyRetryDelay {
+		t.Fatalf("missing pinned key reconciliation = result %#v, error %v", result, err)
+	}
+	if err := base.Get(ctx, request.NamespacedName, current); err != nil {
+		t.Fatal(err)
+	}
+	assertRestoreCondition(t, current, restorePreflightCondition, metav1.ConditionUnknown, "VerificationKeyUnavailable")
+	if current.Status.VerificationKeyUID != keySecret.UID {
+		t.Fatalf("missing key cleared pinned UID: %#v", current.Status)
+	}
+
+	replacement := keySecret.DeepCopy()
+	replacement.UID = "replacement-key-uid"
+	replacement.ResourceVersion = ""
+	if err := base.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := reconciler.Reconcile(ctx, request); err != nil || result != (ctrl.Result{}) {
+		t.Fatalf("replacement key reconciliation = result %#v, error %v", result, err)
+	}
+	if err := base.Get(ctx, request.NamespacedName, current); err != nil {
+		t.Fatal(err)
+	}
+	assertRestoreCondition(t, current, restorePreflightCondition, metav1.ConditionFalse, "VerificationKeyReplaced")
+	assertRestoreCondition(t, current, restoreReadyCondition, metav1.ConditionFalse, "VerificationKeyReplaced")
+	if current.Status.Phase != pgshardv1alpha1.RestorePhaseRejected || current.Status.VerificationKeyUID != keySecret.UID {
+		t.Fatalf("replacement key rebound restore status: %#v", current.Status)
+	}
+}
+
+func TestRequestedTopologyMismatchDoesNotClaimAuthoritativeFingerprint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	restore, keySecret := signedRestore(t, restoreTestTopology(5), restoreTestTopology(3))
+	base := newFakeClient(t, restore, keySecret)
+	if _, err := (&PgShardRestoreReconciler{Client: base, APIReader: base}).Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(restore)}); err != nil {
+		t.Fatal(err)
+	}
+	current := &pgshardv1alpha1.PgShardRestore{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(restore), current); err != nil {
+		t.Fatal(err)
+	}
+	assertRestoreCondition(t, current, restorePreflightCondition, metav1.ConditionFalse, "RestoreTopologyMismatch")
+	if current.Status.ManifestSHA256 == "" || current.Status.TopologySHA256 == "" || current.Status.DestinationTopologySHA256 != "" {
+		t.Fatalf("requested mismatch claimed authoritative destination evidence: %#v", current.Status)
 	}
 }
 
