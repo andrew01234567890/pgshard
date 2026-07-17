@@ -29,7 +29,9 @@ final status after all mutators run. PodGC, copied annotation or condition text,
 a missing or recreated Node, and a webhook outage cannot produce that receipt,
 so cluster deletion fails closed with the PVC protected. This is lifecycle protection, not
 HA takeover or physical node fencing. It has no standby, promotion,
-backup execution, remote catalog transport, or SQL pooler. Restarting a primary interrupts that shard even though
+backup execution or SQL pooler. The pooler can supervise `shardschema` over an
+operator-provisioned TLS 1.3 and SCRAM connection, but still rejects every
+client session. Restarting a primary interrupts that shard even though
 its data survives. Three- and five-member resources continue to fail closed
 without PostgreSQL Pods.
 
@@ -52,7 +54,8 @@ resources, release policy and documentation. CI separately exercises the
 local-only lifecycle image with a disposable PostgreSQL 18 data directory. The
 operator KIND job also starts two single-member primaries, verifies the
 shard-0000 catalog inventory and initial restore identities, proves the other
-shard has no `shardschema` database, queries one primary from an authorized
+shard has no `shardschema` database, observes the pooler's authenticated catalog
+connection through `/status` and `/metrics`, queries one primary from an authorized
 restricted probe client using that destination shard's credential, restarts
 shard-0000, and verifies both application persistence and an unchanged catalog
 epoch and restore-incarnation mapping. The restart fixture also leaves one
@@ -70,7 +73,9 @@ the operator additionally applies the same bytes before a managed shard-0000
 primary starts. Database creation is recoverable; the migration and shard
 inventory update each run in their own transaction. PostgreSQL remains
 unavailable until both succeed and the final catalog invariants pass. An empty
-database left before migration and a released v0.49 catalog are safe to retry.
+database left before migration is safe to retry only when the same PGDATA also
+carries the exact cluster-bound catalog genesis intent; a released v0.49
+catalog is safe to retry after its structural and topology checks pass.
 A fresh install requires the reserved catalog schema to be absent or empty.
 Upgrade accepts only the exact structural fingerprint of the released v0.49
 catalog or a current catalog produced by a fresh install or v0.49 upgrade. The

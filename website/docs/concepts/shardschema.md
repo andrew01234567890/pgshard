@@ -12,19 +12,20 @@ LISTEN-before-initial-load primitive, bounded notification and polling driver,
 bounded reconnect and stale-readiness supervisor, metrics-ready state, and live
 database contract test exist in source. A Linux control executable composes
 the supervisor with pooler HTTP/readiness/status and Prometheus publication,
-bounded runtime settings, a file-backed DSN, and coordinated shutdown. Its
-control HTTP resources and drain are bounded, and its temporary plaintext
-connector rejects non-local endpoints. An explicit credential-free bootstrap
-mode exposes liveness while reporting the catalog unconfigured and making no
-connection attempt. The operator selects that mode until it can provision a
-safe catalog transport. Overall application readiness stays false because
+bounded runtime settings, local file-backed development configuration,
+operator-provisioned TLS 1.3 plus SCRAM catalog access, and coordinated
+shutdown. Its control HTTP resources and drain are bounded, and its temporary
+plaintext connector rejects non-local endpoints. An explicit credential-free
+bootstrap mode exposes liveness while reporting the catalog unconfigured and
+making no connection attempt for unsupported topologies. Overall application
+readiness stays false because
 there is no SQL data plane. The migration now also contains the permanent
 logical-consumer, checkpoint-generation, source-attachment, and managed-slot
 allocation registry described below. Its live PostgreSQL 18 test exercises the
 fenced lifecycle and tombstones. Bounded Rust primitives now authorize exact
 slot creation, activation, deletion, and final retirement; no long-running
-consumer reconciler owns those records yet. Authenticated TLS, remote catalog
-transport, and operator-provisioned credentials are not wired yet; see
+consumer reconciler owns those records yet. General data-shard transport,
+certificate rotation, and the SQL data plane are not wired yet; see
 [implementation status](../project/status.md).
 :::
 
@@ -171,19 +172,52 @@ reports connection phase, attempts,
 connections completing their initial authoritative load, and credential-safe
 failure categories including separate connection and operation timeouts. The
 pooler control executable publishes that catalog usability independently in
-exact JSON status and bounded-label Prometheus metrics. Its overall readiness remains false with reason
-`data_plane_unavailable`, even when the catalog is ready. It opens one regular
-DSN file nonblockingly, performs a bounded read, and accepts only loopback IP
-literals or Unix sockets with `sslmode=disable`, the exact `shardschema`
-database, `target_session_attrs=read-write`, and no startup options. That
-development bridge is not a substitute for authenticated TLS or operator
-credential distribution.
+exact JSON status and bounded-label Prometheus metrics. Its overall readiness
+remains false with reason `data_plane_unavailable`, even when the catalog is
+ready. Local development mode opens one regular DSN file nonblockingly,
+performs a bounded read, and accepts only loopback IP literals or Unix sockets
+with `sslmode=disable`, the exact `shardschema` database,
+`target_session_attrs=read-write`, and no startup options.
+
+The single-member operator path instead builds the connection without a DSN.
+It fixes the `pgshard_pooler_catalog` login, database, Service port,
+application name, and writable-primary requirement; requires SCRAM channel
+binding; and verifies the exact Service DNS name over TLS 1.3 against one
+operator-provisioned CA. Before Secret creation, the operator durably records a
+non-consumable intent containing an unpredictable name. It creates an empty
+mutable Secret, checkpoints that resource's API UID, and only then installs the
+credential and TLS keypair in one resource-version-conditional update that also
+makes the Secret immutable. Separate client and server material digests are
+checkpointed afterward. It uses the exact staged identity to resolve lost
+create, update, or status responses before any workload projection.
+Poolers receive only its password and CA
+certificate. Shard-0000 PostgreSQL receives only the serving keypair; its
+bootstrap init temporarily receives both retained projections so replacement
+material is rejected before PGDATA is touched. The CA private key is discarded
+after issuance. Finalization deletes the exact intent-recorded Secret with UID
+and resource-version preconditions and observes absence before the cluster
+finalizer is released. The login can read the catalog only through TLS and cannot
+connect to other databases or through a Unix socket. After topology validation,
+bootstrap transactionally removes restored database-wide defaults, accepts only
+absent or already canonical per-role login defaults, and re-establishes one
+exact safe session policy for this fixed login. Noncanonical login defaults are
+rejected before mutation; the login itself verifies the policy before the
+serving HBA is published. This secures the catalog
+path, not general data-shard or etcd traffic.
 
 `bootstrap-unavailable` is a separate fail-closed installation state, not an
 empty catalog or a stale-cache policy. It accepts no DSN, reports phase
 `not_configured` and readiness reason `catalog_not_configured`, keeps all
 connection counters at zero, and requires a process rollout to enter supervised
 catalog mode.
+
+Static catalog certificate rotation is not implemented. The development leaf
+is issued for five years and validation fails when less than 180 days remain;
+missing, replaced, malformed, or near-expiry material requires explicit
+recovery. Near expiry stops the whole resource plan/apply reconciliation and
+marks the cluster degraded while already-running workloads remain in place.
+This lifetime is not a production rotation design and does not claim
+zero-downtime renewal.
 
 The empty installed catalog begins at epoch zero. A reader fails closed before
 publishing metadata above the current process limits: 1,024 logical databases,

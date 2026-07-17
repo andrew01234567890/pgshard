@@ -17,10 +17,14 @@ pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-pgwire = { path = "../pgshard-pgwire", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
 rustix.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

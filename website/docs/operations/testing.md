@@ -130,10 +130,15 @@ PostgreSQL startup, and exits cleanly on `SIGTERM`. PostgreSQL listener tests
 refuse sequential GSS and SSL requests, decode the bounded rejection, close
 cancellation without a response, time out an incomplete startup, and drain on
 shutdown. Configuration tests require exactly one explicit catalog path: local
-mode with a regular DSN file, or credential-free `bootstrap-unavailable` mode.
-They open DSN files nonblockingly, reject a FIFO without waiting for a writer,
-bound the read and timing values, reject remote plaintext or session-policy
-overrides, and prove invalid DSN contents do not escape through errors. A
+mode with a regular DSN file, operator mode with an exact DNS host plus
+password and CA projections, or credential-free `bootstrap-unavailable` mode.
+They open files nonblockingly, support Kubernetes Secret symlink projections,
+reject a FIFO without waiting for a writer, bound every read and timing value,
+reject remote plaintext or session-policy overrides, require one canonical CA
+certificate and a 64-byte lowercase hexadecimal password, and prove invalid
+contents do not escape through errors. Operator mode also fixes the database,
+login, port, application name, TLS 1.3 policy, hostname validation, channel
+binding, and writable-primary requirement without accepting a DSN. A
 separate raw-wire PostgreSQL 18 test creates every protocol 3.0, 3.2, and
 negotiated 3.99 outbound packet with the production startup encoder. It
 validates four-byte protocol 3.0 and
@@ -552,7 +557,10 @@ primaries, proves shard passwords differ, executes SQL across an internal shard
 Service from an authorized restricted probe client using the destination-specific
 Secret, rejects otherwise identical unlabeled and wrong-cluster clients through
 the live NetworkPolicy, and verifies that only shard-0000 contains the dedicated
-`shardschema` database. It hash-verifies and loads the exact migration shipped
+`shardschema` database. It reaches the pooler control Service through the
+Kubernetes API proxy and requires a successful operator-provisioned TLS 1.3 and
+SCRAM catalog load in both exact JSON status and Prometheus metrics while
+overall SQL readiness remains false. It hash-verifies and loads the exact migration shipped
 in the non-root PostgreSQL bootstrap image, observes both configured shard
 identities and one active restore incarnation per shard, records the complete
 epoch-and-incarnation snapshot, and requires a primary recreation to reapply
@@ -567,20 +575,36 @@ selected replacement adopts the new template, the other shard remains on its
 original UID and configuration, and the PVC-backed row survives. Against a
 separate Docker volume, the same job upgrades the released v0.49 catalog,
 rejects a one-shard catalog under a requested two-shard configuration without
-mutation, replays after an independently installed exact two-shard inventory,
+changing catalog contents or the serving HBA, replays after an independently installed exact two-shard inventory,
 accepts canonical five-digit retired shard IDs, and rejects wrong home-shard
 identity, missing or orphaned restore lineage, malformed shard IDs, altered or
 rewound identity sequences, rewrite rules, event triggers, and disabled
 internal foreign-key triggers without changing catalog state. It also proves
-inherited search-path, identifier-quoting, and replica session-role settings do
-not subvert bootstrap; active restored `postgresql.auto.conf` settings are
-rejected before PostgreSQL starts. The migration replaces an altered trigger
+inherited search-path, identifier-quoting, replica session-role, disabled
+synchronous commit, damaged-page recovery, and ignored-checksum settings do not
+subvert bootstrap. Hostile restored database and role defaults cannot enable
+statement/parameter logging or alter the fixed SCRAM iteration count. The
+catalog password and generated verifier never enter PostgreSQL query text;
+active restored `postgresql.auto.conf` settings
+are rejected before PostgreSQL starts. The migration replaces an altered trigger
 function body without executing it. A prepared `ACCESS EXCLUSIVE` lock must
 fail within the bootstrap lock timeout; a second blocked init container is then killed with `SIGKILL`,
 after which retry on the same volume must recover. A second PGDATA fixture
 rejects a complete catalog with a missing column, an occupied reserved schema,
 and a two-of-three core catalog before migration can preserve an unsupported
-shape, then proves a recreated empty database is recoverable.
+shape. Fresh shard-0000 fixtures force container and postmaster death
+immediately after the catalog migration commit, while the initial inventory
+transaction is open, and after the inventory commit is externally visible but
+the bootstrap phase has not returned. Each fixture first proves the exact
+genesis intent survived on disk. The first two retries use that intent to finish
+the missing or rolled-back inventory; the post-commit retry proves an
+outcome-unknown exact inventory is idempotent. Complete catalog, credential, and
+serving-HBA publication followed by a clean synchronous PostgreSQL stop removes
+the intent. A separately forged shard-0000-plus-shard-0002 subset under a
+three-shard genesis intent is rejected as crash-impossible rather than filled
+in. An absent or empty `shardschema` on
+pre-existing PGDATA without the intent is rejected instead of being seeded from
+the requested shard count.
 A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the
