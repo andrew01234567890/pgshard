@@ -152,6 +152,122 @@ operator-managed replication, durable lease integration, promotion, automated
 recovery, and rolling restarts are not implemented; see
 [implementation status](../project/status.md).
 
+The operator's direct one-member development mode is intentionally outside the
+HA contract. It creates one writable PostgreSQL 18 Pod per shard and retains its
+PVC across a StatefulSet restart, but the shard is unavailable while that Pod
+restarts. Before publishing that Pod, the controller protects the checkpointed
+PVC UID with its own finalizer, makes the live PVC ownerless, and anchors the
+credential tombstone back to it. The exact claim name cannot be reused until
+the mounting workload is pruned, so a late empty claim cannot enter bootstrap.
+Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
+finalizer. Before workload publication, a cluster challenge update proves that
+the selected admission path has observed the namespace's immutable fencing
+opt-in and returns an HMAC receipt bound to the cluster UID and fresh challenge.
+This does not prove simultaneous selector-cache convergence across every API
+server. The receipt key is an independent immutable Secret whose SHA-256
+continuity fingerprint is anchored in backward-compatible CA Secret metadata.
+Fresh-install state is recorded only after the CA, serving, and key Secrets and
+webhook trust bundles are empty and no PostgreSQL lifecycle or pending cluster
+handshake metadata exists. Recreating both authority Secrets cannot therefore
+masquerade as installation.
+The last keyless release has a distinct two-phase upgrade: the applied manifest
+requests the first key in the new empty Secret, then the manager verifies the
+existing CA and serving material, requires both legacy PgShardCluster webhook
+trust bundles to contain that CA, and requires every newly introduced receipt
+webhook trust bundle to remain empty before recording authorization on the CA.
+Only then can it generate and anchor the key. The same proof establishes that
+receipt-looking annotations stored by that keyless release were never
+authenticated and are not continuity history. An existing initialized but
+unanchored key must instead be pinned while the old manager is healthy before a
+mixed-version rollout; the new manager
+refuses to infer continuity from receipt listings because those listings cannot
+fence an older signer. It inspects every single-member cluster handshake and
+requires every established cluster handshake and managed terminal Pod receipt
+to verify before writing a separate completion marker. Invalid or incomplete
+cluster metadata remains repairable only before the lifecycle finalizer or
+PostgreSQL bootstrap status exists; PostgreSQL storage and workloads cannot
+precede that barrier. Users cannot establish, remove, or replace the handshake.
+The controller may establish or repair it only when both its
+service-account identity and the final HMAC receipt verify; the pair is
+byte-for-byte immutable during deletion. Readiness,
+receipt-authenticated admission, and controller key use require the exact key to
+match that anchor; recreating an empty or different key fails closed and does not
+mint replacement authority.
+
+An upgrade from the keyless default-branch release needs no manual key command,
+but it crosses an incompatible admission contract. Freeze `PgShardCluster`
+writes and do not opt a resource namespace into Pod fencing during that rollout.
+The webhook Service uses a dedicated `9444` client port and selects only
+`receipt-v1` manager Pods. The port change prevents the API server from reusing
+a cached connection to the keyless manager's `443` client, while the selector
+prevents new connections from reaching that manager. Admission therefore fails
+closed, and clients may receive retryable webhook-unavailable errors until the
+new manager is Ready. Deployment process availability does not make the old
+process admission-compatible. Wait for rollout completion before retrying
+writes or enabling Pod fencing. A zero-rejection transition needs staged
+compatibility tooling and is not implemented. Later compatible rollouts have a
+20-second total termination budget: the first five seconds drain stale Service
+endpoints before `SIGTERM`, leaving roughly 15 seconds for graceful shutdown. Do
+not restart the old image with the new command-line arguments. For a pre-release
+development install that already has an initialized unanchored key, record the
+current
+immutable key before changing the
+manager image. Run this while the old manager is healthy:
+
+```console
+KEY_UID="$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.metadata.uid}')"
+KEY_SHA256="$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.data.hmac\.key}' | base64 -d | sha256sum | awk '{print $1}')"
+kubectl --namespace pgshard-system annotate --overwrite secret pgshard-webhook-ca "pgshard.io/pod-fencing-key-sha256=${KEY_SHA256}"
+test "$(kubectl --namespace pgshard-system get secret pgshard-webhook-fencing-key -o jsonpath='{.metadata.uid}')" = "${KEY_UID}"
+```
+
+If the UID check fails, do not roll out the new manager. This explicit
+development upgrade boundary has no automated production tooling yet.
+Binding admission copies the managed identity and selected Node UID and
+boot ID into the Pod atomically with `spec.nodeName`. Both admission stages
+authoritatively require that identity's exact PgShardCluster UID to exist and
+not be deleting, and a final validator checks the result after every mutator.
+The init container reads those annotations
+through the Downward API and exits before touching PGDATA if either is absent,
+which independently closes a missed-binding-admission path. Status admission
+rejects attempts to remove the managed identity, binding identity, or finalizer
+through the status subresource. On deletion, it adds a durable HMAC-authenticated
+process-terminated condition only to a terminal update from the authenticated
+kubelet for that same live Node incarnation, and a final validator rechecks the
+post-mutation status. PodGC's control-plane-authored `Failed` phase and copied
+condition text cannot create this condition. The managed Pod spec and generation
+are immutable across main-resource, ephemeral-container, and resize updates, so
+new process intent cannot be introduced after that proof. An uncached
+Pod read must then prove absence before PVC protection is released. A Pod that
+commits just after that read cannot bind while the cluster is deleting, even if
+the selected kubelet still caches an earlier immutable Secret. If admission
+is unavailable, the Node is absent or rebooted, or the Node name now identifies
+another UID, deletion deliberately remains blocked and the PVC stays protected.
+Manually removing the finalizer is not a storage-fencing operation and is
+outside the safe lifecycle boundary. Credential-only client Pods do not own PGDATA and do
+not block retention after the PostgreSQL process proof; their existing sessions
+are severed when that process stops.
+
+The receipt proves only what the authenticated kubelet reported for the pinned
+Node incarnation; it does not power off a machine or revoke storage access. Do
+not reuse a Node name while its old pgshard Pod may still exist. A lost or
+replaced Node requires external machine or storage fencing and explicit
+recovery. `ReadWriteOnce`, Pod phase, and an out-of-service taint are not treated
+as that fence.
+Its init container binds the durable bootstrap marker to the exact
+cluster UID and shard and repeats the scoped final-data and parent-directory
+publication barrier before
+accepting an existing marker, while the running PostgreSQL container does not
+receive or mount the bootstrap password. `PostgreSQLPrimariesAvailable=True` reports
+process availability, not replication or failover. Zero-downtime restart
+evidence requires at least one eligible standby, a fenced switchover, pooler
+rerouting/buffering, and a continuous client probe with no failed or
+outcome-unknown transactions.
+`pg_isready` is used only for readiness. Direct PostgreSQL Pods have no kubelet
+startup or liveness kill probe: PID 1 exit is handled by the container runtime,
+while slow startup or crash recovery remains unready without being repeatedly
+killed by kubelet.
+
 `shardschema` now reserves one permanent generation/name history for a
 dedicated slot-sync probe per live shard restore. The probe is explicitly
 separate from consumer anchors, so a future freshness challenge cannot skip

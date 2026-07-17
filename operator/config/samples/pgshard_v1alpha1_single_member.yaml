@@ -1,20 +1,20 @@
 apiVersion: pgshard.io/v1alpha1
 kind: PgShardCluster
 metadata:
-  name: development
+  name: single-member
 spec:
-  shards: 1
-  membersPerShard: 3
-  durability: Synchronous
+  shards: 2
+  membersPerShard: 1
+  durability: Asynchronous
   postgresql:
     version: "18"
     resources:
       requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
         cpu: "1"
         memory: 2Gi
-      limits:
-        cpu: "2"
-        memory: 4Gi
   storage:
     size: 4Gi
     deletionPolicy: Retain
@@ -34,6 +34,6 @@ spec:
     repository:
       type: Filesystem
       filesystem:
-        persistentVolumeClaimName: development-backups
+        persistentVolumeClaimName: single-member-backups
   observability:
     prometheus: true

@@ -337,6 +337,15 @@ spec:
                 type: integer
               storage:
                 properties:
+                  deletionPolicy:
+                    default: Retain
+                    description: |-
+                      DeletionPolicy controls PostgreSQL data PVC handling when the cluster is
+                      deleted. Retain is the safe default; Delete must be selected explicitly.
+                    enum:
+                    - Retain
+                    - Delete
+                    type: string
                   size:
                     anyOf:
                     - type: integer
@@ -344,9 +353,6 @@ spec:
                     description: Size is the capacity of each PostgreSQL data volume.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
-                    x-kubernetes-validations:
-                    - message: storage size must be at least 1Gi
-                      rule: quantity(self).compareTo(quantity('1Gi')) >= 0
                   storageClassName:
                     description: |-
                       StorageClassName is used for PostgreSQL data volumes and the supporting
@@ -355,11 +361,33 @@ spec:
                 required:
                 - size
                 type: object
+                x-kubernetes-validations:
+                - message: storage size is immutable except for a one-time upgrade
+                    from a legacy size below 4Gi to at least 4Gi
+                  optionalOldSelf: true
+                  rule: '!oldSelf.hasValue() ? quantity(self.size).compareTo(quantity(''4Gi''))
+                    >= 0 : quantity(self.size).compareTo(quantity(oldSelf.value().size))
+                    == 0 || (quantity(oldSelf.value().size).compareTo(quantity(''4Gi''))
+                    < 0 && quantity(self.size).compareTo(quantity(''4Gi'')) >= 0)'
+                - message: storage class is immutable after cluster creation
+                  rule: has(self.storageClassName) == has(oldSelf.storageClassName)
+                    && (!has(self.storageClassName) || self.storageClassName == oldSelf.storageClassName)
+                - message: deletion policy is immutable after cluster creation
+                  rule: self.deletionPolicy == oldSelf.deletionPolicy
             required:
             - backup
             - postgresql
             - storage
             type: object
+            x-kubernetes-validations:
+            - message: shards is immutable until online resharding is implemented
+              rule: self.shards == oldSelf.shards
+            - message: membersPerShard is immutable until membership transitions are
+                implemented
+              rule: self.membersPerShard == oldSelf.membersPerShard
+            - message: durability is immutable until replication-mode transitions
+                are implemented
+              rule: self.durability == oldSelf.durability
           status:
             description: |-
               PgShardClusterStatus never reports readiness until the operator has actually
@@ -434,6 +462,98 @@ spec:
                 - Ready
                 - Degraded
                 type: string
+              postgresqlBootstrapSpec:
+                description: |-
+                  PostgreSQLBootstrapSpec records the topology and storage contract before
+                  any PostgreSQL credential or data volume is created. It provides a
+                  defensive fence when admission is unavailable or bypassed.
+                properties:
+                  deletionPolicy:
+                    type: string
+                  durability:
+                    type: string
+                  membersPerShard:
+                    format: int32
+                    type: integer
+                  shards:
+                    format: int32
+                    type: integer
+                  storageClassName:
+                    type: string
+                  storageSize:
+                    type: string
+                required:
+                - deletionPolicy
+                - durability
+                - membersPerShard
+                - shards
+                - storageSize
+                type: object
+              postgresqlBootstraps:
+                description: |-
+                  PostgreSQLBootstraps records the API-assigned Secret and PVC identities for
+                  each shard. Missing or replaced children require an explicit recovery;
+                  the controller never silently adopts or regenerates them.
+                items:
+                  description: |-
+                    PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified
+                    bootstrap resources. Names are durable creation intents; UIDs are filled only
+                    after the API server confirms each child. PVCFenceDetached is checkpointed
+                    only after the credential Secret has been detached from cluster garbage
+                    collection, making that exact Secret UID a durable owner for any outcome-
+                    unknown PVC create. After PVCUID is checkpointed, the controller protects and
+                    detaches that exact live PVC and anchors the Secret tombstone back to its UID.
+                    Retain finalization can instead record an absent uncheckpointed outcome as
+                    abandoned, after which no later outcome is retained. A workload cannot
+                    consume an incomplete, abandoned, or unstabilized record.
+                  properties:
+                    pvcCreationAbandoned:
+                      description: |-
+                        PVCCreationAbandoned is set only during Retain finalization after an
+                        authoritative read finds no PVC before its UID was checkpointed. No
+                        workload can use an uncheckpointed claim. The controller never recreates
+                        or retains a later outcome from this creation intent; the detached Secret
+                        remains its garbage-collection fence until finalization removes it.
+                      type: boolean
+                    pvcFenceDetached:
+                      description: |-
+                        PVCFenceDetached proves the exact credential Secret is independent of the
+                        cluster and may be used as the PVC's creation-intent owner.
+                      type: boolean
+                    pvcName:
+                      type: string
+                    pvcStorageClassName:
+                      description: |-
+                        PVCStorageClassName records the explicit or operator-resolved class before
+                        the PVC create is dispatched, including an explicitly empty class.
+                      type: string
+                    pvcUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                    secretName:
+                      type: string
+                    secretUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                    shard:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                  required:
+                  - secretName
+                  - secretUID
+                  - shard
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - shard
+                x-kubernetes-list-type: map
             type: object
         type: object
     served: true

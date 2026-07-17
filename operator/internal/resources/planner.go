@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,10 +32,16 @@ const (
 	ComponentLabel = "app.kubernetes.io/component"
 	ClusterLabel   = "pgshard.io/cluster"
 	ShardLabel     = "pgshard.io/shard"
+	RoleLabel      = "pgshard.io/role"
+	MemberLabel    = "pgshard.io/member"
 
 	ManagedByValue = "pgshard-operator"
+	// ClusterResourceFinalizer protects operator-owned resources and marks a
+	// PgShardCluster lifecycle that crossed the fencing handshake barrier.
+	ClusterResourceFinalizer = "pgshard.io/owned-resources"
 
 	PostgreSQLConfigSuffix = "-postgresql-config"
+	PostgreSQLPasswordKey  = "superuser-password"
 	TopologyConfigSuffix   = "-topology"
 	EtcdSuffix             = "-etcd"
 	OrchestratorSuffix     = "-orchestrator"
@@ -47,13 +55,73 @@ const (
 	EtcdPeerPort   int32 = 2380
 	HTTPPort       int32 = 8080
 
-	etcdExecutable   = "/usr/local/bin/etcd"
-	defaultEtcdImage = "registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534"
+	etcdExecutable         = "/usr/local/bin/etcd"
+	defaultEtcdImage       = "registry.k8s.io/etcd:3.6.5-0@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534"
+	defaultPostgreSQLImage = "docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7"
 
-	configHashAnnotation     = "pgshard.io/config-hash"
-	ApplyOwnershipAnnotation = "pgshard.io/apply-ownership"
-	ApplyOwnershipVersion    = "v1"
+	configHashAnnotation                    = "pgshard.io/config-hash"
+	ApplyOwnershipAnnotation                = "pgshard.io/apply-ownership"
+	ApplyOwnershipVersion                   = "v1"
+	RetainedFromAnnotation                  = "pgshard.io/retained-from"
+	PostgreSQLBootstrapClusterUIDAnnotation = "pgshard.io/bootstrap-cluster-uid"
+	PostgreSQLDataClusterUIDAnnotation      = "pgshard.io/data-cluster-uid"
+	PostgreSQLDataProtectionFinalizer       = "pgshard.io/postgresql-data-protection"
+	PostgreSQLPodClusterUIDAnnotation       = "pgshard.io/postgresql-cluster-uid"
+	PostgreSQLNodeUIDAnnotation             = "pgshard.io/postgresql-node-uid"
+	PostgreSQLNodeBootIDAnnotation          = "pgshard.io/postgresql-node-boot-id"
+	PostgreSQLPodTerminationFinalizer       = "pgshard.io/postgresql-termination"
+	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 )
+
+const postgresqlBootstrapScript = `set -Eeuo pipefail
+: "${PGSHARD_NODE_UID:?binding-time node UID is required}"
+: "${PGSHARD_NODE_BOOT_ID:?binding-time node boot ID is required}"
+
+parent=/var/lib/postgresql/18
+final="$parent/docker"
+staging="$parent/.pgshard-init"
+marker="$final/.pgshard-bootstrap-complete"
+expected=/tmp/pgshard-bootstrap-identity
+
+umask 077
+printf 'cluster_uid=%s\nshard=%s\n' "$PGSHARD_CLUSTER_UID" "$PGSHARD_SHARD_ID" > "$expected"
+
+if [[ -f "$marker" && -f "$final/PG_VERSION" ]]; then
+  if ! cmp -s -- "$marker" "$expected"; then
+    echo "refusing PostgreSQL data directory owned by another cluster or shard" >&2
+    exit 1
+  fi
+  rm -rf -- "$staging"
+  sync "$final" "$parent"
+  exit 0
+fi
+if [[ -e "$final" ]]; then
+  echo "refusing to replace an incomplete or unmarked PostgreSQL data directory" >&2
+  exit 1
+fi
+
+rm -rf -- "$staging"
+mkdir -p -- "$staging"
+chmod 0700 "$staging"
+initdb \
+  --pgdata="$staging" \
+  --username=postgres \
+  --pwfile=/etc/pgshard/bootstrap/superuser-password \
+  --auth-local=trust \
+  --auth-host=scram-sha-256 \
+  --data-checksums \
+  --encoding=UTF8 \
+  --locale=C
+printf '\nhost all all all scram-sha-256\n' >> "$staging/pg_hba.conf"
+cp -- "$expected" "$staging/.pgshard-bootstrap-complete"
+chmod 0600 "$staging/.pgshard-bootstrap-complete"
+# initdb has already persisted the new cluster. Flush only the files and
+# directory entries that this script added so another mounted filesystem
+# cannot delay PostgreSQL bootstrap or Pod termination.
+sync "$staging/pg_hba.conf" "$staging/.pgshard-bootstrap-complete" "$staging"
+mv -- "$staging" "$final"
+sync "$final" "$parent"
+`
 
 // Images contains the deployable images used by the supporting workloads.
 // Image references are controller configuration, not part of the cluster API,
@@ -62,6 +130,7 @@ type Images struct {
 	Etcd         string
 	Orchestrator string
 	Pooler       string
+	PostgreSQL   string
 }
 
 // DefaultImages are development-channel references. The controller never uses
@@ -71,12 +140,14 @@ func DefaultImages() Images {
 		Etcd:         defaultEtcdImage,
 		Orchestrator: "ghcr.io/andrew01234567890/pgshard-orch:main",
 		Pooler:       "ghcr.io/andrew01234567890/pgshard-pooler:main",
+		PostgreSQL:   defaultPostgreSQLImage,
 	}
 }
 
-// Plan returns the complete set of safe-to-create resources for cluster. It
-// intentionally does not create PostgreSQL Pods: bootstrap, replication,
-// fencing integration, promotion, and recovery are not implemented yet.
+// Plan returns the complete set of safe-to-create resources for cluster.
+// Single-member asynchronous shards receive one PostgreSQL 18 primary. The
+// multi-member path stays fail closed until physical replication, fencing,
+// promotion, and recovery are implemented together.
 func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Object, error) {
 	if cluster == nil {
 		return nil, fmt.Errorf("cluster is nil")
@@ -96,8 +167,8 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	if cluster.Spec.Shards < 1 || cluster.Spec.Shards > pgshardv1alpha1.MaximumShards {
 		return nil, fmt.Errorf("shards must be between 1 and %d", pgshardv1alpha1.MaximumShards)
 	}
-	if strings.TrimSpace(images.Etcd) == "" || strings.TrimSpace(images.Orchestrator) == "" || strings.TrimSpace(images.Pooler) == "" {
-		return nil, fmt.Errorf("etcd, orchestrator, and pooler images must all be configured")
+	if strings.TrimSpace(images.Etcd) == "" || strings.TrimSpace(images.Orchestrator) == "" || strings.TrimSpace(images.Pooler) == "" || strings.TrimSpace(images.PostgreSQL) == "" {
+		return nil, fmt.Errorf("etcd, orchestrator, pooler, and PostgreSQL images must all be configured")
 	}
 	if err := pgshardv1alpha1.ValidateClusterForReconciliation(cluster); err != nil {
 		return nil, fmt.Errorf("cluster fails safety validation: %w", err)
@@ -128,16 +199,21 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		return nil, fmt.Errorf("resolve PostgreSQL settings: %w", err)
 	}
 	postgresqlConfig := renderPostgreSQLConfiguration(postgresql)
+	postgresqlHash := configMapDataHash(postgresqlConfig)
+	postgresqlConfigName := PostgreSQLConfigMapName(cluster.Name, postgresqlHash)
 	topologyConfig, err := renderTopology(cluster)
 	if err != nil {
 		return nil, err
 	}
 	topologyHash := configHash(topologyConfig)
-	poolerHash := configHash(configMapDataHash(postgresqlConfig), topologyConfig)
+	bootstraps, err := postgresqlBootstraps(cluster)
+	if err != nil {
+		return nil, err
+	}
 
-	objects := make([]client.Object, 0, 16+cluster.Spec.Shards)
+	objects := make([]client.Object, 0, 16+3*cluster.Spec.Shards)
 	objects = append(objects,
-		configMap(cluster, cluster.Name+PostgreSQLConfigSuffix, postgresqlConfig),
+		immutableConfigMap(cluster, postgresqlConfigName, postgresqlConfig),
 		configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": topologyConfig}),
 		applicationService(cluster, "rw", cluster.Spec.Services.ReadWrite, PoolerRWPort),
 		applicationService(cluster, "ro", cluster.Spec.Services.ReadOnly, PoolerROPort),
@@ -148,13 +224,20 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		etcdNetworkPolicy(cluster),
 	)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
-		objects = append(objects, shardService(cluster, shard))
+		objects = append(objects, shardService(cluster, shard), postgresqlNetworkPolicy(cluster, shard))
+		if cluster.Spec.MembersPerShard == 1 {
+			bootstrap := bootstraps[shard]
+			objects = append(objects,
+				postgresqlPrimaryStatefulSet(cluster, shard, images.PostgreSQL, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash),
+				postgresqlPrimaryDisruptionBudget(cluster, shard),
+			)
+		}
 	}
 
 	objects = append(objects,
 		etcdStatefulSet(cluster, images.Etcd),
 		orchestratorDeployment(cluster, images.Orchestrator, topologyHash),
-		poolerDeployment(cluster, images.Pooler, poolerHash),
+		poolerDeployment(cluster, images.Pooler, topologyHash),
 		podDisruptionBudget(cluster, "etcd", 1),
 		podDisruptionBudget(cluster, "orchestrator", 1),
 		podDisruptionBudget(cluster, "pooler", 1),
@@ -165,16 +248,45 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	return objects, nil
 }
 
+func postgresqlBootstraps(cluster *pgshardv1alpha1.PgShardCluster) (map[int32]pgshardv1alpha1.PostgreSQLBootstrapStatus, error) {
+	if cluster.Spec.MembersPerShard != 1 {
+		return nil, nil
+	}
+	bootstraps := make(map[int32]pgshardv1alpha1.PostgreSQLBootstrapStatus, len(cluster.Status.PostgreSQLBootstraps))
+	for _, bootstrap := range cluster.Status.PostgreSQLBootstraps {
+		if bootstrap.Shard < 0 || bootstrap.Shard >= cluster.Spec.Shards {
+			return nil, fmt.Errorf("PostgreSQL bootstrap references invalid shard %d", bootstrap.Shard)
+		}
+		if bootstrap.SecretName == "" || bootstrap.SecretUID == "" || !bootstrap.PVCFenceDetached || bootstrap.PVCName == "" || bootstrap.PVCUID == "" || bootstrap.PVCStorageClassName == nil {
+			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is incomplete (credential name=%t UID=%t, PVC fence detached=%t, PVC name=%t UID=%t, storage class=%t)", bootstrap.Shard, bootstrap.SecretName != "", bootstrap.SecretUID != "", bootstrap.PVCFenceDetached, bootstrap.PVCName != "", bootstrap.PVCUID != "", bootstrap.PVCStorageClassName != nil)
+		}
+		if _, duplicate := bootstraps[bootstrap.Shard]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is duplicated", bootstrap.Shard)
+		}
+		bootstraps[bootstrap.Shard] = bootstrap
+	}
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		if _, ok := bootstraps[shard]; !ok {
+			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is missing", shard)
+		}
+	}
+	return bootstraps, nil
+}
+
 func renderPostgreSQLConfiguration(configuration pgshardv1alpha1.ResolvedPostgreSQLConfiguration) map[string]string {
 	data := make(map[string]string, 1+len(configuration.Primaries)+len(configuration.Standbys))
 	data["postgresql.conf"] = renderPostgreSQLConfig(configuration.Common)
 	for _, primary := range configuration.Primaries {
-		data[fmt.Sprintf("primary-%04d.conf", primary.Ordinal)] = renderPostgreSQLConfig(primary.Settings)
+		data[fmt.Sprintf("primary-%04d.conf", primary.Ordinal)] = renderPostgreSQLRoleConfig(primary.Settings)
 	}
 	for _, standby := range configuration.Standbys {
-		data[fmt.Sprintf("standby-%04d.conf", standby.Ordinal)] = renderPostgreSQLConfig(standby.Settings)
+		data[fmt.Sprintf("standby-%04d.conf", standby.Ordinal)] = renderPostgreSQLRoleConfig(standby.Settings)
 	}
 	return data
+}
+
+func renderPostgreSQLRoleConfig(settings map[string]string) string {
+	return "include = '/etc/pgshard/postgresql/postgresql.conf'\n" + renderPostgreSQLConfig(settings)
 }
 
 func renderPostgreSQLConfig(settings map[string]string) string {
@@ -298,11 +410,24 @@ func configMapDataHash(data map[string]string) string {
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
+// PostgreSQLConfigMapName returns the content-addressed name for one generated
+// PostgreSQL configuration. A workload keeps using its old immutable object
+// until the same apply publishes both its new resource limit and new reference.
+func PostgreSQLConfigMapName(cluster, hash string) string {
+	return cluster + PostgreSQLConfigSuffix + "-" + hash
+}
+
 func configMap(cluster *pgshardv1alpha1.PgShardCluster, name string, data map[string]string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: ownedMeta(cluster, name, "configuration", nil),
 		Data:       data,
 	}
+}
+
+func immutableConfigMap(cluster *pgshardv1alpha1.PgShardCluster, name string, data map[string]string) *corev1.ConfigMap {
+	configuration := configMap(cluster, name, data)
+	configuration.Immutable = ptr(true)
+	return configuration
 }
 
 func applicationService(cluster *pgshardv1alpha1.PgShardCluster, mode string, template pgshardv1alpha1.ServiceTemplate, targetPort int32) *corev1.Service {
@@ -336,6 +461,231 @@ func shardService(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *corev1.
 				{Name: "postgresql", Protocol: corev1.ProtocolTCP, Port: PostgreSQLPort, TargetPort: intstr.FromString("postgresql")},
 				{Name: "agent-http", Protocol: corev1.ProtocolTCP, Port: HTTPPort, TargetPort: intstr.FromString("agent-http")},
 			},
+		},
+	}
+}
+
+// PostgreSQLAuthSecretPrefix is the readable portion of a randomly named
+// credential. The controller appends cryptographic randomness and records the
+// resulting name and API UID before any workload can reference it.
+func PostgreSQLAuthSecretPrefix(cluster string, shard int32) string {
+	return shardName(cluster, shard) + "-auth-"
+}
+
+// PostgreSQLPrimaryStatefulSetName returns the deterministic singleton primary
+// workload name for one shard.
+func PostgreSQLPrimaryStatefulSetName(cluster string, shard int32) string {
+	return fmt.Sprintf("%s-shard-%04d-primary", boundedPostgreSQLWorkloadPrefix(cluster), shard)
+}
+
+// StatefulSet Pod names append an ordinal and must remain DNS labels. Preserve
+// the legacy cluster-name API limit by bounding only the new PostgreSQL
+// workload prefix, with a deterministic digest preventing truncation aliases.
+func boundedPostgreSQLWorkloadPrefix(cluster string) string {
+	const (
+		maximumPrefixLength = 42
+		digestBytes         = 12
+	)
+	// Hash names at the boundary too: otherwise a longer name's bounded output
+	// could alias an accepted, literal 42-character cluster name.
+	if len(cluster) < maximumPrefixLength {
+		return cluster
+	}
+	digest := sha256.Sum256([]byte(cluster))
+	suffix := hex.EncodeToString(digest[:digestBytes])
+	return cluster[:maximumPrefixLength-len(suffix)-1] + "-" + suffix
+}
+
+// PostgreSQLPrimaryDataPVCPrefix is the readable portion of a randomly named,
+// pre-created data volume. Workloads only reference a name and UID checkpointed
+// in PgShardCluster status.
+func PostgreSQLPrimaryDataPVCPrefix(cluster string, shard int32) string {
+	return shardName(cluster, shard) + "-primary-data-"
+}
+
+// PostgreSQLAuthSecret returns one immutable shard bootstrap Secret. It starts
+// cluster-owned so a late create cannot outlive a failed bootstrap. The
+// controller checkpoints its API UID and detaches it before using that exact
+// Secret as the durable owner of outcome-unknown PVC creates. After the exact
+// PVC UID is checkpointed, ownership is inverted: the live PVC is protected
+// independently and the Secret becomes its dependent tombstone.
+func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, password []byte) *corev1.Secret {
+	metadata := ownedMeta(cluster, name, "postgresql", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	metadata.Annotations[PostgreSQLBootstrapClusterUIDAnnotation] = string(cluster.UID)
+	delete(metadata.Annotations, ApplyOwnershipAnnotation)
+	return &corev1.Secret{
+		ObjectMeta: metadata,
+		Immutable:  ptr(true),
+		Type:       corev1.SecretTypeOpaque,
+		Data:       map[string][]byte{PostgreSQLPasswordKey: append([]byte(nil), password...)},
+	}
+}
+
+// PostgreSQLPrimaryDataPVC returns the standalone data volume for a singleton
+// primary. Size and storage class come from the checkpointed provisioning
+// contract. Every create is controlled by the exact detached credential Secret
+// UID. The controller adds its data-protection finalizer only after the API UID
+// is checkpointed, then detaches the live PVC and anchors the Secret tombstone
+// to it. Delayed create requests retain this initial owner and no finalizer, so
+// Kubernetes can garbage-collect them after the tombstone is deleted.
+func PostgreSQLPrimaryDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageSize resource.Quantity, storageClassName *string, fenceName string, fenceUID types.UID) *corev1.PersistentVolumeClaim {
+	metadata := ownedMeta(cluster, name, "postgresql", nil)
+	controller := true
+	blockDeletion := true
+	metadata.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion:         corev1.SchemeGroupVersion.String(),
+		Kind:               "Secret",
+		Name:               fenceName,
+		UID:                fenceUID,
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockDeletion,
+	}}
+	metadata.Annotations[PostgreSQLDataClusterUIDAnnotation] = string(cluster.UID)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	metadata.Labels[RoleLabel] = "primary"
+	metadata.Labels[MemberLabel] = "0000"
+	delete(metadata.Annotations, ApplyOwnershipAnnotation)
+	var selectedStorageClass *string
+	if storageClassName != nil {
+		selectedStorageClass = ptr(*storageClassName)
+	}
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metadata,
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			StorageClassName: selectedStorageClass,
+			Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: storageSize.DeepCopy()}},
+		},
+	}
+}
+
+func postgresqlPrimaryStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image, secretName, pvcName, configurationName, configurationHash string) *appsv1.StatefulSet {
+	const (
+		postgresUID = int64(999)
+		replicas    = int32(1)
+	)
+	name := PostgreSQLPrimaryStatefulSetName(cluster.Name, shard)
+	selector := componentSelector(cluster, "postgresql")
+	selector[ShardLabel] = shardLabel(shard)
+	selector[RoleLabel] = "primary"
+	selector[MemberLabel] = "0000"
+	podLabels := maps.Clone(selector)
+	podLabels[ManagedByLabel] = ManagedByValue
+	allowPrivilegeEscalation := false
+	readOnlyRootFilesystem := true
+	runAsNonRoot := true
+	seccomp := &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	fsGroupChangePolicy := corev1.FSGroupChangeOnRootMismatch
+	postgresSecurity := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+		ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
+		RunAsNonRoot:             &runAsNonRoot,
+		RunAsUser:                ptr(postgresUID),
+		RunAsGroup:               ptr(postgresUID),
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+	readinessProbeCommand := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
+	postgres := corev1.Container{
+		Name:            "postgresql",
+		Image:           image,
+		ImagePullPolicy: imagePullPolicy(image),
+		Args:            []string{"-c", "config_file=/etc/pgshard/postgresql/primary-0000.conf"},
+		Env:             []corev1.EnvVar{{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"}},
+		Ports:           []corev1.ContainerPort{{Name: "postgresql", ContainerPort: PostgreSQLPort, Protocol: corev1.ProtocolTCP}},
+		Resources:       cluster.Spec.PostgreSQL.Resources,
+		SecurityContext: postgresSecurity,
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: readinessProbeCommand}},
+			PeriodSeconds:    2,
+			TimeoutSeconds:   2,
+			FailureThreshold: 2,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "data", MountPath: "/var/lib/postgresql"},
+			{Name: "runtime", MountPath: "/var/run/postgresql"},
+			{Name: "tmp", MountPath: "/tmp"},
+			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql", ReadOnly: true},
+		},
+	}
+	bootstrap := corev1.Container{
+		Name:            "bootstrap-postgresql",
+		Image:           image,
+		ImagePullPolicy: imagePullPolicy(image),
+		Command:         []string{"bash", "-ceu", postgresqlBootstrapScript},
+		Env: []corev1.EnvVar{
+			{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
+			{Name: "PGSHARD_SHARD_ID", Value: shardLabel(shard)},
+			{Name: "PGSHARD_NODE_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeUIDAnnotation)}}},
+			{Name: "PGSHARD_NODE_BOOT_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeBootIDAnnotation)}}},
+		},
+		Resources:       cluster.Spec.PostgreSQL.Resources,
+		SecurityContext: postgresSecurity.DeepCopy(),
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "data", MountPath: "/var/lib/postgresql"},
+			{Name: "tmp", MountPath: "/tmp"},
+			{Name: "bootstrap-secret", MountPath: "/etc/pgshard/bootstrap", ReadOnly: true},
+		},
+	}
+	automount := false
+	enableServiceLinks := false
+	return &appsv1.StatefulSet{
+		ObjectMeta: ownedMeta(cluster, name, "postgresql", nil),
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:            ptr(replicas),
+			ServiceName:         shardName(cluster.Name, shard),
+			PodManagementPolicy: appsv1.OrderedReadyPodManagement,
+			MinReadySeconds:     5,
+			UpdateStrategy:      appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
+			Selector:            &metav1.LabelSelector{MatchLabels: selector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: podLabels,
+					Annotations: map[string]string{
+						configHashAnnotation:              configurationHash,
+						PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
+					},
+					Finalizers: []string{PostgreSQLPodTerminationFinalizer},
+				},
+				Spec: corev1.PodSpec{
+					AutomountServiceAccountToken:  &automount,
+					EnableServiceLinks:            &enableServiceLinks,
+					TerminationGracePeriodSeconds: ptr(int64(60)),
+					NodeSelector:                  map[string]string{corev1.LabelOSStable: "linux"},
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot:        &runAsNonRoot,
+						RunAsUser:           ptr(postgresUID),
+						RunAsGroup:          ptr(postgresUID),
+						FSGroup:             ptr(postgresUID),
+						FSGroupChangePolicy: &fsGroupChangePolicy,
+						SeccompProfile:      seccomp,
+					},
+					InitContainers: []corev1.Container{bootstrap},
+					Containers:     []corev1.Container{postgres},
+					Volumes: []corev1.Volume{
+						{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName}}},
+						{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr(resource.MustParse("64Mi"))}}},
+						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("64Mi"))}}},
+						{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configurationName}}}},
+						{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName, DefaultMode: ptr(int32(0o440))}}},
+					},
+				},
+			},
+		},
+	}
+}
+
+func postgresqlPrimaryDisruptionBudget(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *policyv1.PodDisruptionBudget {
+	minimum := intstr.FromInt32(1)
+	selector := componentSelector(cluster, "postgresql")
+	selector[ShardLabel] = shardLabel(shard)
+	selector[RoleLabel] = "primary"
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: ownedMeta(cluster, PostgreSQLPrimaryStatefulSetName(cluster.Name, shard), "postgresql", nil),
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable:               &minimum,
+			Selector:                   &metav1.LabelSelector{MatchLabels: selector},
+			UnhealthyPodEvictionPolicy: unhealthyEvictionPolicyPtr(policyv1.AlwaysAllow),
 		},
 	}
 }
@@ -399,6 +749,37 @@ func etcdNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster) *networkingv1.Ne
 				{
 					From:  []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: componentSelector(cluster, "etcd")}}},
 					Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &peerPort}},
+				},
+			},
+		},
+	}
+}
+
+func postgresqlNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *networkingv1.NetworkPolicy {
+	tcp := corev1.ProtocolTCP
+	postgresqlPort := intstr.FromInt32(PostgreSQLPort)
+	selector := componentSelector(cluster, "postgresql")
+	selector[ShardLabel] = shardLabel(shard)
+	postgresqlPeer := maps.Clone(selector)
+	controlPeer := map[string]string{ClusterLabel: cluster.Name}
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: ownedMeta(cluster, shardName(cluster.Name, shard)+"-ingress", "postgresql", nil),
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: selector},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{
+						MatchLabels: controlPeer,
+						MatchExpressions: []metav1.LabelSelectorRequirement{{
+							Key: ComponentLabel, Operator: metav1.LabelSelectorOpIn, Values: []string{"orchestrator", "pooler"},
+						}},
+					}}},
+					Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &postgresqlPort}},
+				},
+				{
+					From:  []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: postgresqlPeer}}},
+					Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &postgresqlPort}},
 				},
 			},
 		},
@@ -558,16 +939,10 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 		ReadinessProbe: httpReadinessProbe("/readyz", "http"),
 		LivenessProbe:  httpLivenessProbe("/healthz", "http"),
 		Lifecycle:      &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{Sleep: &corev1.SleepAction{Seconds: 10}}},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true},
-			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql", ReadOnly: true},
-		},
+		VolumeMounts:   []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true}},
 	}})
 	podSpec.TerminationGracePeriodSeconds = ptr(int64(60))
-	podSpec.Volumes = []corev1.Volume{
-		{Name: "topology", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix}}}},
-		{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + PostgreSQLConfigSuffix}}}},
-	}
+	podSpec.Volumes = []corev1.Volume{{Name: "topology", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix}}}}}
 	return &appsv1.Deployment{
 		ObjectMeta: ownedMeta(cluster, cluster.Name+PoolerSuffix, "pooler", nil),
 		Spec: appsv1.DeploymentSpec{

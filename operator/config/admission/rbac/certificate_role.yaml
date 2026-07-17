@@ -11,6 +11,7 @@ rules:
     resourceNames:
       - pgshard-webhook-ca
       - pgshard-webhook-certificate
+      - pgshard-webhook-fencing-key
     verbs:
       - get
       - update

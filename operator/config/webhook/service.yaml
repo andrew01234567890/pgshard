@@ -11,8 +11,9 @@ spec:
   selector:
     app.kubernetes.io/name: pgshard-operator
     app.kubernetes.io/component: controller-manager
+    pgshard.io/webhook-contract: receipt-v1
   ports:
     - name: webhook
       protocol: TCP
-      port: 443
+      port: 9444
       targetPort: webhook

@@ -1,5 +1,5 @@
 // Package pki provisions and maintains the operator admission webhook's
-// self-signed serving certificate.
+// self-signed serving certificate and durable receipt key.
 package pki
 
 import (
@@ -8,12 +8,17 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"time"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
+	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	"github.com/go-logr/logr"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,8 +31,27 @@ import (
 )
 
 const (
-	ManagedByLabel = "app.kubernetes.io/managed-by"
-	ManagedByValue = "pgshard-operator"
+	ManagedByLabel   = "app.kubernetes.io/managed-by"
+	ManagedByValue   = "pgshard-operator"
+	PodFencingKeyKey = "hmac.key"
+	// PodFencingKeyFingerprintAnnotation anchors key continuity in backward-
+	// compatible metadata on the independent CA Secret.
+	PodFencingKeyFingerprintAnnotation = "pgshard.io/pod-fencing-key-sha256"
+	// PodFencingKeyFreshBootstrapAnnotation is written only while initializing
+	// an empty CA Secret and authorizes automatic key generation for that fresh
+	// install. It is never inferred for a legacy initialized Secret.
+	PodFencingKeyFreshBootstrapAnnotation = "pgshard.io/pod-fencing-key-fresh-bootstrap"
+	PodFencingKeyFreshBootstrapPending    = "pending"
+	PodFencingKeyFreshBootstrapAnchored   = "anchored"
+	// PodFencingKeyLegacyUpgradeAnnotation records the two-phase transition
+	// from the last keyless admission release. The request itself lives on the
+	// newly introduced key Secret, while this state is persisted independently
+	// on the already initialized CA before any key bytes are generated.
+	PodFencingKeyLegacyUpgradeAnnotation  = "pgshard.io/pod-fencing-key-keyless-upgrade"
+	PodFencingKeyLegacyUpgradePending     = "pending"
+	PodFencingKeyLegacyUpgradeAnchored    = "anchored"
+	PodFencingKeyUpgradeRequestAnnotation = "pgshard.io/pod-fencing-keyless-upgrade-request"
+	PodFencingKeyUpgradeRequestValue      = "v1"
 
 	defaultBootstrapTimeout    = 90 * time.Second
 	defaultMaintenanceInterval = time.Hour
@@ -36,9 +60,40 @@ const (
 	validatingWebhookName      = "vpgshardcluster.kb.io"
 	mutatingWebhookPath        = "/mutate-pgshard-io-v1alpha1-pgshardcluster"
 	validatingWebhookPath      = "/validate-pgshard-io-v1alpha1-pgshardcluster"
-	webhookServicePort         = int32(443)
+	webhookServicePort         = int32(9444)
 	webhookTimeoutSeconds      = int32(5)
 )
+
+type podFencingKeyBootstrapState int
+
+const (
+	podFencingKeyBootstrapNone podFencingKeyBootstrapState = iota
+	podFencingKeyBootstrapFreshPending
+	podFencingKeyBootstrapFreshAnchored
+	podFencingKeyBootstrapLegacyPending
+	podFencingKeyBootstrapLegacyAnchored
+)
+
+func (state podFencingKeyBootstrapState) pending() bool {
+	return state == podFencingKeyBootstrapFreshPending || state == podFencingKeyBootstrapLegacyPending
+}
+
+func (state podFencingKeyBootstrapState) fresh() bool {
+	return state == podFencingKeyBootstrapFreshPending || state == podFencingKeyBootstrapFreshAnchored
+}
+
+func (state podFencingKeyBootstrapState) provenKeyless() bool {
+	return state == podFencingKeyBootstrapLegacyPending || state == podFencingKeyBootstrapLegacyAnchored
+}
+
+func (state podFencingKeyBootstrapState) complete(anchor *corev1.Secret) {
+	switch state {
+	case podFencingKeyBootstrapFreshPending:
+		anchor.Annotations[PodFencingKeyFreshBootstrapAnnotation] = PodFencingKeyFreshBootstrapAnchored
+	case podFencingKeyBootstrapLegacyPending:
+		anchor.Annotations[PodFencingKeyLegacyUpgradeAnnotation] = PodFencingKeyLegacyUpgradeAnchored
+	}
+}
 
 type Config struct {
 	Client                      client.Client
@@ -46,6 +101,7 @@ type Config struct {
 	ServiceName                 string
 	CASecretName                string
 	ServingSecretName           string
+	FencingKeySecretName        string
 	MutatingConfigurationName   string
 	ValidatingConfigurationName string
 	CertificateDirectory        string
@@ -62,6 +118,7 @@ type Provisioner struct {
 	serviceName                 string
 	caSecretName                string
 	servingSecretName           string
+	fencingKeySecretName        string
 	mutatingConfigurationName   string
 	validatingConfigurationName string
 	certificateDirectory        string
@@ -108,6 +165,7 @@ func New(config Config) (*Provisioner, error) {
 		{field: "service name", value: config.ServiceName},
 		{field: "CA Secret name", value: config.CASecretName},
 		{field: "serving Secret name", value: config.ServingSecretName},
+		{field: "fencing key Secret name", value: config.FencingKeySecretName},
 		{field: "mutating configuration name", value: config.MutatingConfigurationName},
 		{field: "validating configuration name", value: config.ValidatingConfigurationName},
 	} {
@@ -140,6 +198,7 @@ func New(config Config) (*Provisioner, error) {
 		serviceName:                 config.ServiceName,
 		caSecretName:                config.CASecretName,
 		servingSecretName:           config.ServingSecretName,
+		fencingKeySecretName:        config.FencingKeySecretName,
 		mutatingConfigurationName:   config.MutatingConfigurationName,
 		validatingConfigurationName: config.ValidatingConfigurationName,
 		certificateDirectory:        filepath.Clean(config.CertificateDirectory),
@@ -195,10 +254,18 @@ func (p *Provisioner) Start(ctx context.Context) error {
 
 func (*Provisioner) NeedLeaderElection() bool { return false }
 
-// Checker fails readiness when the local serving material is unusable. A valid
-// certificate remains ready inside its renewal window while maintenance
-// replaces it, avoiding an admission outage at the renewal threshold.
-func (p *Provisioner) Checker(_ *http.Request) error {
+// Checker fails readiness when the local serving material or the durable Pod
+// fencing key is unusable. A valid certificate remains ready inside its
+// renewal window while maintenance replaces it, avoiding an admission outage
+// at the renewal threshold.
+func (p *Provisioner) Checker(request *http.Request) error {
+	ctx := context.Background()
+	if request != nil {
+		ctx = request.Context()
+	}
+	if err := p.checkPodFencingKey(ctx); err != nil {
+		return err
+	}
 	authorityPEM, err := os.ReadFile(filepath.Join(p.certificateDirectory, CACertificateKey))
 	if err != nil {
 		return fmt.Errorf("read local CA certificate: %w", err)
@@ -231,6 +298,9 @@ func (p *Provisioner) ensureOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := p.ensurePodFencingKey(ctx); err != nil {
+		return err
+	}
 	configs, err := p.readConfigurations(ctx, authority.certificatePEM)
 	if err != nil {
 		return err
@@ -248,6 +318,315 @@ func (p *Provisioner) ensureOnce(ctx context.Context) error {
 	return nil
 }
 
+func (p *Provisioner) ensurePodFencingKey(ctx context.Context) error {
+	secret, err := p.readPodFencingKey(ctx)
+	if err != nil {
+		return err
+	}
+	anchor, anchored, bootstrapState, err := p.readPodFencingKeyAnchor(ctx)
+	if err != nil {
+		return err
+	}
+	marker := secret.Annotations[podfence.SecretKeyContinuityAnnotation]
+	if marker != "" && marker != podfence.SecretKeyContinuityValue {
+		return fmt.Errorf("Pod fencing key Secret has unsupported continuity marker %q", marker)
+	}
+	continuityComplete := marker == podfence.SecretKeyContinuityValue
+	if continuityComplete && !anchored {
+		return fmt.Errorf("Pod fencing key continuity marker exists but its fingerprint anchor is missing; restore the anchor or perform explicit fencing recovery")
+	}
+	if bootstrapState.fresh() && !continuityComplete {
+		if err := p.verifyNoEstablishedPostgreSQLLifecycles(ctx); err != nil {
+			return err
+		}
+	}
+	if len(secret.Data) == 0 {
+		if err := validatePodFencingKeyMetadata(secret); err != nil {
+			return err
+		}
+		if secret.Immutable != nil && *secret.Immutable {
+			return fmt.Errorf("empty Pod fencing key Secret %s/%s is immutable", secret.Namespace, secret.Name)
+		}
+		if anchored || continuityComplete {
+			return fmt.Errorf("Pod fencing key Secret is empty but a continuity fingerprint exists; restore the original key or perform explicit fencing recovery")
+		}
+		if !bootstrapState.pending() {
+			return fmt.Errorf("empty Pod fencing key Secret has no authorized bootstrap; restore the original key or perform explicit fencing recovery")
+		}
+		if bootstrapState == podFencingKeyBootstrapLegacyPending && secret.Annotations[PodFencingKeyUpgradeRequestAnnotation] != PodFencingKeyUpgradeRequestValue {
+			return fmt.Errorf("keyless upgrade authorization requires Pod fencing key request %s=%s", PodFencingKeyUpgradeRequestAnnotation, PodFencingKeyUpgradeRequestValue)
+		}
+		value := make([]byte, podfence.SecretKeyBytes)
+		if _, err := io.ReadFull(p.random, value); err != nil {
+			return fmt.Errorf("generate Pod fencing key: %w", err)
+		}
+		secret.Data = map[string][]byte{PodFencingKeyKey: value}
+		immutable := true
+		secret.Immutable = &immutable
+		if err := p.client.Update(ctx, secret); err != nil {
+			return fmt.Errorf("initialize Pod fencing key Secret: %w", err)
+		}
+	}
+	key, err := podfence.ValidateSecretHandshakeKeyCandidate(secret, PodFencingKeyKey)
+	if err != nil {
+		return err
+	}
+	if anchored {
+		if err := podfence.ValidateSecretHandshakeKeyFingerprint(anchor, PodFencingKeyFingerprintAnnotation, key); err != nil {
+			return err
+		}
+		if bootstrapState.pending() {
+			bootstrapState.complete(anchor)
+			if err := p.client.Update(ctx, anchor); err != nil {
+				return fmt.Errorf("complete Pod fencing key bootstrap anchor: %w", err)
+			}
+		}
+		if !continuityComplete {
+			if err := p.verifyPodFencingKeyBootstrapBarrier(ctx, bootstrapState, key); err != nil {
+				return err
+			}
+			if err := p.markPodFencingKeyContinuity(ctx, secret); err != nil {
+				return err
+			}
+		}
+		return p.checkPodFencingKey(ctx)
+	}
+	if !bootstrapState.pending() {
+		return fmt.Errorf("initialized Pod fencing key has no continuity anchor; pin its fingerprint before rolling out this manager or reinstall the pre-release development cluster")
+	}
+	if err := p.verifyPodFencingKeyBootstrapBarrier(ctx, bootstrapState, key); err != nil {
+		return err
+	}
+	if anchor.Annotations == nil {
+		anchor.Annotations = make(map[string]string, 1)
+	}
+	anchor.Annotations[PodFencingKeyFingerprintAnnotation] = podfence.SecretHandshakeKeyFingerprint(key)
+	bootstrapState.complete(anchor)
+	if err := p.client.Update(ctx, anchor); err != nil {
+		return fmt.Errorf("anchor Pod fencing key fingerprint: %w", err)
+	}
+	// Recheck after installing the anchor so a concurrently committed receipt
+	// cannot be skipped before the completion marker is written.
+	if err := p.verifyPodFencingKeyBootstrapBarrier(ctx, bootstrapState, key); err != nil {
+		return err
+	}
+	if err := p.markPodFencingKeyContinuity(ctx, secret); err != nil {
+		return err
+	}
+	return p.checkPodFencingKey(ctx)
+}
+
+func (p *Provisioner) checkPodFencingKey(ctx context.Context) error {
+	secret, err := p.readPodFencingKey(ctx)
+	if err != nil {
+		return err
+	}
+	key, err := podfence.ValidateSecretHandshakeKey(secret, PodFencingKeyKey)
+	if err != nil {
+		return err
+	}
+	anchor, anchored, _, err := p.readPodFencingKeyAnchor(ctx)
+	if err != nil {
+		return err
+	}
+	if !anchored {
+		return fmt.Errorf("Pod fencing key continuity fingerprint is missing")
+	}
+	return podfence.ValidateSecretHandshakeKeyFingerprint(anchor, PodFencingKeyFingerprintAnnotation, key)
+}
+
+func (p *Provisioner) markPodFencingKeyContinuity(ctx context.Context, secret *corev1.Secret) error {
+	if secret.Annotations == nil {
+		secret.Annotations = make(map[string]string, 1)
+	}
+	secret.Annotations[podfence.SecretKeyContinuityAnnotation] = podfence.SecretKeyContinuityValue
+	if err := p.client.Update(ctx, secret); err != nil {
+		return fmt.Errorf("mark Pod fencing key continuity: %w", err)
+	}
+	return nil
+}
+
+func (p *Provisioner) verifyPodFencingKeyBootstrapBarrier(ctx context.Context, bootstrapState podFencingKeyBootstrapState, key []byte) error {
+	if bootstrapState.fresh() {
+		return p.verifyNoEstablishedPostgreSQLLifecycles(ctx)
+	}
+	// The independently proven origin/main state predates every receipt signer,
+	// so receipt-looking resource annotations cannot be continuity evidence.
+	// Receipt-capable pre-anchored releases do not carry this state and remain
+	// subject to the full history scan below.
+	if bootstrapState.provenKeyless() {
+		return nil
+	}
+	return p.verifyExistingReceiptHistory(ctx, key)
+}
+
+func (p *Provisioner) verifyNoEstablishedPostgreSQLLifecycles(ctx context.Context) error {
+	clusters := &pgshardv1alpha1.PgShardClusterList{}
+	if err := p.client.List(ctx, clusters); err != nil {
+		return fmt.Errorf("list PgShardClusters before fresh Pod fencing key bootstrap: %w", err)
+	}
+	for index := range clusters.Items {
+		cluster := &clusters.Items[index]
+		_, hasChallenge := cluster.Annotations[podfence.HandshakeChallengeAnnotation]
+		_, hasReceipt := cluster.Annotations[podfence.HandshakeReceiptAnnotation]
+		if slices.Contains(cluster.Finalizers, owned.ClusterResourceFinalizer) || len(cluster.Status.PostgreSQLBootstraps) != 0 || hasChallenge || hasReceipt {
+			return fmt.Errorf("fresh Pod fencing key bootstrap is unsafe while PgShardCluster %s/%s has an established PostgreSQL lifecycle", cluster.Namespace, cluster.Name)
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := p.client.List(ctx, pods, client.MatchingLabels{
+		owned.ManagedByLabel: owned.ManagedByValue,
+		owned.ComponentLabel: "postgresql",
+	}); err != nil {
+		return fmt.Errorf("list Pods before fresh Pod fencing key bootstrap: %w", err)
+	}
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if podfence.IsManagedPostgreSQLPod(pod) {
+			return fmt.Errorf("fresh Pod fencing key bootstrap is unsafe while managed PostgreSQL Pod %s/%s exists", pod.Namespace, pod.Name)
+		}
+	}
+	return nil
+}
+
+func (p *Provisioner) verifyExistingReceiptHistory(ctx context.Context, key []byte) error {
+	codec := podfence.NewStaticHandshakeCodec(key)
+	clusters := &pgshardv1alpha1.PgShardClusterList{}
+	if err := p.client.List(ctx, clusters); err != nil {
+		return fmt.Errorf("list PgShardClusters during Pod fencing key continuity migration: %w", err)
+	}
+	for index := range clusters.Items {
+		cluster := &clusters.Items[index]
+		challenge, hasChallenge := cluster.Annotations[podfence.HandshakeChallengeAnnotation]
+		receipt, hasReceipt := cluster.Annotations[podfence.HandshakeReceiptAnnotation]
+		if cluster.Spec.MembersPerShard != 1 {
+			continue
+		}
+		established := slices.Contains(cluster.Finalizers, owned.ClusterResourceFinalizer) || len(cluster.Status.PostgreSQLBootstraps) != 0
+		if !hasChallenge && !hasReceipt && !established {
+			continue
+		}
+		if !hasChallenge || !hasReceipt || challenge == "" || receipt == "" {
+			if established {
+				return fmt.Errorf("existing PgShardCluster %s/%s has incomplete Pod fencing handshake metadata", cluster.Namespace, cluster.Name)
+			}
+			continue
+		}
+		verified, err := codec.Verify(ctx, cluster)
+		if err != nil {
+			return fmt.Errorf("verify existing PgShardCluster %s/%s handshake receipt: %w", cluster.Namespace, cluster.Name, err)
+		}
+		if !verified && established {
+			return fmt.Errorf("existing PgShardCluster %s/%s handshake receipt does not match the candidate Pod fencing key", cluster.Namespace, cluster.Name)
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := p.client.List(ctx, pods, client.MatchingLabels{
+		owned.ManagedByLabel: owned.ManagedByValue,
+		owned.ComponentLabel: "postgresql",
+	}); err != nil {
+		return fmt.Errorf("list Pods during Pod fencing key continuity migration: %w", err)
+	}
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if !receiptBearingPostgreSQLPod(pod) {
+			continue
+		}
+		hasTerminationCondition := false
+		for conditionIndex := range pod.Status.Conditions {
+			if pod.Status.Conditions[conditionIndex].Type == podfence.TerminationConditionType {
+				hasTerminationCondition = true
+				break
+			}
+		}
+		if !hasTerminationCondition {
+			continue
+		}
+		verified, err := codec.VerifyTermination(ctx, pod)
+		if err != nil {
+			return fmt.Errorf("verify existing Pod %s/%s termination receipt: %w", pod.Namespace, pod.Name, err)
+		}
+		if !verified {
+			return fmt.Errorf("existing Pod %s/%s termination receipt does not match the candidate Pod fencing key", pod.Namespace, pod.Name)
+		}
+	}
+	return nil
+}
+
+func receiptBearingPostgreSQLPod(pod *corev1.Pod) bool {
+	return podfence.IsManagedPostgreSQLPod(pod) &&
+		pod.Annotations[podfence.NodeUIDAnnotation] != "" &&
+		pod.Annotations[podfence.NodeBootIDAnnotation] != "" &&
+		pod.Spec.NodeName != "" &&
+		(pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed)
+}
+
+func (p *Provisioner) readPodFencingKey(ctx context.Context) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: p.namespace, Name: p.fencingKeySecretName}
+	if err := p.client.Get(ctx, key, secret); err != nil {
+		return nil, fmt.Errorf("get pre-created Pod fencing key Secret: %w", err)
+	}
+	return secret, nil
+}
+
+func (p *Provisioner) readPodFencingKeyAnchor(ctx context.Context) (*corev1.Secret, bool, podFencingKeyBootstrapState, error) {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: p.namespace, Name: p.caSecretName}
+	if err := p.client.Get(ctx, key, secret); err != nil {
+		return nil, false, podFencingKeyBootstrapNone, fmt.Errorf("get Pod fencing key anchor Secret: %w", err)
+	}
+	if err := validateManagedSecret(secret, corev1.SecretTypeOpaque); err != nil {
+		return nil, false, podFencingKeyBootstrapNone, err
+	}
+	_, exists := secret.Annotations[PodFencingKeyFingerprintAnnotation]
+	bootstrapState, err := podFencingKeyBootstrapStateFor(secret)
+	if err != nil {
+		return nil, false, podFencingKeyBootstrapNone, err
+	}
+	if (bootstrapState == podFencingKeyBootstrapFreshAnchored || bootstrapState == podFencingKeyBootstrapLegacyAnchored) && !exists {
+		return nil, false, podFencingKeyBootstrapNone, fmt.Errorf("Pod fencing key bootstrap was completed but its fingerprint anchor is missing; restore the anchor or perform explicit fencing recovery")
+	}
+	return secret, exists, bootstrapState, nil
+}
+
+func podFencingKeyBootstrapStateFor(secret *corev1.Secret) (podFencingKeyBootstrapState, error) {
+	fresh := secret.Annotations[PodFencingKeyFreshBootstrapAnnotation]
+	legacy := secret.Annotations[PodFencingKeyLegacyUpgradeAnnotation]
+	if fresh != "" && legacy != "" {
+		return podFencingKeyBootstrapNone, fmt.Errorf("Pod fencing key CA Secret has both fresh-install and keyless-upgrade bootstrap state")
+	}
+	switch {
+	case fresh == "" && legacy == "":
+		return podFencingKeyBootstrapNone, nil
+	case fresh == PodFencingKeyFreshBootstrapPending:
+		return podFencingKeyBootstrapFreshPending, nil
+	case fresh == PodFencingKeyFreshBootstrapAnchored:
+		return podFencingKeyBootstrapFreshAnchored, nil
+	case fresh != "":
+		return podFencingKeyBootstrapNone, fmt.Errorf("Pod fencing key CA Secret has unsupported fresh-bootstrap state %q", fresh)
+	case legacy == PodFencingKeyLegacyUpgradePending:
+		return podFencingKeyBootstrapLegacyPending, nil
+	case legacy == PodFencingKeyLegacyUpgradeAnchored:
+		return podFencingKeyBootstrapLegacyAnchored, nil
+	default:
+		return podFencingKeyBootstrapNone, fmt.Errorf("Pod fencing key CA Secret has unsupported keyless-upgrade state %q", legacy)
+	}
+}
+
+func validatePodFencingKeyMetadata(secret *corev1.Secret) error {
+	if secret.Labels[ManagedByLabel] != ManagedByValue {
+		return fmt.Errorf("Secret %s/%s is not labeled as managed by %s", secret.Namespace, secret.Name, ManagedByValue)
+	}
+	if secret.Type != corev1.SecretTypeOpaque {
+		return fmt.Errorf("managed Secret %s/%s has type %q, want %q", secret.Namespace, secret.Name, secret.Type, corev1.SecretTypeOpaque)
+	}
+	if request := secret.Annotations[PodFencingKeyUpgradeRequestAnnotation]; request != "" && request != PodFencingKeyUpgradeRequestValue {
+		return fmt.Errorf("managed Secret %s/%s has unsupported keyless-upgrade request %q", secret.Namespace, secret.Name, request)
+	}
+	return nil
+}
+
 func (p *Provisioner) ensureAuthority(ctx context.Context) (*certificateAuthority, error) {
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: p.namespace, Name: p.caSecretName}
@@ -258,6 +637,25 @@ func (p *Provisioner) ensureAuthority(ctx context.Context) (*certificateAuthorit
 		return nil, err
 	}
 	if len(secret.Data) == 0 {
+		fencingKey, err := p.readPodFencingKey(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := validatePodFencingKeyMetadata(fencingKey); err != nil {
+			return nil, err
+		}
+		if len(fencingKey.Data) != 0 {
+			if _, err := podfence.ValidateSecretHandshakeKeyCandidate(fencingKey, PodFencingKeyKey); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("empty CA Secret cannot authorize a fresh Pod fencing key bootstrap while the fencing key Secret is already initialized")
+		}
+		if fencingKey.Immutable != nil || fencingKey.Annotations[podfence.SecretKeyContinuityAnnotation] != "" {
+			return nil, fmt.Errorf("empty CA Secret cannot authorize a fresh Pod fencing key bootstrap while the fencing key Secret is already initialized")
+		}
+		if err := p.verifyFreshBootstrapPrerequisites(ctx); err != nil {
+			return nil, err
+		}
 		authority, err := generateCertificateAuthority(p.now(), p.random, p.serviceName+"."+p.namespace+".svc")
 		if err != nil {
 			return nil, err
@@ -266,6 +664,10 @@ func (p *Provisioner) ensureAuthority(ctx context.Context) (*certificateAuthorit
 			CACertificateKey: authority.certificatePEM,
 			CAPrivateKeyKey:  authority.privateKeyPEM,
 		}
+		if secret.Annotations == nil {
+			secret.Annotations = make(map[string]string, 1)
+		}
+		secret.Annotations[PodFencingKeyFreshBootstrapAnnotation] = PodFencingKeyFreshBootstrapPending
 		if err := p.client.Update(ctx, secret); err != nil {
 			return nil, fmt.Errorf("initialize CA Secret: %w", err)
 		}
@@ -280,7 +682,104 @@ func (p *Provisioner) ensureAuthority(ctx context.Context) (*certificateAuthorit
 	if err != nil {
 		return nil, fmt.Errorf("validate managed CA Secret: %w", err)
 	}
+	if err := p.authorizeLegacyKeylessUpgrade(ctx, secret, authority); err != nil {
+		return nil, err
+	}
 	return authority, nil
+}
+
+func (p *Provisioner) verifyFreshBootstrapPrerequisites(ctx context.Context) error {
+	serving := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: p.namespace, Name: p.servingSecretName}
+	if err := p.client.Get(ctx, key, serving); err != nil {
+		return fmt.Errorf("get pre-created serving Secret before fresh bootstrap: %w", err)
+	}
+	if err := validateManagedServingSecret(serving); err != nil {
+		return err
+	}
+	if len(serving.Data) != 0 {
+		return fmt.Errorf("empty CA Secret cannot authorize a fresh bootstrap while the serving Secret is already initialized")
+	}
+	if _, err := p.readConfigurations(ctx, nil); err != nil {
+		return fmt.Errorf("validate empty webhook trust before fresh bootstrap: %w", err)
+	}
+	return p.verifyNoEstablishedPostgreSQLLifecycles(ctx)
+}
+
+func (p *Provisioner) authorizeLegacyKeylessUpgrade(ctx context.Context, anchor *corev1.Secret, authority *certificateAuthority) error {
+	_, anchored := anchor.Annotations[PodFencingKeyFingerprintAnnotation]
+	bootstrapState, err := podFencingKeyBootstrapStateFor(anchor)
+	if err != nil {
+		return err
+	}
+	if anchored || bootstrapState != podFencingKeyBootstrapNone {
+		return nil
+	}
+	fencingKey, err := p.readPodFencingKey(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validatePodFencingKeyMetadata(fencingKey); err != nil {
+		return err
+	}
+	if len(fencingKey.Data) != 0 || fencingKey.Immutable != nil || fencingKey.Annotations[podfence.SecretKeyContinuityAnnotation] != "" {
+		return nil
+	}
+	request := fencingKey.Annotations[PodFencingKeyUpgradeRequestAnnotation]
+	if request == "" {
+		return nil
+	}
+	if request != PodFencingKeyUpgradeRequestValue {
+		return fmt.Errorf("Pod fencing key Secret has unsupported keyless-upgrade request %q", request)
+	}
+	serving := &corev1.Secret{}
+	servingKey := types.NamespacedName{Namespace: p.namespace, Name: p.servingSecretName}
+	if err := p.client.Get(ctx, servingKey, serving); err != nil {
+		return fmt.Errorf("get serving Secret during keyless upgrade authorization: %w", err)
+	}
+	if err := validateManagedServingSecret(serving); err != nil {
+		return err
+	}
+	servingCA, hasServingCA := serving.Data[CACertificateKey]
+	servingCertificate, hasServingCertificate := serving.Data[TLSCertificateKey]
+	servingPrivateKey, hasServingPrivateKey := serving.Data[TLSPrivateKeyKey]
+	if len(serving.Data) != 3 || !hasServingCA || !hasServingCertificate || !hasServingPrivateKey || !bytes.Equal(servingCA, authority.certificatePEM) {
+		return fmt.Errorf("keyless upgrade requires serving material initialized by the existing CA")
+	}
+	if _, err := parseServingCertificate(servingCertificate, servingPrivateKey); err != nil {
+		return fmt.Errorf("validate serving material during keyless upgrade authorization: %w", err)
+	}
+	configs, err := p.readConfigurations(ctx, authority.certificatePEM)
+	if err != nil {
+		return fmt.Errorf("validate webhook trust during keyless upgrade authorization: %w", err)
+	}
+	legacyMutating := findMutatingWebhook(configs.mutating.Webhooks, mutatingWebhookName)
+	legacyValidating := findValidatingWebhook(configs.validating.Webhooks, validatingWebhookName)
+	if legacyMutating == nil || legacyValidating == nil ||
+		!bytes.Equal(legacyMutating.ClientConfig.CABundle, authority.certificatePEM) ||
+		!bytes.Equal(legacyValidating.ClientConfig.CABundle, authority.certificatePEM) {
+		return fmt.Errorf("keyless upgrade requires both existing PgShardCluster webhooks to trust the initialized CA")
+	}
+	for index := range configs.mutating.Webhooks {
+		webhook := &configs.mutating.Webhooks[index]
+		if webhook.Name != mutatingWebhookName && len(webhook.ClientConfig.CABundle) != 0 {
+			return fmt.Errorf("keyless upgrade requires newly introduced receipt webhooks to have empty trust bundles")
+		}
+	}
+	for index := range configs.validating.Webhooks {
+		webhook := &configs.validating.Webhooks[index]
+		if webhook.Name != validatingWebhookName && len(webhook.ClientConfig.CABundle) != 0 {
+			return fmt.Errorf("keyless upgrade requires newly introduced receipt webhooks to have empty trust bundles")
+		}
+	}
+	if anchor.Annotations == nil {
+		anchor.Annotations = make(map[string]string, 1)
+	}
+	anchor.Annotations[PodFencingKeyLegacyUpgradeAnnotation] = PodFencingKeyLegacyUpgradePending
+	if err := p.client.Update(ctx, anchor); err != nil {
+		return fmt.Errorf("authorize keyless Pod fencing key upgrade: %w", err)
+	}
+	return nil
 }
 
 func (p *Provisioner) ensureServingCertificate(ctx context.Context, authority *certificateAuthority) (*servingCertificate, error) {
@@ -354,56 +853,61 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.mutatingConfigurationName}, mutating); err != nil {
 		return nil, fmt.Errorf("get mutating webhook configuration: %w", err)
 	}
-	if len(mutating.Webhooks) != 1 {
-		return nil, fmt.Errorf("mutating webhook configuration contains %d webhooks, want exactly one", len(mutating.Webhooks))
+	if len(mutating.Webhooks) != 4 {
+		return nil, fmt.Errorf("mutating webhook configuration contains %d webhooks, want exactly four", len(mutating.Webhooks))
 	}
-	mutatingWebhook := mutating.Webhooks[0]
-	if mutatingWebhook.ReinvocationPolicy != nil && *mutatingWebhook.ReinvocationPolicy != admissionregistrationv1.NeverReinvocationPolicy {
-		return nil, fmt.Errorf("mutating webhook %q has reinvocationPolicy %q, want Never", mutatingWebhook.Name, *mutatingWebhook.ReinvocationPolicy)
-	}
-	if err := p.validateWebhookPolicy(webhookPolicy{
-		name:                    mutatingWebhook.Name,
-		clientConfig:            mutatingWebhook.ClientConfig,
-		rules:                   mutatingWebhook.Rules,
-		failurePolicy:           mutatingWebhook.FailurePolicy,
-		matchPolicy:             mutatingWebhook.MatchPolicy,
-		namespaceSelector:       mutatingWebhook.NamespaceSelector,
-		objectSelector:          mutatingWebhook.ObjectSelector,
-		sideEffects:             mutatingWebhook.SideEffects,
-		timeoutSeconds:          mutatingWebhook.TimeoutSeconds,
-		admissionReviewVersions: mutatingWebhook.AdmissionReviewVersions,
-		matchConditionCount:     len(mutatingWebhook.MatchConditions),
-	}, caBundle, mutatingWebhookName, mutatingWebhookPath); err != nil {
-		return nil, fmt.Errorf("mutating webhook %q: %w", mutating.Webhooks[0].Name, err)
+	for _, expected := range []struct {
+		name, path        string
+		rules             func([]admissionregistrationv1.RuleWithOperations) bool
+		namespace, object *metav1.LabelSelector
+	}{
+		{name: mutatingWebhookName, path: mutatingWebhookPath, rules: matchesPgShardClusterRules},
+		{name: podfence.BindingWebhookName, path: podfence.BindingWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
+		{name: podfence.StatusWebhookName, path: podfence.StatusWebhookPath, rules: matchesPostgreSQLStatusRules, object: postgreSQLPodSelector()},
+		{name: podfence.HandshakeWebhookName, path: podfence.HandshakeWebhookPath, rules: matchesPostgreSQLHandshakeRules, namespace: podFencingNamespaceSelector()},
+	} {
+		webhook := findMutatingWebhook(mutating.Webhooks, expected.name)
+		if webhook == nil {
+			return nil, fmt.Errorf("mutating webhook configuration does not contain %q", expected.name)
+		}
+		if webhook.ReinvocationPolicy != nil && *webhook.ReinvocationPolicy != admissionregistrationv1.NeverReinvocationPolicy {
+			return nil, fmt.Errorf("mutating webhook %q has reinvocationPolicy %q, want Never", webhook.Name, *webhook.ReinvocationPolicy)
+		}
+		if err := p.validateWebhookPolicy(policyForMutating(webhook), caBundle, expected.name, expected.path, expected.rules, expected.namespace, expected.object); err != nil {
+			return nil, fmt.Errorf("mutating webhook %q: %w", webhook.Name, err)
+		}
 	}
 
 	validating := &admissionregistrationv1.ValidatingWebhookConfiguration{}
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.validatingConfigurationName}, validating); err != nil {
 		return nil, fmt.Errorf("get validating webhook configuration: %w", err)
 	}
-	if len(validating.Webhooks) != 1 {
-		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly one", len(validating.Webhooks))
+	if len(validating.Webhooks) != 5 {
+		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly five", len(validating.Webhooks))
 	}
-	validatingWebhook := validating.Webhooks[0]
-	if err := p.validateWebhookPolicy(webhookPolicy{
-		name:                    validatingWebhook.Name,
-		clientConfig:            validatingWebhook.ClientConfig,
-		rules:                   validatingWebhook.Rules,
-		failurePolicy:           validatingWebhook.FailurePolicy,
-		matchPolicy:             validatingWebhook.MatchPolicy,
-		namespaceSelector:       validatingWebhook.NamespaceSelector,
-		objectSelector:          validatingWebhook.ObjectSelector,
-		sideEffects:             validatingWebhook.SideEffects,
-		timeoutSeconds:          validatingWebhook.TimeoutSeconds,
-		admissionReviewVersions: validatingWebhook.AdmissionReviewVersions,
-		matchConditionCount:     len(validatingWebhook.MatchConditions),
-	}, caBundle, validatingWebhookName, validatingWebhookPath); err != nil {
-		return nil, fmt.Errorf("validating webhook %q: %w", validating.Webhooks[0].Name, err)
+	for _, expected := range []struct {
+		name, path        string
+		rules             func([]admissionregistrationv1.RuleWithOperations) bool
+		namespace, object *metav1.LabelSelector
+	}{
+		{name: validatingWebhookName, path: validatingWebhookPath, rules: matchesPgShardClusterRules},
+		{name: podfence.MetadataWebhookName, path: podfence.MetadataWebhookPath, rules: matchesPostgreSQLMetadataRules, object: postgreSQLPodSelector()},
+		{name: podfence.NamespaceWebhookName, path: podfence.NamespaceWebhookPath, rules: matchesPostgreSQLNamespaceRules, object: podFencingNamespaceSelector()},
+		{name: podfence.StatusValidationWebhookName, path: podfence.StatusValidationWebhookPath, rules: matchesPostgreSQLStatusRules, object: postgreSQLPodSelector()},
+		{name: podfence.BindingValidationWebhookName, path: podfence.BindingValidationWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
+	} {
+		webhook := findValidatingWebhook(validating.Webhooks, expected.name)
+		if webhook == nil {
+			return nil, fmt.Errorf("validating webhook configuration does not contain %q", expected.name)
+		}
+		if err := p.validateWebhookPolicy(policyForValidating(webhook), caBundle, expected.name, expected.path, expected.rules, expected.namespace, expected.object); err != nil {
+			return nil, fmt.Errorf("validating webhook %q: %w", webhook.Name, err)
+		}
 	}
 	return &configurations{mutating: mutating, validating: validating}, nil
 }
 
-func (p *Provisioner) validateWebhookPolicy(policy webhookPolicy, caBundle []byte, wantedName, wantedPath string) error {
+func (p *Provisioner) validateWebhookPolicy(policy webhookPolicy, caBundle []byte, wantedName, wantedPath string, matchesRules func([]admissionregistrationv1.RuleWithOperations) bool, wantedNamespaceSelector, wantedObjectSelector *metav1.LabelSelector) error {
 	if policy.name != wantedName {
 		return fmt.Errorf("has name %q, want %q", policy.name, wantedName)
 	}
@@ -422,17 +926,20 @@ func (p *Provisioner) validateWebhookPolicy(policy webhookPolicy, caBundle []byt
 	if !slices.Equal(policy.admissionReviewVersions, []string{"v1"}) {
 		return fmt.Errorf("has admissionReviewVersions %q, want [v1]", policy.admissionReviewVersions)
 	}
-	if selectorRestricts(policy.namespaceSelector) || selectorRestricts(policy.objectSelector) || policy.matchConditionCount != 0 {
-		return fmt.Errorf("must not use namespaceSelector, objectSelector, or matchConditions")
+	if !selectorsEqual(policy.namespaceSelector, wantedNamespaceSelector) || !selectorsEqual(policy.objectSelector, wantedObjectSelector) || policy.matchConditionCount != 0 {
+		return fmt.Errorf("has unexpected namespaceSelector, objectSelector, or matchConditions")
 	}
-	if !matchesPgShardClusterRules(policy.rules) {
-		return fmt.Errorf("rules do not exactly cover PgShardCluster create and update")
+	if !matchesRules(policy.rules) {
+		return fmt.Errorf("rules do not exactly cover the required operations")
 	}
 	return p.validateClientConfig(policy.clientConfig, caBundle, wantedPath)
 }
 
-func selectorRestricts(selector *metav1.LabelSelector) bool {
-	return selector != nil && (len(selector.MatchLabels) != 0 || len(selector.MatchExpressions) != 0)
+func selectorsEqual(actual, wanted *metav1.LabelSelector) bool {
+	if wanted == nil || len(wanted.MatchLabels) == 0 && len(wanted.MatchExpressions) == 0 {
+		return actual == nil || len(actual.MatchLabels) == 0 && len(actual.MatchExpressions) == 0
+	}
+	return actual != nil && maps.Equal(actual.MatchLabels, wanted.MatchLabels) && reflect.DeepEqual(actual.MatchExpressions, wanted.MatchExpressions)
 }
 
 func matchesPgShardClusterRules(rules []admissionregistrationv1.RuleWithOperations) bool {
@@ -445,6 +952,103 @@ func matchesPgShardClusterRules(rules []admissionregistrationv1.RuleWithOperatio
 		slices.Equal(rule.APIVersions, []string{"v1alpha1"}) &&
 		slices.Equal(rule.Resources, []string{"pgshardclusters"}) &&
 		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+func matchesPostgreSQLBindingRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Create}, "pods/binding")
+}
+
+func matchesPostgreSQLStatusRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}, "pods/status")
+}
+
+func matchesPostgreSQLHandshakeRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	rule := rules[0]
+	return slices.Equal(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}) &&
+		slices.Equal(rule.APIGroups, []string{"pgshard.io"}) && slices.Equal(rule.APIVersions, []string{"v1alpha1"}) &&
+		slices.Equal(rule.Resources, []string{"pgshardclusters"}) &&
+		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+func matchesPostgreSQLMetadataRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	return matchesCoreResourceRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}, []string{"pods", "pods/ephemeralcontainers", "pods/resize"})
+}
+
+func matchesPostgreSQLNamespaceRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	rule := rules[0]
+	return slices.Equal(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}) &&
+		slices.Equal(rule.APIGroups, []string{""}) && slices.Equal(rule.APIVersions, []string{"v1"}) &&
+		slices.Equal(rule.Resources, []string{"namespaces", "namespaces/status", "namespaces/finalize"}) &&
+		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+func matchesCoreRules(rules []admissionregistrationv1.RuleWithOperations, operations []admissionregistrationv1.OperationType, resource string) bool {
+	return matchesCoreResourceRules(rules, operations, []string{resource})
+}
+
+func matchesCoreResourceRules(rules []admissionregistrationv1.RuleWithOperations, operations []admissionregistrationv1.OperationType, resources []string) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	rule := rules[0]
+	return slices.Equal(rule.Operations, operations) && slices.Equal(rule.APIGroups, []string{""}) &&
+		slices.Equal(rule.APIVersions, []string{"v1"}) && slices.Equal(rule.Resources, resources) &&
+		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+func podFencingNamespaceSelector() *metav1.LabelSelector {
+	return &metav1.LabelSelector{MatchLabels: map[string]string{podfence.NamespaceLabel: podfence.NamespaceLabelValue}}
+}
+
+func postgreSQLPodSelector() *metav1.LabelSelector {
+	return &metav1.LabelSelector{MatchLabels: map[string]string{
+		"app.kubernetes.io/component": "postgresql",
+		ManagedByLabel:                ManagedByValue,
+	}}
+}
+
+func findMutatingWebhook(webhooks []admissionregistrationv1.MutatingWebhook, name string) *admissionregistrationv1.MutatingWebhook {
+	for index := range webhooks {
+		if webhooks[index].Name == name {
+			return &webhooks[index]
+		}
+	}
+	return nil
+}
+
+func findValidatingWebhook(webhooks []admissionregistrationv1.ValidatingWebhook, name string) *admissionregistrationv1.ValidatingWebhook {
+	for index := range webhooks {
+		if webhooks[index].Name == name {
+			return &webhooks[index]
+		}
+	}
+	return nil
+}
+
+func policyForMutating(webhook *admissionregistrationv1.MutatingWebhook) webhookPolicy {
+	return webhookPolicy{
+		name: webhook.Name, clientConfig: webhook.ClientConfig, rules: webhook.Rules,
+		failurePolicy: webhook.FailurePolicy, matchPolicy: webhook.MatchPolicy,
+		namespaceSelector: webhook.NamespaceSelector, objectSelector: webhook.ObjectSelector,
+		sideEffects: webhook.SideEffects, timeoutSeconds: webhook.TimeoutSeconds,
+		admissionReviewVersions: webhook.AdmissionReviewVersions, matchConditionCount: len(webhook.MatchConditions),
+	}
+}
+
+func policyForValidating(webhook *admissionregistrationv1.ValidatingWebhook) webhookPolicy {
+	return webhookPolicy{
+		name: webhook.Name, clientConfig: webhook.ClientConfig, rules: webhook.Rules,
+		failurePolicy: webhook.FailurePolicy, matchPolicy: webhook.MatchPolicy,
+		namespaceSelector: webhook.NamespaceSelector, objectSelector: webhook.ObjectSelector,
+		sideEffects: webhook.SideEffects, timeoutSeconds: webhook.TimeoutSeconds,
+		admissionReviewVersions: webhook.AdmissionReviewVersions, matchConditionCount: len(webhook.MatchConditions),
+	}
 }
 
 func (p *Provisioner) validateClientConfig(config admissionregistrationv1.WebhookClientConfig, caBundle []byte, wantedPath string) error {
@@ -460,7 +1064,10 @@ func (p *Provisioner) validateClientConfig(config admissionregistrationv1.Webhoo
 	if *config.Service.Path != wantedPath {
 		return fmt.Errorf("references Service path %q, want %q", *config.Service.Path, wantedPath)
 	}
-	if config.Service.Port != nil && *config.Service.Port != webhookServicePort {
+	if config.Service.Port == nil {
+		return fmt.Errorf("does not specify Service port %d", webhookServicePort)
+	}
+	if *config.Service.Port != webhookServicePort {
 		return fmt.Errorf("references Service port %d, want %d", *config.Service.Port, webhookServicePort)
 	}
 	if len(config.CABundle) != 0 && !bytes.Equal(config.CABundle, caBundle) {

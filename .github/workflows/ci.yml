@@ -575,7 +575,7 @@ jobs:
           PGSHARD_KIND_E2E: "true"
         run: >-
           go test -race -count=1
-          -run '^(TestKINDDeletionWaitsForPVCBeforeSameNameRecreate|TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership)$'
+          -run '^(TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks|TestKINDDeletionWaitsForPVCBeforeSameNameRecreate|TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence|TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership)$'
           ./internal/controller
       - name: Delete disposable Kubernetes cluster
         if: always()
@@ -588,7 +588,7 @@ jobs:
       needs.changes.outputs.go == 'true' ||
       needs.changes.outputs.images == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -623,6 +623,11 @@ jobs:
             --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
             --wait 90s
           test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"
+          # Pull the digest through the node's CRI. Importing this image from
+          # Docker's containerd store can leave KIND with a transient source
+          # alias that kubelet cannot resolve when it creates a container.
+          docker exec pgshard-manager-control-plane crictl pull \
+            docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7
           kind load docker-image \
             pgshard/operator:dev \
             pgshard/orchestrator:dev \
@@ -635,13 +640,13 @@ jobs:
             --namespace pgshard-system \
             deployment/pgshard-controller-manager \
             --timeout=180s
-      - name: Verify admission and real reconciliation stay fail closed
+      - name: Verify admission and real reconciliation
         working-directory: operator
         env:
           PGSHARD_KIND_MANAGER_E2E: "true"
         run: >-
-          go test -race -count=1
-          -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|ManagerReconcilesFailClosedDevelopmentCluster)$'
+          go test -race -count=1 -timeout=30m
+          -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC)$'
           ./internal/controller
       - name: Capture manager diagnostics
         if: failure()

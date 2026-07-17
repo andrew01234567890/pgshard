@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,7 +18,129 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+func TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence(t *testing.T) {
+	if os.Getenv("PGSHARD_KIND_E2E") != "true" {
+		t.Skip("set PGSHARD_KIND_E2E=true against a disposable KIND cluster")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	kubeClient := newKINDClient(t)
+
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pgshard-late-pvc-%d", os.Getpid())}}
+	if err := kubeClient.Create(ctx, namespace); err != nil {
+		t.Fatal(err)
+	}
+	deleteNamespaceAtCleanup(t, kubeClient, namespace)
+
+	cluster := validCluster()
+	cluster.Namespace = namespace.Name
+	cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
+	cluster.UID = ""
+	cluster.ResourceVersion = ""
+	cluster.Generation = 0
+	if err := kubeClient.Create(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	if cluster.UID == "" {
+		t.Fatal("API server did not assign a PgShardCluster UID")
+	}
+	fence := owned.PostgreSQLAuthSecret(cluster, 0, "late-postgresql-fence", []byte("test-only-password"))
+	if err := kubeClient.Create(ctx, fence); err != nil {
+		t.Fatal(err)
+	}
+	if fence.UID == "" {
+		t.Fatal("API server did not assign a credential-fence UID")
+	}
+	fence.OwnerReferences = nil
+	if err := kubeClient.Update(ctx, fence); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{
+		Shard: 0, SecretName: fence.Name, SecretUID: fence.UID, PVCFenceDetached: true,
+		PVCName: "current-postgresql-data", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
+	}
+	current := owned.PostgreSQLPrimaryDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+	if err := kubeClient.Create(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap.PVCUID = current.UID
+	current.Finalizers = append(current.Finalizers, owned.PostgreSQLDataProtectionFinalizer)
+	current.OwnerReferences = nil
+	if err := kubeClient.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	blockDeletion := true
+	fence.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion:         corev1.SchemeGroupVersion.String(),
+		Kind:               "PersistentVolumeClaim",
+		Name:               current.Name,
+		UID:                current.UID,
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockDeletion,
+	}}
+	if err := kubeClient.Update(ctx, fence); err != nil {
+		t.Fatal(err)
+	}
+	if !postgresqlCredentialIsDataAnchored(fence, bootstrap) {
+		t.Fatalf("credential tombstone is not anchored to the current PVC: %#v", fence.OwnerReferences)
+	}
+	if err := kubeClient.Delete(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	clusterKey := client.ObjectKeyFromObject(cluster)
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, clusterKey, &pgshardv1alpha1.PgShardCluster{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatalf("wait for owner deletion: %v", err)
+	}
+
+	if err := kubeClient.Delete(ctx, fence); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, client.ObjectKeyFromObject(fence), &corev1.Secret{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatalf("wait for credential-fence deletion: %v", err)
+	}
+	currentAfterSecretDelete := &corev1.PersistentVolumeClaim{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(current), currentAfterSecretDelete); err != nil {
+		t.Fatalf("deleting the anchored credential tombstone removed current PostgreSQL data: %v", err)
+	}
+	if currentAfterSecretDelete.UID != bootstrap.PVCUID || currentAfterSecretDelete.DeletionTimestamp != nil || len(currentAfterSecretDelete.OwnerReferences) != 0 || !postgresqlDataPVCIsProtected(currentAfterSecretDelete) {
+		t.Fatalf("current PostgreSQL data changed after credential deletion: %#v", currentAfterSecretDelete.ObjectMeta)
+	}
+
+	lateBootstrap := bootstrap
+	lateBootstrap.PVCName = "late-postgresql-data"
+	lateBootstrap.PVCUID = ""
+	late := owned.PostgreSQLPrimaryDataPVC(cluster, 0, lateBootstrap.PVCName, cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, lateBootstrap.SecretName, lateBootstrap.SecretUID)
+	if !postgresqlDataPVCIsCreationFenced(late, lateBootstrap) {
+		t.Fatalf("late PVC lacks the deleted credential fence: %#v", late.OwnerReferences)
+	}
+	if err := kubeClient.Create(ctx, late); err != nil {
+		t.Fatal(err)
+	}
+	claimKey := client.ObjectKeyFromObject(late)
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, claimKey, &corev1.PersistentVolumeClaim{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatalf("garbage collector did not remove the late fenced PVC: %v", err)
+	}
+	controllerutil.RemoveFinalizer(currentAfterSecretDelete, owned.PostgreSQLDataProtectionFinalizer)
+	if err := kubeClient.Update(ctx, currentAfterSecretDelete); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Delete(ctx, currentAfterSecretDelete); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+}
 
 func TestKINDDeletionWaitsForPVCBeforeSameNameRecreate(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_E2E") != "true" {
@@ -40,7 +163,29 @@ func TestKINDDeletionWaitsForPVCBeforeSameNameRecreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = kubeClient.Delete(context.Background(), namespace)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		cleanupReconciler := &PgShardClusterReconciler{Client: kubeClient, APIReader: kubeClient}
+		request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace.Name, Name: "example"}}
+		current := &pgshardv1alpha1.PgShardCluster{}
+		if err := kubeClient.Get(cleanupCtx, request.NamespacedName, current); err == nil {
+			if err := kubeClient.Delete(cleanupCtx, current); err != nil && !apierrors.IsNotFound(err) {
+				t.Errorf("delete cleanup cluster: %v", err)
+			} else {
+				waitForClusterDeletion(t, cleanupCtx, kubeClient, cleanupReconciler, request)
+			}
+		} else if !apierrors.IsNotFound(err) {
+			t.Errorf("read cleanup cluster: %v", err)
+		}
+		if err := kubeClient.Delete(cleanupCtx, namespace); err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("delete cleanup namespace: %v", err)
+		}
+		if err := wait.PollUntilContextTimeout(cleanupCtx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+			err := kubeClient.Get(ctx, client.ObjectKeyFromObject(namespace), &corev1.Namespace{})
+			return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+		}); err != nil {
+			t.Errorf("wait for cleanup namespace deletion: %v", err)
+		}
 	})
 
 	cluster := validCluster()

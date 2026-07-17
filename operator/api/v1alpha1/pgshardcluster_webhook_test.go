@@ -2,14 +2,35 @@ package v1alpha1
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
+
+const testFencingControllerUsername = "system:serviceaccount:pgshard-system:pgshard-controller-manager"
+
+type fixedPodFencingReceiptVerifier struct {
+	verified bool
+	err      error
+}
+
+func (verifier fixedPodFencingReceiptVerifier) Verify(context.Context, *PgShardCluster) (bool, error) {
+	return verifier.verified, verifier.err
+}
+
+func podFencingAdmissionContext(username string) context.Context {
+	return admission.NewContextWithRequest(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		UserInfo: authenticationv1.UserInfo{Username: username},
+	}})
+}
 
 func validCluster() *PgShardCluster {
 	return &PgShardCluster{
@@ -25,7 +46,7 @@ func validCluster() *PgShardCluster {
 					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 				},
 			},
-			Storage: StorageSpec{Size: resource.MustParse("10Gi")},
+			Storage: StorageSpec{Size: resource.MustParse("10Gi"), DeletionPolicy: DeletionRetain},
 			Pooler:  PoolerSpec{Scaling: PoolerScaling{Mode: ScalingHPA, HPA: &HPAScaling{MinReplicas: 2, MaxReplicas: 10, TargetCPUUtilizationPercentage: 65}}},
 			Services: ServiceSet{
 				ReadWrite: ServiceTemplate{Type: corev1.ServiceTypeClusterIP},
@@ -44,13 +65,14 @@ func TestDefaultsAreSafetyOriented(t *testing.T) {
 	cluster.Spec.MembersPerShard = 0
 	cluster.Spec.Durability = ""
 	cluster.Spec.PostgreSQL.Version = ""
+	cluster.Spec.Storage.DeletionPolicy = ""
 	cluster.Spec.Pooler.Scaling = PoolerScaling{}
 	cluster.Spec.Services = ServiceSet{}
 	cluster.Spec.Observability = ObservabilitySpec{}
 	if err := (&PgShardClusterDefaulter{}).Default(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
-	if cluster.Spec.Shards != 1 || cluster.Spec.MembersPerShard != 3 || cluster.Spec.Durability != DurabilitySynchronous || cluster.Spec.PostgreSQL.Version != "18" {
+	if cluster.Spec.Shards != 1 || cluster.Spec.MembersPerShard != 3 || cluster.Spec.Durability != DurabilitySynchronous || cluster.Spec.PostgreSQL.Version != "18" || cluster.Spec.Storage.DeletionPolicy != DeletionRetain {
 		t.Fatalf("unexpected defaults: %#v", cluster.Spec)
 	}
 	if cluster.Spec.Pooler.Scaling.HPA == nil || cluster.Spec.Pooler.Scaling.HPA.MaxReplicas != 10 || cluster.Spec.Pooler.Scaling.HPA.TargetCPUUtilizationPercentage != 65 {
@@ -160,6 +182,140 @@ func TestValidationRejectsNamesAndShardCountsThatCannotBePlanned(t *testing.T) {
 	}
 }
 
+func TestValidationAcceptsMaximumNameForSingleMemberPodIdentity(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Name = strings.Repeat("a", MaximumClusterNameLength)
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = DurabilityAsynchronous
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
+		t.Fatalf("maximum safe cluster name was rejected: %v", err)
+	}
+}
+
+func TestValidationRejectsUserSuppliedPodFencingMetadata(t *testing.T) {
+	t.Parallel()
+	validator := &PgShardClusterValidator{
+		FencingReceiptVerifier:    fixedPodFencingReceiptVerifier{verified: true},
+		FencingControllerUsername: testFencingControllerUsername,
+	}
+	controllerContext := podFencingAdmissionContext(testFencingControllerUsername)
+	for _, members := range []int32{1, 3} {
+		cluster := validCluster()
+		cluster.Spec.MembersPerShard = members
+		cluster.Spec.Durability = DurabilityAsynchronous
+		cluster.Annotations = map[string]string{
+			PodFencingChallengeAnnotation: "forged",
+			PodFencingReceiptAnnotation:   "forged",
+		}
+		if _, err := validator.ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "reserved for the pgshard controller") {
+			t.Fatalf("membersPerShard=%d create error = %v", members, err)
+		}
+	}
+
+	oldCluster := validCluster()
+	newCluster := oldCluster.DeepCopy()
+	newCluster.Annotations = map[string]string{PodFencingReceiptAnnotation: "forged"}
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "reserved for the pgshard controller") {
+		t.Fatalf("multi-member update error = %v", err)
+	}
+
+	oldCluster = validCluster()
+	oldCluster.Spec.MembersPerShard = 1
+	oldCluster.Spec.Durability = DurabilityAsynchronous
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Annotations = map[string]string{PodFencingReceiptAnnotation: "forged"}
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "preserved or replaced") {
+		t.Fatalf("receipt-only single-member update error = %v", err)
+	}
+
+	oldCluster.Annotations = nil
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Annotations = map[string]string{
+		PodFencingChallengeAnnotation: "controller-challenge",
+		PodFencingReceiptAnnotation:   "admission-receipt",
+	}
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err != nil {
+		t.Fatalf("initial admission-attested metadata was rejected: %v", err)
+	}
+	if _, err := validator.ValidateUpdate(podFencingAdmissionContext("example-user"), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "only be established or repaired by the pgshard controller") {
+		t.Fatalf("user-established metadata error = %v", err)
+	}
+
+	oldCluster = newCluster.DeepCopy()
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Annotations = nil
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "preserved or replaced") {
+		t.Fatalf("established metadata removal error = %v", err)
+	}
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Annotations[PodFencingChallengeAnnotation] = "replacement-challenge"
+	newCluster.Annotations[PodFencingReceiptAnnotation] = "replacement-receipt"
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err != nil {
+		t.Fatalf("controller repair with a valid final receipt was rejected: %v", err)
+	}
+	validator.FencingReceiptVerifier = fixedPodFencingReceiptVerifier{verified: false}
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "valid final admission receipt") {
+		t.Fatalf("invalid controller repair error = %v", err)
+	}
+	validator.FencingReceiptVerifier = fixedPodFencingReceiptVerifier{err: errors.New("key unavailable")}
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "key unavailable") {
+		t.Fatalf("unverifiable controller repair error = %v", err)
+	}
+	validator.FencingReceiptVerifier = fixedPodFencingReceiptVerifier{verified: true}
+
+	deletionTime := metav1.Now()
+	oldCluster.DeletionTimestamp = &deletionTime
+	oldCluster.Finalizers = []string{"pgshard.io/test-finalizer"}
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Finalizers = nil
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err != nil {
+		t.Fatalf("deletion-time finalizer removal with preserved metadata was rejected: %v", err)
+	}
+	newCluster = oldCluster.DeepCopy()
+	delete(newCluster.Annotations, PodFencingChallengeAnnotation)
+	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable during deletion") {
+		t.Fatalf("deletion-time metadata removal error = %v", err)
+	}
+}
+
+func TestValidationRejectsUnsafeStorageAndImmutableResize(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Spec.Storage.Size = resource.MustParse("2Gi")
+	_, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "at least 4Gi") {
+		t.Fatalf("undersized storage was accepted: %v", err)
+	}
+
+	cluster = validCluster()
+	cluster.Spec.PostgreSQL.Parameters = map[string]string{"max_wal_size": "4GB"}
+	_, err = (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "one quarter") {
+		t.Fatalf("unsafe WAL budget was accepted: %v", err)
+	}
+
+	oldCluster := validCluster()
+	newCluster := oldCluster.DeepCopy()
+	newCluster.Spec.Storage.Size = resource.MustParse("20Gi")
+	_, err = (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster)
+	if err == nil || !strings.Contains(err.Error(), "immutable until explicit PVC expansion") {
+		t.Fatalf("unsupported storage resize was accepted: %v", err)
+	}
+
+	oldCluster = validCluster()
+	oldCluster.Spec.Storage.Size = resource.MustParse("2Gi")
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Spec.Storage.Size = resource.MustParse("4Gi")
+	if _, err = (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster); err != nil {
+		t.Fatalf("one-time legacy storage upgrade was rejected: %v", err)
+	}
+	newCluster.Spec.Storage.Size = resource.MustParse("3Gi")
+	if _, err = (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "at least 4Gi") {
+		t.Fatalf("undersized legacy storage update was accepted: %v", err)
+	}
+}
+
 func TestValidationRejectsUnsafeOpenTelemetryEndpoints(t *testing.T) {
 	t.Parallel()
 	for _, endpoint := range []string{
@@ -257,5 +413,27 @@ func TestValidationKeepsStorageClassImmutable(t *testing.T) {
 	newCluster.Spec.Storage.StorageClassName = &newClass
 	if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable") {
 		t.Fatalf("storage class update was admitted: %v", err)
+	}
+}
+
+func TestValidationKeepsUnimplementedDataTransitionsImmutable(t *testing.T) {
+	t.Parallel()
+	tests := map[string]func(*PgShardCluster){
+		"shards":          func(cluster *PgShardCluster) { cluster.Spec.Shards++ },
+		"membersPerShard": func(cluster *PgShardCluster) { cluster.Spec.MembersPerShard = 5 },
+		"durability":      func(cluster *PgShardCluster) { cluster.Spec.Durability = DurabilityAsynchronous },
+		"deletionPolicy":  func(cluster *PgShardCluster) { cluster.Spec.Storage.DeletionPolicy = DeletionDelete },
+	}
+	for name, mutate := range tests {
+		name, mutate := name, mutate
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			oldCluster := validCluster()
+			newCluster := oldCluster.DeepCopy()
+			mutate(newCluster)
+			if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "immutable") {
+				t.Fatalf("%s transition was admitted: %v", name, err)
+			}
+		})
 	}
 }
