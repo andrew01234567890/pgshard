@@ -1019,18 +1019,17 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
- "hmac",
  "hyper",
  "hyper-util",
  "pgshard-catalog",
  "pgshard-pgwire",
+ "pgshard-types",
  "pgshard-version",
  "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1071,7 +1070,9 @@ dependencies = [
 name = "pgshard-types"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "serde",
+ "sha2",
  "thiserror",
  "xxhash-rust",
 ]
