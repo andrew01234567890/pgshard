@@ -21,7 +21,8 @@ use pgshard_catalog::{
     CatalogCache, CatalogConnectionPhase, CatalogFailureKind, CatalogOperation,
     CatalogOperationTimeout, CatalogPollInterval, CatalogReader, CatalogReadinessReason,
     CatalogRefreshError, CatalogSupervisor, CatalogSupervisorConfig, CatalogSupervisorSnapshot,
-    CatalogSupervisorStatus, DatabaseId, InstallOutcome, LoadError, run_catalog_refresh,
+    CatalogSupervisorStatus, DatabaseId, DatabaseShardId, InstallOutcome, LoadError,
+    run_catalog_refresh,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -31,6 +32,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const V0_49_0_MIGRATION_SQL: &str = include_str!("fixtures/v0_49_0_shardschema.sql");
 
 struct Fixture {
+    database_shard_id: String,
     logical_database_id: String,
     nonce: u128,
     restore_incarnation: String,
@@ -122,7 +124,10 @@ fn assert_sqlstate(error: &PgError, expected: &str) {
     assert_eq!(
         actual,
         Some(expected),
-        "unexpected PostgreSQL error: {error}"
+        "unexpected PostgreSQL error: {error}, detail: {:?}",
+        error
+            .as_db_error()
+            .and_then(tokio_postgres::error::DbError::detail)
     );
 }
 
@@ -544,7 +549,11 @@ async fn assert_pre_receipt_probe_upgrade(client: &Client) -> TestResult {
         .expect_err("a receiptless active probe must block the forward migration");
     assert_eq!(
         blocked.code().map(tokio_postgres::error::SqlState::code),
-        Some("55000")
+        Some("55000"),
+        "unexpected pre-receipt rejection: {:?}",
+        blocked
+            .as_db_error()
+            .map(tokio_postgres::error::DbError::detail)
     );
     assert_eq!(
         blocked
@@ -789,7 +798,7 @@ async fn assert_installation_contract(client: &Client, database_url: &str) -> Te
     assert_concurrent_database_genesis_contract(client, database_url).await?;
     assert_legacy_catalog_owner_upgrade(client, database_url)
         .await
-        .map_err(|error| format!("legacy catalog-owner upgrade: {error}"))?;
+        .map_err(|error| format!("legacy catalog-owner upgrade: {error:?}"))?;
     assert_catalog_role_bootstrap_rejections(client)
         .await
         .map_err(|error| format!("catalog role bootstrap rejection: {error}"))?;
@@ -949,8 +958,14 @@ async fn install_database_genesis_fixture(client: &Client) -> TestResult<Databas
                JOIN pgshard_catalog.active_routing_epochs AS active \
                  ON active.logical_database_id = databases.logical_database_id \
                JOIN pgshard_catalog.routing_ranges AS ranges \
-                 ON ranges.routing_epoch = active.routing_epoch \
-               JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id \
+                 ON ranges.logical_database_id = active.logical_database_id \
+                AND ranges.routing_epoch = active.routing_epoch \
+               JOIN pgshard_catalog.database_shard_placements AS placements \
+                 ON placements.logical_database_id = ranges.logical_database_id \
+                AND placements.database_shard_id = ranges.database_shard_id \
+                AND placements.state = 'active' \
+               JOIN pgshard_catalog.shards AS shards \
+                 ON shards.shard_id = placements.shard_id \
               WHERE databases.database_name::text IN ($1, $2) \
               ORDER BY databases.database_name, ranges.range_start",
             &[&first_name, &second_name],
@@ -1254,10 +1269,10 @@ async fn assert_genesis_stage_activation_lock_order(
     staging_client
         .execute(
             "INSERT INTO pgshard_catalog.routing_ranges( \
-                 routing_epoch, range_start, range_end, shard_id \
-             ) SELECT $1, range_start, range_end, shard_id \
-                 FROM pgshard_catalog.routing_ranges \
-                WHERE routing_epoch = $2",
+                 logical_database_id, routing_epoch, range_start, range_end, database_shard_id \
+             ) SELECT logical_database_id, $1, range_start, range_end, database_shard_id \
+                  FROM pgshard_catalog.routing_ranges \
+                 WHERE routing_epoch = $2",
             &[&staged_routing_epoch, &active_routing_epoch],
         )
         .await?;
@@ -1417,8 +1432,8 @@ async fn assert_distinct_superuser_v049_owner_upgrade(
         let epoch_before_upgrade = catalog_epoch(client).await?;
         client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
         upgrade_committed = true;
-        if catalog_epoch(client).await? != epoch_before_upgrade {
-            return Err("owner takeover mutated catalog state".into());
+        if catalog_epoch(client).await? != epoch_before_upgrade + 1 {
+            return Err("owner takeover did not publish the database-shard conversion".into());
         }
         client
             .batch_execute(&format!("ALTER ROLE {legacy_owner} NOSUPERUSER"))
@@ -1447,11 +1462,70 @@ async fn assert_external_catalog_trigger_rejections(
     assert_altered_identity_sequence_is_rejected(client).await?;
     assert_rewound_identity_sequences_are_rejected(client).await?;
     assert_orphaned_restore_lineage_is_rejected(client).await?;
+    assert_external_inherited_relation_is_rejected(client).await?;
+    assert_catalog_relation_with_external_parent_is_rejected(client).await?;
+    assert_pinned_builtin_check_is_rejected(client).await?;
+    assert_external_check_function_is_rejected(client).await?;
     assert_disabled_internal_trigger_is_rejected(client).await?;
     assert_same_identity_altered_trigger_is_rejected(client).await?;
     assert_external_executable_trigger_is_rejected(client).await?;
     assert_external_reference_trigger_is_rejected(client).await?;
     assert_concurrent_external_trigger_is_rejected(client, database_url).await
+}
+
+async fn assert_external_inherited_relation_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "CREATE SCHEMA pgshard_hostile_inheritance; \
+         CREATE TABLE pgshard_hostile_inheritance.registered_tables_child () \
+             INHERITS (pgshard_catalog.registered_tables)",
+        "pre-existing pgshard_catalog contains external inherited relations",
+        &[],
+    )
+    .await
+}
+
+async fn assert_catalog_relation_with_external_parent_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "CREATE SCHEMA pgshard_hostile_parent; \
+         CREATE TABLE pgshard_hostile_parent.registered_tables_parent (); \
+         ALTER TABLE pgshard_catalog.registered_tables \
+             INHERIT pgshard_hostile_parent.registered_tables_parent",
+        "pre-existing pgshard_catalog contains external inherited relations",
+        &[],
+    )
+    .await
+}
+
+async fn assert_pinned_builtin_check_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "ALTER TABLE pgshard_catalog.shards \
+             ADD CONSTRAINT hostile_pinned_builtin_check \
+             CHECK (pg_catalog.set_config('search_path', 'pg_catalog', false) = 'pg_catalog') \
+             NOT VALID",
+        "pre-existing pgshard_catalog contains noncanonical executable relation metadata",
+        &[],
+    )
+    .await
+}
+
+async fn assert_external_check_function_is_rejected(client: &Client) -> TestResult {
+    assert_catalog_migration_rejection(
+        client,
+        "CREATE SCHEMA pgshard_hostile_metadata; \
+         CREATE FUNCTION pgshard_hostile_metadata.execute_as_owner(text) \
+             RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER \
+             AS 'BEGIN RAISE EXCEPTION ''hostile relation metadata executed''; END'; \
+         ALTER TABLE pgshard_catalog.shards \
+             ADD CONSTRAINT hostile_external_check \
+             CHECK (pgshard_hostile_metadata.execute_as_owner(shard_id::text)) \
+             NOT VALID",
+        "pre-existing pgshard_catalog contains noncanonical executable relation metadata",
+        &[],
+    )
+    .await
 }
 
 async fn assert_migration_pins_search_path(client: &Client) -> TestResult {
@@ -1980,9 +2054,389 @@ async fn rollback_concurrent_migration_connection(
     Ok(())
 }
 
+struct V049DatabaseShardFixture<'a> {
+    bootstrap_role: &'a str,
+    runtime_reader: &'a str,
+    runtime_admin: &'a str,
+    database_name: &'a str,
+    first_active_shard_id: &'a str,
+    second_active_shard_id: &'a str,
+    historical_shard_id: &'a str,
+}
+
+async fn stage_ambiguous_v049_epoch(
+    client: &Client,
+    logical_database_id: &str,
+    shard_id: &str,
+) -> TestResult<i64> {
+    let routing_epoch = stage_epoch(client, logical_database_id).await?;
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges( \
+                 routing_epoch, range_start, range_end, shard_id \
+             ) VALUES \
+                 ($1, 0, 9223372036854775808, $2::text), \
+                 ($1, 9223372036854775808, 18446744073709551616, $2::text)",
+            &[&routing_epoch, &shard_id],
+        )
+        .await?;
+    Ok(routing_epoch)
+}
+
+async fn install_v049_database_shard_fixture(
+    client: &Client,
+    fixture: &V049DatabaseShardFixture<'_>,
+) -> TestResult<i64> {
+    let bootstrap_role = fixture.bootstrap_role;
+    let runtime_reader = fixture.runtime_reader;
+    let runtime_admin = fixture.runtime_admin;
+    let database_name = fixture.database_name;
+    let first_active_shard_id = fixture.first_active_shard_id;
+    let second_active_shard_id = fixture.second_active_shard_id;
+    let historical_shard_id = fixture.historical_shard_id;
+    client
+        .batch_execute(&format!(
+            "CREATE ROLE {runtime_reader} NOLOGIN; \
+             CREATE ROLE {runtime_admin} NOLOGIN; \
+             SET ROLE {bootstrap_role}"
+        ))
+        .await?;
+    client.batch_execute(V0_49_0_MIGRATION_SQL).await?;
+    let logical_database_id: String = client
+        .query_one(
+            "INSERT INTO pgshard_catalog.logical_databases(database_name) \
+             VALUES ($1::text) RETURNING logical_database_id::text",
+            &[&database_name],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.shards(shard_id, shard_number) \
+             VALUES ($1::text, 2), ($2::text, 1)",
+            &[&first_active_shard_id, &second_active_shard_id],
+        )
+        .await?;
+    let historical_epoch = stage_epoch(client, &logical_database_id).await?;
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges( \
+                 routing_epoch, range_start, range_end, shard_id \
+             ) VALUES ($1, 0, 18446744073709551616, $2::text)",
+            &[&historical_epoch, &historical_shard_id],
+        )
+        .await?;
+    let observed_catalog_epoch = catalog_epoch(client).await?;
+    client
+        .query_one(
+            "SELECT pgshard_catalog.activate_routing_epoch( \
+                 $1::text::uuid, $2, NULL, $3 \
+             )",
+            &[
+                &logical_database_id,
+                &historical_epoch,
+                &observed_catalog_epoch,
+            ],
+        )
+        .await?;
+    let routing_epoch = stage_epoch(client, &logical_database_id).await?;
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges( \
+                 routing_epoch, range_start, range_end, shard_id \
+             ) VALUES \
+                 ($1, 0, 9223372036854775808, $2::text), \
+                 ($1, 9223372036854775808, 18446744073709551616, $3::text)",
+            &[
+                &routing_epoch,
+                &first_active_shard_id,
+                &second_active_shard_id,
+            ],
+        )
+        .await?;
+    let observed_catalog_epoch = catalog_epoch(client).await?;
+    client
+        .query_one(
+            "SELECT pgshard_catalog.activate_routing_epoch( \
+                 $1::text::uuid, $2, $3, $4 \
+             )",
+            &[
+                &logical_database_id,
+                &routing_epoch,
+                &historical_epoch,
+                &observed_catalog_epoch,
+            ],
+        )
+        .await?;
+    let ambiguous_epoch =
+        stage_ambiguous_v049_epoch(client, &logical_database_id, first_active_shard_id).await?;
+    client
+        .batch_execute(&format!(
+            "GRANT pgshard_catalog_reader TO {runtime_reader} \
+                 WITH ADMIN FALSE, INHERIT TRUE, SET FALSE; \
+             GRANT pgshard_catalog_admin TO {runtime_admin} \
+                 WITH ADMIN FALSE, INHERIT FALSE, SET TRUE; \
+             RESET ROLE"
+        ))
+        .await?;
+    Ok(ambiguous_epoch)
+}
+
+async fn assert_v049_converted_route_order(client: &Client, database_name: &str) -> TestResult {
+    let converted_routes = client
+        .query(
+            "SELECT database_shards.shard_ordinal, \
+                    database_shards.database_shard_id::text, \
+                    placements.placement_generation, shards.shard_number, \
+                    ranges.range_start::text, ranges.range_end::text \
+               FROM pgshard_catalog.logical_databases AS databases \
+               JOIN pgshard_catalog.routing_epochs AS epochs \
+                 ON epochs.logical_database_id = databases.logical_database_id \
+               JOIN pgshard_catalog.routing_ranges AS ranges \
+                 ON ranges.logical_database_id = epochs.logical_database_id \
+                AND ranges.routing_epoch = epochs.routing_epoch \
+               JOIN pgshard_catalog.database_shards AS database_shards \
+                 ON database_shards.logical_database_id = ranges.logical_database_id \
+                AND database_shards.database_shard_id = ranges.database_shard_id \
+               JOIN pgshard_catalog.database_shard_placements AS placements \
+                 ON placements.logical_database_id = database_shards.logical_database_id \
+                AND placements.database_shard_id = database_shards.database_shard_id \
+                AND placements.state = 'active' \
+               JOIN pgshard_catalog.shards AS shards \
+                 ON shards.shard_id = placements.shard_id \
+              WHERE databases.database_name = $1::text \
+                AND epochs.state = 'active' \
+              ORDER BY ranges.range_start",
+            &[&database_name],
+        )
+        .await?;
+    assert_eq!(converted_routes.len(), 2);
+    let first_identity: String = converted_routes[0].get(1);
+    let second_identity: String = converted_routes[1].get(1);
+    assert_ne!(first_identity, second_identity);
+    assert_ne!(first_identity, Uuid::nil().to_string());
+    assert_ne!(second_identity, Uuid::nil().to_string());
+    let expected_routes = [
+        (0, 1, 2, "0", "9223372036854775808"),
+        (1, 1, 1, "9223372036854775808", "18446744073709551616"),
+    ];
+    for (route, expected) in converted_routes.iter().zip(expected_routes) {
+        assert_eq!(route.get::<_, i64>(0), expected.0);
+        assert_eq!(route.get::<_, i64>(2), expected.1);
+        assert_eq!(route.get::<_, i64>(3), expected.2);
+        assert_eq!(route.get::<_, &str>(4), expected.3);
+        assert_eq!(route.get::<_, &str>(5), expected.4);
+    }
+    Ok(())
+}
+
+async fn assert_v049_historical_target(
+    client: &Client,
+    database_name: &str,
+    historical_shard_id: &str,
+) -> TestResult {
+    let historical_states: (String, String) = client
+        .query_one(
+            "SELECT database_shards.state, placements.state \
+               FROM pgshard_catalog.logical_databases AS databases \
+               JOIN pgshard_catalog.database_shards AS database_shards \
+                 USING (logical_database_id) \
+               JOIN pgshard_catalog.database_shard_placements AS placements \
+                 USING (logical_database_id, database_shard_id) \
+              WHERE databases.database_name = $1::text \
+                AND placements.shard_id = $2::text",
+            &[&database_name, &historical_shard_id],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))?;
+    assert_eq!(historical_states, ("retired".into(), "superseded".into()));
+    Ok(())
+}
+
+async fn assert_v049_genesis_replay(client: &Client, database_name: &str) -> TestResult {
+    let genesis_replay = client
+        .query_one(
+            "SELECT logical_database_id::text, routing_epoch, installed \
+               FROM pgshard_catalog.install_database_genesis( \
+                   $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+               )",
+            &[&database_name, &vec![2_i64, 1_i64]],
+        )
+        .await?;
+    assert!(!genesis_replay.get::<_, bool>(2));
+    Ok(())
+}
+
+async fn assert_v049_database_shard_conversion(
+    client: &Client,
+    database_name: &str,
+    historical_shard_id: &str,
+    epoch_after_upgrade: i64,
+    runtime_reader: &str,
+    runtime_admin: &str,
+) -> TestResult {
+    assert_v049_converted_route_order(client, database_name).await?;
+    assert_v049_historical_target(client, database_name, historical_shard_id).await?;
+    let legacy_target_columns: i64 = client
+        .query_one(
+            "SELECT count(*) \
+               FROM pg_catalog.pg_attribute AS attributes \
+              WHERE attributes.attrelid = \
+                        'pgshard_catalog.routing_ranges'::regclass \
+                AND attributes.attname = 'shard_id' \
+                AND attributes.attnum > 0 \
+                AND NOT attributes.attisdropped",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(legacy_target_columns, 0);
+    assert_v049_genesis_replay(client, database_name).await?;
+    client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
+    if catalog_epoch(client).await? != epoch_after_upgrade {
+        return Err("database-shard conversion replay mutated catalog state".into());
+    }
+    for state in ["draining", "retired"] {
+        client
+            .execute(
+                "UPDATE pgshard_catalog.shards SET state = $2::text \
+                 WHERE shard_id = $1::text",
+                &[&historical_shard_id, &state],
+            )
+            .await?;
+    }
+    assert_catalog_owned_by_dedicated_role(client).await?;
+    assert_bootstrap_memberships_preserved(client, runtime_reader, runtime_admin).await?;
+    Ok(())
+}
+
+async fn assert_v049_unavailable_live_target_rejected(
+    client: &Client,
+    shard_id: &str,
+) -> TestResult {
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let lineage_retire_result = client
+        .execute(
+            "UPDATE pgshard_catalog.shard_restore_incarnations \
+                SET state = 'retired', retired_at = statement_timestamp() \
+              WHERE shard_id = $1::text AND state = 'active'",
+            &[&shard_id],
+        )
+        .await;
+    let retire_result = client
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'retired' WHERE shard_id = $1::text",
+            &[&shard_id],
+        )
+        .await;
+    let reset_result = client
+        .batch_execute("SET session_replication_role = origin")
+        .await;
+    lineage_retire_result?;
+    retire_result?;
+    reset_result?;
+
+    let epoch_before_rejection = catalog_epoch(client).await?;
+    let error = client
+        .batch_execute(pgshard_catalog::MIGRATION_SQL)
+        .await
+        .expect_err("legacy live routing to a retired physical shard was upgraded");
+    client.batch_execute("ROLLBACK").await?;
+    assert_database_message(
+        &error,
+        "legacy live routing references an unavailable physical shard",
+    );
+    assert_sqlstate(&error, "55000");
+    if catalog_epoch(client).await? != epoch_before_rejection {
+        return Err("rejected unavailable-target conversion mutated catalog state".into());
+    }
+
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let activate_result = client
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'active' WHERE shard_id = $1::text",
+            &[&shard_id],
+        )
+        .await;
+    let lineage_activate_result = client
+        .execute(
+            "UPDATE pgshard_catalog.shard_restore_incarnations \
+                SET state = 'active', retired_at = NULL \
+              WHERE shard_id = $1::text AND state = 'retired'",
+            &[&shard_id],
+        )
+        .await;
+    let reset_result = client
+        .batch_execute("SET session_replication_role = origin")
+        .await;
+    activate_result?;
+    lineage_activate_result?;
+    reset_result?;
+    Ok(())
+}
+
+async fn assert_v049_unavailable_staged_target_rejected(
+    client: &Client,
+    database_name: &str,
+) -> TestResult {
+    let staged_only_shard_id = format!("legacy-staged-{}", Uuid::new_v4().simple());
+    let logical_database_id: String = client
+        .query_one(
+            "SELECT logical_database_id::text FROM pgshard_catalog.logical_databases \
+              WHERE database_name = $1::text",
+            &[&database_name],
+        )
+        .await?
+        .get(0);
+    let staged_only_shard_number: i64 = client
+        .query_one(
+            "SELECT pg_catalog.max(shard_number) + 1 FROM pgshard_catalog.shards",
+            &[],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.shards(shard_id, shard_number) VALUES ($1::text, $2)",
+            &[&staged_only_shard_id, &staged_only_shard_number],
+        )
+        .await?;
+    let staged_only_epoch = stage_epoch(client, &logical_database_id).await?;
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges( \
+                 routing_epoch, range_start, range_end, shard_id \
+             ) VALUES ($1, 0, 18446744073709551616, $2::text)",
+            &[&staged_only_epoch, &staged_only_shard_id],
+        )
+        .await?;
+    assert_v049_unavailable_live_target_rejected(client, &staged_only_shard_id).await?;
+    client
+        .execute(
+            "DELETE FROM pgshard_catalog.routing_ranges WHERE routing_epoch = $1",
+            &[&staged_only_epoch],
+        )
+        .await?;
+    client
+        .execute(
+            "DELETE FROM pgshard_catalog.routing_epochs WHERE routing_epoch = $1",
+            &[&staged_only_epoch],
+        )
+        .await?;
+    Ok(())
+}
+
 async fn assert_bootstrap_superuser_v049_owner_upgrade(client: &Client) -> TestResult {
     let runtime_reader = format!("pgshard_bootstrap_reader_{}", Uuid::new_v4().simple());
     let runtime_admin = format!("pgshard_bootstrap_admin_{}", Uuid::new_v4().simple());
+    let database_name = format!("legacy_route_{}", Uuid::new_v4().simple());
+    let first_active_shard_id = format!("legacy-cell-a-{}", Uuid::new_v4().simple());
+    let second_active_shard_id = format!("legacy-cell-b-{}", Uuid::new_v4().simple());
+    let historical_shard_id = "shard-0000".to_owned();
     let fixture_roles = [&runtime_reader, &runtime_admin];
     let bootstrap_role: String = client
         .query_one(
@@ -1994,45 +2448,72 @@ async fn assert_bootstrap_superuser_v049_owner_upgrade(client: &Client) -> TestR
         .await?
         .get(0);
 
-    let fixture_setup: TestResult = async {
-        client
-            .batch_execute(&format!(
-                "CREATE ROLE {runtime_reader} NOLOGIN; \
-                 CREATE ROLE {runtime_admin} NOLOGIN; \
-                 SET ROLE {bootstrap_role}"
-            ))
-            .await?;
-        client.batch_execute(V0_49_0_MIGRATION_SQL).await?;
-        client
-            .batch_execute(&format!(
-                "GRANT pgshard_catalog_reader TO {runtime_reader} \
-                     WITH ADMIN FALSE, INHERIT TRUE, SET FALSE; \
-                 GRANT pgshard_catalog_admin TO {runtime_admin} \
-                     WITH ADMIN FALSE, INHERIT FALSE, SET TRUE; \
-                 RESET ROLE"
-            ))
-            .await?;
-        Ok(())
-    }
-    .await;
-    if let Err(error) = fixture_setup {
-        let cleanup = cleanup_legacy_upgrade_fixture(client, &fixture_roles, true).await;
-        cleanup?;
-        return Err(error);
-    }
+    let fixture = V049DatabaseShardFixture {
+        bootstrap_role: &bootstrap_role,
+        runtime_reader: &runtime_reader,
+        runtime_admin: &runtime_admin,
+        database_name: &database_name,
+        first_active_shard_id: &first_active_shard_id,
+        second_active_shard_id: &second_active_shard_id,
+        historical_shard_id: &historical_shard_id,
+    };
+    let ambiguous_epoch = match install_v049_database_shard_fixture(client, &fixture).await {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            cleanup_legacy_upgrade_fixture(client, &fixture_roles, true).await?;
+            return Err(error);
+        }
+    };
 
     let mut upgrade_committed = false;
     let upgrade_result: TestResult = async {
         assert_bootstrap_memberships_preserved(client, &runtime_reader, &runtime_admin).await?;
+        assert_v049_unavailable_live_target_rejected(client, &first_active_shard_id).await?;
+        assert_v049_unavailable_staged_target_rejected(client, &database_name).await?;
+        let epoch_before_rejection = catalog_epoch(client).await?;
+        let error = client
+            .batch_execute(pgshard_catalog::MIGRATION_SQL)
+            .await
+            .expect_err("ambiguous live physical-target reuse was upgraded");
+        client.batch_execute("ROLLBACK").await?;
+        assert_sqlstate(&error, "55000");
+        assert_database_message(
+            &error,
+            "ambiguous legacy live routing reuses a physical target within one epoch",
+        );
+        if catalog_epoch(client).await? != epoch_before_rejection {
+            return Err("rejected database-shard conversion mutated catalog state".into());
+        }
+        client
+            .execute(
+                "DELETE FROM pgshard_catalog.routing_ranges WHERE routing_epoch = $1",
+                &[&ambiguous_epoch],
+            )
+            .await?;
+        client
+            .execute(
+                "DELETE FROM pgshard_catalog.routing_epochs WHERE routing_epoch = $1",
+                &[&ambiguous_epoch],
+            )
+            .await?;
         let epoch_before_upgrade = catalog_epoch(client).await?;
         client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
         upgrade_committed = true;
-        if catalog_epoch(client).await? != epoch_before_upgrade {
-            return Err("bootstrap-owner takeover mutated catalog state".into());
+        let epoch_after_upgrade = catalog_epoch(client).await?;
+        if epoch_after_upgrade != epoch_before_upgrade + 1 {
+            return Err(
+                "bootstrap-owner takeover did not publish the database-shard conversion".into(),
+            );
         }
-        assert_catalog_owned_by_dedicated_role(client).await?;
-        assert_bootstrap_memberships_preserved(client, &runtime_reader, &runtime_admin).await?;
-        Ok(())
+        assert_v049_database_shard_conversion(
+            client,
+            &database_name,
+            &historical_shard_id,
+            epoch_after_upgrade,
+            &runtime_reader,
+            &runtime_admin,
+        )
+        .await
     }
     .await;
     let cleanup_result =
@@ -2714,6 +3195,28 @@ async fn create_fixture(client: &Client) -> TestResult<Fixture> {
             &[&shard_id, &shard_number],
         )
         .await?;
+    let database_shard_id: String = client
+        .query_one(
+            "INSERT INTO pgshard_catalog.database_shards( \
+                 logical_database_id, shard_ordinal, state, activated_at \
+             ) VALUES ($1::text::uuid, 0, 'active', statement_timestamp()) \
+             RETURNING database_shard_id::text",
+            &[&logical_database_id],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.database_shard_placements( \
+                 logical_database_id, database_shard_id, placement_generation, \
+                 shard_id, state, activated_at \
+             ) VALUES ( \
+                 $1::text::uuid, $2::text::uuid, 1, $3::text, \
+                 'active', statement_timestamp() \
+             )",
+            &[&logical_database_id, &database_shard_id, &shard_id],
+        )
+        .await?;
     let restore_incarnation: String = client
         .query_one(
             "SELECT restore_incarnation::text \
@@ -2724,6 +3227,7 @@ async fn create_fixture(client: &Client) -> TestResult<Fixture> {
         .await?
         .get(0);
     Ok(Fixture {
+        database_shard_id,
         logical_database_id,
         nonce,
         restore_incarnation,
@@ -3596,14 +4100,6 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
     transaction
         .batch_execute("SET LOCAL ROLE pgshard_catalog_admin")
         .await?;
-    let logical_database_id: String = transaction
-        .query_one(
-            "INSERT INTO pgshard_catalog.logical_databases(database_name) \
-             VALUES ($1::text) RETURNING logical_database_id::text",
-            &[&format!("admin_route_{nonce}")],
-        )
-        .await?
-        .get(0);
     let shard_number: i64 = transaction
         .query_one(
             "SELECT coalesce(max(shard_number), 0) + 1 FROM pgshard_catalog.shards",
@@ -3619,6 +4115,27 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
             &[&shard_id, &shard_number],
         )
         .await?;
+    let genesis = transaction
+        .query_one(
+            "SELECT logical_database_id::text, routing_epoch \
+               FROM pgshard_catalog.install_database_genesis( \
+                   $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+               )",
+            &[&format!("admin_route_{nonce}"), &vec![shard_number]],
+        )
+        .await?;
+    let logical_database_id: String = genesis.get(0);
+    let active_routing_epoch: i64 = genesis.get(1);
+    let database_shard_id: String = transaction
+        .query_one(
+            "SELECT database_shard_id::text \
+               FROM pgshard_catalog.database_shards \
+              WHERE logical_database_id = $1::text::uuid \
+                AND shard_ordinal = 0",
+            &[&logical_database_id],
+        )
+        .await?
+        .get(0);
     let restore_incarnation: String = transaction
         .query_one(
             "SELECT restore_incarnation::text \
@@ -3646,7 +4163,14 @@ async fn assert_admin_write_path(client: &mut Client) -> TestResult {
         &restore_incarnation,
     )
     .await?;
-    assert_admin_routing_write_path(&transaction, nonce, &logical_database_id, &shard_id).await?;
+    assert_admin_routing_write_path(
+        &transaction,
+        nonce,
+        &logical_database_id,
+        &database_shard_id,
+        active_routing_epoch,
+    )
+    .await?;
     transaction.rollback().await?;
     Ok(())
 }
@@ -3655,7 +4179,8 @@ async fn assert_admin_routing_write_path(
     transaction: &tokio_postgres::Transaction<'_>,
     nonce: u128,
     logical_database_id: &str,
-    shard_id: &str,
+    database_shard_id: &str,
+    active_routing_epoch: i64,
 ) -> TestResult {
     let routing_epoch: i64 = transaction
         .query_one(
@@ -3668,9 +4193,9 @@ async fn assert_admin_routing_write_path(
     transaction
         .execute(
             "INSERT INTO pgshard_catalog.routing_ranges \
-             (routing_epoch, range_start, range_end, shard_id) \
-             VALUES ($1, 0, 18446744073709551616, $2::text)",
-            &[&routing_epoch, &shard_id],
+             (logical_database_id, routing_epoch, range_start, range_end, database_shard_id) \
+             VALUES ($1::text::uuid, $2, 0, 18446744073709551616, $3::text::uuid)",
+            &[&logical_database_id, &routing_epoch, &database_shard_id],
         )
         .await?;
     let observed_catalog_epoch: i64 = transaction
@@ -3686,7 +4211,7 @@ async fn assert_admin_routing_write_path(
             &[
                 &logical_database_id,
                 &routing_epoch,
-                &Option::<i64>::None,
+                &Some(active_routing_epoch),
                 &observed_catalog_epoch,
             ],
         )
@@ -3968,10 +4493,10 @@ async fn assert_malformed_active_routing_fails_closed(
     client
         .execute(
             "INSERT INTO pgshard_catalog.routing_ranges( \
-                 routing_epoch, range_start, range_end, shard_id \
-             ) SELECT $1, range_start, range_end, shard_id \
-                 FROM pgshard_catalog.routing_ranges \
-                WHERE routing_epoch = $2",
+                 logical_database_id, routing_epoch, range_start, range_end, database_shard_id \
+             ) SELECT logical_database_id, $1, range_start, range_end, database_shard_id \
+                  FROM pgshard_catalog.routing_ranges \
+                 WHERE routing_epoch = $2",
             &[&staged_routing_epoch, &active_routing_epoch],
         )
         .await?;
@@ -3995,11 +4520,15 @@ async fn assert_malformed_active_routing_fails_closed(
         .get(0);
     let cell_ordinals: Vec<i64> = client
         .query(
-            "SELECT shards.shard_number \
+            "SELECT DISTINCT shards.shard_number \
                FROM pgshard_catalog.routing_ranges AS ranges \
-               JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id \
+               JOIN pgshard_catalog.database_shard_placements AS placements \
+                 ON placements.logical_database_id = ranges.logical_database_id \
+                AND placements.database_shard_id = ranges.database_shard_id \
+                AND placements.state = 'active' \
+               JOIN pgshard_catalog.shards AS shards ON shards.shard_id = placements.shard_id \
               WHERE ranges.routing_epoch = $1 \
-              ORDER BY ranges.range_start",
+              ORDER BY shards.shard_number",
             &[&staged_routing_epoch],
         )
         .await?
@@ -4015,11 +4544,11 @@ async fn assert_malformed_active_routing_fails_closed(
         )
         .await
         .expect_err("genesis retry must reject a pointer to staged routing");
-    assert_sqlstate(&error, "55000");
     assert_database_message(
         &error,
         "logical database genesis does not reference exactly one owned active routing epoch",
     );
+    assert_sqlstate(&error, "55000");
 
     let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
     let reader_connection_task = tokio::spawn(reader_connection);
@@ -4054,20 +4583,13 @@ async fn assert_malformed_active_routing_fails_closed(
         )
         .await?;
 
-    assert_unavailable_routing_shard_fails_closed(
-        client,
-        database_url,
-        fixture,
-        active_routing_epoch,
-    )
-    .await
+    assert_unavailable_routing_shard_fails_closed(client, database_url, fixture).await
 }
 
 async fn assert_unavailable_routing_shard_fails_closed(
     client: &Client,
     database_url: &str,
     fixture: &Fixture,
-    active_routing_epoch: i64,
 ) -> TestResult {
     let unavailable_shard_id = format!("retired-route-{}", fixture.nonce);
     let unavailable_shard_number: i64 = client
@@ -4087,19 +4609,25 @@ async fn assert_unavailable_routing_shard_fails_closed(
             &[&unavailable_shard_id, &unavailable_shard_number],
         )
         .await;
-    let insert_result = client
+    let placement_update_result = client
         .execute(
-            "INSERT INTO pgshard_catalog.routing_ranges( \
-                 routing_epoch, range_start, range_end, shard_id \
-             ) VALUES ($1, 1, 2, $2::text)",
-            &[&active_routing_epoch, &unavailable_shard_id],
+            "UPDATE pgshard_catalog.database_shard_placements \
+                SET shard_id = $3::text \
+              WHERE logical_database_id = $1::text::uuid \
+                AND database_shard_id = $2::text::uuid \
+                AND state = 'active'",
+            &[
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+                &unavailable_shard_id,
+            ],
         )
         .await;
     client
         .batch_execute("SET session_replication_role = origin")
         .await?;
     shard_insert_result?;
-    insert_result?;
+    placement_update_result?;
 
     let cache = CatalogCache::new();
     let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
@@ -4127,44 +4655,55 @@ async fn assert_unavailable_routing_shard_fails_closed(
     client
         .batch_execute("SET session_replication_role = replica")
         .await?;
-    let delete_result = client
+    let restore_result = client
         .execute(
-            "DELETE FROM pgshard_catalog.routing_ranges \
-              WHERE routing_epoch = $1 AND range_start = 1",
-            &[&active_routing_epoch],
+            "UPDATE pgshard_catalog.database_shard_placements \
+                SET shard_id = $3::text \
+              WHERE logical_database_id = $1::text::uuid \
+                AND database_shard_id = $2::text::uuid \
+                AND state = 'active'",
+            &[
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+                &fixture.shard_id,
+            ],
         )
         .await;
     client
         .batch_execute("SET session_replication_role = origin")
         .await?;
-    delete_result?;
+    restore_result?;
 
-    assert_orphaned_routing_shard_fails_closed(client, database_url, fixture, active_routing_epoch)
-        .await
+    assert_orphaned_routing_shard_fails_closed(client, database_url, fixture).await
 }
 
 async fn assert_orphaned_routing_shard_fails_closed(
     client: &Client,
     database_url: &str,
     fixture: &Fixture,
-    active_routing_epoch: i64,
 ) -> TestResult {
     let orphaned_shard_id = format!("orphan-route-{}", fixture.nonce);
     client
         .batch_execute("SET session_replication_role = replica")
         .await?;
-    let insert_result = client
+    let update_result = client
         .execute(
-            "INSERT INTO pgshard_catalog.routing_ranges( \
-                 routing_epoch, range_start, range_end, shard_id \
-             ) VALUES ($1, 1, 2, $2::text)",
-            &[&active_routing_epoch, &orphaned_shard_id],
+            "UPDATE pgshard_catalog.database_shard_placements \
+                SET shard_id = $3::text \
+              WHERE logical_database_id = $1::text::uuid \
+                AND database_shard_id = $2::text::uuid \
+                AND state = 'active'",
+            &[
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+                &orphaned_shard_id,
+            ],
         )
         .await;
     client
         .batch_execute("SET session_replication_role = origin")
         .await?;
-    insert_result?;
+    update_result?;
 
     let cache = CatalogCache::new();
     let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
@@ -4190,17 +4729,228 @@ async fn assert_orphaned_routing_shard_fails_closed(
     client
         .batch_execute("SET session_replication_role = replica")
         .await?;
-    let delete_result = client
+    let restore_result = client
         .execute(
-            "DELETE FROM pgshard_catalog.routing_ranges \
-              WHERE routing_epoch = $1 AND range_start = 1",
-            &[&active_routing_epoch],
+            "UPDATE pgshard_catalog.database_shard_placements \
+                SET shard_id = $3::text \
+              WHERE logical_database_id = $1::text::uuid \
+                AND database_shard_id = $2::text::uuid \
+                AND state = 'active'",
+            &[
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+                &fixture.shard_id,
+            ],
         )
         .await;
     client
         .batch_execute("SET session_replication_role = origin")
         .await?;
-    delete_result?;
+    restore_result?;
+    assert_database_shard_layers_fail_closed(client, database_url, fixture).await
+}
+
+async fn assert_database_shard_layers_fail_closed(
+    client: &Client,
+    database_url: &str,
+    fixture: &Fixture,
+) -> TestResult {
+    assert_missing_database_shard_fails_closed(client, database_url, fixture).await?;
+    assert_retired_database_shard_fails_closed(client, database_url, fixture).await?;
+    assert_missing_active_placement_fails_closed(client, database_url, fixture).await
+}
+
+async fn assert_missing_database_shard_fails_closed(
+    client: &Client,
+    database_url: &str,
+    fixture: &Fixture,
+) -> TestResult {
+    let missing_database_shard_id = Uuid::new_v4().to_string();
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let corrupt_result = client
+        .execute(
+            "UPDATE pgshard_catalog.routing_ranges \
+                SET database_shard_id = $2::text::uuid \
+              WHERE logical_database_id = $1::text::uuid",
+            &[&fixture.logical_database_id, &missing_database_shard_id],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    corrupt_result?;
+
+    let cache = CatalogCache::new();
+    let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let reader_connection_task = tokio::spawn(reader_connection);
+    let expected_database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
+    let expected_database_shard_id =
+        DatabaseShardId::new(Uuid::parse_str(&missing_database_shard_id)?)?;
+    match CatalogReader::subscribe(reader_client, &cache).await {
+        Err(LoadError::MissingRoutingDatabaseShard {
+            database_id,
+            database_shard_id,
+        }) => {
+            assert_eq!(database_id, expected_database_id);
+            assert_eq!(database_shard_id, expected_database_shard_id);
+        }
+        Err(error) => {
+            return Err(format!("unexpected missing database-shard error: {error}").into());
+        }
+        Ok(_) => return Err("catalog reader hid a missing database-shard identity".into()),
+    }
+    assert!(cache.current_for_planning().is_err());
+    reader_connection_task.abort();
+
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let restore_result = client
+        .execute(
+            "UPDATE pgshard_catalog.routing_ranges \
+                SET database_shard_id = $2::text::uuid \
+              WHERE logical_database_id = $1::text::uuid",
+            &[&fixture.logical_database_id, &fixture.database_shard_id],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    restore_result?;
+    Ok(())
+}
+
+async fn assert_retired_database_shard_fails_closed(
+    client: &Client,
+    database_url: &str,
+    fixture: &Fixture,
+) -> TestResult {
+    let expected_database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
+    let expected_database_shard_id =
+        DatabaseShardId::new(Uuid::parse_str(&fixture.database_shard_id)?)?;
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let retire_result = client
+        .execute(
+            "UPDATE pgshard_catalog.database_shards \
+                SET state = 'retired', draining_at = statement_timestamp(), \
+                    retired_at = statement_timestamp() \
+              WHERE logical_database_id = $1::text::uuid \
+                AND database_shard_id = $2::text::uuid",
+            &[&fixture.logical_database_id, &fixture.database_shard_id],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    retire_result?;
+
+    let cache = CatalogCache::new();
+    let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let reader_connection_task = tokio::spawn(reader_connection);
+    match CatalogReader::subscribe(reader_client, &cache).await {
+        Err(LoadError::InvalidRoutingDatabaseShardState {
+            database_id,
+            database_shard_id,
+            state,
+        }) => {
+            assert_eq!(database_id, expected_database_id);
+            assert_eq!(database_shard_id, expected_database_shard_id);
+            assert_eq!(state, "retired");
+        }
+        Err(error) => {
+            return Err(format!("unexpected retired database-shard error: {error}").into());
+        }
+        Ok(_) => return Err("catalog reader hid a retired database-shard identity".into()),
+    }
+    assert!(cache.current_for_planning().is_err());
+    reader_connection_task.abort();
+
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let activate_result = client
+        .execute(
+            "UPDATE pgshard_catalog.database_shards \
+                SET state = 'active', draining_at = NULL, retired_at = NULL \
+              WHERE logical_database_id = $1::text::uuid \
+                AND database_shard_id = $2::text::uuid",
+            &[&fixture.logical_database_id, &fixture.database_shard_id],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    activate_result?;
+    Ok(())
+}
+
+async fn assert_missing_active_placement_fails_closed(
+    client: &Client,
+    database_url: &str,
+    fixture: &Fixture,
+) -> TestResult {
+    let expected_database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
+    let expected_database_shard_id =
+        DatabaseShardId::new(Uuid::parse_str(&fixture.database_shard_id)?)?;
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let supersede_result = client
+        .execute(
+            "UPDATE pgshard_catalog.database_shard_placements \
+                SET state = 'superseded', superseded_at = statement_timestamp() \
+              WHERE logical_database_id = $1::text::uuid \
+                AND database_shard_id = $2::text::uuid \
+                AND state = 'active'",
+            &[&fixture.logical_database_id, &fixture.database_shard_id],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    supersede_result?;
+
+    let cache = CatalogCache::new();
+    let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let reader_connection_task = tokio::spawn(reader_connection);
+    match CatalogReader::subscribe(reader_client, &cache).await {
+        Err(LoadError::InvalidActivePlacementCount {
+            database_id,
+            database_shard_id,
+            count,
+        }) => {
+            assert_eq!(database_id, expected_database_id);
+            assert_eq!(database_shard_id, expected_database_shard_id);
+            assert_eq!(count, 0);
+        }
+        Err(error) => {
+            return Err(format!("unexpected missing active-placement error: {error}").into());
+        }
+        Ok(_) => return Err("catalog reader hid a missing active placement".into()),
+    }
+    assert!(cache.current_for_planning().is_err());
+    reader_connection_task.abort();
+
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let restore_result = client
+        .execute(
+            "UPDATE pgshard_catalog.database_shard_placements \
+                SET state = 'active', superseded_at = NULL \
+              WHERE logical_database_id = $1::text::uuid \
+                AND database_shard_id = $2::text::uuid",
+            &[&fixture.logical_database_id, &fixture.database_shard_id],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    restore_result?;
     Ok(())
 }
 
@@ -6897,6 +7647,72 @@ async fn assert_logical_consumer_registry_contract(
     retire_consumer_registry_fixture(client, fixture, &consumer).await
 }
 
+async fn assert_duplicate_physical_placement_rejected(
+    client: &Client,
+    fixture: &Fixture,
+) -> TestResult {
+    let duplicate_database_shard_id: String = client
+        .query_one(
+            "INSERT INTO pgshard_catalog.database_shards( \
+                 logical_database_id, shard_ordinal, state, activated_at \
+             ) VALUES ($1::text::uuid, 1, 'active', statement_timestamp()) \
+             RETURNING database_shard_id::text",
+            &[&fixture.logical_database_id],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.database_shard_placements( \
+                 logical_database_id, database_shard_id, placement_generation, \
+                 shard_id, state, activated_at \
+             ) VALUES ($1::text::uuid, $2::text::uuid, 1, $3::text, \
+                       'active', statement_timestamp())",
+            &[
+                &fixture.logical_database_id,
+                &duplicate_database_shard_id,
+                &fixture.shard_id,
+            ],
+        )
+        .await?;
+    let duplicate_physical_epoch = stage_epoch(client, &fixture.logical_database_id).await?;
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges( \
+                 logical_database_id, routing_epoch, range_start, range_end, database_shard_id \
+             ) VALUES \
+                 ($1::text::uuid, $2, 0, 9223372036854775808, $3::text::uuid), \
+                 ($1::text::uuid, $2, 9223372036854775808, 18446744073709551616, $4::text::uuid)",
+            &[
+                &fixture.logical_database_id,
+                &duplicate_physical_epoch,
+                &fixture.database_shard_id,
+                &duplicate_database_shard_id,
+            ],
+        )
+        .await?;
+    let expected_none: Option<i64> = None;
+    let current_catalog_epoch = catalog_epoch(client).await?;
+    let error = client
+        .query_one(
+            "SELECT pgshard_catalog.activate_routing_epoch($1::text::uuid, $2, $3, $4)",
+            &[
+                &fixture.logical_database_id,
+                &duplicate_physical_epoch,
+                &expected_none,
+                &current_catalog_epoch,
+            ],
+        )
+        .await
+        .expect_err("two database shards on one physical shard were activated");
+    assert_sqlstate(&error, "22023");
+    assert_database_message(
+        &error,
+        "routing epoch maps multiple database shards to one physical shard",
+    );
+    Ok(())
+}
+
 async fn assert_invalid_routing_contracts(
     client: &Client,
     fixture: &Fixture,
@@ -6906,9 +7722,15 @@ async fn assert_invalid_routing_contracts(
     client
         .execute(
             "INSERT INTO pgshard_catalog.routing_ranges \
-             (routing_epoch, range_start, range_end, shard_id) VALUES \
-             ($1, 0, 10, 'shard-0000'), ($1, 11, 18446744073709551616, $2::text)",
-            &[&gap_epoch, &fixture.shard_id],
+             (logical_database_id, routing_epoch, range_start, range_end, database_shard_id) \
+             VALUES \
+             ($2::text::uuid, $1, 0, 10, $3::text::uuid), \
+             ($2::text::uuid, $1, 11, 18446744073709551616, $3::text::uuid)",
+            &[
+                &gap_epoch,
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+            ],
         )
         .await?;
     let current_catalog_epoch = catalog_epoch(client).await?;
@@ -6930,9 +7752,15 @@ async fn assert_invalid_routing_contracts(
     client
         .execute(
             "INSERT INTO pgshard_catalog.routing_ranges \
-             (routing_epoch, range_start, range_end, shard_id) VALUES \
-             ($1, 0, 11, 'shard-0000'), ($1, 10, 18446744073709551616, $2::text)",
-            &[&overlap_epoch, &fixture.shard_id],
+             (logical_database_id, routing_epoch, range_start, range_end, database_shard_id) \
+             VALUES \
+             ($2::text::uuid, $1, 0, 11, $3::text::uuid), \
+             ($2::text::uuid, $1, 10, 18446744073709551616, $3::text::uuid)",
+            &[
+                &overlap_epoch,
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+            ],
         )
         .await?;
     let error = client
@@ -6949,14 +7777,23 @@ async fn assert_invalid_routing_contracts(
         .expect_err("an overlap must prevent activation");
     assert_sqlstate(&error, "22023");
 
+    assert_duplicate_physical_placement_rejected(client, fixture).await?;
+    let current_catalog_epoch = catalog_epoch(client).await?;
+
     let valid_epoch = stage_epoch(client, &fixture.logical_database_id).await?;
     client
         .execute(
             "INSERT INTO pgshard_catalog.routing_ranges \
-             (routing_epoch, range_start, range_end, shard_id) VALUES \
-             ($1, 0, 9223372036854775808, 'shard-0000'), \
-             ($1, 9223372036854775808, 18446744073709551616, $2::text)",
-            &[&valid_epoch, &fixture.shard_id],
+             (logical_database_id, routing_epoch, range_start, range_end, database_shard_id) \
+             VALUES \
+             ($2::text::uuid, $1, 0, 9223372036854775808, $3::text::uuid), \
+             ($2::text::uuid, $1, 9223372036854775808, 18446744073709551616, \
+              $3::text::uuid)",
+            &[
+                &valid_epoch,
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+            ],
         )
         .await?;
     assert_cas_failures(
@@ -7675,9 +8512,13 @@ async fn assert_rollback_contract(
     client
         .execute(
             "INSERT INTO pgshard_catalog.routing_ranges \
-             (routing_epoch, range_start, range_end, shard_id) \
-             VALUES ($1, 0, 18446744073709551616, 'shard-0000')",
-            &[&rollback_epoch],
+             (logical_database_id, routing_epoch, range_start, range_end, database_shard_id) \
+             VALUES ($2::text::uuid, $1, 0, 18446744073709551616, $3::text::uuid)",
+            &[
+                &rollback_epoch,
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+            ],
         )
         .await?;
     let transaction = client.transaction().await?;
@@ -7715,9 +8556,13 @@ async fn stage_full_epoch(client: &Client, fixture: &Fixture) -> Result<i64, PgE
     client
         .execute(
             "INSERT INTO pgshard_catalog.routing_ranges \
-             (routing_epoch, range_start, range_end, shard_id) \
-             VALUES ($1, 0, 18446744073709551616, $2::text)",
-            &[&routing_epoch, &fixture.shard_id],
+             (logical_database_id, routing_epoch, range_start, range_end, database_shard_id) \
+             VALUES ($2::text::uuid, $1, 0, 18446744073709551616, $3::text::uuid)",
+            &[
+                &routing_epoch,
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+            ],
         )
         .await?;
     Ok(routing_epoch)
@@ -7987,6 +8832,197 @@ async fn assert_repeatable_read_activation_fences_concurrent_range_mutation(
     Ok(())
 }
 
+async fn stage_database_shard_replacement(
+    client: &Client,
+    fixture: &Fixture,
+) -> Result<(String, i64, String), Box<dyn Error>> {
+    let replacement_shard_number: i64 = client
+        .query_one(
+            "SELECT coalesce(max(shard_number), 0) + 1 FROM pgshard_catalog.shards",
+            &[],
+        )
+        .await?
+        .get(0);
+    let replacement_shard_id = format!("move-{}", fixture.nonce);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.shards(shard_id, shard_number) \
+             VALUES ($1::text, $2)",
+            &[&replacement_shard_id, &replacement_shard_number],
+        )
+        .await?;
+    let replacement_placement_id: String = client
+        .query_one(
+            "INSERT INTO pgshard_catalog.database_shard_placements( \
+                 logical_database_id, database_shard_id, placement_generation, shard_id \
+             ) VALUES ($1::text::uuid, $2::text::uuid, 2, $3::text) \
+             RETURNING placement_id::text",
+            &[
+                &fixture.logical_database_id,
+                &fixture.database_shard_id,
+                &replacement_shard_id,
+            ],
+        )
+        .await?
+        .get(0);
+
+    let error = client
+        .execute(
+            "DELETE FROM pgshard_catalog.database_shard_placements \
+              WHERE placement_id = $1::text::uuid",
+            &[&replacement_placement_id],
+        )
+        .await
+        .expect_err("a staged placement identity was deleted and became reusable");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(&error, "database-shard placement identities are permanent");
+
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.database_shard_placements \
+                SET state = 'active', activated_at = statement_timestamp() \
+              WHERE placement_id = $1::text::uuid",
+            &[&replacement_placement_id],
+        )
+        .await
+        .expect_err("a replacement cannot activate before the old placement is superseded");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "database-shard placement transitions require an atomic target-fenced cutover",
+    );
+    Ok((
+        replacement_shard_id,
+        replacement_shard_number,
+        replacement_placement_id,
+    ))
+}
+
+async fn assert_rejected_placement_rows_unchanged(
+    client: &Client,
+    fixture: &Fixture,
+    replacement_shard_id: &str,
+    replacement_shard_number: i64,
+) -> TestResult<i64> {
+    let placements: Vec<(i64, String, String, i64)> = client
+        .query(
+            "SELECT placements.placement_generation, placements.state, \
+                    placements.shard_id::text, shards.shard_number \
+               FROM pgshard_catalog.database_shard_placements AS placements \
+               JOIN pgshard_catalog.shards AS shards \
+                 ON shards.shard_id = placements.shard_id \
+              WHERE placements.logical_database_id = $1::text::uuid \
+                AND placements.database_shard_id = $2::text::uuid \
+               ORDER BY placements.placement_generation",
+            &[&fixture.logical_database_id, &fixture.database_shard_id],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .collect();
+    let serving_shard_number = placements[0].3;
+    assert_eq!(
+        placements,
+        vec![
+            (
+                1,
+                "active".into(),
+                fixture.shard_id.clone(),
+                serving_shard_number,
+            ),
+            (
+                2,
+                "staged".into(),
+                replacement_shard_id.to_owned(),
+                replacement_shard_number,
+            ),
+        ]
+    );
+    Ok(serving_shard_number)
+}
+
+async fn assert_database_shard_placement_contract(
+    client: &mut Client,
+    database_url: &str,
+    fixture: &Fixture,
+) -> TestResult {
+    let (replacement_shard_id, replacement_shard_number, replacement_placement_id) =
+        stage_database_shard_replacement(client, fixture).await?;
+
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.database_shard_placements \
+                SET state = 'superseded', superseded_at = statement_timestamp() \
+              WHERE logical_database_id = $1::text::uuid \
+                AND database_shard_id = $2::text::uuid \
+                AND state = 'active'",
+            &[&fixture.logical_database_id, &fixture.database_shard_id],
+        )
+        .await
+        .expect_err("an unfenced cutover superseded the serving placement");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "database-shard placement transitions require an atomic target-fenced cutover",
+    );
+
+    let serving_shard_number = assert_rejected_placement_rows_unchanged(
+        client,
+        fixture,
+        &replacement_shard_id,
+        replacement_shard_number,
+    )
+    .await?;
+
+    let unchanged_epoch = catalog_epoch(client).await?;
+    let driver = CatalogDriver::start(
+        database_url,
+        CatalogPollInterval::new(Duration::from_secs(30))?,
+    )
+    .await?;
+    wait_for_cache_epoch(&driver.cache, unchanged_epoch).await?;
+    let snapshot = driver.cache.current_for_planning()?;
+    let database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
+    let database = snapshot
+        .database(database_id)
+        .ok_or("moved database disappeared from the catalog snapshot")?;
+    assert!(
+        database.routes().iter().all(|route| {
+            route.database_shard_id().to_string() == fixture.database_shard_id
+                && i64::from(route.shard_id().0) == serving_shard_number
+        }),
+        "a rejected placement cutover changed the serving route"
+    );
+    driver.shutdown().await?;
+
+    client
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'draining' \
+             WHERE shard_id = $1::text",
+            &[&fixture.shard_id],
+        )
+        .await?;
+    let error = client
+        .execute(
+            "UPDATE pgshard_catalog.shards SET state = 'retired' \
+              WHERE shard_id = $1::text",
+            &[&fixture.shard_id],
+        )
+        .await
+        .expect_err("an active placement allowed physical shard retirement");
+    assert_sqlstate(&error, "55000");
+    let staged_state: String = client
+        .query_one(
+            "SELECT state FROM pgshard_catalog.database_shard_placements \
+              WHERE placement_id = $1::text::uuid",
+            &[&replacement_placement_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(staged_state, "staged");
+    Ok(())
+}
+
 #[tokio::test]
 async fn reconnect_gate_preserves_current_state_across_subscribers() {
     let gate = ReconnectGate::new();
@@ -8058,6 +9094,7 @@ async fn run_migration_and_activation_contract(
         &fixture,
     )
     .await?;
+    assert_database_shard_placement_contract(client, database_url, &fixture).await?;
 
     listener.task.abort();
     Ok(())

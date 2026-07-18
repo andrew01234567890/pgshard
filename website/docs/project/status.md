@@ -58,21 +58,35 @@ The current database-topology foundation accepts immutable logical-database
 shard counts and ordered physical-cell mappings in
 `PgShardCluster.spec.databases`. Shard-zero bootstrap installs all declared
 equal-range routes in one `shardschema` transaction. Exact retries preserve the
-database IDs, routing epochs, and catalog epoch; conflicting mappings and
-undeclared active catalog databases fail without a partial install. This does
-not yet create physical application databases, database-scoped shard records,
-placement reservations, or a client-visible routing path.
+database IDs, database-shard UUIDs, generation-one placements, routing epochs,
+and catalog epoch; conflicting mappings and undeclared active catalog
+databases fail without a partial install. An eligible populated v0.49 catalog
+converts physical route targets into permanent database-shard identities exactly
+once; live unavailable targets require repair or retirement with the previous
+release before conversion.
+Before any catalog-row scan or seed DML, migration relation locks stabilize the
+input and supported-release SHA-256 fingerprints reject changed executable
+constraints, defaults, generated expressions, predicates, indexes, and external
+inheritance. Loader queries use `ONLY` as an independent descendant-row fence.
 Existing catalog topology is compared with the complete declaration before
-migration and again under the catalog-state transaction lock before identity
-allocation. Both the database and range inputs are capped at the expected count
-plus one. Catalog loading uses a fixed set of bounded queries per refresh rather
+migration while bootstrap remains quarantined, then again under the catalog-state
+transaction lock before database-genesis allocation. Legacy conversion allocates
+database-shard identities inside the subsequent migration transaction after that
+separate quarantined preflight. Both database and range inputs are capped at the
+expected count plus one. Catalog loading uses a fixed set of bounded queries per refresh rather
 than per-database query amplification, and refuses staged, superseded, foreign,
 duplicate, or otherwise non-serving active-epoch pointers plus routes to absent,
 provisioning, or retired shards. The provisioned
 storage checkpoint binds the canonical resolved database topology by SHA-256.
+Published routes also retain placement generation, and the version-two snapshot
+checksum covers permanent database-shard identity, generation, and physical target.
 Status written before that field existed remains API-valid: only a provably
 empty legacy declaration is upgraded automatically, while a legacy checkpoint
 with declared databases requires explicit recovery.
+Only genesis may create active placements. Staged identities remain permanent,
+and direct placement transitions are rejected until an atomic target-fenced
+cutover exists. This does not yet create physical application databases, switch
+placements, or expose a client-visible routing path.
 
 The current operator plan starts single-member poolers in `operator-tls`
 catalog mode. It checkpoints an unpredictable name as a non-consumable creation

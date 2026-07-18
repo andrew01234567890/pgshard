@@ -9,6 +9,9 @@ SET LOCAL check_function_bodies = on;
 SET LOCAL default_tablespace = '';
 SET LOCAL temp_tablespaces = '';
 SET LOCAL default_table_access_method = heap;
+SET LOCAL enable_indexscan = off;
+SET LOCAL enable_indexonlyscan = off;
+SET LOCAL enable_bitmapscan = off;
 
 -- Takeover validation uses statement snapshots.  Override a non-default
 -- session characteristic before the transaction takes its first snapshot.  An
@@ -73,6 +76,38 @@ BEGIN
 END
 $pgshard_reject_event_triggers$;
 
+DO $pgshard_reject_executable_catalog_relations$
+DECLARE
+    heap_access_method oid;
+    unsafe_relation text;
+BEGIN
+    SELECT methods.oid
+      INTO STRICT heap_access_method
+      FROM pg_catalog.pg_am AS methods
+     WHERE methods.amname = 'heap'
+       AND methods.amtype = 't';
+
+    SELECT relations.relname
+      INTO unsafe_relation
+      FROM pg_catalog.pg_class AS relations
+      JOIN pg_catalog.pg_namespace AS namespaces
+        ON namespaces.oid = relations.relnamespace
+     WHERE namespaces.nspname = 'pgshard_catalog'
+       AND (
+           relations.relkind IN ('p', 'v', 'm', 'f')
+           OR (relations.relkind = 'r' AND relations.relam <> heap_access_method)
+       )
+     ORDER BY relations.oid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains an executable or noncanonical relation',
+            DETAIL = unsafe_relation;
+    END IF;
+END
+$pgshard_reject_executable_catalog_relations$;
+
 -- Freeze every pre-existing trigger/FK-capable catalog relation before
 -- inspecting attached triggers or foreign keys.  CREATE TRIGGER and
 -- referential-constraint DDL require a conflicting relation lock.  Fail rather
@@ -91,7 +126,7 @@ BEGIN
           JOIN pg_catalog.pg_namespace AS namespaces
             ON namespaces.oid = relations.relnamespace
          WHERE namespaces.nspname = 'pgshard_catalog'
-           AND relations.relkind IN ('r', 'p', 'v', 'm', 'f')
+           AND relations.relkind = 'r'
          ORDER BY relations.oid
     LOOP
         EXECUTE pg_catalog.format(
@@ -102,6 +137,267 @@ BEGIN
     END LOOP;
 END
 $pgshard_lock_existing_catalog_relations$;
+
+-- Catalog rows remain hostile until ownership and executable metadata have
+-- both been validated. Base-table locks above stabilize constraints, defaults,
+-- and indexes. Released definitions depend only on pinned built-in operators,
+-- routines, and btree operator classes, whose dependencies PostgreSQL omits
+-- from pg_depend. Any dependency recorded against an executable object is
+-- therefore user-created and must be rejected before catalog rows are read or
+-- seed DML can evaluate it.
+DO $pgshard_reject_executable_relation_metadata$
+DECLARE
+    catalog_schema_oid oid;
+    metadata_hash text;
+    unsafe_metadata text;
+BEGIN
+    SELECT namespaces.oid
+      INTO catalog_schema_oid
+      FROM pg_catalog.pg_namespace AS namespaces
+     WHERE namespaces.nspname = 'pgshard_catalog';
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    SELECT pg_catalog.format(
+               'relation %I.%I inherits from %I.%I',
+               child_namespaces.nspname,
+               children.relname,
+               parent_namespaces.nspname,
+               parents.relname
+           )
+      INTO unsafe_metadata
+      FROM pg_catalog.pg_inherits AS inheritance
+      JOIN pg_catalog.pg_class AS parents
+        ON parents.oid = inheritance.inhparent
+      JOIN pg_catalog.pg_class AS children
+        ON children.oid = inheritance.inhrelid
+      JOIN pg_catalog.pg_namespace AS parent_namespaces
+        ON parent_namespaces.oid = parents.relnamespace
+      JOIN pg_catalog.pg_namespace AS child_namespaces
+        ON child_namespaces.oid = children.relnamespace
+     WHERE parents.relnamespace = catalog_schema_oid
+        OR children.relnamespace = catalog_schema_oid
+     ORDER BY inheritance.inhseqno, children.oid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains external inherited relations',
+            DETAIL = unsafe_metadata;
+    END IF;
+
+    WITH metadata AS (
+        SELECT pg_catalog.format(
+                   'constraint|%s|%s|%s|%s|%s|%s|%s|%s',
+                   CASE
+                       WHEN relations.oid IS NOT NULL THEN
+                           pg_catalog.format(
+                               '%I.%I',
+                               relation_namespaces.nspname,
+                               relations.relname
+                           )
+                       ELSE pg_catalog.format(
+                           '%I.%I',
+                           type_namespaces.nspname,
+                           types.typname
+                       )
+                   END,
+                   constraints.conname,
+                   constraints.contype,
+                   constraints.condeferrable,
+                   constraints.condeferred,
+                   constraints.convalidated,
+                   constraints.connoinherit,
+                   pg_catalog.pg_get_constraintdef(constraints.oid, false)
+               ) AS object
+          FROM pg_catalog.pg_constraint AS constraints
+          LEFT JOIN pg_catalog.pg_class AS relations
+            ON relations.oid = constraints.conrelid
+          LEFT JOIN pg_catalog.pg_namespace AS relation_namespaces
+            ON relation_namespaces.oid = relations.relnamespace
+          LEFT JOIN pg_catalog.pg_type AS types
+            ON types.oid = constraints.contypid
+          LEFT JOIN pg_catalog.pg_namespace AS type_namespaces
+            ON type_namespaces.oid = types.typnamespace
+         WHERE constraints.connamespace = catalog_schema_oid
+            OR relations.relnamespace = catalog_schema_oid
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'default|%I.%I|%s|%I|%s',
+                   namespaces.nspname,
+                   relations.relname,
+                   attributes.attnum,
+                   attributes.attname,
+                   pg_catalog.pg_get_expr(
+                       defaults.adbin,
+                       defaults.adrelid,
+                       false
+                   )
+               )
+          FROM pg_catalog.pg_attrdef AS defaults
+          JOIN pg_catalog.pg_class AS relations
+            ON relations.oid = defaults.adrelid
+          JOIN pg_catalog.pg_namespace AS namespaces
+            ON namespaces.oid = relations.relnamespace
+          JOIN pg_catalog.pg_attribute AS attributes
+            ON attributes.attrelid = defaults.adrelid
+           AND attributes.attnum = defaults.adnum
+         WHERE relations.relnamespace = catalog_schema_oid
+        UNION ALL
+        SELECT pg_catalog.format(
+                   'index|%I.%I|%I.%I|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+                   table_namespaces.nspname,
+                   tables.relname,
+                   index_namespaces.nspname,
+                   index_relations.relname,
+                   access_methods.amname,
+                   indexes.indisvalid,
+                   indexes.indisready,
+                   indexes.indislive,
+                   indexes.indisunique,
+                   indexes.indisprimary,
+                   indexes.indisexclusion,
+                   indexes.indisreplident,
+                   indexes.indisclustered,
+                   pg_catalog.pg_get_indexdef(indexes.indexrelid, 0, false)
+               )
+          FROM pg_catalog.pg_index AS indexes
+          JOIN pg_catalog.pg_class AS tables
+            ON tables.oid = indexes.indrelid
+          JOIN pg_catalog.pg_namespace AS table_namespaces
+            ON table_namespaces.oid = tables.relnamespace
+          JOIN pg_catalog.pg_class AS index_relations
+            ON index_relations.oid = indexes.indexrelid
+          JOIN pg_catalog.pg_namespace AS index_namespaces
+            ON index_namespaces.oid = index_relations.relnamespace
+          JOIN pg_catalog.pg_am AS access_methods
+            ON access_methods.oid = index_relations.relam
+         WHERE tables.relnamespace = catalog_schema_oid
+    )
+    SELECT pg_catalog.encode(
+               pg_catalog.sha256(
+                   pg_catalog.convert_to(
+                       pg_catalog.string_agg(
+                           object,
+                           E'\n' ORDER BY object COLLATE "C"
+                       ),
+                       'UTF8'
+                   )
+               ),
+               'hex'
+           )
+      INTO metadata_hash
+      FROM metadata;
+    IF metadata_hash NOT IN (
+        '692f622a91f66a3bfeb303e32dfface8309e93c411c9b1fe8cbdd81a2e4e420e',
+        '8bf2ce2a858b56e603b85bff106a20d62af435c549ecbc6eb7ad61c12ca65981',
+        '858ff7c989f5aabb02fe978100b1cba3090cef600636cc5b7fc0a0fb2c9e3a11',
+        '5cef33e65f629aee202b314a13081a54bd64df19e8efbfc710df7abb1a97f32e',
+        '0b8dd28bbbad4d55039f300d1969ba0737c5f783b286d3f7b206a94ea7b08efb',
+        '34beddb4cdfaf101bdb63b4f69283793afea56d50afb26116f039e012fec96d6'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains noncanonical executable relation metadata',
+            DETAIL = COALESCE(metadata_hash, 'no released executable metadata');
+    END IF;
+
+    WITH expression_objects(classid, objid, identity) AS (
+        SELECT 'pg_catalog.pg_constraint'::pg_catalog.regclass,
+               constraints.oid,
+               pg_catalog.pg_describe_object(
+                   'pg_catalog.pg_constraint'::pg_catalog.regclass,
+                   constraints.oid,
+                   0
+               )
+          FROM pg_catalog.pg_constraint AS constraints
+          LEFT JOIN pg_catalog.pg_class AS relations
+            ON relations.oid = constraints.conrelid
+         WHERE constraints.connamespace = catalog_schema_oid
+            OR relations.relnamespace = catalog_schema_oid
+        UNION ALL
+        SELECT 'pg_catalog.pg_attrdef'::pg_catalog.regclass,
+               defaults.oid,
+               pg_catalog.pg_describe_object(
+                   'pg_catalog.pg_attrdef'::pg_catalog.regclass,
+                   defaults.oid,
+                   0
+               )
+          FROM pg_catalog.pg_attrdef AS defaults
+          JOIN pg_catalog.pg_class AS relations
+            ON relations.oid = defaults.adrelid
+         WHERE relations.relnamespace = catalog_schema_oid
+        UNION ALL
+        SELECT 'pg_catalog.pg_class'::pg_catalog.regclass,
+               indexes.indexrelid,
+               pg_catalog.pg_describe_object(
+                   'pg_catalog.pg_class'::pg_catalog.regclass,
+                   indexes.indexrelid,
+                   0
+               )
+          FROM pg_catalog.pg_index AS indexes
+          JOIN pg_catalog.pg_class AS relations
+            ON relations.oid = indexes.indrelid
+         WHERE relations.relnamespace = catalog_schema_oid
+    )
+    SELECT pg_catalog.format(
+               '%s references %s',
+               objects.identity,
+               pg_catalog.pg_describe_object(
+                   dependencies.refclassid,
+                   dependencies.refobjid,
+                   dependencies.refobjsubid
+               )
+           )
+      INTO unsafe_metadata
+      FROM expression_objects AS objects
+      JOIN pg_catalog.pg_depend AS dependencies
+        ON dependencies.classid = objects.classid
+       AND dependencies.objid = objects.objid
+     WHERE dependencies.refclassid IN (
+               'pg_catalog.pg_proc'::pg_catalog.regclass,
+               'pg_catalog.pg_operator'::pg_catalog.regclass,
+               'pg_catalog.pg_opclass'::pg_catalog.regclass,
+               'pg_catalog.pg_opfamily'::pg_catalog.regclass
+           )
+     ORDER BY objects.identity, dependencies.refclassid,
+              dependencies.refobjid, dependencies.refobjsubid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains executable relation metadata',
+            DETAIL = unsafe_metadata;
+    END IF;
+
+    SELECT pg_catalog.format(
+               'index %I.%I',
+               index_namespaces.nspname,
+               index_relations.relname
+           )
+      INTO unsafe_metadata
+      FROM pg_catalog.pg_index AS indexes
+      JOIN pg_catalog.pg_class AS relations
+        ON relations.oid = indexes.indrelid
+      JOIN pg_catalog.pg_class AS index_relations
+        ON index_relations.oid = indexes.indexrelid
+      JOIN pg_catalog.pg_namespace AS index_namespaces
+        ON index_namespaces.oid = index_relations.relnamespace
+      JOIN pg_catalog.pg_am AS access_methods
+        ON access_methods.oid = index_relations.relam
+     WHERE relations.relnamespace = catalog_schema_oid
+       AND (access_methods.amname <> 'btree' OR indexes.indexprs IS NOT NULL)
+     ORDER BY index_relations.oid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_catalog contains executable relation metadata',
+            DETAIL = unsafe_metadata;
+    END IF;
+END
+$pgshard_reject_executable_relation_metadata$;
 
 DO $pgshard_role_bootstrap$
 DECLARE
@@ -426,6 +722,12 @@ BEGIN
                          FROM (VALUES
                              ('cluster_configuration', 'cluster_configuration_immutable', 'reject_all_changes', 27),
                              ('cluster_state', 'cluster_state_notify', 'notify_catalog_state', 17),
+                             ('database_shard_placements', 'database_shard_placements_lock_catalog', 'lock_catalog_state', 30),
+                             ('database_shard_placements', 'database_shard_placements_protect_history', 'protect_database_shard_placement', 31),
+                             ('database_shard_placements', 'database_shard_placements_touch_catalog', 'touch_catalog_state', 28),
+                             ('database_shards', 'database_shards_lock_catalog', 'lock_catalog_state', 30),
+                             ('database_shards', 'database_shards_protect_lifecycle', 'protect_database_shard_lifecycle', 31),
+                             ('database_shards', 'database_shards_touch_catalog', 'touch_catalog_state', 28),
                              ('logical_consumer_attachments', 'logical_consumer_attachments_lock_catalog', 'lock_catalog_state', 30),
                              ('logical_consumer_attachments', 'logical_consumer_attachments_protect_history', 'protect_logical_consumer_attachment', 31),
                              ('logical_consumer_attachments', 'logical_consumer_attachments_touch_catalog', 'touch_catalog_state', 28),
@@ -1155,6 +1457,103 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.shards (
     created_at timestamptz NOT NULL DEFAULT statement_timestamp()
 );
 
+CREATE TABLE IF NOT EXISTS pgshard_catalog.database_shards (
+    database_shard_id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+        CHECK (database_shard_id <> '00000000-0000-0000-0000-000000000000'::uuid),
+    logical_database_id uuid NOT NULL
+        REFERENCES pgshard_catalog.logical_databases(logical_database_id) ON DELETE RESTRICT,
+    shard_ordinal bigint NOT NULL CHECK (shard_ordinal BETWEEN 0 AND 4294967295),
+    state text NOT NULL DEFAULT 'provisioning'
+        CHECK (state IN ('provisioning', 'active', 'draining', 'retired')),
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    activated_at timestamptz,
+    draining_at timestamptz,
+    retired_at timestamptz,
+    CONSTRAINT database_shards_database_ordinal_key
+        UNIQUE (logical_database_id, shard_ordinal),
+    CONSTRAINT database_shards_database_identity_key
+        UNIQUE (logical_database_id, database_shard_id),
+    CONSTRAINT database_shards_lifecycle_check CHECK (
+        (
+            state = 'provisioning'
+            AND activated_at IS NULL
+            AND draining_at IS NULL
+            AND retired_at IS NULL
+        )
+        OR (
+            state = 'active'
+            AND activated_at IS NOT NULL
+            AND draining_at IS NULL
+            AND retired_at IS NULL
+        )
+        OR (
+            state = 'draining'
+            AND activated_at IS NOT NULL
+            AND draining_at IS NOT NULL
+            AND retired_at IS NULL
+        )
+        OR (
+            state = 'retired'
+            AND activated_at IS NOT NULL
+            AND draining_at IS NOT NULL
+            AND retired_at IS NOT NULL
+        )
+    )
+);
+
+COMMENT ON TABLE pgshard_catalog.database_shards IS
+    'Permanent logical shard identities scoped to one logical database; placement is versioned separately.';
+
+CREATE TABLE IF NOT EXISTS pgshard_catalog.database_shard_placements (
+    placement_id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+        CHECK (placement_id <> '00000000-0000-0000-0000-000000000000'::uuid),
+    logical_database_id uuid NOT NULL,
+    database_shard_id uuid NOT NULL,
+    placement_generation bigint NOT NULL CHECK (placement_generation > 0),
+    shard_id pgshard_catalog.resource_name NOT NULL
+        REFERENCES pgshard_catalog.shards(shard_id) ON DELETE RESTRICT,
+    state text NOT NULL DEFAULT 'staged'
+        CHECK (state IN ('staged', 'active', 'superseded')),
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    activated_at timestamptz,
+    superseded_at timestamptz,
+    CONSTRAINT database_shard_placements_database_shard_fkey
+        FOREIGN KEY (logical_database_id, database_shard_id)
+        REFERENCES pgshard_catalog.database_shards(
+            logical_database_id,
+            database_shard_id
+        ) ON DELETE RESTRICT,
+    CONSTRAINT database_shard_placements_generation_key
+        UNIQUE (logical_database_id, database_shard_id, placement_generation),
+    CONSTRAINT database_shard_placements_lifecycle_check CHECK (
+        (
+            state = 'staged'
+            AND activated_at IS NULL
+            AND superseded_at IS NULL
+        )
+        OR (
+            state = 'active'
+            AND activated_at IS NOT NULL
+            AND superseded_at IS NULL
+        )
+        OR (
+            state = 'superseded'
+            AND activated_at IS NOT NULL
+            AND superseded_at IS NOT NULL
+        )
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS database_shard_placements_one_active
+    ON pgshard_catalog.database_shard_placements(
+        logical_database_id,
+        database_shard_id
+    )
+    WHERE state = 'active';
+
+COMMENT ON TABLE pgshard_catalog.database_shard_placements IS
+    'Generationed physical placement history for each permanent database-shard identity.';
+
 CREATE TABLE IF NOT EXISTS pgshard_catalog.shard_restore_incarnations (
     restore_incarnation uuid PRIMARY KEY
         CHECK (restore_incarnation <> '00000000-0000-0000-0000-000000000000'::uuid),
@@ -1372,13 +1771,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS routing_epochs_one_active_per_database
     WHERE state = 'active';
 
 CREATE TABLE IF NOT EXISTS pgshard_catalog.routing_ranges (
-    routing_epoch bigint NOT NULL
-        REFERENCES pgshard_catalog.routing_epochs(routing_epoch) ON DELETE RESTRICT,
+    logical_database_id uuid NOT NULL,
+    routing_epoch bigint NOT NULL,
     range_start pgshard_catalog.uint64_boundary NOT NULL,
     range_end pgshard_catalog.uint64_boundary NOT NULL,
-    shard_id pgshard_catalog.resource_name NOT NULL
-        REFERENCES pgshard_catalog.shards(shard_id) ON DELETE RESTRICT,
+    database_shard_id uuid NOT NULL,
     PRIMARY KEY (routing_epoch, range_start),
+    CONSTRAINT routing_ranges_database_epoch_fkey
+        FOREIGN KEY (logical_database_id, routing_epoch)
+        REFERENCES pgshard_catalog.routing_epochs(logical_database_id, routing_epoch)
+        ON DELETE RESTRICT,
+    CONSTRAINT routing_ranges_database_shard_fkey
+        FOREIGN KEY (logical_database_id, database_shard_id)
+        REFERENCES pgshard_catalog.database_shards(
+            logical_database_id,
+            database_shard_id
+        ) ON DELETE RESTRICT,
     CHECK (range_start < range_end),
     CHECK (range_start < 18446744073709551616)
 );
@@ -1773,6 +2181,296 @@ ON CONFLICT (singleton) DO NOTHING;
 INSERT INTO pgshard_catalog.cluster_state(singleton)
 VALUES (true)
 ON CONFLICT (singleton) DO NOTHING;
+
+-- Routes used to name a physical cell directly. Upgrade that released shape
+-- to a permanent database-shard identity plus a generationed placement. The
+-- legacy catalog cannot distinguish identities across routing generations, so
+-- one identity is recovered for each database/cell pair. Active targets keep
+-- the ordinal implied by active range order, staged-only targets follow them,
+-- and historical-only targets are appended deterministically. Reusing one
+-- physical target within a live epoch is ambiguous and fails closed. A target
+-- used only by superseded epochs is retained as retired history; it must not
+-- become a new live placement that blocks physical-cell retirement.
+-- A partially hand-written conversion is ambiguous and therefore fails
+-- closed instead of guessing which identity owns an existing range.
+ALTER TABLE pgshard_catalog.routing_ranges
+    ADD COLUMN IF NOT EXISTS logical_database_id uuid;
+ALTER TABLE pgshard_catalog.routing_ranges
+    ADD COLUMN IF NOT EXISTS database_shard_id uuid;
+
+DO $pgshard_database_shard_upgrade$
+DECLARE
+    has_legacy_physical_target boolean;
+    changed bigint;
+BEGIN
+    SELECT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_attribute AS attributes
+         WHERE attributes.attrelid =
+                   'pgshard_catalog.routing_ranges'::pg_catalog.regclass
+           AND attributes.attname = 'shard_id'
+           AND attributes.attnum > 0
+           AND NOT attributes.attisdropped
+    ) INTO has_legacy_physical_target;
+
+    IF has_legacy_physical_target THEN
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.routing_ranges AS ranges
+             WHERE ranges.logical_database_id IS NOT NULL
+                OR ranges.database_shard_id IS NOT NULL
+        ) OR EXISTS (
+            SELECT FROM pgshard_catalog.database_shards
+        ) OR EXISTS (
+            SELECT FROM pgshard_catalog.database_shard_placements
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'partially converted database-shard routing blocks catalog upgrade',
+                HINT = 'restore the last complete shardschema backup, then retry the migration';
+        END IF;
+
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.routing_ranges AS ranges
+              JOIN pgshard_catalog.routing_epochs AS epochs
+                ON epochs.routing_epoch = ranges.routing_epoch
+              LEFT JOIN pgshard_catalog.shards AS shards
+                ON shards.shard_id = ranges.shard_id
+             WHERE epochs.state IN ('staged', 'active')
+               AND (shards.shard_id IS NULL OR shards.state NOT IN ('active', 'draining'))
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'legacy live routing references an unavailable physical shard',
+                HINT = 'repair or retire the unavailable staged routing with the previous release, then retry the migration';
+        END IF;
+
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.routing_ranges AS ranges
+              JOIN pgshard_catalog.routing_epochs AS epochs
+                ON epochs.routing_epoch = ranges.routing_epoch
+             WHERE epochs.state IN ('staged', 'active')
+             GROUP BY epochs.logical_database_id,
+                      epochs.routing_epoch,
+                      ranges.shard_id
+            HAVING pg_catalog.count(*) <> 1
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'ambiguous legacy live routing reuses a physical target within one epoch',
+                HINT = 'remove or complete the ambiguous staged routing with the previous release, then retry the migration';
+        END IF;
+
+        DROP TABLE IF EXISTS pg_temp.pgshard_database_shard_upgrade_targets;
+        CREATE TEMPORARY TABLE pg_temp.pgshard_database_shard_upgrade_targets (
+            logical_database_id uuid NOT NULL,
+            shard_id pgshard_catalog.resource_name NOT NULL,
+            is_live boolean NOT NULL,
+            shard_ordinal bigint NOT NULL,
+            PRIMARY KEY (logical_database_id, shard_id),
+            UNIQUE (logical_database_id, shard_ordinal)
+        ) ON COMMIT DROP;
+
+        INSERT INTO pg_temp.pgshard_database_shard_upgrade_targets(
+            logical_database_id,
+            shard_id,
+            is_live,
+            shard_ordinal
+        )
+        WITH legacy_targets AS (
+            SELECT epochs.logical_database_id,
+                   ranges.shard_id,
+                   shards.shard_number,
+                   pg_catalog.min(ranges.range_start)
+                       FILTER (WHERE epochs.state = 'active')
+                       AS active_range_start,
+                   pg_catalog.min(epochs.routing_epoch)
+                       FILTER (WHERE epochs.state = 'staged')
+                       AS staged_routing_epoch,
+                   pg_catalog.min(ranges.range_start)
+                       FILTER (WHERE epochs.state = 'staged')
+                       AS staged_range_start,
+                   pg_catalog.min(epochs.routing_epoch)
+                       FILTER (WHERE epochs.state = 'superseded')
+                       AS historical_routing_epoch,
+                   pg_catalog.min(ranges.range_start)
+                       FILTER (WHERE epochs.state = 'superseded')
+                       AS historical_range_start
+              FROM pgshard_catalog.routing_ranges AS ranges
+              JOIN pgshard_catalog.routing_epochs AS epochs
+                ON epochs.routing_epoch = ranges.routing_epoch
+              JOIN pgshard_catalog.shards AS shards
+                ON shards.shard_id = ranges.shard_id
+             GROUP BY epochs.logical_database_id,
+                      ranges.shard_id,
+                      shards.shard_number
+        )
+        SELECT targets.logical_database_id,
+               targets.shard_id,
+               targets.active_range_start IS NOT NULL
+                   OR targets.staged_routing_epoch IS NOT NULL,
+               pg_catalog.row_number() OVER (
+                   PARTITION BY targets.logical_database_id
+                   ORDER BY
+                       CASE
+                           WHEN targets.active_range_start IS NOT NULL THEN 0
+                           WHEN targets.staged_routing_epoch IS NOT NULL THEN 1
+                           ELSE 2
+                       END,
+                       targets.active_range_start NULLS LAST,
+                       targets.staged_routing_epoch NULLS LAST,
+                       targets.staged_range_start NULLS LAST,
+                       targets.historical_routing_epoch NULLS LAST,
+                       targets.historical_range_start NULLS LAST,
+                       targets.shard_number,
+                       targets.shard_id
+               ) - 1
+          FROM legacy_targets AS targets
+         ORDER BY targets.logical_database_id,
+                  targets.active_range_start NULLS LAST,
+                  targets.shard_number,
+                  targets.shard_id;
+
+        INSERT INTO pgshard_catalog.database_shards(
+            logical_database_id,
+            shard_ordinal,
+            state,
+            activated_at,
+            draining_at,
+            retired_at
+        )
+        SELECT legacy.logical_database_id,
+               legacy.shard_ordinal,
+               CASE WHEN legacy.is_live THEN 'active' ELSE 'retired' END,
+               statement_timestamp(),
+               CASE WHEN legacy.is_live THEN NULL ELSE statement_timestamp() END,
+               CASE WHEN legacy.is_live THEN NULL ELSE statement_timestamp() END
+          FROM pg_temp.pgshard_database_shard_upgrade_targets AS legacy
+         ORDER BY legacy.logical_database_id, legacy.shard_ordinal;
+
+        INSERT INTO pgshard_catalog.database_shard_placements(
+            logical_database_id,
+            database_shard_id,
+            placement_generation,
+            shard_id,
+            state,
+            activated_at,
+            superseded_at
+        )
+        SELECT database_shards.logical_database_id,
+               database_shards.database_shard_id,
+               1,
+               legacy.shard_id,
+               CASE WHEN legacy.is_live THEN 'active' ELSE 'superseded' END,
+               statement_timestamp(),
+               CASE WHEN legacy.is_live THEN NULL ELSE statement_timestamp() END
+          FROM pg_temp.pgshard_database_shard_upgrade_targets AS legacy
+          JOIN pgshard_catalog.database_shards AS database_shards
+            ON database_shards.logical_database_id = legacy.logical_database_id
+           AND database_shards.shard_ordinal = legacy.shard_ordinal
+         ORDER BY database_shards.logical_database_id,
+                  database_shards.shard_ordinal;
+
+        UPDATE pgshard_catalog.routing_ranges AS ranges
+           SET logical_database_id = epochs.logical_database_id,
+               database_shard_id = database_shards.database_shard_id
+          FROM pgshard_catalog.routing_epochs AS epochs,
+               pg_temp.pgshard_database_shard_upgrade_targets AS legacy,
+               pgshard_catalog.database_shards AS database_shards
+         WHERE epochs.routing_epoch = ranges.routing_epoch
+           AND legacy.logical_database_id = epochs.logical_database_id
+           AND legacy.shard_id = ranges.shard_id
+           AND database_shards.logical_database_id = legacy.logical_database_id
+           AND database_shards.shard_ordinal = legacy.shard_ordinal;
+
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.routing_ranges AS ranges
+             WHERE ranges.logical_database_id IS NULL
+                OR ranges.database_shard_id IS NULL
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'legacy routing could not be mapped to database-shard identities';
+        END IF;
+
+        ALTER TABLE pgshard_catalog.routing_ranges
+            DROP CONSTRAINT IF EXISTS routing_ranges_shard_id_fkey;
+        ALTER TABLE pgshard_catalog.routing_ranges
+            DROP CONSTRAINT IF EXISTS routing_ranges_routing_epoch_fkey;
+        ALTER TABLE pgshard_catalog.routing_ranges
+            DROP COLUMN shard_id;
+
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.cluster_state AS state
+             WHERE state.singleton
+               AND state.catalog_epoch = 9223372036854775806
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'catalog epoch exhausted during database-shard upgrade';
+        END IF;
+        UPDATE pgshard_catalog.cluster_state
+           SET catalog_epoch = catalog_epoch + 1,
+               changed_at = statement_timestamp()
+         WHERE singleton;
+        GET DIAGNOSTICS changed = ROW_COUNT;
+        IF changed <> 1 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'database-shard upgrade requires the cluster-state singleton';
+        END IF;
+    END IF;
+END
+$pgshard_database_shard_upgrade$;
+
+ALTER TABLE pgshard_catalog.routing_ranges
+    ALTER COLUMN logical_database_id SET NOT NULL;
+ALTER TABLE pgshard_catalog.routing_ranges
+    ALTER COLUMN database_shard_id SET NOT NULL;
+
+DO $pgshard_database_shard_constraints$
+BEGIN
+    IF NOT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_constraint AS constraints
+         WHERE constraints.conrelid =
+                   'pgshard_catalog.routing_ranges'::pg_catalog.regclass
+           AND constraints.conname = 'routing_ranges_database_epoch_fkey'
+    ) THEN
+        ALTER TABLE pgshard_catalog.routing_ranges
+            ADD CONSTRAINT routing_ranges_database_epoch_fkey
+            FOREIGN KEY (logical_database_id, routing_epoch)
+            REFERENCES pgshard_catalog.routing_epochs(
+                logical_database_id,
+                routing_epoch
+            ) ON DELETE RESTRICT NOT VALID;
+    END IF;
+    ALTER TABLE pgshard_catalog.routing_ranges
+        VALIDATE CONSTRAINT routing_ranges_database_epoch_fkey;
+
+    IF NOT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_constraint AS constraints
+         WHERE constraints.conrelid =
+                   'pgshard_catalog.routing_ranges'::pg_catalog.regclass
+           AND constraints.conname = 'routing_ranges_database_shard_fkey'
+    ) THEN
+        ALTER TABLE pgshard_catalog.routing_ranges
+            ADD CONSTRAINT routing_ranges_database_shard_fkey
+            FOREIGN KEY (logical_database_id, database_shard_id)
+            REFERENCES pgshard_catalog.database_shards(
+                logical_database_id,
+                database_shard_id
+            ) ON DELETE RESTRICT NOT VALID;
+    END IF;
+    ALTER TABLE pgshard_catalog.routing_ranges
+        VALIDATE CONSTRAINT routing_ranges_database_shard_fkey;
+END
+$pgshard_database_shard_constraints$;
 
 INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state)
 VALUES ('shard-0000', 0, 'active')
@@ -3124,19 +3822,6 @@ BEGIN
 
     becoming_unavailable := NEW.state NOT IN ('active', 'draining');
 
-    IF becoming_unavailable AND EXISTS (
-        SELECT
-          FROM pgshard_catalog.routing_ranges AS ranges
-          JOIN pgshard_catalog.routing_epochs AS epochs
-            ON epochs.routing_epoch = ranges.routing_epoch
-         WHERE ranges.shard_id = OLD.shard_id
-           AND epochs.state = 'active'
-    ) THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format('shard %s is referenced by active routing', OLD.shard_id);
-    END IF;
-
     IF NEW.state = 'retired' AND EXISTS (
         SELECT
           FROM pgshard_catalog.logical_consumer_shards AS consumer_shards
@@ -3159,7 +3844,230 @@ BEGIN
             MESSAGE = format('shard %s still has a non-retired slot-sync probe', OLD.shard_id);
     END IF;
 
+    IF becoming_unavailable AND EXISTS (
+        SELECT
+          FROM pgshard_catalog.database_shard_placements AS placements
+         WHERE placements.shard_id = OLD.shard_id
+           AND placements.state IN ('staged', 'active')
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = format('shard %s has a live database-shard placement', OLD.shard_id);
+    END IF;
+
     RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.protect_database_shard_lifecycle()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'database-shard identities are permanent';
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        IF NOT (
+            (
+                NEW.state = 'provisioning'
+                AND NEW.activated_at IS NULL
+                AND NEW.draining_at IS NULL
+                AND NEW.retired_at IS NULL
+            )
+            OR (
+                NEW.state = 'active'
+                AND NEW.activated_at IS NOT NULL
+                AND NEW.draining_at IS NULL
+                AND NEW.retired_at IS NULL
+            )
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'a database shard must start provisioning or active';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.database_shard_id IS DISTINCT FROM OLD.database_shard_id
+       OR NEW.logical_database_id IS DISTINCT FROM OLD.logical_database_id
+       OR NEW.shard_ordinal IS DISTINCT FROM OLD.shard_ordinal
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'database-shard identity is immutable';
+    END IF;
+
+    IF NEW.state = OLD.state
+       AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+       AND NEW.draining_at IS NOT DISTINCT FROM OLD.draining_at
+       AND NEW.retired_at IS NOT DISTINCT FROM OLD.retired_at THEN
+        RETURN NEW;
+    ELSIF OLD.state = 'provisioning'
+          AND NEW.state = 'active'
+          AND OLD.activated_at IS NULL
+          AND NEW.activated_at IS NOT NULL
+          AND NEW.draining_at IS NULL
+          AND NEW.retired_at IS NULL THEN
+        RETURN NEW;
+    ELSIF OLD.state = 'active'
+          AND NEW.state = 'draining'
+          AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+          AND OLD.draining_at IS NULL
+          AND NEW.draining_at IS NOT NULL
+          AND NEW.retired_at IS NULL THEN
+        RETURN NEW;
+    ELSIF OLD.state = 'draining'
+          AND NEW.state = 'active'
+          AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+          AND NEW.draining_at IS NULL
+          AND NEW.retired_at IS NULL THEN
+        RETURN NEW;
+    ELSIF OLD.state = 'draining'
+          AND NEW.state = 'retired'
+          AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+          AND NEW.draining_at IS NOT DISTINCT FROM OLD.draining_at
+          AND OLD.retired_at IS NULL
+          AND NEW.retired_at IS NOT NULL THEN
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.routing_ranges AS ranges
+              JOIN pgshard_catalog.routing_epochs AS epochs
+                ON epochs.logical_database_id = ranges.logical_database_id
+               AND epochs.routing_epoch = ranges.routing_epoch
+             WHERE ranges.logical_database_id = OLD.logical_database_id
+               AND ranges.database_shard_id = OLD.database_shard_id
+               AND epochs.state IN ('staged', 'active')
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = format(
+                    'database shard %s is referenced by live routing',
+                    OLD.database_shard_id
+                );
+        END IF;
+        IF EXISTS (
+            SELECT
+              FROM pgshard_catalog.database_shard_placements AS placements
+             WHERE placements.logical_database_id = OLD.logical_database_id
+               AND placements.database_shard_id = OLD.database_shard_id
+               AND placements.state IN ('staged', 'active')
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = format(
+                    'database shard %s still has a live placement',
+                    OLD.database_shard_id
+                );
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION USING
+        ERRCODE = '55000',
+        MESSAGE = 'invalid database-shard lifecycle transition';
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.protect_database_shard_placement()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    next_generation bigint;
+    database_shard_state text;
+    physical_shard_state text;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'database-shard placement identities are permanent';
+    END IF;
+
+    SELECT database_shards.state
+      INTO database_shard_state
+      FROM pgshard_catalog.database_shards AS database_shards
+     WHERE database_shards.logical_database_id = NEW.logical_database_id
+       AND database_shards.database_shard_id = NEW.database_shard_id
+     FOR KEY SHARE;
+    IF database_shard_state IS NULL
+       OR database_shard_state NOT IN ('active', 'draining') THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'a live placement requires an active or draining database shard';
+    END IF;
+
+    SELECT shards.state
+      INTO physical_shard_state
+      FROM pgshard_catalog.shards AS shards
+     WHERE shards.shard_id = NEW.shard_id
+     FOR KEY SHARE;
+    IF physical_shard_state IS NULL
+       OR physical_shard_state NOT IN ('active', 'draining') THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'a live placement requires an available physical shard';
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        SELECT COALESCE(pg_catalog.max(placements.placement_generation), 0) + 1
+          INTO next_generation
+          FROM pgshard_catalog.database_shard_placements AS placements
+         WHERE placements.logical_database_id = NEW.logical_database_id
+           AND placements.database_shard_id = NEW.database_shard_id;
+        IF NEW.placement_generation <> next_generation THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = format(
+                    'database-shard placement generation must be %s',
+                    next_generation
+                );
+        END IF;
+        IF NEW.state = 'active' THEN
+            IF NEW.placement_generation <> 1
+               OR NEW.activated_at IS NULL
+               OR NEW.superseded_at IS NOT NULL THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '55000',
+                    MESSAGE = 'only a genesis placement may start active';
+            END IF;
+        ELSIF NEW.state <> 'staged'
+              OR NEW.activated_at IS NOT NULL
+              OR NEW.superseded_at IS NOT NULL THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'a replacement placement must start staged';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.placement_id IS DISTINCT FROM OLD.placement_id
+       OR NEW.logical_database_id IS DISTINCT FROM OLD.logical_database_id
+       OR NEW.database_shard_id IS DISTINCT FROM OLD.database_shard_id
+       OR NEW.placement_generation IS DISTINCT FROM OLD.placement_generation
+       OR NEW.shard_id IS DISTINCT FROM OLD.shard_id
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'database-shard placement identity is immutable';
+    END IF;
+
+    IF NEW.state = OLD.state
+       AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+       AND NEW.superseded_at IS NOT DISTINCT FROM OLD.superseded_at THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION USING
+        ERRCODE = '55000',
+        MESSAGE = 'database-shard placement transitions require an atomic target-fenced cutover';
 END
 $function$;
 
@@ -4410,22 +5318,54 @@ DECLARE
     expected_start numeric(20, 0) := 0;
     range_count bigint := 0;
     current_range record;
+    target_logical_database_id uuid;
+    active_placement_count bigint;
+    physical_shard_id pgshard_catalog.resource_name;
+    physical_shard_state text;
 BEGIN
-    IF NOT EXISTS (
-        SELECT FROM pgshard_catalog.routing_epochs
-        WHERE routing_epoch = target_routing_epoch AND state = 'staged'
-    ) THEN
+    SELECT epochs.logical_database_id
+      INTO target_logical_database_id
+      FROM pgshard_catalog.routing_epochs AS epochs
+     WHERE epochs.routing_epoch = target_routing_epoch
+       AND epochs.state = 'staged';
+    IF NOT FOUND THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
             MESSAGE = 'routing epoch is not staged';
     END IF;
 
+    IF EXISTS (
+        SELECT placements.shard_id
+          FROM pgshard_catalog.routing_ranges AS ranges
+          JOIN pgshard_catalog.database_shard_placements AS placements
+            ON placements.logical_database_id = ranges.logical_database_id
+           AND placements.database_shard_id = ranges.database_shard_id
+           AND placements.state = 'active'
+         WHERE ranges.logical_database_id = target_logical_database_id
+           AND ranges.routing_epoch = target_routing_epoch
+         GROUP BY placements.shard_id
+        HAVING pg_catalog.count(DISTINCT ranges.database_shard_id) <> 1
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'routing epoch maps multiple database shards to one physical shard';
+    END IF;
+
     FOR current_range IN
-        SELECT range_start, range_end, shard_id
-          FROM pgshard_catalog.routing_ranges
-         WHERE routing_epoch = target_routing_epoch
-         ORDER BY range_start, range_end
+        SELECT ranges.range_start,
+               ranges.range_end,
+               ranges.logical_database_id,
+               ranges.database_shard_id
+          FROM pgshard_catalog.routing_ranges AS ranges
+         WHERE ranges.routing_epoch = target_routing_epoch
+         ORDER BY ranges.range_start, ranges.range_end
     LOOP
+        IF current_range.logical_database_id <> target_logical_database_id THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22023',
+                MESSAGE = 'routing range belongs to a different logical database';
+        END IF;
+
         IF current_range.range_start > expected_start THEN
             RAISE EXCEPTION USING
                 ERRCODE = '22023',
@@ -4437,12 +5377,50 @@ BEGIN
         END IF;
 
         IF NOT EXISTS (
-            SELECT FROM pgshard_catalog.shards
-            WHERE shard_id = current_range.shard_id AND state IN ('active', 'draining')
+            SELECT
+              FROM pgshard_catalog.database_shards AS database_shards
+             WHERE database_shards.logical_database_id = target_logical_database_id
+               AND database_shards.database_shard_id = current_range.database_shard_id
+               AND database_shards.state IN ('active', 'draining')
         ) THEN
             RAISE EXCEPTION USING
                 ERRCODE = '22023',
-                MESSAGE = format('routing epoch references unavailable shard %s', current_range.shard_id);
+                MESSAGE = format(
+                    'routing epoch references unavailable database shard %s',
+                    current_range.database_shard_id
+                );
+        END IF;
+
+        SELECT pg_catalog.count(*),
+               pg_catalog.min(placements.shard_id::text)::pgshard_catalog.resource_name
+          INTO active_placement_count, physical_shard_id
+          FROM pgshard_catalog.database_shard_placements AS placements
+         WHERE placements.logical_database_id = target_logical_database_id
+           AND placements.database_shard_id = current_range.database_shard_id
+           AND placements.state = 'active';
+        IF active_placement_count <> 1 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22023',
+                MESSAGE = format(
+                    'database shard %s has %s active placements',
+                    current_range.database_shard_id,
+                    active_placement_count
+                );
+        END IF;
+
+        SELECT shards.state
+          INTO physical_shard_state
+          FROM pgshard_catalog.shards AS shards
+         WHERE shards.shard_id = physical_shard_id;
+        IF physical_shard_state IS NULL
+           OR physical_shard_state NOT IN ('active', 'draining') THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22023',
+                MESSAGE = format(
+                    'database shard %s is placed on unavailable shard %s',
+                    current_range.database_shard_id,
+                    physical_shard_id
+                );
         END IF;
 
         expected_start := current_range.range_end;
@@ -4684,6 +5662,7 @@ BEGIN
         IF EXISTS (
             WITH expected AS (
                 SELECT cells.ordinality::bigint AS range_ordinal,
+                       (cells.ordinality - 1)::bigint AS shard_ordinal,
                        pg_catalog.floor(
                            ((cells.ordinality - 1)::numeric * 18446744073709551616)
                            / cell_count
@@ -4702,16 +5681,25 @@ BEGIN
                 SELECT pg_catalog.row_number() OVER (
                            ORDER BY ranges.range_start, ranges.range_end
                        )::bigint AS range_ordinal,
+                       database_shards.shard_ordinal,
                        ranges.range_start,
                        ranges.range_end,
-                       ranges.shard_id
+                       placements.shard_id
                   FROM pgshard_catalog.routing_ranges AS ranges
+                  JOIN pgshard_catalog.database_shards AS database_shards
+                    ON database_shards.logical_database_id = ranges.logical_database_id
+                   AND database_shards.database_shard_id = ranges.database_shard_id
+                  JOIN pgshard_catalog.database_shard_placements AS placements
+                    ON placements.logical_database_id = ranges.logical_database_id
+                   AND placements.database_shard_id = ranges.database_shard_id
+                   AND placements.state = 'active'
                  WHERE ranges.routing_epoch = observed_routing_epoch
             )
             SELECT
               FROM expected
               FULL JOIN actual USING (range_ordinal)
-             WHERE expected.range_start IS DISTINCT FROM actual.range_start
+             WHERE expected.shard_ordinal IS DISTINCT FROM actual.shard_ordinal
+                OR expected.range_start IS DISTINCT FROM actual.range_start
                 OR expected.range_end IS DISTINCT FROM actual.range_end
                 OR expected.shard_id IS DISTINCT FROM actual.shard_id
         ) THEN
@@ -4737,13 +5725,52 @@ BEGIN
     RETURNING routing_epochs.routing_epoch
          INTO observed_routing_epoch;
 
+    INSERT INTO pgshard_catalog.database_shards(
+        logical_database_id,
+        shard_ordinal,
+        state,
+        activated_at
+    )
+    SELECT observed_database_id,
+           (cells.ordinality - 1)::bigint,
+           'active',
+           statement_timestamp()
+      FROM pg_catalog.unnest(target_cell_ordinals)
+               WITH ORDINALITY AS cells(cell_ordinal, ordinality)
+     ORDER BY cells.ordinality;
+
+    INSERT INTO pgshard_catalog.database_shard_placements(
+        logical_database_id,
+        database_shard_id,
+        placement_generation,
+        shard_id,
+        state,
+        activated_at
+    )
+    SELECT observed_database_id,
+           database_shards.database_shard_id,
+           1,
+           shards.shard_id,
+           'active',
+           statement_timestamp()
+      FROM pg_catalog.unnest(target_cell_ordinals)
+               WITH ORDINALITY AS cells(cell_ordinal, ordinality)
+      JOIN pgshard_catalog.database_shards AS database_shards
+        ON database_shards.logical_database_id = observed_database_id
+       AND database_shards.shard_ordinal = cells.ordinality - 1
+      JOIN pgshard_catalog.shards AS shards
+        ON shards.shard_number = cells.cell_ordinal
+     ORDER BY cells.ordinality;
+
     INSERT INTO pgshard_catalog.routing_ranges(
+        logical_database_id,
         routing_epoch,
         range_start,
         range_end,
-        shard_id
+        database_shard_id
     )
-    SELECT observed_routing_epoch,
+    SELECT observed_database_id,
+           observed_routing_epoch,
            pg_catalog.floor(
                ((cells.ordinality - 1)::numeric * 18446744073709551616)
                / cell_count
@@ -4752,11 +5779,12 @@ BEGIN
                (cells.ordinality::numeric * 18446744073709551616)
                / cell_count
            ),
-           shards.shard_id
+           database_shards.database_shard_id
       FROM pg_catalog.unnest(target_cell_ordinals)
                WITH ORDINALITY AS cells(cell_ordinal, ordinality)
-      JOIN pgshard_catalog.shards AS shards
-        ON shards.shard_number = cells.cell_ordinal
+      JOIN pgshard_catalog.database_shards AS database_shards
+        ON database_shards.logical_database_id = observed_database_id
+       AND database_shards.shard_ordinal = cells.ordinality - 1
      ORDER BY cells.ordinality;
 
     SELECT state.catalog_epoch
@@ -4842,6 +5870,42 @@ DROP TRIGGER IF EXISTS shards_install_restore_incarnation ON pgshard_catalog.sha
 CREATE TRIGGER shards_install_restore_incarnation
 AFTER INSERT ON pgshard_catalog.shards
 FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.install_initial_shard_restore_incarnation();
+
+DROP TRIGGER IF EXISTS database_shards_touch_catalog
+    ON pgshard_catalog.database_shards;
+CREATE TRIGGER database_shards_touch_catalog
+AFTER INSERT OR UPDATE OR DELETE ON pgshard_catalog.database_shards
+FOR EACH STATEMENT EXECUTE FUNCTION pgshard_catalog.touch_catalog_state();
+
+DROP TRIGGER IF EXISTS database_shards_lock_catalog
+    ON pgshard_catalog.database_shards;
+CREATE TRIGGER database_shards_lock_catalog
+BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.database_shards
+FOR EACH STATEMENT EXECUTE FUNCTION pgshard_catalog.lock_catalog_state();
+
+DROP TRIGGER IF EXISTS database_shards_protect_lifecycle
+    ON pgshard_catalog.database_shards;
+CREATE TRIGGER database_shards_protect_lifecycle
+BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.database_shards
+FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_database_shard_lifecycle();
+
+DROP TRIGGER IF EXISTS database_shard_placements_touch_catalog
+    ON pgshard_catalog.database_shard_placements;
+CREATE TRIGGER database_shard_placements_touch_catalog
+AFTER INSERT OR UPDATE OR DELETE ON pgshard_catalog.database_shard_placements
+FOR EACH STATEMENT EXECUTE FUNCTION pgshard_catalog.touch_catalog_state();
+
+DROP TRIGGER IF EXISTS database_shard_placements_lock_catalog
+    ON pgshard_catalog.database_shard_placements;
+CREATE TRIGGER database_shard_placements_lock_catalog
+BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.database_shard_placements
+FOR EACH STATEMENT EXECUTE FUNCTION pgshard_catalog.lock_catalog_state();
+
+DROP TRIGGER IF EXISTS database_shard_placements_protect_history
+    ON pgshard_catalog.database_shard_placements;
+CREATE TRIGGER database_shard_placements_protect_history
+BEFORE INSERT OR UPDATE OR DELETE ON pgshard_catalog.database_shard_placements
+FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_database_shard_placement();
 
 DROP TRIGGER IF EXISTS shard_restore_incarnations_touch_catalog
     ON pgshard_catalog.shard_restore_incarnations;
@@ -5146,5 +6210,16 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog REVOKE ALL ON TABLES FROM PUB
 ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog REVOKE ALL ON SEQUENCES FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES IN SCHEMA pgshard_catalog GRANT SELECT ON TABLES TO pgshard_catalog_reader;
+
+-- Trigger bodies are deliberately absent while an older physical-target
+-- catalog is converted. Publish the final epoch explicitly at commit; a replay
+-- notification at an unchanged epoch is harmless because readers de-duplicate
+-- monotonically.
+SELECT pg_catalog.pg_notify(
+           'pgshard_catalog_changed',
+           state.catalog_epoch::text
+       )
+  FROM pgshard_catalog.cluster_state AS state
+ WHERE state.singleton;
 
 COMMIT;

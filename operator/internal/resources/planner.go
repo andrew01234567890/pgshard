@@ -84,7 +84,7 @@ const (
 	databaseGenesisPath                     = "/etc/pgshard/postgresql/database-genesis.sql"
 	databaseTopologyPreflightKey            = "database-topology-preflight.sql"
 	databaseTopologyPreflightPath           = "/etc/pgshard/postgresql/database-topology-preflight.sql"
-	shardschemaMigrationSHA256              = "f64d410356193bbba44f2591f1af85d5ec563af1b367b675d2f6a289f4aa82de"
+	shardschemaMigrationSHA256              = "5c4d0fee9d069580ae90b6c71d78db5f160f6f01fa7fc5150f797693f88ff50a"
 	shardschemaMigrationHashAnnotation      = "pgshard.io/shardschema-migration-sha256"
 )
 
@@ -724,6 +724,7 @@ catalog_schema_fingerprint="$(
           JOIN pg_catalog.pg_namespace AS parent_namespaces
             ON parent_namespaces.oid = parents.relnamespace
          WHERE children.relnamespace = (SELECT oid FROM catalog_namespace)
+            OR parents.relnamespace = (SELECT oid FROM catalog_namespace)
         UNION ALL
         SELECT pg_catalog.format(
                    'column|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
@@ -957,7 +958,9 @@ case "$catalog_core_tables" in
       "2720fa78d0bc96c21311b1656eeaabbb3e745ea65fa9d1ea701ffb67cde1b1d9"|\
       "ceec4ff5d633d28afacf1e93fbc2547591017e57f172dc3a8072814bb6d3867a"|\
       "3189b8a08cf2dedb5542cdf1dd58dec2f173f848ae67612aa4263751c404ea7a"|\
-      "8bb87bb746ed463bf744b7b809477e9d36ad95d7cca06e25980085bba1ae4659") ;;
+      "8bb87bb746ed463bf744b7b809477e9d36ad95d7cca06e25980085bba1ae4659"|\
+      "2a20ec8e1bec9f660d6656484ebbebab0b694788e5f0bda657eb33816bf884a6"|\
+      "06d2271274d6dfdeda51aba8293056b6fb23f451f1806f3dcd41763c595ee1de") ;;
       *)
         echo "refusing an unsupported or malformed pre-existing shardschema catalog ($catalog_schema_fingerprint)" >&2
         exit 1
@@ -989,7 +992,9 @@ if [[ ! -f "$database_topology_preflight" || -L "$database_topology_preflight" ]
 fi
 if [[ "$catalog_core_tables" == "t|t|t" ]]; then
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
-    --set=ON_ERROR_STOP=1 --file="$database_topology_preflight" >/dev/null
+    --set=ON_ERROR_STOP=1 \
+    --set=PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY="$catalog_genesis_pending" \
+    --file="$database_topology_preflight" >/dev/null
 fi
 
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
@@ -1066,7 +1071,9 @@ fi
 validate_bootstrap_session_policy shardschema
 
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
-  --set=ON_ERROR_STOP=1 --file="$database_genesis" >/dev/null
+  --set=ON_ERROR_STOP=1 \
+  --set=PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY="$catalog_requires_initial_inventory" \
+  --file="$database_genesis" >/dev/null
 
 read_catalog_role_state() {
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
@@ -1618,100 +1625,151 @@ func renderDatabaseTopologyPreflightSQL(cluster *pgshardv1alpha1.PgShardCluster)
 		expectedRangeCount += len(database.ResolvedCells(cluster.Spec.Shards))
 	}
 	var output strings.Builder
+	writeMismatchQuery := func(placements bool) {
+		output.WriteString("SELECT EXISTS (\n")
+		output.WriteString("  WITH expected_databases(database_name, shard_numbers) AS (\n")
+		if len(databases) == 0 {
+			output.WriteString("    SELECT NULL::text, NULL::bigint[] WHERE false\n")
+		} else {
+			output.WriteString("    VALUES\n")
+			for index, database := range databases {
+				if index != 0 {
+					output.WriteString(",\n")
+				}
+				fmt.Fprintf(&output, "      (%s::text, ARRAY[", postgresqlStringLiteral(database.Name))
+				for ordinal, cell := range database.ResolvedCells(cluster.Spec.Shards) {
+					if ordinal != 0 {
+						output.WriteByte(',')
+					}
+					fmt.Fprintf(&output, "%d", cell)
+				}
+				output.WriteString("]::bigint[])")
+			}
+			output.WriteByte('\n')
+		}
+		output.WriteString("  ), expected_cells AS (\n")
+		output.WriteString("    SELECT databases.database_name, cells.ordinality::bigint AS range_ordinal, cells.shard_number\n")
+		output.WriteString("      FROM expected_databases AS databases\n")
+		output.WriteString("      CROSS JOIN LATERAL pg_catalog.unnest(databases.shard_numbers) WITH ORDINALITY AS cells(shard_number, ordinality)\n")
+		output.WriteString("  ), expected_ranges AS (\n")
+		output.WriteString("    SELECT database_name, range_ordinal,\n")
+		output.WriteString("           pg_catalog.floor(((range_ordinal - 1)::numeric * 18446744073709551616) / pg_catalog.count(*) OVER (PARTITION BY database_name)) AS range_start,\n")
+		output.WriteString("           pg_catalog.floor((range_ordinal::numeric * 18446744073709551616) / pg_catalog.count(*) OVER (PARTITION BY database_name)) AS range_end,\n")
+		output.WriteString("           shard_number\n")
+		output.WriteString("      FROM expected_cells\n")
+		output.WriteString("  ), actual_topology_state AS (\n")
+		output.WriteString("    SELECT NOT EXISTS (SELECT FROM ONLY pgshard_catalog.logical_databases)\n")
+		output.WriteString("       AND NOT EXISTS (SELECT FROM ONLY pgshard_catalog.routing_epochs)\n")
+		output.WriteString("       AND NOT EXISTS (SELECT FROM ONLY pgshard_catalog.routing_ranges)\n")
+		if placements {
+			output.WriteString("       AND NOT EXISTS (SELECT FROM ONLY pgshard_catalog.database_shards)\n")
+			output.WriteString("       AND NOT EXISTS (SELECT FROM ONLY pgshard_catalog.database_shard_placements)\n")
+		}
+		output.WriteString("           AS is_empty\n")
+		output.WriteString("  ), actual_databases AS MATERIALIZED (\n")
+		output.WriteString("    SELECT databases.logical_database_id, databases.database_name, databases.state\n")
+		output.WriteString("      FROM ONLY pgshard_catalog.logical_databases AS databases\n")
+		output.WriteString("     WHERE databases.state <> 'retired'\n")
+		fmt.Fprintf(&output, "     LIMIT %d\n", len(databases)+1)
+		output.WriteString("  ), active_epoch_counts AS (\n")
+		output.WriteString("    SELECT epochs.logical_database_id, pg_catalog.count(*) AS active_epoch_count\n")
+		output.WriteString("      FROM ONLY pgshard_catalog.routing_epochs AS epochs\n")
+		output.WriteString("      JOIN actual_databases AS databases USING (logical_database_id)\n")
+		output.WriteString("     WHERE epochs.state = 'active'\n")
+		output.WriteString("     GROUP BY epochs.logical_database_id\n")
+		output.WriteString("  ), actual_range_sample AS MATERIALIZED (\n")
+		output.WriteString("    SELECT databases.logical_database_id, databases.database_name::text AS database_name,\n")
+		output.WriteString("           ranges.range_start, ranges.range_end, shards.shard_number,\n")
+		output.WriteString("           databases.state AS database_state, epochs.state AS routing_state,\n")
+		output.WriteString("           epochs.logical_database_id = databases.logical_database_id AS routing_is_owned,\n")
+		if placements {
+			output.WriteString("           database_shards.shard_ordinal AS database_shard_ordinal, database_shards.state AS database_shard_state,\n")
+			output.WriteString("           placement_counts.active_placement_count,\n")
+		} else {
+			output.WriteString("           NULL::bigint AS database_shard_ordinal, 'active'::text AS database_shard_state,\n")
+			output.WriteString("           1::bigint AS active_placement_count,\n")
+		}
+		output.WriteString("           shards.state AS shard_state, COALESCE(active_counts.active_epoch_count, 0) AS active_epoch_count\n")
+		output.WriteString("      FROM actual_databases AS databases\n")
+		output.WriteString("      LEFT JOIN ONLY pgshard_catalog.active_routing_epochs AS active ON active.logical_database_id = databases.logical_database_id\n")
+		output.WriteString("      LEFT JOIN ONLY pgshard_catalog.routing_epochs AS epochs ON epochs.routing_epoch = active.routing_epoch\n")
+		if placements {
+			output.WriteString("      LEFT JOIN ONLY pgshard_catalog.routing_ranges AS ranges ON ranges.logical_database_id = databases.logical_database_id AND ranges.routing_epoch = active.routing_epoch\n")
+			output.WriteString("      LEFT JOIN ONLY pgshard_catalog.database_shards AS database_shards ON database_shards.logical_database_id = ranges.logical_database_id AND database_shards.database_shard_id = ranges.database_shard_id\n")
+			output.WriteString("      LEFT JOIN LATERAL (SELECT pg_catalog.count(*) AS active_placement_count FROM ONLY pgshard_catalog.database_shard_placements AS counted WHERE counted.logical_database_id = ranges.logical_database_id AND counted.database_shard_id = ranges.database_shard_id AND counted.state = 'active') AS placement_counts ON true\n")
+			output.WriteString("      LEFT JOIN ONLY pgshard_catalog.database_shard_placements AS placements ON placements.logical_database_id = ranges.logical_database_id AND placements.database_shard_id = ranges.database_shard_id AND placements.state = 'active'\n")
+			output.WriteString("      LEFT JOIN ONLY pgshard_catalog.shards AS shards ON shards.shard_id = placements.shard_id\n")
+		} else {
+			output.WriteString("      LEFT JOIN ONLY pgshard_catalog.routing_ranges AS ranges ON ranges.routing_epoch = active.routing_epoch\n")
+			output.WriteString("      LEFT JOIN ONLY pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id\n")
+		}
+		output.WriteString("      LEFT JOIN active_epoch_counts AS active_counts ON active_counts.logical_database_id = databases.logical_database_id\n")
+		fmt.Fprintf(&output, "     LIMIT %d\n", expectedRangeCount+1)
+		output.WriteString("  ), actual_ranges AS (\n")
+		output.WriteString("    SELECT sample.database_name,\n")
+		output.WriteString("           pg_catalog.row_number() OVER (PARTITION BY sample.logical_database_id ORDER BY sample.range_start, sample.range_end)::bigint AS range_ordinal,\n")
+		output.WriteString("           sample.range_start, sample.range_end, sample.shard_number, sample.database_state,\n")
+		output.WriteString("           sample.routing_state, sample.routing_is_owned, sample.database_shard_ordinal,\n")
+		output.WriteString("           sample.database_shard_state,\n")
+		output.WriteString("           sample.active_placement_count, sample.shard_state, sample.active_epoch_count\n")
+		output.WriteString("      FROM actual_range_sample AS sample\n")
+		output.WriteString("  ), mismatch AS (\n")
+		output.WriteString("    SELECT 1 WHERE (SELECT pg_catalog.count(*) FROM actual_databases) > ")
+		fmt.Fprintf(&output, "%d\n", len(databases))
+		output.WriteString("    UNION ALL\n")
+		output.WriteString("    SELECT 1 WHERE (SELECT pg_catalog.count(*) FROM actual_range_sample) > ")
+		fmt.Fprintf(&output, "%d\n", expectedRangeCount)
+		output.WriteString("    UNION ALL\n")
+		output.WriteString("    SELECT 1 WHERE NOT EXISTS (SELECT FROM expected_databases)\n")
+		output.WriteString("                   AND NOT (SELECT is_empty FROM actual_topology_state)\n")
+		output.WriteString("    UNION ALL\n")
+		output.WriteString("    SELECT 1\n")
+		output.WriteString("      FROM expected_ranges\n")
+		output.WriteString("      FULL JOIN actual_ranges USING (database_name, range_ordinal)\n")
+		output.WriteString("     WHERE (NOT pg_catalog.current_setting('pgshard.bootstrap_allow_empty_database_topology')::boolean\n")
+		output.WriteString("            OR NOT (SELECT is_empty FROM actual_topology_state))\n")
+		output.WriteString("       AND (expected_ranges.range_start IS DISTINCT FROM actual_ranges.range_start\n")
+		output.WriteString("         OR expected_ranges.range_end IS DISTINCT FROM actual_ranges.range_end\n")
+		output.WriteString("         OR expected_ranges.shard_number IS DISTINCT FROM actual_ranges.shard_number\n")
+		output.WriteString("         OR actual_ranges.database_state IS DISTINCT FROM 'active'\n")
+		output.WriteString("         OR actual_ranges.routing_state IS DISTINCT FROM 'active'\n")
+		output.WriteString("         OR actual_ranges.routing_is_owned IS DISTINCT FROM true\n")
+		if placements {
+			output.WriteString("         OR actual_ranges.database_shard_ordinal IS DISTINCT FROM expected_ranges.range_ordinal - 1\n")
+		}
+		output.WriteString("         OR actual_ranges.database_shard_state IS DISTINCT FROM 'active'\n")
+		output.WriteString("         OR actual_ranges.active_placement_count IS DISTINCT FROM 1\n")
+		output.WriteString("         OR actual_ranges.shard_state IS DISTINCT FROM 'active'\n")
+		output.WriteString("         OR actual_ranges.active_epoch_count IS DISTINCT FROM 1)\n")
+		output.WriteString("    UNION ALL\n")
+		output.WriteString("    SELECT 1\n")
+		output.WriteString("      FROM expected_databases\n")
+		output.WriteString("      JOIN ONLY pgshard_catalog.logical_databases AS databases ON databases.database_name::text = expected_databases.database_name\n")
+		output.WriteString("     WHERE databases.state = 'retired'\n")
+		output.WriteString("  )\n")
+		output.WriteString("  SELECT FROM mismatch\n")
+		output.WriteString(")")
+	}
+
 	output.WriteString("-- Generated by pgshard-operator. Manual edits are overwritten.\n")
-	output.WriteString("DO $pgshard_database_topology_preflight$\nBEGIN\n")
+	output.WriteString("\\if :{?PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY}\n")
+	output.WriteString("\\else\n\\set PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY false\n\\endif\n")
+	output.WriteString("SELECT pg_catalog.set_config('pgshard.bootstrap_allow_empty_database_topology', :'PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY', false);\n")
+	output.WriteString("DO $pgshard_database_topology_preflight$\nDECLARE\n  topology_mismatch boolean;\nBEGIN\n")
 	output.WriteString("  PERFORM state.catalog_epoch FROM pgshard_catalog.cluster_state AS state WHERE state.singleton FOR UPDATE;\n")
 	output.WriteString("  IF NOT FOUND THEN\n")
 	output.WriteString("    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'shardschema cluster state singleton is missing';\n")
 	output.WriteString("  END IF;\n")
-	output.WriteString("  IF EXISTS (\n")
-	output.WriteString("    WITH expected_databases(database_name, shard_numbers) AS (\n")
-	if len(databases) == 0 {
-		output.WriteString("      SELECT NULL::text, NULL::bigint[] WHERE false\n")
-	} else {
-		output.WriteString("      VALUES\n")
-		for index, database := range databases {
-			if index != 0 {
-				output.WriteString(",\n")
-			}
-			fmt.Fprintf(&output, "        (%s::text, ARRAY[", postgresqlStringLiteral(database.Name))
-			for ordinal, cell := range database.ResolvedCells(cluster.Spec.Shards) {
-				if ordinal != 0 {
-					output.WriteByte(',')
-				}
-				fmt.Fprintf(&output, "%d", cell)
-			}
-			output.WriteString("]::bigint[])")
-		}
-		output.WriteByte('\n')
-	}
-	output.WriteString("    ), expected_cells AS (\n")
-	output.WriteString("      SELECT databases.database_name, cells.ordinality::bigint AS range_ordinal, cells.shard_number\n")
-	output.WriteString("        FROM expected_databases AS databases\n")
-	output.WriteString("        CROSS JOIN LATERAL pg_catalog.unnest(databases.shard_numbers) WITH ORDINALITY AS cells(shard_number, ordinality)\n")
-	output.WriteString("    ), expected_ranges AS (\n")
-	output.WriteString("      SELECT database_name, range_ordinal,\n")
-	output.WriteString("             pg_catalog.floor(((range_ordinal - 1)::numeric * 18446744073709551616) / pg_catalog.count(*) OVER (PARTITION BY database_name)) AS range_start,\n")
-	output.WriteString("             pg_catalog.floor((range_ordinal::numeric * 18446744073709551616) / pg_catalog.count(*) OVER (PARTITION BY database_name)) AS range_end,\n")
-	output.WriteString("             shard_number\n")
-	output.WriteString("        FROM expected_cells\n")
-	output.WriteString("    ), actual_databases AS MATERIALIZED (\n")
-	output.WriteString("      SELECT databases.logical_database_id, databases.database_name, databases.state\n")
-	output.WriteString("        FROM pgshard_catalog.logical_databases AS databases\n")
-	output.WriteString("       WHERE databases.state <> 'retired'\n")
-	fmt.Fprintf(&output, "       LIMIT %d\n", len(databases)+1)
-	output.WriteString("    ), active_epoch_counts AS (\n")
-	output.WriteString("      SELECT epochs.logical_database_id, pg_catalog.count(*) AS active_epoch_count\n")
-	output.WriteString("        FROM pgshard_catalog.routing_epochs AS epochs\n")
-	output.WriteString("        JOIN actual_databases AS databases USING (logical_database_id)\n")
-	output.WriteString("       WHERE epochs.state = 'active'\n")
-	output.WriteString("       GROUP BY epochs.logical_database_id\n")
-	output.WriteString("    ), actual_range_sample AS MATERIALIZED (\n")
-	output.WriteString("      SELECT databases.logical_database_id, databases.database_name::text AS database_name,\n")
-	output.WriteString("             ranges.range_start, ranges.range_end, shards.shard_number,\n")
-	output.WriteString("             databases.state AS database_state, epochs.state AS routing_state,\n")
-	output.WriteString("             epochs.logical_database_id = databases.logical_database_id AS routing_is_owned,\n")
-	output.WriteString("             shards.state AS shard_state, COALESCE(active_counts.active_epoch_count, 0) AS active_epoch_count\n")
-	output.WriteString("        FROM actual_databases AS databases\n")
-	output.WriteString("        LEFT JOIN pgshard_catalog.active_routing_epochs AS active ON active.logical_database_id = databases.logical_database_id\n")
-	output.WriteString("        LEFT JOIN pgshard_catalog.routing_epochs AS epochs ON epochs.routing_epoch = active.routing_epoch\n")
-	output.WriteString("        LEFT JOIN pgshard_catalog.routing_ranges AS ranges ON ranges.routing_epoch = active.routing_epoch\n")
-	output.WriteString("        LEFT JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id\n")
-	output.WriteString("        LEFT JOIN active_epoch_counts AS active_counts ON active_counts.logical_database_id = databases.logical_database_id\n")
-	fmt.Fprintf(&output, "       LIMIT %d\n", expectedRangeCount+1)
-	output.WriteString("    ), actual_ranges AS (\n")
-	output.WriteString("      SELECT sample.database_name,\n")
-	output.WriteString("             pg_catalog.row_number() OVER (PARTITION BY sample.logical_database_id ORDER BY sample.range_start, sample.range_end)::bigint AS range_ordinal,\n")
-	output.WriteString("             sample.range_start, sample.range_end, sample.shard_number, sample.database_state,\n")
-	output.WriteString("             sample.routing_state, sample.routing_is_owned, sample.shard_state, sample.active_epoch_count\n")
-	output.WriteString("        FROM actual_range_sample AS sample\n")
-	output.WriteString("    ), mismatch AS (\n")
-	output.WriteString("      SELECT 1 WHERE (SELECT pg_catalog.count(*) FROM actual_databases) > ")
-	fmt.Fprintf(&output, "%d\n", len(databases))
-	output.WriteString("      UNION ALL\n")
-	output.WriteString("      SELECT 1 WHERE (SELECT pg_catalog.count(*) FROM actual_range_sample) > ")
-	fmt.Fprintf(&output, "%d\n", expectedRangeCount)
-	output.WriteString("      UNION ALL\n")
-	output.WriteString("      SELECT 1\n")
-	output.WriteString("        FROM expected_ranges\n")
-	output.WriteString("        FULL JOIN actual_ranges USING (database_name, range_ordinal)\n")
-	output.WriteString("       WHERE EXISTS (SELECT FROM actual_ranges)\n")
-	output.WriteString("         AND (expected_ranges.range_start IS DISTINCT FROM actual_ranges.range_start\n")
-	output.WriteString("           OR expected_ranges.range_end IS DISTINCT FROM actual_ranges.range_end\n")
-	output.WriteString("           OR expected_ranges.shard_number IS DISTINCT FROM actual_ranges.shard_number\n")
-	output.WriteString("           OR actual_ranges.database_state IS DISTINCT FROM 'active'\n")
-	output.WriteString("           OR actual_ranges.routing_state IS DISTINCT FROM 'active'\n")
-	output.WriteString("           OR actual_ranges.routing_is_owned IS DISTINCT FROM true\n")
-	output.WriteString("           OR actual_ranges.shard_state IS DISTINCT FROM 'active'\n")
-	output.WriteString("           OR actual_ranges.active_epoch_count IS DISTINCT FROM 1)\n")
-	output.WriteString("      UNION ALL\n")
-	output.WriteString("      SELECT 1\n")
-	output.WriteString("        FROM expected_databases\n")
-	output.WriteString("        JOIN pgshard_catalog.logical_databases AS databases ON databases.database_name::text = expected_databases.database_name\n")
-	output.WriteString("       WHERE databases.state = 'retired'\n")
-	output.WriteString("    )\n")
-	output.WriteString("    SELECT FROM mismatch\n")
-	output.WriteString("  ) THEN\n")
+	output.WriteString("  IF EXISTS (SELECT FROM pg_catalog.pg_attribute AS attributes WHERE attributes.attrelid = 'pgshard_catalog.routing_ranges'::pg_catalog.regclass AND attributes.attname = 'shard_id' AND attributes.attnum > 0 AND NOT attributes.attisdropped) THEN\n")
+	output.WriteString("    EXECUTE $pgshard_legacy_topology$")
+	writeMismatchQuery(false)
+	output.WriteString("$pgshard_legacy_topology$ INTO topology_mismatch;\n")
+	output.WriteString("  ELSE\n")
+	output.WriteString("    EXECUTE $pgshard_placement_topology$")
+	writeMismatchQuery(true)
+	output.WriteString("$pgshard_placement_topology$ INTO topology_mismatch;\n")
+	output.WriteString("  END IF;\n")
+	output.WriteString("  IF topology_mismatch THEN\n")
 	output.WriteString("    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'RestoreTopologyMismatch: shardschema logical database topology conflicts with configured immutable database genesis';\n")
 	output.WriteString("  END IF;\nEND\n$pgshard_database_topology_preflight$;\n")
 	return output.String()

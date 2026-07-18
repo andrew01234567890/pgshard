@@ -7,12 +7,13 @@ description: Independent per-database shard maps with shared or isolated Postgre
 
 :::info Milestone 1 design contract
 The foundation API now accepts immutable per-database genesis shard counts and
-exact cell ordinals, then installs their initial equal hash ranges atomically in
-`shardschema`. It does not yet create physical application databases, reserve
-cells, route SQL, or implement the `PgShardDatabase`, placement scheduler,
-database move, restore, or resharding runtimes described below. The operator
-still provisions one cluster-wide set of single-member PostgreSQL cells; see
-[implementation status](../project/status.md).
+exact cell ordinals, then atomically allocates permanent database-shard UUIDs,
+generation-one physical placements, and their initial equal hash ranges in
+`shardschema`. It does not yet create physical application databases, route
+SQL, or implement the `PgShardDatabase`, placement scheduler, database move,
+restore, or resharding runtimes described below. The operator still provisions
+one cluster-wide set of single-member PostgreSQL cells; see [implementation
+status](../project/status.md).
 :::
 
 Milestone 1 treats a `PgShardCluster` as one routing and control-plane fleet,
@@ -22,14 +23,15 @@ of physical PostgreSQL cells. A cell is one PostgreSQL HA group with its own
 volumes, primary, standbys, pgBackRest stanza, and failure identity; it is not
 the same thing as a Kubernetes Node.
 
-The target catalog separates these identities:
+The catalog separates these identities:
 
 - A logical database has a stable UUID, user-facing name, topology generation,
   hash algorithm/version and seed.
-- A database shard has a stable identity scoped by its logical-database UUID
-  and owns one range in that database's active routing epoch. The same
-  human-readable shard identifier may therefore exist in both `A` and `B`.
-- A placement maps a database shard to a physical PostgreSQL cell.
+- A database shard has a globally unique permanent UUID, an immutable ordinal
+  scoped by its logical-database UUID, and owns one or more ranges in that
+  database's active routing epoch.
+- A generationed placement maps a database shard to a physical PostgreSQL cell
+  without changing the database-shard UUID or rewriting routing history.
 - A physical cell can host shards from multiple logical databases, or it can
   be reserved for one database.
 
@@ -84,11 +86,18 @@ ConfigMap is bounded too: S3 bucket names are limited to 255 bytes, regions to
 database are reserved and cannot be declared as application databases.
 
 On `cell-0000`, bootstrap installs every declaration in one PostgreSQL
-transaction. A replay of the identical declarations is a no-op. A changed
-placement, an unavailable cell, or an undeclared non-retired catalog database
-aborts the whole transaction. This is catalog topology only: the three entries
-above do not yet create application databases or make the pooler a shard-aware
-router.
+transaction, including fresh database-shard UUIDs and generation-one active
+placements. A replay of the identical declarations preserves those identities
+and is a no-op. A changed placement, an unavailable cell, or an undeclared
+non-retired catalog database aborts the whole transaction. This is catalog
+topology only: the three entries above do not yet create application databases
+or make the pooler a shard-aware router.
+Validated cache routes carry the permanent database-shard UUID, active placement
+generation, and physical target. All three contribute to the snapshot checksum,
+so even a same-target generation change produces a distinct execution identity.
+Only genesis may create an active placement. Staged placement identities are
+permanent, and direct staged-to-active or active-to-superseded updates are
+rejected until an atomic target-fenced cutover API exists.
 
 ## Placement policies
 
