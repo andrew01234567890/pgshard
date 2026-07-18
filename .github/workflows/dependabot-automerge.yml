@@ -19,7 +19,8 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.actor.login == 'dependabot[bot]'
     concurrency:
-      group: pgshard-dependabot-automerge
+      group: pgshard-dependabot-automerge-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
       actions: write

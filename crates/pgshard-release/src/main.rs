@@ -1482,7 +1482,10 @@ mod tests {
         assert!(workflow.contains("workflows: [CI, CodeQL]"));
         assert!(!workflow.contains("github.event.workflow_run.name"));
         assert!(workflow.contains("github.event.workflow_run.actor.login == 'dependabot[bot]'"));
-        assert!(workflow.contains("group: pgshard-dependabot-automerge"));
+        assert!(workflow.contains(
+            "group: pgshard-dependabot-automerge-${{ github.event.workflow_run.head_sha }}"
+        ));
+        assert!(workflow.contains("cancel-in-progress: false"));
         assert!(!workflow.contains("queue: max"));
 
         let ci = include_str!("../../../.github/workflows/ci.yml");
