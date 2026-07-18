@@ -65,8 +65,9 @@ transition term. Before creating a postmaster, the agent first matches the
 operator's canonical `.pgshard-bootstrap-complete` cluster-and-cell identity.
 It then publishes `.pgshard-writable-generation` through a fixed `.next`
 record, file flush, atomic rename, and PGDATA directory flush. An interrupted
-staging record is validated and removed under the exclusive PGDATA lock. Exact
-replay completes the same durability barrier, and a higher requested term can
+staging file has its ownership, mode, mount, size, and inode identity validated
+before it is discarded under the exclusive PGDATA lock. Exact replay completes
+the same durability barrier, and a higher requested term can
 replace a lower durable term. A durable higher term, foreign Lease universe,
 malformed record, or same term with a different holder blocks startup. The
 agent samples the attempt-private authority and shutdown state again after the

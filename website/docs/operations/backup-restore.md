@@ -190,15 +190,19 @@ well-defined logical import boundary.
 
 A physical backup may carry the source cell's
 `.pgshard-bootstrap-complete` and `.pgshard-writable-generation` files. Those
-files are never destination authority. After signed-manifest and exact-topology
-preflight, the future restore materializer must assign the fresh destination
-cell and Lease identities, retain source identity only as catalog provenance,
-and publish destination bootstrap state before its first writable attempt. The
-destination agent then creates its generation record from the destination's
-live Lease term. Until that explicit rebind workflow exists, a copied source
-marker is foreign state and the quarantine agent fails closed before creating a
-postmaster. Deleting or editing the source marker outside the restore journal is
-not a supported shortcut.
+files are never sufficient destination authority. After signed-manifest and
+exact-topology preflight, the future restore materializer must assign the fresh
+destination cell and Lease identities, retain source identity only as catalog
+provenance, and publish destination bootstrap state before its first writable
+attempt. The destination agent then creates its generation record from the
+destination's live Lease term. Until that explicit rebind workflow exists, a
+copied marker whose destination identities differ is foreign state and the
+quarantine agent fails closed before creating a postmaster. A same-identity
+snapshot rollback can instead present a lower but otherwise valid generation;
+this local floor does not make that operation safe. In-place rollback therefore
+remains unsupported until an external restore-incarnation fence rejects the old
+coordination history. Deleting or editing a source marker outside the restore
+journal is not a supported shortcut.
 
 ### Exact-topology preflight
 

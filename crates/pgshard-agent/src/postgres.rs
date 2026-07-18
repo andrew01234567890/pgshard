@@ -91,6 +91,62 @@ fn observe_next_test_exec_handoff(observer: std::sync::mpsc::SyncSender<()>) {
     });
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationPublicationCheckpoint {
+    StagingFileSynced,
+    GenerationRenamed,
+    DirectorySyncPending,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_GENERATION_PUBLICATION_FAULT:
+        std::cell::Cell<Option<GenerationPublicationCheckpoint>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct GenerationPublicationFaultGuard;
+
+#[cfg(test)]
+impl Drop for GenerationPublicationFaultGuard {
+    fn drop(&mut self) {
+        TEST_GENERATION_PUBLICATION_FAULT.with(|fault| fault.set(None));
+    }
+}
+
+#[cfg(test)]
+fn inject_generation_publication_fault(
+    checkpoint: GenerationPublicationCheckpoint,
+) -> GenerationPublicationFaultGuard {
+    TEST_GENERATION_PUBLICATION_FAULT.with(|fault| {
+        assert!(
+            fault.replace(Some(checkpoint)).is_none(),
+            "test thread already has a generation-publication fault"
+        );
+    });
+    GenerationPublicationFaultGuard
+}
+
+#[cfg(test)]
+fn generation_publication_checkpoint(
+    checkpoint: GenerationPublicationCheckpoint,
+) -> Result<(), PostgresError> {
+    let injected = TEST_GENERATION_PUBLICATION_FAULT.with(|fault| {
+        if fault.get() == Some(checkpoint) {
+            fault.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        Err(PostgresError::InjectedGenerationPublicationFault)
+    } else {
+        Ok(())
+    }
+}
+
 /// Configuration for an opt-in postmaster that is isolated from network clients.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostgresConfig {
@@ -745,6 +801,11 @@ impl PreparedPostgres {
         generation: &DurableWritableGeneration,
     ) -> Result<(), PostgresError> {
         self.supervisor_lock.validate_identity()?;
+        let generation_path = self.config.data_dir.join(DURABLE_WRITABLE_GENERATION_FILE);
+        let contents = generation.canonical_bytes();
+        if DurableWritableGeneration::parse_canonical(&contents).as_ref() != Some(generation) {
+            return Err(PostgresError::InvalidRequestedWritableGeneration);
+        }
         let (bootstrap_path, bootstrap) = self.validate_writable_bootstrap(generation)?;
         let staging_path = self
             .config
@@ -752,7 +813,6 @@ impl PreparedPostgres {
             .join(DURABLE_WRITABLE_GENERATION_STAGING_FILE);
         self.remove_interrupted_generation_staging(&staging_path)?;
 
-        let generation_path = self.config.data_dir.join(DURABLE_WRITABLE_GENERATION_FILE);
         let existing = self.read_generation_file(&generation_path)?;
         let existing_snapshot = existing.as_ref().map(|file| file.snapshot);
         if let Some(existing) = existing.as_ref()
@@ -767,8 +827,9 @@ impl PreparedPostgres {
         }
         drop(existing);
 
-        let contents = generation.canonical_bytes();
         let staging = self.create_generation_staging(&staging_path, &contents)?;
+        #[cfg(test)]
+        generation_publication_checkpoint(GenerationPublicationCheckpoint::StagingFileSynced)?;
         self.publish_generation_staging(
             &staging_path,
             &generation_path,
@@ -965,6 +1026,8 @@ impl PreparedPostgres {
                 source,
             }
         })?;
+        #[cfg(test)]
+        generation_publication_checkpoint(GenerationPublicationCheckpoint::GenerationRenamed)?;
         let installed = self
             .read_generation_file(generation_path)?
             .ok_or(PostgresError::PreparedStateChanged)?;
@@ -991,6 +1054,8 @@ impl PreparedPostgres {
         {
             return Err(PostgresError::PreparedStateChanged);
         }
+        #[cfg(test)]
+        generation_publication_checkpoint(GenerationPublicationCheckpoint::DirectorySyncPending)?;
         self.sync_generation_directory("publish generation")?;
         revalidate_managed_generation_file(
             "durable writable-generation file",
@@ -3512,6 +3577,13 @@ pub enum PostgresError {
     /// Attempt-private authority changed while its durable generation was flushed.
     #[error("PostgreSQL startup authority changed during durable generation publication")]
     StartupAuthorityChanged,
+    /// Internal authority data was not representable in the canonical durable format.
+    #[error("PostgreSQL startup authority contains an invalid writable generation")]
+    InvalidRequestedWritableGeneration,
+    /// Unit-test fault at one crash-consistency publication boundary.
+    #[cfg(test)]
+    #[error("injected durable writable-generation publication fault")]
+    InjectedGenerationPublicationFault,
     /// Writable supervision requires the operator's exact durable PGDATA identity.
     #[error("PostgreSQL bootstrap identity is missing at {path:?}")]
     BootstrapIdentityMissing {
@@ -4975,6 +5047,12 @@ mod tests {
         let staging_path = data_dir.join(DURABLE_WRITABLE_GENERATION_STAGING_FILE);
         let first = writable_generation(1, TEST_WRITABLE_HOLDER, TEST_WRITABLE_LEASE_UID);
 
+        assert!(matches!(
+            prepared.persist_durable_writable_generation(&DurableWritableGeneration::for_test(0)),
+            Err(PostgresError::InvalidRequestedWritableGeneration)
+        ));
+        assert!(!generation_path.exists());
+
         prepared
             .persist_durable_writable_generation(&first)
             .expect("persist first generation");
@@ -5039,6 +5117,121 @@ mod tests {
             )),
             Err(PostgresError::InvalidWritableGeneration { path }) if path == generation_path
         ));
+    }
+
+    #[tokio::test]
+    async fn publication_faults_block_spawn_and_recover_at_every_durable_boundary() {
+        for checkpoint in [
+            GenerationPublicationCheckpoint::StagingFileSynced,
+            GenerationPublicationCheckpoint::GenerationRenamed,
+            GenerationPublicationCheckpoint::DirectorySyncPending,
+        ] {
+            assert_publication_fault_blocks_and_recovers(checkpoint).await;
+        }
+    }
+
+    async fn assert_publication_fault_blocks_and_recovers(
+        checkpoint: GenerationPublicationCheckpoint,
+    ) {
+        let root = TempDir::new().expect("create publication-fault fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let marker = root.path().join("postmaster-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n: > '{}'\ntrap '' TERM INT\nwhile :; do sleep 1; done\n",
+                marker.display()
+            ),
+        );
+        let config = test_config(data_dir.clone(), executable, root.path().join("socket"));
+        let previous = writable_generation(1, TEST_WRITABLE_HOLDER, TEST_WRITABLE_LEASE_UID);
+        let generation = writable_generation(
+            2,
+            "cluster-1-shard-0-1/bbbbbbbb-cccc-dddd-eeee-ffffffffffff/89abcdef0123456789abcdef",
+            TEST_WRITABLE_LEASE_UID,
+        );
+        let state = state_with_writable_lease(2);
+        let prepared = prepare_fixture(config.clone()).expect("prepare publication-fault fixture");
+        prepared
+            .persist_durable_writable_generation(&previous)
+            .expect("persist prior durable generation");
+        let fault = inject_generation_publication_fault(checkpoint);
+        let failed = prepared
+            .spawn_tracked_postmaster(&state, &|| {
+                PostgresStartDecision::StartWritable(generation.clone())
+            })
+            .await;
+        drop(fault);
+
+        assert!(matches!(
+            failed,
+            Err(PostgresError::InjectedGenerationPublicationFault)
+        ));
+        assert!(!marker.exists(), "postmaster started before {checkpoint:?}");
+        assert!(state.snapshot().lease.is_none());
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+        assert_interrupted_publication(&data_dir, checkpoint, &previous, &generation);
+
+        let recovered_state = state_with_writable_lease(2);
+        let recovered = prepare_fixture(config.clone()).expect("prepare publication recovery");
+        let Some((mut process_fence, pidfd, process_group)) = recovered
+            .spawn_tracked_postmaster(&recovered_state, &|| {
+                PostgresStartDecision::StartWritable(generation.clone())
+            })
+            .await
+            .expect("complete publication barrier before retry spawn")
+        else {
+            panic!("recovered publication did not create a postmaster");
+        };
+        wait_for_marker(&marker).await;
+        let generation_path = data_dir.join(DURABLE_WRITABLE_GENERATION_FILE);
+        let staging_path = data_dir.join(DURABLE_WRITABLE_GENERATION_STAGING_FILE);
+        assert_eq!(
+            fs::read(generation_path).expect("read recovered generation"),
+            generation.canonical_bytes()
+        );
+        assert!(!staging_path.exists());
+        target_fence_child(
+            &mut process_fence.child,
+            &pidfd,
+            process_group,
+            &process_fence.child_subreaper,
+            &config,
+        )
+        .await
+        .expect("fence recovered publication fixture");
+        process_fence.disarm_if_reaped();
+    }
+
+    fn assert_interrupted_publication(
+        data_dir: &Path,
+        checkpoint: GenerationPublicationCheckpoint,
+        previous: &DurableWritableGeneration,
+        requested: &DurableWritableGeneration,
+    ) {
+        let generation_path = data_dir.join(DURABLE_WRITABLE_GENERATION_FILE);
+        let staging_path = data_dir.join(DURABLE_WRITABLE_GENERATION_STAGING_FILE);
+        if checkpoint == GenerationPublicationCheckpoint::StagingFileSynced {
+            assert_eq!(
+                fs::read(generation_path).expect("read prior generation"),
+                previous.canonical_bytes()
+            );
+            assert_eq!(
+                fs::read(staging_path).expect("read staged generation"),
+                requested.canonical_bytes()
+            );
+        } else {
+            assert_eq!(
+                fs::read(generation_path).expect("read requested generation"),
+                requested.canonical_bytes()
+            );
+            assert!(!staging_path.exists());
+        }
     }
 
     #[test]
@@ -5950,6 +6143,21 @@ mod tests {
             holder.to_owned(),
             term,
         )
+    }
+
+    fn state_with_writable_lease(term: u64) -> AgentState {
+        let state = agent_state();
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "cluster-1-shard-0-0".to_owned(),
+                    epoch: term,
+                    valid_until_unix_ms: 6_000,
+                },
+                1_000,
+            )
+            .expect("install writable fixture Lease");
+        state
     }
 
     fn write_executable(path: &Path, contents: &str) {
