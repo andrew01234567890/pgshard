@@ -50,17 +50,23 @@ reusing the old fencing term. A candidate times an unchanged foreign record
 locally for a full Lease duration instead of comparing the holder's clock. A
 successful response is anchored to the monotonic instant before the request was
 dispatched, so API latency consumes authority and wall-clock jumps cannot extend
-it. With writable coordination enabled, every agent shutdown clears local term
-evidence and immediately enters the PostgreSQL process-tree fence, skipping the
-smart and fast waits. An absolute monotonic renewal cutoff stops awaiting an
-in-flight Kubernetes API request rather than letting response latency consume
-the fencing margin. The write might already have committed; resource-version
-CAS prevents a later stale overwrite, and a candidate restarts the full
-unchanged-record observation window from the changed Lease. Startup rejects a
-Lease/shutdown combination unless the post-renewal margin strictly exceeds the
-configured immediate-stop and normal cleanup budget. The operator does not yet
-project the cell identity or inject the Lease UID and agent runtime into
-PostgreSQL Pods. The supervisor remains
+it. A configured standalone postmaster waits until the exact term remains valid
+beyond the complete fencing margin. Shutdown before acquisition leaves no
+PostgreSQL process, and the supervisor checks the monotonic margin again at the
+final user-space boundary while also rejecting an observed shutdown. A stale
+notification or pause during validation cannot authorize startup, and a
+shutdown already observable at that boundary leaves PostgreSQL absent. With
+writable coordination enabled,
+every agent shutdown clears local term evidence and immediately enters the
+PostgreSQL process-tree fence, skipping the smart and fast waits. An absolute
+monotonic renewal cutoff stops awaiting an in-flight Kubernetes API request
+rather than letting response latency consume the fencing margin. The write
+might already have committed; resource-version CAS prevents a later stale
+overwrite, and a candidate restarts the full unchanged-record observation
+window from the changed Lease. Startup rejects a Lease/shutdown combination
+unless the post-renewal margin strictly exceeds the configured immediate-stop
+and normal cleanup budget. The operator does not yet project the cell identity
+or inject the Lease UID and agent runtime into PostgreSQL Pods. The supervisor remains
 TCP-quarantined; promotion proof, durable generation enforcement, serving
 activation, bounded token projection, and release-after-durable-stop remain
 absent, so this is not yet a serving-primary fence or an HA claim.

@@ -35,9 +35,14 @@ and can be abandoned on shutdown before process creation. Shutdown signal
 phases are bounded, but final process-tree cleanup deliberately holds the
 PGDATA fence without a time bound when the kernel cannot prove termination.
 When the standalone agent is configured with writable-term Lease authority,
-every stop clears local authority and enters immediate process-tree fencing;
-startup rejects a Lease margin that cannot cover the configured fence budget.
-The operator does not mount or run this path in PostgreSQL Pods yet.
+it does not create the postmaster until the exact locally installed term remains
+valid beyond the complete fencing margin. The supervisor checks that margin
+again and rejects an observed shutdown immediately before process creation.
+Shutdown before acquisition or at that final handoff leaves PostgreSQL absent;
+every stop after creation clears local authority and enters immediate
+process-tree fencing. Startup also rejects a Lease margin that cannot cover the
+configured fence budget. The operator does not mount or run this path in
+PostgreSQL Pods yet.
 
 Build the five standard archives from the repository root:
 
