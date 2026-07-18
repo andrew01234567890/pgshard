@@ -675,11 +675,30 @@ jobs:
           PGSHARD_POSTGRES_BOOTSTRAP_IMAGE: pgshard/postgres-agent:dev
         run: |
           go test -race -count=1 -timeout=30m \
-            -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|RestoreTopologyMismatchIsRejectedBeforeMutation|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC)$' \
+            -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|RestoreTopologyMismatchIsRejectedBeforeMutation|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerRejectsPostgreSQLRuntimeChange|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC)$' \
             ./internal/controller
           go test -race -count=1 -timeout=10m \
             -run '^TestPostgreSQLBootstrapDockerRecoveryAndConflict$' \
             ./internal/resources
+      - name: Select the non-serving agent quarantine composition
+        run: |
+          kubectl patch \
+            --namespace pgshard-system \
+            deployment/pgshard-controller-manager \
+            --type=json \
+            --patch='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--postgresql-runtime=agent-quarantine"}]'
+          kubectl rollout status \
+            --namespace pgshard-system \
+            deployment/pgshard-controller-manager \
+            --timeout=180s
+      - name: Verify exact Lease and target-fencing composition
+        working-directory: operator
+        env:
+          PGSHARD_KIND_MANAGER_E2E: "true"
+        run: >-
+          go test -race -count=1 -timeout=10m
+          -run '^TestKINDManagerRunsAgentQuarantine$'
+          ./internal/controller
       - name: Capture manager diagnostics
         if: failure()
         run: |

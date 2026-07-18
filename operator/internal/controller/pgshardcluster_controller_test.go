@@ -443,6 +443,86 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	}
 }
 
+func TestPostgreSQLRuntimeChangeIsRejectedBeforeOnDeleteMutation(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name          string
+		staleTemplate bool
+		wantObject    string
+	}{
+		{name: "existing direct StatefulSet", wantObject: "StatefulSet"},
+		{name: "agent template over live direct Pod", staleTemplate: true, wantObject: "Pod"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			base := newFakeClient(t, cluster)
+			reconciler := developmentReconciler(base, base)
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
+			}
+
+			statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
+			statefulSet := &appsv1.StatefulSet{}
+			if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
+				t.Fatal(err)
+			}
+			originalTemplate := statefulSet.Spec.Template.DeepCopy()
+			pod := &corev1.Pod{ObjectMeta: *originalTemplate.ObjectMeta.DeepCopy(), Spec: *originalTemplate.Spec.DeepCopy()}
+			pod.Name = statefulSet.Name + "-0"
+			pod.Namespace = cluster.Namespace
+			pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))}
+			if err := base.Create(ctx, pod); err != nil {
+				t.Fatal(err)
+			}
+
+			agentImages := owned.DevelopmentImages()
+			agentImages.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+			if test.staleTemplate {
+				currentCluster := getCluster(t, ctx, base, cluster)
+				plan, err := owned.Plan(currentCluster, agentImages)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, planned := range plan {
+					desired, ok := planned.(*appsv1.StatefulSet)
+					if !ok || desired.Name != statefulSet.Name {
+						continue
+					}
+					statefulSet.Spec.Template = *desired.Spec.Template.DeepCopy()
+				}
+				if err := base.Update(ctx, statefulSet); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			reconciler.Images = agentImages
+			_, err := reconciler.Reconcile(ctx, requestFor(cluster))
+			if err == nil || !strings.Contains(err.Error(), test.wantObject+" "+statefulSet.Name) || !strings.Contains(err.Error(), "runtime selection is fixed at workload creation") {
+				t.Fatalf("runtime transition error = %v", err)
+			}
+			currentPod := &corev1.Pod{}
+			if err := base.Get(ctx, client.ObjectKeyFromObject(pod), currentPod); err != nil {
+				t.Fatal(err)
+			}
+			if observed, err := owned.ObservePostgreSQLRuntime(currentPod.Annotations, currentPod.Spec); err != nil || observed != owned.PostgreSQLRuntimeDirect {
+				t.Fatalf("live direct Pod changed after rejected runtime transition: %q, %v", observed, err)
+			}
+			currentStatefulSet := &appsv1.StatefulSet{}
+			if err := base.Get(ctx, statefulSetKey, currentStatefulSet); err != nil {
+				t.Fatal(err)
+			}
+			if !test.staleTemplate && !reflect.DeepEqual(currentStatefulSet.Spec.Template, *originalTemplate) {
+				t.Fatal("rejected runtime transition mutated the OnDelete StatefulSet template")
+			}
+		})
+	}
+}
+
 func TestRoleNeutralPostgreSQLIdentityMigrationNeverPublishesTwoControllers(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

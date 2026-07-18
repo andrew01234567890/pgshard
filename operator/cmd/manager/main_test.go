@@ -36,13 +36,23 @@ func TestCommandFlagsAllowExplicitCertificateFreeDevelopmentMode(t *testing.T) {
 		"--pooler-image=pgshard/pooler:dev",
 		"--postgresql-image=postgres:18",
 		"--postgresql-bootstrap-image=pgshard/postgres-agent:dev",
+		"--postgresql-runtime=agent-quarantine",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if options.webhookEnabled || options.metricsAddress != "0" {
 		t.Fatalf("development options = %#v", options)
 	}
-	if options.images.Orchestrator != "pgshard/orchestrator:dev" || options.images.Pooler != "pgshard/pooler:dev" || options.images.PostgreSQL != "postgres:18" || options.images.PostgreSQLBootstrap != "pgshard/postgres-agent:dev" {
+	if options.images.Orchestrator != "pgshard/orchestrator:dev" || options.images.Pooler != "pgshard/pooler:dev" || options.images.PostgreSQL != "postgres:18" || options.images.PostgreSQLBootstrap != "pgshard/postgres-agent:dev" || options.images.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("development images = %#v", options.images)
+	}
+}
+
+func TestCommandFlagsRejectUnknownPostgreSQLRuntime(t *testing.T) {
+	t.Parallel()
+	flags := flag.NewFlagSet("pgshard-operator", flag.ContinueOnError)
+	bindCommandFlags(flags)
+	if err := flags.Parse([]string{"--postgresql-runtime=serving-without-fence"}); err == nil {
+		t.Fatal("unknown PostgreSQL runtime was accepted")
 	}
 }

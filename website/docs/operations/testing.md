@@ -219,7 +219,9 @@ The Kubernetes Lease coordination tests use an in-memory compare-and-swap
 store. They prove exclusive empty-Lease claims, conditional renewal and release,
 exact fleet owner and Lease UID pinning, local unchanged-record takeover timing,
 that a delayed post-commit replacement response cannot extend local leadership,
-and cancellation of a stalled API operation during shutdown. Operator tests
+same-term monotonic renewal across a backward wall-clock step without decreasing
+the diagnostic expiry, and cancellation of a stalled API operation during
+shutdown. Operator tests
 also prove an arbitrary Pod name and owner still blocks retired etcd PVC
 deletion when it references the claim. The manager KIND
 suite exercises the real Kubernetes API: it verifies exact-name `get`/`update`
@@ -524,6 +526,26 @@ slots must remain valid across the idle timeout, WAL growth, recovery, and clean
 shutdown. PostgreSQL's own CRC-checking control-data tool remains the authority
 for interpreting control-file contents. Test
 images and volumes remain runner-local and are not published.
+
+Operator planner tests cover the explicit non-serving
+`agent-quarantine` composition independently from the default direct runtime.
+They require the checkpointed per-cell Lease name and UID, the role-neutral
+ServiceAccount, a 600-second projected token with namespace CA/name, downward
+API Pod identity, the parent runtime mount, agent health/readiness probes, and
+the absence of bootstrap and catalog credentials from the running container.
+Missing, duplicated, or mismatched Lease checkpoints fail planning. The direct
+runtime test separately proves it receives neither the ServiceAccount nor the
+projected API volume. The manager KIND test removes the cell RoleBinding after
+stopping reconciliation, verifies exact `get` and `update` denial, observes the
+Unix postmaster fenced while agent health remains available, then restores the
+manager. It requires a fresh holder and higher term, a recovered quarantined
+postmaster, repeated Lease renewals, and unchanged Pod UID, container ID, start
+time, and restart count throughout. Renewals are counted only when the Lease's
+`renewTime` strictly advances, not from unrelated resource-version changes.
+Controller tests additionally create a direct `OnDelete` workload, request the
+agent runtime, and require rejection before template mutation. A second case
+models an already-updated agent template over a still-direct Pod and requires
+the authoritative Pod observation to reject it.
 The live PostgreSQL 18 fixture sends the production feedback frame through a
 real COPY-BOTH connection, drains a catch-up keepalive, observes three distinct
 positions in `pg_stat_replication`, receives the subsequent requested keepalive,

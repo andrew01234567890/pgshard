@@ -37,9 +37,9 @@ PostgreSQL fencing, or enable automated failover.
 
 Every cell has a separate role-neutral ServiceAccount with token automount
 disabled. Its Role and RoleBinding allow only `get` and `update` on that cell's
-exact Lease name. No PostgreSQL Pod mounts the identity yet; future candidate
-selection must use a bounded projected token rather than ambient API
-credentials.
+exact Lease name. The default direct PostgreSQL runtime does not mount this
+identity. The explicit quarantine integration selects it and uses a bounded
+projected token rather than ambient API credentials.
 
 The opt-in agent has a separate per-cell Lease transport. Its holder identity
 combines the stable member name, exact Pod UID, and a fresh random process
@@ -50,7 +50,9 @@ reusing the old fencing term. A candidate times an unchanged foreign record
 locally for a full Lease duration instead of comparing the holder's clock. A
 successful response is anchored to the monotonic instant before the request was
 dispatched, so API latency consumes authority and wall-clock jumps cannot extend
-it. A configured standalone postmaster waits until the exact term remains valid
+it. The wall-clock expiry exposed by status is diagnostic only: a backward wall
+step on a same-term renewal is clamped, while only the later monotonic deadline
+can preserve authority. A configured standalone postmaster waits until the exact term remains valid
 beyond the complete fencing margin. Shutdown before acquisition leaves no
 PostgreSQL process, and the supervisor checks the monotonic margin again at the
 final user-space boundary while also rejecting an observed shutdown. A stale
@@ -65,11 +67,24 @@ might already have committed; resource-version CAS prevents a later stale
 overwrite, and a candidate restarts the full unchanged-record observation
 window from the changed Lease. Startup rejects a Lease/shutdown combination
 unless the post-renewal margin strictly exceeds the configured immediate-stop
-and normal cleanup budget. The operator does not yet project the cell identity
-or inject the Lease UID and agent runtime into PostgreSQL Pods. The supervisor remains
-TCP-quarantined; promotion proof, durable generation enforcement, serving
-activation, bounded token projection, and release-after-durable-stop remain
-absent, so this is not yet a serving-primary fence or an HA claim.
+and normal cleanup budget. The default operator runtime remains direct. The
+explicit `--postgresql-runtime=agent-quarantine` integration mode selects the
+exact per-cell ServiceAccount, mounts a rotating 600-second projected API token
+with the namespace CA/name, injects the checkpointed Lease UID and downward-API
+Pod identity, and runs the agent against the role-neutral PGDATA. Its readiness
+probe stays failed and PostgreSQL has no TCP listener. If coordination fails,
+the agent clears the term, fully fences PostgreSQL, keeps HTTP liveness
+available, and retries with bounded backoff while remaining unready. Recovery
+uses a fresh process incarnation, waits behind any old holder, advances the
+term, and starts the quarantined postmaster again in the same container.
+Runtime selection is fixed when the workload is created. Before planning, the
+controller authoritatively classifies both the `OnDelete` StatefulSet template
+and the live Pod. A manager flag mismatch fails reconciliation before template
+mutation, including when an earlier template already differs from its Pod.
+Changing modes requires a future explicitly fenced replacement workflow.
+Promotion proof, durable
+generation enforcement, serving activation, and release-after-durable-stop
+remain absent, so this is not yet a serving-primary fence or an HA claim.
 
 The pre-Lease development layout's three etcd data claims are retired
 automatically. The operator first prunes the old cluster-owned StatefulSet,

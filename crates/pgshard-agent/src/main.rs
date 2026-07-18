@@ -3,15 +3,18 @@
 use pgshard_agent::config::{AgentConfig, ConfigError};
 use pgshard_agent::coordination::{WritableLeaseConfig, WritableLeaseError};
 use pgshard_agent::domain::{AgentState, PostgresProcessState};
-use pgshard_agent::postgres::{PostgresError, PreparedPostgres};
+use pgshard_agent::postgres::{PostgresConfig, PostgresError, PreparedPostgres};
 use std::future::Future;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::watch;
 
 const PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 const BLOCKING_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const INITIAL_COORDINATION_RETRY: Duration = Duration::from_millis(250);
+const MAX_COORDINATION_RETRY: Duration = Duration::from_secs(5);
+const COORDINATION_RETRY_RESET: Duration = Duration::from_secs(30);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -64,13 +67,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let state = AgentState::with_identity(identity, max_lease_ttl_ms)?;
-    let postgres = match postgres {
+    let postgres_config = postgres;
+    let postgres = match postgres_config.clone() {
         Some(config) => {
-            let mut preparation =
-                tokio::task::spawn_blocking(move || PreparedPostgres::prepare(config));
-            if let Some(postgres) =
-                await_preparation(&mut preparation, wait_for_shutdown(shutdown_rx.clone())).await?
-            {
+            if let Some(postgres) = prepare_postgres(config, shutdown_rx.clone()).await? {
                 Some(postgres)
             } else {
                 signal_task.abort();
@@ -95,6 +95,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         http_bind,
         state,
         postgres,
+        postgres_config,
         writable_lease,
         shutdown_tx.clone(),
         shutdown_rx,
@@ -111,90 +112,217 @@ async fn run_services(
     http_bind: SocketAddr,
     state: AgentState,
     postgres: Option<PreparedPostgres>,
+    postgres_config: Option<PostgresConfig>,
     writable_lease: Option<WritableLeaseConfig>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AgentRunError> {
-    let postgres_start_margin = writable_lease
-        .as_ref()
-        .map(WritableLeaseConfig::shutdown_margin);
-    let lease_changes = state.subscribe_lease_changes();
-    let run_shutdown_tx = shutdown_tx.clone();
-    let coordination_state = state.clone();
-    let coordination_shutdown = shutdown_rx.clone();
-    let mut components = Box::pin(async move {
-        if let Some(postgres) = postgres {
-            let listener = tokio::net::TcpListener::bind(http_bind)
-                .await
-                .map_err(AgentRunError::Http)?;
-            let http = pgshard_agent::http::serve_on(
-                listener,
-                state.clone(),
-                wait_for_shutdown(shutdown_rx.clone()),
-            );
-            let postmaster_state = state.clone();
-            let postmaster = async move {
-                if let Some(margin) = postgres_start_margin {
-                    if !wait_for_initial_writable_authority(
-                        &postmaster_state,
-                        lease_changes,
-                        shutdown_rx.clone(),
-                        margin,
-                    )
-                    .await
-                    {
-                        return Ok(());
-                    }
-                    postgres
-                        .supervise_with_writable_authority(postmaster_state, shutdown_rx, margin)
-                        .await
-                } else {
-                    postgres
-                        .supervise(postmaster_state, wait_for_shutdown(shutdown_rx))
-                        .await
-                }
-            };
-            tokio::pin!(http);
-            tokio::pin!(postmaster);
-            tokio::select! {
-                result = &mut http => {
-                    let _ = run_shutdown_tx.send(true);
-                    let postmaster_result = postmaster.await;
-                    combine_component_results(result, postmaster_result)
-                }
-                result = &mut postmaster => {
-                    let _ = run_shutdown_tx.send(true);
-                    let http_result = http.await;
-                    combine_component_results(http_result, result)
-                }
-            }
-        } else {
-            pgshard_agent::http::serve(http_bind, state, wait_for_shutdown(shutdown_rx))
-                .await
-                .map_err(AgentRunError::Http)
-        }
-    });
-    match writable_lease {
-        Some(config) => {
-            let coordination = pgshard_agent::coordination::supervise(
-                config,
-                coordination_state,
-                coordination_shutdown,
-            );
-            tokio::pin!(coordination);
-            tokio::select! {
-                components_result = &mut components => {
-                    let _ = shutdown_tx.send(true);
-                    combine_coordination_results(components_result, coordination.await)
-                }
-                coordination_result = &mut coordination => {
-                    let _ = shutdown_tx.send(true);
-                    combine_coordination_results(components.await, coordination_result)
-                }
-            }
-        }
-        None => components.await,
+    if let Some(writable_lease) = writable_lease {
+        let Some(postgres) = postgres else {
+            return Err(AgentRunError::InvalidRuntimeComposition);
+        };
+        let Some(postgres_config) = postgres_config else {
+            return Err(AgentRunError::InvalidRuntimeComposition);
+        };
+        return Box::pin(run_writable_services(
+            http_bind,
+            state,
+            postgres,
+            postgres_config,
+            writable_lease,
+            shutdown_tx,
+            shutdown_rx,
+        ))
+        .await;
     }
+
+    let run_shutdown_tx = shutdown_tx.clone();
+    if let Some(postgres) = postgres {
+        let listener = tokio::net::TcpListener::bind(http_bind)
+            .await
+            .map_err(AgentRunError::Http)?;
+        let http = pgshard_agent::http::serve_on(
+            listener,
+            state.clone(),
+            wait_for_shutdown(shutdown_rx.clone()),
+        );
+        let postmaster = postgres.supervise(state, wait_for_shutdown(shutdown_rx));
+        tokio::pin!(http);
+        tokio::pin!(postmaster);
+        tokio::select! {
+            result = &mut http => {
+                let _ = run_shutdown_tx.send(true);
+                let postmaster_result = postmaster.await;
+                combine_component_results(result, postmaster_result)
+            }
+            result = &mut postmaster => {
+                let _ = run_shutdown_tx.send(true);
+                let http_result = http.await;
+                combine_component_results(http_result, result)
+            }
+        }
+    } else {
+        pgshard_agent::http::serve(http_bind, state, wait_for_shutdown(shutdown_rx))
+            .await
+            .map_err(AgentRunError::Http)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_writable_services(
+    http_bind: SocketAddr,
+    state: AgentState,
+    postgres: PreparedPostgres,
+    postgres_config: PostgresConfig,
+    writable_lease: WritableLeaseConfig,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), AgentRunError> {
+    let listener = tokio::net::TcpListener::bind(http_bind)
+        .await
+        .map_err(AgentRunError::Http)?;
+    let http = pgshard_agent::http::serve_on(
+        listener,
+        state.clone(),
+        wait_for_shutdown(shutdown_rx.clone()),
+    );
+    let runtime = supervise_writable_runtime(
+        state,
+        postgres,
+        postgres_config,
+        writable_lease,
+        shutdown_rx,
+    );
+    tokio::pin!(http);
+    tokio::pin!(runtime);
+    tokio::select! {
+        http_result = &mut http => {
+            let _ = shutdown_tx.send(true);
+            combine_http_runtime_results(http_result, runtime.await)
+        }
+        runtime_result = &mut runtime => {
+            let _ = shutdown_tx.send(true);
+            combine_http_runtime_results(http.await, runtime_result)
+        }
+    }
+}
+
+async fn supervise_writable_runtime(
+    state: AgentState,
+    mut postgres: PreparedPostgres,
+    postgres_config: PostgresConfig,
+    writable_lease: WritableLeaseConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), AgentRunError> {
+    let mut retry = INITIAL_COORDINATION_RETRY;
+    loop {
+        state.clear_lease();
+        let attempt_started = Instant::now();
+        match Box::pin(run_writable_attempt(
+            state.clone(),
+            postgres,
+            writable_lease.clone(),
+            shutdown.clone(),
+        ))
+        .await?
+        {
+            WritableAttemptOutcome::Shutdown => return Ok(()),
+            WritableAttemptOutcome::Retry(error) => {
+                if attempt_started.elapsed() >= COORDINATION_RETRY_RESET {
+                    retry = INITIAL_COORDINATION_RETRY;
+                }
+                tracing::warn!(reason = %error, retry_after_ms = retry.as_millis(), "writable-term Lease coordination lost; PostgreSQL fenced and coordination will retry");
+            }
+        }
+        if wait_for_shutdown_or_delay(shutdown.clone(), retry).await {
+            return Ok(());
+        }
+        retry = retry.saturating_mul(2).min(MAX_COORDINATION_RETRY);
+        let Some(prepared) = prepare_postgres(postgres_config.clone(), shutdown.clone())
+            .await
+            .map_err(AgentRunError::Postgres)?
+        else {
+            return Ok(());
+        };
+        state.set_postgres_process(PostgresProcessState::Validated);
+        postgres = prepared;
+    }
+}
+
+async fn run_writable_attempt(
+    state: AgentState,
+    postgres: PreparedPostgres,
+    writable_lease: WritableLeaseConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<WritableAttemptOutcome, AgentRunError> {
+    let margin = writable_lease.shutdown_margin();
+    let lease_changes = state.subscribe_lease_changes();
+    let (attempt_shutdown_tx, attempt_shutdown_rx) = watch::channel(false);
+    let postmaster_state = state.clone();
+    let postmaster_shutdown = attempt_shutdown_rx.clone();
+    let postmaster = async move {
+        if !wait_for_initial_writable_authority(
+            &postmaster_state,
+            lease_changes,
+            postmaster_shutdown.clone(),
+            margin,
+        )
+        .await
+        {
+            return Ok(());
+        }
+        postgres
+            .supervise_with_writable_authority(postmaster_state, postmaster_shutdown, margin)
+            .await
+    };
+    let coordination =
+        pgshard_agent::coordination::supervise(writable_lease, state, attempt_shutdown_rx);
+    tokio::pin!(postmaster);
+    tokio::pin!(coordination);
+    tokio::select! {
+        biased;
+        () = wait_for_shutdown(shutdown) => {
+            let _ = attempt_shutdown_tx.send(true);
+            let postmaster_result = postmaster.await;
+            if let Err(error) = coordination.await {
+                tracing::warn!(reason = %error, "writable-term Lease coordination ended during agent shutdown");
+            }
+            postmaster_result.map_err(AgentRunError::Postgres)?;
+            Ok(WritableAttemptOutcome::Shutdown)
+        }
+        coordination_result = &mut coordination => {
+            let _ = attempt_shutdown_tx.send(true);
+            let postmaster_result = postmaster.await.map_err(AgentRunError::Postgres);
+            match coordination_result {
+                Err(coordination) => match postmaster_result {
+                    Ok(()) => Ok(WritableAttemptOutcome::Retry(coordination)),
+                    Err(runtime) => Err(AgentRunError::CoordinationAndRuntime {
+                        coordination,
+                        runtime: Box::new(runtime),
+                    }),
+                },
+                Ok(()) => postmaster_result.and(Err(AgentRunError::CoordinationStopped)),
+            }
+        }
+        postmaster_result = &mut postmaster => {
+            let _ = attempt_shutdown_tx.send(true);
+            let runtime = postmaster_result.map_err(AgentRunError::Postgres);
+            match (runtime, coordination.await) {
+                (Ok(()), Err(coordination)) => Ok(WritableAttemptOutcome::Retry(coordination)),
+                (Err(runtime), Err(coordination)) => Err(AgentRunError::CoordinationAndRuntime {
+                    coordination,
+                    runtime: Box::new(runtime),
+                }),
+                (Err(runtime), Ok(())) => Err(runtime),
+                (Ok(()), Ok(())) => Err(AgentRunError::PostgresStopped),
+            }
+        }
+    }
+}
+
+enum WritableAttemptOutcome {
+    Retry(WritableLeaseError),
+    Shutdown,
 }
 
 async fn wait_for_initial_writable_authority(
@@ -227,18 +355,19 @@ async fn wait_for_initial_writable_authority(
     }
 }
 
-fn combine_coordination_results(
-    runtime: Result<(), AgentRunError>,
-    coordination: Result<(), WritableLeaseError>,
-) -> Result<(), AgentRunError> {
-    match (runtime, coordination) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(runtime), Ok(())) => Err(runtime),
-        (Ok(()), Err(source)) => Err(AgentRunError::Coordination(source)),
-        (Err(runtime), Err(coordination)) => Err(AgentRunError::CoordinationAndRuntime {
-            coordination,
-            runtime: Box::new(runtime),
-        }),
+async fn prepare_postgres(
+    config: PostgresConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<Option<PreparedPostgres>, PostgresError> {
+    let mut preparation = tokio::task::spawn_blocking(move || PreparedPostgres::prepare(config));
+    await_preparation(&mut preparation, wait_for_shutdown(shutdown)).await
+}
+
+async fn wait_for_shutdown_or_delay(shutdown: watch::Receiver<bool>, delay: Duration) -> bool {
+    tokio::select! {
+        biased;
+        () = wait_for_shutdown(shutdown) => true,
+        () = tokio::time::sleep(delay) => false,
     }
 }
 
@@ -274,8 +403,25 @@ fn combine_component_results(
     }
 }
 
+fn combine_http_runtime_results(
+    http: std::io::Result<()>,
+    runtime: Result<(), AgentRunError>,
+) -> Result<(), AgentRunError> {
+    match (http, runtime) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(source), Ok(())) => Err(AgentRunError::Http(source)),
+        (Ok(()), Err(runtime)) => Err(runtime),
+        (Err(http), Err(runtime)) => Err(AgentRunError::HttpAndRuntime {
+            http,
+            runtime: Box::new(runtime),
+        }),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum AgentRunError {
+    #[error("validated agent configuration produced an inconsistent runtime composition")]
+    InvalidRuntimeComposition,
     #[error("agent HTTP server failed: {0}")]
     Http(#[source] std::io::Error),
     #[error("PostgreSQL supervisor failed: {0}")]
@@ -286,14 +432,22 @@ enum AgentRunError {
         postgres: PostgresError,
         http: std::io::Error,
     },
-    #[error("writable-term Lease coordination failed: {0}")]
-    Coordination(#[source] WritableLeaseError),
+    #[error("writable-term Lease coordination stopped without shutdown or an error")]
+    CoordinationStopped,
+    #[error("PostgreSQL supervision stopped without shutdown or an error")]
+    PostgresStopped,
     #[error(
         "writable-term Lease coordination failed: {coordination}; agent runtime also failed: {runtime}"
     )]
     CoordinationAndRuntime {
         #[source]
         coordination: WritableLeaseError,
+        runtime: Box<AgentRunError>,
+    },
+    #[error("agent runtime failed: {runtime}; agent HTTP server also failed: {http}")]
+    HttpAndRuntime {
+        http: std::io::Error,
+        #[source]
         runtime: Box<AgentRunError>,
     },
 }
@@ -349,6 +503,24 @@ mod tests {
         };
         assert_eq!(http.to_string(), "HTTP failed");
         assert!(matches!(postgres, PostgresError::PreparedStateChanged));
+    }
+
+    #[test]
+    fn preserves_simultaneous_http_and_writable_runtime_failures() {
+        let result = combine_http_runtime_results(
+            Err(std::io::Error::other("HTTP failed")),
+            Err(AgentRunError::Postgres(PostgresError::PreparedStateChanged)),
+        );
+        let AgentRunError::HttpAndRuntime { http, runtime } =
+            result.expect_err("both failures survive")
+        else {
+            panic!("expected a combined HTTP and runtime failure");
+        };
+        assert_eq!(http.to_string(), "HTTP failed");
+        assert!(matches!(
+            *runtime,
+            AgentRunError::Postgres(PostgresError::PreparedStateChanged)
+        ));
     }
 
     #[tokio::test]

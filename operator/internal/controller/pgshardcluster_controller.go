@@ -193,6 +193,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	if err := r.validatePostgreSQLRuntimeContract(ctx, cluster, images.PostgreSQLRuntime); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PostgreSQLRuntimeChangeRejected", fmt.Sprintf("PostgreSQL runtime selection is unsafe: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	if err := r.verifyPostgreSQLPodFencingNamespace(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing is unavailable: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
@@ -295,6 +299,64 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		return ctrl.Result{RequeueAfter: bootstrapIntegrityInterval}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// validatePostgreSQLRuntimeContract prevents a manager flag change from
+// silently changing only an OnDelete StatefulSet template while its old Pod
+// keeps running. Runtime transitions require a future explicitly fenced
+// replacement workflow; this controller only composes the selected runtime for
+// a workload that does not exist yet.
+func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, desired owned.PostgreSQLRuntime) error {
+	if cluster.Spec.MembersPerShard != 1 {
+		return nil
+	}
+	desired = owned.PostgreSQLRuntime(desired.String())
+	reader := r.authoritativeReader()
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		for _, name := range []string{
+			owned.PostgreSQLShardStatefulSetName(cluster.Name, shard),
+			owned.LegacyPostgreSQLPrimaryStatefulSetName(cluster.Name, shard),
+		} {
+			statefulSet := &appsv1.StatefulSet{}
+			err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet)
+			if err == nil {
+				if !metav1.IsControlledBy(statefulSet, cluster) {
+					return fmt.Errorf("StatefulSet %s is not controlled by PgShardCluster UID %s", name, cluster.UID)
+				}
+				observed, observeErr := owned.ObservePostgreSQLRuntime(statefulSet.Spec.Template.Annotations, statefulSet.Spec.Template.Spec)
+				if observeErr != nil {
+					return fmt.Errorf("observe StatefulSet %s runtime: %w", name, observeErr)
+				}
+				if observed != desired {
+					return postgresqlRuntimeChangeError("StatefulSet", name, observed, desired)
+				}
+			} else if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("read StatefulSet %s runtime: %w", name, err)
+			}
+
+			podName := name + "-0"
+			pod := &corev1.Pod{}
+			err = reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: podName}, pod)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("read Pod %s runtime: %w", podName, err)
+			}
+			observed, observeErr := owned.ObservePostgreSQLRuntime(pod.Annotations, pod.Spec)
+			if observeErr != nil {
+				return fmt.Errorf("observe Pod %s runtime: %w", podName, observeErr)
+			}
+			if observed != desired {
+				return postgresqlRuntimeChangeError("Pod", podName, observed, desired)
+			}
+		}
+	}
+	return nil
+}
+
+func postgresqlRuntimeChangeError(kind, name string, observed, desired owned.PostgreSQLRuntime) error {
+	return fmt.Errorf("%s %s uses PostgreSQL runtime %q, but the manager requested %q; runtime selection is fixed at workload creation until a fenced replacement workflow exists", kind, name, observed, desired)
 }
 
 // ensurePostgreSQLWritableLeases creates one empty, operator-owned Lease
