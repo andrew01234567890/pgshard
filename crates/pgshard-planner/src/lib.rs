@@ -1328,7 +1328,8 @@ impl ParseError {
 #[cfg(test)]
 mod tests {
     use pgshard_catalog::{
-        ClusterId, DatabaseCatalog, DatabaseEpochs, RegisteredTable, RoutingHashConfig, ShardRoute,
+        ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseShardId, RegisteredTable,
+        RoutingHashConfig, ShardRoute,
     };
     use pgshard_types::{KEYSPACE_END, KeyRange, RoutingHashV1, ShardId};
     use proptest::prelude::*;
@@ -1336,11 +1337,21 @@ mod tests {
 
     use super::*;
 
+    fn shard_route(shard_number: u32, key_range: KeyRange) -> ShardRoute {
+        ShardRoute::new(
+            DatabaseShardId::new(Uuid::from_u128(100 + u128::from(shard_number)))
+                .expect("database shard ID"),
+            1,
+            ShardId(shard_number),
+            key_range,
+        )
+    }
+
     fn route_snapshot() -> (CatalogSnapshot, DatabaseId) {
         route_snapshot_with(
             ShardKeyType::Int64,
-            vec![ShardRoute::new(
-                ShardId(0),
+            vec![shard_route(
+                0,
                 KeyRange::new(0, KEYSPACE_END).expect("complete range"),
             )],
         )
@@ -1911,8 +1922,8 @@ mod tests {
 
         let (text_snapshot, database_id) = route_snapshot_with(
             ShardKeyType::Text,
-            vec![ShardRoute::new(
-                ShardId(0),
+            vec![shard_route(
+                0,
                 KeyRange::new(0, KEYSPACE_END).expect("complete range"),
             )],
         );
@@ -2020,9 +2031,9 @@ mod tests {
         let (two_shards, database_id) = route_snapshot_with(
             ShardKeyType::Int64,
             vec![
-                ShardRoute::new(ShardId(0), KeyRange::new(0, midpoint).expect("lower range")),
-                ShardRoute::new(
-                    ShardId(1),
+                shard_route(0, KeyRange::new(0, midpoint).expect("lower range")),
+                shard_route(
+                    1,
                     KeyRange::new(midpoint, KEYSPACE_END).expect("upper range"),
                 ),
             ],
@@ -2204,9 +2215,9 @@ mod tests {
 
         let midpoint = KEYSPACE_END / 2;
         let two_routes = vec![
-            ShardRoute::new(ShardId(0), KeyRange::new(0, midpoint).expect("lower range")),
-            ShardRoute::new(
-                ShardId(1),
+            shard_route(0, KeyRange::new(0, midpoint).expect("lower range")),
+            shard_route(
+                1,
                 KeyRange::new(midpoint, KEYSPACE_END).expect("upper range"),
             ),
         ];
@@ -2235,8 +2246,8 @@ mod tests {
 
         let (other_cluster, other_database_id) = route_snapshot_with_cluster(
             ShardKeyType::Int64,
-            vec![ShardRoute::new(
-                ShardId(0),
+            vec![shard_route(
+                0,
                 KeyRange::new(0, KEYSPACE_END).expect("complete range"),
             )],
             Uuid::from_u128(9),
@@ -2270,8 +2281,8 @@ mod tests {
     fn text_physical_schema_requires_builtin_c_and_utf8() {
         let (snapshot, database_id) = route_snapshot_with(
             ShardKeyType::Text,
-            vec![ShardRoute::new(
-                ShardId(0),
+            vec![shard_route(
+                0,
                 KeyRange::new(0, KEYSPACE_END).expect("complete range"),
             )],
         );

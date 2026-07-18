@@ -1,8 +1,8 @@
 //! Live `PostgreSQL` 18 positive and known-negative candidate-parser smoke test.
 
 use pgshard_catalog::{
-    CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, RegisteredTable,
-    RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
+    CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, DatabaseShardId,
+    RegisteredTable, RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
 };
 use pgshard_planner::{
     CatalogOnlySearchPath, PhysicalSchemaError, PhysicalShardKeyCatalogIdentity,
@@ -34,6 +34,8 @@ fn route_snapshot_for(
         database_name,
         DatabaseEpochs::new(1, 1, 1).expect("database epochs"),
         vec![ShardRoute::new(
+            DatabaseShardId::new(Uuid::from_u128(100)).expect("database shard ID"),
+            1,
             ShardId(0),
             KeyRange::new(0, KEYSPACE_END).expect("complete range"),
         )],

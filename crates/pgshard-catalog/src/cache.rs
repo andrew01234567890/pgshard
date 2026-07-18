@@ -747,7 +747,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{DatabaseCatalog, DatabaseEpochs, ShardRoute};
+    use crate::{DatabaseCatalog, DatabaseEpochs, DatabaseShardId, ShardRoute};
 
     fn snapshot(cluster: u128, epoch: u64, database_epoch: u64) -> CatalogSnapshot {
         snapshot_with_database(cluster, epoch, 2, "app", database_epoch)
@@ -776,6 +776,8 @@ mod tests {
             DatabaseEpochs::new(database_epoch, database_epoch, database_epoch)
                 .expect("database epochs"),
             vec![ShardRoute::new(
+                DatabaseShardId::new(Uuid::from_u128(100)).expect("database shard ID"),
+                1,
                 ShardId(0),
                 KeyRange::new(0, KEYSPACE_END).expect("full key range"),
             )],

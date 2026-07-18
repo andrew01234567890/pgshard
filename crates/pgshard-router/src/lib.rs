@@ -290,8 +290,8 @@ enum BindRouteError {
 #[cfg(test)]
 mod tests {
     use pgshard_catalog::{
-        CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, RegisteredTable,
-        RoutingHashConfig, ShardRoute,
+        CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseShardId,
+        RegisteredTable, RoutingHashConfig, ShardRoute,
     };
     use pgshard_pgwire::{
         BindParameters, ClientEncodingError, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, FormatCode,
@@ -318,6 +318,16 @@ mod tests {
         )
     }
 
+    fn shard_route(shard_number: u32, key_range: KeyRange) -> ShardRoute {
+        ShardRoute::new(
+            DatabaseShardId::new(Uuid::from_u128(100 + u128::from(shard_number)))
+                .expect("database shard ID"),
+            1,
+            ShardId(shard_number),
+            key_range,
+        )
+    }
+
     fn snapshot(key_type: ShardKeyType) -> (CatalogSnapshot, DatabaseId, TableName) {
         snapshot_with_seed(key_type, 42)
     }
@@ -340,11 +350,8 @@ mod tests {
             "app",
             DatabaseEpochs::new(1, 1, 1).expect("epochs"),
             vec![
-                ShardRoute::new(ShardId(0), KeyRange::new(0, 1_u128 << 63).expect("range")),
-                ShardRoute::new(
-                    ShardId(1),
-                    KeyRange::new(1_u128 << 63, KEYSPACE_END).expect("range"),
-                ),
+                shard_route(0, KeyRange::new(0, 1_u128 << 63).expect("range")),
+                shard_route(1, KeyRange::new(1_u128 << 63, KEYSPACE_END).expect("range")),
             ],
             vec![table],
         )
