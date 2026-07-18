@@ -1330,6 +1330,9 @@ func TestReconcileFencesBypassedProvisionedSpecMutation(t *testing.T) {
 		"deletion policy": func(cluster *pgshardv1alpha1.PgShardCluster) {
 			cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
 		},
+		"database topology": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{{Name: "app", Shards: 1, Cells: []int32{0}}}
+		},
 	} {
 		name, mutate := name, mutate
 		t.Run(name, func(t *testing.T) {
@@ -1350,6 +1353,41 @@ func TestReconcileFencesBypassedProvisionedSpecMutation(t *testing.T) {
 			}
 			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "differs from the provisioned PostgreSQL bootstrap spec") {
 				t.Fatalf("bypassed %s mutation was not fenced: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestReconcileMigratesOnlyEmptyLegacyDatabaseTopologyCheckpoint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for name, declared := range map[string]bool{"empty": false, "declared": true} {
+		name, declared := name, declared
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			if declared {
+				cluster.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{{Name: "app", Shards: 1, Cells: []int32{0}}}
+			}
+			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
+			cluster.Status.PostgreSQLBootstrapSpec.DatabaseTopologySHA256 = ""
+			fakeClient := newFakeClient(t, cluster)
+			_, err := developmentReconciler(fakeClient, nil).Reconcile(ctx, requestFor(cluster))
+			if declared {
+				if err == nil || !strings.Contains(err.Error(), "predates the declared database topology") {
+					t.Fatalf("declared topology accepted an unbound legacy checkpoint: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := getCluster(t, ctx, fakeClient, cluster)
+			if current.Status.PostgreSQLBootstrapSpec == nil || current.Status.PostgreSQLBootstrapSpec.DatabaseTopologySHA256 != current.Spec.DatabaseTopologySHA256() {
+				t.Fatalf("empty legacy topology checkpoint was not migrated: %#v", current.Status.PostgreSQLBootstrapSpec)
 			}
 		})
 	}

@@ -54,6 +54,25 @@ phase is not implemented.
 | Online resharding | Design only | Planned |
 | Admin UI, Prometheus and OpenTelemetry | The pooler control executable serves catalog Prometheus exposition; scraping resources, SQL-path metrics, OpenTelemetry export, dashboards, UI, and Grafana/Tempo validation are absent | Partial |
 | KIND, Jepsen/Elle and PgBouncer comparison | Targeted operator deletion/recreate, admission/fail-closed manager, real Kubernetes Lease identity loss and rollout recovery, and two-shard single-member PostgreSQL startup, shard-0000-only catalog placement, exact shard/restore inventory, idempotent catalog restart, operator-provisioned TLS/SCRAM pooler catalog and relay readiness plus metrics, native-SCRAM SQL through the shard-zero compatibility Service, selectorless unsupported application Services, application-side `shardschema` rejection, graceful restart persistence, and binding-identity plus authenticated force-delete receipt recovery across a webhook outage KIND tests; HA traffic, history, resharding, backup and performance suites remain absent | Partial |
+The current database-topology foundation accepts immutable logical-database
+shard counts and ordered physical-cell mappings in
+`PgShardCluster.spec.databases`. Shard-zero bootstrap installs all declared
+equal-range routes in one `shardschema` transaction. Exact retries preserve the
+database IDs, routing epochs, and catalog epoch; conflicting mappings and
+undeclared active catalog databases fail without a partial install. This does
+not yet create physical application databases, database-scoped shard records,
+placement reservations, or a client-visible routing path.
+Existing catalog topology is compared with the complete declaration before
+migration and again under the catalog-state transaction lock before identity
+allocation. Both the database and range inputs are capped at the expected count
+plus one. Catalog loading uses a fixed set of bounded queries per refresh rather
+than per-database query amplification, and refuses staged, superseded, foreign,
+duplicate, or otherwise non-serving active-epoch pointers plus routes to absent,
+provisioning, or retired shards. The provisioned
+storage checkpoint binds the canonical resolved database topology by SHA-256.
+Status written before that field existed remains API-valid: only a provably
+empty legacy declaration is upgraded automatically, while a legacy checkpoint
+with declared databases requires explicit recovery.
 
 The current operator plan starts single-member poolers in `operator-tls`
 catalog mode. It checkpoints an unpredictable name as a non-consumable creation
@@ -63,7 +82,11 @@ It then checkpoints separate client/server material digests with response-loss
 recovery before projecting only the fixed reader password plus CA into poolers,
 and projects only the server keypair into shard-0000 PostgreSQL. The bootstrap
 init validates both retained projections before PGDATA access; the CA private
-key is never persisted. An outcome-unknown Create carries no key material, and
+key is never persisted. It also authenticates the complete generated
+PostgreSQL configuration against the Pod's controller-owned SHA-256, copies it
+to bounded Pod-local storage, verifies the copy, and leaves the serving
+container no mount of the replaceable ConfigMap source. An outcome-unknown
+Create carries no key material, and
 competing material updates are serialized by the same UID and resource version,
 so a late API commit cannot leave a second untracked credential. The pooler requires TLS 1.3
 hostname validation, SCRAM channel binding, and a writable catalog primary.
@@ -88,9 +111,10 @@ while existing workloads remain. It requires explicit recovery rather than
 silent regeneration. A
 one-member asynchronous resource creates one
 PostgreSQL 18 primary and retained PVC per shard; a three- or five-member
-resource still creates none. Shard-0000 also owns the migrated catalog and the
-configured shard identities; catalog availability gates the compatibility
-relay, but that metadata does not yet select a shard from SQL. The
+resource still creates none. Shard-0000 also owns the migrated catalog, the
+configured physical-cell identities, and any immutable genesis database
+routes; catalog availability gates the compatibility relay, but that metadata
+does not create application databases or select a shard from SQL. The
 privileged bootstrap image has no remote default: releases require an immutable
 digest, while the source-only `:dev` exception is never pulled and verifies the
 migration hash before PGDATA access. PostgreSQL StatefulSets use `OnDelete`, so
@@ -98,6 +122,7 @@ template changes remain inert until a future staged upgrade controller or an
 explicit one-Pod-at-a-time development restart. The `-rw` Service accepts raw
 PostgreSQL sessions only through the one-member shard-zero compatibility relay;
 `-ro` and `-r` remain unavailable. There is no connection pool or router. The
-direct primary path has no HA and restarts interrupt its shard. No sharding,
-availability, backup, restore, resharding, DDL, or performance guarantee is
-claimed until its implementation and required tests are merged and listed here.
+direct primary path has no HA and restarts interrupt its shard. No
+client-visible sharding, availability, backup, restore, resharding, DDL, or
+performance guarantee is claimed until its implementation and required tests
+are merged and listed here.

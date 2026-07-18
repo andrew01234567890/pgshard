@@ -1,6 +1,11 @@
 package v1alpha1
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"sort"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -10,6 +15,15 @@ import (
 const (
 	PostgreSQLMajor18 = "18"
 	MaximumShards     = 128
+	MaximumDatabases  = 512
+	// MaximumTotalRoutingRanges is derived from the two structural CRD bounds.
+	// Keep the equality explicit so the API cannot admit more routes than the
+	// bounded pgshard-catalog snapshot loader can hold.
+	MaximumTotalRoutingRanges = MaximumDatabases * MaximumShards
+	MaximumEndpointLength     = 2_048
+	MaximumS3BucketLength     = 255
+	MaximumS3RegionLength     = 128
+	MaximumS3PrefixLength     = 1_024
 	// MaximumClusterNameLength preserves the public API limit from the first
 	// operator release. Longer workload identities are bounded independently.
 	MaximumClusterNameLength = 50
@@ -33,11 +47,14 @@ type BackupRepositoryType string
 type StorageDeletionPolicy string
 
 // PgShardClusterSpec describes one namespaced pgshard installation.
-// +kubebuilder:validation:XValidation:rule="self.shards == oldSelf.shards",message="shards is immutable until online resharding is implemented"
+// +kubebuilder:validation:XValidation:rule="self.shards == oldSelf.shards",message="shards is immutable until physical cell transitions are implemented"
 // +kubebuilder:validation:XValidation:rule="self.membersPerShard == oldSelf.membersPerShard",message="membersPerShard is immutable until membership transitions are implemented"
 // +kubebuilder:validation:XValidation:rule="self.durability == oldSelf.durability",message="durability is immutable until replication-mode transitions are implemented"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.databases) ? !has(self.databases) || size(self.databases) == 0 : has(self.databases) && sets.equivalent(self.databases.map(database, database.name), oldSelf.databases.map(database, database.name))",message="databases is immutable until database lifecycle and online resharding are implemented"
 type PgShardClusterSpec struct {
-	// Shards is the number of logical hash ranges. The catalog remains on shard-0000.
+	// Shards is the number of physical PostgreSQL cells in the foundation API.
+	// Each logical database maps its independently ordered hash ranges onto a
+	// subset of these cells. The catalog remains on physical cell zero.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=128
 	// +kubebuilder:default=1
@@ -62,8 +79,10 @@ type PgShardClusterSpec struct {
 	Backup        BackupSpec        `json:"backup"`
 	Observability ObservabilitySpec `json:"observability,omitempty"`
 
-	// Databases reserves the shared-topology database names. Database lifecycle
-	// will move to PgShardDatabase without changing the cluster topology.
+	// Databases declares immutable genesis database topologies. Database
+	// lifecycle will move to PgShardDatabase without changing this placement
+	// contract.
+	// +kubebuilder:validation:MaxItems=512
 	// +listType=map
 	// +listMapKey=name
 	Databases []DatabaseTemplate `json:"databases,omitempty"`
@@ -98,9 +117,85 @@ type StorageSpec struct {
 	DeletionPolicy StorageDeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!(self.name in ['postgres', 'shardschema', 'template0', 'template1'])",message="database name is reserved by PostgreSQL or pgshard"
+// +kubebuilder:validation:XValidation:rule="self == oldSelf || (!has(oldSelf.shards) && !has(oldSelf.cells) && has(self.shards) && has(self.cells) && self.shards == size(self.cells) && self.cells.all(cell, cell == self.cells.indexOf(cell)))",message="database topology is immutable except for exact materialization of legacy defaults"
 type DatabaseTemplate struct {
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
+
+	// Shards is this database's logical shard count. Zero is defaulted to the
+	// number of explicitly selected cells, or to every cluster cell when cells
+	// is also omitted.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=128
+	Shards int32 `json:"shards,omitempty"`
+
+	// Cells maps logical shard ordinal i to one exact physical cell ordinal.
+	// Omitting it selects the first Shards cells. Reusing cells across different
+	// databases is explicit shared-cell placement; cells within one database
+	// must be unique.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=128
+	// +kubebuilder:validation:items:Minimum=0
+	// +kubebuilder:validation:items:Maximum=127
+	Cells []int32 `json:"cells,omitempty"`
+}
+
+// ResolvedShardCount returns the database shard count after applying the
+// admission default contract. Validation must still prove it is in range.
+func (database DatabaseTemplate) ResolvedShardCount(clusterCells int32) int32 {
+	if database.Shards != 0 {
+		return database.Shards
+	}
+	if database.Cells != nil {
+		return int32(len(database.Cells))
+	}
+	return clusterCells
+}
+
+// ResolvedCells returns an owned copy of the exact physical-cell placement
+// after applying the admission default contract.
+func (database DatabaseTemplate) ResolvedCells(clusterCells int32) []int32 {
+	if database.Cells != nil {
+		return append([]int32(nil), database.Cells...)
+	}
+	count := database.ResolvedShardCount(clusterCells)
+	if count <= 0 || count > MaximumShards {
+		return nil
+	}
+	cells := make([]int32, count)
+	for ordinal := range cells {
+		cells[ordinal] = int32(ordinal)
+	}
+	return cells
+}
+
+// DatabaseTopologySHA256 returns a canonical digest of every resolved immutable
+// database name and ordered physical-cell placement.
+func (spec PgShardClusterSpec) DatabaseTopologySHA256() string {
+	databases := append([]DatabaseTemplate(nil), spec.Databases...)
+	sort.Slice(databases, func(left, right int) bool {
+		return databases[left].Name < databases[right].Name
+	})
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("pgshard-database-topology-v1\x00"))
+	var encoded [4]byte
+	binary.BigEndian.PutUint32(encoded[:], uint32(len(databases)))
+	_, _ = hash.Write(encoded[:])
+	for _, database := range databases {
+		binary.BigEndian.PutUint32(encoded[:], uint32(len(database.Name)))
+		_, _ = hash.Write(encoded[:])
+		_, _ = hash.Write([]byte(database.Name))
+		cells := database.ResolvedCells(spec.Shards)
+		binary.BigEndian.PutUint32(encoded[:], uint32(len(cells)))
+		_, _ = hash.Write(encoded[:])
+		for _, cell := range cells {
+			binary.BigEndian.PutUint32(encoded[:], uint32(cell))
+			_, _ = hash.Write(encoded[:])
+		}
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 type PoolerSpec struct {
@@ -160,14 +255,20 @@ type BackupRepository struct {
 }
 
 type S3Repository struct {
-	Bucket               string                      `json:"bucket"`
-	Endpoint             string                      `json:"endpoint,omitempty"`
-	Region               string                      `json:"region,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	Bucket string `json:"bucket"`
+	// +kubebuilder:validation:MaxLength=2048
+	Endpoint string `json:"endpoint,omitempty"`
+	// +kubebuilder:validation:MaxLength=128
+	Region string `json:"region,omitempty"`
+	// +kubebuilder:validation:MaxLength=1024
 	Prefix               string                      `json:"prefix,omitempty"`
 	CredentialsSecretRef corev1.LocalObjectReference `json:"credentialsSecretRef"`
 }
 
 type FilesystemRepository struct {
+	// +kubebuilder:validation:MaxLength=253
 	PersistentVolumeClaimName string `json:"persistentVolumeClaimName"`
 }
 
@@ -175,7 +276,8 @@ type ObservabilitySpec struct {
 	// +kubebuilder:default=true
 	Prometheus *bool `json:"prometheus,omitempty"`
 	// +kubebuilder:default=false
-	ServiceMonitor        bool   `json:"serviceMonitor,omitempty"`
+	ServiceMonitor bool `json:"serviceMonitor,omitempty"`
+	// +kubebuilder:validation:MaxLength=2048
 	OpenTelemetryEndpoint string `json:"openTelemetryEndpoint,omitempty"`
 }
 
@@ -227,12 +329,17 @@ type CatalogAccessStatus struct {
 
 // PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract.
 type PostgreSQLBootstrapSpecStatus struct {
-	Shards           int32                 `json:"shards"`
-	MembersPerShard  int32                 `json:"membersPerShard"`
-	Durability       DurabilityMode        `json:"durability"`
-	StorageSize      string                `json:"storageSize"`
-	StorageClassName *string               `json:"storageClassName,omitempty"`
-	DeletionPolicy   StorageDeletionPolicy `json:"deletionPolicy"`
+	Shards          int32          `json:"shards"`
+	MembersPerShard int32          `json:"membersPerShard"`
+	Durability      DurabilityMode `json:"durability"`
+	// DatabaseTopologySHA256 binds provisioned storage to the complete resolved
+	// immutable logical-database genesis topology. It is omitted only on status
+	// written by releases that predate database-scoped genesis.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	DatabaseTopologySHA256 string                `json:"databaseTopologySHA256,omitempty"`
+	StorageSize            string                `json:"storageSize"`
+	StorageClassName       *string               `json:"storageClassName,omitempty"`
+	DeletionPolicy         StorageDeletionPolicy `json:"deletionPolicy"`
 }
 
 // PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified

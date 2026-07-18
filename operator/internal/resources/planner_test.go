@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -68,8 +69,29 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	if strings.Index(contents, "default_statistics_target") > strings.Index(contents, "log_statement") {
 		t.Fatal("PostgreSQL parameters are not sorted")
 	}
-	if len(postgresConfig.Data) != 7 {
+	if len(postgresConfig.Data) != 9 {
 		t.Fatalf("PostgreSQL configuration documents = %#v", postgresConfig.Data)
+	}
+	databaseGenesis := postgresConfig.Data[databaseGenesisKey]
+	analytics := "install_database_genesis('analytics'::pgshard_catalog.sql_identifier, ARRAY[0,1]::bigint[])"
+	app := "install_database_genesis('app'::pgshard_catalog.sql_identifier, ARRAY[0,1]::bigint[])"
+	if !strings.Contains(databaseGenesis, analytics) || !strings.Contains(databaseGenesis, app) || strings.Index(databaseGenesis, analytics) > strings.Index(databaseGenesis, app) {
+		t.Fatalf("database genesis is not canonical:\n%s", databaseGenesis)
+	}
+	if !strings.Contains(databaseGenesis, "\\i "+databaseTopologyPreflightPath) {
+		t.Fatalf("database genesis does not repeat topology preflight under its transaction lock:\n%s", databaseGenesis)
+	}
+	databasePreflight := postgresConfig.Data[databaseTopologyPreflightKey]
+	analyticsPreflight := "('analytics'::text, ARRAY[0,1]::bigint[])"
+	appPreflight := "('app'::text, ARRAY[0,1]::bigint[])"
+	if !strings.Contains(databasePreflight, analyticsPreflight) || !strings.Contains(databasePreflight, appPreflight) || strings.Index(databasePreflight, analyticsPreflight) > strings.Index(databasePreflight, appPreflight) {
+		t.Fatalf("database topology preflight is not canonical:\n%s", databasePreflight)
+	}
+	if !strings.Contains(databasePreflight, "actual_databases AS MATERIALIZED") ||
+		!strings.Contains(databasePreflight, "WHERE databases.state <> 'retired'\n       LIMIT 3") ||
+		!strings.Contains(databasePreflight, "actual_range_sample AS MATERIALIZED") ||
+		!strings.Contains(databasePreflight, "LEFT JOIN active_epoch_counts AS active_counts ON active_counts.logical_database_id = databases.logical_database_id\n       LIMIT 5") {
+		t.Fatalf("database topology preflight is not bounded by declared topology:\n%s", databasePreflight)
 	}
 	primary := postgresConfig.Data["primary-0000.conf"]
 	if !strings.Contains(primary, "synchronized_standby_slots = 'pgshard_member_0001,pgshard_member_0002'\n") || !strings.Contains(primary, "synchronous_standby_names = 'ANY 1 (pgshard_member_0001,pgshard_member_0002)'\n") {
@@ -127,6 +149,94 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 			t.Fatal("planner must not create PostgreSQL Pods before safe lifecycle and HA exist")
 		}
 		assertOwned(t, item, cluster)
+	}
+}
+
+func TestMaximumValidClusterFitsKubernetesConfigMaps(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Name = strings.Repeat("c", pgshardv1alpha1.MaximumClusterNameLength)
+	cluster.Namespace = strings.Repeat("n", 63)
+	cluster.Spec.Shards = pgshardv1alpha1.MaximumShards
+	cluster.Spec.Databases = make([]pgshardv1alpha1.DatabaseTemplate, pgshardv1alpha1.MaximumDatabases)
+	for index := range cluster.Spec.Databases {
+		cluster.Spec.Databases[index] = pgshardv1alpha1.DatabaseTemplate{
+			Name:   fmt.Sprintf("db-%04d-%s", index, strings.Repeat("x", 55)),
+			Shards: pgshardv1alpha1.MaximumShards,
+		}
+	}
+	maximumEndpoint := func(host string) string {
+		prefix := "https://" + host + "/"
+		return prefix + strings.Repeat("x", pgshardv1alpha1.MaximumEndpointLength-len(prefix))
+	}
+	cluster.Spec.Backup.Repository = pgshardv1alpha1.BackupRepository{
+		Type: pgshardv1alpha1.RepositoryS3,
+		S3: &pgshardv1alpha1.S3Repository{
+			Bucket:   strings.Repeat("b", pgshardv1alpha1.MaximumS3BucketLength),
+			Endpoint: maximumEndpoint("minio.example.com"),
+			Region:   strings.Repeat("r", pgshardv1alpha1.MaximumS3RegionLength),
+			Prefix:   strings.Repeat("p", pgshardv1alpha1.MaximumS3PrefixLength),
+			CredentialsSecretRef: corev1.LocalObjectReference{
+				Name: strings.Repeat("s", 63) + "." + strings.Repeat("s", 63) + "." + strings.Repeat("s", 63) + "." + strings.Repeat("s", 61),
+			},
+		},
+	}
+	cluster.Spec.Observability.OpenTelemetryEndpoint = maximumEndpoint("collector.example.com")
+	if err := pgshardv1alpha1.ValidateClusterForReconciliation(cluster); err != nil {
+		t.Fatalf("maximum bounded cluster is not valid: %v", err)
+	}
+
+	plan, err := Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := []*corev1.ConfigMap{
+		postgresqlConfigMap(t, plan, cluster.Name),
+		object[*corev1.ConfigMap](t, plan, cluster.Name+TopologyConfigSuffix),
+	}
+	for _, object := range objects {
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(encoded) >= 1024*1024 {
+			t.Fatalf("maximum valid ConfigMap %s serializes to %d bytes", object.Name, len(encoded))
+		}
+	}
+}
+
+func TestTopologyDocumentKeepsIndependentDatabasePlacements(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.Shards = 8
+	cluster.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{
+		{Name: "b-dedicated", Shards: 3, Cells: []int32{5, 6, 7}},
+		{Name: "a", Shards: 5, Cells: []int32{0, 1, 2, 3, 4}},
+		{Name: "b-shared", Shards: 3, Cells: []int32{0, 1, 2}},
+	}
+	plan, err := Plan(cluster, DefaultImages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	topology := object[*corev1.ConfigMap](t, plan, cluster.Name+TopologyConfigSuffix)
+	var document topologyDocument
+	if err := json.Unmarshal([]byte(topology.Data["cluster.json"]), &document); err != nil {
+		t.Fatal(err)
+	}
+	want := []topologyDatabase{
+		{Name: "a", Shards: 5, Cells: []int32{0, 1, 2, 3, 4}},
+		{Name: "b-dedicated", Shards: 3, Cells: []int32{5, 6, 7}},
+		{Name: "b-shared", Shards: 3, Cells: []int32{0, 1, 2}},
+	}
+	if !reflect.DeepEqual(document.Databases, want) {
+		t.Fatalf("database topology document = %#v, want %#v", document.Databases, want)
+	}
+}
+
+func TestDatabaseGenesisSQLQuotesIdentifiersAsData(t *testing.T) {
+	t.Parallel()
+	if got, want := postgresqlStringLiteral("customer's-db"), "'customer''s-db'"; got != want {
+		t.Fatalf("PostgreSQL string literal = %q, want %q", got, want)
 	}
 }
 
@@ -218,6 +328,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	}
 
 	configuration := postgresqlConfigMap(t, plan, cluster.Name)
+	configurationHash := configMapDataHash(configuration.Data)
 	primaryConfiguration := configuration.Data["primary-0000.conf"]
 	if !strings.HasPrefix(primaryConfiguration, "include = '/etc/pgshard/postgresql/postgresql.conf'\n") ||
 		!strings.Contains(primaryConfiguration, "synchronized_standby_slots = ''\n") ||
@@ -305,6 +416,45 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		if got := strings.Count(bootstrap.Command[2], "sync \"$final\" \"$parent\" \"$volume_root\""); got != 3 {
 			t.Fatalf("PostgreSQL final-data publication barriers = %d, want 3", got)
 		}
+		if envValue(bootstrap.Env, "PGSHARD_POSTGRESQL_CONFIG_SHA256") != configurationHash {
+			t.Fatalf("PostgreSQL configuration digest environment = %#v", bootstrap.Env)
+		}
+		if statefulSet.Spec.Template.Annotations[ConfigHashAnnotation] != configurationHash {
+			t.Fatalf("PostgreSQL configuration digest annotation = %#v", statefulSet.Spec.Template.Annotations)
+		}
+		sourceMounts := 0
+		runtimeMounts := 0
+		for _, mount := range bootstrap.VolumeMounts {
+			switch mount.MountPath {
+			case "/etc/pgshard/postgresql-source":
+				sourceMounts++
+				if mount.Name != "postgresql-config" || !mount.ReadOnly {
+					t.Fatalf("PostgreSQL configuration source mount = %#v", mount)
+				}
+			case "/etc/pgshard/postgresql":
+				runtimeMounts++
+				if mount.Name != "postgresql-runtime-config" || mount.ReadOnly {
+					t.Fatalf("PostgreSQL runtime configuration mount = %#v", mount)
+				}
+			}
+		}
+		if sourceMounts != 1 || runtimeMounts != 1 {
+			t.Fatalf("PostgreSQL authenticated configuration mounts = source %d, runtime %d, want 1 each", sourceMounts, runtimeMounts)
+		}
+		if !strings.Contains(bootstrap.Command[2], "database_genesis="+databaseGenesisPath) || !strings.Contains(bootstrap.Command[2], "database_topology_preflight="+databaseTopologyPreflightPath) {
+			t.Fatal("PostgreSQL bootstrap does not read copied database topology files")
+		}
+		if !containsVolumeMount(postgres.VolumeMounts, "postgresql-runtime-config", true) || containsVolumeMount(postgres.VolumeMounts, "postgresql-config", true) {
+			t.Fatalf("PostgreSQL runtime configuration mounts = %#v", postgres.VolumeMounts)
+		}
+		configurationSource := volumeByName(t, pod.Volumes, "postgresql-config")
+		if configurationSource.ConfigMap == nil || configurationSource.ConfigMap.Name != configuration.Name {
+			t.Fatalf("PostgreSQL configuration source volume = %#v", configurationSource)
+		}
+		configurationRuntime := volumeByName(t, pod.Volumes, "postgresql-runtime-config")
+		if configurationRuntime.EmptyDir == nil || configurationRuntime.EmptyDir.SizeLimit == nil || configurationRuntime.EmptyDir.SizeLimit.Cmp(resource.MustParse("2Mi")) != 0 {
+			t.Fatalf("PostgreSQL runtime configuration volume = %#v", configurationRuntime)
+		}
 		if !strings.Contains(bootstrap.Command[2], "catalog_schema_fingerprint") ||
 			!strings.Contains(bootstrap.Command[2], "ee17a64c8eec5e2e9a44f29d4764edac90680980f61df35bdb2284c01b57c4d9") ||
 			!strings.Contains(bootstrap.Command[2], "2720fa78d0bc96c21311b1656eeaabbb3e745ea65fa9d1ea701ffb67cde1b1d9") ||
@@ -327,6 +477,10 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			!strings.Contains(bootstrap.Command[2], "count_missing_shards") ||
 			!strings.Contains(bootstrap.Command[2], "validate_genesis_inventory_reachable") ||
 			!strings.Contains(bootstrap.Command[2], "refusing shardschema inventory with missing configured shards") ||
+			!strings.Contains(bootstrap.Command[2], "--file=\"$database_genesis\"") ||
+			!strings.Contains(bootstrap.Command[2], "--file=\"$database_topology_preflight\"") ||
+			!strings.Contains(bootstrap.Command[2], "database genesis topology is missing or not a regular file") ||
+			!strings.Contains(bootstrap.Command[2], "database topology preflight is missing or not a regular file") ||
 			!strings.Contains(bootstrap.Command[2], "CREATE ROLE pgshard_pooler_catalog") ||
 			!strings.Contains(bootstrap.Command[2], "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE") ||
 			!strings.Contains(bootstrap.Command[2], "roles.rolpassword LIKE 'SCRAM-SHA-256\\$4096:%'") ||
@@ -360,9 +514,9 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		if !strings.Contains(bootstrap.Command[2], expectedHBAOrder) {
 			t.Fatal("catalog HBA rules are not ordered before the generic host grant")
 		}
-		expectedEnvironmentLength := 10
+		expectedEnvironmentLength := 11
 		if shard == 0 {
-			expectedEnvironmentLength = 12
+			expectedEnvironmentLength = 13
 		}
 		if len(bootstrap.Env) != expectedEnvironmentLength || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
 			bootstrap.Env[2].Name != "PGSHARD_POSTGRESQL_MAJOR" || bootstrap.Env[2].Value != pgshardv1alpha1.PostgreSQLMajor18 ||
@@ -371,11 +525,12 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			bootstrap.Env[5].Name != "PGSHARD_BOOTSTRAP_SHARDSCHEMA" || bootstrap.Env[5].Value != fmt.Sprintf("%t", shard == 0) ||
 			bootstrap.Env[6].Name != "PGSHARD_SHARDSCHEMA_MIGRATION" || bootstrap.Env[6].Value != shardschemaMigrationPath ||
 			bootstrap.Env[7].Name != "PGSHARD_SHARDSCHEMA_MIGRATION_SHA256" || bootstrap.Env[7].Value != shardschemaMigrationSHA256 ||
-			bootstrap.Env[8].Name != "PGSHARD_NODE_UID" || bootstrap.Env[8].ValueFrom == nil || bootstrap.Env[8].ValueFrom.FieldRef == nil || bootstrap.Env[8].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-uid']" ||
-			bootstrap.Env[9].Name != "PGSHARD_NODE_BOOT_ID" || bootstrap.Env[9].ValueFrom == nil || bootstrap.Env[9].ValueFrom.FieldRef == nil || bootstrap.Env[9].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-boot-id']" {
+			bootstrap.Env[8].Name != "PGSHARD_POSTGRESQL_CONFIG_SHA256" || bootstrap.Env[8].Value != configurationHash ||
+			bootstrap.Env[9].Name != "PGSHARD_NODE_UID" || bootstrap.Env[9].ValueFrom == nil || bootstrap.Env[9].ValueFrom.FieldRef == nil || bootstrap.Env[9].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-uid']" ||
+			bootstrap.Env[10].Name != "PGSHARD_NODE_BOOT_ID" || bootstrap.Env[10].ValueFrom == nil || bootstrap.Env[10].ValueFrom.FieldRef == nil || bootstrap.Env[10].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-boot-id']" {
 			t.Fatalf("PostgreSQL bootstrap identity = %#v", bootstrap.Env)
 		}
-		if shard == 0 && (bootstrap.Env[10].Name != "PGSHARD_CATALOG_CLIENT_SHA256" || bootstrap.Env[10].Value != cluster.Status.CatalogAccess.ClientSHA256 || bootstrap.Env[11].Name != "PGSHARD_CATALOG_SERVER_SHA256" || bootstrap.Env[11].Value != cluster.Status.CatalogAccess.ServerSHA256) {
+		if shard == 0 && (bootstrap.Env[11].Name != "PGSHARD_CATALOG_CLIENT_SHA256" || bootstrap.Env[11].Value != cluster.Status.CatalogAccess.ClientSHA256 || bootstrap.Env[12].Name != "PGSHARD_CATALOG_SERVER_SHA256" || bootstrap.Env[12].Value != cluster.Status.CatalogAccess.ServerSHA256) {
 			t.Fatalf("PostgreSQL catalog material checkpoint = %#v", bootstrap.Env)
 		}
 		if configMapVolumeName(t, pod.Volumes, "postgresql-config") != configuration.Name || !containsVolumeMount(bootstrap.VolumeMounts, "postgresql-config", true) {
@@ -711,6 +866,52 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(configurationDirectory, "primary-0000.conf"), []byte("include = '/etc/pgshard/postgresql/postgresql.conf'\n"), 0o444); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(
+		filepath.Join(configurationDirectory, databaseGenesisKey),
+		[]byte(renderDatabaseGenesisSQL(&pgshardv1alpha1.PgShardCluster{})),
+		0o444,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(configurationDirectory, databaseTopologyPreflightKey),
+		[]byte(renderDatabaseTopologyPreflightSQL(&pgshardv1alpha1.PgShardCluster{})),
+		0o444,
+	); err != nil {
+		t.Fatal(err)
+	}
+	configurationData := make(map[string]string)
+	configurationEntries, err := os.ReadDir(configurationDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range configurationEntries {
+		contents, err := os.ReadFile(filepath.Join(configurationDirectory, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		configurationData[entry.Name()] = string(contents)
+	}
+	configurationSHA256 := configMapDataHash(configurationData)
+	currentConfigurationSHA256 := func() string {
+		t.Helper()
+		entries, err := os.ReadDir(configurationDirectory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data := make(map[string]string, len(entries))
+		for _, entry := range entries {
+			if !entry.Type().IsRegular() {
+				continue
+			}
+			contents, err := os.ReadFile(filepath.Join(configurationDirectory, entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			data[entry.Name()] = string(contents)
+		}
+		return configMapDataHash(data)
+	}
 	legacyMigration, err := filepath.Abs(filepath.Join("..", "..", "..", "crates", "pgshard-catalog", "tests", "fixtures", "v0_49_0_shardschema.sql"))
 	if err != nil {
 		t.Fatal(err)
@@ -719,7 +920,7 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 		t.Fatalf("locate legacy shardschema fixture: %v", err)
 	}
 
-	containerArguments := func(dataParent, script string, environment ...string) []string {
+	containerArguments := func(dataParent, script string, copyConfiguration bool, environment ...string) []string {
 		t.Helper()
 		arguments := []string{
 			"--user", "999:999", "--network", "none", "--read-only",
@@ -727,10 +928,15 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 			"--volume", secretDirectory + ":/etc/pgshard/bootstrap:ro",
 			"--volume", catalogAuthDirectory + ":/etc/pgshard/catalog-auth:ro",
 			"--volume", catalogTLSDirectory + ":/etc/pgshard/catalog-tls:ro",
-			"--volume", configurationDirectory + ":/etc/pgshard/postgresql:ro",
+			"--volume", configurationDirectory + ":/etc/pgshard/postgresql-source:ro",
 			"--volume", legacyMigration + ":/tmp/v0_49_0_shardschema.sql:ro",
 			"--tmpfs", "/tmp:rw,uid=999,gid=999,mode=0700,size=67108864",
 			"--env", "PGDATA=" + dataParent + "/docker",
+		}
+		if copyConfiguration {
+			arguments = append(arguments, "--tmpfs", "/etc/pgshard/postgresql:rw,uid=999,gid=999,mode=0700,size=2097152")
+		} else {
+			arguments = append(arguments, "--volume", configurationDirectory+":/etc/pgshard/postgresql:ro")
 		}
 		for _, variable := range environment {
 			arguments = append(arguments, "--env", variable)
@@ -740,12 +946,17 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 	}
 	runContainer := func(dataParent, script string, environment ...string) (string, error) {
 		t.Helper()
-		arguments := append([]string{"run", "--rm"}, containerArguments(dataParent, script, environment...)...)
+		arguments := append([]string{"run", "--rm"}, containerArguments(dataParent, script, false, environment...)...)
+		return runDocker(arguments...)
+	}
+	runBootstrapContainer := func(dataParent, script string, environment ...string) (string, error) {
+		t.Helper()
+		arguments := append([]string{"run", "--rm"}, containerArguments(dataParent, script, true, environment...)...)
 		return runDocker(arguments...)
 	}
 	runContainerWithTimeout := func(name, dataParent, script string, timeout time.Duration, environment ...string) (string, error) {
 		t.Helper()
-		arguments := append([]string{"run", "--rm", "--name", name}, containerArguments(dataParent, script, environment...)...)
+		arguments := append([]string{"run", "--rm", "--name", name}, containerArguments(dataParent, script, true, environment...)...)
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		output, err := exec.CommandContext(ctx, "docker", arguments...).CombinedOutput()
@@ -765,6 +976,7 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 			fmt.Sprintf("PGSHARD_BOOTSTRAP_SHARDSCHEMA=%t", installCatalog),
 			"PGSHARD_SHARDSCHEMA_MIGRATION=" + shardschemaMigrationPath,
 			"PGSHARD_SHARDSCHEMA_MIGRATION_SHA256=" + shardschemaMigrationSHA256,
+			"PGSHARD_POSTGRESQL_CONFIG_SHA256=" + currentConfigurationSHA256(),
 			"PGSHARD_NODE_UID=bootstrap-e2e-node",
 			"PGSHARD_NODE_BOOT_ID=bootstrap-e2e-boot",
 			"PGSHARD_CATALOG_CLIENT_SHA256=" + catalogClientSHA256,
@@ -779,11 +991,42 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 	}
 	bootstrap := func(dataParent string, installCatalog bool, shardCount int) (string, error) {
 		t.Helper()
-		output, err := runContainer(dataParent, bootstrapScript(dataParent), bootstrapEnvironment(installCatalog, shardCount)...)
+		output, err := runBootstrapContainer(dataParent, bootstrapScript(dataParent), bootstrapEnvironment(installCatalog, shardCount)...)
 		if strings.Contains(output, catalogPassword) {
 			t.Fatalf("PostgreSQL bootstrap logged the catalog password:\n%s", output)
 		}
 		return output, err
+	}
+	configurationPath := filepath.Join(configurationDirectory, "postgresql.conf")
+	originalConfiguration, err := os.ReadFile(configurationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(configurationPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configurationPath, append(originalConfiguration, []byte("archive_command = 'false'\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const replacedConfigurationParent = "/var/lib/postgresql/18-replaced-config"
+	replacedEnvironment := bootstrapEnvironment(false, 2)
+	for index := range replacedEnvironment {
+		if strings.HasPrefix(replacedEnvironment[index], "PGSHARD_POSTGRESQL_CONFIG_SHA256=") {
+			replacedEnvironment[index] = "PGSHARD_POSTGRESQL_CONFIG_SHA256=" + configurationSHA256
+		}
+	}
+	replacedOutput, replacedErr := runBootstrapContainer(replacedConfigurationParent, bootstrapScript(replacedConfigurationParent), replacedEnvironment...)
+	if err := os.WriteFile(configurationPath, originalConfiguration, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(configurationPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if replacedErr == nil || !strings.Contains(replacedOutput, "PostgreSQL configuration does not match the controller-owned Pod contract") {
+		t.Fatalf("bootstrap accepted replaced configuration: %v\n%s", replacedErr, replacedOutput)
+	}
+	if output, err := runContainer(replacedConfigurationParent, "test ! -e \"$PGDATA\"", bootstrapEnvironment(false, 2)...); err != nil {
+		t.Fatalf("replaced configuration touched PGDATA: %v\n%s", err, output)
 	}
 	const primaryDataParent = "/var/lib/postgresql/18"
 	if output, err := bootstrap(primaryDataParent, false, 2); err != nil {
@@ -877,9 +1120,9 @@ trap - EXIT
 		}
 		return strings.TrimSpace(output)
 	}
-	fingerprint := func() string {
+	fingerprint := func(dataParent string) string {
 		t.Helper()
-		output, err := runContainer(primaryDataParent, postgresHarness+`
+		output, err := runContainer(dataParent, postgresHarness+`
 {
   {
   pg_dump --no-password --host="$socket" --username=postgres --dbname=shardschema \
@@ -988,15 +1231,53 @@ trap - EXIT
 	}
 	assertRejectedWithoutCatalogOrHBAMutation := func(shardCount int, want string) {
 		t.Helper()
-		before := fingerprint()
+		before := fingerprint(primaryDataParent)
 		output, err := bootstrap(primaryDataParent, true, shardCount)
 		if err == nil || !strings.Contains(output, want) {
 			t.Fatalf("conflicting catalog bootstrap error = %v, want %q\n%s", err, want, output)
 		}
-		if after := fingerprint(); after != before {
+		if after := fingerprint(primaryDataParent); after != before {
 			t.Fatalf("rejected catalog or serving HBA changed before=%q after=%q", before, after)
 		}
 	}
+
+	const legacyTopologyMismatchParent = "/var/lib/postgresql/18-legacy-topology-mismatch"
+	if output, err := bootstrap(legacyTopologyMismatchParent, false, 2); err != nil {
+		t.Fatalf("initialize legacy topology mismatch PGDATA: %v\n%s", err, output)
+	}
+	if output, err := runContainer(legacyTopologyMismatchParent, prepareLegacyCatalog); err != nil {
+		t.Fatalf("prepare legacy topology mismatch catalog: %v\n%s", err, output)
+	}
+	catalogSQL(legacyTopologyMismatchParent, `
+INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state)
+VALUES ('shard-0001', 1, 'active');
+DO $pgshard_legacy_database_topology$
+DECLARE
+  database_id uuid;
+  routing_generation bigint;
+  observed_catalog_epoch bigint;
+BEGIN
+  INSERT INTO pgshard_catalog.logical_databases(database_name)
+  VALUES ('app')
+  RETURNING logical_database_id INTO database_id;
+  INSERT INTO pgshard_catalog.routing_epochs(logical_database_id)
+  VALUES (database_id)
+  RETURNING routing_epoch INTO routing_generation;
+  INSERT INTO pgshard_catalog.routing_ranges(routing_epoch, range_start, range_end, shard_id)
+  VALUES
+    (routing_generation, 0, 9223372036854775808, 'shard-0000'),
+    (routing_generation, 9223372036854775808, 18446744073709551616, 'shard-0001');
+  SELECT catalog_epoch INTO STRICT observed_catalog_epoch
+    FROM pgshard_catalog.cluster_state WHERE singleton;
+  PERFORM pgshard_catalog.activate_routing_epoch(
+    database_id,
+    routing_generation,
+    NULL,
+    observed_catalog_epoch
+  );
+END
+$pgshard_legacy_database_topology$;
+`)
 
 	assertRejectedWithoutCatalogOrHBAMutation(2, "RestoreTopologyMismatch")
 	catalogSQL(primaryDataParent, "INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) VALUES ('shard-0001', 1, 'active')")
@@ -1008,6 +1289,127 @@ trap - EXIT
 	}
 	assertRejectedWithoutCatalogOrHBAMutation(1, "RestoreTopologyMismatch")
 
+	genesisCluster := &pgshardv1alpha1.PgShardCluster{Spec: pgshardv1alpha1.PgShardClusterSpec{
+		Shards: 2,
+		Databases: []pgshardv1alpha1.DatabaseTemplate{
+			{Name: "app", Shards: 2, Cells: []int32{0, 1}},
+			{Name: "analytics", Shards: 1, Cells: []int32{0}},
+		},
+	}}
+	genesisPath := filepath.Join(configurationDirectory, databaseGenesisKey)
+	replaceDatabaseGenesis := func(cluster *pgshardv1alpha1.PgShardCluster) {
+		t.Helper()
+		files := map[string]string{
+			genesisPath: renderDatabaseGenesisSQL(cluster),
+			filepath.Join(configurationDirectory, databaseTopologyPreflightKey): renderDatabaseTopologyPreflightSQL(cluster),
+		}
+		for path, contents := range files {
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatalf("make database topology fixture writable: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+				t.Fatalf("write database topology fixture: %v", err)
+			}
+			if err := os.Chmod(path, 0o444); err != nil {
+				t.Fatalf("make database topology fixture read-only: %v", err)
+			}
+		}
+	}
+	conflictingLegacyGenesis := genesisCluster.DeepCopy()
+	conflictingLegacyGenesis.Spec.Databases[0].Cells = []int32{1, 0}
+	replaceDatabaseGenesis(conflictingLegacyGenesis)
+	legacyBefore := fingerprint(legacyTopologyMismatchParent)
+	legacyOutput, legacyErr := bootstrap(legacyTopologyMismatchParent, true, 2)
+	if legacyErr == nil || !strings.Contains(legacyOutput, "RestoreTopologyMismatch: shardschema logical database topology conflicts") {
+		t.Fatalf("legacy topology preflight error = %v\n%s", legacyErr, legacyOutput)
+	}
+	if legacyAfter := fingerprint(legacyTopologyMismatchParent); legacyAfter != legacyBefore {
+		t.Fatalf("legacy topology mismatch mutated catalog before=%q after=%q", legacyBefore, legacyAfter)
+	}
+	if got := catalogSQL(legacyTopologyMismatchParent, "SELECT pg_catalog.to_regprocedure('pgshard_catalog.install_database_genesis(pgshard_catalog.sql_identifier,bigint[])') IS NULL"); got != "t" {
+		t.Fatalf("legacy topology mismatch ran forward migration: %q", got)
+	}
+	replaceDatabaseGenesis(genesisCluster)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("install declared database genesis: %v\n%s", err, output)
+	}
+	if got := catalogSQL(primaryDataParent, `
+SELECT pg_catalog.string_agg(
+         databases.database_name::text || ':' || ranges.range_start::text || ':' || shards.shard_number::text,
+         ',' ORDER BY databases.database_name, ranges.range_start
+       )
+  FROM pgshard_catalog.logical_databases AS databases
+  JOIN pgshard_catalog.active_routing_epochs AS active
+	ON active.logical_database_id = databases.logical_database_id
+  JOIN pgshard_catalog.routing_ranges AS ranges
+	ON ranges.routing_epoch = active.routing_epoch
+  JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id`); got != "analytics:0:0,app:0:0,app:9223372036854775808:1" {
+		t.Fatalf("installed database genesis topology = %q", got)
+	}
+	genesisEpoch := catalogSQL(primaryDataParent, "SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton")
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("replay exact database genesis: %v\n%s", err, output)
+	}
+	if replayedEpoch := catalogSQL(primaryDataParent, "SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton"); replayedEpoch != genesisEpoch {
+		t.Fatalf("idempotent database genesis changed catalog epoch: before=%q after=%q", genesisEpoch, replayedEpoch)
+	}
+	conflictingGenesis := genesisCluster.DeepCopy()
+	conflictingGenesis.Spec.Databases = append(
+		conflictingGenesis.Spec.Databases,
+		pgshardv1alpha1.DatabaseTemplate{Name: "aardvark", Shards: 1, Cells: []int32{0}},
+	)
+	conflictingGenesis.Spec.Databases[0].Cells = []int32{1, 0}
+	replaceDatabaseGenesis(conflictingGenesis)
+	topologySnapshot := func() string {
+		t.Helper()
+		return catalogSQL(primaryDataParent, `
+SELECT state.catalog_epoch,
+       (SELECT pg_catalog.string_agg(
+                 databases.database_name::text || ':' || active.routing_epoch::text || ':' ||
+                 ranges.range_start::text || ':' || ranges.range_end::text || ':' || ranges.shard_id::text,
+                 ',' ORDER BY databases.database_name, ranges.range_start
+               )
+          FROM pgshard_catalog.logical_databases AS databases
+          JOIN pgshard_catalog.active_routing_epochs AS active
+            ON active.logical_database_id = databases.logical_database_id
+          JOIN pgshard_catalog.routing_ranges AS ranges
+            ON ranges.routing_epoch = active.routing_epoch),
+		(SELECT pg_catalog.count(*) FROM pgshard_catalog.logical_databases),
+		(SELECT pg_catalog.count(*) FROM pgshard_catalog.routing_epochs),
+		(SELECT pg_catalog.count(*) FROM pgshard_catalog.routing_ranges),
+		(SELECT sequence_state.last_value::text || ':' || sequence_state.is_called::text
+		   FROM pgshard_catalog.routing_epochs_routing_epoch_seq AS sequence_state)
+  FROM pgshard_catalog.cluster_state AS state
+ WHERE state.singleton`)
+	}
+	beforeConflict := topologySnapshot()
+	conflictOutput, conflictErr := bootstrap(primaryDataParent, true, 2)
+	if conflictErr == nil || !strings.Contains(conflictOutput, "RestoreTopologyMismatch: shardschema logical database topology conflicts") {
+		t.Fatalf("conflicting multi-database genesis error = %v\n%s", conflictErr, conflictOutput)
+	}
+	if afterConflict := topologySnapshot(); afterConflict != beforeConflict {
+		t.Fatalf("failed multi-database genesis changed catalog topology: before=%q after=%q", beforeConflict, afterConflict)
+	}
+	if got := catalogSQL(primaryDataParent, "SELECT count(*) FROM pgshard_catalog.logical_databases WHERE database_name = 'aardvark'"); got != "0" {
+		t.Fatalf("failed multi-database genesis partially installed an earlier declaration: %q", got)
+	}
+	replaceDatabaseGenesis(genesisCluster)
+	catalogSQL(primaryDataParent, "SELECT pgshard_catalog.install_database_genesis('undeclared'::pgshard_catalog.sql_identifier, ARRAY[0]::bigint[])")
+	assertRejectedWithoutCatalogOrHBAMutation(2, "RestoreTopologyMismatch: shardschema logical database topology conflicts")
+	catalogSQL(primaryDataParent, `
+SET session_replication_role = replica;
+DELETE FROM pgshard_catalog.active_routing_epochs
+ WHERE logical_database_id = (SELECT logical_database_id FROM pgshard_catalog.logical_databases WHERE database_name = 'undeclared');
+DELETE FROM pgshard_catalog.routing_ranges
+ WHERE routing_epoch IN (SELECT routing_epoch FROM pgshard_catalog.routing_epochs WHERE logical_database_id = (SELECT logical_database_id FROM pgshard_catalog.logical_databases WHERE database_name = 'undeclared'));
+DELETE FROM pgshard_catalog.routing_epochs
+ WHERE logical_database_id = (SELECT logical_database_id FROM pgshard_catalog.logical_databases WHERE database_name = 'undeclared');
+DELETE FROM pgshard_catalog.logical_databases WHERE database_name = 'undeclared';
+SET session_replication_role = origin;
+`)
+	if output, err := bootstrap(primaryDataParent, true, 2); err != nil {
+		t.Fatalf("canonical topology was rejected after undeclared-database fixture cleanup: %v\n%s", err, output)
+	}
 	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 2 CYCLE")
 	assertRejectedWithoutCatalogOrHBAMutation(2, "refusing an unsupported or malformed pre-existing shardschema catalog")
 	catalogSQL(primaryDataParent, "ALTER SEQUENCE pgshard_catalog.routing_epochs_routing_epoch_seq INCREMENT BY 1 NO CYCLE")
@@ -1015,10 +1417,6 @@ trap - EXIT
 		t.Fatalf("canonical identity sequence was not restored: %v\n%s", err, output)
 	}
 	catalogSQL(primaryDataParent, `
-INSERT INTO pgshard_catalog.logical_databases(logical_database_id, database_name)
-VALUES ('11111111-1111-1111-1111-111111111111', 'sequence_progress');
-INSERT INTO pgshard_catalog.routing_epochs(logical_database_id)
-VALUES ('11111111-1111-1111-1111-111111111111');
 INSERT INTO pgshard_catalog.registered_tables(
   logical_database_id,
   schema_name,
@@ -1026,13 +1424,14 @@ INSERT INTO pgshard_catalog.registered_tables(
   shard_key_column,
   shard_key_type
 )
-VALUES (
-  '11111111-1111-1111-1111-111111111111',
+SELECT
+  logical_database_id,
   'public',
   'sequence_progress',
   'id',
   'bigint'
-);
+FROM pgshard_catalog.logical_databases
+WHERE database_name = 'app';
 SELECT pg_catalog.setval(
   'pgshard_catalog.routing_epochs_routing_epoch_seq',
   (SELECT pg_catalog.max(routing_epoch) FROM pgshard_catalog.routing_epochs),
@@ -1300,7 +1699,7 @@ PREPARE TRANSACTION 'pgshard_bootstrap_lock';
 		_, _ = runDocker("rm", "--force", crashContainer)
 	})
 	crashBootstrapScript := strings.Replace(bootstrapScript(primaryDataParent), "lock_timeout=5s", "lock_timeout=30s", 1)
-	crashArguments := append([]string{"run", "--detach", "--name", crashContainer}, containerArguments(primaryDataParent, crashBootstrapScript, bootstrapEnvironment(true, 2)...)...)
+	crashArguments := append([]string{"run", "--detach", "--name", crashContainer}, containerArguments(primaryDataParent, crashBootstrapScript, true, bootstrapEnvironment(true, 2)...)...)
 	if output, err := runDocker(crashArguments...); err != nil {
 		t.Fatalf("start crash-retry bootstrap container: %v\n%s", err, output)
 	}
@@ -1334,7 +1733,7 @@ PREPARE TRANSACTION 'pgshard_bootstrap_lock';
 		t.Fatalf("post-recovery catalog inventory = %q", got)
 	}
 
-	assertGenesisCrashRetry := func(dataParent, interruptedScript, probeSQL, wantProbe, boundary string) {
+	assertGenesisCrashRetry := func(dataParent, interruptedScript, probeSQL, wantProbe, boundary string, prepareRetry func()) {
 		t.Helper()
 		containerName := fmt.Sprintf("pgshard-genesis-crash-%d-%d", os.Getpid(), time.Now().UnixNano())
 		t.Cleanup(func() {
@@ -1342,7 +1741,7 @@ PREPARE TRANSACTION 'pgshard_bootstrap_lock';
 		})
 		arguments := append(
 			[]string{"run", "--detach", "--name", containerName},
-			containerArguments(dataParent, interruptedScript, bootstrapEnvironment(true, 2)...)...,
+			containerArguments(dataParent, interruptedScript, true, bootstrapEnvironment(true, 2)...)...,
 		)
 		if output, err := runDocker(arguments...); err != nil {
 			t.Fatalf("start %s crash fixture: %v\n%s", boundary, err, output)
@@ -1379,11 +1778,17 @@ test ! -L "$PGDATA/.pgshard-catalog-genesis-intent"
 `); err != nil {
 			t.Fatalf("%s did not preserve the durable genesis intent before retry: %v\n%s", boundary, err, output)
 		}
+		if prepareRetry != nil {
+			prepareRetry()
+		}
 		if output, err := bootstrap(dataParent, true, 2); err != nil {
 			t.Fatalf("catalog genesis did not recover after forced death at %s: %v\n%s", boundary, err, output)
 		}
 		if got := catalogSQL(dataParent, "SELECT count(*) FILTER (WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active') FROM pgshard_catalog.shards"); got != "2|2" {
 			t.Fatalf("recovered genesis inventory = %q", got)
+		}
+		if got := catalogSQL(dataParent, "SELECT (SELECT count(*) FROM pgshard_catalog.logical_databases WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.routing_ranges AS ranges JOIN pgshard_catalog.active_routing_epochs AS active ON active.routing_epoch = ranges.routing_epoch)"); got != "2|3" {
+			t.Fatalf("recovered database genesis topology = %q", got)
 		}
 		if output, err := runContainer(dataParent, `set -Eeuo pipefail
 test ! -e "$PGDATA/.pgshard-catalog-genesis-intent"
@@ -1410,6 +1815,7 @@ test ! -e "$PGDATA/.pgshard-catalog-genesis-intent"
 		"SELECT pg_catalog.to_regclass('pgshard_catalog.shards') IS NOT NULL",
 		"t",
 		"catalog migration commit",
+		nil,
 	)
 
 	const unreachablePartialDataParent = "/var/lib/postgresql/18-genesis-unreachable-partial"
@@ -1428,7 +1834,7 @@ test ! -e "$PGDATA/.pgshard-catalog-genesis-intent"
 	})
 	partialArguments := append(
 		[]string{"run", "--detach", "--name", partialContainer},
-		containerArguments(unreachablePartialDataParent, unreachablePartialScript, bootstrapEnvironment(true, 3)...)...,
+		containerArguments(unreachablePartialDataParent, unreachablePartialScript, true, bootstrapEnvironment(true, 3)...)...,
 	)
 	if output, err := runDocker(partialArguments...); err != nil {
 		t.Fatalf("start unreachable partial genesis fixture: %v\n%s", err, output)
@@ -1491,6 +1897,7 @@ test ! -L "$PGDATA/.pgshard-catalog-genesis-intent"
 		"SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE datname = 'shardschema' AND wait_event = 'PgSleep' AND query = 'SELECT pg_catalog.pg_sleep(600);'",
 		"1",
 		"open catalog inventory transaction",
+		nil,
 	)
 
 	const inventoryBoundaryDataParent = "/var/lib/postgresql/18-genesis-inventory-boundary"
@@ -1509,6 +1916,61 @@ test ! -L "$PGDATA/.pgshard-catalog-genesis-intent"
 		"SELECT count(*) FILTER (WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.shard_restore_incarnations WHERE state = 'active') FROM pgshard_catalog.shards",
 		"2|2",
 		"catalog inventory commit",
+		nil,
+	)
+
+	canonicalDatabaseGenesis := renderDatabaseGenesisSQL(genesisCluster)
+	writeDatabaseGenesis := func(contents string) {
+		t.Helper()
+		if err := os.Chmod(genesisPath, 0o644); err != nil {
+			t.Fatalf("make crash-boundary database genesis writable: %v", err)
+		}
+		if err := os.WriteFile(genesisPath, []byte(contents), 0o644); err != nil {
+			t.Fatalf("write crash-boundary database genesis: %v", err)
+		}
+		if err := os.Chmod(genesisPath, 0o444); err != nil {
+			t.Fatalf("make crash-boundary database genesis read-only: %v", err)
+		}
+	}
+	t.Cleanup(func() { writeDatabaseGenesis(canonicalDatabaseGenesis) })
+	openDatabaseGenesis := strings.Replace(
+		canonicalDatabaseGenesis,
+		"DO $pgshard_database_genesis_postcondition$",
+		"SELECT pg_catalog.pg_sleep(600);\nDO $pgshard_database_genesis_postcondition$",
+		1,
+	)
+	if openDatabaseGenesis == canonicalDatabaseGenesis {
+		t.Fatal("open database genesis transaction injection did not match")
+	}
+	writeDatabaseGenesis(openDatabaseGenesis)
+	const openDatabaseGenesisParent = "/var/lib/postgresql/18-genesis-database-open"
+	assertGenesisCrashRetry(
+		openDatabaseGenesisParent,
+		bootstrapScript(openDatabaseGenesisParent),
+		"SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE datname = 'shardschema' AND wait_event = 'PgSleep' AND query = 'SELECT pg_catalog.pg_sleep(600);'",
+		"1",
+		"open database genesis transaction",
+		func() { writeDatabaseGenesis(canonicalDatabaseGenesis) },
+	)
+
+	committedDatabaseGenesis := strings.Replace(
+		canonicalDatabaseGenesis,
+		"COMMIT;\n",
+		"COMMIT;\nSELECT pg_catalog.pg_sleep(600);\n",
+		1,
+	)
+	if committedDatabaseGenesis == canonicalDatabaseGenesis {
+		t.Fatal("database genesis commit boundary injection did not match")
+	}
+	writeDatabaseGenesis(committedDatabaseGenesis)
+	const committedDatabaseGenesisParent = "/var/lib/postgresql/18-genesis-database-committed"
+	assertGenesisCrashRetry(
+		committedDatabaseGenesisParent,
+		bootstrapScript(committedDatabaseGenesisParent),
+		"SELECT (SELECT count(*) FROM pgshard_catalog.logical_databases WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.routing_ranges AS ranges JOIN pgshard_catalog.active_routing_epochs AS active ON active.routing_epoch = ranges.routing_epoch)",
+		"2|3",
+		"database genesis commit",
+		func() { writeDatabaseGenesis(canonicalDatabaseGenesis) },
 	)
 
 	const emptyDataParent = "/var/lib/postgresql/18-empty"
@@ -2171,6 +2633,8 @@ func singleMemberImages() Images {
 func bootstrapVersionTestEnvironment(t *testing.T, major string, initdbMajor ...string) []string {
 	t.Helper()
 	directory := t.TempDir()
+	configurationSource := t.TempDir()
+	configurationTarget := t.TempDir()
 	postgres := filepath.Join(directory, "postgres")
 	contents := "#!/bin/sh\nprintf '%s\\n' 'postgres (PostgreSQL) " + major + ".0'\n"
 	if err := os.WriteFile(postgres, []byte(contents), 0o755); err != nil {
@@ -2183,7 +2647,12 @@ func bootstrapVersionTestEnvironment(t *testing.T, major string, initdbMajor ...
 			t.Fatal(err)
 		}
 	}
-	return append(os.Environ(), "PATH="+directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return append(os.Environ(),
+		"PATH="+directory+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"PGSHARD_POSTGRESQL_CONFIG_SHA256="+configMapDataHash(map[string]string{}),
+		"PGSHARD_POSTGRESQL_CONFIG_SOURCE="+configurationSource,
+		"PGSHARD_POSTGRESQL_CONFIG_TARGET="+configurationTarget,
+	)
 }
 
 func copyString(value *string) *string {

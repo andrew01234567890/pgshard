@@ -1,5 +1,7 @@
 //! Transactionally consistent `PostgreSQL` catalog loading.
 
+use std::collections::HashMap;
+
 use pgshard_types::{KeyRange, KeyRangeError, ShardId};
 use thiserror::Error;
 use tokio::time::Instant;
@@ -25,8 +27,8 @@ pub const MAX_TOTAL_ROUTING_RANGES: usize = 65_536;
 pub const MAX_TOTAL_REGISTERED_TABLES: usize = 65_536;
 
 const DATABASE_QUERY_LIMIT: i64 = 1_025;
-const ROUTE_QUERY_LIMIT: i64 = 4_097;
-const TABLE_QUERY_LIMIT: i64 = 16_385;
+const ROUTE_QUERY_LIMIT: i64 = 65_537;
+const TABLE_QUERY_LIMIT: i64 = 65_537;
 // The client deadline remains authoritative. This slightly later PostgreSQL 18
 // transaction timeout interrupts lock waits and rolls back even if a backend
 // does not notice that the client socket was dropped while it is blocked.
@@ -45,28 +47,52 @@ const CONFIGURATION_SQL: &str = "\
 
 const DATABASES_SQL: &str = "\
     SELECT databases.logical_database_id::text, databases.database_name, \
-           databases.schema_epoch, databases.authorization_epoch, active.routing_epoch \
+           databases.schema_epoch, databases.authorization_epoch, active.routing_epoch, \
+           coalesce(epochs.logical_database_id = databases.logical_database_id \
+                    AND epochs.state = 'active', false), \
+           (SELECT pg_catalog.count(*) = 1 \
+              FROM pgshard_catalog.routing_epochs AS active_epochs \
+             WHERE active_epochs.logical_database_id = databases.logical_database_id \
+               AND active_epochs.state = 'active') \
       FROM pgshard_catalog.logical_databases AS databases \
       JOIN pgshard_catalog.active_routing_epochs AS active \
         ON active.logical_database_id = databases.logical_database_id \
+      LEFT JOIN pgshard_catalog.routing_epochs AS epochs \
+        ON epochs.routing_epoch = active.routing_epoch \
      WHERE databases.state IN ('active', 'draining') \
-     ORDER BY databases.logical_database_id \
-     LIMIT $1";
+      ORDER BY databases.logical_database_id \
+      LIMIT $1";
 
 const ROUTES_SQL: &str = "\
-    SELECT shards.shard_number, ranges.range_start::text, ranges.range_end::text \
-      FROM pgshard_catalog.routing_ranges AS ranges \
-      JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id \
-     WHERE ranges.routing_epoch = $1 \
-     ORDER BY ranges.range_start, ranges.range_end \
-     LIMIT $2";
+    SELECT databases.logical_database_id::text, shards.shard_number, \
+           ranges.range_start::text, ranges.range_end::text, shards.state, \
+           ranges.shard_id::text \
+      FROM pgshard_catalog.logical_databases AS databases \
+      JOIN pgshard_catalog.active_routing_epochs AS active \
+        ON active.logical_database_id = databases.logical_database_id \
+      JOIN pgshard_catalog.routing_epochs AS epochs \
+        ON epochs.routing_epoch = active.routing_epoch \
+       AND epochs.logical_database_id = databases.logical_database_id \
+       AND epochs.state = 'active' \
+      JOIN pgshard_catalog.routing_ranges AS ranges \
+        ON ranges.routing_epoch = active.routing_epoch \
+       LEFT JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id \
+     WHERE databases.state IN ('active', 'draining') \
+     ORDER BY databases.logical_database_id, ranges.range_start, ranges.range_end \
+     LIMIT $1";
 
 const TABLES_SQL: &str = "\
-    SELECT schema_name, table_name, shard_key_column, shard_key_type, hash_version \
-      FROM pgshard_catalog.registered_tables \
-     WHERE logical_database_id = $1::text::uuid AND state = 'active' \
-     ORDER BY schema_name, table_name \
-     LIMIT $2";
+    SELECT databases.logical_database_id::text, tables.schema_name, tables.table_name, \
+           tables.shard_key_column, tables.shard_key_type, tables.hash_version \
+      FROM pgshard_catalog.logical_databases AS databases \
+      JOIN pgshard_catalog.active_routing_epochs AS active \
+        ON active.logical_database_id = databases.logical_database_id \
+      JOIN pgshard_catalog.registered_tables AS tables \
+        ON tables.logical_database_id = databases.logical_database_id \
+       AND tables.state = 'active' \
+     WHERE databases.state IN ('active', 'draining') \
+     ORDER BY databases.logical_database_id, tables.schema_name, tables.table_name \
+     LIMIT $1";
 
 /// Dedicated authoritative catalog connection.
 ///
@@ -221,7 +247,7 @@ fn server_transaction_timeout_setting(deadline: Instant) -> String {
 async fn load_in_transaction(transaction: &Transaction<'_>) -> Result<CatalogSnapshot, LoadError> {
     let configuration = transaction.query_opt(CONFIGURATION_SQL, &[]).await?;
     let configuration = configuration.ok_or(LoadError::MissingSingleton)?;
-    let cluster_id = parse_uuid("cluster_id", configuration.get::<_, String>(0))?;
+    let cluster_id = parse_uuid("cluster_id", configuration.get::<_, &str>(0))?;
     let hash_version = positive_u16("hash_version", configuration.get::<_, i16>(1))?;
     let hash_seed = parse_u64("hash_seed", &configuration.get::<_, String>(2))?;
     let catalog_epoch = nonnegative_u64("catalog_epoch", configuration.get::<_, i64>(3))?;
@@ -230,11 +256,26 @@ async fn load_in_transaction(transaction: &Transaction<'_>) -> Result<CatalogSna
         .query(DATABASES_SQL, &[&DATABASE_QUERY_LIMIT])
         .await?;
     ensure_cardinality("logical databases", rows.len(), MAX_LOGICAL_DATABASES)?;
-    let mut totals = LoadTotals::default();
-    let mut databases = Vec::with_capacity(rows.len());
+    let mut pending = Vec::with_capacity(rows.len());
+    let mut database_indices = HashMap::with_capacity(rows.len());
     for row in rows {
-        databases.push(load_database(transaction, &row, &mut totals).await?);
+        let database = parse_database(&row)?;
+        let database_index = pending.len();
+        if database_indices
+            .insert(database.id, database_index)
+            .is_some()
+        {
+            return Err(LoadError::DuplicateLogicalDatabase(database.id));
+        }
+        pending.push(database);
     }
+
+    load_routes(transaction, &mut pending, &database_indices).await?;
+    load_tables(transaction, &mut pending, &database_indices).await?;
+    let databases = pending
+        .into_iter()
+        .map(PendingDatabase::finish)
+        .collect::<Result<Vec<_>, _>>()?;
     CatalogSnapshot::new(
         ClusterId::new(cluster_id)?,
         catalog_epoch,
@@ -244,81 +285,134 @@ async fn load_in_transaction(transaction: &Transaction<'_>) -> Result<CatalogSna
     .map_err(LoadError::Snapshot)
 }
 
-async fn load_database(
+async fn load_routes(
     transaction: &Transaction<'_>,
-    row: &Row,
-    totals: &mut LoadTotals,
-) -> Result<DatabaseCatalog, LoadError> {
-    let id_text = row.get::<_, String>(0);
-    let id = DatabaseId::new(parse_uuid("logical_database_id", id_text.clone())?)?;
-    let name = row.get::<_, String>(1);
-    let schema_epoch = positive_u64("schema_epoch", row.get::<_, i64>(2))?;
-    let authorization_epoch = positive_u64("authorization_epoch", row.get::<_, i64>(3))?;
-    let routing_epoch_i64 = row.get::<_, i64>(4);
-    let routing_epoch = positive_u64("routing_epoch", routing_epoch_i64)?;
-
-    let route_rows = transaction
-        .query(ROUTES_SQL, &[&routing_epoch_i64, &ROUTE_QUERY_LIMIT])
-        .await?;
+    pending: &mut [PendingDatabase],
+    database_indices: &HashMap<DatabaseId, usize>,
+) -> Result<(), LoadError> {
+    let route_rows = transaction.query(ROUTES_SQL, &[&ROUTE_QUERY_LIMIT]).await?;
     ensure_cardinality(
-        "routing ranges for one database",
-        route_rows.len(),
-        MAX_ROUTING_RANGES_PER_DATABASE,
-    )?;
-    add_to_total(
         "routing ranges in one snapshot",
-        &mut totals.routes,
         route_rows.len(),
         MAX_TOTAL_ROUTING_RANGES,
     )?;
-    let mut routes = Vec::with_capacity(route_rows.len());
-    for route in route_rows {
-        let shard_number = nonnegative_u32("shard_number", route.get::<_, i64>(0))?;
-        let start = parse_u128("range_start", &route.get::<_, String>(1))?;
-        let end = parse_u128("range_end", &route.get::<_, String>(2))?;
-        routes.push(ShardRoute::new(
+    for row in route_rows {
+        let id = DatabaseId::new(parse_uuid(
+            "routing logical_database_id",
+            row.get::<_, &str>(0),
+        )?)?;
+        let database_index =
+            database_indices
+                .get(&id)
+                .copied()
+                .ok_or(LoadError::UnexpectedDatabaseReference {
+                    resource: "routing range",
+                    database_id: id,
+                })?;
+        let database = &mut pending[database_index];
+        ensure_cardinality(
+            "routing ranges for one database",
+            database.routes.len() + 1,
+            MAX_ROUTING_RANGES_PER_DATABASE,
+        )?;
+        let target_shard_id = row.get::<_, &str>(5);
+        let shard_number =
+            row.get::<_, Option<i64>>(1)
+                .ok_or_else(|| LoadError::MissingRoutingShard {
+                    database_id: id,
+                    shard_id: target_shard_id.to_owned(),
+                })?;
+        let shard_number = nonnegative_u32("shard_number", shard_number)?;
+        let shard_state =
+            row.get::<_, Option<String>>(4)
+                .ok_or_else(|| LoadError::MissingRoutingShard {
+                    database_id: id,
+                    shard_id: target_shard_id.to_owned(),
+                })?;
+        if !matches!(shard_state.as_str(), "active" | "draining") {
+            return Err(LoadError::InvalidRoutingShardState {
+                database_id: id,
+                shard_number,
+                state: shard_state,
+            });
+        }
+        let start = parse_u128("range_start", &row.get::<_, String>(2))?;
+        let end = parse_u128("range_end", &row.get::<_, String>(3))?;
+        database.routes.push(ShardRoute::new(
             ShardId(shard_number),
             KeyRange::new(start, end)?,
         ));
     }
+    Ok(())
+}
 
-    let table_rows = transaction
-        .query(TABLES_SQL, &[&id_text, &TABLE_QUERY_LIMIT])
-        .await?;
+async fn load_tables(
+    transaction: &Transaction<'_>,
+    pending: &mut [PendingDatabase],
+    database_indices: &HashMap<DatabaseId, usize>,
+) -> Result<(), LoadError> {
+    let table_rows = transaction.query(TABLES_SQL, &[&TABLE_QUERY_LIMIT]).await?;
     ensure_cardinality(
-        "registered tables for one database",
-        table_rows.len(),
-        MAX_REGISTERED_TABLES_PER_DATABASE,
-    )?;
-    add_to_total(
         "registered tables in one snapshot",
-        &mut totals.tables,
         table_rows.len(),
         MAX_TOTAL_REGISTERED_TABLES,
     )?;
-    let mut tables = Vec::with_capacity(table_rows.len());
-    for table in table_rows {
-        let schema_name = table.get::<_, String>(0);
-        let table_name = table.get::<_, String>(1);
-        let column = table.get::<_, String>(2);
-        let key_type = parse_shard_key_type(&table.get::<_, String>(3))?;
-        let hash_version = positive_u16("table hash_version", table.get::<_, i16>(4))?;
-        tables.push(RegisteredTable::new(
+    for row in table_rows {
+        let id = DatabaseId::new(parse_uuid(
+            "table logical_database_id",
+            row.get::<_, &str>(0),
+        )?)?;
+        let database_index =
+            database_indices
+                .get(&id)
+                .copied()
+                .ok_or(LoadError::UnexpectedDatabaseReference {
+                    resource: "registered table",
+                    database_id: id,
+                })?;
+        let database = &mut pending[database_index];
+        ensure_cardinality(
+            "registered tables for one database",
+            database.tables.len() + 1,
+            MAX_REGISTERED_TABLES_PER_DATABASE,
+        )?;
+        let schema_name = row.get::<_, String>(1);
+        let table_name = row.get::<_, String>(2);
+        let column = row.get::<_, String>(3);
+        let key_type = parse_shard_key_type(&row.get::<_, String>(4))?;
+        let hash_version = positive_u16("table hash_version", row.get::<_, i16>(5))?;
+        database.tables.push(RegisteredTable::new(
             TableName::new(schema_name, table_name)?,
             column,
             key_type,
             hash_version,
         )?);
     }
+    Ok(())
+}
 
-    DatabaseCatalog::new(
+fn parse_database(row: &Row) -> Result<PendingDatabase, LoadError> {
+    let id = DatabaseId::new(parse_uuid("logical_database_id", row.get::<_, &str>(0))?)?;
+    let name = row.get::<_, String>(1);
+    let schema_epoch = positive_u64("schema_epoch", row.get::<_, i64>(2))?;
+    let authorization_epoch = positive_u64("authorization_epoch", row.get::<_, i64>(3))?;
+    let routing_epoch_i64 = row
+        .get::<_, Option<i64>>(4)
+        .ok_or(LoadError::InvalidActiveRoutingEpoch { database_id: id })?;
+    let routing_epoch_is_owned_and_active = row.get::<_, bool>(5);
+    let has_exactly_one_active_epoch = row.get::<_, bool>(6);
+    if !routing_epoch_is_owned_and_active || !has_exactly_one_active_epoch {
+        return Err(LoadError::InvalidActiveRoutingEpoch { database_id: id });
+    }
+    let routing_epoch = positive_u64("routing_epoch", routing_epoch_i64)?;
+
+    Ok(PendingDatabase {
         id,
         name,
-        DatabaseEpochs::new(routing_epoch, schema_epoch, authorization_epoch)?,
-        routes,
-        tables,
-    )
-    .map_err(LoadError::Snapshot)
+        epochs: DatabaseEpochs::new(routing_epoch, schema_epoch, authorization_epoch)?,
+        routes: Vec::new(),
+        tables: Vec::new(),
+    })
 }
 
 fn parse_shard_key_type(value: &str) -> Result<ShardKeyType, LoadError> {
@@ -331,10 +425,10 @@ fn parse_shard_key_type(value: &str) -> Result<ShardKeyType, LoadError> {
     }
 }
 
-fn parse_uuid(field: &'static str, value: String) -> Result<Uuid, LoadError> {
-    Uuid::parse_str(&value).map_err(|source| LoadError::InvalidUuid {
+fn parse_uuid(field: &'static str, value: &str) -> Result<Uuid, LoadError> {
+    Uuid::parse_str(value).map_err(|source| LoadError::InvalidUuid {
         field,
-        value,
+        value: value.to_owned(),
         source,
     })
 }
@@ -359,10 +453,19 @@ fn nonnegative_u64(field: &'static str, value: i64) -> Result<u64, LoadError> {
     u64::try_from(value).map_err(|_| invalid_integer(field, &value))
 }
 
-#[derive(Default)]
-struct LoadTotals {
-    routes: usize,
-    tables: usize,
+struct PendingDatabase {
+    id: DatabaseId,
+    name: String,
+    epochs: DatabaseEpochs,
+    routes: Vec<ShardRoute>,
+    tables: Vec<RegisteredTable>,
+}
+
+impl PendingDatabase {
+    fn finish(self) -> Result<DatabaseCatalog, LoadError> {
+        DatabaseCatalog::new(self.id, self.name, self.epochs, self.routes, self.tables)
+            .map_err(LoadError::Snapshot)
+    }
 }
 
 fn ensure_cardinality(
@@ -375,18 +478,6 @@ fn ensure_cardinality(
     } else {
         Ok(())
     }
-}
-
-fn add_to_total(
-    resource: &'static str,
-    total: &mut usize,
-    additional: usize,
-    maximum: usize,
-) -> Result<(), LoadError> {
-    let actual = total.checked_add(additional).unwrap_or(usize::MAX);
-    ensure_cardinality(resource, actual, maximum)?;
-    *total = actual;
-    Ok(())
 }
 
 fn nonnegative_u32(field: &'static str, value: i64) -> Result<u32, LoadError> {
@@ -420,6 +511,47 @@ pub enum LoadError {
     /// A required singleton configuration/state row is absent.
     #[error("shardschema singleton configuration or state row is missing")]
     MissingSingleton,
+    /// An active logical database does not point at exactly one owned active
+    /// routing epoch.
+    #[error(
+        "logical database {database_id} does not reference exactly one owned active routing epoch"
+    )]
+    InvalidActiveRoutingEpoch {
+        /// Logical database whose serving pointer is inconsistent.
+        database_id: DatabaseId,
+    },
+    /// A set query returned a row for a database omitted by the authoritative
+    /// database query in the same repeatable-read snapshot.
+    #[error("{resource} references unpublished logical database {database_id}")]
+    UnexpectedDatabaseReference {
+        /// Catalog resource carrying the reference.
+        resource: &'static str,
+        /// Referenced logical database.
+        database_id: DatabaseId,
+    },
+    /// The authoritative database query returned a duplicate primary key.
+    #[error("logical database {0} was loaded more than once")]
+    DuplicateLogicalDatabase(DatabaseId),
+    /// An active route references a shard identity absent from the catalog.
+    #[error("logical database {database_id} routes to missing shard {shard_id:?}")]
+    MissingRoutingShard {
+        /// Logical database whose active route is malformed.
+        database_id: DatabaseId,
+        /// Absent physical shard identity referenced by the route.
+        shard_id: String,
+    },
+    /// An active route references a physical shard that cannot serve traffic.
+    #[error(
+        "logical database {database_id} routes to unavailable shard {shard_number} in state {state:?}"
+    )]
+    InvalidRoutingShardState {
+        /// Logical database whose active route is malformed.
+        database_id: DatabaseId,
+        /// Physical shard ordinal referenced by the route.
+        shard_number: u32,
+        /// Rejected catalog shard state.
+        state: String,
+    },
     /// A catalog UUID cannot be represented by the Rust model.
     #[error("invalid {field} UUID {value:?}: {source}")]
     InvalidUuid {
@@ -483,19 +615,19 @@ mod tests {
     #[test]
     fn cardinality_limits_accept_boundary_and_reject_cap_plus_one() {
         assert!(DATABASES_SQL.contains("LIMIT $1"));
-        assert!(ROUTES_SQL.contains("LIMIT $2"));
-        assert!(TABLES_SQL.contains("LIMIT $2"));
+        assert!(ROUTES_SQL.contains("LIMIT $1"));
+        assert!(TABLES_SQL.contains("LIMIT $1"));
         assert_eq!(
             usize::try_from(DATABASE_QUERY_LIMIT).expect("database query limit"),
             MAX_LOGICAL_DATABASES + 1
         );
         assert_eq!(
             usize::try_from(ROUTE_QUERY_LIMIT).expect("route query limit"),
-            MAX_ROUTING_RANGES_PER_DATABASE + 1
+            MAX_TOTAL_ROUTING_RANGES + 1
         );
         assert_eq!(
             usize::try_from(TABLE_QUERY_LIMIT).expect("table query limit"),
-            MAX_REGISTERED_TABLES_PER_DATABASE + 1
+            MAX_TOTAL_REGISTERED_TABLES + 1
         );
         assert!(
             ensure_cardinality("test rows", MAX_LOGICAL_DATABASES, MAX_LOGICAL_DATABASES).is_ok()
@@ -509,17 +641,6 @@ mod tests {
             Err(LoadError::CardinalityLimit {
                 resource: "test rows",
                 maximum: MAX_LOGICAL_DATABASES
-            })
-        ));
-
-        let mut total = MAX_TOTAL_ROUTING_RANGES - 1;
-        add_to_total("test total", &mut total, 1, MAX_TOTAL_ROUTING_RANGES)
-            .expect("exact total limit");
-        assert!(matches!(
-            add_to_total("test total", &mut total, 1, MAX_TOTAL_ROUTING_RANGES),
-            Err(LoadError::CardinalityLimit {
-                resource: "test total",
-                maximum: MAX_TOTAL_ROUTING_RANGES
             })
         ));
     }
