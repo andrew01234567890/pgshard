@@ -682,6 +682,13 @@ jobs:
             ./internal/resources
       - name: Select the non-serving agent quarantine composition
         run: |
+          mapfile -t previous_manager_pods < <(
+            kubectl get pods \
+              --namespace pgshard-system \
+              --selector=app.kubernetes.io/name=pgshard-operator,app.kubernetes.io/component=controller-manager \
+              --output=name
+          )
+          test "${#previous_manager_pods[@]}" -ge 1
           kubectl patch \
             --namespace pgshard-system \
             deployment/pgshard-controller-manager \
@@ -691,6 +698,27 @@ jobs:
             --namespace pgshard-system \
             deployment/pgshard-controller-manager \
             --timeout=180s
+          for previous_manager_pod in "${previous_manager_pods[@]}"; do
+            kubectl wait \
+              --namespace pgshard-system \
+              --for=delete \
+              "$previous_manager_pod" \
+              --timeout=60s
+          done
+          test "$(
+            kubectl get deployment \
+              --namespace pgshard-system \
+              pgshard-controller-manager \
+              --output=json |
+              jq '[.spec.template.spec.containers[] | select(.name == "manager") | .args[] | select(startswith("--postgresql-runtime="))] | length'
+          )" = 1
+          test "$(
+            kubectl get deployment \
+              --namespace pgshard-system \
+              pgshard-controller-manager \
+              --output=json |
+              jq --raw-output '.spec.template.spec.containers[] | select(.name == "manager") | .args[] | select(startswith("--postgresql-runtime="))'
+          )" = "--postgresql-runtime=agent-quarantine"
       - name: Verify exact Lease and target-fencing composition
         working-directory: operator
         env:
