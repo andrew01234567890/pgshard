@@ -14,11 +14,6 @@ updates:
           - "*"
         update-types:
           - patch
-    ignore:
-      - dependency-name: "*"
-        update-types:
-          - version-update:semver-minor
-          - version-update:semver-major
     commit-message:
       prefix: "build"
       include: scope
@@ -37,11 +32,6 @@ updates:
           - "*"
         update-types:
           - patch
-    ignore:
-      - dependency-name: "*"
-        update-types:
-          - version-update:semver-minor
-          - version-update:semver-major
     commit-message:
       prefix: "build"
       include: scope
@@ -60,11 +50,6 @@ updates:
           - "*"
         update-types:
           - patch
-    ignore:
-      - dependency-name: "*"
-        update-types:
-          - version-update:semver-minor
-          - version-update:semver-major
     commit-message:
       prefix: "build"
       include: scope
@@ -83,11 +68,24 @@ updates:
           - "*"
         update-types:
           - patch
-    ignore:
-      - dependency-name: "*"
+    commit-message:
+      prefix: "build"
+      include: scope
+
+  - package-ecosystem: docker
+    directory: /deploy/images
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:15"
+      timezone: Europe/London
+    open-pull-requests-limit: 5
+    groups:
+      patch-updates:
+        patterns:
+          - "*"
         update-types:
-          - version-update:semver-minor
-          - version-update:semver-major
+          - patch
     commit-message:
       prefix: "build"
       include: scope
@@ -106,11 +104,6 @@ updates:
           - "*"
         update-types:
           - patch
-    ignore:
-      - dependency-name: "*"
-        update-types:
-          - version-update:semver-minor
-          - version-update:semver-major
     commit-message:
       prefix: "ci"
       include: scope

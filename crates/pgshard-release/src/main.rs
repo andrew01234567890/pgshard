@@ -1645,17 +1645,34 @@ mod tests {
     }
 
     #[test]
-    fn dependabot_version_updates_are_patch_only() {
+    fn dependabot_covers_supported_dependency_ecosystems() {
         let configuration = include_str!("../../../.github/dependabot.yml");
-        assert!(configuration.contains("directory: /crates/pgshard-pgwire/fuzz"));
+        let entries = [
+            ("cargo", "/"),
+            ("cargo", "/crates/pgshard-pgwire/fuzz"),
+            ("npm", "/website"),
+            ("gomod", "/operator"),
+            ("docker", "/deploy/images"),
+            ("github-actions", "/"),
+        ];
         assert_eq!(
-            configuration.matches("version-update:semver-minor").count(),
-            5
+            configuration.matches("  - package-ecosystem:").count(),
+            entries.len()
         );
-        assert_eq!(
-            configuration.matches("version-update:semver-major").count(),
-            5
-        );
+        for (ecosystem, directory) in entries {
+            let entry = format!(
+                "  - package-ecosystem: {ecosystem}\n    directory: {directory}\n    schedule:"
+            );
+            assert!(
+                configuration.contains(&entry),
+                "missing Dependabot entry: {entry}"
+            );
+        }
+        let patch_group = "    groups:\n      patch-updates:\n        patterns:\n          - \"*\"\n        update-types:\n          - patch\n";
+        assert_eq!(configuration.matches(patch_group).count(), entries.len());
+        assert!(!configuration.contains("    ignore:"));
+        assert!(!configuration.contains("version-update:semver-minor"));
+        assert!(!configuration.contains("version-update:semver-major"));
     }
 
     #[test]
