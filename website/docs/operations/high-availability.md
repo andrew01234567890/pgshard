@@ -52,12 +52,15 @@ successful response is anchored to the monotonic instant before the request was
 dispatched, so API latency consumes authority and wall-clock jumps cannot extend
 it. With writable coordination enabled, every agent shutdown clears local term
 evidence and immediately enters the PostgreSQL process-tree fence, skipping the
-smart and fast waits. An absolute monotonic renewal cutoff cancels an in-flight
-Kubernetes API request rather than letting request latency consume the fencing
-margin. Startup rejects a Lease/shutdown combination unless the post-renewal
-margin strictly exceeds the configured immediate-stop and normal cleanup
-budget. The operator does not yet project the cell identity or inject
-the Lease UID and agent runtime into PostgreSQL Pods. The supervisor remains
+smart and fast waits. An absolute monotonic renewal cutoff stops awaiting an
+in-flight Kubernetes API request rather than letting response latency consume
+the fencing margin. The write might already have committed; resource-version
+CAS prevents a later stale overwrite, and a candidate restarts the full
+unchanged-record observation window from the changed Lease. Startup rejects a
+Lease/shutdown combination unless the post-renewal margin strictly exceeds the
+configured immediate-stop and normal cleanup budget. The operator does not yet
+project the cell identity or inject the Lease UID and agent runtime into
+PostgreSQL Pods. The supervisor remains
 TCP-quarantined; promotion proof, durable generation enforcement, serving
 activation, bounded token projection, and release-after-durable-stop remain
 absent, so this is not yet a serving-primary fence or an HA claim.
@@ -71,8 +74,8 @@ resource-version preconditions. A mismatch or mount blocks deletion. No
 PostgreSQL data claim participates in this migration.
 
 On `SIGTERM`, the process removes readiness before notifying its workers,
-cancels any in-flight Kubernetes API request, limits best-effort Lease release
-to one second, and limits HTTP plus coordination drain to ten
+stops awaiting any in-flight Kubernetes API request, limits best-effort Lease
+release to one second, and limits HTTP plus coordination drain to ten
 seconds. The operator explicitly gives orchestrator Pods a 30-second Kubernetes
 termination grace. Lease expiry remains the cleanup backstop when revocation
 cannot complete.
@@ -435,9 +438,11 @@ locally and may take it over only after the same holder and renewal record stay
 unchanged for a full lease duration. Resource-version conditional updates pick
 one winner without trusting the old holder's wall clock. The agent translates
 each proven response into a monotonic local deadline and stops renewing at a
-separate earlier deadline; the deadline races and cancels any in-flight Lease
-request. A coordination failure clears that evidence and requests immediate
-process-tree fencing. That local mechanism is necessary but
+separate earlier deadline; the deadline race stops awaiting any in-flight Lease
+request. An unknown commit cannot overwrite a later resource version, and a
+visible commit restarts a candidate's full unchanged-record observation window.
+A coordination failure clears that evidence and requests immediate process-tree
+fencing. That local mechanism is necessary but
 not sufficient: the serving-primary lifecycle, peer-isolation policy, durable
 generation fence, and promotion ordering remain unimplemented, and a Kubernetes
 Lease alone cannot fence an isolated process or node.

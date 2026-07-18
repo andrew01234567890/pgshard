@@ -1323,7 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renewal_cutoff_cancels_an_inflight_api_request_before_fencing_margin() {
+    async fn renewal_cutoff_stops_waiting_for_an_inflight_request_before_fencing_margin() {
         let mut config = config();
         config.lease_duration = Duration::from_secs(2);
         config.renew_deadline = Duration::from_millis(200);
@@ -1343,7 +1343,7 @@ mod tests {
             supervise_with_store(&store, &config, state.clone(), shutdown_rx),
         )
         .await
-        .expect("renewal cutoff must cancel the delayed API request");
+        .expect("renewal cutoff must stop waiting for the delayed API request");
 
         assert!(matches!(
             result,
