@@ -77,9 +77,11 @@ immutable until the database lifecycle and online-resharding controllers exist.
 An explicitly empty `cells` list is invalid rather than equivalent to omission.
 The foundation API accepts at most 512 databases and 65,536 total ranges, which
 matches the Rust snapshot ceiling and keeps the generated topology ConfigMaps
-within Kubernetes' object-size limit. PostgreSQL's `postgres`, `template0`, and
-`template1` databases plus pgshard's `shardschema` database are reserved and
-cannot be declared as application databases.
+within Kubernetes' object-size limit. Every other value copied into that
+ConfigMap is bounded too: S3 bucket names are limited to 255 bytes, regions to
+128, prefixes to 1,024, and S3 or OpenTelemetry endpoints to 2,048. PostgreSQL's
+`postgres`, `template0`, and `template1` databases plus pgshard's `shardschema`
+database are reserved and cannot be declared as application databases.
 
 On `cell-0000`, bootstrap installs every declaration in one PostgreSQL
 transaction. A replay of the identical declarations is a no-op. A changed

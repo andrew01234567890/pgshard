@@ -344,6 +344,9 @@ func ValidateOpenTelemetryEndpoint(value string) error {
 // ValidateCredentialFreeHTTPSEndpoint accepts only a concrete HTTP(S) origin
 // or path and rejects URL components commonly abused to embed credentials.
 func ValidateCredentialFreeHTTPSEndpoint(value string) error {
+	if len(value) > MaximumEndpointLength {
+		return fmt.Errorf("must not exceed %d bytes", MaximumEndpointLength)
+	}
 	if strings.TrimSpace(value) != value {
 		return fmt.Errorf("must not contain surrounding whitespace")
 	}
@@ -523,20 +526,29 @@ func validateBackup(backup BackupSpec, path *field.Path) field.ErrorList {
 			return field.ErrorList{field.Required(path.Child("repository", "s3"), "required for an S3 repository")}
 		}
 		var errs field.ErrorList
+		s3Path := path.Child("repository", "s3")
 		if repository.Filesystem != nil {
 			errs = append(errs, field.Forbidden(path.Child("repository", "filesystem"), "must be absent for an S3 repository"))
 		}
 		if repository.S3.Bucket == "" {
-			errs = append(errs, field.Required(path.Child("repository", "s3", "bucket"), "must not be empty"))
+			errs = append(errs, field.Required(s3Path.Child("bucket"), "must not be empty"))
+		} else if len(repository.S3.Bucket) > MaximumS3BucketLength {
+			errs = append(errs, field.TooLong(s3Path.Child("bucket"), repository.S3.Bucket, MaximumS3BucketLength))
+		}
+		if len(repository.S3.Region) > MaximumS3RegionLength {
+			errs = append(errs, field.TooLong(s3Path.Child("region"), repository.S3.Region, MaximumS3RegionLength))
+		}
+		if len(repository.S3.Prefix) > MaximumS3PrefixLength {
+			errs = append(errs, field.TooLong(s3Path.Child("prefix"), repository.S3.Prefix, MaximumS3PrefixLength))
 		}
 		if repository.S3.CredentialsSecretRef.Name == "" {
-			errs = append(errs, field.Required(path.Child("repository", "s3", "credentialsSecretRef", "name"), "must not be empty"))
+			errs = append(errs, field.Required(s3Path.Child("credentialsSecretRef", "name"), "must not be empty"))
 		} else if err := ValidateObjectReferenceName(repository.S3.CredentialsSecretRef.Name); err != nil {
-			errs = append(errs, field.Invalid(path.Child("repository", "s3", "credentialsSecretRef", "name"), repository.S3.CredentialsSecretRef.Name, err.Error()))
+			errs = append(errs, field.Invalid(s3Path.Child("credentialsSecretRef", "name"), repository.S3.CredentialsSecretRef.Name, err.Error()))
 		}
 		if repository.S3.Endpoint != "" {
 			if err := ValidateCredentialFreeHTTPSEndpoint(repository.S3.Endpoint); err != nil {
-				errs = append(errs, field.Invalid(path.Child("repository", "s3", "endpoint"), repository.S3.Endpoint, err.Error()))
+				errs = append(errs, field.Invalid(s3Path.Child("endpoint"), repository.S3.Endpoint, err.Error()))
 			}
 		}
 		return errs

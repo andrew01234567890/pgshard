@@ -11,10 +11,14 @@ const (
 	PostgreSQLMajor18 = "18"
 	MaximumShards     = 128
 	MaximumDatabases  = 512
-	// MaximumTotalRoutingRanges matches pgshard-catalog's bounded snapshot
-	// loader and keeps each generated topology ConfigMap below Kubernetes' 1 MiB
-	// object limit at the maximum supported identifier lengths.
-	MaximumTotalRoutingRanges = 65_536
+	// MaximumTotalRoutingRanges is derived from the two structural CRD bounds.
+	// Keep the equality explicit so the API cannot admit more routes than the
+	// bounded pgshard-catalog snapshot loader can hold.
+	MaximumTotalRoutingRanges = MaximumDatabases * MaximumShards
+	MaximumEndpointLength     = 2_048
+	MaximumS3BucketLength     = 255
+	MaximumS3RegionLength     = 128
+	MaximumS3PrefixLength     = 1_024
 	// MaximumClusterNameLength preserves the public API limit from the first
 	// operator release. Longer workload identities are bounded independently.
 	MaximumClusterNameLength = 50
@@ -41,8 +45,7 @@ type StorageDeletionPolicy string
 // +kubebuilder:validation:XValidation:rule="self.shards == oldSelf.shards",message="shards is immutable until physical cell transitions are implemented"
 // +kubebuilder:validation:XValidation:rule="self.membersPerShard == oldSelf.membersPerShard",message="membersPerShard is immutable until membership transitions are implemented"
 // +kubebuilder:validation:XValidation:rule="self.durability == oldSelf.durability",message="durability is immutable until replication-mode transitions are implemented"
-// +kubebuilder:validation:XValidation:rule="!has(self.databases) || self.databases.map(database, has(database.shards) ? database.shards : (has(database.cells) ? size(database.cells) : self.shards)).sum() <= 65536",message="databases may contain at most 65536 total routing ranges"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.databases) ? !has(self.databases) || size(self.databases) == 0 : has(self.databases) && (self.databases == oldSelf.databases || (size(self.databases) == size(oldSelf.databases) && oldSelf.databases.all(database, !has(database.shards) && !has(database.cells)) && self.databases.all(database, has(database.shards) && has(database.cells) && database.shards == oldSelf.shards && size(database.cells) == database.shards) && oldSelf.databases.map(database, database.name) == self.databases.map(database, database.name)))",message="databases is immutable until database lifecycle and online resharding are implemented"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.databases) ? !has(self.databases) || size(self.databases) == 0 : has(self.databases) && sets.equivalent(self.databases.map(database, database.name), oldSelf.databases.map(database, database.name))",message="databases is immutable until database lifecycle and online resharding are implemented"
 type PgShardClusterSpec struct {
 	// Shards is the number of physical PostgreSQL cells in the foundation API.
 	// Each logical database maps its independently ordered hash ranges onto a
@@ -220,14 +223,20 @@ type BackupRepository struct {
 }
 
 type S3Repository struct {
-	Bucket               string                      `json:"bucket"`
-	Endpoint             string                      `json:"endpoint,omitempty"`
-	Region               string                      `json:"region,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	Bucket string `json:"bucket"`
+	// +kubebuilder:validation:MaxLength=2048
+	Endpoint string `json:"endpoint,omitempty"`
+	// +kubebuilder:validation:MaxLength=128
+	Region string `json:"region,omitempty"`
+	// +kubebuilder:validation:MaxLength=1024
 	Prefix               string                      `json:"prefix,omitempty"`
 	CredentialsSecretRef corev1.LocalObjectReference `json:"credentialsSecretRef"`
 }
 
 type FilesystemRepository struct {
+	// +kubebuilder:validation:MaxLength=253
 	PersistentVolumeClaimName string `json:"persistentVolumeClaimName"`
 }
 
@@ -235,7 +244,8 @@ type ObservabilitySpec struct {
 	// +kubebuilder:default=true
 	Prometheus *bool `json:"prometheus,omitempty"`
 	// +kubebuilder:default=false
-	ServiceMonitor        bool   `json:"serviceMonitor,omitempty"`
+	ServiceMonitor bool `json:"serviceMonitor,omitempty"`
+	// +kubebuilder:validation:MaxLength=2048
 	OpenTelemetryEndpoint string `json:"openTelemetryEndpoint,omitempty"`
 }
 

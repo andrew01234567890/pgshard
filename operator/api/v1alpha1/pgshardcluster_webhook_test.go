@@ -151,6 +151,9 @@ func TestDatabaseTopologyValidationRejectsReservedNames(t *testing.T) {
 
 func TestDatabaseTopologyValidationBoundsTotalRoutingRanges(t *testing.T) {
 	t.Parallel()
+	if got, want := MaximumTotalRoutingRanges, MaximumDatabases*MaximumShards; got != want {
+		t.Fatalf("maximum routing ranges = %d, want structural product %d", got, want)
+	}
 	cluster := validCluster()
 	cluster.Spec.Shards = MaximumShards
 	cluster.Spec.Databases = make([]DatabaseTemplate, MaximumTotalRoutingRanges/MaximumShards)
@@ -227,13 +230,17 @@ func TestDatabaseTopologyIsImmutableUntilLifecycleControllerExists(t *testing.T)
 	}
 
 	materializedDefaults := validCluster()
-	materializedDefaults.Spec.Databases = []DatabaseTemplate{{Name: "a"}}
+	materializedDefaults.Spec.Databases = []DatabaseTemplate{
+		{Name: "legacy"},
+		{Name: "explicit", Shards: 1, Cells: []int32{0}},
+	}
 	defaulted := materializedDefaults.DeepCopy()
 	if err := (&PgShardClusterDefaulter{}).Default(context.Background(), defaulted); err != nil {
 		t.Fatal(err)
 	}
+	defaulted.Spec.Databases[0], defaulted.Spec.Databases[1] = defaulted.Spec.Databases[1], defaulted.Spec.Databases[0]
 	if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), materializedDefaults, defaulted); err != nil {
-		t.Fatalf("materializing equivalent defaults changed database topology: %v", err)
+		t.Fatalf("reordering map items while materializing equivalent defaults changed database topology: %v", err)
 	}
 
 	mutated := oldCluster.DeepCopy()
@@ -487,6 +494,73 @@ func TestValidationRejectsUnsafeOpenTelemetryEndpoints(t *testing.T) {
 	cluster.Spec.Observability.OpenTelemetryEndpoint = "https://collector.example.com:4317/v1/traces"
 	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
 		t.Fatalf("safe endpoint rejected: %v", err)
+	}
+}
+
+func TestValidationBoundsRenderedTopologyStrings(t *testing.T) {
+	t.Parallel()
+	maximumEndpoint := func(host string, length int) string {
+		prefix := "https://" + host + "/"
+		return prefix + strings.Repeat("x", length-len(prefix))
+	}
+	validS3 := func() BackupRepository {
+		return BackupRepository{Type: RepositoryS3, S3: &S3Repository{
+			Bucket:               "backups",
+			Endpoint:             "https://minio.example.com",
+			Region:               "region",
+			Prefix:               "prefix",
+			CredentialsSecretRef: corev1.LocalObjectReference{Name: "backup-credentials"},
+		}}
+	}
+	tests := map[string]struct {
+		mutate func(*PgShardCluster)
+		field  string
+	}{
+		"bucket": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Backup.Repository = validS3()
+				cluster.Spec.Backup.Repository.S3.Bucket = strings.Repeat("b", MaximumS3BucketLength+1)
+			},
+			field: "bucket",
+		},
+		"S3 endpoint": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Backup.Repository = validS3()
+				cluster.Spec.Backup.Repository.S3.Endpoint = maximumEndpoint("minio.example.com", MaximumEndpointLength+1)
+			},
+			field: "endpoint",
+		},
+		"region": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Backup.Repository = validS3()
+				cluster.Spec.Backup.Repository.S3.Region = strings.Repeat("r", MaximumS3RegionLength+1)
+			},
+			field: "region",
+		},
+		"prefix": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Backup.Repository = validS3()
+				cluster.Spec.Backup.Repository.S3.Prefix = strings.Repeat("p", MaximumS3PrefixLength+1)
+			},
+			field: "prefix",
+		},
+		"OpenTelemetry endpoint": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Observability.OpenTelemetryEndpoint = maximumEndpoint("collector.example.com", MaximumEndpointLength+1)
+			},
+			field: "openTelemetryEndpoint",
+		},
+	}
+	for name, test := range tests {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			test.mutate(cluster)
+			if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("oversized %s was admitted: %v", test.field, err)
+			}
+		})
 	}
 }
 

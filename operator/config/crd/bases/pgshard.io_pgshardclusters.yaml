@@ -63,6 +63,7 @@ spec:
                       filesystem:
                         properties:
                           persistentVolumeClaimName:
+                            maxLength: 253
                             type: string
                         required:
                         - persistentVolumeClaimName
@@ -70,6 +71,8 @@ spec:
                       s3:
                         properties:
                           bucket:
+                            maxLength: 255
+                            minLength: 1
                             type: string
                           credentialsSecretRef:
                             description: |-
@@ -88,10 +91,13 @@ spec:
                             type: object
                             x-kubernetes-map-type: atomic
                           endpoint:
+                            maxLength: 2048
                             type: string
                           prefix:
+                            maxLength: 1024
                             type: string
                           region:
+                            maxLength: 128
                             type: string
                         required:
                         - bucket
@@ -182,6 +188,7 @@ spec:
               observability:
                 properties:
                   openTelemetryEndpoint:
+                    maxLength: 2048
                     type: string
                   prometheus:
                     default: true
@@ -423,19 +430,11 @@ spec:
             - message: durability is immutable until replication-mode transitions
                 are implemented
               rule: self.durability == oldSelf.durability
-            - message: databases may contain at most 65536 total routing ranges
-              rule: '!has(self.databases) || self.databases.map(database, has(database.shards)
-                ? database.shards : (has(database.cells) ? size(database.cells) :
-                self.shards)).sum() <= 65536'
             - message: databases is immutable until database lifecycle and online
                 resharding are implemented
               rule: '!has(oldSelf.databases) ? !has(self.databases) || size(self.databases)
-                == 0 : has(self.databases) && (self.databases == oldSelf.databases
-                || (size(self.databases) == size(oldSelf.databases) && oldSelf.databases.all(database,
-                !has(database.shards) && !has(database.cells)) && self.databases.all(database,
-                has(database.shards) && has(database.cells) && database.shards ==
-                oldSelf.shards && size(database.cells) == database.shards) && oldSelf.databases.map(database,
-                database.name) == self.databases.map(database, database.name)))'
+                == 0 : has(self.databases) && sets.equivalent(self.databases.map(database,
+                database.name), oldSelf.databases.map(database, database.name))'
           status:
             description: |-
               PgShardClusterStatus never reports readiness until the operator has actually

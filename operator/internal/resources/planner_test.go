@@ -137,9 +137,11 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	}
 }
 
-func TestMaximumDatabaseTopologyFitsKubernetesConfigMaps(t *testing.T) {
+func TestMaximumValidClusterFitsKubernetesConfigMaps(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
+	cluster.Name = strings.Repeat("c", pgshardv1alpha1.MaximumClusterNameLength)
+	cluster.Namespace = strings.Repeat("n", 63)
 	cluster.Spec.Shards = pgshardv1alpha1.MaximumShards
 	cluster.Spec.Databases = make([]pgshardv1alpha1.DatabaseTemplate, pgshardv1alpha1.MaximumDatabases)
 	for index := range cluster.Spec.Databases {
@@ -148,20 +150,34 @@ func TestMaximumDatabaseTopologyFitsKubernetesConfigMaps(t *testing.T) {
 			Shards: pgshardv1alpha1.MaximumShards,
 		}
 	}
-
-	configuration, err := cluster.ResolvedPostgreSQLConfiguration()
-	if err != nil {
-		t.Fatal(err)
+	maximumEndpoint := func(host string) string {
+		prefix := "https://" + host + "/"
+		return prefix + strings.Repeat("x", pgshardv1alpha1.MaximumEndpointLength-len(prefix))
 	}
-	postgresqlData := renderPostgreSQLConfiguration(configuration)
-	postgresqlData[databaseGenesisKey] = renderDatabaseGenesisSQL(cluster)
-	topology, err := renderTopology(cluster)
+	cluster.Spec.Backup.Repository = pgshardv1alpha1.BackupRepository{
+		Type: pgshardv1alpha1.RepositoryS3,
+		S3: &pgshardv1alpha1.S3Repository{
+			Bucket:   strings.Repeat("b", pgshardv1alpha1.MaximumS3BucketLength),
+			Endpoint: maximumEndpoint("minio.example.com"),
+			Region:   strings.Repeat("r", pgshardv1alpha1.MaximumS3RegionLength),
+			Prefix:   strings.Repeat("p", pgshardv1alpha1.MaximumS3PrefixLength),
+			CredentialsSecretRef: corev1.LocalObjectReference{
+				Name: strings.Repeat("s", 63) + "." + strings.Repeat("s", 63) + "." + strings.Repeat("s", 63) + "." + strings.Repeat("s", 61),
+			},
+		},
+	}
+	cluster.Spec.Observability.OpenTelemetryEndpoint = maximumEndpoint("collector.example.com")
+	if err := pgshardv1alpha1.ValidateClusterForReconciliation(cluster); err != nil {
+		t.Fatalf("maximum bounded cluster is not valid: %v", err)
+	}
+
+	plan, err := Plan(cluster, DefaultImages())
 	if err != nil {
 		t.Fatal(err)
 	}
 	objects := []*corev1.ConfigMap{
-		immutableConfigMap(cluster, PostgreSQLConfigMapName(cluster.Name, configMapDataHash(postgresqlData)), postgresqlData),
-		configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": topology}),
+		postgresqlConfigMap(t, plan, cluster.Name),
+		object[*corev1.ConfigMap](t, plan, cluster.Name+TopologyConfigSuffix),
 	}
 	for _, object := range objects {
 		encoded, err := json.Marshal(object)
