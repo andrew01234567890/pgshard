@@ -1388,9 +1388,19 @@ func assertPostgreSQLRoleProfiles(t *testing.T, ctx context.Context, kubeClient 
 	if configuration == nil {
 		t.Fatalf("PostgreSQL configuration with prefix %q not found", prefix)
 	}
-	wantDocuments := 1 + int(cluster.Spec.MembersPerShard)*2
+	wantDocuments := 2 + int(cluster.Spec.MembersPerShard)*2
 	if len(configuration.Data) != wantDocuments {
 		t.Fatalf("PostgreSQL configuration documents = %#v", configuration.Data)
+	}
+	databaseGenesis := configuration.Data["database-genesis.sql"]
+	for _, statement := range []string{
+		"BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;\n",
+		"database genesis contains an undeclared active logical database",
+		"COMMIT;\n",
+	} {
+		if !strings.Contains(databaseGenesis, statement) {
+			t.Fatalf("database genesis is missing %q:\n%s", statement, databaseGenesis)
+		}
 	}
 	common := configuration.Data["postgresql.conf"]
 	for _, setting := range []string{
