@@ -30,13 +30,14 @@ unchecked gap. It creates no version-bump commit, preventing release loops.
 Documentation-only and CI-only default-branch commits still receive patch
 releases.
 
-Verified Dependabot patch updates are squash-merged by the trusted default-branch
-workflow only after their exact pull-request head passes the aggregate CI gate
-and every reported check is terminal without a failure. The GitHub Advanced
-Security CodeQL aggregate must be completed successfully; a neutral summary,
-including "configurations not found", fails closed instead of authorizing an
-unattended merge. The pull request must also be based on the current `main`
-commit. Merge attempts are
+Verified Dependabot updates to the unattended file allowlist are squash-merged
+by the trusted default-branch workflow when every dependency has explicit patch
+or minor metadata and their exact pull-request head passes the aggregate CI gate
+with every reported check terminal without a failure. Missing or major update
+metadata requires manual review. The GitHub Advanced Security CodeQL aggregate
+must be completed successfully; a neutral summary, including "configurations
+not found", fails closed instead of authorizing an unattended merge. The pull
+request must also be based on the current `main` commit. Merge attempts are
 [queued and serialized](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency#using-concurrency-in-different-scenarios)
 so concurrent green updates recheck that base after the preceding squash instead
 of racing it.
@@ -55,11 +56,12 @@ than a personal access token or repository secret.
 Unattended merging is limited to two exact dependency-file pairs:
 `operator/go.mod` with `operator/go.sum`, and
 `crates/pgshard-pgwire/fuzz/Cargo.toml` with its colocated `Cargo.lock`. npm,
-root-workspace Cargo, other Cargo, and GitHub Actions updates still require a
-normal reviewed squash because default-branch workflows can deploy the website
-or execute the Rust publisher and pinned actions with a write token. All still
-receive Dependabot pull requests and CI. The allowlist also rejects renamed
-files and any unexpected bot-authored source or workflow change.
+Docker, root-workspace Cargo, other Cargo, and GitHub Actions updates still
+require a normal reviewed squash because default-branch workflows can deploy
+the website or execute the Rust publisher, image builds, and pinned actions
+with a write token. All still receive Dependabot pull requests and CI. The
+allowlist also rejects renamed files and any unexpected bot-authored source or
+workflow change.
 
 Source-branch commits must use GitHub noreply author and committer addresses.
 GitHub's squash operation may retain the account's public author address when
