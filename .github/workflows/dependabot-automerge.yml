@@ -15,10 +15,11 @@ jobs:
     # workflow_run.name here. The helper independently revalidates the SHA,
     # associated pull request, author, checks, base, and complete
     # patch-or-minor metadata. Unclassified updates fail closed for review.
-    if: github.event.workflow_run.conclusion == 'success'
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.actor.login == 'dependabot[bot]'
     concurrency:
       group: pgshard-dependabot-automerge
-      queue: max
     runs-on: ubuntu-24.04
     permissions:
       actions: write
