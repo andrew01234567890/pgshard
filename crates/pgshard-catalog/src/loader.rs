@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::cache::InstallBeforeError;
 use crate::{
     CatalogCache, CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId,
-    IdentifierError, InstallOutcome, NOTIFY_CHANNEL, RegisteredTable, RoutingHashConfig,
-    ShardKeyType, ShardRoute, SnapshotError, TableName,
+    DatabaseShardId, IdentifierError, InstallOutcome, NOTIFY_CHANNEL, RegisteredTable,
+    RoutingHashConfig, ShardKeyType, ShardRoute, SnapshotError, TableName,
 };
 
 /// Maximum logical databases published in one process snapshot.
@@ -41,8 +41,8 @@ const SET_LOCAL_TRANSACTION_TIMEOUT_SQL: &str =
 const CONFIGURATION_SQL: &str = "\
     SELECT configuration.cluster_id::text, configuration.hash_version, \
            configuration.hash_seed::text, state.catalog_epoch \
-      FROM pgshard_catalog.cluster_configuration AS configuration \
-      CROSS JOIN pgshard_catalog.cluster_state AS state \
+       FROM ONLY pgshard_catalog.cluster_configuration AS configuration \
+       CROSS JOIN ONLY pgshard_catalog.cluster_state AS state \
      WHERE configuration.singleton AND state.singleton";
 
 const DATABASES_SQL: &str = "\
@@ -51,43 +51,76 @@ const DATABASES_SQL: &str = "\
            coalesce(epochs.logical_database_id = databases.logical_database_id \
                     AND epochs.state = 'active', false), \
            (SELECT pg_catalog.count(*) = 1 \
-              FROM pgshard_catalog.routing_epochs AS active_epochs \
+               FROM ONLY pgshard_catalog.routing_epochs AS active_epochs \
              WHERE active_epochs.logical_database_id = databases.logical_database_id \
                AND active_epochs.state = 'active') \
-      FROM pgshard_catalog.logical_databases AS databases \
-      JOIN pgshard_catalog.active_routing_epochs AS active \
+       FROM ONLY pgshard_catalog.logical_databases AS databases \
+       JOIN ONLY pgshard_catalog.active_routing_epochs AS active \
         ON active.logical_database_id = databases.logical_database_id \
-      LEFT JOIN pgshard_catalog.routing_epochs AS epochs \
+       LEFT JOIN ONLY pgshard_catalog.routing_epochs AS epochs \
         ON epochs.routing_epoch = active.routing_epoch \
      WHERE databases.state IN ('active', 'draining') \
       ORDER BY databases.logical_database_id \
       LIMIT $1";
 
 const ROUTES_SQL: &str = "\
-    SELECT databases.logical_database_id::text, shards.shard_number, \
-           ranges.range_start::text, ranges.range_end::text, shards.state, \
-           ranges.shard_id::text \
-      FROM pgshard_catalog.logical_databases AS databases \
-      JOIN pgshard_catalog.active_routing_epochs AS active \
-        ON active.logical_database_id = databases.logical_database_id \
-      JOIN pgshard_catalog.routing_epochs AS epochs \
-        ON epochs.routing_epoch = active.routing_epoch \
-       AND epochs.logical_database_id = databases.logical_database_id \
-       AND epochs.state = 'active' \
-      JOIN pgshard_catalog.routing_ranges AS ranges \
-        ON ranges.routing_epoch = active.routing_epoch \
-       LEFT JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id \
-     WHERE databases.state IN ('active', 'draining') \
-     ORDER BY databases.logical_database_id, ranges.range_start, ranges.range_end \
-     LIMIT $1";
+    WITH serving_ranges AS MATERIALIZED ( \
+        SELECT databases.logical_database_id, ranges.database_shard_id, \
+               ranges.range_start, ranges.range_end \
+           FROM ONLY pgshard_catalog.logical_databases AS databases \
+           JOIN ONLY pgshard_catalog.active_routing_epochs AS active \
+            ON active.logical_database_id = databases.logical_database_id \
+           JOIN ONLY pgshard_catalog.routing_epochs AS epochs \
+            ON epochs.routing_epoch = active.routing_epoch \
+           AND epochs.logical_database_id = databases.logical_database_id \
+           AND epochs.state = 'active' \
+           JOIN ONLY pgshard_catalog.routing_ranges AS ranges \
+            ON ranges.logical_database_id = databases.logical_database_id \
+           AND ranges.routing_epoch = active.routing_epoch \
+         WHERE databases.state IN ('active', 'draining') \
+         ORDER BY databases.logical_database_id, ranges.range_start, ranges.range_end \
+         LIMIT $1 \
+    ), routed_database_shards AS MATERIALIZED ( \
+        SELECT DISTINCT ranges.logical_database_id, ranges.database_shard_id \
+          FROM serving_ranges AS ranges \
+    ), active_placement_counts AS MATERIALIZED ( \
+        SELECT placements.logical_database_id, placements.database_shard_id, \
+               pg_catalog.count(*) AS active_count \
+           FROM ONLY pgshard_catalog.database_shard_placements AS placements \
+          JOIN routed_database_shards AS routed \
+            ON routed.logical_database_id = placements.logical_database_id \
+           AND routed.database_shard_id = placements.database_shard_id \
+         WHERE placements.state = 'active' \
+         GROUP BY placements.logical_database_id, placements.database_shard_id \
+    ) \
+    SELECT ranges.logical_database_id::text, ranges.database_shard_id::text, \
+           database_shards.state, \
+           coalesce(placement_counts.active_count, 0), placements.placement_generation, \
+           placements.shard_id::text, shards.shard_number, shards.state, \
+           ranges.range_start::text, ranges.range_end::text \
+       FROM serving_ranges AS ranges \
+        LEFT JOIN ONLY pgshard_catalog.database_shards AS database_shards \
+         ON database_shards.logical_database_id = ranges.logical_database_id \
+        AND database_shards.database_shard_id = ranges.database_shard_id \
+       LEFT JOIN active_placement_counts AS placement_counts \
+         ON placement_counts.logical_database_id = ranges.logical_database_id \
+        AND placement_counts.database_shard_id = ranges.database_shard_id \
+        LEFT JOIN ONLY pgshard_catalog.database_shard_placements AS placements \
+         ON placements.logical_database_id = ranges.logical_database_id \
+        AND placements.database_shard_id = ranges.database_shard_id \
+        AND placements.state = 'active' \
+        LEFT JOIN ONLY pgshard_catalog.shards AS shards ON shards.shard_id = placements.shard_id \
+      ORDER BY ranges.logical_database_id, ranges.range_start, ranges.range_end, \
+               placements.placement_generation \
+      LIMIT $1";
 
 const TABLES_SQL: &str = "\
     SELECT databases.logical_database_id::text, tables.schema_name, tables.table_name, \
            tables.shard_key_column, tables.shard_key_type, tables.hash_version \
-      FROM pgshard_catalog.logical_databases AS databases \
-      JOIN pgshard_catalog.active_routing_epochs AS active \
+       FROM ONLY pgshard_catalog.logical_databases AS databases \
+       JOIN ONLY pgshard_catalog.active_routing_epochs AS active \
         ON active.logical_database_id = databases.logical_database_id \
-      JOIN pgshard_catalog.registered_tables AS tables \
+       JOIN ONLY pgshard_catalog.registered_tables AS tables \
         ON tables.logical_database_id = databases.logical_database_id \
        AND tables.state = 'active' \
      WHERE databases.state IN ('active', 'draining') \
@@ -315,16 +348,52 @@ async fn load_routes(
             database.routes.len() + 1,
             MAX_ROUTING_RANGES_PER_DATABASE,
         )?;
-        let target_shard_id = row.get::<_, &str>(5);
+        let database_shard_id =
+            DatabaseShardId::new(parse_uuid("database_shard_id", row.get::<_, &str>(1))?)?;
+        let database_shard_state =
+            row.get::<_, Option<String>>(2)
+                .ok_or(LoadError::MissingRoutingDatabaseShard {
+                    database_id: id,
+                    database_shard_id,
+                })?;
+        if !matches!(database_shard_state.as_str(), "active" | "draining") {
+            return Err(LoadError::InvalidRoutingDatabaseShardState {
+                database_id: id,
+                database_shard_id,
+                state: database_shard_state,
+            });
+        }
+        let active_placement_count =
+            nonnegative_u64("active placement count", row.get::<_, i64>(3))?;
+        if active_placement_count != 1 {
+            return Err(LoadError::InvalidActivePlacementCount {
+                database_id: id,
+                database_shard_id,
+                count: active_placement_count,
+            });
+        }
+        let placement_generation =
+            row.get::<_, Option<i64>>(4)
+                .ok_or(LoadError::MissingRoutingPlacement {
+                    database_id: id,
+                    database_shard_id,
+                })?;
+        let placement_generation = positive_u64("placement_generation", placement_generation)?;
+        let target_shard_id =
+            row.get::<_, Option<&str>>(5)
+                .ok_or(LoadError::MissingRoutingPlacement {
+                    database_id: id,
+                    database_shard_id,
+                })?;
         let shard_number =
-            row.get::<_, Option<i64>>(1)
+            row.get::<_, Option<i64>>(6)
                 .ok_or_else(|| LoadError::MissingRoutingShard {
                     database_id: id,
                     shard_id: target_shard_id.to_owned(),
                 })?;
         let shard_number = nonnegative_u32("shard_number", shard_number)?;
         let shard_state =
-            row.get::<_, Option<String>>(4)
+            row.get::<_, Option<String>>(7)
                 .ok_or_else(|| LoadError::MissingRoutingShard {
                     database_id: id,
                     shard_id: target_shard_id.to_owned(),
@@ -336,9 +405,11 @@ async fn load_routes(
                 state: shard_state,
             });
         }
-        let start = parse_u128("range_start", &row.get::<_, String>(2))?;
-        let end = parse_u128("range_end", &row.get::<_, String>(3))?;
+        let start = parse_u128("range_start", &row.get::<_, String>(8))?;
+        let end = parse_u128("range_end", &row.get::<_, String>(9))?;
         database.routes.push(ShardRoute::new(
+            database_shard_id,
+            placement_generation,
             ShardId(shard_number),
             KeyRange::new(start, end)?,
         ));
@@ -532,6 +603,51 @@ pub enum LoadError {
     /// The authoritative database query returned a duplicate primary key.
     #[error("logical database {0} was loaded more than once")]
     DuplicateLogicalDatabase(DatabaseId),
+    /// An active route references a permanent database-shard identity absent
+    /// from the catalog.
+    #[error(
+        "logical database {database_id} routes through missing database shard {database_shard_id}"
+    )]
+    MissingRoutingDatabaseShard {
+        /// Logical database whose active route is malformed.
+        database_id: DatabaseId,
+        /// Absent permanent database-shard identity.
+        database_shard_id: DatabaseShardId,
+    },
+    /// An active route references a permanent database shard that cannot serve.
+    #[error(
+        "logical database {database_id} routes through unavailable database shard {database_shard_id} in state {state:?}"
+    )]
+    InvalidRoutingDatabaseShardState {
+        /// Logical database whose active route is malformed.
+        database_id: DatabaseId,
+        /// Unavailable permanent database-shard identity.
+        database_shard_id: DatabaseShardId,
+        /// Rejected lifecycle state.
+        state: String,
+    },
+    /// A routed permanent database shard lacks exactly one active placement.
+    #[error(
+        "logical database {database_id} routes through database shard {database_shard_id} with {count} active placements"
+    )]
+    InvalidActivePlacementCount {
+        /// Logical database whose active route is malformed.
+        database_id: DatabaseId,
+        /// Permanent database-shard identity with malformed placement state.
+        database_shard_id: DatabaseShardId,
+        /// Active placements observed in one repeatable-read snapshot.
+        count: u64,
+    },
+    /// A supposedly active placement row is incomplete.
+    #[error(
+        "logical database {database_id} routes through database shard {database_shard_id} without a complete active placement"
+    )]
+    MissingRoutingPlacement {
+        /// Logical database whose active route is malformed.
+        database_id: DatabaseId,
+        /// Permanent database-shard identity lacking placement fields.
+        database_shard_id: DatabaseShardId,
+    },
     /// An active route references a shard identity absent from the catalog.
     #[error("logical database {database_id} routes to missing shard {shard_id:?}")]
     MissingRoutingShard {

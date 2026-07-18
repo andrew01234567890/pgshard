@@ -29,11 +29,23 @@ v0.49 migration bytes and installs them through `SET ROLE`, first proving that a
 non-superuser `CREATEROLE` owner and its real PostgreSQL 18 grantor chain are
 rejected rather than elevated. An exact fixture installed as PostgreSQL's
 bootstrap superuser proves its non-delegable runtime memberships and their
-`INHERIT` and `SET` options survive takeover without a same-grantor revoke. A
+`INHERIT` and `SET` options survive takeover without a same-grantor revoke. Its
+populated two-cell route becomes two distinct permanent database-shard UUIDs
+with the same boundaries and physical targets; the catalog epoch advances once
+because the cache checksum shape changed, and migration replay does not advance
+it again. A target present only in a superseded epoch becomes retired
+database-shard history with a superseded placement, and does not block the old
+physical cell from retiring. A
+live active or staged route to an unavailable physical cell rejects conversion
+without changing catalog state and must be repaired with the previous release.
+Placement lifecycle coverage proves staged identities cannot be deleted and
+reused, direct cutover transitions fail closed, and rejected transitions leave
+the serving route unchanged. A
 second eligible superuser-owned fixture moves the released catalog to the
 dedicated NOLOGIN owner, re-homes those memberships under the bootstrap
 grantor, removes explicit fixed-role memberships held by the old owner,
-preserves the epoch, and proves the deprivileged old owner has no residual
+publishes the same one-time conversion epoch, and proves the deprivileged old
+owner has no residual
 catalog access and can be dropped. Hostile reader/admin schema, table, column,
 function, procedure, type, and grant-option ACLs, including PUBLIC procedure
 execution, are cleared before the documented boundary is rebuilt, and a
@@ -41,7 +53,8 @@ standalone composite type proves complete ownership transfer. Rollback-only
 cases cover unsafe fixed-role attributes, delegable memberships, unexpected
 reader/admin/owner inheritance, owner members, fixed-role schema ownership,
 missing released roles, mixed object ownership, unsupported schema object
-classes, external executable or referential triggers, a same-identity released
+classes, external inherited relations, noncanonical CHECK/default/index metadata,
+external executable or referential triggers, a same-identity released
 trigger with altered predicate and arguments, and unexpected default privileges
 without advancing the catalog epoch or retaining fixture roles. A concurrent
 case holds an uncommitted external trigger on a target relation and requires the
@@ -643,7 +656,10 @@ transactions commit without a deadlock. The operator bootstrap fixture proves al
 are one transaction: a later conflicting database leaves an earlier new
 declaration absent and the active topology unchanged. Legacy and current
 catalog fixtures prove topology mismatch is rejected before migration while
-catalog, HBA, and routing-sequence fingerprints remain unchanged. Generated
+catalog, HBA, and routing-sequence fingerprints remain unchanged. A current
+catalog with every declared database and route removed is likewise rejected
+without mutation; only durable in-progress genesis intent permits empty topology
+between migration commit and atomic database genesis. Generated
 preflight SQL bounds non-retired databases and active ranges at the declared
 counts plus one and aggregates active epochs once per sampled database. API and planner tests
 cover deterministic defaults, shared and disjoint placements, out-of-range
