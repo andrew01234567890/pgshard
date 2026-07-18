@@ -1,9 +1,11 @@
 //! `pgshard-agent` Linux container entry point.
 
 use pgshard_agent::config::{AgentConfig, ConfigError};
+use pgshard_agent::coordination::{WritableLeaseConfig, WritableLeaseError};
 use pgshard_agent::domain::{AgentState, PostgresProcessState};
 use pgshard_agent::postgres::{PostgresError, PreparedPostgres};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::watch;
@@ -50,6 +52,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         http_bind,
         identity,
         max_lease_ttl_ms,
+        writable_lease,
         telemetry,
         postgres,
     } = config;
@@ -88,10 +91,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         git_sha = pgshard_version::GIT_SHA,
         "starting agent HTTP server"
     );
+    let result = Box::pin(run_services(
+        http_bind,
+        state,
+        postgres,
+        writable_lease,
+        shutdown_tx.clone(),
+        shutdown_rx,
+    ))
+    .await;
+    signal_task.abort();
+    let _ = signal_task.await;
+    result?;
+    tracing::info!("agent shutdown complete");
+    Ok(())
+}
+
+async fn run_services(
+    http_bind: SocketAddr,
+    state: AgentState,
+    postgres: Option<PreparedPostgres>,
+    writable_lease: Option<WritableLeaseConfig>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), AgentRunError> {
     let run_shutdown_tx = shutdown_tx.clone();
-    let run = async move {
+    let coordination_state = state.clone();
+    let coordination_shutdown = shutdown_rx.clone();
+    let components = async move {
         if let Some(postgres) = postgres {
-            let listener = tokio::net::TcpListener::bind(http_bind).await?;
+            let listener = tokio::net::TcpListener::bind(http_bind)
+                .await
+                .map_err(AgentRunError::Http)?;
             let http = pgshard_agent::http::serve_on(
                 listener,
                 state.clone(),
@@ -104,25 +135,57 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 result = &mut http => {
                     let _ = run_shutdown_tx.send(true);
                     let postmaster_result = postmaster.await;
-                    combine_component_results(result, postmaster_result)?;
+                    combine_component_results(result, postmaster_result)
                 }
                 result = &mut postmaster => {
                     let _ = run_shutdown_tx.send(true);
                     let http_result = http.await;
-                    combine_component_results(http_result, result)?;
+                    combine_component_results(http_result, result)
                 }
             }
         } else {
-            pgshard_agent::http::serve(http_bind, state, wait_for_shutdown(shutdown_rx)).await?;
+            pgshard_agent::http::serve(http_bind, state, wait_for_shutdown(shutdown_rx))
+                .await
+                .map_err(AgentRunError::Http)
         }
-        Ok::<(), Box<dyn std::error::Error>>(())
     };
-    let result = run.await;
-    signal_task.abort();
-    let _ = signal_task.await;
-    result?;
-    tracing::info!("agent shutdown complete");
-    Ok(())
+    match writable_lease {
+        Some(config) => {
+            let coordination = pgshard_agent::coordination::supervise(
+                config,
+                coordination_state,
+                coordination_shutdown,
+            );
+            tokio::pin!(components);
+            tokio::pin!(coordination);
+            tokio::select! {
+                components_result = &mut components => {
+                    let _ = shutdown_tx.send(true);
+                    combine_coordination_results(components_result, coordination.await)
+                }
+                coordination_result = &mut coordination => {
+                    let _ = shutdown_tx.send(true);
+                    combine_coordination_results(components.await, coordination_result)
+                }
+            }
+        }
+        None => components.await,
+    }
+}
+
+fn combine_coordination_results(
+    runtime: Result<(), AgentRunError>,
+    coordination: Result<(), WritableLeaseError>,
+) -> Result<(), AgentRunError> {
+    match (runtime, coordination) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(runtime), Ok(())) => Err(runtime),
+        (Ok(()), Err(source)) => Err(AgentRunError::Coordination(source)),
+        (Err(runtime), Err(coordination)) => Err(AgentRunError::CoordinationAndRuntime {
+            coordination,
+            runtime: Box::new(runtime),
+        }),
+    }
 }
 
 async fn await_preparation<T, F>(
@@ -168,6 +231,16 @@ enum AgentRunError {
         #[source]
         postgres: PostgresError,
         http: std::io::Error,
+    },
+    #[error("writable-term Lease coordination failed: {0}")]
+    Coordination(#[source] WritableLeaseError),
+    #[error(
+        "writable-term Lease coordination failed: {coordination}; agent runtime also failed: {runtime}"
+    )]
+    CoordinationAndRuntime {
+        #[source]
+        coordination: WritableLeaseError,
+        runtime: Box<AgentRunError>,
     },
 }
 

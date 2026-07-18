@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pgshard_types::{PgLsn, ShardId};
 use serde::{Serialize, Serializer};
@@ -83,7 +83,8 @@ pub struct FencingLease {
     /// Strictly positive fencing epoch.
     #[serde(serialize_with = "serialize_u64_decimal")]
     pub epoch: u64,
-    /// Lease expiration as Unix time in milliseconds.
+    /// Lease expiration as Unix time in milliseconds for status reporting.
+    /// Live authority is bounded independently by a local monotonic deadline.
     #[serde(serialize_with = "serialize_u64_decimal")]
     pub valid_until_unix_ms: u64,
 }
@@ -125,10 +126,22 @@ pub struct AgentSnapshot {
 /// Thread-safe state shared by reconciliation and HTTP handlers.
 #[derive(Clone, Debug, Default)]
 pub struct AgentState {
-    inner: Arc<RwLock<AgentSnapshot>>,
+    inner: Arc<RwLock<AgentInner>>,
     last_checked_unix_ms: Arc<AtomicU64>,
     highest_lease_epoch: Arc<AtomicU64>,
     max_lease_ttl_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct AgentInner {
+    snapshot: AgentSnapshot,
+    lease_deadline: Option<LeaseDeadline>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LeaseDeadline {
+    epoch: u64,
+    expires_at: Instant,
 }
 
 impl AgentState {
@@ -146,9 +159,12 @@ impl AgentState {
             return Err(LeaseInstallError::InvalidMaximumLeaseTtl(max_lease_ttl_ms));
         }
         Ok(Self {
-            inner: Arc::new(RwLock::new(AgentSnapshot {
-                identity: Some(identity),
-                ..AgentSnapshot::default()
+            inner: Arc::new(RwLock::new(AgentInner {
+                snapshot: AgentSnapshot {
+                    identity: Some(identity),
+                    ..AgentSnapshot::default()
+                },
+                lease_deadline: None,
             })),
             last_checked_unix_ms: Arc::new(AtomicU64::new(0)),
             highest_lease_epoch: Arc::new(AtomicU64::new(0)),
@@ -162,6 +178,7 @@ impl AgentState {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
             .clone()
     }
 
@@ -170,6 +187,7 @@ impl AgentState {
         self.inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
             .postgres = Some(observation);
     }
 
@@ -178,6 +196,7 @@ impl AgentState {
         self.inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
             .postgres_process = process;
     }
 
@@ -194,11 +213,46 @@ impl AgentState {
         lease: FencingLease,
         now_unix_ms: u64,
     ) -> Result<LeaseInstallOutcome, LeaseInstallError> {
-        let mut snapshot = self
+        let now = Instant::now();
+        self.install_lease_at(lease, now_unix_ms, now, now)
+    }
+
+    /// Installs authority whose monotonic validity window began at
+    /// `valid_from`. Callers performing a remote compare-and-swap must capture
+    /// that instant before dispatch and pass the later `observed_at` instant so
+    /// response latency consumes rather than extends the lease.
+    pub(crate) fn install_lease_at(
+        &self,
+        lease: FencingLease,
+        valid_from_unix_ms: u64,
+        valid_from: Instant,
+        observed_at: Instant,
+    ) -> Result<LeaseInstallOutcome, LeaseInstallError> {
+        let Some(ttl_ms) = lease.valid_until_unix_ms.checked_sub(valid_from_unix_ms) else {
+            return Err(LeaseInstallError::Expired);
+        };
+        if ttl_ms == 0 {
+            return Err(LeaseInstallError::Expired);
+        }
+        if ttl_ms > self.max_lease_ttl_ms {
+            return Err(LeaseInstallError::LeaseTtlExceeded {
+                requested_ms: ttl_ms,
+                maximum_ms: self.max_lease_ttl_ms,
+            });
+        }
+        let expires_at = valid_from
+            .checked_add(Duration::from_millis(ttl_ms))
+            .ok_or(LeaseInstallError::DeadlineOverflow)?;
+        if expires_at <= observed_at {
+            return Err(LeaseInstallError::Expired);
+        }
+
+        let mut inner = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let identity = snapshot
+        let identity = inner
+            .snapshot
             .identity
             .as_ref()
             .ok_or(LeaseInstallError::IdentityMissing)?;
@@ -211,66 +265,90 @@ impl AgentState {
         if lease.epoch == 0 || lease.epoch == u64::MAX {
             return Err(LeaseInstallError::ReservedEpoch(lease.epoch));
         }
-        let Some(ttl_ms) = lease.valid_until_unix_ms.checked_sub(now_unix_ms) else {
-            return Err(LeaseInstallError::Expired);
-        };
-        if ttl_ms == 0 {
-            return Err(LeaseInstallError::Expired);
-        }
-        if ttl_ms > self.max_lease_ttl_ms {
-            return Err(LeaseInstallError::LeaseTtlExceeded {
-                requested_ms: ttl_ms,
-                maximum_ms: self.max_lease_ttl_ms,
-            });
-        }
 
         let highest = self.highest_lease_epoch.load(Ordering::Acquire);
-        if lease.epoch < highest || (lease.epoch == highest && snapshot.lease.is_none()) {
+        if lease.epoch < highest || (lease.epoch == highest && inner.snapshot.lease.is_none()) {
             return Err(LeaseInstallError::StaleEpoch {
                 requested: lease.epoch,
                 minimum: highest.saturating_add(1),
             });
         }
-        if let Some(current) = snapshot.lease.as_ref()
+        if let Some(current) = inner.snapshot.lease.as_ref()
             && lease.epoch == current.epoch
         {
             if lease.valid_until_unix_ms < current.valid_until_unix_ms {
                 return Err(LeaseInstallError::RegressiveExpiry);
             }
-            if lease.valid_until_unix_ms == current.valid_until_unix_ms {
+            let current_deadline = inner
+                .lease_deadline
+                .filter(|deadline| deadline.epoch == current.epoch)
+                .ok_or(LeaseInstallError::DeadlineMissing)?;
+            if expires_at < current_deadline.expires_at {
+                return Err(LeaseInstallError::RegressiveDeadline);
+            }
+            if lease.valid_until_unix_ms == current.valid_until_unix_ms
+                && expires_at == current_deadline.expires_at
+            {
                 return Ok(LeaseInstallOutcome::Existing);
             }
-            snapshot.lease = Some(lease);
+            inner.snapshot.lease = Some(lease.clone());
+            inner.lease_deadline = Some(LeaseDeadline {
+                epoch: lease.epoch,
+                expires_at,
+            });
             return Ok(LeaseInstallOutcome::Renewed);
         }
 
         self.highest_lease_epoch
             .store(lease.epoch, Ordering::Release);
-        snapshot.lease = Some(lease);
+        inner.snapshot.lease = Some(lease.clone());
+        inner.lease_deadline = Some(LeaseDeadline {
+            epoch: lease.epoch,
+            expires_at,
+        });
         Ok(LeaseInstallOutcome::Installed)
     }
 
     /// Removes local authorization immediately.
     pub fn clear_lease(&self) {
-        self.inner
+        let mut inner = self
+            .inner
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .lease = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.snapshot.lease = None;
+        inner.lease_deadline = None;
     }
 
-    /// Evaluates readiness against the current wall clock.
+    /// Evaluates readiness against the current wall and monotonic clocks.
     #[must_use]
     pub fn readiness(&self) -> Readiness {
-        self.readiness_at(unix_time_ms())
+        self.readiness_at(unix_time_ms(), Instant::now())
     }
 
-    /// Evaluates deterministic readiness at a supplied Unix timestamp.
+    /// Evaluates deterministic readiness at supplied wall and monotonic times.
     #[must_use]
-    pub fn readiness_at(&self, now_unix_ms: u64) -> Readiness {
+    pub fn readiness_at(&self, now_unix_ms: u64, now: Instant) -> Readiness {
         let previous = self
             .last_checked_unix_ms
             .fetch_max(now_unix_ms, Ordering::AcqRel);
-        evaluate_readiness(&self.snapshot(), previous.max(now_unix_ms))
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        evaluate_readiness(
+            &inner.snapshot,
+            inner.lease_deadline,
+            previous.max(now_unix_ms),
+            now,
+        )
+    }
+
+    pub(crate) fn lease_deadline(&self) -> Option<Instant> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lease_deadline
+            .map(|deadline| deadline.expires_at)
     }
 }
 
@@ -327,6 +405,15 @@ pub enum LeaseInstallError {
     /// A renewal cannot reduce its current expiration.
     #[error("lease renewal cannot shorten its expiration")]
     RegressiveExpiry,
+    /// A monotonic lease deadline could not be represented.
+    #[error("fencing lease monotonic deadline overflowed")]
+    DeadlineOverflow,
+    /// Reported lease state exists without its matching monotonic authority.
+    #[error("fencing lease has no matching monotonic deadline")]
+    DeadlineMissing,
+    /// A renewal cannot move the monotonic deadline backwards.
+    #[error("lease renewal cannot shorten its monotonic deadline")]
+    RegressiveDeadline,
 }
 
 /// Machine-readable reason for accepting or rejecting traffic.
@@ -347,6 +434,8 @@ pub enum ReadinessReason {
     LeaseOwnerMismatch,
     /// Epoch zero can never authorize an instance.
     LeaseEpochInvalid,
+    /// Reported lease state has no matching local monotonic authority.
+    LeaseDeadlineMissing,
     /// The installed lease is no longer valid.
     LeaseExpired,
     /// `PostgreSQL` has not been inspected successfully.
@@ -374,14 +463,20 @@ pub struct Readiness {
     pub reason: ReadinessReason,
 }
 
-fn evaluate_readiness(snapshot: &AgentSnapshot, now_unix_ms: u64) -> Readiness {
+fn evaluate_readiness(
+    snapshot: &AgentSnapshot,
+    lease_deadline: Option<LeaseDeadline>,
+    now_unix_ms: u64,
+    now: Instant,
+) -> Readiness {
     let reason = match (
         &snapshot.identity,
         snapshot.postgres_process,
         &snapshot.lease,
+        lease_deadline,
         &snapshot.postgres,
     ) {
-        (_, PostgresProcessState::Failed, _, _) => ReadinessReason::PostgresFailed,
+        (_, PostgresProcessState::Failed, _, _, _) => ReadinessReason::PostgresFailed,
         (
             Some(_),
             PostgresProcessState::Validated
@@ -390,35 +485,40 @@ fn evaluate_readiness(snapshot: &AgentSnapshot, now_unix_ms: u64) -> Readiness {
             | PostgresProcessState::Stopping,
             _,
             _,
+            _,
         ) => ReadinessReason::PostgresQuarantined,
-        (None, _, _, _) => ReadinessReason::IdentityMissing,
-        (Some(_), _, None, _) => ReadinessReason::LeaseMissing,
-        (Some(identity), _, Some(lease), _) if identity.instance_id != lease.owner_instance => {
+        (None, _, _, _, _) => ReadinessReason::IdentityMissing,
+        (Some(_), _, None, _, _) => ReadinessReason::LeaseMissing,
+        (Some(identity), _, Some(lease), _, _) if identity.instance_id != lease.owner_instance => {
             ReadinessReason::LeaseOwnerMismatch
         }
-        (_, _, Some(lease), _) if lease.epoch == 0 => ReadinessReason::LeaseEpochInvalid,
-        (_, _, Some(lease), _) if lease.valid_until_unix_ms <= now_unix_ms => {
+        (_, _, Some(lease), _, _) if lease.epoch == 0 => ReadinessReason::LeaseEpochInvalid,
+        (_, _, Some(_), None, _) => ReadinessReason::LeaseDeadlineMissing,
+        (_, _, Some(lease), Some(deadline), _) if lease.epoch != deadline.epoch => {
+            ReadinessReason::LeaseDeadlineMissing
+        }
+        (_, _, Some(_), Some(deadline), _) if deadline.expires_at <= now => {
             ReadinessReason::LeaseExpired
         }
-        (_, _, _, None) => ReadinessReason::PostgresUnobserved,
-        (_, _, _, Some(postgres))
+        (_, _, _, _, None) => ReadinessReason::PostgresUnobserved,
+        (_, _, _, _, Some(postgres))
             if postgres.observed_at_unix_ms == 0 || postgres.observed_at_unix_ms > now_unix_ms =>
         {
             ReadinessReason::PostgresObservationTimeInvalid
         }
-        (_, _, _, Some(postgres))
+        (_, _, _, _, Some(postgres))
             if now_unix_ms - postgres.observed_at_unix_ms > POSTGRES_OBSERVATION_MAX_AGE_MS =>
         {
             ReadinessReason::PostgresObservationStale
         }
-        (_, _, _, Some(postgres)) if postgres.role == PostgresRole::Unknown => {
+        (_, _, _, _, Some(postgres)) if postgres.role == PostgresRole::Unknown => {
             ReadinessReason::PostgresRoleUnknown
         }
-        (_, _, _, Some(postgres)) if postgres.timeline == 0 => ReadinessReason::TimelineInvalid,
-        (_, _, Some(lease), Some(postgres)) if postgres.fencing_epoch != lease.epoch => {
+        (_, _, _, _, Some(postgres)) if postgres.timeline == 0 => ReadinessReason::TimelineInvalid,
+        (_, _, Some(lease), _, Some(postgres)) if postgres.fencing_epoch != lease.epoch => {
             ReadinessReason::FencingEpochMismatch
         }
-        (_, _, _, Some(postgres))
+        (_, _, _, _, Some(postgres))
             if (postgres.role == PostgresRole::Primary && postgres.flush_lsn.is_none())
                 || (postgres.role == PostgresRole::Replica && postgres.replay_lsn.is_none()) =>
         {
@@ -467,14 +567,24 @@ mod tests {
         AgentState::with_identity(identity(), 10_000).expect("valid lease policy")
     }
 
+    fn install(
+        state: &AgentState,
+        lease: FencingLease,
+        valid_from_unix_ms: u64,
+        valid_from: Instant,
+    ) -> Result<LeaseInstallOutcome, LeaseInstallError> {
+        state.install_lease_at(lease, valid_from_unix_ms, valid_from, valid_from)
+    }
+
     #[test]
     fn readiness_fails_closed_without_identity_or_lease() {
+        let now = Instant::now();
         assert_eq!(
-            AgentState::default().readiness_at(100).reason,
+            AgentState::default().readiness_at(100, now).reason,
             ReadinessReason::IdentityMissing
         );
         assert_eq!(
-            state().readiness_at(100).reason,
+            state().readiness_at(100, now).reason,
             ReadinessReason::LeaseMissing
         );
     }
@@ -482,35 +592,41 @@ mod tests {
     #[test]
     fn readiness_rejects_wrong_owner_and_expired_lease() {
         let state = state();
+        let now = Instant::now();
         state.set_postgres(primary());
         assert!(matches!(
-            state.install_lease(
+            install(
+                &state,
                 FencingLease {
                     owner_instance: "someone-else".to_owned(),
                     epoch: 3,
                     valid_until_unix_ms: 200,
                 },
                 100,
+                now,
             ),
             Err(LeaseInstallError::OwnerMismatch { .. })
         ));
         assert_eq!(
-            state.readiness_at(100).reason,
+            state.readiness_at(100, now).reason,
             ReadinessReason::LeaseMissing
         );
 
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 3,
-                    valid_until_unix_ms: 100,
-                },
-                99,
-            )
-            .expect("install expired fixture");
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 3,
+                valid_until_unix_ms: 100,
+            },
+            99,
+            now,
+        )
+        .expect("install expired fixture");
         assert_eq!(
-            state.readiness_at(100).reason,
+            state
+                .readiness_at(100, now + Duration::from_millis(1))
+                .reason,
             ReadinessReason::LeaseExpired
         );
     }
@@ -518,16 +634,18 @@ mod tests {
     #[test]
     fn readiness_requires_role_specific_lsn() {
         let state = state();
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 3,
-                    valid_until_unix_ms: 200,
-                },
-                100,
-            )
-            .expect("install lease");
+        let now = Instant::now();
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 3,
+                valid_until_unix_ms: 200,
+            },
+            100,
+            now,
+        )
+        .expect("install lease");
         state.set_postgres(PostgresObservation {
             role: PostgresRole::Replica,
             timeline: 4,
@@ -536,25 +654,30 @@ mod tests {
             flush_lsn: Some(PgLsn(100)),
             replay_lsn: None,
         });
-        assert_eq!(state.readiness_at(100).reason, ReadinessReason::LsnMissing);
+        assert_eq!(
+            state.readiness_at(100, now).reason,
+            ReadinessReason::LsnMissing
+        );
     }
 
     #[test]
     fn readiness_accepts_current_matching_fence() {
         let state = state();
+        let now = Instant::now();
         state.set_postgres(primary());
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 3,
-                    valid_until_unix_ms: 200,
-                },
-                100,
-            )
-            .expect("install lease");
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 3,
+                valid_until_unix_ms: 200,
+            },
+            100,
+            now,
+        )
+        .expect("install lease");
         assert_eq!(
-            state.readiness_at(100),
+            state.readiness_at(100, now),
             Readiness {
                 ready: true,
                 reason: ReadinessReason::Ready,
@@ -565,29 +688,31 @@ mod tests {
     #[test]
     fn quarantine_process_state_overrides_valid_authority() {
         let state = state();
+        let now = Instant::now();
         state.set_postgres(primary());
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 3,
-                    valid_until_unix_ms: 200,
-                },
-                100,
-            )
-            .expect("install matching lease");
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 3,
+                valid_until_unix_ms: 200,
+            },
+            100,
+            now,
+        )
+        .expect("install matching lease");
         state.set_postgres_process(PostgresProcessState::RunningQuarantined);
 
         assert_eq!(
-            state.readiness_at(100).reason,
+            state.readiness_at(100, now).reason,
             ReadinessReason::PostgresQuarantined
         );
         state.set_postgres_process(PostgresProcessState::Disabled);
-        assert_eq!(state.readiness_at(100).reason, ReadinessReason::Ready);
+        assert_eq!(state.readiness_at(100, now).reason, ReadinessReason::Ready);
 
         state.set_postgres_process(PostgresProcessState::Failed);
         assert_eq!(
-            state.readiness_at(100).reason,
+            state.readiness_at(100, now).reason,
             ReadinessReason::PostgresFailed
         );
     }
@@ -595,28 +720,30 @@ mod tests {
     #[test]
     fn readiness_rejects_invalid_and_stale_observation_time() {
         let state = state();
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 3,
-                    valid_until_unix_ms: 10_000,
-                },
-                100,
-            )
-            .expect("install lease");
+        let now = Instant::now();
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 3,
+                valid_until_unix_ms: 10_000,
+            },
+            100,
+            now,
+        )
+        .expect("install lease");
         let mut observation = primary();
         observation.observed_at_unix_ms = 0;
         state.set_postgres(observation);
         assert_eq!(
-            state.readiness_at(100).reason,
+            state.readiness_at(100, now).reason,
             ReadinessReason::PostgresObservationTimeInvalid
         );
 
         state.set_postgres(primary());
         assert_eq!(
             state
-                .readiness_at(100 + POSTGRES_OBSERVATION_MAX_AGE_MS + 1)
+                .readiness_at(100 + POSTGRES_OBSERVATION_MAX_AGE_MS + 1, now)
                 .reason,
             ReadinessReason::PostgresObservationStale
         );
@@ -625,19 +752,21 @@ mod tests {
     #[test]
     fn readiness_rejects_a_stale_postgres_fence() {
         let state = state();
+        let now = Instant::now();
         state.set_postgres(primary());
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 4,
-                    valid_until_unix_ms: 300,
-                },
-                100,
-            )
-            .expect("install lease");
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 4,
+                valid_until_unix_ms: 300,
+            },
+            100,
+            now,
+        )
+        .expect("install lease");
         assert_eq!(
-            state.readiness_at(100).reason,
+            state.readiness_at(100, now).reason,
             ReadinessReason::FencingEpochMismatch
         );
     }
@@ -645,42 +774,144 @@ mod tests {
     #[test]
     fn clock_rollback_cannot_revive_an_expired_lease() {
         let state = state();
+        let now = Instant::now();
         state.set_postgres(primary());
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 3,
-                    valid_until_unix_ms: 200,
-                },
-                100,
-            )
-            .expect("install lease");
-        assert!(state.readiness_at(199).ready);
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 3,
+                valid_until_unix_ms: 200,
+            },
+            100,
+            now,
+        )
+        .expect("install lease");
+        assert!(
+            state
+                .readiness_at(199, now + Duration::from_millis(99))
+                .ready
+        );
         assert_eq!(
-            state.readiness_at(200).reason,
+            state
+                .readiness_at(200, now + Duration::from_millis(100))
+                .reason,
             ReadinessReason::LeaseExpired
         );
         assert_eq!(
-            state.readiness_at(150).reason,
+            state
+                .readiness_at(150, now + Duration::from_millis(100))
+                .reason,
             ReadinessReason::LeaseExpired
+        );
+    }
+
+    #[test]
+    fn wall_clock_jump_cannot_expire_live_monotonic_authority() {
+        let state = state();
+        let now = Instant::now();
+        state.set_postgres(primary());
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 3,
+                valid_until_unix_ms: 200,
+            },
+            100,
+            now,
+        )
+        .expect("install lease");
+
+        assert_eq!(
+            state.readiness_at(300, now + Duration::from_millis(50)),
+            Readiness {
+                ready: true,
+                reason: ReadinessReason::Ready,
+            }
+        );
+    }
+
+    #[test]
+    fn delayed_install_consumes_authority_window() {
+        let state = state();
+        let valid_from = Instant::now();
+        let lease = FencingLease {
+            owner_instance: "instance-1".to_owned(),
+            epoch: 3,
+            valid_until_unix_ms: 200,
+        };
+        assert_eq!(
+            state.install_lease_at(
+                lease.clone(),
+                100,
+                valid_from,
+                valid_from + Duration::from_millis(99),
+            ),
+            Ok(LeaseInstallOutcome::Installed)
+        );
+        assert_eq!(
+            state.lease_deadline(),
+            Some(valid_from + Duration::from_millis(100))
+        );
+        assert_eq!(
+            state.install_lease_at(
+                FencingLease { epoch: 4, ..lease },
+                100,
+                valid_from,
+                valid_from + Duration::from_millis(100),
+            ),
+            Err(LeaseInstallError::Expired)
+        );
+    }
+
+    #[test]
+    fn renewal_cannot_regress_monotonic_deadline() {
+        let state = state();
+        let now = Instant::now();
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 3,
+                valid_until_unix_ms: 300,
+            },
+            100,
+            now,
+        )
+        .expect("install lease");
+
+        assert_eq!(
+            install(
+                &state,
+                FencingLease {
+                    owner_instance: "instance-1".to_owned(),
+                    epoch: 3,
+                    valid_until_unix_ms: 301,
+                },
+                200,
+                now,
+            ),
+            Err(LeaseInstallError::RegressiveDeadline)
         );
     }
 
     #[test]
     fn status_json_uses_exact_decimal_strings() {
         let state = state();
+        let now = Instant::now();
         state.set_postgres(primary());
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: u64::MAX - 1,
-                    valid_until_unix_ms: 200,
-                },
-                100,
-            )
-            .expect("install large exact epoch");
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: u64::MAX - 1,
+                valid_until_unix_ms: 200,
+            },
+            100,
+            now,
+        )
+        .expect("install large exact epoch");
         let json = serde_json::to_value(state.snapshot()).expect("serialize status");
         assert_eq!(json["lease"]["epoch"], (u64::MAX - 1).to_string());
         assert_eq!(json["lease"]["valid_until_unix_ms"], "200");
@@ -691,32 +922,35 @@ mod tests {
     #[test]
     fn lease_terms_are_monotonic_and_clear_revokes_the_term() {
         let state = state();
+        let now = Instant::now();
         let lease = FencingLease {
             owner_instance: "instance-1".to_owned(),
             epoch: 7,
             valid_until_unix_ms: 200,
         };
         assert_eq!(
-            state.install_lease(lease.clone(), 100),
+            install(&state, lease.clone(), 100, now),
             Ok(LeaseInstallOutcome::Installed)
         );
         assert_eq!(
-            state.install_lease(lease.clone(), 100),
+            install(&state, lease.clone(), 100, now),
             Ok(LeaseInstallOutcome::Existing)
         );
         state.clear_lease();
         assert!(matches!(
-            state.install_lease(lease, 100),
+            install(&state, lease, 100, now),
             Err(LeaseInstallError::StaleEpoch { .. })
         ));
         assert_eq!(
-            state.install_lease(
+            install(
+                &state,
                 FencingLease {
                     owner_instance: "instance-1".to_owned(),
                     epoch: 8,
                     valid_until_unix_ms: 300,
                 },
                 200,
+                now,
             ),
             Ok(LeaseInstallOutcome::Installed)
         );
@@ -734,19 +968,20 @@ mod tests {
             epoch: 3,
             valid_until_unix_ms,
         };
+        let now = Instant::now();
         assert_eq!(
-            state.install_lease(lease(100), 100),
+            install(&state, lease(100), 100, now),
             Err(LeaseInstallError::Expired)
         );
         assert_eq!(
-            state.install_lease(lease(201), 100),
+            install(&state, lease(201), 100, now),
             Err(LeaseInstallError::LeaseTtlExceeded {
                 requested_ms: 101,
                 maximum_ms: 100,
             })
         );
         assert!(matches!(
-            state.install_lease(lease(u64::MAX), 100),
+            install(&state, lease(u64::MAX), 100, now),
             Err(LeaseInstallError::LeaseTtlExceeded { .. })
         ));
         assert!(state.snapshot().lease.is_none());

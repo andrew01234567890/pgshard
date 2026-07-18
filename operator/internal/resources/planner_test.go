@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -2347,6 +2348,19 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if !metav1.IsControlledBy(lease, cluster) || lease.Spec.HolderIdentity != nil || lease.Spec.RenewTime != nil || lease.Spec.LeaseDurationSeconds != nil {
 		t.Fatalf("operator must own only the empty Lease envelope: %#v", lease)
 	}
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		name := PostgreSQLWritableLeaseName(cluster.Name, shard)
+		writableLease := object[*coordinationv1.Lease](t, plan, name)
+		if !metav1.IsControlledBy(writableLease, cluster) ||
+			writableLease.Labels[ComponentLabel] != "postgresql" ||
+			writableLease.Labels[ShardLabel] != shardLabel(shard) ||
+			!reflect.DeepEqual(writableLease.Spec, coordinationv1.LeaseSpec{}) {
+			t.Fatalf("PostgreSQL writable-term Lease %s is not an empty cell-bound envelope: %#v", name, writableLease)
+		}
+		if strings.Contains(name, "primary") || strings.Contains(name, "replica") {
+			t.Fatalf("PostgreSQL writable-term Lease name encodes a mutable role: %s", name)
+		}
+	}
 	for _, planned := range plan {
 		if planned.GetLabels()[ComponentLabel] == "etcd" || strings.Contains(planned.GetName(), "-etcd") {
 			t.Fatalf("dedicated etcd resource remains in plan: %T %s", planned, planned.GetName())
@@ -2616,6 +2630,17 @@ func TestImagePullPolicyHandlesRegistryPortsAndDigests(t *testing.T) {
 		if got := imagePullPolicy(image); got != want {
 			t.Errorf("imagePullPolicy(%q) = %q, want %q", image, got, want)
 		}
+	}
+}
+
+func TestPostgreSQLWritableLeaseNameFitsDNSLabelAtMaximumClusterLength(t *testing.T) {
+	t.Parallel()
+	name := PostgreSQLWritableLeaseName(strings.Repeat("c", pgshardv1alpha1.MaximumClusterNameLength), pgshardv1alpha1.MaximumShards-1)
+	if messages := validation.IsDNS1123Label(name); len(messages) != 0 {
+		t.Fatalf("writable-term Lease name %q is invalid: %s", name, messages[0])
+	}
+	if len(name) > 63 {
+		t.Fatalf("writable-term Lease name has %d bytes", len(name))
 	}
 }
 

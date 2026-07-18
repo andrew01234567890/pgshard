@@ -10,6 +10,7 @@ use pgshard_types::ShardId;
 use thiserror::Error;
 use url::Url;
 
+use crate::coordination::WritableLeaseConfig;
 use crate::domain::AgentIdentity;
 use crate::postgres::{PostgresConfig, PostgresConfigError};
 use crate::telemetry::TelemetryConfig;
@@ -23,6 +24,8 @@ pub struct AgentConfig {
     pub identity: AgentIdentity,
     /// Maximum authenticated fencing lease duration accepted by the agent.
     pub max_lease_ttl_ms: u64,
+    /// Optional exact per-cell writable-term Lease authority.
+    pub writable_lease: Option<WritableLeaseConfig>,
     /// OpenTelemetry configuration placeholder.
     pub telemetry: TelemetryConfig,
     /// Optional client-TCP-quarantined `PostgreSQL` process supervision.
@@ -53,6 +56,33 @@ struct RawConfig {
 
     #[arg(long, env = "PGSHARD_MAX_LEASE_TTL_MS", default_value_t = 15_000)]
     max_lease_ttl_ms: u64,
+
+    #[arg(long, env = "PGSHARD_CLUSTER_UID")]
+    cluster_uid: Option<String>,
+
+    #[arg(long, env = "PGSHARD_POD_UID")]
+    pod_uid: Option<String>,
+
+    #[arg(long, env = "PGSHARD_LEASE_NAMESPACE")]
+    lease_namespace: Option<String>,
+
+    #[arg(long, env = "PGSHARD_WRITABLE_LEASE_NAME")]
+    writable_lease_name: Option<String>,
+
+    #[arg(long, env = "PGSHARD_WRITABLE_LEASE_UID")]
+    writable_lease_uid: Option<String>,
+
+    #[arg(long, env = "PGSHARD_WRITABLE_LEASE_DURATION_SECONDS")]
+    writable_lease_duration_seconds: Option<u64>,
+
+    #[arg(long, env = "PGSHARD_WRITABLE_LEASE_RENEW_DEADLINE_SECONDS")]
+    writable_lease_renew_deadline_seconds: Option<u64>,
+
+    #[arg(long, env = "PGSHARD_WRITABLE_LEASE_RETRY_MS")]
+    writable_lease_retry_ms: Option<u64>,
+
+    #[arg(long, env = "PGSHARD_KUBERNETES_REQUEST_TIMEOUT_MS")]
+    kubernetes_request_timeout_ms: Option<u64>,
 
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
@@ -140,6 +170,63 @@ impl AgentConfig {
             return Err(ConfigError::InvalidLeaseTtl(raw.max_lease_ttl_ms));
         }
 
+        let identity = AgentIdentity {
+            cluster_id: raw.cluster_id,
+            shard_id: ShardId(raw.shard_id),
+            instance_id: raw.instance_id,
+        };
+        let writable_setting_supplied = raw.cluster_uid.is_some()
+            || raw.pod_uid.is_some()
+            || raw.lease_namespace.is_some()
+            || raw.writable_lease_uid.is_some()
+            || raw.writable_lease_duration_seconds.is_some()
+            || raw.writable_lease_renew_deadline_seconds.is_some()
+            || raw.writable_lease_retry_ms.is_some()
+            || raw.kubernetes_request_timeout_ms.is_some();
+        let writable_lease = match raw.writable_lease_name {
+            Some(lease_name) => {
+                let cluster_uid = raw
+                    .cluster_uid
+                    .ok_or(ConfigError::IncompleteWritableLease)?;
+                let lease_uid = raw
+                    .writable_lease_uid
+                    .ok_or(ConfigError::IncompleteWritableLease)?;
+                let pod_uid = raw.pod_uid.ok_or(ConfigError::IncompleteWritableLease)?;
+                let namespace = raw
+                    .lease_namespace
+                    .ok_or(ConfigError::IncompleteWritableLease)?;
+                let lease_duration =
+                    Duration::from_secs(raw.writable_lease_duration_seconds.unwrap_or(15));
+                if duration_millis(lease_duration) > raw.max_lease_ttl_ms {
+                    return Err(ConfigError::WritableLeaseExceedsAgentPolicy {
+                        requested_ms: duration_millis(lease_duration),
+                        maximum_ms: raw.max_lease_ttl_ms,
+                    });
+                }
+                Some(
+                    WritableLeaseConfig::new(
+                        namespace,
+                        lease_name,
+                        identity.clone(),
+                        cluster_uid,
+                        lease_uid,
+                        pod_uid,
+                        lease_duration,
+                        Duration::from_secs(
+                            raw.writable_lease_renew_deadline_seconds.unwrap_or(10),
+                        ),
+                        Duration::from_millis(raw.writable_lease_retry_ms.unwrap_or(2_000)),
+                        Duration::from_millis(raw.kubernetes_request_timeout_ms.unwrap_or(2_000)),
+                    )
+                    .map_err(|_| ConfigError::InvalidWritableLeaseSettings)?,
+                )
+            }
+            None if writable_setting_supplied => {
+                return Err(ConfigError::IncompleteWritableLease);
+            }
+            None => None,
+        };
+
         let otlp_endpoint = raw
             .otlp_endpoint
             .map(|value| validate_otlp_endpoint(&value))
@@ -161,19 +248,31 @@ impl AgentConfig {
                 )?)
             }
         };
+        validate_writable_postgres_pair(writable_lease.as_ref(), postgres.as_ref())?;
 
         Ok(Self {
             http_bind: raw.http_bind,
-            identity: AgentIdentity {
-                cluster_id: raw.cluster_id,
-                shard_id: ShardId(raw.shard_id),
-                instance_id: raw.instance_id,
-            },
+            identity,
             max_lease_ttl_ms: raw.max_lease_ttl_ms,
+            writable_lease,
             telemetry: TelemetryConfig { otlp_endpoint },
             postgres,
         })
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn validate_writable_postgres_pair(
+    writable_lease: Option<&WritableLeaseConfig>,
+    postgres: Option<&PostgresConfig>,
+) -> Result<(), ConfigError> {
+    if writable_lease.is_some() && postgres.is_none() {
+        return Err(ConfigError::WritableLeaseRequiresPostgres);
+    }
+    Ok(())
 }
 
 fn validate_identifier(name: &'static str, value: &str) -> Result<(), ConfigError> {
@@ -232,6 +331,25 @@ pub enum ConfigError {
     /// Lease TTL is outside the bounded safety range.
     #[error("maximum lease TTL {0} ms must be between 1000 and 300000 ms")]
     InvalidLeaseTtl(u64),
+    /// Only part of the exact writable-term Lease identity was supplied.
+    #[error(
+        "writable-term Lease name, namespace, Lease UID, fleet UID, and Pod UID must be supplied together"
+    )]
+    IncompleteWritableLease,
+    /// Writable-term Lease timing or identity is unsafe.
+    #[error("writable-term Lease settings are invalid")]
+    InvalidWritableLeaseSettings,
+    /// The Kubernetes Lease can outlive the agent's accepted fencing policy.
+    #[error("writable-term Lease duration {requested_ms} ms exceeds agent maximum {maximum_ms} ms")]
+    WritableLeaseExceedsAgentPolicy {
+        /// Requested Kubernetes Lease duration.
+        requested_ms: u64,
+        /// Agent's configured maximum accepted lease duration.
+        maximum_ms: u64,
+    },
+    /// Lease ownership without the supervised postmaster has no safe runtime role.
+    #[error("writable-term Lease coordination requires supervised PostgreSQL quarantine mode")]
+    WritableLeaseRequiresPostgres,
     /// Endpoint URL parsing failed.
     #[error("invalid OTLP endpoint {value:?}: {source}")]
     InvalidOtlpEndpoint {
@@ -272,6 +390,7 @@ mod tests {
         let config = AgentConfig::try_parse_from(required_args()).expect("valid config");
         assert_eq!(config.identity.shard_id, ShardId(3));
         assert_eq!(config.max_lease_ttl_ms, 15_000);
+        assert!(config.writable_lease.is_none());
         assert!(config.telemetry.otlp_endpoint.is_none());
         assert!(config.postgres.is_none());
     }
@@ -304,6 +423,87 @@ mod tests {
         assert!(matches!(
             AgentConfig::try_parse_from(args),
             Err(ConfigError::InvalidLeaseTtl(300_001))
+        ));
+    }
+
+    #[test]
+    fn accepts_exact_writable_lease_identity() {
+        let mut args = required_args();
+        args.extend([
+            "--cluster-uid",
+            "11111111-2222-3333-4444-555555555555",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--lease-namespace",
+            "database",
+            "--writable-lease-name",
+            "cluster-1-cell-0003-writable",
+            "--writable-lease-uid",
+            "99999999-8888-7777-6666-555555555555",
+            "--postgres-mode",
+            "quarantine",
+            "--postgres-data-dir",
+            "/var/lib/postgresql/data",
+        ]);
+        let config = AgentConfig::try_parse_from(args).expect("valid writable Lease config");
+        assert!(config.writable_lease.is_some());
+    }
+
+    #[test]
+    fn rejects_partial_or_overlong_writable_lease_authority() {
+        let mut partial = required_args();
+        partial.extend(["--writable-lease-name", "cluster-1-cell-0003-writable"]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(partial),
+            Err(ConfigError::IncompleteWritableLease)
+        ));
+
+        let mut timing_without_identity = required_args();
+        timing_without_identity.extend(["--writable-lease-retry-ms", "1000"]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(timing_without_identity),
+            Err(ConfigError::IncompleteWritableLease)
+        ));
+
+        let mut complete_without_postgres = required_args();
+        complete_without_postgres.extend([
+            "--cluster-uid",
+            "11111111-2222-3333-4444-555555555555",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--lease-namespace",
+            "database",
+            "--writable-lease-name",
+            "cluster-1-cell-0003-writable",
+            "--writable-lease-uid",
+            "99999999-8888-7777-6666-555555555555",
+        ]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(complete_without_postgres),
+            Err(ConfigError::WritableLeaseRequiresPostgres)
+        ));
+
+        let mut overlong = required_args();
+        overlong.extend([
+            "--cluster-uid",
+            "11111111-2222-3333-4444-555555555555",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--lease-namespace",
+            "database",
+            "--writable-lease-name",
+            "cluster-1-cell-0003-writable",
+            "--writable-lease-uid",
+            "99999999-8888-7777-6666-555555555555",
+            "--max-lease-ttl-ms",
+            "14000",
+        ]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(overlong),
+            Err(ConfigError::WritableLeaseExceedsAgentPolicy {
+                requested_ms: 15_000,
+                maximum_ms: 14_000,
+            })
         ));
     }
 
