@@ -188,6 +188,18 @@ it onto shared cells or shared Nodes. This keeps physical staging bytes out of
 already-serving PostgreSQL cells and gives the first implementation one
 well-defined logical import boundary.
 
+A physical backup may carry the source cell's
+`.pgshard-bootstrap-complete` and `.pgshard-writable-generation` files. Those
+files are never destination authority. After signed-manifest and exact-topology
+preflight, the future restore materializer must assign the fresh destination
+cell and Lease identities, retain source identity only as catalog provenance,
+and publish destination bootstrap state before its first writable attempt. The
+destination agent then creates its generation record from the destination's
+live Lease term. Until that explicit rebind workflow exists, a copied source
+marker is foreign state and the quarantine agent fails closed before creating a
+postmaster. Deleting or editing the source marker outside the restore journal is
+not a supported shortcut.
+
 ### Exact-topology preflight
 
 Restore never performs implicit resharding. Before creating Secrets, PVCs,

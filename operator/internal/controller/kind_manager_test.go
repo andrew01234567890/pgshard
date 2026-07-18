@@ -1194,6 +1194,17 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}
 
 	waitForQuarantinedPostgreSQL(t, ctx, namespace.Name, podName, "initial acquisition")
+	assertDurableWritableGeneration(
+		t,
+		ctx,
+		namespace.Name,
+		podName,
+		cluster.Name,
+		current.UID,
+		checkpoint,
+		*liveLease.Spec.HolderIdentity,
+		*liveLease.Spec.LeaseTransitions,
+	)
 	if output, err := exec.CommandContext(ctx, "kubectl", "--namespace", namespace.Name, "exec", podName, "--container=postgresql", "--", "pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432").CombinedOutput(); err == nil {
 		t.Fatalf("agent quarantine exposed PostgreSQL TCP: %s", output)
 	}
@@ -1311,6 +1322,17 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatalf("wait for quarantined PostgreSQL recovery: %v; last output=%q", err, lastStatusOutput)
 	}
 	waitForQuarantinedPostgreSQL(t, ctx, namespace.Name, podName, "coordination recovery")
+	assertDurableWritableGeneration(
+		t,
+		ctx,
+		namespace.Name,
+		podName,
+		cluster.Name,
+		current.UID,
+		checkpoint,
+		*recoveredLease.Spec.HolderIdentity,
+		*recoveredLease.Spec.LeaseTransitions,
+	)
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
 		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: podName}, pod); err != nil {
 			return false, err
@@ -1431,6 +1453,17 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatalf("post-release holder does not bind the replacement Pod: Pod=%s Lease=%#v", restartedPod.UID, restartedLease.Spec)
 	}
 	waitForQuarantinedPostgreSQL(t, ctx, namespace.Name, podName, "clean-release replacement")
+	assertDurableWritableGeneration(
+		t,
+		ctx,
+		namespace.Name,
+		podName,
+		cluster.Name,
+		current.UID,
+		checkpoint,
+		*restartedLease.Spec.HolderIdentity,
+		*restartedLease.Spec.LeaseTransitions,
+	)
 }
 
 func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
@@ -2086,6 +2119,48 @@ func waitForQuarantinedPostgreSQL(t *testing.T, ctx context.Context, namespace, 
 		return probeErr == nil, nil
 	}); err != nil {
 		t.Fatalf("wait for quarantined PostgreSQL during %s: %v; last probe error=%v\n%s", phase, err, probeErr, probeOutput)
+	}
+}
+
+func assertDurableWritableGeneration(
+	t *testing.T,
+	ctx context.Context,
+	namespace string,
+	podName string,
+	clusterName string,
+	clusterUID types.UID,
+	checkpoint pgshardv1alpha1.PostgreSQLWritableLeaseStatus,
+	holder string,
+	term int32,
+) {
+	t.Helper()
+	execCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(
+		execCtx,
+		"kubectl",
+		"--namespace", namespace,
+		"exec", podName,
+		"--container=postgresql",
+		"--",
+		"cat", "/var/lib/postgresql/18/docker/.pgshard-writable-generation",
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read durable writable generation: %v\n%s", err, output)
+	}
+	want := fmt.Sprintf(
+		"format=1\ncluster_name=%s\ncluster_uid=%s\nshard=%d\nlease_namespace=%s\nlease_name=%s\nlease_uid=%s\nholder=%s\nterm=%d\n",
+		clusterName,
+		clusterUID,
+		checkpoint.Shard,
+		namespace,
+		checkpoint.LeaseName,
+		checkpoint.LeaseUID,
+		holder,
+		term,
+	)
+	if string(output) != want {
+		t.Fatalf("durable writable generation = %q, want %q", output, want)
 	}
 }
 

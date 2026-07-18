@@ -553,7 +553,14 @@ stopping reconciliation, verifies exact `get` and `update` denial, observes the
 Unix postmaster fenced while agent health remains available, then restores the
 manager. It requires a fresh holder and higher term, a recovered quarantined
 postmaster, repeated Lease renewals, and unchanged Pod UID, container ID, start
-time, and restart count throughout. Renewals are counted only when the Lease's
+time, and restart count throughout. Before each observed postmaster, it also
+reads the canonical durable PGDATA generation and matches its cluster UID,
+cell, Lease UID, exact holder, and term to Kubernetes. This is repeated after
+same-container recovery and after clean-release Pod replacement. Rust fault
+tests separately cover interrupted staging cleanup, exact replay, monotonic
+advance, stale and foreign generations, same-term holder conflict, malformed
+state, bootstrap mismatch, and authority changing between the durability
+barrier and exec. Renewals are counted only when the Lease's
 `renewTime` strictly advances, not from unrelated resource-version changes.
 It then pauses reconciliation without removing Lease permissions, scales the
 member to zero, and pins the postmaster PID, Linux start time, and process group

@@ -57,8 +57,24 @@ beyond the complete fencing margin. Shutdown before acquisition leaves no
 PostgreSQL process, and the supervisor checks the monotonic margin again at the
 final user-space boundary while also rejecting an observed shutdown. A stale
 notification or pause during validation cannot authorize startup, and a
-shutdown already observable at that boundary leaves PostgreSQL absent. With
-writable coordination enabled,
+shutdown already observable at that boundary leaves PostgreSQL absent.
+
+The same private authority carries an exact cell generation: cluster name and
+UID, physical-cell ordinal, Lease namespace/name/UID, holder identity, and
+transition term. Before creating a postmaster, the agent first matches the
+operator's canonical `.pgshard-bootstrap-complete` cluster-and-cell identity.
+It then publishes `.pgshard-writable-generation` through a fixed `.next`
+record, file flush, atomic rename, and PGDATA directory flush. An interrupted
+staging record is validated and removed under the exclusive PGDATA lock. Exact
+replay completes the same durability barrier, and a higher requested term can
+replace a lower durable term. A durable higher term, foreign Lease universe,
+malformed record, or same term with a different holder blocks startup. The
+agent samples the attempt-private authority and shutdown state again after the
+flush, so a slow storage barrier cannot authorize an expired or changed term.
+The record is cell-scoped rather than member-scoped: a later member may advance
+it only by holding a higher term from the same exact cell Lease.
+
+With writable coordination enabled,
 every agent shutdown clears local term evidence and immediately enters the
 PostgreSQL process-tree fence, skipping the smart and fast waits. An absolute
 monotonic renewal cutoff stops awaiting an in-flight Kubernetes API request
@@ -98,9 +114,11 @@ even after the StatefulSet and Pod are deleted. Before planning, the controller
 also authoritatively classifies both the `OnDelete` StatefulSet template and
 the live Pod, including when an earlier template already differs from its Pod.
 Changing modes requires a future explicitly fenced replacement workflow.
-Promotion proof, durable
-generation enforcement, and serving activation remain absent, so this is not
-yet a serving-primary fence or an HA claim.
+This durable record is only a pre-start term floor. PostgreSQL SQL write and
+prepare hooks do not yet reject stale request generations, standby copies are
+not yet reconciled as promotion evidence, and promotion proof plus serving
+activation remain absent. This is therefore not yet a serving-primary fence or
+an HA claim.
 
 The pre-Lease development layout's three etcd data claims are retired
 automatically. The operator first prunes the old cluster-owned StatefulSet,

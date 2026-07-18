@@ -32,7 +32,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::domain::{AgentState, PostgresProcessState};
-use crate::writable::WritablePostgresAttempt;
+use crate::writable::{DurableWritableGeneration, WritablePostgresAttempt};
 
 const POSTGRES_MAJOR: &str = "18";
 const PG_CONTROL_FILE_SIZE: u64 = 8_192;
@@ -41,6 +41,11 @@ const MAX_EXTERNAL_PID_FILE_BYTES: u64 = 64;
 const MAX_POSTGRES_PATH_BYTES: usize = 1_023;
 const SOCKET_LOCK_FILE: &str = ".s.PGSQL.5432.lock";
 const EXTERNAL_PID_FILE: &str = "postmaster.external.pid";
+const BOOTSTRAP_IDENTITY_FILE: &str = ".pgshard-bootstrap-complete";
+const DURABLE_WRITABLE_GENERATION_FILE: &str = ".pgshard-writable-generation";
+const DURABLE_WRITABLE_GENERATION_STAGING_FILE: &str = ".pgshard-writable-generation.next";
+const MAX_BOOTSTRAP_IDENTITY_BYTES: u64 = 512;
+const MAX_DURABLE_WRITABLE_GENERATION_BYTES: u64 = 1_024;
 // Linux sockaddr_un.sun_path is 108 bytes. PostgreSQL requires the forced
 // 14-byte `/.s.PGSQL.5432` suffix plus the directory to fit below that size.
 const MAX_SOCKET_DIRECTORY_BYTES: usize = 93;
@@ -202,11 +207,18 @@ enum PostgresStopMode {
     Fence,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum PostgresStartDecision {
     Start,
+    StartWritable(DurableWritableGeneration),
     Shutdown,
     AuthorityMissing,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PostgresStartAuthorization {
+    Direct,
+    Writable(DurableWritableGeneration),
 }
 
 /// Offline-validated postmaster configuration ready to spawn.
@@ -309,6 +321,13 @@ struct ValidatedDataDir {
     postmaster_lock: Option<PostmasterLockSnapshot>,
 }
 
+#[derive(Debug)]
+struct ManagedGenerationFile {
+    file: File,
+    snapshot: FileSnapshot,
+    contents: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PostmasterLockSnapshot {
     file: FileSnapshot,
@@ -380,6 +399,30 @@ impl SupervisorLock {
         )?;
         if file_snapshot(&fd_metadata) != self.snapshot
             || file_snapshot(&path_metadata) != self.snapshot
+        {
+            return Err(PostgresError::PreparedStateChanged);
+        }
+        Ok(())
+    }
+
+    fn validate_identity(&self) -> Result<(), PostgresError> {
+        let fd_metadata = self
+            .file
+            .metadata()
+            .map_err(|source| PostgresError::Metadata {
+                name: "PostgreSQL supervisor lock",
+                path: self.path.clone(),
+                source,
+            })?;
+        let path_metadata = validate_owned_directory("PGDATA", &self.path, self.expected_uid)?;
+        require_same_mount(
+            self.expected_mount_id,
+            "PostgreSQL supervisor lock",
+            &self.path,
+        )?;
+        if !snapshot_has_file_identity(self.snapshot, &fd_metadata)
+            || !snapshot_has_file_identity(self.snapshot, &path_metadata)
+            || !same_file_identity(&fd_metadata, &path_metadata)
         {
             return Err(PostgresError::PreparedStateChanged);
         }
@@ -526,7 +569,7 @@ impl PreparedPostgres {
         self.supervise_with_writable_authority_guard(
             state,
             shutdown,
-            move || authority.valid_for(required_margin),
+            move || authority.generation_valid_for(required_margin),
             attempt,
         )
         .await
@@ -540,7 +583,7 @@ impl PreparedPostgres {
         attempt: WritablePostgresAttempt,
     ) -> Result<WritablePostgresStopped, PostgresError>
     where
-        G: Fn() -> bool,
+        G: Fn() -> Option<DurableWritableGeneration>,
     {
         let shutdown_state = state.clone();
         let final_shutdown = shutdown.clone();
@@ -557,11 +600,11 @@ impl PreparedPostgres {
                 PostgresStopMode::Fence
             },
             move || {
-                let authorized = startup_guard();
+                let generation = startup_guard();
                 if watch_shutdown_observed(&final_shutdown) {
                     PostgresStartDecision::Shutdown
-                } else if authorized {
-                    PostgresStartDecision::Start
+                } else if let Some(generation) = generation {
+                    PostgresStartDecision::StartWritable(generation)
                 } else {
                     PostgresStartDecision::AuthorityMissing
                 }
@@ -697,6 +740,306 @@ impl PreparedPostgres {
         )
     }
 
+    fn persist_durable_writable_generation(
+        &self,
+        generation: &DurableWritableGeneration,
+    ) -> Result<(), PostgresError> {
+        self.supervisor_lock.validate_identity()?;
+        let (bootstrap_path, bootstrap) = self.validate_writable_bootstrap(generation)?;
+        let staging_path = self
+            .config
+            .data_dir
+            .join(DURABLE_WRITABLE_GENERATION_STAGING_FILE);
+        self.remove_interrupted_generation_staging(&staging_path)?;
+
+        let generation_path = self.config.data_dir.join(DURABLE_WRITABLE_GENERATION_FILE);
+        let existing = self.read_generation_file(&generation_path)?;
+        let existing_snapshot = existing.as_ref().map(|file| file.snapshot);
+        if let Some(existing) = existing.as_ref()
+            && self.existing_generation_is_current(generation, &generation_path, existing)?
+        {
+            revalidate_managed_generation_file(
+                "PostgreSQL bootstrap identity",
+                &bootstrap_path,
+                &bootstrap,
+            )?;
+            return Ok(());
+        }
+        drop(existing);
+
+        let contents = generation.canonical_bytes();
+        let staging = self.create_generation_staging(&staging_path, &contents)?;
+        self.publish_generation_staging(
+            &staging_path,
+            &generation_path,
+            existing_snapshot,
+            &contents,
+            &staging,
+        )?;
+        revalidate_managed_generation_file(
+            "PostgreSQL bootstrap identity",
+            &bootstrap_path,
+            &bootstrap,
+        )
+    }
+
+    fn validate_writable_bootstrap(
+        &self,
+        generation: &DurableWritableGeneration,
+    ) -> Result<(PathBuf, ManagedGenerationFile), PostgresError> {
+        let expected_uid = self.supervisor_lock.expected_uid;
+        let mount_id = self.validated.data.mount_id;
+        let bootstrap_path = self.config.data_dir.join(BOOTSTRAP_IDENTITY_FILE);
+        let bootstrap = read_managed_generation_file(
+            "PostgreSQL bootstrap identity",
+            &bootstrap_path,
+            expected_uid,
+            mount_id,
+            MAX_BOOTSTRAP_IDENTITY_BYTES,
+        )?
+        .ok_or_else(|| PostgresError::BootstrapIdentityMissing {
+            path: bootstrap_path.clone(),
+        })?;
+        if bootstrap.contents != generation.bootstrap_identity_bytes() {
+            return Err(PostgresError::BootstrapIdentityMismatch {
+                path: bootstrap_path,
+            });
+        }
+        Ok((bootstrap_path, bootstrap))
+    }
+
+    fn remove_interrupted_generation_staging(
+        &self,
+        staging_path: &Path,
+    ) -> Result<(), PostgresError> {
+        if let Some(staging) = read_managed_generation_file(
+            "durable writable-generation staging file",
+            staging_path,
+            self.supervisor_lock.expected_uid,
+            self.validated.data.mount_id,
+            MAX_DURABLE_WRITABLE_GENERATION_BYTES,
+        )? {
+            revalidate_managed_generation_file(
+                "durable writable-generation staging file",
+                staging_path,
+                &staging,
+            )?;
+            drop(staging.file);
+            fs::remove_file(staging_path).map_err(|source| {
+                PostgresError::PersistWritableGeneration {
+                    operation: "remove interrupted staging file",
+                    path: staging_path.to_owned(),
+                    source,
+                }
+            })?;
+            self.sync_generation_directory("persist staging cleanup")?;
+        }
+        Ok(())
+    }
+
+    fn read_generation_file(
+        &self,
+        generation_path: &Path,
+    ) -> Result<Option<ManagedGenerationFile>, PostgresError> {
+        read_managed_generation_file(
+            "durable writable-generation file",
+            generation_path,
+            self.supervisor_lock.expected_uid,
+            self.validated.data.mount_id,
+            MAX_DURABLE_WRITABLE_GENERATION_BYTES,
+        )
+    }
+
+    fn existing_generation_is_current(
+        &self,
+        requested: &DurableWritableGeneration,
+        path: &Path,
+        existing: &ManagedGenerationFile,
+    ) -> Result<bool, PostgresError> {
+        let durable =
+            DurableWritableGeneration::parse_canonical(&existing.contents).ok_or_else(|| {
+                PostgresError::InvalidWritableGeneration {
+                    path: path.to_owned(),
+                }
+            })?;
+        if !durable.same_cell(requested) {
+            return Err(PostgresError::ForeignWritableGeneration {
+                path: path.to_owned(),
+            });
+        }
+        if durable.term() > requested.term() {
+            return Err(PostgresError::WritableGenerationRegression {
+                durable: durable.term(),
+                requested: requested.term(),
+            });
+        }
+        if durable.term() != requested.term() {
+            return Ok(false);
+        }
+        if durable.holder() != requested.holder() {
+            return Err(PostgresError::WritableGenerationConflict {
+                term: requested.term(),
+            });
+        }
+        existing
+            .file
+            .sync_all()
+            .map_err(|source| PostgresError::PersistWritableGeneration {
+                operation: "flush existing generation",
+                path: path.to_owned(),
+                source,
+            })?;
+        revalidate_managed_generation_file("durable writable-generation file", path, existing)?;
+        self.sync_generation_directory("complete existing generation barrier")?;
+        Ok(true)
+    }
+
+    fn create_generation_staging(
+        &self,
+        staging_path: &Path,
+        contents: &[u8],
+    ) -> Result<ManagedGenerationFile, PostgresError> {
+        let fd = open(
+            staging_path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|source| PostgresError::PersistWritableGeneration {
+            operation: "create staging file",
+            path: staging_path.to_owned(),
+            source: source.into(),
+        })?;
+        let mut staging_file = File::from(fd);
+        staging_file
+            .write_all(contents)
+            .and_then(|()| staging_file.set_permissions(fs::Permissions::from_mode(0o600)))
+            .and_then(|()| staging_file.sync_all())
+            .map_err(|source| PostgresError::PersistWritableGeneration {
+                operation: "write and flush staging file",
+                path: staging_path.to_owned(),
+                source,
+            })?;
+        let staging = read_managed_generation_file(
+            "durable writable-generation staging file",
+            staging_path,
+            self.supervisor_lock.expected_uid,
+            self.validated.data.mount_id,
+            MAX_DURABLE_WRITABLE_GENERATION_BYTES,
+        )?
+        .ok_or(PostgresError::PreparedStateChanged)?;
+        let staging_metadata =
+            staging_file
+                .metadata()
+                .map_err(|source| PostgresError::Metadata {
+                    name: "durable writable-generation staging file",
+                    path: staging_path.to_owned(),
+                    source,
+                })?;
+        let staging_path_metadata =
+            strict_metadata("durable writable-generation staging file", staging_path)?;
+        if staging.contents != contents
+            || !same_file_identity(&staging_metadata, &staging_path_metadata)
+            || staging.snapshot != file_snapshot(&staging_metadata)
+        {
+            return Err(PostgresError::PreparedStateChanged);
+        }
+        Ok(staging)
+    }
+
+    fn publish_generation_staging(
+        &self,
+        staging_path: &Path,
+        generation_path: &Path,
+        existing_snapshot: Option<FileSnapshot>,
+        contents: &[u8],
+        staging: &ManagedGenerationFile,
+    ) -> Result<(), PostgresError> {
+        let current = self.read_generation_file(generation_path)?;
+        if current.as_ref().map(|file| file.snapshot) != existing_snapshot {
+            return Err(PostgresError::PreparedStateChanged);
+        }
+        fs::rename(staging_path, generation_path).map_err(|source| {
+            PostgresError::PersistWritableGeneration {
+                operation: "publish generation",
+                path: generation_path.to_owned(),
+                source,
+            }
+        })?;
+        let installed = self
+            .read_generation_file(generation_path)?
+            .ok_or(PostgresError::PreparedStateChanged)?;
+        let staging_metadata =
+            staging
+                .file
+                .metadata()
+                .map_err(|source| PostgresError::Metadata {
+                    name: "durable writable-generation staging file",
+                    path: staging_path.to_owned(),
+                    source,
+                })?;
+        let installed_metadata =
+            installed
+                .file
+                .metadata()
+                .map_err(|source| PostgresError::Metadata {
+                    name: "durable writable-generation file",
+                    path: generation_path.to_owned(),
+                    source,
+                })?;
+        if installed.contents != contents
+            || !same_file_identity(&installed_metadata, &staging_metadata)
+        {
+            return Err(PostgresError::PreparedStateChanged);
+        }
+        self.sync_generation_directory("publish generation")?;
+        revalidate_managed_generation_file(
+            "durable writable-generation file",
+            generation_path,
+            &installed,
+        )
+    }
+
+    fn sync_generation_directory(&self, operation: &'static str) -> Result<(), PostgresError> {
+        self.supervisor_lock.validate_identity()?;
+        self.supervisor_lock.file.sync_all().map_err(|source| {
+            PostgresError::PersistWritableGeneration {
+                operation,
+                path: self.config.data_dir.clone(),
+                source,
+            }
+        })?;
+        self.supervisor_lock.validate_identity()
+    }
+
+    fn authorize_persisted_postmaster_start(
+        &self,
+        state: &AgentState,
+        startup_guard: &impl Fn() -> PostgresStartDecision,
+    ) -> Result<bool, PostgresError> {
+        let Some(authorization) = authorize_postmaster_start(state, startup_guard)? else {
+            return Ok(false);
+        };
+        let PostgresStartAuthorization::Writable(generation) = authorization else {
+            return Ok(true);
+        };
+        if let Err(error) = self.persist_durable_writable_generation(&generation) {
+            state.clear_lease();
+            state.set_postgres_process(PostgresProcessState::Failed);
+            return Err(error);
+        }
+        match authorize_postmaster_start(state, startup_guard)? {
+            Some(PostgresStartAuthorization::Writable(current)) if current == generation => {
+                Ok(true)
+            }
+            None => Ok(false),
+            Some(_) => {
+                state.clear_lease();
+                state.set_postgres_process(PostgresProcessState::Failed);
+                Err(PostgresError::StartupAuthorityChanged)
+            }
+        }
+    }
+
     async fn spawn_tracked_postmaster(
         self,
         state: &AgentState,
@@ -712,7 +1055,7 @@ impl PreparedPostgres {
         let spawn_result = {
             #[cfg(test)]
             let _exec_handoff = test_exec_handoff_guard();
-            if !authorize_postmaster_start(state, startup_guard)? {
+            if !self.authorize_persisted_postmaster_start(state, startup_guard)? {
                 return Ok(None);
             }
             self.command().spawn()
@@ -902,13 +1245,16 @@ impl PreparedPostgres {
 fn authorize_postmaster_start(
     state: &AgentState,
     startup_guard: &impl Fn() -> PostgresStartDecision,
-) -> Result<bool, PostgresError> {
+) -> Result<Option<PostgresStartAuthorization>, PostgresError> {
     match startup_guard() {
-        PostgresStartDecision::Start => Ok(true),
+        PostgresStartDecision::Start => Ok(Some(PostgresStartAuthorization::Direct)),
+        PostgresStartDecision::StartWritable(generation) => {
+            Ok(Some(PostgresStartAuthorization::Writable(generation)))
+        }
         PostgresStartDecision::Shutdown => {
             state.clear_lease();
             state.set_postgres_process(PostgresProcessState::Validated);
-            Ok(false)
+            Ok(None)
         }
         PostgresStartDecision::AuthorityMissing => {
             state.clear_lease();
@@ -1113,6 +1459,104 @@ fn replace_validated_lock(
     })?;
     if !same_file_identity(&path_metadata, &fd_metadata)
         || fd_metadata.len() != replacement.len() as u64
+    {
+        return Err(PostgresError::PreparedStateChanged);
+    }
+    Ok(())
+}
+
+fn read_managed_generation_file(
+    name: &'static str,
+    path: &Path,
+    expected_uid: u32,
+    expected_mount_id: u64,
+    maximum_bytes: u64,
+) -> Result<Option<ManagedGenerationFile>, PostgresError> {
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(_) => strict_metadata(name, path)?,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(PostgresError::Metadata {
+                name,
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    validate_owned_regular_file(name, path, &path_metadata, expected_uid)?;
+    require_same_mount(expected_mount_id, name, path)?;
+    if path_metadata.len() > maximum_bytes {
+        return Err(PostgresError::OversizedManagedGenerationFile {
+            name,
+            path: path.to_owned(),
+            bytes: path_metadata.len(),
+            maximum: maximum_bytes,
+        });
+    }
+    let expected = file_snapshot(&path_metadata);
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|source| PostgresError::Read {
+        name,
+        path: path.to_owned(),
+        source: source.into(),
+    })?;
+    let mut file = File::from(fd);
+    let fd_metadata = file.metadata().map_err(|source| PostgresError::Metadata {
+        name,
+        path: path.to_owned(),
+        source,
+    })?;
+    if file_snapshot(&fd_metadata) != expected || !same_file_identity(&path_metadata, &fd_metadata)
+    {
+        return Err(PostgresError::PreparedStateChanged);
+    }
+    let mut contents = Vec::new();
+    Read::by_ref(&mut file)
+        .take(maximum_bytes + 1)
+        .read_to_end(&mut contents)
+        .map_err(|source| PostgresError::Read {
+            name,
+            path: path.to_owned(),
+            source,
+        })?;
+    if contents.len() as u64 > maximum_bytes {
+        return Err(PostgresError::OversizedManagedGenerationFile {
+            name,
+            path: path.to_owned(),
+            bytes: contents.len() as u64,
+            maximum: maximum_bytes,
+        });
+    }
+    let result = ManagedGenerationFile {
+        file,
+        snapshot: expected,
+        contents,
+    };
+    revalidate_managed_generation_file(name, path, &result)?;
+    Ok(Some(result))
+}
+
+fn revalidate_managed_generation_file(
+    name: &'static str,
+    path: &Path,
+    file: &ManagedGenerationFile,
+) -> Result<(), PostgresError> {
+    let path_metadata = strict_metadata(name, path)?;
+    let fd_metadata = file
+        .file
+        .metadata()
+        .map_err(|source| PostgresError::Metadata {
+            name,
+            path: path.to_owned(),
+            source,
+        })?;
+    if file_snapshot(&path_metadata) != file.snapshot
+        || file_snapshot(&fd_metadata) != file.snapshot
+        || !same_file_identity(&path_metadata, &fd_metadata)
     {
         return Err(PostgresError::PreparedStateChanged);
     }
@@ -2638,6 +3082,13 @@ fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
         && left.mode() == right.mode()
 }
 
+fn snapshot_has_file_identity(snapshot: FileSnapshot, metadata: &Metadata) -> bool {
+    snapshot.device == metadata.dev()
+        && snapshot.inode == metadata.ino()
+        && snapshot.owner == metadata.uid()
+        && snapshot.mode == metadata.mode()
+}
+
 fn strict_metadata(name: &'static str, path: &Path) -> Result<Metadata, PostgresError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| PostgresError::Metadata {
         name,
@@ -2922,6 +3373,18 @@ pub enum PostgresError {
         /// Observed size.
         bytes: u64,
     },
+    /// A bounded operator-owned identity or generation file was oversized.
+    #[error("{name} at {path:?} is {bytes} bytes; expected at most {maximum}")]
+    OversizedManagedGenerationFile {
+        /// Managed file being inspected.
+        name: &'static str,
+        /// Oversized file path.
+        path: PathBuf,
+        /// Observed size.
+        bytes: u64,
+        /// Accepted upper bound.
+        maximum: u64,
+    },
     /// A small required file could not be read.
     #[error("read {name} at {path:?}: {source}")]
     Read {
@@ -3046,6 +3509,59 @@ pub enum PostgresError {
     /// The final process-creation guard no longer proves writable authority.
     #[error("PostgreSQL startup authority is absent or inside its fencing margin")]
     StartupAuthorityMissing,
+    /// Attempt-private authority changed while its durable generation was flushed.
+    #[error("PostgreSQL startup authority changed during durable generation publication")]
+    StartupAuthorityChanged,
+    /// Writable supervision requires the operator's exact durable PGDATA identity.
+    #[error("PostgreSQL bootstrap identity is missing at {path:?}")]
+    BootstrapIdentityMissing {
+        /// Required bootstrap marker path.
+        path: PathBuf,
+    },
+    /// PGDATA belongs to another cluster or physical cell.
+    #[error("PostgreSQL bootstrap identity at {path:?} does not match writable authority")]
+    BootstrapIdentityMismatch {
+        /// Rejected bootstrap marker path.
+        path: PathBuf,
+    },
+    /// The durable generation record was not in its one canonical format.
+    #[error("durable PostgreSQL writable generation at {path:?} is invalid")]
+    InvalidWritableGeneration {
+        /// Rejected generation path.
+        path: PathBuf,
+    },
+    /// The durable generation record belongs to another coordination universe.
+    #[error("durable PostgreSQL writable generation at {path:?} belongs to another cell")]
+    ForeignWritableGeneration {
+        /// Rejected generation path.
+        path: PathBuf,
+    },
+    /// Kubernetes attempted to authorize a term below the durable target floor.
+    #[error(
+        "writable-term regression rejected: requested term {requested}, durable term {durable}"
+    )]
+    WritableGenerationRegression {
+        /// Term already durable on the target.
+        durable: u64,
+        /// Stale requested term.
+        requested: u64,
+    },
+    /// One term was presented by two different holders.
+    #[error("writable term {term} conflicts with the durable target holder")]
+    WritableGenerationConflict {
+        /// Conflicting fencing term.
+        term: u64,
+    },
+    /// Crash-safe generation publication could not complete.
+    #[error("{operation} for durable PostgreSQL writable generation at {path:?}: {source}")]
+    PersistWritableGeneration {
+        /// Failed publication stage.
+        operation: &'static str,
+        /// File or directory being persisted.
+        path: PathBuf,
+        /// Operating-system error.
+        source: std::io::Error,
+    },
     /// The blocking revalidation worker did not complete normally.
     #[error("PostgreSQL pre-spawn validation task failed: {0}")]
     ValidationTask(#[source] tokio::task::JoinError),
@@ -3202,6 +3718,10 @@ mod tests {
     use pgshard_types::ShardId;
 
     use super::*;
+
+    const TEST_WRITABLE_LEASE_UID: &str = "99999999-8888-7777-6666-555555555555";
+    const TEST_WRITABLE_HOLDER: &str =
+        "cluster-1-shard-0-0/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/0123456789abcdef01234567";
 
     struct ProcessGuard(StdChild);
 
@@ -4442,6 +4962,199 @@ mod tests {
         );
     }
 
+    #[test]
+    fn durable_writable_generation_advances_and_rejects_stale_or_foreign_state() {
+        let root = TempDir::new().expect("create durable-generation fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let executable = root.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let config = test_config(data_dir.clone(), executable, root.path().join("socket"));
+        let prepared = prepare_fixture(config).expect("prepare durable-generation fixture");
+        let generation_path = data_dir.join(DURABLE_WRITABLE_GENERATION_FILE);
+        let staging_path = data_dir.join(DURABLE_WRITABLE_GENERATION_STAGING_FILE);
+        let first = writable_generation(1, TEST_WRITABLE_HOLDER, TEST_WRITABLE_LEASE_UID);
+
+        prepared
+            .persist_durable_writable_generation(&first)
+            .expect("persist first generation");
+        assert_eq!(
+            fs::read(&generation_path).expect("read first generation"),
+            first.canonical_bytes()
+        );
+        prepared
+            .persist_durable_writable_generation(&first)
+            .expect("replay exact generation and complete its barrier");
+
+        fs::write(&staging_path, b"interrupted").expect("write interrupted staging file");
+        fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o600))
+            .expect("protect interrupted staging file");
+        let second = writable_generation(
+            2,
+            "cluster-1-shard-0-1/bbbbbbbb-cccc-dddd-eeee-ffffffffffff/89abcdef0123456789abcdef",
+            TEST_WRITABLE_LEASE_UID,
+        );
+        prepared
+            .persist_durable_writable_generation(&second)
+            .expect("clean interrupted staging and advance generation");
+        assert!(!staging_path.exists());
+        assert_eq!(
+            fs::read(&generation_path).expect("read second generation"),
+            second.canonical_bytes()
+        );
+
+        assert!(matches!(
+            prepared.persist_durable_writable_generation(&first),
+            Err(PostgresError::WritableGenerationRegression {
+                durable: 2,
+                requested: 1,
+            })
+        ));
+        let conflicting = writable_generation(
+            2,
+            "cluster-1-shard-0-2/cccccccc-dddd-eeee-ffff-000000000000/abcdef0123456789abcdef01",
+            TEST_WRITABLE_LEASE_UID,
+        );
+        assert!(matches!(
+            prepared.persist_durable_writable_generation(&conflicting),
+            Err(PostgresError::WritableGenerationConflict { term: 2 })
+        ));
+        let foreign = writable_generation(
+            3,
+            TEST_WRITABLE_HOLDER,
+            "77777777-6666-5555-4444-333333333333",
+        );
+        assert!(matches!(
+            prepared.persist_durable_writable_generation(&foreign),
+            Err(PostgresError::ForeignWritableGeneration { path }) if path == generation_path
+        ));
+
+        fs::write(&generation_path, b"not-canonical\n")
+            .expect("corrupt durable generation fixture");
+        assert!(matches!(
+            prepared.persist_durable_writable_generation(&writable_generation(
+                3,
+                TEST_WRITABLE_HOLDER,
+                TEST_WRITABLE_LEASE_UID,
+            )),
+            Err(PostgresError::InvalidWritableGeneration { path }) if path == generation_path
+        ));
+    }
+
+    #[test]
+    fn durable_writable_generation_requires_exact_bootstrap_identity() {
+        for mismatch in [false, true] {
+            let root = TempDir::new().expect("create bootstrap-identity fixture");
+            let data_dir = root.path().join("data");
+            pgdata_fixture_at(&data_dir);
+            let bootstrap_path = data_dir.join(BOOTSTRAP_IDENTITY_FILE);
+            if mismatch {
+                fs::write(
+                    &bootstrap_path,
+                    b"cluster_uid=00000000-0000-0000-0000-000000000000\nshard=0\n",
+                )
+                .expect("write foreign bootstrap identity");
+            } else {
+                fs::remove_file(&bootstrap_path).expect("remove bootstrap identity");
+            }
+            let executable = root.path().join("postgres");
+            write_executable(&executable, "#!/bin/sh\nexit 0\n");
+            let prepared = prepare_fixture(test_config(
+                data_dir,
+                executable,
+                root.path().join("socket"),
+            ))
+            .expect("prepare bootstrap-identity fixture");
+
+            let result = prepared.persist_durable_writable_generation(&writable_generation(
+                1,
+                TEST_WRITABLE_HOLDER,
+                TEST_WRITABLE_LEASE_UID,
+            ));
+            if mismatch {
+                assert!(matches!(
+                    result,
+                    Err(PostgresError::BootstrapIdentityMismatch { path })
+                        if path == bootstrap_path
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(PostgresError::BootstrapIdentityMissing { path })
+                        if path == bootstrap_path
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_authority_after_generation_flush_never_starts_postgres() {
+        let root = TempDir::new().expect("create generation-handoff fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let marker = root.path().join("postmaster-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+        );
+        let prepared = prepare_fixture(test_config(
+            data_dir.clone(),
+            executable,
+            root.path().join("socket"),
+        ))
+        .expect("prepare generation-handoff fixture");
+        let state = agent_state();
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "cluster-1-shard-0-0".to_owned(),
+                    epoch: 1,
+                    valid_until_unix_ms: 6_000,
+                },
+                1_000,
+            )
+            .expect("install generation-handoff authority");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let result = prepared
+            .supervise_with_writable_authority_guard(
+                state.clone(),
+                shutdown_rx,
+                || {
+                    let call = calls.fetch_add(1, Ordering::AcqRel);
+                    Some(writable_generation(
+                        if call == 0 { 1 } else { 2 },
+                        TEST_WRITABLE_HOLDER,
+                        TEST_WRITABLE_LEASE_UID,
+                    ))
+                },
+                crate::writable::writable_attempt_pair_for_test().1,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PostgresError::StartupAuthorityChanged)
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert!(!marker.exists(), "postmaster ran after its term changed");
+        let durable = fs::read(data_dir.join(DURABLE_WRITABLE_GENERATION_FILE))
+            .expect("read durable pre-spawn generation");
+        assert_eq!(
+            DurableWritableGeneration::parse_canonical(&durable)
+                .expect("parse durable pre-spawn generation")
+                .term(),
+            1
+        );
+        assert!(state.snapshot().lease.is_none());
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+    }
+
     #[tokio::test]
     async fn startup_guard_blocks_process_creation_after_validation() {
         let root = TempDir::new().expect("create startup-authority fixture");
@@ -4472,7 +5185,7 @@ mod tests {
             .supervise_with_writable_authority_guard(
                 state.clone(),
                 shutdown_rx,
-                || false,
+                || None,
                 crate::writable::writable_attempt_pair_for_test().1,
             )
             .await;
@@ -4497,6 +5210,7 @@ mod tests {
         let root = TempDir::new().expect("create fence-budget fixture");
         let data_dir = root.path().join("data");
         pgdata_fixture_at(&data_dir);
+        let generation_path = data_dir.join(DURABLE_WRITABLE_GENERATION_FILE);
         let marker = root.path().join("postmaster-started");
         let executable = root.path().join("postgres");
         write_executable(
@@ -4518,7 +5232,10 @@ mod tests {
             .expect("install authority inside the process fence budget");
         assert!(state.snapshot().lease.is_some());
         let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
-        lease_attempt.install_authority(state.lease_deadline().expect("monotonic deadline"));
+        lease_attempt.install_authority(
+            state.lease_deadline().expect("monotonic deadline"),
+            DurableWritableGeneration::for_test(1),
+        );
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let result = prepared
@@ -4535,6 +5252,10 @@ mod tests {
             Err(PostgresError::StartupAuthorityMissing)
         ));
         assert!(!marker.exists(), "postmaster bypassed the fence budget");
+        assert!(
+            !generation_path.exists(),
+            "authority inside the fence budget advanced durable generation"
+        );
         assert!(state.snapshot().lease.is_none());
         assert_eq!(
             state.snapshot().postgres_process,
@@ -4592,7 +5313,7 @@ mod tests {
                     guard_continue_rx
                         .recv_timeout(Duration::from_secs(1))
                         .expect("wait for shutdown publication");
-                    true
+                    Some(DurableWritableGeneration::for_test(1))
                 },
                 crate::writable::writable_attempt_pair_for_test().1,
             )
@@ -4782,6 +5503,7 @@ mod tests {
         let root = TempDir::new().expect("create target-fence fixture");
         let data_dir = root.path().join("data");
         pgdata_fixture_at(&data_dir);
+        let generation_path = data_dir.join(DURABLE_WRITABLE_GENERATION_FILE);
         let ready = root.path().join("signal-handlers-ready");
         let smart = root.path().join("smart-shutdown");
         let fast = root.path().join("fast-shutdown");
@@ -4811,7 +5533,10 @@ mod tests {
             )
             .expect("install target-fence authority");
         let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
-        lease_attempt.install_authority(state.lease_deadline().expect("monotonic deadline"));
+        lease_attempt.install_authority(
+            state.lease_deadline().expect("monotonic deadline"),
+            DurableWritableGeneration::for_test(1),
+        );
         let shutdown_state = state.clone();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shutdown_task = tokio::spawn(async move {
@@ -4846,6 +5571,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(fenced).expect("read target-fence marker"),
             "fenced"
+        );
+        assert_eq!(
+            fs::read(generation_path).expect("read target-fence generation"),
+            DurableWritableGeneration::for_test(1).canonical_bytes()
         );
         assert!(state.snapshot().lease.is_none());
         assert_eq!(
@@ -4882,7 +5611,10 @@ mod tests {
             )
             .expect("install process-tree fence authority");
         let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
-        lease_attempt.install_authority(state.lease_deadline().expect("monotonic deadline"));
+        lease_attempt.install_authority(
+            state.lease_deadline().expect("monotonic deadline"),
+            DurableWritableGeneration::for_test(1),
+        );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shutdown_descendant = descendant.clone();
         let shutdown_task = tokio::spawn(async move {
@@ -5138,6 +5870,16 @@ mod tests {
         fs::write(path.join("PG_VERSION"), "18\n").expect("write version");
         fs::set_permissions(path.join("PG_VERSION"), fs::Permissions::from_mode(0o600))
             .expect("protect version file");
+        fs::write(
+            path.join(BOOTSTRAP_IDENTITY_FILE),
+            DurableWritableGeneration::for_test(1).bootstrap_identity_bytes(),
+        )
+        .expect("write bootstrap identity");
+        fs::set_permissions(
+            path.join(BOOTSTRAP_IDENTITY_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("protect bootstrap identity");
         let control = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -5195,6 +5937,19 @@ mod tests {
             10_000,
         )
         .expect("valid agent state")
+    }
+
+    fn writable_generation(term: u64, holder: &str, lease_uid: &str) -> DurableWritableGeneration {
+        DurableWritableGeneration::new(
+            "cluster-1".to_owned(),
+            "11111111-2222-3333-4444-555555555555".to_owned(),
+            ShardId(0),
+            "database".to_owned(),
+            "cluster-1-cell-0000-writable".to_owned(),
+            lease_uid.to_owned(),
+            holder.to_owned(),
+            term,
+        )
     }
 
     fn write_executable(path: &Path, contents: &str) {

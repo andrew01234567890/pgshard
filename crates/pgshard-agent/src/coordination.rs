@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::domain::{AgentIdentity, AgentState, FencingLease, LeaseInstallError};
 use crate::postgres::WritablePostgresStopped;
-use crate::writable::{WritableLeaseAttempt, same_writable_attempt};
+use crate::writable::{DurableWritableGeneration, WritableLeaseAttempt, same_writable_attempt};
 
 const INITIAL_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(5);
@@ -108,6 +108,19 @@ impl WritableLeaseConfig {
             retry_period,
             request_timeout,
         })
+    }
+
+    fn durable_generation(&self, holder: &str, term: u64) -> DurableWritableGeneration {
+        DurableWritableGeneration::new(
+            self.identity.cluster_id.clone(),
+            self.cluster_uid.clone(),
+            self.identity.shard_id,
+            self.namespace.clone(),
+            self.lease_name.clone(),
+            self.lease_uid.clone(),
+            holder.to_owned(),
+            term,
+        )
     }
 
     fn holder_identity(&self, process_incarnation: &str) -> String {
@@ -269,7 +282,10 @@ async fn supervise_with_store<S: LeaseStore>(
                     attempt.clear_authority();
                     return Err(error);
                 }
-                attempt.install_authority(authority.deadline);
+                attempt.install_authority(
+                    authority.deadline,
+                    config.durable_generation(&holder_identity, authority.epoch),
+                );
                 held_deadline = Some(authority.deadline);
                 release = Some(authority.release);
                 retry = INITIAL_RETRY;
