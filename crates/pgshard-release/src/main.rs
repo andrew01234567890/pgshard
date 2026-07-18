@@ -16,11 +16,12 @@ const RELEASE_MARKER: &str = "crates/pgshard-release/RELEASE_START";
 const RELEASE_HELPER_SOURCE: &str = "crates/pgshard-release/src/main.rs";
 const CI_WAIT_TIMEOUT: Duration = Duration::from_mins(15);
 const CI_POLL_INTERVAL: Duration = Duration::from_secs(10);
-const UNPRIVILEGED_DEPENDABOT_PATHS: [&str; 4] = [
-    "operator/go.mod",
-    "operator/go.sum",
-    "crates/pgshard-pgwire/fuzz/Cargo.toml",
-    "crates/pgshard-pgwire/fuzz/Cargo.lock",
+const UNPRIVILEGED_DEPENDABOT_FILE_PAIRS: [[&str; 2]; 2] = [
+    ["operator/go.mod", "operator/go.sum"],
+    [
+        "crates/pgshard-pgwire/fuzz/Cargo.toml",
+        "crates/pgshard-pgwire/fuzz/Cargo.lock",
+    ],
 ];
 const DEPENDABOT_MERGE_QUERY: &str = "query=mutation($id: ID!, $headline: String!, $oid: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, mergeMethod: SQUASH, commitHeadline: $headline, expectedHeadOid: $oid}) { pullRequest { state mergedAt mergeCommit { oid } } } }";
 
@@ -63,7 +64,7 @@ enum ReleaseCommand {
         #[arg(long)]
         sha: String,
     },
-    /// Safely squash-merge a verified patch update after successful CI.
+    /// Safely squash-merge a verified patch or minor update after successful CI.
     DependabotAutomerge {
         /// Repository in owner/name form.
         #[arg(long)]
@@ -766,9 +767,9 @@ fn dependabot_automerge(repository: &str, requested_sha: &str) -> Result<()> {
         dependabot_commits_verified(&commits, requested_sha),
         "every auto-merged commit must be verified and authored by Dependabot"
     );
-    if !dependabot_patch_only(commits.iter().map(|commit| commit.commit.message.as_str())) {
+    if !dependabot_patch_or_minor(commits.iter().map(|commit| commit.commit.message.as_str())) {
         println!(
-            "Dependabot pull request #{} is not a verified patch-only update",
+            "Dependabot pull request #{} is not a verified patch-or-minor update",
             pull.number
         );
         return Ok(());
@@ -1069,11 +1070,13 @@ fn load_dependabot_files(
 }
 
 fn dependabot_files_are_unprivileged(files: &[PullFile]) -> bool {
-    !files.is_empty()
-        && files.iter().all(|file| {
-            file.status == "modified"
-                && file.previous_filename.is_none()
-                && UNPRIVILEGED_DEPENDABOT_PATHS.contains(&file.filename.as_str())
+    files.len() == 2
+        && files
+            .iter()
+            .all(|file| file.status == "modified" && file.previous_filename.is_none())
+        && UNPRIVILEGED_DEPENDABOT_FILE_PAIRS.iter().any(|pair| {
+            pair.iter()
+                .all(|expected| files.iter().any(|file| file.filename.as_str() == *expected))
         })
 }
 
@@ -1274,7 +1277,7 @@ fn dependabot_commits_verified(commits: &[PullCommit], requested_sha: &str) -> b
         })
 }
 
-fn dependabot_patch_only<'a>(messages: impl IntoIterator<Item = &'a str>) -> bool {
+fn dependabot_patch_or_minor<'a>(messages: impl IntoIterator<Item = &'a str>) -> bool {
     let mut dependency_count = 0_usize;
     let mut update_types = Vec::new();
     for message in messages {
@@ -1289,9 +1292,12 @@ fn dependabot_patch_only<'a>(messages: impl IntoIterator<Item = &'a str>) -> boo
     }
     dependency_count > 0
         && dependency_count == update_types.len()
-        && update_types
-            .iter()
-            .all(|update_type| *update_type == "version-update:semver-patch")
+        && update_types.iter().all(|update_type| {
+            matches!(
+                *update_type,
+                "version-update:semver-patch" | "version-update:semver-minor"
+            )
+        })
 }
 
 fn ensure_release_exists(tag: &str, sha: &str) -> Result<()> {
@@ -1450,13 +1456,17 @@ mod tests {
     }
 
     #[test]
-    fn dependabot_metadata_must_cover_only_patch_updates() {
+    fn dependabot_metadata_must_cover_only_patch_or_minor_updates() {
         let patch = "---\nupdated-dependencies:\n- dependency-name: serde\n  update-type: version-update:semver-patch\n...";
+        let minor = "---\nupdated-dependencies:\n- dependency-name: serde\n  update-type: version-update:semver-minor\n...";
         let mixed = "---\nupdated-dependencies:\n- dependency-name: serde\n  update-type: version-update:semver-patch\n- dependency-name: tokio\n  update-type: version-update:semver-minor\n...";
+        let major = "---\nupdated-dependencies:\n- dependency-name: serde\n  update-type: version-update:semver-major\n...";
         let incomplete = "---\nupdated-dependencies:\n- dependency-name: serde\n...";
-        assert!(dependabot_patch_only([patch]));
-        assert!(!dependabot_patch_only([mixed]));
-        assert!(!dependabot_patch_only([incomplete]));
+        assert!(dependabot_patch_or_minor([patch]));
+        assert!(dependabot_patch_or_minor([minor]));
+        assert!(dependabot_patch_or_minor([mixed]));
+        assert!(!dependabot_patch_or_minor([major]));
+        assert!(!dependabot_patch_or_minor([incomplete]));
         assert!(!DEPENDABOT_MERGE_QUERY.contains("authorEmail"));
         assert!(DEPENDABOT_MERGE_QUERY.contains("mergePullRequest"));
         assert!(!DEPENDABOT_MERGE_QUERY.contains("enablePullRequestAutoMerge"));
@@ -1471,8 +1481,12 @@ mod tests {
         assert!(workflow.contains("dependabot-automerge"));
         assert!(workflow.contains("workflows: [CI, CodeQL]"));
         assert!(!workflow.contains("github.event.workflow_run.name"));
-        assert!(workflow.contains("group: pgshard-dependabot-automerge"));
-        assert_eq!(workflow.matches("queue: max").count(), 1);
+        assert!(workflow.contains("github.event.workflow_run.actor.login == 'dependabot[bot]'"));
+        assert!(workflow.contains(
+            "group: pgshard-dependabot-automerge-${{ github.event.workflow_run.head_sha }}"
+        ));
+        assert!(workflow.contains("cancel-in-progress: false"));
+        assert!(!workflow.contains("queue: max"));
 
         let ci = include_str!("../../../.github/workflows/ci.yml");
         assert!(ci.contains("workflow_dispatch"));
@@ -1623,6 +1637,23 @@ mod tests {
             file("crates/pgshard-pgwire/fuzz/Cargo.toml"),
             file("crates/pgshard-pgwire/fuzz/Cargo.lock"),
         ]));
+        assert!(!dependabot_files_are_unprivileged(&[file(
+            "operator/go.mod"
+        )]));
+        assert!(!dependabot_files_are_unprivileged(&[
+            file("operator/go.mod"),
+            file("crates/pgshard-pgwire/fuzz/Cargo.lock"),
+        ]));
+        assert!(!dependabot_files_are_unprivileged(&[
+            file("operator/go.mod"),
+            file("operator/go.mod"),
+        ]));
+        assert!(!dependabot_files_are_unprivileged(&[
+            file("operator/go.mod"),
+            file("operator/go.sum"),
+            file("crates/pgshard-pgwire/fuzz/Cargo.toml"),
+            file("crates/pgshard-pgwire/fuzz/Cargo.lock"),
+        ]));
         assert!(!dependabot_files_are_unprivileged(&[
             file("website/package.json"),
             file("website/package-lock.json"),
@@ -1645,17 +1676,34 @@ mod tests {
     }
 
     #[test]
-    fn dependabot_version_updates_are_patch_only() {
+    fn dependabot_covers_supported_dependency_ecosystems() {
         let configuration = include_str!("../../../.github/dependabot.yml");
-        assert!(configuration.contains("directory: /crates/pgshard-pgwire/fuzz"));
+        let entries = [
+            ("cargo", "/"),
+            ("cargo", "/crates/pgshard-pgwire/fuzz"),
+            ("npm", "/website"),
+            ("gomod", "/operator"),
+            ("docker", "/deploy/images"),
+            ("github-actions", "/"),
+        ];
         assert_eq!(
-            configuration.matches("version-update:semver-minor").count(),
-            5
+            configuration.matches("  - package-ecosystem:").count(),
+            entries.len()
         );
-        assert_eq!(
-            configuration.matches("version-update:semver-major").count(),
-            5
-        );
+        for (ecosystem, directory) in entries {
+            let entry = format!(
+                "  - package-ecosystem: {ecosystem}\n    directory: {directory}\n    schedule:"
+            );
+            assert!(
+                configuration.contains(&entry),
+                "missing Dependabot entry: {entry}"
+            );
+        }
+        let patch_group = "    groups:\n      patch-updates:\n        patterns:\n          - \"*\"\n        update-types:\n          - patch\n";
+        assert_eq!(configuration.matches(patch_group).count(), entries.len());
+        assert!(!configuration.contains("    ignore:"));
+        assert!(!configuration.contains("version-update:semver-minor"));
+        assert!(!configuration.contains("version-update:semver-major"));
     }
 
     #[test]
