@@ -50,6 +50,8 @@ pub enum PostgresProcessState {
     RunningQuarantined,
     /// A bounded postmaster shutdown is in progress.
     Stopping,
+    /// Target-side fencing completed; crash recovery is required before reuse.
+    Fenced,
     /// Startup, supervision, or shutdown failed terminally.
     Failed,
 }
@@ -428,6 +430,8 @@ pub enum ReadinessReason {
     LeaseMissing,
     /// The local postmaster is intentionally unavailable to routed traffic.
     PostgresQuarantined,
+    /// The local postmaster was target-fenced and requires restart recovery.
+    PostgresFenced,
     /// Local postmaster validation, startup, supervision, or shutdown failed.
     PostgresFailed,
     /// The lease belongs to another instance.
@@ -477,6 +481,7 @@ fn evaluate_readiness(
         &snapshot.postgres,
     ) {
         (_, PostgresProcessState::Failed, _, _, _) => ReadinessReason::PostgresFailed,
+        (_, PostgresProcessState::Fenced, _, _, _) => ReadinessReason::PostgresFenced,
         (
             Some(_),
             PostgresProcessState::Validated
@@ -714,6 +719,12 @@ mod tests {
         assert_eq!(
             state.readiness_at(100, now).reason,
             ReadinessReason::PostgresFailed
+        );
+
+        state.set_postgres_process(PostgresProcessState::Fenced);
+        assert_eq!(
+            state.readiness_at(100, now).reason,
+            ReadinessReason::PostgresFenced
         );
     }
 

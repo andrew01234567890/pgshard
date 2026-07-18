@@ -58,6 +58,12 @@ phase is not implemented.
 Per-cell agent API identities are planned resources: token automount is disabled,
 and each Role/RoleBinding allows only `get` and `update` on one exact writable-term
 Lease. They are not mounted into PostgreSQL Pods and grant no serving authority.
+The standalone opt-in agent now maps every shutdown with writable coordination
+to immediate PostgreSQL process-tree fencing, clears local term evidence first,
+and rejects a Lease timing whose remaining margin cannot cover the configured
+fence escalation budget. This remains quarantine-only and is not operator
+injection, promotion, serving activation, peer-isolation fencing, or clean Lease
+release.
 The current database-topology foundation accepts immutable logical-database
 shard counts and ordered physical-cell mappings in
 `PgShardCluster.spec.databases`. Shard-zero bootstrap installs all declared
