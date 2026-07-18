@@ -1,6 +1,11 @@
 package v1alpha1
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"sort"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -166,6 +171,33 @@ func (database DatabaseTemplate) ResolvedCells(clusterCells int32) []int32 {
 	return cells
 }
 
+// DatabaseTopologySHA256 returns a canonical digest of every resolved immutable
+// database name and ordered physical-cell placement.
+func (spec PgShardClusterSpec) DatabaseTopologySHA256() string {
+	databases := append([]DatabaseTemplate(nil), spec.Databases...)
+	sort.Slice(databases, func(left, right int) bool {
+		return databases[left].Name < databases[right].Name
+	})
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("pgshard-database-topology-v1\x00"))
+	var encoded [4]byte
+	binary.BigEndian.PutUint32(encoded[:], uint32(len(databases)))
+	_, _ = hash.Write(encoded[:])
+	for _, database := range databases {
+		binary.BigEndian.PutUint32(encoded[:], uint32(len(database.Name)))
+		_, _ = hash.Write(encoded[:])
+		_, _ = hash.Write([]byte(database.Name))
+		cells := database.ResolvedCells(spec.Shards)
+		binary.BigEndian.PutUint32(encoded[:], uint32(len(cells)))
+		_, _ = hash.Write(encoded[:])
+		for _, cell := range cells {
+			binary.BigEndian.PutUint32(encoded[:], uint32(cell))
+			_, _ = hash.Write(encoded[:])
+		}
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
 type PoolerSpec struct {
 	Scaling PoolerScaling `json:"scaling,omitempty"`
 }
@@ -297,12 +329,17 @@ type CatalogAccessStatus struct {
 
 // PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract.
 type PostgreSQLBootstrapSpecStatus struct {
-	Shards           int32                 `json:"shards"`
-	MembersPerShard  int32                 `json:"membersPerShard"`
-	Durability       DurabilityMode        `json:"durability"`
-	StorageSize      string                `json:"storageSize"`
-	StorageClassName *string               `json:"storageClassName,omitempty"`
-	DeletionPolicy   StorageDeletionPolicy `json:"deletionPolicy"`
+	Shards          int32          `json:"shards"`
+	MembersPerShard int32          `json:"membersPerShard"`
+	Durability      DurabilityMode `json:"durability"`
+	// DatabaseTopologySHA256 binds provisioned storage to the complete resolved
+	// immutable logical-database genesis topology. It is omitted only on status
+	// written by releases that predate database-scoped genesis.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	DatabaseTopologySHA256 string                `json:"databaseTopologySHA256,omitempty"`
+	StorageSize            string                `json:"storageSize"`
+	StorageClassName       *string               `json:"storageClassName,omitempty"`
+	DeletionPolicy         StorageDeletionPolicy `json:"deletionPolicy"`
 }
 
 // PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified

@@ -541,8 +541,9 @@ relinquishes it. The fixture also proves the crash-detectable managed-field
 migration then completes without an Update co-owner. A stale-cache conflict
 fixture proves that newly authoritative operator-owned marker-plus-Apply
 ownership stops the legacy Update path even when scale and external Apply
-managers are visible. A
-historical Create-plus-Apply fixture proves markerless operator Apply ownership
+managers are visible. A separate API-server upgrade fixture accepts a legacy provisioned-storage status
+without a database-topology digest but rejects any malformed nonempty digest.
+A historical Create-plus-Apply fixture proves markerless operator Apply ownership
 does not bypass alignment: keys retained only by the create-time Update owner
 are removed before that owner is migrated away.
 Interrupted and completed upgrades from the earlier whole-Deployment HPA
@@ -632,16 +633,33 @@ the requested shard count.
 The same PostgreSQL 18 fixture installs two declared logical databases with
 different shard counts and shared cell mappings, proves exact replay preserves
 database IDs, routing epochs, and the catalog epoch, and rejects reordered or
-duplicate placements. The operator bootstrap fixture proves all declarations
+duplicate placements. Its concurrency fixture holds the first genesis call in
+an uncommitted transaction, observes the second backend waiting on PostgreSQL's
+catalog lock, then proves identical retry and conflicting-retry outcomes without
+extra routing-identity consumption. Another fixture retains a staged epoch's
+foreign-key key-share lock, completes an exact genesis replay, then blocks that
+staged activation on the replay transaction's catalog lock and proves both
+transactions commit without a deadlock. The operator bootstrap fixture proves all declarations
 are one transaction: a later conflicting database leaves an earlier new
-declaration absent and the active topology unchanged. API and planner tests
+declaration absent and the active topology unchanged. Legacy and current
+catalog fixtures prove topology mismatch is rejected before migration while
+catalog, HBA, and routing-sequence fingerprints remain unchanged. Generated
+preflight SQL bounds non-retired databases and active ranges at the declared
+counts plus one and aggregates active epochs once per sampled database. API and planner tests
 cover deterministic defaults, shared and disjoint placements, out-of-range
-cells, duplicate cells, count mismatches, and immutable updates.
-Planner coverage also requires shard-0000 to mount the immutable generated SQL
-key as one read-only `subPath` regular file. The bootstrap continues to reject
-symlinks, including the symlink entries used by a whole-directory ConfigMap
-projection, so the Kubernetes mount contract is tested independently from the
-Docker regular-file fixture.
+cells, duplicate cells, count mismatches, and immutable updates. A hostile live
+catalog fixture adds overlapping active-epoch routes first to a retired shard
+and then to an absent shard identity. It proves the loader reports each exact
+target without publishing a snapshot; inner joins or shard-state filtering
+cannot hide malformed ranges from validation or cardinality limits.
+Planner coverage binds the complete generated ConfigMap hash into both the Pod
+annotation and init environment. Bootstrap hashes the read-only ConfigMap
+projection, copies its files into a bounded Pod-local `emptyDir`, hashes the
+copy, and executes generated SQL only from regular copied files. The serving
+PostgreSQL container mounts only that read-only runtime copy. Docker coverage
+replaces source configuration while retaining the expected hash and proves
+bootstrap rejects it before PGDATA access; KIND coverage proves both primaries
+start from the authenticated copy.
 A unit Create interceptor separately proves the
 credential UID, detached credential-Secret creation fence, and resolved storage
 class are durably checkpointed before PVC dispatch; the live test confirms the

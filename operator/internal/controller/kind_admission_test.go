@@ -65,9 +65,18 @@ func TestKINDAdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec(t *testing.T) {
 	valid.Spec.Pooler = pgshardv1alpha1.PoolerSpec{}
 	valid.Spec.Services = pgshardv1alpha1.ServiceSet{}
 	valid.Spec.Observability.Prometheus = nil
+	valid.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{
+		{Name: "implicit"},
+		{Name: "shards-only", Shards: 1},
+	}
 	valid = waitForDefaultedDryRunCreate(t, ctx, kubeClient, valid)
 	if valid.Spec.Shards != 1 || valid.Spec.MembersPerShard != 3 || valid.Spec.Durability != pgshardv1alpha1.DurabilitySynchronous || valid.Spec.PostgreSQL.Version != pgshardv1alpha1.PostgreSQLMajor18 || valid.Spec.Storage.DeletionPolicy != pgshardv1alpha1.DeletionRetain || valid.Spec.Pooler.Scaling.Mode != pgshardv1alpha1.ScalingHPA || valid.Spec.Observability.Prometheus == nil || !*valid.Spec.Observability.Prometheus {
 		t.Fatalf("admission defaults = %#v", valid.Spec)
+	}
+	for _, database := range valid.Spec.Databases {
+		if database.Shards != 1 || len(database.Cells) != 1 || database.Cells[0] != 0 {
+			t.Fatalf("database admission defaults = %#v", valid.Spec.Databases)
+		}
 	}
 
 	invalid := readDevelopmentSample(t)

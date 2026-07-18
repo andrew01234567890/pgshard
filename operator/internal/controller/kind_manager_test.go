@@ -293,6 +293,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	cluster.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{
 		{Name: "app", Shards: 2, Cells: []int32{0, 1}},
 		{Name: "analytics", Shards: 1, Cells: []int32{0}},
+		{Name: "dedicated", Shards: 1, Cells: []int32{1}},
 	}
 	if err := kubeClient.Create(ctx, cluster); err != nil {
 		t.Fatal(err)
@@ -342,18 +343,37 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	if len(initialShardZero.Status.InitContainerStatuses) != 1 || initialShardZero.Status.InitContainerStatuses[0].ImageID == "" || initialShardZero.Status.InitContainerStatuses[0].RestartCount != 0 || initialShardZero.Status.InitContainerStatuses[0].State.Terminated == nil || initialShardZero.Status.InitContainerStatuses[0].State.Terminated.ExitCode != 0 {
 		t.Fatalf("shard-0000 bootstrap completion = %#v", initialShardZero.Status.InitContainerStatuses)
 	}
-	databaseGenesisMounts := 0
-	for _, mount := range initialShardZero.Spec.InitContainers[0].VolumeMounts {
-		if mount.MountPath != "/etc/pgshard/database-genesis.sql" {
-			continue
-		}
-		databaseGenesisMounts++
-		if mount.Name != "postgresql-config" || mount.SubPath != "database-genesis.sql" || !mount.ReadOnly {
-			t.Fatalf("shard-0000 database genesis mount = %#v", mount)
+	configurationSourceMounts := 0
+	configurationRuntimeMounts := 0
+	configurationDigest := ""
+	for _, variable := range initialShardZero.Spec.InitContainers[0].Env {
+		if variable.Name == "PGSHARD_POSTGRESQL_CONFIG_SHA256" {
+			configurationDigest = variable.Value
 		}
 	}
-	if databaseGenesisMounts != 1 {
-		t.Fatalf("shard-0000 database genesis mounts = %d, want 1", databaseGenesisMounts)
+	if configurationDigest == "" || configurationDigest != initialShardZero.Annotations[owned.ConfigHashAnnotation] {
+		t.Fatalf("shard-0000 authenticated configuration digest = %q, annotations = %#v", configurationDigest, initialShardZero.Annotations)
+	}
+	for _, mount := range initialShardZero.Spec.InitContainers[0].VolumeMounts {
+		switch mount.MountPath {
+		case "/etc/pgshard/postgresql-source":
+			configurationSourceMounts++
+			if mount.Name != "postgresql-config" || !mount.ReadOnly {
+				t.Fatalf("shard-0000 configuration source mount = %#v", mount)
+			}
+		case "/etc/pgshard/postgresql":
+			configurationRuntimeMounts++
+			if mount.Name != "postgresql-runtime-config" || mount.ReadOnly {
+				t.Fatalf("shard-0000 runtime configuration mount = %#v", mount)
+			}
+		}
+	}
+	if configurationSourceMounts != 1 || configurationRuntimeMounts != 1 {
+		t.Fatalf("shard-0000 authenticated configuration mounts = source %d, runtime %d, want 1 each", configurationSourceMounts, configurationRuntimeMounts)
+	}
+	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
+		"bash", "-ceu", "test -f /etc/pgshard/postgresql/database-genesis.sql && test ! -L /etc/pgshard/postgresql/database-genesis.sql && test -f /etc/pgshard/postgresql/database-topology-preflight.sql && test ! -L /etc/pgshard/postgresql/database-topology-preflight.sql")); got != "" {
+		t.Fatalf("shard-0000 copied database topology check = %q", got)
 	}
 	if current.Status.CatalogAccess == nil || current.Status.CatalogAccess.SecretName == "" || current.Status.CatalogAccess.SecretUID == "" {
 		t.Fatalf("catalog access identity was not checkpointed: %#v", current.Status.CatalogAccess)
@@ -393,12 +413,12 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
 		"SELECT string_agg(database_name::text || '=' || logical_database_id::text, ',' ORDER BY database_name) FROM pgshard_catalog.logical_databases"))
 	databaseSnapshotParts := strings.Split(databaseSnapshot, ",")
-	if len(databaseSnapshotParts) != 2 || !strings.HasPrefix(databaseSnapshotParts[0], "analytics=") || !strings.HasPrefix(databaseSnapshotParts[1], "app=") || strings.HasSuffix(databaseSnapshotParts[0], "=") || strings.HasSuffix(databaseSnapshotParts[1], "=") {
+	if len(databaseSnapshotParts) != 3 || !strings.HasPrefix(databaseSnapshotParts[0], "analytics=") || !strings.HasPrefix(databaseSnapshotParts[1], "app=") || !strings.HasPrefix(databaseSnapshotParts[2], "dedicated=") || strings.HasSuffix(databaseSnapshotParts[0], "=") || strings.HasSuffix(databaseSnapshotParts[1], "=") || strings.HasSuffix(databaseSnapshotParts[2], "=") {
 		t.Fatalf("database genesis identity snapshot = %q", databaseSnapshot)
 	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
-		"SELECT string_agg(databases.database_name::text || ':' || ranges.range_start::text || ':' || shards.shard_number::text, ',' ORDER BY databases.database_name, ranges.range_start) FROM pgshard_catalog.logical_databases AS databases JOIN pgshard_catalog.active_routing_epochs AS active ON active.logical_database_id = databases.logical_database_id JOIN pgshard_catalog.routing_ranges AS ranges ON ranges.routing_epoch = active.routing_epoch JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id")); got != "analytics:0:0,app:0:0,app:9223372036854775808:1" {
+		"SELECT string_agg(databases.database_name::text || ':' || ranges.range_start::text || ':' || shards.shard_number::text, ',' ORDER BY databases.database_name, ranges.range_start) FROM pgshard_catalog.logical_databases AS databases JOIN pgshard_catalog.active_routing_epochs AS active ON active.logical_database_id = databases.logical_database_id JOIN pgshard_catalog.routing_ranges AS ranges ON ranges.routing_epoch = active.routing_epoch JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id")); got != "analytics:0:0,app:0:0,app:9223372036854775808:1,dedicated:0:1" {
 		t.Fatalf("database genesis routing = %q", got)
 	}
 	catalogSnapshot := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
@@ -1388,9 +1408,18 @@ func assertPostgreSQLRoleProfiles(t *testing.T, ctx context.Context, kubeClient 
 	if configuration == nil {
 		t.Fatalf("PostgreSQL configuration with prefix %q not found", prefix)
 	}
-	wantDocuments := 2 + int(cluster.Spec.MembersPerShard)*2
+	wantDocuments := 3 + int(cluster.Spec.MembersPerShard)*2
 	if len(configuration.Data) != wantDocuments {
 		t.Fatalf("PostgreSQL configuration documents = %#v", configuration.Data)
+	}
+	databaseTopologyPreflight := configuration.Data["database-topology-preflight.sql"]
+	for _, statement := range []string{
+		"FOR UPDATE;\n",
+		"RestoreTopologyMismatch: shardschema logical database topology conflicts",
+	} {
+		if !strings.Contains(databaseTopologyPreflight, statement) {
+			t.Fatalf("database topology preflight is missing %q:\n%s", statement, databaseTopologyPreflight)
+		}
 	}
 	databaseGenesis := configuration.Data["database-genesis.sql"]
 	for _, statement := range []string{

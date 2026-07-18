@@ -104,6 +104,12 @@ Database genesis runs only after that physical-cell inventory is exact. All
 declared databases are installed in one transaction, exact replay leaves the
 catalog epoch unchanged, and a changed mapping, unavailable cell, or
 undeclared active logical database aborts startup without a partial topology.
+Before migration, bootstrap compares any released or current catalog topology
+with the declared topology. It repeats that comparison under the catalog-state
+transaction lock before allocating database or routing identities. Mismatch
+therefore fails before migration or sequence progress. Both checks cap catalog
+rows at the declared database and range counts plus one, so malformed restored
+catalogs cannot turn bootstrap into an unbounded sort or join.
 See [Database topology and placement](concepts/database-placement.md) for the
 current fields and their limits.
 
@@ -145,7 +151,12 @@ must configure `--postgresql-bootstrap-image` with an immutable SHA-256 digest.
 The operator parses the complete digest-pinned reference before creating
 bootstrap credentials or storage. At runtime the init process still verifies
 that image's `postgres` binary and both existing and newly initialized PGDATA
-report major 18 before publication.
+report major 18 before publication. It also verifies the complete generated
+PostgreSQL ConfigMap against the controller-owned SHA-256 in the Pod contract,
+copies those bytes into a Pod-local bounded `emptyDir`, verifies the copy, and
+runs both bootstrap and the normal PostgreSQL container only from that copy.
+Deleting and recreating the immutable ConfigMap under the same name therefore
+cannot inject SQL or server settings on a Pod restart.
 
 The admission overlay provisions an ECDSA serving chain and a separate immutable
 256-bit fencing key into exact-name operator-managed Secrets, injects the CA

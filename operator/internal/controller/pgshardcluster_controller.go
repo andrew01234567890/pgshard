@@ -466,6 +466,14 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return fmt.Errorf("checkpoint PostgreSQL provisioned spec: %w", err)
 		}
+	} else if cluster.Status.PostgreSQLBootstrapSpec.DatabaseTopologySHA256 == "" {
+		if len(cluster.Spec.Databases) != 0 {
+			return fmt.Errorf("recorded PostgreSQL bootstrap spec predates the declared database topology; explicit recovery is required")
+		}
+		cluster.Status.PostgreSQLBootstrapSpec.DatabaseTopologySHA256 = cluster.Spec.DatabaseTopologySHA256()
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint empty legacy database topology: %w", err)
+		}
 	}
 	if err := validateBootstrapSpecStatus(cluster); err != nil {
 		return err
@@ -986,14 +994,15 @@ func isDefaultStorageClass(annotations map[string]string) bool {
 func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) *pgshardv1alpha1.PostgreSQLBootstrapSpecStatus {
 	return &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
 		Shards: cluster.Spec.Shards, MembersPerShard: cluster.Spec.MembersPerShard, Durability: cluster.Spec.Durability,
-		StorageSize: cluster.Spec.Storage.Size.String(), StorageClassName: copyOptionalString(cluster.Spec.Storage.StorageClassName), DeletionPolicy: storageDeletionPolicy(cluster),
+		DatabaseTopologySHA256: cluster.Spec.DatabaseTopologySHA256(),
+		StorageSize:            cluster.Spec.Storage.Size.String(), StorageClassName: copyOptionalString(cluster.Spec.Storage.StorageClassName), DeletionPolicy: storageDeletionPolicy(cluster),
 	}
 }
 
 func validateBootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) error {
 	recorded := cluster.Status.PostgreSQLBootstrapSpec
 	wanted := bootstrapSpecStatus(cluster)
-	if recorded.Shards != wanted.Shards || recorded.MembersPerShard != wanted.MembersPerShard || recorded.Durability != wanted.Durability || recorded.StorageSize != wanted.StorageSize || !optionalStringsEqual(recorded.StorageClassName, wanted.StorageClassName) || recorded.DeletionPolicy != wanted.DeletionPolicy {
+	if !bootstrapSpecsEqual(recorded, wanted) {
 		return fmt.Errorf("current topology or storage differs from the provisioned PostgreSQL bootstrap spec; an explicit transition is required")
 	}
 	return nil
@@ -3148,7 +3157,7 @@ func bootstrapSpecsEqual(left, right *pgshardv1alpha1.PostgreSQLBootstrapSpecSta
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName) && left.DeletionPolicy == right.DeletionPolicy
+	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.DatabaseTopologySHA256 == right.DatabaseTopologySHA256 && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName) && left.DeletionPolicy == right.DeletionPolicy
 }
 
 func postgreSQLBootstrapsEqual(left, right pgshardv1alpha1.PostgreSQLBootstrapStatus) bool {

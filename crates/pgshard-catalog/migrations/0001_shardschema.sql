@@ -4650,7 +4650,7 @@ BEGIN
       INTO observed_database_id, observed_database_state
       FROM pgshard_catalog.logical_databases AS databases
      WHERE databases.database_name = target_database_name
-     FOR UPDATE;
+     FOR NO KEY UPDATE;
 
     IF observed_database_id IS NOT NULL THEN
         IF observed_database_state <> 'active' THEN
@@ -4662,12 +4662,23 @@ BEGIN
         SELECT active.routing_epoch
           INTO observed_routing_epoch
           FROM pgshard_catalog.active_routing_epochs AS active
+          JOIN pgshard_catalog.routing_epochs AS epochs
+            ON epochs.routing_epoch = active.routing_epoch
+           AND epochs.logical_database_id = active.logical_database_id
+           AND epochs.state = 'active'
          WHERE active.logical_database_id = observed_database_id
-         FOR KEY SHARE;
+           AND NOT EXISTS (
+               SELECT
+                 FROM pgshard_catalog.routing_epochs AS competing_epochs
+                WHERE competing_epochs.logical_database_id = observed_database_id
+                  AND competing_epochs.state = 'active'
+                  AND competing_epochs.routing_epoch <> active.routing_epoch
+           )
+         FOR KEY SHARE OF active, epochs;
         IF observed_routing_epoch IS NULL THEN
             RAISE EXCEPTION USING
                 ERRCODE = '55000',
-                MESSAGE = 'logical database genesis has no active routing epoch';
+                MESSAGE = 'logical database genesis does not reference exactly one owned active routing epoch';
         END IF;
 
         IF EXISTS (

@@ -544,6 +544,13 @@ spec:
                   any PostgreSQL credential or data volume is created. It provides a
                   defensive fence when admission is unavailable or bypassed.
                 properties:
+                  databaseTopologySHA256:
+                    description: |-
+                      DatabaseTopologySHA256 binds provisioned storage to the complete resolved
+                      immutable logical-database genesis topology. It is omitted only on status
+                      written by releases that predate database-scoped genesis.
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
                   deletionPolicy:
                     type: string
                   durability:

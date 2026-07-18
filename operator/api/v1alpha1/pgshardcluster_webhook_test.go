@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -56,6 +57,33 @@ func validCluster() *PgShardCluster {
 			},
 			Backup: BackupSpec{Repository: BackupRepository{Type: RepositoryFilesystem, Filesystem: &FilesystemRepository{PersistentVolumeClaimName: "backups"}}},
 		},
+	}
+}
+
+func TestDatabaseTopologySHA256IsCanonicalAndPlacementSensitive(t *testing.T) {
+	left := PgShardClusterSpec{
+		Shards: 3,
+		Databases: []DatabaseTemplate{
+			{Name: "app", Shards: 2},
+			{Name: "analytics", Cells: []int32{2}},
+		},
+	}
+	right := PgShardClusterSpec{
+		Shards: 3,
+		Databases: []DatabaseTemplate{
+			{Name: "analytics", Shards: 1, Cells: []int32{2}},
+			{Name: "app", Shards: 2, Cells: []int32{0, 1}},
+		},
+	}
+	if left.DatabaseTopologySHA256() != right.DatabaseTopologySHA256() {
+		t.Fatal("equivalent resolved database topologies produced different digests")
+	}
+	if len(left.DatabaseTopologySHA256()) != sha256.Size*2 {
+		t.Fatalf("database topology digest = %q", left.DatabaseTopologySHA256())
+	}
+	right.Databases[1].Cells = []int32{1, 0}
+	if left.DatabaseTopologySHA256() == right.DatabaseTopologySHA256() {
+		t.Fatal("ordered database placement change retained topology digest")
 	}
 }
 

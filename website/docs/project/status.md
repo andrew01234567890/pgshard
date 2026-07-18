@@ -62,6 +62,17 @@ database IDs, routing epochs, and catalog epoch; conflicting mappings and
 undeclared active catalog databases fail without a partial install. This does
 not yet create physical application databases, database-scoped shard records,
 placement reservations, or a client-visible routing path.
+Existing catalog topology is compared with the complete declaration before
+migration and again under the catalog-state transaction lock before identity
+allocation. Both the database and range inputs are capped at the expected count
+plus one. Catalog loading uses a fixed set of bounded queries per refresh rather
+than per-database query amplification, and refuses staged, superseded, foreign,
+duplicate, or otherwise non-serving active-epoch pointers plus routes to absent,
+provisioning, or retired shards. The provisioned
+storage checkpoint binds the canonical resolved database topology by SHA-256.
+Status written before that field existed remains API-valid: only a provably
+empty legacy declaration is upgraded automatically, while a legacy checkpoint
+with declared databases requires explicit recovery.
 
 The current operator plan starts single-member poolers in `operator-tls`
 catalog mode. It checkpoints an unpredictable name as a non-consumable creation
@@ -71,7 +82,11 @@ It then checkpoints separate client/server material digests with response-loss
 recovery before projecting only the fixed reader password plus CA into poolers,
 and projects only the server keypair into shard-0000 PostgreSQL. The bootstrap
 init validates both retained projections before PGDATA access; the CA private
-key is never persisted. An outcome-unknown Create carries no key material, and
+key is never persisted. It also authenticates the complete generated
+PostgreSQL configuration against the Pod's controller-owned SHA-256, copies it
+to bounded Pod-local storage, verifies the copy, and leaves the serving
+container no mount of the replaceable ConfigMap source. An outcome-unknown
+Create carries no key material, and
 competing material updates are serialized by the same UID and resource version,
 so a late API commit cannot leave a second untracked credential. The pooler requires TLS 1.3
 hostname validation, SCRAM channel binding, and a writable catalog primary.

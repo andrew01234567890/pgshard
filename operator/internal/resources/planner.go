@@ -81,8 +81,10 @@ const (
 	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
 	shardschemaMigrationPath                = "/usr/share/pgshard/migrations/0001_shardschema.sql"
 	databaseGenesisKey                      = "database-genesis.sql"
-	databaseGenesisPath                     = "/etc/pgshard/database-genesis.sql"
-	shardschemaMigrationSHA256              = "1512c1aee0e555c2208560f75e9b1c4261d8b0444d4505128e2db016d610d3d7"
+	databaseGenesisPath                     = "/etc/pgshard/postgresql/database-genesis.sql"
+	databaseTopologyPreflightKey            = "database-topology-preflight.sql"
+	databaseTopologyPreflightPath           = "/etc/pgshard/postgresql/database-topology-preflight.sql"
+	shardschemaMigrationSHA256              = "f64d410356193bbba44f2591f1af85d5ec563af1b367b675d2f6a289f4aa82de"
 	shardschemaMigrationHashAnnotation      = "pgshard.io/shardschema-migration-sha256"
 )
 
@@ -90,6 +92,7 @@ const postgresqlBootstrapScript = `set -Eeuo pipefail
 : "${PGSHARD_NODE_UID:?binding-time node UID is required}"
 : "${PGSHARD_NODE_BOOT_ID:?binding-time node boot ID is required}"
 : "${PGSHARD_POSTGRESQL_MAJOR:?expected PostgreSQL major is required}"
+: "${PGSHARD_POSTGRESQL_CONFIG_SHA256:?expected PostgreSQL configuration digest is required}"
 
 if [[ "$PGSHARD_POSTGRESQL_MAJOR" != "18" ]]; then
   echo "operator release has an unsupported PostgreSQL major" >&2
@@ -103,6 +106,52 @@ case "$postgres_version" in
     exit 1
     ;;
 esac
+
+if [[ ! "$PGSHARD_POSTGRESQL_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "refusing invalid PostgreSQL configuration digest" >&2
+  exit 1
+fi
+configuration_source="${PGSHARD_POSTGRESQL_CONFIG_SOURCE:-/etc/pgshard/postgresql-source}"
+configuration_target="${PGSHARD_POSTGRESQL_CONFIG_TARGET:-/etc/pgshard/postgresql}"
+source_configuration_hash() {
+  local path key
+  {
+    while IFS= read -r -d '' path; do
+      if [[ ! -f "$path" ]]; then
+        echo "PostgreSQL configuration source contains a non-file entry" >&2
+        return 1
+      fi
+      key="${path##*/}"
+      printf '%s\0' "$key"
+      cat -- "$path"
+      printf '\0'
+    done < <(find "$configuration_source" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) ! -name '..data' -print0 | LC_ALL=C sort -z)
+  } | sha256sum | cut -d ' ' -f 1
+}
+target_configuration_hash() {
+  local path key
+  {
+    while IFS= read -r -d '' path; do
+      key="${path##*/}"
+      printf '%s\0' "$key"
+      cat -- "$path"
+      printf '\0'
+    done < <(find "$configuration_target" -mindepth 1 -maxdepth 1 -type f -print0 | LC_ALL=C sort -z)
+  } | sha256sum | cut -d ' ' -f 1
+}
+observed_configuration_hash="$(source_configuration_hash)"
+if [[ "$observed_configuration_hash" != "$PGSHARD_POSTGRESQL_CONFIG_SHA256" ]]; then
+  echo "PostgreSQL configuration does not match the controller-owned Pod contract" >&2
+  exit 1
+fi
+find "$configuration_target" -mindepth 1 -maxdepth 1 -delete
+while IFS= read -r -d '' path; do
+  install -m 0444 -- "$path" "$configuration_target/${path##*/}"
+done < <(find "$configuration_source" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) ! -name '..data' -print0 | LC_ALL=C sort -z)
+if [[ "$(target_configuration_hash)" != "$PGSHARD_POSTGRESQL_CONFIG_SHA256" ]]; then
+  echo "copied PostgreSQL configuration does not match the controller-owned Pod contract" >&2
+  exit 1
+fi
 
 parent=/var/lib/postgresql/18
 volume_root="${parent%/*}"
@@ -928,6 +977,21 @@ case "$catalog_core_tables" in
     ;;
 esac
 
+database_genesis=/etc/pgshard/postgresql/database-genesis.sql
+database_topology_preflight=/etc/pgshard/postgresql/database-topology-preflight.sql
+if [[ ! -f "$database_genesis" || -L "$database_genesis" ]]; then
+  echo "database genesis topology is missing or not a regular file" >&2
+  exit 1
+fi
+if [[ ! -f "$database_topology_preflight" || -L "$database_topology_preflight" ]]; then
+  echo "database topology preflight is missing or not a regular file" >&2
+  exit 1
+fi
+if [[ "$catalog_core_tables" == "t|t|t" ]]; then
+  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --file="$database_topology_preflight" >/dev/null
+fi
+
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
   --set=ON_ERROR_STOP=1 --file="$PGSHARD_SHARDSCHEMA_MIGRATION"
 
@@ -1001,11 +1065,6 @@ fi
 
 validate_bootstrap_session_policy shardschema
 
-database_genesis=/etc/pgshard/database-genesis.sql
-if [[ ! -f "$database_genesis" || -L "$database_genesis" ]]; then
-  echo "database genesis topology is missing or not a regular file" >&2
-  exit 1
-fi
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
   --set=ON_ERROR_STOP=1 --file="$database_genesis" >/dev/null
 
@@ -1393,6 +1452,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	}
 	postgresqlConfig := renderPostgreSQLConfiguration(postgresql)
 	postgresqlConfig[databaseGenesisKey] = renderDatabaseGenesisSQL(cluster)
+	postgresqlConfig[databaseTopologyPreflightKey] = renderDatabaseTopologyPreflightSQL(cluster)
 	postgresqlHash := configMapDataHash(postgresqlConfig)
 	postgresqlConfigName := PostgreSQLConfigMapName(cluster.Name, postgresqlHash)
 	topologyConfig, err := renderTopology(cluster)
@@ -1511,15 +1571,13 @@ func renderPostgreSQLConfig(settings map[string]string) string {
 }
 
 func renderDatabaseGenesisSQL(cluster *pgshardv1alpha1.PgShardCluster) string {
-	databases := append([]pgshardv1alpha1.DatabaseTemplate(nil), cluster.Spec.Databases...)
-	sort.Slice(databases, func(left, right int) bool {
-		return databases[left].Name < databases[right].Name
-	})
+	databases := sortedDatabaseTemplates(cluster)
 
 	var output strings.Builder
 	output.WriteString("-- Generated by pgshard-operator. Manual edits are overwritten.\n")
 	output.WriteString("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;\n")
 	output.WriteString("SET LOCAL search_path = pg_catalog;\n")
+	output.WriteString("\\i " + databaseTopologyPreflightPath + "\n")
 	for _, database := range databases {
 		fmt.Fprintf(
 			&output,
@@ -1551,6 +1609,120 @@ func renderDatabaseGenesisSQL(cluster *pgshardv1alpha1.PgShardCluster) string {
 	output.WriteString("  END IF;\nEND\n$pgshard_database_genesis_postcondition$;\n")
 	output.WriteString("COMMIT;\n")
 	return output.String()
+}
+
+func renderDatabaseTopologyPreflightSQL(cluster *pgshardv1alpha1.PgShardCluster) string {
+	databases := sortedDatabaseTemplates(cluster)
+	expectedRangeCount := 0
+	for _, database := range databases {
+		expectedRangeCount += len(database.ResolvedCells(cluster.Spec.Shards))
+	}
+	var output strings.Builder
+	output.WriteString("-- Generated by pgshard-operator. Manual edits are overwritten.\n")
+	output.WriteString("DO $pgshard_database_topology_preflight$\nBEGIN\n")
+	output.WriteString("  PERFORM state.catalog_epoch FROM pgshard_catalog.cluster_state AS state WHERE state.singleton FOR UPDATE;\n")
+	output.WriteString("  IF NOT FOUND THEN\n")
+	output.WriteString("    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'shardschema cluster state singleton is missing';\n")
+	output.WriteString("  END IF;\n")
+	output.WriteString("  IF EXISTS (\n")
+	output.WriteString("    WITH expected_databases(database_name, shard_numbers) AS (\n")
+	if len(databases) == 0 {
+		output.WriteString("      SELECT NULL::text, NULL::bigint[] WHERE false\n")
+	} else {
+		output.WriteString("      VALUES\n")
+		for index, database := range databases {
+			if index != 0 {
+				output.WriteString(",\n")
+			}
+			fmt.Fprintf(&output, "        (%s::text, ARRAY[", postgresqlStringLiteral(database.Name))
+			for ordinal, cell := range database.ResolvedCells(cluster.Spec.Shards) {
+				if ordinal != 0 {
+					output.WriteByte(',')
+				}
+				fmt.Fprintf(&output, "%d", cell)
+			}
+			output.WriteString("]::bigint[])")
+		}
+		output.WriteByte('\n')
+	}
+	output.WriteString("    ), expected_cells AS (\n")
+	output.WriteString("      SELECT databases.database_name, cells.ordinality::bigint AS range_ordinal, cells.shard_number\n")
+	output.WriteString("        FROM expected_databases AS databases\n")
+	output.WriteString("        CROSS JOIN LATERAL pg_catalog.unnest(databases.shard_numbers) WITH ORDINALITY AS cells(shard_number, ordinality)\n")
+	output.WriteString("    ), expected_ranges AS (\n")
+	output.WriteString("      SELECT database_name, range_ordinal,\n")
+	output.WriteString("             pg_catalog.floor(((range_ordinal - 1)::numeric * 18446744073709551616) / pg_catalog.count(*) OVER (PARTITION BY database_name)) AS range_start,\n")
+	output.WriteString("             pg_catalog.floor((range_ordinal::numeric * 18446744073709551616) / pg_catalog.count(*) OVER (PARTITION BY database_name)) AS range_end,\n")
+	output.WriteString("             shard_number\n")
+	output.WriteString("        FROM expected_cells\n")
+	output.WriteString("    ), actual_databases AS MATERIALIZED (\n")
+	output.WriteString("      SELECT databases.logical_database_id, databases.database_name, databases.state\n")
+	output.WriteString("        FROM pgshard_catalog.logical_databases AS databases\n")
+	output.WriteString("       WHERE databases.state <> 'retired'\n")
+	fmt.Fprintf(&output, "       LIMIT %d\n", len(databases)+1)
+	output.WriteString("    ), active_epoch_counts AS (\n")
+	output.WriteString("      SELECT epochs.logical_database_id, pg_catalog.count(*) AS active_epoch_count\n")
+	output.WriteString("        FROM pgshard_catalog.routing_epochs AS epochs\n")
+	output.WriteString("        JOIN actual_databases AS databases USING (logical_database_id)\n")
+	output.WriteString("       WHERE epochs.state = 'active'\n")
+	output.WriteString("       GROUP BY epochs.logical_database_id\n")
+	output.WriteString("    ), actual_range_sample AS MATERIALIZED (\n")
+	output.WriteString("      SELECT databases.logical_database_id, databases.database_name::text AS database_name,\n")
+	output.WriteString("             ranges.range_start, ranges.range_end, shards.shard_number,\n")
+	output.WriteString("             databases.state AS database_state, epochs.state AS routing_state,\n")
+	output.WriteString("             epochs.logical_database_id = databases.logical_database_id AS routing_is_owned,\n")
+	output.WriteString("             shards.state AS shard_state, COALESCE(active_counts.active_epoch_count, 0) AS active_epoch_count\n")
+	output.WriteString("        FROM actual_databases AS databases\n")
+	output.WriteString("        LEFT JOIN pgshard_catalog.active_routing_epochs AS active ON active.logical_database_id = databases.logical_database_id\n")
+	output.WriteString("        LEFT JOIN pgshard_catalog.routing_epochs AS epochs ON epochs.routing_epoch = active.routing_epoch\n")
+	output.WriteString("        LEFT JOIN pgshard_catalog.routing_ranges AS ranges ON ranges.routing_epoch = active.routing_epoch\n")
+	output.WriteString("        LEFT JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id\n")
+	output.WriteString("        LEFT JOIN active_epoch_counts AS active_counts ON active_counts.logical_database_id = databases.logical_database_id\n")
+	fmt.Fprintf(&output, "       LIMIT %d\n", expectedRangeCount+1)
+	output.WriteString("    ), actual_ranges AS (\n")
+	output.WriteString("      SELECT sample.database_name,\n")
+	output.WriteString("             pg_catalog.row_number() OVER (PARTITION BY sample.logical_database_id ORDER BY sample.range_start, sample.range_end)::bigint AS range_ordinal,\n")
+	output.WriteString("             sample.range_start, sample.range_end, sample.shard_number, sample.database_state,\n")
+	output.WriteString("             sample.routing_state, sample.routing_is_owned, sample.shard_state, sample.active_epoch_count\n")
+	output.WriteString("        FROM actual_range_sample AS sample\n")
+	output.WriteString("    ), mismatch AS (\n")
+	output.WriteString("      SELECT 1 WHERE (SELECT pg_catalog.count(*) FROM actual_databases) > ")
+	fmt.Fprintf(&output, "%d\n", len(databases))
+	output.WriteString("      UNION ALL\n")
+	output.WriteString("      SELECT 1 WHERE (SELECT pg_catalog.count(*) FROM actual_range_sample) > ")
+	fmt.Fprintf(&output, "%d\n", expectedRangeCount)
+	output.WriteString("      UNION ALL\n")
+	output.WriteString("      SELECT 1\n")
+	output.WriteString("        FROM expected_ranges\n")
+	output.WriteString("        FULL JOIN actual_ranges USING (database_name, range_ordinal)\n")
+	output.WriteString("       WHERE EXISTS (SELECT FROM actual_ranges)\n")
+	output.WriteString("         AND (expected_ranges.range_start IS DISTINCT FROM actual_ranges.range_start\n")
+	output.WriteString("           OR expected_ranges.range_end IS DISTINCT FROM actual_ranges.range_end\n")
+	output.WriteString("           OR expected_ranges.shard_number IS DISTINCT FROM actual_ranges.shard_number\n")
+	output.WriteString("           OR actual_ranges.database_state IS DISTINCT FROM 'active'\n")
+	output.WriteString("           OR actual_ranges.routing_state IS DISTINCT FROM 'active'\n")
+	output.WriteString("           OR actual_ranges.routing_is_owned IS DISTINCT FROM true\n")
+	output.WriteString("           OR actual_ranges.shard_state IS DISTINCT FROM 'active'\n")
+	output.WriteString("           OR actual_ranges.active_epoch_count IS DISTINCT FROM 1)\n")
+	output.WriteString("      UNION ALL\n")
+	output.WriteString("      SELECT 1\n")
+	output.WriteString("        FROM expected_databases\n")
+	output.WriteString("        JOIN pgshard_catalog.logical_databases AS databases ON databases.database_name::text = expected_databases.database_name\n")
+	output.WriteString("       WHERE databases.state = 'retired'\n")
+	output.WriteString("    )\n")
+	output.WriteString("    SELECT FROM mismatch\n")
+	output.WriteString("  ) THEN\n")
+	output.WriteString("    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'RestoreTopologyMismatch: shardschema logical database topology conflicts with configured immutable database genesis';\n")
+	output.WriteString("  END IF;\nEND\n$pgshard_database_topology_preflight$;\n")
+	return output.String()
+}
+
+func sortedDatabaseTemplates(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.DatabaseTemplate {
+	databases := append([]pgshardv1alpha1.DatabaseTemplate(nil), cluster.Spec.Databases...)
+	sort.Slice(databases, func(left, right int) bool {
+		return databases[left].Name < databases[right].Name
+	})
+	return databases
 }
 
 func postgresqlStringLiteral(value string) string {
@@ -1624,16 +1796,13 @@ func renderTopology(cluster *pgshardv1alpha1.PgShardCluster) (string, error) {
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		document.Shards = append(document.Shards, topologyShard{ID: shard, Service: shardName(cluster.Name, shard)})
 	}
-	for _, database := range cluster.Spec.Databases {
+	for _, database := range sortedDatabaseTemplates(cluster) {
 		document.Databases = append(document.Databases, topologyDatabase{
 			Name:   database.Name,
 			Shards: database.ResolvedShardCount(cluster.Spec.Shards),
 			Cells:  database.ResolvedCells(cluster.Spec.Shards),
 		})
 	}
-	sort.Slice(document.Databases, func(left, right int) bool {
-		return document.Databases[left].Name < document.Databases[right].Name
-	})
 	if repository := cluster.Spec.Backup.Repository; repository.S3 != nil {
 		document.Backup.Bucket = repository.S3.Bucket
 		document.Backup.Endpoint = repository.S3.Endpoint
@@ -1994,7 +2163,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 			{Name: "data", MountPath: "/var/lib/postgresql"},
 			{Name: "runtime", MountPath: "/var/run/postgresql"},
 			{Name: "tmp", MountPath: "/tmp"},
-			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql", ReadOnly: true},
+			{Name: "postgresql-runtime-config", MountPath: "/etc/pgshard/postgresql", ReadOnly: true},
 		},
 	}
 	if shard == 0 {
@@ -2023,6 +2192,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 			{Name: "PGSHARD_BOOTSTRAP_SHARDSCHEMA", Value: fmt.Sprintf("%t", shard == 0)},
 			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION", Value: shardschemaMigrationPath},
 			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION_SHA256", Value: shardschemaMigrationSHA256},
+			{Name: "PGSHARD_POSTGRESQL_CONFIG_SHA256", Value: configurationHash},
 			{Name: "PGSHARD_NODE_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeUIDAnnotation)}}},
 			{Name: "PGSHARD_NODE_BOOT_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeBootIDAnnotation)}}},
 		},
@@ -2031,7 +2201,8 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "data", MountPath: "/var/lib/postgresql"},
 			{Name: "tmp", MountPath: "/tmp"},
-			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql", ReadOnly: true},
+			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql-source", ReadOnly: true},
+			{Name: "postgresql-runtime-config", MountPath: "/etc/pgshard/postgresql"},
 			{Name: "bootstrap-secret", MountPath: "/etc/pgshard/bootstrap", ReadOnly: true},
 		},
 	}
@@ -2040,7 +2211,6 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 			panic("validated single-member plan has no catalog access checkpoint")
 		}
 		bootstrap.VolumeMounts = append(bootstrap.VolumeMounts,
-			corev1.VolumeMount{Name: "postgresql-config", MountPath: databaseGenesisPath, SubPath: databaseGenesisKey, ReadOnly: true},
 			corev1.VolumeMount{Name: "catalog-bootstrap-auth", MountPath: "/etc/pgshard/catalog-auth", ReadOnly: true},
 			corev1.VolumeMount{Name: "catalog-server-tls", MountPath: "/etc/pgshard/catalog-tls", ReadOnly: true},
 		)
@@ -2063,6 +2233,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 		{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr(resource.MustParse("64Mi"))}}},
 		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("64Mi"))}}},
 		{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configurationName}}}},
+		{Name: "postgresql-runtime-config", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("2Mi"))}}},
 		{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName, DefaultMode: ptr(int32(0o440))}}},
 	}
 	if shard == 0 {
