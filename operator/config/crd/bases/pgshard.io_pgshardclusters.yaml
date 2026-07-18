@@ -145,7 +145,16 @@ spec:
                   required:
                   - name
                   type: object
-                maxItems: 1024
+                  x-kubernetes-validations:
+                  - message: database name is reserved by PostgreSQL or pgshard
+                    rule: '!(self.name in [''postgres'', ''shardschema'', ''template0'',
+                      ''template1''])'
+                  - message: database topology is immutable except for exact materialization
+                      of legacy defaults
+                    rule: self == oldSelf || (!has(oldSelf.shards) && !has(oldSelf.cells)
+                      && has(self.shards) && has(self.cells) && self.shards == size(self.cells)
+                      && self.cells.all(cell, cell == self.cells.indexOf(cell)))
+                maxItems: 512
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
@@ -414,10 +423,19 @@ spec:
             - message: durability is immutable until replication-mode transitions
                 are implemented
               rule: self.durability == oldSelf.durability
+            - message: databases may contain at most 65536 total routing ranges
+              rule: '!has(self.databases) || self.databases.map(database, has(database.shards)
+                ? database.shards : (has(database.cells) ? size(database.cells) :
+                self.shards)).sum() <= 65536'
             - message: databases is immutable until database lifecycle and online
                 resharding are implemented
               rule: '!has(oldSelf.databases) ? !has(self.databases) || size(self.databases)
-                == 0 : has(self.databases) && self.databases == oldSelf.databases'
+                == 0 : has(self.databases) && (self.databases == oldSelf.databases
+                || (size(self.databases) == size(oldSelf.databases) && oldSelf.databases.all(database,
+                !has(database.shards) && !has(database.cells)) && self.databases.all(database,
+                has(database.shards) && has(database.cells) && database.shards ==
+                oldSelf.shards && size(database.cells) == database.shards) && oldSelf.databases.map(database,
+                database.name) == self.databases.map(database, database.name)))'
           status:
             description: |-
               PgShardClusterStatus never reports readiness until the operator has actually

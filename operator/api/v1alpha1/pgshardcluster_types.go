@@ -10,7 +10,11 @@ import (
 const (
 	PostgreSQLMajor18 = "18"
 	MaximumShards     = 128
-	MaximumDatabases  = 1024
+	MaximumDatabases  = 512
+	// MaximumTotalRoutingRanges matches pgshard-catalog's bounded snapshot
+	// loader and keeps each generated topology ConfigMap below Kubernetes' 1 MiB
+	// object limit at the maximum supported identifier lengths.
+	MaximumTotalRoutingRanges = 65_536
 	// MaximumClusterNameLength preserves the public API limit from the first
 	// operator release. Longer workload identities are bounded independently.
 	MaximumClusterNameLength = 50
@@ -37,7 +41,8 @@ type StorageDeletionPolicy string
 // +kubebuilder:validation:XValidation:rule="self.shards == oldSelf.shards",message="shards is immutable until physical cell transitions are implemented"
 // +kubebuilder:validation:XValidation:rule="self.membersPerShard == oldSelf.membersPerShard",message="membersPerShard is immutable until membership transitions are implemented"
 // +kubebuilder:validation:XValidation:rule="self.durability == oldSelf.durability",message="durability is immutable until replication-mode transitions are implemented"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.databases) ? !has(self.databases) || size(self.databases) == 0 : has(self.databases) && self.databases == oldSelf.databases",message="databases is immutable until database lifecycle and online resharding are implemented"
+// +kubebuilder:validation:XValidation:rule="!has(self.databases) || self.databases.map(database, has(database.shards) ? database.shards : (has(database.cells) ? size(database.cells) : self.shards)).sum() <= 65536",message="databases may contain at most 65536 total routing ranges"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.databases) ? !has(self.databases) || size(self.databases) == 0 : has(self.databases) && (self.databases == oldSelf.databases || (size(self.databases) == size(oldSelf.databases) && oldSelf.databases.all(database, !has(database.shards) && !has(database.cells)) && self.databases.all(database, has(database.shards) && has(database.cells) && database.shards == oldSelf.shards && size(database.cells) == database.shards) && oldSelf.databases.map(database, database.name) == self.databases.map(database, database.name)))",message="databases is immutable until database lifecycle and online resharding are implemented"
 type PgShardClusterSpec struct {
 	// Shards is the number of physical PostgreSQL cells in the foundation API.
 	// Each logical database maps its independently ordered hash ranges onto a
@@ -69,7 +74,7 @@ type PgShardClusterSpec struct {
 	// Databases declares immutable genesis database topologies. Database
 	// lifecycle will move to PgShardDatabase without changing this placement
 	// contract.
-	// +kubebuilder:validation:MaxItems=1024
+	// +kubebuilder:validation:MaxItems=512
 	// +listType=map
 	// +listMapKey=name
 	Databases []DatabaseTemplate `json:"databases,omitempty"`
@@ -104,6 +109,8 @@ type StorageSpec struct {
 	DeletionPolicy StorageDeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!(self.name in ['postgres', 'shardschema', 'template0', 'template1'])",message="database name is reserved by PostgreSQL or pgshard"
+// +kubebuilder:validation:XValidation:rule="self == oldSelf || (!has(oldSelf.shards) && !has(oldSelf.cells) && has(self.shards) && has(self.cells) && self.shards == size(self.cells) && self.cells.all(cell, cell == self.cells.indexOf(cell)))",message="database topology is immutable except for exact materialization of legacy defaults"
 type DatabaseTemplate struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
@@ -133,7 +140,7 @@ func (database DatabaseTemplate) ResolvedShardCount(clusterCells int32) int32 {
 	if database.Shards != 0 {
 		return database.Shards
 	}
-	if len(database.Cells) != 0 {
+	if database.Cells != nil {
 		return int32(len(database.Cells))
 	}
 	return clusterCells
@@ -142,7 +149,7 @@ func (database DatabaseTemplate) ResolvedShardCount(clusterCells int32) int32 {
 // ResolvedCells returns an owned copy of the exact physical-cell placement
 // after applying the admission default contract.
 func (database DatabaseTemplate) ResolvedCells(clusterCells int32) []int32 {
-	if len(database.Cells) != 0 {
+	if database.Cells != nil {
 		return append([]int32(nil), database.Cells...)
 	}
 	count := database.ResolvedShardCount(clusterCells)

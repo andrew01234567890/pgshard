@@ -137,6 +137,43 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	}
 }
 
+func TestMaximumDatabaseTopologyFitsKubernetesConfigMaps(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.Shards = pgshardv1alpha1.MaximumShards
+	cluster.Spec.Databases = make([]pgshardv1alpha1.DatabaseTemplate, pgshardv1alpha1.MaximumDatabases)
+	for index := range cluster.Spec.Databases {
+		cluster.Spec.Databases[index] = pgshardv1alpha1.DatabaseTemplate{
+			Name:   fmt.Sprintf("db-%04d-%s", index, strings.Repeat("x", 55)),
+			Shards: pgshardv1alpha1.MaximumShards,
+		}
+	}
+
+	configuration, err := cluster.ResolvedPostgreSQLConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgresqlData := renderPostgreSQLConfiguration(configuration)
+	postgresqlData[databaseGenesisKey] = renderDatabaseGenesisSQL(cluster)
+	topology, err := renderTopology(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := []*corev1.ConfigMap{
+		immutableConfigMap(cluster, PostgreSQLConfigMapName(cluster.Name, configMapDataHash(postgresqlData)), postgresqlData),
+		configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": topology}),
+	}
+	for _, object := range objects {
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(encoded) >= 1024*1024 {
+			t.Fatalf("maximum valid ConfigMap %s serializes to %d bytes", object.Name, len(encoded))
+		}
+	}
+}
+
 func TestTopologyDocumentKeepsIndependentDatabasePlacements(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()

@@ -57,7 +57,7 @@ func (*PgShardClusterDefaulter) Default(_ context.Context, cluster *PgShardClust
 		if database.Shards == 0 {
 			database.Shards = database.ResolvedShardCount(cluster.Spec.Shards)
 		}
-		if len(database.Cells) == 0 {
+		if database.Cells == nil {
 			database.Cells = database.ResolvedCells(cluster.Spec.Shards)
 		}
 	}
@@ -413,16 +413,21 @@ func validateScaling(scaling PoolerScaling, path *field.Path) (int32, field.Erro
 }
 
 func validateDatabases(databases []DatabaseTemplate, clusterCells int32, path *field.Path) field.ErrorList {
+	var errs field.ErrorList
 	if len(databases) > MaximumDatabases {
-		return field.ErrorList{field.TooMany(path, len(databases), MaximumDatabases)}
+		errs = append(errs, field.TooMany(path, len(databases), MaximumDatabases))
 	}
 	seen := make(map[string]struct{}, len(databases))
-	var errs field.ErrorList
+	var totalRoutingRanges int64
 	for i, database := range databases {
 		itemPath := path.Index(i)
 		namePath := itemPath.Child("name")
 		if messages := validation.IsDNS1123Label(database.Name); len(messages) != 0 {
 			errs = append(errs, field.Invalid(namePath, database.Name, messages[0]))
+		}
+		switch database.Name {
+		case "postgres", "shardschema", "template0", "template1":
+			errs = append(errs, field.Invalid(namePath, database.Name, "is reserved by PostgreSQL or pgshard"))
 		}
 		if _, exists := seen[database.Name]; exists {
 			errs = append(errs, field.Duplicate(namePath, database.Name))
@@ -431,6 +436,9 @@ func validateDatabases(databases []DatabaseTemplate, clusterCells int32, path *f
 
 		shards := database.ResolvedShardCount(clusterCells)
 		cells := database.ResolvedCells(clusterCells)
+		if shards > 0 {
+			totalRoutingRanges += int64(shards)
+		}
 		if shards < 1 || shards > MaximumShards {
 			errs = append(errs, field.Invalid(itemPath.Child("shards"), database.Shards, fmt.Sprintf("must resolve to between 1 and %d logical shards", MaximumShards)))
 		}
@@ -451,6 +459,9 @@ func validateDatabases(databases []DatabaseTemplate, clusterCells int32, path *f
 			}
 			seenCells[cell] = struct{}{}
 		}
+	}
+	if totalRoutingRanges > MaximumTotalRoutingRanges {
+		errs = append(errs, field.TooMany(path, int(totalRoutingRanges), MaximumTotalRoutingRanges))
 	}
 	return errs
 }

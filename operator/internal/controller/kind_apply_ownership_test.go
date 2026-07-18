@@ -99,6 +99,57 @@ func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
 		}
 	}
 
+	legacyDatabases := transition.DeepCopy()
+	legacyDatabases.Name = "crd-legacy-database-defaults"
+	legacyDatabases.ResourceVersion = ""
+	legacyDatabases.UID = ""
+	legacyDatabases.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{{Name: "app"}}
+	if err := kubeClient.Create(ctx, legacyDatabases); err != nil {
+		t.Fatal(err)
+	}
+	storedLegacyDatabases := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(legacyDatabases), storedLegacyDatabases); err != nil {
+		t.Fatal(err)
+	}
+	legacyBefore := storedLegacyDatabases.DeepCopy()
+	storedLegacyDatabases.Spec.Databases[0].Shards = 2
+	storedLegacyDatabases.Spec.Databases[0].Cells = []int32{0, 1}
+	if err := kubeClient.Patch(ctx, storedLegacyDatabases, client.MergeFrom(legacyBefore)); err != nil {
+		t.Fatalf("CRD rejected equivalent materialization of legacy database defaults: %v", err)
+	}
+	changedPlacementBefore := storedLegacyDatabases.DeepCopy()
+	storedLegacyDatabases.Spec.Databases[0].Cells = []int32{1, 0}
+	if err := kubeClient.Patch(ctx, storedLegacyDatabases, client.MergeFrom(changedPlacementBefore)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "databases is immutable") {
+		t.Fatalf("CRD admitted a database placement change after default materialization: %v", err)
+	}
+
+	for index, reserved := range []string{"postgres", "shardschema", "template0", "template1"} {
+		candidate := transition.DeepCopy()
+		candidate.Name = fmt.Sprintf("crd-reserved-database-%d", index)
+		candidate.ResourceVersion = ""
+		candidate.UID = ""
+		candidate.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{{Name: reserved, Shards: 1, Cells: []int32{0}}}
+		if err := kubeClient.Create(ctx, candidate); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("CRD admitted reserved database name %q without a webhook: %v", reserved, err)
+		}
+	}
+
+	overflow := transition.DeepCopy()
+	overflow.Name = "crd-routing-range-overflow"
+	overflow.ResourceVersion = ""
+	overflow.UID = ""
+	overflow.Spec.Shards = pgshardv1alpha1.MaximumShards
+	overflow.Spec.Databases = make([]pgshardv1alpha1.DatabaseTemplate, pgshardv1alpha1.MaximumTotalRoutingRanges/pgshardv1alpha1.MaximumShards+1)
+	for index := range overflow.Spec.Databases {
+		overflow.Spec.Databases[index] = pgshardv1alpha1.DatabaseTemplate{
+			Name:   fmt.Sprintf("db-%04d", index),
+			Shards: pgshardv1alpha1.MaximumShards,
+		}
+	}
+	if err := kubeClient.Create(ctx, overflow); err == nil || !apierrors.IsInvalid(err) || (!strings.Contains(err.Error(), "at most 512") && !strings.Contains(err.Error(), "65536")) {
+		t.Fatalf("CRD admitted too many total routing ranges without a webhook: %v", err)
+	}
+
 	absentClass := transition.DeepCopy()
 	absentClass.Name = "crd-transition-absent-class"
 	absentClass.ResourceVersion = ""

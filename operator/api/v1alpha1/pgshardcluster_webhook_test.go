@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -113,6 +114,62 @@ func TestDatabaseTopologyDefaultsAreExplicitAndDeterministic(t *testing.T) {
 	}
 	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
 		t.Fatalf("defaulted topology was rejected: %v", err)
+	}
+}
+
+func TestDatabaseTopologyDefaultingPreservesExplicitEmptyCellsForValidation(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Spec.Databases = []DatabaseTemplate{{
+		Name: "app", Shards: 1, Cells: []int32{},
+	}}
+	if err := (&PgShardClusterDefaulter{}).Default(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if cluster.Spec.Databases[0].Cells == nil || len(cluster.Spec.Databases[0].Cells) != 0 {
+		t.Fatalf("explicit empty cells were defaulted: %#v", cluster.Spec.Databases[0].Cells)
+	}
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "cells") {
+		t.Fatalf("explicit empty cells were admitted: %v", err)
+	}
+}
+
+func TestDatabaseTopologyValidationRejectsReservedNames(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"postgres", "shardschema", "template0", "template1"} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			cluster.Spec.Databases = []DatabaseTemplate{{Name: name, Shards: 1, Cells: []int32{0}}}
+			if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("reserved database name was admitted: %v", err)
+			}
+		})
+	}
+}
+
+func TestDatabaseTopologyValidationBoundsTotalRoutingRanges(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Spec.Shards = MaximumShards
+	cluster.Spec.Databases = make([]DatabaseTemplate, MaximumTotalRoutingRanges/MaximumShards)
+	for index := range cluster.Spec.Databases {
+		cluster.Spec.Databases[index] = DatabaseTemplate{
+			Name:   fmt.Sprintf("db-%04d", index),
+			Shards: MaximumShards,
+		}
+	}
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
+		t.Fatalf("maximum total routing range count was rejected: %v", err)
+	}
+
+	cluster.Spec.Databases = append(cluster.Spec.Databases, DatabaseTemplate{
+		Name:   "one-too-many",
+		Shards: MaximumShards,
+	})
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "65536") {
+		t.Fatalf("excess total routing ranges were admitted: %v", err)
 	}
 }
 
