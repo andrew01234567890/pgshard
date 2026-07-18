@@ -591,6 +591,14 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, object := range legacyPlan {
+		_, writableLease := object.(*coordinationv1.Lease)
+		component := object.GetLabels()[owned.ComponentLabel]
+		if (writableLease && component == "postgresql") || component == "postgresql-agent" {
+			// These resources were introduced after the pre-SSA controller
+			// represented by this fixture. Let reconciliation create their
+			// canonical metadata instead of fabricating legacy incarnations.
+			continue
+		}
 		// The pre-SSA controller created desired objects without a field owner or
 		// migration marker. Recreate that exact upgrade boundary against the API.
 		removeApplyOwnershipMarker(object)
@@ -688,6 +696,14 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	}
 	if _, err := reconciler.Reconcile(ctx, legacyRequest); err != nil {
 		t.Fatal(err)
+	}
+	for shard := int32(0); shard < legacy.Spec.Shards; shard++ {
+		lease := &coordinationv1.Lease{}
+		key := types.NamespacedName{Namespace: legacy.Namespace, Name: owned.PostgreSQLWritableLeaseName(legacy.Name, shard)}
+		if err := kubeClient.Get(ctx, key, lease); err != nil {
+			t.Fatalf("get upgraded writable-term Lease %s: %v", key, err)
+		}
+		assertApplyOwner(t, lease)
 	}
 
 	if err := kubeClient.Get(ctx, legacyConfigurationKey, legacyConfiguration); err != nil {
