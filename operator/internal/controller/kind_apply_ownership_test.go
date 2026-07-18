@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -71,6 +72,29 @@ func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
 	if err := kubeClient.Create(ctx, transition); err != nil {
 		t.Fatal(err)
 	}
+	legacyStatus := transition.DeepCopy()
+	legacyStatus.Name = "crd-legacy-bootstrap-status"
+	legacyStatus.ResourceVersion = ""
+	legacyStatus.UID = ""
+	legacyStatus.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{{Name: "legacy", Shards: 1, Cells: []int32{0}}}
+	if err := kubeClient.Create(ctx, legacyStatus); err != nil {
+		t.Fatal(err)
+	}
+	legacyStatus.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
+		Shards:           legacyStatus.Spec.Shards,
+		MembersPerShard:  legacyStatus.Spec.MembersPerShard,
+		Durability:       legacyStatus.Spec.Durability,
+		StorageSize:      legacyStatus.Spec.Storage.Size.String(),
+		StorageClassName: legacyStatus.Spec.Storage.StorageClassName,
+		DeletionPolicy:   legacyStatus.Spec.Storage.DeletionPolicy,
+	}
+	if err := kubeClient.Status().Update(ctx, legacyStatus); err != nil {
+		t.Fatalf("CRD rejected a status written before database topology digests: %v", err)
+	}
+	legacyStatus.Status.PostgreSQLBootstrapSpec.DatabaseTopologySHA256 = "invalid"
+	if err := kubeClient.Status().Update(ctx, legacyStatus); err == nil || !apierrors.IsInvalid(err) {
+		t.Fatalf("CRD admitted malformed database topology digest: %v", err)
+	}
 	for name, mutate := range map[string]func(*pgshardv1alpha1.PgShardCluster){
 		"shards":          func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.Shards++ },
 		"membersPerShard": func(cluster *pgshardv1alpha1.PgShardCluster) { cluster.Spec.MembersPerShard = 5 },
@@ -86,6 +110,9 @@ func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
 		"deletion policy": func(cluster *pgshardv1alpha1.PgShardCluster) {
 			cluster.Spec.Storage.DeletionPolicy = pgshardv1alpha1.DeletionDelete
 		},
+		"database added": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{{Name: "added", Shards: 1, Cells: []int32{0}}}
+		},
 	} {
 		current := &pgshardv1alpha1.PgShardCluster{}
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(transition), current); err != nil {
@@ -96,6 +123,112 @@ func TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks(t *testing.T) {
 		if err := kubeClient.Patch(ctx, current, client.MergeFrom(before)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
 			t.Fatalf("CRD admitted %s without any admission webhook installed: %v", name, err)
 		}
+	}
+
+	legacyDatabases := transition.DeepCopy()
+	legacyDatabases.Name = "crd-legacy-database-defaults"
+	legacyDatabases.ResourceVersion = ""
+	legacyDatabases.UID = ""
+	legacyDatabases.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{
+		{Name: "legacy"},
+		{Name: "explicit", Shards: 1, Cells: []int32{0}},
+	}
+	if err := kubeClient.Create(ctx, legacyDatabases); err != nil {
+		t.Fatal(err)
+	}
+	storedLegacyDatabases := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(legacyDatabases), storedLegacyDatabases); err != nil {
+		t.Fatal(err)
+	}
+	legacyBefore := storedLegacyDatabases.DeepCopy()
+	storedLegacyDatabases.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{
+		{Name: "explicit", Shards: 1, Cells: []int32{0}},
+		{Name: "legacy", Shards: 2, Cells: []int32{0, 1}},
+	}
+	if err := kubeClient.Patch(ctx, storedLegacyDatabases, client.MergeFrom(legacyBefore)); err != nil {
+		t.Fatalf("CRD rejected reordered map items with equivalent legacy default materialization: %v", err)
+	}
+	materializedLegacyDatabases := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(legacyDatabases), materializedLegacyDatabases); err != nil {
+		t.Fatal(err)
+	}
+	changedPlacementBefore := materializedLegacyDatabases.DeepCopy()
+	for index := range materializedLegacyDatabases.Spec.Databases {
+		if materializedLegacyDatabases.Spec.Databases[index].Name == "legacy" {
+			materializedLegacyDatabases.Spec.Databases[index].Cells = []int32{1, 0}
+		}
+	}
+	if err := kubeClient.Patch(ctx, materializedLegacyDatabases, client.MergeFrom(changedPlacementBefore)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "database topology is immutable") {
+		t.Fatalf("CRD admitted a database placement change after default materialization: %v", err)
+	}
+	for name, mutate := range map[string]func(*pgshardv1alpha1.PgShardCluster){
+		"add": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.Databases = append(cluster.Spec.Databases, pgshardv1alpha1.DatabaseTemplate{Name: "added", Shards: 1, Cells: []int32{0}})
+		},
+		"remove": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.Databases = cluster.Spec.Databases[1:]
+		},
+		"rename": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Spec.Databases[0].Name = "renamed"
+		},
+		"shard count": func(cluster *pgshardv1alpha1.PgShardCluster) {
+			for index := range cluster.Spec.Databases {
+				if cluster.Spec.Databases[index].Name == "legacy" {
+					cluster.Spec.Databases[index].Shards = 1
+					cluster.Spec.Databases[index].Cells = []int32{0}
+					return
+				}
+			}
+			t.Fatal("materialized legacy database is missing")
+		},
+	} {
+		current := &pgshardv1alpha1.PgShardCluster{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(legacyDatabases), current); err != nil {
+			t.Fatal(err)
+		}
+		before := current.DeepCopy()
+		mutate(current)
+		if err := kubeClient.Patch(ctx, current, client.MergeFrom(before)); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "immutable") {
+			t.Fatalf("CRD admitted database %s transition without webhooks: %v", name, err)
+		}
+	}
+
+	for index, reserved := range []string{"postgres", "shardschema", "template0", "template1"} {
+		candidate := transition.DeepCopy()
+		candidate.Name = fmt.Sprintf("crd-reserved-database-%d", index)
+		candidate.ResourceVersion = ""
+		candidate.UID = ""
+		candidate.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{{Name: reserved, Shards: 1, Cells: []int32{0}}}
+		if err := kubeClient.Create(ctx, candidate); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("CRD admitted reserved database name %q without a webhook: %v", reserved, err)
+		}
+	}
+
+	maximumTopology := transition.DeepCopy()
+	maximumTopology.Name = "crd-maximum-routing-ranges"
+	maximumTopology.ResourceVersion = ""
+	maximumTopology.UID = ""
+	maximumTopology.Spec.Shards = pgshardv1alpha1.MaximumShards
+	maximumTopology.Spec.Databases = make([]pgshardv1alpha1.DatabaseTemplate, pgshardv1alpha1.MaximumDatabases)
+	for index := range maximumTopology.Spec.Databases {
+		maximumTopology.Spec.Databases[index] = pgshardv1alpha1.DatabaseTemplate{
+			Name:   fmt.Sprintf("db-%04d", index),
+			Shards: pgshardv1alpha1.MaximumShards,
+		}
+	}
+	if err := kubeClient.Create(ctx, maximumTopology); err != nil {
+		t.Fatalf("CRD rejected the structural maximum of %d routing ranges: %v", pgshardv1alpha1.MaximumTotalRoutingRanges, err)
+	}
+	overflow := maximumTopology.DeepCopy()
+	overflow.Name = "crd-routing-range-overflow"
+	overflow.ResourceVersion = ""
+	overflow.UID = ""
+	overflow.Spec.Databases = append(overflow.Spec.Databases, pgshardv1alpha1.DatabaseTemplate{
+		Name:   "one-too-many",
+		Shards: pgshardv1alpha1.MaximumShards,
+	})
+	if err := kubeClient.Create(ctx, overflow); err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "at most 512") {
+		t.Fatalf("CRD admitted more than the structural maximum routing ranges without a webhook: %v", err)
 	}
 
 	absentClass := transition.DeepCopy()
@@ -355,7 +488,7 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertApplyOwner(t, configuration)
-	if len(configuration.Data) != 11 || !strings.Contains(configuration.Data["postgresql.conf"], "log_statement = ddl\n") {
+	if !maps.Equal(configuration.Data, desiredConfiguration.Data) {
 		t.Fatalf("new PostgreSQL configuration was not published: %#v", configuration.Data)
 	}
 	// This test uses the deliberately unimplemented multi-member path, so no

@@ -4571,6 +4571,218 @@ BEGIN
 END
 $function$;
 
+CREATE OR REPLACE FUNCTION pgshard_catalog.install_database_genesis(
+    target_database_name pgshard_catalog.sql_identifier,
+    target_cell_ordinals bigint[]
+)
+RETURNS TABLE(
+    logical_database_id uuid,
+    routing_epoch bigint,
+    installed boolean
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    cell_count bigint;
+    observed_database_id uuid;
+    observed_database_state text;
+    observed_routing_epoch bigint;
+    observed_catalog_epoch bigint;
+BEGIN
+    IF target_database_name::text IN ('postgres', 'shardschema', 'template0', 'template1') THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'logical database name is reserved';
+    END IF;
+
+    cell_count := pg_catalog.cardinality(target_cell_ordinals);
+    IF target_cell_ordinals IS NULL OR cell_count NOT BETWEEN 1 AND 128 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'logical database genesis requires between 1 and 128 cells';
+    END IF;
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.unnest(target_cell_ordinals) AS cells(cell_ordinal)
+         WHERE cells.cell_ordinal IS NULL
+            OR cells.cell_ordinal NOT BETWEEN 0 AND 4294967295
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'logical database genesis contains an invalid cell ordinal';
+    END IF;
+    IF EXISTS (
+        SELECT cells.cell_ordinal
+          FROM pg_catalog.unnest(target_cell_ordinals) AS cells(cell_ordinal)
+         GROUP BY cells.cell_ordinal
+        HAVING pg_catalog.count(*) <> 1
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'logical database genesis contains a duplicate cell ordinal';
+    END IF;
+
+    -- Serialize with every catalog mutation before reading either the physical
+    -- cell inventory or the database name. This gives retries one exact view
+    -- and follows the catalog-state-before-target lock order used elsewhere.
+    SELECT state.catalog_epoch
+      INTO STRICT observed_catalog_epoch
+      FROM pgshard_catalog.cluster_state AS state
+     WHERE state.singleton
+     FOR UPDATE;
+
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.unnest(target_cell_ordinals) AS cells(cell_ordinal)
+          LEFT JOIN pgshard_catalog.shards AS shards
+            ON shards.shard_number = cells.cell_ordinal
+           AND shards.state = 'active'
+         WHERE shards.shard_id IS NULL
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'logical database genesis references an unavailable cell';
+    END IF;
+
+    SELECT databases.logical_database_id, databases.state
+      INTO observed_database_id, observed_database_state
+      FROM pgshard_catalog.logical_databases AS databases
+     WHERE databases.database_name = target_database_name
+     FOR NO KEY UPDATE;
+
+    IF observed_database_id IS NOT NULL THEN
+        IF observed_database_state <> 'active' THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'logical database genesis identity is not active';
+        END IF;
+
+        SELECT active.routing_epoch
+          INTO observed_routing_epoch
+          FROM pgshard_catalog.active_routing_epochs AS active
+          JOIN pgshard_catalog.routing_epochs AS epochs
+            ON epochs.routing_epoch = active.routing_epoch
+           AND epochs.logical_database_id = active.logical_database_id
+           AND epochs.state = 'active'
+         WHERE active.logical_database_id = observed_database_id
+           AND NOT EXISTS (
+               SELECT
+                 FROM pgshard_catalog.routing_epochs AS competing_epochs
+                WHERE competing_epochs.logical_database_id = observed_database_id
+                  AND competing_epochs.state = 'active'
+                  AND competing_epochs.routing_epoch <> active.routing_epoch
+           )
+         FOR KEY SHARE OF active, epochs;
+        IF observed_routing_epoch IS NULL THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'logical database genesis does not reference exactly one owned active routing epoch';
+        END IF;
+
+        IF EXISTS (
+            WITH expected AS (
+                SELECT cells.ordinality::bigint AS range_ordinal,
+                       pg_catalog.floor(
+                           ((cells.ordinality - 1)::numeric * 18446744073709551616)
+                           / cell_count
+                       ) AS range_start,
+                       pg_catalog.floor(
+                           (cells.ordinality::numeric * 18446744073709551616)
+                           / cell_count
+                       ) AS range_end,
+                       shards.shard_id
+                  FROM pg_catalog.unnest(target_cell_ordinals)
+                           WITH ORDINALITY AS cells(cell_ordinal, ordinality)
+                  JOIN pgshard_catalog.shards AS shards
+                    ON shards.shard_number = cells.cell_ordinal
+            ),
+            actual AS (
+                SELECT pg_catalog.row_number() OVER (
+                           ORDER BY ranges.range_start, ranges.range_end
+                       )::bigint AS range_ordinal,
+                       ranges.range_start,
+                       ranges.range_end,
+                       ranges.shard_id
+                  FROM pgshard_catalog.routing_ranges AS ranges
+                 WHERE ranges.routing_epoch = observed_routing_epoch
+            )
+            SELECT
+              FROM expected
+              FULL JOIN actual USING (range_ordinal)
+             WHERE expected.range_start IS DISTINCT FROM actual.range_start
+                OR expected.range_end IS DISTINCT FROM actual.range_end
+                OR expected.shard_id IS DISTINCT FROM actual.shard_id
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22023',
+                MESSAGE = 'logical database genesis topology does not match active routing';
+        END IF;
+
+        logical_database_id := observed_database_id;
+        routing_epoch := observed_routing_epoch;
+        installed := false;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    INSERT INTO pgshard_catalog.logical_databases(database_name)
+    VALUES (target_database_name)
+    RETURNING logical_databases.logical_database_id
+         INTO observed_database_id;
+
+    INSERT INTO pgshard_catalog.routing_epochs(logical_database_id)
+    VALUES (observed_database_id)
+    RETURNING routing_epochs.routing_epoch
+         INTO observed_routing_epoch;
+
+    INSERT INTO pgshard_catalog.routing_ranges(
+        routing_epoch,
+        range_start,
+        range_end,
+        shard_id
+    )
+    SELECT observed_routing_epoch,
+           pg_catalog.floor(
+               ((cells.ordinality - 1)::numeric * 18446744073709551616)
+               / cell_count
+           ),
+           pg_catalog.floor(
+               (cells.ordinality::numeric * 18446744073709551616)
+               / cell_count
+           ),
+           shards.shard_id
+      FROM pg_catalog.unnest(target_cell_ordinals)
+               WITH ORDINALITY AS cells(cell_ordinal, ordinality)
+      JOIN pgshard_catalog.shards AS shards
+        ON shards.shard_number = cells.cell_ordinal
+     ORDER BY cells.ordinality;
+
+    SELECT state.catalog_epoch
+      INTO STRICT observed_catalog_epoch
+      FROM pgshard_catalog.cluster_state AS state
+     WHERE state.singleton;
+    PERFORM pgshard_catalog.activate_routing_epoch(
+        observed_database_id,
+        observed_routing_epoch,
+        NULL,
+        observed_catalog_epoch
+    );
+
+    logical_database_id := observed_database_id;
+    routing_epoch := observed_routing_epoch;
+    installed := true;
+    RETURN NEXT;
+END
+$function$;
+
+COMMENT ON FUNCTION pgshard_catalog.install_database_genesis(
+    pgshard_catalog.sql_identifier,
+    bigint[]
+) IS
+    'Idempotently installs one immutable genesis database topology or rejects a conflicting retry.';
+
 DROP TRIGGER IF EXISTS cluster_configuration_immutable ON pgshard_catalog.cluster_configuration;
 CREATE TRIGGER cluster_configuration_immutable
 BEFORE UPDATE OR DELETE ON pgshard_catalog.cluster_configuration
@@ -4829,6 +5041,10 @@ GRANT EXECUTE ON FUNCTION pgshard_catalog.begin_slot_sync_probe_retirement(uuid,
     TO pgshard_catalog_admin;
 GRANT EXECUTE ON FUNCTION pgshard_catalog.complete_slot_sync_probe_retirement(
     uuid, text, uuid, uuid
+) TO pgshard_catalog_admin;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.install_database_genesis(
+    pgshard_catalog.sql_identifier,
+    bigint[]
 ) TO pgshard_catalog_admin;
 
 GRANT INSERT (database_name) ON pgshard_catalog.logical_databases TO pgshard_catalog_admin;

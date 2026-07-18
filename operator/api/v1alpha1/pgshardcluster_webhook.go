@@ -52,6 +52,15 @@ func (*PgShardClusterDefaulter) Default(_ context.Context, cluster *PgShardClust
 		enabled := true
 		cluster.Spec.Observability.Prometheus = &enabled
 	}
+	for index := range cluster.Spec.Databases {
+		database := &cluster.Spec.Databases[index]
+		if database.Shards == 0 {
+			database.Shards = database.ResolvedShardCount(cluster.Spec.Shards)
+		}
+		if database.Cells == nil {
+			database.Cells = database.ResolvedCells(cluster.Spec.Shards)
+		}
+	}
 	return nil
 }
 
@@ -130,6 +139,9 @@ func (v *PgShardClusterValidator) ValidateUpdate(ctx context.Context, oldCluster
 	}
 	if oldCluster.Spec.Durability != newCluster.Spec.Durability {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "durability"), newCluster.Spec.Durability, "durability is immutable until replication-mode transitions are implemented"))
+	}
+	if !databaseTemplatesEqual(oldCluster.Spec.Databases, newCluster.Spec.Databases, oldCluster.Spec.Shards, newCluster.Spec.Shards) {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "databases"), newCluster.Spec.Databases, "databases is immutable until database lifecycle and online resharding are implemented"))
 	}
 	if !equalOptionalString(oldCluster.Spec.Storage.StorageClassName, newCluster.Spec.Storage.StorageClassName) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "storage", "storageClassName"), newCluster.Spec.Storage.StorageClassName, "storage class is immutable after cluster creation"))
@@ -252,7 +264,7 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 		}
 	}
 
-	allErrs = append(allErrs, validateDatabases(cluster.Spec.Databases, specPath.Child("databases"))...)
+	allErrs = append(allErrs, validateDatabases(cluster.Spec.Databases, cluster.Spec.Shards, specPath.Child("databases"))...)
 	allErrs = append(allErrs, validateServices(cluster.Spec.Services, specPath.Child("services"))...)
 	allErrs = append(allErrs, validateBackup(cluster.Spec.Backup, specPath.Child("backup"))...)
 	if cluster.Spec.Observability.ServiceMonitor && cluster.Spec.Observability.Prometheus != nil && !*cluster.Spec.Observability.Prometheus {
@@ -332,6 +344,9 @@ func ValidateOpenTelemetryEndpoint(value string) error {
 // ValidateCredentialFreeHTTPSEndpoint accepts only a concrete HTTP(S) origin
 // or path and rejects URL components commonly abused to embed credentials.
 func ValidateCredentialFreeHTTPSEndpoint(value string) error {
+	if len(value) > MaximumEndpointLength {
+		return fmt.Errorf("must not exceed %d bytes", MaximumEndpointLength)
+	}
 	if strings.TrimSpace(value) != value {
 		return fmt.Errorf("must not contain surrounding whitespace")
 	}
@@ -400,20 +415,85 @@ func validateScaling(scaling PoolerScaling, path *field.Path) (int32, field.Erro
 	}
 }
 
-func validateDatabases(databases []DatabaseTemplate, path *field.Path) field.ErrorList {
-	seen := make(map[string]struct{}, len(databases))
+func validateDatabases(databases []DatabaseTemplate, clusterCells int32, path *field.Path) field.ErrorList {
 	var errs field.ErrorList
+	if len(databases) > MaximumDatabases {
+		errs = append(errs, field.TooMany(path, len(databases), MaximumDatabases))
+	}
+	seen := make(map[string]struct{}, len(databases))
+	var totalRoutingRanges int64
 	for i, database := range databases {
-		itemPath := path.Index(i).Child("name")
+		itemPath := path.Index(i)
+		namePath := itemPath.Child("name")
 		if messages := validation.IsDNS1123Label(database.Name); len(messages) != 0 {
-			errs = append(errs, field.Invalid(itemPath, database.Name, messages[0]))
+			errs = append(errs, field.Invalid(namePath, database.Name, messages[0]))
+		}
+		switch database.Name {
+		case "postgres", "shardschema", "template0", "template1":
+			errs = append(errs, field.Invalid(namePath, database.Name, "is reserved by PostgreSQL or pgshard"))
 		}
 		if _, exists := seen[database.Name]; exists {
-			errs = append(errs, field.Duplicate(itemPath, database.Name))
+			errs = append(errs, field.Duplicate(namePath, database.Name))
 		}
 		seen[database.Name] = struct{}{}
+
+		shards := database.ResolvedShardCount(clusterCells)
+		cells := database.ResolvedCells(clusterCells)
+		if shards > 0 {
+			totalRoutingRanges += int64(shards)
+		}
+		if shards < 1 || shards > MaximumShards {
+			errs = append(errs, field.Invalid(itemPath.Child("shards"), database.Shards, fmt.Sprintf("must resolve to between 1 and %d logical shards", MaximumShards)))
+		}
+		if shards > clusterCells {
+			errs = append(errs, field.Invalid(itemPath.Child("shards"), shards, "cannot exceed the cluster's physical cell count"))
+		}
+		if len(cells) != int(shards) {
+			errs = append(errs, field.Invalid(itemPath.Child("cells"), database.Cells, "must contain exactly one physical cell for every logical shard"))
+		}
+		seenCells := make(map[int32]struct{}, len(cells))
+		for ordinal, cell := range cells {
+			cellPath := itemPath.Child("cells").Index(ordinal)
+			if cell < 0 || cell >= clusterCells {
+				errs = append(errs, field.Invalid(cellPath, cell, fmt.Sprintf("must reference a physical cell in [0,%d)", clusterCells)))
+			}
+			if _, duplicate := seenCells[cell]; duplicate {
+				errs = append(errs, field.Duplicate(cellPath, cell))
+			}
+			seenCells[cell] = struct{}{}
+		}
+	}
+	if totalRoutingRanges > MaximumTotalRoutingRanges {
+		errs = append(errs, field.TooMany(path, int(totalRoutingRanges), MaximumTotalRoutingRanges))
 	}
 	return errs
+}
+
+func databaseTemplatesEqual(left, right []DatabaseTemplate, leftCells, rightCells int32) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftByName := make(map[string]DatabaseTemplate, len(left))
+	for _, database := range left {
+		leftByName[database.Name] = database
+	}
+	for _, database := range right {
+		previous, exists := leftByName[database.Name]
+		if !exists || previous.ResolvedShardCount(leftCells) != database.ResolvedShardCount(rightCells) {
+			return false
+		}
+		previousPlacement := previous.ResolvedCells(leftCells)
+		placement := database.ResolvedCells(rightCells)
+		if len(previousPlacement) != len(placement) {
+			return false
+		}
+		for ordinal := range placement {
+			if previousPlacement[ordinal] != placement[ordinal] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func validateServices(services ServiceSet, path *field.Path) field.ErrorList {
@@ -446,20 +526,29 @@ func validateBackup(backup BackupSpec, path *field.Path) field.ErrorList {
 			return field.ErrorList{field.Required(path.Child("repository", "s3"), "required for an S3 repository")}
 		}
 		var errs field.ErrorList
+		s3Path := path.Child("repository", "s3")
 		if repository.Filesystem != nil {
 			errs = append(errs, field.Forbidden(path.Child("repository", "filesystem"), "must be absent for an S3 repository"))
 		}
 		if repository.S3.Bucket == "" {
-			errs = append(errs, field.Required(path.Child("repository", "s3", "bucket"), "must not be empty"))
+			errs = append(errs, field.Required(s3Path.Child("bucket"), "must not be empty"))
+		} else if len(repository.S3.Bucket) > MaximumS3BucketLength {
+			errs = append(errs, field.TooLong(s3Path.Child("bucket"), repository.S3.Bucket, MaximumS3BucketLength))
+		}
+		if len(repository.S3.Region) > MaximumS3RegionLength {
+			errs = append(errs, field.TooLong(s3Path.Child("region"), repository.S3.Region, MaximumS3RegionLength))
+		}
+		if len(repository.S3.Prefix) > MaximumS3PrefixLength {
+			errs = append(errs, field.TooLong(s3Path.Child("prefix"), repository.S3.Prefix, MaximumS3PrefixLength))
 		}
 		if repository.S3.CredentialsSecretRef.Name == "" {
-			errs = append(errs, field.Required(path.Child("repository", "s3", "credentialsSecretRef", "name"), "must not be empty"))
+			errs = append(errs, field.Required(s3Path.Child("credentialsSecretRef", "name"), "must not be empty"))
 		} else if err := ValidateObjectReferenceName(repository.S3.CredentialsSecretRef.Name); err != nil {
-			errs = append(errs, field.Invalid(path.Child("repository", "s3", "credentialsSecretRef", "name"), repository.S3.CredentialsSecretRef.Name, err.Error()))
+			errs = append(errs, field.Invalid(s3Path.Child("credentialsSecretRef", "name"), repository.S3.CredentialsSecretRef.Name, err.Error()))
 		}
 		if repository.S3.Endpoint != "" {
 			if err := ValidateCredentialFreeHTTPSEndpoint(repository.S3.Endpoint); err != nil {
-				errs = append(errs, field.Invalid(path.Child("repository", "s3", "endpoint"), repository.S3.Endpoint, err.Error()))
+				errs = append(errs, field.Invalid(s3Path.Child("endpoint"), repository.S3.Endpoint, err.Error()))
 			}
 		}
 		return errs

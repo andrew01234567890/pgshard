@@ -785,6 +785,8 @@ async fn assert_installation_contract(client: &Client, database_url: &str) -> Te
         epoch_after_first_migration,
         "reapplying the migration must not mutate catalog state"
     );
+    assert_database_genesis_contract(client).await?;
+    assert_concurrent_database_genesis_contract(client, database_url).await?;
     assert_legacy_catalog_owner_upgrade(client, database_url)
         .await
         .map_err(|error| format!("legacy catalog-owner upgrade: {error}"))?;
@@ -857,6 +859,463 @@ async fn assert_installation_contract(client: &Client, database_url: &str) -> Te
         .await
         .expect_err("64-byte identifiers must be rejected");
     assert_sqlstate(&error, "23514");
+    Ok(())
+}
+
+async fn assert_database_genesis_contract(client: &Client) -> TestResult {
+    client
+        .batch_execute("BEGIN; SET LOCAL ROLE pgshard_catalog_admin")
+        .await?;
+    let result: TestResult = async {
+        let fixture = install_database_genesis_fixture(client).await?;
+        assert_database_genesis_rejections(client, &fixture).await?;
+        Ok(())
+    }
+    .await;
+    let rollback = client.batch_execute("ROLLBACK").await;
+    result?;
+    rollback?;
+    Ok(())
+}
+
+struct DatabaseGenesisFixture {
+    nonce: u128,
+    first_name: String,
+    next_cell: i64,
+    catalog_epoch: i64,
+}
+
+async fn install_database_genesis_fixture(client: &Client) -> TestResult<DatabaseGenesisFixture> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let first_name = format!("genesis_a_{nonce}");
+    let second_name = format!("genesis_b_{nonce}");
+    let next_cell: i64 = client
+        .query_one(
+            "SELECT coalesce(max(shard_number), 0) + 1 FROM pgshard_catalog.shards",
+            &[],
+        )
+        .await?
+        .get(0);
+    let next_shard = format!("genesis-{nonce}");
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.shards(shard_id, shard_number) VALUES ($1::text, $2)",
+            &[&next_shard, &next_cell],
+        )
+        .await?;
+
+    let shared_cells = vec![0_i64, next_cell];
+    let installed = client
+        .query_one(
+            "SELECT logical_database_id::text, routing_epoch, installed \
+               FROM pgshard_catalog.install_database_genesis( \
+                   $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+               )",
+            &[&first_name, &shared_cells],
+        )
+        .await?;
+    let database_id: String = installed.get(0);
+    let routing_epoch: i64 = installed.get(1);
+    assert!(installed.get::<_, bool>(2));
+    let epoch_after_install = catalog_epoch(client).await?;
+    let retried = client
+        .query_one(
+            "SELECT logical_database_id::text, routing_epoch, installed \
+               FROM pgshard_catalog.install_database_genesis( \
+                   $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+               )",
+            &[&first_name, &shared_cells],
+        )
+        .await?;
+    assert_eq!(retried.get::<_, String>(0), database_id);
+    assert_eq!(retried.get::<_, i64>(1), routing_epoch);
+    assert!(!retried.get::<_, bool>(2));
+    assert_eq!(catalog_epoch(client).await?, epoch_after_install);
+
+    let dedicated_cells = vec![next_cell];
+    client
+        .query_one(
+            "SELECT installed FROM pgshard_catalog.install_database_genesis( \
+                 $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+             )",
+            &[&second_name, &dedicated_cells],
+        )
+        .await?;
+    let catalog_epoch = catalog_epoch(client).await?;
+    let placements: Vec<(String, i64)> = client
+        .query(
+            "SELECT databases.database_name::text, shards.shard_number \
+               FROM pgshard_catalog.logical_databases AS databases \
+               JOIN pgshard_catalog.active_routing_epochs AS active \
+                 ON active.logical_database_id = databases.logical_database_id \
+               JOIN pgshard_catalog.routing_ranges AS ranges \
+                 ON ranges.routing_epoch = active.routing_epoch \
+               JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id \
+              WHERE databases.database_name::text IN ($1, $2) \
+              ORDER BY databases.database_name, ranges.range_start",
+            &[&first_name, &second_name],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        placements,
+        vec![
+            (first_name.clone(), 0),
+            (first_name.clone(), next_cell),
+            (second_name, next_cell),
+        ]
+    );
+    Ok(DatabaseGenesisFixture {
+        nonce,
+        first_name,
+        next_cell,
+        catalog_epoch,
+    })
+}
+
+async fn assert_database_genesis_rejections(
+    client: &Client,
+    fixture: &DatabaseGenesisFixture,
+) -> TestResult {
+    client
+        .batch_execute("SAVEPOINT conflicting_genesis")
+        .await?;
+    let conflicting_cells = vec![fixture.next_cell, 0_i64];
+    let error = client
+        .query_one(
+            "SELECT * FROM pgshard_catalog.install_database_genesis( \
+                 $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+             )",
+            &[&fixture.first_name, &conflicting_cells],
+        )
+        .await
+        .expect_err("a conflicting database topology must fail closed");
+    assert_sqlstate(&error, "22023");
+    assert_database_message(
+        &error,
+        "logical database genesis topology does not match active routing",
+    );
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT conflicting_genesis")
+        .await?;
+    assert_eq!(catalog_epoch(client).await?, fixture.catalog_epoch);
+
+    client.batch_execute("SAVEPOINT duplicate_cells").await?;
+    let duplicate_cells = vec![0_i64, 0_i64];
+    let duplicate_name = format!("genesis_duplicate_{}", fixture.nonce);
+    let error = client
+        .query_one(
+            "SELECT * FROM pgshard_catalog.install_database_genesis( \
+                 $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+             )",
+            &[&duplicate_name, &duplicate_cells],
+        )
+        .await
+        .expect_err("duplicate cell placement must fail closed");
+    assert_sqlstate(&error, "22023");
+    assert_database_message(
+        &error,
+        "logical database genesis contains a duplicate cell ordinal",
+    );
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT duplicate_cells")
+        .await?;
+
+    client.batch_execute("SAVEPOINT unavailable_cell").await?;
+    let unavailable_name = format!("genesis_unavailable_{}", fixture.nonce);
+    let unavailable_cells = vec![fixture.next_cell + 1];
+    let error = client
+        .query_one(
+            "SELECT * FROM pgshard_catalog.install_database_genesis( \
+                 $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+             )",
+            &[&unavailable_name, &unavailable_cells],
+        )
+        .await
+        .expect_err("unavailable cell placement must fail closed");
+    assert_sqlstate(&error, "22023");
+    assert_database_message(
+        &error,
+        "logical database genesis references an unavailable cell",
+    );
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT unavailable_cell")
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct GenesisOutcome {
+    database_id: String,
+    routing_epoch: i64,
+    installed: bool,
+}
+
+async fn race_database_genesis(
+    database_url: &str,
+    database_name: &str,
+    left_cells: Vec<i64>,
+    right_cells: Vec<i64>,
+) -> TestResult<(
+    Result<GenesisOutcome, PgError>,
+    Result<GenesisOutcome, PgError>,
+)> {
+    let (left_client, left_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (right_client, right_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (observer, observer_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connections = [
+        tokio::spawn(left_connection),
+        tokio::spawn(right_connection),
+        tokio::spawn(observer_connection),
+    ];
+
+    left_client.batch_execute("BEGIN").await?;
+    let left = left_client
+        .query_one(
+            "SELECT logical_database_id::text, routing_epoch, installed \
+               FROM pgshard_catalog.install_database_genesis( \
+                   $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+               )",
+            &[&database_name, &left_cells],
+        )
+        .await
+        .map(|row| GenesisOutcome {
+            database_id: row.get(0),
+            routing_epoch: row.get(1),
+            installed: row.get(2),
+        })?;
+    let right_pid: i32 = right_client
+        .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    let right_name = database_name.to_owned();
+    let right = tokio::spawn(async move {
+        right_client
+            .query_one(
+                "SELECT logical_database_id::text, routing_epoch, installed \
+                   FROM pgshard_catalog.install_database_genesis( \
+                       $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+                   )",
+                &[&right_name, &right_cells],
+            )
+            .await
+            .map(|row| GenesisOutcome {
+                database_id: row.get(0),
+                routing_epoch: row.get(1),
+                installed: row.get(2),
+            })
+    });
+
+    if !wait_for_backend_lock(&observer, right_pid).await? {
+        left_client.batch_execute("ROLLBACK").await?;
+        right.abort();
+        for connection in connections {
+            connection.abort();
+        }
+        return Err("concurrent genesis call did not wait for the catalog transaction lock".into());
+    }
+
+    left_client.batch_execute("COMMIT").await?;
+    let right = right.await?;
+    for connection in connections {
+        connection.abort();
+    }
+    Ok((Ok(left), right))
+}
+
+async fn assert_concurrent_database_genesis_contract(
+    client: &Client,
+    database_url: &str,
+) -> TestResult {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let identical_name = format!("genesis_same_{nonce}");
+    let (left, right) =
+        race_database_genesis(database_url, &identical_name, vec![0_i64], vec![0_i64]).await?;
+    let mut identical = [left?, right?];
+    identical.sort_by_key(|outcome| outcome.installed);
+    assert!(!identical[0].installed);
+    assert!(identical[1].installed);
+    assert_eq!(identical[0].database_id, identical[1].database_id);
+    assert_eq!(identical[0].routing_epoch, identical[1].routing_epoch);
+
+    let next_cell: i64 = client
+        .query_one(
+            "SELECT coalesce(max(shard_number), 0) + 1 FROM pgshard_catalog.shards",
+            &[],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.shards(shard_id, shard_number) VALUES ($1::text, $2)",
+            &[&format!("genesis-race-{nonce}"), &next_cell],
+        )
+        .await?;
+    let conflicting_name = format!("genesis_conflict_{nonce}");
+    let sequence_before: i64 = client
+        .query_one(
+            "SELECT last_value FROM pgshard_catalog.routing_epochs_routing_epoch_seq",
+            &[],
+        )
+        .await?
+        .get(0);
+    let (left, right) = race_database_genesis(
+        database_url,
+        &conflicting_name,
+        vec![0_i64, next_cell],
+        vec![next_cell, 0_i64],
+    )
+    .await?;
+    let winner = match (left, right) {
+        (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => {
+            assert!(winner.installed);
+            assert_sqlstate(&loser, "22023");
+            assert_database_message(
+                &loser,
+                "logical database genesis topology does not match active routing",
+            );
+            winner
+        }
+        (left, right) => {
+            return Err(format!("conflicting genesis race outcomes: {left:?}, {right:?}").into());
+        }
+    };
+    let sequence_after: i64 = client
+        .query_one(
+            "SELECT last_value FROM pgshard_catalog.routing_epochs_routing_epoch_seq",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        sequence_after,
+        sequence_before + 1,
+        "conflicting loser consumed a routing identity"
+    );
+    let durable: (i64, i64) = client
+        .query_one(
+            "SELECT pg_catalog.count(*), min(active.routing_epoch) \
+               FROM pgshard_catalog.logical_databases AS databases \
+               JOIN pgshard_catalog.active_routing_epochs AS active \
+                 ON active.logical_database_id = databases.logical_database_id \
+              WHERE databases.database_name = $1::text",
+            &[&conflicting_name],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))?;
+    assert_eq!(durable, (1, winner.routing_epoch));
+    assert_genesis_stage_activation_lock_order(client, database_url).await
+}
+
+async fn assert_genesis_stage_activation_lock_order(
+    client: &Client,
+    database_url: &str,
+) -> TestResult {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let database_name = format!("genesis_lock_order_{nonce}");
+    let installed = client
+        .query_one(
+            "SELECT logical_database_id::text, routing_epoch, installed \
+               FROM pgshard_catalog.install_database_genesis( \
+                   $1::text::pgshard_catalog.sql_identifier, ARRAY[0]::bigint[] \
+               )",
+            &[&database_name],
+        )
+        .await?;
+    assert!(installed.get::<_, bool>(2));
+    let database_id = installed.get::<_, String>(0);
+    let active_routing_epoch = installed.get::<_, i64>(1);
+    let expected_catalog_epoch = catalog_epoch(client).await?;
+
+    let (staging_client, staging_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (genesis_client, genesis_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (observer, observer_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let connections = [
+        tokio::spawn(staging_connection),
+        tokio::spawn(genesis_connection),
+        tokio::spawn(observer_connection),
+    ];
+
+    staging_client.batch_execute("BEGIN").await?;
+    let staging_pid: i32 = staging_client
+        .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    let staged_routing_epoch: i64 = staging_client
+        .query_one(
+            "INSERT INTO pgshard_catalog.routing_epochs(logical_database_id) \
+             VALUES ($1::text::uuid) RETURNING routing_epoch",
+            &[&database_id],
+        )
+        .await?
+        .get(0);
+    staging_client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges( \
+                 routing_epoch, range_start, range_end, shard_id \
+             ) SELECT $1, range_start, range_end, shard_id \
+                 FROM pgshard_catalog.routing_ranges \
+                WHERE routing_epoch = $2",
+            &[&staged_routing_epoch, &active_routing_epoch],
+        )
+        .await?;
+
+    genesis_client.batch_execute("BEGIN").await?;
+    let replay = tokio::time::timeout(
+        Duration::from_secs(5),
+        genesis_client.query_one(
+            "SELECT logical_database_id::text, routing_epoch, installed \
+               FROM pgshard_catalog.install_database_genesis( \
+                   $1::text::pgshard_catalog.sql_identifier, ARRAY[0]::bigint[] \
+               )",
+            &[&database_name],
+        ),
+    )
+    .await
+    .map_err(|_| "database genesis blocked behind staged-epoch foreign-key lock")??;
+    assert_eq!(replay.get::<_, String>(0), database_id);
+    assert_eq!(replay.get::<_, i64>(1), active_routing_epoch);
+    assert!(!replay.get::<_, bool>(2));
+
+    let activation_database_id = database_id.clone();
+    let activation = tokio::spawn(async move {
+        let resulting_catalog_epoch: i64 = staging_client
+            .query_one(
+                "SELECT pgshard_catalog.activate_routing_epoch( \
+                     $1::text::uuid, $2, $3, $4 \
+                 )",
+                &[
+                    &activation_database_id,
+                    &staged_routing_epoch,
+                    &active_routing_epoch,
+                    &expected_catalog_epoch,
+                ],
+            )
+            .await?
+            .get(0);
+        staging_client.batch_execute("COMMIT").await?;
+        Ok::<i64, PgError>(resulting_catalog_epoch)
+    });
+
+    if !wait_for_backend_lock(&observer, staging_pid).await? {
+        genesis_client.batch_execute("ROLLBACK").await?;
+        activation.abort();
+        for connection in connections {
+            connection.abort();
+        }
+        return Err("staged activation did not wait for genesis catalog lock".into());
+    }
+
+    genesis_client.batch_execute("COMMIT").await?;
+    let resulting_catalog_epoch = tokio::time::timeout(Duration::from_secs(5), activation)
+        .await
+        .map_err(|_| "staged activation remained blocked after genesis commit")???;
+    assert!(resulting_catalog_epoch >= staged_routing_epoch);
+    for connection in connections {
+        connection.abort();
+    }
     Ok(())
 }
 
@@ -3496,6 +3955,252 @@ async fn assert_initial_catalog_reader_contract(client: &Client, database_url: &
     );
     drop(reader);
     reader_connection_task.abort();
+    Ok(())
+}
+
+async fn assert_malformed_active_routing_fails_closed(
+    client: &Client,
+    database_url: &str,
+    fixture: &Fixture,
+    active_routing_epoch: i64,
+) -> TestResult {
+    let staged_routing_epoch = stage_epoch(client, &fixture.logical_database_id).await?;
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges( \
+                 routing_epoch, range_start, range_end, shard_id \
+             ) SELECT $1, range_start, range_end, shard_id \
+                 FROM pgshard_catalog.routing_ranges \
+                WHERE routing_epoch = $2",
+            &[&staged_routing_epoch, &active_routing_epoch],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE pgshard_catalog.active_routing_epochs \
+                SET routing_epoch = $1 \
+              WHERE logical_database_id = $2::text::uuid",
+            &[&staged_routing_epoch, &fixture.logical_database_id],
+        )
+        .await?;
+
+    let database_name: String = client
+        .query_one(
+            "SELECT database_name::text \
+               FROM pgshard_catalog.logical_databases \
+              WHERE logical_database_id = $1::text::uuid",
+            &[&fixture.logical_database_id],
+        )
+        .await?
+        .get(0);
+    let cell_ordinals: Vec<i64> = client
+        .query(
+            "SELECT shards.shard_number \
+               FROM pgshard_catalog.routing_ranges AS ranges \
+               JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id \
+              WHERE ranges.routing_epoch = $1 \
+              ORDER BY ranges.range_start",
+            &[&staged_routing_epoch],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let error = client
+        .query_one(
+            "SELECT * FROM pgshard_catalog.install_database_genesis( \
+                 $1::text::pgshard_catalog.sql_identifier, $2::bigint[] \
+             )",
+            &[&database_name, &cell_ordinals],
+        )
+        .await
+        .expect_err("genesis retry must reject a pointer to staged routing");
+    assert_sqlstate(&error, "55000");
+    assert_database_message(
+        &error,
+        "logical database genesis does not reference exactly one owned active routing epoch",
+    );
+
+    let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let reader_connection_task = tokio::spawn(reader_connection);
+    let expected_database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
+    match CatalogReader::subscribe(reader_client, &CatalogCache::new()).await {
+        Err(LoadError::InvalidActiveRoutingEpoch { database_id }) => {
+            assert_eq!(database_id, expected_database_id);
+        }
+        Err(error) => return Err(format!("unexpected malformed routing error: {error}").into()),
+        Ok(_) => return Err("catalog reader published staged routing as active".into()),
+    }
+    reader_connection_task.abort();
+
+    client
+        .execute(
+            "UPDATE pgshard_catalog.active_routing_epochs \
+                SET routing_epoch = $1 \
+              WHERE logical_database_id = $2::text::uuid",
+            &[&active_routing_epoch, &fixture.logical_database_id],
+        )
+        .await?;
+    client
+        .execute(
+            "DELETE FROM pgshard_catalog.routing_ranges WHERE routing_epoch = $1",
+            &[&staged_routing_epoch],
+        )
+        .await?;
+    client
+        .execute(
+            "DELETE FROM pgshard_catalog.routing_epochs WHERE routing_epoch = $1",
+            &[&staged_routing_epoch],
+        )
+        .await?;
+
+    assert_unavailable_routing_shard_fails_closed(
+        client,
+        database_url,
+        fixture,
+        active_routing_epoch,
+    )
+    .await
+}
+
+async fn assert_unavailable_routing_shard_fails_closed(
+    client: &Client,
+    database_url: &str,
+    fixture: &Fixture,
+    active_routing_epoch: i64,
+) -> TestResult {
+    let unavailable_shard_id = format!("retired-route-{}", fixture.nonce);
+    let unavailable_shard_number: i64 = client
+        .query_one(
+            "SELECT pg_catalog.max(shard_number) + 1 FROM pgshard_catalog.shards",
+            &[],
+        )
+        .await?
+        .get(0);
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let shard_insert_result = client
+        .execute(
+            "INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) \
+             VALUES ($1::text, $2, 'retired')",
+            &[&unavailable_shard_id, &unavailable_shard_number],
+        )
+        .await;
+    let insert_result = client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges( \
+                 routing_epoch, range_start, range_end, shard_id \
+             ) VALUES ($1, 1, 2, $2::text)",
+            &[&active_routing_epoch, &unavailable_shard_id],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    shard_insert_result?;
+    insert_result?;
+
+    let cache = CatalogCache::new();
+    let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let reader_connection_task = tokio::spawn(reader_connection);
+    let expected_database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
+    match CatalogReader::subscribe(reader_client, &cache).await {
+        Err(LoadError::InvalidRoutingShardState {
+            database_id,
+            shard_number,
+            state,
+        }) => {
+            assert_eq!(database_id, expected_database_id);
+            assert_eq!(i64::from(shard_number), unavailable_shard_number);
+            assert_eq!(state, "retired");
+        }
+        Err(error) => return Err(format!("unexpected unavailable route error: {error}").into()),
+        Ok(_) => return Err("catalog reader hid an active route to a retired shard".into()),
+    }
+    assert!(
+        cache.current_for_planning().is_err(),
+        "malformed unavailable route was published"
+    );
+    reader_connection_task.abort();
+
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let delete_result = client
+        .execute(
+            "DELETE FROM pgshard_catalog.routing_ranges \
+              WHERE routing_epoch = $1 AND range_start = 1",
+            &[&active_routing_epoch],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    delete_result?;
+
+    assert_orphaned_routing_shard_fails_closed(client, database_url, fixture, active_routing_epoch)
+        .await
+}
+
+async fn assert_orphaned_routing_shard_fails_closed(
+    client: &Client,
+    database_url: &str,
+    fixture: &Fixture,
+    active_routing_epoch: i64,
+) -> TestResult {
+    let orphaned_shard_id = format!("orphan-route-{}", fixture.nonce);
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let insert_result = client
+        .execute(
+            "INSERT INTO pgshard_catalog.routing_ranges( \
+                 routing_epoch, range_start, range_end, shard_id \
+             ) VALUES ($1, 1, 2, $2::text)",
+            &[&active_routing_epoch, &orphaned_shard_id],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    insert_result?;
+
+    let cache = CatalogCache::new();
+    let (reader_client, reader_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let reader_connection_task = tokio::spawn(reader_connection);
+    let expected_database_id = DatabaseId::new(Uuid::parse_str(&fixture.logical_database_id)?)?;
+    match CatalogReader::subscribe(reader_client, &cache).await {
+        Err(LoadError::MissingRoutingShard {
+            database_id,
+            shard_id,
+        }) => {
+            assert_eq!(database_id, expected_database_id);
+            assert_eq!(shard_id, orphaned_shard_id);
+        }
+        Err(error) => return Err(format!("unexpected orphaned route error: {error}").into()),
+        Ok(_) => return Err("catalog reader hid an active route to a missing shard".into()),
+    }
+    assert!(
+        cache.current_for_planning().is_err(),
+        "malformed orphaned route was published"
+    );
+    reader_connection_task.abort();
+
+    client
+        .batch_execute("SET session_replication_role = replica")
+        .await?;
+    let delete_result = client
+        .execute(
+            "DELETE FROM pgshard_catalog.routing_ranges \
+              WHERE routing_epoch = $1 AND range_start = 1",
+            &[&active_routing_epoch],
+        )
+        .await;
+    client
+        .batch_execute("SET session_replication_role = origin")
+        .await?;
+    delete_result?;
     Ok(())
 }
 
@@ -7333,6 +8038,13 @@ async fn run_migration_and_activation_contract(
         client,
         database_url,
         &listener,
+        &fixture,
+        routing.valid_epoch,
+    )
+    .await?;
+    assert_malformed_active_routing_fails_closed(
+        client,
+        database_url,
         &fixture,
         routing.valid_epoch,
     )

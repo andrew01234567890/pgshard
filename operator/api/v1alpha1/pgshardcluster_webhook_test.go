@@ -2,7 +2,9 @@ package v1alpha1
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -58,6 +60,33 @@ func validCluster() *PgShardCluster {
 	}
 }
 
+func TestDatabaseTopologySHA256IsCanonicalAndPlacementSensitive(t *testing.T) {
+	left := PgShardClusterSpec{
+		Shards: 3,
+		Databases: []DatabaseTemplate{
+			{Name: "app", Shards: 2},
+			{Name: "analytics", Cells: []int32{2}},
+		},
+	}
+	right := PgShardClusterSpec{
+		Shards: 3,
+		Databases: []DatabaseTemplate{
+			{Name: "analytics", Shards: 1, Cells: []int32{2}},
+			{Name: "app", Shards: 2, Cells: []int32{0, 1}},
+		},
+	}
+	if left.DatabaseTopologySHA256() != right.DatabaseTopologySHA256() {
+		t.Fatal("equivalent resolved database topologies produced different digests")
+	}
+	if len(left.DatabaseTopologySHA256()) != sha256.Size*2 {
+		t.Fatalf("database topology digest = %q", left.DatabaseTopologySHA256())
+	}
+	right.Databases[1].Cells = []int32{1, 0}
+	if left.DatabaseTopologySHA256() == right.DatabaseTopologySHA256() {
+		t.Fatal("ordered database placement change retained topology digest")
+	}
+}
+
 func TestDefaultsAreSafetyOriented(t *testing.T) {
 	t.Parallel()
 	cluster := validCluster()
@@ -88,6 +117,164 @@ func TestDefaultsAreSafetyOriented(t *testing.T) {
 	}
 	if *cluster.Spec.Observability.Prometheus {
 		t.Fatal("explicitly disabled Prometheus was overwritten")
+	}
+}
+
+func TestDatabaseTopologyDefaultsAreExplicitAndDeterministic(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Spec.Shards = 8
+	cluster.Spec.Databases = []DatabaseTemplate{
+		{Name: "all-cells"},
+		{Name: "first-three", Shards: 3},
+		{Name: "dedicated", Cells: []int32{5, 6, 7}},
+	}
+	if err := (&PgShardClusterDefaulter{}).Default(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	want := []DatabaseTemplate{
+		{Name: "all-cells", Shards: 8, Cells: []int32{0, 1, 2, 3, 4, 5, 6, 7}},
+		{Name: "first-three", Shards: 3, Cells: []int32{0, 1, 2}},
+		{Name: "dedicated", Shards: 3, Cells: []int32{5, 6, 7}},
+	}
+	if !databaseTemplatesEqual(cluster.Spec.Databases, want, 8, 8) {
+		t.Fatalf("database topology defaults = %#v, want %#v", cluster.Spec.Databases, want)
+	}
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
+		t.Fatalf("defaulted topology was rejected: %v", err)
+	}
+}
+
+func TestDatabaseTopologyDefaultingPreservesExplicitEmptyCellsForValidation(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Spec.Databases = []DatabaseTemplate{{
+		Name: "app", Shards: 1, Cells: []int32{},
+	}}
+	if err := (&PgShardClusterDefaulter{}).Default(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if cluster.Spec.Databases[0].Cells == nil || len(cluster.Spec.Databases[0].Cells) != 0 {
+		t.Fatalf("explicit empty cells were defaulted: %#v", cluster.Spec.Databases[0].Cells)
+	}
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "cells") {
+		t.Fatalf("explicit empty cells were admitted: %v", err)
+	}
+}
+
+func TestDatabaseTopologyValidationRejectsReservedNames(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"postgres", "shardschema", "template0", "template1"} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			cluster.Spec.Databases = []DatabaseTemplate{{Name: name, Shards: 1, Cells: []int32{0}}}
+			if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("reserved database name was admitted: %v", err)
+			}
+		})
+	}
+}
+
+func TestDatabaseTopologyValidationBoundsTotalRoutingRanges(t *testing.T) {
+	t.Parallel()
+	if got, want := MaximumTotalRoutingRanges, MaximumDatabases*MaximumShards; got != want {
+		t.Fatalf("maximum routing ranges = %d, want structural product %d", got, want)
+	}
+	cluster := validCluster()
+	cluster.Spec.Shards = MaximumShards
+	cluster.Spec.Databases = make([]DatabaseTemplate, MaximumTotalRoutingRanges/MaximumShards)
+	for index := range cluster.Spec.Databases {
+		cluster.Spec.Databases[index] = DatabaseTemplate{
+			Name:   fmt.Sprintf("db-%04d", index),
+			Shards: MaximumShards,
+		}
+	}
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
+		t.Fatalf("maximum total routing range count was rejected: %v", err)
+	}
+
+	cluster.Spec.Databases = append(cluster.Spec.Databases, DatabaseTemplate{
+		Name:   "one-too-many",
+		Shards: MaximumShards,
+	})
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "65536") {
+		t.Fatalf("excess total routing ranges were admitted: %v", err)
+	}
+}
+
+func TestDatabaseTopologyValidationAllowsSharedAndDisjointCells(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	cluster.Spec.Shards = 8
+	cluster.Spec.Databases = []DatabaseTemplate{
+		{Name: "a", Shards: 5, Cells: []int32{0, 1, 2, 3, 4}},
+		{Name: "b-shared", Shards: 3, Cells: []int32{0, 1, 2}},
+		{Name: "b-dedicated", Shards: 3, Cells: []int32{5, 6, 7}},
+	}
+	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDatabaseTopologyValidationRejectsAmbiguousPlacement(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		database DatabaseTemplate
+		field    string
+	}{
+		"count mismatch":  {database: DatabaseTemplate{Name: "app", Shards: 2, Cells: []int32{0}}, field: "cells"},
+		"duplicate cell":  {database: DatabaseTemplate{Name: "app", Shards: 2, Cells: []int32{0, 0}}, field: "cells[1]"},
+		"outside cluster": {database: DatabaseTemplate{Name: "app", Shards: 2, Cells: []int32{0, 2}}, field: "cells[1]"},
+		"too many shards": {database: DatabaseTemplate{Name: "app", Shards: 3, Cells: []int32{0, 1, 2}}, field: "shards"},
+	}
+	for name, test := range tests {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			cluster.Spec.Databases = []DatabaseTemplate{test.database}
+			_, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster)
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("invalid database placement was admitted: %v", err)
+			}
+		})
+	}
+}
+
+func TestDatabaseTopologyIsImmutableUntilLifecycleControllerExists(t *testing.T) {
+	t.Parallel()
+	oldCluster := validCluster()
+	oldCluster.Spec.Databases = []DatabaseTemplate{
+		{Name: "a", Shards: 2, Cells: []int32{0, 1}},
+		{Name: "b", Shards: 1, Cells: []int32{0}},
+	}
+
+	reordered := oldCluster.DeepCopy()
+	reordered.Spec.Databases[0], reordered.Spec.Databases[1] = reordered.Spec.Databases[1], reordered.Spec.Databases[0]
+	if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, reordered); err != nil {
+		t.Fatalf("map-list reordering changed database topology: %v", err)
+	}
+
+	materializedDefaults := validCluster()
+	materializedDefaults.Spec.Databases = []DatabaseTemplate{
+		{Name: "legacy"},
+		{Name: "explicit", Shards: 1, Cells: []int32{0}},
+	}
+	defaulted := materializedDefaults.DeepCopy()
+	if err := (&PgShardClusterDefaulter{}).Default(context.Background(), defaulted); err != nil {
+		t.Fatal(err)
+	}
+	defaulted.Spec.Databases[0], defaulted.Spec.Databases[1] = defaulted.Spec.Databases[1], defaulted.Spec.Databases[0]
+	if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), materializedDefaults, defaulted); err != nil {
+		t.Fatalf("reordering map items while materializing equivalent defaults changed database topology: %v", err)
+	}
+
+	mutated := oldCluster.DeepCopy()
+	mutated.Spec.Databases[1].Cells[0] = 1
+	if _, err := (&PgShardClusterValidator{}).ValidateUpdate(context.Background(), oldCluster, mutated); err == nil || !strings.Contains(err.Error(), "databases is immutable") {
+		t.Fatalf("database placement mutation was admitted: %v", err)
 	}
 }
 
@@ -335,6 +522,73 @@ func TestValidationRejectsUnsafeOpenTelemetryEndpoints(t *testing.T) {
 	cluster.Spec.Observability.OpenTelemetryEndpoint = "https://collector.example.com:4317/v1/traces"
 	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
 		t.Fatalf("safe endpoint rejected: %v", err)
+	}
+}
+
+func TestValidationBoundsRenderedTopologyStrings(t *testing.T) {
+	t.Parallel()
+	maximumEndpoint := func(host string, length int) string {
+		prefix := "https://" + host + "/"
+		return prefix + strings.Repeat("x", length-len(prefix))
+	}
+	validS3 := func() BackupRepository {
+		return BackupRepository{Type: RepositoryS3, S3: &S3Repository{
+			Bucket:               "backups",
+			Endpoint:             "https://minio.example.com",
+			Region:               "region",
+			Prefix:               "prefix",
+			CredentialsSecretRef: corev1.LocalObjectReference{Name: "backup-credentials"},
+		}}
+	}
+	tests := map[string]struct {
+		mutate func(*PgShardCluster)
+		field  string
+	}{
+		"bucket": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Backup.Repository = validS3()
+				cluster.Spec.Backup.Repository.S3.Bucket = strings.Repeat("b", MaximumS3BucketLength+1)
+			},
+			field: "bucket",
+		},
+		"S3 endpoint": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Backup.Repository = validS3()
+				cluster.Spec.Backup.Repository.S3.Endpoint = maximumEndpoint("minio.example.com", MaximumEndpointLength+1)
+			},
+			field: "endpoint",
+		},
+		"region": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Backup.Repository = validS3()
+				cluster.Spec.Backup.Repository.S3.Region = strings.Repeat("r", MaximumS3RegionLength+1)
+			},
+			field: "region",
+		},
+		"prefix": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Backup.Repository = validS3()
+				cluster.Spec.Backup.Repository.S3.Prefix = strings.Repeat("p", MaximumS3PrefixLength+1)
+			},
+			field: "prefix",
+		},
+		"OpenTelemetry endpoint": {
+			mutate: func(cluster *PgShardCluster) {
+				cluster.Spec.Observability.OpenTelemetryEndpoint = maximumEndpoint("collector.example.com", MaximumEndpointLength+1)
+			},
+			field: "openTelemetryEndpoint",
+		},
+	}
+	for name, test := range tests {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := validCluster()
+			test.mutate(cluster)
+			if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("oversized %s was admitted: %v", test.field, err)
+			}
+		})
 	}
 }
 
