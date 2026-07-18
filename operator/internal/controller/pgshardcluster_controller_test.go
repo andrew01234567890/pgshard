@@ -208,6 +208,106 @@ func TestReconcileCheckpointsExactPostgreSQLWritableLeaseIdentities(t *testing.T
 	}
 }
 
+func TestPostgreSQLWritableLeaseRuntimeSpecAcceptsOnlyCompleteStates(t *testing.T) {
+	t.Parallel()
+	holder := "cluster-shard-0000-0/pod-uid/0123456789abcdef01234567"
+	emptyHolder := ""
+	whitespaceHolder := " " + holder
+	duration := int32(15)
+	zeroDuration := int32(0)
+	oversizedDuration := int32(301)
+	transitions := int32(3)
+	zeroTransitions := int32(0)
+	now := metav1.NewMicroTime(time.Unix(1_700_000_000, 0).UTC())
+	zeroTime := metav1.MicroTime{}
+	complete := func(holder *string) coordinationv1.LeaseSpec {
+		return coordinationv1.LeaseSpec{
+			HolderIdentity:       holder,
+			LeaseDurationSeconds: &duration,
+			AcquireTime:          &now,
+			RenewTime:            &now,
+			LeaseTransitions:     &transitions,
+		}
+	}
+	preferredHolder := holder
+	strategy := coordinationv1.OldestEmulationVersion
+
+	for _, test := range []struct {
+		name    string
+		spec    coordinationv1.LeaseSpec
+		wantErr string
+	}{
+		{name: "pristine envelope", spec: coordinationv1.LeaseSpec{}},
+		{name: "occupied term", spec: complete(&holder)},
+		{name: "released term", spec: complete(nil)},
+		{name: "empty holder string", spec: complete(&emptyHolder), wantErr: "holder identity is invalid"},
+		{name: "whitespace holder", spec: complete(&whitespaceHolder), wantErr: "holder identity is invalid"},
+		{name: "released term without duration", spec: coordinationv1.LeaseSpec{AcquireTime: &now, RenewTime: &now, LeaseTransitions: &transitions}, wantErr: "partial or invalid released runtime state"},
+		{name: "released term without acquire time", spec: coordinationv1.LeaseSpec{LeaseDurationSeconds: &duration, RenewTime: &now, LeaseTransitions: &transitions}, wantErr: "partial or invalid released runtime state"},
+		{name: "released term without renew time", spec: coordinationv1.LeaseSpec{LeaseDurationSeconds: &duration, AcquireTime: &now, LeaseTransitions: &transitions}, wantErr: "partial or invalid released runtime state"},
+		{name: "released term without transitions", spec: coordinationv1.LeaseSpec{LeaseDurationSeconds: &duration, AcquireTime: &now, RenewTime: &now}, wantErr: "partial or invalid released runtime state"},
+		{name: "zero duration", spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &zeroDuration, AcquireTime: &now, RenewTime: &now, LeaseTransitions: &transitions}, wantErr: "holder duration"},
+		{name: "oversized duration", spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &oversizedDuration, AcquireTime: &now, RenewTime: &now, LeaseTransitions: &transitions}, wantErr: "holder duration"},
+		{name: "zero acquire time", spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, AcquireTime: &zeroTime, RenewTime: &now, LeaseTransitions: &transitions}, wantErr: "holder duration"},
+		{name: "zero renew time", spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, AcquireTime: &now, RenewTime: &zeroTime, LeaseTransitions: &transitions}, wantErr: "holder duration"},
+		{name: "zero transitions", spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, AcquireTime: &now, RenewTime: &now, LeaseTransitions: &zeroTransitions}, wantErr: "holder duration"},
+		{name: "preferred holder", spec: coordinationv1.LeaseSpec{PreferredHolder: &preferredHolder}, wantErr: "coordinated leader-election fields"},
+		{name: "strategy", spec: coordinationv1.LeaseSpec{Strategy: &strategy}, wantErr: "coordinated leader-election fields"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validatePostgreSQLWritableLeaseRuntimeSpec(test.spec)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("valid runtime state rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("runtime validation error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestReconcileAcceptsCompleteReleasedPostgreSQLWritableLease(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	fakeClient := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(fakeClient, nil)
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	checkpointed := getCluster(t, ctx, fakeClient, cluster)
+	checkpoint := checkpointed.Status.PostgreSQLWritableLeases[0]
+	lease := &coordinationv1.Lease{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.LeaseName}
+	if err := fakeClient.Get(ctx, key, lease); err != nil {
+		t.Fatal(err)
+	}
+	duration := int32(15)
+	transitions := int32(4)
+	now := metav1.NewMicroTime(time.Unix(1_700_000_000, 0).UTC())
+	lease.Spec = coordinationv1.LeaseSpec{
+		LeaseDurationSeconds: &duration,
+		AcquireTime:          &now,
+		RenewTime:            &now,
+		LeaseTransitions:     &transitions,
+	}
+	if err := fakeClient.Update(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatalf("complete released Lease blocked reconciliation: %v", err)
+	}
+	current := getCluster(t, ctx, fakeClient, cluster)
+	if !reflect.DeepEqual(current.Status.PostgreSQLWritableLeases, checkpointed.Status.PostgreSQLWritableLeases) {
+		t.Fatalf("released Lease changed identity checkpoints: before=%#v after=%#v", checkpointed.Status.PostgreSQLWritableLeases, current.Status.PostgreSQLWritableLeases)
+	}
+}
+
 func TestRecordedPostgreSQLWritableLeaseLossFailsClosed(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -4701,10 +4801,10 @@ func TestRuntimeLeaseEventsFilterRenewalsButKeepEnvelopeLifecycle(t *testing.T) 
 	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: holderChanged}) {
 		t.Fatal("runtime Lease holder transition was filtered")
 	}
-	partialRuntimeState := renewed.DeepCopy()
-	partialRuntimeState.Spec.HolderIdentity = nil
-	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: partialRuntimeState}) {
-		t.Fatal("malformed runtime Lease transition was filtered")
+	releasedRuntimeState := renewed.DeepCopy()
+	releasedRuntimeState.Spec.HolderIdentity = nil
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: releasedRuntimeState}) {
+		t.Fatal("released runtime Lease transition was filtered")
 	}
 
 	envelopeChanged := renewed.DeepCopy()

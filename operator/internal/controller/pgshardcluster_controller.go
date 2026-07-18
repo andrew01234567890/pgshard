@@ -490,15 +490,22 @@ func validatePostgreSQLWritableLeaseRuntimeSpec(spec coordinationv1.LeaseSpec) e
 		return fmt.Errorf("coordinated leader-election fields are unsupported")
 	}
 	if spec.HolderIdentity == nil {
-		if spec.LeaseDurationSeconds != nil || spec.AcquireTime != nil || spec.RenewTime != nil || spec.LeaseTransitions != nil {
-			return fmt.Errorf("an empty holder has partial runtime state")
+		if spec.LeaseDurationSeconds == nil && spec.AcquireTime == nil && spec.RenewTime == nil && spec.LeaseTransitions == nil {
+			return nil
+		}
+		if err := validatePostgreSQLWritableLeaseTerm(spec); err != nil {
+			return fmt.Errorf("an empty holder has partial or invalid released runtime state: %w", err)
 		}
 		return nil
 	}
 	holder := *spec.HolderIdentity
-	if strings.TrimSpace(holder) != holder || len(holder) > 128 {
+	if holder == "" || strings.TrimSpace(holder) != holder || len(holder) > 128 {
 		return fmt.Errorf("holder identity is invalid")
 	}
+	return validatePostgreSQLWritableLeaseTerm(spec)
+}
+
+func validatePostgreSQLWritableLeaseTerm(spec coordinationv1.LeaseSpec) error {
 	if spec.LeaseDurationSeconds == nil || *spec.LeaseDurationSeconds < 1 || *spec.LeaseDurationSeconds > 300 ||
 		spec.AcquireTime == nil || spec.AcquireTime.IsZero() || spec.RenewTime == nil || spec.RenewTime.IsZero() ||
 		spec.LeaseTransitions == nil || *spec.LeaseTransitions < 1 {

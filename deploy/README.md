@@ -50,6 +50,17 @@ with TCP closed. Losing Lease coordination clears authority, immediately fences
 the postmaster, and leaves HTTP health available while the process retries with
 bounded backoff. Reacquisition prepares PGDATA offline, uses a fresh process
 incarnation, and takes a higher term without relying on a container restart.
+Requested process shutdown retains the latest exact conditional-release
+receipt, fences and reaps the complete PostgreSQL process tree, and only then
+consumes the matching half of a single-use, non-cloneable absence proof to
+clear that exact holder without advancing the term. Pair creation and both
+supervisor lifetimes are sealed inside one composed runtime operation, so a
+caller cannot retain a proof across attempts. Postmaster startup authority is
+published only on that attempt's identity-tagged private channel; the cloneable
+HTTP status state is observational and cannot authorize another attempt. A
+stale, mismatched,
+failed, or outcome-unknown release is not retried;
+the occupied Lease expires through the normal unchanged-record protocol.
 Monotonic deadlines remain authoritative across wall-clock steps; the reported
 wall-clock expiry is status-only. It is a composition test boundary, not
 serving activation. The operator checkpoints this runtime in cluster status
