@@ -1482,7 +1482,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		}
 	}
 
-	objects := make([]client.Object, 0, 18+4*cluster.Spec.Shards)
+	objects := make([]client.Object, 0, 18+7*cluster.Spec.Shards)
 	objects = append(objects,
 		immutableConfigMap(cluster, postgresqlConfigName, postgresqlConfig),
 		configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": topologyConfig}),
@@ -1502,6 +1502,9 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		objects = append(objects,
 			shardService(cluster, shard),
+			postgresqlAgentServiceAccount(cluster, shard),
+			postgresqlAgentLeaseRole(cluster, shard),
+			postgresqlAgentLeaseRoleBinding(cluster, shard),
 			PostgreSQLWritableLease(cluster, shard),
 			postgresqlNetworkPolicy(cluster, shard),
 		)
@@ -2076,6 +2079,55 @@ func PostgreSQLShardStatefulSetName(cluster string, shard int32) string {
 // runtime holder identity, never in this reusable coordination envelope.
 func PostgreSQLWritableLeaseName(cluster string, shard int32) string {
 	return PostgreSQLShardStatefulSetName(cluster, shard) + "-term"
+}
+
+// PostgreSQLAgentServiceAccountName returns the role-neutral API identity shared
+// by candidate agents in one physical cell. Pods must explicitly opt into a
+// bounded projected token; the ServiceAccount itself never automounts one.
+func PostgreSQLAgentServiceAccountName(cluster string, shard int32) string {
+	return PostgreSQLShardStatefulSetName(cluster, shard) + "-agent"
+}
+
+func postgresqlAgentServiceAccount(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *corev1.ServiceAccount {
+	metadata := ownedMeta(cluster, PostgreSQLAgentServiceAccountName(cluster.Name, shard), "postgresql-agent", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	return &corev1.ServiceAccount{
+		ObjectMeta:                   metadata,
+		AutomountServiceAccountToken: ptr(false),
+	}
+}
+
+func postgresqlAgentLeaseRole(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *rbacv1.Role {
+	metadata := ownedMeta(cluster, PostgreSQLAgentServiceAccountName(cluster.Name, shard), "postgresql-agent", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	return &rbacv1.Role{
+		ObjectMeta: metadata,
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups:     []string{coordinationv1.GroupName},
+			Resources:     []string{"leases"},
+			ResourceNames: []string{PostgreSQLWritableLeaseName(cluster.Name, shard)},
+			Verbs:         []string{"get", "update"},
+		}},
+	}
+}
+
+func postgresqlAgentLeaseRoleBinding(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *rbacv1.RoleBinding {
+	name := PostgreSQLAgentServiceAccountName(cluster.Name, shard)
+	metadata := ownedMeta(cluster, name, "postgresql-agent", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metadata,
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Role",
+			Name:     name,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      name,
+			Namespace: cluster.Namespace,
+		}},
+	}
 }
 
 // PostgreSQLWritableLease creates only the operator-owned coordination
