@@ -58,10 +58,12 @@ The current database-topology foundation accepts immutable logical-database
 shard counts and ordered physical-cell mappings in
 `PgShardCluster.spec.databases`. Shard-zero bootstrap installs all declared
 equal-range routes in one `shardschema` transaction. Exact retries preserve the
-database IDs, routing epochs, and catalog epoch; conflicting mappings and
-undeclared active catalog databases fail without a partial install. This does
-not yet create physical application databases, database-scoped shard records,
-placement reservations, or a client-visible routing path.
+database IDs, database-shard UUIDs, generation-one placements, routing epochs,
+and catalog epoch; conflicting mappings and undeclared active catalog
+databases fail without a partial install. A populated v0.49 catalog converts
+physical route targets into permanent database-shard identities exactly once.
+This does not yet create physical application databases, switch placements, or
+expose a client-visible routing path.
 
 The current operator plan starts single-member poolers in `operator-tls`
 catalog mode. It checkpoints an unpredictable name as a non-consumable creation

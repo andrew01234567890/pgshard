@@ -67,6 +67,39 @@ impl fmt::Display for DatabaseId {
     }
 }
 
+/// Stable identity of one shard within a logical database.
+///
+/// This identity survives physical-cell moves. A restore or reshard creates
+/// fresh identities instead of rebinding an existing shard UUID.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DatabaseShardId(Uuid);
+
+impl DatabaseShardId {
+    /// Creates a non-nil database-shard identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::NilDatabaseShardId`] for the nil UUID.
+    pub fn new(value: Uuid) -> Result<Self, SnapshotError> {
+        if value.is_nil() {
+            return Err(SnapshotError::NilDatabaseShardId);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the underlying UUID.
+    #[must_use]
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for DatabaseShardId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Validated `PostgreSQL` schema/table name used as an exact lookup key.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TableName {
@@ -205,9 +238,10 @@ impl DatabaseEpochs {
     }
 }
 
-/// One active half-open key range and its logical shard.
+/// One active half-open key range, stable database shard, and physical placement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShardRoute {
+    database_shard_id: DatabaseShardId,
     shard_id: ShardId,
     key_range: KeyRange,
 }
@@ -215,14 +249,25 @@ pub struct ShardRoute {
 impl ShardRoute {
     /// Creates a route from an already validated key range.
     #[must_use]
-    pub const fn new(shard_id: ShardId, key_range: KeyRange) -> Self {
+    pub const fn new(
+        database_shard_id: DatabaseShardId,
+        shard_id: ShardId,
+        key_range: KeyRange,
+    ) -> Self {
         Self {
+            database_shard_id,
             shard_id,
             key_range,
         }
     }
 
-    /// Returns the target shard.
+    /// Returns the stable logical database-shard identity.
+    #[must_use]
+    pub const fn database_shard_id(self) -> DatabaseShardId {
+        self.database_shard_id
+    }
+
+    /// Returns the currently placed physical shard-cell ordinal.
     #[must_use]
     pub const fn shard_id(self) -> ShardId {
         self.shard_id
@@ -344,6 +389,19 @@ impl DatabaseCatalog {
         validate_identifier("database", &name)?;
         routes.sort_by_key(|route| route.key_range.start());
         validate_routes(&routes)?;
+
+        let mut placements = HashMap::with_capacity(routes.len());
+        for route in &routes {
+            if let Some(existing) = placements.insert(route.database_shard_id, route.shard_id)
+                && existing != route.shard_id
+            {
+                return Err(SnapshotError::DatabaseShardPlacementConflict {
+                    database_shard_id: route.database_shard_id,
+                    first: existing,
+                    second: route.shard_id,
+                });
+            }
+        }
 
         let mut table_map = HashMap::with_capacity(tables.len());
         for table in tables {
@@ -468,6 +526,7 @@ impl CatalogSnapshot {
         let catalog_epoch = CatalogEpoch(catalog_epoch);
         let mut database_map = HashMap::with_capacity(databases.len());
         let mut names = HashSet::with_capacity(databases.len());
+        let mut database_shard_owners = HashMap::new();
         for database in databases {
             for (kind, epoch) in [
                 ("routing", database.epochs.routing.0),
@@ -494,6 +553,18 @@ impl CatalogSnapshot {
             }
             if !names.insert(database.name.clone()) {
                 return Err(SnapshotError::DuplicateDatabaseName(database.name));
+            }
+            for route in &database.routes {
+                if let Some(owner) =
+                    database_shard_owners.insert(route.database_shard_id, database.id)
+                    && owner != database.id
+                {
+                    return Err(SnapshotError::DatabaseShardIdentityReused {
+                        database_shard_id: route.database_shard_id,
+                        first: owner,
+                        second: database.id,
+                    });
+                }
             }
             let id = database.id;
             if database_map.insert(id, database).is_some() {
@@ -618,6 +689,7 @@ impl CatalogSnapshot {
             writer.u64(database.epochs.authorization);
             writer.u64(database.routes.len() as u64);
             for route in &database.routes {
+                writer.bytes(route.database_shard_id.0.as_bytes());
                 writer.u32(route.shard_id.0);
                 writer.u128(route.key_range.start());
                 writer.u128(route.key_range.end());
@@ -688,6 +760,9 @@ pub enum SnapshotError {
     /// A database UUID is nil.
     #[error("database ID must not be nil")]
     NilDatabaseId,
+    /// A database-shard UUID is nil.
+    #[error("database shard ID must not be nil")]
+    NilDatabaseShardId,
     /// An identifier violates `PostgreSQL` length/content rules.
     #[error(transparent)]
     Identifier(#[from] IdentifierError),
@@ -738,6 +813,30 @@ pub enum SnapshotError {
     /// A database name appears more than once.
     #[error("duplicate database name {0:?}")]
     DuplicateDatabaseName(String),
+    /// One database-shard identity resolves to two physical cells.
+    #[error(
+        "database shard {database_shard_id} resolves to physical shards {first:?} and {second:?}"
+    )]
+    DatabaseShardPlacementConflict {
+        /// Stable database-shard identity.
+        database_shard_id: DatabaseShardId,
+        /// First physical shard.
+        first: ShardId,
+        /// Conflicting physical shard.
+        second: ShardId,
+    },
+    /// A globally unique database-shard identity appears in two databases.
+    #[error(
+        "database shard {database_shard_id} is reused by logical databases {first} and {second}"
+    )]
+    DatabaseShardIdentityReused {
+        /// Reused database-shard identity.
+        database_shard_id: DatabaseShardId,
+        /// First logical database owner.
+        first: DatabaseId,
+        /// Conflicting logical database owner.
+        second: DatabaseId,
+    },
     /// A table refers to a different hash algorithm.
     #[error("table {schema}.{table} uses hash version {actual}, expected {expected}")]
     TableHashVersionMismatch {
@@ -768,6 +867,18 @@ mod tests {
         DatabaseId::new(Uuid::from_u128(value)).expect("nonzero database ID")
     }
 
+    fn database_shard_id(value: u128) -> DatabaseShardId {
+        DatabaseShardId::new(Uuid::from_u128(value)).expect("nonzero database shard ID")
+    }
+
+    fn route(shard_number: u32, key_range: KeyRange) -> ShardRoute {
+        ShardRoute::new(
+            database_shard_id(100 + u128::from(shard_number)),
+            ShardId(shard_number),
+            key_range,
+        )
+    }
+
     fn cluster_id() -> ClusterId {
         ClusterId::new(Uuid::from_u128(1)).expect("nonzero cluster ID")
     }
@@ -788,12 +899,9 @@ mod tests {
             "app",
             DatabaseEpochs::new(epoch, epoch, epoch).expect("epochs"),
             vec![
-                ShardRoute::new(
-                    ShardId(0),
-                    KeyRange::new(0, 1_u128 << 63).expect("first range"),
-                ),
-                ShardRoute::new(
-                    ShardId(1),
+                route(0, KeyRange::new(0, 1_u128 << 63).expect("first range")),
+                route(
+                    1,
                     KeyRange::new(1_u128 << 63, KEYSPACE_END).expect("second range"),
                 ),
             ],
@@ -829,25 +937,95 @@ mod tests {
     fn rejects_gaps_overlaps_and_incomplete_coverage() {
         let epochs = DatabaseEpochs::new(1, 1, 1).expect("epochs");
         for ranges in [
-            vec![ShardRoute::new(
-                ShardId(0),
-                KeyRange::new(1, KEYSPACE_END).expect("range"),
-            )],
+            vec![route(0, KeyRange::new(1, KEYSPACE_END).expect("range"))],
             vec![
-                ShardRoute::new(ShardId(0), KeyRange::new(0, 10).expect("range")),
-                ShardRoute::new(ShardId(1), KeyRange::new(11, KEYSPACE_END).expect("range")),
+                route(0, KeyRange::new(0, 10).expect("range")),
+                route(1, KeyRange::new(11, KEYSPACE_END).expect("range")),
             ],
             vec![
-                ShardRoute::new(ShardId(0), KeyRange::new(0, 11).expect("range")),
-                ShardRoute::new(ShardId(1), KeyRange::new(10, KEYSPACE_END).expect("range")),
+                route(0, KeyRange::new(0, 11).expect("range")),
+                route(1, KeyRange::new(10, KEYSPACE_END).expect("range")),
             ],
-            vec![ShardRoute::new(
-                ShardId(0),
-                KeyRange::new(0, 10).expect("range"),
-            )],
+            vec![route(0, KeyRange::new(0, 10).expect("range"))],
         ] {
             assert!(DatabaseCatalog::new(id(2), "app", epochs, ranges, vec![]).is_err());
         }
+    }
+
+    #[test]
+    fn database_shard_identity_must_be_non_nil() {
+        assert!(matches!(
+            DatabaseShardId::new(Uuid::nil()),
+            Err(SnapshotError::NilDatabaseShardId)
+        ));
+    }
+
+    #[test]
+    fn rejects_one_database_shard_on_two_physical_shards() {
+        let database_shard_id = database_shard_id(100);
+        let routes = vec![
+            ShardRoute::new(
+                database_shard_id,
+                ShardId(0),
+                KeyRange::new(0, 1_u128 << 63).expect("first range"),
+            ),
+            ShardRoute::new(
+                database_shard_id,
+                ShardId(1),
+                KeyRange::new(1_u128 << 63, KEYSPACE_END).expect("second range"),
+            ),
+        ];
+        assert!(matches!(
+            DatabaseCatalog::new(
+                id(2),
+                "app",
+                DatabaseEpochs::new(1, 1, 1).expect("epochs"),
+                routes,
+                vec![]
+            ),
+            Err(SnapshotError::DatabaseShardPlacementConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_database_shard_identity_reuse_across_databases() {
+        let first = database(1);
+        let mut second = database(1);
+        second.id = id(3);
+        second.name = "other".to_owned();
+        assert!(matches!(
+            CatalogSnapshot::new(
+                cluster_id(),
+                2,
+                RoutingHashConfig::new(1, 42).expect("hash"),
+                vec![first, second]
+            ),
+            Err(SnapshotError::DatabaseShardIdentityReused { .. })
+        ));
+    }
+
+    #[test]
+    fn checksum_covers_database_shard_identity_and_placement() {
+        let hash = RoutingHashConfig::new(1, 42).expect("hash");
+        let original = CatalogSnapshot::new(cluster_id(), 2, hash, vec![database(1)])
+            .expect("original")
+            .checksum();
+
+        let mut changed_identity = database(1);
+        changed_identity.routes[0].database_shard_id = database_shard_id(999);
+        let changed_identity = CatalogSnapshot::new(cluster_id(), 2, hash, vec![changed_identity])
+            .expect("changed identity")
+            .checksum();
+
+        let mut changed_placement = database(1);
+        changed_placement.routes[0].shard_id = ShardId(9);
+        let changed_placement =
+            CatalogSnapshot::new(cluster_id(), 2, hash, vec![changed_placement])
+                .expect("changed placement")
+                .checksum();
+
+        assert_ne!(original, changed_identity);
+        assert_ne!(original, changed_placement);
     }
 
     #[test]
@@ -858,6 +1036,10 @@ mod tests {
         let mut second = database(1);
         second.id = id(3);
         second.name = "other".to_owned();
+        for (index, route) in second.routes.iter_mut().enumerate() {
+            route.database_shard_id =
+                database_shard_id(200 + u128::try_from(index).expect("route index fits u128"));
+        }
         let first = database(1);
         let ordered =
             CatalogSnapshot::new(cluster_id(), 2, hash, vec![first.clone(), second.clone()])
@@ -878,10 +1060,7 @@ mod tests {
             id(2),
             "app",
             DatabaseEpochs::new(1, 1, 1).expect("epochs"),
-            vec![ShardRoute::new(
-                ShardId(0),
-                KeyRange::new(0, KEYSPACE_END).expect("range"),
-            )],
+            vec![route(0, KeyRange::new(0, KEYSPACE_END).expect("range"))],
             vec![wrong_table],
         )
         .expect("database model permits snapshot-level hash check");

@@ -83,9 +83,12 @@ Current foundation slice: `PgShardCluster.spec.databases` records immutable
 genesis shard counts and ordered physical-cell mappings. Shard-zero bootstrap
 atomically installs equal full-keyspace ranges for those declarations in
 `shardschema`, makes exact replays no-ops, and rejects conflicting or
-undeclared active topology. Physical application databases, database-scoped
-shard identities, placement reservations, routing, moves, and resharding remain
-work in this workstream.
+undeclared active topology. Each genesis range now references a permanent
+database-shard UUID whose generation-one placement names the physical cell;
+the Rust cache validates and hashes both identity and current placement. A
+populated v0.49 catalog upgrades once without changing range ownership.
+Physical application databases, placement switching, routed execution, moves,
+and resharding remain work in this workstream.
 
 - Define physical cells, logical databases, database-scoped shards, placements,
   topology generations, routing generations, database generation fences,

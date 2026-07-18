@@ -26,8 +26,9 @@ pub use loader::{
     MAX_ROUTING_RANGES_PER_DATABASE, MAX_TOTAL_REGISTERED_TABLES, MAX_TOTAL_ROUTING_RANGES,
 };
 pub use model::{
-    CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, IdentifierError,
-    RegisteredTable, RoutingHashConfig, ShardKeyType, ShardRoute, SnapshotError, TableName,
+    CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, DatabaseShardId,
+    IdentifierError, RegisteredTable, RoutingHashConfig, ShardKeyType, ShardRoute, SnapshotError,
+    TableName,
 };
 pub use supervisor::{
     CatalogConnectionPhase, CatalogFailureKind, CatalogReadinessReason, CatalogSupervisor,

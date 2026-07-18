@@ -12,7 +12,7 @@ use xxhash_rust::xxh3::Xxh3;
 /// The exclusive upper bound of the 64-bit hash keyspace.
 pub const KEYSPACE_END: u128 = 1_u128 << 64;
 
-/// Stable identifier for a shard.
+/// Physical shard-cell ordinal selected by a database-shard placement.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ShardId(pub u32);

@@ -9,8 +9,8 @@ use uuid::Uuid;
 use crate::cache::InstallBeforeError;
 use crate::{
     CatalogCache, CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId,
-    IdentifierError, InstallOutcome, NOTIFY_CHANNEL, RegisteredTable, RoutingHashConfig,
-    ShardKeyType, ShardRoute, SnapshotError, TableName,
+    DatabaseShardId, IdentifierError, InstallOutcome, NOTIFY_CHANNEL, RegisteredTable,
+    RoutingHashConfig, ShardKeyType, ShardRoute, SnapshotError, TableName,
 };
 
 /// Maximum logical databases published in one process snapshot.
@@ -54,9 +54,18 @@ const DATABASES_SQL: &str = "\
      LIMIT $1";
 
 const ROUTES_SQL: &str = "\
-    SELECT shards.shard_number, ranges.range_start::text, ranges.range_end::text \
+    SELECT database_shards.database_shard_id::text, shards.shard_number, \
+           ranges.range_start::text, ranges.range_end::text \
       FROM pgshard_catalog.routing_ranges AS ranges \
-      JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id \
+      JOIN pgshard_catalog.database_shards AS database_shards \
+        ON database_shards.logical_database_id = ranges.logical_database_id \
+       AND database_shards.database_shard_id = ranges.database_shard_id \
+       AND database_shards.state IN ('active', 'draining') \
+      JOIN pgshard_catalog.database_shard_placements AS placements \
+        ON placements.logical_database_id = database_shards.logical_database_id \
+       AND placements.database_shard_id = database_shards.database_shard_id \
+       AND placements.state = 'active' \
+      JOIN pgshard_catalog.shards AS shards ON shards.shard_id = placements.shard_id \
      WHERE ranges.routing_epoch = $1 \
      ORDER BY ranges.range_start, ranges.range_end \
      LIMIT $2";
@@ -273,10 +282,13 @@ async fn load_database(
     )?;
     let mut routes = Vec::with_capacity(route_rows.len());
     for route in route_rows {
-        let shard_number = nonnegative_u32("shard_number", route.get::<_, i64>(0))?;
-        let start = parse_u128("range_start", &route.get::<_, String>(1))?;
-        let end = parse_u128("range_end", &route.get::<_, String>(2))?;
+        let database_shard_id =
+            DatabaseShardId::new(parse_uuid("database_shard_id", route.get::<_, String>(0))?)?;
+        let shard_number = nonnegative_u32("shard_number", route.get::<_, i64>(1))?;
+        let start = parse_u128("range_start", &route.get::<_, String>(2))?;
+        let end = parse_u128("range_end", &route.get::<_, String>(3))?;
         routes.push(ShardRoute::new(
+            database_shard_id,
             ShardId(shard_number),
             KeyRange::new(start, end)?,
         ));

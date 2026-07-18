@@ -332,11 +332,19 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 
 	shardZeroPod := owned.PostgreSQLShardStatefulSetName(cluster.Name, 0) + "-0"
 	shardOnePod := owned.PostgreSQLShardStatefulSetName(cluster.Name, 1) + "-0"
+	postgresqlBootstrapImage := os.Getenv("PGSHARD_KIND_POSTGRES_BOOTSTRAP_IMAGE")
+	if postgresqlBootstrapImage == "" {
+		postgresqlBootstrapImage = "pgshard/postgres-agent:dev"
+	}
+	postgresqlBootstrapPullPolicy := corev1.PullIfNotPresent
+	if postgresqlBootstrapImage == "pgshard/postgres-agent:dev" {
+		postgresqlBootstrapPullPolicy = corev1.PullNever
+	}
 	initialShardZero := &corev1.Pod{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: shardZeroPod}, initialShardZero); err != nil {
 		t.Fatal(err)
 	}
-	if len(initialShardZero.Spec.InitContainers) != 1 || initialShardZero.Spec.InitContainers[0].Image != "pgshard/postgres-agent:dev" || initialShardZero.Spec.InitContainers[0].ImagePullPolicy != corev1.PullNever || initialShardZero.Annotations["pgshard.io/shardschema-migration-sha256"] == "" {
+	if len(initialShardZero.Spec.InitContainers) != 1 || initialShardZero.Spec.InitContainers[0].Image != postgresqlBootstrapImage || initialShardZero.Spec.InitContainers[0].ImagePullPolicy != postgresqlBootstrapPullPolicy || initialShardZero.Annotations["pgshard.io/shardschema-migration-sha256"] == "" {
 		t.Fatalf("shard-0000 bootstrap image contract = %#v", initialShardZero)
 	}
 	if len(initialShardZero.Status.InitContainerStatuses) != 1 || initialShardZero.Status.InitContainerStatuses[0].ImageID == "" || initialShardZero.Status.InitContainerStatuses[0].RestartCount != 0 || initialShardZero.Status.InitContainerStatuses[0].State.Terminated == nil || initialShardZero.Status.InitContainerStatuses[0].State.Terminated.ExitCode != 0 {
@@ -398,7 +406,7 @@ func TestKINDManagerRunsSingleMemberPostgreSQL18Primaries(t *testing.T) {
 	}
 	if got := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
 		"psql", "-X", "-U", "postgres", "-d", "shardschema", "-Atc",
-		"SELECT string_agg(databases.database_name::text || ':' || ranges.range_start::text || ':' || shards.shard_number::text, ',' ORDER BY databases.database_name, ranges.range_start) FROM pgshard_catalog.logical_databases AS databases JOIN pgshard_catalog.active_routing_epochs AS active ON active.logical_database_id = databases.logical_database_id JOIN pgshard_catalog.routing_ranges AS ranges ON ranges.routing_epoch = active.routing_epoch JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id")); got != "analytics:0:0,app:0:0,app:9223372036854775808:1" {
+		"SELECT string_agg(databases.database_name::text || ':' || ranges.range_start::text || ':' || shards.shard_number::text, ',' ORDER BY databases.database_name, ranges.range_start) FROM pgshard_catalog.logical_databases AS databases JOIN pgshard_catalog.active_routing_epochs AS active ON active.logical_database_id = databases.logical_database_id JOIN pgshard_catalog.routing_ranges AS ranges ON ranges.logical_database_id = active.logical_database_id AND ranges.routing_epoch = active.routing_epoch JOIN pgshard_catalog.database_shard_placements AS placements ON placements.logical_database_id = ranges.logical_database_id AND placements.database_shard_id = ranges.database_shard_id AND placements.state = 'active' JOIN pgshard_catalog.shards AS shards ON shards.shard_id = placements.shard_id")); got != "analytics:0:0,app:0:0,app:9223372036854775808:1" {
 		t.Fatalf("database genesis routing = %q", got)
 	}
 	catalogSnapshot := strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace.Name, "exec", "--container", "postgresql", shardZeroPod, "--",
@@ -1388,9 +1396,19 @@ func assertPostgreSQLRoleProfiles(t *testing.T, ctx context.Context, kubeClient 
 	if configuration == nil {
 		t.Fatalf("PostgreSQL configuration with prefix %q not found", prefix)
 	}
-	wantDocuments := 1 + int(cluster.Spec.MembersPerShard)*2
+	wantDocuments := 2 + int(cluster.Spec.MembersPerShard)*2
 	if len(configuration.Data) != wantDocuments {
 		t.Fatalf("PostgreSQL configuration documents = %#v", configuration.Data)
+	}
+	databaseGenesis := configuration.Data["database-genesis.sql"]
+	for _, statement := range []string{
+		"BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;\n",
+		"database genesis contains an undeclared active logical database",
+		"COMMIT;\n",
+	} {
+		if !strings.Contains(databaseGenesis, statement) {
+			t.Fatalf("database genesis is missing %q:\n%s", statement, databaseGenesis)
+		}
 	}
 	common := configuration.Data["postgresql.conf"]
 	for _, setting := range []string{

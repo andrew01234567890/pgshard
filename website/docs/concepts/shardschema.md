@@ -22,8 +22,9 @@ development topology, catalog readiness also gates a raw read-write
 compatibility relay to the singleton shard-0000 writer. That relay blocks
 `shardschema` and replication startup and is not a pool, router, or general
 data-shard transport. Unsupported topologies remain application-unready. The
-migration now also contains the permanent
-logical-consumer, checkpoint-generation, source-attachment, and managed-slot
+migration now also contains permanent database-shard identities,
+generationed physical placements, logical-consumer identities,
+checkpoint generations, source attachments, and managed-slot
 allocation registry described below. Its live PostgreSQL 18 test exercises the
 fenced lifecycle and tombstones. Bounded Rust primitives now authorize exact
 slot creation, activation, deletion, and final retirement; no long-running
@@ -48,7 +49,9 @@ The current internal `pgshard_catalog` migration records:
 - Logical databases, registered tables, shard-key types, and the fleet-wide
   hash version and seed.
 - Cluster-wide shard identities and permanent restore-incarnation history,
-  plus per-database routing epochs and non-overlapping half-open key ranges.
+  permanent per-database shard UUIDs and ordinals, generationed physical
+  placements, plus per-database routing epochs and non-overlapping half-open
+  key ranges that reference database-shard UUIDs rather than physical cells.
 - Routing, schema, authorization, and catalog epochs.
 - Permanent logical-consumer identities and per-shard ownership fences.
 - Never-reused checkpoint, source-attachment, and managed-slot generations.
@@ -56,10 +59,11 @@ The current internal `pgshard_catalog` migration records:
   capabilities authorize exact activation and absence-fenced retirement.
 - Permanent fixed-size operation tombstones for idempotency.
 
-Physical-cell identities, independent per-database shard sets and hash
-contracts, and database-to-cell placement generations are also target-schema
-work; the current migration does not contain them. Durable DDL, reshard,
-backup/restore and delivered-change journals remain planned extensions. The
+Physical-cell identities, independent per-database shard sets, and
+database-to-cell placement generations are present. Genesis is the only
+production mutation path today; placement switching and reshard lifecycle
+controllers remain unimplemented. Durable DDL, backup/restore and
+delivered-change journals remain planned extensions. The
 logical-consumer registry keys each stable per-shard fence by consumer,
 `logical_database_id`, and shard. Its source-attachment key adds an immutable
 shard restore-incarnation UUID, PostgreSQL system identifier, and database OID;

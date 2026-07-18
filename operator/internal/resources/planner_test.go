@@ -1166,8 +1166,13 @@ SELECT pg_catalog.string_agg(
   JOIN pgshard_catalog.active_routing_epochs AS active
 	ON active.logical_database_id = databases.logical_database_id
   JOIN pgshard_catalog.routing_ranges AS ranges
-	ON ranges.routing_epoch = active.routing_epoch
-  JOIN pgshard_catalog.shards AS shards ON shards.shard_id = ranges.shard_id`); got != "analytics:0:0,app:0:0,app:9223372036854775808:1" {
+	ON ranges.logical_database_id = active.logical_database_id
+	AND ranges.routing_epoch = active.routing_epoch
+  JOIN pgshard_catalog.database_shard_placements AS placements
+	ON placements.logical_database_id = ranges.logical_database_id
+	AND placements.database_shard_id = ranges.database_shard_id
+	AND placements.state = 'active'
+  JOIN pgshard_catalog.shards AS shards ON shards.shard_id = placements.shard_id`); got != "analytics:0:0,app:0:0,app:9223372036854775808:1" {
 		t.Fatalf("installed database genesis topology = %q", got)
 	}
 	genesisEpoch := catalogSQL(primaryDataParent, "SELECT catalog_epoch FROM pgshard_catalog.cluster_state WHERE singleton")
@@ -1190,15 +1195,23 @@ SELECT pg_catalog.string_agg(
 SELECT state.catalog_epoch,
        (SELECT pg_catalog.string_agg(
                  databases.database_name::text || ':' || active.routing_epoch::text || ':' ||
-                 ranges.range_start::text || ':' || ranges.range_end::text || ':' || ranges.shard_id::text,
+                 ranges.range_start::text || ':' || ranges.range_end::text || ':' ||
+                 ranges.database_shard_id::text || ':' || placements.shard_id::text,
                  ',' ORDER BY databases.database_name, ranges.range_start
                )
           FROM pgshard_catalog.logical_databases AS databases
           JOIN pgshard_catalog.active_routing_epochs AS active
             ON active.logical_database_id = databases.logical_database_id
           JOIN pgshard_catalog.routing_ranges AS ranges
-            ON ranges.routing_epoch = active.routing_epoch),
+            ON ranges.logical_database_id = active.logical_database_id
+           AND ranges.routing_epoch = active.routing_epoch
+          JOIN pgshard_catalog.database_shard_placements AS placements
+            ON placements.logical_database_id = ranges.logical_database_id
+           AND placements.database_shard_id = ranges.database_shard_id
+           AND placements.state = 'active'),
        (SELECT pg_catalog.count(*) FROM pgshard_catalog.logical_databases),
+       (SELECT pg_catalog.count(*) FROM pgshard_catalog.database_shards),
+       (SELECT pg_catalog.count(*) FROM pgshard_catalog.database_shard_placements),
        (SELECT pg_catalog.count(*) FROM pgshard_catalog.routing_epochs),
        (SELECT pg_catalog.count(*) FROM pgshard_catalog.routing_ranges)
   FROM pgshard_catalog.cluster_state AS state

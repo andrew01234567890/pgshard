@@ -82,7 +82,7 @@ const (
 	shardschemaMigrationPath                = "/usr/share/pgshard/migrations/0001_shardschema.sql"
 	databaseGenesisKey                      = "database-genesis.sql"
 	databaseGenesisPath                     = "/etc/pgshard/database-genesis.sql"
-	shardschemaMigrationSHA256              = "1512c1aee0e555c2208560f75e9b1c4261d8b0444d4505128e2db016d610d3d7"
+	shardschemaMigrationSHA256              = "9f810bbb4f7f06d8a24989c9ce902c38bc2e5a90bc31c649db104910b4c1ef84"
 	shardschemaMigrationHashAnnotation      = "pgshard.io/shardschema-migration-sha256"
 )
 
@@ -908,7 +908,9 @@ case "$catalog_core_tables" in
       "2720fa78d0bc96c21311b1656eeaabbb3e745ea65fa9d1ea701ffb67cde1b1d9"|\
       "ceec4ff5d633d28afacf1e93fbc2547591017e57f172dc3a8072814bb6d3867a"|\
       "3189b8a08cf2dedb5542cdf1dd58dec2f173f848ae67612aa4263751c404ea7a"|\
-      "8bb87bb746ed463bf744b7b809477e9d36ad95d7cca06e25980085bba1ae4659") ;;
+      "8bb87bb746ed463bf744b7b809477e9d36ad95d7cca06e25980085bba1ae4659"|\
+      "2a20ec8e1bec9f660d6656484ebbebab0b694788e5f0bda657eb33816bf884a6"|\
+      "06d2271274d6dfdeda51aba8293056b6fb23f451f1806f3dcd41763c595ee1de") ;;
       *)
         echo "refusing an unsupported or malformed pre-existing shardschema catalog ($catalog_schema_fingerprint)" >&2
         exit 1
