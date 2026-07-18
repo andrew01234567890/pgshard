@@ -2143,7 +2143,8 @@ func provePinnedPostgreSQLProcessAbsent(t *testing.T, ctx context.Context, kubeC
 	t.Helper()
 	const absentMarker = "pgshard-postgres-absent"
 	const liveMarker = "pgshard-postgres-live"
-	const missingContainer = `error: Internal error occurred: unable to upgrade connection: container not found ("postgresql")`
+	const missingContainer = `error: unable to upgrade connection: container not found ("postgresql")`
+	const missingContainerInternal = `error: Internal error occurred: unable to upgrade connection: container not found ("postgresql")`
 	current := &corev1.Pod{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, current); apierrors.IsNotFound(err) {
 		return nil
@@ -2198,7 +2199,7 @@ printf 'pgshard-postgres-absent\n'`, pin.pid, pin.startTime, pin.processGroup)
 	if exitError, ok := execErr.(*exec.ExitError); ok && exitError.ExitCode() == 42 && trimmed == liveMarker {
 		return fmt.Errorf("pinned postmaster or process group remains live")
 	}
-	if current.DeletionTimestamp != nil && execErr != nil && trimmed == "" && trimmedStderr == missingContainer {
+	if current.DeletionTimestamp != nil && execErr != nil && trimmed == "" && (trimmedStderr == missingContainer || trimmedStderr == missingContainerInternal) {
 		return nil
 	}
 	return fmt.Errorf("process-table probe failed: %v; stdout=%q; stderr=%q", execErr, output, stderr.String())
