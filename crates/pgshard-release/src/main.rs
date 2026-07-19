@@ -1439,8 +1439,11 @@ mod tests {
         assert!(ci.contains("github.event_name == 'workflow_dispatch'"));
         assert!(ci.contains("refs/tags/pgshard-ci-"));
         assert!(ci.contains("cleanup-dependabot-ci-ref:"));
+        assert!(ci.contains(
+            "group: pgshard-ci-${{ github.event_name == 'pull_request' && github.run_id || 'main' }}"
+        ));
         assert!(ci.contains("group: pgshard-source-release"));
-        assert_eq!(ci.matches("queue: max").count(), 1);
+        assert_eq!(ci.matches("queue: max").count(), 2);
         assert!(ci.contains("always() &&"));
     }
 

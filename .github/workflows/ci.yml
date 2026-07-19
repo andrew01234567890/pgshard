@@ -11,6 +11,13 @@ on:
 permissions:
   contents: read
 
+# Pull requests keep independent CI capacity. Every default-branch, scheduled,
+# and exact-SHA dispatch run joins one FIFO queue so rapid main updates cannot
+# build or publish concurrently.
+concurrency:
+  group: pgshard-ci-${{ github.event_name == 'pull_request' && github.run_id || 'main' }}
+  queue: max
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
