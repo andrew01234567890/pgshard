@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pgshard_types::ShardId;
+pub(crate) use pgshard_types::writable_generation::DurableWritableGeneration;
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -20,163 +20,24 @@ use crate::coordination::{
 use crate::domain::AgentState;
 use crate::postgres::{PostgresError, PreparedPostgres, WritablePostgresStopped};
 
+#[cfg(test)]
+pub(crate) fn durable_generation_for_test(term: u64) -> DurableWritableGeneration {
+    DurableWritableGeneration::new(
+        "cluster-1".to_owned(),
+        "11111111-2222-3333-4444-555555555555".to_owned(),
+        pgshard_types::ShardId(0),
+        "database".to_owned(),
+        "cluster-1-cell-0000-writable".to_owned(),
+        "99999999-8888-7777-6666-555555555555".to_owned(),
+        "cluster-1-shard-0-0/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/0123456789abcdef01234567"
+            .to_owned(),
+        term,
+    )
+    .expect("valid durable-generation fixture")
+}
+
 #[derive(Debug)]
 struct WritableAttemptIdentity;
-
-/// Exact cell and holder generation that must be durable before a postmaster
-/// can start for one writable attempt.
-///
-/// This value is carried only by the attempt-private authority channel. It is
-/// ordinary data rather than a capability: the non-cloneable attempt identity
-/// remains the authority that decides whether the value is current.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DurableWritableGeneration {
-    cluster_name: String,
-    cluster_uid: String,
-    shard_id: ShardId,
-    lease_namespace: String,
-    lease_name: String,
-    lease_uid: String,
-    holder: String,
-    term: u64,
-}
-
-impl DurableWritableGeneration {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        cluster_name: String,
-        cluster_uid: String,
-        shard_id: ShardId,
-        lease_namespace: String,
-        lease_name: String,
-        lease_uid: String,
-        holder: String,
-        term: u64,
-    ) -> Self {
-        Self {
-            cluster_name,
-            cluster_uid,
-            shard_id,
-            lease_namespace,
-            lease_name,
-            lease_uid,
-            holder,
-            term,
-        }
-    }
-
-    pub(crate) fn term(&self) -> u64 {
-        self.term
-    }
-
-    pub(crate) fn holder(&self) -> &str {
-        &self.holder
-    }
-
-    pub(crate) fn same_cell(&self, other: &Self) -> bool {
-        self.cluster_name == other.cluster_name
-            && self.cluster_uid == other.cluster_uid
-            && self.shard_id == other.shard_id
-            && self.lease_namespace == other.lease_namespace
-            && self.lease_name == other.lease_name
-            && self.lease_uid == other.lease_uid
-    }
-
-    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
-        format!(
-            "format=1\ncluster_name={}\ncluster_uid={}\nshard={}\nlease_namespace={}\nlease_name={}\nlease_uid={}\nholder={}\nterm={}\n",
-            self.cluster_name,
-            self.cluster_uid,
-            self.shard_id.0,
-            self.lease_namespace,
-            self.lease_name,
-            self.lease_uid,
-            self.holder,
-            self.term,
-        )
-        .into_bytes()
-    }
-
-    pub(crate) fn bootstrap_identity_bytes(&self) -> Vec<u8> {
-        format!(
-            "cluster_uid={}\nshard={:04}\n",
-            self.cluster_uid, self.shard_id.0
-        )
-        .into_bytes()
-    }
-
-    pub(crate) fn parse_canonical(bytes: &[u8]) -> Option<Self> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let mut lines = text.split_terminator('\n');
-        if lines.next()? != "format=1" {
-            return None;
-        }
-        let cluster_name = parse_field(lines.next()?, "cluster_name", 63, false)?;
-        let cluster_uid = parse_field(lines.next()?, "cluster_uid", 128, false)?;
-        let shard = parse_decimal::<u32>(lines.next()?, "shard")?;
-        let lease_namespace = parse_field(lines.next()?, "lease_namespace", 63, false)?;
-        let lease_name = parse_field(lines.next()?, "lease_name", 63, false)?;
-        let lease_uid = parse_field(lines.next()?, "lease_uid", 128, false)?;
-        let holder = parse_field(lines.next()?, "holder", 128, true)?;
-        let term = parse_decimal::<u64>(lines.next()?, "term").filter(|term| *term > 0)?;
-        if lines.next().is_some() || !text.ends_with('\n') {
-            return None;
-        }
-        let parsed = Self::new(
-            cluster_name,
-            cluster_uid,
-            ShardId(shard),
-            lease_namespace,
-            lease_name,
-            lease_uid,
-            holder,
-            term,
-        );
-        (parsed.canonical_bytes() == bytes).then_some(parsed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(term: u64) -> Self {
-        Self::new(
-            "cluster-1".to_owned(),
-            "11111111-2222-3333-4444-555555555555".to_owned(),
-            ShardId(0),
-            "database".to_owned(),
-            "cluster-1-cell-0000-writable".to_owned(),
-            "99999999-8888-7777-6666-555555555555".to_owned(),
-            "cluster-1-shard-0-0/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/0123456789abcdef01234567"
-                .to_owned(),
-            term,
-        )
-    }
-}
-
-fn parse_field(line: &str, name: &str, maximum: usize, allow_slash: bool) -> Option<String> {
-    let value = line.strip_prefix(name)?.strip_prefix('=')?;
-    if value.is_empty()
-        || value.len() > maximum
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'.' | b'_' | b'-')
-                || (allow_slash && byte == b'/')
-        })
-    {
-        return None;
-    }
-    Some(value.to_owned())
-}
-
-fn parse_decimal<T>(line: &str, name: &str) -> Option<T>
-where
-    T: std::str::FromStr + ToString,
-{
-    let value = line.strip_prefix(name)?.strip_prefix('=')?;
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let parsed = value.parse::<T>().ok()?;
-    (parsed.to_string() == value).then_some(parsed)
-}
 
 #[derive(Clone, Debug)]
 struct WritableAuthority {
@@ -479,7 +340,7 @@ mod tests {
 
     #[test]
     fn durable_generation_has_one_canonical_bounded_encoding() {
-        let generation = DurableWritableGeneration::for_test(42);
+        let generation = durable_generation_for_test(42);
         let canonical = generation.canonical_bytes();
 
         assert_eq!(
@@ -487,7 +348,7 @@ mod tests {
             Some(generation)
         );
         assert_eq!(
-            DurableWritableGeneration::for_test(42).bootstrap_identity_bytes(),
+            durable_generation_for_test(42).bootstrap_identity_bytes(),
             b"cluster_uid=11111111-2222-3333-4444-555555555555\nshard=0000\n"
         );
 
@@ -522,7 +383,7 @@ mod tests {
         let (_second_lease, second_postgres) = writable_attempt_pair();
         first_lease.install_authority(
             Instant::now() + Duration::from_secs(5),
-            DurableWritableGeneration::for_test(1),
+            durable_generation_for_test(1),
         );
 
         assert!(first_postgres.authority_valid_for(Duration::from_secs(1)));
@@ -536,7 +397,7 @@ mod tests {
         first_lease.authority.send_replace(Some(WritableAuthority {
             identity: Arc::clone(&second_lease.identity),
             deadline: Instant::now() + Duration::from_secs(5),
-            generation: DurableWritableGeneration::for_test(1),
+            generation: durable_generation_for_test(1),
         }));
 
         assert!(!first_postgres.authority_valid_for(Duration::ZERO));
@@ -560,7 +421,7 @@ mod tests {
         );
         lease_attempt.install_authority(
             Instant::now() + Duration::from_secs(5),
-            DurableWritableGeneration::for_test(1),
+            durable_generation_for_test(1),
         );
 
         assert!(
@@ -582,7 +443,7 @@ mod tests {
 
         lease_attempt.install_authority(
             Instant::now() + Duration::from_secs(5),
-            DurableWritableGeneration::for_test(1),
+            durable_generation_for_test(1),
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(10), &mut wait)
@@ -593,7 +454,7 @@ mod tests {
 
         lease_attempt.install_authority(
             Instant::now() + Duration::from_secs(10),
-            DurableWritableGeneration::for_test(1),
+            durable_generation_for_test(1),
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), wait)

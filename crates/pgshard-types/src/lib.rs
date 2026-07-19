@@ -2,6 +2,7 @@
 
 pub mod catalog_material;
 pub mod restore;
+pub mod writable_generation;
 
 use std::cmp::Ordering;
 

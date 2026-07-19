@@ -857,7 +857,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.postgres_agent == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -896,6 +896,10 @@ jobs:
           docker run --rm --platform linux/amd64 --network none --read-only \
             --cap-drop ALL --security-opt no-new-privileges \
             "$image" --help >/dev/null
+      - name: Prove WAL generation across a streaming standby
+        run: |
+          rustup show active-toolchain
+          make agent-wal-generation-test
       - name: Exercise real PostgreSQL 18 quarantine and recovery
         shell: bash
         run: |
@@ -1239,10 +1243,18 @@ jobs:
                   ! -e /var/lib/postgresql/redirected/postmaster.pid
                 test "$(docker exec "$container" /bin/sh -ceu \
                   'cat /run/pgshard/deployment.pid')" = external-pid-sentinel
+                test "$(docker exec "$container" \
+                  /usr/lib/postgresql/18/bin/psql -X --no-password \
+                  -h /run/pgshard/postgres -U postgres -d postgres -Atqc \
+                  "SELECT current_user || '|' || current_database()")" = 'postgres|postgres'
+                test "$(docker exec "$container" \
+                  /usr/lib/postgresql/18/bin/psql -X --no-password \
+                  -h /run/pgshard/postgres -U postgres -d postgres -Atqc \
+                  "SELECT pg_catalog.to_regnamespace('pgshard_internal') IS NULL")" = t
                 set +e
                 sql_output="$(docker exec "$container" \
-                  /usr/lib/postgresql/18/bin/psql -h /run/pgshard/postgres \
-                  -d postgres -Atqc 'CREATE TABLE quarantine_must_reject(i int)' 2>&1)"
+                  /usr/lib/postgresql/18/bin/psql -X --no-password \
+                  -h /run/pgshard/postgres -U postgres -d template1 -Atqc 'SELECT 1' 2>&1)"
                 sql_status=$?
                 set -e
                 test "$sql_status" -ne 0

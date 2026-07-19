@@ -8,6 +8,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use k8s_openapi::jiff::Timestamp;
 use kube::api::{Api, PostParams};
 use kube::{Client, Config};
+use pgshard_types::writable_generation::WritableGenerationValidationError;
 use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -110,7 +111,11 @@ impl WritableLeaseConfig {
         })
     }
 
-    fn durable_generation(&self, holder: &str, term: u64) -> DurableWritableGeneration {
+    fn durable_generation(
+        &self,
+        holder: &str,
+        term: u64,
+    ) -> Result<DurableWritableGeneration, WritableGenerationValidationError> {
         DurableWritableGeneration::new(
             self.identity.cluster_id.clone(),
             self.cluster_uid.clone(),
@@ -284,7 +289,7 @@ async fn supervise_with_store<S: LeaseStore>(
                 }
                 attempt.install_authority(
                     authority.deadline,
-                    config.durable_generation(&holder_identity, authority.epoch),
+                    config.durable_generation(&holder_identity, authority.epoch)?,
                 );
                 held_deadline = Some(authority.deadline);
                 release = Some(authority.release);
@@ -828,6 +833,9 @@ pub enum WritableLeaseError {
     /// The Lease spec cannot support safe local observation.
     #[error("writable-term Lease has an invalid holder, duration, renewal, or transition record")]
     InvalidLeaseSpec,
+    /// Validated Lease identity could not form the canonical durable record.
+    #[error("writable-term Lease identity cannot form a durable generation: {0}")]
+    InvalidDurableGeneration(#[from] WritableGenerationValidationError),
     /// Coordinated leader-election fields would change the ownership protocol.
     #[error("Kubernetes coordinated leader-election fields are not supported")]
     UnsupportedCoordinatedElection,
@@ -865,6 +873,7 @@ impl WritableLeaseError {
             | Self::LeaseIdentityMismatch
             | Self::LeaseOwnershipMismatch
             | Self::InvalidLeaseSpec
+            | Self::InvalidDurableGeneration(_)
             | Self::UnsupportedCoordinatedElection
             | Self::LeaseTransitionOverflow
             | Self::StateEvidenceRejected

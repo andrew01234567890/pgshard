@@ -1578,6 +1578,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "tracing-subscriber",
  "url",
