@@ -3,7 +3,7 @@
 use pgshard_agent::config::{AgentConfig, ConfigError};
 use pgshard_agent::coordination::{WritableLeaseConfig, WritableLeaseError};
 use pgshard_agent::domain::{AgentState, PostgresProcessState};
-use pgshard_agent::postgres::{PostgresError, PreparedPostgres};
+use pgshard_agent::postgres::{PostgresError, PostgresStopMode, PreparedPostgres};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -115,6 +115,7 @@ async fn run_services(
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AgentRunError> {
+    let postgres_stop_mode = postgres_stop_mode(writable_lease.is_some());
     let run_shutdown_tx = shutdown_tx.clone();
     let coordination_state = state.clone();
     let coordination_shutdown = shutdown_rx.clone();
@@ -128,7 +129,10 @@ async fn run_services(
                 state.clone(),
                 wait_for_shutdown(shutdown_rx.clone()),
             );
-            let postmaster = postgres.supervise(state, wait_for_shutdown(shutdown_rx));
+            let postmaster = postgres.supervise_with_stop_mode(state, async move {
+                wait_for_shutdown(shutdown_rx).await;
+                postgres_stop_mode
+            });
             tokio::pin!(http);
             tokio::pin!(postmaster);
             tokio::select! {
@@ -170,6 +174,14 @@ async fn run_services(
             }
         }
         None => components.await,
+    }
+}
+
+fn postgres_stop_mode(writable_term_configured: bool) -> PostgresStopMode {
+    if writable_term_configured {
+        PostgresStopMode::Fence
+    } else {
+        PostgresStopMode::Graceful
     }
 }
 
@@ -293,6 +305,12 @@ mod tests {
         };
         assert_eq!(http.to_string(), "HTTP failed");
         assert!(matches!(postgres, PostgresError::PreparedStateChanged));
+    }
+
+    #[test]
+    fn writable_term_always_selects_target_fencing() {
+        assert_eq!(postgres_stop_mode(true), PostgresStopMode::Fence);
+        assert_eq!(postgres_stop_mode(false), PostgresStopMode::Graceful);
     }
 
     #[tokio::test]

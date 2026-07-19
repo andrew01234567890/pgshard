@@ -46,6 +46,7 @@ const MIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(10);
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(55);
 const MAX_SHUTDOWN_BUDGET: Duration = Duration::from_secs(55);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const TARGET_FENCE_CLEANUP_STAGES: u32 = 3;
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const QUARANTINE_HBA_CONTENT: &[u8] = b"local all all reject\nlocal replication all reject\n";
 
@@ -174,6 +175,29 @@ impl PostgresConfig {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
+
+    /// Returns the bounded signal and process-tree cleanup interval that must
+    /// fit inside a writable Lease's post-renewal fencing margin.
+    ///
+    /// If the kernel cannot provide bounded process-absence proof, cleanup
+    /// deliberately remains blocked beyond this interval and retains the
+    /// PGDATA lock. The configured margin covers the normal immediate-stop,
+    /// kill, and reap stages; it is not permission to release an inconclusive
+    /// local storage fence.
+    #[must_use]
+    pub(crate) fn target_fence_budget(&self) -> Duration {
+        self.immediate_shutdown_timeout
+            .saturating_add(KILL_REAP_TIMEOUT.saturating_mul(TARGET_FENCE_CLEANUP_STAGES))
+    }
+}
+
+/// Requested termination mode for a supervised postmaster.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostgresStopMode {
+    /// Preserve `PostgreSQL`'s smart, fast, then immediate shutdown ordering.
+    Graceful,
+    /// Revoke local authority and immediately fence the complete process tree.
+    Fence,
 }
 
 /// Offline-validated postmaster configuration ready to spawn.
@@ -444,6 +468,29 @@ impl PreparedPostgres {
         state: AgentState,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), PostgresError> {
+        self.supervise_with_stop_mode(state, async {
+            shutdown.await;
+            PostgresStopMode::Graceful
+        })
+        .await
+    }
+
+    /// Runs the postmaster with an explicit termination mode.
+    ///
+    /// Writable-term coordination must select [`PostgresStopMode::Fence`].
+    /// This revokes local Lease evidence before signaling the postmaster and
+    /// skips the smart and fast shutdown waits that can outlive the Lease's
+    /// fencing margin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation, startup, supervision, or the selected
+    /// process-tree shutdown cannot be completed safely.
+    pub async fn supervise_with_stop_mode(
+        self,
+        state: AgentState,
+        shutdown: impl Future<Output = PostgresStopMode>,
+    ) -> Result<(), PostgresError> {
         state.clear_lease();
         tokio::pin!(shutdown);
         if shutdown_requested(shutdown.as_mut()).await {
@@ -506,19 +553,31 @@ impl PreparedPostgres {
                 state.set_postgres_process(PostgresProcessState::Failed);
                 Err(error)
             }
-            () = &mut shutdown => {
+            stop_mode = &mut shutdown => {
+                state.clear_lease();
                 state.set_postgres_process(PostgresProcessState::Stopping);
-                let result = shutdown_child(
-                    &mut process_group_fence.child,
-                    &pidfd,
-                    process_group,
-                    &process_group_fence.child_subreaper,
-                    &shutdown_config,
-                ).await;
-                state.set_postgres_process(if result.is_ok() {
-                    PostgresProcessState::Validated
-                } else {
+                let result = match stop_mode {
+                    PostgresStopMode::Graceful => shutdown_child(
+                        &mut process_group_fence.child,
+                        &pidfd,
+                        process_group,
+                        &process_group_fence.child_subreaper,
+                        &shutdown_config,
+                    ).await,
+                    PostgresStopMode::Fence => target_fence_child(
+                        &mut process_group_fence.child,
+                        &pidfd,
+                        process_group,
+                        &process_group_fence.child_subreaper,
+                        &shutdown_config,
+                    ).await,
+                };
+                state.set_postgres_process(if result.is_err() {
                     PostgresProcessState::Failed
+                } else if stop_mode == PostgresStopMode::Fence {
+                    PostgresProcessState::Fenced
+                } else {
+                    PostgresProcessState::Validated
                 });
                 result
             }
@@ -749,11 +808,11 @@ async fn await_validation<F>(
     shutdown: Pin<&mut F>,
 ) -> Result<Option<ValidatedPostgresState>, PostgresError>
 where
-    F: Future<Output = ()>,
+    F: Future,
 {
     tokio::select! {
         biased;
-        () = shutdown => Ok(None),
+        _ = shutdown => Ok(None),
         result = timeout(VALIDATION_TIMEOUT, task) => {
             result
                 .map_err(|_| PostgresError::ValidationTimeout(VALIDATION_TIMEOUT))?
@@ -765,11 +824,11 @@ where
 
 async fn shutdown_requested<F>(shutdown: Pin<&mut F>) -> bool
 where
-    F: Future<Output = ()>,
+    F: Future,
 {
     tokio::select! {
         biased;
-        () = shutdown => true,
+        _ = shutdown => true,
         () = std::future::ready(()) => false,
     }
 }
@@ -1007,6 +1066,35 @@ async fn shutdown_child(
     let result = shutdown_child_inner(pidfd, config).await;
     let cleanup = kill_and_reap(child, Some(pidfd), Some(process_group), child_subreaper).await;
     combine_shutdown_result(result, cleanup)
+}
+
+async fn target_fence_child(
+    child: &mut Child,
+    pidfd: &AsyncFd<OwnedFd>,
+    process_group: Pid,
+    child_subreaper: &ChildSubreaper,
+    config: &PostgresConfig,
+) -> Result<(), PostgresError> {
+    let signal_result = signal_and_wait(pidfd, Signal::QUIT, config.immediate_shutdown_timeout)
+        .await
+        .map(|_| ());
+    let cleanup = kill_and_reap(child, Some(pidfd), Some(process_group), child_subreaper).await;
+    combine_target_fence_result(signal_result, cleanup)
+}
+
+fn combine_target_fence_result(
+    signal: Result<(), PostgresError>,
+    cleanup: Result<ProcessTreeCleanup, PostgresError>,
+) -> Result<(), PostgresError> {
+    match (signal, cleanup) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(PostgresError::CleanupFailed {
+            error: Box::new(error),
+            cleanup: Box::new(cleanup),
+        }),
+    }
 }
 
 fn combine_shutdown_result(
@@ -4392,6 +4480,97 @@ mod tests {
             state.snapshot().postgres_process,
             PostgresProcessState::Validated
         );
+    }
+
+    #[tokio::test]
+    async fn target_fence_skips_smart_and_fast_shutdown() {
+        let root = TempDir::new().expect("create target-fence fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let ready = root.path().join("signal-handlers-ready");
+        let smart = root.path().join("smart-shutdown");
+        let fast = root.path().join("fast-shutdown");
+        let fenced = root.path().join("target-fenced");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\ntrap 'printf smart > \"{}\"; exit 0' TERM\ntrap 'printf fast > \"{}\"; exit 0' INT\ntrap 'printf fenced > \"{}\"; exit 0' QUIT\n: > '{}'\nwhile :; do :; done\n",
+                smart.display(),
+                fast.display(),
+                fenced.display(),
+                ready.display()
+            ),
+        );
+        let config = test_config(data_dir, executable, root.path().join("socket"));
+        let prepared = prepare_fixture(config).expect("prepare target-fence fixture");
+        let state = agent_state();
+
+        let result = timeout(
+            Duration::from_secs(2),
+            prepared.supervise_with_stop_mode(state.clone(), async {
+                wait_for_marker(&ready).await;
+                PostgresStopMode::Fence
+            }),
+        )
+        .await
+        .expect("bounded target fence");
+
+        assert!(result.is_ok(), "target fence failed: {result:?}");
+        assert!(!smart.exists(), "target fence attempted smart shutdown");
+        assert!(!fast.exists(), "target fence attempted fast shutdown");
+        assert_eq!(
+            fs::read_to_string(fenced).expect("read target-fence marker"),
+            "fenced"
+        );
+        assert!(state.snapshot().lease.is_none());
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Fenced
+        );
+    }
+
+    #[tokio::test]
+    async fn target_fence_kills_the_complete_unresponsive_process_tree() {
+        let root = TempDir::new().expect("create target-fence process-tree fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let descendant = root.path().join("descendant-pid");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\ntrap '' TERM INT QUIT\n(trap '' TERM INT QUIT; while :; do :; done) &\nprintf '%s\\n' \"$!\" > '{}'\nwhile :; do :; done\n",
+                descendant.display()
+            ),
+        );
+        let config = test_config(data_dir, executable, root.path().join("socket"));
+        let prepared = prepare_fixture(config.clone()).expect("prepare target-fence fixture");
+
+        let result = timeout(
+            Duration::from_secs(2),
+            prepared.supervise_with_stop_mode(agent_state(), async {
+                wait_for_marker(&descendant).await;
+                PostgresStopMode::Fence
+            }),
+        )
+        .await
+        .expect("bounded target-fence process-tree cleanup");
+
+        assert!(result.is_ok(), "target-fence cleanup failed: {result:?}");
+        let descendant_pid = fs::read_to_string(&descendant)
+            .expect("read descendant PID")
+            .trim_ascii()
+            .parse::<u32>()
+            .expect("parse descendant PID");
+        if let Ok(status) = fs::read_to_string(format!("/proc/{descendant_pid}/status")) {
+            assert!(
+                status.lines().any(|line| line.starts_with("State:\tZ")),
+                "live postmaster descendant survived the target fence"
+            );
+        }
+        let reacquired = prepare_fixture(config).expect("reacquire target-fenced PGDATA");
+        drop(reacquired);
     }
 
     #[tokio::test]

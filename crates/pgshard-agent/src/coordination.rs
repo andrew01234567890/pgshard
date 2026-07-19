@@ -120,6 +120,13 @@ impl WritableLeaseConfig {
         i32::try_from(self.lease_duration.as_secs())
             .expect("validated Kubernetes Lease duration fits i32")
     }
+
+    /// Returns the local interval reserved for target-side fencing after Lease
+    /// renewal must stop.
+    #[must_use]
+    pub(crate) fn shutdown_margin(&self) -> Duration {
+        self.lease_duration.saturating_sub(self.renew_deadline)
+    }
 }
 
 /// Acquires and renews the exact operator-owned writable-term Lease.
@@ -163,10 +170,15 @@ async fn supervise_with_store<S: LeaseStore>(
             state.clear_lease();
             return Ok(());
         }
-        if held && !renewal_window_open(&state, config, Instant::now()) {
-            state.clear_lease();
-            return Err(WritableLeaseError::RenewDeadlineExceeded);
-        }
+        let renewal_cutoff = if held {
+            let Some(cutoff) = renewal_cutoff(&state, config) else {
+                state.clear_lease();
+                return Err(WritableLeaseError::RenewDeadlineExceeded);
+            };
+            Some(cutoff)
+        } else {
+            None
+        };
         let result = tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -175,6 +187,10 @@ async fn supervise_with_store<S: LeaseStore>(
                     return Ok(());
                 }
                 continue;
+            }
+            () = wait_for_renewal_cutoff(renewal_cutoff) => {
+                state.clear_lease();
+                return Err(WritableLeaseError::RenewDeadlineExceeded);
             }
             result = reconcile_once(store, config, &holder_identity, &mut observed_holder) => result,
         };
@@ -577,6 +593,13 @@ async fn wait_or_stop(shutdown: &mut watch::Receiver<bool>, duration: Duration) 
     }
 }
 
+async fn wait_for_renewal_cutoff(cutoff: Option<Instant>) {
+    match cutoff {
+        Some(cutoff) => tokio::time::sleep_until(tokio::time::Instant::from_std(cutoff)).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -586,11 +609,13 @@ fn new_process_incarnation() -> String {
 }
 
 fn renewal_window_open(state: &AgentState, config: &WritableLeaseConfig, now: Instant) -> bool {
-    let shutdown_margin = config.lease_duration.saturating_sub(config.renew_deadline);
+    renewal_cutoff(state, config).is_some_and(|deadline| now < deadline)
+}
+
+fn renewal_cutoff(state: &AgentState, config: &WritableLeaseConfig) -> Option<Instant> {
     state
-        .lease_deadline()
-        .and_then(|deadline| deadline.checked_sub(shutdown_margin))
-        .is_some_and(|deadline| now < deadline)
+        .lease_deadline()?
+        .checked_sub(config.shutdown_margin())
 }
 
 fn unix_time_ms() -> u64 {
@@ -704,7 +729,10 @@ impl WritableLeaseError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
     use pgshard_types::ShardId;
@@ -838,6 +866,31 @@ mod tests {
                 return Err(WritableLeaseError::RequestTimedOut("replace Lease"));
             }
             Ok(stored.clone())
+        }
+    }
+
+    struct DelayedRenewalStore {
+        inner: FakeStore,
+        replace_calls: AtomicUsize,
+        renewal_delay: Duration,
+        delay_after_commit: bool,
+    }
+
+    impl LeaseStore for DelayedRenewalStore {
+        async fn get(&self) -> Result<Lease, WritableLeaseError> {
+            self.inner.get().await
+        }
+
+        async fn replace(&self, lease: &Lease) -> Result<Lease, WritableLeaseError> {
+            let delayed_renewal = self.replace_calls.fetch_add(1, Ordering::SeqCst) > 0;
+            if delayed_renewal && !self.delay_after_commit {
+                tokio::time::sleep(self.renewal_delay).await;
+            }
+            let result = self.inner.replace(lease).await;
+            if delayed_renewal && self.delay_after_commit {
+                tokio::time::sleep(self.renewal_delay).await;
+            }
+            result
         }
     }
 
@@ -1265,6 +1318,80 @@ mod tests {
             result.expect("supervisor observed preemption"),
             Err(WritableLeaseError::AuthorityPreempted)
         ));
+        assert!(state.snapshot().lease.is_none());
+        assert!(state.lease_deadline().is_none());
+    }
+
+    #[tokio::test]
+    async fn renewal_cutoff_stops_waiting_for_an_inflight_request_before_fencing_margin() {
+        let mut config = config();
+        config.lease_duration = Duration::from_secs(2);
+        config.renew_deadline = Duration::from_millis(200);
+        config.retry_period = Duration::from_millis(10);
+        let store = DelayedRenewalStore {
+            inner: FakeStore::new(lease(&config)),
+            replace_calls: AtomicUsize::new(0),
+            renewal_delay: Duration::from_secs(5),
+            delay_after_commit: false,
+        };
+        let state =
+            AgentState::with_identity(config.identity.clone(), 10_000).expect("valid agent state");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervise_with_store(&store, &config, state.clone(), shutdown_rx),
+        )
+        .await
+        .expect("renewal cutoff must stop waiting for the delayed API request");
+
+        assert!(matches!(
+            result,
+            Err(WritableLeaseError::RenewDeadlineExceeded)
+        ));
+        assert!(store.replace_calls.load(Ordering::SeqCst) >= 2);
+        assert!(state.snapshot().lease.is_none());
+        assert!(state.lease_deadline().is_none());
+    }
+
+    #[tokio::test]
+    async fn renewal_cutoff_revokes_local_authority_after_an_unanswered_commit() {
+        let mut config = config();
+        config.lease_duration = Duration::from_secs(2);
+        config.renew_deadline = Duration::from_millis(200);
+        config.retry_period = Duration::from_millis(10);
+        let store = DelayedRenewalStore {
+            inner: FakeStore::new(lease(&config)),
+            replace_calls: AtomicUsize::new(0),
+            renewal_delay: Duration::from_secs(5),
+            delay_after_commit: true,
+        };
+        let state =
+            AgentState::with_identity(config.identity.clone(), 10_000).expect("valid agent state");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervise_with_store(&store, &config, state.clone(), shutdown_rx),
+        )
+        .await
+        .expect("renewal cutoff must not wait for a committed response");
+
+        assert!(matches!(
+            result,
+            Err(WritableLeaseError::RenewDeadlineExceeded)
+        ));
+        assert_eq!(
+            store
+                .inner
+                .lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .metadata
+                .resource_version
+                .as_deref(),
+            Some("3")
+        );
         assert!(state.snapshot().lease.is_none());
         assert!(state.lease_deadline().is_none());
     }

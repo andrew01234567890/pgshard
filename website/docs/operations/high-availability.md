@@ -50,12 +50,20 @@ reusing the old fencing term. A candidate times an unchanged foreign record
 locally for a full Lease duration instead of comparing the holder's clock. A
 successful response is anchored to the monotonic instant before the request was
 dispatched, so API latency consumes authority and wall-clock jumps cannot extend
-it. The operator does not yet project the cell identity or inject the Lease UID
-and agent runtime into PostgreSQL Pods. The current postmaster supervisor is
-TCP-quarantined, and signal/process-tree cleanup is not a target-side
-serving-primary fence. Promotion proof, serving activation, bounded token
-projection, and release-after-durable-stop remain absent, so the existence of
-these envelopes is not an HA claim.
+it. With writable coordination enabled, every agent shutdown clears local term
+evidence and immediately enters the PostgreSQL process-tree fence, skipping the
+smart and fast waits. An absolute monotonic renewal cutoff stops awaiting an
+in-flight Kubernetes API request rather than letting response latency consume
+the fencing margin. The write might already have committed; resource-version
+CAS prevents a later stale overwrite, and a candidate restarts the full
+unchanged-record observation window from the changed Lease. Startup rejects a
+Lease/shutdown combination unless the post-renewal margin strictly exceeds the
+configured immediate-stop and normal cleanup budget. The operator does not yet
+project the cell identity or inject the Lease UID and agent runtime into
+PostgreSQL Pods. The supervisor remains
+TCP-quarantined; promotion proof, durable generation enforcement, serving
+activation, bounded token projection, and release-after-durable-stop remain
+absent, so this is not yet a serving-primary fence or an HA claim.
 
 The pre-Lease development layout's three etcd data claims are retired
 automatically. The operator first prunes the old cluster-owned StatefulSet,
@@ -66,8 +74,8 @@ resource-version preconditions. A mismatch or mount blocks deletion. No
 PostgreSQL data claim participates in this migration.
 
 On `SIGTERM`, the process removes readiness before notifying its workers,
-cancels any in-flight Kubernetes API request, limits best-effort Lease release
-to one second, and limits HTTP plus coordination drain to ten
+stops awaiting any in-flight Kubernetes API request, limits best-effort Lease
+release to one second, and limits HTTP plus coordination drain to ten
 seconds. The operator explicitly gives orchestrator Pods a 30-second Kubernetes
 termination grace. Lease expiry remains the cleanup backstop when revocation
 cannot complete.
@@ -417,11 +425,12 @@ durable authority: topology, operations, fencing generations, and transaction
 decisions remain in PostgreSQL. The operator now creates and UID-checkpoints an
 empty Lease envelope per cell with an unmounted exact-name API identity, and the
 opt-in Rust agent implements the exact claim, renewal, takeover-observation, and
-monotonic-deadline transport. The operator does not yet inject that runtime
-into PostgreSQL Pods, and the agent
-supports only TCP-quarantined PostgreSQL. Signal escalation alone cannot prove
-every backend is fenced before Lease expiry, and there is no promotion or
-serving activation path. The fleet-level orchestrator leadership Lease remains
+monotonic-deadline transport. A configured writable term forces every shutdown
+through immediate process-tree fencing, and unsafe Lease/fence timing pairs are
+rejected. The operator does not yet inject that runtime into PostgreSQL Pods,
+and the agent supports only TCP-quarantined PostgreSQL. There is no durable
+generation install, promotion, or serving activation path. The fleet-level
+orchestrator leadership Lease remains
 a separate control-plane mutex and is deliberately not a shard term.
 
 As in CloudNativePG, a candidate observes a competing holder's Lease record
@@ -429,10 +438,14 @@ locally and may take it over only after the same holder and renewal record stay
 unchanged for a full lease duration. Resource-version conditional updates pick
 one winner without trusting the old holder's wall clock. The agent translates
 each proven response into a monotonic local deadline and stops renewing at a
-separate earlier deadline. A coordination failure requests the quarantine
-supervisor stop, but target-side fencing, the serving-primary lifecycle, and
-promotion ordering remain unimplemented; a Kubernetes Lease alone cannot fence
-an isolated process.
+separate earlier deadline; the deadline race stops awaiting any in-flight Lease
+request. An unknown commit cannot overwrite a later resource version, and a
+visible commit restarts a candidate's full unchanged-record observation window.
+A coordination failure clears that evidence and requests immediate process-tree
+fencing. That local mechanism is necessary but
+not sufficient: the serving-primary lifecycle, peer-isolation policy, durable
+generation fence, and promotion ordering remain unimplemented, and a Kubernetes
+Lease alone cannot fence an isolated process or node.
 
 The existing in-memory state machines model the later boundary. Both the
 orchestrator authority and receiving agent reject expired or overlong leases;

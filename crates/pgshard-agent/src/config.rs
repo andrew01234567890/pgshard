@@ -136,7 +136,7 @@ struct RawConfig {
     #[arg(
         long,
         env = "PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS",
-        default_value_t = 5_000
+        default_value_t = 500
     )]
     postgres_immediate_shutdown_ms: u64,
 }
@@ -272,6 +272,16 @@ fn validate_writable_postgres_pair(
     if writable_lease.is_some() && postgres.is_none() {
         return Err(ConfigError::WritableLeaseRequiresPostgres);
     }
+    if let (Some(writable_lease), Some(postgres)) = (writable_lease, postgres) {
+        let shutdown_margin = writable_lease.shutdown_margin();
+        let target_fence_budget = postgres.target_fence_budget();
+        if target_fence_budget >= shutdown_margin {
+            return Err(ConfigError::WritableLeaseFenceMarginInsufficient {
+                shutdown_margin_ms: duration_millis(shutdown_margin),
+                target_fence_budget_ms: duration_millis(target_fence_budget),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -350,6 +360,16 @@ pub enum ConfigError {
     /// Lease ownership without the supervised postmaster has no safe runtime role.
     #[error("writable-term Lease coordination requires supervised PostgreSQL quarantine mode")]
     WritableLeaseRequiresPostgres,
+    /// Target-side fencing cannot finish inside the reserved Lease margin.
+    #[error(
+        "writable-term Lease shutdown margin {shutdown_margin_ms} ms must exceed PostgreSQL target-fence budget {target_fence_budget_ms} ms"
+    )]
+    WritableLeaseFenceMarginInsufficient {
+        /// Time between the renewal deadline and local Lease expiry.
+        shutdown_margin_ms: u64,
+        /// Configured immediate-stop and process-tree cleanup budget.
+        target_fence_budget_ms: u64,
+    },
     /// Endpoint URL parsing failed.
     #[error("invalid OTLP endpoint {value:?}: {source}")]
     InvalidOtlpEndpoint {
@@ -447,6 +467,43 @@ mod tests {
         ]);
         let config = AgentConfig::try_parse_from(args).expect("valid writable Lease config");
         assert!(config.writable_lease.is_some());
+    }
+
+    #[test]
+    fn rejects_writable_lease_without_target_fence_margin() {
+        let mut args = required_args();
+        args.extend([
+            "--cluster-uid",
+            "11111111-2222-3333-4444-555555555555",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--lease-namespace",
+            "database",
+            "--writable-lease-name",
+            "cluster-1-cell-0003-writable",
+            "--writable-lease-uid",
+            "99999999-8888-7777-6666-555555555555",
+            "--writable-lease-duration-seconds",
+            "6",
+            "--writable-lease-renew-deadline-seconds",
+            "4",
+            "--writable-lease-retry-ms",
+            "100",
+            "--kubernetes-request-timeout-ms",
+            "100",
+            "--postgres-mode",
+            "quarantine",
+            "--postgres-data-dir",
+            "/var/lib/postgresql/data",
+        ]);
+
+        assert!(matches!(
+            AgentConfig::try_parse_from(args),
+            Err(ConfigError::WritableLeaseFenceMarginInsufficient {
+                shutdown_margin_ms: 2_000,
+                target_fence_budget_ms: 3_500,
+            })
+        ));
     }
 
     #[test]

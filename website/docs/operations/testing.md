@@ -480,7 +480,14 @@ establishes its data and socket locks before overwriting the external PID file.
 Shutdown tests exercise smart-to-fast escalation, forced reaping, a
 signal-ignoring postmaster descendant, nested PID-namespace group identifiers,
 a leader that exits before its descendant, unreaped pidfd observation,
-non-UTF-8 Linux process names, and cancellation of the supervision future. A
+non-UTF-8 Linux process names, and cancellation of the supervision future.
+Writable-term tests additionally require immediate fencing to skip smart and
+fast shutdown, clear local authority, kill an unresponsive complete process
+tree, preserve the PGDATA exclusion boundary, and reject a Lease margin smaller
+than its fence budget. Coordination tests delay an in-flight renewal past the
+absolute cutoff both before and after a simulated commit; both cases must clear
+local authority without waiting for the response or consuming the fencing
+margin. A
 deterministic cleanup-state test injects a transient process-table inspection
 failure and requires a later absence proof not to be mislabeled as a surviving
 descendant. Cancellation also reaps the direct child before the PGDATA fence can
