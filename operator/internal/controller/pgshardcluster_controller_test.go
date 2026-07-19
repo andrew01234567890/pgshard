@@ -436,7 +436,7 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 		if err := fakeClient.Get(ctx, secretKey, secret); err != nil {
 			t.Fatal(err)
 		}
-		if err := validatePostgreSQLAuthSecret(secret, cluster, shard, bootstrap.SecretName); err != nil {
+		if err := validatePostgreSQLAuthSecret(secret, cluster, bootstrap, bootstrap.SecretName); err != nil {
 			t.Fatalf("generated credential for shard %d is invalid: %v", shard, err)
 		}
 		claim := &corev1.PersistentVolumeClaim{}
@@ -575,23 +575,46 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			if current.Status.CatalogAccess != nil {
 				t.Fatalf("multi-member source storage created catalog access: %#v", current.Status.CatalogAccess)
 			}
-			bootstrap := bootstrapForShard(t, current, 0)
-			secret := &corev1.Secret{}
-			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}, secret); err != nil {
-				t.Fatal(err)
+			if len(current.Status.PostgreSQLBootstraps) != int(members) {
+				t.Fatalf("multi-member source storage has %d records, want %d: %#v", len(current.Status.PostgreSQLBootstraps), members, current.Status.PostgreSQLBootstraps)
 			}
-			claim := &corev1.PersistentVolumeClaim{}
-			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, claim); err != nil {
-				t.Fatal(err)
-			}
-			if secret.UID != bootstrap.SecretUID || claim.UID != bootstrap.PVCUID || !bootstrap.PVCFenceDetached || !postgresqlCredentialIsDataAnchored(secret, bootstrap) || len(claim.OwnerReferences) != 0 || !postgresqlDataPVCIsProtected(claim) {
-				t.Fatalf("source-storage lifecycle is incomplete: secret=%#v claim=%#v bootstrap=%#v", secret.ObjectMeta, claim.ObjectMeta, bootstrap)
-			}
-			if claim.Labels[owned.MemberLabel] != "0000" {
-				t.Fatalf("source-storage member label = %q", claim.Labels[owned.MemberLabel])
-			}
-			if role, exists := claim.Labels[owned.RoleLabel]; exists {
-				t.Fatalf("non-serving source storage carries authorizing role label %q", role)
+			resourceNames := make(map[string]struct{}, 2*members)
+			resourceUIDs := make(map[types.UID]struct{}, 2*members)
+			for member := int32(0); member < members; member++ {
+				bootstrap := bootstrapForMember(t, current, 0, member)
+				secret := &corev1.Secret{}
+				if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}, secret); err != nil {
+					t.Fatal(err)
+				}
+				claim := &corev1.PersistentVolumeClaim{}
+				if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, claim); err != nil {
+					t.Fatal(err)
+				}
+				if secret.UID != bootstrap.SecretUID || claim.UID != bootstrap.PVCUID || !bootstrap.PVCFenceDetached || !postgresqlCredentialIsDataAnchored(secret, bootstrap) || len(claim.OwnerReferences) != 0 || !postgresqlDataPVCIsProtected(claim) {
+					t.Fatalf("source-storage lifecycle is incomplete for member %d: secret=%#v claim=%#v bootstrap=%#v", member, secret.ObjectMeta, claim.ObjectMeta, bootstrap)
+				}
+				wantMember := fmt.Sprintf("%04d", member)
+				if secret.Labels[owned.MemberLabel] != wantMember || claim.Labels[owned.MemberLabel] != wantMember {
+					t.Fatalf("source-storage member labels = secret %q claim %q, want %q", secret.Labels[owned.MemberLabel], claim.Labels[owned.MemberLabel], wantMember)
+				}
+				if _, exists := secret.Labels[owned.RoleLabel]; exists {
+					t.Fatalf("non-serving source credential carries a role label: %#v", secret.Labels)
+				}
+				if role, exists := claim.Labels[owned.RoleLabel]; exists {
+					t.Fatalf("non-serving source storage carries authorizing role label %q", role)
+				}
+				for _, name := range []string{bootstrap.SecretName, bootstrap.PVCName} {
+					if _, duplicate := resourceNames[name]; duplicate {
+						t.Fatalf("source-storage name %q is shared by multiple members", name)
+					}
+					resourceNames[name] = struct{}{}
+				}
+				for _, uid := range []types.UID{bootstrap.SecretUID, bootstrap.PVCUID} {
+					if _, duplicate := resourceUIDs[uid]; duplicate {
+						t.Fatalf("source-storage UID %q is shared by multiple members", uid)
+					}
+					resourceUIDs[uid] = struct{}{}
+				}
 			}
 			statefulSets := &appsv1.StatefulSetList{}
 			pods := &corev1.PodList{}
@@ -615,9 +638,13 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			if _, err := direct.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "durable multi-member PostgreSQL source storage requires runtime \"agent-quarantine\"") {
 				t.Fatalf("direct manager accepted agent source storage: %v", err)
 			}
-			unchanged := bootstrapForShard(t, getCluster(t, ctx, base, cluster), 0)
-			if unchanged.SecretUID != bootstrap.SecretUID || unchanged.PVCUID != bootstrap.PVCUID {
-				t.Fatalf("rejected runtime transition changed source storage: before=%#v after=%#v", bootstrap, unchanged)
+			unchangedCluster := getCluster(t, ctx, base, cluster)
+			for member := int32(0); member < members; member++ {
+				before := bootstrapForMember(t, current, 0, member)
+				after := bootstrapForMember(t, unchangedCluster, 0, member)
+				if after.SecretUID != before.SecretUID || after.PVCUID != before.PVCUID {
+					t.Fatalf("rejected runtime transition changed source storage for member %d: before=%#v after=%#v", member, before, after)
+				}
 			}
 		})
 	}
@@ -650,6 +677,177 @@ func TestDirectMultiMemberRuntimeDoesNotCreateSourceStorage(t *testing.T) {
 	}
 	if len(secrets.Items) != 0 || len(claims.Items) != 0 || len(statefulSets.Items) != 0 {
 		t.Fatalf("direct multi-member runtime created source storage or workloads: Secrets=%d PVCs=%d StatefulSets=%d", len(secrets.Items), len(claims.Items), len(statefulSets.Items))
+	}
+}
+
+func TestLegacyMemberZeroCredentialMetadataMigratesWithoutChangingIdentity(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 3
+	name := legacyPostgreSQLAuthSecretPrefix(cluster.Name, 0) + strings.Repeat("a", hex.EncodedLen(bootstrapNameRandomBytes))
+	secret := owned.PostgreSQLMemberAuthSecret(cluster, 0, 0, name, []byte(strings.Repeat("b", hex.EncodedLen(postgresqlPasswordBytes))))
+	secret.UID = "legacy-member-zero-secret"
+	secret.ResourceVersion = "1"
+	delete(secret.Labels, owned.MemberLabel)
+	bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{Shard: 0, Member: 0, SecretName: name, SecretUID: secret.UID}
+	base := newFakeClient(t, cluster, secret)
+	reconciler := developmentReconciler(base, nil)
+
+	observed := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, observed); err != nil {
+		t.Fatal(err)
+	}
+	originalUID := observed.UID
+	if err := reconciler.migrateLegacyPostgreSQLAuthSecretMetadata(ctx, cluster, bootstrap, observed); err != nil {
+		t.Fatal(err)
+	}
+	migrated := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated.UID != originalUID || migrated.Labels[owned.MemberLabel] != "0000" {
+		t.Fatalf("legacy credential migration changed identity or missed member label: %#v", migrated.ObjectMeta)
+	}
+	if err := validatePostgreSQLAuthSecret(migrated, cluster, bootstrap, name); err != nil {
+		t.Fatalf("migrated credential is invalid: %v", err)
+	}
+}
+
+func TestReconcileUpgradesMemberlessSourceStorageStatusFromPreviousRelease(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 3
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	legacySecretName := legacyPostgreSQLAuthSecretPrefix(cluster.Name, 0) + strings.Repeat("a", hex.EncodedLen(bootstrapNameRandomBytes))
+	legacyPVCName := fmt.Sprintf("%s-shard-0000-data-%s", cluster.Name, strings.Repeat("b", hex.EncodedLen(bootstrapNameRandomBytes)))
+	legacySecretUID := types.UID("legacy-source-secret")
+	legacyPVCUID := types.UID("legacy-source-pvc")
+	cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{{
+		Shard: 0, Member: 0, SecretName: legacySecretName, SecretUID: legacySecretUID,
+		PVCFenceDetached: true, PVCName: legacyPVCName, PVCUID: legacyPVCUID,
+		PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
+	}}
+
+	encoded, err := json.Marshal(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		t.Fatal(err)
+	}
+	status := document["status"].(map[string]any)
+	bootstraps := status["postgresqlBootstraps"].([]any)
+	delete(bootstraps[0].(map[string]any), "member")
+	legacyEncoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyCluster := &pgshardv1alpha1.PgShardCluster{}
+	if err := json.Unmarshal(legacyEncoded, legacyCluster); err != nil {
+		t.Fatal(err)
+	}
+	if legacyCluster.Status.PostgreSQLBootstraps[0].Member != 0 {
+		t.Fatalf("memberless status did not decode as stable member zero: %#v", legacyCluster.Status.PostgreSQLBootstraps)
+	}
+
+	secret := owned.PostgreSQLMemberAuthSecret(legacyCluster, 0, 0, legacySecretName, []byte(strings.Repeat("c", hex.EncodedLen(postgresqlPasswordBytes))))
+	secret.UID = legacySecretUID
+	secret.ResourceVersion = "1"
+	delete(secret.Labels, owned.MemberLabel)
+	claim := owned.PostgreSQLMemberDataPVC(legacyCluster, 0, 0, legacyPVCName, legacyCluster.Spec.Storage.Size, legacyCluster.Spec.Storage.StorageClassName, legacySecretName, legacySecretUID)
+	claim.UID = legacyPVCUID
+	claim.ResourceVersion = "1"
+	claim.OwnerReferences = nil
+	claim.Finalizers = []string{owned.PostgreSQLDataProtectionFinalizer}
+	controller := true
+	blockDeletion := true
+	secret.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: corev1.SchemeGroupVersion.String(), Kind: "PersistentVolumeClaim",
+		Name: legacyPVCName, UID: legacyPVCUID, Controller: &controller, BlockOwnerDeletion: &blockDeletion,
+	}}
+
+	base := newFakeClient(t, legacyCluster, secret, claim)
+	reconciler := developmentReconciler(base, nil)
+	reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	if _, err := reconciler.Reconcile(ctx, requestFor(legacyCluster)); err != nil {
+		t.Fatal(err)
+	}
+	upgraded := getCluster(t, ctx, base, legacyCluster)
+	if len(upgraded.Status.PostgreSQLBootstraps) != 3 {
+		t.Fatalf("upgraded source-storage records = %#v", upgraded.Status.PostgreSQLBootstraps)
+	}
+	memberZero := bootstrapForMember(t, upgraded, 0, 0)
+	if memberZero.SecretName != legacySecretName || memberZero.SecretUID != legacySecretUID || memberZero.PVCName != legacyPVCName || memberZero.PVCUID != legacyPVCUID {
+		t.Fatalf("member-zero API identity changed during status upgrade: %#v", memberZero)
+	}
+	migratedSecret := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: legacyCluster.Namespace, Name: legacySecretName}, migratedSecret); err != nil {
+		t.Fatal(err)
+	}
+	if migratedSecret.Labels[owned.MemberLabel] != "0000" {
+		t.Fatalf("member-zero credential metadata was not migrated: %#v", migratedSecret.Labels)
+	}
+}
+
+func TestPostgreSQLFinalizationPodUsesImmutableMemberIdentity(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{Shard: 2, Member: 1}
+	statefulSet := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: owned.PostgreSQLMemberStatefulSetName(cluster.Name, bootstrap.Shard, bootstrap.Member),
+		UID:  "statefulset-uid",
+	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: statefulSet.Name + "-0",
+		UID:  "pod-uid",
+		Annotations: map[string]string{
+			owned.PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
+		},
+		Labels: map[string]string{
+			owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "postgresql",
+			owned.ShardLabel: "0002", owned.MemberLabel: "0001", owned.RoleLabel: "replica",
+		},
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
+	}}
+	if err := validatePostgreSQLFinalizationPod(pod, cluster, bootstrap); err != nil {
+		t.Fatalf("role-neutral member identity was rejected: %v", err)
+	}
+	pod.Labels[owned.RoleLabel] = "primary"
+	if err := validatePostgreSQLFinalizationPod(pod, cluster, bootstrap); err != nil {
+		t.Fatalf("mutable role changed the protected member identity: %v", err)
+	}
+	pod.Labels[owned.MemberLabel] = "0000"
+	if err := validatePostgreSQLFinalizationPod(pod, cluster, bootstrap); err == nil {
+		t.Fatal("another member identity was accepted for protected data")
+	}
+	pod.Labels[owned.MemberLabel] = "0001"
+	pod.OwnerReferences = nil
+	if err := validatePostgreSQLFinalizationPod(pod, cluster, bootstrap); err == nil {
+		t.Fatal("member Pod without its exact StatefulSet controller was accepted")
+	}
+
+	legacyStatefulSet := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: owned.LegacyPostgreSQLPrimaryStatefulSetName(cluster.Name, 0),
+		UID:  "legacy-statefulset-uid",
+	}}
+	legacyBootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{Shard: 0, Member: 0}
+	legacyPod := pod.DeepCopy()
+	legacyPod.Name = legacyStatefulSet.Name + "-0"
+	legacyPod.Labels[owned.ShardLabel] = "0000"
+	legacyPod.Labels[owned.MemberLabel] = "0000"
+	legacyPod.Labels[owned.RoleLabel] = "replica"
+	legacyPod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(legacyStatefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))}
+	if err := validatePostgreSQLFinalizationPod(legacyPod, cluster, legacyBootstrap); err == nil {
+		t.Fatal("legacy primary-named Pod accepted a replica role")
+	}
+	legacyPod.Labels[owned.RoleLabel] = "primary"
+	if err := validatePostgreSQLFinalizationPod(legacyPod, cluster, legacyBootstrap); err != nil {
+		t.Fatalf("legacy member-zero primary was rejected: %v", err)
 	}
 }
 
@@ -5378,13 +5576,17 @@ func retiredEtcdPVC(cluster *pgshardv1alpha1.PgShardCluster, ordinal int) *corev
 }
 
 func bootstrapForShard(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster, shard int32) pgshardv1alpha1.PostgreSQLBootstrapStatus {
+	return bootstrapForMember(t, cluster, shard, 0)
+}
+
+func bootstrapForMember(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster, shard, member int32) pgshardv1alpha1.PostgreSQLBootstrapStatus {
 	t.Helper()
 	for _, bootstrap := range cluster.Status.PostgreSQLBootstraps {
-		if bootstrap.Shard == shard {
+		if bootstrap.Shard == shard && bootstrap.Member == member {
 			return bootstrap
 		}
 	}
-	t.Fatalf("PostgreSQL bootstrap for shard %d not found: %#v", shard, cluster.Status.PostgreSQLBootstraps)
+	t.Fatalf("PostgreSQL bootstrap for shard %d member %d not found: %#v", shard, member, cluster.Status.PostgreSQLBootstraps)
 	return pgshardv1alpha1.PostgreSQLBootstrapStatus{}
 }
 

@@ -1606,9 +1606,12 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		return nil, err
 	}
 	topologyHash := configHash(topologyConfig)
-	bootstraps, err := postgresqlBootstraps(cluster)
-	if err != nil {
-		return nil, err
+	var bootstraps map[postgresqlBootstrapKey]pgshardv1alpha1.PostgreSQLBootstrapStatus
+	if cluster.Spec.MembersPerShard == 1 || images.PostgreSQLRuntime.agentQuarantine() {
+		bootstraps, err = postgresqlBootstraps(cluster)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var writableLeases map[int32]pgshardv1alpha1.PostgreSQLWritableLeaseStatus
 	if images.PostgreSQLRuntime.agentQuarantine() {
@@ -1655,7 +1658,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			postgresqlNetworkPolicy(cluster, shard),
 		)
 		if cluster.Spec.MembersPerShard == 1 {
-			bootstrap := bootstraps[shard]
+			bootstrap := bootstraps[postgresqlBootstrapKey{shard: shard, member: 0}]
 			writableLease := writableLeases[shard]
 			objects = append(objects,
 				postgresqlShardStatefulSet(cluster, shard, images, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess, writableLease),
@@ -1676,26 +1679,31 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	return objects, nil
 }
 
-func postgresqlBootstraps(cluster *pgshardv1alpha1.PgShardCluster) (map[int32]pgshardv1alpha1.PostgreSQLBootstrapStatus, error) {
-	if cluster.Spec.MembersPerShard != 1 {
-		return nil, nil
-	}
-	bootstraps := make(map[int32]pgshardv1alpha1.PostgreSQLBootstrapStatus, len(cluster.Status.PostgreSQLBootstraps))
+type postgresqlBootstrapKey struct {
+	shard  int32
+	member int32
+}
+
+func postgresqlBootstraps(cluster *pgshardv1alpha1.PgShardCluster) (map[postgresqlBootstrapKey]pgshardv1alpha1.PostgreSQLBootstrapStatus, error) {
+	bootstraps := make(map[postgresqlBootstrapKey]pgshardv1alpha1.PostgreSQLBootstrapStatus, len(cluster.Status.PostgreSQLBootstraps))
 	for _, bootstrap := range cluster.Status.PostgreSQLBootstraps {
-		if bootstrap.Shard < 0 || bootstrap.Shard >= cluster.Spec.Shards {
-			return nil, fmt.Errorf("PostgreSQL bootstrap references invalid shard %d", bootstrap.Shard)
+		if bootstrap.Shard < 0 || bootstrap.Shard >= cluster.Spec.Shards || bootstrap.Member < 0 || bootstrap.Member >= cluster.Spec.MembersPerShard {
+			return nil, fmt.Errorf("PostgreSQL bootstrap references invalid shard %d member %d", bootstrap.Shard, bootstrap.Member)
 		}
 		if bootstrap.SecretName == "" || bootstrap.SecretUID == "" || !bootstrap.PVCFenceDetached || bootstrap.PVCName == "" || bootstrap.PVCUID == "" || bootstrap.PVCStorageClassName == nil {
-			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is incomplete (credential name=%t UID=%t, PVC fence detached=%t, PVC name=%t UID=%t, storage class=%t)", bootstrap.Shard, bootstrap.SecretName != "", bootstrap.SecretUID != "", bootstrap.PVCFenceDetached, bootstrap.PVCName != "", bootstrap.PVCUID != "", bootstrap.PVCStorageClassName != nil)
+			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d member %d is incomplete (credential name=%t UID=%t, PVC fence detached=%t, PVC name=%t UID=%t, storage class=%t)", bootstrap.Shard, bootstrap.Member, bootstrap.SecretName != "", bootstrap.SecretUID != "", bootstrap.PVCFenceDetached, bootstrap.PVCName != "", bootstrap.PVCUID != "", bootstrap.PVCStorageClassName != nil)
 		}
-		if _, duplicate := bootstraps[bootstrap.Shard]; duplicate {
-			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is duplicated", bootstrap.Shard)
+		key := postgresqlBootstrapKey{shard: bootstrap.Shard, member: bootstrap.Member}
+		if _, duplicate := bootstraps[key]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d member %d is duplicated", bootstrap.Shard, bootstrap.Member)
 		}
-		bootstraps[bootstrap.Shard] = bootstrap
+		bootstraps[key] = bootstrap
 	}
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
-		if _, ok := bootstraps[shard]; !ok {
-			return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d is missing", shard)
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			if _, ok := bootstraps[postgresqlBootstrapKey{shard: shard, member: member}]; !ok {
+				return nil, fmt.Errorf("PostgreSQL bootstrap for shard %d member %d is missing", shard, member)
+			}
 		}
 	}
 	return bootstraps, nil
@@ -2235,11 +2243,18 @@ func catalogService(cluster *pgshardv1alpha1.PgShardCluster) *corev1.Service {
 	}
 }
 
-// PostgreSQLAuthSecretPrefix is the readable portion of a randomly named
-// credential. The controller appends cryptographic randomness and records the
-// resulting name and API UID before any workload can reference it.
+// PostgreSQLMemberAuthSecretPrefix is the readable, role-neutral portion of a
+// randomly named member credential. The controller appends cryptographic
+// randomness and records the resulting name and API UID before any workload can
+// reference it.
+func PostgreSQLMemberAuthSecretPrefix(cluster string, shard, member int32) string {
+	return postgresqlMemberName(cluster, shard, member) + "-auth-"
+}
+
+// PostgreSQLAuthSecretPrefix preserves the member-zero helper used by the
+// direct singleton path.
 func PostgreSQLAuthSecretPrefix(cluster string, shard int32) string {
-	return shardName(cluster, shard) + "-auth-"
+	return PostgreSQLMemberAuthSecretPrefix(cluster, shard, 0)
 }
 
 // PostgreSQLShardStatefulSetName returns the deterministic, role-neutral
@@ -2247,6 +2262,17 @@ func PostgreSQLAuthSecretPrefix(cluster string, shard int32) string {
 // member identity; primary and replica roles belong in mutable labels.
 func PostgreSQLShardStatefulSetName(cluster string, shard int32) string {
 	return fmt.Sprintf("%s-shard-%04d", boundedPostgreSQLWorkloadPrefix(cluster), shard)
+}
+
+// PostgreSQLMemberStatefulSetName returns the singleton workload identity for a
+// stable physical member. Member zero retains the existing name so this
+// storage-only transition does not replace a running single-member Pod.
+func PostgreSQLMemberStatefulSetName(cluster string, shard, member int32) string {
+	base := PostgreSQLShardStatefulSetName(cluster, shard)
+	if member == 0 {
+		return base
+	}
+	return fmt.Sprintf("%s-m%04d", base, member)
 }
 
 // PostgreSQLWritableLeaseName returns the deterministic, role-neutral Lease
@@ -2339,22 +2365,29 @@ func boundedPostgreSQLWorkloadPrefix(cluster string) string {
 	return cluster[:maximumPrefixLength-len(suffix)-1] + "-" + suffix
 }
 
-// PostgreSQLDataPVCPrefix is the readable, role-neutral portion of a randomly
-// named, pre-created data volume. Workloads only reference a name and UID
-// checkpointed in PgShardCluster status.
-func PostgreSQLDataPVCPrefix(cluster string, shard int32) string {
-	return shardName(cluster, shard) + "-data-"
+// PostgreSQLMemberDataPVCPrefix is the readable, role-neutral portion of a randomly
+// named, pre-created member data volume. Workloads only reference a name and
+// UID checkpointed in PgShardCluster status.
+func PostgreSQLMemberDataPVCPrefix(cluster string, shard, member int32) string {
+	return postgresqlMemberName(cluster, shard, member) + "-data-"
 }
 
-// PostgreSQLAuthSecret returns one immutable shard bootstrap Secret. It starts
+// PostgreSQLDataPVCPrefix preserves the member-zero helper used by the direct
+// singleton path.
+func PostgreSQLDataPVCPrefix(cluster string, shard int32) string {
+	return PostgreSQLMemberDataPVCPrefix(cluster, shard, 0)
+}
+
+// PostgreSQLMemberAuthSecret returns one immutable member bootstrap Secret. It starts
 // cluster-owned so a late create cannot outlive a failed bootstrap. The
 // controller checkpoints its API UID and detaches it before using that exact
 // Secret as the durable owner of outcome-unknown PVC creates. After the exact
 // PVC UID is checkpointed, ownership is inverted: the live PVC is protected
 // independently and the Secret becomes its dependent tombstone.
-func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, password []byte) *corev1.Secret {
+func PostgreSQLMemberAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard, member int32, name string, password []byte) *corev1.Secret {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
+	metadata.Labels[MemberLabel] = memberLabel(member)
 	metadata.Annotations[PostgreSQLBootstrapClusterUIDAnnotation] = string(cluster.UID)
 	delete(metadata.Annotations, ApplyOwnershipAnnotation)
 	return &corev1.Secret{
@@ -2363,6 +2396,12 @@ func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, 
 		Type:       corev1.SecretTypeOpaque,
 		Data:       map[string][]byte{PostgreSQLPasswordKey: append([]byte(nil), password...)},
 	}
+}
+
+// PostgreSQLAuthSecret preserves the member-zero helper used by the direct
+// singleton path.
+func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, password []byte) *corev1.Secret {
+	return PostgreSQLMemberAuthSecret(cluster, shard, 0, name, password)
 }
 
 // CatalogAccessIntentSecret is the stable, non-consumable identity created
@@ -2380,17 +2419,17 @@ func CatalogAccessIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, name str
 	}
 }
 
-// PostgreSQLDataPVC returns the standalone data volume for stable member 0000.
-// A single-member volume is the current primary; multi-member agent-quarantine
-// uses the same lifecycle only as non-serving initial-source storage and gives
-// it no role label. Size and storage class come from the checkpointed
+// PostgreSQLMemberDataPVC returns the standalone data volume for one stable physical
+// member. A single-member volume is the current primary; multi-member
+// agent-quarantine uses the same lifecycle only as non-serving source storage
+// and gives it no role label. Size and storage class come from the checkpointed
 // provisioning contract. Every create is controlled by the exact detached
 // credential Secret UID. The controller adds its data-protection finalizer only
 // after the API UID is checkpointed, then detaches the live PVC and anchors the
 // Secret tombstone to it. Delayed create requests retain this initial owner and
 // no finalizer, so Kubernetes can garbage-collect them after the tombstone is
 // deleted.
-func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageSize resource.Quantity, storageClassName *string, fenceName string, fenceUID types.UID) *corev1.PersistentVolumeClaim {
+func PostgreSQLMemberDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard, member int32, name string, storageSize resource.Quantity, storageClassName *string, fenceName string, fenceUID types.UID) *corev1.PersistentVolumeClaim {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
 	controller := true
 	blockDeletion := true
@@ -2404,7 +2443,7 @@ func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, nam
 	}}
 	metadata.Annotations[PostgreSQLDataClusterUIDAnnotation] = string(cluster.UID)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
-	metadata.Labels[MemberLabel] = "0000"
+	metadata.Labels[MemberLabel] = memberLabel(member)
 	if cluster.Spec.MembersPerShard == 1 {
 		metadata.Labels[RoleLabel] = "primary"
 	}
@@ -2421,6 +2460,12 @@ func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, nam
 			Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: storageSize.DeepCopy()}},
 		},
 	}
+}
+
+// PostgreSQLDataPVC preserves the member-zero helper used by the direct
+// singleton path.
+func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageSize resource.Quantity, storageClassName *string, fenceName string, fenceUID types.UID) *corev1.PersistentVolumeClaim {
+	return PostgreSQLMemberDataPVC(cluster, shard, 0, name, storageSize, storageClassName, fenceName, fenceUID)
 }
 
 func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) *appsv1.StatefulSet {
@@ -3082,7 +3127,13 @@ func shardName(cluster string, shard int32) string {
 	return fmt.Sprintf("%s-shard-%04d", cluster, shard)
 }
 
+func postgresqlMemberName(cluster string, shard, member int32) string {
+	return fmt.Sprintf("%s-member-%04d", shardName(cluster, shard), member)
+}
+
 func shardLabel(shard int32) string { return fmt.Sprintf("%04d", shard) }
+
+func memberLabel(member int32) string { return fmt.Sprintf("%04d", member) }
 
 func poolerReplicas(cluster *pgshardv1alpha1.PgShardCluster) int32 {
 	if cluster.Spec.Pooler.Scaling.Mode == pgshardv1alpha1.ScalingFixed {
