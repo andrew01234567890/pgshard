@@ -1639,10 +1639,64 @@ impl ActiveLogicalReplicationStream {
             .batch_execute(&format!("DROP PUBLICATION {}", self.publication))
             .await?;
         drop(self.observer);
-        self.observer_task
+        let observer_result = self
+            .observer_task
             .finish("active-drop observer connection")
-            .await
+            .await;
+        match observer_result {
+            Ok(()) => Ok(()),
+            Err(error) if error_chain_is_closed_connection(error.as_ref()) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
+}
+
+fn error_chain_is_closed_connection(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+            )
+        }) {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+#[test]
+fn recognizes_only_closed_connection_errors_in_an_error_chain() {
+    #[derive(Debug)]
+    struct WrappedIoError(io::Error);
+
+    impl std::fmt::Display for WrappedIoError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "wrapped I/O error: {}", self.0)
+        }
+    }
+
+    impl Error for WrappedIoError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    for kind in [
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::BrokenPipe,
+        io::ErrorKind::NotConnected,
+    ] {
+        let wrapped = WrappedIoError(io::Error::from(kind));
+        assert!(error_chain_is_closed_connection(&wrapped));
+    }
+    assert!(!error_chain_is_closed_connection(&io::Error::from(
+        io::ErrorKind::PermissionDenied,
+    )));
 }
 
 async fn recover_receipt_after_active_drop_rejection(
