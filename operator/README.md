@@ -21,7 +21,8 @@ API. The controller now reconciles the safe supporting-resource slice:
   physical member using the same exact-UID Secret/PVC lifecycle, plus one
   staged immutable physical-replication credential per shard and one
   role-neutral, non-serving member-zero replication-bootstrap source per shard,
-  but no standby, PostgreSQL PDB, catalog credential, or application endpoint;
+  plus one role-neutral, TCP-closed physical standby for every nonzero member,
+  but no PostgreSQL PDB, catalog credential, or application endpoint;
 - an idempotently migrated `shardschema` database on shard-0000 containing the
   complete immutable shard inventory and an initial restore incarnation for
   each shard;
@@ -121,9 +122,16 @@ material digest, creates or validates the fixed least-privilege
 physical-replication protocol, and reserves one exact physical slot for every
 other configured member. The running agent has no Secret mount. Ordinary SQL
 remains closed and the source remains non-serving, although authenticated
-physical cloning is now possible. Other members remain storage-only. This is
-bootstrap-source composition, not
-evidence of a primary, standby, synchronous replica, or HA availability.
+physical cloning is now possible. Every other member receives one singleton,
+role-neutral standby workload over its already-checkpointed PVC. Its init
+container verifies the same credential digest, clones from member zero through
+the member's exact slot, publishes the complete clone atomically, and converts
+the raw Secret into one private memory-backed passfile. The running standby
+agent receives that passfile read-only but receives neither the raw Secret nor
+Kubernetes writable-Lease authority; it keeps TCP closed and continuously
+proves recovery. All member Pods remain unready and outside application
+routing. This is non-serving physical bootstrap composition, not evidence of a
+serving primary, synchronous durability, promotion safety, or HA availability.
 PostgreSQL StatefulSets use `OnDelete` updates. A controller image, bootstrap
 image, script, or generated-configuration change therefore updates the desired
 template without concurrently deleting every singleton primary. Until a

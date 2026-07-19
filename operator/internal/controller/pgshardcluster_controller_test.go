@@ -631,10 +631,13 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			if err := base.List(ctx, budgets, client.InNamespace(cluster.Namespace), client.MatchingLabels{owned.ComponentLabel: "postgresql"}); err != nil {
 				t.Fatal(err)
 			}
-			if len(statefulSets.Items) != 1 || len(pods.Items) != 0 || len(budgets.Items) != 0 {
-				t.Fatalf("bootstrap-source composition = StatefulSets=%d Pods=%d PostgreSQL PDBs=%d", len(statefulSets.Items), len(pods.Items), len(budgets.Items))
+			if len(statefulSets.Items) != int(members) || len(pods.Items) != 0 || len(budgets.Items) != 0 {
+				t.Fatalf("physical-member composition = StatefulSets=%d Pods=%d PostgreSQL PDBs=%d", len(statefulSets.Items), len(pods.Items), len(budgets.Items))
 			}
-			source := statefulSets.Items[0]
+			source := appsv1.StatefulSet{}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0)}, &source); err != nil {
+				t.Fatal(err)
+			}
 			if source.Name != owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0) || source.Spec.Template.Labels[owned.MemberLabel] != "0000" {
 				t.Fatalf("bootstrap-source identity = %#v", source.ObjectMeta)
 			}
@@ -648,9 +651,9 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			assertCondition(t, current, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 			postgresqlCondition := meta.FindStatusCondition(current.Status.Conditions, postgresqlAvailableCondition)
 			ready := meta.FindStatusCondition(current.Status.Conditions, readyCondition)
-			if postgresqlCondition == nil || !strings.Contains(postgresqlCondition.Message, "role-neutral member-zero bootstrap sources are composed") ||
-				ready == nil || !strings.Contains(ready.Message, "standbys and serving primaries remain unavailable") {
-				t.Fatalf("multi-member status does not describe composed non-serving sources: PostgreSQL=%#v Ready=%#v", postgresqlCondition, ready)
+			if postgresqlCondition == nil || !strings.Contains(postgresqlCondition.Message, "bootstrap sources and physical standbys are composed") ||
+				ready == nil || !strings.Contains(ready.Message, "bootstrap sources and physical standbys are composed") {
+				t.Fatalf("multi-member status does not describe composed non-serving members: PostgreSQL=%#v Ready=%#v", postgresqlCondition, ready)
 			}
 
 			direct := developmentReconciler(base, nil)
@@ -1037,8 +1040,10 @@ func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 			if err := base.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
 				t.Fatal(err)
 			}
-			if len(statefulSets.Items) > 1 || len(statefulSets.Items) == 1 && statefulSets.Items[0].DeletionTimestamp == nil {
-				t.Fatalf("identity failure did not fence the bootstrap source: %#v", statefulSets.Items)
+			for index := range statefulSets.Items {
+				if statefulSets.Items[index].DeletionTimestamp == nil {
+					t.Fatalf("identity failure did not fence every PostgreSQL member: %#v", statefulSets.Items)
+				}
 			}
 			if test.orphanPod {
 				orphan := &corev1.Pod{}
@@ -1052,7 +1057,7 @@ func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 	}
 }
 
-func TestMultiMemberSourceFencingAttemptsEveryShardAfterCollision(t *testing.T) {
+func TestMultiMemberFencingAttemptsEveryShardAndMemberAfterCollision(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	cluster := validCluster()
@@ -1065,44 +1070,51 @@ func TestMultiMemberSourceFencingAttemptsEveryShardAfterCollision(t *testing.T) 
 	}
 	current := getCluster(t, ctx, base, cluster)
 	for shard := int32(0); shard < current.Spec.Shards; shard++ {
-		source := &appsv1.StatefulSet{}
-		key := types.NamespacedName{Namespace: current.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(current.Name, shard, 0)}
-		if err := base.Get(ctx, key, source); err != nil {
-			t.Fatal(err)
-		}
-		pod := &corev1.Pod{ObjectMeta: *source.Spec.Template.ObjectMeta.DeepCopy(), Spec: *source.Spec.Template.Spec.DeepCopy()}
-		pod.Name = source.Name + "-0"
-		pod.Namespace = current.Namespace
-		if err := base.Create(ctx, pod); err != nil {
-			t.Fatal(err)
-		}
-		if shard == 0 {
-			source.OwnerReferences = nil
-			if err := base.Update(ctx, source); err != nil {
+		for member := int32(0); member < current.Spec.MembersPerShard; member++ {
+			statefulSet := &appsv1.StatefulSet{}
+			key := types.NamespacedName{Namespace: current.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(current.Name, shard, member)}
+			if err := base.Get(ctx, key, statefulSet); err != nil {
 				t.Fatal(err)
+			}
+			pod := &corev1.Pod{ObjectMeta: *statefulSet.Spec.Template.ObjectMeta.DeepCopy(), Spec: *statefulSet.Spec.Template.Spec.DeepCopy()}
+			pod.Name = statefulSet.Name + "-0"
+			pod.Namespace = current.Namespace
+			if err := base.Create(ctx, pod); err != nil {
+				t.Fatal(err)
+			}
+			if shard == 0 && member == 0 {
+				statefulSet.OwnerReferences = nil
+				if err := base.Update(ctx, statefulSet); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 	}
 
-	err := reconciler.fenceMultiMemberPostgreSQLBootstrapSources(ctx, current)
+	err := reconciler.fenceMultiMemberPostgreSQLMembers(ctx, current)
 	if err == nil || !strings.Contains(err.Error(), "not controlled by PgShardCluster UID") {
-		t.Fatalf("source fencing collision error = %v", err)
+		t.Fatalf("member fencing collision error = %v", err)
 	}
 	for shard := int32(0); shard < current.Spec.Shards; shard++ {
-		pod := &corev1.Pod{}
-		key := types.NamespacedName{Namespace: current.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(current.Name, shard, 0) + "-0"}
-		if err := base.Get(ctx, key, pod); err == nil && pod.DeletionTimestamp == nil {
-			t.Fatalf("shard %d source Pod was not fenced after another shard collided: %#v", shard, pod)
-		} else if err != nil && !apierrors.IsNotFound(err) {
-			t.Fatal(err)
+		for member := int32(0); member < current.Spec.MembersPerShard; member++ {
+			pod := &corev1.Pod{}
+			key := types.NamespacedName{Namespace: current.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(current.Name, shard, member) + "-0"}
+			if err := base.Get(ctx, key, pod); err == nil && pod.DeletionTimestamp == nil {
+				t.Fatalf("shard %d member %d Pod was not fenced after another controller collided: %#v", shard, member, pod)
+			} else if err != nil && !apierrors.IsNotFound(err) {
+				t.Fatal(err)
+			}
+			statefulSet := &appsv1.StatefulSet{}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(current.Name, shard, member)}, statefulSet); shard == 0 && member == 0 {
+				if err != nil {
+					t.Fatalf("colliding controller disappeared unexpectedly: %v", err)
+				}
+			} else if err == nil && statefulSet.DeletionTimestamp == nil {
+				t.Fatalf("shard %d member %d controller was not fenced: %#v", shard, member, statefulSet)
+			} else if err != nil && !apierrors.IsNotFound(err) {
+				t.Fatal(err)
+			}
 		}
-	}
-	secondSource := &appsv1.StatefulSet{}
-	secondKey := types.NamespacedName{Namespace: current.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(current.Name, 1, 0)}
-	if err := base.Get(ctx, secondKey, secondSource); err == nil && secondSource.DeletionTimestamp == nil {
-		t.Fatalf("later shard source controller was not fenced: %#v", secondSource)
-	} else if err != nil && !apierrors.IsNotFound(err) {
-		t.Fatal(err)
 	}
 }
 
@@ -1245,6 +1257,41 @@ func TestPostgreSQLRuntimeChangeIsRejectedBeforeOnDeleteMutation(t *testing.T) {
 				t.Fatal("rejected runtime transition mutated the OnDelete StatefulSet template")
 			}
 		})
+	}
+}
+
+func TestMultiMemberRuntimeContractInspectsEveryStandby(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+
+	name := owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, cluster.Spec.MembersPerShard-1)
+	standby := &appsv1.StatefulSet{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, standby); err != nil {
+		t.Fatal(err)
+	}
+	standby.Spec.Template.Annotations[owned.PostgreSQLRuntimeAnnotation] = owned.PostgreSQLRuntimeDirect.String()
+	if err := base.Update(ctx, standby); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil ||
+		!strings.Contains(err.Error(), "observe StatefulSet "+name+" runtime") {
+		t.Fatalf("mutated standby runtime was not rejected before planning: %v", err)
+	}
+	observed := &appsv1.StatefulSet{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Spec.Template.Annotations[owned.PostgreSQLRuntimeAnnotation] != owned.PostgreSQLRuntimeDirect.String() {
+		t.Fatalf("runtime rejection rewrote the OnDelete standby template: %#v", observed.Spec.Template.Annotations)
 	}
 }
 

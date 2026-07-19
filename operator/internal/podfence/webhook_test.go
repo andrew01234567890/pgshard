@@ -102,6 +102,14 @@ func TestBindingAdmissionAcceptsOnlyTheExactRoleNeutralBootstrapSource(t *testin
 	if !IsManagedPostgreSQLPod(pod) {
 		t.Fatalf("exact role-neutral bootstrap source is not managed: %#v", pod.ObjectMeta)
 	}
+	standby := roleNeutralStandbyPod()
+	if !IsManagedPostgreSQLPod(standby) {
+		t.Fatalf("exact role-neutral physical standby is not managed: %#v", standby.ObjectMeta)
+	}
+	standby.Labels[owned.RoleLabel] = "replica"
+	if owned.IsPostgreSQLReplicationStandbyPod(standby) {
+		t.Fatalf("role-labeled physical standby bypassed its exact role-neutral classifier: %#v", standby.ObjectMeta)
+	}
 	generic := managedPod()
 	delete(generic.Labels, owned.RoleLabel)
 	if IsManagedPostgreSQLPod(generic) {
@@ -787,6 +795,46 @@ func roleNeutralBootstrapSourcePod() *corev1.Pod {
 		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz"}}},
 	}}
 	pod.Spec.Volumes = []corev1.Volume{{Name: "kubernetes-api", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{}}}}
+	return pod
+}
+
+func roleNeutralStandbyPod() *corev1.Pod {
+	pod := managedPod()
+	pod.Name = owned.PostgreSQLMemberStatefulSetName(pod.Labels[owned.ClusterLabel], 0, 1) + "-0"
+	pod.Labels[owned.MemberLabel] = "0001"
+	delete(pod.Labels, owned.RoleLabel)
+	pod.Annotations[owned.PostgreSQLRuntimeAnnotation] = string(owned.PostgreSQLRuntimeAgentQuarantine)
+	automount := false
+	pod.Spec.AutomountServiceAccountToken = &automount
+	pod.Spec.ServiceAccountName = owned.PostgreSQLStandbyServiceAccountName(pod.Labels[owned.ClusterLabel], 0)
+	pod.Spec.Containers = []corev1.Container{{
+		Name: "postgresql",
+		Env: []corev1.EnvVar{
+			{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"},
+			{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/quarantine.pg_hba.conf"},
+			{Name: "PGSHARD_POSTGRES_PRIMARY_HOST", Value: "example-shard-0000-0.example-shard-0000.database.svc"},
+			{Name: "PGSHARD_POSTGRES_PRIMARY_PORT", Value: "5432"},
+			{Name: "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", Value: "pgshard_member_0001"},
+			{Name: "PGSHARD_POSTGRES_PRIMARY_PASSFILE", Value: "/run/pgshard/standby-auth/passfile"},
+		},
+		Ports: []corev1.ContainerPort{{Name: "agent-http", ContainerPort: owned.HTTPPort, Protocol: corev1.ProtocolTCP}},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "runtime", MountPath: "/run/pgshard"},
+			{Name: "standby-passfile", MountPath: "/run/pgshard/standby-auth", ReadOnly: true},
+		},
+		StartupProbe:   &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz"}}},
+		LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz"}}},
+		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz"}}},
+	}}
+	pod.Spec.Volumes = []corev1.Volume{
+		{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+		{
+			Name: "standby-passfile",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				Medium: corev1.StorageMediumMemory,
+			}},
+		},
+	}
 	return pod
 }
 

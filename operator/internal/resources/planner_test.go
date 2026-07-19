@@ -54,6 +54,15 @@ func TestPostgreSQLBootstrapScriptHasValidBashSyntax(t *testing.T) {
 	}
 }
 
+func TestPostgreSQLStandbyBootstrapScriptHasValidBashSyntax(t *testing.T) {
+	t.Parallel()
+	command := exec.Command("bash", "-n")
+	command.Stdin = strings.NewReader(postgresqlStandbyBootstrapScript)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("PostgreSQL standby bootstrap script syntax: %v\n%s", err, output)
+	}
+}
+
 func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
@@ -2950,7 +2959,7 @@ func TestPlanFailsClosedForUnsafeIdentityOrMissingImages(t *testing.T) {
 	}
 }
 
-func TestMultiMemberAgentPlanPublishesOnlyMemberZeroBootstrapSources(t *testing.T) {
+func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) {
 	t.Parallel()
 	for _, members := range []int32{3, 5} {
 		members := members
@@ -2970,42 +2979,107 @@ func TestMultiMemberAgentPlanPublishesOnlyMemberZeroBootstrapSources(t *testing.
 				t.Fatal(err)
 			}
 			sources := 0
+			standbys := 0
 			for _, item := range plan {
 				switch object := item.(type) {
 				case *appsv1.StatefulSet:
 					if object.Labels[ComponentLabel] != "postgresql" {
 						continue
 					}
-					sources++
-					if _, role := object.Spec.Template.Labels[RoleLabel]; role || object.Spec.Template.Labels[MemberLabel] != "0000" {
-						t.Fatalf("bootstrap source %s labels = %#v", object.Name, object.Spec.Template.Labels)
+					member := object.Spec.Template.Labels[MemberLabel]
+					if _, role := object.Spec.Template.Labels[RoleLabel]; role {
+						t.Fatalf("non-serving PostgreSQL member %s labels = %#v", object.Name, object.Spec.Template.Labels)
 					}
 					if observed, err := ObservePostgreSQLRuntime(object.Spec.Template.Annotations, object.Spec.Template.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
-						t.Fatalf("observe bootstrap source %s runtime = %q, %v", object.Name, observed, err)
+						t.Fatalf("observe PostgreSQL member %s runtime = %q, %v", object.Name, observed, err)
 					}
 					agent := object.Spec.Template.Spec.Containers[0]
-					if !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-bootstrap-primary") || !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf") {
-						t.Fatalf("bootstrap source %s agent environment = %#v", object.Name, agent.Env)
-					}
-					if containsNamedVolumeMount(agent.VolumeMounts, "replication-credential") {
-						t.Fatalf("bootstrap source %s agent retained the replication credential", object.Name)
-					}
 					bootstrapContainer := object.Spec.Template.Spec.InitContainers[0]
-					if !containsVolumeMount(bootstrapContainer.VolumeMounts, "replication-credential", true) ||
-						envValue(bootstrapContainer.Env, "PGSHARD_MEMBERS_PER_SHARD") != fmt.Sprintf("%d", members) {
-						t.Fatalf("bootstrap source %s replication initialization = %#v", object.Name, bootstrapContainer)
-					}
 					var shard int32
 					if _, err := fmt.Sscanf(object.Spec.Template.Labels[ShardLabel], "%04d", &shard); err != nil {
-						t.Fatalf("bootstrap source %s shard label: %v", object.Name, err)
+						t.Fatalf("PostgreSQL member %s shard label: %v", object.Name, err)
 					}
 					credential := cluster.Status.PostgreSQLReplicationCredentials[shard]
 					if envValue(bootstrapContainer.Env, "PGSHARD_REPLICATION_MATERIAL_SHA256") != credential.MaterialSHA256 {
-						t.Fatalf("bootstrap source %s replication digest environment = %#v", object.Name, bootstrapContainer.Env)
+						t.Fatalf("PostgreSQL member %s replication digest environment = %#v", object.Name, bootstrapContainer.Env)
 					}
 					replicationVolume := volumeByName(t, object.Spec.Template.Spec.Volumes, "replication-credential").Secret
 					if replicationVolume == nil || replicationVolume.SecretName != credential.SecretName || replicationVolume.DefaultMode == nil || *replicationVolume.DefaultMode != 0o440 || !reflect.DeepEqual(secretItemKeys(replicationVolume.Items), []string{PostgreSQLReplicationPasswordKey}) {
-						t.Fatalf("bootstrap source %s replication projection = %#v", object.Name, replicationVolume)
+						t.Fatalf("PostgreSQL member %s replication projection = %#v", object.Name, replicationVolume)
+					}
+					if containsNamedVolumeMount(agent.VolumeMounts, "replication-credential") {
+						t.Fatalf("running PostgreSQL member %s retained the raw replication credential", object.Name)
+					}
+
+					if member == "0000" {
+						sources++
+						if !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-bootstrap-primary") || !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf") {
+							t.Fatalf("bootstrap source %s agent environment = %#v", object.Name, agent.Env)
+						}
+						if !containsVolumeMount(bootstrapContainer.VolumeMounts, "replication-credential", true) ||
+							envValue(bootstrapContainer.Env, "PGSHARD_MEMBERS_PER_SHARD") != fmt.Sprintf("%d", members) {
+							t.Fatalf("bootstrap source %s replication initialization = %#v", object.Name, bootstrapContainer)
+						}
+						continue
+					}
+
+					standbys++
+					var memberOrdinal int32
+					if _, err := fmt.Sscanf(member, "%04d", &memberOrdinal); err != nil || memberOrdinal <= 0 {
+						t.Fatalf("standby %s member label = %q, %v", object.Name, member, err)
+					}
+					sourceHost := postgresqlMemberPodDNS(cluster.Name, shard, 0, cluster.Namespace)
+					slotName := "pgshard_member_" + member
+					if object.Spec.Template.Spec.ServiceAccountName != PostgreSQLStandbyServiceAccountName(cluster.Name, shard) ||
+						object.Spec.Template.Spec.AutomountServiceAccountToken == nil || *object.Spec.Template.Spec.AutomountServiceAccountToken ||
+						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-standby") ||
+						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_HOST", sourceHost) ||
+						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", slotName) ||
+						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_PASSFILE", "/run/pgshard/standby-auth/passfile") ||
+						!containerHasReadOnlyMount(agent, "standby-passfile", "/run/pgshard/standby-auth") ||
+						podHasServiceAccountTokenProjection(object.Spec.Template.Spec) {
+						t.Fatalf("standby %s runtime authority = %#v", object.Name, object.Spec.Template.Spec)
+					}
+					for _, forbidden := range []string{"PGSHARD_CLUSTER_UID", "PGSHARD_POD_UID", "PGSHARD_WRITABLE_LEASE_NAME", "PGSHARD_WRITABLE_LEASE_UID", "PGSHARD_LEASE_NAMESPACE"} {
+						if containerHasEnvironment(agent, forbidden) {
+							t.Fatalf("standby %s received writable authority %s", object.Name, forbidden)
+						}
+					}
+					sourceBootstrap := cluster.Status.PostgreSQLBootstraps[shard*members]
+					targetBootstrap := cluster.Status.PostgreSQLBootstraps[shard*members+memberOrdinal]
+					passfileVolume := volumeByName(t, object.Spec.Template.Spec.Volumes, "standby-passfile").EmptyDir
+					if passfileVolume == nil || passfileVolume.Medium != corev1.StorageMediumMemory ||
+						!containsVolumeMount(bootstrapContainer.VolumeMounts, "replication-credential", true) ||
+						!containsNamedVolumeMount(bootstrapContainer.VolumeMounts, "standby-passfile") ||
+						envValue(bootstrapContainer.Env, "PGSHARD_SOURCE_HOST") != sourceHost ||
+						envValue(bootstrapContainer.Env, "PGSHARD_PRIMARY_SLOT_NAME") != slotName ||
+						envValue(bootstrapContainer.Env, "PGSHARD_TARGET_PVC_UID") != string(targetBootstrap.PVCUID) ||
+						envValue(bootstrapContainer.Env, "PGSHARD_TARGET_SECRET_UID") != string(targetBootstrap.SecretUID) ||
+						envValue(bootstrapContainer.Env, "PGSHARD_SOURCE_PVC_UID") != string(sourceBootstrap.PVCUID) ||
+						envValue(bootstrapContainer.Env, "PGSHARD_REPLICATION_SECRET_UID") != string(credential.SecretUID) ||
+						volumeByName(t, object.Spec.Template.Spec.Volumes, "data").PersistentVolumeClaim.ClaimName != targetBootstrap.PVCName {
+						t.Fatalf("standby %s initialization = %#v", object.Name, bootstrapContainer)
+					}
+					identifyIndex := strings.Index(bootstrapContainer.Command[2], "--command='IDENTIFY_SYSTEM'")
+					baseBackupIndex := strings.Index(bootstrapContainer.Command[2], "pg_basebackup")
+					if !strings.Contains(bootstrapContainer.Command[2], "timeout --signal=TERM --kill-after=10s 15m") ||
+						!strings.Contains(bootstrapContainer.Command[2], "staging=\"$parent/.pgshard-standby-init\"") ||
+						!strings.Contains(bootstrapContainer.Command[2], "rm -f -- \\\n  \"$staging/.pgshard-writable-generation\"") ||
+						!strings.Contains(bootstrapContainer.Command[2], "install -m 0600 /dev/null \"$staging/standby.signal\"") ||
+						!strings.Contains(bootstrapContainer.Command[2], "mv -- \"$staging\" \"$final\"") ||
+						!strings.Contains(bootstrapContainer.Command[2], "cmp -s -- \"$final/$clone_marker_name\" \"$expected_clone_identity\"") ||
+						!strings.Contains(bootstrapContainer.Command[2], "system_identifier") ||
+						identifyIndex < 0 || baseBackupIndex < 0 || identifyIndex >= baseBackupIndex ||
+						!strings.Contains(bootstrapContainer.Command[2], "target_pvc_uid=%s") ||
+						!strings.Contains(bootstrapContainer.Command[2], "target_secret_uid=%s") ||
+						!strings.Contains(bootstrapContainer.Command[2], "source_pvc_uid=%s") ||
+						!strings.Contains(bootstrapContainer.Command[2], "replication_secret_uid=%s") ||
+						!strings.Contains(bootstrapContainer.Command[2], "pg_tblspc") ||
+						!strings.Contains(bootstrapContainer.Command[2], "pg_wal") ||
+						!strings.Contains(bootstrapContainer.Command[2], "sslmode=disable") {
+						// Replication TLS is intentionally deferred; this slice remains
+						// internal, TCP-closed, role-neutral, and non-serving.
+						t.Fatalf("standby %s crash-safe bootstrap contract is incomplete", object.Name)
 					}
 				case *policyv1.PodDisruptionBudget:
 					if object.Labels[ComponentLabel] == "postgresql" {
@@ -3019,6 +3093,29 @@ func TestMultiMemberAgentPlanPublishesOnlyMemberZeroBootstrapSources(t *testing.
 			}
 			if sources != int(cluster.Spec.Shards) {
 				t.Fatalf("bootstrap source StatefulSets = %d, want %d", sources, cluster.Spec.Shards)
+			}
+			if want := int(cluster.Spec.Shards * (members - 1)); standbys != want {
+				t.Fatalf("standby StatefulSets = %d, want %d", standbys, want)
+			}
+			for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+				standbyAccount := object[*corev1.ServiceAccount](t, plan, PostgreSQLStandbyServiceAccountName(cluster.Name, shard))
+				if standbyAccount.AutomountServiceAccountToken == nil || *standbyAccount.AutomountServiceAccountToken || standbyAccount.Labels[ComponentLabel] != "postgresql-standby" {
+					t.Fatalf("standby ServiceAccount %s has authority: %#v", standbyAccount.Name, standbyAccount)
+				}
+				for _, item := range plan {
+					switch typed := item.(type) {
+					case *rbacv1.Role:
+						if typed.Name == standbyAccount.Name {
+							t.Fatalf("standby ServiceAccount %s received Role %#v", standbyAccount.Name, typed.Rules)
+						}
+					case *rbacv1.RoleBinding:
+						for _, subject := range typed.Subjects {
+							if subject.Kind == "ServiceAccount" && subject.Name == standbyAccount.Name {
+								t.Fatalf("standby ServiceAccount %s received RoleBinding %s", standbyAccount.Name, typed.Name)
+							}
+						}
+					}
+				}
 			}
 
 			claim := PostgreSQLDataPVC(cluster, 0, "source-data", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, "source-fence", "source-fence-uid")
@@ -3116,6 +3213,130 @@ func testReplicationBootstrapSourcePod(t *testing.T) *corev1.Pod {
 		}
 	}
 	t.Fatalf("plan has no bootstrap source StatefulSet %s", name)
+	return nil
+}
+
+func TestReplicationStandbyPodClassificationIsExact(t *testing.T) {
+	t.Parallel()
+	pod := testReplicationStandbyPod(t)
+	if !IsPostgreSQLReplicationStandbyPod(pod) {
+		t.Fatalf("planned role-neutral standby Pod was not recognized: %#v", pod.ObjectMeta)
+	}
+	if observed, err := ObservePostgreSQLRuntime(pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		t.Fatalf("observe standby runtime = %q, %v", observed, err)
+	}
+	setEnvironment := func(pod *corev1.Pod, name, value string) {
+		for index := range pod.Spec.Containers[0].Env {
+			if pod.Spec.Containers[0].Env[index].Name == name {
+				pod.Spec.Containers[0].Env[index].Value = value
+				return
+			}
+		}
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: name, Value: value})
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{name: "present role", mutate: func(pod *corev1.Pod) { pod.Labels[RoleLabel] = "standby" }},
+		{name: "empty role", mutate: func(pod *corev1.Pod) { pod.Labels[RoleLabel] = "" }},
+		{name: "member zero", mutate: func(pod *corev1.Pod) { pod.Labels[MemberLabel] = "0000" }},
+		{name: "noncanonical member", mutate: func(pod *corev1.Pod) { pod.Labels[MemberLabel] = "1" }},
+		{name: "different shard", mutate: func(pod *corev1.Pod) { pod.Labels[ShardLabel] = "0001" }},
+		{name: "different namespace", mutate: func(pod *corev1.Pod) { pod.Namespace = "other" }},
+		{name: "different name", mutate: func(pod *corev1.Pod) { pod.Name += "-other" }},
+		{name: "different service account", mutate: func(pod *corev1.Pod) { pod.Spec.ServiceAccountName += "-other" }},
+		{name: "direct runtime", mutate: func(pod *corev1.Pod) { pod.Annotations[PostgreSQLRuntimeAnnotation] = string(PostgreSQLRuntimeDirect) }},
+		{name: "different mode", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POSTGRES_MODE", "quarantine") }},
+		{name: "different HBA", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POSTGRES_HBA_FILE", "/other") }},
+		{name: "different source", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POSTGRES_PRIMARY_HOST", "other.database.svc") }},
+		{name: "different slot", mutate: func(pod *corev1.Pod) {
+			setEnvironment(pod, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", "pgshard_member_0002")
+		}},
+		{name: "different passfile", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POSTGRES_PRIMARY_PASSFILE", "/other") }},
+		{name: "writable cluster UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_CLUSTER_UID", "cluster-uid") }},
+		{name: "writable Pod UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POD_UID", "pod-uid") }},
+		{name: "writable Lease", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_WRITABLE_LEASE_NAME", "lease") }},
+		{name: "duplicate mode", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"})
+		}},
+		{name: "writable passfile mount", mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Containers[0].VolumeMounts {
+				if pod.Spec.Containers[0].VolumeMounts[index].Name == "standby-passfile" {
+					pod.Spec.Containers[0].VolumeMounts[index].ReadOnly = false
+				}
+			}
+		}},
+		{name: "PVC-backed passfile", mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "standby-passfile" {
+					pod.Spec.Volumes[index].EmptyDir = nil
+					pod.Spec.Volumes[index].PersistentVolumeClaim = &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "credential-pvc"}
+				}
+			}
+		}},
+		{name: "raw replication Secret mount", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "replication-credential", MountPath: "/etc/pgshard/replication", ReadOnly: true})
+		}},
+		{name: "renamed Secret mount", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: "renamed", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "credential"}}})
+			pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "renamed", MountPath: "/renamed", ReadOnly: true})
+		}},
+		{name: "projected Secret mount", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: "projected-secret", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{Secret: &corev1.SecretProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "credential"}}}}}}})
+			pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "projected-secret", MountPath: "/projected-secret", ReadOnly: true})
+		}},
+		{name: "Kubernetes API mount", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "kubernetes-api", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true})
+		}},
+		{name: "service account token projection", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: "token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token"}}}}}})
+			pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "token", MountPath: "/renamed-token", ReadOnly: true})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			changed := pod.DeepCopy()
+			test.mutate(changed)
+			if IsPostgreSQLReplicationStandbyPod(changed) {
+				t.Fatalf("changed Pod retained standby identity: %#v", changed.ObjectMeta)
+			}
+		})
+	}
+}
+
+func testReplicationStandbyPod(t *testing.T) *corev1.Pod {
+	t.Helper()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 3
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.CatalogAccess = nil
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := PostgreSQLMemberStatefulSetName(cluster.Name, 0, 1)
+	for _, item := range plan {
+		statefulSet, ok := item.(*appsv1.StatefulSet)
+		if !ok || statefulSet.Name != name {
+			continue
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        name + "-0",
+				Namespace:   cluster.Namespace,
+				Labels:      maps.Clone(statefulSet.Spec.Template.Labels),
+				Annotations: maps.Clone(statefulSet.Spec.Template.Annotations),
+				Finalizers:  slices.Clone(statefulSet.Spec.Template.Finalizers),
+			},
+			Spec: *statefulSet.Spec.Template.Spec.DeepCopy(),
+		}
+	}
+	t.Fatalf("plan has no replication standby StatefulSet %s", name)
 	return nil
 }
 
@@ -3340,6 +3561,7 @@ func TestPostgreSQLWritableLeaseNameFitsDNSLabelAtMaximumClusterLength(t *testin
 	names := []string{
 		PostgreSQLWritableLeaseName(cluster, pgshardv1alpha1.MaximumShards-1),
 		PostgreSQLAgentServiceAccountName(cluster, pgshardv1alpha1.MaximumShards-1),
+		PostgreSQLStandbyServiceAccountName(cluster, pgshardv1alpha1.MaximumShards-1),
 	}
 	for _, name := range names {
 		if messages := validation.IsDNS1123Label(name); len(messages) != 0 {

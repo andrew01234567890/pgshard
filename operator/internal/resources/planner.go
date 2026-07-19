@@ -1687,6 +1687,284 @@ cleanup_bootstrap_runtime
 sync "$final" "$parent" "$volume_root"
 `
 
+const postgresqlStandbyBootstrapScript = `set -Eeuo pipefail
+: "${PGSHARD_CLUSTER_UID:?cluster UID is required}"
+: "${PGSHARD_SHARD_ID:?shard identity is required}"
+: "${PGSHARD_MEMBER_ID:?member identity is required}"
+: "${PGSHARD_SOURCE_HOST:?source Pod DNS is required}"
+: "${PGSHARD_PRIMARY_SLOT_NAME:?physical replication slot is required}"
+: "${PGSHARD_REPLICATION_MATERIAL_SHA256:?replication material digest is required}"
+: "${PGSHARD_TARGET_PVC_UID:?target PVC UID is required}"
+: "${PGSHARD_TARGET_SECRET_UID:?target creation-fence Secret UID is required}"
+: "${PGSHARD_SOURCE_PVC_UID:?source PVC UID is required}"
+: "${PGSHARD_REPLICATION_SECRET_UID:?replication Secret UID is required}"
+: "${PGSHARD_NODE_UID:?binding-time node UID is required}"
+: "${PGSHARD_NODE_BOOT_ID:?binding-time node boot ID is required}"
+
+if [[ ! "$PGSHARD_SHARD_ID" =~ ^[0-9]{4}$ ]] \
+  || [[ ! "$PGSHARD_MEMBER_ID" =~ ^[0-9]{4}$ ]] \
+  || [[ "$PGSHARD_MEMBER_ID" == "0000" ]]; then
+  echo "refusing a non-canonical physical standby identity" >&2
+  exit 1
+fi
+if [[ "$PGSHARD_PRIMARY_SLOT_NAME" != "pgshard_member_$PGSHARD_MEMBER_ID" ]]; then
+  echo "refusing a physical slot that differs from the member identity" >&2
+  exit 1
+fi
+if [[ ! "$PGSHARD_SOURCE_HOST" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]] \
+  || (( ${#PGSHARD_SOURCE_HOST} > 253 )); then
+  echo "refusing invalid source Pod DNS" >&2
+  exit 1
+fi
+if [[ ! "$PGSHARD_REPLICATION_MATERIAL_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "refusing an invalid checkpointed replication material digest" >&2
+  exit 1
+fi
+for checkpoint_uid in \
+  "$PGSHARD_TARGET_PVC_UID" \
+  "$PGSHARD_TARGET_SECRET_UID" \
+  "$PGSHARD_SOURCE_PVC_UID" \
+  "$PGSHARD_REPLICATION_SECRET_UID"; do
+  if [[ ! "$checkpoint_uid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    echo "refusing an invalid checkpointed Kubernetes UID" >&2
+    exit 1
+  fi
+done
+
+replication_password_path=/etc/pgshard/replication/replication-password
+observed_replication_sha="$(
+  pgshard-catalog-material-digest replication "$replication_password_path"
+)"
+if [[ "$observed_replication_sha" != "$PGSHARD_REPLICATION_MATERIAL_SHA256" ]]; then
+  echo "refusing replication material that differs from the checkpointed creation result" >&2
+  exit 1
+fi
+unset observed_replication_sha
+
+replication_password="$(<"$replication_password_path")"
+if [[ "$(wc -c < "$replication_password_path")" != "64" ]] \
+  || [[ ! "$replication_password" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "refusing an invalid PostgreSQL replication credential" >&2
+  exit 1
+fi
+passfile_directory=/run/pgshard/standby-auth
+passfile="$passfile_directory/passfile"
+passfile_staging="$passfile_directory/.passfile.next"
+umask 077
+rm -f -- "$passfile_staging"
+printf '%s:%s:*:pgshard_replication:%s\n' \
+  "$PGSHARD_SOURCE_HOST" 5432 "$replication_password" > "$passfile_staging"
+unset replication_password
+chmod 0400 "$passfile_staging"
+mv -- "$passfile_staging" "$passfile"
+
+parent=/var/lib/postgresql/18
+volume_root="${parent%/*}"
+final="$parent/docker"
+staging="$parent/.pgshard-standby-init"
+clone_marker_name=.pgshard-standby-clone-complete
+source_identity_name=.pgshard-bootstrap-complete
+expected_source_identity="$(mktemp /tmp/pgshard-source-identity.XXXXXX)"
+expected_clone_identity="$(mktemp /tmp/pgshard-standby-identity.XXXXXX)"
+socket="$(mktemp -d /tmp/pgshard-standby-socket.XXXXXX)"
+started=false
+source_system_identifier=
+runtime_uid="$(id -u)"
+cleanup_standby_bootstrap() {
+  result=$?
+  trap - EXIT
+  if [[ "$started" == "true" ]] || pg_ctl -D "$staging" status >/dev/null 2>&1; then
+    if ! pg_ctl -D "$staging" -w -t 45 stop -m immediate >/dev/null 2>&1; then
+      result=1
+    fi
+  fi
+  rm -f -- "$expected_source_identity" "$expected_clone_identity"
+  rm -rf -- "$socket"
+  exit "$result"
+}
+trap cleanup_standby_bootstrap EXIT
+printf 'cluster_uid=%s\nshard=%s\n' \
+  "$PGSHARD_CLUSTER_UID" "$PGSHARD_SHARD_ID" > "$expected_source_identity"
+
+validate_standby_data() {
+  local candidate="$1"
+  local control_report system_identifier tablespace_entry symlink_entry
+  if [[ ! -d "$candidate" || -L "$candidate" ]]; then
+    echo "refusing a missing or unsafe PostgreSQL standby data directory" >&2
+    return 1
+  fi
+  if [[ ! -f "$candidate/PG_VERSION" || -L "$candidate/PG_VERSION" ]]; then
+    echo "refusing a missing or unsafe PostgreSQL standby version" >&2
+    return 1
+  fi
+  if [[ "$(<"$candidate/PG_VERSION")" != "18" ]]; then
+    echo "refusing a PostgreSQL standby from another major version" >&2
+    return 1
+  fi
+  if [[ ! -f "$candidate/global/pg_control" || -L "$candidate/global/pg_control" ]]; then
+    echo "refusing a missing or unsafe PostgreSQL standby control file" >&2
+    return 1
+  fi
+  control_report="$(LC_ALL=C pg_controldata "$candidate")"
+  system_identifier="$(
+    awk -F: '$1 == "Database system identifier" { value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }' \
+      <<<"$control_report"
+  )"
+  if [[ ! "$system_identifier" =~ ^[1-9][0-9]*$ ]]; then
+    echo "refusing an invalid or ambiguous PostgreSQL system identifier" >&2
+    return 1
+  fi
+  if [[ -n "$source_system_identifier" ]] \
+    && [[ "$system_identifier" != "$source_system_identifier" ]]; then
+    echo "refusing a physical clone with a different PostgreSQL system identifier" >&2
+    return 1
+  fi
+  if [[ ! -d "$candidate/pg_wal" || -L "$candidate/pg_wal" ]]; then
+    echo "refusing PostgreSQL WAL outside the managed standby PGDATA" >&2
+    return 1
+  fi
+  if [[ ! -d "$candidate/pg_tblspc" || -L "$candidate/pg_tblspc" ]]; then
+    echo "refusing an unsafe PostgreSQL standby tablespace directory" >&2
+    return 1
+  fi
+  tablespace_entry="$(find "$candidate/pg_tblspc" -mindepth 1 -maxdepth 1 -print -quit)"
+  if [[ -n "$tablespace_entry" ]]; then
+    echo "refusing PostgreSQL standby tablespaces outside the managed PGDATA" >&2
+    return 1
+  fi
+  symlink_entry="$(find "$candidate" -xdev -type l -print -quit)"
+  if [[ -n "$symlink_entry" ]]; then
+    echo "refusing a symlink in PostgreSQL standby storage" >&2
+    return 1
+  fi
+  if [[ ! -f "$candidate/$source_identity_name" || -L "$candidate/$source_identity_name" ]] \
+    || [[ "$(stat -c '%a:%u' "$candidate/$source_identity_name")" != "600:$runtime_uid" ]] \
+    || ! cmp -s -- "$candidate/$source_identity_name" "$expected_source_identity"; then
+    echo "refusing a physical backup from another cluster or shard" >&2
+    return 1
+  fi
+  if [[ ! -f "$candidate/standby.signal" || -L "$candidate/standby.signal" ]] \
+    || [[ -s "$candidate/standby.signal" ]] \
+    || [[ "$(stat -c '%a:%u' "$candidate/standby.signal")" != "600:$runtime_uid" ]]; then
+    echo "refusing a missing or unsafe physical standby signal" >&2
+    return 1
+  fi
+  for recovery_state in recovery.signal backup_label tablespace_map; do
+    if [[ -e "$candidate/$recovery_state" || -L "$candidate/$recovery_state" ]]; then
+      echo "refusing incomplete PostgreSQL standby recovery state ($recovery_state)" >&2
+      return 1
+    fi
+  done
+  if [[ ! -f "$candidate/postgresql.auto.conf" || -L "$candidate/postgresql.auto.conf" ]]; then
+    echo "refusing an unsafe standby postgresql.auto.conf" >&2
+    return 1
+  fi
+  if grep -Eq '^[[:space:]]*[^#[:space:]]' "$candidate/postgresql.auto.conf"; then
+    echo "refusing active settings in standby postgresql.auto.conf" >&2
+    return 1
+  else
+    inspect_status=$?
+    if (( inspect_status != 1 )); then
+      echo "refusing standby postgresql.auto.conf that cannot be inspected safely" >&2
+      return 1
+    fi
+  fi
+  printf 'version=1\ncluster_uid=%s\nshard=%s\nmember=%s\nsource=%s\nslot=%s\ntarget_pvc_uid=%s\ntarget_secret_uid=%s\nsource_pvc_uid=%s\nreplication_secret_uid=%s\nreplication_material_sha256=%s\nsystem_identifier=%s\n' \
+    "$PGSHARD_CLUSTER_UID" \
+    "$PGSHARD_SHARD_ID" \
+    "$PGSHARD_MEMBER_ID" \
+    "$PGSHARD_SOURCE_HOST" \
+    "$PGSHARD_PRIMARY_SLOT_NAME" \
+    "$PGSHARD_TARGET_PVC_UID" \
+    "$PGSHARD_TARGET_SECRET_UID" \
+    "$PGSHARD_SOURCE_PVC_UID" \
+    "$PGSHARD_REPLICATION_SECRET_UID" \
+    "$PGSHARD_REPLICATION_MATERIAL_SHA256" \
+    "$system_identifier" > "$expected_clone_identity"
+}
+
+if [[ -e "$final" || -L "$final" ]]; then
+  if [[ ! -d "$final" || -L "$final" ]]; then
+    echo "refusing to replace foreign PostgreSQL standby state" >&2
+    exit 1
+  fi
+  validate_standby_data "$final"
+  if [[ ! -f "$final/$clone_marker_name" || -L "$final/$clone_marker_name" ]] \
+    || [[ "$(stat -c '%a:%u' "$final/$clone_marker_name")" != "600:$runtime_uid" ]] \
+    || ! cmp -s -- "$final/$clone_marker_name" "$expected_clone_identity"; then
+    echo "refusing incomplete or foreign PostgreSQL standby state" >&2
+    exit 1
+  fi
+  rm -rf -- "$staging"
+  sync "$final" "$parent" "$volume_root"
+  trap - EXIT
+  rm -f -- "$expected_source_identity" "$expected_clone_identity"
+  rm -rf -- "$socket"
+  exit 0
+fi
+
+rm -rf -- "$staging"
+export PGPASSFILE="$passfile"
+source_system_record="$(
+  timeout --signal=TERM --kill-after=2s 10s \
+    psql -X --no-password \
+      --dbname="host=$PGSHARD_SOURCE_HOST port=5432 user=pgshard_replication passfile=$passfile replication=true sslmode=disable" \
+      --no-align --tuples-only --field-separator='|' \
+      --command='IDENTIFY_SYSTEM'
+)"
+if [[ ! "$source_system_record" =~ ^([1-9][0-9]*)\|([1-9][0-9]*)\|[0-9A-F]+/[0-9A-F]+\|$ ]]; then
+  echo "refusing an invalid or ambiguous source IDENTIFY_SYSTEM response" >&2
+  exit 1
+fi
+source_system_identifier="${BASH_REMATCH[1]}"
+timeout --signal=TERM --kill-after=10s 15m \
+  pg_basebackup \
+    --pgdata="$staging" \
+    --host="$PGSHARD_SOURCE_HOST" \
+    --port=5432 \
+    --username=pgshard_replication \
+    --slot="$PGSHARD_PRIMARY_SLOT_NAME" \
+    --wal-method=stream \
+    --checkpoint=fast \
+    --no-password
+
+if [[ -e "$staging/standby.signal" || -L "$staging/standby.signal" ]]; then
+  echo "refusing unexpected recovery state in a new physical base backup" >&2
+  exit 1
+fi
+install -m 0600 /dev/null "$staging/standby.signal"
+rm -f -- \
+  "$staging/.pgshard-writable-generation" \
+  "$staging/.pgshard-writable-generation.next"
+
+primary_conninfo="host=$PGSHARD_SOURCE_HOST port=5432 user=pgshard_replication application_name=$PGSHARD_PRIMARY_SLOT_NAME passfile=$passfile sslmode=disable"
+pg_ctl -D "$staging" -w -t 60 start \
+  -o "-c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c hba_file=/etc/pgshard/quarantine.pg_hba.conf -c external_pid_file=/tmp/pgshard-standby-bootstrap.pid -c ssl=off -c restart_after_crash=off -c primary_conninfo='$primary_conninfo' -c primary_slot_name='$PGSHARD_PRIMARY_SLOT_NAME' -c recovery_target_timeline=latest -c recovery_target_action=shutdown -c restore_command= -c archive_cleanup_command= -c recovery_end_command= -c shared_preload_libraries= -c synchronous_standby_names='' -c synchronous_commit=local"
+started=true
+if [[ "$(timeout --signal=TERM --kill-after=2s 10s psql -X --no-password --host="$socket" --username=postgres --dbname=postgres --no-align --tuples-only --command='SELECT pg_catalog.pg_is_in_recovery()')" != "t" ]]; then
+  echo "refusing a physical clone that did not enter standby recovery" >&2
+  exit 1
+fi
+pg_ctl -D "$staging" -w -t 45 stop -m fast
+started=false
+
+validate_standby_data "$staging"
+if [[ -e "$staging/$clone_marker_name" || -L "$staging/$clone_marker_name" ]]; then
+  echo "refusing a pre-existing physical standby clone marker" >&2
+  exit 1
+fi
+install -m 0600 -- "$expected_clone_identity" "$staging/$clone_marker_name"
+sync \
+  "$staging/standby.signal" \
+  "$staging/$clone_marker_name" \
+  "$staging"
+mv -- "$staging" "$final"
+sync "$final" "$parent" "$volume_root"
+trap - EXIT
+rm -f -- "$expected_source_identity" "$expected_clone_identity"
+rm -rf -- "$socket"
+`
+
 // Images contains controller-owned workload composition inputs. Image
 // references and the PostgreSQL runtime mode are controller configuration, not
 // part of the cluster API, so changing a controller release does not mutate the
@@ -1809,6 +2087,59 @@ func IsPostgreSQLReplicationBootstrapSourcePod(pod *corev1.Pod) bool {
 	return false
 }
 
+// IsPostgreSQLReplicationStandbyPod recognizes only one deterministic,
+// role-neutral nonzero member composed as a TCP-closed physical standby. The
+// classifier deliberately includes its upstream Pod DNS, pre-created slot,
+// private passfile, and lack of writable-term or Kubernetes API authority.
+func IsPostgreSQLReplicationStandbyPod(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	if _, hasRole := pod.Labels[RoleLabel]; hasRole {
+		return false
+	}
+	shardText := pod.Labels[ShardLabel]
+	shard, err := strconv.ParseInt(shardText, 10, 32)
+	if err != nil || shard < 0 || shardText != shardLabel(int32(shard)) {
+		return false
+	}
+	memberText := pod.Labels[MemberLabel]
+	member, err := strconv.ParseInt(memberText, 10, 32)
+	if err != nil || member <= 0 || memberText != memberLabel(int32(member)) {
+		return false
+	}
+	cluster := pod.Labels[ClusterLabel]
+	if cluster == "" || pod.Namespace == "" ||
+		pod.Name != PostgreSQLMemberStatefulSetName(cluster, int32(shard), int32(member))+"-0" ||
+		pod.Spec.ServiceAccountName != PostgreSQLStandbyServiceAccountName(cluster, int32(shard)) {
+		return false
+	}
+	runtime, err := ObservePostgreSQLRuntime(pod.Annotations, pod.Spec)
+	if err != nil || runtime != PostgreSQLRuntimeAgentQuarantine {
+		return false
+	}
+	expectedSource := postgresqlMemberPodDNS(cluster, int32(shard), 0, pod.Namespace)
+	expectedSlot := "pgshard_member_" + memberText
+	for index := range pod.Spec.Containers {
+		container := pod.Spec.Containers[index]
+		if container.Name != "postgresql" {
+			continue
+		}
+		mode, modeOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_MODE")
+		hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_HBA_FILE")
+		source, sourceOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_HOST")
+		slot, slotOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME")
+		passfile, passfileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_PASSFILE")
+		return modeOK && hbaFileOK && sourceOK && slotOK && passfileOK &&
+			mode == "replication-standby" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf" &&
+			source == expectedSource && slot == expectedSlot &&
+			passfile == "/run/pgshard/standby-auth/passfile" &&
+			containerHasReadOnlyMount(container, "standby-passfile", "/run/pgshard/standby-auth") &&
+			!containerHasMount(container, "replication-credential", "/etc/pgshard/replication")
+	}
+	return false
+}
+
 func postgresqlAgentShape(spec corev1.PodSpec, postgres corev1.Container) bool {
 	if spec.ServiceAccountName == "" || spec.AutomountServiceAccountToken == nil || *spec.AutomountServiceAccountToken || len(postgres.Command) != 0 || len(postgres.Args) != 0 {
 		return false
@@ -1817,16 +2148,60 @@ func postgresqlAgentShape(spec corev1.PodSpec, postgres corev1.Container) bool {
 	hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_HBA_FILE")
 	quarantine := modeOK && hbaFileOK && mode == "quarantine" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
 	bootstrapSource := modeOK && hbaFileOK && mode == "replication-bootstrap-primary" && hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
-	if (!quarantine && !bootstrapSource) ||
+	standby := modeOK && hbaFileOK && mode == "replication-standby" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
+	if standby {
+		source, sourceOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_HOST")
+		port, portOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_PORT")
+		slot, slotOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME")
+		passfile, passfileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_PASSFILE")
+		standby = sourceOK && source != "" && portOK && port == "5432" &&
+			slotOK && canonicalPostgreSQLMemberSlot(slot) && passfileOK &&
+			passfile == "/run/pgshard/standby-auth/passfile"
+	}
+	if (!quarantine && !bootstrapSource && !standby) ||
 		!containerHasPort(postgres, "agent-http", HTTPPort) ||
-		!containerHasMount(postgres, "kubernetes-api", "/var/run/secrets/kubernetes.io/serviceaccount") ||
-		!containerHasMount(postgres, "runtime", "/run/pgshard") ||
+		!containerHasMount(postgres, "runtime", "/run/pgshard") {
+		return false
+	}
+	if standby {
+		if !containerHasReadOnlyMount(postgres, "standby-passfile", "/run/pgshard/standby-auth") ||
+			!podHasMemoryEmptyDirVolume(spec, "standby-passfile") ||
+			containerMountsSecretOrServiceAccountToken(spec, postgres) ||
+			containerHasMount(postgres, "kubernetes-api", "/var/run/secrets/kubernetes.io/serviceaccount") ||
+			containerHasVolumeMount(postgres, "replication-credential") ||
+			podHasServiceAccountTokenProjection(spec) {
+			return false
+		}
+		for _, name := range []string{
+			"PGSHARD_CLUSTER_UID",
+			"PGSHARD_POD_UID",
+			"PGSHARD_LEASE_NAMESPACE",
+			"PGSHARD_WRITABLE_LEASE_NAME",
+			"PGSHARD_WRITABLE_LEASE_UID",
+			"PGSHARD_MAX_LEASE_TTL_MS",
+			"PGSHARD_WRITABLE_LEASE_DURATION_SECONDS",
+			"PGSHARD_WRITABLE_LEASE_RENEW_DEADLINE_SECONDS",
+			"PGSHARD_WRITABLE_LEASE_RETRY_MS",
+			"PGSHARD_KUBERNETES_REQUEST_TIMEOUT_MS",
+		} {
+			if containerHasEnvironment(postgres, name) {
+				return false
+			}
+		}
+	} else if !containerHasMount(postgres, "kubernetes-api", "/var/run/secrets/kubernetes.io/serviceaccount") ||
 		!podHasProjectedVolume(spec, "kubernetes-api") {
 		return false
 	}
 	return probeHTTPPath(postgres.StartupProbe) == "/healthz" &&
 		probeHTTPPath(postgres.LivenessProbe) == "/healthz" &&
 		probeHTTPPath(postgres.ReadinessProbe) == "/readyz"
+}
+
+func canonicalPostgreSQLMemberSlot(slot string) bool {
+	member, ok := strings.CutPrefix(slot, "pgshard_member_")
+	return ok && len(member) == 4 && strings.IndexFunc(member, func(character rune) bool {
+		return character < '0' || character > '9'
+	}) == -1
 }
 
 func containerUniqueLiteralEnvironment(container corev1.Container, name string) (string, bool) {
@@ -1854,6 +2229,15 @@ func containerHasLiteralEnvironment(container corev1.Container, name, value stri
 	return false
 }
 
+func containerHasEnvironment(container corev1.Container, name string) bool {
+	for _, environment := range container.Env {
+		if environment.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func containerHasPort(container corev1.Container, name string, port int32) bool {
 	for _, candidate := range container.Ports {
 		if candidate.Name == name && candidate.ContainerPort == port && candidate.Protocol == corev1.ProtocolTCP {
@@ -1872,9 +2256,85 @@ func containerHasMount(container corev1.Container, name, path string) bool {
 	return false
 }
 
+func containerHasVolumeMount(container corev1.Container, name string) bool {
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func containerHasReadOnlyMount(container corev1.Container, name, path string) bool {
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == name && mount.MountPath == path && mount.ReadOnly {
+			return true
+		}
+	}
+	return false
+}
+
 func podHasProjectedVolume(spec corev1.PodSpec, name string) bool {
 	for _, volume := range spec.Volumes {
 		if volume.Name == name && volume.Projected != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func podHasServiceAccountTokenProjection(spec corev1.PodSpec) bool {
+	for _, volume := range spec.Volumes {
+		if volume.Projected == nil {
+			continue
+		}
+		for _, source := range volume.Projected.Sources {
+			if source.ServiceAccountToken != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func podHasMemoryEmptyDirVolume(spec corev1.PodSpec, name string) bool {
+	found := false
+	for _, volume := range spec.Volumes {
+		if volume.Name != name {
+			continue
+		}
+		if found || volume.EmptyDir == nil || volume.EmptyDir.Medium != corev1.StorageMediumMemory ||
+			volume.Secret != nil || volume.Projected != nil || volume.PersistentVolumeClaim != nil {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
+func containerMountsSecretOrServiceAccountToken(spec corev1.PodSpec, container corev1.Container) bool {
+	for _, mount := range container.VolumeMounts {
+		matched := false
+		for _, volume := range spec.Volumes {
+			if volume.Name != mount.Name {
+				continue
+			}
+			if matched {
+				return true
+			}
+			matched = true
+			if volume.Secret != nil {
+				return true
+			}
+			if volume.Projected != nil {
+				for _, source := range volume.Projected.Sources {
+					if source.Secret != nil || source.ServiceAccountToken != nil {
+						return true
+					}
+				}
+			}
+		}
+		if !matched {
 			return true
 		}
 	}
@@ -1950,8 +2410,8 @@ func ValidateImagesForCluster(cluster *pgshardv1alpha1.PgShardCluster, images Im
 // Plan returns the complete set of safe-to-create resources for cluster.
 // Single-member asynchronous shards receive one PostgreSQL 18 primary. An
 // explicit multi-member agent runtime receives one non-serving member-zero
-// replication-bootstrap source per shard; standbys, serving activation,
-// promotion, and recovery remain fail closed.
+// replication-bootstrap source and one TCP-closed physical standby per other
+// member. Serving activation, promotion, and recovery remain fail closed.
 func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Object, error) {
 	if cluster == nil {
 		return nil, fmt.Errorf("cluster is nil")
@@ -2044,7 +2504,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		}
 	}
 
-	objects := make([]client.Object, 0, 18+7*cluster.Spec.Shards)
+	objects := make([]client.Object, 0, 18+(7+cluster.Spec.MembersPerShard)*cluster.Spec.Shards)
 	objects = append(objects,
 		immutableConfigMap(cluster, postgresqlConfigName, postgresqlConfig),
 		configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": topologyConfig}),
@@ -2082,8 +2542,20 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			writableLease := writableLeases[shard]
 			replicationCredential := replicationCredentials[shard]
 			objects = append(objects,
+				postgresqlStandbyServiceAccount(cluster, shard),
 				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease, replicationCredential),
 			)
+			for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
+				objects = append(objects, postgresqlReplicationStandbyStatefulSet(
+					cluster,
+					shard,
+					member,
+					images,
+					bootstraps[postgresqlBootstrapKey{shard: shard, member: member}],
+					bootstrap,
+					replicationCredential,
+				))
+			}
 		}
 	}
 
@@ -2760,6 +3232,15 @@ func PostgreSQLMemberStatefulSetName(cluster string, shard, member int32) string
 	return fmt.Sprintf("%s-m%04d", base, member)
 }
 
+func postgresqlMemberPodDNS(cluster string, shard, member int32, namespace string) string {
+	return fmt.Sprintf(
+		"%s-0.%s.%s.svc",
+		PostgreSQLMemberStatefulSetName(cluster, shard, member),
+		shardName(cluster, shard),
+		namespace,
+	)
+}
+
 // PostgreSQLWritableLeaseName returns the deterministic, role-neutral Lease
 // name for one physical cell. The stable member name and Pod UID belong in the
 // runtime holder identity, never in this reusable coordination envelope.
@@ -2776,6 +3257,22 @@ func PostgreSQLAgentServiceAccountName(cluster string, shard int32) string {
 
 func postgresqlAgentServiceAccount(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *corev1.ServiceAccount {
 	metadata := ownedMeta(cluster, PostgreSQLAgentServiceAccountName(cluster.Name, shard), "postgresql-agent", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	return &corev1.ServiceAccount{
+		ObjectMeta:                   metadata,
+		AutomountServiceAccountToken: ptr(false),
+	}
+}
+
+// PostgreSQLStandbyServiceAccountName returns the unprivileged identity shared
+// by physical standbys in one shard. It has no Role or RoleBinding and exists
+// only to make the lack of Kubernetes API authority explicit and fenceable.
+func PostgreSQLStandbyServiceAccountName(cluster string, shard int32) string {
+	return PostgreSQLShardStatefulSetName(cluster, shard) + "-standby"
+}
+
+func postgresqlStandbyServiceAccount(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *corev1.ServiceAccount {
+	metadata := ownedMeta(cluster, PostgreSQLStandbyServiceAccountName(cluster.Name, shard), "postgresql-standby", nil)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
 	return &corev1.ServiceAccount{
 		ObjectMeta:                   metadata,
@@ -3291,12 +3788,201 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 	}
 }
 
+func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard, member int32, images Images, bootstrap, sourceBootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) *appsv1.StatefulSet {
+	const (
+		postgresUID = int64(999)
+		replicas    = int32(1)
+	)
+	name := PostgreSQLMemberStatefulSetName(cluster.Name, shard, member)
+	selector := componentSelector(cluster, "postgresql")
+	selector[ShardLabel] = shardLabel(shard)
+	selector[MemberLabel] = memberLabel(member)
+	podLabels := maps.Clone(selector)
+	podLabels[ManagedByLabel] = ManagedByValue
+	allowPrivilegeEscalation := false
+	readOnlyRootFilesystem := true
+	runAsNonRoot := true
+	seccomp := &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	fsGroupChangePolicy := corev1.FSGroupChangeOnRootMismatch
+	postgresSecurity := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+		ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
+		RunAsNonRoot:             &runAsNonRoot,
+		RunAsUser:                ptr(postgresUID),
+		RunAsGroup:               ptr(postgresUID),
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+	pullPolicy := imagePullPolicy(images.PostgreSQLBootstrap)
+	if images.PostgreSQLBootstrap == developmentPostgreSQLBootstrapImage {
+		pullPolicy = corev1.PullNever
+	}
+	sourceHost := postgresqlMemberPodDNS(cluster.Name, shard, 0, cluster.Namespace)
+	slotName := "pgshard_member_" + memberLabel(member)
+	bootstrapContainer := corev1.Container{
+		Name:            "bootstrap-standby",
+		Image:           images.PostgreSQLBootstrap,
+		ImagePullPolicy: pullPolicy,
+		Command:         []string{"bash", "-ceu", postgresqlStandbyBootstrapScript},
+		Env: []corev1.EnvVar{
+			{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
+			{Name: "PGSHARD_SHARD_ID", Value: shardLabel(shard)},
+			{Name: "PGSHARD_MEMBER_ID", Value: memberLabel(member)},
+			{Name: "PGSHARD_SOURCE_HOST", Value: sourceHost},
+			{Name: "PGSHARD_PRIMARY_SLOT_NAME", Value: slotName},
+			{Name: "PGSHARD_REPLICATION_MATERIAL_SHA256", Value: replicationCredential.MaterialSHA256},
+			{Name: "PGSHARD_TARGET_PVC_UID", Value: string(bootstrap.PVCUID)},
+			{Name: "PGSHARD_TARGET_SECRET_UID", Value: string(bootstrap.SecretUID)},
+			{Name: "PGSHARD_SOURCE_PVC_UID", Value: string(sourceBootstrap.PVCUID)},
+			{Name: "PGSHARD_REPLICATION_SECRET_UID", Value: string(replicationCredential.SecretUID)},
+			{Name: "PGSHARD_NODE_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeUIDAnnotation)}}},
+			{Name: "PGSHARD_NODE_BOOT_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeBootIDAnnotation)}}},
+		},
+		Resources:       cluster.Spec.PostgreSQL.Resources,
+		SecurityContext: postgresSecurity.DeepCopy(),
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "data", MountPath: "/var/lib/postgresql"},
+			{Name: "tmp", MountPath: "/tmp"},
+			{Name: "replication-credential", MountPath: "/etc/pgshard/replication", ReadOnly: true},
+			{Name: "standby-passfile", MountPath: "/run/pgshard/standby-auth"},
+		},
+	}
+	agent := postgresqlReplicationStandbyContainer(
+		cluster,
+		shard,
+		images.PostgreSQLBootstrap,
+		pullPolicy,
+		postgresSecurity,
+		sourceHost,
+		slotName,
+	)
+	automount := false
+	enableServiceLinks := false
+	podAnnotations := map[string]string{
+		PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
+		PostgreSQLRuntimeAnnotation:       images.PostgreSQLRuntime.String(),
+	}
+	volumes := []corev1.Volume{
+		{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: bootstrap.PVCName}}},
+		{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr(resource.MustParse("64Mi"))}}},
+		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("64Mi"))}}},
+		{Name: "replication-credential", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName:  replicationCredential.SecretName,
+			DefaultMode: ptr(int32(0o440)),
+			Items:       []corev1.KeyToPath{{Key: PostgreSQLReplicationPasswordKey, Path: "replication-password", Mode: ptr(int32(0o440))}},
+		}}},
+		{Name: "standby-passfile", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			Medium:    corev1.StorageMediumMemory,
+			SizeLimit: ptr(resource.MustParse("64Ki")),
+		}}},
+	}
+	statefulSetMetadata := ownedMeta(cluster, name, "postgresql", nil)
+	statefulSetMetadata.Labels[ShardLabel] = shardLabel(shard)
+	statefulSetMetadata.Labels[MemberLabel] = memberLabel(member)
+	statefulSetMetadata.Annotations[PostgreSQLRuntimeAnnotation] = images.PostgreSQLRuntime.String()
+	return &appsv1.StatefulSet{
+		ObjectMeta: statefulSetMetadata,
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:            ptr(replicas),
+			ServiceName:         shardName(cluster.Name, shard),
+			PodManagementPolicy: appsv1.OrderedReadyPodManagement,
+			MinReadySeconds:     5,
+			UpdateStrategy:      appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType},
+			Selector:            &metav1.LabelSelector{MatchLabels: selector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      podLabels,
+					Annotations: podAnnotations,
+					Finalizers:  []string{PostgreSQLPodTerminationFinalizer},
+				},
+				Spec: corev1.PodSpec{
+					AutomountServiceAccountToken:  &automount,
+					ServiceAccountName:            PostgreSQLStandbyServiceAccountName(cluster.Name, shard),
+					EnableServiceLinks:            &enableServiceLinks,
+					TerminationGracePeriodSeconds: ptr(int64(60)),
+					NodeSelector:                  map[string]string{corev1.LabelOSStable: "linux"},
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot:        &runAsNonRoot,
+						RunAsUser:           ptr(postgresUID),
+						RunAsGroup:          ptr(postgresUID),
+						FSGroup:             ptr(postgresUID),
+						FSGroupChangePolicy: &fsGroupChangePolicy,
+						SeccompProfile:      seccomp,
+					},
+					InitContainers: []corev1.Container{bootstrapContainer},
+					Containers:     []corev1.Container{agent},
+					Volumes:        volumes,
+				},
+			},
+		},
+	}
+}
+
 func postgresqlAgentQuarantineContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
 	return postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "quarantine", "/etc/pgshard/quarantine.pg_hba.conf")
 }
 
 func postgresqlReplicationBootstrapPrimaryContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
 	return postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "replication-bootstrap-primary", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf")
+}
+
+func postgresqlReplicationStandbyContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, sourceHost, slotName string) corev1.Container {
+	environment := []corev1.EnvVar{
+		{Name: "PGSHARD_HTTP_BIND", Value: "0.0.0.0:8080"},
+		{Name: "PGSHARD_CLUSTER_ID", Value: cluster.Name},
+		{Name: "PGSHARD_SHARD_ID", Value: fmt.Sprintf("%d", shard)},
+		{Name: "PGSHARD_INSTANCE_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"},
+		{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"},
+		{Name: "PGSHARD_POSTGRES_BIN", Value: "/usr/lib/postgresql/18/bin/postgres"},
+		{Name: "PGSHARD_POSTGRES_SOCKET_DIR", Value: "/run/pgshard/postgres"},
+		{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/quarantine.pg_hba.conf"},
+		{Name: "PGSHARD_POSTGRES_PRIMARY_HOST", Value: sourceHost},
+		{Name: "PGSHARD_POSTGRES_PRIMARY_PORT", Value: "5432"},
+		{Name: "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", Value: slotName},
+		{Name: "PGSHARD_POSTGRES_PRIMARY_PASSFILE", Value: "/run/pgshard/standby-auth/passfile"},
+		{Name: "PGSHARD_POSTGRES_SMART_SHUTDOWN_MS", Value: "5000"},
+		{Name: "PGSHARD_POSTGRES_FAST_SHUTDOWN_MS", Value: "44000"},
+		{Name: "PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS", Value: "500"},
+	}
+	if endpoint := cluster.Spec.Observability.OpenTelemetryEndpoint; endpoint != "" {
+		environment = append(environment, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: endpoint})
+	}
+	return corev1.Container{
+		Name:            "postgresql",
+		Image:           image,
+		ImagePullPolicy: pullPolicy,
+		Env:             environment,
+		Ports: []corev1.ContainerPort{
+			{Name: "postgresql", ContainerPort: PostgreSQLPort, Protocol: corev1.ProtocolTCP},
+			{Name: "agent-http", ContainerPort: HTTPPort, Protocol: corev1.ProtocolTCP},
+		},
+		Resources:       cluster.Spec.PostgreSQL.Resources,
+		SecurityContext: security.DeepCopy(),
+		StartupProbe: &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("agent-http"), Scheme: corev1.URISchemeHTTP}},
+			PeriodSeconds:    1,
+			TimeoutSeconds:   1,
+			FailureThreshold: 40,
+		},
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("agent-http"), Scheme: corev1.URISchemeHTTP}},
+			PeriodSeconds:    5,
+			TimeoutSeconds:   1,
+			FailureThreshold: 3,
+		},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromString("agent-http"), Scheme: corev1.URISchemeHTTP}},
+			PeriodSeconds:    2,
+			TimeoutSeconds:   1,
+			FailureThreshold: 1,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "data", MountPath: "/var/lib/postgresql"},
+			{Name: "runtime", MountPath: "/run/pgshard"},
+			{Name: "tmp", MountPath: "/tmp"},
+			{Name: "standby-passfile", MountPath: "/run/pgshard/standby-auth", ReadOnly: true},
+		},
+	}
 }
 
 func postgresqlAgentWritableContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, mode, hbaFile string) corev1.Container {

@@ -724,7 +724,7 @@ jobs:
         env:
           PGSHARD_KIND_MANAGER_E2E: "true"
         run: >-
-          go test -race -count=1 -timeout=10m
+          go test -race -count=1 -timeout=20m
           -run '^TestKINDManagerRunsAgentQuarantine$'
           ./internal/controller
       - name: Capture manager diagnostics

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -1068,7 +1069,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
 		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against an admission manager in agent-quarantine mode")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	kubeClient := newKINDClient(t)
 
@@ -1196,6 +1197,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if replicationState != "safe\npgshard_member_0001,pgshard_member_0002" {
 		t.Fatalf("replication bootstrap materialized state = %q", replicationState)
 	}
+	assertKINDPhysicalStandbys(t, ctx, kubeClient, haCurrent, sourcePodName)
 
 	cluster := readSingleMemberSample(t)
 	cluster.Name = "agent-quarantine"
@@ -1783,6 +1785,193 @@ func runPostgreSQLServiceQuery(t *testing.T, ctx context.Context, kubeClient cli
 		t.Fatalf("wait for PostgreSQL client Pod: %v", err)
 	}
 	return strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
+}
+
+func assertKINDPhysicalStandbys(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster, sourcePodName string) {
+	t.Helper()
+	const shard = int32(0)
+	namespace := cluster.Namespace
+	wantSourceHost := fmt.Sprintf("%s-0.%s-shard-%04d.%s.svc", owned.PostgreSQLMemberStatefulSetName(cluster.Name, shard, 0), cluster.Name, shard, namespace)
+	type standbyIdentity struct {
+		podName string
+		podUID  types.UID
+		pvcName string
+		pvcUID  types.UID
+	}
+	standbys := make(map[int32]standbyIdentity, cluster.Spec.MembersPerShard-1)
+
+	for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
+		statefulSetName := owned.PostgreSQLMemberStatefulSetName(cluster.Name, shard, member)
+		statefulSet := &appsv1.StatefulSet{}
+		if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+			err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: statefulSetName}, statefulSet)
+			return err == nil, client.IgnoreNotFound(err)
+		}); err != nil {
+			t.Fatalf("wait for physical standby member %d StatefulSet: %v", member, err)
+		}
+		if _, hasRole := statefulSet.Spec.Template.Labels[owned.RoleLabel]; hasRole {
+			t.Fatalf("physical standby member %d received a serving role: %#v", member, statefulSet.Spec.Template.Labels)
+		}
+		if statefulSet.Spec.Template.Spec.ServiceAccountName != owned.PostgreSQLStandbyServiceAccountName(cluster.Name, shard) ||
+			statefulSet.Spec.Template.Spec.AutomountServiceAccountToken == nil || *statefulSet.Spec.Template.Spec.AutomountServiceAccountToken ||
+			len(statefulSet.Spec.Template.Spec.Containers) != 1 {
+			t.Fatalf("physical standby member %d Pod identity = %#v", member, statefulSet.Spec.Template.Spec)
+		}
+		standby := statefulSet.Spec.Template.Spec.Containers[0]
+		slotName := fmt.Sprintf("pgshard_member_%04d", member)
+		if agentEnvironmentValue(standby.Env, "PGSHARD_POSTGRES_MODE") != "replication-standby" ||
+			agentEnvironmentValue(standby.Env, "PGSHARD_POSTGRES_PRIMARY_HOST") != wantSourceHost ||
+			agentEnvironmentValue(standby.Env, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME") != slotName {
+			t.Fatalf("physical standby member %d source and slot environment = %#v", member, standby.Env)
+		}
+		if podContainerHasNamedVolumeMount(standby.VolumeMounts, "replication-credential") ||
+			podContainerHasNamedVolumeMount(standby.VolumeMounts, "kubernetes-api") {
+			t.Fatalf("running physical standby member %d retained privileged material: %#v", member, standby.VolumeMounts)
+		}
+		var pvcName string
+		for _, volume := range statefulSet.Spec.Template.Spec.Volumes {
+			if volume.Name == "data" && volume.PersistentVolumeClaim != nil {
+				pvcName = volume.PersistentVolumeClaim.ClaimName
+			}
+		}
+		if pvcName == "" {
+			t.Fatalf("physical standby member %d has no persistent data volume: %#v", member, statefulSet.Spec.Template.Spec.Volumes)
+		}
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pvcName}, pvc); err != nil {
+			t.Fatal(err)
+		}
+
+		podName := statefulSetName + "-0"
+		pod := waitForRunningPhysicalStandby(t, ctx, kubeClient, types.NamespacedName{Namespace: namespace, Name: podName}, "")
+		standbys[member] = standbyIdentity{podName: podName, podUID: pod.UID, pvcName: pvcName, pvcUID: pvc.UID}
+	}
+
+	wantStreams := "pgshard_member_0001:pgshard_member_0001:streaming,pgshard_member_0002:pgshard_member_0002:streaming"
+	waitForPhysicalReplicationStreams(t, ctx, namespace, sourcePodName, wantStreams)
+	for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
+		assertKINDPhysicalStandbyFailClosed(t, ctx, kubeClient, namespace, standbys[member].podName, member)
+	}
+	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace, cluster.Name)
+
+	if _, err := runPostgreSQLPodQuery(ctx, namespace, sourcePodName, "CREATE TABLE IF NOT EXISTS pgshard_kind_physical_replication (id integer PRIMARY KEY, note text NOT NULL); INSERT INTO pgshard_kind_physical_replication VALUES (1, 'before-restart') ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note; SELECT pg_catalog.pg_switch_wal();"); err != nil {
+		t.Fatalf("write physical-replication marker on source: %v", err)
+	}
+	for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
+		waitForPhysicalStandbyReplay(t, ctx, namespace, standbys[member].podName, 1, "before-restart")
+	}
+
+	restartedMember := int32(1)
+	restarted := standbys[restartedMember]
+	before := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: restarted.podName}, before); err != nil {
+		t.Fatal(err)
+	}
+	uid := before.UID
+	resourceVersion := before.ResourceVersion
+	if err := kubeClient.Delete(ctx, before, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil {
+		t.Fatalf("delete physical standby member %d Pod: %v", restartedMember, err)
+	}
+	waitForRunningPhysicalStandby(t, ctx, kubeClient, types.NamespacedName{Namespace: namespace, Name: restarted.podName}, restarted.podUID)
+	reusedPVC := &corev1.PersistentVolumeClaim{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: restarted.pvcName}, reusedPVC); err != nil {
+		t.Fatal(err)
+	}
+	if reusedPVC.UID != restarted.pvcUID {
+		t.Fatalf("physical standby member %d recreated its PVC: before=%q after=%q", restartedMember, restarted.pvcUID, reusedPVC.UID)
+	}
+	waitForPhysicalReplicationStreams(t, ctx, namespace, sourcePodName, wantStreams)
+	assertKINDPhysicalStandbyFailClosed(t, ctx, kubeClient, namespace, restarted.podName, restartedMember)
+	waitForPhysicalStandbyReplay(t, ctx, namespace, restarted.podName, 1, "before-restart")
+	if _, err := runPostgreSQLPodQuery(ctx, namespace, sourcePodName, "INSERT INTO pgshard_kind_physical_replication VALUES (2, 'after-restart') ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note; SELECT pg_catalog.pg_switch_wal();"); err != nil {
+		t.Fatalf("write post-restart physical-replication marker on source: %v", err)
+	}
+	for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
+		waitForPhysicalStandbyReplay(t, ctx, namespace, standbys[member].podName, 2, "after-restart")
+	}
+}
+
+func assertKINDPhysicalStandbyFailClosed(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, podName string, member int32) {
+	t.Helper()
+	pod := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, pod); err != nil {
+		t.Fatal(err)
+	}
+	if _, hasRole := pod.Labels[owned.RoleLabel]; hasRole {
+		t.Fatalf("physical standby member %d Pod received a serving role: %#v", member, pod.Labels)
+	}
+	if podReady(pod) || len(pod.Status.ContainerStatuses) != 1 || pod.Status.ContainerStatuses[0].Name != "postgresql" || pod.Status.ContainerStatuses[0].Ready {
+		t.Fatalf("physical standby member %d became routable: conditions=%#v containers=%#v", member, pod.Status.Conditions, pod.Status.ContainerStatuses)
+	}
+	output, err := exec.CommandContext(ctx, "kubectl", "--namespace", namespace, "exec", podName, "--container=postgresql", "--", "pg_isready", "--quiet", "--timeout=2", "--host=127.0.0.1", "--port=5432").CombinedOutput()
+	var exitError *exec.ExitError
+	if err == nil {
+		t.Fatalf("physical standby member %d exposed PostgreSQL TCP: %s", member, output)
+	} else if !errors.As(err, &exitError) || exitError.ExitCode() != 2 {
+		t.Fatalf("inspect physical standby member %d TCP state: %v: %s", member, err, output)
+	}
+}
+
+func waitForRunningPhysicalStandby(t *testing.T, ctx context.Context, kubeClient client.Client, key types.NamespacedName, previousUID types.UID) *corev1.Pod {
+	t.Helper()
+	pod := &corev1.Pod{}
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 4*time.Minute, true, func(ctx context.Context) (bool, error) {
+		pod = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, key, pod); err != nil {
+			return false, client.IgnoreNotFound(err)
+		}
+		if pod.UID == previousUID || len(pod.Status.ContainerStatuses) != 1 || pod.Status.ContainerStatuses[0].Name != "postgresql" {
+			return false, nil
+		}
+		return pod.Status.Phase == corev1.PodRunning && pod.Status.ContainerStatuses[0].State.Running != nil, nil
+	}); err != nil {
+		t.Fatalf("wait for running physical standby Pod %s: %v; last Pod=%#v", key, err, pod)
+	}
+	return pod
+}
+
+func waitForPhysicalReplicationStreams(t *testing.T, ctx context.Context, namespace, sourcePodName, want string) {
+	t.Helper()
+	var last string
+	var lastErr error
+	query := "SELECT string_agg(replication.application_name || ':' || slots.slot_name || ':' || replication.state, ',' ORDER BY replication.application_name) FROM pg_catalog.pg_stat_replication AS replication JOIN pg_catalog.pg_replication_slots AS slots ON slots.active_pid = replication.pid WHERE replication.application_name IN ('pgshard_member_0001', 'pgshard_member_0002');"
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		last, lastErr = runPostgreSQLPodQuery(ctx, namespace, sourcePodName, query)
+		return lastErr == nil && last == want, nil
+	}); err != nil {
+		t.Fatalf("wait for exact physical replication streams: %v; last=%q error=%v", err, last, lastErr)
+	}
+}
+
+func waitForPhysicalStandbyReplay(t *testing.T, ctx context.Context, namespace, podName string, id int, note string) {
+	t.Helper()
+	want := "true|" + note
+	var last string
+	var lastErr error
+	query := fmt.Sprintf("SELECT pg_catalog.pg_is_in_recovery()::text || '|' || note FROM pgshard_kind_physical_replication WHERE id = %d;", id)
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		last, lastErr = runPostgreSQLPodQuery(ctx, namespace, podName, query)
+		return lastErr == nil && last == want, nil
+	}); err != nil {
+		t.Fatalf("wait for physical replay on Pod %s: %v; want=%q last=%q error=%v", podName, err, want, last, lastErr)
+	}
+}
+
+func runPostgreSQLPodQuery(ctx context.Context, namespace, podName, query string) (string, error) {
+	arguments := []string{
+		"--namespace", namespace,
+		"exec", podName,
+		"--container=postgresql",
+		"--",
+		"psql", "-X", "--no-password", "--host=/run/pgshard/postgres", "--username=postgres", "--dbname=postgres", "--no-align", "--tuples-only",
+		"--set=ON_ERROR_STOP=1",
+		"--command=" + query,
+	}
+	output, err := exec.CommandContext(ctx, "kubectl", arguments...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("kubectl %s: %w: %s", strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 func assertPostgreSQLServiceQueryDenied(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, suffix string, labels map[string]string, image, secret, host string) {

@@ -586,7 +586,9 @@ func IsManagedPostgreSQLPod(pod *corev1.Pod) bool {
 		pod.Labels[owned.ComponentLabel] == "postgresql" &&
 		pod.Labels[owned.ClusterLabel] != "" &&
 		pod.Labels[owned.ShardLabel] != "" &&
-		(pod.Labels[owned.RoleLabel] != "" || owned.IsPostgreSQLReplicationBootstrapSourcePod(pod)) &&
+		(pod.Labels[owned.RoleLabel] != "" ||
+			owned.IsPostgreSQLReplicationBootstrapSourcePod(pod) ||
+			owned.IsPostgreSQLReplicationStandbyPod(pod)) &&
 		pod.Labels[owned.MemberLabel] != "" &&
 		pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != "" &&
 		slices.Contains(pod.Finalizers, owned.PostgreSQLPodTerminationFinalizer)
