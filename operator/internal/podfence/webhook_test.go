@@ -91,6 +91,63 @@ func TestBindingAttestorPinsTheNodeIncarnationInTheBinding(t *testing.T) {
 	}
 }
 
+func TestBindingAdmissionAcceptsOnlyTheExactRoleNeutralBootstrapSource(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	pod := roleNeutralBootstrapSourcePod()
+	pod.Spec.NodeName = ""
+	pod.DeletionTimestamp = nil
+	delete(pod.Annotations, NodeUIDAnnotation)
+	delete(pod.Annotations, NodeBootIDAnnotation)
+	if !IsManagedPostgreSQLPod(pod) {
+		t.Fatalf("exact role-neutral bootstrap source is not managed: %#v", pod.ObjectMeta)
+	}
+	generic := managedPod()
+	delete(generic.Labels, owned.RoleLabel)
+	if IsManagedPostgreSQLPod(generic) {
+		t.Fatalf("generic roleless PostgreSQL Pod was accepted: %#v", generic.ObjectMeta)
+	}
+
+	node := testNode("node-a", "node-uid-a", "boot-a")
+	cluster := managedClusterForPod(pod)
+	cluster.Spec.MembersPerShard = 3
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node, cluster).Build()
+	binding := &corev1.Binding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID,
+			Labels: map[string]string{owned.RoleLabel: "attacker"},
+		},
+		Target: corev1.ObjectReference{Kind: "Node", Name: node.Name},
+	}
+	raw := marshalObject(t, binding)
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: raw},
+	}}
+	attested := NewBindingAttestor(reader, scheme).Handle(context.Background(), request)
+	if !attested.Allowed {
+		t.Fatalf("role-neutral bootstrap-source binding denied: %#v", attested.Result)
+	}
+	got := &corev1.Binding{}
+	if err := json.Unmarshal(applyResponsePatch(t, raw, attested), got); err != nil {
+		t.Fatal(err)
+	}
+	if _, hasRole := got.Labels[owned.RoleLabel]; hasRole {
+		t.Fatalf("attested role-neutral binding carries role label: %#v", got.Labels)
+	}
+	request.Object = runtime.RawExtension{Raw: marshalObject(t, got)}
+	validated := NewBindingValidator(reader, scheme).Handle(context.Background(), request)
+	if !validated.Allowed {
+		t.Fatalf("attested role-neutral bootstrap-source binding denied: %#v", validated.Result)
+	}
+	changed := got.DeepCopy()
+	changed.Labels[owned.RoleLabel] = ""
+	request.Object = runtime.RawExtension{Raw: marshalObject(t, changed)}
+	validated = NewBindingValidator(reader, scheme).Handle(context.Background(), request)
+	if validated.Allowed || validated.Result == nil || !strings.Contains(validated.Result.Message, "does not match") {
+		t.Fatalf("present-empty role binding response = %#v", validated)
+	}
+}
+
 func TestBindingAdmissionRequiresTheLiveOwningCluster(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -609,15 +666,49 @@ func TestMetadataValidatorProtectsAttestedPodGenerationAcrossSpecSubresources(t 
 func TestUnscheduledDeletingPodCanReleaseItsFence(t *testing.T) {
 	t.Parallel()
 	scheme := testScheme(t)
-	oldPod := managedPod()
-	oldPod.Spec.NodeName = ""
-	delete(oldPod.Annotations, NodeUIDAnnotation)
-	delete(oldPod.Annotations, NodeBootIDAnnotation)
-	newPod := oldPod.DeepCopy()
-	newPod.Finalizers = nil
-	response := NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, newPod, ""))
-	if !response.Allowed {
-		t.Fatalf("unassigned Pod fence release denied: %#v", response.Result)
+	for _, test := range []struct {
+		name string
+		pod  func() *corev1.Pod
+	}{
+		{name: "serving member", pod: managedPod},
+		{name: "role-neutral bootstrap source", pod: roleNeutralBootstrapSourcePod},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			oldPod := test.pod()
+			oldPod.Spec.NodeName = ""
+			delete(oldPod.Annotations, NodeUIDAnnotation)
+			delete(oldPod.Annotations, NodeBootIDAnnotation)
+			newPod := oldPod.DeepCopy()
+			newPod.Finalizers = nil
+			response := NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, newPod, ""))
+			if !response.Allowed {
+				t.Fatalf("unassigned Pod fence release denied: %#v", response.Result)
+			}
+		})
+	}
+}
+
+func TestRoleNeutralBootstrapSourceIdentityIsImmutable(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	for _, subresource := range []string{"", "status"} {
+		t.Run(subresource, func(t *testing.T) {
+			t.Parallel()
+			oldPod := roleNeutralBootstrapSourcePod()
+			newPod := oldPod.DeepCopy()
+			newPod.Labels[owned.RoleLabel] = ""
+			var response admission.Response
+			if subresource == "status" {
+				request, _ := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
+				response = NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).Build(), testCodec(), scheme).Handle(context.Background(), request)
+			} else {
+				response = NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, newPod, ""))
+			}
+			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "identity") {
+				t.Fatalf("present-empty role through %q response = %#v", subresource, response)
+			}
+		})
 	}
 }
 
@@ -660,6 +751,32 @@ func managedPod() *corev1.Pod {
 		Spec:   corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{Name: "postgresql"}}},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
+}
+
+func roleNeutralBootstrapSourcePod() *corev1.Pod {
+	pod := managedPod()
+	delete(pod.Labels, owned.RoleLabel)
+	pod.Annotations[owned.PostgreSQLRuntimeAnnotation] = string(owned.PostgreSQLRuntimeAgentQuarantine)
+	automount := false
+	pod.Spec.AutomountServiceAccountToken = &automount
+	pod.Spec.ServiceAccountName = owned.PostgreSQLAgentServiceAccountName(pod.Labels[owned.ClusterLabel], 0)
+	pod.Spec.Containers = []corev1.Container{{
+		Name: "postgresql",
+		Env: []corev1.EnvVar{
+			{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-bootstrap-primary"},
+			{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"},
+		},
+		Ports: []corev1.ContainerPort{{Name: "agent-http", ContainerPort: owned.HTTPPort, Protocol: corev1.ProtocolTCP}},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "kubernetes-api", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount"},
+			{Name: "runtime", MountPath: "/run/pgshard"},
+		},
+		StartupProbe:   &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz"}}},
+		LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz"}}},
+		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz"}}},
+	}}
+	pod.Spec.Volumes = []corev1.Volume{{Name: "kubernetes-api", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{}}}}
+	return pod
 }
 
 func managedClusterForPod(pod *corev1.Pod) *pgshardv1alpha1.PgShardCluster {

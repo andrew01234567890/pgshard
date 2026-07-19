@@ -942,14 +942,13 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLReplicationCredentials(ctx co
 	}
 
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
-		index, ok := indices[shard]
+		recorded, ok := postgreSQLReplicationCredentialForShard(cluster, shard)
 		if !ok {
 			if err := r.createPostgreSQLReplicationCredentialIntent(ctx, cluster, shard, reader); err != nil {
 				return err
 			}
 			continue
 		}
-		recorded := &cluster.Status.PostgreSQLReplicationCredentials[index]
 		secret := &corev1.Secret{}
 		key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
 		if err := reader.Get(ctx, key, secret); err != nil {
@@ -3694,7 +3693,7 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 
 func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, string, string, error) {
 	if cluster.Spec.MembersPerShard != 1 {
-		return false, "PostgreSQLHAUnavailable", "three- and five-member PostgreSQL lifecycle remains disabled until bootstrap, replication, fencing, promotion, and recovery are implemented", nil
+		return false, "PostgreSQLHAUnavailable", "role-neutral member-zero bootstrap sources are composed, but standby replication, serving primary activation, promotion, and recovery remain unavailable", nil
 	}
 	reader := client.Reader(r.Client)
 	if r.APIReader != nil {
@@ -3767,7 +3766,7 @@ func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *p
 		postgresqlStatus = metav1.ConditionTrue
 	}
 	readyReason := "PostgreSQLHAUnavailable"
-	readyMessage := "PostgreSQL Pods are intentionally absent until bootstrap, replication, fencing, promotion, and recovery are implemented"
+	readyMessage := "role-neutral member-zero bootstrap sources are composed, but standbys and serving primaries remain unavailable until replication, activation, promotion, and recovery are implemented"
 	if cluster.Spec.MembersPerShard == 1 {
 		readyReason = "DataPlaneUnavailable"
 		readyMessage = "single-member PostgreSQL primaries are supported, but SQL routing and high-availability failover are not implemented"

@@ -1147,6 +1147,13 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("wait for replication bootstrap source Pod: %v; Pod=%#v", err, sourcePod)
 	}
+	if !podfence.IsManagedPostgreSQLPod(sourcePod) || sourcePod.Spec.NodeName == "" ||
+		sourcePod.Annotations[podfence.NodeUIDAnnotation] == "" || sourcePod.Annotations[podfence.NodeBootIDAnnotation] == "" {
+		t.Fatalf("replication bootstrap source lacks fenced binding identity: %#v", sourcePod.ObjectMeta)
+	}
+	sourceKey := types.NamespacedName{Namespace: namespace.Name, Name: sourcePodName}
+	assertPostgreSQLStatusMetadataImmutable(t, ctx, kubeClient, sourceKey)
+	assertPostgreSQLSpecImmutable(t, ctx, kubeClient, sourceKey)
 	if podReady(sourcePod) || sourcePod.Status.ContainerStatuses[0].Ready {
 		t.Fatalf("replication bootstrap source became routable: conditions=%#v containers=%#v", sourcePod.Status.Conditions, sourcePod.Status.ContainerStatuses)
 	}

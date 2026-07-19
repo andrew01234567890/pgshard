@@ -135,7 +135,11 @@ func (a *BindingAttestor) Handle(ctx context.Context, request admission.Request)
 		binding.Labels = make(map[string]string, 6)
 	}
 	for _, key := range protectedBindingLabels() {
-		binding.Labels[key] = evidence.pod.Labels[key]
+		if value, exists := evidence.pod.Labels[key]; exists {
+			binding.Labels[key] = value
+		} else {
+			delete(binding.Labels, key)
+		}
 	}
 	binding.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] = evidence.pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]
 	binding.Annotations[NodeUIDAnnotation] = string(evidence.node.UID)
@@ -160,7 +164,9 @@ func (v *BindingValidator) Handle(ctx context.Context, request admission.Request
 		return *response
 	}
 	for _, key := range protectedBindingLabels() {
-		if binding.Labels[key] != evidence.pod.Labels[key] {
+		bindingValue, bindingHas := binding.Labels[key]
+		podValue, podHas := evidence.pod.Labels[key]
+		if bindingHas != podHas || bindingValue != podValue {
 			return admission.Denied(fmt.Sprintf("managed PostgreSQL Pod binding label %s does not match the selected Pod", key))
 		}
 	}
@@ -580,7 +586,7 @@ func IsManagedPostgreSQLPod(pod *corev1.Pod) bool {
 		pod.Labels[owned.ComponentLabel] == "postgresql" &&
 		pod.Labels[owned.ClusterLabel] != "" &&
 		pod.Labels[owned.ShardLabel] != "" &&
-		pod.Labels[owned.RoleLabel] != "" &&
+		(pod.Labels[owned.RoleLabel] != "" || owned.IsPostgreSQLReplicationBootstrapSourcePod(pod)) &&
 		pod.Labels[owned.MemberLabel] != "" &&
 		pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != "" &&
 		slices.Contains(pod.Finalizers, owned.PostgreSQLPodTerminationFinalizer)
@@ -627,7 +633,9 @@ func managedIdentityEqual(oldPod, newPod *corev1.Pod) bool {
 		return false
 	}
 	for _, key := range []string{owned.ManagedByLabel, owned.ComponentLabel, owned.ClusterLabel, owned.ShardLabel, owned.RoleLabel, owned.MemberLabel} {
-		if oldPod.Labels[key] != newPod.Labels[key] {
+		oldValue, oldHas := oldPod.Labels[key]
+		newValue, newHas := newPod.Labels[key]
+		if oldHas != newHas || oldValue != newValue {
 			return false
 		}
 	}

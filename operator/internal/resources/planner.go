@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strconv"
 	"strings"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
@@ -1440,6 +1441,44 @@ func ObservePostgreSQLRuntime(annotations map[string]string, spec corev1.PodSpec
 	default:
 		return "", fmt.Errorf("PostgreSQL runtime annotation %q is invalid", annotated)
 	}
+}
+
+// IsPostgreSQLReplicationBootstrapSourcePod recognizes only the deterministic,
+// role-neutral member-zero Pod composed while a multi-member shard is being
+// bootstrapped. The absent role label is deliberate: this source may seed
+// standbys, but it is not authorized to serve application traffic.
+func IsPostgreSQLReplicationBootstrapSourcePod(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	if _, hasRole := pod.Labels[RoleLabel]; hasRole || pod.Labels[MemberLabel] != memberLabel(0) {
+		return false
+	}
+	shardText := pod.Labels[ShardLabel]
+	shard, err := strconv.ParseInt(shardText, 10, 32)
+	if err != nil || shard < 0 || shardText != shardLabel(int32(shard)) {
+		return false
+	}
+	cluster := pod.Labels[ClusterLabel]
+	if cluster == "" || pod.Name != PostgreSQLMemberStatefulSetName(cluster, int32(shard), 0)+"-0" ||
+		pod.Spec.ServiceAccountName != PostgreSQLAgentServiceAccountName(cluster, int32(shard)) {
+		return false
+	}
+	runtime, err := ObservePostgreSQLRuntime(pod.Annotations, pod.Spec)
+	if err != nil || runtime != PostgreSQLRuntimeAgentQuarantine {
+		return false
+	}
+	for index := range pod.Spec.Containers {
+		container := pod.Spec.Containers[index]
+		if container.Name != "postgresql" {
+			continue
+		}
+		mode, modeOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_MODE")
+		hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_HBA_FILE")
+		return modeOK && hbaFileOK && mode == "replication-bootstrap-primary" &&
+			hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+	}
+	return false
 }
 
 func postgresqlAgentShape(spec corev1.PodSpec, postgres corev1.Container) bool {

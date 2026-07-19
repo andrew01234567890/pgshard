@@ -646,6 +646,12 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			}
 			assertCondition(t, current, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 			assertCondition(t, current, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+			postgresqlCondition := meta.FindStatusCondition(current.Status.Conditions, postgresqlAvailableCondition)
+			ready := meta.FindStatusCondition(current.Status.Conditions, readyCondition)
+			if postgresqlCondition == nil || !strings.Contains(postgresqlCondition.Message, "role-neutral member-zero bootstrap sources are composed") ||
+				ready == nil || !strings.Contains(ready.Message, "standbys and serving primaries remain unavailable") {
+				t.Fatalf("multi-member status does not describe composed non-serving sources: PostgreSQL=%#v Ready=%#v", postgresqlCondition, ready)
+			}
 
 			direct := developmentReconciler(base, nil)
 			if _, err := direct.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "durable multi-member PostgreSQL source storage requires runtime \"agent-quarantine\"") {
@@ -1451,6 +1457,60 @@ func TestReplicationCredentialsAreStagedCheckpointedAndFailClosed(t *testing.T) 
 	current = getCluster(t, ctx, base, cluster)
 	if err := reconciler.ensurePostgreSQLReplicationCredentials(ctx, current); err == nil || !strings.Contains(err.Error(), "material differs from the checkpointed creation result") {
 		t.Fatalf("changed replication material error = %v", err)
+	}
+}
+
+func TestReplicationCredentialReconciliationReindexesAfterSortedInsert(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationCredentials(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	current = getCluster(t, ctx, base, cluster)
+	shardZero, found := postgreSQLReplicationCredentialForShard(current, 0)
+	if !found {
+		t.Fatal("shard-zero replication credential was not checkpointed")
+	}
+	oldShardZeroName := shardZero.SecretName
+	shardOne, found := postgreSQLReplicationCredentialForShard(current, 1)
+	if !found {
+		t.Fatal("shard-one replication credential was not checkpointed")
+	}
+	checkpointedShardOne := *shardOne
+	for _, recorded := range current.Status.PostgreSQLReplicationCredentials {
+		secret := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: current.Namespace, Name: recorded.SecretName}
+		if err := base.Get(ctx, key, secret); err != nil {
+			t.Fatal(err)
+		}
+		if err := base.Delete(ctx, secret); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current.Status.PostgreSQLReplicationCredentials = []pgshardv1alpha1.PostgreSQLReplicationCredentialStatus{checkpointedShardOne}
+	if err := base.Status().Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	current = getCluster(t, ctx, base, cluster)
+	err := reconciler.ensurePostgreSQLReplicationCredentials(ctx, current)
+	if err == nil || !strings.Contains(err.Error(), "replication credential Secret "+checkpointedShardOne.SecretName) || !strings.Contains(err.Error(), "is missing; explicit recovery is required") {
+		t.Fatalf("broken later-shard credential error = %v", err)
+	}
+	after := getCluster(t, ctx, base, cluster)
+	newShardZero, found := postgreSQLReplicationCredentialForShard(after, 0)
+	if !found || newShardZero.SecretName == oldShardZeroName || newShardZero.SecretUID == "" || newShardZero.MaterialSHA256 == "" {
+		t.Fatalf("missing lower shard was not safely recreated: %#v", after.Status.PostgreSQLReplicationCredentials)
+	}
+	observedShardOne, found := postgreSQLReplicationCredentialForShard(after, 1)
+	if !found || *observedShardOne != checkpointedShardOne {
+		t.Fatalf("broken later-shard checkpoint changed: before=%#v after=%#v", checkpointedShardOne, observedShardOne)
 	}
 }
 

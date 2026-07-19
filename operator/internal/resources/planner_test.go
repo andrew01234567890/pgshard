@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2849,6 +2850,84 @@ func TestMultiMemberAgentPlanPublishesOnlyMemberZeroBootstrapSources(t *testing.
 			}
 		})
 	}
+}
+
+func TestReplicationBootstrapSourcePodClassificationIsExact(t *testing.T) {
+	t.Parallel()
+	pod := testReplicationBootstrapSourcePod(t)
+	if !IsPostgreSQLReplicationBootstrapSourcePod(pod) {
+		t.Fatalf("planned role-neutral source Pod was not recognized: %#v", pod.ObjectMeta)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{name: "present role", mutate: func(pod *corev1.Pod) { pod.Labels[RoleLabel] = "primary" }},
+		{name: "empty role", mutate: func(pod *corev1.Pod) { pod.Labels[RoleLabel] = "" }},
+		{name: "different member", mutate: func(pod *corev1.Pod) { pod.Labels[MemberLabel] = "0001" }},
+		{name: "different shard", mutate: func(pod *corev1.Pod) { pod.Labels[ShardLabel] = "0001" }},
+		{name: "noncanonical shard", mutate: func(pod *corev1.Pod) { pod.Labels[ShardLabel] = "0" }},
+		{name: "different name", mutate: func(pod *corev1.Pod) { pod.Name += "-other" }},
+		{name: "different service account", mutate: func(pod *corev1.Pod) { pod.Spec.ServiceAccountName += "-other" }},
+		{name: "direct runtime", mutate: func(pod *corev1.Pod) { pod.Annotations[PostgreSQLRuntimeAnnotation] = string(PostgreSQLRuntimeDirect) }},
+		{name: "quarantine mode", mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Containers[0].Env {
+				if pod.Spec.Containers[0].Env[index].Name == "PGSHARD_POSTGRES_MODE" {
+					pod.Spec.Containers[0].Env[index].Value = "quarantine"
+				}
+				if pod.Spec.Containers[0].Env[index].Name == "PGSHARD_POSTGRES_HBA_FILE" {
+					pod.Spec.Containers[0].Env[index].Value = "/etc/pgshard/quarantine.pg_hba.conf"
+				}
+			}
+		}},
+		{name: "duplicate mode", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-bootstrap-primary"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			changed := pod.DeepCopy()
+			test.mutate(changed)
+			if IsPostgreSQLReplicationBootstrapSourcePod(changed) {
+				t.Fatalf("changed Pod retained bootstrap-source identity: %#v", changed.ObjectMeta)
+			}
+		})
+	}
+}
+
+func testReplicationBootstrapSourcePod(t *testing.T) *corev1.Pod {
+	t.Helper()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 3
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.CatalogAccess = nil
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0)
+	for _, item := range plan {
+		statefulSet, ok := item.(*appsv1.StatefulSet)
+		if !ok || statefulSet.Name != name {
+			continue
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        name + "-0",
+				Namespace:   cluster.Namespace,
+				Labels:      maps.Clone(statefulSet.Spec.Template.Labels),
+				Annotations: maps.Clone(statefulSet.Spec.Template.Annotations),
+				Finalizers:  slices.Clone(statefulSet.Spec.Template.Finalizers),
+			},
+			Spec: *statefulSet.Spec.Template.Spec.DeepCopy(),
+		}
+	}
+	t.Fatalf("plan has no bootstrap source StatefulSet %s", name)
+	return nil
 }
 
 func TestMultiMemberAgentSourceStorageRequiresImmutableBootstrapImage(t *testing.T) {
