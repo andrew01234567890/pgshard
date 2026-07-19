@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -75,6 +76,9 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	assertCondition(t, current, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 	assertCondition(t, current, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 	assertCondition(t, current, transportSecurityCondition, metav1.ConditionFalse, "TransportTLSUnavailable")
+	if len(current.Status.PostgreSQLReplicationCredentials) != 0 {
+		t.Fatalf("direct runtime staged replication credentials: %#v", current.Status.PostgreSQLReplicationCredentials)
+	}
 	assertPostgreSQLRoleProfiles(t, ctx, kubeClient, current)
 
 	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "orchestrator", 3, true)
@@ -1074,6 +1078,43 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatal(err)
 	}
 	deleteNamespaceAtCleanup(t, kubeClient, namespace)
+
+	haCluster := readDevelopmentSample(t)
+	haCluster.Name = "agent-quarantine-ha"
+	haCluster.Namespace = namespace.Name
+	haCluster.Spec.Shards = 1
+	haCluster.Spec.Databases = nil
+	if err := kubeClient.Create(ctx, haCluster); err != nil {
+		t.Fatal(err)
+	}
+	haCurrent := &pgshardv1alpha1.PgShardCluster{}
+	if err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(haCluster), haCurrent); err != nil {
+			return false, err
+		}
+		if len(haCurrent.Status.PostgreSQLBootstraps) != int(haCluster.Spec.MembersPerShard) || len(haCurrent.Status.PostgreSQLReplicationCredentials) != 1 {
+			return false, nil
+		}
+		recorded := haCurrent.Status.PostgreSQLReplicationCredentials[0]
+		return recorded.Shard == 0 && recorded.SecretUID != "" && validCatalogAccessDigest(recorded.MaterialSHA256), nil
+	}); err != nil {
+		t.Fatalf("wait for staged multi-member replication credential: %v; status=%#v", err, haCurrent.Status)
+	}
+	recordedReplication := &haCurrent.Status.PostgreSQLReplicationCredentials[0]
+	replicationSecret := &corev1.Secret{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: recordedReplication.SecretName}, replicationSecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCheckpointedPostgreSQLReplicationCredential(replicationSecret, haCurrent, recordedReplication); err != nil {
+		t.Fatal(err)
+	}
+	if replicationSecret.Immutable == nil || !*replicationSecret.Immutable || len(replicationSecret.Data) != 1 || len(replicationSecret.Data[owned.PostgreSQLReplicationPasswordKey]) != hex.EncodedLen(postgresqlPasswordBytes) {
+		t.Fatalf("staged multi-member replication Secret = %#v", replicationSecret)
+	}
+	if haCurrent.Status.CatalogAccess != nil {
+		t.Fatalf("multi-member source intent received catalog access: %#v", haCurrent.Status.CatalogAccess)
+	}
+	assertNoPostgreSQLWorkload(t, ctx, kubeClient, namespace.Name, haCluster.Name)
 
 	cluster := readSingleMemberSample(t)
 	cluster.Name = "agent-quarantine"

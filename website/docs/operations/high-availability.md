@@ -330,12 +330,16 @@ checkpoints one uninitialized source-storage intent for every stable physical
 member. Each uses an immutable member bootstrap Secret, exact UID checkpoints,
 outcome-unknown create fence, protected ownerless PVC, and Retain/Delete
 finalization. Status, Secret, and PVC identity are keyed by shard and member;
-the PVCs deliberately have no role label. No Pod, StatefulSet, PDB, catalog or
-replication credential, physical slot, `primary_conninfo`, initialization, or
-Service endpoint is created, so this
+the PVCs deliberately have no role label. The controller also stages one
+unpredictably named replication credential per shard: it checkpoints an empty
+Secret intent, its API UID, and then the exact immutable password digest. No
+Pod, StatefulSet, PDB, catalog credential, physical slot, `primary_conninfo`,
+initialization, or Service endpoint is created, and no workload receives the
+replication password, so this
 durable storage intent is not evidence of a primary, standby, synchronous
 replica, or HA availability. A missing or same-name recreated Secret or PVC
-fails closed against the recorded UID.
+fails closed against the recorded UID; changed replication material fails
+closed against its recorded digest.
 
 Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
 finalizer. Before workload publication, a cluster challenge update proves that
@@ -557,9 +561,11 @@ restart loop. Once running, it continuously repeats the recovery proof; recovery
 ending, an unknown query result, timeout, or local connection loss immediately
 fences the complete PostgreSQL process tree. A later upstream outage alone does
 not kill a server that remains safely in recovery. Writable Lease authority is
-forbidden for this role. The operator does not select either replication role yet; it has no
-base-backup completion protocol, replication credential or TLS wiring, slot
-creation, standby Pod, Service, or NetworkPolicy wiring. The temporary standby
+forbidden for this role. The operator does not select either replication role
+yet. It now checkpoints one per-shard replication password through an empty
+intent, exact API UID, immutable update, and material digest, but does not
+project or consume it. There is no base-backup completion protocol, TLS wiring,
+slot creation, standby Pod, Service, or NetworkPolicy wiring. The temporary standby
 conninfo therefore explicitly disables TLS and is not a serving deployment.
 SQL and
 prepare target-side generation enforcement, replicated promotion evidence,

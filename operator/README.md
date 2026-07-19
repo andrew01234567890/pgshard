@@ -18,9 +18,9 @@ API. The controller now reconciles the safe supporting-resource slice:
   immutable bootstrap credential, and restricted Pod security;
 - for a three- or five-member topology only when the manager explicitly selects
   `agent-quarantine`, one uninitialized source-storage intent for every stable
-  physical member using the same exact-UID Secret/PVC lifecycle, but no
-  PostgreSQL Pod, StatefulSet, PDB, catalog credential, or replication
-  credential;
+  physical member using the same exact-UID Secret/PVC lifecycle, plus one
+  staged immutable physical-replication credential per shard, but no
+  PostgreSQL Pod, StatefulSet, PDB, or catalog credential;
 - an idempotently migrated `shardschema` database on shard-0000 containing the
   complete immutable shard inventory and an initial restore incarnation for
   each shard;
@@ -107,8 +107,11 @@ replication, fencing integration, promotion, and recovery exist. The default
 `direct` runtime also creates no multi-member bootstrap Secret or PVC. With the
 explicit `agent-quarantine` runtime, the controller checkpoints one blank,
 protected PVC and bootstrap Secret for every stable member as non-serving
-source-storage intent. None is mounted, initialized, selected by a Service, or
-evidence of a primary or standby.
+source-storage intent. It also checkpoints one unpredictably named replication
+Secret per shard by first recording an empty intent and its API UID, then
+installing immutable password material and recording its digest. No workload
+mounts that Secret; none of these resources is initialized, selected by a
+Service, or evidence of a primary or standby.
 PostgreSQL StatefulSets use `OnDelete` updates. A controller image, bootstrap
 image, script, or generated-configuration change therefore updates the desired
 template without concurrently deleting every singleton primary. Until a

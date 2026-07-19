@@ -168,6 +168,13 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 				return ctrl.Result{RequeueAfter: retryDelay}, nil
 			}
 		}
+		deletingReplicationCredential, err := r.deletePostgreSQLReplicationCredentialsForFinalization(ctx, cluster)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("delete PostgreSQL replication credentials during cluster deletion: %w", err)
+		}
+		if deletingReplicationCredential {
+			return ctrl.Result{RequeueAfter: retryDelay}, nil
+		}
 		deletingCatalogAccess, err := r.deleteCatalogAccessForFinalization(ctx, cluster)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("delete shardschema access material during cluster deletion: %w", err)
@@ -221,6 +228,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	}
 	if err := r.ensurePostgreSQLBootstrap(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "BootstrapReconcileFailed", fmt.Sprintf("PostgreSQL bootstrap reconciliation failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if err := r.ensurePostgreSQLReplicationCredentials(ctx, cluster); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "ReplicationCredentialReconcileFailed", fmt.Sprintf("PostgreSQL replication credential reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 	if err := r.ensureCatalogAccess(ctx, cluster); err != nil {
@@ -879,6 +890,311 @@ func postgresqlBootstrapForKey(cluster *pgshardv1alpha1.PgShardCluster, key post
 		bootstrap := &cluster.Status.PostgreSQLBootstraps[index]
 		if bootstrap.Shard == key.shard && bootstrap.Member == key.member {
 			return bootstrap, true
+		}
+	}
+	return nil, false
+}
+
+func (r *PgShardClusterReconciler) ensurePostgreSQLReplicationCredentials(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	if cluster.Spec.MembersPerShard == 1 {
+		if len(cluster.Status.PostgreSQLReplicationCredentials) != 0 {
+			return fmt.Errorf("single-member topology has recorded replication credentials")
+		}
+		return nil
+	}
+	if cluster.Status.PostgreSQLBootstrapSpec == nil {
+		if len(cluster.Status.PostgreSQLReplicationCredentials) != 0 {
+			return fmt.Errorf("replication credentials exist without a checkpointed PostgreSQL runtime contract")
+		}
+		return nil
+	}
+	if cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine.String() {
+		if len(cluster.Status.PostgreSQLReplicationCredentials) != 0 {
+			return fmt.Errorf("multi-member replication credentials require runtime %q", owned.PostgreSQLRuntimeAgentQuarantine)
+		}
+		return nil
+	}
+	reader := r.authoritativeReader()
+	indices := make(map[int32]int, len(cluster.Status.PostgreSQLReplicationCredentials))
+	names := make(map[string]struct{}, len(cluster.Status.PostgreSQLReplicationCredentials))
+	uids := make(map[types.UID]struct{}, len(cluster.Status.PostgreSQLReplicationCredentials))
+	for index, recorded := range cluster.Status.PostgreSQLReplicationCredentials {
+		if recorded.Shard < 0 || recorded.Shard >= cluster.Spec.Shards || !validPostgreSQLReplicationCredentialStatus(cluster.Name, &recorded) {
+			return fmt.Errorf("recorded replication credential state for shard %d is invalid", recorded.Shard)
+		}
+		if _, duplicate := indices[recorded.Shard]; duplicate {
+			return fmt.Errorf("recorded replication credential state repeats shard %d", recorded.Shard)
+		}
+		if _, duplicate := names[recorded.SecretName]; duplicate {
+			return fmt.Errorf("recorded replication credential state reuses Secret name %s", recorded.SecretName)
+		}
+		if recorded.SecretUID != "" {
+			if _, duplicate := uids[recorded.SecretUID]; duplicate {
+				return fmt.Errorf("recorded replication credential state reuses Secret UID %s", recorded.SecretUID)
+			}
+			uids[recorded.SecretUID] = struct{}{}
+		}
+		indices[recorded.Shard] = index
+		names[recorded.SecretName] = struct{}{}
+	}
+
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		index, ok := indices[shard]
+		if !ok {
+			return r.createPostgreSQLReplicationCredentialIntent(ctx, cluster, shard, reader)
+		}
+		recorded := &cluster.Status.PostgreSQLReplicationCredentials[index]
+		secret := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+		if err := reader.Get(ctx, key, secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				if recorded.SecretUID == "" {
+					return r.createPostgreSQLReplicationCredentialIntent(ctx, cluster, shard, reader)
+				}
+				return fmt.Errorf("replication credential Secret %s with recorded UID %s is missing; explicit recovery is required", recorded.SecretName, recorded.SecretUID)
+			}
+			return fmt.Errorf("read replication credential Secret %s: %w", recorded.SecretName, err)
+		}
+		if recorded.SecretUID == "" {
+			if err := validatePostgreSQLReplicationIntentSecret(secret, cluster, shard, recorded.SecretName); err != nil {
+				return err
+			}
+			if secret.UID == "" {
+				return fmt.Errorf("replication credential intent Secret %s has no API-assigned UID", secret.Name)
+			}
+			recorded.SecretUID = secret.UID
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				return fmt.Errorf("checkpoint replication credential Secret identity for shard %d: %w", shard, err)
+			}
+			recorded, _ = postgreSQLReplicationCredentialForShard(cluster, shard)
+		} else if secret.UID != recorded.SecretUID {
+			return fmt.Errorf("replication credential Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, secret.UID, recorded.SecretUID)
+		}
+		if recorded.MaterialSHA256 == "" {
+			return r.materializePostgreSQLReplicationCredential(ctx, cluster, secret, recorded, reader)
+		}
+		if err := validateCheckpointedPostgreSQLReplicationCredential(secret, cluster, recorded); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *PgShardClusterReconciler) createPostgreSQLReplicationCredentialIntent(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, shard int32, reader client.Reader) error {
+	recorded, found := postgreSQLReplicationCredentialForShard(cluster, shard)
+	if !found {
+		name, err := randomBootstrapName(owned.PostgreSQLReplicationSecretPrefix(cluster.Name, shard))
+		if err != nil {
+			return fmt.Errorf("generate replication credential Secret name for shard %d: %w", shard, err)
+		}
+		cluster.Status.PostgreSQLReplicationCredentials = append(
+			cluster.Status.PostgreSQLReplicationCredentials,
+			pgshardv1alpha1.PostgreSQLReplicationCredentialStatus{Shard: shard, SecretName: name},
+		)
+		sort.Slice(cluster.Status.PostgreSQLReplicationCredentials, func(left, right int) bool {
+			return cluster.Status.PostgreSQLReplicationCredentials[left].Shard < cluster.Status.PostgreSQLReplicationCredentials[right].Shard
+		})
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint replication credential creation intent for shard %d: %w", shard, err)
+		}
+		recorded, _ = postgreSQLReplicationCredentialForShard(cluster, shard)
+	} else if !validPostgreSQLReplicationCredentialStatus(cluster.Name, recorded) || recorded.SecretUID != "" {
+		return fmt.Errorf("cannot create replication credential intent for shard %d from invalid or completed state", shard)
+	}
+
+	name := recorded.SecretName
+	candidate := owned.PostgreSQLReplicationIntentSecret(cluster, shard, name)
+	if createErr := r.Create(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); createErr != nil {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
+		if readErr := reader.Get(ctx, key, observed); readErr != nil {
+			if apierrors.IsNotFound(readErr) {
+				return fmt.Errorf("create replication credential Secret %s: %w", name, createErr)
+			}
+			return errors.Join(
+				fmt.Errorf("create replication credential Secret %s: %w", name, createErr),
+				fmt.Errorf("resolve replication credential Secret creation outcome: %w", readErr),
+			)
+		}
+		candidate = observed
+	}
+	if candidate.UID == "" {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
+		if err := reader.Get(ctx, key, observed); err != nil {
+			return fmt.Errorf("read created replication credential Secret %s: %w", name, err)
+		}
+		candidate = observed
+	}
+	if err := validatePostgreSQLReplicationIntentSecret(candidate, cluster, shard, name); err != nil {
+		return err
+	}
+	recorded, _ = postgreSQLReplicationCredentialForShard(cluster, shard)
+	recorded.SecretUID = candidate.UID
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint replication credential Secret identity for shard %d: %w", shard, err)
+	}
+	recorded, _ = postgreSQLReplicationCredentialForShard(cluster, shard)
+	return r.materializePostgreSQLReplicationCredential(ctx, cluster, candidate, recorded, reader)
+}
+
+func (r *PgShardClusterReconciler) materializePostgreSQLReplicationCredential(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret, recorded *pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, reader client.Reader) error {
+	if secret.UID != recorded.SecretUID || recorded.SecretUID == "" {
+		return fmt.Errorf("replication credential Secret %s identity changed before material installation", recorded.SecretName)
+	}
+	if err := validatePostgreSQLReplicationIntentSecret(secret, cluster, recorded.Shard, recorded.SecretName); err != nil {
+		if completeErr := validatePostgreSQLReplicationSecret(secret, cluster, recorded.Shard, recorded.SecretName); completeErr != nil {
+			return errors.Join(err, completeErr)
+		}
+		return r.checkpointPostgreSQLReplicationCredentialMaterial(ctx, cluster, secret, recorded)
+	}
+
+	password, err := newPostgreSQLReplicationPassword()
+	if err != nil {
+		return err
+	}
+	candidate := secret.DeepCopy()
+	canonical := owned.PostgreSQLReplicationIntentSecret(cluster, recorded.Shard, recorded.SecretName)
+	candidate.GenerateName = ""
+	candidate.Labels = maps.Clone(canonical.Labels)
+	candidate.Annotations = maps.Clone(canonical.Annotations)
+	candidate.OwnerReferences = append([]metav1.OwnerReference(nil), canonical.OwnerReferences...)
+	candidate.Finalizers = nil
+	candidate.Type = corev1.SecretTypeOpaque
+	immutable := true
+	candidate.Immutable = &immutable
+	candidate.Data = map[string][]byte{owned.PostgreSQLReplicationPasswordKey: password}
+	candidate.StringData = nil
+	if updateErr := r.Update(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); updateErr != nil {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+		if readErr := reader.Get(ctx, key, observed); readErr != nil {
+			return errors.Join(
+				fmt.Errorf("install immutable replication material in Secret %s: %w", recorded.SecretName, updateErr),
+				fmt.Errorf("resolve replication material update outcome: %w", readErr),
+			)
+		}
+		if observed.UID != recorded.SecretUID {
+			return fmt.Errorf("replication credential Secret %s has UID %s, expected recorded UID %s after material update; explicit recovery is required", recorded.SecretName, observed.UID, recorded.SecretUID)
+		}
+		if intentErr := validatePostgreSQLReplicationIntentSecret(observed, cluster, recorded.Shard, recorded.SecretName); intentErr == nil {
+			return fmt.Errorf("install immutable replication material in Secret %s: %w", recorded.SecretName, updateErr)
+		}
+		candidate = observed
+	}
+	return r.checkpointPostgreSQLReplicationCredentialMaterial(ctx, cluster, candidate, recorded)
+}
+
+func (r *PgShardClusterReconciler) checkpointPostgreSQLReplicationCredentialMaterial(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret, recorded *pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) error {
+	if err := validatePostgreSQLReplicationSecret(secret, cluster, recorded.Shard, recorded.SecretName); err != nil {
+		return err
+	}
+	observed := postgreSQLReplicationCredentialStatus(secret, recorded.Shard)
+	if observed.SecretUID != recorded.SecretUID {
+		return fmt.Errorf("replication credential Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, observed.SecretUID, recorded.SecretUID)
+	}
+	*recorded = observed
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint replication credential material for shard %d: %w", recorded.Shard, err)
+	}
+	return nil
+}
+
+func validateCheckpointedPostgreSQLReplicationCredential(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) error {
+	if err := validatePostgreSQLReplicationSecret(secret, cluster, recorded.Shard, recorded.SecretName); err != nil {
+		return err
+	}
+	observed := postgreSQLReplicationCredentialStatus(secret, recorded.Shard)
+	if observed.SecretUID != recorded.SecretUID {
+		return fmt.Errorf("replication credential Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, observed.SecretUID, recorded.SecretUID)
+	}
+	if observed.MaterialSHA256 != recorded.MaterialSHA256 {
+		return fmt.Errorf("replication credential Secret %s material differs from the checkpointed creation result; explicit recovery is required", recorded.SecretName)
+	}
+	return nil
+}
+
+func validPostgreSQLReplicationCredentialStatus(cluster string, status *pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) bool {
+	if status == nil || status.Shard < 0 || !owned.PostgreSQLReplicationSecretNameIsValid(cluster, status.Shard, status.SecretName) {
+		return false
+	}
+	if status.SecretUID == "" {
+		return status.MaterialSHA256 == ""
+	}
+	return status.MaterialSHA256 == "" || validCatalogAccessDigest(status.MaterialSHA256)
+}
+
+func newPostgreSQLReplicationPassword() ([]byte, error) {
+	randomPassword := make([]byte, postgresqlPasswordBytes)
+	if _, err := rand.Read(randomPassword); err != nil {
+		return nil, fmt.Errorf("generate PostgreSQL replication credential: %w", err)
+	}
+	password := make([]byte, hex.EncodedLen(len(randomPassword)))
+	hex.Encode(password, randomPassword)
+	return password, nil
+}
+
+func validatePostgreSQLReplicationSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, shard int32, expectedName string) error {
+	if !owned.PostgreSQLReplicationSecretNameIsValid(cluster.Name, shard, expectedName) {
+		return fmt.Errorf("replication credential Secret name %s is not a valid unpredictable cluster-bound name", expectedName)
+	}
+	if secret.DeletionTimestamp != nil || !postgreSQLReplicationSecretMetadataMatches(secret, cluster, shard, expectedName, false) {
+		return fmt.Errorf("replication credential Secret %s metadata is not bound to the exact PgShardCluster shard", expectedName)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || secret.Immutable == nil || !*secret.Immutable {
+		return fmt.Errorf("replication credential Secret %s must be immutable and have type Opaque", expectedName)
+	}
+	if len(secret.Data) != 1 {
+		return fmt.Errorf("replication credential Secret %s has an unexpected key set", expectedName)
+	}
+	password, ok := secret.Data[owned.PostgreSQLReplicationPasswordKey]
+	if !ok {
+		return fmt.Errorf("replication credential Secret %s has an unexpected key set", expectedName)
+	}
+	decoded := make([]byte, postgresqlPasswordBytes)
+	if len(password) != hex.EncodedLen(postgresqlPasswordBytes) {
+		return fmt.Errorf("replication credential Secret %s password has an invalid shape", expectedName)
+	}
+	if _, err := hex.Decode(decoded, password); err != nil || hex.EncodeToString(decoded) != string(password) {
+		return fmt.Errorf("replication credential Secret %s password is not canonical lowercase hexadecimal", expectedName)
+	}
+	return nil
+}
+
+func validatePostgreSQLReplicationIntentSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, shard int32, expectedName string) error {
+	if !owned.PostgreSQLReplicationSecretNameIsValid(cluster.Name, shard, expectedName) {
+		return fmt.Errorf("replication credential Secret name %s is not a valid unpredictable cluster-bound name", expectedName)
+	}
+	if secret.DeletionTimestamp != nil || !postgreSQLReplicationSecretMetadataMatches(secret, cluster, shard, expectedName, false) {
+		return fmt.Errorf("replication credential intent Secret %s metadata is not bound to the exact PgShardCluster shard", expectedName)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || (secret.Immutable != nil && *secret.Immutable) || len(secret.Data) != 0 || len(secret.StringData) != 0 {
+		return fmt.Errorf("replication credential intent Secret %s must be empty, mutable, and have type Opaque", expectedName)
+	}
+	return nil
+}
+
+func postgreSQLReplicationSecretMetadataMatches(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, shard int32, expectedName string, allowFinalizers bool) bool {
+	canonical := owned.PostgreSQLReplicationIntentSecret(cluster, shard, expectedName)
+	return secret.Name == canonical.Name && secret.Namespace == canonical.Namespace && secret.GenerateName == "" &&
+		maps.Equal(secret.Labels, canonical.Labels) && maps.Equal(secret.Annotations, canonical.Annotations) &&
+		reflect.DeepEqual(secret.OwnerReferences, canonical.OwnerReferences) && (allowFinalizers || len(secret.Finalizers) == 0)
+}
+
+func postgreSQLReplicationCredentialStatus(secret *corev1.Secret, shard int32) pgshardv1alpha1.PostgreSQLReplicationCredentialStatus {
+	return pgshardv1alpha1.PostgreSQLReplicationCredentialStatus{
+		Shard:          shard,
+		SecretName:     secret.Name,
+		SecretUID:      secret.UID,
+		MaterialSHA256: owned.PostgreSQLReplicationMaterialSHA256(secret.Data[owned.PostgreSQLReplicationPasswordKey]),
+	}
+}
+
+func postgreSQLReplicationCredentialForShard(cluster *pgshardv1alpha1.PgShardCluster, shard int32) (*pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, bool) {
+	for index := range cluster.Status.PostgreSQLReplicationCredentials {
+		recorded := &cluster.Status.PostgreSQLReplicationCredentials[index]
+		if recorded.Shard == shard {
+			return recorded, true
 		}
 	}
 	return nil, false
@@ -2686,6 +3002,68 @@ func (r *PgShardClusterReconciler) deletePostgreSQLCredentialFences(ctx context.
 	return false, nil
 }
 
+func (r *PgShardClusterReconciler) deletePostgreSQLReplicationCredentialsForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	if r.APIReader == nil {
+		return false, fmt.Errorf("authoritative API reader is required for replication credential deletion")
+	}
+	for index := range cluster.Status.PostgreSQLReplicationCredentials {
+		recorded := &cluster.Status.PostgreSQLReplicationCredentials[index]
+		if !validPostgreSQLReplicationCredentialStatus(cluster.Name, recorded) {
+			return false, fmt.Errorf("recorded replication credential state for shard %d is invalid", recorded.Shard)
+		}
+		secret := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+		if err := r.APIReader.Get(ctx, key, secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, fmt.Errorf("read replication credential Secret %s during finalization: %w", recorded.SecretName, err)
+		}
+		if err := validatePostgreSQLReplicationCredentialForDeletion(secret, cluster, recorded); err != nil {
+			return false, err
+		}
+		if secret.DeletionTimestamp != nil {
+			return true, nil
+		}
+		uid := secret.UID
+		resourceVersion := secret.ResourceVersion
+		if uid == "" || resourceVersion == "" {
+			return false, fmt.Errorf("replication credential Secret %s has no stable API identity", secret.Name)
+		}
+		if err := r.Delete(ctx, secret, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("delete replication credential Secret %s with UID %s: %w", secret.Name, secret.UID, err)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func validatePostgreSQLReplicationCredentialForDeletion(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) error {
+	if secret.Name != recorded.SecretName || secret.Namespace != cluster.Namespace {
+		return fmt.Errorf("replication credential Secret %s identity is not bound to the deleting PgShardCluster", recorded.SecretName)
+	}
+	if recorded.SecretUID != "" {
+		if secret.UID != recorded.SecretUID {
+			return fmt.Errorf("replication credential Secret %s has UID %s, expected recorded UID %s during finalization", recorded.SecretName, secret.UID, recorded.SecretUID)
+		}
+		if recorded.MaterialSHA256 != "" {
+			observed := owned.PostgreSQLReplicationMaterialSHA256(secret.Data[owned.PostgreSQLReplicationPasswordKey])
+			if observed != recorded.MaterialSHA256 {
+				return fmt.Errorf("replication credential Secret %s material differs from the checkpointed creation result during finalization", recorded.SecretName)
+			}
+		}
+		return nil
+	}
+	if !owned.PostgreSQLReplicationSecretNameIsValid(cluster.Name, recorded.Shard, recorded.SecretName) ||
+		!postgreSQLReplicationSecretMetadataMatches(secret, cluster, recorded.Shard, recorded.SecretName, true) {
+		return fmt.Errorf("replication credential intent Secret %s metadata is not bound to the exact deleting PgShardCluster shard", recorded.SecretName)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || (secret.Immutable != nil && *secret.Immutable) || len(secret.Data) != 0 || len(secret.StringData) != 0 {
+		return fmt.Errorf("replication credential intent Secret %s must be empty, mutable, and have type Opaque during finalization", recorded.SecretName)
+	}
+	return nil
+}
+
 func (r *PgShardClusterReconciler) deleteCatalogAccessForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	if r.APIReader == nil {
 		return false, fmt.Errorf("authoritative API reader is required for catalog access deletion")
@@ -3455,7 +3833,7 @@ func (r *PgShardClusterReconciler) updateStatus(ctx context.Context, cluster *pg
 }
 
 func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
-	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) {
+	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !slices.EqualFunc(left.PostgreSQLReplicationCredentials, right.PostgreSQLReplicationCredentials, postgreSQLReplicationCredentialsEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) {
 		return false
 	}
 	for index := range left.Conditions {
@@ -3464,6 +3842,10 @@ func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
 		}
 	}
 	return true
+}
+
+func postgreSQLReplicationCredentialsEqual(left, right pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) bool {
+	return left.Shard == right.Shard && left.SecretName == right.SecretName && left.SecretUID == right.SecretUID && left.MaterialSHA256 == right.MaterialSHA256
 }
 
 func postgreSQLWritableLeasesEqual(left, right pgshardv1alpha1.PostgreSQLWritableLeaseStatus) bool {

@@ -605,6 +605,15 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		t.Fatalf("catalog access intent Secret = %#v", catalogIntent)
 	}
 	assertOwned(t, catalogIntent, cluster)
+	replicationName := PostgreSQLReplicationSecretPrefix(cluster.Name, 1) + strings.Repeat("b", 32)
+	replicationIntent := PostgreSQLReplicationIntentSecret(cluster, 1, replicationName)
+	if replicationIntent.Name != replicationName || !PostgreSQLReplicationSecretNameIsValid(cluster.Name, 1, replicationIntent.Name) || PostgreSQLReplicationSecretNameIsValid(cluster.Name, 0, replicationIntent.Name) || replicationIntent.Immutable != nil || len(replicationIntent.Data) != 0 || replicationIntent.Labels[ShardLabel] != "0001" || replicationIntent.Annotations[PostgreSQLReplicationClusterUIDAnnotation] != string(cluster.UID) {
+		t.Fatalf("replication credential intent Secret = %#v", replicationIntent)
+	}
+	assertOwned(t, replicationIntent, cluster)
+	if got := PostgreSQLReplicationMaterialSHA256([]byte("password")); len(got) != 64 || !validCatalogMaterialSHA256(got) {
+		t.Fatalf("replication material digest = %q", got)
+	}
 	if got, want := CatalogTLSDNSNames(cluster.Name, cluster.Namespace), []string{"demo-shardschema", "demo-shardschema.database", "demo-shardschema.database.svc", "demo-shardschema.database.svc.cluster.local"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("catalog TLS DNS names = %#v, want %#v", got, want)
 	}

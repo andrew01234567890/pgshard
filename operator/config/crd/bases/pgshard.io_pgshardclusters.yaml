@@ -652,6 +652,44 @@ spec:
                 - shard
                 - member
                 x-kubernetes-list-type: map
+              postgresqlReplicationCredentials:
+                description: |-
+                  PostgreSQLReplicationCredentials records one staged, immutable physical-
+                  replication credential per shard. Multi-member workloads may consume a
+                  credential only after its API UID and material digest are checkpointed.
+                  Missing, replaced, or changed Secrets require explicit recovery.
+                items:
+                  description: |-
+                    PostgreSQLReplicationCredentialStatus binds one shard to a staged shared
+                    physical-replication password. SecretUID is checkpointed while the Secret is
+                    still empty; MaterialSHA256 appears only after the same UID is immutable.
+                  properties:
+                    materialSHA256:
+                      description: |-
+                        MaterialSHA256 binds the exact password projection to the checkpointed
+                        creation result.
+                      pattern: ^[0-9a-f]{64}$
+                      type: string
+                    secretName:
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    secretUID:
+                      description: SecretUID is empty only before the empty Secret
+                        identity is observed.
+                      type: string
+                    shard:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                  required:
+                  - secretName
+                  - shard
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - shard
+                x-kubernetes-list-type: map
               postgresqlWritableLeases:
                 description: |-
                   PostgreSQLWritableLeases binds every physical cell to the exact
