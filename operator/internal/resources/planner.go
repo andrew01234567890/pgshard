@@ -63,7 +63,7 @@ const (
 	PoolerRPort    int32 = 5434
 	HTTPPort       int32 = 8080
 
-	defaultPostgreSQLImage              = "docker.io/library/postgres@sha256:311136771dca6826c3b6e691ebf8cb6e896e165074bc57a728f9619f25f0c4c7"
+	defaultPostgreSQLImage              = "docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
 	developmentPostgreSQLBootstrapImage = "pgshard/postgres-agent:dev"
 
 	ConfigHashAnnotation                    = "pgshard.io/config-hash"
