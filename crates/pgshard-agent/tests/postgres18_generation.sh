@@ -93,7 +93,10 @@ docker run --detach --name "$primary" \
 wait_ready() {
   local container="$1"
   for _ in $(seq 1 120); do
-    if docker exec "$container" pg_isready \
+    if docker exec "$container" /bin/sh -ceu \
+      'test "$(cat /proc/1/comm)" = postgres' \
+      >/dev/null 2>&1 && \
+      docker exec "$container" pg_isready \
       --host=/var/run/postgresql --username=postgres --dbname=postgres \
       >/dev/null 2>&1; then
       return 0

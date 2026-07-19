@@ -106,6 +106,8 @@ const RELATION_IS_SAFE: &str = "\
     WHERE n.nspname = 'pgshard_internal' AND c.relname = 'writable_generation'";
 const LOCK_GENERATION_TABLE: &str = "\
     LOCK TABLE pgshard_internal.writable_generation IN SHARE ROW EXCLUSIVE MODE";
+const LOCK_DEFAULT_ACL_CATALOG: &str = "\
+    LOCK TABLE pg_catalog.pg_default_acl IN SHARE ROW EXCLUSIVE MODE";
 const LOCK_GENERATION_CATALOG_ROWS: &str = "\
     SELECT n.oid, c.oid, i.indexrelid, ic.oid \
     FROM pg_catalog.pg_namespace AS n \
@@ -241,8 +243,14 @@ async fn query_safety(
 async fn lock_and_validate_generation_relation(
     transaction: &tokio_postgres::Transaction<'_>,
 ) -> Result<(), PostgresGenerationError> {
-    // The relation lock resolves the currently named object and excludes
-    // DDL that changes its table/index shape. Catalog tuple locks additionally
+    // Take the shared catalog lock first: ALTER DEFAULT PRIVILEGES takes
+    // RowExclusive on pg_default_acl, while unrelated relation DDL does not
+    // need to acquire this stronger catalog lock after locking our table. This
+    // fixed order avoids introducing a table/catalog lock cycle. The bounded
+    // transaction lock timeout remains the fail-closed deadlock backstop.
+    transaction.batch_execute(LOCK_DEFAULT_ACL_CATALOG).await?;
+    // The relation lock resolves the currently named object and excludes DDL
+    // that changes its table/index shape. Catalog tuple locks additionally
     // serialize namespace and ACL/owner metadata updates that need not take a
     // conflicting relation lock. All locks remain held until commit/rollback.
     transaction.batch_execute(LOCK_GENERATION_TABLE).await?;
@@ -558,6 +566,7 @@ mod tests {
         assert!(RELATION_IS_SAFE.contains("i.indpred IS NULL"));
         assert!(RELATION_IS_SAFE.contains("i.indclass[0]"));
         assert!(LOCK_GENERATION_TABLE.contains("SHARE ROW EXCLUSIVE"));
+        assert!(LOCK_DEFAULT_ACL_CATALOG.contains("pg_catalog.pg_default_acl"));
         assert!(LOCK_GENERATION_CATALOG_ROWS.contains("FOR UPDATE OF n, c, i, ic"));
         assert!(CONNECTION_OPTIONS.contains("event_triggers=off"));
         assert!(CONNECTION_OPTIONS.contains("log_statement=none"));
@@ -595,6 +604,15 @@ mod tests {
             &socket_dir,
             &first,
             "BEGIN; SET LOCAL lock_timeout = '5s'; \
+             ALTER DEFAULT PRIVILEGES FOR ROLE postgres \
+             IN SCHEMA pgshard_internal \
+             GRANT SELECT ON TABLES TO PUBLIC; ROLLBACK",
+        )
+        .await;
+        assert_stable_publication_blocks_ddl(
+            &socket_dir,
+            &first,
+            "BEGIN; SET LOCAL lock_timeout = '5s'; \
              DROP TABLE pgshard_internal.writable_generation; \
              CREATE TABLE pgshard_internal.writable_generation (\
                  singleton boolean, generation bytea); \
@@ -602,6 +620,11 @@ mod tests {
         )
         .await;
         let primary = connect(&socket_dir).await.expect("inspect primary WAL");
+        assert_eq!(
+            default_acl_count(&primary.client).await,
+            0,
+            "blocked default-privilege change must not survive its rollback"
+        );
         assert_eq!(
             control_identity(&primary.client).await,
             control_identity(&standby.client).await,
@@ -800,6 +823,20 @@ mod tests {
             row.try_get(0).expect("system identifier"),
             row.try_get(1).expect("checkpoint timeline"),
         )
+    }
+
+    async fn default_acl_count(client: &Client) -> i64 {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_catalog.pg_default_acl AS d \
+                 WHERE d.defaclrole = (\
+                     SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'postgres')",
+                &[],
+            )
+            .await
+            .expect("read PostgreSQL default ACL count")
+            .try_get(0)
+            .expect("PostgreSQL default ACL count")
     }
 
     async fn current_flush_lsn(client: &Client) -> String {
