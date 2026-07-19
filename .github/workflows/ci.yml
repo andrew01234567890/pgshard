@@ -1439,97 +1439,16 @@ jobs:
           "$failed" && exit 1
           echo "All applicable CI jobs passed."
 
-  release:
-    name: Source-only SemVer release
-    needs: aggregate
-    if: >-
-      always() &&
-      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-       (github.event_name == 'workflow_dispatch' &&
-        (github.ref == 'refs/heads/main' ||
-         startsWith(github.ref, 'refs/tags/pgshard-ci-')))) &&
-      needs.aggregate.result == 'success'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      checks: read
-      contents: write
-    concurrency:
-      group: pgshard-source-release
-      queue: max
-    steps:
-      - name: Validate temporary exact-SHA ref
-        if: startsWith(github.ref, 'refs/tags/pgshard-ci-')
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          expected_sha="${REF_NAME#pgshard-ci-}"
-          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$expected_sha" == "$GITHUB_SHA" ]]
-      - name: Check out complete history
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-      - name: Select repository Rust toolchain
-        run: rustup show active-toolchain
-      - name: Configure release commit identity
-        run: |
-          git config user.name "pgshard release"
-          git config user.email "noreply@github.com"
-      - name: Publish tag and source-only GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: cargo run --locked -p pgshard-release -- publish --sha "$GITHUB_SHA"
-
-  cleanup-dependabot-ci-ref:
-    name: Clean temporary Dependabot CI ref
-    needs: [aggregate, release]
-    if: >-
-      always() &&
-      github.event_name == 'workflow_dispatch' &&
-      startsWith(github.ref, 'refs/tags/pgshard-ci-') &&
-      needs.aggregate.result == 'success' &&
-      needs.release.result == 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - name: Validate temporary exact-SHA ref
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          expected_sha="${REF_NAME#pgshard-ci-}"
-          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$expected_sha" == "$GITHUB_SHA" ]]
-      - name: Delete temporary ref after release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REF_NAME: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! output="$(gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$REF_NAME" 2>&1)"; then
-            if [[ "$output" == *"Reference does not exist"* && "$output" == *"HTTP 422"* ]]; then
-              echo "Temporary ref was already deleted by an equivalent exact-SHA run."
-            else
-              printf '%s\n' "$output" >&2
-              exit 1
-            fi
-          fi
-
   pages:
     name: Deploy documentation to GitHub Pages
-    needs: [changes, website, aggregate, release]
+    needs: [changes, website, aggregate]
     if: >-
       always() &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
       needs.changes.outputs.website == 'true' &&
       needs.website.result == 'success' &&
-      needs.aggregate.result == 'success' &&
-      needs.release.result == 'success'
+      needs.aggregate.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: read

@@ -383,8 +383,11 @@ fn publish(requested_sha: &str) -> Result<()> {
         "publish may only run in GitHub Actions"
     );
     let sha = git(&["rev-parse", &format!("{requested_sha}^{{commit}}")])?;
-    if let Ok(expected) = env::var("GITHUB_SHA") {
-        ensure!(sha == expected, "requested SHA does not match GITHUB_SHA");
+    if let Ok(expected) = env::var("PGSHARD_RELEASE_SHA").or_else(|_| env::var("GITHUB_SHA")) {
+        ensure!(
+            sha == expected,
+            "requested SHA does not match workflow event SHA"
+        );
     }
 
     let repository = env::var("GITHUB_REPOSITORY").context("GITHUB_REPOSITORY is required")?;
@@ -1435,16 +1438,26 @@ mod tests {
         assert!(!workflow.contains("queue: max"));
 
         let ci = include_str!("../../../.github/workflows/ci.yml");
+        let release = include_str!("../../../.github/workflows/release.yml");
         assert!(ci.contains("workflow_dispatch"));
-        assert!(ci.contains("github.event_name == 'workflow_dispatch'"));
-        assert!(ci.contains("refs/tags/pgshard-ci-"));
-        assert!(ci.contains("cleanup-dependabot-ci-ref:"));
         assert!(ci.contains(
             "group: pgshard-ci-${{ github.event_name == 'pull_request' && github.run_id || 'main' }}"
         ));
-        assert!(ci.contains("group: pgshard-source-release"));
-        assert_eq!(ci.matches("queue: max").count(), 2);
+        assert_eq!(ci.matches("queue: max").count(), 1);
         assert!(ci.contains("always() &&"));
+        assert!(release.contains("workflow_run:"));
+        assert!(release.contains("workflows: [CI]"));
+        assert!(release.contains("github.event.workflow_run.conclusion == 'success'"));
+        assert!(release.contains("github.event.workflow_run.head_repository.full_name"));
+        assert!(release.contains("github.event.workflow_run.event == 'workflow_dispatch'"));
+        assert!(
+            release.contains("startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')")
+        );
+        assert!(release.contains("group: pgshard-source-release"));
+        assert_eq!(release.matches("queue: max").count(), 1);
+        assert!(release.contains("PGSHARD_RELEASE_SHA"));
+        assert!(release.contains("ref: main"));
+        assert!(release.contains("Delete temporary ref after release"));
     }
 
     #[test]

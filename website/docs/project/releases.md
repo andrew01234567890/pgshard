@@ -30,13 +30,17 @@ unchecked gap. It creates no version-bump commit, preventing release loops.
 Documentation-only and CI-only default-branch commits still receive patch
 releases.
 
-The complete CI workflow is also serialized for every non-pull-request run.
-Main pushes, scheduled validation, and exact-SHA Dependabot dispatches share a
-maximum-depth concurrency queue, so only one such run builds and publishes at a
-time while pull requests retain independent CI capacity. GitHub processes this
-queue first-in-first-out by the time each run starts waiting; the release
-planner still handles any platform-level dispatch reordering by publishing
-untagged first-parent commits oldest-first.
+The complete CI workflow is serialized for every non-pull-request run. Main
+pushes, scheduled validation, and exact-SHA Dependabot dispatches share a
+maximum-depth concurrency queue, so only one such run builds at a time while
+pull requests retain independent CI capacity. GitHub processes this queue
+first-in-first-out by the time each run starts waiting, rather than by dispatch
+or commit order.
+
+Publication runs in a separate trusted `workflow_run` workflow after successful
+CI and retains its own serialized queue. A descendant release invocation can
+therefore wait for a reordered ancestor build without holding the build queue.
+The release planner still publishes untagged first-parent commits oldest-first.
 
 Verified Dependabot updates to the unattended file allowlist are squash-merged
 by the trusted default-branch workflow when every dependency has explicit patch

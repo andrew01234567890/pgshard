@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  release:
+    name: Source-only SemVer release
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      ((github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main') ||
+       (github.event.workflow_run.event == 'workflow_dispatch' &&
+        (github.event.workflow_run.head_branch == 'main' ||
+         startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-'))))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      checks: read
+      contents: write
+    concurrency:
+      group: pgshard-source-release
+      queue: max
+    steps:
+      # workflow_run executes the trusted default-branch implementation. The
+      # triggering SHA is data only and must already be reachable from main.
+      - name: Check out trusted release automation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Validate temporary exact-SHA ref
+        if: startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')
+        env:
+          REF_NAME: ${{ github.event.workflow_run.head_branch }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          expected_sha="${REF_NAME#pgshard-ci-}"
+          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$expected_sha" == "$RELEASE_SHA" ]]
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Configure release commit identity
+        run: |
+          git config user.name "pgshard release"
+          git config user.email "noreply@github.com"
+      - name: Publish tag and source-only GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PGSHARD_RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: >-
+          cargo run --locked -p pgshard-release -- publish
+          --sha "$PGSHARD_RELEASE_SHA"
+      - name: Delete temporary ref after release
+        if: startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! output="$(gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$REF_NAME" 2>&1)"; then
+            if [[ "$output" == *"Reference does not exist"* && "$output" == *"HTTP 422"* ]]; then
+              echo "Temporary ref was already deleted by an equivalent exact-SHA run."
+            else
+              printf '%s\n' "$output" >&2
+              exit 1
+            fi
+          fi
