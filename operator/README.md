@@ -511,6 +511,10 @@ one by default. A manager started explicitly with
 `--postgresql-runtime=agent-quarantine` composes the bounded token and exact
 Lease identity into each singleton PostgreSQL Pod, but those Pods intentionally
 remain unready and expose no PostgreSQL TCP listener. The manager end-to-end
+test checks the exact cluster UID, cell, Lease identity, holder, and transition
+term in PGDATA after initial acquisition, same-container recovery at a higher
+term, and clean-release Pod replacement. Rust supervisor and publication-fault
+tests establish that the durable record precedes process creation. The manager
 test also removes a cell's exact Lease permissions, proves PostgreSQL is fenced
 while the agent stays healthy, restores reconciliation, and requires a higher
 term plus repeated renewals in the same Pod and container without a restart.
