@@ -683,7 +683,13 @@ jobs:
   website:
     name: Documentation website
     needs: changes
-    if: needs.changes.outputs.website == 'true'
+    # Every non-PR CI run must retain a Pages candidate. Release reconciliation
+    # selects the artifact at the released live-main SHA, which may be a
+    # code-only descendant of the commit that last changed the documentation.
+    if: >-
+      needs.changes.outputs.website == 'true' ||
+      (github.event_name != 'pull_request' &&
+       needs.changes.outputs.website_exists == 'true')
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source

@@ -8,7 +8,18 @@ on:
 permissions: {}
 
 concurrency:
-  group: pgshard-source-release
+  # Only eligible successful CI completions share the stateful release queue.
+  # All other workflow_run events get unique groups and cannot fill that queue.
+  group: >-
+    pgshard-source-release-${{
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      ((github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main') ||
+       (github.event.workflow_run.event == 'workflow_dispatch' &&
+        (github.event.workflow_run.head_branch == 'main' ||
+         startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')))) &&
+      'eligible' || github.run_id }}
   queue: max
 
 jobs:
@@ -136,21 +147,22 @@ jobs:
             exit 0
           fi
 
+          run_ids="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$live_sha&status=success&per_page=100" \
+              --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | .id'
+          )"
           candidate_run=""
           while IFS= read -r run_id; do
+            [[ -n "$run_id" ]] || continue
             artifact_id="$(
               gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
-                --jq '.artifacts[] | select(.name == "pages-site" and (.expired | not)) | .id' \
-                | head -n 1
+                --jq '[.artifacts[] | select(.name == "pages-site" and (.expired | not))][0].id // empty'
             )"
             if [[ -n "$artifact_id" ]]; then
               candidate_run="$run_id"
               break
             fi
-          done < <(
-            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$live_sha&status=success&per_page=100" \
-              --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | .id'
-          )
+          done <<< "$run_ids"
           if [[ -z "$candidate_run" ]]; then
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             echo "Released live main has no Pages candidate; no deployment is needed."

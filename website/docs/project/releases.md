@@ -47,10 +47,13 @@ first-parent commits oldest-first.
 
 Pages deployment is reconciled after publication under that same serialized
 workflow. It resolves the live main SHA, requires an exact source release at
-that commit, locates the `pages-site` artifact from successful CI on the same
-SHA, and deploys only that artifact. A reordered older run therefore either
-deploys the same live content or defers; it cannot overwrite the site with an
-older commit.
+that commit, and deploys the `pages-site` artifact produced by successful CI on
+that exact SHA. Every non-PR CI run builds and retains that candidate, including
+code-only main commits. A reordered older run therefore either deploys the same
+live content or defers; it cannot lose an intervening documentation change or
+overwrite the site with an older commit. Candidate lookup failures fail the
+release workflow so GitHub exposes the error instead of recording a successful
+no-op.
 
 Verified Dependabot updates to the unattended file allowlist are squash-merged
 by the trusted default-branch workflow when every dependency has explicit patch

@@ -1469,7 +1469,8 @@ mod tests {
         assert!(
             release.contains("startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')")
         );
-        assert!(release.contains("group: pgshard-source-release"));
+        assert!(release.contains("pgshard-source-release-${{"));
+        assert!(release.contains("'eligible' || github.run_id"));
         assert_eq!(release.matches("queue: max").count(), 1);
         assert!(release.contains("PGSHARD_RELEASE_SHA"));
         assert!(release.contains("--ready-only"));
@@ -1480,6 +1481,11 @@ mod tests {
         assert!(release.contains("actions: read"));
         assert!(release.contains("actions/workflows/ci.yml/runs?head_sha=$live_sha"));
         assert!(release.contains("git tag --points-at \"$live_sha\""));
+        assert!(ci.contains("github.event_name != 'pull_request'"));
+        assert!(ci.contains("needs.changes.outputs.website_exists == 'true'"));
+        assert!(release.contains("run_ids=\"$("));
+        assert!(release.contains("done <<< \"$run_ids\""));
+        assert!(!release.contains("done < <("));
         assert!(release.contains("run-id: ${{ steps.candidate.outputs.run_id }}"));
         assert!(!ci.contains("Deploy documentation to GitHub Pages"));
     }
