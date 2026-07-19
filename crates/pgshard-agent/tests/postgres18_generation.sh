@@ -14,6 +14,7 @@ readonly standby_data="pgshard-generation-standby-data-${suffix}"
 readonly primary_socket="pgshard-generation-primary-socket-${suffix}"
 readonly standby_socket="pgshard-generation-standby-socket-${suffix}"
 readonly replication_password="pgshard_generation_replication_test"
+readonly standby_application_name="pgshard_member_0001"
 fixture_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/pgshard-generation.XXXXXX")"
 readonly fixture_dir
 readonly primary_hba="$fixture_dir/primary.pg_hba.conf"
@@ -126,8 +127,9 @@ docker run --rm --user 999:999 --network "$network" \
   --env PGPASSWORD="$replication_password" \
   --entrypoint /usr/lib/postgresql/18/bin/pg_basebackup \
   "$image" \
-  --host=primary --port=5432 --username=replicator \
+  --dbname="host=primary port=5432 user=replicator application_name=${standby_application_name}" \
   --pgdata=/standby --wal-method=stream --checkpoint=fast \
+  --slot="$standby_application_name" --create-slot \
   --write-recovery-conf --no-password
 
 docker run --detach --name "$standby" \
@@ -150,7 +152,8 @@ for _ in $(seq 1 120); do
       --host=/var/run/postgresql --username=postgres --dbname=postgres \
       --tuples-only --no-align \
       --command="SELECT count(*) FROM pg_catalog.pg_stat_replication \
-                 WHERE application_name = 'walreceiver' AND state = 'streaming'")" = 1 ]]; then
+                 WHERE application_name = '${standby_application_name}' \
+                   AND state = 'streaming'")" = 1 ]]; then
     break
   fi
   sleep 0.25
@@ -159,7 +162,34 @@ test "$(docker exec --user 999:999 "$primary" psql -X --no-password \
   --host=/var/run/postgresql --username=postgres --dbname=postgres \
   --tuples-only --no-align \
   --command="SELECT count(*) FROM pg_catalog.pg_stat_replication \
-             WHERE application_name = 'walreceiver' AND state = 'streaming'")" = 1
+             WHERE application_name = '${standby_application_name}' \
+               AND state = 'streaming'")" = 1
+
+docker exec --user 999:999 "$primary" psql -X --no-password \
+  --host=/var/run/postgresql --username=postgres --dbname=postgres \
+  --set=ON_ERROR_STOP=1 \
+  --command="ALTER SYSTEM SET synchronous_standby_names = \
+             'ANY 1 (${standby_application_name})'" >/dev/null
+docker exec --user 999:999 "$primary" psql -X --no-password \
+  --host=/var/run/postgresql --username=postgres --dbname=postgres \
+  --set=ON_ERROR_STOP=1 --command="SELECT pg_catalog.pg_reload_conf()" >/dev/null
+for _ in $(seq 1 120); do
+  if [[ "$(docker exec --user 999:999 "$primary" psql -X --no-password \
+      --host=/var/run/postgresql --username=postgres --dbname=postgres \
+      --tuples-only --no-align \
+      --command="SELECT count(*) FROM pg_catalog.pg_stat_replication \
+                 WHERE application_name = '${standby_application_name}' \
+                   AND state = 'streaming' AND sync_state = 'quorum'")" = 1 ]]; then
+    break
+  fi
+  sleep 0.25
+done
+test "$(docker exec --user 999:999 "$primary" psql -X --no-password \
+  --host=/var/run/postgresql --username=postgres --dbname=postgres \
+  --tuples-only --no-align \
+  --command="SELECT count(*) FROM pg_catalog.pg_stat_replication \
+             WHERE application_name = '${standby_application_name}' \
+               AND state = 'streaming' AND sync_state = 'quorum'")" = 1
 
 docker run --rm --user 999:999 --network none --read-only \
   --cap-drop ALL --security-opt no-new-privileges \
@@ -171,5 +201,5 @@ docker run --rm --user 999:999 --network none --read-only \
   --entrypoint /test/pgshard-agent-test \
   "$image" \
   --ignored --exact \
-  postgres_generation::tests::live_postgres18_replicates_exact_generation_across_flush_barriers \
+  postgres_generation::tests::live_postgres18_proves_exact_synchronous_generation_replay \
   --nocapture

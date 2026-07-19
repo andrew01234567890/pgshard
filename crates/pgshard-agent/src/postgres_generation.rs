@@ -31,8 +31,9 @@ const TRANSACTION_SETTINGS: &str = "\
     SET LOCAL lock_timeout = '2s';\
     SET LOCAL statement_timeout = '5s';\
     SET LOCAL transaction_timeout = '10s';\
-    SET LOCAL idle_in_transaction_session_timeout = '5s';\
-    SET LOCAL synchronous_commit = on;";
+    SET LOCAL idle_in_transaction_session_timeout = '5s';";
+const LOCAL_COMMIT: &str = "SET LOCAL synchronous_commit = on";
+const REMOTE_APPLY_COMMIT: &str = "SET LOCAL synchronous_commit = remote_apply";
 const CREATE_SCHEMA: &str = "CREATE SCHEMA pgshard_internal AUTHORIZATION postgres";
 const SCHEMA_IS_SAFE: &str = "\
     SELECT n.nspowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'postgres') \
@@ -124,6 +125,54 @@ const INSERT_GENERATION: &str = "\
 const UPDATE_GENERATION: &str = "\
     UPDATE pgshard_internal.writable_generation SET generation = $1 \
     WHERE singleton = true";
+const CURRENT_FLUSH_LSN: &str = "SELECT pg_catalog.pg_current_wal_flush_lsn()::text";
+const SYNCHRONOUS_STANDBY_OBSERVATION: &str = "\
+    SELECT r.state, r.sync_state, \
+           r.flush_lsn >= $2::text::pg_catalog.pg_lsn, \
+           r.replay_lsn >= $2::text::pg_catalog.pg_lsn \
+    FROM pg_catalog.pg_stat_replication AS r \
+    JOIN pg_catalog.pg_replication_slots AS s ON s.active_pid = r.pid \
+    WHERE r.application_name = $1 AND s.slot_name = $1 \
+      AND s.slot_type = 'physical' AND NOT s.temporary AND s.active \
+    ORDER BY r.pid";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationDurability<'a> {
+    Local,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the synchronous proof is intentionally uncomposed until runtime replicas exist"
+        )
+    )]
+    ExactSynchronousStandby {
+        application_name: &'a str,
+    },
+}
+
+impl GenerationDurability<'_> {
+    const fn transaction_setting(self) -> &'static str {
+        match self {
+            Self::Local => LOCAL_COMMIT,
+            Self::ExactSynchronousStandby { .. } => REMOTE_APPLY_COMMIT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SynchronousStandbyObservation {
+    state: String,
+    sync_state: String,
+    flush_covers_barrier: Option<bool>,
+    replay_covers_barrier: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SynchronousStandbyProof {
+    Pending,
+    Replayed,
+}
 
 #[cfg(test)]
 struct StablePublicationGate {
@@ -149,6 +198,25 @@ pub(crate) async fn publish_writable_generation<F>(
 where
     F: Fn() -> bool,
 {
+    publish_writable_generation_with_durability(
+        socket_dir,
+        requested,
+        GenerationDurability::Local,
+        authority_exact,
+    )
+    .await
+}
+
+async fn publish_writable_generation_with_durability<F>(
+    socket_dir: &Path,
+    requested: &DurableWritableGeneration,
+    durability: GenerationDurability<'_>,
+    authority_exact: &F,
+) -> Result<(), PostgresGenerationError>
+where
+    F: Fn() -> bool,
+{
+    validate_generation_durability(durability)?;
     loop {
         if !authority_exact() {
             return Err(PostgresGenerationError::AuthorityChanged);
@@ -163,6 +231,9 @@ where
         };
         let transaction = connection.client.transaction().await?;
         transaction.batch_execute(TRANSACTION_SETTINGS).await?;
+        transaction
+            .batch_execute(durability.transaction_setting())
+            .await?;
         match query_safety(&transaction, SCHEMA_IS_SAFE).await? {
             Some(true) => {}
             Some(false) => return Err(PostgresGenerationError::UnsafeSchema),
@@ -209,7 +280,15 @@ where
             return Err(PostgresGenerationError::AuthorityChanged);
         }
         match transaction.commit().await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                return prove_publication_durability(
+                    socket_dir,
+                    requested,
+                    durability,
+                    authority_exact,
+                )
+                .await;
+            }
             Err(commit_error) => {
                 tracing::warn!(reason = %commit_error, "reconciling ambiguous writable-generation commit");
                 match reconcile_ambiguous_commit(
@@ -220,7 +299,15 @@ where
                 )
                 .await?
                 {
-                    AmbiguousCommitOutcome::Committed => return Ok(()),
+                    AmbiguousCommitOutcome::Committed => {
+                        return prove_publication_durability(
+                            socket_dir,
+                            requested,
+                            durability,
+                            authority_exact,
+                        )
+                        .await;
+                    }
                     AmbiguousCommitOutcome::Retry => {
                         sleep(CONNECT_RETRY_DELAY).await;
                     }
@@ -228,6 +315,117 @@ where
             }
         }
     }
+}
+
+fn validate_generation_durability(
+    durability: GenerationDurability<'_>,
+) -> Result<(), PostgresGenerationError> {
+    let GenerationDurability::ExactSynchronousStandby { application_name } = durability else {
+        return Ok(());
+    };
+    let ordinal = application_name.strip_prefix("pgshard_member_");
+    if !matches!(ordinal, Some(value) if value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(PostgresGenerationError::InvalidSynchronousStandbyTarget);
+    }
+    Ok(())
+}
+
+async fn prove_publication_durability<F>(
+    socket_dir: &Path,
+    requested: &DurableWritableGeneration,
+    durability: GenerationDurability<'_>,
+    authority_exact: &F,
+) -> Result<(), PostgresGenerationError>
+where
+    F: Fn() -> bool,
+{
+    let GenerationDurability::ExactSynchronousStandby { application_name } = durability else {
+        return Ok(());
+    };
+    if !authority_exact() {
+        return Err(PostgresGenerationError::AuthorityChanged);
+    }
+    let mut connection = connect(socket_dir).await?;
+    let barrier = connection
+        .client
+        .query_one(CURRENT_FLUSH_LSN, &[])
+        .await?
+        .try_get::<_, String>(0)?;
+    loop {
+        if !authority_exact() {
+            return Err(PostgresGenerationError::AuthorityChanged);
+        }
+        let rows = connection
+            .client
+            .query(
+                SYNCHRONOUS_STANDBY_OBSERVATION,
+                &[&application_name, &barrier],
+            )
+            .await?;
+        let observations = rows
+            .iter()
+            .map(parse_synchronous_standby_observation)
+            .collect::<Result<Vec<_>, _>>()?;
+        match classify_synchronous_standby_observations(&observations)? {
+            SynchronousStandbyProof::Pending => sleep(CONNECT_RETRY_DELAY).await,
+            SynchronousStandbyProof::Replayed => break,
+        }
+    }
+
+    if !authority_exact() {
+        return Err(PostgresGenerationError::AuthorityChanged);
+    }
+    let observed = read_current(&mut connection.client).await?;
+    verify_synchronous_publication(observed.as_ref(), requested, authority_exact())
+}
+
+fn parse_synchronous_standby_observation(
+    row: &tokio_postgres::Row,
+) -> Result<SynchronousStandbyObservation, tokio_postgres::Error> {
+    Ok(SynchronousStandbyObservation {
+        state: row.try_get(0)?,
+        sync_state: row.try_get(1)?,
+        flush_covers_barrier: row.try_get(2)?,
+        replay_covers_barrier: row.try_get(3)?,
+    })
+}
+
+fn classify_synchronous_standby_observations(
+    observations: &[SynchronousStandbyObservation],
+) -> Result<SynchronousStandbyProof, PostgresGenerationError> {
+    let [observation] = observations else {
+        return if observations.len() > 1 {
+            Err(PostgresGenerationError::AmbiguousSynchronousStandby {
+                matches: observations.len(),
+            })
+        } else {
+            Ok(SynchronousStandbyProof::Pending)
+        };
+    };
+    if observation.state == "streaming"
+        && matches!(observation.sync_state.as_str(), "sync" | "quorum")
+        && observation.flush_covers_barrier == Some(true)
+        && observation.replay_covers_barrier == Some(true)
+    {
+        Ok(SynchronousStandbyProof::Replayed)
+    } else {
+        Ok(SynchronousStandbyProof::Pending)
+    }
+}
+
+fn verify_synchronous_publication(
+    observed: Option<&DurableWritableGeneration>,
+    requested: &DurableWritableGeneration,
+    authority_exact: bool,
+) -> Result<(), PostgresGenerationError> {
+    if !authority_exact {
+        return Err(PostgresGenerationError::AuthorityChanged);
+    }
+    if observed != Some(requested) {
+        return Err(PostgresGenerationError::SynchronousGenerationChanged);
+    }
+    Ok(())
 }
 
 async fn query_safety(
@@ -452,6 +650,18 @@ pub enum PostgresGenerationError {
     /// Ambiguous reconciliation observed neither the old nor requested value.
     #[error("PostgreSQL writable-generation row changed during ambiguous commit recovery")]
     AmbiguousGenerationChanged,
+    /// The exact synchronous target is not a canonical managed member identity.
+    #[error("PostgreSQL writable-generation synchronous target is not a managed member identity")]
+    InvalidSynchronousStandbyTarget,
+    /// More than one physical walsender claimed the exact managed standby identity.
+    #[error("PostgreSQL exposed {matches} walsenders for the exact synchronous standby identity")]
+    AmbiguousSynchronousStandby {
+        /// Number of matching physical walsenders.
+        matches: usize,
+    },
+    /// The primary generation changed before synchronous proof completed.
+    #[error("PostgreSQL writable-generation row changed during synchronous durability proof")]
+    SynchronousGenerationChanged,
     /// The requested transition violates the durable fencing floor.
     #[error(transparent)]
     UnsafeTransition(#[from] WritableGenerationTransitionError),
@@ -477,6 +687,116 @@ mod tests {
             term,
         )
         .expect("valid PostgreSQL generation fixture")
+    }
+
+    fn standby_observation(
+        state: &str,
+        sync_state: &str,
+        flush_covers_barrier: Option<bool>,
+        replay_covers_barrier: Option<bool>,
+    ) -> SynchronousStandbyObservation {
+        SynchronousStandbyObservation {
+            state: state.to_owned(),
+            sync_state: sync_state.to_owned(),
+            flush_covers_barrier,
+            replay_covers_barrier,
+        }
+    }
+
+    #[test]
+    fn synchronous_target_requires_canonical_managed_member_name() {
+        assert!(validate_generation_durability(GenerationDurability::Local).is_ok());
+        assert!(
+            validate_generation_durability(GenerationDurability::ExactSynchronousStandby {
+                application_name: "pgshard_member_0001",
+            })
+            .is_ok()
+        );
+        for application_name in [
+            "",
+            "walreceiver",
+            "pgshard_member_001",
+            "pgshard_member_00001",
+            "pgshard_member_abcd",
+        ] {
+            assert!(matches!(
+                validate_generation_durability(GenerationDurability::ExactSynchronousStandby {
+                    application_name,
+                }),
+                Err(PostgresGenerationError::InvalidSynchronousStandbyTarget)
+            ));
+        }
+    }
+
+    #[test]
+    fn synchronous_classifier_requires_one_streaming_selected_replayed_standby() {
+        for sync_state in ["sync", "quorum"] {
+            assert_eq!(
+                classify_synchronous_standby_observations(&[standby_observation(
+                    "streaming",
+                    sync_state,
+                    Some(true),
+                    Some(true),
+                )])
+                .expect("exact synchronous standby proves replay"),
+                SynchronousStandbyProof::Replayed
+            );
+        }
+
+        let adverse = [
+            standby_observation("startup", "quorum", Some(true), Some(true)),
+            standby_observation("catchup", "quorum", Some(true), Some(true)),
+            standby_observation("streaming", "async", Some(true), Some(true)),
+            standby_observation("streaming", "potential", Some(true), Some(true)),
+            standby_observation("streaming", "quorum", None, Some(true)),
+            standby_observation("streaming", "quorum", Some(true), None),
+            standby_observation("streaming", "quorum", Some(false), Some(true)),
+            standby_observation("streaming", "quorum", Some(true), Some(false)),
+        ];
+        for observation in adverse {
+            assert_eq!(
+                classify_synchronous_standby_observations(&[observation])
+                    .expect("transiently unsafe standby remains pending"),
+                SynchronousStandbyProof::Pending
+            );
+        }
+        assert_eq!(
+            classify_synchronous_standby_observations(&[])
+                .expect("missing exact standby remains pending"),
+            SynchronousStandbyProof::Pending
+        );
+    }
+
+    #[test]
+    fn synchronous_classifier_rejects_duplicate_identity() {
+        let observations = [
+            standby_observation("streaming", "quorum", Some(true), Some(true)),
+            standby_observation("streaming", "quorum", Some(true), Some(true)),
+        ];
+        assert!(matches!(
+            classify_synchronous_standby_observations(&observations),
+            Err(PostgresGenerationError::AmbiguousSynchronousStandby { matches: 2 })
+        ));
+    }
+
+    #[test]
+    fn synchronous_final_recheck_requires_exact_row_and_authority() {
+        let requested = generation("cluster-1", "holder-b", 2);
+        assert!(verify_synchronous_publication(Some(&requested), &requested, true).is_ok());
+        assert!(matches!(
+            verify_synchronous_publication(Some(&requested), &requested, false),
+            Err(PostgresGenerationError::AuthorityChanged)
+        ));
+        for observed in [
+            None,
+            Some(generation("cluster-1", "holder-a", 1)),
+            Some(generation("cluster-1", "holder-c", 3)),
+        ] {
+            assert!(matches!(
+                verify_synchronous_publication(observed.as_ref(), &requested, true),
+                Err(PostgresGenerationError::SynchronousGenerationChanged)
+            ));
+        }
     }
 
     #[test]
@@ -547,7 +867,8 @@ mod tests {
     fn publication_sql_is_fixed_logged_and_local() {
         assert!(TRANSACTION_SETTINGS.contains("search_path = pg_catalog"));
         assert!(TRANSACTION_SETTINGS.contains("ISOLATION LEVEL READ COMMITTED"));
-        assert!(TRANSACTION_SETTINGS.contains("synchronous_commit = on"));
+        assert!(LOCAL_COMMIT.contains("synchronous_commit = on"));
+        assert!(REMOTE_APPLY_COMMIT.contains("synchronous_commit = remote_apply"));
         assert!(TRANSACTION_SETTINGS.contains("lock_timeout"));
         assert!(TRANSACTION_SETTINGS.contains("statement_timeout"));
         assert!(TRANSACTION_SETTINGS.contains("transaction_timeout"));
@@ -568,13 +889,19 @@ mod tests {
         assert!(LOCK_GENERATION_TABLE.contains("SHARE ROW EXCLUSIVE"));
         assert!(LOCK_DEFAULT_ACL_CATALOG.contains("pg_catalog.pg_default_acl"));
         assert!(LOCK_GENERATION_CATALOG_ROWS.contains("FOR UPDATE OF n, c, i, ic"));
+        assert!(CURRENT_FLUSH_LSN.contains("pg_current_wal_flush_lsn"));
+        assert!(SYNCHRONOUS_STANDBY_OBSERVATION.contains("pg_stat_replication"));
+        assert!(SYNCHRONOUS_STANDBY_OBSERVATION.contains("pg_replication_slots"));
+        assert!(SYNCHRONOUS_STANDBY_OBSERVATION.contains("slot_type = 'physical'"));
+        assert!(SYNCHRONOUS_STANDBY_OBSERVATION.contains("flush_lsn"));
+        assert!(SYNCHRONOUS_STANDBY_OBSERVATION.contains("replay_lsn"));
         assert!(CONNECTION_OPTIONS.contains("event_triggers=off"));
         assert!(CONNECTION_OPTIONS.contains("log_statement=none"));
     }
 
     #[tokio::test]
     #[ignore = "requires disposable primary and streaming-standby PostgreSQL 18 Unix sockets"]
-    async fn live_postgres18_replicates_exact_generation_across_flush_barriers() {
+    async fn live_postgres18_proves_exact_synchronous_generation_replay() {
         let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
             .map(std::path::PathBuf::from)
             .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
@@ -584,15 +911,22 @@ mod tests {
         let standby = connect(&standby_socket_dir)
             .await
             .expect("connect to streaming standby");
+        let primary = connect(&socket_dir).await.expect("inspect primary WAL");
+        assert_same_control_identity(&primary.client, &standby.client).await;
         let first = generation("cluster-1", "holder-a", 1);
         assert_unsafe_schema_rejected_before_ddl(&socket_dir, &first).await;
 
-        publish_writable_generation(&socket_dir, &first, &|| true)
+        assert_remote_apply_blocks_on_paused_replay(
+            &socket_dir,
+            &primary.client,
+            &standby.client,
+            &first,
+        )
+        .await;
+
+        publish_synchronous_generation(&socket_dir, &first)
             .await
-            .expect("initialize live generation");
-        publish_writable_generation(&socket_dir, &first, &|| true)
-            .await
-            .expect("replay live generation");
+            .expect("replay live synchronous generation");
         assert_stable_publication_blocks_ddl(
             &socket_dir,
             &first,
@@ -619,19 +953,11 @@ mod tests {
              ROLLBACK",
         )
         .await;
-        let primary = connect(&socket_dir).await.expect("inspect primary WAL");
         assert_eq!(
             default_acl_count(&primary.client).await,
             0,
             "blocked default-privilege change must not survive its rollback"
         );
-        assert_eq!(
-            control_identity(&primary.client).await,
-            control_identity(&standby.client).await,
-            "standby must be the same physical PostgreSQL system and timeline"
-        );
-        let first_barrier = current_flush_lsn(&primary.client).await;
-        wait_for_replayed_generation(&standby.client, &first_barrier, &first).await;
         assert!(matches!(
             publish_writable_generation(
                 &socket_dir,
@@ -647,11 +973,10 @@ mod tests {
         assert_ambiguous_reread_rejects_extra_row(&socket_dir, &first).await;
         assert_hostile_indexes_rejected_before_dml(&socket_dir, &second).await;
 
-        publish_writable_generation(&socket_dir, &second, &|| true)
+        publish_synchronous_generation(&socket_dir, &second)
             .await
-            .expect("advance live generation");
-        let second_barrier = current_flush_lsn(&primary.client).await;
-        wait_for_replayed_generation(&standby.client, &second_barrier, &second).await;
+            .expect("advance synchronously replayed generation");
+        assert_replayed_generation(&standby.client, &second).await;
 
         let row = primary
             .client
@@ -678,6 +1003,53 @@ mod tests {
             .batch_execute("DROP SCHEMA pgshard_internal CASCADE")
             .await
             .expect("remove disposable generation schema");
+    }
+
+    async fn assert_remote_apply_blocks_on_paused_replay(
+        socket_dir: &Path,
+        primary: &Client,
+        standby: &Client,
+        generation: &DurableWritableGeneration,
+    ) {
+        standby
+            .batch_execute("SELECT pg_catalog.pg_wal_replay_pause()")
+            .await
+            .expect("pause standby replay");
+        let publication_socket = socket_dir.to_owned();
+        let publication_generation = generation.clone();
+        let publication = tokio::spawn(async move {
+            publish_synchronous_generation(&publication_socket, &publication_generation).await
+        });
+        wait_for_synchronous_commit(primary).await;
+        assert!(
+            !publication.is_finished(),
+            "remote-apply generation publication passed paused standby replay"
+        );
+        standby
+            .batch_execute("SELECT pg_catalog.pg_wal_replay_resume()")
+            .await
+            .expect("resume standby replay");
+        tokio::time::timeout(Duration::from_secs(15), publication)
+            .await
+            .expect("synchronous generation publication completed after replay resumed")
+            .expect("join synchronous generation publication")
+            .expect("initialize synchronously replayed generation");
+        assert_replayed_generation(standby, generation).await;
+    }
+
+    async fn publish_synchronous_generation(
+        socket_dir: &Path,
+        generation: &DurableWritableGeneration,
+    ) -> Result<(), PostgresGenerationError> {
+        publish_writable_generation_with_durability(
+            socket_dir,
+            generation,
+            GenerationDurability::ExactSynchronousStandby {
+                application_name: "pgshard_member_0001",
+            },
+            &|| true,
+        )
+        .await
     }
 
     async fn assert_unsafe_schema_rejected_before_ddl(
@@ -825,6 +1197,14 @@ mod tests {
         )
     }
 
+    async fn assert_same_control_identity(primary: &Client, standby: &Client) {
+        assert_eq!(
+            control_identity(primary).await,
+            control_identity(standby).await,
+            "standby must be the same physical PostgreSQL system and timeline"
+        );
+    }
+
     async fn default_acl_count(client: &Client) -> i64 {
         client
             .query_one(
@@ -839,13 +1219,28 @@ mod tests {
             .expect("PostgreSQL default ACL count")
     }
 
-    async fn current_flush_lsn(client: &Client) -> String {
-        client
-            .query_one("SELECT pg_catalog.pg_current_wal_flush_lsn()::text", &[])
-            .await
-            .expect("read primary WAL flush barrier")
-            .try_get(0)
-            .expect("primary flush LSN")
+    async fn wait_for_synchronous_commit(primary: &Client) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting = primary
+                    .query_one(
+                        "SELECT count(*) = 1 FROM pg_catalog.pg_stat_activity \
+                         WHERE application_name = 'pgshard-generation-publisher' \
+                           AND wait_event_type = 'IPC' AND wait_event = 'SyncRep'",
+                        &[],
+                    )
+                    .await
+                    .expect("observe remote-apply commit wait")
+                    .try_get::<_, bool>(0)
+                    .expect("remote-apply wait count");
+                if waiting {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("generation publisher reached PostgreSQL synchronous-replication wait");
     }
 
     async fn assert_stable_publication_blocks_ddl(
@@ -931,31 +1326,7 @@ mod tests {
         )
     }
 
-    async fn wait_for_replayed_generation(
-        standby: &Client,
-        barrier: &str,
-        expected: &DurableWritableGeneration,
-    ) {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let replayed = standby
-                    .query_one(
-                        "SELECT COALESCE(\
-                             pg_catalog.pg_last_wal_replay_lsn() >= $1::text::pg_lsn, false)",
-                        &[&barrier],
-                    )
-                    .await
-                    .expect("read standby replay position")
-                    .try_get::<_, bool>(0)
-                    .expect("standby replay comparison");
-                if replayed {
-                    break;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("standby replay reached primary flush barrier");
+    async fn assert_replayed_generation(standby: &Client, expected: &DurableWritableGeneration) {
         let bytes = standby
             .query_one(
                 "SELECT generation FROM pgshard_internal.writable_generation \

@@ -93,6 +93,20 @@ shutdown, Lease loss, publication timeout, and child exit. Only a committed or
 reconciled row followed by one final exact authority check advances the process
 to `RunningQuarantined`.
 
+A private opt-in publication mode exercises the next durability boundary against
+a disposable PostgreSQL 18 primary and physical standby. It commits with
+`synchronous_commit=remote_apply`, then captures a primary flush barrier and
+accepts exactly one canonical managed standby identity only while its walsender
+is streaming through its same-named active physical slot and selected as `sync`
+or `quorum`. Both the standby flush and
+replay positions must cover that barrier before the primary row and
+attempt-private authority are rechecked. Missing, duplicate, asynchronous,
+lagging, unknown, disconnected, or changed evidence remains fail closed. The
+live test pauses standby replay, observes the primary publication blocked in
+PostgreSQL's synchronous-replication wait, resumes replay, and requires the exact
+row to be readable on the standby before publication returns. The operator and
+agent runtime do not select this mode yet.
+
 With writable coordination enabled,
 every agent shutdown clears local term evidence and immediately enters the
 PostgreSQL process-tree fence, skipping the smart and fast waits. An absolute
@@ -134,8 +148,9 @@ also authoritatively classifies both the `OnDelete` StatefulSet template and
 the live Pod, including when an earlier template already differs from its Pod.
 Changing modes requires a future explicitly fenced replacement workflow.
 These durable records are only non-serving startup floors. The WAL-backed row
-can eventually reach a future physical standby, but this runtime still disables
-physical replication and provides no synchronous-replica durability guarantee.
+has a tested synchronous-replay proof primitive, but this runtime still disables
+physical replication and therefore provides no runtime synchronous-replica
+durability guarantee.
 PostgreSQL SQL write and prepare hooks do not yet reject stale request
 generations, standby copies are not yet reconciled as promotion evidence, and
 promotion proof plus serving activation remain absent. This is therefore not
