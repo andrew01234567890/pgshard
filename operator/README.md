@@ -222,10 +222,15 @@ required channel binding, but general PostgreSQL shard traffic still lacks
 authenticated TLS; the independent `TransportSecurityReady=False` condition
 reports that remaining gap. Orchestrator coordination goes only through the
 Kubernetes API server using its TLS service-account path. The operator creates
-the empty Lease envelope and owns no runtime Lease spec fields. A dedicated
-ServiceAccount may only `get` and `update` that exact Lease name; pooler and
-PostgreSQL Pods receive no Kubernetes API token through this path. Durable
-topology and operation state stays in PostgreSQL rather than the Lease. During
+the empty orchestrator Lease envelope and one empty, role-neutral writable-term
+Lease envelope per physical cell; it owns no runtime Lease spec fields. Every
+cell Lease's API UID is checkpointed in `PgShardCluster` status, and deletion or
+same-name recreation fails closed instead of silently changing coordination
+universes. The orchestrator's dedicated ServiceAccount may only `get` and
+`update` its exact Lease name. PostgreSQL Pods do not yet receive a Kubernetes
+API token or run the writable-term agent path, so these cell envelopes are not
+evidence of promotion, self-fencing, or HA. Durable topology and operation state
+stays in PostgreSQL rather than any Lease. During
 an upgrade from the retired development etcd layout, normal pruning first
 removes the old StatefulSet. Uncached API reads must then prove that controller
 and all three exact Pods absent before the operator validates and deletes only
@@ -462,7 +467,9 @@ The sample proves only real manager reconciliation and fail-closed supporting
 processes. Each orchestrator Pod becomes ready only after validating the exact
 operator-owned Kubernetes Lease through the API server. One process holds the
 Lease and reports `pgshard_orch_leader 1`; followers remain ready but never
-claim leadership. The pooler remains unready, application Services
+claim leadership. The operator also checkpoints one empty writable-term Lease
+per requested physical cell, but no PostgreSQL agent is authorized to hold one.
+The pooler remains unready, application Services
 have no ready endpoints, no PostgreSQL workload is created, and the cluster
 reports `Ready=False` with `PostgreSQLHAUnavailable`. Orchestrator readiness is
 process-incarnation evidence only: durable operation records, shard-term

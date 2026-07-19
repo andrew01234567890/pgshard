@@ -1482,7 +1482,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		}
 	}
 
-	objects := make([]client.Object, 0, 18+3*cluster.Spec.Shards)
+	objects := make([]client.Object, 0, 18+4*cluster.Spec.Shards)
 	objects = append(objects,
 		immutableConfigMap(cluster, postgresqlConfigName, postgresqlConfig),
 		configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": topologyConfig}),
@@ -1500,7 +1500,11 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		objects = append(objects, catalogService(cluster))
 	}
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
-		objects = append(objects, shardService(cluster, shard), postgresqlNetworkPolicy(cluster, shard))
+		objects = append(objects,
+			shardService(cluster, shard),
+			PostgreSQLWritableLease(cluster, shard),
+			postgresqlNetworkPolicy(cluster, shard),
+		)
 		if cluster.Spec.MembersPerShard == 1 {
 			bootstrap := bootstraps[shard]
 			objects = append(objects,
@@ -2065,6 +2069,22 @@ func PostgreSQLAuthSecretPrefix(cluster string, shard int32) string {
 // member identity; primary and replica roles belong in mutable labels.
 func PostgreSQLShardStatefulSetName(cluster string, shard int32) string {
 	return fmt.Sprintf("%s-shard-%04d", boundedPostgreSQLWorkloadPrefix(cluster), shard)
+}
+
+// PostgreSQLWritableLeaseName returns the deterministic, role-neutral Lease
+// name for one physical cell. The stable member name and Pod UID belong in the
+// runtime holder identity, never in this reusable coordination envelope.
+func PostgreSQLWritableLeaseName(cluster string, shard int32) string {
+	return PostgreSQLShardStatefulSetName(cluster, shard) + "-term"
+}
+
+// PostgreSQLWritableLease creates only the operator-owned coordination
+// envelope. Agents own every runtime spec field and update them with
+// resource-version compare-and-swap operations after pinning the Lease UID.
+func PostgreSQLWritableLease(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *coordinationv1.Lease {
+	metadata := ownedMeta(cluster, PostgreSQLWritableLeaseName(cluster.Name, shard), "postgresql", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	return &coordinationv1.Lease{ObjectMeta: metadata}
 }
 
 // LegacyPostgreSQLPrimaryStatefulSetName identifies the pre-role-neutral

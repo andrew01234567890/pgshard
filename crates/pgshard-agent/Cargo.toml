@@ -13,6 +13,8 @@ axum.workspace = true
 clap = { workspace = true, features = ["env"] }
 hyper.workspace = true
 hyper-util.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
 pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
 postgres-protocol.workspace = true
@@ -24,6 +26,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

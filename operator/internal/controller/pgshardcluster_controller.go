@@ -211,6 +211,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 			return ctrl.Result{}, err
 		}
 	}
+	if err := r.ensurePostgreSQLWritableLeases(ctx, cluster); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "WritableLeaseReconcileFailed", fmt.Sprintf("PostgreSQL writable-term Lease reconciliation failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	if err := r.ensurePostgreSQLBootstrap(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "BootstrapReconcileFailed", fmt.Sprintf("PostgreSQL bootstrap reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
@@ -291,6 +295,135 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		return ctrl.Result{RequeueAfter: bootstrapIntegrityInterval}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// ensurePostgreSQLWritableLeases creates one empty, operator-owned Lease
+// envelope per physical cell and checkpoints its API UID before any workload
+// can be configured to use it. A recorded Lease that disappears or changes UID
+// is never recreated or adopted implicitly: that name now denotes a different
+// coordination universe and requires explicit recovery.
+func (r *PgShardClusterReconciler) ensurePostgreSQLWritableLeases(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	indices := make(map[int32]int, len(cluster.Status.PostgreSQLWritableLeases))
+	names := make(map[string]struct{}, len(cluster.Status.PostgreSQLWritableLeases))
+	uids := make(map[types.UID]struct{}, len(cluster.Status.PostgreSQLWritableLeases))
+	for index, recorded := range cluster.Status.PostgreSQLWritableLeases {
+		expectedName := owned.PostgreSQLWritableLeaseName(cluster.Name, recorded.Shard)
+		if recorded.Shard < 0 || recorded.Shard >= cluster.Spec.Shards ||
+			recorded.LeaseName != expectedName || recorded.LeaseUID == "" || len(recorded.LeaseUID) > 128 {
+			return fmt.Errorf("recorded PostgreSQL writable-term Lease for shard %d is invalid", recorded.Shard)
+		}
+		if _, duplicate := indices[recorded.Shard]; duplicate {
+			return fmt.Errorf("recorded PostgreSQL writable-term Lease for shard %d is duplicated", recorded.Shard)
+		}
+		if _, duplicate := names[recorded.LeaseName]; duplicate {
+			return fmt.Errorf("recorded PostgreSQL writable-term Lease name %s is duplicated", recorded.LeaseName)
+		}
+		if _, duplicate := uids[recorded.LeaseUID]; duplicate {
+			return fmt.Errorf("recorded PostgreSQL writable-term Lease UID %s is duplicated", recorded.LeaseUID)
+		}
+		indices[recorded.Shard] = index
+		names[recorded.LeaseName] = struct{}{}
+		uids[recorded.LeaseUID] = struct{}{}
+	}
+
+	reader := r.authoritativeReader()
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		index, recorded := indices[shard]
+		name := owned.PostgreSQLWritableLeaseName(cluster.Name, shard)
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
+		lease := &coordinationv1.Lease{}
+		if err := reader.Get(ctx, key, lease); apierrors.IsNotFound(err) {
+			if recorded {
+				checkpoint := cluster.Status.PostgreSQLWritableLeases[index]
+				return fmt.Errorf("PostgreSQL writable-term Lease %s with recorded UID %s is missing; explicit recovery is required", name, checkpoint.LeaseUID)
+			}
+			candidate := owned.PostgreSQLWritableLease(cluster, shard)
+			if createErr := r.Create(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); createErr != nil {
+				observed := &coordinationv1.Lease{}
+				if readErr := reader.Get(ctx, key, observed); readErr != nil {
+					if apierrors.IsNotFound(readErr) {
+						return fmt.Errorf("create PostgreSQL writable-term Lease %s: %w", name, createErr)
+					}
+					return errors.Join(
+						fmt.Errorf("create PostgreSQL writable-term Lease %s: %w", name, createErr),
+						fmt.Errorf("resolve PostgreSQL writable-term Lease creation outcome: %w", readErr),
+					)
+				}
+				candidate = observed
+			}
+			if candidate.UID == "" || candidate.ResourceVersion == "" {
+				observed := &coordinationv1.Lease{}
+				if err := reader.Get(ctx, key, observed); err != nil {
+					return fmt.Errorf("read created PostgreSQL writable-term Lease %s: %w", name, err)
+				}
+				candidate = observed
+			}
+			lease = candidate
+		} else if err != nil {
+			return fmt.Errorf("read PostgreSQL writable-term Lease %s: %w", name, err)
+		}
+
+		if err := validatePostgreSQLWritableLeaseMetadata(lease, cluster, shard); err != nil {
+			return err
+		}
+		if recorded {
+			checkpoint := cluster.Status.PostgreSQLWritableLeases[index]
+			if lease.UID != checkpoint.LeaseUID {
+				return fmt.Errorf("PostgreSQL writable-term Lease %s has UID %s, expected recorded UID %s; explicit recovery is required", name, lease.UID, checkpoint.LeaseUID)
+			}
+			if err := validatePostgreSQLWritableLeaseRuntimeSpec(lease.Spec); err != nil {
+				return fmt.Errorf("PostgreSQL writable-term Lease %s has invalid runtime state: %w", name, err)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(lease.Spec, coordinationv1.LeaseSpec{}) {
+			return fmt.Errorf("uncheckpointed PostgreSQL writable-term Lease %s is not an empty coordination envelope", name)
+		}
+		cluster.Status.PostgreSQLWritableLeases = append(
+			cluster.Status.PostgreSQLWritableLeases,
+			pgshardv1alpha1.PostgreSQLWritableLeaseStatus{Shard: shard, LeaseName: name, LeaseUID: lease.UID},
+		)
+		sort.Slice(cluster.Status.PostgreSQLWritableLeases, func(left, right int) bool {
+			return cluster.Status.PostgreSQLWritableLeases[left].Shard < cluster.Status.PostgreSQLWritableLeases[right].Shard
+		})
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint PostgreSQL writable-term Lease identity for shard %d: %w", shard, err)
+		}
+	}
+	return nil
+}
+
+func validatePostgreSQLWritableLeaseMetadata(lease *coordinationv1.Lease, cluster *pgshardv1alpha1.PgShardCluster, shard int32) error {
+	canonical := owned.PostgreSQLWritableLease(cluster, shard)
+	if lease.Name != canonical.Name || lease.Namespace != canonical.Namespace || lease.GenerateName != "" ||
+		lease.UID == "" || lease.ResourceVersion == "" || lease.DeletionTimestamp != nil ||
+		!maps.Equal(lease.Labels, canonical.Labels) || !maps.Equal(lease.Annotations, canonical.Annotations) ||
+		!reflect.DeepEqual(lease.OwnerReferences, canonical.OwnerReferences) || len(lease.Finalizers) != 0 {
+		return fmt.Errorf("PostgreSQL writable-term Lease %s metadata is not bound to shard %d and the exact PgShardCluster API identity", canonical.Name, shard)
+	}
+	return nil
+}
+
+func validatePostgreSQLWritableLeaseRuntimeSpec(spec coordinationv1.LeaseSpec) error {
+	if spec.Strategy != nil || spec.PreferredHolder != nil {
+		return fmt.Errorf("coordinated leader-election fields are unsupported")
+	}
+	if spec.HolderIdentity == nil {
+		if spec.LeaseDurationSeconds != nil || spec.AcquireTime != nil || spec.RenewTime != nil || spec.LeaseTransitions != nil {
+			return fmt.Errorf("an empty holder has partial runtime state")
+		}
+		return nil
+	}
+	holder := *spec.HolderIdentity
+	if strings.TrimSpace(holder) != holder || len(holder) > 128 {
+		return fmt.Errorf("holder identity is invalid")
+	}
+	if spec.LeaseDurationSeconds == nil || *spec.LeaseDurationSeconds < 1 || *spec.LeaseDurationSeconds > 300 ||
+		spec.AcquireTime == nil || spec.AcquireTime.IsZero() || spec.RenewTime == nil || spec.RenewTime.IsZero() ||
+		spec.LeaseTransitions == nil || *spec.LeaseTransitions < 1 {
+		return fmt.Errorf("holder duration, timestamps, or transition counter is invalid")
+	}
+	return nil
 }
 
 // cleanupRetiredEtcdStorage removes only the three fixed data claims created by
@@ -1618,7 +1751,8 @@ func legacyAlignedObject(current, desired client.Object) (client.Object, error) 
 		if _, ok := aligned.(*coordinationv1.Lease); !ok {
 			return nil, fmt.Errorf("legacy object type %T does not match desired Lease", current)
 		}
-		// Runtime Lease spec fields belong exclusively to orchestrator replicas.
+		// Runtime Lease spec fields belong exclusively to the corresponding
+		// orchestrator or PostgreSQL agent replicas.
 	case *appsv1.Deployment:
 		got, ok := aligned.(*appsv1.Deployment)
 		if !ok {
@@ -3134,7 +3268,7 @@ func (r *PgShardClusterReconciler) updateStatus(ctx context.Context, cluster *pg
 }
 
 func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
-	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) {
+	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) {
 		return false
 	}
 	for index := range left.Conditions {
@@ -3143,6 +3277,10 @@ func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
 		}
 	}
 	return true
+}
+
+func postgreSQLWritableLeasesEqual(left, right pgshardv1alpha1.PostgreSQLWritableLeaseStatus) bool {
+	return left.Shard == right.Shard && left.LeaseName == right.LeaseName && left.LeaseUID == right.LeaseUID
 }
 
 func catalogAccessStatusesEqual(left, right *pgshardv1alpha1.CatalogAccessStatus) bool {
@@ -3164,10 +3302,11 @@ func postgreSQLBootstrapsEqual(left, right pgshardv1alpha1.PostgreSQLBootstrapSt
 	return left.Shard == right.Shard && left.SecretName == right.SecretName && left.SecretUID == right.SecretUID && left.PVCFenceDetached == right.PVCFenceDetached && left.PVCName == right.PVCName && left.PVCUID == right.PVCUID && left.PVCCreationAbandoned == right.PVCCreationAbandoned && optionalStringsEqual(left.PVCStorageClassName, right.PVCStorageClassName)
 }
 
-// orchestratorLeaseEvents ignores the runtime-owned spec updates made during
-// every claim and renewal. Envelope drift, ownership changes, deletion, create,
-// and delete events still reconcile the owning cluster.
-func orchestratorLeaseEvents() predicate.Funcs {
+// runtimeLeaseEvents ignores renewTime-only updates made by the current holder.
+// Holder, term, duration, acquisition, coordinated-election, and envelope
+// changes still reconcile the owner so structural corruption is surfaced
+// without turning every heartbeat into a full-cluster reconciliation.
+func runtimeLeaseEvents() predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc:  func(event.CreateEvent) bool { return true },
 		DeleteFunc:  func(event.DeleteEvent) bool { return true },
@@ -3185,7 +3324,21 @@ func orchestratorLeaseEvents() predicate.Funcs {
 				metadata.Generation = 0
 				metadata.ManagedFields = nil
 			}
-			return !reflect.DeepEqual(oldMetadata, newMetadata)
+			if !reflect.DeepEqual(oldMetadata, newMetadata) {
+				return true
+			}
+			oldSpec := oldLease.Spec.DeepCopy()
+			newSpec := newLease.Spec.DeepCopy()
+			oldSpec.RenewTime = nil
+			newSpec.RenewTime = nil
+			if !reflect.DeepEqual(oldSpec, newSpec) {
+				return true
+			}
+			// Suppress only a heartbeat between two complete runtime records.
+			// A missing or zero renewal timestamp is structural corruption and
+			// must wake reconciliation even when every other field is unchanged.
+			return validatePostgreSQLWritableLeaseRuntimeSpec(oldLease.Spec) != nil ||
+				validatePostgreSQLWritableLeaseRuntimeSpec(newLease.Spec) != nil
 		},
 	}
 }
@@ -3198,7 +3351,7 @@ func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error 
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
-		Owns(&coordinationv1.Lease{}, builder.WithPredicates(orchestratorLeaseEvents())).
+		Owns(&coordinationv1.Lease{}, builder.WithPredicates(runtimeLeaseEvents())).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).

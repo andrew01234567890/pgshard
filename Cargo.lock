@@ -1567,6 +1567,8 @@ dependencies = [
  "clap",
  "hyper",
  "hyper-util",
+ "k8s-openapi",
+ "kube",
  "pgshard-types",
  "pgshard-version",
  "postgres-protocol",
@@ -1579,6 +1581,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

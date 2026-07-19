@@ -300,12 +300,31 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=shard
 	PostgreSQLBootstraps []PostgreSQLBootstrapStatus `json:"postgresqlBootstraps,omitempty"`
+	// PostgreSQLWritableLeases binds every physical cell to the exact
+	// operator-owned Kubernetes Lease used for writable-term coordination. A
+	// missing or recreated Lease is a new coordination universe and requires
+	// explicit recovery; the controller never silently adopts its replacement.
+	// +listType=map
+	// +listMapKey=shard
+	PostgreSQLWritableLeases []PostgreSQLWritableLeaseStatus `json:"postgresqlWritableLeases,omitempty"`
 	// CatalogAccess records the staged creation and API identity of the
 	// catalog-only credential and TLS Secret. The operator first creates an empty
 	// non-consumable Secret, checkpoints its UID, then atomically installs
 	// immutable material and checkpoints its digests. A missing or replaced
 	// checkpointed Secret requires explicit recovery.
 	CatalogAccess *CatalogAccessStatus `json:"catalogAccess,omitempty"`
+}
+
+// PostgreSQLWritableLeaseStatus pins one physical cell's writable-term Lease
+// to its API-assigned identity. The name is deterministic and role-neutral;
+// LeaseUID distinguishes deletion and recreation under that same name.
+type PostgreSQLWritableLeaseStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	Shard int32 `json:"shard"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	LeaseName string    `json:"leaseName"`
+	LeaseUID  types.UID `json:"leaseUID"`
 }
 
 // CatalogAccessStatus binds the cluster to one staged catalog access Secret.

@@ -152,6 +152,138 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 	}
 }
 
+func TestReconcileCheckpointsExactPostgreSQLWritableLeaseIdentities(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	fakeClient := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(fakeClient, nil)
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	got := getCluster(t, ctx, fakeClient, cluster)
+	if len(got.Status.PostgreSQLWritableLeases) != int(cluster.Spec.Shards) {
+		t.Fatalf("writable-term Lease checkpoints = %#v", got.Status.PostgreSQLWritableLeases)
+	}
+	initial := append([]pgshardv1alpha1.PostgreSQLWritableLeaseStatus(nil), got.Status.PostgreSQLWritableLeases...)
+	for shard, checkpoint := range got.Status.PostgreSQLWritableLeases {
+		if checkpoint.Shard != int32(shard) || checkpoint.LeaseName != owned.PostgreSQLWritableLeaseName(cluster.Name, int32(shard)) || checkpoint.LeaseUID == "" {
+			t.Fatalf("writable-term Lease checkpoint %d = %#v", shard, checkpoint)
+		}
+		lease := &coordinationv1.Lease{}
+		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.LeaseName}, lease); err != nil {
+			t.Fatal(err)
+		}
+		if lease.UID != checkpoint.LeaseUID {
+			t.Fatalf("writable-term Lease %s UID = %s, want %s", lease.Name, lease.UID, checkpoint.LeaseUID)
+		}
+		if err := validatePostgreSQLWritableLeaseMetadata(lease, got, checkpoint.Shard); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(lease.Spec, coordinationv1.LeaseSpec{}) {
+			t.Fatalf("operator populated runtime Lease fields: %#v", lease.Spec)
+		}
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	if current := getCluster(t, ctx, fakeClient, cluster); !reflect.DeepEqual(current.Status.PostgreSQLWritableLeases, initial) {
+		t.Fatalf("steady reconciliation changed writable-term Lease identities: before=%#v after=%#v", initial, current.Status.PostgreSQLWritableLeases)
+	}
+}
+
+func TestRecordedPostgreSQLWritableLeaseLossFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		recreate bool
+		want     string
+	}{
+		{name: "missing", want: "is missing; explicit recovery is required"},
+		{name: "recreated", recreate: true, want: "expected recorded UID"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			fakeClient := newFakeClient(t, cluster)
+			reconciler := developmentReconciler(fakeClient, nil)
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
+			}
+			before := getCluster(t, ctx, fakeClient, cluster)
+			checkpoint := before.Status.PostgreSQLWritableLeases[0]
+			lease := &coordinationv1.Lease{}
+			key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.LeaseName}
+			if err := fakeClient.Get(ctx, key, lease); err != nil {
+				t.Fatal(err)
+			}
+			if err := fakeClient.Delete(ctx, lease); err != nil {
+				t.Fatal(err)
+			}
+			var replacementUID types.UID
+			if test.recreate {
+				replacement := owned.PostgreSQLWritableLease(before, checkpoint.Shard)
+				if err := fakeClient.Create(ctx, replacement); err != nil {
+					t.Fatal(err)
+				}
+				if replacement.UID == checkpoint.LeaseUID {
+					t.Fatalf("replacement reused recorded UID %s", checkpoint.LeaseUID)
+				}
+				replacementUID = replacement.UID
+			}
+
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("reconcile error = %v, want %q", err, test.want)
+			}
+			after := getCluster(t, ctx, fakeClient, cluster)
+			if !reflect.DeepEqual(after.Status.PostgreSQLWritableLeases, before.Status.PostgreSQLWritableLeases) {
+				t.Fatalf("failed reconciliation changed Lease checkpoints: before=%#v after=%#v", before.Status.PostgreSQLWritableLeases, after.Status.PostgreSQLWritableLeases)
+			}
+			if test.recreate {
+				replacement := &coordinationv1.Lease{}
+				if err := fakeClient.Get(ctx, key, replacement); err != nil {
+					t.Fatal(err)
+				}
+				if replacement.UID != replacementUID {
+					t.Fatalf("controller replaced colliding Lease UID %s with %s", replacementUID, replacement.UID)
+				}
+			}
+		})
+	}
+}
+
+func TestUncheckpointedPostgreSQLWritableLeaseMustBeEmpty(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	lease := owned.PostgreSQLWritableLease(cluster, 0)
+	lease.UID = "preexisting-lease-uid"
+	lease.ResourceVersion = "1"
+	holder := "example-shard-0000-0/pod-uid"
+	duration := int32(15)
+	transitions := int32(1)
+	now := metav1.NewMicroTime(time.Now())
+	lease.Spec = coordinationv1.LeaseSpec{
+		HolderIdentity:       &holder,
+		LeaseDurationSeconds: &duration,
+		AcquireTime:          &now,
+		RenewTime:            &now,
+		LeaseTransitions:     &transitions,
+	}
+	fakeClient := newFakeClient(t, cluster, lease)
+	reconciler := developmentReconciler(fakeClient, nil)
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "is not an empty coordination envelope") {
+		t.Fatalf("reconcile error = %v", err)
+	}
+	if got := getCluster(t, ctx, fakeClient, cluster); len(got.Status.PostgreSQLWritableLeases) != 0 {
+		t.Fatalf("untrusted runtime Lease was checkpointed: %#v", got.Status.PostgreSQLWritableLeases)
+	}
+}
+
 func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -2983,9 +3115,19 @@ func TestReconcilePrunesResourcesRemovedByUpdate(t *testing.T) {
 	if err := fakeClient.Update(ctx, driftedHPA); err != nil {
 		t.Fatal(err)
 	}
+	obsolete := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name:      "example-obsolete",
+		Namespace: cluster.Namespace,
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(
+			cluster,
+			pgshardv1alpha1.GroupVersion.WithKind("PgShardCluster"),
+		)},
+	}}
+	if err := fakeClient.Create(ctx, obsolete); err != nil {
+		t.Fatal(err)
+	}
 
 	current := getCluster(t, ctx, fakeClient, cluster)
-	current.Spec.Shards = 1
 	current.Spec.Pooler.Scaling = pgshardv1alpha1.PoolerScaling{Mode: pgshardv1alpha1.ScalingFixed, Fixed: &pgshardv1alpha1.FixedScaling{Replicas: 4}}
 	current.Generation = 8
 	if err := fakeClient.Update(ctx, current); err != nil {
@@ -3012,8 +3154,8 @@ func TestReconcilePrunesResourcesRemovedByUpdate(t *testing.T) {
 	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 		t.Fatal(err)
 	}
-	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: "example-shard-0001"}, &corev1.Service{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("stale shard Service was not pruned after scaling handoff: %v", err)
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: obsolete.Name}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("stale owned resource was not pruned after scaling handoff: %v", err)
 	}
 	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: "example-pooler"}, &autoscalingv2.HorizontalPodAutoscaler{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("stale HPA was not pruned: %v", err)
@@ -4338,10 +4480,13 @@ func TestRetiredEtcdStorageCleanupRequiresAuthoritativeReader(t *testing.T) {
 	}
 }
 
-func TestOrchestratorLeaseEventsFilterRenewalsButKeepEnvelopeLifecycle(t *testing.T) {
+func TestRuntimeLeaseEventsFilterRenewalsButKeepEnvelopeLifecycle(t *testing.T) {
 	t.Parallel()
 	cluster := validCluster()
 	holderIdentity := "orchestrator-a"
+	duration := int32(15)
+	transitions := int32(1)
+	acquired := metav1.NowMicro()
 	lease := &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            cluster.Name + owned.OrchestratorLeaseSuffix,
@@ -4352,16 +4497,51 @@ func TestOrchestratorLeaseEventsFilterRenewalsButKeepEnvelopeLifecycle(t *testin
 			Labels:          map[string]string{owned.ClusterLabel: cluster.Name},
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cluster, pgshardv1alpha1.GroupVersion.WithKind("PgShardCluster"))},
 		},
-		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holderIdentity},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holderIdentity,
+			LeaseDurationSeconds: &duration,
+			AcquireTime:          &acquired,
+			RenewTime:            &acquired,
+			LeaseTransitions:     &transitions,
+		},
 	}
 	renewed := lease.DeepCopy()
 	renewed.ResourceVersion = "2"
 	renewed.Generation = 2
 	renewTime := metav1.NowMicro()
 	renewed.Spec.RenewTime = &renewTime
-	predicates := orchestratorLeaseEvents()
+	predicates := runtimeLeaseEvents()
 	if predicates.Update(event.UpdateEvent{ObjectOld: lease, ObjectNew: renewed}) {
 		t.Fatal("runtime Lease renewal enqueued a full cluster reconciliation")
+	}
+	missingRenewal := renewed.DeepCopy()
+	missingRenewal.Spec.RenewTime = nil
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: missingRenewal}) {
+		t.Fatal("missing runtime Lease renewal timestamp was filtered")
+	}
+	zeroRenewal := renewed.DeepCopy()
+	zero := metav1.MicroTime{}
+	zeroRenewal.Spec.RenewTime = &zero
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: zeroRenewal}) {
+		t.Fatal("zero runtime Lease renewal timestamp was filtered")
+	}
+	empty := lease.DeepCopy()
+	empty.Spec = coordinationv1.LeaseSpec{}
+	partialEmpty := empty.DeepCopy()
+	partialEmpty.Spec.RenewTime = &renewTime
+	if !predicates.Update(event.UpdateEvent{ObjectOld: empty, ObjectNew: partialEmpty}) {
+		t.Fatal("renewal-only mutation of an empty Lease was filtered")
+	}
+	newHolderIdentity := "orchestrator-b"
+	holderChanged := renewed.DeepCopy()
+	holderChanged.Spec.HolderIdentity = &newHolderIdentity
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: holderChanged}) {
+		t.Fatal("runtime Lease holder transition was filtered")
+	}
+	partialRuntimeState := renewed.DeepCopy()
+	partialRuntimeState.Spec.HolderIdentity = nil
+	if !predicates.Update(event.UpdateEvent{ObjectOld: renewed, ObjectNew: partialRuntimeState}) {
+		t.Fatal("malformed runtime Lease transition was filtered")
 	}
 
 	envelopeChanged := renewed.DeepCopy()
