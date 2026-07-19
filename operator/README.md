@@ -16,6 +16,10 @@ API. The controller now reconciles the safe supporting-resource slice:
   role-neutral `<cluster>-shard-NNNN-0` Pod identity, mutable
   `pgshard.io/role` and `pgshard.io/member` labels, a generated per-shard
   immutable bootstrap credential, and restricted Pod security;
+- for a three- or five-member topology only when the manager explicitly selects
+  `agent-quarantine`, one uninitialized member-`0000` source-storage intent per
+  shard using the same exact-UID Secret/PVC lifecycle, but no PostgreSQL Pod,
+  StatefulSet, PDB, catalog credential, or replication credential;
 - an idempotently migrated `shardschema` database on shard-0000 containing the
   complete immutable shard inventory and an initial restore incarnation for
   each shard;
@@ -41,9 +45,10 @@ the Secret is detached from cluster garbage collection and that transition is
 checkpointed before the first PVC create. Every PVC create is owned by that
 exact detached Secret UID. Once the PVC UID is checkpointed, the controller
 adds its data-protection finalizer, detaches that exact live PVC, and anchors
-the Secret tombstone to the PVC. Workloads are published only after that
-ownership inversion is complete. Deleting the Secret therefore cannot cascade
-to current data, while deleting the protected PVC cascades to the credential
+the Secret tombstone to the PVC. Any workload is published only after that
+ownership inversion is complete. The multi-member source-storage slice stops
+at the inversion and publishes no workload. Deleting the Secret therefore
+cannot cascade to current data, while deleting the protected PVC cascades to the credential
 tombstone and reserves the claim name until every mounting workload has been
 pruned. Original timed-out PVC creates carry the tombstone owner but never the
 data-protection finalizer, so deleting the tombstone garbage-collects any such
@@ -95,8 +100,13 @@ new children. No later resize is accepted.
 `PostgreSQLPrimariesAvailable=True` means only that all of those single-member
 primaries have passed the StatefulSet's minimum-ready window. It does not claim standby
 replication, failover, routing, or zero-downtime restart. Three- and five-member
-resources continue to create no PostgreSQL Pods until bootstrap, replication,
-fencing integration, promotion, and recovery exist.
+resources continue to create no PostgreSQL Pods until initialization,
+replication, fencing integration, promotion, and recovery exist. The default
+`direct` runtime also creates no multi-member bootstrap Secret or PVC. With the
+explicit `agent-quarantine` runtime, the controller checkpoints one blank,
+protected member-`0000` PVC and its bootstrap Secret per shard as non-serving
+source-storage intent. Neither resource is mounted, initialized, selected by a
+Service, or evidence of a primary or standby.
 PostgreSQL StatefulSets use `OnDelete` updates. A controller image, bootstrap
 image, script, or generated-configuration change therefore updates the desired
 template without concurrently deleting every singleton primary. Until a
@@ -113,7 +123,10 @@ As in CloudNativePG, role is routing state rather than instance identity:
 Services select `pgshard.io/role`, while the StatefulSet ordinal and
 `pgshard.io/member` label identify the member. The current one-member slice
 labels member `0000` as `primary`; later promotion must change role labels and
-Service endpoints without renaming or recreating the promoted member.
+Service endpoints without renaming or recreating the promoted member. A
+multi-member source-intent PVC has `pgshard.io/member=0000` but deliberately no
+`pgshard.io/role`, so it cannot authorize a primary or match a role-selecting
+Service.
 An upgrade from the earlier `*-primary` StatefulSet deliberately stops that
 singleton first. The controller foreground-deletes the exact owned workload,
 waits for its termination-fenced Pod to disappear through the uncached API,
@@ -419,7 +432,8 @@ select credential-free `bootstrap-unavailable` and create no PostgreSQL data
 plane. Override the defaults with `--orchestrator-image`, `--pooler-image`, and
 `--postgresql-image` when concrete images
 exist. The privileged `--postgresql-bootstrap-image` deliberately has no remote
-default and is required for the single-member slice. Non-development values
+default and is required for the single-member slice and multi-member
+`agent-quarantine` source-storage intent. Non-development values
 must carry an immutable `@sha256:` digest. The exact local
 `pgshard/postgres-agent:dev` exception uses `imagePullPolicy: Never` and must be
 loaded into every node before creating a cluster. The complete non-development
@@ -532,7 +546,10 @@ application Services have no ready endpoints, no PostgreSQL workload is
 created, and the cluster reports `Ready=False` with
 `PostgreSQLHAUnavailable`. Orchestrator readiness is process-incarnation
 evidence only: durable operation records, shard-term authority, and automated
-failover are not implemented. The named backup PVC is only validated
+failover are not implemented. A default/direct manager creates no PostgreSQL
+storage. An explicitly `agent-quarantine` manager creates only the protected,
+uninitialized member-`0000` source-storage intent; it does not start the agent
+or PostgreSQL for a multi-member resource. The named backup PVC is only validated
 configuration; no backup job or repository is created.
 The manager end-to-end test also pauses reconciliation, deletes the Lease, and
 proves the same orchestrator Pod incarnations lose readiness without restarting.

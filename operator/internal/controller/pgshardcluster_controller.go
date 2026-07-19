@@ -295,7 +295,7 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	if !available {
 		return ctrl.Result{RequeueAfter: retryDelay}, nil
 	}
-	if cluster.Spec.MembersPerShard == 1 {
+	if cluster.Status.PostgreSQLBootstrapSpec != nil || len(cluster.Status.PostgreSQLBootstraps) != 0 {
 		return ctrl.Result{RequeueAfter: bootstrapIntegrityInterval}, nil
 	}
 	return ctrl.Result{}, nil
@@ -307,11 +307,20 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 // replacement workflow; this controller only composes the selected runtime for
 // a workload that does not exist yet.
 func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, desired owned.PostgreSQLRuntime) error {
-	if cluster.Spec.MembersPerShard != 1 {
-		return nil
-	}
 	desired = owned.PostgreSQLRuntime(desired.String())
 	recorded := cluster.Status.PostgreSQLBootstrapSpec
+	if cluster.Spec.MembersPerShard != 1 && desired != owned.PostgreSQLRuntimeAgentQuarantine {
+		if recorded != nil {
+			wanted := bootstrapSpecStatus(cluster, owned.PostgreSQLRuntime(recorded.PostgreSQLRuntime))
+			if !bootstrapSpecsEqual(recorded, wanted) {
+				return fmt.Errorf("current topology or storage differs from the provisioned PostgreSQL bootstrap spec; an explicit transition is required")
+			}
+		}
+		if recorded != nil || len(cluster.Status.PostgreSQLBootstraps) != 0 {
+			return fmt.Errorf("durable multi-member PostgreSQL source storage requires runtime %q, but the manager requested %q", owned.PostgreSQLRuntimeAgentQuarantine, desired)
+		}
+		return nil
+	}
 	if recorded == nil {
 		cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, desired)
 		if err := r.Status().Update(ctx, cluster); err != nil {
@@ -696,8 +705,8 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 	if err := validateBootstrapSpecStatus(cluster); err != nil {
 		return err
 	}
-	if cluster.Spec.MembersPerShard != 1 {
-		return nil
+	if cluster.Spec.MembersPerShard != 1 && cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine.String() {
+		return fmt.Errorf("multi-member PostgreSQL source storage requires runtime %q", owned.PostgreSQLRuntimeAgentQuarantine)
 	}
 
 	reader := r.authoritativeReader()
@@ -1337,7 +1346,10 @@ func validatePostgreSQLDataPVCState(claim *corev1.PersistentVolumeClaim, cluster
 	if claim.Annotations[owned.PostgreSQLDataClusterUIDAnnotation] != string(cluster.UID) {
 		return fmt.Errorf("PostgreSQL data PVC is not bound to PgShardCluster UID %s", cluster.UID)
 	}
-	if claim.Name != bootstrap.PVCName || (!allowDeleting && claim.DeletionTimestamp != nil) || claim.Labels[owned.ClusterLabel] != cluster.Name || claim.Labels[owned.ComponentLabel] != "postgresql" || claim.Labels[owned.ShardLabel] != fmt.Sprintf("%04d", shard) || claim.Labels[owned.RoleLabel] != "primary" || claim.Labels[owned.MemberLabel] != "0000" {
+	role, hasRole := claim.Labels[owned.RoleLabel]
+	roleMatchesTopology := (cluster.Spec.MembersPerShard == 1 && hasRole && role == "primary") ||
+		(cluster.Spec.MembersPerShard != 1 && !hasRole)
+	if claim.Name != bootstrap.PVCName || (!allowDeleting && claim.DeletionTimestamp != nil) || claim.Labels[owned.ClusterLabel] != cluster.Name || claim.Labels[owned.ComponentLabel] != "postgresql" || claim.Labels[owned.ShardLabel] != fmt.Sprintf("%04d", shard) || !roleMatchesTopology || claim.Labels[owned.MemberLabel] != "0000" {
 		return fmt.Errorf("PostgreSQL data PVC metadata does not match shard %d", shard)
 	}
 	if len(claim.Spec.AccessModes) != 1 || claim.Spec.AccessModes[0] != corev1.ReadWriteOnce || claim.Spec.Selector != nil || claim.Spec.DataSource != nil || claim.Spec.DataSourceRef != nil {

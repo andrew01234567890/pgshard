@@ -1533,7 +1533,8 @@ func ValidateImagesForCluster(cluster *pgshardv1alpha1.PgShardCluster, images Im
 	if images.PostgreSQLRuntime != "" && images.PostgreSQLRuntime != PostgreSQLRuntimeDirect && images.PostgreSQLRuntime != PostgreSQLRuntimeAgentQuarantine {
 		return fmt.Errorf("PostgreSQL runtime must be %q or %q", PostgreSQLRuntimeDirect, PostgreSQLRuntimeAgentQuarantine)
 	}
-	if cluster.Spec.MembersPerShard == 1 {
+	multiMemberSourceStorage := (cluster.Spec.MembersPerShard == 3 || cluster.Spec.MembersPerShard == 5) && images.PostgreSQLRuntime.agentQuarantine()
+	if cluster.Spec.MembersPerShard == 1 || multiMemberSourceStorage {
 		if err := validatePostgreSQLBootstrapImage(images.PostgreSQLBootstrap); err != nil {
 			return err
 		}
@@ -2379,14 +2380,16 @@ func CatalogAccessIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, name str
 	}
 }
 
-// PostgreSQLDataPVC returns the standalone data volume for the stable member
-// currently bootstrapped for a shard. Size and storage class come from the
-// checkpointed provisioning contract. Every create is controlled by the exact
-// detached credential Secret UID. The controller adds its data-protection
-// finalizer only after the API UID is checkpointed, then detaches the live PVC
-// and anchors the Secret tombstone to it. Delayed create requests retain this
-// initial owner and no finalizer, so Kubernetes can garbage-collect them after
-// the tombstone is deleted.
+// PostgreSQLDataPVC returns the standalone data volume for stable member 0000.
+// A single-member volume is the current primary; multi-member agent-quarantine
+// uses the same lifecycle only as non-serving initial-source storage and gives
+// it no role label. Size and storage class come from the checkpointed
+// provisioning contract. Every create is controlled by the exact detached
+// credential Secret UID. The controller adds its data-protection finalizer only
+// after the API UID is checkpointed, then detaches the live PVC and anchors the
+// Secret tombstone to it. Delayed create requests retain this initial owner and
+// no finalizer, so Kubernetes can garbage-collect them after the tombstone is
+// deleted.
 func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string, storageSize resource.Quantity, storageClassName *string, fenceName string, fenceUID types.UID) *corev1.PersistentVolumeClaim {
 	metadata := ownedMeta(cluster, name, "postgresql", nil)
 	controller := true
@@ -2401,8 +2404,10 @@ func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, nam
 	}}
 	metadata.Annotations[PostgreSQLDataClusterUIDAnnotation] = string(cluster.UID)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
-	metadata.Labels[RoleLabel] = "primary"
 	metadata.Labels[MemberLabel] = "0000"
+	if cluster.Spec.MembersPerShard == 1 {
+		metadata.Labels[RoleLabel] = "primary"
+	}
 	delete(metadata.Annotations, ApplyOwnershipAnnotation)
 	var selectedStorageClass *string
 	if storageClassName != nil {
