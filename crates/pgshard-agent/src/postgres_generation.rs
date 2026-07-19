@@ -13,15 +13,20 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_postgres::{Client, Config, NoTls};
 
+#[cfg(test)]
+use tokio::sync::oneshot;
+
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const CONNECTION_OPTIONS: &str = "-c search_path=pg_catalog \
     -c session_preload_libraries= -c local_preload_libraries= \
     -c event_triggers=off -c jit=off -c default_tablespace= -c temp_tablespaces= \
     -c default_table_access_method=heap -c default_transaction_read_only=off \
+    -c default_transaction_isolation=read\\ committed \
     -c row_security=off -c synchronous_commit=on -c log_statement=none \
     -c log_min_error_statement=panic -c log_parameter_max_length=0 \
     -c log_parameter_max_length_on_error=0";
 const TRANSACTION_SETTINGS: &str = "\
+    SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\
     SET LOCAL search_path = pg_catalog;\
     SET LOCAL lock_timeout = '2s';\
     SET LOCAL statement_timeout = '5s';\
@@ -47,6 +52,7 @@ const RELATION_IS_SAFE: &str = "\
        AND n.nspacl IS NULL AND c.relacl IS NULL \
        AND c.relkind = 'r' AND c.relpersistence = 'p' AND c.reltablespace = 0 \
        AND c.relam = (SELECT oid FROM pg_catalog.pg_am WHERE amname = 'heap') \
+       AND c.reloptions IS NULL AND NOT c.relispartition AND c.relreplident = 'd' \
        AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity \
        AND NOT c.relhasrules AND NOT c.relhastriggers \
        AND (SELECT pg_catalog.array_agg(\
@@ -68,22 +74,64 @@ const RELATION_IS_SAFE: &str = "\
                                   ORDER BY x.contype, x.conkey::text) \
                         = ARRAY['n:{1}', 'n:{2}', 'p:{1}'] \
             FROM pg_catalog.pg_constraint AS x WHERE x.conrelid = c.oid) \
+       AND (SELECT count(*) = 1 AND bool_and( \
+                       i.indisprimary AND i.indisunique AND NOT i.indisexclusion \
+                       AND i.indimmediate AND i.indisvalid AND i.indisready \
+                       AND i.indislive AND NOT i.indisclustered \
+                       AND NOT i.indisreplident AND NOT i.indcheckxmin \
+                       AND NOT i.indnullsnotdistinct \
+                       AND i.indnatts = 1 AND i.indnkeyatts = 1 \
+                       AND i.indkey[0] = 1 AND i.indcollation[0] = 0 \
+                       AND i.indoption[0] = 0 \
+                       AND i.indexprs IS NULL AND i.indpred IS NULL \
+                       AND ic.relname = 'writable_generation_pkey' \
+                       AND ic.relnamespace = n.oid AND ic.relowner = c.relowner \
+                       AND ic.relkind = 'i' AND ic.relpersistence = 'p' \
+                       AND ic.reltablespace = 0 AND ic.relacl IS NULL \
+                       AND ic.reloptions IS NULL \
+                       AND ic.relam = (SELECT oid FROM pg_catalog.pg_am \
+                                      WHERE amname = 'btree') \
+                       AND i.indclass[0] = ( \
+                           SELECT o.oid FROM pg_catalog.pg_opclass AS o \
+                           JOIN pg_catalog.pg_am AS a ON a.oid = o.opcmethod \
+                           JOIN pg_catalog.pg_namespace AS x ON x.oid = o.opcnamespace \
+                           WHERE o.opcname = 'bool_ops' AND o.opcdefault \
+                             AND o.opcintype = pg_catalog.to_regtype('pg_catalog.bool') \
+                             AND a.amname = 'btree' AND x.nspname = 'pg_catalog')) \
+            FROM pg_catalog.pg_index AS i \
+            JOIN pg_catalog.pg_class AS ic ON ic.oid = i.indexrelid \
+            WHERE i.indrelid = c.oid) \
     FROM pg_catalog.pg_namespace AS n \
     JOIN pg_catalog.pg_class AS c ON c.relnamespace = n.oid \
     WHERE n.nspname = 'pgshard_internal' AND c.relname = 'writable_generation'";
 const LOCK_GENERATION_TABLE: &str = "\
     LOCK TABLE pgshard_internal.writable_generation IN SHARE ROW EXCLUSIVE MODE";
+const LOCK_GENERATION_CATALOG_ROWS: &str = "\
+    SELECT n.oid, c.oid, i.indexrelid, ic.oid \
+    FROM pg_catalog.pg_namespace AS n \
+    JOIN pg_catalog.pg_class AS c ON c.relnamespace = n.oid \
+    JOIN pg_catalog.pg_index AS i ON i.indrelid = c.oid \
+    JOIN pg_catalog.pg_class AS ic ON ic.oid = i.indexrelid \
+    WHERE n.nspname = 'pgshard_internal' AND c.relname = 'writable_generation' \
+    FOR UPDATE OF n, c, i, ic";
 const SELECT_FOR_UPDATE: &str = "\
     SELECT singleton, generation FROM pgshard_internal.writable_generation FOR UPDATE";
-const SELECT_CURRENT: &str = "\
-    SELECT generation FROM pgshard_internal.writable_generation \
-    WHERE singleton = true";
 const INSERT_GENERATION: &str = "\
     INSERT INTO pgshard_internal.writable_generation (singleton, generation) \
     VALUES (true, $1)";
 const UPDATE_GENERATION: &str = "\
     UPDATE pgshard_internal.writable_generation SET generation = $1 \
     WHERE singleton = true";
+
+#[cfg(test)]
+struct StablePublicationGate {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static TEST_STABLE_PUBLICATION_GATE: std::sync::Mutex<Option<StablePublicationGate>> =
+    std::sync::Mutex::new(None);
 
 /// Publishes one generation to a singleton WAL-logged row in the `postgres`
 /// database over the private Unix socket.
@@ -133,24 +181,11 @@ where
                 }
             }
         }
-        if query_safety(&transaction, SCHEMA_IS_SAFE).await? != Some(true) {
-            // Recheck after relation setup so a catalog-level race cannot make
-            // a previously safe namespace authorize publication.
-            return Err(PostgresGenerationError::UnsafeSchema);
-        }
-        if query_safety(&transaction, RELATION_IS_SAFE).await? != Some(true) {
-            return Err(PostgresGenerationError::UnsafeRelation);
-        }
-        transaction.batch_execute(LOCK_GENERATION_TABLE).await?;
+        lock_and_validate_generation_relation(&transaction).await?;
+        #[cfg(test)]
+        stable_publication_checkpoint().await;
         let rows = transaction.query(SELECT_FOR_UPDATE, &[]).await?;
-        let existing = match rows.as_slice() {
-            [] => None,
-            [row] if row.try_get::<_, bool>(0)? => {
-                let bytes = row.try_get::<_, Vec<u8>>(1)?;
-                Some(parse_generation(&bytes)?)
-            }
-            _ => return Err(PostgresGenerationError::SingletonChanged),
-        };
+        let existing = parse_locked_generation_rows(&rows)?;
         let transition = classify_writable_generation_transition(existing.as_ref(), requested)?;
         let bytes = requested.canonical_bytes();
         match transition {
@@ -203,6 +238,70 @@ async fn query_safety(
     }
 }
 
+async fn lock_and_validate_generation_relation(
+    transaction: &tokio_postgres::Transaction<'_>,
+) -> Result<(), PostgresGenerationError> {
+    // The relation lock resolves the currently named object and excludes
+    // DDL that changes its table/index shape. Catalog tuple locks additionally
+    // serialize namespace and ACL/owner metadata updates that need not take a
+    // conflicting relation lock. All locks remain held until commit/rollback.
+    transaction.batch_execute(LOCK_GENERATION_TABLE).await?;
+    let catalog_rows = transaction.query(LOCK_GENERATION_CATALOG_ROWS, &[]).await?;
+    if catalog_rows.is_empty() {
+        return Err(PostgresGenerationError::UnsafeRelation);
+    }
+    if query_safety(transaction, SCHEMA_IS_SAFE).await? != Some(true) {
+        return Err(PostgresGenerationError::UnsafeSchema);
+    }
+    if query_safety(transaction, RELATION_IS_SAFE).await? != Some(true) {
+        return Err(PostgresGenerationError::UnsafeRelation);
+    }
+    Ok(())
+}
+
+fn parse_locked_generation_rows(
+    rows: &[tokio_postgres::Row],
+) -> Result<Option<DurableWritableGeneration>, PostgresGenerationError> {
+    match rows {
+        [] => Ok(None),
+        [row] if row.try_get::<_, bool>(0)? => {
+            let bytes = row.try_get::<_, Vec<u8>>(1)?;
+            Ok(Some(parse_generation(&bytes)?))
+        }
+        _ => Err(PostgresGenerationError::SingletonChanged),
+    }
+}
+
+#[cfg(test)]
+fn gate_next_stable_publication() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let mut gate = TEST_STABLE_PUBLICATION_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        gate.replace(StablePublicationGate {
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .is_none(),
+        "test already has a stable-publication gate"
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn stable_publication_checkpoint() {
+    let gate = TEST_STABLE_PUBLICATION_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
 async fn reconcile_ambiguous_commit<F>(
     socket_dir: &Path,
     previous: Option<&DurableWritableGeneration>,
@@ -252,21 +351,9 @@ async fn read_current(
         Some(false) => return Err(PostgresGenerationError::UnsafeRelation),
         Some(true) => {}
     }
-    transaction.batch_execute(LOCK_GENERATION_TABLE).await?;
-    if query_safety(&transaction, SCHEMA_IS_SAFE).await? != Some(true) {
-        return Err(PostgresGenerationError::UnsafeSchema);
-    }
-    if query_safety(&transaction, RELATION_IS_SAFE).await? != Some(true) {
-        return Err(PostgresGenerationError::UnsafeRelation);
-    }
-    match transaction.query_opt(SELECT_CURRENT, &[]).await {
-        Ok(Some(row)) => {
-            let bytes = row.try_get::<_, Vec<u8>>(0)?;
-            Ok(Some(parse_generation(&bytes)?))
-        }
-        Ok(None) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+    lock_and_validate_generation_relation(&transaction).await?;
+    let rows = transaction.query(SELECT_FOR_UPDATE, &[]).await?;
+    parse_locked_generation_rows(&rows)
 }
 
 fn classify_ambiguous_commit(
@@ -451,6 +538,7 @@ mod tests {
     #[test]
     fn publication_sql_is_fixed_logged_and_local() {
         assert!(TRANSACTION_SETTINGS.contains("search_path = pg_catalog"));
+        assert!(TRANSACTION_SETTINGS.contains("ISOLATION LEVEL READ COMMITTED"));
         assert!(TRANSACTION_SETTINGS.contains("synchronous_commit = on"));
         assert!(TRANSACTION_SETTINGS.contains("lock_timeout"));
         assert!(TRANSACTION_SETTINGS.contains("statement_timeout"));
@@ -465,7 +553,12 @@ mod tests {
         assert!(RELATION_IS_SAFE.contains("relpersistence = 'p'"));
         assert!(RELATION_IS_SAFE.contains("NOT c.relhastriggers"));
         assert!(RELATION_IS_SAFE.contains("ARRAY['n:{1}', 'n:{2}', 'p:{1}']"));
+        assert!(RELATION_IS_SAFE.contains("count(*) = 1"));
+        assert!(RELATION_IS_SAFE.contains("i.indexprs IS NULL"));
+        assert!(RELATION_IS_SAFE.contains("i.indpred IS NULL"));
+        assert!(RELATION_IS_SAFE.contains("i.indclass[0]"));
         assert!(LOCK_GENERATION_TABLE.contains("SHARE ROW EXCLUSIVE"));
+        assert!(LOCK_GENERATION_CATALOG_ROWS.contains("FOR UPDATE OF n, c, i, ic"));
         assert!(CONNECTION_OPTIONS.contains("event_triggers=off"));
         assert!(CONNECTION_OPTIONS.contains("log_statement=none"));
     }
@@ -483,40 +576,7 @@ mod tests {
             .await
             .expect("connect to streaming standby");
         let first = generation("cluster-1", "holder-a", 1);
-        let unsafe_schema = connect(&socket_dir).await.expect("prepare unsafe schema");
-        unsafe_schema
-            .client
-            .batch_execute(
-                "CREATE SCHEMA pgshard_internal AUTHORIZATION postgres; \
-                 GRANT USAGE ON SCHEMA pgshard_internal TO PUBLIC",
-            )
-            .await
-            .expect("create unsafe preexisting schema");
-        assert!(matches!(
-            publish_writable_generation(&socket_dir, &first, &|| true).await,
-            Err(PostgresGenerationError::UnsafeSchema)
-        ));
-        let relation = unsafe_schema
-            .client
-            .query_one(
-                "SELECT pg_catalog.to_regclass(\
-                     'pgshard_internal.writable_generation')::text",
-                &[],
-            )
-            .await
-            .expect("inspect rejected schema")
-            .try_get::<_, Option<String>>(0)
-            .expect("optional rejected relation");
-        assert!(
-            relation.is_none(),
-            "unsafe schema was mutated before rejection"
-        );
-        unsafe_schema
-            .client
-            .batch_execute("DROP SCHEMA pgshard_internal")
-            .await
-            .expect("remove unsafe schema fixture");
-        drop(unsafe_schema);
+        assert_unsafe_schema_rejected_before_ddl(&socket_dir, &first).await;
 
         publish_writable_generation(&socket_dir, &first, &|| true)
             .await
@@ -524,6 +584,23 @@ mod tests {
         publish_writable_generation(&socket_dir, &first, &|| true)
             .await
             .expect("replay live generation");
+        assert_stable_publication_blocks_ddl(
+            &socket_dir,
+            &first,
+            "BEGIN; SET LOCAL lock_timeout = '5s'; \
+             GRANT USAGE ON SCHEMA pgshard_internal TO PUBLIC; ROLLBACK",
+        )
+        .await;
+        assert_stable_publication_blocks_ddl(
+            &socket_dir,
+            &first,
+            "BEGIN; SET LOCAL lock_timeout = '5s'; \
+             DROP TABLE pgshard_internal.writable_generation; \
+             CREATE TABLE pgshard_internal.writable_generation (\
+                 singleton boolean, generation bytea); \
+             ROLLBACK",
+        )
+        .await;
         let primary = connect(&socket_dir).await.expect("inspect primary WAL");
         assert_eq!(
             control_identity(&primary.client).await,
@@ -544,6 +621,9 @@ mod tests {
             ))
         ));
         let second = generation("cluster-1", "holder-b", 2);
+        assert_ambiguous_reread_rejects_extra_row(&socket_dir, &first).await;
+        assert_hostile_indexes_rejected_before_dml(&socket_dir, &second).await;
+
         publish_writable_generation(&socket_dir, &second, &|| true)
             .await
             .expect("advance live generation");
@@ -577,6 +657,135 @@ mod tests {
             .expect("remove disposable generation schema");
     }
 
+    async fn assert_unsafe_schema_rejected_before_ddl(
+        socket_dir: &Path,
+        generation: &DurableWritableGeneration,
+    ) {
+        let connection = connect(socket_dir).await.expect("prepare unsafe schema");
+        connection
+            .client
+            .batch_execute(
+                "CREATE SCHEMA pgshard_internal AUTHORIZATION postgres; \
+                 GRANT USAGE ON SCHEMA pgshard_internal TO PUBLIC",
+            )
+            .await
+            .expect("create unsafe preexisting schema");
+        assert!(matches!(
+            publish_writable_generation(socket_dir, generation, &|| true).await,
+            Err(PostgresGenerationError::UnsafeSchema)
+        ));
+        let relation = connection
+            .client
+            .query_one(
+                "SELECT pg_catalog.to_regclass(\
+                     'pgshard_internal.writable_generation')::text",
+                &[],
+            )
+            .await
+            .expect("inspect rejected schema")
+            .try_get::<_, Option<String>>(0)
+            .expect("optional rejected relation");
+        assert!(
+            relation.is_none(),
+            "unsafe schema was mutated before rejection"
+        );
+        connection
+            .client
+            .batch_execute("DROP SCHEMA pgshard_internal")
+            .await
+            .expect("remove unsafe schema fixture");
+    }
+
+    async fn assert_ambiguous_reread_rejects_extra_row(
+        socket_dir: &Path,
+        generation: &DurableWritableGeneration,
+    ) {
+        let attacker = connect(socket_dir)
+            .await
+            .expect("prepare singleton-cardinality attack");
+        attacker
+            .client
+            .execute(
+                "INSERT INTO pgshard_internal.writable_generation \
+                 (singleton, generation) VALUES (false, $1)",
+                &[&generation.canonical_bytes()],
+            )
+            .await
+            .expect("insert false singleton row");
+        let mut rereader = connect(socket_dir)
+            .await
+            .expect("connect ambiguous rereader");
+        assert!(matches!(
+            read_current(&mut rereader.client).await,
+            Err(PostgresGenerationError::SingletonChanged)
+        ));
+        attacker
+            .client
+            .execute(
+                "DELETE FROM pgshard_internal.writable_generation WHERE NOT singleton",
+                &[],
+            )
+            .await
+            .expect("remove false singleton row");
+    }
+
+    async fn assert_hostile_indexes_rejected_before_dml(
+        socket_dir: &Path,
+        requested: &DurableWritableGeneration,
+    ) {
+        let attacker = connect(socket_dir)
+            .await
+            .expect("prepare hostile index fixtures");
+        attacker
+            .client
+            .batch_execute(
+                "CREATE SEQUENCE pgshard_internal.attacker_calls; \
+                 CREATE FUNCTION pgshard_internal.attacker_index_expression(boolean) \
+                 RETURNS boolean LANGUAGE plpgsql IMMUTABLE STRICT \
+                 SET search_path = pg_catalog AS $$ \
+                 BEGIN \
+                   PERFORM pg_catalog.nextval(\
+                     'pgshard_internal.attacker_calls'::pg_catalog.regclass); \
+                   RETURN $1; \
+                 END $$; \
+                 CREATE INDEX writable_generation_attacker_expression \
+                 ON pgshard_internal.writable_generation \
+                 ((pgshard_internal.attacker_index_expression(singleton)))",
+            )
+            .await
+            .expect("create hostile expression index");
+        let calls_before = sequence_state(&attacker.client).await;
+        assert!(matches!(
+            publish_writable_generation(socket_dir, requested, &|| true).await,
+            Err(PostgresGenerationError::UnsafeRelation)
+        ));
+        assert_eq!(
+            sequence_state(&attacker.client).await,
+            calls_before,
+            "relation rejection must precede attacker expression execution"
+        );
+        attacker
+            .client
+            .batch_execute(
+                "DROP INDEX pgshard_internal.writable_generation_attacker_expression; \
+                 DROP FUNCTION pgshard_internal.attacker_index_expression(boolean); \
+                 DROP SEQUENCE pgshard_internal.attacker_calls; \
+                 CREATE INDEX writable_generation_attacker_extra \
+                 ON pgshard_internal.writable_generation (generation)",
+            )
+            .await
+            .expect("replace expression index with extra plain index");
+        assert!(matches!(
+            publish_writable_generation(socket_dir, requested, &|| true).await,
+            Err(PostgresGenerationError::UnsafeRelation)
+        ));
+        attacker
+            .client
+            .batch_execute("DROP INDEX pgshard_internal.writable_generation_attacker_extra")
+            .await
+            .expect("remove extra plain index");
+    }
+
     async fn control_identity(client: &Client) -> (String, String) {
         let row = client
             .query_one(
@@ -600,6 +809,89 @@ mod tests {
             .expect("read primary WAL flush barrier")
             .try_get(0)
             .expect("primary flush LSN")
+    }
+
+    async fn assert_stable_publication_blocks_ddl(
+        socket_dir: &Path,
+        generation: &DurableWritableGeneration,
+        ddl: &'static str,
+    ) {
+        let (entered, release) = gate_next_stable_publication();
+        let publication_socket = socket_dir.to_owned();
+        let publication_generation = generation.clone();
+        let publication = tokio::spawn(async move {
+            publish_writable_generation(&publication_socket, &publication_generation, &|| true)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("publisher reached stable relation lock")
+            .expect("publisher retained stable relation gate");
+
+        let attacker = connect(socket_dir).await.expect("connect concurrent DDL");
+        let attacker_pid = attacker
+            .client
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .await
+            .expect("read concurrent DDL backend PID")
+            .try_get::<_, i32>(0)
+            .expect("concurrent DDL backend PID");
+        let ddl_task = tokio::spawn(async move { attacker.client.batch_execute(ddl).await });
+        let observer = connect(socket_dir).await.expect("observe concurrent DDL");
+        wait_for_backend_lock(&observer.client, attacker_pid).await;
+        assert!(
+            !ddl_task.is_finished(),
+            "concurrent DDL passed the publisher's stable lock"
+        );
+
+        release.send(()).expect("release stable publication");
+        publication
+            .await
+            .expect("join stable publication")
+            .expect("stable publication commits before DDL");
+        ddl_task
+            .await
+            .expect("join concurrent DDL")
+            .expect("concurrent DDL proceeds only after publication commit");
+    }
+
+    async fn wait_for_backend_lock(observer: &Client, backend_pid: i32) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting = observer
+                    .query_one(
+                        "SELECT COALESCE((\
+                             SELECT wait_event_type = 'Lock' \
+                             FROM pg_catalog.pg_stat_activity WHERE pid = $1), false)",
+                        &[&backend_pid],
+                    )
+                    .await
+                    .expect("inspect concurrent DDL wait")
+                    .try_get::<_, bool>(0)
+                    .expect("concurrent DDL lock wait");
+                if waiting {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("concurrent DDL reached the publisher lock");
+    }
+
+    async fn sequence_state(client: &Client) -> (i64, bool) {
+        let row = client
+            .query_one(
+                "SELECT last_value, is_called \
+                 FROM pgshard_internal.attacker_calls",
+                &[],
+            )
+            .await
+            .expect("read attacker sequence state");
+        (
+            row.try_get(0).expect("attacker sequence value"),
+            row.try_get(1).expect("attacker sequence called state"),
+        )
     }
 
     async fn wait_for_replayed_generation(
