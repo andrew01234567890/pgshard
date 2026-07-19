@@ -380,12 +380,8 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
         .as_ref()
         .and_then(|postgres| postgres.replay_lsn)
         .map_or(0, |PgLsn(lsn)| lsn);
-    let postgres_process_up = u8::from(matches!(
-        snapshot.postgres_process,
-        PostgresProcessState::StartingQuarantined
-            | PostgresProcessState::RunningQuarantined
-            | PostgresProcessState::Stopping
-    ));
+    let (postgres_process_up, postgres_replication_bootstrap) =
+        postgres_process_metrics(snapshot.postgres_process);
     let body = format!(
         concat!(
             "# HELP pgshard_agent_up Whether the process health endpoint is running.\n",
@@ -414,7 +410,10 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
             "pgshard_agent_postgres_replay_lsn {replay_lsn}\n",
             "# HELP pgshard_agent_postgres_process_up Whether a locally supervised postmaster process exists.\n",
             "# TYPE pgshard_agent_postgres_process_up gauge\n",
-            "pgshard_agent_postgres_process_up {postgres_process_up}\n"
+            "pgshard_agent_postgres_process_up {postgres_process_up}\n",
+            "# HELP pgshard_agent_postgres_replication_bootstrap Whether the postmaster is a non-serving physical-clone source.\n",
+            "# TYPE pgshard_agent_postgres_replication_bootstrap gauge\n",
+            "pgshard_agent_postgres_replication_bootstrap {postgres_replication_bootstrap}\n"
         ),
         pgshard_version::VERSION,
         pgshard_version::GIT_SHA,
@@ -425,8 +424,26 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
         flush_lsn = flush_lsn,
         replay_lsn = replay_lsn,
         postgres_process_up = postgres_process_up,
+        postgres_replication_bootstrap = postgres_replication_bootstrap,
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+}
+
+fn postgres_process_metrics(process: PostgresProcessState) -> (u8, u8) {
+    let process_up = u8::from(matches!(
+        process,
+        PostgresProcessState::StartingQuarantined
+            | PostgresProcessState::RunningQuarantined
+            | PostgresProcessState::StartingReplicationBootstrap
+            | PostgresProcessState::RunningReplicationBootstrap
+            | PostgresProcessState::Stopping
+    ));
+    let replication_bootstrap = u8::from(matches!(
+        process,
+        PostgresProcessState::StartingReplicationBootstrap
+            | PostgresProcessState::RunningReplicationBootstrap
+    ));
+    (process_up, replication_bootstrap)
 }
 
 #[cfg(test)]
@@ -437,6 +454,26 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[test]
+    fn process_metrics_distinguish_replication_bootstrap_from_quarantine() {
+        assert_eq!(
+            postgres_process_metrics(PostgresProcessState::RunningQuarantined),
+            (1, 0)
+        );
+        assert_eq!(
+            postgres_process_metrics(PostgresProcessState::StartingReplicationBootstrap),
+            (1, 1)
+        );
+        assert_eq!(
+            postgres_process_metrics(PostgresProcessState::RunningReplicationBootstrap),
+            (1, 1)
+        );
+        assert_eq!(
+            postgres_process_metrics(PostgresProcessState::Validated),
+            (0, 0)
+        );
+    }
 
     struct ErrorOnceAcceptor {
         listener: TcpListener,

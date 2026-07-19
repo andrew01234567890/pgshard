@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::coordination::WritableLeaseConfig;
 use crate::domain::AgentIdentity;
-use crate::postgres::{PostgresConfig, PostgresConfigError};
+use crate::postgres::{PostgresConfig, PostgresConfigError, PostgresRuntimeRole};
 use crate::telemetry::TelemetryConfig;
 
 /// Validated process configuration.
@@ -28,7 +28,7 @@ pub struct AgentConfig {
     pub writable_lease: Option<WritableLeaseConfig>,
     /// OpenTelemetry configuration placeholder.
     pub telemetry: TelemetryConfig,
-    /// Optional client-TCP-quarantined `PostgreSQL` process supervision.
+    /// Optional fail-closed `PostgreSQL` process supervision.
     pub postgres: Option<PostgresConfig>,
 }
 
@@ -37,6 +37,7 @@ enum PostgresMode {
     #[default]
     Disabled,
     Quarantine,
+    ReplicationBootstrapPrimary,
 }
 
 #[derive(Debug, Parser)]
@@ -141,6 +142,34 @@ struct RawConfig {
     postgres_immediate_shutdown_ms: u64,
 }
 
+impl RawConfig {
+    fn postgres_config(&self) -> Result<Option<PostgresConfig>, ConfigError> {
+        let role = match self.postgres_mode {
+            PostgresMode::Disabled => return Ok(None),
+            PostgresMode::Quarantine => PostgresRuntimeRole::Quarantine,
+            PostgresMode::ReplicationBootstrapPrimary => {
+                PostgresRuntimeRole::ReplicationBootstrapPrimary
+            }
+        };
+        let data_dir = self
+            .postgres_data_dir
+            .clone()
+            .ok_or(ConfigError::PostgresDataDirectoryMissing)?;
+        PostgresConfig::new_for_role(
+            role,
+            data_dir,
+            self.postgres_bin.clone(),
+            self.postgres_socket_dir.clone(),
+            self.postgres_hba_file.clone(),
+            Duration::from_millis(self.postgres_smart_shutdown_ms),
+            Duration::from_millis(self.postgres_fast_shutdown_ms),
+            Duration::from_millis(self.postgres_immediate_shutdown_ms),
+        )
+        .map(Some)
+        .map_err(ConfigError::from)
+    }
+}
+
 impl AgentConfig {
     /// Parses configuration from process arguments and environment variables.
     ///
@@ -169,6 +198,7 @@ impl AgentConfig {
         if !(1_000..=300_000).contains(&raw.max_lease_ttl_ms) {
             return Err(ConfigError::InvalidLeaseTtl(raw.max_lease_ttl_ms));
         }
+        let postgres = raw.postgres_config()?;
 
         let identity = AgentIdentity {
             cluster_id: raw.cluster_id,
@@ -229,25 +259,9 @@ impl AgentConfig {
 
         let otlp_endpoint = raw
             .otlp_endpoint
-            .map(|value| validate_otlp_endpoint(&value))
+            .as_deref()
+            .map(validate_otlp_endpoint)
             .transpose()?;
-        let postgres = match raw.postgres_mode {
-            PostgresMode::Disabled => None,
-            PostgresMode::Quarantine => {
-                let data_dir = raw
-                    .postgres_data_dir
-                    .ok_or(ConfigError::PostgresDataDirectoryMissing)?;
-                Some(PostgresConfig::new(
-                    data_dir,
-                    raw.postgres_bin,
-                    raw.postgres_socket_dir,
-                    raw.postgres_hba_file,
-                    Duration::from_millis(raw.postgres_smart_shutdown_ms),
-                    Duration::from_millis(raw.postgres_fast_shutdown_ms),
-                    Duration::from_millis(raw.postgres_immediate_shutdown_ms),
-                )?)
-            }
-        };
         validate_writable_postgres_pair(writable_lease.as_ref(), postgres.as_ref())?;
 
         Ok(Self {
@@ -271,6 +285,10 @@ fn validate_writable_postgres_pair(
 ) -> Result<(), ConfigError> {
     if writable_lease.is_some() && postgres.is_none() {
         return Err(ConfigError::WritableLeaseRequiresPostgres);
+    }
+    if postgres.is_some_and(PostgresConfig::requires_writable_authority) && writable_lease.is_none()
+    {
+        return Err(ConfigError::ReplicationBootstrapPrimaryRequiresWritableLease);
     }
     if let (Some(writable_lease), Some(postgres)) = (writable_lease, postgres) {
         let shutdown_margin = writable_lease.shutdown_margin();
@@ -358,8 +376,13 @@ pub enum ConfigError {
         maximum_ms: u64,
     },
     /// Lease ownership without the supervised postmaster has no safe runtime role.
-    #[error("writable-term Lease coordination requires supervised PostgreSQL quarantine mode")]
+    #[error("writable-term Lease coordination requires supervised PostgreSQL")]
     WritableLeaseRequiresPostgres,
+    /// Replication-bootstrap-primary TCP must never start without exact writable authority.
+    #[error(
+        "PostgreSQL replication-bootstrap-primary mode requires writable-term Lease coordination"
+    )]
+    ReplicationBootstrapPrimaryRequiresWritableLease,
     /// Target-side fencing cannot finish inside the reserved Lease margin.
     #[error(
         "writable-term Lease shutdown margin {shutdown_margin_ms} ms must exceed PostgreSQL target-fence budget {target_fence_budget_ms} ms"
@@ -381,8 +404,8 @@ pub enum ConfigError {
     /// Endpoint is not an unauthenticated HTTP(S) URL.
     #[error("OTLP endpoint {0:?} must be an HTTP(S) URL without embedded credentials")]
     UnsafeOtlpEndpoint(String),
-    /// Quarantine mode requires an explicit durable data directory.
-    #[error("PGDATA is required when PostgreSQL quarantine supervision is enabled")]
+    /// Every supervised `PostgreSQL` role requires an explicit durable data directory.
+    #[error("PGDATA is required when PostgreSQL supervision is enabled")]
     PostgresDataDirectoryMissing,
     /// `PostgreSQL` process configuration is unsafe or unbounded.
     #[error(transparent)]
@@ -467,6 +490,47 @@ mod tests {
         ]);
         let config = AgentConfig::try_parse_from(args).expect("valid writable Lease config");
         assert!(config.writable_lease.is_some());
+    }
+
+    #[test]
+    fn replication_bootstrap_primary_requires_exact_writable_lease_identity() {
+        let mut unleased = required_args();
+        unleased.extend([
+            "--postgres-mode",
+            "replication-bootstrap-primary",
+            "--postgres-data-dir",
+            "/var/lib/postgresql/data",
+        ]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(unleased),
+            Err(ConfigError::ReplicationBootstrapPrimaryRequiresWritableLease)
+        ));
+
+        let mut leased = required_args();
+        leased.extend([
+            "--cluster-uid",
+            "11111111-2222-3333-4444-555555555555",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--lease-namespace",
+            "database",
+            "--writable-lease-name",
+            "cluster-1-cell-0003-writable",
+            "--writable-lease-uid",
+            "99999999-8888-7777-6666-555555555555",
+            "--postgres-mode",
+            "replication-bootstrap-primary",
+            "--postgres-data-dir",
+            "/var/lib/postgresql/data",
+        ]);
+        let config = AgentConfig::try_parse_from(leased).expect("leased replication primary");
+        assert!(config.writable_lease.is_some());
+        assert!(
+            config
+                .postgres
+                .as_ref()
+                .is_some_and(PostgresConfig::requires_writable_authority)
+        );
     }
 
     #[test]
