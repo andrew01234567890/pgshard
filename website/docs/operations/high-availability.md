@@ -483,10 +483,13 @@ empty Lease envelope per cell with an unmounted exact-name API identity, and the
 opt-in Rust agent implements the exact claim, renewal, takeover-observation, and
 monotonic-deadline transport. A configured writable term forces every shutdown
 through immediate process-tree fencing, and unsafe Lease/fence timing pairs are
-rejected. The operator does not yet inject that runtime into PostgreSQL Pods,
-and the agent supports only TCP-quarantined PostgreSQL. There is no durable
-generation install, promotion, or serving activation path. The fleet-level
-orchestrator leadership Lease remains
+rejected. The operator's default runtime remains direct, while the explicit
+`agent-quarantine` mode injects that runtime into a non-serving PostgreSQL Pod.
+The agent supports only TCP-quarantined PostgreSQL and installs the local durable
+pre-start generation floor described above. SQL and prepare target-side
+generation enforcement, replicated promotion evidence, peer isolation,
+promotion, and serving activation remain absent. The fleet-level orchestrator
+leadership Lease remains
 a separate control-plane mutex and is deliberately not a shard term.
 
 As in CloudNativePG, a candidate observes a competing holder's Lease record
@@ -498,10 +501,11 @@ separate earlier deadline; the deadline race stops awaiting any in-flight Lease
 request. An unknown commit cannot overwrite a later resource version, and a
 visible commit restarts a candidate's full unchanged-record observation window.
 A coordination failure clears that evidence and requests immediate process-tree
-fencing. That local mechanism is necessary but
-not sufficient: the serving-primary lifecycle, peer-isolation policy, durable
-generation fence, and promotion ordering remain unimplemented, and a Kubernetes
-Lease alone cannot fence an isolated process or node.
+fencing. That local mechanism is necessary but not sufficient: the durable
+record is only a pre-start floor, not target-side SQL or prepare enforcement.
+The serving-primary lifecycle, peer-isolation policy, replicated promotion
+evidence, and promotion ordering remain unimplemented, and a Kubernetes Lease
+alone cannot fence an isolated process or node.
 
 The existing in-memory state machines model the later boundary. Both the
 orchestrator authority and receiving agent reject expired or overlong leases;
