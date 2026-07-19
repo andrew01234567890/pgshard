@@ -19,16 +19,41 @@ commit rather than bypassing the exact-head CI release gate.
 - Promotion to 1.0 is an explicit maintainer decision and is not performed by the automated pre-1.0 calculator.
 - Pull request titles follow Conventional Commits because squash merge makes the title the `main` commit subject.
 
-The release job is serialized and idempotent. Queue order is not trusted: each
-invocation finds the nearest SemVer tag on the selected commit's first-parent
-history and publishes every untagged first-parent commit oldest-first. A
-descendant job may therefore safely run before its ancestor's job. Before
-publishing, it waits for every planned ancestor's exact aggregate check to
-succeed and fails immediately if a completed aggregate failed; this covers
-GitHub's explicitly unordered concurrency scheduling without releasing an
-unchecked gap. It creates no version-bump commit, preventing release loops.
+The release planner is serialized and idempotent. Queue order is not trusted:
+it finds the nearest SemVer tag on the selected commit's first-parent history
+and considers every untagged first-parent commit oldest-first. Strict exact-SHA
+publication waits for every planned ancestor's exact aggregate check and fails
+if a completed aggregate failed. Normal main reconciliation, described below,
+instead stops before the first unchecked commit. Neither mode releases an
+unchecked gap or creates a version-bump commit.
 Documentation-only and CI-only default-branch commits still receive patch
 releases.
+
+The complete CI workflow is serialized for every non-pull-request run. Main
+pushes, scheduled validation, and exact-SHA Dependabot dispatches share a
+maximum-depth concurrency queue, so only one such run builds at a time while
+pull requests retain independent CI capacity. GitHub processes this queue
+first-in-first-out by the time each run starts waiting, rather than by dispatch
+or commit order.
+
+Publication runs in a separate trusted `workflow_run` workflow after successful
+CI and retains its own serialized queue. Normal main publication resolves the
+live main tip and publishes only its oldest contiguous CI-green prefix. A
+reordered descendant therefore defers at the first unchecked ancestor without
+holding or failing the build queue; every later successful completion retries
+the live gap. Exact-SHA Dependabot publication retains its strict wait before
+deleting the temporary tag. The release planner always publishes untagged
+first-parent commits oldest-first.
+
+Pages deployment is reconciled after publication under that same serialized
+workflow. It resolves the live main SHA, requires an exact source release at
+that commit, and deploys the `pages-site` artifact produced by successful CI on
+that exact SHA. Every non-PR CI run builds and retains that candidate, including
+code-only main commits. A reordered older run therefore either deploys the same
+live content or defers; it cannot lose an intervening documentation change or
+overwrite the site with an older commit. Candidate lookup failures fail the
+release workflow so GitHub exposes the error instead of recording a successful
+no-op.
 
 Verified Dependabot updates to the unattended file allowlist are squash-merged
 by the trusted default-branch workflow when every dependency has explicit patch

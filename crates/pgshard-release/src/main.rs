@@ -60,6 +60,9 @@ enum ReleaseCommand {
         /// Exact main-branch commit to release.
         #[arg(long)]
         sha: String,
+        /// Publish only the oldest contiguous CI-green prefix without waiting.
+        #[arg(long)]
+        ready_only: bool,
     },
     /// Safely squash-merge a verified patch or minor update after successful CI.
     DependabotAutomerge {
@@ -266,7 +269,7 @@ fn main() -> Result<()> {
                 message.lines().next().unwrap_or_default()
             );
         }
-        ReleaseCommand::Publish { sha } => publish(&sha)?,
+        ReleaseCommand::Publish { sha, ready_only } => publish(&sha, ready_only)?,
         ReleaseCommand::DependabotAutomerge { repository, sha } => {
             dependabot_automerge(&repository, &sha)?;
         }
@@ -377,14 +380,17 @@ fn is_legacy_scanner_fixture(path: &str, line: &str, pattern: &str) -> bool {
     line == home_test || line == token_test
 }
 
-fn publish(requested_sha: &str) -> Result<()> {
+fn publish(requested_sha: &str, ready_only: bool) -> Result<()> {
     ensure!(
         env::var("GITHUB_ACTIONS").as_deref() == Ok("true"),
         "publish may only run in GitHub Actions"
     );
     let sha = git(&["rev-parse", &format!("{requested_sha}^{{commit}}")])?;
-    if let Ok(expected) = env::var("GITHUB_SHA") {
-        ensure!(sha == expected, "requested SHA does not match GITHUB_SHA");
+    if let Ok(expected) = env::var("PGSHARD_RELEASE_SHA").or_else(|_| env::var("GITHUB_SHA")) {
+        ensure!(
+            sha == expected,
+            "requested SHA does not match workflow event SHA"
+        );
     }
 
     let repository = env::var("GITHUB_REPOSITORY").context("GITHUB_REPOSITORY is required")?;
@@ -403,9 +409,18 @@ fn publish(requested_sha: &str) -> Result<()> {
     ensure!(!plan.is_empty(), "no releasable first-parent commits found");
 
     // One workflow for a descendant may run before an ancestor's workflow.
-    // Publish the complete gap oldest-first and wait for each exact aggregate;
-    // the later job then becomes an idempotent verification.
+    // Publish the gap oldest-first. Strict callers wait for each exact
+    // aggregate; ready-only callers stop at the first unchecked commit so a
+    // later successful workflow can retry the live gap.
     for release in plan {
+        if ready_only && exact_aggregate_state(&repository, &release.sha)? != AggregateState::Passed
+        {
+            println!(
+                "release deferred at {} until its exact CI aggregate succeeds",
+                release.sha
+            );
+            break;
+        }
         publish_one(&repository, &release)?;
     }
     Ok(())
@@ -469,19 +484,7 @@ fn publish_one(repository: &str, release: &PlannedRelease) -> Result<()> {
 fn ensure_ci_passed(repository: &str, sha: &str) -> Result<()> {
     let started = Instant::now();
     loop {
-        let response = run(
-            "gh",
-            [
-                "api",
-                "-H",
-                "Accept: application/vnd.github+json",
-                &format!(
-                    "repos/{repository}/commits/{sha}/check-runs?check_name=CI%20aggregate&filter=latest&per_page=10"
-                ),
-            ],
-        )?;
-        let checks: CheckRuns = serde_json::from_str(&response)?;
-        match aggregate_state(&checks) {
+        match exact_aggregate_state(repository, sha)? {
             AggregateState::Passed => return Ok(()),
             AggregateState::Failed => {
                 bail!("commit {sha} has a failed exact-head CI aggregate check")
@@ -495,6 +498,22 @@ fn ensure_ci_passed(repository: &str, sha: &str) -> Result<()> {
             }
         }
     }
+}
+
+fn exact_aggregate_state(repository: &str, sha: &str) -> Result<AggregateState> {
+    let response = run(
+        "gh",
+        [
+            "api",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &format!(
+                "repos/{repository}/commits/{sha}/check-runs?check_name=CI%20aggregate&filter=latest&per_page=10"
+            ),
+        ],
+    )?;
+    let checks: CheckRuns = serde_json::from_str(&response)?;
+    Ok(aggregate_state(&checks))
 }
 
 fn ci_passed(checks: &CheckRuns) -> bool {
@@ -1435,13 +1454,40 @@ mod tests {
         assert!(!workflow.contains("queue: max"));
 
         let ci = include_str!("../../../.github/workflows/ci.yml");
+        let release = include_str!("../../../.github/workflows/release.yml");
         assert!(ci.contains("workflow_dispatch"));
-        assert!(ci.contains("github.event_name == 'workflow_dispatch'"));
-        assert!(ci.contains("refs/tags/pgshard-ci-"));
-        assert!(ci.contains("cleanup-dependabot-ci-ref:"));
-        assert!(ci.contains("group: pgshard-source-release"));
+        assert!(ci.contains(
+            "group: pgshard-ci-${{ github.event_name == 'pull_request' && github.run_id || 'main' }}"
+        ));
         assert_eq!(ci.matches("queue: max").count(), 1);
-        assert!(ci.contains("always() &&"));
+        assert!(ci.contains("aggregate:"));
+        assert!(release.contains("workflow_run:"));
+        assert!(release.contains("workflows: [CI]"));
+        assert!(release.contains("github.event.workflow_run.conclusion == 'success'"));
+        assert!(release.contains("github.event.workflow_run.head_repository.full_name"));
+        assert!(release.contains("github.event.workflow_run.event == 'workflow_dispatch'"));
+        assert!(
+            release.contains("startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')")
+        );
+        assert!(release.contains("pgshard-source-release-${{"));
+        assert!(release.contains("'eligible' || github.run_id"));
+        assert_eq!(release.matches("queue: max").count(), 1);
+        assert!(release.contains("PGSHARD_RELEASE_SHA"));
+        assert!(release.contains("--ready-only"));
+        assert!(release.contains("git/ref/heads/main"));
+        assert!(release.contains("ref: ${{ github.sha }}"));
+        assert!(release.contains("Delete temporary ref after release"));
+        assert!(release.contains("Deploy released main documentation"));
+        assert!(release.contains("actions: read"));
+        assert!(release.contains("actions/workflows/ci.yml/runs?head_sha=$live_sha"));
+        assert!(release.contains("git tag --points-at \"$live_sha\""));
+        assert!(ci.contains("github.event_name != 'pull_request'"));
+        assert!(ci.contains("needs.changes.outputs.website_exists == 'true'"));
+        assert!(release.contains("run_ids=\"$("));
+        assert!(release.contains("done <<< \"$run_ids\""));
+        assert!(!release.contains("done < <("));
+        assert!(release.contains("run-id: ${{ steps.candidate.outputs.run_id }}"));
+        assert!(!ci.contains("Deploy documentation to GitHub Pages"));
     }
 
     #[test]

@@ -11,6 +11,13 @@ on:
 permissions:
   contents: read
 
+# Pull requests keep independent CI capacity. Every default-branch, scheduled,
+# and exact-SHA dispatch run joins one FIFO queue so rapid main updates cannot
+# build or publish concurrently.
+concurrency:
+  group: pgshard-ci-${{ github.event_name == 'pull_request' && github.run_id || 'main' }}
+  queue: max
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
@@ -676,7 +683,13 @@ jobs:
   website:
     name: Documentation website
     needs: changes
-    if: needs.changes.outputs.website == 'true'
+    # Every non-PR CI run must retain a Pages candidate. Release reconciliation
+    # selects the artifact at the released live-main SHA, which may be a
+    # code-only descendant of the commit that last changed the documentation.
+    if: >-
+      needs.changes.outputs.website == 'true' ||
+      (github.event_name != 'pull_request' &&
+       needs.changes.outputs.website_exists == 'true')
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -1431,118 +1444,3 @@ jobs:
           done
           "$failed" && exit 1
           echo "All applicable CI jobs passed."
-
-  release:
-    name: Source-only SemVer release
-    needs: aggregate
-    if: >-
-      always() &&
-      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-       (github.event_name == 'workflow_dispatch' &&
-        (github.ref == 'refs/heads/main' ||
-         startsWith(github.ref, 'refs/tags/pgshard-ci-')))) &&
-      needs.aggregate.result == 'success'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      checks: read
-      contents: write
-    concurrency:
-      group: pgshard-source-release
-      queue: max
-    steps:
-      - name: Validate temporary exact-SHA ref
-        if: startsWith(github.ref, 'refs/tags/pgshard-ci-')
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          expected_sha="${REF_NAME#pgshard-ci-}"
-          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$expected_sha" == "$GITHUB_SHA" ]]
-      - name: Check out complete history
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-      - name: Select repository Rust toolchain
-        run: rustup show active-toolchain
-      - name: Configure release commit identity
-        run: |
-          git config user.name "pgshard release"
-          git config user.email "noreply@github.com"
-      - name: Publish tag and source-only GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: cargo run --locked -p pgshard-release -- publish --sha "$GITHUB_SHA"
-
-  cleanup-dependabot-ci-ref:
-    name: Clean temporary Dependabot CI ref
-    needs: [aggregate, release]
-    if: >-
-      always() &&
-      github.event_name == 'workflow_dispatch' &&
-      startsWith(github.ref, 'refs/tags/pgshard-ci-') &&
-      needs.aggregate.result == 'success' &&
-      needs.release.result == 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - name: Validate temporary exact-SHA ref
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          expected_sha="${REF_NAME#pgshard-ci-}"
-          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$expected_sha" == "$GITHUB_SHA" ]]
-      - name: Delete temporary ref after release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REF_NAME: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! output="$(gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$REF_NAME" 2>&1)"; then
-            if [[ "$output" == *"Reference does not exist"* && "$output" == *"HTTP 422"* ]]; then
-              echo "Temporary ref was already deleted by an equivalent exact-SHA run."
-            else
-              printf '%s\n' "$output" >&2
-              exit 1
-            fi
-          fi
-
-  pages:
-    name: Deploy documentation to GitHub Pages
-    needs: [changes, website, aggregate, release]
-    if: >-
-      always() &&
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/main' &&
-      needs.changes.outputs.website == 'true' &&
-      needs.website.result == 'success' &&
-      needs.aggregate.result == 'success' &&
-      needs.release.result == 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-      - name: Download documentation site
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: pages-site
-          path: _site
-      - name: Package Pages artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: _site
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
