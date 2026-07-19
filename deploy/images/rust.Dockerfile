@@ -28,7 +28,7 @@ RUN PGSHARD_BUILD_VERSION="${PGSHARD_BUILD_VERSION}" \
     install -D -m 0755 target/release/pgshard-catalog-material-digest /out/pgshard-catalog-material-digest && \
     install -D -m 0755 target/release/pgshard-scram-verifier /out/pgshard-scram-verifier
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:ce0d66bc0f64aae46e6a03add867b07f42cc7b8799c949c2e898057b7f75a151 AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:66aa873a4a14fb164aa01296058efd8253744606d72715e45acface073359faa AS runtime
 
 ARG PGSHARD_BUILD_VERSION
 ARG PGSHARD_GIT_SHA
