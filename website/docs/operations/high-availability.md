@@ -121,7 +121,9 @@ explicit `--postgresql-runtime=agent-quarantine` integration mode selects the
 exact per-cell ServiceAccount, mounts a rotating 600-second projected API token
 with the namespace CA/name, injects the checkpointed Lease UID and downward-API
 Pod identity, and runs the agent against the role-neutral PGDATA. Its readiness
-probe stays failed and PostgreSQL has no TCP listener. If coordination fails,
+probe stays failed. Singleton quarantine keeps PostgreSQL TCP closed; the
+multi-member replication-bootstrap source described below uses a replication-only
+listener while remaining non-serving. If coordination fails,
 the agent clears the term, fully fences PostgreSQL, keeps HTTP liveness
 available, and retries with bounded backoff while remaining unready. Recovery
 uses a fresh process incarnation, waits behind any old holder, advances the
@@ -568,7 +570,10 @@ forbidden for this role. The operator does not select the standby role yet. It
 checkpoints one per-shard replication password through an empty intent, exact
 API UID, immutable update, and material digest, but does not project or consume
 it or create the database role. There is no base-backup completion protocol, TLS wiring,
-slot creation, standby Pod, Service, or NetworkPolicy wiring. The temporary standby
+slot creation, standby Pod, standby-specific Service, or standby-specific NetworkPolicy.
+The role-neutral source can be selected by the existing shard headless Service and
+cluster PostgreSQL NetworkPolicy, but its unready state, absent serving role, and
+replication-only HBA keep it outside application routing. The temporary standby
 conninfo therefore explicitly disables TLS and is not a serving deployment.
 SQL and
 prepare target-side generation enforcement, replicated promotion evidence,
