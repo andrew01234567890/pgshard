@@ -543,8 +543,25 @@ ordinary database connection, and permits enough senders and physical slots to
 clone the two default M1 standbys with one bounded bootstrap-repair slot of
 headroom. It deliberately clears synchronous standby
 selection and uses local commit while bootstrapping, so it is neither a durable
-nor serving primary. The operator does not select that role yet; it has no replication
-credential, TLS, slot, standby, Service, or NetworkPolicy wiring. SQL and
+nor serving primary. A separate uncomposed `replication-standby` role requires
+an exact protected `standby.signal`, a recovery control-file state, a canonical
+member slot, and a runtime-owned `0400` passfile outside PGDATA and the socket
+directory. The passfile must contain one bounded record for the exact configured
+primary and fixed replication role; its identity, metadata, and contents are
+snapshotted again immediately before spawn. Its command contains no password,
+keeps TCP closed, and uses the private peer-authenticated socket to prove both
+recovery and an initially streaming WAL receiver before reporting the distinct
+running state. A valid postmaster may remain sealed in the starting state for
+unbounded crash recovery or while its upstream is unavailable, avoiding a
+restart loop. Once running, it continuously repeats the recovery proof; recovery
+ending, an unknown query result, timeout, or local connection loss immediately
+fences the complete PostgreSQL process tree. A later upstream outage alone does
+not kill a server that remains safely in recovery. Writable Lease authority is
+forbidden for this role. The operator does not select either replication role yet; it has no
+base-backup completion protocol, replication credential or TLS wiring, slot
+creation, standby Pod, Service, or NetworkPolicy wiring. The temporary standby
+conninfo therefore explicitly disables TLS and is not a serving deployment.
+SQL and
 prepare target-side generation enforcement, replicated promotion evidence,
 peer isolation, promotion, and serving activation remain absent. The
 fleet-level orchestrator leadership Lease remains

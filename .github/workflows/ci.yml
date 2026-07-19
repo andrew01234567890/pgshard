@@ -897,6 +897,8 @@ jobs:
             --cap-drop ALL --security-opt no-new-privileges \
             "$image" --help >/dev/null
       - name: Prove WAL generation across a streaming standby
+        env:
+          PGSHARD_AGENT_RUNTIME_TEST_IMAGE: pgshard/postgres-agent:ci
         run: |
           rustup show active-toolchain
           make agent-wal-generation-test

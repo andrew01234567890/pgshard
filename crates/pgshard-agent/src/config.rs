@@ -521,8 +521,8 @@ mod tests {
             PathBuf::from("/usr/lib/postgresql/18/bin/postgres"),
             PathBuf::from("/run/pgshard/postgres"),
             PathBuf::from("/etc/pgshard/quarantine.pg_hba.conf"),
-            Duration::from_millis(5_000),
-            Duration::from_millis(44_000),
+            Duration::from_secs(5),
+            Duration::from_secs(44),
             Duration::from_millis(500),
         )
         .expect("valid standby process configuration")

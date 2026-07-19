@@ -13,8 +13,13 @@ readonly primary_data="pgshard-generation-primary-data-${suffix}"
 readonly standby_data="pgshard-generation-standby-data-${suffix}"
 readonly primary_socket="pgshard-generation-primary-socket-${suffix}"
 readonly standby_socket="pgshard-generation-standby-socket-${suffix}"
+readonly standby_credentials="pgshard-generation-standby-credentials-${suffix}"
 readonly replication_password="pgshard_generation_replication_test"
 readonly standby_application_name="pgshard_member_0001"
+readonly replication_role="pgshard_replication"
+readonly standby_passfile="/run/pgshard/credentials/primary.pass"
+readonly ambient_password_canary="pgshard_ambient_password_canary"
+readonly runtime_image="${PGSHARD_AGENT_RUNTIME_TEST_IMAGE:-}"
 fixture_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/pgshard-generation.XXXXXX")"
 readonly fixture_dir
 readonly primary_hba="$fixture_dir/primary.pg_hba.conf"
@@ -30,6 +35,7 @@ cleanup() {
   docker network rm "$network" >/dev/null 2>&1 || true
   docker volume rm --force \
     "$primary_data" "$standby_data" "$primary_socket" "$standby_socket" \
+    "$standby_credentials" \
     >/dev/null 2>&1 || true
   rm -f "$primary_hba" "$build_messages"
   rmdir "$fixture_dir" 2>/dev/null || true
@@ -55,7 +61,7 @@ printf '%s\n' \
   'local postgres postgres peer' \
   'local all all reject' \
   'local replication all reject' \
-  'host replication replicator all scram-sha-256' \
+  'host replication pgshard_replication all scram-sha-256' \
   'host all all all reject' >"$primary_hba"
 chmod 0444 "$primary_hba"
 
@@ -75,6 +81,7 @@ docker volume create "$primary_data" >/dev/null
 docker volume create "$standby_data" >/dev/null
 docker volume create "$primary_socket" >/dev/null
 docker volume create "$standby_socket" >/dev/null
+docker volume create "$standby_credentials" >/dev/null
 
 docker run --detach --name "$primary" \
   --network "$network" --network-alias primary \
@@ -112,13 +119,32 @@ wait_ready() {
   return 1
 }
 
+normalize_standby_socket() {
+  docker run --rm --user 0:0 --volume "$standby_socket:/socket" \
+    --entrypoint /bin/sh "$image" -ceu '
+      find /socket -mindepth 1 -maxdepth 1 -delete
+      chown 999:999 /socket
+      chmod 0700 /socket
+    '
+}
+
 wait_ready "$primary"
 docker exec --user 999:999 "$primary" psql -X --no-password \
   --host=/var/run/postgresql --username=postgres --dbname=postgres \
   --set=ON_ERROR_STOP=1 --command="
-    CREATE ROLE replicator WITH REPLICATION LOGIN
+    CREATE ROLE ${replication_role} WITH REPLICATION LOGIN
       PASSWORD '${replication_password}';
   " >/dev/null
+
+docker run --rm --user 0:0 \
+  --volume "$standby_credentials:/run/pgshard/credentials" \
+  --env REPLICATION_PASSWORD="$replication_password" \
+  --entrypoint /bin/sh "$image" -ceu '
+    printf "primary:5432:*:pgshard_replication:%s\n" "$REPLICATION_PASSWORD" \
+      > /run/pgshard/credentials/primary.pass
+    chown 999:999 /run/pgshard/credentials/primary.pass
+    chmod 0400 /run/pgshard/credentials/primary.pass
+  '
 
 docker run --rm --user 0:0 --volume "$standby_data:/standby" \
   --entrypoint /bin/chown "$image" -R 999:999 /standby
@@ -127,25 +153,117 @@ docker run --rm --user 999:999 --network "$network" \
   --env PGPASSWORD="$replication_password" \
   --entrypoint /usr/lib/postgresql/18/bin/pg_basebackup \
   "$image" \
-  --dbname="host=primary port=5432 user=replicator application_name=${standby_application_name}" \
+  --dbname="host=primary port=5432 user=${replication_role} application_name=${standby_application_name}" \
   --pgdata=/standby --wal-method=stream --checkpoint=fast \
   --slot="$standby_application_name" --create-slot \
-  --write-recovery-conf --no-password
+  --no-password
+
+docker run --rm --user 999:999 --volume "$standby_data:/standby" \
+  --entrypoint /bin/sh "$image" -ceu '
+    : > /standby/standby.signal
+    chmod 0600 /standby/standby.signal
+  '
 
 docker run --detach --name "$standby" \
   --network "$network" \
   --volume "$standby_data:/var/lib/postgresql/18/docker" \
   --volume "$standby_socket:/var/run/postgresql" \
+  --volume "$standby_credentials:/run/pgshard/credentials:ro" \
   --mount "type=bind,src=$repo_root/deploy/images/quarantine.pg_hba.conf,dst=/etc/pgshard-generation-standby-hba.conf,readonly" \
   --env PGDATA=/var/lib/postgresql/18/docker \
   --env POSTGRES_PASSWORD=disposable-standby-password \
   "$image" \
   -c listen_addresses= \
   -c hba_file=/etc/pgshard-generation-standby-hba.conf \
+  -c "primary_conninfo=host=primary port=5432 user=${replication_role} application_name=${standby_application_name} passfile=${standby_passfile} sslmode=disable" \
+  -c "primary_slot_name=${standby_application_name}" \
   -c max_wal_senders=4 \
   -c hot_standby=on \
   -c event_triggers=off >/dev/null
 wait_ready "$standby"
+docker stop --time 10 "$standby" >/dev/null
+docker rm "$standby" >/dev/null
+normalize_standby_socket
+
+if [[ -n "$runtime_image" ]]; then
+  test "$(docker inspect --format '{{.Config.User}}' "$runtime_image")" = "999:999"
+  start_agent_standby() {
+    docker run --detach --name "$standby" \
+      --network "$network" --read-only --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --volume "$standby_data:/var/lib/postgresql/18/docker" \
+      --volume "$standby_socket:/run/pgshard/postgres" \
+      --volume "$standby_credentials:/run/pgshard/credentials:ro" \
+      --env PGDATA=/var/lib/postgresql/18/docker \
+      --env PGSHARD_HTTP_BIND=0.0.0.0:8080 \
+      --env PGSHARD_CLUSTER_ID=cluster-1 \
+      --env PGSHARD_SHARD_ID=0 \
+      --env PGSHARD_INSTANCE_ID=cluster-1-shard-0-1 \
+      --env PGSHARD_POSTGRES_MODE=replication-standby \
+      --env PGSHARD_POSTGRES_SOCKET_DIR=/run/pgshard/postgres \
+      --env PGSHARD_POSTGRES_HBA_FILE=/etc/pgshard/quarantine.pg_hba.conf \
+      --env PGSHARD_POSTGRES_PRIMARY_HOST=primary \
+      --env PGSHARD_POSTGRES_PRIMARY_PORT=5432 \
+      --env PGSHARD_POSTGRES_PRIMARY_SLOT_NAME="$standby_application_name" \
+      --env PGSHARD_POSTGRES_PRIMARY_PASSFILE="$standby_passfile" \
+      --env PGPASSWORD="$ambient_password_canary" \
+      "$runtime_image" >/dev/null
+  }
+  standby_status() {
+    docker exec "$primary" /bin/bash -ceu '
+      exec 3<>"/dev/tcp/$1/8080"
+      printf "GET /status HTTP/1.0\r\nHost: %s\r\n\r\n" "$1" >&3
+      sed -n "/^{/p" <&3
+    ' -- "$standby"
+  }
+  wait_agent_standby_running() {
+    for _ in $(seq 1 120); do
+      if standby_status \
+          | jq --exit-status '.postgres_process == "running_replication_standby"' \
+          >/dev/null 2>&1 && \
+        [[ "$(docker exec --user 999:999 "$standby" psql -X --no-password \
+          --host=/run/pgshard/postgres --username=postgres --dbname=postgres \
+          --tuples-only --no-align \
+          --command='SELECT pg_catalog.pg_is_in_recovery()')" = t ]]; then
+        return 0
+      fi
+      if [[ "$(docker inspect --format '{{.State.Running}}' "$standby")" != true ]]; then
+        docker logs "$standby" >&2
+        return 1
+      fi
+      sleep 0.25
+    done
+    standby_status \
+      | jq --exit-status '.postgres_process == "running_replication_standby"' \
+      >/dev/null
+  }
+  start_agent_standby
+  wait_agent_standby_running
+  postmaster_environment="$(docker exec --user 999:999 "$standby" /bin/sh -ceu '
+    postmaster_pid="$(cat /run/pgshard/postgres/postmaster.external.pid)"
+    tr "\000" "\n" < "/proc/$postmaster_pid/environ"
+  ')"
+  [[ "$postmaster_environment" != *PGPASSWORD=* ]]
+  [[ "$postmaster_environment" != *"$ambient_password_canary"* ]]
+else
+  docker run --detach --name "$standby" \
+    --network "$network" \
+    --volume "$standby_data:/var/lib/postgresql/18/docker" \
+    --volume "$standby_socket:/var/run/postgresql" \
+    --volume "$standby_credentials:/run/pgshard/credentials:ro" \
+    --mount "type=bind,src=$repo_root/deploy/images/quarantine.pg_hba.conf,dst=/etc/pgshard-generation-standby-hba.conf,readonly" \
+    --env PGDATA=/var/lib/postgresql/18/docker \
+    --env POSTGRES_PASSWORD=disposable-standby-password \
+    "$image" \
+    -c listen_addresses= \
+    -c hba_file=/etc/pgshard-generation-standby-hba.conf \
+    -c "primary_conninfo=host=primary port=5432 user=${replication_role} application_name=${standby_application_name} passfile=${standby_passfile} sslmode=disable" \
+    -c "primary_slot_name=${standby_application_name}" \
+    -c max_wal_senders=4 \
+    -c hot_standby=on \
+    -c event_triggers=off >/dev/null
+  wait_ready "$standby"
+fi
 
 for _ in $(seq 1 120); do
   if [[ "$(docker exec --user 999:999 "$primary" psql -X --no-password \
@@ -203,3 +321,32 @@ docker run --rm --user 999:999 --network none --read-only \
   --ignored --exact \
   postgres_generation::tests::live_postgres18_proves_exact_synchronous_generation_replay \
   --nocapture
+
+if [[ -n "$runtime_image" ]]; then
+  # Kill the container before the agent's 5-second smart-stop deadline. A
+  # monitor connection left open would block smart shutdown and fail this
+  # clean-exit assertion instead of being masked by the agent's fast fallback.
+  docker stop --time 4 "$standby" >/dev/null
+  test "$(docker inspect --format '{{.State.ExitCode}}' "$standby")" -eq 0
+  clean_control_data="$(docker run --rm --user 999:999 \
+    --volume "$standby_data:/standby:ro" \
+    --entrypoint /usr/lib/postgresql/18/bin/pg_controldata \
+    "$image" /standby)"
+  [[ "$clean_control_data" = *'Database cluster state:               shut down in recovery'* ]]
+  docker rm "$standby" >/dev/null
+  normalize_standby_socket
+  start_agent_standby
+  wait_agent_standby_running
+  docker exec --user 999:999 "$standby" \
+    pg_ctl -D /var/lib/postgresql/18/docker promote -W || true
+  for _ in $(seq 1 120); do
+    if [[ "$(docker inspect --format '{{.State.Running}}' "$standby")" = false ]]; then
+      break
+    fi
+    sleep 0.25
+  done
+  test "$(docker inspect --format '{{.State.Running}}' "$standby")" = false
+  test "$(docker inspect --format '{{.State.ExitCode}}' "$standby")" -ne 0
+  standby_logs="$(docker logs "$standby" 2>&1)"
+  [[ "$standby_logs" = *'StandbyRecovery { source: RecoveryEnded }'* ]]
+fi
