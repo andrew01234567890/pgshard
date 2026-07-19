@@ -52,6 +52,10 @@ pub enum PostgresProcessState {
     StartingReplicationBootstrap,
     /// The postmaster accepts only authenticated physical-replication traffic.
     RunningReplicationBootstrap,
+    /// The postmaster is starting as a non-serving physical-replication standby.
+    StartingReplicationStandby,
+    /// The postmaster is replaying as a non-serving physical-replication standby.
+    RunningReplicationStandby,
     /// A bounded postmaster shutdown is in progress.
     Stopping,
     /// Target-side fencing completed; crash recovery is required before reuse.
@@ -442,6 +446,8 @@ pub enum ReadinessReason {
     PostgresQuarantined,
     /// The local postmaster is a non-serving physical-replication bootstrap source.
     PostgresReplicationBootstrap,
+    /// The local postmaster is a non-serving physical-replication standby.
+    PostgresReplicationStandby,
     /// The local postmaster was target-fenced and requires restart recovery.
     PostgresFenced,
     /// Local postmaster validation, startup, supervision, or shutdown failed.
@@ -512,6 +518,14 @@ fn evaluate_readiness(
             _,
             _,
         ) => ReadinessReason::PostgresReplicationBootstrap,
+        (
+            Some(_),
+            PostgresProcessState::StartingReplicationStandby
+            | PostgresProcessState::RunningReplicationStandby,
+            _,
+            _,
+            _,
+        ) => ReadinessReason::PostgresReplicationStandby,
         (None, _, _, _, _) => ReadinessReason::IdentityMissing,
         (Some(_), _, None, _, _) => ReadinessReason::LeaseMissing,
         (Some(identity), _, Some(lease), _, _) if identity.instance_id != lease.owner_instance => {
@@ -736,6 +750,19 @@ mod tests {
         assert_eq!(
             state.readiness_at(100, now).reason,
             ReadinessReason::PostgresReplicationBootstrap
+        );
+        state.set_postgres_process(PostgresProcessState::StartingReplicationStandby);
+        assert_eq!(
+            state.readiness_at(100, now).reason,
+            ReadinessReason::PostgresReplicationStandby
+        );
+        state.set_postgres_process(PostgresProcessState::RunningReplicationStandby);
+        assert_eq!(
+            state.readiness_at(100, now),
+            Readiness {
+                ready: false,
+                reason: ReadinessReason::PostgresReplicationStandby,
+            }
         );
         state.set_postgres_process(PostgresProcessState::Disabled);
         assert_eq!(state.readiness_at(100, now).reason, ReadinessReason::Ready);

@@ -380,7 +380,7 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
         .as_ref()
         .and_then(|postgres| postgres.replay_lsn)
         .map_or(0, |PgLsn(lsn)| lsn);
-    let (postgres_process_up, postgres_replication_bootstrap) =
+    let (postgres_process_up, postgres_replication_bootstrap, postgres_replication_standby) =
         postgres_process_metrics(snapshot.postgres_process);
     let body = format!(
         concat!(
@@ -413,7 +413,10 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
             "pgshard_agent_postgres_process_up {postgres_process_up}\n",
             "# HELP pgshard_agent_postgres_replication_bootstrap Whether the postmaster is a non-serving physical-clone source.\n",
             "# TYPE pgshard_agent_postgres_replication_bootstrap gauge\n",
-            "pgshard_agent_postgres_replication_bootstrap {postgres_replication_bootstrap}\n"
+            "pgshard_agent_postgres_replication_bootstrap {postgres_replication_bootstrap}\n",
+            "# HELP pgshard_agent_postgres_replication_standby Whether the postmaster is a non-serving physical-replication standby.\n",
+            "# TYPE pgshard_agent_postgres_replication_standby gauge\n",
+            "pgshard_agent_postgres_replication_standby {postgres_replication_standby}\n"
         ),
         pgshard_version::VERSION,
         pgshard_version::GIT_SHA,
@@ -425,17 +428,20 @@ async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
         replay_lsn = replay_lsn,
         postgres_process_up = postgres_process_up,
         postgres_replication_bootstrap = postgres_replication_bootstrap,
+        postgres_replication_standby = postgres_replication_standby,
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
-fn postgres_process_metrics(process: PostgresProcessState) -> (u8, u8) {
+fn postgres_process_metrics(process: PostgresProcessState) -> (u8, u8, u8) {
     let process_up = u8::from(matches!(
         process,
         PostgresProcessState::StartingQuarantined
             | PostgresProcessState::RunningQuarantined
             | PostgresProcessState::StartingReplicationBootstrap
             | PostgresProcessState::RunningReplicationBootstrap
+            | PostgresProcessState::StartingReplicationStandby
+            | PostgresProcessState::RunningReplicationStandby
             | PostgresProcessState::Stopping
     ));
     let replication_bootstrap = u8::from(matches!(
@@ -443,7 +449,12 @@ fn postgres_process_metrics(process: PostgresProcessState) -> (u8, u8) {
         PostgresProcessState::StartingReplicationBootstrap
             | PostgresProcessState::RunningReplicationBootstrap
     ));
-    (process_up, replication_bootstrap)
+    let replication_standby = u8::from(matches!(
+        process,
+        PostgresProcessState::StartingReplicationStandby
+            | PostgresProcessState::RunningReplicationStandby
+    ));
+    (process_up, replication_bootstrap, replication_standby)
 }
 
 #[cfg(test)]
@@ -456,23 +467,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn process_metrics_distinguish_replication_bootstrap_from_quarantine() {
+    fn process_metrics_distinguish_replication_lifecycles_from_quarantine() {
         assert_eq!(
             postgres_process_metrics(PostgresProcessState::RunningQuarantined),
-            (1, 0)
+            (1, 0, 0)
         );
         assert_eq!(
             postgres_process_metrics(PostgresProcessState::StartingReplicationBootstrap),
-            (1, 1)
+            (1, 1, 0)
         );
         assert_eq!(
             postgres_process_metrics(PostgresProcessState::RunningReplicationBootstrap),
-            (1, 1)
+            (1, 1, 0)
+        );
+        assert_eq!(
+            postgres_process_metrics(PostgresProcessState::StartingReplicationStandby),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            postgres_process_metrics(PostgresProcessState::RunningReplicationStandby),
+            (1, 0, 1)
         );
         assert_eq!(
             postgres_process_metrics(PostgresProcessState::Validated),
-            (0, 0)
+            (0, 0, 0)
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_publish_replication_standby_separately_from_bootstrap() {
+        let state = AgentState::default();
+        state.set_postgres_process(PostgresProcessState::RunningReplicationStandby);
+
+        let response = metrics(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("bounded metrics response");
+        let body = String::from_utf8(body.to_vec()).expect("UTF-8 metrics response");
+
+        assert!(body.contains("pgshard_agent_postgres_process_up 1\n"));
+        assert!(body.contains("pgshard_agent_postgres_replication_bootstrap 0\n"));
+        assert!(body.contains("pgshard_agent_postgres_replication_standby 1\n"));
     }
 
     struct ErrorOnceAcceptor {

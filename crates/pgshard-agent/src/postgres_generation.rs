@@ -323,12 +323,20 @@ fn validate_generation_durability(
     let GenerationDurability::ExactSynchronousStandby { application_name } = durability else {
         return Ok(());
     };
-    let ordinal = application_name.strip_prefix("pgshard_member_");
-    if !matches!(ordinal, Some(value) if value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_digit()))
-    {
+    if !is_canonical_managed_member_name(application_name) {
         return Err(PostgresGenerationError::InvalidSynchronousStandbyTarget);
     }
     Ok(())
+}
+
+pub(crate) fn is_canonical_managed_member_name(name: &str) -> bool {
+    let Some(ordinal) = name
+        .strip_prefix("pgshard_member_")
+        .and_then(|value| value.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    format!("pgshard_member_{ordinal:04}") == name
 }
 
 async fn prove_publication_durability<F>(
@@ -673,6 +681,17 @@ pub enum PostgresGenerationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct ReplicationSlotNameContract {
+        member_physical_slots: Vec<MemberPhysicalSlotCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct MemberPhysicalSlotCase {
+        member_ordinal: u16,
+        slot_name: String,
+    }
     use pgshard_types::ShardId;
 
     fn generation(cluster: &str, holder: &str, term: u64) -> DurableWritableGeneration {
@@ -725,6 +744,22 @@ mod tests {
                 }),
                 Err(PostgresGenerationError::InvalidSynchronousStandbyTarget)
             ));
+        }
+    }
+
+    #[test]
+    fn managed_member_names_match_shared_contract() {
+        let contract: ReplicationSlotNameContract = serde_json::from_str(include_str!(
+            "../../../contracts/replication-slot-names.json"
+        ))
+        .expect("valid shared replication-slot naming contract");
+        assert!(!contract.member_physical_slots.is_empty());
+        for case in contract.member_physical_slots {
+            assert_eq!(
+                format!("pgshard_member_{:04}", case.member_ordinal),
+                case.slot_name
+            );
+            assert!(is_canonical_managed_member_name(&case.slot_name));
         }
     }
 

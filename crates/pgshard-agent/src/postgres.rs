@@ -32,13 +32,15 @@ use thiserror::Error;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::domain::{AgentState, PostgresProcessState};
 #[cfg(not(test))]
 use crate::postgres_generation;
 use crate::postgres_generation::PostgresGenerationError;
+use crate::postgres_generation::is_canonical_managed_member_name;
+use crate::postgres_recovery::{self, PostgresRecoveryError};
 #[cfg(test)]
 use crate::writable::durable_generation_for_test;
 use crate::writable::{DurableWritableGeneration, WritablePostgresAttempt};
@@ -65,6 +67,7 @@ const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const TARGET_FENCE_CLEANUP_STAGES: u32 = 3;
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITABLE_GENERATION_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_STANDBY_PASSFILE_BYTES: u64 = 4_096;
 const QUARANTINE_HBA_CONTENT: &[u8] =
     b"local postgres postgres peer\nlocal all all reject\nlocal replication all reject\n";
 const REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT: &[u8] = b"local postgres postgres peer\n\
@@ -188,12 +191,70 @@ pub enum PostgresRuntimeRole {
     Quarantine,
     /// Asynchronous writable-Lease-fenced bootstrap source for physical clones.
     ReplicationBootstrapPrimary,
+    /// TCP-closed physical standby that must remain in recovery.
+    ReplicationStandby,
+}
+
+/// Typed upstream identity for a physical standby.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostgresStandbyConfig {
+    primary_host: String,
+    primary_port: u16,
+    slot_name: String,
+    passfile: PathBuf,
+}
+
+impl PostgresStandbyConfig {
+    /// Creates an exact password-free primary connection description.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe host, non-canonical managed slot, zero
+    /// port, or a passfile path that could not be embedded unambiguously.
+    pub fn new(
+        primary_host: String,
+        primary_port: u16,
+        slot_name: String,
+        passfile: PathBuf,
+    ) -> Result<Self, PostgresConfigError> {
+        validate_primary_host(&primary_host)?;
+        if primary_port == 0 {
+            return Err(PostgresConfigError::InvalidPrimaryPort);
+        }
+        validate_managed_member_name(&slot_name)?;
+        validate_absolute_normal_path("PostgreSQL replication passfile", &passfile, false)?;
+        if !passfile
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+        {
+            return Err(PostgresConfigError::UnsafePassfilePath(passfile));
+        }
+        Ok(Self {
+            primary_host,
+            primary_port,
+            slot_name,
+            passfile,
+        })
+    }
+
+    fn primary_conninfo(&self) -> String {
+        format!(
+            "host={} port={} user=pgshard_replication application_name={} passfile={} sslmode=disable",
+            self.primary_host,
+            self.primary_port,
+            self.slot_name,
+            self.passfile.display()
+        )
+    }
 }
 
 /// Configuration for an opt-in postmaster with a fail-closed runtime role.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostgresConfig {
     role: PostgresRuntimeRole,
+    standby: Option<PostgresStandbyConfig>,
     data_dir: PathBuf,
     executable: PathBuf,
     controldata_executable: PathBuf,
@@ -222,6 +283,7 @@ impl PostgresConfig {
     ) -> Result<Self, PostgresConfigError> {
         Self::new_for_role(
             PostgresRuntimeRole::Quarantine,
+            None,
             data_dir,
             executable,
             socket_dir,
@@ -253,6 +315,36 @@ impl PostgresConfig {
     ) -> Result<Self, PostgresConfigError> {
         Self::new_for_role(
             PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            None,
+            data_dir,
+            executable,
+            socket_dir,
+            hba_file,
+            smart_shutdown_timeout,
+            fast_shutdown_timeout,
+            immediate_shutdown_timeout,
+        )
+    }
+
+    /// Creates a validated TCP-closed replication-standby configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe paths, upstream identity, or shutdown bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_replication_standby(
+        standby: PostgresStandbyConfig,
+        data_dir: PathBuf,
+        executable: PathBuf,
+        socket_dir: PathBuf,
+        hba_file: PathBuf,
+        smart_shutdown_timeout: Duration,
+        fast_shutdown_timeout: Duration,
+        immediate_shutdown_timeout: Duration,
+    ) -> Result<Self, PostgresConfigError> {
+        Self::new_for_role(
+            PostgresRuntimeRole::ReplicationStandby,
+            Some(standby),
             data_dir,
             executable,
             socket_dir,
@@ -266,6 +358,7 @@ impl PostgresConfig {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_for_role(
         role: PostgresRuntimeRole,
+        standby: Option<PostgresStandbyConfig>,
         data_dir: PathBuf,
         executable: PathBuf,
         socket_dir: PathBuf,
@@ -274,6 +367,9 @@ impl PostgresConfig {
         fast_shutdown_timeout: Duration,
         immediate_shutdown_timeout: Duration,
     ) -> Result<Self, PostgresConfigError> {
+        if (role == PostgresRuntimeRole::ReplicationStandby) != standby.is_some() {
+            return Err(PostgresConfigError::InvalidStandbyComposition);
+        }
         validate_absolute_normal_path("PGDATA", &data_dir, false)?;
         validate_absolute_normal_path("PostgreSQL executable", &executable, false)?;
         let controldata_executable = executable
@@ -299,6 +395,14 @@ impl PostgresConfig {
         if hba_file.starts_with(&data_dir) || hba_file.starts_with(&socket_dir) {
             return Err(PostgresConfigError::MutableHbaFile { hba_file });
         }
+        if let Some(standby) = standby.as_ref()
+            && (standby.passfile.starts_with(&data_dir)
+                || standby.passfile.starts_with(&socket_dir))
+        {
+            return Err(PostgresConfigError::MutablePassfile {
+                passfile: standby.passfile.clone(),
+            });
+        }
         for (name, value) in [
             ("smart", smart_shutdown_timeout),
             ("fast", fast_shutdown_timeout),
@@ -321,6 +425,7 @@ impl PostgresConfig {
         }
         Ok(Self {
             role,
+            standby,
             data_dir,
             executable,
             controldata_executable,
@@ -344,27 +449,38 @@ impl PostgresConfig {
         self.role == PostgresRuntimeRole::ReplicationBootstrapPrimary
     }
 
+    pub(crate) fn forbids_writable_authority(&self) -> bool {
+        self.role == PostgresRuntimeRole::ReplicationStandby
+    }
+
+    fn is_replication_standby(&self) -> bool {
+        self.role == PostgresRuntimeRole::ReplicationStandby
+    }
+
     fn runtime_network_settings(
         &self,
     ) -> (
         &'static str,
-        &'static str,
+        Option<&'static str>,
         Option<&'static str>,
         &'static str,
     ) {
         match self.role {
             PostgresRuntimeRole::Quarantine => (
                 "listen_addresses=",
-                "max_wal_senders=0",
+                Some("max_wal_senders=0"),
                 None,
                 "archive_mode=on",
             ),
             PostgresRuntimeRole::ReplicationBootstrapPrimary => (
                 "listen_addresses=*",
-                "max_wal_senders=3",
+                Some("max_wal_senders=3"),
                 Some("max_replication_slots=3"),
                 "archive_mode=off",
             ),
+            PostgresRuntimeRole::ReplicationStandby => {
+                ("listen_addresses=", None, None, "archive_mode=off")
+            }
         }
     }
 
@@ -374,6 +490,9 @@ impl PostgresConfig {
             PostgresRuntimeRole::ReplicationBootstrapPrimary => {
                 PostgresProcessState::StartingReplicationBootstrap
             }
+            PostgresRuntimeRole::ReplicationStandby => {
+                PostgresProcessState::StartingReplicationStandby
+            }
         }
     }
 
@@ -382,6 +501,9 @@ impl PostgresConfig {
             PostgresRuntimeRole::Quarantine => PostgresProcessState::RunningQuarantined,
             PostgresRuntimeRole::ReplicationBootstrapPrimary => {
                 PostgresProcessState::RunningReplicationBootstrap
+            }
+            PostgresRuntimeRole::ReplicationStandby => {
+                PostgresProcessState::RunningReplicationStandby
             }
         }
     }
@@ -510,6 +632,7 @@ struct ValidatedPostgresState {
     socket_lock: Option<PostmasterLockSnapshot>,
     external_pid_file: Option<FileSnapshot>,
     hba_file: FileSnapshot,
+    standby_passfile: Option<FileSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -522,6 +645,7 @@ struct ValidatedDataDir {
     wal_directory: FileSnapshot,
     tablespace_directory: FileSnapshot,
     postmaster_lock: Option<PostmasterLockSnapshot>,
+    standby_signal: Option<FileSnapshot>,
 }
 
 #[derive(Debug)]
@@ -772,6 +896,11 @@ impl PreparedPostgres {
         required_margin: Duration,
         attempt: WritablePostgresAttempt,
     ) -> Result<WritablePostgresStopped, PostgresError> {
+        if self.config.forbids_writable_authority() {
+            state.clear_lease();
+            state.set_postgres_process(PostgresProcessState::Failed);
+            return Err(PostgresError::WritableAuthorityForbidden);
+        }
         let required_margin = required_margin.max(self.config.target_fence_budget());
         let authority = attempt.authority_observer();
         self.supervise_with_writable_authority_guard(
@@ -793,6 +922,11 @@ impl PreparedPostgres {
     where
         G: Fn() -> Option<DurableWritableGeneration>,
     {
+        if self.config.forbids_writable_authority() {
+            state.clear_lease();
+            state.set_postgres_process(PostgresProcessState::Failed);
+            return Err(PostgresError::WritableAuthorityForbidden);
+        }
         let shutdown_state = state.clone();
         let final_shutdown = shutdown.clone();
         self.supervise_with_stop_mode_and_start_guard(
@@ -900,35 +1034,15 @@ impl PreparedPostgres {
                 }
             }
         }
-        state.set_postgres_process(shutdown_config.running_process_state());
-
-        let result = tokio::select! {
-            status = wait_pidfd_exit(&pidfd) => {
-                state.set_postgres_process(PostgresProcessState::Stopping);
-                let error = cleanup_after_error(
-                    &mut process_group_fence.child,
-                    Some(&pidfd),
-                    Some(process_group),
-                    &process_group_fence.child_subreaper,
-                    match status {
-                        Ok(status) => PostgresError::UnexpectedExit(status),
-                        Err(error) => error,
-                    },
-                ).await;
-                state.set_postgres_process(PostgresProcessState::Failed);
-                Err(error)
-            }
-            stop_mode = &mut shutdown => {
-                stop_tracked_postmaster(
-                    &state,
-                    &mut process_group_fence,
-                    &pidfd,
-                    process_group,
-                    &shutdown_config,
-                    stop_mode,
-                ).await
-            }
-        };
+        let result = supervise_running_postmaster(
+            &state,
+            &mut process_group_fence,
+            &pidfd,
+            process_group,
+            &shutdown_config,
+            shutdown.as_mut(),
+        )
+        .await;
         process_group_fence.disarm_if_reaped();
         result
     }
@@ -1407,7 +1521,7 @@ impl PreparedPostgres {
             .arg("ssl=off")
             .arg("-c")
             .arg("restart_after_crash=off");
-        force_external_recovery_sources_disabled(&mut command);
+        force_role_recovery_settings(&mut command, self.config.standby.as_ref());
         command
             .arg("-c")
             .arg("restore_command=")
@@ -1424,12 +1538,9 @@ impl PreparedPostgres {
             .arg("-c")
             .arg("archive_command=")
             .arg("-c")
-            .arg("archive_library=")
-            .arg("-c")
-            .arg(max_wal_senders);
-        if let Some(max_replication_slots) = max_replication_slots {
-            command.arg("-c").arg(max_replication_slots);
-        }
+            .arg("archive_library=");
+        append_optional_postmaster_setting(&mut command, max_wal_senders);
+        append_optional_postmaster_setting(&mut command, max_replication_slots);
         command
             .arg("-c")
             .arg("wal_level=logical")
@@ -1481,8 +1592,39 @@ impl PreparedPostgres {
     }
 }
 
-fn force_external_recovery_sources_disabled(command: &mut Command) {
-    for setting in ["primary_conninfo=", "primary_slot_name="] {
+fn append_optional_postmaster_setting(command: &mut Command, setting: Option<&str>) {
+    if let Some(setting) = setting {
+        command.arg("-c").arg(setting);
+    }
+}
+
+fn force_role_recovery_settings(command: &mut Command, standby: Option<&PostgresStandbyConfig>) {
+    let (primary_conninfo, primary_slot_name, read_only, feedback) = match standby {
+        Some(standby) => (
+            format!("primary_conninfo={}", standby.primary_conninfo()),
+            format!("primary_slot_name={}", standby.slot_name),
+            "default_transaction_read_only=on",
+            "hot_standby_feedback=on",
+        ),
+        None => (
+            "primary_conninfo=".to_owned(),
+            "primary_slot_name=".to_owned(),
+            "default_transaction_read_only=off",
+            "hot_standby_feedback=off",
+        ),
+    };
+    for setting in [
+        primary_conninfo,
+        primary_slot_name,
+        "recovery_target_action=shutdown".to_owned(),
+        "recovery_target_timeline=latest".to_owned(),
+        "hot_standby=on".to_owned(),
+        feedback.to_owned(),
+        read_only.to_owned(),
+        "wal_receiver_status_interval=1s".to_owned(),
+        "wal_receiver_timeout=5s".to_owned(),
+        "wal_retrieve_retry_interval=100ms".to_owned(),
+    ] {
         command.arg("-c").arg(setting);
     }
 }
@@ -1704,6 +1846,157 @@ async fn cleanup_tracked_startup_failure(
     .await;
     state.set_postgres_process(PostgresProcessState::Failed);
     error
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_running_postmaster<F>(
+    state: &AgentState,
+    process: &mut PostgresProcessFence,
+    pidfd: &AsyncFd<OwnedFd>,
+    process_group: Pid,
+    config: &PostgresConfig,
+    mut shutdown: Pin<&mut F>,
+) -> Result<(), PostgresError>
+where
+    F: Future<Output = PostgresStopMode>,
+{
+    if config.is_replication_standby() {
+        return supervise_replication_standby(
+            state,
+            process,
+            pidfd,
+            process_group,
+            config,
+            shutdown.as_mut(),
+        )
+        .await;
+    }
+    state.set_postgres_process(config.running_process_state());
+    tokio::select! {
+        status = wait_pidfd_exit(pidfd) => {
+            state.set_postgres_process(PostgresProcessState::Stopping);
+            let error = cleanup_after_error(
+                &mut process.child,
+                Some(pidfd),
+                Some(process_group),
+                &process.child_subreaper,
+                match status {
+                    Ok(status) => PostgresError::UnexpectedExit(status),
+                    Err(error) => error,
+                },
+            ).await;
+            state.set_postgres_process(PostgresProcessState::Failed);
+            Err(error)
+        }
+        stop_mode = shutdown.as_mut() => {
+            stop_tracked_postmaster(
+                state, process, pidfd, process_group, config, stop_mode,
+            ).await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_replication_standby<F>(
+    state: &AgentState,
+    process: &mut PostgresProcessFence,
+    pidfd: &AsyncFd<OwnedFd>,
+    process_group: Pid,
+    config: &PostgresConfig,
+    mut shutdown: Pin<&mut F>,
+) -> Result<(), PostgresError>
+where
+    F: Future<Output = PostgresStopMode>,
+{
+    let (confirmed_tx, mut confirmed_rx) = oneshot::channel();
+    let mut recovery_monitor = Box::pin(postgres_recovery::monitor_standby_recovery(
+        config.socket_dir.clone(),
+        confirmed_tx,
+    ));
+
+    let confirmation = tokio::select! {
+        status = wait_pidfd_exit(pidfd) => {
+            let error = match status {
+                Ok(status) => PostgresError::UnexpectedExit(status),
+                Err(error) => error,
+            };
+            return Err(cleanup_tracked_startup_failure(
+                state, process, pidfd, process_group, error,
+            ).await);
+        }
+        stop_mode = shutdown.as_mut() => {
+            drop(recovery_monitor);
+            return stop_tracked_postmaster(
+                state, process, pidfd, process_group, config, stop_mode,
+            ).await;
+        }
+        result = &mut recovery_monitor => {
+            return Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                standby_monitor_error(result),
+            ).await);
+        }
+        result = &mut confirmed_rx => result,
+    };
+    match confirmation {
+        Ok(()) => {}
+        Err(_) => {
+            return Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                PostgresError::StandbyRecoveryMonitorStopped,
+            )
+            .await);
+        }
+    }
+
+    state.set_postgres_process(config.running_process_state());
+    tokio::select! {
+        status = wait_pidfd_exit(pidfd) => {
+            state.set_postgres_process(PostgresProcessState::Stopping);
+            let error = cleanup_after_error(
+                &mut process.child,
+                Some(pidfd),
+                Some(process_group),
+                &process.child_subreaper,
+                match status {
+                    Ok(status) => PostgresError::UnexpectedExit(status),
+                    Err(error) => error,
+                },
+            ).await;
+            state.set_postgres_process(PostgresProcessState::Failed);
+            Err(error)
+        }
+        stop_mode = shutdown.as_mut() => {
+            drop(recovery_monitor);
+            stop_tracked_postmaster(
+                state, process, pidfd, process_group, config, stop_mode,
+            ).await
+        }
+        result = &mut recovery_monitor => {
+            Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                standby_monitor_error(result),
+            ).await)
+        }
+    }
+}
+
+fn standby_monitor_error(result: Result<(), PostgresRecoveryError>) -> PostgresError {
+    match result {
+        Ok(()) => PostgresError::StandbyRecoveryMonitorStopped,
+        Err(error) => PostgresError::StandbyRecovery {
+            source: Box::new(error),
+        },
+    }
 }
 
 fn authorize_postmaster_start(
@@ -2786,7 +3079,7 @@ fn validate_prepared_state(
     create_socket_dir: bool,
 ) -> Result<ValidatedPostgresState, PostgresError> {
     let expected_uid = geteuid().as_raw();
-    let data = validate_data_dir(&config.data_dir, expected_uid)?;
+    let data = validate_data_dir_for_role(&config.data_dir, expected_uid, config.role)?;
     let executable = validate_executable(&config.executable, expected_uid)?;
     let controldata_executable = validate_trusted_executable(
         "PostgreSQL control-data executable",
@@ -2809,6 +3102,11 @@ fn validate_prepared_state(
         validate_postmaster_lock_at(&config.socket_dir.join(SOCKET_LOCK_FILE), expected_uid)?;
     let external_pid_file =
         validate_external_pid_file_at(&config.socket_dir.join(EXTERNAL_PID_FILE), expected_uid)?;
+    let standby_passfile = config
+        .standby
+        .as_ref()
+        .map(|standby| validate_standby_passfile(standby, expected_uid))
+        .transpose()?;
     Ok(ValidatedPostgresState {
         data,
         executable,
@@ -2818,10 +3116,15 @@ fn validate_prepared_state(
         socket_lock,
         external_pid_file,
         hba_file,
+        standby_passfile,
     })
 }
 
-fn validate_data_dir(path: &Path, expected_uid: u32) -> Result<ValidatedDataDir, PostgresError> {
+fn validate_data_dir_for_role(
+    path: &Path,
+    expected_uid: u32,
+    role: PostgresRuntimeRole,
+) -> Result<ValidatedDataDir, PostgresError> {
     validate_owned_directory("PGDATA", path, expected_uid)?;
     let data_mount_id = mount_id("PGDATA", path)?;
 
@@ -2861,7 +3164,7 @@ fn validate_data_dir(path: &Path, expected_uid: u32) -> Result<ValidatedDataDir,
             expected: PG_CONTROL_FILE_SIZE,
         });
     }
-    reject_recovery_state(path)?;
+    let standby_signal = validate_recovery_state(path, expected_uid, data_mount_id, role)?;
     let wal_directory = validate_owned_data_subdirectory(path, "pg_wal", expected_uid)?;
     require_same_mount(data_mount_id, "pg_wal", &path.join("pg_wal"))?;
     let tablespace_directory = validate_no_tablespaces(path, expected_uid)?;
@@ -2878,7 +3181,13 @@ fn validate_data_dir(path: &Path, expected_uid: u32) -> Result<ValidatedDataDir,
         wal_directory,
         tablespace_directory,
         postmaster_lock,
+        standby_signal,
     })
+}
+
+#[cfg(test)]
+fn validate_data_dir(path: &Path, expected_uid: u32) -> Result<ValidatedDataDir, PostgresError> {
+    validate_data_dir_for_role(path, expected_uid, PostgresRuntimeRole::Quarantine)
 }
 
 fn validate_storage_tree(
@@ -3118,13 +3427,55 @@ fn validate_no_tablespaces(
     Ok(snapshot)
 }
 
-fn reject_recovery_state(data_dir: &Path) -> Result<(), PostgresError> {
-    for file_name in [
-        "standby.signal",
-        "recovery.signal",
-        "backup_label",
-        "tablespace_map",
-    ] {
+fn validate_recovery_state(
+    data_dir: &Path,
+    expected_uid: u32,
+    expected_mount_id: u64,
+    role: PostgresRuntimeRole,
+) -> Result<Option<FileSnapshot>, PostgresError> {
+    let standby_signal_path = data_dir.join("standby.signal");
+    let standby_signal = match fs::symlink_metadata(&standby_signal_path) {
+        Ok(_) if role == PostgresRuntimeRole::ReplicationStandby => {
+            let metadata = strict_metadata("standby.signal", &standby_signal_path)?;
+            validate_owned_regular_file(
+                "standby.signal",
+                &standby_signal_path,
+                &metadata,
+                expected_uid,
+            )?;
+            require_same_mount(expected_mount_id, "standby.signal", &standby_signal_path)?;
+            if metadata.len() != 0 {
+                return Err(PostgresError::InvalidStandbySignal {
+                    path: standby_signal_path,
+                });
+            }
+            Some(file_snapshot(&strict_metadata(
+                "standby.signal",
+                &standby_signal_path,
+            )?))
+        }
+        Ok(_) => {
+            return Err(PostgresError::RecoveryStatePresent {
+                path: standby_signal_path,
+            });
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            if role == PostgresRuntimeRole::ReplicationStandby {
+                return Err(PostgresError::StandbySignalMissing {
+                    path: standby_signal_path,
+                });
+            }
+            None
+        }
+        Err(source) => {
+            return Err(PostgresError::Metadata {
+                name: "standby.signal",
+                path: standby_signal_path,
+                source,
+            });
+        }
+    };
+    for file_name in ["recovery.signal", "backup_label", "tablespace_map"] {
         let path = data_dir.join(file_name);
         match fs::symlink_metadata(&path) {
             Ok(_) => return Err(PostgresError::RecoveryStatePresent { path }),
@@ -3138,7 +3489,109 @@ fn reject_recovery_state(data_dir: &Path) -> Result<(), PostgresError> {
             }
         }
     }
-    Ok(())
+    Ok(standby_signal)
+}
+
+fn validate_standby_passfile(
+    standby: &PostgresStandbyConfig,
+    expected_uid: u32,
+) -> Result<FileSnapshot, PostgresError> {
+    let path = &standby.passfile;
+    let metadata = strict_metadata("PostgreSQL standby passfile", path)?;
+    require_regular("PostgreSQL standby passfile", path, &metadata)?;
+    if metadata.uid() != expected_uid {
+        return Err(PostgresError::WrongOwner {
+            name: "PostgreSQL standby passfile",
+            path: path.to_owned(),
+            actual: metadata.uid(),
+            expected: expected_uid,
+        });
+    }
+    let mode = metadata.permissions().mode() & 0o7_777;
+    if mode != 0o400 {
+        return Err(PostgresError::UnsafePermissions {
+            name: "PostgreSQL standby passfile",
+            path: path.to_owned(),
+            mode,
+            expected: "runtime-UID-owned 0400",
+        });
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_STANDBY_PASSFILE_BYTES {
+        return Err(PostgresError::InvalidStandbyPassfile {
+            path: path.to_owned(),
+        });
+    }
+    let file = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|source| PostgresError::Read {
+        name: "PostgreSQL standby passfile",
+        path: path.to_owned(),
+        source: source.into(),
+    })?;
+    let fd_metadata = file.metadata().map_err(|source| PostgresError::Metadata {
+        name: "PostgreSQL standby passfile",
+        path: path.to_owned(),
+        source,
+    })?;
+    if !same_file_identity(&metadata, &fd_metadata) {
+        return Err(PostgresError::PreparedStateChanged);
+    }
+    let capacity =
+        usize::try_from(metadata.len()).map_err(|_| PostgresError::InvalidStandbyPassfile {
+            path: path.to_owned(),
+        })?;
+    let mut contents = Vec::with_capacity(capacity);
+    file.take(MAX_STANDBY_PASSFILE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|source| PostgresError::Read {
+            name: "PostgreSQL standby passfile",
+            path: path.to_owned(),
+            source,
+        })?;
+    if !valid_standby_passfile_contents(standby, &contents) {
+        return Err(PostgresError::InvalidStandbyPassfile {
+            path: path.to_owned(),
+        });
+    }
+    let final_metadata = strict_metadata("PostgreSQL standby passfile", path)?;
+    if file_snapshot(&metadata) != file_snapshot(&final_metadata) {
+        return Err(PostgresError::PreparedStateChanged);
+    }
+    Ok(file_snapshot(&final_metadata))
+}
+
+fn valid_standby_passfile_contents(standby: &PostgresStandbyConfig, contents: &[u8]) -> bool {
+    let prefix = format!(
+        "{}:{}:*:pgshard_replication:",
+        standby.primary_host, standby.primary_port
+    );
+    let Some(password) = contents
+        .strip_prefix(prefix.as_bytes())
+        .and_then(|contents| contents.strip_suffix(b"\n"))
+    else {
+        return false;
+    };
+    let mut offset = 0;
+    while offset < password.len() {
+        match password[offset] {
+            b'\\' => {
+                let Some(escaped) = password.get(offset + 1) else {
+                    return false;
+                };
+                if !matches!(*escaped, b':' | b'\\') {
+                    return false;
+                }
+                offset += 2;
+            }
+            b':' | 0..=31 | 127..=u8::MAX => return false,
+            _ => offset += 1,
+        }
+    }
+    offset != 0
 }
 
 fn validate_postmaster_lock_at(
@@ -3343,19 +3796,32 @@ fn validate_control_data(
         parse_control_data(&output.stdout).ok_or_else(|| PostgresError::InvalidControlData {
             executable: config.controldata_executable.clone(),
         })?;
-    match state {
-        ControlDataState::ShutDownInRecovery | ControlDataState::InArchiveRecovery => {
-            Err(PostgresError::RecoveryControlState {
+    match (config.role, state) {
+        (_, ControlDataState::StartingUp) => Err(PostgresError::UnsafeControlState {
+            state: control_data_state_name(state),
+        }),
+        (
+            PostgresRuntimeRole::ReplicationStandby,
+            ControlDataState::ShutDownInRecovery | ControlDataState::InArchiveRecovery,
+        )
+        | (
+            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            ControlDataState::ShutDown
+            | ControlDataState::ShuttingDown
+            | ControlDataState::InCrashRecovery
+            | ControlDataState::InProduction,
+        ) => Ok(state),
+        (PostgresRuntimeRole::ReplicationStandby, _) => {
+            Err(PostgresError::NonRecoveryControlState {
                 state: control_data_state_name(state),
             })
         }
-        ControlDataState::StartingUp => Err(PostgresError::UnsafeControlState {
+        (
+            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            ControlDataState::ShutDownInRecovery | ControlDataState::InArchiveRecovery,
+        ) => Err(PostgresError::RecoveryControlState {
             state: control_data_state_name(state),
         }),
-        ControlDataState::ShutDown
-        | ControlDataState::ShuttingDown
-        | ControlDataState::InCrashRecovery
-        | ControlDataState::InProduction => Ok(state),
     }
 }
 
@@ -3406,7 +3872,9 @@ fn validate_hba_file(
 ) -> Result<FileSnapshot, PostgresError> {
     let name = hba_policy_name(role);
     let expected_contents = match role {
-        PostgresRuntimeRole::Quarantine => QUARANTINE_HBA_CONTENT,
+        PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationStandby => {
+            QUARANTINE_HBA_CONTENT
+        }
         PostgresRuntimeRole::ReplicationBootstrapPrimary => {
             REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT
         }
@@ -3450,6 +3918,7 @@ fn hba_policy_name(role: PostgresRuntimeRole) -> &'static str {
         PostgresRuntimeRole::ReplicationBootstrapPrimary => {
             "PostgreSQL replication-bootstrap-primary HBA file"
         }
+        PostgresRuntimeRole::ReplicationStandby => "PostgreSQL replication-standby HBA file",
     }
 }
 
@@ -3463,6 +3932,9 @@ fn invalid_hba(role: PostgresRuntimeRole, path: &Path) -> PostgresError {
                 path: path.to_owned(),
             }
         }
+        PostgresRuntimeRole::ReplicationStandby => PostgresError::InvalidReplicationStandbyHba {
+            path: path.to_owned(),
+        },
     }
 }
 
@@ -3660,9 +4132,62 @@ fn validate_absolute_normal_path(
     Ok(())
 }
 
+fn validate_primary_host(host: &str) -> Result<(), PostgresConfigError> {
+    let valid = !host.is_empty()
+        && host.len() <= 253
+        && host.is_ascii()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(PostgresConfigError::InvalidPrimaryHost(host.to_owned()))
+    }
+}
+
+fn validate_managed_member_name(name: &str) -> Result<(), PostgresConfigError> {
+    if is_canonical_managed_member_name(name) {
+        Ok(())
+    } else {
+        Err(PostgresConfigError::InvalidManagedMemberName(
+            name.to_owned(),
+        ))
+    }
+}
+
 /// Invalid opt-in postmaster configuration.
 #[derive(Debug, Error)]
 pub enum PostgresConfigError {
+    /// Standby fields and runtime role did not form one exact composition.
+    #[error("PostgreSQL standby settings are incomplete or supplied for another runtime role")]
+    InvalidStandbyComposition,
+    /// The primary endpoint was not a bounded DNS name.
+    #[error("PostgreSQL primary host {0:?} must be a bounded ASCII DNS name")]
+    InvalidPrimaryHost(String),
+    /// Port zero cannot address a `PostgreSQL` primary.
+    #[error("PostgreSQL primary port must be nonzero")]
+    InvalidPrimaryPort,
+    /// Physical slot and application identity must use the shared member name.
+    #[error(
+        "PostgreSQL member name {0:?} must be canonical pgshard_member_ plus at least four decimal digits"
+    )]
+    InvalidManagedMemberName(String),
+    /// The passfile path could not be represented without conninfo escaping.
+    #[error("PostgreSQL replication passfile path {0:?} contains unsafe conninfo bytes")]
+    UnsafePassfilePath(PathBuf),
     /// A path is not absolute, normalized, non-root, and bounded.
     #[error(
         "{name} path {path:?} must be an absolute normalized non-root path of at most 1023 bytes"
@@ -3693,6 +4218,14 @@ pub enum PostgresConfigError {
     MutableHbaFile {
         /// Rejected HBA path.
         hba_file: PathBuf,
+    },
+    /// The replication credential was placed in mutable `PostgreSQL` state.
+    #[error(
+        "PostgreSQL replication passfile {passfile:?} must not be stored inside PGDATA or the socket directory"
+    )]
+    MutablePassfile {
+        /// Rejected passfile path.
+        passfile: PathBuf,
     },
     /// One shutdown phase is outside its bounded range.
     #[error("PostgreSQL {name} shutdown timeout {value:?} must be between 10ms and 55s")]
@@ -3943,6 +4476,12 @@ pub enum PostgresError {
         /// Rejected `PostgreSQL` control-file state.
         state: &'static str,
     },
+    /// A standby data directory was not last shut down while in recovery.
+    #[error("PostgreSQL control-file state {state:?} is not a standby recovery state")]
+    NonRecoveryControlState {
+        /// Rejected `PostgreSQL` control-file state.
+        state: &'static str,
+    },
     /// The control file is not in a complete primary state that supervision may recover.
     #[error("PostgreSQL control-file state {state:?} is not safe for supervised startup")]
     UnsafeControlState {
@@ -3955,6 +4494,20 @@ pub enum PostgresError {
     )]
     RecoveryStatePresent {
         /// Recovery marker that prevented process creation.
+        path: PathBuf,
+    },
+    /// The role requires the exact physical-standby marker.
+    #[error("PostgreSQL replication-standby marker is missing at {path:?}")]
+    StandbySignalMissing {
+        /// Required marker path.
+        path: PathBuf,
+    },
+    /// The physical-standby marker was not an empty protected regular file.
+    #[error(
+        "PostgreSQL replication-standby marker at {path:?} must be an empty protected regular file"
+    )]
+    InvalidStandbySignal {
+        /// Rejected marker path.
         path: PathBuf,
     },
     /// User tablespaces escape the single-volume supervision boundary.
@@ -3979,6 +4532,22 @@ pub enum PostgresError {
     )]
     InvalidReplicationBootstrapPrimaryHba {
         /// Rejected HBA path.
+        path: PathBuf,
+    },
+    /// The standby HBA policy was not the exact private publisher-plus-reject policy.
+    #[error(
+        "PostgreSQL replication-standby HBA file {path:?} must contain only the built-in local publisher and reject policy"
+    )]
+    InvalidReplicationStandbyHba {
+        /// Rejected HBA path.
+        path: PathBuf,
+    },
+    /// The standby passfile was not one exact bounded upstream credential.
+    #[error(
+        "PostgreSQL standby passfile {path:?} must contain one bounded credential for the configured primary and fixed replication role"
+    )]
+    InvalidStandbyPassfile {
+        /// Rejected credential file.
         path: PathBuf,
     },
     /// A crash lock was malformed, partial, or too large to handle safely.
@@ -4010,6 +4579,9 @@ pub enum PostgresError {
     /// A role that opens replication TCP was sent through direct supervision.
     #[error("PostgreSQL replication-bootstrap-primary mode requires writable-term Lease authority")]
     WritableAuthorityRequired,
+    /// A physical standby was sent through writable-term supervision.
+    #[error("PostgreSQL replication-standby mode forbids writable-term Lease authority")]
+    WritableAuthorityForbidden,
     /// Attempt-private authority changed while its durable generation was flushed.
     #[error("PostgreSQL startup authority changed during durable generation publication")]
     StartupAuthorityChanged,
@@ -4076,6 +4648,16 @@ pub enum PostgresError {
     /// WAL-backed generation publication did not finish within the startup bound.
     #[error("WAL-backed PostgreSQL writable-generation publication exceeded {0:?}")]
     WritableGenerationPublicationTimeout(Duration),
+    /// Continuous recovery proof ended without returning an explicit failure.
+    #[error("PostgreSQL standby recovery monitor stopped unexpectedly")]
+    StandbyRecoveryMonitorStopped,
+    /// Continuous recovery proof was lost.
+    #[error("monitor PostgreSQL standby recovery: {source}")]
+    StandbyRecovery {
+        /// Exact connection, query, timeout, or recovery-state failure.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// The blocking revalidation worker did not complete normally.
     #[error("PostgreSQL pre-spawn validation task failed: {0}")]
     ValidationTask(#[source] tokio::task::JoinError),
@@ -5025,6 +5607,285 @@ mod tests {
     }
 
     #[test]
+    fn replication_standby_requires_exact_recovery_state_and_private_credentials() {
+        let root = TempDir::new().expect("create standby fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let executable = root.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let socket = root.path().join("socket");
+        let (config, passfile) =
+            standby_test_config(&root, data_dir.clone(), executable.clone(), socket);
+
+        assert!(prepare_fixture(config.clone()).is_ok());
+        write_control_data_state(&executable, "in archive recovery", "");
+        assert!(prepare_fixture(config.clone()).is_ok());
+        for state in [
+            "shut down",
+            "shutting down",
+            "in crash recovery",
+            "in production",
+        ] {
+            write_control_data_state(&executable, state, "");
+            assert!(matches!(
+                prepare_fixture(config.clone()),
+                Err(PostgresError::NonRecoveryControlState { state: actual }) if actual == state
+            ));
+        }
+        write_control_data_state(&executable, "shut down in recovery", "");
+
+        fs::remove_file(data_dir.join("standby.signal")).expect("remove standby signal");
+        assert!(matches!(
+            prepare_fixture(config.clone()),
+            Err(PostgresError::StandbySignalMissing { .. })
+        ));
+        write_standby_signal(&data_dir);
+
+        for forbidden in ["recovery.signal", "backup_label", "tablespace_map"] {
+            let path = data_dir.join(forbidden);
+            fs::write(&path, []).expect("write forbidden recovery marker");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("protect forbidden recovery marker");
+            assert!(matches!(
+                prepare_fixture(config.clone()),
+                Err(PostgresError::RecoveryStatePresent { path: actual }) if actual == path
+            ));
+            fs::remove_file(path).expect("remove forbidden recovery marker");
+        }
+
+        let write_passfile = |contents: &[u8]| {
+            fs::set_permissions(&passfile, fs::Permissions::from_mode(0o600))
+                .expect("make passfile replaceable");
+            fs::write(&passfile, contents).expect("replace passfile contents");
+            fs::set_permissions(&passfile, fs::Permissions::from_mode(0o400))
+                .expect("protect replaced passfile");
+        };
+        let invalid_passfiles = [
+            Vec::new(),
+            b"other.database.svc:5432:*:pgshard_replication:secret\n".to_vec(),
+            b"primary.database.svc:5432:*:pgshard_replication:\n".to_vec(),
+            b"primary.database.svc:5432:*:other:secret\n".to_vec(),
+            b"primary.database.svc:5432:*:pgshard_replication:one\nprimary.database.svc:5432:*:pgshard_replication:two\n".to_vec(),
+            b"primary.database.svc:5432:*:pgshard_replication:unescaped:colon\n".to_vec(),
+            b"primary.database.svc:5432:*:pgshard_replication:dangling\\\n".to_vec(),
+            vec![b'a'; usize::try_from(MAX_STANDBY_PASSFILE_BYTES).expect("bounded test size") + 1],
+        ];
+        for contents in invalid_passfiles {
+            write_passfile(&contents);
+            assert!(matches!(
+                prepare_fixture(config.clone()),
+                Err(PostgresError::InvalidStandbyPassfile { path }) if path == passfile
+            ));
+        }
+        write_passfile(
+            b"primary.database.svc:5432:*:pgshard_replication:escaped\\:colon\\\\slash\n",
+        );
+        assert!(prepare_fixture(config.clone()).is_ok());
+        write_passfile(b"primary.database.svc:5432:*:pgshard_replication:secret\n");
+
+        fs::set_permissions(&passfile, fs::Permissions::from_mode(0o600))
+            .expect("make passfile writable");
+        assert!(matches!(
+            prepare_fixture(config),
+            Err(PostgresError::UnsafePermissions {
+                name: "PostgreSQL standby passfile",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn replication_standby_accepts_canonical_member_slot_identities() {
+        for valid in [
+            "pgshard_member_0000",
+            "pgshard_member_9999",
+            "pgshard_member_10000",
+            "pgshard_member_65535",
+        ] {
+            assert!(validate_managed_member_name(valid).is_ok());
+        }
+        for invalid in [
+            "pgshard_member_001",
+            "pgshard_member_00000",
+            "pgshard_member_00a0",
+            "pgshard_member_65536",
+            "pgshard-member-0000",
+        ] {
+            assert!(matches!(
+                validate_managed_member_name(invalid),
+                Err(PostgresConfigError::InvalidManagedMemberName(actual)) if actual == invalid
+            ));
+        }
+    }
+
+    #[test]
+    fn replication_standby_command_is_tcp_closed_password_free_and_recovery_locked() {
+        let root = TempDir::new().expect("create standby command fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let executable = root.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let socket = root.path().join("socket");
+        let (config, passfile) = standby_test_config(&root, data_dir, executable, socket);
+        assert_eq!(
+            config.starting_process_state(),
+            PostgresProcessState::StartingReplicationStandby
+        );
+        assert_eq!(
+            config.running_process_state(),
+            PostgresProcessState::RunningReplicationStandby
+        );
+        let prepared = prepare_fixture(config).expect("prepare standby command fixture");
+        let command = prepared.command();
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        let required_settings = vec![
+            "listen_addresses=".to_owned(),
+            "archive_mode=off".to_owned(),
+            format!(
+                "primary_conninfo=host=primary.database.svc port=5432 user=pgshard_replication application_name=pgshard_member_0001 passfile={} sslmode=disable",
+                passfile.display()
+            ),
+            "primary_slot_name=pgshard_member_0001".to_owned(),
+            "recovery_target_action=shutdown".to_owned(),
+            "recovery_target_timeline=latest".to_owned(),
+            "hot_standby=on".to_owned(),
+            "hot_standby_feedback=on".to_owned(),
+            "default_transaction_read_only=on".to_owned(),
+            "wal_receiver_create_temp_slot=off".to_owned(),
+        ];
+        for required in required_settings {
+            assert!(
+                arguments.contains(&OsStr::new(&required)),
+                "missing standby setting {required:?}"
+            );
+        }
+        for preserved in ["max_wal_senders=", "max_replication_slots="] {
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|argument| argument.as_bytes().starts_with(preserved.as_bytes())),
+                "standby must not shrink recovery capacity with {preserved:?}"
+            );
+        }
+        assert!(
+            !arguments.iter().any(|argument| argument
+                .as_bytes()
+                .windows(b"password".len())
+                .any(|window| window == b"password")),
+            "standby command embedded a password"
+        );
+        assert!(
+            !arguments.iter().any(|argument| argument
+                .as_bytes()
+                .windows(b"secret".len())
+                .any(|window| window == b"secret")),
+            "standby command embedded the fixture credential"
+        );
+        for (name, value) in command.as_std().get_envs() {
+            assert_ne!(name, OsStr::new("PGPASSWORD"));
+            assert!(
+                value.is_none_or(|value| !value
+                    .as_bytes()
+                    .windows(b"secret".len())
+                    .any(|window| window == b"secret")),
+                "standby environment embedded the fixture credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_standby_delays_running_and_fences_lost_recovery_proof() {
+        for terminal in [
+            crate::postgres_recovery::TestRecoveryObservation::RecoveryEnded,
+            crate::postgres_recovery::TestRecoveryObservation::Unknown,
+        ] {
+            let root = TempDir::new().expect("create standby supervision fixture");
+            let data_dir = root.path().join("data");
+            pgdata_fixture_at(&data_dir);
+            let marker = root.path().join("started");
+            let executable = root.path().join("postgres");
+            write_executable(
+                &executable,
+                &format!(
+                    "#!/bin/sh\nprintf started > '{}'\ntrap '' TERM INT QUIT\nwhile :; do sleep 1; done\n",
+                    marker.display()
+                ),
+            );
+            let socket = root.path().join("socket");
+            let (config, _) = standby_test_config(&root, data_dir, executable, socket);
+            let prepared = prepare_fixture(config).expect("prepare standby supervisor");
+            let state = agent_state();
+            let (observed_tx, observed_rx) =
+                watch::channel(crate::postgres_recovery::TestRecoveryObservation::Pending);
+            crate::postgres_recovery::set_test_recovery_observations(observed_rx);
+            let supervisor_state = state.clone();
+            let supervisor = tokio::spawn(async move {
+                prepared
+                    .supervise(supervisor_state, std::future::pending())
+                    .await
+            });
+            wait_for_marker(&marker).await;
+            assert_eq!(
+                state.snapshot().postgres_process,
+                PostgresProcessState::StartingReplicationStandby
+            );
+            observed_tx
+                .send(crate::postgres_recovery::TestRecoveryObservation::InRecovery)
+                .expect("confirm recovery");
+            timeout(Duration::from_secs(1), async {
+                while state.snapshot().postgres_process
+                    != PostgresProcessState::RunningReplicationStandby
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("standby reached running only after recovery proof");
+            observed_tx.send(terminal).expect("lose recovery proof");
+            let result = timeout(Duration::from_secs(2), supervisor)
+                .await
+                .expect("standby fenced inside cleanup bound")
+                .expect("join standby supervisor");
+            assert!(matches!(result, Err(PostgresError::StandbyRecovery { .. })));
+            assert_eq!(
+                state.snapshot().postgres_process,
+                PostgresProcessState::Failed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_standby_rejects_writable_supervision_independently() {
+        let root = TempDir::new().expect("create standby authority fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let executable = root.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let socket = root.path().join("socket");
+        let (config, _) = standby_test_config(&root, data_dir, executable, socket);
+        let prepared = prepare_fixture(config).expect("prepare standby authority fixture");
+        let state = agent_state();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let result = prepared
+            .supervise_with_writable_authority(
+                state.clone(),
+                shutdown_rx,
+                Duration::from_secs(1),
+                crate::writable::writable_attempt_pair_for_test().1,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(PostgresError::WritableAuthorityForbidden)
+        ));
+        assert!(state.snapshot().lease.is_none());
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+    }
+
+    #[test]
     fn accepts_only_owner_private_socket_directory_modes() {
         let fixture = TempDir::new().expect("create socket fixture");
         let socket = fixture.path().join("socket");
@@ -5594,6 +6455,58 @@ mod tests {
             state.snapshot().postgres_process,
             PostgresProcessState::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn replication_standby_revalidates_signal_and_passfile_before_spawn() {
+        for mutate_signal in [true, false] {
+            let root = TempDir::new().expect("create standby revalidation fixture");
+            let data_dir = root.path().join("data");
+            pgdata_fixture_at(&data_dir);
+            let marker = root.path().join("postmaster-started");
+            let executable = root.path().join("postgres");
+            write_executable(
+                &executable,
+                &format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+            );
+            let socket = root.path().join("socket");
+            let (config, passfile) =
+                standby_test_config(&root, data_dir.clone(), executable, socket);
+            let prepared = prepare_fixture(config).expect("prepare standby fixture");
+            let path = if mutate_signal {
+                data_dir.join("standby.signal")
+            } else {
+                passfile
+            };
+            fs::remove_file(&path).expect("remove prepared standby input");
+            fs::write(
+                &path,
+                if mutate_signal {
+                    &b""[..]
+                } else {
+                    &b"primary.database.svc:5432:*:pgshard_replication:replacement\n"[..]
+                },
+            )
+            .expect("replace prepared standby input");
+            fs::set_permissions(
+                &path,
+                fs::Permissions::from_mode(if mutate_signal { 0o600 } else { 0o400 }),
+            )
+            .expect("protect replaced standby input");
+            let state = agent_state();
+            let result = prepared
+                .supervise(state.clone(), std::future::pending())
+                .await;
+            assert!(matches!(result, Err(PostgresError::PreparedStateChanged)));
+            assert!(
+                !marker.exists(),
+                "postmaster ran after standby input changed"
+            );
+            assert_eq!(
+                state.snapshot().postgres_process,
+                PostgresProcessState::Failed
+            );
+        }
     }
 
     #[tokio::test]
@@ -6809,6 +7722,52 @@ mod tests {
             Duration::from_millis(100),
         )
         .expect("valid test config")
+    }
+
+    fn standby_test_config(
+        root: &TempDir,
+        data_dir: PathBuf,
+        executable: PathBuf,
+        socket_dir: PathBuf,
+    ) -> (PostgresConfig, PathBuf) {
+        write_standby_signal(&data_dir);
+        write_control_data_state(&executable, "shut down in recovery", "");
+        let passfile = root.path().join("replication.pass");
+        fs::write(
+            &passfile,
+            b"primary.database.svc:5432:*:pgshard_replication:secret\n",
+        )
+        .expect("write standby passfile");
+        fs::set_permissions(&passfile, fs::Permissions::from_mode(0o400))
+            .expect("protect standby passfile");
+        let hba_file = root.path().join("standby.pg_hba.conf");
+        write_hba(&hba_file);
+        let standby = PostgresStandbyConfig::new(
+            "primary.database.svc".to_owned(),
+            5432,
+            "pgshard_member_0001".to_owned(),
+            passfile.clone(),
+        )
+        .expect("valid standby identity");
+        let config = PostgresConfig::new_replication_standby(
+            standby,
+            data_dir,
+            executable,
+            socket_dir,
+            hba_file,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid standby test config");
+        (config, passfile)
+    }
+
+    fn write_standby_signal(data_dir: &Path) {
+        let path = data_dir.join("standby.signal");
+        fs::write(&path, []).expect("write standby signal");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("protect standby signal");
     }
 
     fn prepare_fixture(config: PostgresConfig) -> Result<PreparedPostgres, PostgresError> {
