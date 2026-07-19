@@ -631,11 +631,27 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			if err := base.List(ctx, budgets, client.InNamespace(cluster.Namespace), client.MatchingLabels{owned.ComponentLabel: "postgresql"}); err != nil {
 				t.Fatal(err)
 			}
-			if len(statefulSets.Items) != 0 || len(pods.Items) != 0 || len(budgets.Items) != 0 {
-				t.Fatalf("source-storage intent became a workload: StatefulSets=%d Pods=%d PostgreSQL PDBs=%d", len(statefulSets.Items), len(pods.Items), len(budgets.Items))
+			if len(statefulSets.Items) != 1 || len(pods.Items) != 0 || len(budgets.Items) != 0 {
+				t.Fatalf("bootstrap-source composition = StatefulSets=%d Pods=%d PostgreSQL PDBs=%d", len(statefulSets.Items), len(pods.Items), len(budgets.Items))
+			}
+			source := statefulSets.Items[0]
+			if source.Name != owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0) || source.Spec.Template.Labels[owned.MemberLabel] != "0000" {
+				t.Fatalf("bootstrap-source identity = %#v", source.ObjectMeta)
+			}
+			if _, role := source.Spec.Template.Labels[owned.RoleLabel]; role {
+				t.Fatalf("bootstrap source received a serving role: %#v", source.Spec.Template.Labels)
+			}
+			if observed, err := owned.ObservePostgreSQLRuntime(source.Spec.Template.Annotations, source.Spec.Template.Spec); err != nil || observed != owned.PostgreSQLRuntimeAgentQuarantine {
+				t.Fatalf("bootstrap-source runtime = %q, %v", observed, err)
 			}
 			assertCondition(t, current, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 			assertCondition(t, current, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+			postgresqlCondition := meta.FindStatusCondition(current.Status.Conditions, postgresqlAvailableCondition)
+			ready := meta.FindStatusCondition(current.Status.Conditions, readyCondition)
+			if postgresqlCondition == nil || !strings.Contains(postgresqlCondition.Message, "role-neutral member-zero bootstrap sources are composed") ||
+				ready == nil || !strings.Contains(ready.Message, "standbys and serving primaries remain unavailable") {
+				t.Fatalf("multi-member status does not describe composed non-serving sources: PostgreSQL=%#v Ready=%#v", postgresqlCondition, ready)
+			}
 
 			direct := developmentReconciler(base, nil)
 			if _, err := direct.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "durable multi-member PostgreSQL source storage requires runtime \"agent-quarantine\"") {
@@ -887,15 +903,20 @@ func TestMultiMemberSourceStorageRejectsBootstrapImageBeforeDurableWrites(t *tes
 func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		name    string
-		kind    string
-		replace bool
-		want    string
+		name         string
+		kind         string
+		replace      bool
+		mutateSource bool
+		orphanPod    bool
+		want         string
 	}{
-		{name: "missing credential", kind: "secret", want: "is missing; explicit recovery is required"},
-		{name: "replaced credential", kind: "secret", replace: true, want: "expected recorded UID"},
+		{name: "missing bootstrap credential", kind: "secret", want: "is missing; explicit recovery is required"},
+		{name: "replaced bootstrap credential", kind: "secret", replace: true, want: "expected recorded UID"},
 		{name: "missing data", kind: "pvc", want: "is missing; restore is required"},
 		{name: "replaced data", kind: "pvc", replace: true, want: "expected recorded UID"},
+		{name: "missing writable Lease", kind: "lease", want: "is missing; explicit recovery is required"},
+		{name: "missing replication credential fences mutated source", kind: "replication-secret", mutateSource: true, want: "is missing; explicit recovery is required"},
+		{name: "missing replication credential fences orphaned source Pod", kind: "replication-secret", orphanPod: true, want: "is missing; explicit recovery is required"},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
@@ -911,6 +932,38 @@ func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 			}
 			current := getCluster(t, ctx, base, cluster)
 			bootstrap := bootstrapForShard(t, current, 0)
+			if test.mutateSource {
+				source := &appsv1.StatefulSet{}
+				key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0)}
+				if err := base.Get(ctx, key, source); err != nil {
+					t.Fatal(err)
+				}
+				source.Spec.Template.Labels[owned.RoleLabel] = "primary"
+				if err := base.Update(ctx, source); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var orphanPodKey types.NamespacedName
+			if test.orphanPod {
+				source := &appsv1.StatefulSet{}
+				sourceKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0)}
+				if err := base.Get(ctx, sourceKey, source); err != nil {
+					t.Fatal(err)
+				}
+				orphan := &corev1.Pod{
+					ObjectMeta: *source.Spec.Template.ObjectMeta.DeepCopy(),
+					Spec:       *source.Spec.Template.Spec.DeepCopy(),
+				}
+				orphan.Name = source.Name + "-0"
+				orphan.Namespace = cluster.Namespace
+				if err := base.Create(ctx, orphan); err != nil {
+					t.Fatal(err)
+				}
+				orphanPodKey = client.ObjectKeyFromObject(orphan)
+				if err := base.Delete(ctx, source); err != nil {
+					t.Fatal(err)
+				}
+			}
 
 			switch test.kind {
 			case "secret":
@@ -949,6 +1002,26 @@ func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+			case "lease":
+				checkpoint := current.Status.PostgreSQLWritableLeases[0]
+				lease := &coordinationv1.Lease{}
+				key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.LeaseName}
+				if err := base.Get(ctx, key, lease); err != nil {
+					t.Fatal(err)
+				}
+				if err := base.Delete(ctx, lease); err != nil {
+					t.Fatal(err)
+				}
+			case "replication-secret":
+				checkpoint := current.Status.PostgreSQLReplicationCredentials[0]
+				secret := &corev1.Secret{}
+				key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.SecretName}
+				if err := base.Get(ctx, key, secret); err != nil {
+					t.Fatal(err)
+				}
+				if err := base.Delete(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
 			default:
 				t.Fatalf("unknown test kind %q", test.kind)
 			}
@@ -964,10 +1037,72 @@ func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 			if err := base.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
 				t.Fatal(err)
 			}
-			if len(statefulSets.Items) != 0 {
-				t.Fatalf("identity failure published %d PostgreSQL workloads", len(statefulSets.Items))
+			if len(statefulSets.Items) > 1 || len(statefulSets.Items) == 1 && statefulSets.Items[0].DeletionTimestamp == nil {
+				t.Fatalf("identity failure did not fence the bootstrap source: %#v", statefulSets.Items)
+			}
+			if test.orphanPod {
+				orphan := &corev1.Pod{}
+				if err := base.Get(ctx, orphanPodKey, orphan); err == nil && orphan.DeletionTimestamp == nil {
+					t.Fatalf("identity failure left orphaned bootstrap source Pod running: %#v", orphan)
+				} else if err != nil && !apierrors.IsNotFound(err) {
+					t.Fatal(err)
+				}
 			}
 		})
+	}
+}
+
+func TestMultiMemberSourceFencingAttemptsEveryShardAfterCollision(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 2
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, nil)
+	reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	for shard := int32(0); shard < current.Spec.Shards; shard++ {
+		source := &appsv1.StatefulSet{}
+		key := types.NamespacedName{Namespace: current.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(current.Name, shard, 0)}
+		if err := base.Get(ctx, key, source); err != nil {
+			t.Fatal(err)
+		}
+		pod := &corev1.Pod{ObjectMeta: *source.Spec.Template.ObjectMeta.DeepCopy(), Spec: *source.Spec.Template.Spec.DeepCopy()}
+		pod.Name = source.Name + "-0"
+		pod.Namespace = current.Namespace
+		if err := base.Create(ctx, pod); err != nil {
+			t.Fatal(err)
+		}
+		if shard == 0 {
+			source.OwnerReferences = nil
+			if err := base.Update(ctx, source); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	err := reconciler.fenceMultiMemberPostgreSQLBootstrapSources(ctx, current)
+	if err == nil || !strings.Contains(err.Error(), "not controlled by PgShardCluster UID") {
+		t.Fatalf("source fencing collision error = %v", err)
+	}
+	for shard := int32(0); shard < current.Spec.Shards; shard++ {
+		pod := &corev1.Pod{}
+		key := types.NamespacedName{Namespace: current.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(current.Name, shard, 0) + "-0"}
+		if err := base.Get(ctx, key, pod); err == nil && pod.DeletionTimestamp == nil {
+			t.Fatalf("shard %d source Pod was not fenced after another shard collided: %#v", shard, pod)
+		} else if err != nil && !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	}
+	secondSource := &appsv1.StatefulSet{}
+	secondKey := types.NamespacedName{Namespace: current.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(current.Name, 1, 0)}
+	if err := base.Get(ctx, secondKey, secondSource); err == nil && secondSource.DeletionTimestamp == nil {
+		t.Fatalf("later shard source controller was not fenced: %#v", secondSource)
+	} else if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
 	}
 }
 
@@ -1322,6 +1457,60 @@ func TestReplicationCredentialsAreStagedCheckpointedAndFailClosed(t *testing.T) 
 	current = getCluster(t, ctx, base, cluster)
 	if err := reconciler.ensurePostgreSQLReplicationCredentials(ctx, current); err == nil || !strings.Contains(err.Error(), "material differs from the checkpointed creation result") {
 		t.Fatalf("changed replication material error = %v", err)
+	}
+}
+
+func TestReplicationCredentialReconciliationReindexesAfterSortedInsert(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationCredentials(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	current = getCluster(t, ctx, base, cluster)
+	shardZero, found := postgreSQLReplicationCredentialForShard(current, 0)
+	if !found {
+		t.Fatal("shard-zero replication credential was not checkpointed")
+	}
+	oldShardZeroName := shardZero.SecretName
+	shardOne, found := postgreSQLReplicationCredentialForShard(current, 1)
+	if !found {
+		t.Fatal("shard-one replication credential was not checkpointed")
+	}
+	checkpointedShardOne := *shardOne
+	for _, recorded := range current.Status.PostgreSQLReplicationCredentials {
+		secret := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: current.Namespace, Name: recorded.SecretName}
+		if err := base.Get(ctx, key, secret); err != nil {
+			t.Fatal(err)
+		}
+		if err := base.Delete(ctx, secret); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current.Status.PostgreSQLReplicationCredentials = []pgshardv1alpha1.PostgreSQLReplicationCredentialStatus{checkpointedShardOne}
+	if err := base.Status().Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	current = getCluster(t, ctx, base, cluster)
+	err := reconciler.ensurePostgreSQLReplicationCredentials(ctx, current)
+	if err == nil || !strings.Contains(err.Error(), "replication credential Secret "+checkpointedShardOne.SecretName) || !strings.Contains(err.Error(), "is missing; explicit recovery is required") {
+		t.Fatalf("broken later-shard credential error = %v", err)
+	}
+	after := getCluster(t, ctx, base, cluster)
+	newShardZero, found := postgreSQLReplicationCredentialForShard(after, 0)
+	if !found || newShardZero.SecretName == oldShardZeroName || newShardZero.SecretUID == "" || newShardZero.MaterialSHA256 == "" {
+		t.Fatalf("missing lower shard was not safely recreated: %#v", after.Status.PostgreSQLReplicationCredentials)
+	}
+	observedShardOne, found := postgreSQLReplicationCredentialForShard(after, 1)
+	if !found || *observedShardOne != checkpointedShardOne {
+		t.Fatalf("broken later-shard checkpoint changed: before=%#v after=%#v", checkpointedShardOne, observedShardOne)
 	}
 }
 

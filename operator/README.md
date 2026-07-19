@@ -19,8 +19,9 @@ API. The controller now reconciles the safe supporting-resource slice:
 - for a three- or five-member topology only when the manager explicitly selects
   `agent-quarantine`, one uninitialized source-storage intent for every stable
   physical member using the same exact-UID Secret/PVC lifecycle, plus one
-  staged immutable physical-replication credential per shard, but no
-  PostgreSQL Pod, StatefulSet, PDB, or catalog credential;
+  staged immutable physical-replication credential per shard and one
+  role-neutral, non-serving member-zero replication-bootstrap source per shard,
+  but no standby, PostgreSQL PDB, catalog credential, or application endpoint;
 - an idempotently migrated `shardschema` database on shard-0000 containing the
   complete immutable shard inventory and an initial restore incarnation for
   each shard;
@@ -48,9 +49,10 @@ exact detached Secret UID. Once the PVC UID is checkpointed, the controller
 adds its data-protection finalizer, detaches that exact live PVC, and anchors
 the Secret tombstone to the PVC. Any workload is published only after that
 ownership inversion is complete. Multi-member status and resource labels key
-that lifecycle by both shard and immutable member; the source-storage slice
-stops at the inversion and publishes no workload. Deleting the Secret therefore
-cannot cascade to current data, while deleting the protected PVC cascades to the credential
+that lifecycle by both shard and immutable member. After every storage, Lease,
+and replication-credential checkpoint is complete, the explicit agent runtime
+publishes only member zero as a non-serving bootstrap source. Deleting the
+Secret therefore cannot cascade to current data, while deleting the protected PVC cascades to the credential
 tombstone and reserves the claim name until every mounting workload has been
 pruned. Original timed-out PVC creates carry the tombstone owner but never the
 data-protection finalizer, so deleting the tombstone garbage-collects any such
@@ -101,17 +103,21 @@ increase the value directly to at least 4Gi before this controller will plan
 new children. No later resize is accepted.
 `PostgreSQLPrimariesAvailable=True` means only that all of those single-member
 primaries have passed the StatefulSet's minimum-ready window. It does not claim standby
-replication, failover, routing, or zero-downtime restart. Three- and five-member
-resources continue to create no PostgreSQL Pods until initialization,
-replication, fencing integration, promotion, and recovery exist. The default
+replication, failover, routing, or zero-downtime restart. The default
 `direct` runtime also creates no multi-member bootstrap Secret or PVC. With the
 explicit `agent-quarantine` runtime, the controller checkpoints one blank,
 protected PVC and bootstrap Secret for every stable member as non-serving
 source-storage intent. It also checkpoints one unpredictably named replication
 Secret per shard by first recording an empty intent and its API UID, then
-installing immutable password material and recording its digest. No workload
-mounts that Secret; none of these resources is initialized, selected by a
-Service, or evidence of a primary or standby.
+installing immutable password material and recording its digest. Once every
+checkpoint is complete, member zero is atomically initialized with a
+replication-only HBA and supervised by the agent's
+`replication-bootstrap-primary` role under the exact writable Lease. The Pod
+has no `pgshard.io/role`, remains unready, and cannot match an application
+Service. No workload mounts the replication Secret yet, so the fixed
+`pgshard_replication` login is absent and remote authentication remains closed.
+Other members remain storage-only. This is bootstrap-source composition, not
+evidence of a primary, standby, synchronous replica, or HA availability.
 PostgreSQL StatefulSets use `OnDelete` updates. A controller image, bootstrap
 image, script, or generated-configuration change therefore updates the desired
 template without concurrently deleting every singleton primary. Until a

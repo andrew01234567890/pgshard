@@ -223,16 +223,19 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		}
 	}
 	if err := r.ensurePostgreSQLWritableLeases(ctx, cluster); err != nil {
+		fenceErr := r.fenceMultiMemberPostgreSQLBootstrapSources(ctx, cluster)
 		statusErr := r.reportFailure(ctx, cluster, "WritableLeaseReconcileFailed", fmt.Sprintf("PostgreSQL writable-term Lease reconciliation failed: %v", err))
-		return ctrl.Result{}, errors.Join(err, statusErr)
+		return ctrl.Result{}, errors.Join(err, fenceErr, statusErr)
 	}
 	if err := r.ensurePostgreSQLBootstrap(ctx, cluster); err != nil {
+		fenceErr := r.fenceMultiMemberPostgreSQLBootstrapSources(ctx, cluster)
 		statusErr := r.reportFailure(ctx, cluster, "BootstrapReconcileFailed", fmt.Sprintf("PostgreSQL bootstrap reconciliation failed: %v", err))
-		return ctrl.Result{}, errors.Join(err, statusErr)
+		return ctrl.Result{}, errors.Join(err, fenceErr, statusErr)
 	}
 	if err := r.ensurePostgreSQLReplicationCredentials(ctx, cluster); err != nil {
+		fenceErr := r.fenceMultiMemberPostgreSQLBootstrapSources(ctx, cluster)
 		statusErr := r.reportFailure(ctx, cluster, "ReplicationCredentialReconcileFailed", fmt.Sprintf("PostgreSQL replication credential reconciliation failed: %v", err))
-		return ctrl.Result{}, errors.Join(err, statusErr)
+		return ctrl.Result{}, errors.Join(err, fenceErr, statusErr)
 	}
 	if err := r.ensureCatalogAccess(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "CatalogAccessReconcileFailed", fmt.Sprintf("shardschema access reconciliation failed: %v", err))
@@ -939,11 +942,13 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLReplicationCredentials(ctx co
 	}
 
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
-		index, ok := indices[shard]
+		recorded, ok := postgreSQLReplicationCredentialForShard(cluster, shard)
 		if !ok {
-			return r.createPostgreSQLReplicationCredentialIntent(ctx, cluster, shard, reader)
+			if err := r.createPostgreSQLReplicationCredentialIntent(ctx, cluster, shard, reader); err != nil {
+				return err
+			}
+			continue
 		}
-		recorded := &cluster.Status.PostgreSQLReplicationCredentials[index]
 		secret := &corev1.Secret{}
 		key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
 		if err := reader.Get(ctx, key, secret); err != nil {
@@ -971,7 +976,10 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLReplicationCredentials(ctx co
 			return fmt.Errorf("replication credential Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, secret.UID, recorded.SecretUID)
 		}
 		if recorded.MaterialSHA256 == "" {
-			return r.materializePostgreSQLReplicationCredential(ctx, cluster, secret, recorded, reader)
+			if err := r.materializePostgreSQLReplicationCredential(ctx, cluster, secret, recorded, reader); err != nil {
+				return err
+			}
+			continue
 		}
 		if err := validateCheckpointedPostgreSQLReplicationCredential(secret, cluster, recorded); err != nil {
 			return err
@@ -2004,6 +2012,74 @@ func (r *PgShardClusterReconciler) authoritativeReader() client.Reader {
 		return r.APIReader
 	}
 	return r.Client
+}
+
+// fenceMultiMemberPostgreSQLBootstrapSources removes every exact cluster-owned
+// member-zero source controller and every exact source Pod when an identity
+// prerequisite fails. The template is deliberately not trusted here: mutating
+// the runtime or its labels must not provide a way to defeat fencing. All
+// shards are attempted so one colliding object cannot leave another source
+// running.
+func (r *PgShardClusterReconciler) fenceMultiMemberPostgreSQLBootstrapSources(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	if cluster.Spec.MembersPerShard == 1 || cluster.Status.PostgreSQLBootstrapSpec == nil || cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine.String() {
+		return nil
+	}
+	reader := r.authoritativeReader()
+	var fenceErrors []error
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		name := owned.PostgreSQLMemberStatefulSetName(cluster.Name, shard, 0)
+		statefulSet := &appsv1.StatefulSet{}
+		statefulSetErr := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet)
+		if statefulSetErr != nil && !apierrors.IsNotFound(statefulSetErr) {
+			fenceErrors = append(fenceErrors, fmt.Errorf("read replication bootstrap source StatefulSet %s before fencing: %w", name, statefulSetErr))
+		} else if statefulSetErr == nil {
+			if !metav1.IsControlledBy(statefulSet, cluster) {
+				fenceErrors = append(fenceErrors, fmt.Errorf("refusing to fence replication bootstrap source StatefulSet %s because it is not controlled by PgShardCluster UID %s", name, cluster.UID))
+			} else if statefulSet.DeletionTimestamp == nil {
+				uid := statefulSet.UID
+				resourceVersion := statefulSet.ResourceVersion
+				if uid == "" || resourceVersion == "" {
+					fenceErrors = append(fenceErrors, fmt.Errorf("replication bootstrap source StatefulSet %s has no stable API identity", name))
+				} else if err := r.Delete(ctx, statefulSet,
+					client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+					client.PropagationPolicy(metav1.DeletePropagationForeground),
+				); err != nil && !apierrors.IsNotFound(err) {
+					fenceErrors = append(fenceErrors, fmt.Errorf("fence replication bootstrap source StatefulSet %s with UID %s: %w", name, uid, err))
+				}
+			}
+		}
+
+		podName := name + "-0"
+		pod := &corev1.Pod{}
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: podName}, pod); err != nil {
+			if !apierrors.IsNotFound(err) {
+				fenceErrors = append(fenceErrors, fmt.Errorf("read replication bootstrap source Pod %s before fencing: %w", podName, err))
+			}
+			continue
+		}
+		if pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != string(cluster.UID) ||
+			pod.Labels[owned.ClusterLabel] != cluster.Name ||
+			pod.Labels[owned.ComponentLabel] != "postgresql" ||
+			pod.Labels[owned.ShardLabel] != fmt.Sprintf("%04d", shard) ||
+			pod.Labels[owned.MemberLabel] != "0000" ||
+			pod.Spec.ServiceAccountName != owned.PostgreSQLAgentServiceAccountName(cluster.Name, shard) {
+			fenceErrors = append(fenceErrors, fmt.Errorf("refusing to fence replication bootstrap source Pod %s because it is not bound to PgShardCluster UID %s shard %d member 0", podName, cluster.UID, shard))
+			continue
+		}
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		uid := pod.UID
+		resourceVersion := pod.ResourceVersion
+		if uid == "" || resourceVersion == "" {
+			fenceErrors = append(fenceErrors, fmt.Errorf("replication bootstrap source Pod %s has no stable API identity", podName))
+			continue
+		}
+		if err := r.Delete(ctx, pod, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+			fenceErrors = append(fenceErrors, fmt.Errorf("fence replication bootstrap source Pod %s with UID %s: %w", podName, uid, err))
+		}
+	}
+	return errors.Join(fenceErrors...)
 }
 
 // migrateLegacyPostgreSQLWorkloadNames establishes an authoritative absence
@@ -3617,7 +3693,7 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 
 func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, string, string, error) {
 	if cluster.Spec.MembersPerShard != 1 {
-		return false, "PostgreSQLHAUnavailable", "three- and five-member PostgreSQL lifecycle remains disabled until bootstrap, replication, fencing, promotion, and recovery are implemented", nil
+		return false, "PostgreSQLHAUnavailable", "role-neutral member-zero bootstrap sources are composed, but standby replication, serving primary activation, promotion, and recovery remain unavailable", nil
 	}
 	reader := client.Reader(r.Client)
 	if r.APIReader != nil {
@@ -3690,7 +3766,7 @@ func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *p
 		postgresqlStatus = metav1.ConditionTrue
 	}
 	readyReason := "PostgreSQLHAUnavailable"
-	readyMessage := "PostgreSQL Pods are intentionally absent until bootstrap, replication, fencing, promotion, and recovery are implemented"
+	readyMessage := "role-neutral member-zero bootstrap sources are composed, but standbys and serving primaries remain unavailable until replication, activation, promotion, and recovery are implemented"
 	if cluster.Spec.MembersPerShard == 1 {
 		readyReason = "DataPlaneUnavailable"
 		readyMessage = "single-member PostgreSQL primaries are supported, but SQL routing and high-availability failover are not implemented"

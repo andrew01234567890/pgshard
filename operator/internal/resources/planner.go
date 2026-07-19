@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strconv"
 	"strings"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
@@ -112,6 +113,18 @@ esac
 
 if [[ ! "$PGSHARD_POSTGRESQL_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   echo "refusing invalid PostgreSQL configuration digest" >&2
+  exit 1
+fi
+bootstrap_hba_mode="${PGSHARD_BOOTSTRAP_HBA_MODE:-serving}"
+case "$bootstrap_hba_mode" in
+  serving|replication-bootstrap-primary) ;;
+  *)
+    echo "refusing invalid PostgreSQL bootstrap HBA mode" >&2
+    exit 1
+    ;;
+esac
+if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]] && [[ "$bootstrap_hba_mode" != "serving" ]]; then
+  echo "shardschema bootstrap requires the serving HBA mode" >&2
   exit 1
 fi
 configuration_source="${PGSHARD_POSTGRESQL_CONFIG_SOURCE:-/etc/pgshard/postgresql-source}"
@@ -337,9 +350,13 @@ fi
 if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" != "true" ]]; then
   hba_staging="$final/.pgshard-pg_hba.conf.next"
   rm -f -- "$hba_staging"
-  printf '%s\n' \
-    'local all all trust' \
-    'host all all all scram-sha-256' > "$hba_staging"
+  if [[ "$bootstrap_hba_mode" == "replication-bootstrap-primary" ]]; then
+    install -m 0600 -- /etc/pgshard/replication-bootstrap-primary.pg_hba.conf "$hba_staging"
+  else
+    printf '%s\n' \
+      'local all all trust' \
+      'host all all all scram-sha-256' > "$hba_staging"
+  fi
   chmod 0600 "$hba_staging"
   sync "$hba_staging" "$final"
   mv -- "$hba_staging" "$final/pg_hba.conf"
@@ -1409,7 +1426,7 @@ func ObservePostgreSQLRuntime(annotations map[string]string, spec corev1.PodSpec
 	}
 
 	annotated := PostgreSQLRuntime(annotations[PostgreSQLRuntimeAnnotation])
-	agentShape := postgresqlAgentQuarantineShape(spec, *postgres)
+	agentShape := postgresqlAgentShape(spec, *postgres)
 	switch annotated {
 	case "", PostgreSQLRuntimeDirect:
 		if agentShape {
@@ -1426,11 +1443,53 @@ func ObservePostgreSQLRuntime(annotations map[string]string, spec corev1.PodSpec
 	}
 }
 
-func postgresqlAgentQuarantineShape(spec corev1.PodSpec, postgres corev1.Container) bool {
+// IsPostgreSQLReplicationBootstrapSourcePod recognizes only the deterministic,
+// role-neutral member-zero Pod composed while a multi-member shard is being
+// bootstrapped. The absent role label is deliberate: this source may seed
+// standbys, but it is not authorized to serve application traffic.
+func IsPostgreSQLReplicationBootstrapSourcePod(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	if _, hasRole := pod.Labels[RoleLabel]; hasRole || pod.Labels[MemberLabel] != memberLabel(0) {
+		return false
+	}
+	shardText := pod.Labels[ShardLabel]
+	shard, err := strconv.ParseInt(shardText, 10, 32)
+	if err != nil || shard < 0 || shardText != shardLabel(int32(shard)) {
+		return false
+	}
+	cluster := pod.Labels[ClusterLabel]
+	if cluster == "" || pod.Name != PostgreSQLMemberStatefulSetName(cluster, int32(shard), 0)+"-0" ||
+		pod.Spec.ServiceAccountName != PostgreSQLAgentServiceAccountName(cluster, int32(shard)) {
+		return false
+	}
+	runtime, err := ObservePostgreSQLRuntime(pod.Annotations, pod.Spec)
+	if err != nil || runtime != PostgreSQLRuntimeAgentQuarantine {
+		return false
+	}
+	for index := range pod.Spec.Containers {
+		container := pod.Spec.Containers[index]
+		if container.Name != "postgresql" {
+			continue
+		}
+		mode, modeOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_MODE")
+		hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_HBA_FILE")
+		return modeOK && hbaFileOK && mode == "replication-bootstrap-primary" &&
+			hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+	}
+	return false
+}
+
+func postgresqlAgentShape(spec corev1.PodSpec, postgres corev1.Container) bool {
 	if spec.ServiceAccountName == "" || spec.AutomountServiceAccountToken == nil || *spec.AutomountServiceAccountToken || len(postgres.Command) != 0 || len(postgres.Args) != 0 {
 		return false
 	}
-	if !containerHasLiteralEnvironment(postgres, "PGSHARD_POSTGRES_MODE", "quarantine") ||
+	mode, modeOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_MODE")
+	hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_HBA_FILE")
+	quarantine := modeOK && hbaFileOK && mode == "quarantine" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
+	bootstrapSource := modeOK && hbaFileOK && mode == "replication-bootstrap-primary" && hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+	if (!quarantine && !bootstrapSource) ||
 		!containerHasPort(postgres, "agent-http", HTTPPort) ||
 		!containerHasMount(postgres, "kubernetes-api", "/var/run/secrets/kubernetes.io/serviceaccount") ||
 		!containerHasMount(postgres, "runtime", "/run/pgshard") ||
@@ -1440,6 +1499,22 @@ func postgresqlAgentQuarantineShape(spec corev1.PodSpec, postgres corev1.Contain
 	return probeHTTPPath(postgres.StartupProbe) == "/healthz" &&
 		probeHTTPPath(postgres.LivenessProbe) == "/healthz" &&
 		probeHTTPPath(postgres.ReadinessProbe) == "/readyz"
+}
+
+func containerUniqueLiteralEnvironment(container corev1.Container, name string) (string, bool) {
+	var value string
+	found := false
+	for _, environment := range container.Env {
+		if environment.Name != name {
+			continue
+		}
+		if found || environment.ValueFrom != nil {
+			return "", false
+		}
+		value = environment.Value
+		found = true
+	}
+	return value, found
 }
 
 func containerHasLiteralEnvironment(container corev1.Container, name, value string) bool {
@@ -1545,9 +1620,10 @@ func ValidateImagesForCluster(cluster *pgshardv1alpha1.PgShardCluster, images Im
 }
 
 // Plan returns the complete set of safe-to-create resources for cluster.
-// Single-member asynchronous shards receive one PostgreSQL 18 primary. The
-// multi-member path stays fail closed until physical replication, fencing,
-// promotion, and recovery are implemented together.
+// Single-member asynchronous shards receive one PostgreSQL 18 primary. An
+// explicit multi-member agent runtime receives one non-serving member-zero
+// replication-bootstrap source per shard; standbys, serving activation,
+// promotion, and recovery remain fail closed.
 func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Object, error) {
 	if cluster == nil {
 		return nil, fmt.Errorf("cluster is nil")
@@ -1632,6 +1708,11 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			return nil, fmt.Errorf("catalog access creation result is missing or invalid")
 		}
 	}
+	if cluster.Spec.MembersPerShard > 1 && images.PostgreSQLRuntime.agentQuarantine() {
+		if _, err := postgresqlReplicationCredentials(cluster); err != nil {
+			return nil, err
+		}
+	}
 
 	objects := make([]client.Object, 0, 18+7*cluster.Spec.Shards)
 	objects = append(objects,
@@ -1665,6 +1746,12 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			objects = append(objects,
 				postgresqlShardStatefulSet(cluster, shard, images, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess, writableLease),
 				postgresqlPrimaryDisruptionBudget(cluster, shard),
+			)
+		} else if images.PostgreSQLRuntime.agentQuarantine() {
+			bootstrap := bootstraps[postgresqlBootstrapKey{shard: shard, member: 0}]
+			writableLease := writableLeases[shard]
+			objects = append(objects,
+				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease),
 			)
 		}
 	}
@@ -1737,6 +1824,37 @@ func postgresqlWritableLeases(cluster *pgshardv1alpha1.PgShardCluster) (map[int3
 		}
 	}
 	return checkpoints, nil
+}
+
+func postgresqlReplicationCredentials(cluster *pgshardv1alpha1.PgShardCluster) (map[int32]pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, error) {
+	credentials := make(map[int32]pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, len(cluster.Status.PostgreSQLReplicationCredentials))
+	names := make(map[string]struct{}, len(cluster.Status.PostgreSQLReplicationCredentials))
+	uids := make(map[types.UID]struct{}, len(cluster.Status.PostgreSQLReplicationCredentials))
+	for _, credential := range cluster.Status.PostgreSQLReplicationCredentials {
+		if credential.Shard < 0 || credential.Shard >= cluster.Spec.Shards ||
+			!PostgreSQLReplicationSecretNameIsValid(cluster.Name, credential.Shard, credential.SecretName) ||
+			credential.SecretUID == "" || !validCatalogMaterialSHA256(credential.MaterialSHA256) {
+			return nil, fmt.Errorf("PostgreSQL replication credential checkpoint for shard %d is invalid", credential.Shard)
+		}
+		if _, duplicate := credentials[credential.Shard]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL replication credential checkpoint for shard %d is duplicated", credential.Shard)
+		}
+		if _, duplicate := names[credential.SecretName]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL replication credential Secret name %s is duplicated", credential.SecretName)
+		}
+		if _, duplicate := uids[credential.SecretUID]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL replication credential Secret UID %s is duplicated", credential.SecretUID)
+		}
+		credentials[credential.Shard] = credential
+		names[credential.SecretName] = struct{}{}
+		uids[credential.SecretUID] = struct{}{}
+	}
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		if _, ok := credentials[shard]; !ok {
+			return nil, fmt.Errorf("PostgreSQL replication credential checkpoint for shard %d is missing", shard)
+		}
+	}
+	return credentials, nil
 }
 
 func renderPostgreSQLConfiguration(configuration pgshardv1alpha1.ResolvedPostgreSQLConfiguration) map[string]string {
@@ -2718,7 +2836,131 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 	}
 }
 
+func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) *appsv1.StatefulSet {
+	const (
+		postgresUID = int64(999)
+		replicas    = int32(1)
+	)
+	name := PostgreSQLMemberStatefulSetName(cluster.Name, shard, 0)
+	selector := componentSelector(cluster, "postgresql")
+	selector[ShardLabel] = shardLabel(shard)
+	selector[MemberLabel] = memberLabel(0)
+	podLabels := maps.Clone(selector)
+	podLabels[ManagedByLabel] = ManagedByValue
+	allowPrivilegeEscalation := false
+	readOnlyRootFilesystem := true
+	runAsNonRoot := true
+	seccomp := &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	fsGroupChangePolicy := corev1.FSGroupChangeOnRootMismatch
+	postgresSecurity := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+		ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
+		RunAsNonRoot:             &runAsNonRoot,
+		RunAsUser:                ptr(postgresUID),
+		RunAsGroup:               ptr(postgresUID),
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+	bootstrapPullPolicy := imagePullPolicy(images.PostgreSQLBootstrap)
+	if images.PostgreSQLBootstrap == developmentPostgreSQLBootstrapImage {
+		bootstrapPullPolicy = corev1.PullNever
+	}
+	agent := postgresqlReplicationBootstrapPrimaryContainer(cluster, shard, images.PostgreSQLBootstrap, bootstrapPullPolicy, postgresSecurity, writableLease)
+	bootstrapContainer := corev1.Container{
+		Name:            "bootstrap-postgresql",
+		Image:           images.PostgreSQLBootstrap,
+		ImagePullPolicy: bootstrapPullPolicy,
+		Command:         []string{"bash", "-ceu", postgresqlBootstrapScript},
+		Env: []corev1.EnvVar{
+			{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
+			{Name: "PGSHARD_SHARD_ID", Value: shardLabel(shard)},
+			{Name: "PGSHARD_POSTGRESQL_MAJOR", Value: pgshardv1alpha1.PostgreSQLMajor18},
+			{Name: "PGSHARD_SHARD_COUNT", Value: fmt.Sprintf("%d", cluster.Spec.Shards)},
+			{Name: "PGSHARD_MAXIMUM_SHARDS", Value: fmt.Sprintf("%d", pgshardv1alpha1.MaximumShards)},
+			{Name: "PGSHARD_BOOTSTRAP_SHARDSCHEMA", Value: "false"},
+			{Name: "PGSHARD_BOOTSTRAP_HBA_MODE", Value: "replication-bootstrap-primary"},
+			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION", Value: shardschemaMigrationPath},
+			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION_SHA256", Value: shardschemaMigrationSHA256},
+			{Name: "PGSHARD_POSTGRESQL_CONFIG_SHA256", Value: configurationHash},
+			{Name: "PGSHARD_NODE_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeUIDAnnotation)}}},
+			{Name: "PGSHARD_NODE_BOOT_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeBootIDAnnotation)}}},
+		},
+		Resources:       cluster.Spec.PostgreSQL.Resources,
+		SecurityContext: postgresSecurity.DeepCopy(),
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "data", MountPath: "/var/lib/postgresql"},
+			{Name: "tmp", MountPath: "/tmp"},
+			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql-source", ReadOnly: true},
+			{Name: "postgresql-runtime-config", MountPath: "/etc/pgshard/postgresql"},
+			{Name: "bootstrap-secret", MountPath: "/etc/pgshard/bootstrap", ReadOnly: true},
+		},
+	}
+	automount := false
+	enableServiceLinks := false
+	podAnnotations := map[string]string{
+		ConfigHashAnnotation:              configurationHash,
+		PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
+		PostgreSQLRuntimeAnnotation:       images.PostgreSQLRuntime.String(),
+	}
+	volumes := []corev1.Volume{
+		{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: bootstrap.PVCName}}},
+		{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr(resource.MustParse("64Mi"))}}},
+		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("64Mi"))}}},
+		{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configurationName}}}},
+		{Name: "postgresql-runtime-config", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("2Mi"))}}},
+		{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: bootstrap.SecretName, DefaultMode: ptr(int32(0o440))}}},
+		postgresqlAgentKubernetesAPIVolume(),
+	}
+	statefulSetMetadata := ownedMeta(cluster, name, "postgresql", nil)
+	statefulSetMetadata.Labels[ShardLabel] = shardLabel(shard)
+	statefulSetMetadata.Labels[MemberLabel] = memberLabel(0)
+	statefulSetMetadata.Annotations[PostgreSQLRuntimeAnnotation] = images.PostgreSQLRuntime.String()
+	return &appsv1.StatefulSet{
+		ObjectMeta: statefulSetMetadata,
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:            ptr(replicas),
+			ServiceName:         shardName(cluster.Name, shard),
+			PodManagementPolicy: appsv1.OrderedReadyPodManagement,
+			MinReadySeconds:     5,
+			UpdateStrategy:      appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType},
+			Selector:            &metav1.LabelSelector{MatchLabels: selector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      podLabels,
+					Annotations: podAnnotations,
+					Finalizers:  []string{PostgreSQLPodTerminationFinalizer},
+				},
+				Spec: corev1.PodSpec{
+					AutomountServiceAccountToken:  &automount,
+					ServiceAccountName:            PostgreSQLAgentServiceAccountName(cluster.Name, shard),
+					EnableServiceLinks:            &enableServiceLinks,
+					TerminationGracePeriodSeconds: ptr(int64(60)),
+					NodeSelector:                  map[string]string{corev1.LabelOSStable: "linux"},
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot:        &runAsNonRoot,
+						RunAsUser:           ptr(postgresUID),
+						RunAsGroup:          ptr(postgresUID),
+						FSGroup:             ptr(postgresUID),
+						FSGroupChangePolicy: &fsGroupChangePolicy,
+						SeccompProfile:      seccomp,
+					},
+					InitContainers: []corev1.Container{bootstrapContainer},
+					Containers:     []corev1.Container{agent},
+					Volumes:        volumes,
+				},
+			},
+		},
+	}
+}
+
 func postgresqlAgentQuarantineContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
+	return postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "quarantine", "/etc/pgshard/quarantine.pg_hba.conf")
+}
+
+func postgresqlReplicationBootstrapPrimaryContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
+	return postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "replication-bootstrap-primary", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf")
+}
+
+func postgresqlAgentWritableContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, mode, hbaFile string) corev1.Container {
 	environment := []corev1.EnvVar{
 		{Name: "PGSHARD_HTTP_BIND", Value: "0.0.0.0:8080"},
 		{Name: "PGSHARD_CLUSTER_ID", Value: cluster.Name},
@@ -2734,11 +2976,11 @@ func postgresqlAgentQuarantineContainer(cluster *pgshardv1alpha1.PgShardCluster,
 		{Name: "PGSHARD_WRITABLE_LEASE_RENEW_DEADLINE_SECONDS", Value: "10"},
 		{Name: "PGSHARD_WRITABLE_LEASE_RETRY_MS", Value: "2000"},
 		{Name: "PGSHARD_KUBERNETES_REQUEST_TIMEOUT_MS", Value: "2000"},
-		{Name: "PGSHARD_POSTGRES_MODE", Value: "quarantine"},
+		{Name: "PGSHARD_POSTGRES_MODE", Value: mode},
 		{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"},
 		{Name: "PGSHARD_POSTGRES_BIN", Value: "/usr/lib/postgresql/18/bin/postgres"},
 		{Name: "PGSHARD_POSTGRES_SOCKET_DIR", Value: "/run/pgshard/postgres"},
-		{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/quarantine.pg_hba.conf"},
+		{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: hbaFile},
 		{Name: "PGSHARD_POSTGRES_SMART_SHUTDOWN_MS", Value: "5000"},
 		{Name: "PGSHARD_POSTGRES_FAST_SHUTDOWN_MS", Value: "44000"},
 		{Name: "PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS", Value: "500"},
