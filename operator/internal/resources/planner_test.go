@@ -2757,6 +2757,69 @@ func TestPlanFailsClosedForUnsafeIdentityOrMissingImages(t *testing.T) {
 	}
 }
 
+func TestMultiMemberAgentSourceStorageStaysOutsideTheResourcePlan(t *testing.T) {
+	t.Parallel()
+	for _, members := range []int32{3, 5} {
+		members := members
+		t.Run(fmt.Sprintf("members=%d", members), func(t *testing.T) {
+			t.Parallel()
+			cluster := testCluster()
+			cluster.Spec.MembersPerShard = members
+			cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+			cluster.Status.CatalogAccess = nil
+			cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+			images := DevelopmentImages()
+			images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+
+			plan, err := Plan(cluster, images)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, item := range plan {
+				switch object := item.(type) {
+				case *appsv1.StatefulSet:
+					t.Fatalf("multi-member source storage published StatefulSet %s", object.Name)
+				case *policyv1.PodDisruptionBudget:
+					if object.Labels[ComponentLabel] == "postgresql" {
+						t.Fatalf("multi-member source storage published PostgreSQL PDB %s", object.Name)
+					}
+				case *corev1.Service:
+					if object.Name == CatalogServiceName(cluster.Name) {
+						t.Fatalf("multi-member source storage published catalog Service %s", object.Name)
+					}
+				}
+			}
+
+			claim := PostgreSQLDataPVC(cluster, 0, "source-data", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, "source-fence", "source-fence-uid")
+			if claim.Labels[MemberLabel] != "0000" {
+				t.Fatalf("source-storage member label = %q", claim.Labels[MemberLabel])
+			}
+			if role, exists := claim.Labels[RoleLabel]; exists {
+				t.Fatalf("non-serving source storage carries authorizing role label %q", role)
+			}
+		})
+	}
+}
+
+func TestMultiMemberAgentSourceStorageRequiresImmutableBootstrapImage(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	images := DefaultImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	for _, image := range []string{"", "ghcr.io/andrew01234567890/pgshard-postgres-agent:main"} {
+		images.PostgreSQLBootstrap = image
+		if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), "bootstrap image") {
+			t.Fatalf("mutable multi-member bootstrap image %q error = %v", image, err)
+		}
+	}
+
+	// Direct multi-member planning neither creates nor validates source storage.
+	if _, err := Plan(cluster, DefaultImages()); err != nil {
+		t.Fatalf("direct multi-member plan unexpectedly required a bootstrap image: %v", err)
+	}
+}
+
 func TestPostgreSQLBootstrapImageRejectsMutableRemoteReferences(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()

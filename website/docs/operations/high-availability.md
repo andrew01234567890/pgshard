@@ -323,6 +323,19 @@ restarts. Before publishing that Pod, the controller protects the checkpointed
 PVC UID with its own finalizer, makes the live PVC ownerless, and anchors the
 credential tombstone back to it. The exact claim name cannot be reused until
 the mounting workload is pruned, so a late empty claim cannot enter bootstrap.
+
+For a three- or five-member resource, the default `direct` runtime creates no
+PostgreSQL storage or workload. An explicit `agent-quarantine` manager now
+checkpoints one uninitialized member-`0000` source-storage intent per shard. It
+uses the existing immutable bootstrap Secret, exact UID checkpoints,
+outcome-unknown create fence, protected ownerless PVC, and Retain/Delete
+finalization. The PVC has a member label but deliberately no role label. No Pod,
+StatefulSet, PDB, catalog or replication credential, physical slot,
+`primary_conninfo`, initialization, or Service endpoint is created, so this
+durable storage intent is not evidence of a primary, standby, synchronous
+replica, or HA availability. A missing or same-name recreated Secret or PVC
+fails closed against the recorded UID.
+
 Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
 finalizer. Before workload publication, a cluster challenge update proves that
 the selected admission path has observed the namespace's immutable fencing
@@ -518,8 +531,10 @@ empty Lease envelope per cell with an unmounted exact-name API identity, and the
 opt-in Rust agent implements the exact claim, renewal, takeover-observation, and
 monotonic-deadline transport. A configured writable term forces every shutdown
 through immediate process-tree fencing, and unsafe Lease/fence timing pairs are
-rejected. The operator's default runtime remains direct, while the explicit
-`agent-quarantine` mode injects that runtime into a non-serving PostgreSQL Pod.
+rejected. The operator's default runtime remains direct. For the supported
+single-member integration, explicit `agent-quarantine` injects that runtime
+into a non-serving PostgreSQL Pod. For multi-member resources it currently
+stops at the protected member-`0000` storage intent and creates no Pod.
 The agent supports only TCP-quarantined PostgreSQL and installs the local durable
 pre-start generation floor described above. SQL and prepare target-side
 generation enforcement, replicated promotion evidence, peer isolation,

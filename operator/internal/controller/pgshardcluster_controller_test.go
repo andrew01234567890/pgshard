@@ -543,6 +543,281 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	}
 }
 
+func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
+	t.Parallel()
+	for _, members := range []int32{3, 5} {
+		members := members
+		t.Run(fmt.Sprintf("members=%d", members), func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = members
+			base := newFakeClient(t, cluster)
+			reconciler := developmentReconciler(base, nil)
+			reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
+			}
+			current := getCluster(t, ctx, base, cluster)
+			if current.Status.PostgreSQLBootstrapSpec == nil || current.Status.PostgreSQLBootstrapSpec.MembersPerShard != members || current.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine.String() {
+				t.Fatalf("multi-member source-storage snapshot = %#v", current.Status.PostgreSQLBootstrapSpec)
+			}
+			if current.Status.CatalogAccess != nil {
+				t.Fatalf("multi-member source storage created catalog access: %#v", current.Status.CatalogAccess)
+			}
+			bootstrap := bootstrapForShard(t, current, 0)
+			secret := &corev1.Secret{}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}, secret); err != nil {
+				t.Fatal(err)
+			}
+			claim := &corev1.PersistentVolumeClaim{}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, claim); err != nil {
+				t.Fatal(err)
+			}
+			if secret.UID != bootstrap.SecretUID || claim.UID != bootstrap.PVCUID || !bootstrap.PVCFenceDetached || !postgresqlCredentialIsDataAnchored(secret, bootstrap) || len(claim.OwnerReferences) != 0 || !postgresqlDataPVCIsProtected(claim) {
+				t.Fatalf("source-storage lifecycle is incomplete: secret=%#v claim=%#v bootstrap=%#v", secret.ObjectMeta, claim.ObjectMeta, bootstrap)
+			}
+			if claim.Labels[owned.MemberLabel] != "0000" {
+				t.Fatalf("source-storage member label = %q", claim.Labels[owned.MemberLabel])
+			}
+			if role, exists := claim.Labels[owned.RoleLabel]; exists {
+				t.Fatalf("non-serving source storage carries authorizing role label %q", role)
+			}
+			statefulSets := &appsv1.StatefulSetList{}
+			pods := &corev1.PodList{}
+			budgets := &policyv1.PodDisruptionBudgetList{}
+			if err := base.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if err := base.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if err := base.List(ctx, budgets, client.InNamespace(cluster.Namespace), client.MatchingLabels{owned.ComponentLabel: "postgresql"}); err != nil {
+				t.Fatal(err)
+			}
+			if len(statefulSets.Items) != 0 || len(pods.Items) != 0 || len(budgets.Items) != 0 {
+				t.Fatalf("source-storage intent became a workload: StatefulSets=%d Pods=%d PostgreSQL PDBs=%d", len(statefulSets.Items), len(pods.Items), len(budgets.Items))
+			}
+			assertCondition(t, current, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+			assertCondition(t, current, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
+
+			direct := developmentReconciler(base, nil)
+			if _, err := direct.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "durable multi-member PostgreSQL source storage requires runtime \"agent-quarantine\"") {
+				t.Fatalf("direct manager accepted agent source storage: %v", err)
+			}
+			unchanged := bootstrapForShard(t, getCluster(t, ctx, base, cluster), 0)
+			if unchanged.SecretUID != bootstrap.SecretUID || unchanged.PVCUID != bootstrap.PVCUID {
+				t.Fatalf("rejected runtime transition changed source storage: before=%#v after=%#v", bootstrap, unchanged)
+			}
+		})
+	}
+}
+
+func TestDirectMultiMemberRuntimeDoesNotCreateSourceStorage(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	base := newFakeClient(t, cluster)
+	if _, err := developmentReconciler(base, nil).Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	if current.Status.PostgreSQLBootstrapSpec != nil || len(current.Status.PostgreSQLBootstraps) != 0 {
+		t.Fatalf("direct multi-member runtime checkpointed source storage: %#v", current.Status)
+	}
+	secrets := &corev1.SecretList{}
+	claims := &corev1.PersistentVolumeClaimList{}
+	statefulSets := &appsv1.StatefulSetList{}
+	if err := base.List(ctx, secrets, client.InNamespace(cluster.Namespace), client.MatchingLabels{owned.ComponentLabel: "postgresql"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.List(ctx, claims, client.InNamespace(cluster.Namespace), client.MatchingLabels{owned.ComponentLabel: "postgresql"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(secrets.Items) != 0 || len(claims.Items) != 0 || len(statefulSets.Items) != 0 {
+		t.Fatalf("direct multi-member runtime created source storage or workloads: Secrets=%d PVCs=%d StatefulSets=%d", len(secrets.Items), len(claims.Items), len(statefulSets.Items))
+	}
+}
+
+func TestMultiMemberSourceStorageRejectsBootstrapImageBeforeDurableWrites(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	base := newFakeClient(t, cluster)
+	images := owned.DefaultImages()
+	images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	images.PostgreSQLBootstrap = "ghcr.io/andrew01234567890/pgshard-postgres-agent:main"
+	reconciler := &PgShardClusterReconciler{Client: base, Images: images}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "immutable sha256 digest") {
+		t.Fatalf("mutable source-storage bootstrap image error = %v", err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	if controllerutil.ContainsFinalizer(current, resourceFinalizer) || current.Status.PostgreSQLBootstrapSpec != nil || len(current.Status.PostgreSQLBootstraps) != 0 || len(current.Status.PostgreSQLWritableLeases) != 0 {
+		t.Fatalf("invalid source-storage image crossed a durable barrier: %#v", current)
+	}
+	secrets := &corev1.SecretList{}
+	claims := &corev1.PersistentVolumeClaimList{}
+	if err := base.List(ctx, secrets, client.InNamespace(cluster.Namespace), client.MatchingLabels{owned.ComponentLabel: "postgresql"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.List(ctx, claims, client.InNamespace(cluster.Namespace), client.MatchingLabels{owned.ComponentLabel: "postgresql"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(secrets.Items) != 0 || len(claims.Items) != 0 {
+		t.Fatalf("invalid source-storage image created Secrets=%d PVCs=%d", len(secrets.Items), len(claims.Items))
+	}
+}
+
+func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		kind    string
+		replace bool
+		want    string
+	}{
+		{name: "missing credential", kind: "secret", want: "is missing; explicit recovery is required"},
+		{name: "replaced credential", kind: "secret", replace: true, want: "expected recorded UID"},
+		{name: "missing data", kind: "pvc", want: "is missing; restore is required"},
+		{name: "replaced data", kind: "pvc", replace: true, want: "expected recorded UID"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			base := newFakeClient(t, cluster)
+			reconciler := developmentReconciler(base, nil)
+			reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
+			}
+			current := getCluster(t, ctx, base, cluster)
+			bootstrap := bootstrapForShard(t, current, 0)
+
+			switch test.kind {
+			case "secret":
+				key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}
+				secret := &corev1.Secret{}
+				if err := base.Get(ctx, key, secret); err != nil {
+					t.Fatal(err)
+				}
+				if err := base.Delete(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
+				if test.replace {
+					replacement := owned.PostgreSQLAuthSecret(cluster, 0, bootstrap.SecretName, []byte(strings.Repeat("a", hex.EncodedLen(postgresqlPasswordBytes))))
+					replacement.UID = "replacement-secret-uid"
+					if err := base.Create(ctx, replacement); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "pvc":
+				key := types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}
+				claim := &corev1.PersistentVolumeClaim{}
+				if err := base.Get(ctx, key, claim); err != nil {
+					t.Fatal(err)
+				}
+				controllerutil.RemoveFinalizer(claim, owned.PostgreSQLDataProtectionFinalizer)
+				if err := base.Update(ctx, claim); err != nil {
+					t.Fatal(err)
+				}
+				if err := base.Delete(ctx, claim); err != nil {
+					t.Fatal(err)
+				}
+				if test.replace {
+					replacement := owned.PostgreSQLDataPVC(cluster, 0, bootstrap.PVCName, cluster.Spec.Storage.Size, bootstrap.PVCStorageClassName, bootstrap.SecretName, bootstrap.SecretUID)
+					replacement.UID = "replacement-pvc-uid"
+					if err := base.Create(ctx, replacement); err != nil {
+						t.Fatal(err)
+					}
+				}
+			default:
+				t.Fatalf("unknown test kind %q", test.kind)
+			}
+
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("reconcile error = %v, want %q", err, test.want)
+			}
+			after := bootstrapForShard(t, getCluster(t, ctx, base, cluster), 0)
+			if after.SecretUID != bootstrap.SecretUID || after.PVCUID != bootstrap.PVCUID {
+				t.Fatalf("identity failure changed source-storage checkpoint: before=%#v after=%#v", bootstrap, after)
+			}
+			statefulSets := &appsv1.StatefulSetList{}
+			if err := base.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if len(statefulSets.Items) != 0 {
+				t.Fatalf("identity failure published %d PostgreSQL workloads", len(statefulSets.Items))
+			}
+		})
+	}
+}
+
+func TestMultiMemberSourceStorageFinalizationHonorsDeletionPolicy(t *testing.T) {
+	t.Parallel()
+	for _, policy := range []pgshardv1alpha1.StorageDeletionPolicy{pgshardv1alpha1.DeletionRetain, pgshardv1alpha1.DeletionDelete} {
+		policy := policy
+		t.Run(string(policy), func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.Storage.DeletionPolicy = policy
+			base := newFakeClient(t, cluster)
+			reconciler := developmentReconciler(base, base)
+			reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
+			}
+			current := getCluster(t, ctx, base, cluster)
+			bootstrap := bootstrapForShard(t, current, 0)
+			if err := base.Delete(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			for range 16 {
+				if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+					t.Fatal(err)
+				}
+				if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+					break
+				}
+			}
+			if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("cluster finalization did not complete: %v", err)
+			}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("source-storage credential survived finalization: %v", err)
+			}
+			claim := &corev1.PersistentVolumeClaim{}
+			err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, claim)
+			if policy == pgshardv1alpha1.DeletionDelete {
+				if !apierrors.IsNotFound(err) {
+					t.Fatalf("Delete policy retained source storage: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claim.Annotations[owned.RetainedFromAnnotation] != cluster.Namespace+"/"+cluster.Name || postgresqlDataPVCIsProtected(claim) || len(claim.OwnerReferences) != 0 {
+				t.Fatalf("Retain policy did not release source storage safely: %#v", claim.ObjectMeta)
+			}
+			if _, exists := claim.Labels[owned.RoleLabel]; exists {
+				t.Fatalf("retained source storage acquired a role label: %#v", claim.Labels)
+			}
+		})
+	}
+}
+
 func TestPostgreSQLRuntimeChangeIsRejectedBeforeOnDeleteMutation(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
