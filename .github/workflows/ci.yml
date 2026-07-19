@@ -643,8 +643,17 @@ jobs:
           # Pull the digest through the node's CRI. Importing this image from
           # Docker's containerd store can leave KIND with a transient source
           # alias that kubelet cannot resolve when it creates a container.
-          docker exec pgshard-manager-control-plane crictl pull \
-            docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500
+          readonly postgres_image="docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
+          for attempt in 1 2 3 4; do
+            if docker exec pgshard-manager-control-plane crictl pull "$postgres_image"; then
+              break
+            fi
+            if (( attempt == 4 )); then
+              echo "failed to pull the pinned PostgreSQL image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           kind load docker-image \
             pgshard/operator:dev \
             pgshard/orchestrator:dev \
