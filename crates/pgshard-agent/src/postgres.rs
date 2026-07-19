@@ -344,18 +344,25 @@ impl PostgresConfig {
         self.role == PostgresRuntimeRole::ReplicationBootstrapPrimary
     }
 
-    fn runtime_network_settings(&self) -> (&'static str, &'static str, &'static str, &'static str) {
+    fn runtime_network_settings(
+        &self,
+    ) -> (
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+    ) {
         match self.role {
             PostgresRuntimeRole::Quarantine => (
                 "listen_addresses=",
                 "max_wal_senders=0",
-                "max_replication_slots=0",
+                None,
                 "archive_mode=on",
             ),
             PostgresRuntimeRole::ReplicationBootstrapPrimary => (
                 "listen_addresses=*",
                 "max_wal_senders=3",
-                "max_replication_slots=3",
+                Some("max_replication_slots=3"),
                 "archive_mode=off",
             ),
         }
@@ -1421,9 +1428,11 @@ impl PreparedPostgres {
             .arg("-c")
             .arg("archive_library=")
             .arg("-c")
-            .arg(max_wal_senders)
-            .arg("-c")
-            .arg(max_replication_slots)
+            .arg(max_wal_senders);
+        if let Some(max_replication_slots) = max_replication_slots {
+            command.arg("-c").arg(max_replication_slots);
+        }
+        command
             .arg("-c")
             .arg("wal_level=logical")
             .arg("-c")
@@ -5307,6 +5316,12 @@ mod tests {
                 "missing {required:?}"
             );
         }
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.as_bytes().starts_with(b"max_replication_slots=")),
+            "quarantine must preserve persistent slots instead of shrinking their startup capacity"
+        );
     }
 
     #[test]
