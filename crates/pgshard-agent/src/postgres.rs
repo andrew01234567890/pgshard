@@ -355,7 +355,7 @@ impl PostgresConfig {
             PostgresRuntimeRole::ReplicationBootstrapPrimary => (
                 "listen_addresses=*",
                 "max_wal_senders=3",
-                "max_replication_slots=2",
+                "max_replication_slots=3",
                 "archive_mode=off",
             ),
         }
@@ -5346,7 +5346,7 @@ mod tests {
         for required in [
             "listen_addresses=*",
             "max_wal_senders=3",
-            "max_replication_slots=2",
+            "max_replication_slots=3",
             "wal_level=logical",
             "synchronous_standby_names=",
             "synchronous_commit=local",

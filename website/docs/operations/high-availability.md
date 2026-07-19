@@ -540,7 +540,8 @@ creates no Pod. The agent's default quarantine role keeps TCP disabled. Its
 uncomposed `replication-bootstrap-primary` role requires the same exact writable Lease,
 accepts only the fixed `pgshard_replication` SCRAM role over TCP, rejects every
 ordinary database connection, and permits enough senders and physical slots to
-clone the two default M1 standbys. It deliberately clears synchronous standby
+clone the two default M1 standbys with one bounded bootstrap-repair slot of
+headroom. It deliberately clears synchronous standby
 selection and uses local commit while bootstrapping, so it is neither a durable
 nor serving primary. The operator does not select that role yet; it has no replication
 credential, TLS, slot, standby, Service, or NetworkPolicy wiring. SQL and
