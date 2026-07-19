@@ -8,8 +8,8 @@ description: SemVer rules and source-only GitHub releases.
 Every successful new commit on `main` at or after the repository's release-start
 marker receives exactly one SemVer tag and a source-only GitHub Release.
 Milestone 1 releases use `0.x` prerelease versions. The initial foundation
-commit predates the usable post-squash identity policy and remains an untagged
-bootstrap commit rather than bypassing the exact-head CI release gate.
+commit predates the release-start marker and remains an untagged bootstrap
+commit rather than bypassing the exact-head CI release gate.
 
 ## Version calculation
 
@@ -63,17 +63,10 @@ with a write token. All still receive Dependabot pull requests and CI. The
 allowlist also rejects renamed files and any unexpected bot-authored source or
 workflow change.
 
-Source-branch commits must use GitHub noreply author and committer addresses.
-GitHub's squash operation may retain the account's public author address when
-an author override is unavailable. The default-branch audit accepts that narrow
-exception only when GitHub's commit API reports a valid signed commit created by
-the `web-flow` committer and the local committer uses GitHub's noreply address.
-The exception does not rewrite or hide author metadata.
-
-The same audit scans every added or modified historical blob as raw bytes. Safe
-non-UTF-8 assets are permitted, while forbidden ASCII credential and private-path
-signatures remain rejected inside text or binary content, including content
-removed by a later commit in the pull request.
+The public-history audit scans every added or modified historical blob as raw
+bytes. Safe non-UTF-8 assets are permitted, while forbidden ASCII credential and
+private-path signatures remain rejected inside text or binary content, including
+content removed by a later commit in the pull request.
 
 Runtime version strings are derived from the exact release tag when building a
 tagged commit. Untagged builds report a development SemVer containing the commit

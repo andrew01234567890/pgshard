@@ -13,5 +13,4 @@
 ## Release
 
 - [ ] PR title is a valid Conventional Commit and describes the squash commit
-- [ ] Source commits use GitHub noreply author and committer identities; any final squash-author exception follows the documented signed `web-flow` policy
 - [ ] This PR will be squash-merged only

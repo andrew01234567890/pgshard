@@ -164,7 +164,6 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
-          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -174,8 +173,7 @@ jobs:
           elif [[ "$EVENT_NAME" == push && -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
             cargo run --locked -p pgshard-release -- validate
             cargo run --locked -p pgshard-release -- audit \
-              --base "$PUSH_BEFORE_SHA" --head "$GITHUB_SHA" \
-              --allow-github-squash-author
+              --base "$PUSH_BEFORE_SHA" --head "$GITHUB_SHA"
           else
             cargo run --locked -p pgshard-release -- validate
           fi
@@ -1468,10 +1466,10 @@ jobs:
           fetch-depth: 0
       - name: Select repository Rust toolchain
         run: rustup show active-toolchain
-      - name: Configure public commit identity
+      - name: Configure release commit identity
         run: |
-          git config user.name "andrew01234567890"
-          git config user.email "13841202+andrew01234567890@users.noreply.github.com"
+          git config user.name "pgshard release"
+          git config user.email "noreply@github.com"
       - name: Publish tag and source-only GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

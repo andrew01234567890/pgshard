@@ -42,9 +42,6 @@ enum ReleaseCommand {
         /// Head revision included in the audit.
         #[arg(long, default_value = "HEAD")]
         head: String,
-        /// Permit GitHub's squash author while still requiring its noreply committer.
-        #[arg(long)]
-        allow_github_squash_author: bool,
     },
     /// Print the version that the selected commit would receive.
     Next {
@@ -244,11 +241,7 @@ struct ReleaseSummary<'a> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        ReleaseCommand::Audit {
-            base,
-            head,
-            allow_github_squash_author,
-        } => audit(&base, &head, allow_github_squash_author)?,
+        ReleaseCommand::Audit { base, head } => audit(&base, &head)?,
         ReleaseCommand::Next { sha } => {
             let sha = git(&["rev-parse", &format!("{sha}^{{commit}}")])?;
             if let Some(tag) = semver_tag_at(&sha)? {
@@ -281,25 +274,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn audit(base: &str, head: &str, allow_github_squash_author: bool) -> Result<()> {
+fn audit(base: &str, head: &str) -> Result<()> {
     let merge_base = git(&["merge-base", base, head])?;
     let range = format!("{merge_base}..{head}");
-    let identities = git(&["log", "--format=%H%x09%ae%x09%cn%x09%ce", &range])?;
-    for line in identities.lines() {
-        let mut fields = line.split('\t');
-        let sha = fields.next().unwrap_or_default();
-        let author = fields.next().unwrap_or_default();
-        let committer_name = fields.next().unwrap_or_default();
-        let committer = fields.next().unwrap_or_default();
-        let github_squash_verified = allow_github_squash_author
-            && github_squash_identity(committer_name, committer)
-            && github_commit_is_verified(sha)?;
-        ensure!(
-            commit_identity_is_allowed(author, committer, github_squash_verified),
-            "commit {sha} must use noreply identities or an explicitly allowed GitHub squash author"
-        );
-    }
-
     let messages = git(&["log", "--format=%B", &range])?;
     audit_content("commit messages", &messages)?;
 
@@ -337,21 +314,9 @@ fn audit_repository_path(path: &str) -> Result<()> {
     audit_content("repository path", path)
 }
 
-fn is_noreply(email: &str) -> bool {
-    email == "noreply@github.com" || email.ends_with("@users.noreply.github.com")
-}
-
-fn commit_identity_is_allowed(author: &str, committer: &str, github_squash_verified: bool) -> bool {
-    (is_noreply(author) && is_noreply(committer)) || github_squash_verified
-}
-
-fn github_squash_identity(committer_name: &str, committer: &str) -> bool {
-    committer_name == "GitHub" && committer == "noreply@github.com"
-}
-
-fn github_commit_is_verified(sha: &str) -> Result<bool> {
+fn dependabot_squash_is_verified(sha: &str) -> Result<bool> {
     let repository = env::var("GITHUB_REPOSITORY")
-        .context("GITHUB_REPOSITORY is required to verify a GitHub squash commit")?;
+        .context("GITHUB_REPOSITORY is required to verify a Dependabot squash commit")?;
     let response = run(
         "gh",
         [
@@ -818,7 +783,7 @@ fn dependabot_automerge(repository: &str, requested_sha: &str) -> Result<()> {
         "Dependabot squash commit is not reachable from current main"
     );
     ensure!(
-        github_commit_is_verified(&merge_sha)?,
+        dependabot_squash_is_verified(&merge_sha)?,
         "Dependabot squash commit is not a valid signed GitHub web-flow commit"
     );
     dispatch_exact_ci(repository, &merge_sha)?;
@@ -1421,25 +1386,6 @@ mod tests {
     }
 
     #[test]
-    fn noreply_validation_accepts_only_github_noreply_domains() {
-        assert!(is_noreply("123+contributor@users.noreply.github.com"));
-        assert!(is_noreply("noreply@github.com"));
-        assert!(!is_noreply("developer@example.com"));
-        assert!(commit_identity_is_allowed(
-            "developer@example.com",
-            "noreply@github.com",
-            true,
-        ));
-        assert!(!commit_identity_is_allowed(
-            "developer@example.com",
-            "noreply@github.com",
-            false,
-        ));
-        assert!(github_squash_identity("GitHub", "noreply@github.com"));
-        assert!(!github_squash_identity("maintainer", "noreply@github.com"));
-    }
-
-    #[test]
     fn content_audit_rejects_sensitive_added_lines() {
         assert!(audit_content("safe.md", "safe public content").is_ok());
         let private_path = format!("path from /{}/example", "home");
@@ -1729,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn github_squash_exception_requires_verified_web_flow_commit() {
+    fn dependabot_squash_requires_verified_web_flow_commit() {
         let mut details = GitHubCommitDetails {
             sha: "a".repeat(40),
             committer: Some(Login {

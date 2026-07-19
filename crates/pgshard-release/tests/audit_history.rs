@@ -51,6 +51,20 @@ fn accepts_safe_non_utf8_binary_history() {
 }
 
 #[test]
+fn accepts_safe_history_with_non_noreply_commit_email() {
+    let (repository, base) = repository_with_base();
+    fs::write(repository.path().join("safe.txt"), "safe public content\n").expect("write safe");
+    git(repository.path(), &["add", "safe.txt"]);
+    git(
+        repository.path(),
+        &["commit", "--quiet", "-m", "test: add safe content"],
+    );
+
+    let output = audit(repository.path(), &base);
+    assert_success(&output, &["pgshard-release", "audit"]);
+}
+
+#[test]
 fn rejects_sensitive_ascii_inside_non_utf8_binary_history() {
     let (repository, base) = repository_with_base();
     let mut content = vec![0, 0xff, 0xfe];
@@ -81,7 +95,7 @@ fn repository_with_base() -> (TempDir, String) {
     git(repository.path(), &["config", "user.name", "pgshard test"]);
     git(
         repository.path(),
-        &["config", "user.email", "noreply@github.com"],
+        &["config", "user.email", "contributor@example.com"],
     );
 
     fs::write(repository.path().join("README.md"), "safe\n").expect("write base");

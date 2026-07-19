@@ -69,10 +69,8 @@ certificate-free path only for supporting-controller debugging and must not
 manage direct PostgreSQL Pods. Neither path provides a routed database
 quickstart or production distribution.
 
-## Git identity and history
+## Git history
 
-Source-branch commits use GitHub noreply author and committer identities. Direct
-default-branch pushes, merge commits, and rebase merges are disabled. After
-squash merge, automation verifies either those noreply identities or the narrow,
-signed GitHub `web-flow` exception in the [release policy](./releases.md). That
-exception may retain public author metadata and does not hide it.
+Direct default-branch pushes, merge commits, and rebase merges are disabled.
+Changes reach the default branch through reviewed squash merges after required
+checks pass.
