@@ -857,6 +857,7 @@ func assertPostgreSQLStatusMetadataImmutable(t *testing.T, ctx context.Context, 
 	}{
 		{name: "managed label", mutate: func(pod *corev1.Pod) { delete(pod.Labels, owned.ManagedByLabel) }},
 		{name: "cluster UID annotation", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, owned.PostgreSQLPodClusterUIDAnnotation) }},
+		{name: "runtime annotation", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, owned.PostgreSQLRuntimeAnnotation) }},
 		{name: "termination finalizer", mutate: func(pod *corev1.Pod) { pod.Finalizers = nil }},
 	} {
 		t.Run("status protects "+test.name, func(t *testing.T) {
@@ -879,6 +880,10 @@ func assertPostgreSQLStatusMetadataImmutable(t *testing.T, ctx context.Context, 
 	}
 	if !podfence.IsManagedPostgreSQLPod(current) {
 		t.Fatalf("PostgreSQL Pod identity changed despite status webhook denials: %#v", current.ObjectMeta)
+	}
+	delete(current.Annotations, owned.PostgreSQLRuntimeAnnotation)
+	if err := kubeClient.Update(ctx, current); !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "identity") {
+		t.Fatalf("ordinary update removed PostgreSQL runtime identity: %v, want webhook denial", err)
 	}
 }
 

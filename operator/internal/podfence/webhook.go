@@ -639,8 +639,10 @@ func managedIdentityEqual(oldPod, newPod *corev1.Pod) bool {
 			return false
 		}
 	}
-	for _, key := range []string{owned.PostgreSQLPodClusterUIDAnnotation, NodeUIDAnnotation, NodeBootIDAnnotation} {
-		if oldPod.Annotations[key] != newPod.Annotations[key] {
+	for _, key := range []string{owned.PostgreSQLPodClusterUIDAnnotation, owned.PostgreSQLRuntimeAnnotation, NodeUIDAnnotation, NodeBootIDAnnotation} {
+		oldValue, oldHas := oldPod.Annotations[key]
+		newValue, newHas := newPod.Annotations[key]
+		if oldHas != newHas || oldValue != newValue {
 			return false
 		}
 	}

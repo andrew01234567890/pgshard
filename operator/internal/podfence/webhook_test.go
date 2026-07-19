@@ -692,23 +692,34 @@ func TestUnscheduledDeletingPodCanReleaseItsFence(t *testing.T) {
 func TestRoleNeutralBootstrapSourceIdentityIsImmutable(t *testing.T) {
 	t.Parallel()
 	scheme := testScheme(t)
-	for _, subresource := range []string{"", "status"} {
-		t.Run(subresource, func(t *testing.T) {
-			t.Parallel()
-			oldPod := roleNeutralBootstrapSourcePod()
-			newPod := oldPod.DeepCopy()
-			newPod.Labels[owned.RoleLabel] = ""
-			var response admission.Response
-			if subresource == "status" {
-				request, _ := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
-				response = NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).Build(), testCodec(), scheme).Handle(context.Background(), request)
-			} else {
-				response = NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, newPod, ""))
-			}
-			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "identity") {
-				t.Fatalf("present-empty role through %q response = %#v", subresource, response)
-			}
-		})
+	for _, mutation := range []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{name: "present-empty role", mutate: func(pod *corev1.Pod) { pod.Labels[owned.RoleLabel] = "" }},
+		{name: "missing runtime annotation", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, owned.PostgreSQLRuntimeAnnotation) }},
+		{name: "empty runtime annotation", mutate: func(pod *corev1.Pod) { pod.Annotations[owned.PostgreSQLRuntimeAnnotation] = "" }},
+	} {
+		mutation := mutation
+		for _, subresource := range []string{"", "status"} {
+			subresource := subresource
+			t.Run(mutation.name+"/"+subresource, func(t *testing.T) {
+				t.Parallel()
+				oldPod := roleNeutralBootstrapSourcePod()
+				newPod := oldPod.DeepCopy()
+				mutation.mutate(newPod)
+				var response admission.Response
+				if subresource == "status" {
+					request, _ := statusRequest(t, oldPod, newPod, "system:node:node-a", []string{"system:nodes"})
+					response = NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).Build(), testCodec(), scheme).Handle(context.Background(), request)
+				} else {
+					response = NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, newPod, ""))
+				}
+				if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "identity") {
+					t.Fatalf("%s through %q response = %#v", mutation.name, subresource, response)
+				}
+			})
+		}
 	}
 }
 
