@@ -146,6 +146,9 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 	if got.Status.CatalogAccess != nil {
 		t.Fatalf("unsupported multi-member cluster received catalog access: %#v", got.Status.CatalogAccess)
 	}
+	if len(got.Status.PostgreSQLReplicationCredentials) != 0 {
+		t.Fatalf("direct multi-member cluster received replication credentials: %#v", got.Status.PostgreSQLReplicationCredentials)
+	}
 	if got.Status.Phase != "Reconciling" || got.Status.ObservedGeneration != cluster.Generation {
 		t.Fatalf("status = %#v", got.Status)
 	}
@@ -1251,6 +1254,282 @@ func TestRoleNeutralPostgreSQLIdentityMigrationNeverPublishesTwoControllers(t *t
 	}
 	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: legacyPod.Name}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("legacy PostgreSQL Pod remains after migration: %v", err)
+	}
+}
+
+func TestReplicationCredentialsAreStagedCheckpointedAndFailClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	for range cluster.Spec.Shards {
+		current := getCluster(t, ctx, base, cluster)
+		if err := reconciler.ensurePostgreSQLReplicationCredentials(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	current := getCluster(t, ctx, base, cluster)
+	if len(current.Status.PostgreSQLReplicationCredentials) != int(cluster.Spec.Shards) {
+		t.Fatalf("replication credential checkpoints = %#v", current.Status.PostgreSQLReplicationCredentials)
+	}
+	names := make(map[string]struct{}, cluster.Spec.Shards)
+	uids := make(map[types.UID]struct{}, cluster.Spec.Shards)
+	for index := range current.Status.PostgreSQLReplicationCredentials {
+		recorded := &current.Status.PostgreSQLReplicationCredentials[index]
+		if recorded.Shard != int32(index) || recorded.SecretUID == "" || !validCatalogAccessDigest(recorded.MaterialSHA256) {
+			t.Fatalf("replication credential checkpoint = %#v", recorded)
+		}
+		if _, duplicate := names[recorded.SecretName]; duplicate {
+			t.Fatalf("replication Secret name was reused: %s", recorded.SecretName)
+		}
+		if _, duplicate := uids[recorded.SecretUID]; duplicate {
+			t.Fatalf("replication Secret UID was reused: %s", recorded.SecretUID)
+		}
+		names[recorded.SecretName] = struct{}{}
+		uids[recorded.SecretUID] = struct{}{}
+		secret := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: current.Namespace, Name: recorded.SecretName}
+		if err := base.Get(ctx, key, secret); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateCheckpointedPostgreSQLReplicationCredential(secret, current, recorded); err != nil {
+			t.Fatal(err)
+		}
+		if secret.Immutable == nil || !*secret.Immutable || len(secret.Data) != 1 || len(secret.Data[owned.PostgreSQLReplicationPasswordKey]) != hex.EncodedLen(postgresqlPasswordBytes) {
+			t.Fatalf("replication credential Secret = %#v", secret)
+		}
+	}
+
+	recorded := &current.Status.PostgreSQLReplicationCredentials[0]
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: current.Namespace, Name: recorded.SecretName}
+	if err := base.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	password := append([]byte(nil), secret.Data[owned.PostgreSQLReplicationPasswordKey]...)
+	if password[0] == 'a' {
+		password[0] = 'b'
+	} else {
+		password[0] = 'a'
+	}
+	secret.Data[owned.PostgreSQLReplicationPasswordKey] = password
+	if err := base.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationCredentials(ctx, current); err == nil || !strings.Contains(err.Error(), "material differs from the checkpointed creation result") {
+		t.Fatalf("changed replication material error = %v", err)
+	}
+}
+
+func TestReplicationCredentialLifecycleRecoversEveryCommittedWriteResponse(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		stage          string
+		firstCallFails bool
+	}{
+		{name: "intent checkpoint", stage: "intent", firstCallFails: true},
+		{name: "Secret creation", stage: "create"},
+		{name: "Secret UID checkpoint", stage: "uid", firstCallFails: true},
+		{name: "material installation", stage: "material"},
+		{name: "material checkpoint", stage: "digest", firstCallFails: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+			base := newFakeClient(t, cluster)
+			injected := false
+			writeClient := interceptedClient(t, base, interceptor.Funcs{
+				SubResourceUpdate: func(ctx context.Context, kubeClient client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+					candidate, ok := object.(*pgshardv1alpha1.PgShardCluster)
+					if subresource == "status" && ok && len(candidate.Status.PostgreSQLReplicationCredentials) == 1 && !injected {
+						recorded := candidate.Status.PostgreSQLReplicationCredentials[0]
+						matches := test.stage == "intent" && recorded.SecretUID == "" ||
+							test.stage == "uid" && recorded.SecretUID != "" && recorded.MaterialSHA256 == "" ||
+							test.stage == "digest" && recorded.MaterialSHA256 != ""
+						if matches {
+							injected = true
+							if err := kubeClient.SubResource(subresource).Update(ctx, object, options...); err != nil {
+								return err
+							}
+							return apierrors.NewTimeoutError("injected lost replication "+test.stage+" response", 1)
+						}
+					}
+					return kubeClient.SubResource(subresource).Update(ctx, object, options...)
+				},
+				Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+					secret, ok := object.(*corev1.Secret)
+					if test.stage != "create" || !ok || secret.Labels[owned.ComponentLabel] != "postgresql-replication" || injected {
+						return kubeClient.Create(ctx, object, options...)
+					}
+					injected = true
+					if err := kubeClient.Create(ctx, object, options...); err != nil {
+						return err
+					}
+					return apierrors.NewTimeoutError("injected lost replication create response", 1)
+				},
+				Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+					secret, ok := object.(*corev1.Secret)
+					if test.stage != "material" || !ok || secret.Labels[owned.ComponentLabel] != "postgresql-replication" || injected {
+						return kubeClient.Update(ctx, object, options...)
+					}
+					injected = true
+					if err := kubeClient.Update(ctx, object, options...); err != nil {
+						return err
+					}
+					return apierrors.NewTimeoutError("injected lost replication material response", 1)
+				},
+			})
+
+			current := getCluster(t, ctx, base, cluster)
+			err := developmentReconciler(writeClient, base).ensurePostgreSQLReplicationCredentials(ctx, current)
+			if test.firstCallFails {
+				if err == nil || !strings.Contains(err.Error(), "injected lost replication") {
+					t.Fatalf("first call error = %v, want injected response loss", err)
+				}
+			} else if err != nil {
+				t.Fatalf("committed write outcome was not recovered: %v", err)
+			}
+			if !injected {
+				t.Fatal("configured write response loss was not injected")
+			}
+
+			current = getCluster(t, ctx, base, cluster)
+			if err := developmentReconciler(base, base).ensurePostgreSQLReplicationCredentials(ctx, current); err != nil {
+				t.Fatalf("retry did not converge: %v", err)
+			}
+			current = getCluster(t, ctx, base, cluster)
+			if len(current.Status.PostgreSQLReplicationCredentials) != 1 {
+				t.Fatalf("replication credential checkpoints = %#v", current.Status.PostgreSQLReplicationCredentials)
+			}
+			recorded := &current.Status.PostgreSQLReplicationCredentials[0]
+			secrets := &corev1.SecretList{}
+			if err := base.List(ctx, secrets, client.InNamespace(cluster.Namespace), client.MatchingLabels{
+				owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "postgresql-replication",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if len(secrets.Items) != 1 {
+				t.Fatalf("replication Secret count = %d, want one", len(secrets.Items))
+			}
+			if err := validateCheckpointedPostgreSQLReplicationCredential(&secrets.Items[0], current, recorded); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestReplicationCredentialDeletionIsAnObservedFinalizerBarrier(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Finalizers = []string{resourceFinalizer}
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	current := getCluster(t, ctx, base, cluster)
+	if err := developmentReconciler(base, base).ensurePostgreSQLReplicationCredentials(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	recorded := &current.Status.PostgreSQLReplicationCredentials[0]
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+	secret := &corev1.Secret{}
+	if err := base.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Finalizers = []string{"test.pgshard.io/hold"}
+	if err := base.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := developmentReconciler(base, base)
+	result, err := reconciler.Reconcile(ctx, requestFor(cluster))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != retryDelay {
+		t.Fatalf("replication credential deletion barrier result = %#v", result)
+	}
+	deletingCluster := getCluster(t, ctx, base, cluster)
+	if !controllerutil.ContainsFinalizer(deletingCluster, resourceFinalizer) {
+		t.Fatal("cluster finalizer was released while replication material remained")
+	}
+	terminatingSecret := &corev1.Secret{}
+	if err := base.Get(ctx, key, terminatingSecret); err != nil || terminatingSecret.DeletionTimestamp == nil {
+		t.Fatalf("replication Secret was not held deleting: secret=%#v error=%v", terminatingSecret.ObjectMeta, err)
+	}
+	terminatingSecret.Finalizers = nil
+	if err := base.Update(ctx, terminatingSecret); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	for range 6 {
+		if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+			t.Fatal(err)
+		}
+		if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+			break
+		}
+	}
+	if err := base.Get(ctx, key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("recorded replication Secret survived finalization: %v", err)
+	}
+	if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("cluster finalized before replication Secret absence: %v", err)
+	}
+}
+
+func TestReplicationCredentialFinalizationCannotMaterializeALatePreUIDCreate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	current := getCluster(t, ctx, base, cluster)
+	name := owned.PostgreSQLReplicationSecretPrefix(current.Name, 0) + strings.Repeat("a", 32)
+	current.Status.PostgreSQLReplicationCredentials = []pgshardv1alpha1.PostgreSQLReplicationCredentialStatus{{Shard: 0, SecretName: name}}
+	if err := base.Status().Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	absentReader := interceptedClient(t, base, interceptor.Funcs{
+		Get: func(ctx context.Context, kubeClient client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+			if _, ok := object.(*corev1.Secret); ok && key.Namespace == current.Namespace && key.Name == name {
+				return apierrors.NewNotFound(corev1.Resource("secrets"), name)
+			}
+			return kubeClient.Get(ctx, key, object, options...)
+		},
+	})
+	deleting, err := developmentReconciler(base, absentReader).deletePostgreSQLReplicationCredentialsForFinalization(ctx, current)
+	if err != nil || deleting {
+		t.Fatalf("absent pre-UID replication intent barrier = deleting %t, error %v", deleting, err)
+	}
+
+	delayed := owned.PostgreSQLReplicationIntentSecret(current, 0, name)
+	if err := base.Create(ctx, delayed); err != nil {
+		t.Fatal(err)
+	}
+	observed := &corev1.Secret{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(delayed), observed); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePostgreSQLReplicationIntentSecret(observed, current, 0, name); err != nil {
+		t.Fatalf("late Create was not the empty replication intent: %v", err)
+	}
+	if len(observed.Data) != 0 || len(observed.StringData) != 0 || !metav1.IsControlledBy(observed, current) {
+		t.Fatalf("late replication Create carried material or escaped cluster GC: %#v", observed)
 	}
 }
 
@@ -5362,8 +5641,13 @@ func TestDeletionFinalizerPrunesOwnedResources(t *testing.T) {
 	if !contains(deleting.Finalizers, resourceFinalizer) {
 		t.Fatal("cleanup finalizer was removed before absence was observed")
 	}
-	if _, err := reconciler.Reconcile(ctx, request); err != nil {
-		t.Fatal(err)
+	for range 1 + int(cluster.Spec.Shards) {
+		if _, err := reconciler.Reconcile(ctx, request); client.IgnoreNotFound(err) != nil {
+			t.Fatal(err)
+		}
+		if err := fakeClient.Get(ctx, request.NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+			break
+		}
 	}
 	if err := fakeClient.Get(ctx, request.NamespacedName, &pgshardv1alpha1.PgShardCluster{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("cluster still exists after finalizer removal: %v", err)

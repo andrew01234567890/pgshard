@@ -309,12 +309,36 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=shard
 	PostgreSQLWritableLeases []PostgreSQLWritableLeaseStatus `json:"postgresqlWritableLeases,omitempty"`
+	// PostgreSQLReplicationCredentials records one staged, immutable physical-
+	// replication credential per shard. Multi-member workloads may consume a
+	// credential only after its API UID and material digest are checkpointed.
+	// Missing, replaced, or changed Secrets require explicit recovery.
+	// +listType=map
+	// +listMapKey=shard
+	PostgreSQLReplicationCredentials []PostgreSQLReplicationCredentialStatus `json:"postgresqlReplicationCredentials,omitempty"`
 	// CatalogAccess records the staged creation and API identity of the
 	// catalog-only credential and TLS Secret. The operator first creates an empty
 	// non-consumable Secret, checkpoints its UID, then atomically installs
 	// immutable material and checkpoints its digests. A missing or replaced
 	// checkpointed Secret requires explicit recovery.
 	CatalogAccess *CatalogAccessStatus `json:"catalogAccess,omitempty"`
+}
+
+// PostgreSQLReplicationCredentialStatus binds one shard to a staged shared
+// physical-replication password. SecretUID is checkpointed while the Secret is
+// still empty; MaterialSHA256 appears only after the same UID is immutable.
+type PostgreSQLReplicationCredentialStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	Shard int32 `json:"shard"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	SecretName string `json:"secretName"`
+	// SecretUID is empty only before the empty Secret identity is observed.
+	SecretUID types.UID `json:"secretUID,omitempty"`
+	// MaterialSHA256 binds the exact password projection to the checkpointed
+	// creation result.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	MaterialSHA256 string `json:"materialSHA256,omitempty"`
 }
 
 // PostgreSQLWritableLeaseStatus pins one physical cell's writable-term Lease

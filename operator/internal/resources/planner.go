@@ -46,17 +46,18 @@ const (
 	// PgShardCluster lifecycle that crossed the fencing handshake barrier.
 	ClusterResourceFinalizer = "pgshard.io/owned-resources"
 
-	PostgreSQLConfigSuffix   = "-postgresql-config"
-	PostgreSQLPasswordKey    = "superuser-password"
-	CatalogServiceSuffix     = "-shardschema"
-	CatalogPasswordKey       = "catalog-password"
-	CatalogCACertificateKey  = "ca.crt"
-	CatalogTLSCertificateKey = "tls.crt"
-	CatalogTLSPrivateKeyKey  = "tls.key"
-	TopologyConfigSuffix     = "-topology"
-	OrchestratorSuffix       = "-orchestrator"
-	OrchestratorLeaseSuffix  = "-orch-lease"
-	PoolerSuffix             = "-pooler"
+	PostgreSQLConfigSuffix           = "-postgresql-config"
+	PostgreSQLPasswordKey            = "superuser-password"
+	PostgreSQLReplicationPasswordKey = "replication-password"
+	CatalogServiceSuffix             = "-shardschema"
+	CatalogPasswordKey               = "catalog-password"
+	CatalogCACertificateKey          = "ca.crt"
+	CatalogTLSCertificateKey         = "tls.crt"
+	CatalogTLSPrivateKeyKey          = "tls.key"
+	TopologyConfigSuffix             = "-topology"
+	OrchestratorSuffix               = "-orchestrator"
+	OrchestratorLeaseSuffix          = "-orch-lease"
+	PoolerSuffix                     = "-pooler"
 
 	PostgreSQLPort int32 = 5432
 	PoolerRWPort   int32 = 5432
@@ -67,26 +68,27 @@ const (
 	defaultPostgreSQLImage              = "docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
 	developmentPostgreSQLBootstrapImage = "pgshard/postgres-agent:dev"
 
-	ConfigHashAnnotation                    = "pgshard.io/config-hash"
-	ApplyOwnershipAnnotation                = "pgshard.io/apply-ownership"
-	ApplyOwnershipVersion                   = "v1"
-	RetainedFromAnnotation                  = "pgshard.io/retained-from"
-	PostgreSQLBootstrapClusterUIDAnnotation = "pgshard.io/bootstrap-cluster-uid"
-	CatalogAccessClusterUIDAnnotation       = "pgshard.io/catalog-access-cluster-uid"
-	PostgreSQLDataClusterUIDAnnotation      = "pgshard.io/data-cluster-uid"
-	PostgreSQLDataProtectionFinalizer       = "pgshard.io/postgresql-data-protection"
-	PostgreSQLPodClusterUIDAnnotation       = "pgshard.io/postgresql-cluster-uid"
-	PostgreSQLNodeUIDAnnotation             = "pgshard.io/postgresql-node-uid"
-	PostgreSQLNodeBootIDAnnotation          = "pgshard.io/postgresql-node-boot-id"
-	PostgreSQLPodTerminationFinalizer       = "pgshard.io/postgresql-termination"
-	postgresqlBootstrapMarker               = ".pgshard-bootstrap-complete"
-	shardschemaMigrationPath                = "/usr/share/pgshard/migrations/0001_shardschema.sql"
-	databaseGenesisKey                      = "database-genesis.sql"
-	databaseGenesisPath                     = "/etc/pgshard/postgresql/database-genesis.sql"
-	databaseTopologyPreflightKey            = "database-topology-preflight.sql"
-	databaseTopologyPreflightPath           = "/etc/pgshard/postgresql/database-topology-preflight.sql"
-	shardschemaMigrationSHA256              = "5c4d0fee9d069580ae90b6c71d78db5f160f6f01fa7fc5150f797693f88ff50a"
-	shardschemaMigrationHashAnnotation      = "pgshard.io/shardschema-migration-sha256"
+	ConfigHashAnnotation                      = "pgshard.io/config-hash"
+	ApplyOwnershipAnnotation                  = "pgshard.io/apply-ownership"
+	ApplyOwnershipVersion                     = "v1"
+	RetainedFromAnnotation                    = "pgshard.io/retained-from"
+	PostgreSQLBootstrapClusterUIDAnnotation   = "pgshard.io/bootstrap-cluster-uid"
+	PostgreSQLReplicationClusterUIDAnnotation = "pgshard.io/replication-cluster-uid"
+	CatalogAccessClusterUIDAnnotation         = "pgshard.io/catalog-access-cluster-uid"
+	PostgreSQLDataClusterUIDAnnotation        = "pgshard.io/data-cluster-uid"
+	PostgreSQLDataProtectionFinalizer         = "pgshard.io/postgresql-data-protection"
+	PostgreSQLPodClusterUIDAnnotation         = "pgshard.io/postgresql-cluster-uid"
+	PostgreSQLNodeUIDAnnotation               = "pgshard.io/postgresql-node-uid"
+	PostgreSQLNodeBootIDAnnotation            = "pgshard.io/postgresql-node-boot-id"
+	PostgreSQLPodTerminationFinalizer         = "pgshard.io/postgresql-termination"
+	postgresqlBootstrapMarker                 = ".pgshard-bootstrap-complete"
+	shardschemaMigrationPath                  = "/usr/share/pgshard/migrations/0001_shardschema.sql"
+	databaseGenesisKey                        = "database-genesis.sql"
+	databaseGenesisPath                       = "/etc/pgshard/postgresql/database-genesis.sql"
+	databaseTopologyPreflightKey              = "database-topology-preflight.sql"
+	databaseTopologyPreflightPath             = "/etc/pgshard/postgresql/database-topology-preflight.sql"
+	shardschemaMigrationSHA256                = "5c4d0fee9d069580ae90b6c71d78db5f160f6f01fa7fc5150f797693f88ff50a"
+	shardschemaMigrationHashAnnotation        = "pgshard.io/shardschema-migration-sha256"
 )
 
 const postgresqlBootstrapScript = `set -Eeuo pipefail
@@ -2184,6 +2186,40 @@ func CatalogAccessSecretNameIsValid(cluster, name string) bool {
 	return err == nil && len(decoded) == 16 && hex.EncodeToString(decoded) == suffix
 }
 
+// PostgreSQLReplicationSecretPrefix returns a bounded shard-specific prefix
+// for an unpredictable staged replication credential name. The controller
+// appends 128 bits of randomness before checkpointing the creation intent.
+func PostgreSQLReplicationSecretPrefix(cluster string, shard int32) string {
+	const maximumPrefixLength = 31 // leaves 32 hexadecimal characters in a DNS label
+	literal := fmt.Sprintf("%s-r%04d-", cluster, shard)
+	if len(literal) <= maximumPrefixLength {
+		return literal
+	}
+	digest := sha256.Sum256([]byte(cluster))
+	encoded := hex.EncodeToString(digest[:6])
+	shardSuffix := fmt.Sprintf("-r%04d-", shard)
+	prefixLength := maximumPrefixLength - len(encoded) - len(shardSuffix) - 1
+	return cluster[:prefixLength] + "-" + encoded + shardSuffix
+}
+
+// PostgreSQLReplicationSecretNameIsValid verifies the checkpointed random
+// suffix and exact cluster/shard prefix.
+func PostgreSQLReplicationSecretNameIsValid(cluster string, shard int32, name string) bool {
+	prefix := PostgreSQLReplicationSecretPrefix(cluster, shard)
+	if !strings.HasPrefix(name, prefix) || len(name) != len(prefix)+32 {
+		return false
+	}
+	suffix := name[len(prefix):]
+	decoded, err := hex.DecodeString(suffix)
+	return err == nil && len(decoded) == 16 && hex.EncodeToString(decoded) == suffix
+}
+
+// PostgreSQLReplicationMaterialSHA256 binds the exact password bytes projected
+// into primary bootstrap and standby passfile-formatting containers.
+func PostgreSQLReplicationMaterialSHA256(password []byte) string {
+	return catalogMaterialSHA256("pgshard-postgresql-replication-v1", password)
+}
+
 // CatalogClientMaterialSHA256 binds the exact password and CA projection used
 // by the pooler and shard-zero bootstrap init container.
 func CatalogClientMaterialSHA256(password, caCertificate []byte) string {
@@ -2413,6 +2449,19 @@ func PostgreSQLAuthSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, 
 func CatalogAccessIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, name string) *corev1.Secret {
 	metadata := ownedMeta(cluster, name, "shardschema", nil)
 	metadata.Annotations[CatalogAccessClusterUIDAnnotation] = string(cluster.UID)
+	return &corev1.Secret{
+		ObjectMeta: metadata,
+		Type:       corev1.SecretTypeOpaque,
+	}
+}
+
+// PostgreSQLReplicationIntentSecret is the non-consumable empty identity
+// checkpointed before replication material exists. The controller may install
+// an immutable password only by updating this exact UID and resourceVersion.
+func PostgreSQLReplicationIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string) *corev1.Secret {
+	metadata := ownedMeta(cluster, name, "postgresql-replication", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	metadata.Annotations[PostgreSQLReplicationClusterUIDAnnotation] = string(cluster.UID)
 	return &corev1.Secret{
 		ObjectMeta: metadata,
 		Type:       corev1.SecretTypeOpaque,
