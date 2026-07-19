@@ -7,6 +7,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: pgshard-source-release
+  queue: max
+
 jobs:
   release:
     name: Source-only SemVer release
@@ -23,16 +27,13 @@ jobs:
     permissions:
       checks: read
       contents: write
-    concurrency:
-      group: pgshard-source-release
-      queue: max
     steps:
       # workflow_run executes the trusted default-branch implementation. The
       # triggering SHA is data only and must already be reachable from main.
       - name: Check out trusted release automation
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Validate temporary exact-SHA ref
         if: startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')
@@ -50,13 +51,28 @@ jobs:
         run: |
           git config user.name "pgshard release"
           git config user.email "noreply@github.com"
-      - name: Publish tag and source-only GitHub Release
+      - name: Publish exact Dependabot tag and source-only GitHub Release
+        if: startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')
         env:
           GH_TOKEN: ${{ github.token }}
           PGSHARD_RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
         run: >-
           cargo run --locked -p pgshard-release -- publish
           --sha "$PGSHARD_RELEASE_SHA"
+      - name: Publish the contiguous CI-green main history
+        if: ${{ !startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGSHARD_RELEASE_SHA="$(
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha
+          )"
+          [[ "$PGSHARD_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          export PGSHARD_RELEASE_SHA
+          cargo run --locked -p pgshard-release -- publish \
+            --sha "$PGSHARD_RELEASE_SHA" --ready-only
       - name: Delete temporary ref after release
         if: startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')
         env:
@@ -73,3 +89,93 @@ jobs:
               exit 1
             fi
           fi
+
+  pages:
+    name: Deploy released main documentation
+    needs: release
+    if: needs.release.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out trusted deployment automation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Select the released live-main Pages candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          live_sha="$(
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha
+          )"
+          [[ "$live_sha" =~ ^[0-9a-f]{40}$ ]]
+
+          release_tag="$(git tag --points-at "$live_sha" --list 'v[0-9]*' | sort -V | tail -n 1)"
+          if [[ -z "$release_tag" ]]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Live main is not released; Pages reconciliation is deferred."
+            exit 0
+          fi
+          release_sha="$(
+            gh release view "$release_tag" --json targetCommitish --jq .targetCommitish
+          )"
+          if [[ "$release_sha" != "$live_sha" ]]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Live main release target is not exact; Pages reconciliation is deferred."
+            exit 0
+          fi
+
+          candidate_run=""
+          while IFS= read -r run_id; do
+            artifact_id="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+                --jq '.artifacts[] | select(.name == "pages-site" and (.expired | not)) | .id' \
+                | head -n 1
+            )"
+            if [[ -n "$artifact_id" ]]; then
+              candidate_run="$run_id"
+              break
+            fi
+          done < <(
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$live_sha&status=success&per_page=100" \
+              --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | .id'
+          )
+          if [[ -z "$candidate_run" ]]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Released live main has no Pages candidate; no deployment is needed."
+            exit 0
+          fi
+
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
+          echo "run_id=$candidate_run" >> "$GITHUB_OUTPUT"
+      - name: Configure GitHub Pages
+        if: steps.candidate.outputs.deploy == 'true'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Download exact live-main documentation site
+        if: steps.candidate.outputs.deploy == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pages-site
+          path: _site
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.candidate.outputs.run_id }}
+      - name: Package Pages artifact
+        if: steps.candidate.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        if: steps.candidate.outputs.deploy == 'true'
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
