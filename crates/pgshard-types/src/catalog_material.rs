@@ -9,6 +9,9 @@ pub const CATALOG_CLIENT_DIGEST_DOMAIN: &str = "pgshard-catalog-client-v1";
 /// Domain separating the shard-zero catalog certificate fingerprint.
 pub const CATALOG_SERVER_DIGEST_DOMAIN: &str = "pgshard-catalog-server-v1";
 
+/// Domain separating the per-shard physical-replication password fingerprint.
+pub const POSTGRESQL_REPLICATION_DIGEST_DOMAIN: &str = "pgshard-postgresql-replication-v1";
+
 /// Computes the canonical length-framed HMAC-SHA-256 material fingerprint.
 ///
 /// # Panics
@@ -63,6 +66,22 @@ mod tests {
         assert_ne!(
             client,
             catalog_material_sha256(CATALOG_SERVER_DIGEST_DOMAIN, b"", [&b"catalog-ca"[..]],)
+        );
+        assert_eq!(
+            catalog_material_sha256(
+                POSTGRESQL_REPLICATION_DIGEST_DOMAIN,
+                b"password",
+                std::iter::empty(),
+            ),
+            "f28e708e623164f153012f8f21e13d4bbd3ad2de150d3181b69316275bb49f7e"
+        );
+        assert_ne!(
+            client,
+            catalog_material_sha256(
+                POSTGRESQL_REPLICATION_DIGEST_DOMAIN,
+                b"",
+                [&b"catalog-ca"[..]],
+            )
         );
         assert_ne!(
             catalog_material_sha256("ab", b"key", [&b"c"[..]]),

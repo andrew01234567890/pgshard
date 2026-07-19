@@ -338,11 +338,15 @@ Secret intent, its API UID, and then the exact immutable password digest. Once
 those checkpoints are complete, the controller atomically initializes member
 zero and runs one role-neutral `replication-bootstrap-primary` agent per shard.
 Its immutable HBA rejects ordinary SQL, the Pod remains unready, and no
-application Service selects it. The replication Secret is not mounted and the
-fixed login is not created yet, so remote replication authentication remains
-closed. No standby, PDB, catalog credential, physical slot, `primary_conninfo`,
-or serving endpoint is created. A missing or same-name recreated Secret or PVC
-fences the bootstrap-source controller against the recorded UID; changed
+application Service selects it. Only the init container receives the one-key
+replication Secret projection. It verifies the checkpointed digest, creates or
+validates the fixed least-privilege SCRAM login, proves the exact password over
+the physical-replication protocol, and immediately reserves one exact slot for
+each other configured member before publishing the durable HBA. The running
+agent has no Secret mount. No standby, PDB, catalog credential,
+`primary_conninfo`, or serving endpoint is created. A missing or same-name
+recreated Secret or PVC fences the bootstrap-source controller against the
+recorded UID; changed
 replication material fails closed against its recorded digest. This source is
 not evidence of a primary, standby, synchronous replica, or HA availability.
 
@@ -546,13 +550,15 @@ single-member integration, explicit `agent-quarantine` injects that runtime
 into a non-serving PostgreSQL Pod. For multi-member resources it now selects
 the agent's `replication-bootstrap-primary` role for member zero after every
 source-storage, Lease, and replication-credential checkpoint is complete. The
-agent's default quarantine role keeps TCP disabled. The bootstrap role requires the same exact writable Lease,
+agent's default quarantine role keeps TCP disabled. The bootstrap role requires
+the same exact writable Lease,
 accepts only the fixed `pgshard_replication` SCRAM role over TCP, rejects every
-ordinary database connection, and permits enough senders and physical slots to
-clone the two default M1 standbys with one bounded bootstrap-repair slot of
-headroom. It deliberately clears synchronous standby
-selection and uses local commit while bootstrapping, so it is neither a durable
-nor serving primary. A separate uncomposed `replication-standby` role requires
+ordinary database connection, and explicitly permits up to four configured
+member senders and slots plus one bounded bootstrap-repair sender and slot of
+headroom. Logical consumers remain uncomposed here. The role deliberately
+clears synchronous standby selection and uses local commit while bootstrapping,
+so it is neither a durable nor serving primary. A separate uncomposed
+`replication-standby` role requires
 an exact protected `standby.signal`, a recovery control-file state, a canonical
 member slot, and a runtime-owned `0400` passfile outside PGDATA and the socket
 directory. The passfile must contain one bounded record for the exact configured
@@ -568,9 +574,11 @@ fences the complete PostgreSQL process tree. A later upstream outage alone does
 not kill a server that remains safely in recovery. Writable Lease authority is
 forbidden for this role. The operator does not select the standby role yet. It
 checkpoints one per-shard replication password through an empty intent, exact
-API UID, immutable update, and material digest, but does not project or consume
-it or create the database role. There is no base-backup completion protocol, TLS wiring,
-slot creation, standby Pod, standby-specific Service, or standby-specific NetworkPolicy.
+API UID, immutable update, and material digest. The source init container alone
+projects it, proves its digest and physical-protocol authentication, creates the
+fixed replication role, and reserves the exact member slots; the main agent has
+no credential mount. There is no base-backup completion protocol, TLS wiring,
+standby Pod, standby-specific Service, or standby-specific NetworkPolicy.
 The role-neutral source can be selected by the existing shard headless Service and
 cluster PostgreSQL NetworkPolicy, but its unready state, absent serving role, and
 replication-only HBA keep it outside application routing. The temporary standby

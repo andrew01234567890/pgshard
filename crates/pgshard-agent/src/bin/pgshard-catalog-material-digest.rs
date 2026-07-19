@@ -6,7 +6,8 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use pgshard_types::catalog_material::{
-    CATALOG_CLIENT_DIGEST_DOMAIN, CATALOG_SERVER_DIGEST_DOMAIN, catalog_material_sha256,
+    CATALOG_CLIENT_DIGEST_DOMAIN, CATALOG_SERVER_DIGEST_DOMAIN,
+    POSTGRESQL_REPLICATION_DIGEST_DOMAIN, catalog_material_sha256,
 };
 use rustix::fs::{Mode, OFlags};
 
@@ -17,13 +18,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let profile = required_argument(&mut arguments, "profile")?;
     let key_path = required_argument(&mut arguments, "key file")?;
-    let value_path = required_argument(&mut arguments, "value file")?;
-    if arguments.next().is_some() {
-        return Err(
-            "usage: pgshard-catalog-material-digest <client|server> <key-file> <value-file>".into(),
-        );
-    }
-
     let profile = profile
         .into_string()
         .map_err(|_| "catalog material profile must be UTF-8")?;
@@ -31,19 +25,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "client" => (
             CATALOG_CLIENT_DIGEST_DOMAIN,
             "catalog password",
-            "catalog CA certificate",
+            Some("catalog CA certificate"),
         ),
         "server" => (
             CATALOG_SERVER_DIGEST_DOMAIN,
             "catalog server private key",
-            "catalog server certificate",
+            Some("catalog server certificate"),
         ),
-        _ => return Err("catalog material profile must be client or server".into()),
+        "replication" => (
+            POSTGRESQL_REPLICATION_DIGEST_DOMAIN,
+            "PostgreSQL replication password",
+            None,
+        ),
+        _ => return Err("material profile must be client, server, or replication".into()),
     };
 
     let key = read_bounded_file(&key_path, key_description, MAXIMUM_KEY_BYTES)?;
-    let value = read_bounded_file(&value_path, value_description, MAXIMUM_VALUE_BYTES)?;
-    let fingerprint = catalog_material_sha256(domain, &key, [&value[..]]);
+    let fingerprint = if let Some(value_description) = value_description {
+        let value_path = required_argument(&mut arguments, "value file")?;
+        let value = read_bounded_file(&value_path, value_description, MAXIMUM_VALUE_BYTES)?;
+        catalog_material_sha256(domain, &key, [&value[..]])
+    } else {
+        catalog_material_sha256(domain, &key, std::iter::empty())
+    };
+    if arguments.next().is_some() {
+        return Err("usage: pgshard-catalog-material-digest <client|server> <key-file> <value-file> | pgshard-catalog-material-digest replication <password-file>".into());
+    }
     let mut stdout = io::stdout().lock();
     stdout.write_all(fingerprint.as_bytes())?;
     stdout.write_all(b"\n")?;

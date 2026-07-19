@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1113,8 +1114,10 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if err := validateCheckpointedPostgreSQLReplicationCredential(replicationSecret, haCurrent, recordedReplication); err != nil {
 		t.Fatal(err)
 	}
-	if replicationSecret.Immutable == nil || !*replicationSecret.Immutable || len(replicationSecret.Data) != 1 || len(replicationSecret.Data[owned.PostgreSQLReplicationPasswordKey]) != hex.EncodedLen(postgresqlPasswordBytes) {
-		t.Fatalf("staged multi-member replication Secret = %#v", replicationSecret)
+	replicationPassword, hasReplicationPassword := replicationSecret.Data[owned.PostgreSQLReplicationPasswordKey]
+	immutable := replicationSecret.Immutable != nil && *replicationSecret.Immutable
+	if !immutable || len(replicationSecret.Data) != 1 || !hasReplicationPassword || len(replicationPassword) != hex.EncodedLen(postgresqlPasswordBytes) {
+		t.Fatalf("staged multi-member replication Secret metadata: immutable=%t dataKeys=%d hasPassword=%t passwordBytes=%d uid=%q", immutable, len(replicationSecret.Data), hasReplicationPassword, len(replicationPassword), replicationSecret.UID)
 	}
 	if haCurrent.Status.CatalogAccess != nil {
 		t.Fatalf("multi-member source intent received catalog access: %#v", haCurrent.Status.CatalogAccess)
@@ -1137,10 +1140,18 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_MODE") != "replication-bootstrap-primary" || agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_HBA_FILE") != "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf" {
 		t.Fatalf("replication bootstrap source environment = %#v", sourceAgent.Env)
 	}
-	for _, volume := range source.Spec.Template.Spec.Volumes {
-		if volume.Name == "replication-credential" {
-			t.Fatalf("replication bootstrap source consumed staged material: %#v", volume)
-		}
+	if podContainerHasNamedVolumeMount(sourceAgent.VolumeMounts, "replication-credential") {
+		t.Fatalf("replication bootstrap source agent retained the replication credential: %#v", sourceAgent.VolumeMounts)
+	}
+	sourceBootstrap := source.Spec.Template.Spec.InitContainers[0]
+	if !podContainerHasVolumeMount(sourceBootstrap.VolumeMounts, "replication-credential", true) ||
+		agentEnvironmentValue(sourceBootstrap.Env, "PGSHARD_MEMBERS_PER_SHARD") != "3" ||
+		agentEnvironmentValue(sourceBootstrap.Env, "PGSHARD_REPLICATION_MATERIAL_SHA256") != recordedReplication.MaterialSHA256 {
+		t.Fatalf("replication bootstrap source initialization = %#v", sourceBootstrap)
+	}
+	replicationProjection := podVolumeByName(t, source.Spec.Template.Spec.Volumes, "replication-credential").Secret
+	if replicationProjection == nil || replicationProjection.SecretName != recordedReplication.SecretName || replicationProjection.DefaultMode == nil || *replicationProjection.DefaultMode != 0o440 || !reflect.DeepEqual(projectedSecretItemKeys(replicationProjection.Items), []string{owned.PostgreSQLReplicationPasswordKey}) {
+		t.Fatalf("replication bootstrap source projection = %#v", replicationProjection)
 	}
 	sourcePodName := sourceName + "-0"
 	sourcePod := &corev1.Pod{}
@@ -1171,6 +1182,19 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		return err == nil && json.Unmarshal(output, &sourceStatus) == nil && sourceStatus.PostgresProcess == "running_replication_bootstrap", nil
 	}); err != nil {
 		t.Fatalf("wait for running replication bootstrap source: %v; status=%#v", err, sourceStatus)
+	}
+	replicationState := strings.TrimSpace(runKubectl(
+		t,
+		ctx,
+		"--namespace", namespace.Name,
+		"exec", sourcePodName,
+		"--container=postgresql",
+		"--",
+		"psql", "-X", "--no-password", "--host=/run/pgshard/postgres", "--username=postgres", "--dbname=postgres", "--no-align", "--tuples-only",
+		"--command=SELECT CASE WHEN rolcanlogin AND rolreplication AND NOT rolsuper AND NOT rolinherit AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolbypassrls AND rolpassword LIKE 'SCRAM-SHA-256$4096:%' THEN 'safe' ELSE 'unsafe' END FROM pg_catalog.pg_authid WHERE rolname = 'pgshard_replication'; SELECT string_agg(slot_name, ',' ORDER BY slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_type = 'physical';",
+	))
+	if replicationState != "safe\npgshard_member_0001,pgshard_member_0002" {
+		t.Fatalf("replication bootstrap materialized state = %q", replicationState)
 	}
 
 	cluster := readSingleMemberSample(t)
@@ -1935,6 +1959,32 @@ func podVolumeByName(t *testing.T, volumes []corev1.Volume, name string) corev1.
 	}
 	t.Fatalf("Pod volume %q not found: %#v", name, volumes)
 	return corev1.VolumeSource{}
+}
+
+func podContainerHasVolumeMount(mounts []corev1.VolumeMount, name string, readOnly bool) bool {
+	for _, mount := range mounts {
+		if mount.Name == name && mount.ReadOnly == readOnly {
+			return true
+		}
+	}
+	return false
+}
+
+func podContainerHasNamedVolumeMount(mounts []corev1.VolumeMount, name string) bool {
+	for _, mount := range mounts {
+		if mount.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func projectedSecretItemKeys(items []corev1.KeyToPath) []string {
+	keys := make([]string, 0, len(items))
+	for _, item := range items {
+		keys = append(keys, item.Key)
+	}
+	return keys
 }
 
 func podReady(pod *corev1.Pod) bool {
