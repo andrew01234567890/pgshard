@@ -35,6 +35,12 @@ This Lease proves only orchestrator availability and exclusive leadership. It
 does not persist operation or shard-term records, provide target-side
 PostgreSQL fencing, or enable automated failover.
 
+Every cell has a separate role-neutral ServiceAccount with token automount
+disabled. Its Role and RoleBinding allow only `get` and `update` on that cell's
+exact Lease name. No PostgreSQL Pod mounts the identity yet; future candidate
+selection must use a bounded projected token rather than ambient API
+credentials.
+
 The opt-in agent has a separate per-cell Lease transport. Its holder identity
 combines the stable member name, exact Pod UID, and a fresh random process
 incarnation, and every claim or renewal pins the fleet UID, Lease UID, and
@@ -44,11 +50,11 @@ reusing the old fencing term. A candidate times an unchanged foreign record
 locally for a full Lease duration instead of comparing the holder's clock. A
 successful response is anchored to the monotonic instant before the request was
 dispatched, so API latency consumes authority and wall-clock jumps cannot extend
-it. The operator does not yet inject the cell ServiceAccount, Lease UID, or
-agent runtime into PostgreSQL Pods. The current postmaster supervisor is
+it. The operator does not yet project the cell identity or inject the Lease UID
+and agent runtime into PostgreSQL Pods. The current postmaster supervisor is
 TCP-quarantined, and signal/process-tree cleanup is not a target-side
-serving-primary fence. Promotion proof, serving activation, operator RBAC
-injection, and release-after-durable-stop remain absent, so the existence of
+serving-primary fence. Promotion proof, serving activation, bounded token
+projection, and release-after-durable-stop remain absent, so the existence of
 these envelopes is not an HA claim.
 
 The pre-Lease development layout's three etcd data claims are retired
@@ -409,9 +415,10 @@ Lease through the Kubernetes API server; they never connect directly to the
 control plane's private etcd. The Lease record is short-lived coordination, not
 durable authority: topology, operations, fencing generations, and transaction
 decisions remain in PostgreSQL. The operator now creates and UID-checkpoints an
-empty Lease envelope per cell, and the opt-in Rust agent implements the exact
-claim, renewal, takeover-observation, and monotonic-deadline transport. The
-operator does not yet inject that runtime into PostgreSQL Pods, and the agent
+empty Lease envelope per cell with an unmounted exact-name API identity, and the
+opt-in Rust agent implements the exact claim, renewal, takeover-observation, and
+monotonic-deadline transport. The operator does not yet inject that runtime
+into PostgreSQL Pods, and the agent
 supports only TCP-quarantined PostgreSQL. Signal escalation alone cannot prove
 every backend is fenced before Lease expiry, and there is no promotion or
 serving activation path. The fleet-level orchestrator leadership Lease remains

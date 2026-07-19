@@ -2360,6 +2360,28 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		if strings.Contains(name, "primary") || strings.Contains(name, "replica") {
 			t.Fatalf("PostgreSQL writable-term Lease name encodes a mutable role: %s", name)
 		}
+
+		agentName := PostgreSQLAgentServiceAccountName(cluster.Name, shard)
+		agentAccount := object[*corev1.ServiceAccount](t, plan, agentName)
+		if agentAccount.AutomountServiceAccountToken == nil || *agentAccount.AutomountServiceAccountToken ||
+			agentAccount.Labels[ComponentLabel] != "postgresql-agent" ||
+			agentAccount.Labels[ShardLabel] != shardLabel(shard) {
+			t.Fatalf("PostgreSQL agent ServiceAccount %s is not fail closed: %#v", agentName, agentAccount)
+		}
+		agentRole := object[*rbacv1.Role](t, plan, agentName)
+		if len(agentRole.Rules) != 1 ||
+			!reflect.DeepEqual(agentRole.Rules[0].APIGroups, []string{coordinationv1.GroupName}) ||
+			!reflect.DeepEqual(agentRole.Rules[0].Resources, []string{"leases"}) ||
+			!reflect.DeepEqual(agentRole.Rules[0].ResourceNames, []string{name}) ||
+			!reflect.DeepEqual(agentRole.Rules[0].Verbs, []string{"get", "update"}) {
+			t.Fatalf("PostgreSQL agent Role %s is broader than its exact Lease: %#v", agentName, agentRole.Rules)
+		}
+		agentBinding := object[*rbacv1.RoleBinding](t, plan, agentName)
+		if agentBinding.RoleRef != (rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: agentName}) ||
+			len(agentBinding.Subjects) != 1 ||
+			agentBinding.Subjects[0] != (rbacv1.Subject{Kind: "ServiceAccount", Name: agentName, Namespace: cluster.Namespace}) {
+			t.Fatalf("PostgreSQL agent RoleBinding %s crosses its cell identity: %#v", agentName, agentBinding)
+		}
 	}
 	for _, planned := range plan {
 		if planned.GetLabels()[ComponentLabel] == "etcd" || strings.Contains(planned.GetName(), "-etcd") {
@@ -2635,12 +2657,18 @@ func TestImagePullPolicyHandlesRegistryPortsAndDigests(t *testing.T) {
 
 func TestPostgreSQLWritableLeaseNameFitsDNSLabelAtMaximumClusterLength(t *testing.T) {
 	t.Parallel()
-	name := PostgreSQLWritableLeaseName(strings.Repeat("c", pgshardv1alpha1.MaximumClusterNameLength), pgshardv1alpha1.MaximumShards-1)
-	if messages := validation.IsDNS1123Label(name); len(messages) != 0 {
-		t.Fatalf("writable-term Lease name %q is invalid: %s", name, messages[0])
+	cluster := strings.Repeat("c", pgshardv1alpha1.MaximumClusterNameLength)
+	names := []string{
+		PostgreSQLWritableLeaseName(cluster, pgshardv1alpha1.MaximumShards-1),
+		PostgreSQLAgentServiceAccountName(cluster, pgshardv1alpha1.MaximumShards-1),
 	}
-	if len(name) > 63 {
-		t.Fatalf("writable-term Lease name has %d bytes", len(name))
+	for _, name := range names {
+		if messages := validation.IsDNS1123Label(name); len(messages) != 0 {
+			t.Fatalf("writable-term resource name %q is invalid: %s", name, messages[0])
+		}
+		if len(name) > 63 {
+			t.Fatalf("writable-term resource name %q has %d bytes", name, len(name))
+		}
 	}
 }
 

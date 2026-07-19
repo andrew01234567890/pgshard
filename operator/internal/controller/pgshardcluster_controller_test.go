@@ -126,6 +126,20 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 		}
 		assertControllerOwner(t, object, cluster)
 	}
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		name := owned.PostgreSQLAgentServiceAccountName(cluster.Name, shard)
+		for _, object := range []client.Object{
+			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace}},
+			&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace}},
+		} {
+			key := client.ObjectKeyFromObject(object)
+			if err := fakeClient.Get(ctx, key, object); err != nil {
+				t.Fatalf("get cell %d API identity %T %s: %v", shard, object, key, err)
+			}
+			assertControllerOwner(t, object, cluster)
+		}
+	}
 	assertControllerOwner(t, getPostgreSQLConfigMap(t, ctx, fakeClient, cluster), cluster)
 
 	got := getCluster(t, ctx, fakeClient, cluster)
