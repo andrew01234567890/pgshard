@@ -77,10 +77,11 @@ the agent clears the term, fully fences PostgreSQL, keeps HTTP liveness
 available, and retries with bounded backoff while remaining unready. Recovery
 uses a fresh process incarnation, waits behind any old holder, advances the
 term, and starts the quarantined postmaster again in the same container.
-Runtime selection is fixed when the workload is created. Before planning, the
-controller authoritatively classifies both the `OnDelete` StatefulSet template
-and the live Pod. A manager flag mismatch fails reconciliation before template
-mutation, including when an earlier template already differs from its Pod.
+Runtime selection is fixed before the workload is created and checkpointed in
+cluster status before credentials or storage. A manager flag mismatch fails
+even after the StatefulSet and Pod are deleted. Before planning, the controller
+also authoritatively classifies both the `OnDelete` StatefulSet template and
+the live Pod, including when an earlier template already differs from its Pod.
 Changing modes requires a future explicitly fenced replacement workflow.
 Promotion proof, durable
 generation enforcement, serving activation, and release-after-durable-stop

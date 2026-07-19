@@ -558,6 +558,11 @@ spec:
                   membersPerShard:
                     format: int32
                     type: integer
+                  postgresqlRuntime:
+                    enum:
+                    - direct
+                    - agent-quarantine
+                    type: string
                   shards:
                     format: int32
                     type: integer

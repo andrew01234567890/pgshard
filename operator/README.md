@@ -246,12 +246,14 @@ wall-clock expiry is status-only and never authorizes PostgreSQL. This
 integration mode is diagnostic and non-serving; neither mode is
 evidence of promotion or HA. Durable topology and operation state stays in
 PostgreSQL rather than any Lease. Runtime selection is a creation-time workload
-contract. The controller reads both the `OnDelete` StatefulSet template and its
-live Pod through the authoritative API path before planning. If either carries
-a different runtime, reconciliation fails before mutating the template;
-changing the manager flag therefore cannot leave an old direct server running
-under a quarantine-shaped template. A future fenced replacement workflow is
-required to change modes. During
+contract checkpointed in cluster status before any credential or data volume
+is created. The controller rejects a different manager selection even when the
+StatefulSet and Pod are absent, and also reads both objects through the
+authoritative API path before planning. If either carries a different runtime,
+reconciliation fails before mutating the template; changing the manager flag
+therefore cannot leave an old direct server running under a quarantine-shaped
+template or reinterpret retained storage after workload deletion. A future
+fenced replacement workflow is required to change modes. During
 an upgrade from the retired development etcd layout, normal pruning first
 removes the old StatefulSet. Uncached API reads must then prove that controller
 and all three exact Pods absent before the operator validates and deletes only

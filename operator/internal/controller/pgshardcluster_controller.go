@@ -311,6 +311,25 @@ func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context
 		return nil
 	}
 	desired = owned.PostgreSQLRuntime(desired.String())
+	recorded := cluster.Status.PostgreSQLBootstrapSpec
+	if recorded == nil {
+		cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, desired)
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint PostgreSQL runtime contract: %w", err)
+		}
+		recorded = cluster.Status.PostgreSQLBootstrapSpec
+	} else if recorded.PostgreSQLRuntime == "" {
+		// Releases before agent-quarantine could only create the direct runtime.
+		// Persist that fact before considering the current manager flag so an
+		// upgrade cannot reinterpret existing data after workload deletion.
+		recorded.PostgreSQLRuntime = owned.PostgreSQLRuntimeDirect.String()
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint legacy direct PostgreSQL runtime: %w", err)
+		}
+	}
+	if recorded.PostgreSQLRuntime != desired.String() {
+		return fmt.Errorf("durable PostgreSQL runtime is %q, but the manager requested %q; runtime selection is fixed at workload creation until a fenced replacement workflow exists", recorded.PostgreSQLRuntime, desired)
+	}
 	reader := r.authoritativeReader()
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		for _, name := range []string{
@@ -657,10 +676,7 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 		if cluster.Spec.MembersPerShard != 1 {
 			return nil
 		}
-		cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
-		if err := r.Status().Update(ctx, cluster); err != nil {
-			return fmt.Errorf("checkpoint PostgreSQL provisioned spec: %w", err)
-		}
+		return fmt.Errorf("PostgreSQL runtime contract must be checkpointed before provisioning")
 	} else if cluster.Status.PostgreSQLBootstrapSpec.DatabaseTopologySHA256 == "" {
 		if len(cluster.Spec.Databases) != 0 {
 			return fmt.Errorf("recorded PostgreSQL bootstrap spec predates the declared database topology; explicit recovery is required")
@@ -1186,9 +1202,10 @@ func isDefaultStorageClass(annotations map[string]string) bool {
 		annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true"
 }
 
-func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) *pgshardv1alpha1.PostgreSQLBootstrapSpecStatus {
+func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster, postgresqlRuntime owned.PostgreSQLRuntime) *pgshardv1alpha1.PostgreSQLBootstrapSpecStatus {
 	return &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
 		Shards: cluster.Spec.Shards, MembersPerShard: cluster.Spec.MembersPerShard, Durability: cluster.Spec.Durability,
+		PostgreSQLRuntime:      postgresqlRuntime.String(),
 		DatabaseTopologySHA256: cluster.Spec.DatabaseTopologySHA256(),
 		StorageSize:            cluster.Spec.Storage.Size.String(), StorageClassName: copyOptionalString(cluster.Spec.Storage.StorageClassName), DeletionPolicy: storageDeletionPolicy(cluster),
 	}
@@ -1196,7 +1213,7 @@ func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) *pgshardv1alph
 
 func validateBootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) error {
 	recorded := cluster.Status.PostgreSQLBootstrapSpec
-	wanted := bootstrapSpecStatus(cluster)
+	wanted := bootstrapSpecStatus(cluster, owned.PostgreSQLRuntime(recorded.PostgreSQLRuntime))
 	if !bootstrapSpecsEqual(recorded, wanted) {
 		return fmt.Errorf("current topology or storage differs from the provisioned PostgreSQL bootstrap spec; an explicit transition is required")
 	}
@@ -3357,7 +3374,7 @@ func bootstrapSpecsEqual(left, right *pgshardv1alpha1.PostgreSQLBootstrapSpecSta
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.DatabaseTopologySHA256 == right.DatabaseTopologySHA256 && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName) && left.DeletionPolicy == right.DeletionPolicy
+	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.PostgreSQLRuntime == right.PostgreSQLRuntime && left.DatabaseTopologySHA256 == right.DatabaseTopologySHA256 && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName) && left.DeletionPolicy == right.DeletionPolicy
 }
 
 func postgreSQLBootstrapsEqual(left, right pgshardv1alpha1.PostgreSQLBootstrapStatus) bool {

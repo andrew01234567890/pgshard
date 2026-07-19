@@ -52,10 +52,11 @@ bounded backoff. Reacquisition prepares PGDATA offline, uses a fresh process
 incarnation, and takes a higher term without relying on a container restart.
 Monotonic deadlines remain authoritative across wall-clock steps; the reported
 wall-clock expiry is status-only. It is a composition test boundary, not
-serving activation. The operator stamps this runtime at workload creation and
-rejects later flag mismatches against either the authoritative StatefulSet
-template or live Pod. It never treats an `OnDelete` template update as a runtime
-transition; an explicit fenced replacement workflow is still required.
+serving activation. The operator checkpoints this runtime in cluster status
+before storage creation and rejects later flag mismatches even when workloads
+are absent, as well as against either the authoritative StatefulSet template or
+live Pod. It never treats an `OnDelete` template update as a runtime transition;
+an explicit fenced replacement workflow is still required.
 
 Build the five standard archives from the repository root:
 

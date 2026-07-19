@@ -346,11 +346,15 @@ type CatalogAccessStatus struct {
 	ServerSHA256 string `json:"serverSHA256,omitempty"`
 }
 
-// PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract.
+// PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract. The
+// runtime is checkpointed before any credential or data volume is created so
+// deleted workload objects cannot erase the selected process composition.
 type PostgreSQLBootstrapSpecStatus struct {
 	Shards          int32          `json:"shards"`
 	MembersPerShard int32          `json:"membersPerShard"`
 	Durability      DurabilityMode `json:"durability"`
+	// +kubebuilder:validation:Enum=direct;agent-quarantine
+	PostgreSQLRuntime string `json:"postgresqlRuntime,omitempty"`
 	// DatabaseTopologySHA256 binds provisioned storage to the complete resolved
 	// immutable logical-database genesis topology. It is omitted only on status
 	// written by releases that predate database-scoped genesis.
