@@ -6,3 +6,4 @@ pub mod domain;
 pub mod http;
 pub mod postgres;
 pub mod telemetry;
+pub mod writable;

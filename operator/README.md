@@ -242,7 +242,21 @@ fences PostgreSQL, keeps `/healthz` available while `/readyz` remains failed,
 and retries with bounded backoff. A recovered attempt uses a fresh process
 incarnation and takes a higher term in the same container. Same-term monotonic
 authority can advance across a backward wall-clock step; the reported
-wall-clock expiry is status-only and never authorizes PostgreSQL. This
+wall-clock expiry is status-only and never authorizes PostgreSQL. On requested
+process shutdown the agent stops renewal and retains the latest exact
+resource-version release receipt, then clears that holder only after the
+writable PostgreSQL supervisor returns the matching half of a single-use,
+non-cloneable complete process-tree absence proof. Release does not advance the
+term. Pair creation, both supervisors, and release are sealed inside one
+composed library operation; callers cannot reorder their lifetimes. Lease
+authority reaches the final postmaster startup guard only through an
+identity-tagged, attempt-private channel. Shared agent status remains
+observational and cannot cross-authorize concurrent attempts. Stale, mismatched,
+or outcome-unknown release evidence is never retried, leaving Lease expiry as
+the backstop. The
+controller accepts only a pristine envelope, a complete occupied term, or a
+complete released term with its holder absent; partial released history fails
+closed. This
 integration mode is diagnostic and non-serving; neither mode is
 evidence of promotion or HA. Durable topology and operation state stays in
 PostgreSQL rather than any Lease. Runtime selection is a creation-time workload
@@ -500,6 +514,14 @@ remain unready and expose no PostgreSQL TCP listener. The manager end-to-end
 test also removes a cell's exact Lease permissions, proves PostgreSQL is fenced
 while the agent stays healthy, restores reconciliation, and requires a higher
 term plus repeated renewals in the same Pod and container without a restart.
+It then scales the member down with no replacement process, requires the exact
+holder to clear without changing the term, and pins the postmaster PID, Linux
+start time, and process group before shutdown. When the holder first becomes
+absent, the test immediately requires every pinned `/proc` identity to be gone
+or the exact old container to be terminal or kubelet-confirmed absent. It then
+requires the replacement Pod to claim the empty envelope at the next term. The
+same process-table probe must first detect the pinned process while it is known
+to be running, preventing a vacuous absence check.
 
 For the multi-member development sample above, the pooler remains unready,
 application Services have no ready endpoints, no PostgreSQL workload is

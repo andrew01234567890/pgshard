@@ -32,6 +32,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::domain::{AgentState, PostgresProcessState};
+use crate::writable::WritablePostgresAttempt;
 
 const POSTGRES_MAJOR: &str = "18";
 const PG_CONTROL_FILE_SIZE: u64 = 8_192;
@@ -214,6 +215,19 @@ pub struct PreparedPostgres {
     config: PostgresConfig,
     validated: ValidatedPostgresState,
     supervisor_lock: SupervisorLock,
+}
+
+/// Linear proof that a writable `PostgreSQL` supervision attempt completed with
+/// no remaining postmaster process tree.
+///
+/// The writable-term coordinator consumes this proof before it can clear an
+/// exact Kubernetes Lease holder. The proof carries one half of the exact
+/// single-use writable-attempt identity and is intentionally neither
+/// constructible outside this crate nor cloneable.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct WritablePostgresStopped {
+    pub(crate) attempt: WritablePostgresAttempt,
 }
 
 #[derive(Debug)]
@@ -488,7 +502,8 @@ impl PreparedPostgres {
         .await
     }
 
-    /// Runs the postmaster only after writable-term startup authority is proven.
+    /// Runs the postmaster only after attempt-private writable-term startup
+    /// authority is proven.
     ///
     /// The guard is evaluated at the final user-space boundary before process
     /// creation. Every requested shutdown revokes local Lease evidence and
@@ -499,17 +514,21 @@ impl PreparedPostgres {
     ///
     /// Returns an error if startup authority is absent or if validation,
     /// process creation, supervision, or target fencing fails.
-    pub async fn supervise_with_writable_authority(
+    pub(crate) async fn supervise_with_writable_authority(
         self,
         state: AgentState,
         shutdown: watch::Receiver<bool>,
         required_margin: Duration,
-    ) -> Result<(), PostgresError> {
+        attempt: WritablePostgresAttempt,
+    ) -> Result<WritablePostgresStopped, PostgresError> {
         let required_margin = required_margin.max(self.config.target_fence_budget());
-        let startup_state = state.clone();
-        self.supervise_with_writable_authority_guard(state, shutdown, move || {
-            startup_state.lease_authority_valid_for(required_margin)
-        })
+        let authority = attempt.authority_observer();
+        self.supervise_with_writable_authority_guard(
+            state,
+            shutdown,
+            move || authority.valid_for(required_margin),
+            attempt,
+        )
         .await
     }
 
@@ -518,7 +537,8 @@ impl PreparedPostgres {
         state: AgentState,
         mut shutdown: watch::Receiver<bool>,
         startup_guard: G,
-    ) -> Result<(), PostgresError>
+        attempt: WritablePostgresAttempt,
+    ) -> Result<WritablePostgresStopped, PostgresError>
     where
         G: Fn() -> bool,
     {
@@ -547,7 +567,8 @@ impl PreparedPostgres {
                 }
             },
         )
-        .await
+        .await?;
+        Ok(WritablePostgresStopped { attempt })
     }
 
     async fn supervise_with_stop_mode_and_start_guard<G>(
@@ -4448,7 +4469,12 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let result = prepared
-            .supervise_with_writable_authority_guard(state.clone(), shutdown_rx, || false)
+            .supervise_with_writable_authority_guard(
+                state.clone(),
+                shutdown_rx,
+                || false,
+                crate::writable::writable_attempt_pair_for_test().1,
+            )
             .await;
 
         assert!(matches!(
@@ -4490,11 +4516,18 @@ mod tests {
                 1_000,
             )
             .expect("install authority inside the process fence budget");
-        assert!(state.lease_authority_valid_for(Duration::ZERO));
+        assert!(state.snapshot().lease.is_some());
+        let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        lease_attempt.install_authority(state.lease_deadline().expect("monotonic deadline"));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let result = prepared
-            .supervise_with_writable_authority(state.clone(), shutdown_rx, Duration::ZERO)
+            .supervise_with_writable_authority(
+                state.clone(),
+                shutdown_rx,
+                Duration::ZERO,
+                postgres_attempt,
+            )
             .await;
 
         assert!(matches!(
@@ -4549,15 +4582,20 @@ mod tests {
         });
 
         let result = prepared
-            .supervise_with_writable_authority_guard(state.clone(), shutdown_rx, || {
-                guard_entered_tx
-                    .send(())
-                    .expect("publish final exec-handoff guard");
-                guard_continue_rx
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("wait for shutdown publication");
-                true
-            })
+            .supervise_with_writable_authority_guard(
+                state.clone(),
+                shutdown_rx,
+                || {
+                    guard_entered_tx
+                        .send(())
+                        .expect("publish final exec-handoff guard");
+                    guard_continue_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("wait for shutdown publication");
+                    true
+                },
+                crate::writable::writable_attempt_pair_for_test().1,
+            )
             .await;
         signal.join().expect("join shutdown publisher");
 
@@ -4772,6 +4810,8 @@ mod tests {
                 1_000,
             )
             .expect("install target-fence authority");
+        let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        lease_attempt.install_authority(state.lease_deadline().expect("monotonic deadline"));
         let shutdown_state = state.clone();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shutdown_task = tokio::spawn(async move {
@@ -4793,6 +4833,7 @@ mod tests {
                 state.clone(),
                 shutdown_rx,
                 Duration::from_secs(1),
+                postgres_attempt,
             ),
         )
         .await
@@ -4840,6 +4881,8 @@ mod tests {
                 1_000,
             )
             .expect("install process-tree fence authority");
+        let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        lease_attempt.install_authority(state.lease_deadline().expect("monotonic deadline"));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shutdown_descendant = descendant.clone();
         let shutdown_task = tokio::spawn(async move {
@@ -4849,7 +4892,12 @@ mod tests {
 
         let result = timeout(
             Duration::from_secs(2),
-            prepared.supervise_with_writable_authority(state, shutdown_rx, Duration::from_secs(1)),
+            prepared.supervise_with_writable_authority(
+                state,
+                shutdown_rx,
+                Duration::from_secs(1),
+                postgres_attempt,
+            ),
         )
         .await
         .expect("bounded target-fence process-tree cleanup");

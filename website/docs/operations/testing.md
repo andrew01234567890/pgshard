@@ -220,8 +220,21 @@ store. They prove exclusive empty-Lease claims, conditional renewal and release,
 exact fleet owner and Lease UID pinning, local unchanged-record takeover timing,
 that a delayed post-commit replacement response cannot extend local leadership,
 same-term monotonic renewal across a backward wall-clock step without decreasing
-the diagnostic expiry, and cancellation of a stalled API operation during
-shutdown. Operator tests
+the diagnostic expiry, cancellation of a stalled API operation during
+shutdown, exact-holder release without a term increment, rejection of a stale
+release after a later renewal, outcome-unknown release without a stale retry,
+and rejection of a process-absence proof from another writable attempt. The
+release capability is sealed and can be consumed only with the matching half of
+the single-use, non-cloneable process-tree absence proof returned by successful
+writable PostgreSQL cleanup. The public API exposes only the composed operation;
+pair creation, both underlying supervisors, their proof types, and release stay
+crate-private. Unit coverage proves authority from one attempt cannot wake or
+pass the final guard for another, and rejects an authority payload whose hidden
+identity tag does not match its private observer. Shared agent state is tested
+only as status evidence. Operator tests accept complete released history through the real
+reconciliation path while rejecting partial released fields, empty or whitespace
+holders, invalid duration/timestamp/term bounds, and coordinated leader-election
+fields. Operator tests
 also prove an arbitrary Pod name and owner still blocks retired etcd PVC
 deletion when it references the claim. The manager KIND
 suite exercises the real Kubernetes API: it verifies exact-name `get`/`update`
@@ -542,6 +555,16 @@ manager. It requires a fresh holder and higher term, a recovered quarantined
 postmaster, repeated Lease renewals, and unchanged Pod UID, container ID, start
 time, and restart count throughout. Renewals are counted only when the Lease's
 `renewTime` strictly advances, not from unrelated resource-version changes.
+It then pauses reconciliation without removing Lease permissions, scales the
+member to zero, and pins the postmaster PID, Linux start time, and process group
+before shutdown. When it first observes the exact holder cleared at the same
+term, it immediately requires every pinned `/proc` identity to be absent or the
+exact old container to be terminal or kubelet-confirmed absent. It then requires
+the replacement Pod to claim the empty envelope at exactly the next term. The
+same process-table probe must first detect the pin while PostgreSQL is known to
+be running, so an empty or disabled enumeration fails the test. The Rust
+composition boundary, rather than a fallible `kubectl exec`, prevents release
+receipts and process-absence proofs from crossing supervision attempts.
 Controller tests additionally create a direct `OnDelete` workload, request the
 agent runtime, and require rejection before template mutation. A second case
 models an already-updated agent template over a still-direct Pod and requires

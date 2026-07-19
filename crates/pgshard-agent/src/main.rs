@@ -1,9 +1,10 @@
 //! `pgshard-agent` Linux container entry point.
 
 use pgshard_agent::config::{AgentConfig, ConfigError};
-use pgshard_agent::coordination::{WritableLeaseConfig, WritableLeaseError};
+use pgshard_agent::coordination::WritableLeaseConfig;
 use pgshard_agent::domain::{AgentState, PostgresProcessState};
 use pgshard_agent::postgres::{PostgresConfig, PostgresError, PreparedPostgres};
+use pgshard_agent::writable::{WritableAttemptError, WritableAttemptOutcome};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -218,7 +219,7 @@ async fn supervise_writable_runtime(
     loop {
         state.clear_lease();
         let attempt_started = Instant::now();
-        match Box::pin(run_writable_attempt(
+        match Box::pin(pgshard_agent::writable::supervise_attempt(
             state.clone(),
             postgres,
             writable_lease.clone(),
@@ -246,112 +247,6 @@ async fn supervise_writable_runtime(
         };
         state.set_postgres_process(PostgresProcessState::Validated);
         postgres = prepared;
-    }
-}
-
-async fn run_writable_attempt(
-    state: AgentState,
-    postgres: PreparedPostgres,
-    writable_lease: WritableLeaseConfig,
-    shutdown: watch::Receiver<bool>,
-) -> Result<WritableAttemptOutcome, AgentRunError> {
-    let margin = writable_lease.shutdown_margin();
-    let lease_changes = state.subscribe_lease_changes();
-    let (attempt_shutdown_tx, attempt_shutdown_rx) = watch::channel(false);
-    let postmaster_state = state.clone();
-    let postmaster_shutdown = attempt_shutdown_rx.clone();
-    let postmaster = async move {
-        if !wait_for_initial_writable_authority(
-            &postmaster_state,
-            lease_changes,
-            postmaster_shutdown.clone(),
-            margin,
-        )
-        .await
-        {
-            return Ok(());
-        }
-        postgres
-            .supervise_with_writable_authority(postmaster_state, postmaster_shutdown, margin)
-            .await
-    };
-    let coordination =
-        pgshard_agent::coordination::supervise(writable_lease, state, attempt_shutdown_rx);
-    tokio::pin!(postmaster);
-    tokio::pin!(coordination);
-    tokio::select! {
-        biased;
-        () = wait_for_shutdown(shutdown) => {
-            let _ = attempt_shutdown_tx.send(true);
-            let postmaster_result = postmaster.await;
-            if let Err(error) = coordination.await {
-                tracing::warn!(reason = %error, "writable-term Lease coordination ended during agent shutdown");
-            }
-            postmaster_result.map_err(AgentRunError::Postgres)?;
-            Ok(WritableAttemptOutcome::Shutdown)
-        }
-        coordination_result = &mut coordination => {
-            let _ = attempt_shutdown_tx.send(true);
-            let postmaster_result = postmaster.await.map_err(AgentRunError::Postgres);
-            match coordination_result {
-                Err(coordination) => match postmaster_result {
-                    Ok(()) => Ok(WritableAttemptOutcome::Retry(coordination)),
-                    Err(runtime) => Err(AgentRunError::CoordinationAndRuntime {
-                        coordination,
-                        runtime: Box::new(runtime),
-                    }),
-                },
-                Ok(()) => postmaster_result.and(Err(AgentRunError::CoordinationStopped)),
-            }
-        }
-        postmaster_result = &mut postmaster => {
-            let _ = attempt_shutdown_tx.send(true);
-            let runtime = postmaster_result.map_err(AgentRunError::Postgres);
-            match (runtime, coordination.await) {
-                (Ok(()), Err(coordination)) => Ok(WritableAttemptOutcome::Retry(coordination)),
-                (Err(runtime), Err(coordination)) => Err(AgentRunError::CoordinationAndRuntime {
-                    coordination,
-                    runtime: Box::new(runtime),
-                }),
-                (Err(runtime), Ok(())) => Err(runtime),
-                (Ok(()), Ok(())) => Err(AgentRunError::PostgresStopped),
-            }
-        }
-    }
-}
-
-enum WritableAttemptOutcome {
-    Retry(WritableLeaseError),
-    Shutdown,
-}
-
-async fn wait_for_initial_writable_authority(
-    state: &AgentState,
-    mut lease_changes: watch::Receiver<()>,
-    mut shutdown: watch::Receiver<bool>,
-    required_margin: Duration,
-) -> bool {
-    loop {
-        if *shutdown.borrow_and_update() {
-            return false;
-        }
-        lease_changes.borrow_and_update();
-        if state.lease_authority_valid_for(required_margin) {
-            return true;
-        }
-        tokio::select! {
-            biased;
-            changed = shutdown.changed() => {
-                if changed.is_err() {
-                    return false;
-                }
-            }
-            changed = lease_changes.changed() => {
-                if changed.is_err() {
-                    return false;
-                }
-            }
-        }
     }
 }
 
@@ -432,18 +327,8 @@ enum AgentRunError {
         postgres: PostgresError,
         http: std::io::Error,
     },
-    #[error("writable-term Lease coordination stopped without shutdown or an error")]
-    CoordinationStopped,
-    #[error("PostgreSQL supervision stopped without shutdown or an error")]
-    PostgresStopped,
-    #[error(
-        "writable-term Lease coordination failed: {coordination}; agent runtime also failed: {runtime}"
-    )]
-    CoordinationAndRuntime {
-        #[source]
-        coordination: WritableLeaseError,
-        runtime: Box<AgentRunError>,
-    },
+    #[error("writable PostgreSQL runtime failed: {0}")]
+    Writable(#[from] WritableAttemptError),
     #[error("agent runtime failed: {runtime}; agent HTTP server also failed: {http}")]
     HttpAndRuntime {
         http: std::io::Error,
@@ -487,8 +372,6 @@ async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgshard_agent::domain::{AgentIdentity, FencingLease};
-    use pgshard_types::ShardId;
     use std::sync::mpsc;
 
     #[test]
@@ -509,7 +392,9 @@ mod tests {
     fn preserves_simultaneous_http_and_writable_runtime_failures() {
         let result = combine_http_runtime_results(
             Err(std::io::Error::other("HTTP failed")),
-            Err(AgentRunError::Postgres(PostgresError::PreparedStateChanged)),
+            Err(AgentRunError::Writable(WritableAttemptError::Postgres(
+                PostgresError::PreparedStateChanged,
+            ))),
         );
         let AgentRunError::HttpAndRuntime { http, runtime } =
             result.expect_err("both failures survive")
@@ -519,120 +404,10 @@ mod tests {
         assert_eq!(http.to_string(), "HTTP failed");
         assert!(matches!(
             *runtime,
-            AgentRunError::Postgres(PostgresError::PreparedStateChanged)
+            AgentRunError::Writable(WritableAttemptError::Postgres(
+                PostgresError::PreparedStateChanged
+            ))
         ));
-    }
-
-    #[tokio::test]
-    async fn postgres_start_waits_for_authority_beyond_the_fencing_margin() {
-        let state = agent_state(10_000);
-        let lease_changes = state.subscribe_lease_changes();
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut wait = Box::pin(wait_for_initial_writable_authority(
-            &state,
-            lease_changes,
-            shutdown_rx,
-            Duration::from_secs(1),
-        ));
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut wait)
-                .await
-                .is_err(),
-            "PostgreSQL start advanced without authority"
-        );
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 1,
-                    valid_until_unix_ms: 5_001,
-                },
-                1,
-            )
-            .expect("install startup authority");
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), wait)
-                .await
-                .expect("authority notification is bounded")
-        );
-    }
-
-    #[tokio::test]
-    async fn postgres_start_waits_for_a_renewal_after_authority_enters_the_margin() {
-        let state = agent_state(20_000);
-        let lease_changes = state.subscribe_lease_changes();
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut wait = Box::pin(wait_for_initial_writable_authority(
-            &state,
-            lease_changes,
-            shutdown_rx,
-            Duration::from_secs(6),
-        ));
-
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 1,
-                    valid_until_unix_ms: 5_001,
-                },
-                1,
-            )
-            .expect("install authority inside the startup margin");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut wait)
-                .await
-                .is_err(),
-            "PostgreSQL start accepted authority inside the fencing margin"
-        );
-
-        state
-            .install_lease(
-                FencingLease {
-                    owner_instance: "instance-1".to_owned(),
-                    epoch: 1,
-                    valid_until_unix_ms: 10_001,
-                },
-                1,
-            )
-            .expect("renew authority beyond the startup margin");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), wait)
-                .await
-                .expect("renewal notification is bounded")
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_before_authority_leaves_postgres_unstarted() {
-        let state = agent_state(10_000);
-        let lease_changes = state.subscribe_lease_changes();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        shutdown_tx.send(true).expect("request shutdown");
-
-        assert!(
-            !wait_for_initial_writable_authority(
-                &state,
-                lease_changes,
-                shutdown_rx,
-                Duration::from_secs(1),
-            )
-            .await
-        );
-    }
-
-    fn agent_state(max_lease_ttl_ms: u64) -> AgentState {
-        AgentState::with_identity(
-            AgentIdentity {
-                cluster_id: "cluster-1".to_owned(),
-                shard_id: ShardId(0),
-                instance_id: "instance-1".to_owned(),
-            },
-            max_lease_ttl_ms,
-        )
-        .expect("valid state")
     }
 
     #[tokio::test]

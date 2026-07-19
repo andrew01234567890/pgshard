@@ -76,7 +76,22 @@ probe stays failed and PostgreSQL has no TCP listener. If coordination fails,
 the agent clears the term, fully fences PostgreSQL, keeps HTTP liveness
 available, and retries with bounded backoff while remaining unready. Recovery
 uses a fresh process incarnation, waits behind any old holder, advances the
-term, and starts the quarantined postmaster again in the same container.
+term, and starts the quarantined postmaster again in the same container. On a
+requested process shutdown, coordination stops renewal and retains only the
+latest exact resource-version release receipt while PostgreSQL enters its
+complete process-tree fence. The writable supervisor emits the matching half
+of a single-use, non-cloneable absence proof only after cleanup succeeds; that
+proof is required to consume the receipt. The conditional replacement clears
+only the exact holder and does not advance the transition counter. Pair
+creation, both supervisor lifetimes, and release are private to one composed
+runtime operation, so callers cannot retain a proof across attempts. The
+coordinator publishes monotonic startup authority only on that attempt's
+identity-tagged private channel. Cloneable agent status is observational and
+cannot authorize a concurrent attempt. A mismatched proof, conflict, timeout,
+lost response, or response mismatch is not retried with stale evidence, so the occupied-record
+expiry protocol remains the safety fallback. Controller reconciliation accepts
+only the pristine envelope, a complete occupied term, or this complete released
+term; partial released history and empty-string holders fail closed.
 Runtime selection is fixed before the workload is created and checkpointed in
 cluster status before credentials or storage. A manager flag mismatch fails
 even after the StatefulSet and Pod are deleted. Before planning, the controller
@@ -84,8 +99,8 @@ also authoritatively classifies both the `OnDelete` StatefulSet template and
 the live Pod, including when an earlier template already differs from its Pod.
 Changing modes requires a future explicitly fenced replacement workflow.
 Promotion proof, durable
-generation enforcement, serving activation, and release-after-durable-stop
-remain absent, so this is not yet a serving-primary fence or an HA claim.
+generation enforcement, and serving activation remain absent, so this is not
+yet a serving-primary fence or an HA claim.
 
 The pre-Lease development layout's three etcd data claims are retired
 automatically. The operator first prunes the old cluster-owned StatefulSet,

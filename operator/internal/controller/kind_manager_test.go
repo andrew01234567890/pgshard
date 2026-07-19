@@ -1058,7 +1058,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
 		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against an admission manager in agent-quarantine mode")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 	kubeClient := newKINDClient(t)
 
@@ -1193,9 +1193,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatalf("agent status does not match Kubernetes identity: status=%#v Lease=%#v", observed, liveLease.Spec)
 	}
 
-	if output, err := exec.CommandContext(ctx, "kubectl", "--namespace", namespace.Name, "exec", podName, "--container=postgresql", "--", "pg_isready", "--quiet", "--host=/run/pgshard/postgres", "--port=5432").CombinedOutput(); err != nil {
-		t.Fatalf("quarantined Unix postmaster is not running: %v\n%s", err, output)
-	}
+	waitForQuarantinedPostgreSQL(t, ctx, namespace.Name, podName, "initial acquisition")
 	if output, err := exec.CommandContext(ctx, "kubectl", "--namespace", namespace.Name, "exec", podName, "--container=postgresql", "--", "pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432").CombinedOutput(); err == nil {
 		t.Fatalf("agent quarantine exposed PostgreSQL TCP: %s", output)
 	}
@@ -1312,9 +1310,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("wait for quarantined PostgreSQL recovery: %v; last output=%q", err, lastStatusOutput)
 	}
-	if output, err := exec.CommandContext(ctx, "kubectl", "--namespace", namespace.Name, "exec", podName, "--container=postgresql", "--", "pg_isready", "--quiet", "--host=/run/pgshard/postgres", "--port=5432").CombinedOutput(); err != nil {
-		t.Fatalf("quarantined postmaster did not recover under the fresh term: %v\n%s", err, output)
-	}
+	waitForQuarantinedPostgreSQL(t, ctx, namespace.Name, podName, "coordination recovery")
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
 		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: podName}, pod); err != nil {
 			return false, err
@@ -1369,6 +1365,72 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if err != nil || json.Unmarshal(output, &stable) != nil || stable.Lease == nil || stable.PostgresProcess != "running_quarantined" || stable.Lease.Epoch != strconv.FormatInt(int64(stableTerm), 10) {
 		t.Fatalf("agent status changed during stable renewal observation: error=%v output=%q status=%#v", err, output, stable)
 	}
+	processPin := pinQuarantinedPostgreSQLProcess(t, ctx, namespace.Name, podName)
+	if err := provePinnedPostgreSQLProcessAbsent(t, ctx, kubeClient, namespace.Name, podName, initialPodUID, processPin); err == nil || !strings.Contains(err.Error(), "pinned postmaster or process group remains live") {
+		t.Fatalf("live PostgreSQL process pin was not detected before shutdown: %v", err)
+	}
+
+	// Stop the workload controller while leaving the exact Lease permission in
+	// place, then scale the member down. No replacement process can race the old
+	// agent's conditional release, so the empty-holder transition is observable.
+	managerRestored = false
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=0")
+	waitForManagerReplicas(t, ctx, kubeClient, 0)
+	runKubectl(t, ctx, "--namespace", namespace.Name, "scale", "statefulset/"+statefulSetName, "--replicas=0")
+
+	releasedLease := &coordinationv1.Lease{}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		releasedLease = &coordinationv1.Lease{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: checkpoint.LeaseName}, releasedLease); err != nil {
+			return false, err
+		}
+		if releasedLease.UID != checkpoint.LeaseUID || releasedLease.Spec.LeaseTransitions == nil || *releasedLease.Spec.LeaseTransitions != stableTerm {
+			return false, fmt.Errorf("clean shutdown changed the Lease identity or fencing term: %#v", releasedLease)
+		}
+		if releasedLease.Spec.HolderIdentity != nil {
+			if *releasedLease.Spec.HolderIdentity != stableHolder {
+				return false, fmt.Errorf("clean shutdown changed the holder instead of releasing it: %#v", releasedLease.Spec)
+			}
+			return false, nil
+		}
+		if err := provePinnedPostgreSQLProcessAbsent(t, ctx, kubeClient, namespace.Name, podName, initialPodUID, processPin); err != nil {
+			return false, fmt.Errorf("Lease holder cleared before immediate process-absence proof: %w", err)
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("wait for exact clean Lease release after PostgreSQL fence: %v; Lease=%#v", err, releasedLease)
+	}
+
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1")
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "rollout", "status", "deployment/pgshard-controller-manager", "--timeout=120s")
+	waitForManagerReplicas(t, ctx, kubeClient, 1)
+	managerRestored = true
+
+	restartedPod := &corev1.Pod{}
+	if err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		restartedPod = &corev1.Pod{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: podName}, restartedPod); err != nil {
+			return false, client.IgnoreNotFound(err)
+		}
+		return restartedPod.UID != initialPodUID && restartedPod.Status.Phase == corev1.PodRunning && len(restartedPod.Status.ContainerStatuses) == 1 && restartedPod.Status.ContainerStatuses[0].State.Running != nil, nil
+	}); err != nil {
+		t.Fatalf("wait for cleanly restarted agent Pod: %v; Pod=%#v", err, restartedPod)
+	}
+	restartedLease := &coordinationv1.Lease{}
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		restartedLease = &coordinationv1.Lease{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: checkpoint.LeaseName}, restartedLease); err != nil {
+			return false, err
+		}
+		return restartedLease.Spec.LeaseTransitions != nil && *restartedLease.Spec.LeaseTransitions == stableTerm+1 && restartedLease.Spec.HolderIdentity != nil && *restartedLease.Spec.HolderIdentity != "", nil
+	}); err != nil {
+		t.Fatalf("wait for immediate post-release Lease claim: %v; Lease=%#v", err, restartedLease)
+	}
+	restartedHolder := strings.Split(*restartedLease.Spec.HolderIdentity, "/")
+	if len(restartedHolder) != 3 || restartedHolder[0] != podName || restartedHolder[1] != string(restartedPod.UID) || *restartedLease.Spec.HolderIdentity == stableHolder {
+		t.Fatalf("post-release holder does not bind the replacement Pod: Pod=%s Lease=%#v", restartedPod.UID, restartedLease.Spec)
+	}
+	waitForQuarantinedPostgreSQL(t, ctx, namespace.Name, podName, "clean-release replacement")
 }
 
 func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
@@ -2011,6 +2073,136 @@ func waitForManagerReplicas(t *testing.T, ctx context.Context, kubeClient client
 	if err != nil {
 		t.Fatalf("wait for manager replicas %d: %v; last status = %#v; last pods = %#v", wanted, err, deployment.Status, managerPods.Items)
 	}
+}
+
+func waitForQuarantinedPostgreSQL(t *testing.T, ctx context.Context, namespace, podName, phase string) {
+	t.Helper()
+	var probeOutput []byte
+	var probeErr error
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		probeOutput, probeErr = exec.CommandContext(probeCtx, "kubectl", "--namespace", namespace, "exec", podName, "--container=postgresql", "--", "pg_isready", "--quiet", "--host=/run/pgshard/postgres", "--port=5432").CombinedOutput()
+		cancel()
+		return probeErr == nil, nil
+	}); err != nil {
+		t.Fatalf("wait for quarantined PostgreSQL during %s: %v; last probe error=%v\n%s", phase, err, probeErr, probeOutput)
+	}
+}
+
+type postgreSQLProcessPin struct {
+	pid          uint64
+	processGroup uint64
+	startTime    uint64
+}
+
+func pinQuarantinedPostgreSQLProcess(t *testing.T, ctx context.Context, namespace, podName string) postgreSQLProcessPin {
+	t.Helper()
+	execCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(
+		execCtx,
+		"kubectl",
+		"--namespace", namespace,
+		"exec", podName,
+		"--container=postgresql",
+		"--",
+		"sh", "-ceu",
+		`set -f
+IFS= read -r pid < /run/pgshard/postgres/postmaster.external.pid
+case "$pid" in ''|*[!0-9]*) exit 41 ;; esac
+stat=$(cat "/proc/$pid/stat")
+stat=${stat##*) }
+set -- $stat
+test "$#" -ge 20
+test "$1" != Z
+process_group=$3
+shift 19
+start_time=$1
+case "$process_group:$start_time" in *[!0-9:]*|:*|*:) exit 41 ;; esac
+printf '%s %s %s\n' "$pid" "$process_group" "$start_time"`,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("pin quarantined PostgreSQL process: %v\n%s", err, output)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) != 3 {
+		t.Fatalf("pin quarantined PostgreSQL process returned %q", output)
+	}
+	values := make([]uint64, len(fields))
+	for index, field := range fields {
+		value, err := strconv.ParseUint(field, 10, 64)
+		if err != nil || value == 0 {
+			t.Fatalf("pin quarantined PostgreSQL process returned invalid value %q", output)
+		}
+		values[index] = value
+	}
+	return postgreSQLProcessPin{pid: values[0], processGroup: values[1], startTime: values[2]}
+}
+
+func provePinnedPostgreSQLProcessAbsent(t *testing.T, ctx context.Context, kubeClient client.Client, namespace, podName string, podUID types.UID, pin postgreSQLProcessPin) error {
+	t.Helper()
+	const absentMarker = "pgshard-postgres-absent"
+	const liveMarker = "pgshard-postgres-live"
+	const missingContainer = `error: unable to upgrade connection: container not found ("postgresql")`
+	const missingContainerInternal = `error: Internal error occurred: unable to upgrade connection: container not found ("postgresql")`
+	current := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, current); apierrors.IsNotFound(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("read exact PostgreSQL Pod: %w", err)
+	}
+	if current.UID != podUID {
+		return fmt.Errorf("Pod identity changed: got %s, want %s", current.UID, podUID)
+	}
+	for _, status := range current.Status.ContainerStatuses {
+		if status.Name == "postgresql" && status.State.Terminated != nil {
+			return nil
+		}
+	}
+
+	probe := fmt.Sprintf(`for stat_path in /proc/[0-9]*/stat; do
+  test -r "$stat_path" || continue
+  stat=$(cat "$stat_path") || continue
+  stat=${stat##*) }
+  set -- $stat
+  test "$#" -ge 20 || exit 43
+  process_group=$3
+  shift 19
+  start_time=$1
+  pid=${stat_path#/proc/}
+  pid=${pid%%/stat}
+  if { test "$pid" = %d && test "$start_time" = %d; } || test "$process_group" = %d; then
+    printf 'pgshard-postgres-live\n'
+    exit 42
+  fi
+done
+printf 'pgshard-postgres-absent\n'`, pin.pid, pin.startTime, pin.processGroup)
+	execCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	command := exec.CommandContext(
+		execCtx,
+		"kubectl",
+		"--namespace", namespace,
+		"exec", podName,
+		"--container=postgresql",
+		"--",
+		"sh", "-ceu", probe,
+	)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	output, execErr := command.Output()
+	cancel()
+	trimmed := strings.TrimSpace(string(output))
+	trimmedStderr := strings.TrimSpace(stderr.String())
+	if execErr == nil && trimmed == absentMarker && trimmedStderr == "" {
+		return nil
+	}
+	if exitError, ok := execErr.(*exec.ExitError); ok && exitError.ExitCode() == 42 && trimmed == liveMarker {
+		return fmt.Errorf("pinned postmaster or process group remains live")
+	}
+	if current.DeletionTimestamp != nil && execErr != nil && trimmed == "" && (trimmedStderr == missingContainer || trimmedStderr == missingContainerInternal) {
+		return nil
+	}
+	return fmt.Errorf("process-table probe failed: %v; stdout=%q; stderr=%q", execErr, output, stderr.String())
 }
 
 func waitForManagerStatus(t *testing.T, ctx context.Context, kubeClient client.Client, key client.ObjectKey) *pgshardv1alpha1.PgShardCluster {

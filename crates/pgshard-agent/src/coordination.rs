@@ -13,6 +13,8 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::domain::{AgentIdentity, AgentState, FencingLease, LeaseInstallError};
+use crate::postgres::WritablePostgresStopped;
+use crate::writable::{WritableLeaseAttempt, same_writable_attempt};
 
 const INITIAL_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(5);
@@ -129,6 +131,62 @@ impl WritableLeaseConfig {
     }
 }
 
+/// Requested-shutdown result for one writable-term Lease supervisor.
+///
+/// The optional release capability is deliberately sealed inside this type.
+/// It can only be consumed together with proof that the supervised writable
+/// `PostgreSQL` process tree is absent.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct WritableLeaseShutdown {
+    config: WritableLeaseConfig,
+    release: Option<Box<WritableLeaseRelease>>,
+    attempt: WritableLeaseAttempt,
+}
+
+/// Result of attempting the optional exact-holder release after `PostgreSQL`
+/// shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WritableLeaseReleaseOutcome {
+    /// This process never established writable Lease authority.
+    NotHeld,
+    /// The exact last observed holder was conditionally cleared.
+    Released,
+}
+
+impl WritableLeaseShutdown {
+    /// Clears the exact last observed holder only after the writable
+    /// `PostgreSQL` supervisor proves its complete process tree is absent.
+    ///
+    /// A failed or outcome-unknown release is safe: the occupied Lease remains
+    /// subject to the normal unchanged-record expiry protocol. The caller must
+    /// not retry with stale evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pinned Lease changed, the API request failed,
+    /// or the response did not prove the exact empty-holder transition.
+    pub(crate) async fn release_after_postgres_stopped(
+        self,
+        postgres_stopped: WritablePostgresStopped,
+    ) -> Result<WritableLeaseReleaseOutcome, WritableLeaseError> {
+        if !same_writable_attempt(&self.attempt, &postgres_stopped.attempt) {
+            return Err(WritableLeaseError::PostgresProofMismatch);
+        }
+        let Some(release) = self.release else {
+            return Ok(WritableLeaseReleaseOutcome::NotHeld);
+        };
+        let store = KubernetesLeaseStore::new(&self.config)?;
+        release_with_store(&store, &self.config, release).await?;
+        Ok(WritableLeaseReleaseOutcome::Released)
+    }
+}
+
+#[derive(Debug)]
+struct WritableLeaseRelease {
+    lease: Lease,
+}
+
 /// Acquires and renews the exact operator-owned writable-term Lease.
 ///
 /// The caller must start this future only for a candidate already proven safe
@@ -136,21 +194,23 @@ impl WritableLeaseConfig {
 /// instant captured before dispatch; response latency consumes the authority
 /// window. Once authority has been held, preemption or local expiry is
 /// terminal so the caller can stop `PostgreSQL`. Shutdown clears local authority
-/// but deliberately leaves the Kubernetes Lease occupied: a clean release is
-/// safe only after the supervised postmaster has stopped and flushed WAL.
+/// and returns a sealed capability for the latest exact holder while leaving
+/// the Kubernetes Lease occupied. That capability requires the writable
+/// supervisor's complete process-tree absence proof before it can release.
 ///
 /// # Errors
 ///
 /// Returns on permanent identity/protocol failure, preemption, local authority
 /// expiry, or agent-state rejection. Transient API failures are retried only
 /// within the last successfully established monotonic deadline.
-pub async fn supervise(
+pub(crate) async fn supervise(
     config: WritableLeaseConfig,
     state: AgentState,
     shutdown: watch::Receiver<bool>,
-) -> Result<(), WritableLeaseError> {
+    attempt: WritableLeaseAttempt,
+) -> Result<WritableLeaseShutdown, WritableLeaseError> {
     let store = KubernetesLeaseStore::new(&config)?;
-    supervise_with_store(&store, &config, state, shutdown).await
+    supervise_with_store(&store, &config, state, shutdown, attempt).await
 }
 
 async fn supervise_with_store<S: LeaseStore>(
@@ -158,21 +218,23 @@ async fn supervise_with_store<S: LeaseStore>(
     config: &WritableLeaseConfig,
     state: AgentState,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), WritableLeaseError> {
-    state.clear_lease();
+    attempt: WritableLeaseAttempt,
+) -> Result<WritableLeaseShutdown, WritableLeaseError> {
+    revoke_authority(&state, &attempt);
     let holder_identity = config.holder_identity(&new_process_incarnation());
     let mut observed_holder = None;
     let mut retry = INITIAL_RETRY;
-    let mut held = false;
+    let mut held_deadline = None;
+    let mut release = None;
 
     loop {
         if stopping(&shutdown) {
-            state.clear_lease();
-            return Ok(());
+            revoke_authority(&state, &attempt);
+            return Ok(writable_lease_shutdown(config, release, attempt));
         }
-        let renewal_cutoff = if held {
-            let Some(cutoff) = renewal_cutoff(&state, config) else {
-                state.clear_lease();
+        let renewal_cutoff = if let Some(deadline) = held_deadline {
+            let Some(cutoff) = renewal_cutoff(deadline, config) else {
+                revoke_authority(&state, &attempt);
                 return Err(WritableLeaseError::RenewDeadlineExceeded);
             };
             Some(cutoff)
@@ -183,13 +245,13 @@ async fn supervise_with_store<S: LeaseStore>(
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    state.clear_lease();
-                    return Ok(());
+                    revoke_authority(&state, &attempt);
+                    return Ok(writable_lease_shutdown(config, release, attempt));
                 }
                 continue;
             }
             () = wait_for_renewal_cutoff(renewal_cutoff) => {
-                state.clear_lease();
+                revoke_authority(&state, &attempt);
                 return Err(WritableLeaseError::RenewDeadlineExceeded);
             }
             result = reconcile_once(store, config, &holder_identity, &mut observed_holder) => result,
@@ -197,35 +259,39 @@ async fn supervise_with_store<S: LeaseStore>(
 
         let delay = match result {
             Ok(CoordinationStep::Holder(authority)) => {
-                if held && !renewal_window_open(&state, config, authority.observed_at) {
-                    state.clear_lease();
+                if let Some(deadline) = held_deadline
+                    && !renewal_window_open(deadline, config, authority.observed_at)
+                {
+                    revoke_authority(&state, &attempt);
                     return Err(WritableLeaseError::RenewDeadlineExceeded);
                 }
-                install_authority(&state, config, &authority)?;
-                held = true;
+                if let Err(error) = install_authority(&state, config, &authority) {
+                    attempt.clear_authority();
+                    return Err(error);
+                }
+                attempt.install_authority(authority.deadline);
+                held_deadline = Some(authority.deadline);
+                release = Some(authority.release);
                 retry = INITIAL_RETRY;
                 authority.delay
             }
-            Ok(CoordinationStep::Follower { delay: _ }) if held => {
-                state.clear_lease();
+            Ok(CoordinationStep::Follower { delay: _ }) if held_deadline.is_some() => {
+                revoke_authority(&state, &attempt);
                 return Err(WritableLeaseError::AuthorityPreempted);
             }
             Ok(CoordinationStep::Follower { delay }) => {
-                state.clear_lease();
+                revoke_authority(&state, &attempt);
                 retry = INITIAL_RETRY;
                 delay
             }
             Err(error) if !error.is_permanent() => {
-                let delay = if held {
-                    let remaining = state
-                        .lease_deadline()
-                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                        .unwrap_or_default();
+                let delay = if let Some(deadline) = held_deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
                     let shutdown_margin =
                         config.lease_duration.saturating_sub(config.renew_deadline);
                     let renewal_time = remaining.saturating_sub(shutdown_margin);
                     if renewal_time.is_zero() {
-                        state.clear_lease();
+                        revoke_authority(&state, &attempt);
                         return Err(WritableLeaseError::RenewDeadlineExceeded);
                     }
                     cmp::min(retry, renewal_time)
@@ -237,15 +303,32 @@ async fn supervise_with_store<S: LeaseStore>(
                 delay
             }
             Err(error) => {
-                state.clear_lease();
+                revoke_authority(&state, &attempt);
                 return Err(error);
             }
         };
 
         if wait_or_stop(&mut shutdown, delay).await {
-            state.clear_lease();
-            return Ok(());
+            revoke_authority(&state, &attempt);
+            return Ok(writable_lease_shutdown(config, release, attempt));
         }
+    }
+}
+
+fn revoke_authority(state: &AgentState, attempt: &WritableLeaseAttempt) {
+    attempt.clear_authority();
+    state.clear_lease();
+}
+
+fn writable_lease_shutdown(
+    config: &WritableLeaseConfig,
+    release: Option<Box<WritableLeaseRelease>>,
+    attempt: WritableLeaseAttempt,
+) -> WritableLeaseShutdown {
+    WritableLeaseShutdown {
+        config: config.clone(),
+        release,
+        attempt,
     }
 }
 
@@ -396,8 +479,54 @@ async fn replace_as_holder<S: LeaseStore>(
         valid_until_unix_ms,
         valid_from,
         observed_at,
+        deadline,
         delay: cmp::min(config.retry_period, renewal_time / 2),
+        release: Box::new(WritableLeaseRelease { lease: updated }),
     }))
+}
+
+async fn release_with_store<S: LeaseStore>(
+    store: &S,
+    config: &WritableLeaseConfig,
+    release: Box<WritableLeaseRelease>,
+) -> Result<(), WritableLeaseError> {
+    let mut release = *release;
+    let previous = validate_lease(&release.lease, config)?;
+    let mut expected_spec = release
+        .lease
+        .spec
+        .take()
+        .ok_or(WritableLeaseError::InvalidLeaseSpec)?;
+    reject_coordinated_election(&expected_spec)?;
+    if occupied_lease_duration(&expected_spec)? != config.lease_duration
+        || !expected_spec
+            .holder_identity
+            .as_deref()
+            .is_some_and(|holder| holder_belongs_to_config(holder, config))
+    {
+        return Err(WritableLeaseError::StateEvidenceRejected);
+    }
+    expected_spec.holder_identity = None;
+    release.lease.spec = Some(expected_spec.clone());
+
+    let updated = store.replace(&release.lease).await?;
+    let evidence = validate_lease(&updated, config)?;
+    if evidence.resource_version == previous.resource_version
+        || updated.spec.as_ref() != Some(&expected_spec)
+    {
+        return Err(WritableLeaseError::StateEvidenceRejected);
+    }
+    Ok(())
+}
+
+fn holder_belongs_to_config(holder: &str, config: &WritableLeaseConfig) -> bool {
+    let prefix = format!("{}/{}/", config.identity.instance_id, config.pod_uid);
+    holder.strip_prefix(&prefix).is_some_and(|incarnation| {
+        incarnation.len() == PROCESS_INCARNATION_HEX_LENGTH
+            && incarnation
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn occupied_lease_duration(spec: &LeaseSpec) -> Result<Duration, WritableLeaseError> {
@@ -512,7 +641,9 @@ struct AuthorityObservation {
     valid_until_unix_ms: u64,
     valid_from: Instant,
     observed_at: Instant,
+    deadline: Instant,
     delay: Duration,
+    release: Box<WritableLeaseRelease>,
 }
 
 trait LeaseStore: Send + Sync {
@@ -608,14 +739,12 @@ fn new_process_incarnation() -> String {
     Uuid::new_v4().simple().to_string()[..PROCESS_INCARNATION_HEX_LENGTH].to_owned()
 }
 
-fn renewal_window_open(state: &AgentState, config: &WritableLeaseConfig, now: Instant) -> bool {
-    renewal_cutoff(state, config).is_some_and(|deadline| now < deadline)
+fn renewal_window_open(deadline: Instant, config: &WritableLeaseConfig, now: Instant) -> bool {
+    renewal_cutoff(deadline, config).is_some_and(|cutoff| now < cutoff)
 }
 
-fn renewal_cutoff(state: &AgentState, config: &WritableLeaseConfig) -> Option<Instant> {
-    state
-        .lease_deadline()?
-        .checked_sub(config.shutdown_margin())
+fn renewal_cutoff(deadline: Instant, config: &WritableLeaseConfig) -> Option<Instant> {
+    deadline.checked_sub(config.shutdown_margin())
 }
 
 fn unix_time_ms() -> u64 {
@@ -692,6 +821,9 @@ pub enum WritableLeaseError {
     /// The API response contradicted the exact resource-version write.
     #[error("writable-term Lease update response rejected local authority evidence")]
     StateEvidenceRejected,
+    /// The `PostgreSQL` absence proof belongs to another writable attempt.
+    #[error("PostgreSQL process-tree absence proof does not match the writable Lease attempt")]
+    PostgresProofMismatch,
     /// The receiving agent rejected the term or deadline.
     #[error("agent rejected writable-term authority: {0}")]
     AgentState(#[from] LeaseInstallError),
@@ -720,6 +852,7 @@ impl WritableLeaseError {
             | Self::UnsupportedCoordinatedElection
             | Self::LeaseTransitionOverflow
             | Self::StateEvidenceRejected
+            | Self::PostgresProofMismatch
             | Self::AgentState(_)
             | Self::AuthorityPreempted
             | Self::RenewDeadlineExceeded => true,
@@ -967,6 +1100,231 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_clean_release_clears_only_the_holder_without_advancing_term() {
+        let config = config();
+        let store = FakeStore::new(lease(&config));
+        let mut observed = None;
+        let step = reconcile_once(&store, &config, &holder(&config), &mut observed)
+            .await
+            .expect("claim empty Lease");
+        let CoordinationStep::Holder(authority) = step else {
+            panic!("empty Lease was not claimed");
+        };
+
+        release_with_store(&store, &config, authority.release)
+            .await
+            .expect("release exact holder");
+
+        let stored = store
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spec = stored.spec.as_ref().expect("released Lease spec");
+        assert!(spec.holder_identity.is_none());
+        assert_eq!(spec.lease_transitions, Some(1));
+        assert_eq!(
+            spec.lease_duration_seconds,
+            Some(config.lease_duration_seconds())
+        );
+        assert!(spec.acquire_time.is_some());
+        assert!(spec.renew_time.is_some());
+        assert_eq!(stored.metadata.resource_version.as_deref(), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn process_absence_proof_from_another_attempt_cannot_release() {
+        let config = config();
+        let store = FakeStore::new(lease(&config));
+        let mut observed = None;
+        let step = reconcile_once(&store, &config, &holder(&config), &mut observed)
+            .await
+            .expect("claim empty Lease");
+        let CoordinationStep::Holder(authority) = step else {
+            panic!("empty Lease was not claimed");
+        };
+        let (lease_attempt, _) = crate::writable::writable_attempt_pair_for_test();
+        let (_, other_postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        let shutdown = WritableLeaseShutdown {
+            config,
+            release: Some(authority.release),
+            attempt: lease_attempt,
+        };
+        let stopped = WritablePostgresStopped {
+            attempt: other_postgres_attempt,
+        };
+
+        assert!(matches!(
+            shutdown.release_after_postgres_stopped(stopped).await,
+            Err(WritableLeaseError::PostgresProofMismatch)
+        ));
+        let stored = store
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            stored
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.holder_identity.as_ref())
+                .is_some()
+        );
+        assert_eq!(stored.metadata.resource_version.as_deref(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn stale_clean_release_cannot_clear_a_later_renewal() {
+        let config = config();
+        let store = FakeStore::new(lease(&config));
+        let process_holder = holder(&config);
+        let mut observed = None;
+        let first = reconcile_once(&store, &config, &process_holder, &mut observed)
+            .await
+            .expect("claim empty Lease");
+        let CoordinationStep::Holder(first) = first else {
+            panic!("empty Lease was not claimed");
+        };
+        let stale_release = first.release;
+
+        let renewed = reconcile_once(&store, &config, &process_holder, &mut observed)
+            .await
+            .expect("renew current holder");
+        assert!(matches!(renewed, CoordinationStep::Holder(_)));
+
+        assert!(matches!(
+            release_with_store(&store, &config, stale_release).await,
+            Err(WritableLeaseError::StateEvidenceRejected)
+        ));
+        let stored = store
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spec = stored.spec.as_ref().expect("renewed Lease spec");
+        assert_eq!(
+            spec.holder_identity.as_deref(),
+            Some(process_holder.as_str())
+        );
+        assert_eq!(spec.lease_transitions, Some(1));
+        assert_eq!(stored.metadata.resource_version.as_deref(), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_clean_release_is_not_retried_with_stale_evidence() {
+        let config = config();
+        let store = FakeStore::new(lease(&config));
+        let mut observed = None;
+        let step = reconcile_once(&store, &config, &holder(&config), &mut observed)
+            .await
+            .expect("claim empty Lease");
+        let CoordinationStep::Holder(authority) = step else {
+            panic!("empty Lease was not claimed");
+        };
+        *store
+            .replace_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ReplaceFailure::AfterCommit);
+
+        assert!(matches!(
+            release_with_store(&store, &config, authority.release).await,
+            Err(WritableLeaseError::RequestTimedOut("replace Lease"))
+        ));
+        let stored = store
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spec = stored.spec.as_ref().expect("released Lease spec");
+        assert!(spec.holder_identity.is_none());
+        assert_eq!(spec.lease_transitions, Some(1));
+        assert_eq!(stored.metadata.resource_version.as_deref(), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_returns_the_latest_exact_release_capability() {
+        let config = config();
+        let store = FakeStore::new(lease(&config));
+        let state =
+            AgentState::with_identity(config.identity.clone(), 10_000).expect("valid agent state");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        let holder_prefix = format!("{}/{}/", config.identity.instance_id, config.pod_uid);
+        let request_shutdown = async {
+            loop {
+                let claimed = store
+                    .lease
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.holder_identity.as_deref())
+                    .is_some_and(|holder| holder.starts_with(&holder_prefix));
+                if claimed && postgres_attempt.authority_valid_for(Duration::ZERO) {
+                    shutdown_tx.send(true).expect("request clean shutdown");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                supervise_with_store(&store, &config, state.clone(), shutdown_rx, lease_attempt,),
+            ),
+            request_shutdown,
+        );
+        let shutdown = result
+            .expect("supervisor observes requested shutdown")
+            .expect("requested shutdown succeeds");
+        let release = shutdown.release.expect("held Lease has release capability");
+        let current_resource_version = store
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .metadata
+            .resource_version
+            .clone();
+        assert_eq!(
+            release.lease.metadata.resource_version,
+            current_resource_version
+        );
+        assert!(state.snapshot().lease.is_none());
+        assert!(state.lease_deadline().is_none());
+        assert!(!postgres_attempt.authority_valid_for(Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_acquisition_has_no_release_capability() {
+        let config = config();
+        let store = FakeStore::new(lease(&config));
+        let state =
+            AgentState::with_identity(config.identity.clone(), 10_000).expect("valid agent state");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx
+            .send(true)
+            .expect("request shutdown before claim");
+
+        let shutdown = supervise_with_store(
+            &store,
+            &config,
+            state,
+            shutdown_rx,
+            crate::writable::writable_attempt_pair_for_test().0,
+        )
+        .await
+        .expect("shutdown before claim succeeds");
+        assert!(shutdown.release.is_none());
+        assert_eq!(
+            store
+                .lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .metadata
+                .resource_version
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
     async fn process_restart_cannot_renew_the_previous_incarnations_term() {
         let config = config();
         let store = FakeStore::new(lease(&config));
@@ -1190,7 +1548,11 @@ mod tests {
             valid_until_unix_ms: 6_500,
             valid_from: later_valid_from,
             observed_at: later_valid_from,
+            deadline: later_valid_from + config.lease_duration,
             delay: config.retry_period,
+            release: Box::new(WritableLeaseRelease {
+                lease: lease(&config),
+            }),
         };
         install_authority(&state, &config, &renewal).expect("later monotonic renewal");
         assert_eq!(
@@ -1258,8 +1620,11 @@ mod tests {
         let immediately_before = renewal_deadline
             .checked_sub(Duration::from_nanos(1))
             .expect("test renewal deadline is after Instant origin");
-        assert!(renewal_window_open(&state, &config, immediately_before));
-        assert!(!renewal_window_open(&state, &config, renewal_deadline));
+        let deadline = state
+            .lease_deadline()
+            .expect("installed monotonic deadline");
+        assert!(renewal_window_open(deadline, &config, immediately_before));
+        assert!(!renewal_window_open(deadline, &config, renewal_deadline));
         assert!(
             state
                 .lease_deadline()
@@ -1315,7 +1680,13 @@ mod tests {
         };
         let supervise = tokio::time::timeout(
             Duration::from_secs(1),
-            supervise_with_store(&store, &config, state.clone(), shutdown_rx),
+            supervise_with_store(
+                &store,
+                &config,
+                state.clone(),
+                shutdown_rx,
+                crate::writable::writable_attempt_pair_for_test().0,
+            ),
         );
         let (result, ()) = tokio::join!(supervise, replace_holder);
         assert!(matches!(
@@ -1344,7 +1715,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            supervise_with_store(&store, &config, state.clone(), shutdown_rx),
+            supervise_with_store(
+                &store,
+                &config,
+                state.clone(),
+                shutdown_rx,
+                crate::writable::writable_attempt_pair_for_test().0,
+            ),
         )
         .await
         .expect("renewal cutoff must stop waiting for the delayed API request");
@@ -1376,7 +1753,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            supervise_with_store(&store, &config, state.clone(), shutdown_rx),
+            supervise_with_store(
+                &store,
+                &config,
+                state.clone(),
+                shutdown_rx,
+                crate::writable::writable_attempt_pair_for_test().0,
+            ),
         )
         .await
         .expect("renewal cutoff must not wait for a committed response");
