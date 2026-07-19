@@ -295,7 +295,7 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	if !available {
 		return ctrl.Result{RequeueAfter: retryDelay}, nil
 	}
-	if cluster.Spec.MembersPerShard == 1 {
+	if cluster.Status.PostgreSQLBootstrapSpec != nil || len(cluster.Status.PostgreSQLBootstraps) != 0 {
 		return ctrl.Result{RequeueAfter: bootstrapIntegrityInterval}, nil
 	}
 	return ctrl.Result{}, nil

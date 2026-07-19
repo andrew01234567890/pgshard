@@ -560,6 +560,14 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
 				t.Fatal(err)
 			}
+			markSupportingWorkloadsAvailable(t, ctx, base, cluster)
+			result, err := reconciler.Reconcile(ctx, requestFor(cluster))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.RequeueAfter != bootstrapIntegrityInterval {
+				t.Fatalf("source-storage integrity requeue = %#v, want %s", result, bootstrapIntegrityInterval)
+			}
 			current := getCluster(t, ctx, base, cluster)
 			if current.Status.PostgreSQLBootstrapSpec == nil || current.Status.PostgreSQLBootstrapSpec.MembersPerShard != members || current.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine.String() {
 				t.Fatalf("multi-member source-storage snapshot = %#v", current.Status.PostgreSQLBootstrapSpec)
@@ -3592,32 +3600,7 @@ func TestReconcileObservesSupportingAvailabilityWithoutClaimingDatabaseReady(t *
 		t.Fatal(err)
 	}
 
-	for name, replicas := range map[string]int32{"example-orchestrator": 3, "example-pooler": 2} {
-		deployment := &appsv1.Deployment{}
-		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, deployment); err != nil {
-			t.Fatal(err)
-		}
-		deployment.Status.ObservedGeneration = deployment.Generation
-		deployment.Status.AvailableReplicas = replicas
-		deployment.Status.UpdatedReplicas = replicas
-		if err := fakeClient.Status().Update(ctx, deployment); err != nil {
-			t.Fatal(err)
-		}
-	}
-	hpa := &autoscalingv2.HorizontalPodAutoscaler{}
-	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: "example-pooler"}, hpa); err != nil {
-		t.Fatal(err)
-	}
-	hpa.Status.ObservedGeneration = &hpa.Generation
-	hpa.Status.CurrentReplicas = 2
-	hpa.Status.DesiredReplicas = 2
-	hpa.Status.Conditions = []autoscalingv2.HorizontalPodAutoscalerCondition{
-		{Type: autoscalingv2.AbleToScale, Status: corev1.ConditionTrue},
-		{Type: autoscalingv2.ScalingActive, Status: corev1.ConditionTrue},
-	}
-	if err := fakeClient.Status().Update(ctx, hpa); err != nil {
-		t.Fatal(err)
-	}
+	markSupportingWorkloadsAvailable(t, ctx, fakeClient, cluster)
 
 	result, err := reconciler.Reconcile(ctx, requestFor(cluster))
 	if err != nil {
@@ -3634,6 +3617,36 @@ func TestReconcileObservesSupportingAvailabilityWithoutClaimingDatabaseReady(t *
 	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 	assertCondition(t, got, transportSecurityCondition, metav1.ConditionFalse, "TransportTLSUnavailable")
+}
+
+func markSupportingWorkloadsAvailable(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	for name, replicas := range map[string]int32{cluster.Name + owned.OrchestratorSuffix: 3, cluster.Name + owned.PoolerSuffix: 2} {
+		deployment := &appsv1.Deployment{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, deployment); err != nil {
+			t.Fatal(err)
+		}
+		deployment.Status.ObservedGeneration = deployment.Generation
+		deployment.Status.AvailableReplicas = replicas
+		deployment.Status.UpdatedReplicas = replicas
+		if err := kubeClient.Status().Update(ctx, deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.PoolerSuffix}, hpa); err != nil {
+		t.Fatal(err)
+	}
+	hpa.Status.ObservedGeneration = &hpa.Generation
+	hpa.Status.CurrentReplicas = 2
+	hpa.Status.DesiredReplicas = 2
+	hpa.Status.Conditions = []autoscalingv2.HorizontalPodAutoscalerCondition{
+		{Type: autoscalingv2.AbleToScale, Status: corev1.ConditionTrue},
+		{Type: autoscalingv2.ScalingActive, Status: corev1.ConditionTrue},
+	}
+	if err := kubeClient.Status().Update(ctx, hpa); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReconcilePrunesResourcesRemovedByUpdate(t *testing.T) {
