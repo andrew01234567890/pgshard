@@ -12,7 +12,9 @@ use url::Url;
 
 use crate::coordination::WritableLeaseConfig;
 use crate::domain::AgentIdentity;
-use crate::postgres::{PostgresConfig, PostgresConfigError, PostgresRuntimeRole};
+use crate::postgres::{
+    PostgresConfig, PostgresConfigError, PostgresRuntimeRole, PostgresStandbyConfig,
+};
 use crate::telemetry::TelemetryConfig;
 
 /// Validated process configuration.
@@ -38,6 +40,7 @@ enum PostgresMode {
     Disabled,
     Quarantine,
     ReplicationBootstrapPrimary,
+    ReplicationStandby,
 }
 
 #[derive(Debug, Parser)]
@@ -120,6 +123,18 @@ struct RawConfig {
     )]
     postgres_hba_file: PathBuf,
 
+    #[arg(long, env = "PGSHARD_POSTGRES_PRIMARY_HOST")]
+    postgres_primary_host: Option<String>,
+
+    #[arg(long, env = "PGSHARD_POSTGRES_PRIMARY_PORT")]
+    postgres_primary_port: Option<u16>,
+
+    #[arg(long, env = "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME")]
+    postgres_primary_slot_name: Option<String>,
+
+    #[arg(long, env = "PGSHARD_POSTGRES_PRIMARY_PASSFILE")]
+    postgres_primary_passfile: Option<PathBuf>,
+
     #[arg(
         long,
         env = "PGSHARD_POSTGRES_SMART_SHUTDOWN_MS",
@@ -144,19 +159,53 @@ struct RawConfig {
 
 impl RawConfig {
     fn postgres_config(&self) -> Result<Option<PostgresConfig>, ConfigError> {
-        let role = match self.postgres_mode {
-            PostgresMode::Disabled => return Ok(None),
-            PostgresMode::Quarantine => PostgresRuntimeRole::Quarantine,
+        let standby_setting_supplied = self.postgres_primary_host.is_some()
+            || self.postgres_primary_port.is_some()
+            || self.postgres_primary_slot_name.is_some()
+            || self.postgres_primary_passfile.is_some();
+        let (role, standby) = match self.postgres_mode {
+            PostgresMode::Disabled => {
+                if standby_setting_supplied {
+                    return Err(ConfigError::ReplicationStandbySettingsRequireMode);
+                }
+                return Ok(None);
+            }
+            PostgresMode::Quarantine => (PostgresRuntimeRole::Quarantine, None),
             PostgresMode::ReplicationBootstrapPrimary => {
-                PostgresRuntimeRole::ReplicationBootstrapPrimary
+                (PostgresRuntimeRole::ReplicationBootstrapPrimary, None)
+            }
+            PostgresMode::ReplicationStandby => {
+                let primary_host = self
+                    .postgres_primary_host
+                    .clone()
+                    .ok_or(ConfigError::IncompleteReplicationStandbySettings)?;
+                let primary_slot_name = self
+                    .postgres_primary_slot_name
+                    .clone()
+                    .ok_or(ConfigError::IncompleteReplicationStandbySettings)?;
+                let primary_passfile = self
+                    .postgres_primary_passfile
+                    .clone()
+                    .ok_or(ConfigError::IncompleteReplicationStandbySettings)?;
+                let standby = PostgresStandbyConfig::new(
+                    primary_host,
+                    self.postgres_primary_port.unwrap_or(5432),
+                    primary_slot_name,
+                    primary_passfile,
+                )?;
+                (PostgresRuntimeRole::ReplicationStandby, Some(standby))
             }
         };
+        if standby_setting_supplied && standby.is_none() {
+            return Err(ConfigError::ReplicationStandbySettingsRequireMode);
+        }
         let data_dir = self
             .postgres_data_dir
             .clone()
             .ok_or(ConfigError::PostgresDataDirectoryMissing)?;
         PostgresConfig::new_for_role(
             role,
+            standby,
             data_dir,
             self.postgres_bin.clone(),
             self.postgres_socket_dir.clone(),
@@ -286,6 +335,10 @@ fn validate_writable_postgres_pair(
     if writable_lease.is_some() && postgres.is_none() {
         return Err(ConfigError::WritableLeaseRequiresPostgres);
     }
+    if writable_lease.is_some() && postgres.is_some_and(PostgresConfig::forbids_writable_authority)
+    {
+        return Err(ConfigError::ReplicationStandbyForbidsWritableLease);
+    }
     if postgres.is_some_and(PostgresConfig::requires_writable_authority) && writable_lease.is_none()
     {
         return Err(ConfigError::ReplicationBootstrapPrimaryRequiresWritableLease);
@@ -383,6 +436,15 @@ pub enum ConfigError {
         "PostgreSQL replication-bootstrap-primary mode requires writable-term Lease coordination"
     )]
     ReplicationBootstrapPrimaryRequiresWritableLease,
+    /// Physical standbys must never hold writable-term authority.
+    #[error("PostgreSQL replication-standby mode forbids writable-term Lease coordination")]
+    ReplicationStandbyForbidsWritableLease,
+    /// Standby connection settings are valid only for the standby runtime role.
+    #[error("PostgreSQL primary settings require replication-standby mode")]
+    ReplicationStandbySettingsRequireMode,
+    /// A standby requires one complete upstream identity and credential path.
+    #[error("PostgreSQL replication-standby settings are incomplete")]
+    IncompleteReplicationStandbySettings,
     /// Target-side fencing cannot finish inside the reserved Lease margin.
     #[error(
         "writable-term Lease shutdown margin {shutdown_margin_ms} ms must exceed PostgreSQL target-fence budget {target_fence_budget_ms} ms"
@@ -426,6 +488,44 @@ mod tests {
             "--instance-id",
             "cluster-1-shard-3-0",
         ]
+    }
+
+    fn replication_standby_args() -> Vec<&'static str> {
+        let mut args = required_args();
+        args.extend([
+            "--postgres-mode",
+            "replication-standby",
+            "--postgres-data-dir",
+            "/var/lib/postgresql/data",
+            "--postgres-primary-host",
+            "cluster-1-shard-0003-member-0000.database.svc",
+            "--postgres-primary-slot-name",
+            "pgshard_member_0001",
+            "--postgres-primary-passfile",
+            "/etc/pgshard/replication/passfile",
+        ]);
+        args
+    }
+
+    fn expected_replication_standby(primary_port: u16) -> PostgresConfig {
+        let standby = PostgresStandbyConfig::new(
+            "cluster-1-shard-0003-member-0000.database.svc".to_owned(),
+            primary_port,
+            "pgshard_member_0001".to_owned(),
+            PathBuf::from("/etc/pgshard/replication/passfile"),
+        )
+        .expect("valid standby identity");
+        PostgresConfig::new_replication_standby(
+            standby,
+            PathBuf::from("/var/lib/postgresql/data"),
+            PathBuf::from("/usr/lib/postgresql/18/bin/postgres"),
+            PathBuf::from("/run/pgshard/postgres"),
+            PathBuf::from("/etc/pgshard/quarantine.pg_hba.conf"),
+            Duration::from_millis(5_000),
+            Duration::from_millis(44_000),
+            Duration::from_millis(500),
+        )
+        .expect("valid standby process configuration")
     }
 
     #[test]
@@ -531,6 +631,104 @@ mod tests {
                 .as_ref()
                 .is_some_and(PostgresConfig::requires_writable_authority)
         );
+    }
+
+    #[test]
+    fn accepts_complete_replication_standby_settings() {
+        let mut args = replication_standby_args();
+        args.extend(["--postgres-primary-port", "6432"]);
+
+        let config = AgentConfig::try_parse_from(args).expect("complete replication standby");
+        assert_eq!(config.postgres, Some(expected_replication_standby(6432)));
+        assert!(config.writable_lease.is_none());
+    }
+
+    #[test]
+    fn replication_standby_defaults_primary_port() {
+        let config = AgentConfig::try_parse_from(replication_standby_args())
+            .expect("replication standby with default port");
+        assert_eq!(config.postgres, Some(expected_replication_standby(5432)));
+    }
+
+    #[test]
+    fn rejects_incomplete_replication_standby_settings() {
+        for missing in [
+            "--postgres-primary-host",
+            "--postgres-primary-slot-name",
+            "--postgres-primary-passfile",
+        ] {
+            let mut args = replication_standby_args();
+            let index = args
+                .iter()
+                .position(|argument| *argument == missing)
+                .expect("required standby setting");
+            args.drain(index..=index + 1);
+            assert!(matches!(
+                AgentConfig::try_parse_from(args),
+                Err(ConfigError::IncompleteReplicationStandbySettings)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_replication_standby_settings_in_other_modes() {
+        for setting in [
+            ["--postgres-primary-host", "primary.database.svc"],
+            ["--postgres-primary-port", "5432"],
+            ["--postgres-primary-slot-name", "pgshard_member_0001"],
+            [
+                "--postgres-primary-passfile",
+                "/etc/pgshard/replication/passfile",
+            ],
+        ] {
+            let mut args = required_args();
+            args.extend(setting);
+            assert!(matches!(
+                AgentConfig::try_parse_from(args),
+                Err(ConfigError::ReplicationStandbySettingsRequireMode)
+            ));
+        }
+
+        let mut quarantine = replication_standby_args();
+        let mode = quarantine
+            .iter()
+            .position(|argument| *argument == "replication-standby")
+            .expect("standby mode");
+        quarantine[mode] = "quarantine";
+        assert!(matches!(
+            AgentConfig::try_parse_from(quarantine),
+            Err(ConfigError::ReplicationStandbySettingsRequireMode)
+        ));
+    }
+
+    #[test]
+    fn replication_standby_forbids_writable_lease_before_fence_margin() {
+        let mut args = replication_standby_args();
+        args.extend([
+            "--cluster-uid",
+            "11111111-2222-3333-4444-555555555555",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--lease-namespace",
+            "database",
+            "--writable-lease-name",
+            "cluster-1-cell-0003-writable",
+            "--writable-lease-uid",
+            "99999999-8888-7777-6666-555555555555",
+            "--writable-lease-duration-seconds",
+            "6",
+            "--writable-lease-renew-deadline-seconds",
+            "4",
+            "--writable-lease-retry-ms",
+            "100",
+            "--kubernetes-request-timeout-ms",
+            "100",
+        ]);
+
+        assert!(matches!(
+            AgentConfig::try_parse_from(args),
+            Err(ConfigError::ReplicationStandbyForbidsWritableLease)
+        ));
     }
 
     #[test]
