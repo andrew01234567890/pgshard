@@ -1622,8 +1622,18 @@ impl ActiveLogicalReplicationStream {
     }
 
     async fn release(mut self) -> TestResult {
-        self.stream.shutdown().await?;
+        let shutdown_result = self.stream.shutdown().await;
         drop(self.stream);
+        if let Err(error) = shutdown_result
+            && !matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error.into());
+        }
         wait_for_slot_activity(&self.observer, &self.target, false).await?;
         self.observer
             .batch_execute(&format!("DROP PUBLICATION {}", self.publication))

@@ -99,11 +99,17 @@ fn poll_child(
 
 #[test]
 fn quarantine_process_status_and_sigterm_form_one_supervised_contract() {
-    let fixture = AgentFixture::new("#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do :; done\n");
+    let fixture = AgentFixture::new("#!/bin/sh\nwhile :; do :; done\n");
+    let signal_handlers_ready = fixture.root.path().join("signal-handlers-ready");
+    fixture.replace_executable(&format!(
+        "#!/bin/sh\ntrap 'exit 0' TERM\n: > '{}'\nwhile :; do :; done\n",
+        signal_handlers_ready.display()
+    ));
     let address = reserve_address();
     let mut child = fixture.spawn(address);
 
     wait_for_quarantine(&mut child, address);
+    wait_for_marker(&signal_handlers_ready);
 
     let readiness = request_http(address, "/readyz").expect("request readiness");
     assert!(readiness.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
@@ -198,10 +204,18 @@ fn setsid_descendant_is_reaped_before_pgdata_can_be_reacquired() {
     );
     first_agent.disarm_after_descendants_are_gone();
 
-    fixture.replace_executable("#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do :; done\n");
+    let replacement_ready = fixture
+        .root
+        .path()
+        .join("replacement-signal-handlers-ready");
+    fixture.replace_executable(&format!(
+        "#!/bin/sh\ntrap 'exit 0' TERM\n: > '{}'\nwhile :; do :; done\n",
+        replacement_ready.display()
+    ));
     let replacement_address = reserve_address();
     let mut replacement = fixture.spawn(replacement_address);
     wait_for_quarantine(&mut replacement, replacement_address);
+    wait_for_marker(&replacement_ready);
     kill_process(Pid::from_child(replacement.child()), Signal::TERM)
         .expect("stop replacement agent");
     let replacement_status = replacement.wait().expect("wait for replacement agent");
@@ -446,6 +460,18 @@ fn wait_for_pid_marker(path: &Path) -> u32 {
         assert!(
             started.elapsed() < PROCESS_TIMEOUT,
             "process marker {} was not populated",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_marker(path: &Path) {
+    let started = Instant::now();
+    while !path.exists() {
+        assert!(
+            started.elapsed() < PROCESS_TIMEOUT,
+            "process marker {} was not created",
             path.display()
         );
         thread::sleep(Duration::from_millis(10));
