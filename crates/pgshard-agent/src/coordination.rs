@@ -124,7 +124,7 @@ impl WritableLeaseConfig {
     /// Returns the local interval reserved for target-side fencing after Lease
     /// renewal must stop.
     #[must_use]
-    pub(crate) fn shutdown_margin(&self) -> Duration {
+    pub fn shutdown_margin(&self) -> Duration {
         self.lease_duration.saturating_sub(self.renew_deadline)
     }
 }

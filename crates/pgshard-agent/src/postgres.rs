@@ -28,6 +28,7 @@ use thiserror::Error;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::domain::{AgentState, PostgresProcessState};
@@ -191,13 +192,20 @@ impl PostgresConfig {
     }
 }
 
-/// Requested termination mode for a supervised postmaster.
+/// Requested termination mode inside the supervised postmaster implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PostgresStopMode {
+enum PostgresStopMode {
     /// Preserve `PostgreSQL`'s smart, fast, then immediate shutdown ordering.
     Graceful,
     /// Revoke local authority and immediately fence the complete process tree.
     Fence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PostgresStartDecision {
+    Start,
+    Shutdown,
+    AuthorityMissing,
 }
 
 /// Offline-validated postmaster configuration ready to spawn.
@@ -468,30 +476,89 @@ impl PreparedPostgres {
         state: AgentState,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), PostgresError> {
-        self.supervise_with_stop_mode(state, async {
-            shutdown.await;
-            PostgresStopMode::Graceful
+        state.clear_lease();
+        self.supervise_with_stop_mode_and_start_guard(
+            state,
+            async {
+                shutdown.await;
+                PostgresStopMode::Graceful
+            },
+            || PostgresStartDecision::Start,
+        )
+        .await
+    }
+
+    /// Runs the postmaster only after writable-term startup authority is proven.
+    ///
+    /// The guard is evaluated at the final user-space boundary before process
+    /// creation. Every requested shutdown revokes local Lease evidence and
+    /// immediately fences the complete process tree, skipping smart and fast
+    /// waits that can outlive the Lease's fencing margin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if startup authority is absent or if validation,
+    /// process creation, supervision, or target fencing fails.
+    pub async fn supervise_with_writable_authority(
+        self,
+        state: AgentState,
+        shutdown: watch::Receiver<bool>,
+        required_margin: Duration,
+    ) -> Result<(), PostgresError> {
+        let required_margin = required_margin.max(self.config.target_fence_budget());
+        let startup_state = state.clone();
+        self.supervise_with_writable_authority_guard(state, shutdown, move || {
+            startup_state.lease_authority_valid_for(required_margin)
         })
         .await
     }
 
-    /// Runs the postmaster with an explicit termination mode.
-    ///
-    /// Writable-term coordination must select [`PostgresStopMode::Fence`].
-    /// This revokes local Lease evidence before signaling the postmaster and
-    /// skips the smart and fast shutdown waits that can outlive the Lease's
-    /// fencing margin.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if validation, startup, supervision, or the selected
-    /// process-tree shutdown cannot be completed safely.
-    pub async fn supervise_with_stop_mode(
+    async fn supervise_with_writable_authority_guard<G>(
+        self,
+        state: AgentState,
+        mut shutdown: watch::Receiver<bool>,
+        startup_guard: G,
+    ) -> Result<(), PostgresError>
+    where
+        G: Fn() -> bool,
+    {
+        let shutdown_state = state.clone();
+        let final_shutdown = shutdown.clone();
+        self.supervise_with_stop_mode_and_start_guard(
+            state,
+            async move {
+                loop {
+                    if watch_shutdown_requested(&mut shutdown) || shutdown.changed().await.is_err()
+                    {
+                        break;
+                    }
+                }
+                shutdown_state.clear_lease();
+                PostgresStopMode::Fence
+            },
+            move || {
+                let authorized = startup_guard();
+                if watch_shutdown_observed(&final_shutdown) {
+                    PostgresStartDecision::Shutdown
+                } else if authorized {
+                    PostgresStartDecision::Start
+                } else {
+                    PostgresStartDecision::AuthorityMissing
+                }
+            },
+        )
+        .await
+    }
+
+    async fn supervise_with_stop_mode_and_start_guard<G>(
         self,
         state: AgentState,
         shutdown: impl Future<Output = PostgresStopMode>,
-    ) -> Result<(), PostgresError> {
-        state.clear_lease();
+        startup_guard: G,
+    ) -> Result<(), PostgresError>
+    where
+        G: Fn() -> PostgresStartDecision,
+    {
         tokio::pin!(shutdown);
         if shutdown_requested(shutdown.as_mut()).await {
             state.set_postgres_process(PostgresProcessState::Validated);
@@ -534,8 +601,12 @@ impl PreparedPostgres {
             return Ok(());
         }
         let shutdown_config = self.config.clone();
-        let (mut process_group_fence, pidfd, process_group) =
-            self.spawn_tracked_postmaster(&state).await?;
+        let Some((mut process_group_fence, pidfd, process_group)) = self
+            .spawn_tracked_postmaster(&state, &startup_guard)
+            .await?
+        else {
+            return Ok(());
+        };
 
         let result = tokio::select! {
             status = wait_pidfd_exit(&pidfd) => {
@@ -608,7 +679,8 @@ impl PreparedPostgres {
     async fn spawn_tracked_postmaster(
         self,
         state: &AgentState,
-    ) -> Result<(PostgresProcessFence, AsyncFd<OwnedFd>, Pid), PostgresError> {
+        startup_guard: &impl Fn() -> PostgresStartDecision,
+    ) -> Result<Option<(PostgresProcessFence, AsyncFd<OwnedFd>, Pid)>, PostgresError> {
         let child_subreaper = match ChildSubreaper::claim() {
             Ok(child_subreaper) => child_subreaper,
             Err(error) => {
@@ -619,6 +691,9 @@ impl PreparedPostgres {
         let spawn_result = {
             #[cfg(test)]
             let _exec_handoff = test_exec_handoff_guard();
+            if !authorize_postmaster_start(state, startup_guard)? {
+                return Ok(None);
+            }
             self.command().spawn()
         };
         let child = match spawn_result {
@@ -702,7 +777,7 @@ impl PreparedPostgres {
             }
         };
         state.set_postgres_process(PostgresProcessState::RunningQuarantined);
-        Ok((process_group_fence, pidfd, pid))
+        Ok(Some((process_group_fence, pidfd, pid)))
     }
 
     fn command(&self) -> Command {
@@ -801,6 +876,33 @@ impl PreparedPostgres {
         }
         command
     }
+}
+
+fn authorize_postmaster_start(
+    state: &AgentState,
+    startup_guard: &impl Fn() -> PostgresStartDecision,
+) -> Result<bool, PostgresError> {
+    match startup_guard() {
+        PostgresStartDecision::Start => Ok(true),
+        PostgresStartDecision::Shutdown => {
+            state.clear_lease();
+            state.set_postgres_process(PostgresProcessState::Validated);
+            Ok(false)
+        }
+        PostgresStartDecision::AuthorityMissing => {
+            state.clear_lease();
+            state.set_postgres_process(PostgresProcessState::Failed);
+            Err(PostgresError::StartupAuthorityMissing)
+        }
+    }
+}
+
+fn watch_shutdown_requested(shutdown: &mut watch::Receiver<bool>) -> bool {
+    *shutdown.borrow_and_update()
+}
+
+fn watch_shutdown_observed(shutdown: &watch::Receiver<bool>) -> bool {
+    shutdown.has_changed().is_err() || *shutdown.borrow()
 }
 
 async fn await_validation<F>(
@@ -2920,6 +3022,9 @@ pub enum PostgresError {
     /// A preflighted path changed before process creation.
     #[error("validated PostgreSQL state changed between prepare and process creation")]
     PreparedStateChanged,
+    /// The final process-creation guard no longer proves writable authority.
+    #[error("PostgreSQL startup authority is absent or inside its fencing margin")]
+    StartupAuthorityMissing,
     /// The blocking revalidation worker did not complete normally.
     #[error("PostgreSQL pre-spawn validation task failed: {0}")]
     ValidationTask(#[source] tokio::task::JoinError),
@@ -4317,6 +4422,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_guard_blocks_process_creation_after_validation() {
+        let root = TempDir::new().expect("create startup-authority fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let marker = root.path().join("postmaster-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+        );
+        let config = test_config(data_dir, executable, root.path().join("socket"));
+        let prepared = prepare_fixture(config).expect("prepare startup-authority fixture");
+        let state = agent_state();
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "cluster-1-shard-0-0".to_owned(),
+                    epoch: 1,
+                    valid_until_unix_ms: 6_000,
+                },
+                1_000,
+            )
+            .expect("install authority rejected by the final guard");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let result = prepared
+            .supervise_with_writable_authority_guard(state.clone(), shutdown_rx, || false)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PostgresError::StartupAuthorityMissing)
+        ));
+        assert!(!marker.exists(), "postmaster ran without startup authority");
+        assert!(
+            state.snapshot().lease.is_none(),
+            "failed startup guard retained local authority"
+        );
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn public_writable_supervisor_enforces_the_process_fence_budget() {
+        let root = TempDir::new().expect("create fence-budget fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let marker = root.path().join("postmaster-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+        );
+        let config = test_config(data_dir, executable, root.path().join("socket"));
+        let prepared = prepare_fixture(config).expect("prepare fence-budget fixture");
+        let state = agent_state();
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "cluster-1-shard-0-0".to_owned(),
+                    epoch: 1,
+                    valid_until_unix_ms: 4_000,
+                },
+                1_000,
+            )
+            .expect("install authority inside the process fence budget");
+        assert!(state.lease_authority_valid_for(Duration::ZERO));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let result = prepared
+            .supervise_with_writable_authority(state.clone(), shutdown_rx, Duration::ZERO)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PostgresError::StartupAuthorityMissing)
+        ));
+        assert!(!marker.exists(), "postmaster bypassed the fence budget");
+        assert!(state.snapshot().lease.is_none());
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_at_final_exec_handoff_prevents_process_creation() {
+        let root = TempDir::new().expect("create shutdown-handoff fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let marker = root.path().join("postmaster-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+        );
+        let config = test_config(data_dir, executable, root.path().join("socket"));
+        let prepared = prepare_fixture(config).expect("prepare shutdown-handoff fixture");
+        let state = agent_state();
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "cluster-1-shard-0-0".to_owned(),
+                    epoch: 1,
+                    valid_until_unix_ms: 6_000,
+                },
+                1_000,
+            )
+            .expect("install shutdown-handoff authority");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (guard_entered_tx, guard_entered_rx) = mpsc::sync_channel(1);
+        let (guard_continue_tx, guard_continue_rx) = mpsc::sync_channel(1);
+        let signal = std::thread::spawn(move || {
+            guard_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("observe final exec-handoff guard");
+            shutdown_tx
+                .send(true)
+                .expect("publish shutdown at final exec handoff");
+            guard_continue_tx
+                .send(())
+                .expect("release final exec-handoff guard");
+        });
+
+        let result = prepared
+            .supervise_with_writable_authority_guard(state.clone(), shutdown_rx, || {
+                guard_entered_tx
+                    .send(())
+                    .expect("publish final exec-handoff guard");
+                guard_continue_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("wait for shutdown publication");
+                true
+            })
+            .await;
+        signal.join().expect("join shutdown publisher");
+
+        assert!(result.is_ok(), "shutdown handoff failed: {result:?}");
+        assert!(
+            !marker.exists(),
+            "postmaster started after shutdown reached the final exec handoff"
+        );
+        assert!(state.snapshot().lease.is_none());
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Validated
+        );
+    }
+
+    #[tokio::test]
     async fn pidfd_observation_keeps_group_leader_unreaped_until_cleanup() {
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg("exit 42").kill_on_drop(true);
@@ -4505,16 +4762,42 @@ mod tests {
         let config = test_config(data_dir, executable, root.path().join("socket"));
         let prepared = prepare_fixture(config).expect("prepare target-fence fixture");
         let state = agent_state();
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "cluster-1-shard-0-0".to_owned(),
+                    epoch: 1,
+                    valid_until_unix_ms: 6_000,
+                },
+                1_000,
+            )
+            .expect("install target-fence authority");
+        let shutdown_state = state.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shutdown_task = tokio::spawn(async move {
+            assert!(
+                shutdown_state.snapshot().lease.is_some(),
+                "writable supervisor cleared authority before process creation"
+            );
+            wait_for_marker(&ready).await;
+            assert!(
+                shutdown_state.snapshot().lease.is_some(),
+                "writable supervisor cleared authority while PostgreSQL was running"
+            );
+            shutdown_tx.send(true).expect("request target fence");
+        });
 
         let result = timeout(
             Duration::from_secs(2),
-            prepared.supervise_with_stop_mode(state.clone(), async {
-                wait_for_marker(&ready).await;
-                PostgresStopMode::Fence
-            }),
+            prepared.supervise_with_writable_authority(
+                state.clone(),
+                shutdown_rx,
+                Duration::from_secs(1),
+            ),
         )
         .await
         .expect("bounded target fence");
+        shutdown_task.await.expect("join target-fence request");
 
         assert!(result.is_ok(), "target fence failed: {result:?}");
         assert!(!smart.exists(), "target fence attempted smart shutdown");
@@ -4546,16 +4829,33 @@ mod tests {
         );
         let config = test_config(data_dir, executable, root.path().join("socket"));
         let prepared = prepare_fixture(config.clone()).expect("prepare target-fence fixture");
+        let state = agent_state();
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "cluster-1-shard-0-0".to_owned(),
+                    epoch: 1,
+                    valid_until_unix_ms: 6_000,
+                },
+                1_000,
+            )
+            .expect("install process-tree fence authority");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shutdown_descendant = descendant.clone();
+        let shutdown_task = tokio::spawn(async move {
+            wait_for_marker(&shutdown_descendant).await;
+            shutdown_tx.send(true).expect("request process-tree fence");
+        });
 
         let result = timeout(
             Duration::from_secs(2),
-            prepared.supervise_with_stop_mode(agent_state(), async {
-                wait_for_marker(&descendant).await;
-                PostgresStopMode::Fence
-            }),
+            prepared.supervise_with_writable_authority(state, shutdown_rx, Duration::from_secs(1)),
         )
         .await
         .expect("bounded target-fence process-tree cleanup");
+        shutdown_task
+            .await
+            .expect("join process-tree fence request");
 
         assert!(result.is_ok(), "target-fence cleanup failed: {result:?}");
         let descendant_pid = fs::read_to_string(&descendant)

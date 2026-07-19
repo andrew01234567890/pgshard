@@ -484,10 +484,14 @@ non-UTF-8 Linux process names, and cancellation of the supervision future.
 Writable-term tests additionally require immediate fencing to skip smart and
 fast shutdown, clear local authority, kill an unresponsive complete process
 tree, preserve the PGDATA exclusion boundary, and reject a Lease margin smaller
-than its fence budget. Coordination tests delay an in-flight renewal past the
-absolute cutoff both before and after a simulated commit; both cases must clear
-local authority without waiting for the response or consuming the fencing
-margin. A
+than its fence budget. They also prove PostgreSQL remains absent before initial
+authority, shutdown wins while waiting, an installed term is not cleared before
+or during supervision, a failed final margin guard cannot execute the postmaster
+after storage validation, and shutdown published at the final exec handoff
+prevents process creation. Coordination tests delay an in-flight
+renewal past the absolute cutoff both before and after a simulated commit; both
+cases must clear local authority without waiting for the response or consuming
+the fencing margin. A
 deterministic cleanup-state test injects a transient process-table inspection
 failure and requires a later absence proof not to be mislabeled as a surviving
 descendant. Cancellation also reaps the direct child before the PGDATA fence can

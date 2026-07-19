@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pgshard_types::{PgLsn, ShardId};
 use serde::{Serialize, Serializer};
 use thiserror::Error;
+use tokio::sync::watch;
 
 /// Maximum age of a role/fence observation that can authorize readiness.
 pub const POSTGRES_OBSERVATION_MAX_AGE_MS: u64 = 5_000;
@@ -126,11 +127,12 @@ pub struct AgentSnapshot {
 }
 
 /// Thread-safe state shared by reconciliation and HTTP handlers.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AgentState {
     inner: Arc<RwLock<AgentInner>>,
     last_checked_unix_ms: Arc<AtomicU64>,
     highest_lease_epoch: Arc<AtomicU64>,
+    lease_changes: watch::Sender<()>,
     max_lease_ttl_ms: u64,
 }
 
@@ -144,6 +146,19 @@ struct AgentInner {
 struct LeaseDeadline {
     epoch: u64,
     expires_at: Instant,
+}
+
+impl Default for AgentState {
+    fn default() -> Self {
+        let (lease_changes, _receiver) = watch::channel(());
+        Self {
+            inner: Arc::default(),
+            last_checked_unix_ms: Arc::default(),
+            highest_lease_epoch: Arc::default(),
+            lease_changes,
+            max_lease_ttl_ms: 0,
+        }
+    }
 }
 
 impl AgentState {
@@ -160,6 +175,7 @@ impl AgentState {
         if !(1..=300_000).contains(&max_lease_ttl_ms) {
             return Err(LeaseInstallError::InvalidMaximumLeaseTtl(max_lease_ttl_ms));
         }
+        let (lease_changes, _receiver) = watch::channel(());
         Ok(Self {
             inner: Arc::new(RwLock::new(AgentInner {
                 snapshot: AgentSnapshot {
@@ -170,6 +186,7 @@ impl AgentState {
             })),
             last_checked_unix_ms: Arc::new(AtomicU64::new(0)),
             highest_lease_epoch: Arc::new(AtomicU64::new(0)),
+            lease_changes,
             max_lease_ttl_ms,
         })
     }
@@ -291,6 +308,8 @@ impl AgentState {
             if lease.valid_until_unix_ms == current.valid_until_unix_ms
                 && expires_at == current_deadline.expires_at
             {
+                drop(inner);
+                self.lease_changes.send_replace(());
                 return Ok(LeaseInstallOutcome::Existing);
             }
             inner.snapshot.lease = Some(lease.clone());
@@ -298,6 +317,8 @@ impl AgentState {
                 epoch: lease.epoch,
                 expires_at,
             });
+            drop(inner);
+            self.lease_changes.send_replace(());
             return Ok(LeaseInstallOutcome::Renewed);
         }
 
@@ -308,17 +329,58 @@ impl AgentState {
             epoch: lease.epoch,
             expires_at,
         });
+        drop(inner);
+        self.lease_changes.send_replace(());
         Ok(LeaseInstallOutcome::Installed)
     }
 
     /// Removes local authorization immediately.
     pub fn clear_lease(&self) {
-        let mut inner = self
+        {
+            let mut inner = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.snapshot.lease = None;
+            inner.lease_deadline = None;
+        }
+        self.lease_changes.send_replace(());
+    }
+
+    /// Subscribes to changes in locally installed writable-term authority.
+    ///
+    /// Notifications are hints only. A subscriber must revalidate the locked
+    /// Lease term and monotonic deadline after every wake-up; concurrent
+    /// install and clear operations may publish their notifications in either
+    /// order.
+    #[must_use]
+    pub fn subscribe_lease_changes(&self) -> watch::Receiver<()> {
+        self.lease_changes.subscribe()
+    }
+
+    /// Returns whether the current locally installed term remains valid beyond
+    /// the supplied fencing margin.
+    ///
+    /// Process creation uses this immediately before `exec` so a runtime pause
+    /// cannot turn a stale watch notification into startup authority.
+    #[must_use]
+    pub fn lease_authority_valid_for(&self, required: Duration) -> bool {
+        let inner = self
             .inner
-            .write()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.snapshot.lease = None;
-        inner.lease_deadline = None;
+        let Some(lease) = inner.snapshot.lease.as_ref() else {
+            return false;
+        };
+        inner
+            .lease_deadline
+            .filter(|deadline| deadline.epoch == lease.epoch)
+            .is_some_and(|deadline| {
+                deadline
+                    .expires_at
+                    .saturating_duration_since(Instant::now())
+                    > required
+            })
     }
 
     /// Evaluates readiness against the current wall and monotonic clocks.
@@ -965,6 +1027,35 @@ mod tests {
             ),
             Ok(LeaseInstallOutcome::Installed)
         );
+    }
+
+    #[test]
+    fn lease_change_signal_and_margin_follow_installed_state() {
+        let state = state();
+        let mut changes = state.subscribe_lease_changes();
+        assert!(!state.lease_authority_valid_for(Duration::ZERO));
+
+        install(
+            &state,
+            FencingLease {
+                owner_instance: "instance-1".to_owned(),
+                epoch: 7,
+                valid_until_unix_ms: 5_100,
+            },
+            100,
+            Instant::now(),
+        )
+        .expect("install five-second authority");
+
+        assert!(changes.has_changed().expect("change sender remains"));
+        changes.borrow_and_update();
+        assert!(state.lease_authority_valid_for(Duration::from_secs(4)));
+        assert!(!state.lease_authority_valid_for(Duration::from_secs(5)));
+
+        state.clear_lease();
+        assert!(changes.has_changed().expect("change sender remains"));
+        changes.borrow_and_update();
+        assert!(!state.lease_authority_valid_for(Duration::ZERO));
     }
 
     #[test]
