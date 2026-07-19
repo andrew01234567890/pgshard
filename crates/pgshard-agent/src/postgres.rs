@@ -474,8 +474,8 @@ impl PostgresConfig {
             ),
             PostgresRuntimeRole::ReplicationBootstrapPrimary => (
                 "listen_addresses=*",
-                Some("max_wal_senders=3"),
-                Some("max_replication_slots=3"),
+                Some("max_wal_senders=5"),
+                Some("max_replication_slots=5"),
                 "archive_mode=off",
             ),
             PostgresRuntimeRole::ReplicationStandby => {
@@ -6225,8 +6225,8 @@ mod tests {
         let arguments: Vec<_> = command.as_std().get_args().collect();
         for required in [
             "listen_addresses=*",
-            "max_wal_senders=3",
-            "max_replication_slots=3",
+            "max_wal_senders=5",
+            "max_replication_slots=5",
             "wal_level=logical",
             "synchronous_standby_names=",
             "synchronous_commit=local",

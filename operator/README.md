@@ -114,9 +114,15 @@ checkpoint is complete, member zero is atomically initialized with a
 replication-only HBA and supervised by the agent's
 `replication-bootstrap-primary` role under the exact writable Lease. The Pod
 has no `pgshard.io/role`, remains unready, and cannot match an application
-Service. No workload mounts the replication Secret yet, so the fixed
-`pgshard_replication` login is absent and remote authentication remains closed.
-Other members remain storage-only. This is bootstrap-source composition, not
+Service. Only the init container receives the one-key replication Secret
+projection. Before publishing the durable HBA, it verifies the checkpointed
+material digest, creates or validates the fixed least-privilege
+`pgshard_replication` SCRAM login, proves the exact password over PostgreSQL's
+physical-replication protocol, and reserves one exact physical slot for every
+other configured member. The running agent has no Secret mount. Ordinary SQL
+remains closed and the source remains non-serving, although authenticated
+physical cloning is now possible. Other members remain storage-only. This is
+bootstrap-source composition, not
 evidence of a primary, standby, synchronous replica, or HA availability.
 PostgreSQL StatefulSets use `OnDelete` updates. A controller image, bootstrap
 image, script, or generated-configuration change therefore updates the desired

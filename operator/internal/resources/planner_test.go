@@ -34,11 +34,23 @@ import (
 
 func TestCatalogMaterialSHA256MatchesRustContract(t *testing.T) {
 	t.Parallel()
+	if got, want := PostgreSQLReplicationMaterialSHA256([]byte("password")), "f28e708e623164f153012f8f21e13d4bbd3ad2de150d3181b69316275bb49f7e"; got != want {
+		t.Fatalf("replication material SHA-256 = %q, want shared Rust vector %q", got, want)
+	}
 	if got, want := CatalogClientMaterialSHA256(nil, []byte("catalog-ca")), "f25d89531a7aa9937005eb56aab838662145cadff1315196229e0cd334ece559"; got != want {
 		t.Fatalf("client material SHA-256 = %q, want shared Rust vector %q", got, want)
 	}
 	if got, want := CatalogServerMaterialSHA256([]byte("catalog-certificate"), nil), "219f722b1a1d47cb6b569c6c6bc6e9dfe5131f6d4e8fc507bcf93c106df8409d"; got != want {
 		t.Fatalf("server material SHA-256 = %q, want shared Rust vector %q", got, want)
+	}
+}
+
+func TestPostgreSQLBootstrapScriptHasValidBashSyntax(t *testing.T) {
+	t.Parallel()
+	command := exec.Command("bash", "-n")
+	command.Stdin = strings.NewReader(postgresqlBootstrapScript)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("PostgreSQL bootstrap script syntax: %v\n%s", err, output)
 	}
 }
 
@@ -499,7 +511,9 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			!strings.Contains(bootstrap.Command[2], "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE") ||
 			!strings.Contains(bootstrap.Command[2], "roles.rolpassword LIKE 'SCRAM-SHA-256\\$4096:%'") ||
 			!strings.Contains(bootstrap.Command[2], "pgshard-scram-verifier") ||
-			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest") != 2 ||
+			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest client") != 1 ||
+			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest server") != 1 ||
+			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest replication") != 1 ||
 			!strings.Contains(bootstrap.Command[2], "SET rolpassword = $1, rolcanlogin = true") ||
 			strings.Contains(bootstrap.Command[2], "PASSWORD '$catalog_password'") ||
 			!strings.Contains(bootstrap.Command[2], "PGPASSWORD=\"$catalog_password\"") ||
@@ -1051,6 +1065,12 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 	if err := os.WriteFile(passwordPath, []byte("bootstrap-e2e-only-password\n"), 0o444); err != nil {
 		t.Fatal(err)
 	}
+	replicationDirectory := newTraversableFixtureDirectory("pgshard-replication-auth-")
+	const replicationPassword = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	replicationPasswordPath := filepath.Join(replicationDirectory, PostgreSQLReplicationPasswordKey)
+	if err := os.WriteFile(replicationPasswordPath, []byte(replicationPassword), 0o444); err != nil {
+		t.Fatal(err)
+	}
 	catalogAuthDirectory := newTraversableFixtureDirectory("pgshard-catalog-auth-")
 	const catalogPassword = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	catalogCA := []byte("bootstrap-e2e-catalog-ca\n")
@@ -1153,6 +1173,7 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 			"--user", "999:999", "--network", "none", "--read-only",
 			"--volume", volume + ":/var/lib/postgresql",
 			"--volume", secretDirectory + ":/etc/pgshard/bootstrap:ro",
+			"--volume", replicationDirectory + ":/etc/pgshard/replication:ro",
 			"--volume", catalogAuthDirectory + ":/etc/pgshard/catalog-auth:ro",
 			"--volume", catalogTLSDirectory + ":/etc/pgshard/catalog-tls:ro",
 			"--volume", configurationDirectory + ":/etc/pgshard/postgresql-source:ro",
@@ -1210,6 +1231,13 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 			"PGSHARD_CATALOG_SERVER_SHA256=" + catalogServerSHA256,
 		}
 	}
+	replicationBootstrapEnvironment := func(password string, members int) []string {
+		return append(bootstrapEnvironment(false, 1),
+			"PGSHARD_BOOTSTRAP_HBA_MODE=replication-bootstrap-primary",
+			fmt.Sprintf("PGSHARD_MEMBERS_PER_SHARD=%d", members),
+			"PGSHARD_REPLICATION_MATERIAL_SHA256="+PostgreSQLReplicationMaterialSHA256([]byte(password)),
+		)
+	}
 	bootstrapScript := func(dataParent string) string {
 		if dataParent == "/var/lib/postgresql/18" {
 			return postgresqlBootstrapScript
@@ -1223,6 +1251,18 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 			t.Fatalf("PostgreSQL bootstrap logged the catalog password:\n%s", output)
 		}
 		return output, err
+	}
+	bootstrapReplicationMembers := func(dataParent, password string, members int) (string, error) {
+		t.Helper()
+		output, err := runBootstrapContainer(dataParent, bootstrapScript(dataParent), replicationBootstrapEnvironment(password, members)...)
+		if strings.Contains(output, replicationPassword) || strings.Contains(output, password) {
+			t.Fatalf("PostgreSQL replication bootstrap logged a plaintext password")
+		}
+		return output, err
+	}
+	bootstrapReplication := func(dataParent, password string) (string, error) {
+		t.Helper()
+		return bootstrapReplicationMembers(dataParent, password, 3)
 	}
 	configurationPath := filepath.Join(configurationDirectory, "postgresql.conf")
 	originalConfiguration, err := os.ReadFile(configurationPath)
@@ -1265,7 +1305,7 @@ socket=/tmp/pgshard-bootstrap-e2e
 mkdir -m 0700 "$socket"
 pg_ctl -D "$PGDATA" -w -t 45 start \
   -l /tmp/postgres.log \
-  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c event_triggers=off" >/dev/null
+  -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c event_triggers=off -c synchronous_standby_names='' -c synchronized_standby_slots=''" >/dev/null
 stop_postgres() {
   result=$?
   trap - EXIT
@@ -1274,6 +1314,140 @@ stop_postgres() {
 }
 trap stop_postgres EXIT
 `
+	writeReplicationPassword := func(password string) {
+		t.Helper()
+		if err := os.Chmod(replicationPasswordPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(replicationPasswordPath, []byte(password), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(replicationPasswordPath, 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replicationSQL := func(dataParent, sql string) (string, error) {
+		t.Helper()
+		output, err := runContainer(dataParent, postgresHarness+`
+psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+  --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="$PGSHARD_TEST_SQL"
+pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
+trap - EXIT
+`, "PGSHARD_TEST_SQL="+sql)
+		return strings.TrimSpace(output), err
+	}
+	mustReplicationSQL := func(dataParent, sql string) string {
+		t.Helper()
+		output, err := replicationSQL(dataParent, sql)
+		if err != nil {
+			t.Fatalf("query replication-bootstrap fixture: %v\n%s", err, output)
+		}
+		return output
+	}
+	replicationState := func(dataParent string) string {
+		t.Helper()
+		return mustReplicationSQL(dataParent, `
+SELECT CASE WHEN roles.rolcanlogin
+                  AND roles.rolreplication
+                  AND NOT roles.rolsuper
+                  AND NOT roles.rolinherit
+                  AND NOT EXISTS (
+                    SELECT FROM pg_catalog.pg_shdepend AS dependencies
+                     WHERE dependencies.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+                       AND dependencies.refobjid = roles.oid
+                  )
+            THEN 'safe' ELSE 'unsafe' END
+  FROM pg_catalog.pg_authid AS roles
+ WHERE roles.rolname = 'pgshard_replication';
+SELECT COALESCE(pg_catalog.string_agg(slot_name, ',' ORDER BY slot_name), '')
+  FROM pg_catalog.pg_replication_slots
+ WHERE pg_catalog.left(slot_name, pg_catalog.length('pgshard_member_')) = 'pgshard_member_';`)
+	}
+
+	const replicationDataParent = "/var/lib/postgresql/18-replication-material"
+	replicationConfiguration := append(slices.Clone(originalConfiguration), []byte(
+		"synchronous_standby_names = 'ANY 1 (pgshard_member_0001,pgshard_member_0002)'\n"+
+			"synchronized_standby_slots = 'pgshard_member_0001,pgshard_member_0002'\n",
+	)...)
+	if err := os.Chmod(configurationPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configurationPath, replicationConfiguration, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(configurationPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := bootstrapReplication(replicationDataParent, replicationPassword); err != nil {
+		t.Fatalf("materialize replication role and slots: %v\n%s", err, output)
+	}
+	if output, err := bootstrapReplication(replicationDataParent, replicationPassword); err != nil {
+		t.Fatalf("replay replication role and slots: %v\n%s", err, output)
+	}
+	if got := replicationState(replicationDataParent); got != "safe\npgshard_member_0001,pgshard_member_0002" {
+		t.Fatalf("replication-bootstrap state = %q", got)
+	}
+	mustReplicationSQL(replicationDataParent, "SELECT slot_name FROM pg_catalog.pg_create_physical_replication_slot('pgshardxmemberyoutside', true, false)")
+	if output, err := bootstrapReplication(replicationDataParent, replicationPassword); err != nil {
+		t.Fatalf("unrelated physical slot entered the reserved namespace: %v\n%s", err, output)
+	}
+
+	mustReplicationSQL(replicationDataParent, "SELECT pg_catalog.pg_drop_replication_slot('pgshard_member_0002')")
+	const wrongReplicationPassword = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	writeReplicationPassword(wrongReplicationPassword)
+	wrongOutput, wrongErr := bootstrapReplication(replicationDataParent, wrongReplicationPassword)
+	if wrongErr == nil || !strings.Contains(wrongOutput, "replication credential that does not authenticate") {
+		t.Fatalf("wrong replication password did not fail closed before slot repair: %v\n%s", wrongErr, wrongOutput)
+	}
+	if got := replicationState(replicationDataParent); got != "safe\npgshard_member_0001" {
+		t.Fatalf("wrong credential mutated replication state: %q", got)
+	}
+	writeReplicationPassword(replicationPassword)
+	if output, err := bootstrapReplication(replicationDataParent, replicationPassword); err != nil {
+		t.Fatalf("repair missing slot after credential proof: %v\n%s", err, output)
+	}
+
+	mustReplicationSQL(replicationDataParent, "SELECT pg_catalog.pg_drop_replication_slot('pgshard_member_0002')")
+	mustReplicationSQL(replicationDataParent, "SELECT slot_name FROM pg_catalog.pg_create_physical_replication_slot('pgshard_member_0002', false, false)")
+	unsafeOutput, unsafeErr := bootstrapReplication(replicationDataParent, replicationPassword)
+	if unsafeErr == nil || !strings.Contains(unsafeOutput, "unsafe or foreign managed physical replication slot") {
+		t.Fatalf("unsafe expected slot was adopted: %v\n%s", unsafeErr, unsafeOutput)
+	}
+	mustReplicationSQL(replicationDataParent, "SELECT pg_catalog.pg_drop_replication_slot('pgshard_member_0002')")
+	mustReplicationSQL(replicationDataParent, "SELECT slot_name FROM pg_catalog.pg_create_physical_replication_slot('pgshard_member_9999', true, false)")
+	foreignOutput, foreignErr := bootstrapReplication(replicationDataParent, replicationPassword)
+	if foreignErr == nil || !strings.Contains(foreignOutput, "unsafe or foreign managed physical replication slot") {
+		t.Fatalf("foreign reserved slot was adopted: %v\n%s", foreignErr, foreignOutput)
+	}
+	if got := replicationState(replicationDataParent); got != "safe\npgshard_member_0001,pgshard_member_9999" {
+		t.Fatalf("foreign slot rejection mutated replication state: %q", got)
+	}
+	mustReplicationSQL(replicationDataParent, "SELECT pg_catalog.pg_drop_replication_slot('pgshard_member_9999')")
+	mustReplicationSQL(replicationDataParent, "CREATE TABLE replication_dependency_guard (id integer); GRANT SELECT ON replication_dependency_guard TO pgshard_replication")
+	dependencyOutput, dependencyErr := bootstrapReplication(replicationDataParent, replicationPassword)
+	if dependencyErr == nil || !strings.Contains(dependencyOutput, "unsafe PostgreSQL replication role") {
+		t.Fatalf("replication role with direct object dependencies was adopted: %v\n%s", dependencyErr, dependencyOutput)
+	}
+	if got := replicationState(replicationDataParent); got != "unsafe\npgshard_member_0001" {
+		t.Fatalf("unsafe role rejection mutated replication slots: %q", got)
+	}
+	const fiveMemberReplicationDataParent = "/var/lib/postgresql/18-replication-material-five"
+	if output, err := bootstrapReplicationMembers(fiveMemberReplicationDataParent, replicationPassword, 5); err != nil {
+		t.Fatalf("materialize five-member replication role and slots: %v\n%s", err, output)
+	}
+	if got := replicationState(fiveMemberReplicationDataParent); got != "safe\npgshard_member_0001,pgshard_member_0002,pgshard_member_0003,pgshard_member_0004" {
+		t.Fatalf("five-member replication-bootstrap state = %q", got)
+	}
+	if err := os.Chmod(configurationPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configurationPath, originalConfiguration, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(configurationPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+
 	prepareLegacyCatalog := postgresHarness + `
 createdb --no-password --host="$socket" --username=postgres --template=template0 --encoding=UTF8 shardschema
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
@@ -2813,10 +2987,25 @@ func TestMultiMemberAgentPlanPublishesOnlyMemberZeroBootstrapSources(t *testing.
 					if !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-bootstrap-primary") || !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf") {
 						t.Fatalf("bootstrap source %s agent environment = %#v", object.Name, agent.Env)
 					}
-					for _, volume := range object.Spec.Template.Spec.Volumes {
-						if volume.Name == "replication-credential" {
-							t.Fatalf("bootstrap source %s consumed staged replication material", object.Name)
-						}
+					if containsNamedVolumeMount(agent.VolumeMounts, "replication-credential") {
+						t.Fatalf("bootstrap source %s agent retained the replication credential", object.Name)
+					}
+					bootstrapContainer := object.Spec.Template.Spec.InitContainers[0]
+					if !containsVolumeMount(bootstrapContainer.VolumeMounts, "replication-credential", true) ||
+						envValue(bootstrapContainer.Env, "PGSHARD_MEMBERS_PER_SHARD") != fmt.Sprintf("%d", members) {
+						t.Fatalf("bootstrap source %s replication initialization = %#v", object.Name, bootstrapContainer)
+					}
+					var shard int32
+					if _, err := fmt.Sscanf(object.Spec.Template.Labels[ShardLabel], "%04d", &shard); err != nil {
+						t.Fatalf("bootstrap source %s shard label: %v", object.Name, err)
+					}
+					credential := cluster.Status.PostgreSQLReplicationCredentials[shard]
+					if envValue(bootstrapContainer.Env, "PGSHARD_REPLICATION_MATERIAL_SHA256") != credential.MaterialSHA256 {
+						t.Fatalf("bootstrap source %s replication digest environment = %#v", object.Name, bootstrapContainer.Env)
+					}
+					replicationVolume := volumeByName(t, object.Spec.Template.Spec.Volumes, "replication-credential").Secret
+					if replicationVolume == nil || replicationVolume.SecretName != credential.SecretName || replicationVolume.DefaultMode == nil || *replicationVolume.DefaultMode != 0o440 || !reflect.DeepEqual(secretItemKeys(replicationVolume.Items), []string{PostgreSQLReplicationPasswordKey}) {
+						t.Fatalf("bootstrap source %s replication projection = %#v", object.Name, replicationVolume)
 					}
 				case *policyv1.PodDisruptionBudget:
 					if object.Labels[ComponentLabel] == "postgresql" {
@@ -3371,6 +3560,15 @@ func secretItemKeys(items []corev1.KeyToPath) []string {
 func containsVolumeMount(mounts []corev1.VolumeMount, name string, readOnly bool) bool {
 	for _, mount := range mounts {
 		if mount.Name == name && mount.ReadOnly == readOnly {
+			return true
+		}
+	}
+	return false
+}
+
+func containsNamedVolumeMount(mounts []corev1.VolumeMount, name string) bool {
+	for _, mount := range mounts {
+		if mount.Name == name {
 			return true
 		}
 	}

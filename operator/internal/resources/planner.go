@@ -127,6 +127,31 @@ if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]] && [[ "$bootstrap_hba_mode" 
   echo "shardschema bootstrap requires the serving HBA mode" >&2
   exit 1
 fi
+if [[ "$bootstrap_hba_mode" == "replication-bootstrap-primary" ]]; then
+  if [[ "$PGSHARD_MEMBERS_PER_SHARD" != "3" && "$PGSHARD_MEMBERS_PER_SHARD" != "5" ]]; then
+    echo "replication bootstrap requires three or five members per shard" >&2
+    exit 1
+  fi
+  if [[ ! "$PGSHARD_REPLICATION_MATERIAL_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "refusing an invalid checkpointed replication material digest" >&2
+    exit 1
+  fi
+  replication_password="$(</etc/pgshard/replication/replication-password)"
+  if [[ ! "$replication_password" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "refusing an invalid PostgreSQL replication credential" >&2
+    exit 1
+  fi
+  unset replication_password
+  observed_replication_sha="$(
+    pgshard-catalog-material-digest replication \
+      /etc/pgshard/replication/replication-password
+  )"
+  if [[ "$observed_replication_sha" != "$PGSHARD_REPLICATION_MATERIAL_SHA256" ]]; then
+    echo "refusing replication material that differs from the checkpointed creation result" >&2
+    exit 1
+  fi
+  unset observed_replication_sha
+fi
 configuration_source="${PGSHARD_POSTGRESQL_CONFIG_SOURCE:-/etc/pgshard/postgresql-source}"
 configuration_target="${PGSHARD_POSTGRESQL_CONFIG_TARGET:-/etc/pgshard/postgresql}"
 source_configuration_hash() {
@@ -347,20 +372,323 @@ fi
 # new serving HBA. Starting PostgreSQL to inspect a physical backup can still
 # advance internal PGDATA state, so full restore no-mutation belongs to the
 # signed-manifest controller preflight before a target is provisioned.
-if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" != "true" ]]; then
+if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" != "true" ]] \
+  && [[ "$bootstrap_hba_mode" != "replication-bootstrap-primary" ]]; then
   hba_staging="$final/.pgshard-pg_hba.conf.next"
   rm -f -- "$hba_staging"
-  if [[ "$bootstrap_hba_mode" == "replication-bootstrap-primary" ]]; then
-    install -m 0600 -- /etc/pgshard/replication-bootstrap-primary.pg_hba.conf "$hba_staging"
-  else
-    printf '%s\n' \
-      'local all all trust' \
-      'host all all all scram-sha-256' > "$hba_staging"
-  fi
+  printf '%s\n' \
+    'local all all trust' \
+    'host all all all scram-sha-256' > "$hba_staging"
   chmod 0600 "$hba_staging"
   sync "$hba_staging" "$final"
   mv -- "$hba_staging" "$final/pg_hba.conf"
   sync "$final/pg_hba.conf" "$final"
+  exit 0
+fi
+
+if [[ "$bootstrap_hba_mode" == "replication-bootstrap-primary" ]]; then
+  socket=/tmp/pgshard-replication-bootstrap
+  rm -rf -- "$socket"
+  mkdir -m 0700 -- "$socket"
+  quarantine_hba="$(mktemp /tmp/pgshard-replication-bootstrap-hba.XXXXXX)"
+  chmod 0600 "$quarantine_hba"
+  printf '%s\n' \
+    'local all postgres trust' \
+    'local replication pgshard_replication scram-sha-256' \
+    'local replication all reject' \
+    'local all all reject' \
+    'host all all 0.0.0.0/0 reject' \
+    'host all all ::0/0 reject' > "$quarantine_hba"
+  export PGOPTIONS='-c lock_timeout=5s -c statement_timeout=30s -c transaction_timeout=120s -c idle_in_transaction_session_timeout=30s -c search_path=pg_catalog -c quote_all_identifiers=off -c event_triggers=off -c session_replication_role=origin -c session_preload_libraries= -c local_preload_libraries= -c jit=off -c default_tablespace= -c temp_tablespaces= -c default_table_access_method=heap -c default_transaction_read_only=off -c row_security=off -c synchronous_commit=on -c zero_damaged_pages=off -c ignore_checksum_failure=off -c password_encryption=scram-sha-256 -c scram_iterations=4096 -c log_statement=none -c log_min_error_statement=panic -c log_min_duration_statement=-1 -c log_min_duration_sample=-1 -c log_statement_sample_rate=0 -c log_transaction_sample_rate=0 -c log_duration=off -c log_parameter_max_length=0 -c log_parameter_max_length_on_error=0 -c log_min_messages=warning -c debug_print_parse=off -c debug_print_rewritten=off -c debug_print_plan=off -c log_parser_stats=off -c log_planner_stats=off -c log_executor_stats=off -c log_statement_stats=off'
+  cleanup_replication_bootstrap_runtime() {
+    rm -f -- "$quarantine_hba"
+    rm -rf -- "$socket"
+  }
+  stop_replication_bootstrap_postgres() {
+    result=$?
+    trap - EXIT
+    if pg_ctl -D "$final" status >/dev/null 2>&1; then
+      if ! pg_ctl -D "$final" -w -t 45 stop -m fast; then
+        result=1
+      fi
+    fi
+    cleanup_replication_bootstrap_runtime
+    exit "$result"
+  }
+  trap stop_replication_bootstrap_postgres EXIT
+
+  # Start only on the private Unix socket with every inherited extension,
+  # recovery, network, logging, and unsafe-durability path pinned closed.
+  pg_ctl -D "$final" -w -t 45 start \
+    -o "-c config_file=/etc/pgshard/postgresql/primary-0000.conf -c data_directory='$final' -c hba_file='$quarantine_hba' -c external_pid_file=/tmp/pgshard-replication-bootstrap.pid -c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c unix_socket_group= -c port=5432 -c ssl=off -c restart_after_crash=off -c primary_conninfo= -c primary_slot_name= -c restore_command= -c archive_cleanup_command= -c recovery_end_command= -c archive_mode=on -c archive_command= -c archive_library= -c max_wal_senders=1 -c max_logical_replication_workers=0 -c sync_replication_slots=off -c wal_receiver_create_temp_slot=off -c idle_replication_slot_timeout=0 -c max_slot_wal_keep_size=-1 -c synchronous_standby_names='' -c synchronized_standby_slots='' -c shared_preload_libraries= -c session_preload_libraries= -c local_preload_libraries= -c event_triggers=off -c jit=off -c fsync=on -c full_page_writes=on -c synchronous_commit=on -c ignore_invalid_pages=off -c data_sync_retry=off -c ignore_checksum_failure=off -c zero_damaged_pages=off -c password_encryption=scram-sha-256 -c scram_iterations=4096 -c logging_collector=off -c log_statement=none -c log_min_error_statement=panic -c log_min_duration_statement=-1 -c log_min_duration_sample=-1 -c log_statement_sample_rate=0 -c log_transaction_sample_rate=0 -c log_duration=off -c log_parameter_max_length=0 -c log_parameter_max_length_on_error=0"
+
+  replication_session_policy="$(
+    psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+      --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+        SELECT CASE WHEN
+          current_setting('search_path') = 'pg_catalog'
+          AND current_setting('event_triggers') = 'off'
+          AND current_setting('session_replication_role') = 'origin'
+          AND current_setting('default_transaction_read_only') = 'off'
+          AND current_setting('row_security') = 'off'
+          AND current_setting('synchronous_commit') = 'on'
+          AND current_setting('synchronous_standby_names') = ''
+          AND current_setting('synchronized_standby_slots') = ''
+          AND current_setting('zero_damaged_pages') = 'off'
+          AND current_setting('ignore_checksum_failure') = 'off'
+          AND current_setting('password_encryption') = 'scram-sha-256'
+          AND current_setting('scram_iterations') = '4096'
+          AND current_setting('log_statement') = 'none'
+          AND current_setting('log_min_error_statement') = 'panic'
+          AND current_setting('log_parameter_max_length') = '0'
+          AND current_setting('log_parameter_max_length_on_error') = '0'
+        THEN 1 ELSE 0 END"
+  )"
+  if [[ "$replication_session_policy" != "1" ]]; then
+    echo "refusing to materialize replication state without the enforced bootstrap session policy" >&2
+    exit 1
+  fi
+
+  read_replication_role_state() {
+    psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+      --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+        SELECT COALESCE((
+          SELECT CASE WHEN
+            NOT roles.rolsuper
+            AND NOT roles.rolinherit
+            AND NOT roles.rolcreaterole
+            AND NOT roles.rolcreatedb
+            AND NOT roles.rolbypassrls
+            AND roles.rolconnlimit = -1
+            AND roles.rolvaliduntil IS NULL
+            AND NOT EXISTS (
+              SELECT FROM pg_catalog.pg_auth_members AS memberships
+               WHERE memberships.member = roles.oid OR memberships.roleid = roles.oid
+            )
+            AND NOT EXISTS (
+              SELECT FROM pg_catalog.pg_database AS databases
+               WHERE databases.datdba = roles.oid
+            )
+            AND NOT EXISTS (
+              SELECT FROM pg_catalog.pg_tablespace AS tablespaces
+               WHERE tablespaces.spcowner = roles.oid
+            )
+            AND NOT EXISTS (
+              SELECT FROM pg_catalog.pg_db_role_setting AS settings
+               WHERE settings.setrole = roles.oid
+            )
+            AND NOT EXISTS (
+              SELECT FROM pg_catalog.pg_shdepend AS dependencies
+               WHERE dependencies.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+                 AND dependencies.refobjid = roles.oid
+            )
+          THEN CASE
+            WHEN roles.rolcanlogin
+              AND roles.rolreplication
+              AND roles.rolpassword LIKE 'SCRAM-SHA-256\$4096:%'
+              THEN 'safe'
+            WHEN NOT roles.rolcanlogin
+              AND NOT roles.rolreplication
+              AND roles.rolpassword IS NULL
+              THEN 'staging'
+            ELSE 'unsafe'
+          END
+          ELSE 'unsafe'
+          END
+            FROM pg_catalog.pg_authid AS roles
+           WHERE roles.rolname = 'pgshard_replication'
+        ), 'absent')"
+  }
+
+  declare -a expected_replication_slots=()
+  declare -A expected_replication_slot_set=()
+  for (( member = 1; member < PGSHARD_MEMBERS_PER_SHARD; member++ )); do
+    printf -v slot_name 'pgshard_member_%04d' "$member"
+    expected_replication_slots+=("$slot_name")
+    expected_replication_slot_set["$slot_name"]=1
+  done
+
+  # Preflight the complete reserved namespace before any role or slot write.
+  # A same-name object with an unexpected shape is never adopted or deleted.
+  if ! replication_slot_preflight="$(
+    psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+      --set=ON_ERROR_STOP=1 --no-align --tuples-only --field-separator='|' --command="
+        SELECT slot_name,
+               CASE WHEN slot_type = 'physical'
+                          AND database IS NULL
+                          AND plugin IS NULL
+                          AND NOT temporary
+                          AND NOT active
+                          AND active_pid IS NULL
+                          AND restart_lsn IS NOT NULL
+                          AND wal_status IN ('reserved', 'extended')
+                          AND invalidation_reason IS NULL
+                          AND NOT two_phase
+                          AND NOT failover
+                          AND NOT synced
+                    THEN 'safe' ELSE 'unsafe' END
+          FROM pg_catalog.pg_replication_slots
+         WHERE pg_catalog.left(slot_name, pg_catalog.length('pgshard_member_')) = 'pgshard_member_'
+         ORDER BY slot_name"
+  )"; then
+    echo "refusing replication state whose managed slot namespace cannot be inspected" >&2
+    exit 1
+  fi
+  if [[ -n "$replication_slot_preflight" ]]; then
+    while IFS='|' read -r slot_name slot_state extra; do
+      if [[ -n "$extra" || -z "${expected_replication_slot_set[$slot_name]:-}" || "$slot_state" != "safe" ]]; then
+        echo "refusing an unsafe or foreign managed physical replication slot" >&2
+        exit 1
+      fi
+    done <<< "$replication_slot_preflight"
+  fi
+  unset replication_slot_preflight
+
+  replication_role_state="$(read_replication_role_state)"
+  case "$replication_role_state" in
+    absent)
+      psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+        --set=ON_ERROR_STOP=1 <<'PGSHARD_REPLICATION_LOGIN_STAGING'
+BEGIN;
+CREATE ROLE pgshard_replication
+  NOLOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION
+  NOBYPASSRLS CONNECTION LIMIT -1;
+COMMIT;
+PGSHARD_REPLICATION_LOGIN_STAGING
+      replication_role_state=staging
+      ;;
+    staging|safe) ;;
+    *)
+      echo "refusing an unsafe PostgreSQL replication role" >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ "$replication_role_state" == "staging" ]]; then
+    replication_scram_verifier="$(
+      pgshard-scram-verifier < /etc/pgshard/replication/replication-password
+    )"
+    case "$replication_scram_verifier" in
+      'SCRAM-SHA-256$4096:'*) ;;
+      *)
+        echo "refusing an invalid client-generated replication SCRAM verifier" >&2
+        exit 1
+        ;;
+    esac
+    replication_login_update="$(
+      {
+        printf '%s\n' \
+          'UPDATE pg_catalog.pg_authid SET rolpassword = $1, rolcanlogin = true, rolreplication = true WHERE rolname = '\''pgshard_replication'\'' AND NOT rolcanlogin AND rolpassword IS NULL AND NOT rolsuper AND NOT rolinherit AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolreplication AND NOT rolbypassrls AND rolconnlimit = -1 AND rolvaliduntil IS NULL RETURNING 1'
+        printf '%s %s\n' '\bind' "'$replication_scram_verifier'"
+        printf '%s\n' '\g'
+      } | psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+        --set=ON_ERROR_STOP=1 --quiet --no-align --tuples-only
+    )"
+    if [[ "$replication_login_update" != "1" ]]; then
+      echo "refusing a replication role that changed during credential installation" >&2
+      exit 1
+    fi
+    replication_verifier_matches="$(
+      {
+        printf '%s\n' \
+          'SELECT 1 FROM pg_catalog.pg_authid WHERE rolname = '\''pgshard_replication'\'' AND rolpassword = $1'
+        printf '%s %s\n' '\bind' "'$replication_scram_verifier'"
+        printf '%s\n' '\g'
+      } | psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+        --set=ON_ERROR_STOP=1 --quiet --no-align --tuples-only
+    )"
+    unset replication_scram_verifier
+    if [[ "$replication_verifier_matches" != "1" ]]; then
+      echo "refusing a replication role that changed during credential installation" >&2
+      exit 1
+    fi
+  fi
+
+  if [[ "$(read_replication_role_state)" != "safe" ]]; then
+    echo "refusing an unsafe PostgreSQL replication role" >&2
+    exit 1
+  fi
+
+  # Prove the exact password before creating any slot. The plaintext remains
+  # in bootstrap-shell memory and the child libpq environment; it never enters
+  # SQL, argv, or PostgreSQL logs. Physical replication mode is required for
+  # the special replication HBA database token.
+  replication_password="$(</etc/pgshard/replication/replication-password)"
+  if ! PGPASSWORD="$replication_password" env -u PGOPTIONS \
+    timeout --signal=TERM --kill-after=2s 10s psql -X --no-password \
+      --dbname="host=$socket port=5432 user=pgshard_replication replication=true connect_timeout=5" \
+      --set=ON_ERROR_STOP=1 --quiet --command='IDENTIFY_SYSTEM' >/dev/null; then
+    echo "refusing a PostgreSQL replication credential that does not authenticate" >&2
+    exit 1
+  fi
+  unset replication_password
+
+  for slot_name in "${expected_replication_slots[@]}"; do
+    existing_slot="$(
+      {
+        printf '%s\n' 'SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = $1'
+        printf '%s %s\n' '\bind' "'$slot_name'"
+        printf '%s\n' '\g'
+      } | psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+        --set=ON_ERROR_STOP=1 --quiet --no-align --tuples-only
+    )"
+    case "$existing_slot" in
+      1) ;;
+      "")
+        created_slot="$(
+          {
+            printf '%s\n' 'SELECT slot_name FROM pg_catalog.pg_create_physical_replication_slot($1, true, false)'
+            printf '%s %s\n' '\bind' "'$slot_name'"
+            printf '%s\n' '\g'
+          } | psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+            --set=ON_ERROR_STOP=1 --quiet --no-align --tuples-only
+        )"
+        if [[ "$created_slot" != "$slot_name" ]]; then
+          echo "physical replication slot creation returned an unexpected identity" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        echo "physical replication slot lookup returned an unexpected result" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  safe_replication_slot_count="$(
+    psql -X --no-password --host="$socket" --username=postgres --dbname=postgres \
+      --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+        SELECT count(*)
+          FROM pg_catalog.pg_replication_slots
+         WHERE pg_catalog.left(slot_name, pg_catalog.length('pgshard_member_')) = 'pgshard_member_'
+           AND slot_type = 'physical'
+           AND database IS NULL
+           AND plugin IS NULL
+           AND NOT temporary
+           AND NOT active
+           AND active_pid IS NULL
+           AND restart_lsn IS NOT NULL
+           AND wal_status IN ('reserved', 'extended')
+           AND invalidation_reason IS NULL
+           AND NOT two_phase
+           AND NOT failover
+           AND NOT synced"
+  )"
+  if [[ "$safe_replication_slot_count" != "$((PGSHARD_MEMBERS_PER_SHARD - 1))" ]]; then
+    echo "refusing an incomplete or unsafe managed physical replication slot set" >&2
+    exit 1
+  fi
+
+  pg_ctl -D "$final" -w -t 45 stop -m fast
+  trap - EXIT
+  cleanup_replication_bootstrap_runtime
+
+  hba_staging="$final/.pgshard-pg_hba.conf.next"
+  rm -f -- "$hba_staging"
+  install -m 0600 -- /etc/pgshard/replication-bootstrap-primary.pg_hba.conf "$hba_staging"
+  sync "$hba_staging" "$final"
+  mv -- "$hba_staging" "$final/pg_hba.conf"
+  sync "$final/pg_hba.conf" "$final" "$parent" "$volume_root"
   exit 0
 fi
 
@@ -1708,8 +2036,10 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			return nil, fmt.Errorf("catalog access creation result is missing or invalid")
 		}
 	}
+	var replicationCredentials map[int32]pgshardv1alpha1.PostgreSQLReplicationCredentialStatus
 	if cluster.Spec.MembersPerShard > 1 && images.PostgreSQLRuntime.agentQuarantine() {
-		if _, err := postgresqlReplicationCredentials(cluster); err != nil {
+		replicationCredentials, err = postgresqlReplicationCredentials(cluster)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -1750,8 +2080,9 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		} else if images.PostgreSQLRuntime.agentQuarantine() {
 			bootstrap := bootstraps[postgresqlBootstrapKey{shard: shard, member: 0}]
 			writableLease := writableLeases[shard]
+			replicationCredential := replicationCredentials[shard]
 			objects = append(objects,
-				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease),
+				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease, replicationCredential),
 			)
 		}
 	}
@@ -2836,7 +3167,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 	}
 }
 
-func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) *appsv1.StatefulSet {
+func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) *appsv1.StatefulSet {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
@@ -2878,6 +3209,8 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			{Name: "PGSHARD_MAXIMUM_SHARDS", Value: fmt.Sprintf("%d", pgshardv1alpha1.MaximumShards)},
 			{Name: "PGSHARD_BOOTSTRAP_SHARDSCHEMA", Value: "false"},
 			{Name: "PGSHARD_BOOTSTRAP_HBA_MODE", Value: "replication-bootstrap-primary"},
+			{Name: "PGSHARD_MEMBERS_PER_SHARD", Value: fmt.Sprintf("%d", cluster.Spec.MembersPerShard)},
+			{Name: "PGSHARD_REPLICATION_MATERIAL_SHA256", Value: replicationCredential.MaterialSHA256},
 			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION", Value: shardschemaMigrationPath},
 			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION_SHA256", Value: shardschemaMigrationSHA256},
 			{Name: "PGSHARD_POSTGRESQL_CONFIG_SHA256", Value: configurationHash},
@@ -2892,6 +3225,7 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			{Name: "postgresql-config", MountPath: "/etc/pgshard/postgresql-source", ReadOnly: true},
 			{Name: "postgresql-runtime-config", MountPath: "/etc/pgshard/postgresql"},
 			{Name: "bootstrap-secret", MountPath: "/etc/pgshard/bootstrap", ReadOnly: true},
+			{Name: "replication-credential", MountPath: "/etc/pgshard/replication", ReadOnly: true},
 		},
 	}
 	automount := false
@@ -2908,6 +3242,11 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 		{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configurationName}}}},
 		{Name: "postgresql-runtime-config", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("2Mi"))}}},
 		{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: bootstrap.SecretName, DefaultMode: ptr(int32(0o440))}}},
+		{Name: "replication-credential", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName:  replicationCredential.SecretName,
+			DefaultMode: ptr(int32(0o440)),
+			Items:       []corev1.KeyToPath{{Key: PostgreSQLReplicationPasswordKey, Path: "replication-password", Mode: ptr(int32(0o440))}},
+		}}},
 		postgresqlAgentKubernetesAPIVolume(),
 	}
 	statefulSetMetadata := ownedMeta(cluster, name, "postgresql", nil)
