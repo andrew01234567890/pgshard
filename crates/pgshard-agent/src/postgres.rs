@@ -1406,11 +1406,9 @@ impl PreparedPostgres {
             .arg("-c")
             .arg("ssl=off")
             .arg("-c")
-            .arg("restart_after_crash=off")
-            .arg("-c")
-            .arg("primary_conninfo=")
-            .arg("-c")
-            .arg("primary_slot_name=")
+            .arg("restart_after_crash=off");
+        force_external_recovery_sources_disabled(&mut command);
+        command
             .arg("-c")
             .arg("restore_command=")
             .arg("-c")
@@ -1480,6 +1478,12 @@ impl PreparedPostgres {
             }
         }
         command
+    }
+}
+
+fn force_external_recovery_sources_disabled(command: &mut Command) {
+    for setting in ["primary_conninfo=", "primary_slot_name="] {
+        command.arg("-c").arg(setting);
     }
 }
 
