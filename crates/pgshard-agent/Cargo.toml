@@ -23,6 +23,7 @@ serde.workspace = true
 tempfile = "3.27.0"
 thiserror.workspace = true
 tokio.workspace = true
+tokio-postgres.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true

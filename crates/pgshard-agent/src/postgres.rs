@@ -15,6 +15,10 @@ use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
+use pgshard_types::writable_generation::{
+    WritableGenerationTransition, WritableGenerationTransitionError,
+    classify_writable_generation_transition,
+};
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, CWD, FlockOperation, Mode, OFlags, StatxFlags, flock, open, statx};
 use rustix::process::{
@@ -32,6 +36,11 @@ use tokio::sync::watch;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::domain::{AgentState, PostgresProcessState};
+#[cfg(not(test))]
+use crate::postgres_generation;
+use crate::postgres_generation::PostgresGenerationError;
+#[cfg(test)]
+use crate::writable::durable_generation_for_test;
 use crate::writable::{DurableWritableGeneration, WritablePostgresAttempt};
 
 const POSTGRES_MAJOR: &str = "18";
@@ -55,7 +64,9 @@ const MAX_SHUTDOWN_BUDGET: Duration = Duration::from_secs(55);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const TARGET_FENCE_CLEANUP_STAGES: u32 = 3;
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
-const QUARANTINE_HBA_CONTENT: &[u8] = b"local all all reject\nlocal replication all reject\n";
+const WRITABLE_GENERATION_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(10);
+const QUARANTINE_HBA_CONTENT: &[u8] =
+    b"local postgres postgres peer\nlocal all all reject\nlocal replication all reject\n";
 
 // A process forked while a test owns a writable fixture descriptor inherits
 // that descriptor until exec, even with O_CLOEXEC. Serialize test fixture
@@ -68,6 +79,22 @@ std::thread_local! {
     static TEST_EXEC_HANDOFF_OBSERVER:
         std::cell::RefCell<Option<std::sync::mpsc::SyncSender<()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_POSTGRES_GENERATION_PUBLICATION_GATE:
+        std::cell::RefCell<Option<watch::Receiver<bool>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn gate_next_postgres_generation_publication(receiver: watch::Receiver<bool>) {
+    TEST_POSTGRES_GENERATION_PUBLICATION_GATE.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(receiver).is_none(),
+            "test thread already has a PostgreSQL generation-publication gate"
+        );
+    });
 }
 
 #[cfg(test)]
@@ -693,18 +720,13 @@ impl PreparedPostgres {
                 state.set_postgres_process(PostgresProcessState::Validated);
                 return Ok(());
             }
-            Err(error) => {
-                state.set_postgres_process(PostgresProcessState::Failed);
-                return Err(error);
-            }
+            Err(error) => return fail_postgres_start(&state, error),
         };
         if let Err(error) = self.supervisor_lock.validate() {
-            state.set_postgres_process(PostgresProcessState::Failed);
-            return Err(error);
+            return fail_postgres_start(&state, error);
         }
         if current != self.validated {
-            state.set_postgres_process(PostgresProcessState::Failed);
-            return Err(PostgresError::PreparedStateChanged);
+            return fail_postgres_start(&state, PostgresError::PreparedStateChanged);
         }
         tokio::task::yield_now().await;
         if shutdown_requested(shutdown.as_mut()).await {
@@ -712,8 +734,7 @@ impl PreparedPostgres {
             return Ok(());
         }
         if let Err(error) = self.finalize_pre_spawn(&current) {
-            state.set_postgres_process(PostgresProcessState::Failed);
-            return Err(error);
+            return fail_postgres_start(&state, error);
         }
         tokio::task::yield_now().await;
         if shutdown_requested(shutdown.as_mut()).await {
@@ -721,12 +742,40 @@ impl PreparedPostgres {
             return Ok(());
         }
         let shutdown_config = self.config.clone();
-        let Some((mut process_group_fence, pidfd, process_group)) = self
+        let socket_dir = self.config.socket_dir.clone();
+        let Some((mut process_group_fence, pidfd, process_group, authorization)) = self
             .spawn_tracked_postmaster(&state, &startup_guard)
             .await?
         else {
             return Ok(());
         };
+
+        if let PostgresStartAuthorization::Writable(generation) = authorization {
+            let publication = publish_generation_before_running(
+                &state,
+                &mut process_group_fence,
+                &pidfd,
+                process_group,
+                shutdown.as_mut(),
+                &shutdown_config,
+                &socket_dir,
+                &generation,
+                &startup_guard,
+            )
+            .await;
+            match publication {
+                Ok(WritablePublicationOutcome::Published) => {}
+                Ok(WritablePublicationOutcome::Stopped) => {
+                    process_group_fence.disarm_if_reaped();
+                    return Ok(());
+                }
+                Err(error) => {
+                    process_group_fence.disarm_if_reaped();
+                    return Err(error);
+                }
+            }
+        }
+        state.set_postgres_process(PostgresProcessState::RunningQuarantined);
 
         let result = tokio::select! {
             status = wait_pidfd_exit(&pidfd) => {
@@ -745,32 +794,14 @@ impl PreparedPostgres {
                 Err(error)
             }
             stop_mode = &mut shutdown => {
-                state.clear_lease();
-                state.set_postgres_process(PostgresProcessState::Stopping);
-                let result = match stop_mode {
-                    PostgresStopMode::Graceful => shutdown_child(
-                        &mut process_group_fence.child,
-                        &pidfd,
-                        process_group,
-                        &process_group_fence.child_subreaper,
-                        &shutdown_config,
-                    ).await,
-                    PostgresStopMode::Fence => target_fence_child(
-                        &mut process_group_fence.child,
-                        &pidfd,
-                        process_group,
-                        &process_group_fence.child_subreaper,
-                        &shutdown_config,
-                    ).await,
-                };
-                state.set_postgres_process(if result.is_err() {
-                    PostgresProcessState::Failed
-                } else if stop_mode == PostgresStopMode::Fence {
-                    PostgresProcessState::Fenced
-                } else {
-                    PostgresProcessState::Validated
-                });
-                result
+                stop_tracked_postmaster(
+                    &state,
+                    &mut process_group_fence,
+                    &pidfd,
+                    process_group,
+                    &shutdown_config,
+                    stop_mode,
+                ).await
             }
         };
         process_group_fence.disarm_if_reaped();
@@ -923,24 +954,23 @@ impl PreparedPostgres {
                     path: path.to_owned(),
                 }
             })?;
-        if !durable.same_cell(requested) {
-            return Err(PostgresError::ForeignWritableGeneration {
-                path: path.to_owned(),
-            });
-        }
-        if durable.term() > requested.term() {
-            return Err(PostgresError::WritableGenerationRegression {
-                durable: durable.term(),
-                requested: requested.term(),
-            });
-        }
-        if durable.term() != requested.term() {
-            return Ok(false);
-        }
-        if durable.holder() != requested.holder() {
-            return Err(PostgresError::WritableGenerationConflict {
-                term: requested.term(),
-            });
+        match classify_writable_generation_transition(Some(&durable), requested) {
+            Ok(WritableGenerationTransition::Advance) => return Ok(false),
+            Ok(WritableGenerationTransition::Replay) => {}
+            Ok(WritableGenerationTransition::Initialize) => {
+                return Err(PostgresError::PreparedStateChanged);
+            }
+            Err(WritableGenerationTransitionError::ForeignUniverse) => {
+                return Err(PostgresError::ForeignWritableGeneration {
+                    path: path.to_owned(),
+                });
+            }
+            Err(WritableGenerationTransitionError::Regression { durable, requested }) => {
+                return Err(PostgresError::WritableGenerationRegression { durable, requested });
+            }
+            Err(WritableGenerationTransitionError::ConflictingHolder { term }) => {
+                return Err(PostgresError::WritableGenerationConflict { term });
+            }
         }
         existing
             .file
@@ -1080,23 +1110,23 @@ impl PreparedPostgres {
         &self,
         state: &AgentState,
         startup_guard: &impl Fn() -> PostgresStartDecision,
-    ) -> Result<bool, PostgresError> {
+    ) -> Result<Option<PostgresStartAuthorization>, PostgresError> {
         let Some(authorization) = authorize_postmaster_start(state, startup_guard)? else {
-            return Ok(false);
+            return Ok(None);
         };
-        let PostgresStartAuthorization::Writable(generation) = authorization else {
-            return Ok(true);
+        let PostgresStartAuthorization::Writable(generation) = &authorization else {
+            return Ok(Some(authorization));
         };
-        if let Err(error) = self.persist_durable_writable_generation(&generation) {
+        if let Err(error) = self.persist_durable_writable_generation(generation) {
             state.clear_lease();
             state.set_postgres_process(PostgresProcessState::Failed);
             return Err(error);
         }
         match authorize_postmaster_start(state, startup_guard)? {
-            Some(PostgresStartAuthorization::Writable(current)) if current == generation => {
-                Ok(true)
+            Some(PostgresStartAuthorization::Writable(current)) if &current == generation => {
+                Ok(Some(PostgresStartAuthorization::Writable(current)))
             }
-            None => Ok(false),
+            None => Ok(None),
             Some(_) => {
                 state.clear_lease();
                 state.set_postgres_process(PostgresProcessState::Failed);
@@ -1109,7 +1139,15 @@ impl PreparedPostgres {
         self,
         state: &AgentState,
         startup_guard: &impl Fn() -> PostgresStartDecision,
-    ) -> Result<Option<(PostgresProcessFence, AsyncFd<OwnedFd>, Pid)>, PostgresError> {
+    ) -> Result<
+        Option<(
+            PostgresProcessFence,
+            AsyncFd<OwnedFd>,
+            Pid,
+            PostgresStartAuthorization,
+        )>,
+        PostgresError,
+    > {
         let child_subreaper = match ChildSubreaper::claim() {
             Ok(child_subreaper) => child_subreaper,
             Err(error) => {
@@ -1117,13 +1155,15 @@ impl PreparedPostgres {
                 return Err(error);
             }
         };
-        let spawn_result = {
+        let (spawn_result, authorization) = {
             #[cfg(test)]
             let _exec_handoff = test_exec_handoff_guard();
-            if !self.authorize_persisted_postmaster_start(state, startup_guard)? {
+            let Some(authorization) =
+                self.authorize_persisted_postmaster_start(state, startup_guard)?
+            else {
                 return Ok(None);
-            }
-            self.command().spawn()
+            };
+            (self.command().spawn(), authorization)
         };
         let child = match spawn_result {
             Ok(child) => child,
@@ -1205,8 +1245,7 @@ impl PreparedPostgres {
                 return Err(error);
             }
         };
-        state.set_postgres_process(PostgresProcessState::RunningQuarantined);
-        Ok(Some((process_group_fence, pidfd, pid)))
+        Ok(Some((process_group_fence, pidfd, pid, authorization)))
     }
 
     fn command(&self) -> Command {
@@ -1276,7 +1315,9 @@ impl PreparedPostgres {
             .arg("-c")
             .arg("max_slot_wal_keep_size=-1")
             .arg("-c")
-            .arg("shared_preload_libraries=")
+            .arg("shared_preload_libraries=");
+        force_generation_publication_settings(&mut command);
+        command
             .arg("-c")
             .arg("fsync=on")
             .arg("-c")
@@ -1305,6 +1346,219 @@ impl PreparedPostgres {
         }
         command
     }
+}
+
+fn fail_postgres_start<T>(state: &AgentState, error: PostgresError) -> Result<T, PostgresError> {
+    state.set_postgres_process(PostgresProcessState::Failed);
+    Err(error)
+}
+
+fn force_generation_publication_settings(command: &mut Command) {
+    for setting in [
+        "session_preload_libraries=",
+        "local_preload_libraries=",
+        "event_triggers=off",
+        "jit=off",
+        "log_statement=none",
+        "log_min_error_statement=panic",
+        "log_parameter_max_length=0",
+        "log_parameter_max_length_on_error=0",
+    ] {
+        command.arg("-c").arg(setting);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WritablePublicationOutcome {
+    Published,
+    Stopped,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_generation_before_running<F, G>(
+    state: &AgentState,
+    process: &mut PostgresProcessFence,
+    pidfd: &AsyncFd<OwnedFd>,
+    process_group: Pid,
+    mut shutdown: Pin<&mut F>,
+    shutdown_config: &PostgresConfig,
+    socket_dir: &Path,
+    generation: &DurableWritableGeneration,
+    startup_guard: &G,
+) -> Result<WritablePublicationOutcome, PostgresError>
+where
+    F: Future<Output = PostgresStopMode>,
+    G: Fn() -> PostgresStartDecision,
+{
+    let authority_exact = || {
+        matches!(
+            startup_guard(),
+            PostgresStartDecision::StartWritable(current) if current == *generation
+        )
+    };
+    let publication = publish_postgres_generation(socket_dir, generation, &authority_exact);
+    let authority_lost = wait_for_authority_loss(&authority_exact);
+    tokio::pin!(publication);
+    tokio::pin!(authority_lost);
+    let result = tokio::select! {
+        biased;
+        status = wait_pidfd_exit(pidfd) => {
+            let error = match status {
+                Ok(status) => PostgresError::UnexpectedExit(status),
+                Err(error) => error,
+            };
+            return Err(cleanup_tracked_startup_failure(
+                state, process, pidfd, process_group, error,
+            ).await);
+        }
+        stop_mode = shutdown.as_mut() => {
+            stop_tracked_postmaster(
+                state,
+                process,
+                pidfd,
+                process_group,
+                shutdown_config,
+                stop_mode,
+            ).await?;
+            return Ok(WritablePublicationOutcome::Stopped);
+        }
+        () = &mut authority_lost => {
+            return Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                PostgresError::StartupAuthorityChanged,
+            ).await);
+        }
+        result = timeout(WRITABLE_GENERATION_PUBLICATION_TIMEOUT, &mut publication) => result,
+    };
+    let publication_error = match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(_) => Some(PostgresError::WritableGenerationPublicationTimeout(
+            WRITABLE_GENERATION_PUBLICATION_TIMEOUT,
+        )),
+    };
+    if let Some(error) = publication_error {
+        return Err(
+            cleanup_tracked_startup_failure(state, process, pidfd, process_group, error).await,
+        );
+    }
+    if !authority_exact() {
+        return Err(cleanup_tracked_startup_failure(
+            state,
+            process,
+            pidfd,
+            process_group,
+            PostgresError::StartupAuthorityChanged,
+        )
+        .await);
+    }
+    Ok(WritablePublicationOutcome::Published)
+}
+
+async fn publish_postgres_generation<F>(
+    socket_dir: &Path,
+    generation: &DurableWritableGeneration,
+    authority_exact: &F,
+) -> Result<(), PostgresError>
+where
+    F: Fn() -> bool,
+{
+    #[cfg(test)]
+    {
+        let _ = socket_dir;
+        let _ = generation;
+        let gate = TEST_POSTGRES_GENERATION_PUBLICATION_GATE.with(|slot| slot.borrow_mut().take());
+        if let Some(mut gate) = gate {
+            while !*gate.borrow_and_update() && gate.changed().await.is_ok() {}
+        }
+        tokio::task::yield_now().await;
+        if authority_exact() {
+            Ok(())
+        } else {
+            Err(PostgresError::StartupAuthorityChanged)
+        }
+    }
+    #[cfg(not(test))]
+    {
+        postgres_generation::publish_writable_generation(socket_dir, generation, authority_exact)
+            .await
+            .map_err(PostgresError::from)
+    }
+}
+
+async fn stop_tracked_postmaster(
+    state: &AgentState,
+    process: &mut PostgresProcessFence,
+    pidfd: &AsyncFd<OwnedFd>,
+    process_group: Pid,
+    config: &PostgresConfig,
+    stop_mode: PostgresStopMode,
+) -> Result<(), PostgresError> {
+    state.clear_lease();
+    state.set_postgres_process(PostgresProcessState::Stopping);
+    let result = match stop_mode {
+        PostgresStopMode::Graceful => {
+            shutdown_child(
+                &mut process.child,
+                pidfd,
+                process_group,
+                &process.child_subreaper,
+                config,
+            )
+            .await
+        }
+        PostgresStopMode::Fence => {
+            target_fence_child(
+                &mut process.child,
+                pidfd,
+                process_group,
+                &process.child_subreaper,
+                config,
+            )
+            .await
+        }
+    };
+    state.set_postgres_process(if result.is_err() {
+        PostgresProcessState::Failed
+    } else if stop_mode == PostgresStopMode::Fence {
+        PostgresProcessState::Fenced
+    } else {
+        PostgresProcessState::Validated
+    });
+    result
+}
+
+async fn wait_for_authority_loss<F>(authority_exact: &F)
+where
+    F: Fn() -> bool,
+{
+    while authority_exact() {
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn cleanup_tracked_startup_failure(
+    state: &AgentState,
+    process: &mut PostgresProcessFence,
+    pidfd: &AsyncFd<OwnedFd>,
+    process_group: Pid,
+    error: PostgresError,
+) -> PostgresError {
+    state.clear_lease();
+    state.set_postgres_process(PostgresProcessState::Stopping);
+    let error = cleanup_after_error(
+        &mut process.child,
+        Some(pidfd),
+        Some(process_group),
+        &process.child_subreaper,
+        error,
+    )
+    .await;
+    state.set_postgres_process(PostgresProcessState::Failed);
+    error
 }
 
 fn authorize_postmaster_start(
@@ -3540,9 +3794,9 @@ pub enum PostgresError {
         /// Entry that prevented process creation.
         path: PathBuf,
     },
-    /// The HBA policy did not consist solely of the two deny-all local rules.
+    /// The HBA policy was not the exact private publisher-plus-reject policy.
     #[error(
-        "PostgreSQL quarantine HBA file {path:?} must contain only the built-in deny-all policy"
+        "PostgreSQL quarantine HBA file {path:?} must contain only the built-in generation-publisher and reject policy"
     )]
     InvalidQuarantineHba {
         /// Rejected HBA path.
@@ -3634,6 +3888,12 @@ pub enum PostgresError {
         /// Operating-system error.
         source: std::io::Error,
     },
+    /// WAL-backed generation publication failed while `PostgreSQL` was quarantined.
+    #[error("publish WAL-backed PostgreSQL writable generation: {0}")]
+    PublishWritableGeneration(#[from] PostgresGenerationError),
+    /// WAL-backed generation publication did not finish within the startup bound.
+    #[error("WAL-backed PostgreSQL writable-generation publication exceeded {0:?}")]
+    WritableGenerationPublicationTimeout(Duration),
     /// The blocking revalidation worker did not complete normally.
     #[error("PostgreSQL pre-spawn validation task failed: {0}")]
     ValidationTask(#[source] tokio::task::JoinError),
@@ -4791,7 +5051,7 @@ mod tests {
         hba_file.push(runtime.path().join("quarantine.pg_hba.conf"));
         assert!(
             arguments.contains(&hba_file.as_os_str()),
-            "deny-all HBA policy must override PGDATA configuration"
+            "private generation-publisher HBA policy must override PGDATA configuration"
         );
         let mut external_pid_file = OsString::from("external_pid_file=");
         external_pid_file.push(runtime.path().join("socket/postmaster.external.pid"));
@@ -4818,12 +5078,20 @@ mod tests {
             "idle_replication_slot_timeout=0",
             "max_slot_wal_keep_size=-1",
             "shared_preload_libraries=",
+            "session_preload_libraries=",
+            "local_preload_libraries=",
+            "event_triggers=off",
+            "jit=off",
             "fsync=on",
             "full_page_writes=on",
             "ignore_invalid_pages=off",
             "data_sync_retry=off",
             "ignore_checksum_failure=off",
             "zero_damaged_pages=off",
+            "log_statement=none",
+            "log_min_error_statement=panic",
+            "log_parameter_max_length=0",
+            "log_parameter_max_length_on_error=0",
         ] {
             assert!(
                 arguments.contains(&OsStr::new(required)),
@@ -5046,11 +5314,6 @@ mod tests {
         let generation_path = data_dir.join(DURABLE_WRITABLE_GENERATION_FILE);
         let staging_path = data_dir.join(DURABLE_WRITABLE_GENERATION_STAGING_FILE);
         let first = writable_generation(1, TEST_WRITABLE_HOLDER, TEST_WRITABLE_LEASE_UID);
-
-        assert!(matches!(
-            prepared.persist_durable_writable_generation(&DurableWritableGeneration::for_test(0)),
-            Err(PostgresError::InvalidRequestedWritableGeneration)
-        ));
         assert!(!generation_path.exists());
 
         prepared
@@ -5179,7 +5442,7 @@ mod tests {
 
         let recovered_state = state_with_writable_lease(2);
         let recovered = prepare_fixture(config.clone()).expect("prepare publication recovery");
-        let Some((mut process_fence, pidfd, process_group)) = recovered
+        let Some((mut process_fence, pidfd, process_group, _authorization)) = recovered
             .spawn_tracked_postmaster(&recovered_state, &|| {
                 PostgresStartDecision::StartWritable(generation.clone())
             })
@@ -5427,7 +5690,7 @@ mod tests {
         let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
         lease_attempt.install_authority(
             state.lease_deadline().expect("monotonic deadline"),
-            DurableWritableGeneration::for_test(1),
+            durable_generation_for_test(1),
         );
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -5453,6 +5716,135 @@ mod tests {
         assert_eq!(
             state.snapshot().postgres_process,
             PostgresProcessState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_publication_gates_running_quarantined_state() {
+        let root = TempDir::new().expect("create WAL-publication gate fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let ready = root.path().join("postmaster-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\ntrap 'exit 0' QUIT\n: > '{}'\nwhile :; do sleep 1; done\n",
+                ready.display()
+            ),
+        );
+        let prepared = prepare_fixture(test_config(
+            data_dir,
+            executable,
+            root.path().join("socket"),
+        ))
+        .expect("prepare WAL-publication gate fixture");
+        let state = state_with_writable_lease(1);
+        let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        lease_attempt.install_authority(
+            state.lease_deadline().expect("monotonic deadline"),
+            durable_generation_for_test(1),
+        );
+        let (publication_tx, publication_rx) = watch::channel(false);
+        gate_next_postgres_generation_publication(publication_rx);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task_state = state.clone();
+        let supervisor = tokio::spawn(async move {
+            prepared
+                .supervise_with_writable_authority(
+                    task_state,
+                    shutdown_rx,
+                    Duration::ZERO,
+                    postgres_attempt,
+                )
+                .await
+        });
+
+        wait_for_marker(&ready).await;
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::StartingQuarantined,
+            "pidfd tracking must not imply a durable WAL generation"
+        );
+        publication_tx
+            .send(true)
+            .expect("release WAL-publication gate");
+        timeout(Duration::from_secs(1), async {
+            while state.snapshot().postgres_process != PostgresProcessState::RunningQuarantined {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("WAL publication advances the quarantine state");
+        shutdown_tx.send(true).expect("request writable fence");
+        let result = timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("bounded writable shutdown")
+            .expect("join writable supervisor");
+        assert!(result.is_ok(), "writable shutdown failed: {result:?}");
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Fenced
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_wal_publication_fences_without_running_state() {
+        let root = TempDir::new().expect("create publication-shutdown fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let ready = root.path().join("postmaster-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\ntrap 'exit 0' QUIT\n: > '{}'\nwhile :; do sleep 1; done\n",
+                ready.display()
+            ),
+        );
+        let prepared = prepare_fixture(test_config(
+            data_dir,
+            executable,
+            root.path().join("socket"),
+        ))
+        .expect("prepare publication-shutdown fixture");
+        let state = state_with_writable_lease(1);
+        let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        lease_attempt.install_authority(
+            state.lease_deadline().expect("monotonic deadline"),
+            durable_generation_for_test(1),
+        );
+        let (_publication_tx, publication_rx) = watch::channel(false);
+        gate_next_postgres_generation_publication(publication_rx);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task_state = state.clone();
+        let supervisor = tokio::spawn(async move {
+            prepared
+                .supervise_with_writable_authority(
+                    task_state,
+                    shutdown_rx,
+                    Duration::ZERO,
+                    postgres_attempt,
+                )
+                .await
+        });
+
+        wait_for_marker(&ready).await;
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::StartingQuarantined
+        );
+        shutdown_tx
+            .send(true)
+            .expect("request fence during publication");
+        let result = timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("bounded publication shutdown")
+            .expect("join publication shutdown");
+        assert!(result.is_ok(), "publication shutdown failed: {result:?}");
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Fenced
         );
     }
 
@@ -5506,7 +5898,7 @@ mod tests {
                     guard_continue_rx
                         .recv_timeout(Duration::from_secs(1))
                         .expect("wait for shutdown publication");
-                    Some(DurableWritableGeneration::for_test(1))
+                    Some(durable_generation_for_test(1))
                 },
                 crate::writable::writable_attempt_pair_for_test().1,
             )
@@ -5728,7 +6120,7 @@ mod tests {
         let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
         lease_attempt.install_authority(
             state.lease_deadline().expect("monotonic deadline"),
-            DurableWritableGeneration::for_test(1),
+            durable_generation_for_test(1),
         );
         let shutdown_state = state.clone();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -5767,7 +6159,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(generation_path).expect("read target-fence generation"),
-            DurableWritableGeneration::for_test(1).canonical_bytes()
+            durable_generation_for_test(1).canonical_bytes()
         );
         assert!(state.snapshot().lease.is_none());
         assert_eq!(
@@ -5806,7 +6198,7 @@ mod tests {
         let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
         lease_attempt.install_authority(
             state.lease_deadline().expect("monotonic deadline"),
-            DurableWritableGeneration::for_test(1),
+            durable_generation_for_test(1),
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shutdown_descendant = descendant.clone();
@@ -6065,7 +6457,7 @@ mod tests {
             .expect("protect version file");
         fs::write(
             path.join(BOOTSTRAP_IDENTITY_FILE),
-            DurableWritableGeneration::for_test(1).bootstrap_identity_bytes(),
+            durable_generation_for_test(1).bootstrap_identity_bytes(),
         )
         .expect("write bootstrap identity");
         fs::set_permissions(
@@ -6143,6 +6535,7 @@ mod tests {
             holder.to_owned(),
             term,
         )
+        .expect("valid writable-generation fixture")
     }
 
     fn state_with_writable_lease(term: u64) -> AgentState {

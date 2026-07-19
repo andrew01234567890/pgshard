@@ -75,6 +75,24 @@ flush, so a slow storage barrier cannot authorize an expired or changed term.
 The record is cell-scoped rather than member-scoped: a later member may advance
 it only by holding a higher term from the same exact cell Lease.
 
+After the postmaster is created and tracked by pidfd, it remains
+`StartingQuarantined`. The HBA permits only the operating-system `postgres`
+identity to connect as `postgres` to the `postgres` database over the private
+0700 Unix socket; every other local connection and every replication connection
+is rejected, and TCP remains disabled. In a fixed `pg_catalog` search path with
+bounded transaction, statement, lock, and idle timeouts plus
+`synchronous_commit=on`, the agent locks a singleton row in an owned,
+WAL-logged `pgshard_internal.writable_generation` table. It accepts only an
+empty record, exact replay, or a higher term in the same Lease universe. The
+attempt-private authority must still exactly match immediately before commit.
+If the commit response is lost, a fresh connection accepts the exact requested
+row as committed; the exact old or empty state may retry only while authority
+still matches. Malformed, foreign, conflicting, higher, or otherwise changed
+state fences the postmaster. The same fence applies to unknown reread timeout,
+shutdown, Lease loss, publication timeout, and child exit. Only a committed or
+reconciled row followed by one final exact authority check advances the process
+to `RunningQuarantined`.
+
 With writable coordination enabled,
 every agent shutdown clears local term evidence and immediately enters the
 PostgreSQL process-tree fence, skipping the smart and fast waits. An absolute
@@ -115,11 +133,13 @@ even after the StatefulSet and Pod are deleted. Before planning, the controller
 also authoritatively classifies both the `OnDelete` StatefulSet template and
 the live Pod, including when an earlier template already differs from its Pod.
 Changing modes requires a future explicitly fenced replacement workflow.
-This durable record is only a pre-start term floor. PostgreSQL SQL write and
-prepare hooks do not yet reject stale request generations, standby copies are
-not yet reconciled as promotion evidence, and promotion proof plus serving
-activation remain absent. This is therefore not yet a serving-primary fence or
-an HA claim.
+These durable records are only non-serving startup floors. The WAL-backed row
+can eventually reach a future physical standby, but this runtime still disables
+physical replication and provides no synchronous-replica durability guarantee.
+PostgreSQL SQL write and prepare hooks do not yet reject stale request
+generations, standby copies are not yet reconciled as promotion evidence, and
+promotion proof plus serving activation remain absent. This is therefore not
+yet a serving-primary fence or an HA claim.
 
 The pre-Lease development layout's three etcd data claims are retired
 automatically. The operator first prunes the old cluster-owned StatefulSet,

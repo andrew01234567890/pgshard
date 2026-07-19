@@ -5,5 +5,6 @@ pub mod coordination;
 pub mod domain;
 pub mod http;
 pub mod postgres;
+pub mod postgres_generation;
 pub mod telemetry;
 pub mod writable;

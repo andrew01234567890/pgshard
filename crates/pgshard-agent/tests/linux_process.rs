@@ -281,7 +281,7 @@ impl AgentFixture {
         let hba_file = root.path().join("quarantine.pg_hba.conf");
         fs::write(
             &hba_file,
-            "local all all reject\nlocal replication all reject\n",
+            "local postgres postgres peer\nlocal all all reject\nlocal replication all reject\n",
         )
         .expect("write quarantine HBA fixture");
         fs::set_permissions(&hba_file, fs::Permissions::from_mode(0o400))
