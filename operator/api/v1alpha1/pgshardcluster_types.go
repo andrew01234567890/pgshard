@@ -295,10 +295,12 @@ type PgShardClusterStatus struct {
 	// defensive fence when admission is unavailable or bypassed.
 	PostgreSQLBootstrapSpec *PostgreSQLBootstrapSpecStatus `json:"postgresqlBootstrapSpec,omitempty"`
 	// PostgreSQLBootstraps records the API-assigned Secret and PVC identities for
-	// each shard. Missing or replaced children require an explicit recovery;
-	// the controller never silently adopts or regenerates them.
+	// each physical shard member. Missing or replaced children require an
+	// explicit recovery; the controller never silently adopts or regenerates
+	// them.
 	// +listType=map
 	// +listMapKey=shard
+	// +listMapKey=member
 	PostgreSQLBootstraps []PostgreSQLBootstrapStatus `json:"postgresqlBootstraps,omitempty"`
 	// PostgreSQLWritableLeases binds every physical cell to the exact
 	// operator-owned Kubernetes Lease used for writable-term coordination. A
@@ -365,19 +367,23 @@ type PostgreSQLBootstrapSpecStatus struct {
 	DeletionPolicy         StorageDeletionPolicy `json:"deletionPolicy"`
 }
 
-// PostgreSQLBootstrapStatus binds one shard to randomly named, API-identified
-// bootstrap resources. Names are durable creation intents; UIDs are filled only
-// after the API server confirms each child. PVCFenceDetached is checkpointed
-// only after the credential Secret has been detached from cluster garbage
-// collection, making that exact Secret UID a durable owner for any outcome-
-// unknown PVC create. After PVCUID is checkpointed, the controller protects and
-// detaches that exact live PVC and anchors the Secret tombstone back to its UID.
-// Retain finalization can instead record an absent uncheckpointed outcome as
-// abandoned, after which no later outcome is retained. A workload cannot
-// consume an incomplete, abandoned, or unstabilized record.
+// PostgreSQLBootstrapStatus binds one physical shard member to randomly named,
+// API-identified bootstrap resources. Names are durable creation intents; UIDs
+// are filled only after the API server confirms each child. PVCFenceDetached is
+// checkpointed only after the credential Secret has been detached from cluster
+// garbage collection, making that exact Secret UID a durable owner for any
+// outcome-unknown PVC create. After PVCUID is checkpointed, the controller
+// protects and detaches that exact live PVC and anchors the Secret tombstone
+// back to its UID. Retain finalization can instead record an absent
+// uncheckpointed outcome as abandoned, after which no later outcome is
+// retained. A workload cannot consume an incomplete, abandoned, or
+// unstabilized record.
 type PostgreSQLBootstrapStatus struct {
 	// +kubebuilder:validation:Minimum=0
-	Shard      int32     `json:"shard"`
+	Shard int32 `json:"shard"`
+	// Member is a stable physical identity, never a mutable PostgreSQL role.
+	// +kubebuilder:validation:Minimum=0
+	Member     int32     `json:"member"`
 	SecretName string    `json:"secretName"`
 	SecretUID  types.UID `json:"secretUID"`
 	// PVCFenceDetached proves the exact credential Secret is independent of the

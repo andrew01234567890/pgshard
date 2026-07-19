@@ -326,12 +326,13 @@ the mounting workload is pruned, so a late empty claim cannot enter bootstrap.
 
 For a three- or five-member resource, the default `direct` runtime creates no
 PostgreSQL storage or workload. An explicit `agent-quarantine` manager now
-checkpoints one uninitialized member-`0000` source-storage intent per shard. It
-uses the existing immutable bootstrap Secret, exact UID checkpoints,
+checkpoints one uninitialized source-storage intent for every stable physical
+member. Each uses an immutable member bootstrap Secret, exact UID checkpoints,
 outcome-unknown create fence, protected ownerless PVC, and Retain/Delete
-finalization. The PVC has a member label but deliberately no role label. No Pod,
-StatefulSet, PDB, catalog or replication credential, physical slot,
-`primary_conninfo`, initialization, or Service endpoint is created, so this
+finalization. Status, Secret, and PVC identity are keyed by shard and member;
+the PVCs deliberately have no role label. No Pod, StatefulSet, PDB, catalog or
+replication credential, physical slot, `primary_conninfo`, initialization, or
+Service endpoint is created, so this
 durable storage intent is not evidence of a primary, standby, synchronous
 replica, or HA availability. A missing or same-name recreated Secret or PVC
 fails closed against the recorded UID.

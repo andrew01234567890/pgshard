@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -621,7 +622,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	if len(claim.Finalizers) != 0 {
 		t.Fatalf("creation-fenced PVC received protection before its API UID checkpoint: %#v", claim.Finalizers)
 	}
-	if got := PostgreSQLDataPVCPrefix(cluster.Name, 1); got != "demo-shard-0001-data-" || strings.Contains(got, "primary") || strings.Contains(got, "replica") {
+	if got := PostgreSQLDataPVCPrefix(cluster.Name, 1); got != "demo-shard-0001-member-0000-data-" || strings.Contains(got, "primary") || strings.Contains(got, "replica") {
 		t.Fatalf("PostgreSQL data PVC prefix is not role-neutral: %q", got)
 	}
 }
@@ -2797,6 +2798,15 @@ func TestMultiMemberAgentSourceStorageStaysOutsideTheResourcePlan(t *testing.T) 
 			if role, exists := claim.Labels[RoleLabel]; exists {
 				t.Fatalf("non-serving source storage carries authorizing role label %q", role)
 			}
+			memberClaim := PostgreSQLMemberDataPVC(cluster, 0, members-1, "member-data", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, "member-fence", "member-fence-uid")
+			memberSecret := PostgreSQLMemberAuthSecret(cluster, 0, members-1, "member-auth", []byte(strings.Repeat("a", 64)))
+			wantMember := fmt.Sprintf("%04d", members-1)
+			if memberClaim.Labels[MemberLabel] != wantMember || memberSecret.Labels[MemberLabel] != wantMember {
+				t.Fatalf("member resource labels = claim %q secret %q, want %q", memberClaim.Labels[MemberLabel], memberSecret.Labels[MemberLabel], wantMember)
+			}
+			if PostgreSQLMemberDataPVCPrefix(cluster.Name, 0, 0) == PostgreSQLMemberDataPVCPrefix(cluster.Name, 0, members-1) || PostgreSQLMemberAuthSecretPrefix(cluster.Name, 0, 0) == PostgreSQLMemberAuthSecretPrefix(cluster.Name, 0, members-1) {
+				t.Fatal("distinct members share a bootstrap resource prefix")
+			}
 		})
 	}
 }
@@ -2817,6 +2827,35 @@ func TestMultiMemberAgentSourceStorageRequiresImmutableBootstrapImage(t *testing
 	// Direct multi-member planning neither creates nor validates source storage.
 	if _, err := Plan(cluster, DefaultImages()); err != nil {
 		t.Fatalf("direct multi-member plan unexpectedly required a bootstrap image: %v", err)
+	}
+}
+
+func TestMultiMemberPlanRequiresOneCompleteBootstrapPerMember(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.CatalogAccess = nil
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+
+	missing := cluster.DeepCopy()
+	missing.Status.PostgreSQLBootstraps = slices.DeleteFunc(missing.Status.PostgreSQLBootstraps, func(bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus) bool {
+		return bootstrap.Shard == 0 && bootstrap.Member == 1
+	})
+	if _, err := Plan(missing, images); err == nil || !strings.Contains(err.Error(), "shard 0 member 1 is missing") {
+		t.Fatalf("missing member bootstrap error = %v", err)
+	}
+
+	duplicate := cluster.DeepCopy()
+	repeated := duplicate.Status.PostgreSQLBootstraps[0]
+	repeated.SecretName += "-duplicate"
+	repeated.SecretUID += "-duplicate"
+	repeated.PVCName += "-duplicate"
+	repeated.PVCUID += "-duplicate"
+	duplicate.Status.PostgreSQLBootstraps = append(duplicate.Status.PostgreSQLBootstraps, repeated)
+	if _, err := Plan(duplicate, images); err == nil || !strings.Contains(err.Error(), "shard 0 member 0 is duplicated") {
+		t.Fatalf("duplicate member bootstrap error = %v", err)
 	}
 }
 
@@ -2889,6 +2928,10 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	}
 	if strings.Contains(statefulSet.Name, "primary") || strings.Contains(statefulSet.Name, "replica") {
 		t.Fatalf("PostgreSQL StatefulSet identity contains a mutable role: %q", statefulSet.Name)
+	}
+	lastMemberStatefulSet := PostgreSQLMemberStatefulSetName(cluster.Name, pgshardv1alpha1.MaximumShards-1, 4)
+	if len(lastMemberStatefulSet) > 63 || len(lastMemberStatefulSet+"-0") > 63 || len(validation.IsDNS1123Label(lastMemberStatefulSet)) != 0 {
+		t.Fatalf("maximum member StatefulSet identity is invalid: %q", lastMemberStatefulSet)
 	}
 	if statefulSet.Spec.ServiceName != shardName(cluster.Name, 0) {
 		t.Fatalf("bounded StatefulSet changed the existing shard Service identity: %q", statefulSet.Spec.ServiceName)
@@ -3013,12 +3056,14 @@ func testPostgreSQLBootstraps(cluster *pgshardv1alpha1.PgShardCluster) []pgshard
 		ClientSHA256: strings.Repeat("b", 64),
 		ServerSHA256: strings.Repeat("c", 64),
 	}
-	bootstraps := make([]pgshardv1alpha1.PostgreSQLBootstrapStatus, 0, cluster.Spec.Shards)
+	bootstraps := make([]pgshardv1alpha1.PostgreSQLBootstrapStatus, 0, cluster.Spec.Shards*cluster.Spec.MembersPerShard)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
-		bootstraps = append(bootstraps, pgshardv1alpha1.PostgreSQLBootstrapStatus{
-			Shard: shard, SecretName: fmt.Sprintf("test-secret-%04d", shard), SecretUID: types.UID(fmt.Sprintf("test-secret-uid-%04d", shard)),
-			PVCFenceDetached: true, PVCName: fmt.Sprintf("test-data-%04d", shard), PVCUID: types.UID(fmt.Sprintf("test-pvc-uid-%04d", shard)), PVCStorageClassName: copyString(cluster.Spec.Storage.StorageClassName),
-		})
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			bootstraps = append(bootstraps, pgshardv1alpha1.PostgreSQLBootstrapStatus{
+				Shard: shard, Member: member, SecretName: fmt.Sprintf("test-secret-%04d-%04d", shard, member), SecretUID: types.UID(fmt.Sprintf("test-secret-uid-%04d-%04d", shard, member)),
+				PVCFenceDetached: true, PVCName: fmt.Sprintf("test-data-%04d-%04d", shard, member), PVCUID: types.UID(fmt.Sprintf("test-pvc-uid-%04d-%04d", shard, member)), PVCStorageClassName: copyString(cluster.Spec.Storage.StorageClassName),
+			})
+		}
 	}
 	return bootstraps
 }
