@@ -535,12 +535,18 @@ through immediate process-tree fencing, and unsafe Lease/fence timing pairs are
 rejected. The operator's default runtime remains direct. For the supported
 single-member integration, explicit `agent-quarantine` injects that runtime
 into a non-serving PostgreSQL Pod. For multi-member resources it currently
-stops at the protected member-`0000` storage intent and creates no Pod.
-The agent supports only TCP-quarantined PostgreSQL and installs the local durable
-pre-start generation floor described above. SQL and prepare target-side
-generation enforcement, replicated promotion evidence, peer isolation,
-promotion, and serving activation remain absent. The fleet-level orchestrator
-leadership Lease remains
+stops after protecting one role-neutral storage identity for every member and
+creates no Pod. The agent's default quarantine role keeps TCP disabled. Its
+uncomposed `replication-bootstrap-primary` role requires the same exact writable Lease,
+accepts only the fixed `pgshard_replication` SCRAM role over TCP, rejects every
+ordinary database connection, and permits enough senders and physical slots to
+clone the two default M1 standbys. It deliberately clears synchronous standby
+selection and uses local commit while bootstrapping, so it is neither a durable
+nor serving primary. The operator does not select that role yet; it has no replication
+credential, TLS, slot, standby, Service, or NetworkPolicy wiring. SQL and
+prepare target-side generation enforcement, replicated promotion evidence,
+peer isolation, promotion, and serving activation remain absent. The
+fleet-level orchestrator leadership Lease remains
 a separate control-plane mutex and is deliberately not a shard term.
 
 As in CloudNativePG, a candidate observes a competing holder's Lease record

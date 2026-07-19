@@ -87,7 +87,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!(
         bind = %http_bind,
-        postgres_quarantine = postgres.is_some(),
+        postgres_supervision = postgres.is_some(),
         version = pgshard_version::VERSION,
         git_sha = pgshard_version::GIT_SHA,
         "starting agent HTTP server"

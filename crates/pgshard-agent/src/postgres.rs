@@ -67,6 +67,13 @@ const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITABLE_GENERATION_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(10);
 const QUARANTINE_HBA_CONTENT: &[u8] =
     b"local postgres postgres peer\nlocal all all reject\nlocal replication all reject\n";
+const REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT: &[u8] = b"local postgres postgres peer\n\
+local all all reject\n\
+local replication all reject\n\
+host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n\
+host replication pgshard_replication ::0/0 scram-sha-256\n\
+host all all 0.0.0.0/0 reject\n\
+host all all ::0/0 reject\n";
 
 // A process forked while a test owns a writable fixture descriptor inherits
 // that descriptor until exec, even with O_CLOEXEC. Serialize test fixture
@@ -174,9 +181,19 @@ fn generation_publication_checkpoint(
     }
 }
 
-/// Configuration for an opt-in postmaster that is isolated from network clients.
+/// The only network/runtime roles the agent can supervise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostgresRuntimeRole {
+    /// No TCP listener and no replication ingress.
+    Quarantine,
+    /// Asynchronous writable-Lease-fenced bootstrap source for physical clones.
+    ReplicationBootstrapPrimary,
+}
+
+/// Configuration for an opt-in postmaster with a fail-closed runtime role.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostgresConfig {
+    role: PostgresRuntimeRole,
     data_dir: PathBuf,
     executable: PathBuf,
     controldata_executable: PathBuf,
@@ -203,6 +220,60 @@ impl PostgresConfig {
         fast_shutdown_timeout: Duration,
         immediate_shutdown_timeout: Duration,
     ) -> Result<Self, PostgresConfigError> {
+        Self::new_for_role(
+            PostgresRuntimeRole::Quarantine,
+            data_dir,
+            executable,
+            socket_dir,
+            hba_file,
+            smart_shutdown_timeout,
+            fast_shutdown_timeout,
+            immediate_shutdown_timeout,
+        )
+    }
+
+    /// Creates a validated replication-bootstrap-primary configuration.
+    ///
+    /// This role still requires exact writable-Lease authority at runtime. It
+    /// opens `PostgreSQL` TCP only for the fixed `pgshard_replication` role and
+    /// rejects every ordinary database connection in its immutable HBA file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe paths or a shutdown sequence that can exceed
+    /// the bounded supervisor shutdown budget.
+    pub fn new_replication_bootstrap_primary(
+        data_dir: PathBuf,
+        executable: PathBuf,
+        socket_dir: PathBuf,
+        hba_file: PathBuf,
+        smart_shutdown_timeout: Duration,
+        fast_shutdown_timeout: Duration,
+        immediate_shutdown_timeout: Duration,
+    ) -> Result<Self, PostgresConfigError> {
+        Self::new_for_role(
+            PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            data_dir,
+            executable,
+            socket_dir,
+            hba_file,
+            smart_shutdown_timeout,
+            fast_shutdown_timeout,
+            immediate_shutdown_timeout,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_role(
+        role: PostgresRuntimeRole,
+        data_dir: PathBuf,
+        executable: PathBuf,
+        socket_dir: PathBuf,
+        hba_file: PathBuf,
+        smart_shutdown_timeout: Duration,
+        fast_shutdown_timeout: Duration,
+        immediate_shutdown_timeout: Duration,
+    ) -> Result<Self, PostgresConfigError> {
         validate_absolute_normal_path("PGDATA", &data_dir, false)?;
         validate_absolute_normal_path("PostgreSQL executable", &executable, false)?;
         let controldata_executable = executable
@@ -218,7 +289,7 @@ impl PostgresConfig {
             false,
         )?;
         validate_absolute_normal_path("PostgreSQL socket directory", &socket_dir, true)?;
-        validate_absolute_normal_path("PostgreSQL quarantine HBA file", &hba_file, false)?;
+        validate_absolute_normal_path(hba_policy_name(role), &hba_file, false)?;
         if socket_dir.starts_with(&data_dir) || data_dir.starts_with(&socket_dir) {
             return Err(PostgresConfigError::OverlappingPaths {
                 data_dir,
@@ -249,6 +320,7 @@ impl PostgresConfig {
             });
         }
         Ok(Self {
+            role,
             data_dir,
             executable,
             controldata_executable,
@@ -264,6 +336,47 @@ impl PostgresConfig {
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Returns whether starting this role requires writable-Lease authority.
+    #[must_use]
+    pub(crate) fn requires_writable_authority(&self) -> bool {
+        self.role == PostgresRuntimeRole::ReplicationBootstrapPrimary
+    }
+
+    fn runtime_network_settings(&self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self.role {
+            PostgresRuntimeRole::Quarantine => (
+                "listen_addresses=",
+                "max_wal_senders=0",
+                "max_replication_slots=0",
+                "archive_mode=on",
+            ),
+            PostgresRuntimeRole::ReplicationBootstrapPrimary => (
+                "listen_addresses=*",
+                "max_wal_senders=3",
+                "max_replication_slots=2",
+                "archive_mode=off",
+            ),
+        }
+    }
+
+    fn starting_process_state(&self) -> PostgresProcessState {
+        match self.role {
+            PostgresRuntimeRole::Quarantine => PostgresProcessState::StartingQuarantined,
+            PostgresRuntimeRole::ReplicationBootstrapPrimary => {
+                PostgresProcessState::StartingReplicationBootstrap
+            }
+        }
+    }
+
+    fn running_process_state(&self) -> PostgresProcessState {
+        match self.role {
+            PostgresRuntimeRole::Quarantine => PostgresProcessState::RunningQuarantined,
+            PostgresRuntimeRole::ReplicationBootstrapPrimary => {
+                PostgresProcessState::RunningReplicationBootstrap
+            }
+        }
     }
 
     /// Returns the bounded signal and process-tree cleanup interval that must
@@ -616,6 +729,11 @@ impl PreparedPostgres {
         state: AgentState,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), PostgresError> {
+        if self.config.requires_writable_authority() {
+            state.clear_lease();
+            state.set_postgres_process(PostgresProcessState::Failed);
+            return Err(PostgresError::WritableAuthorityRequired);
+        }
         state.clear_lease();
         self.supervise_with_stop_mode_and_start_guard(
             state,
@@ -775,7 +893,7 @@ impl PreparedPostgres {
                 }
             }
         }
-        state.set_postgres_process(PostgresProcessState::RunningQuarantined);
+        state.set_postgres_process(shutdown_config.running_process_state());
 
         let result = tokio::select! {
             status = wait_pidfd_exit(&pidfd) => {
@@ -1175,7 +1293,7 @@ impl PreparedPostgres {
                 });
             }
         };
-        state.set_postgres_process(PostgresProcessState::StartingQuarantined);
+        state.set_postgres_process(self.config.starting_process_state());
         let mut process_group_fence =
             PostgresProcessFence::new(child, child_subreaper, self.supervisor_lock);
         let Some(child_id) = process_group_fence.child.id() else {
@@ -1249,10 +1367,10 @@ impl PreparedPostgres {
     }
 
     fn command(&self) -> Command {
-        let mut data_directory = OsString::from("data_directory=");
-        data_directory.push(&self.config.data_dir);
-        let mut hba_file = OsString::from("hba_file=");
-        hba_file.push(&self.config.hba_file);
+        let (listen_addresses, max_wal_senders, max_replication_slots, archive_mode) =
+            self.config.runtime_network_settings();
+        let data_directory = setting_with_path("data_directory=", &self.config.data_dir);
+        let hba_file = setting_with_path("hba_file=", &self.config.hba_file);
         let mut external_pid_file = OsString::from("external_pid_file=");
         external_pid_file.push(self.config.socket_dir.join(EXTERNAL_PID_FILE));
         let mut command = Command::new(&self.config.executable);
@@ -1266,7 +1384,7 @@ impl PreparedPostgres {
             .arg("-c")
             .arg(external_pid_file)
             .arg("-c")
-            .arg("listen_addresses=")
+            .arg(listen_addresses)
             .arg("-c")
             .arg(format!(
                 "unix_socket_directories={}",
@@ -1293,17 +1411,25 @@ impl PreparedPostgres {
             .arg("-c")
             .arg("recovery_end_command=")
             .arg("-c")
-            // An enabled archive mode with no callback retains every pending
-            // WAL segment without executing deployment-supplied code. Turning
-            // archiving off would let checkpoints recycle existing `.ready`
-            // segments and could break backup/PITR continuity.
-            .arg("archive_mode=on")
+            // Quarantine preserves existing `.ready` archive state without
+            // executing deployment callbacks. The bootstrap source disables
+            // archiving until a verified pipeline exists, avoiding unbounded
+            // WAL retention while physical clones are created.
+            .arg(archive_mode)
             .arg("-c")
             .arg("archive_command=")
             .arg("-c")
             .arg("archive_library=")
             .arg("-c")
-            .arg("max_wal_senders=0")
+            .arg(max_wal_senders)
+            .arg("-c")
+            .arg(max_replication_slots)
+            .arg("-c")
+            .arg("wal_level=logical")
+            .arg("-c")
+            .arg("synchronous_standby_names=")
+            .arg("-c")
+            .arg("synchronous_commit=local")
             .arg("-c")
             .arg("max_logical_replication_workers=0")
             .arg("-c")
@@ -1346,6 +1472,12 @@ impl PreparedPostgres {
         }
         command
     }
+}
+
+fn setting_with_path(prefix: &str, path: &Path) -> OsString {
+    let mut setting = OsString::from(prefix);
+    setting.push(path);
+    setting
 }
 
 fn fail_postgres_start<T>(state: &AgentState, error: PostgresError) -> Result<T, PostgresError> {
@@ -2654,7 +2786,7 @@ fn validate_prepared_state(
         controldata_executable,
         expected_uid,
     )?;
-    let hba_file = validate_hba_file(&config.hba_file, expected_uid)?;
+    let hba_file = validate_hba_file(&config.hba_file, expected_uid, config.role)?;
     let socket_dir = if create_socket_dir {
         ensure_socket_dir(&config.socket_dir, expected_uid)?
     } else {
@@ -3254,12 +3386,23 @@ fn control_data_state_name(state: ControlDataState) -> &'static str {
     }
 }
 
-fn validate_hba_file(path: &Path, expected_uid: u32) -> Result<FileSnapshot, PostgresError> {
-    let metadata = strict_metadata("PostgreSQL quarantine HBA file", path)?;
-    require_regular("PostgreSQL quarantine HBA file", path, &metadata)?;
+fn validate_hba_file(
+    path: &Path,
+    expected_uid: u32,
+    role: PostgresRuntimeRole,
+) -> Result<FileSnapshot, PostgresError> {
+    let name = hba_policy_name(role);
+    let expected_contents = match role {
+        PostgresRuntimeRole::Quarantine => QUARANTINE_HBA_CONTENT,
+        PostgresRuntimeRole::ReplicationBootstrapPrimary => {
+            REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT
+        }
+    };
+    let metadata = strict_metadata(name, path)?;
+    require_regular(name, path, &metadata)?;
     if metadata.uid() != 0 && metadata.uid() != expected_uid {
         return Err(PostgresError::WrongOwner {
-            name: "PostgreSQL quarantine HBA file",
+            name,
             path: path.to_owned(),
             actual: metadata.uid(),
             expected: expected_uid,
@@ -3268,31 +3411,46 @@ fn validate_hba_file(path: &Path, expected_uid: u32) -> Result<FileSnapshot, Pos
     let mode = metadata.permissions().mode() & 0o7_777;
     if mode & 0o022 != 0 || (metadata.uid() == expected_uid && mode & 0o200 != 0) {
         return Err(PostgresError::UnsafePermissions {
-            name: "PostgreSQL quarantine HBA file",
+            name,
             path: path.to_owned(),
             mode,
             expected: "not writable by the runtime identity, group, or world",
         });
     }
-    if metadata.len() != QUARANTINE_HBA_CONTENT.len() as u64 {
-        return Err(PostgresError::InvalidQuarantineHba {
-            path: path.to_owned(),
-        });
+    if metadata.len() != expected_contents.len() as u64 {
+        return Err(invalid_hba(role, path));
     }
     let contents = fs::read(path).map_err(|source| PostgresError::Read {
-        name: "PostgreSQL quarantine HBA file",
+        name,
         path: path.to_owned(),
         source,
     })?;
-    if contents != QUARANTINE_HBA_CONTENT {
-        return Err(PostgresError::InvalidQuarantineHba {
-            path: path.to_owned(),
-        });
+    if contents != expected_contents {
+        return Err(invalid_hba(role, path));
     }
-    Ok(file_snapshot(&strict_metadata(
-        "PostgreSQL quarantine HBA file",
-        path,
-    )?))
+    Ok(file_snapshot(&strict_metadata(name, path)?))
+}
+
+fn hba_policy_name(role: PostgresRuntimeRole) -> &'static str {
+    match role {
+        PostgresRuntimeRole::Quarantine => "PostgreSQL quarantine HBA file",
+        PostgresRuntimeRole::ReplicationBootstrapPrimary => {
+            "PostgreSQL replication-bootstrap-primary HBA file"
+        }
+    }
+}
+
+fn invalid_hba(role: PostgresRuntimeRole, path: &Path) -> PostgresError {
+    match role {
+        PostgresRuntimeRole::Quarantine => PostgresError::InvalidQuarantineHba {
+            path: path.to_owned(),
+        },
+        PostgresRuntimeRole::ReplicationBootstrapPrimary => {
+            PostgresError::InvalidReplicationBootstrapPrimaryHba {
+                path: path.to_owned(),
+            }
+        }
+    }
 }
 
 fn ensure_socket_dir(path: &Path, expected_uid: u32) -> Result<FileSnapshot, PostgresError> {
@@ -3517,7 +3675,7 @@ pub enum PostgresConfigError {
     },
     /// The immutable deny-all HBA policy was placed in mutable runtime state.
     #[error(
-        "PostgreSQL quarantine HBA file {hba_file:?} must not be stored inside PGDATA or the socket directory"
+        "PostgreSQL supervision HBA file {hba_file:?} must not be stored inside PGDATA or the socket directory"
     )]
     MutableHbaFile {
         /// Rejected HBA path.
@@ -3636,7 +3794,7 @@ pub enum PostgresError {
     },
     /// Durable state crossed a mount boundary inside PGDATA.
     #[error(
-        "{name} at {path:?} is on mount {actual}, but PGDATA is on mount {expected}; quarantine requires one PGDATA volume"
+        "{name} at {path:?} is on mount {actual}, but PGDATA is on mount {expected}; supervision requires one PGDATA volume"
     )]
     ExternalMount {
         /// State being inspected.
@@ -3772,23 +3930,23 @@ pub enum PostgresError {
         /// Rejected `PostgreSQL` control-file state.
         state: &'static str,
     },
-    /// The control file is not in a complete primary state that quarantine may recover.
-    #[error("PostgreSQL control-file state {state:?} is not safe for quarantine startup")]
+    /// The control file is not in a complete primary state that supervision may recover.
+    #[error("PostgreSQL control-file state {state:?} is not safe for supervised startup")]
     UnsafeControlState {
         /// Rejected `PostgreSQL` control-file state.
         state: &'static str,
     },
-    /// Role-aware standby, archive, or base-backup recovery is outside quarantine mode.
+    /// Role-aware standby, archive, or base-backup recovery is outside this runtime role.
     #[error(
-        "PostgreSQL recovery state {path:?} is not supported in quarantine mode; a role-aware orchestrator must handle this state before startup"
+        "PostgreSQL recovery state {path:?} is not supported by this supervision role; a role-aware orchestrator must handle this state before startup"
     )]
     RecoveryStatePresent {
         /// Recovery marker that prevented process creation.
         path: PathBuf,
     },
-    /// User tablespaces escape the single-volume quarantine boundary.
+    /// User tablespaces escape the single-volume supervision boundary.
     #[error(
-        "PostgreSQL tablespace entry {path:?} is not supported in quarantine mode; Milestone 1 requires all database state inside PGDATA"
+        "PostgreSQL tablespace entry {path:?} is not supported by supervised modes; Milestone 1 requires all database state inside PGDATA"
     )]
     TablespacePresent {
         /// Entry that prevented process creation.
@@ -3799,6 +3957,14 @@ pub enum PostgresError {
         "PostgreSQL quarantine HBA file {path:?} must contain only the built-in generation-publisher and reject policy"
     )]
     InvalidQuarantineHba {
+        /// Rejected HBA path.
+        path: PathBuf,
+    },
+    /// The HBA policy was not the exact replication-role-plus-reject policy.
+    #[error(
+        "PostgreSQL replication-bootstrap-primary HBA file {path:?} must allow only the fixed SCRAM replication role and the built-in local publisher"
+    )]
+    InvalidReplicationBootstrapPrimaryHba {
         /// Rejected HBA path.
         path: PathBuf,
     },
@@ -3828,6 +3994,9 @@ pub enum PostgresError {
     /// The final process-creation guard no longer proves writable authority.
     #[error("PostgreSQL startup authority is absent or inside its fencing margin")]
     StartupAuthorityMissing,
+    /// A role that opens replication TCP was sent through direct supervision.
+    #[error("PostgreSQL replication-bootstrap-primary mode requires writable-term Lease authority")]
+    WritableAuthorityRequired,
     /// Attempt-private authority changed while its durable generation was flushed.
     #[error("PostgreSQL startup authority changed during durable generation publication")]
     StartupAuthorityChanged,
@@ -3888,7 +4057,7 @@ pub enum PostgresError {
         /// Operating-system error.
         source: std::io::Error,
     },
-    /// WAL-backed generation publication failed while `PostgreSQL` was quarantined.
+    /// WAL-backed generation publication failed while `PostgreSQL` was non-serving.
     #[error("publish WAL-backed PostgreSQL writable generation: {0}")]
     PublishWritableGeneration(#[from] PostgresGenerationError),
     /// WAL-backed generation publication did not finish within the startup bound.
@@ -4771,21 +4940,23 @@ mod tests {
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect unsafe HBA fixture");
         assert!(matches!(
-            validate_hba_file(&hba, geteuid().as_raw()),
+            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine),
             Err(PostgresError::InvalidQuarantineHba { .. })
         ));
 
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o600)).expect("make HBA replaceable");
         fs::write(&hba, QUARANTINE_HBA_CONTENT).expect("write deny-all HBA");
         assert!(matches!(
-            validate_hba_file(&hba, geteuid().as_raw()),
+            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine),
             Err(PostgresError::UnsafePermissions {
                 name: "PostgreSQL quarantine HBA file",
                 ..
             })
         ));
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400)).expect("protect deny-all HBA");
-        assert!(validate_hba_file(&hba, geteuid().as_raw()).is_ok());
+        assert!(
+            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine).is_ok()
+        );
 
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o600)).expect("resize HBA");
         OpenOptions::new()
@@ -4797,8 +4968,46 @@ mod tests {
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect oversized HBA");
         assert!(matches!(
-            validate_hba_file(&hba, geteuid().as_raw()),
+            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine),
             Err(PostgresError::InvalidQuarantineHba { .. })
+        ));
+    }
+
+    #[test]
+    fn replication_bootstrap_primary_hba_allows_only_fixed_scram_replication_role() {
+        let fixture = TempDir::new().expect("create HBA fixture");
+        let hba = fixture
+            .path()
+            .join("replication-bootstrap-primary.pg_hba.conf");
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+            .expect("protect replication HBA");
+        assert!(
+            validate_hba_file(
+                &hba,
+                geteuid().as_raw(),
+                PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine),
+            Err(PostgresError::InvalidQuarantineHba { .. })
+        ));
+
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o600))
+            .expect("make replication HBA replaceable");
+        fs::write(&hba, b"host all all 0.0.0.0/0 scram-sha-256\n")
+            .expect("write ordinary-client HBA");
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+            .expect("protect ordinary-client HBA");
+        assert!(matches!(
+            validate_hba_file(
+                &hba,
+                geteuid().as_raw(),
+                PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            ),
+            Err(PostgresError::InvalidReplicationBootstrapPrimaryHba { .. })
         ));
     }
 
@@ -5098,6 +5307,95 @@ mod tests {
                 "missing {required:?}"
             );
         }
+    }
+
+    #[test]
+    fn replication_bootstrap_primary_command_opens_only_physical_replication_paths() {
+        let fixture = pgdata_fixture();
+        let executable = fixture.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let runtime = TempDir::new().expect("create runtime fixture");
+        let socket = runtime.path().join("socket");
+        let hba = runtime
+            .path()
+            .join("replication-bootstrap-primary.pg_hba.conf");
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+            .expect("protect replication HBA");
+        let config = PostgresConfig::new_replication_bootstrap_primary(
+            fixture.path().to_owned(),
+            executable,
+            socket,
+            hba,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid replication-bootstrap-primary config");
+        assert_eq!(
+            config.starting_process_state(),
+            PostgresProcessState::StartingReplicationBootstrap
+        );
+        assert_eq!(
+            config.running_process_state(),
+            PostgresProcessState::RunningReplicationBootstrap
+        );
+        let prepared = prepare_fixture(config).expect("prepare replication bootstrap primary");
+        let command = prepared.command();
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        for required in [
+            "listen_addresses=*",
+            "max_wal_senders=3",
+            "max_replication_slots=2",
+            "wal_level=logical",
+            "synchronous_standby_names=",
+            "synchronous_commit=local",
+            "archive_mode=off",
+        ] {
+            assert!(
+                arguments.contains(&OsStr::new(required)),
+                "missing {required:?}"
+            );
+        }
+        for forbidden in ["listen_addresses=", "max_wal_senders=0"] {
+            assert!(
+                !arguments.contains(&OsStr::new(forbidden)),
+                "replication bootstrap primary retained quarantine setting {forbidden:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_supervision_refuses_replication_bootstrap_primary_without_writable_authority() {
+        let fixture = pgdata_fixture();
+        let executable = fixture.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let runtime = TempDir::new().expect("create runtime fixture");
+        let socket = runtime.path().join("socket");
+        let hba = runtime
+            .path()
+            .join("replication-bootstrap-primary.pg_hba.conf");
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+            .expect("protect replication HBA");
+        let config = PostgresConfig::new_replication_bootstrap_primary(
+            fixture.path().to_owned(),
+            executable,
+            socket,
+            hba,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid replication-bootstrap-primary config");
+        let prepared = prepare_fixture(config).expect("prepare replication bootstrap primary");
+
+        assert!(matches!(
+            prepared
+                .supervise(agent_state(), std::future::pending())
+                .await,
+            Err(PostgresError::WritableAuthorityRequired)
+        ));
     }
 
     #[test]
