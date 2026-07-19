@@ -443,6 +443,155 @@ func TestReconcileCreatesSingleMemberPrimariesWithPerShardImmutableCredentials(t
 	}
 }
 
+func TestPostgreSQLRuntimeChangeIsRejectedBeforeOnDeleteMutation(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name          string
+		staleTemplate bool
+		wantObject    string
+	}{
+		{name: "existing direct StatefulSet", wantObject: "StatefulSet"},
+		{name: "agent template over live direct Pod", staleTemplate: true, wantObject: "Pod"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			base := newFakeClient(t, cluster)
+			reconciler := developmentReconciler(base, base)
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+				t.Fatal(err)
+			}
+
+			statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
+			statefulSet := &appsv1.StatefulSet{}
+			if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
+				t.Fatal(err)
+			}
+			originalTemplate := statefulSet.Spec.Template.DeepCopy()
+			pod := &corev1.Pod{ObjectMeta: *originalTemplate.ObjectMeta.DeepCopy(), Spec: *originalTemplate.Spec.DeepCopy()}
+			pod.Name = statefulSet.Name + "-0"
+			pod.Namespace = cluster.Namespace
+			pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))}
+			if err := base.Create(ctx, pod); err != nil {
+				t.Fatal(err)
+			}
+
+			agentImages := owned.DevelopmentImages()
+			agentImages.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+			// Corrupt only the durable checkpoint to the requested runtime so this
+			// test continues exercising the live workload defense independently.
+			currentCluster := getCluster(t, ctx, base, cluster)
+			currentCluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine.String()
+			if err := base.Status().Update(ctx, currentCluster); err != nil {
+				t.Fatal(err)
+			}
+			if test.staleTemplate {
+				plan, err := owned.Plan(currentCluster, agentImages)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, planned := range plan {
+					desired, ok := planned.(*appsv1.StatefulSet)
+					if !ok || desired.Name != statefulSet.Name {
+						continue
+					}
+					statefulSet.Spec.Template = *desired.Spec.Template.DeepCopy()
+				}
+				if err := base.Update(ctx, statefulSet); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			reconciler.Images = agentImages
+			_, err := reconciler.Reconcile(ctx, requestFor(cluster))
+			if err == nil || !strings.Contains(err.Error(), test.wantObject+" "+statefulSet.Name) || !strings.Contains(err.Error(), "runtime selection is fixed at workload creation") {
+				t.Fatalf("runtime transition error = %v", err)
+			}
+			currentPod := &corev1.Pod{}
+			if err := base.Get(ctx, client.ObjectKeyFromObject(pod), currentPod); err != nil {
+				t.Fatal(err)
+			}
+			if observed, err := owned.ObservePostgreSQLRuntime(currentPod.Annotations, currentPod.Spec); err != nil || observed != owned.PostgreSQLRuntimeDirect {
+				t.Fatalf("live direct Pod changed after rejected runtime transition: %q, %v", observed, err)
+			}
+			currentStatefulSet := &appsv1.StatefulSet{}
+			if err := base.Get(ctx, statefulSetKey, currentStatefulSet); err != nil {
+				t.Fatal(err)
+			}
+			if !test.staleTemplate && !reflect.DeepEqual(currentStatefulSet.Spec.Template, *originalTemplate) {
+				t.Fatal("rejected runtime transition mutated the OnDelete StatefulSet template")
+			}
+		})
+	}
+}
+
+func TestPostgreSQLRuntimeChangeIsRejectedAfterWorkloadDeletion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	agentImages := owned.DevelopmentImages()
+	agentImages.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	reconciler.Images = agentImages
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+
+	currentCluster := getCluster(t, ctx, base, cluster)
+	if got := currentCluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime; got != owned.PostgreSQLRuntimeAgentQuarantine.String() {
+		t.Fatalf("durable PostgreSQL runtime = %q, want agent-quarantine", got)
+	}
+	statefulSet := &appsv1.StatefulSet{}
+	statefulSetKey := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLShardStatefulSetName(cluster.Name, 0)}
+	if err := base.Get(ctx, statefulSetKey, statefulSet); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, statefulSet); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler.Images = owned.DevelopmentImages()
+	_, err := reconciler.Reconcile(ctx, requestFor(cluster))
+	if err == nil || !strings.Contains(err.Error(), "durable PostgreSQL runtime is \"agent-quarantine\"") || !strings.Contains(err.Error(), "manager requested \"direct\"") {
+		t.Fatalf("runtime transition error after workload deletion = %v", err)
+	}
+	if err := base.Get(ctx, statefulSetKey, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("rejected runtime transition recreated StatefulSet: %v", err)
+	}
+}
+
+func TestLegacyRuntimeCheckpointMigratesToDirectBeforeFlagValidation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeDirect)
+	cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime = ""
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	agentImages := owned.DevelopmentImages()
+	agentImages.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	reconciler.Images = agentImages
+
+	_, err := reconciler.Reconcile(ctx, requestFor(cluster))
+	if err == nil || !strings.Contains(err.Error(), "durable PostgreSQL runtime is \"direct\"") || !strings.Contains(err.Error(), "manager requested \"agent-quarantine\"") {
+		t.Fatalf("legacy runtime transition error = %v", err)
+	}
+	if got := getCluster(t, ctx, base, cluster).Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime; got != owned.PostgreSQLRuntimeDirect.String() {
+		t.Fatalf("migrated legacy PostgreSQL runtime = %q, want direct", got)
+	}
+}
+
 func TestRoleNeutralPostgreSQLIdentityMigrationNeverPublishesTwoControllers(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1518,7 +1667,7 @@ func TestReconcileMigratesOnlyEmptyLegacyDatabaseTopologyCheckpoint(t *testing.T
 			if declared {
 				cluster.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{{Name: "app", Shards: 1, Cells: []int32{0}}}
 			}
-			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
+			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeDirect)
 			cluster.Status.PostgreSQLBootstrapSpec.DatabaseTopologySHA256 = ""
 			fakeClient := newFakeClient(t, cluster)
 			_, err := developmentReconciler(fakeClient, nil).Reconcile(ctx, requestFor(cluster))
@@ -2197,7 +2346,7 @@ func TestPostgreSQLPodTerminationFenceRequiresAuthenticatedKubeletAttestation(t 
 	cluster.Spec.Shards = 1
 	cluster.Spec.MembersPerShard = 1
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
-	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeDirect)
 	bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{
 		Shard: 0, PVCName: "recorded-data", PVCUID: "recorded-data-uid",
 		SecretName: "recorded-secret", SecretUID: "recorded-secret-uid", PVCFenceDetached: true,
@@ -2340,7 +2489,7 @@ func TestFinalizationRefusesUncheckpointedDeletingPVCWithoutCredentialFence(t *t
 			t.Parallel()
 			cluster := validCluster()
 			cluster.Spec.Storage.DeletionPolicy = policy
-			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
+			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeDirect)
 			bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{
 				Shard: 0, SecretName: "expected-secret", SecretUID: "expected-secret-uid", PVCFenceDetached: true,
 				PVCName: "deleting-collision", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
@@ -2906,7 +3055,7 @@ func TestFinalizationDoesNotCreateDataBeforeCredentialCheckpoint(t *testing.T) {
 			t.Parallel()
 			cluster := validCluster()
 			cluster.Spec.Storage.DeletionPolicy = policy
-			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
+			cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeDirect)
 			cluster.Status.PostgreSQLBootstraps = []pgshardv1alpha1.PostgreSQLBootstrapStatus{{
 				Shard: 0, SecretName: "intent-secret", PVCName: "intent-data", PVCStorageClassName: cluster.Spec.Storage.StorageClassName,
 			}}

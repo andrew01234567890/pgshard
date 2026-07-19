@@ -1163,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_renewal_revokes_the_previously_reported_term() {
+    fn wall_clock_regression_preserves_later_monotonic_renewal() {
         let config = config();
         let state =
             AgentState::with_identity(config.identity.clone(), 10_000).expect("valid agent state");
@@ -1184,7 +1184,7 @@ mod tests {
         let later_valid_from = initial_valid_from
             .checked_add(Duration::from_secs(1))
             .expect("test instant can advance");
-        let rejected = AuthorityObservation {
+        let renewal = AuthorityObservation {
             epoch: 1,
             valid_from_unix_ms: 500,
             valid_until_unix_ms: 6_500,
@@ -1192,14 +1192,18 @@ mod tests {
             observed_at: later_valid_from,
             delay: config.retry_period,
         };
-        assert!(matches!(
-            install_authority(&state, &config, &rejected),
-            Err(WritableLeaseError::AgentState(
-                LeaseInstallError::RegressiveExpiry
-            ))
-        ));
-        assert!(state.snapshot().lease.is_none());
-        assert!(state.lease_deadline().is_none());
+        install_authority(&state, &config, &renewal).expect("later monotonic renewal");
+        assert_eq!(
+            state
+                .snapshot()
+                .lease
+                .map(|lease| lease.valid_until_unix_ms),
+            Some(7_000)
+        );
+        assert_eq!(
+            state.lease_deadline(),
+            Some(initial_valid_from + Duration::from_secs(7))
+        );
     }
 
     #[test]

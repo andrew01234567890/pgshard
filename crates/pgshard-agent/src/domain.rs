@@ -226,7 +226,9 @@ impl AgentState {
     /// # Errors
     ///
     /// Returns an error for the wrong instance, a reserved or stale epoch, or a
-    /// renewal that shortens the existing authorization.
+    /// renewal that shortens the existing monotonic authorization. Wall-clock
+    /// expiry is status-only and is clamped when the system clock moves
+    /// backwards.
     pub fn install_lease(
         &self,
         lease: FencingLease,
@@ -242,7 +244,7 @@ impl AgentState {
     /// response latency consumes rather than extends the lease.
     pub(crate) fn install_lease_at(
         &self,
-        lease: FencingLease,
+        mut lease: FencingLease,
         valid_from_unix_ms: u64,
         valid_from: Instant,
         observed_at: Instant,
@@ -295,9 +297,6 @@ impl AgentState {
         if let Some(current) = inner.snapshot.lease.as_ref()
             && lease.epoch == current.epoch
         {
-            if lease.valid_until_unix_ms < current.valid_until_unix_ms {
-                return Err(LeaseInstallError::RegressiveExpiry);
-            }
             let current_deadline = inner
                 .lease_deadline
                 .filter(|deadline| deadline.epoch == current.epoch)
@@ -305,6 +304,7 @@ impl AgentState {
             if expires_at < current_deadline.expires_at {
                 return Err(LeaseInstallError::RegressiveDeadline);
             }
+            lease.valid_until_unix_ms = lease.valid_until_unix_ms.max(current.valid_until_unix_ms);
             if lease.valid_until_unix_ms == current.valid_until_unix_ms
                 && expires_at == current_deadline.expires_at
             {
@@ -466,9 +466,6 @@ pub enum LeaseInstallError {
         /// Minimum safe next term.
         minimum: u64,
     },
-    /// A renewal cannot reduce its current expiration.
-    #[error("lease renewal cannot shorten its expiration")]
-    RegressiveExpiry,
     /// A monotonic lease deadline could not be represented.
     #[error("fencing lease monotonic deadline overflowed")]
     DeadlineOverflow,
@@ -966,6 +963,51 @@ mod tests {
                 now,
             ),
             Err(LeaseInstallError::RegressiveDeadline)
+        );
+    }
+
+    #[test]
+    fn renewal_clamps_status_expiry_when_wall_clock_moves_backwards() {
+        let state = state();
+        let initial_valid_from = Instant::now();
+        assert_eq!(
+            state.install_lease_at(
+                FencingLease {
+                    owner_instance: "instance-1".to_owned(),
+                    epoch: 3,
+                    valid_until_unix_ms: 7_000,
+                },
+                1_000,
+                initial_valid_from,
+                initial_valid_from,
+            ),
+            Ok(LeaseInstallOutcome::Installed)
+        );
+
+        let later_valid_from = initial_valid_from + Duration::from_secs(1);
+        assert_eq!(
+            state.install_lease_at(
+                FencingLease {
+                    owner_instance: "instance-1".to_owned(),
+                    epoch: 3,
+                    valid_until_unix_ms: 6_500,
+                },
+                500,
+                later_valid_from,
+                later_valid_from,
+            ),
+            Ok(LeaseInstallOutcome::Renewed)
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .lease
+                .map(|lease| lease.valid_until_unix_ms),
+            Some(7_000)
+        );
+        assert_eq!(
+            state.lease_deadline(),
+            Some(initial_valid_from + Duration::from_secs(7))
         );
     }
 

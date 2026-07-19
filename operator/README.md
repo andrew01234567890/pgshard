@@ -230,9 +230,30 @@ universes. The orchestrator's dedicated ServiceAccount may only `get` and
 `update` its exact Lease name. Each cell also has a dedicated, role-neutral
 ServiceAccount with token automount disabled and an exact-name Role/RoleBinding
 limited to `get` and `update` on that cell's Lease. PostgreSQL Pods do not mount
-that identity or run the writable-term agent path, so these cell envelopes are
-not evidence of promotion, self-fencing, or HA. Durable topology and operation
-state stays in PostgreSQL rather than any Lease. During
+that identity in the default `direct` runtime. The explicit operator flag
+`--postgresql-runtime=agent-quarantine` instead runs the digest-pinned agent
+image as the PostgreSQL container, selects the cell ServiceAccount, and mounts
+only a 600-second projected API token, the namespace CA, and namespace name.
+It passes the checkpointed Lease UID plus downward-API Pod identity to the
+agent, mounts the parent runtime directory so UID 999 can create a private
+`0700` socket child, and deliberately keeps the Pod unready and PostgreSQL off
+TCP. If Lease coordination is lost, the agent clears its local term, fully
+fences PostgreSQL, keeps `/healthz` available while `/readyz` remains failed,
+and retries with bounded backoff. A recovered attempt uses a fresh process
+incarnation and takes a higher term in the same container. Same-term monotonic
+authority can advance across a backward wall-clock step; the reported
+wall-clock expiry is status-only and never authorizes PostgreSQL. This
+integration mode is diagnostic and non-serving; neither mode is
+evidence of promotion or HA. Durable topology and operation state stays in
+PostgreSQL rather than any Lease. Runtime selection is a creation-time workload
+contract checkpointed in cluster status before any credential or data volume
+is created. The controller rejects a different manager selection even when the
+StatefulSet and Pod are absent, and also reads both objects through the
+authoritative API path before planning. If either carries a different runtime,
+reconciliation fails before mutating the template; changing the manager flag
+therefore cannot leave an old direct server running under a quarantine-shaped
+template or reinterpret retained storage after workload deletion. A future
+fenced replacement workflow is required to change modes. During
 an upgrade from the retired development etcd layout, normal pruning first
 removes the old StatefulSet. Uncached API reads must then prove that controller
 and all three exact Pods absent before the operator validates and deletes only
@@ -472,13 +493,21 @@ Lease and reports `pgshard_orch_leader 1`; followers remain ready but never
 claim leadership. The operator also checkpoints one empty writable-term Lease
 per requested physical cell and creates an unmounted least-privilege API
 identity for its future agents, but no PostgreSQL agent is configured to hold
-one.
-The pooler remains unready, application Services
-have no ready endpoints, no PostgreSQL workload is created, and the cluster
-reports `Ready=False` with `PostgreSQLHAUnavailable`. Orchestrator readiness is
-process-incarnation evidence only: durable operation records, shard-term
-authority, and automated failover are not implemented. The named backup PVC is
-only validated configuration; no backup job or repository is created.
+one by default. A manager started explicitly with
+`--postgresql-runtime=agent-quarantine` composes the bounded token and exact
+Lease identity into each singleton PostgreSQL Pod, but those Pods intentionally
+remain unready and expose no PostgreSQL TCP listener. The manager end-to-end
+test also removes a cell's exact Lease permissions, proves PostgreSQL is fenced
+while the agent stays healthy, restores reconciliation, and requires a higher
+term plus repeated renewals in the same Pod and container without a restart.
+
+For the multi-member development sample above, the pooler remains unready,
+application Services have no ready endpoints, no PostgreSQL workload is
+created, and the cluster reports `Ready=False` with
+`PostgreSQLHAUnavailable`. Orchestrator readiness is process-incarnation
+evidence only: durable operation records, shard-term authority, and automated
+failover are not implemented. The named backup PVC is only validated
+configuration; no backup job or repository is created.
 The manager end-to-end test also pauses reconciliation, deletes the Lease, and
 proves the same orchestrator Pod incarnations lose readiness without restarting.
 Because a recreated Lease has a new API UID, those processes stay fail closed;

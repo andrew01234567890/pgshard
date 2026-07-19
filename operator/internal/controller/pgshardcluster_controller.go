@@ -193,6 +193,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	if err := r.validatePostgreSQLRuntimeContract(ctx, cluster, images.PostgreSQLRuntime); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PostgreSQLRuntimeChangeRejected", fmt.Sprintf("PostgreSQL runtime selection is unsafe: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	if err := r.verifyPostgreSQLPodFencingNamespace(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing is unavailable: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
@@ -295,6 +299,83 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		return ctrl.Result{RequeueAfter: bootstrapIntegrityInterval}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// validatePostgreSQLRuntimeContract prevents a manager flag change from
+// silently changing only an OnDelete StatefulSet template while its old Pod
+// keeps running. Runtime transitions require a future explicitly fenced
+// replacement workflow; this controller only composes the selected runtime for
+// a workload that does not exist yet.
+func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, desired owned.PostgreSQLRuntime) error {
+	if cluster.Spec.MembersPerShard != 1 {
+		return nil
+	}
+	desired = owned.PostgreSQLRuntime(desired.String())
+	recorded := cluster.Status.PostgreSQLBootstrapSpec
+	if recorded == nil {
+		cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, desired)
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint PostgreSQL runtime contract: %w", err)
+		}
+		recorded = cluster.Status.PostgreSQLBootstrapSpec
+	} else if recorded.PostgreSQLRuntime == "" {
+		// Releases before agent-quarantine could only create the direct runtime.
+		// Persist that fact before considering the current manager flag so an
+		// upgrade cannot reinterpret existing data after workload deletion.
+		recorded.PostgreSQLRuntime = owned.PostgreSQLRuntimeDirect.String()
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint legacy direct PostgreSQL runtime: %w", err)
+		}
+	}
+	if recorded.PostgreSQLRuntime != desired.String() {
+		return fmt.Errorf("durable PostgreSQL runtime is %q, but the manager requested %q; runtime selection is fixed at workload creation until a fenced replacement workflow exists", recorded.PostgreSQLRuntime, desired)
+	}
+	reader := r.authoritativeReader()
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		for _, name := range []string{
+			owned.PostgreSQLShardStatefulSetName(cluster.Name, shard),
+			owned.LegacyPostgreSQLPrimaryStatefulSetName(cluster.Name, shard),
+		} {
+			statefulSet := &appsv1.StatefulSet{}
+			err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet)
+			if err == nil {
+				if !metav1.IsControlledBy(statefulSet, cluster) {
+					return fmt.Errorf("StatefulSet %s is not controlled by PgShardCluster UID %s", name, cluster.UID)
+				}
+				observed, observeErr := owned.ObservePostgreSQLRuntime(statefulSet.Spec.Template.Annotations, statefulSet.Spec.Template.Spec)
+				if observeErr != nil {
+					return fmt.Errorf("observe StatefulSet %s runtime: %w", name, observeErr)
+				}
+				if observed != desired {
+					return postgresqlRuntimeChangeError("StatefulSet", name, observed, desired)
+				}
+			} else if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("read StatefulSet %s runtime: %w", name, err)
+			}
+
+			podName := name + "-0"
+			pod := &corev1.Pod{}
+			err = reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: podName}, pod)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("read Pod %s runtime: %w", podName, err)
+			}
+			observed, observeErr := owned.ObservePostgreSQLRuntime(pod.Annotations, pod.Spec)
+			if observeErr != nil {
+				return fmt.Errorf("observe Pod %s runtime: %w", podName, observeErr)
+			}
+			if observed != desired {
+				return postgresqlRuntimeChangeError("Pod", podName, observed, desired)
+			}
+		}
+	}
+	return nil
+}
+
+func postgresqlRuntimeChangeError(kind, name string, observed, desired owned.PostgreSQLRuntime) error {
+	return fmt.Errorf("%s %s uses PostgreSQL runtime %q, but the manager requested %q; runtime selection is fixed at workload creation until a fenced replacement workflow exists", kind, name, observed, desired)
 }
 
 // ensurePostgreSQLWritableLeases creates one empty, operator-owned Lease
@@ -595,10 +676,7 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLBootstrap(ctx context.Context
 		if cluster.Spec.MembersPerShard != 1 {
 			return nil
 		}
-		cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster)
-		if err := r.Status().Update(ctx, cluster); err != nil {
-			return fmt.Errorf("checkpoint PostgreSQL provisioned spec: %w", err)
-		}
+		return fmt.Errorf("PostgreSQL runtime contract must be checkpointed before provisioning")
 	} else if cluster.Status.PostgreSQLBootstrapSpec.DatabaseTopologySHA256 == "" {
 		if len(cluster.Spec.Databases) != 0 {
 			return fmt.Errorf("recorded PostgreSQL bootstrap spec predates the declared database topology; explicit recovery is required")
@@ -1124,9 +1202,10 @@ func isDefaultStorageClass(annotations map[string]string) bool {
 		annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true"
 }
 
-func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) *pgshardv1alpha1.PostgreSQLBootstrapSpecStatus {
+func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster, postgresqlRuntime owned.PostgreSQLRuntime) *pgshardv1alpha1.PostgreSQLBootstrapSpecStatus {
 	return &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
 		Shards: cluster.Spec.Shards, MembersPerShard: cluster.Spec.MembersPerShard, Durability: cluster.Spec.Durability,
+		PostgreSQLRuntime:      postgresqlRuntime.String(),
 		DatabaseTopologySHA256: cluster.Spec.DatabaseTopologySHA256(),
 		StorageSize:            cluster.Spec.Storage.Size.String(), StorageClassName: copyOptionalString(cluster.Spec.Storage.StorageClassName), DeletionPolicy: storageDeletionPolicy(cluster),
 	}
@@ -1134,7 +1213,7 @@ func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) *pgshardv1alph
 
 func validateBootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) error {
 	recorded := cluster.Status.PostgreSQLBootstrapSpec
-	wanted := bootstrapSpecStatus(cluster)
+	wanted := bootstrapSpecStatus(cluster, owned.PostgreSQLRuntime(recorded.PostgreSQLRuntime))
 	if !bootstrapSpecsEqual(recorded, wanted) {
 		return fmt.Errorf("current topology or storage differs from the provisioned PostgreSQL bootstrap spec; an explicit transition is required")
 	}
@@ -3295,7 +3374,7 @@ func bootstrapSpecsEqual(left, right *pgshardv1alpha1.PostgreSQLBootstrapSpecSta
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.DatabaseTopologySHA256 == right.DatabaseTopologySHA256 && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName) && left.DeletionPolicy == right.DeletionPolicy
+	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.PostgreSQLRuntime == right.PostgreSQLRuntime && left.DatabaseTopologySHA256 == right.DatabaseTopologySHA256 && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName) && left.DeletionPolicy == right.DeletionPolicy
 }
 
 func postgreSQLBootstrapsEqual(left, right pgshardv1alpha1.PostgreSQLBootstrapStatus) bool {

@@ -32,13 +32,14 @@ import (
 )
 
 const (
-	ManagedByLabel = "app.kubernetes.io/managed-by"
-	InstanceLabel  = "app.kubernetes.io/instance"
-	ComponentLabel = "app.kubernetes.io/component"
-	ClusterLabel   = "pgshard.io/cluster"
-	ShardLabel     = "pgshard.io/shard"
-	RoleLabel      = "pgshard.io/role"
-	MemberLabel    = "pgshard.io/member"
+	ManagedByLabel              = "app.kubernetes.io/managed-by"
+	InstanceLabel               = "app.kubernetes.io/instance"
+	ComponentLabel              = "app.kubernetes.io/component"
+	ClusterLabel                = "pgshard.io/cluster"
+	ShardLabel                  = "pgshard.io/shard"
+	RoleLabel                   = "pgshard.io/role"
+	MemberLabel                 = "pgshard.io/member"
+	PostgreSQLRuntimeAnnotation = "pgshard.io/postgresql-runtime"
 
 	ManagedByValue = "pgshard-operator"
 	// ClusterResourceFinalizer protects operator-owned resources and marks a
@@ -1339,14 +1340,147 @@ cleanup_bootstrap_runtime
 sync "$final" "$parent" "$volume_root"
 `
 
-// Images contains the deployable images used by the supporting workloads.
-// Image references are controller configuration, not part of the cluster API,
-// so changing a controller release does not mutate the user's database spec.
+// Images contains controller-owned workload composition inputs. Image
+// references and the PostgreSQL runtime mode are controller configuration, not
+// part of the cluster API, so changing a controller release does not mutate the
+// user's database spec.
 type Images struct {
 	Orchestrator        string
 	Pooler              string
 	PostgreSQL          string
 	PostgreSQLBootstrap string
+	PostgreSQLRuntime   PostgreSQLRuntime
+}
+
+// PostgreSQLRuntime selects the controller-owned process composition. Direct
+// preserves the currently serving singleton foundation. AgentQuarantine is an
+// explicit non-serving integration boundary used to validate projected API
+// identity, writable-term Lease coordination, and target-side process fencing
+// before serving activation is implemented.
+type PostgreSQLRuntime string
+
+const (
+	PostgreSQLRuntimeDirect          PostgreSQLRuntime = "direct"
+	PostgreSQLRuntimeAgentQuarantine PostgreSQLRuntime = "agent-quarantine"
+)
+
+// String implements flag.Value without turning an empty zero value into an
+// invalid default.
+func (runtime PostgreSQLRuntime) String() string {
+	if runtime == "" {
+		return string(PostgreSQLRuntimeDirect)
+	}
+	return string(runtime)
+}
+
+// Set validates one explicit operator process-composition mode.
+func (runtime *PostgreSQLRuntime) Set(value string) error {
+	requested := PostgreSQLRuntime(value)
+	if requested != PostgreSQLRuntimeDirect && requested != PostgreSQLRuntimeAgentQuarantine {
+		return fmt.Errorf("PostgreSQL runtime must be %q or %q", PostgreSQLRuntimeDirect, PostgreSQLRuntimeAgentQuarantine)
+	}
+	*runtime = requested
+	return nil
+}
+
+func (runtime PostgreSQLRuntime) agentQuarantine() bool {
+	return runtime == PostgreSQLRuntimeAgentQuarantine
+}
+
+// ObservePostgreSQLRuntime classifies the process composition carried by an
+// existing StatefulSet template or Pod. Missing annotations are accepted only
+// for the legacy direct shape, so an operator upgrade can retain an existing
+// direct singleton without silently adopting an agent runtime.
+func ObservePostgreSQLRuntime(annotations map[string]string, spec corev1.PodSpec) (PostgreSQLRuntime, error) {
+	var postgres *corev1.Container
+	for index := range spec.Containers {
+		if spec.Containers[index].Name != "postgresql" {
+			continue
+		}
+		if postgres != nil {
+			return "", fmt.Errorf("PostgreSQL runtime has duplicate postgresql containers")
+		}
+		postgres = &spec.Containers[index]
+	}
+	if postgres == nil {
+		return "", fmt.Errorf("PostgreSQL runtime has no postgresql container")
+	}
+
+	annotated := PostgreSQLRuntime(annotations[PostgreSQLRuntimeAnnotation])
+	agentShape := postgresqlAgentQuarantineShape(spec, *postgres)
+	switch annotated {
+	case "", PostgreSQLRuntimeDirect:
+		if agentShape {
+			return "", fmt.Errorf("direct PostgreSQL runtime carries agent-quarantine process composition")
+		}
+		return PostgreSQLRuntimeDirect, nil
+	case PostgreSQLRuntimeAgentQuarantine:
+		if !agentShape {
+			return "", fmt.Errorf("agent-quarantine PostgreSQL runtime annotation does not match its process composition")
+		}
+		return PostgreSQLRuntimeAgentQuarantine, nil
+	default:
+		return "", fmt.Errorf("PostgreSQL runtime annotation %q is invalid", annotated)
+	}
+}
+
+func postgresqlAgentQuarantineShape(spec corev1.PodSpec, postgres corev1.Container) bool {
+	if spec.ServiceAccountName == "" || spec.AutomountServiceAccountToken == nil || *spec.AutomountServiceAccountToken || len(postgres.Command) != 0 || len(postgres.Args) != 0 {
+		return false
+	}
+	if !containerHasLiteralEnvironment(postgres, "PGSHARD_POSTGRES_MODE", "quarantine") ||
+		!containerHasPort(postgres, "agent-http", HTTPPort) ||
+		!containerHasMount(postgres, "kubernetes-api", "/var/run/secrets/kubernetes.io/serviceaccount") ||
+		!containerHasMount(postgres, "runtime", "/run/pgshard") ||
+		!podHasProjectedVolume(spec, "kubernetes-api") {
+		return false
+	}
+	return probeHTTPPath(postgres.StartupProbe) == "/healthz" &&
+		probeHTTPPath(postgres.LivenessProbe) == "/healthz" &&
+		probeHTTPPath(postgres.ReadinessProbe) == "/readyz"
+}
+
+func containerHasLiteralEnvironment(container corev1.Container, name, value string) bool {
+	for _, environment := range container.Env {
+		if environment.Name == name && environment.ValueFrom == nil && environment.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containerHasPort(container corev1.Container, name string, port int32) bool {
+	for _, candidate := range container.Ports {
+		if candidate.Name == name && candidate.ContainerPort == port && candidate.Protocol == corev1.ProtocolTCP {
+			return true
+		}
+	}
+	return false
+}
+
+func containerHasMount(container corev1.Container, name, path string) bool {
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == name && mount.MountPath == path {
+			return true
+		}
+	}
+	return false
+}
+
+func podHasProjectedVolume(spec corev1.PodSpec, name string) bool {
+	for _, volume := range spec.Volumes {
+		if volume.Name == name && volume.Projected != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func probeHTTPPath(probe *corev1.Probe) string {
+	if probe == nil || probe.HTTPGet == nil {
+		return ""
+	}
+	return probe.HTTPGet.Path
 }
 
 // DefaultImages are safe supporting-runtime defaults. The privileged
@@ -1355,9 +1489,10 @@ type Images struct {
 // image used by the repository manifests.
 func DefaultImages() Images {
 	return Images{
-		Orchestrator: "ghcr.io/andrew01234567890/pgshard-orch:main",
-		Pooler:       "ghcr.io/andrew01234567890/pgshard-pooler:main",
-		PostgreSQL:   defaultPostgreSQLImage,
+		Orchestrator:      "ghcr.io/andrew01234567890/pgshard-orch:main",
+		Pooler:            "ghcr.io/andrew01234567890/pgshard-pooler:main",
+		PostgreSQL:        defaultPostgreSQLImage,
+		PostgreSQLRuntime: PostgreSQLRuntimeDirect,
 	}
 }
 
@@ -1394,6 +1529,9 @@ func ValidateImagesForCluster(cluster *pgshardv1alpha1.PgShardCluster, images Im
 	}
 	if strings.TrimSpace(images.Orchestrator) == "" || strings.TrimSpace(images.Pooler) == "" || strings.TrimSpace(images.PostgreSQL) == "" {
 		return fmt.Errorf("orchestrator, pooler, and PostgreSQL images must all be configured")
+	}
+	if images.PostgreSQLRuntime != "" && images.PostgreSQLRuntime != PostgreSQLRuntimeDirect && images.PostgreSQLRuntime != PostgreSQLRuntimeAgentQuarantine {
+		return fmt.Errorf("PostgreSQL runtime must be %q or %q", PostgreSQLRuntimeDirect, PostgreSQLRuntimeAgentQuarantine)
 	}
 	if cluster.Spec.MembersPerShard == 1 {
 		if err := validatePostgreSQLBootstrapImage(images.PostgreSQLBootstrap); err != nil {
@@ -1471,6 +1609,13 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	if err != nil {
 		return nil, err
 	}
+	var writableLeases map[int32]pgshardv1alpha1.PostgreSQLWritableLeaseStatus
+	if images.PostgreSQLRuntime.agentQuarantine() {
+		writableLeases, err = postgresqlWritableLeases(cluster)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var catalogAccess *pgshardv1alpha1.CatalogAccessStatus
 	if cluster.Spec.MembersPerShard == 1 {
 		catalogAccess = cluster.Status.CatalogAccess
@@ -1510,8 +1655,9 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		)
 		if cluster.Spec.MembersPerShard == 1 {
 			bootstrap := bootstraps[shard]
+			writableLease := writableLeases[shard]
 			objects = append(objects,
-				postgresqlShardStatefulSet(cluster, shard, images.PostgreSQL, images.PostgreSQLBootstrap, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess),
+				postgresqlShardStatefulSet(cluster, shard, images, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess, writableLease),
 				postgresqlPrimaryDisruptionBudget(cluster, shard),
 			)
 		}
@@ -1552,6 +1698,34 @@ func postgresqlBootstraps(cluster *pgshardv1alpha1.PgShardCluster) (map[int32]pg
 		}
 	}
 	return bootstraps, nil
+}
+
+func postgresqlWritableLeases(cluster *pgshardv1alpha1.PgShardCluster) (map[int32]pgshardv1alpha1.PostgreSQLWritableLeaseStatus, error) {
+	checkpoints := make(map[int32]pgshardv1alpha1.PostgreSQLWritableLeaseStatus, len(cluster.Status.PostgreSQLWritableLeases))
+	uids := make(map[types.UID]struct{}, len(cluster.Status.PostgreSQLWritableLeases))
+	for _, checkpoint := range cluster.Status.PostgreSQLWritableLeases {
+		if checkpoint.Shard < 0 || checkpoint.Shard >= cluster.Spec.Shards {
+			return nil, fmt.Errorf("PostgreSQL writable-term Lease checkpoint for shard %d is invalid", checkpoint.Shard)
+		}
+		expectedName := PostgreSQLWritableLeaseName(cluster.Name, checkpoint.Shard)
+		if checkpoint.LeaseName != expectedName || checkpoint.LeaseUID == "" || len(checkpoint.LeaseUID) > 128 {
+			return nil, fmt.Errorf("PostgreSQL writable-term Lease checkpoint for shard %d is invalid", checkpoint.Shard)
+		}
+		if _, duplicate := checkpoints[checkpoint.Shard]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL writable-term Lease checkpoint for shard %d is duplicated", checkpoint.Shard)
+		}
+		if _, duplicate := uids[checkpoint.LeaseUID]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL writable-term Lease UID %s is duplicated", checkpoint.LeaseUID)
+		}
+		checkpoints[checkpoint.Shard] = checkpoint
+		uids[checkpoint.LeaseUID] = struct{}{}
+	}
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		if _, ok := checkpoints[shard]; !ok {
+			return nil, fmt.Errorf("PostgreSQL writable-term Lease checkpoint for shard %d is missing", shard)
+		}
+	}
+	return checkpoints, nil
 }
 
 func renderPostgreSQLConfiguration(configuration pgshardv1alpha1.ResolvedPostgreSQLConfiguration) map[string]string {
@@ -2244,7 +2418,7 @@ func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, nam
 	}
 }
 
-func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image, bootstrapImage, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus) *appsv1.StatefulSet {
+func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) *appsv1.StatefulSet {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
@@ -2270,14 +2444,14 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
 	readinessProbeCommand := []string{"pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432", "--username=postgres"}
-	bootstrapPullPolicy := imagePullPolicy(bootstrapImage)
-	if bootstrapImage == developmentPostgreSQLBootstrapImage {
+	bootstrapPullPolicy := imagePullPolicy(images.PostgreSQLBootstrap)
+	if images.PostgreSQLBootstrap == developmentPostgreSQLBootstrapImage {
 		bootstrapPullPolicy = corev1.PullNever
 	}
 	postgres := corev1.Container{
 		Name:            "postgresql",
-		Image:           image,
-		ImagePullPolicy: imagePullPolicy(image),
+		Image:           images.PostgreSQL,
+		ImagePullPolicy: imagePullPolicy(images.PostgreSQL),
 		Args:            []string{"-c", "config_file=/etc/pgshard/postgresql/primary-0000.conf", "-c", "allow_alter_system=off"},
 		Env:             []corev1.EnvVar{{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"}},
 		Ports:           []corev1.ContainerPort{{Name: "postgresql", ContainerPort: PostgreSQLPort, Protocol: corev1.ProtocolTCP}},
@@ -2308,9 +2482,12 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 			corev1.VolumeMount{Name: "catalog-server-tls", MountPath: "/etc/pgshard/catalog-tls", ReadOnly: true},
 		)
 	}
+	if images.PostgreSQLRuntime.agentQuarantine() {
+		postgres = postgresqlAgentQuarantineContainer(cluster, shard, images.PostgreSQLBootstrap, bootstrapPullPolicy, postgresSecurity, writableLease)
+	}
 	bootstrap := corev1.Container{
 		Name:            "bootstrap-postgresql",
-		Image:           bootstrapImage,
+		Image:           images.PostgreSQLBootstrap,
 		ImagePullPolicy: bootstrapPullPolicy,
 		Command:         []string{"bash", "-ceu", postgresqlBootstrapScript},
 		Env: []corev1.EnvVar{
@@ -2354,6 +2531,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 	podAnnotations := map[string]string{
 		ConfigHashAnnotation:              configurationHash,
 		PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
+		PostgreSQLRuntimeAnnotation:       images.PostgreSQLRuntime.String(),
 	}
 	if shard == 0 {
 		podAnnotations[shardschemaMigrationHashAnnotation] = shardschemaMigrationSHA256
@@ -2365,6 +2543,11 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 		{Name: "postgresql-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configurationName}}}},
 		{Name: "postgresql-runtime-config", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("2Mi"))}}},
 		{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName, DefaultMode: ptr(int32(0o440))}}},
+	}
+	serviceAccountName := ""
+	if images.PostgreSQLRuntime.agentQuarantine() {
+		serviceAccountName = PostgreSQLAgentServiceAccountName(cluster.Name, shard)
+		volumes = append(volumes, postgresqlAgentKubernetesAPIVolume())
 	}
 	if shard == 0 {
 		catalogSecret := catalogAccess.SecretName
@@ -2393,8 +2576,10 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 			},
 		)
 	}
+	statefulSetMetadata := ownedMeta(cluster, name, "postgresql", nil)
+	statefulSetMetadata.Annotations[PostgreSQLRuntimeAnnotation] = images.PostgreSQLRuntime.String()
 	return &appsv1.StatefulSet{
-		ObjectMeta: ownedMeta(cluster, name, "postgresql", nil),
+		ObjectMeta: statefulSetMetadata,
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:            ptr(replicas),
 			ServiceName:         shardName(cluster.Name, shard),
@@ -2413,6 +2598,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken:  &automount,
+					ServiceAccountName:            serviceAccountName,
 					EnableServiceLinks:            &enableServiceLinks,
 					TerminationGracePeriodSeconds: ptr(int64(60)),
 					NodeSelector:                  map[string]string{corev1.LabelOSStable: "linux"},
@@ -2430,6 +2616,92 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 				},
 			},
 		},
+	}
+}
+
+func postgresqlAgentQuarantineContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
+	environment := []corev1.EnvVar{
+		{Name: "PGSHARD_HTTP_BIND", Value: "0.0.0.0:8080"},
+		{Name: "PGSHARD_CLUSTER_ID", Value: cluster.Name},
+		{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
+		{Name: "PGSHARD_SHARD_ID", Value: fmt.Sprintf("%d", shard)},
+		{Name: "PGSHARD_INSTANCE_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: "PGSHARD_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
+		{Name: "PGSHARD_LEASE_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+		{Name: "PGSHARD_WRITABLE_LEASE_NAME", Value: writableLease.LeaseName},
+		{Name: "PGSHARD_WRITABLE_LEASE_UID", Value: string(writableLease.LeaseUID)},
+		{Name: "PGSHARD_MAX_LEASE_TTL_MS", Value: "15000"},
+		{Name: "PGSHARD_WRITABLE_LEASE_DURATION_SECONDS", Value: "15"},
+		{Name: "PGSHARD_WRITABLE_LEASE_RENEW_DEADLINE_SECONDS", Value: "10"},
+		{Name: "PGSHARD_WRITABLE_LEASE_RETRY_MS", Value: "2000"},
+		{Name: "PGSHARD_KUBERNETES_REQUEST_TIMEOUT_MS", Value: "2000"},
+		{Name: "PGSHARD_POSTGRES_MODE", Value: "quarantine"},
+		{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"},
+		{Name: "PGSHARD_POSTGRES_BIN", Value: "/usr/lib/postgresql/18/bin/postgres"},
+		{Name: "PGSHARD_POSTGRES_SOCKET_DIR", Value: "/run/pgshard/postgres"},
+		{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/quarantine.pg_hba.conf"},
+		{Name: "PGSHARD_POSTGRES_SMART_SHUTDOWN_MS", Value: "5000"},
+		{Name: "PGSHARD_POSTGRES_FAST_SHUTDOWN_MS", Value: "44000"},
+		{Name: "PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS", Value: "500"},
+	}
+	if endpoint := cluster.Spec.Observability.OpenTelemetryEndpoint; endpoint != "" {
+		environment = append(environment, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: endpoint})
+	}
+	return corev1.Container{
+		Name:            "postgresql",
+		Image:           image,
+		ImagePullPolicy: pullPolicy,
+		Env:             environment,
+		Ports: []corev1.ContainerPort{
+			{Name: "postgresql", ContainerPort: PostgreSQLPort, Protocol: corev1.ProtocolTCP},
+			{Name: "agent-http", ContainerPort: HTTPPort, Protocol: corev1.ProtocolTCP},
+		},
+		Resources:       cluster.Spec.PostgreSQL.Resources,
+		SecurityContext: security.DeepCopy(),
+		StartupProbe: &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("agent-http"), Scheme: corev1.URISchemeHTTP}},
+			PeriodSeconds:    1,
+			TimeoutSeconds:   1,
+			FailureThreshold: 40,
+		},
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("agent-http"), Scheme: corev1.URISchemeHTTP}},
+			PeriodSeconds:    5,
+			TimeoutSeconds:   1,
+			FailureThreshold: 3,
+		},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromString("agent-http"), Scheme: corev1.URISchemeHTTP}},
+			PeriodSeconds:    2,
+			TimeoutSeconds:   1,
+			FailureThreshold: 1,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "data", MountPath: "/var/lib/postgresql"},
+			{Name: "runtime", MountPath: "/run/pgshard"},
+			{Name: "tmp", MountPath: "/tmp"},
+			{Name: "kubernetes-api", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
+		},
+	}
+}
+
+func postgresqlAgentKubernetesAPIVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: "kubernetes-api",
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			DefaultMode: ptr(int32(0o440)),
+			Sources: []corev1.VolumeProjection{
+				{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token", ExpirationSeconds: ptr(int64(600))}},
+				{ConfigMap: &corev1.ConfigMapProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
+					Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+				}},
+				{DownwardAPI: &corev1.DownwardAPIProjection{Items: []corev1.DownwardAPIVolumeFile{{
+					Path:     "namespace",
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+				}}}},
+			},
+		}},
 	}
 }
 

@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -381,6 +382,12 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		if statefulSet.Spec.Template.Annotations[PostgreSQLPodClusterUIDAnnotation] != string(cluster.UID) || !reflect.DeepEqual(statefulSet.Spec.Template.Finalizers, []string{PostgreSQLPodTerminationFinalizer}) {
 			t.Fatalf("PostgreSQL termination fence = %#v", statefulSet.Spec.Template.ObjectMeta)
 		}
+		if statefulSet.Annotations[PostgreSQLRuntimeAnnotation] != string(PostgreSQLRuntimeDirect) || statefulSet.Spec.Template.Annotations[PostgreSQLRuntimeAnnotation] != string(PostgreSQLRuntimeDirect) {
+			t.Fatalf("direct PostgreSQL runtime contract = StatefulSet %#v Pod %#v", statefulSet.Annotations, statefulSet.Spec.Template.Annotations)
+		}
+		if observed, err := ObservePostgreSQLRuntime(statefulSet.Spec.Template.Annotations, statefulSet.Spec.Template.Spec); err != nil || observed != PostgreSQLRuntimeDirect {
+			t.Fatalf("observe direct PostgreSQL runtime = %q, %v", observed, err)
+		}
 		if got := statefulSet.Spec.Template.Annotations[shardschemaMigrationHashAnnotation]; (shard == 0 && got != shardschemaMigrationSHA256) || (shard != 0 && got != "") {
 			t.Fatalf("shardschema migration annotation for shard %d = %q", shard, got)
 		}
@@ -392,7 +399,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("PostgreSQL data volume = %#v", dataVolume)
 		}
 		pod := statefulSet.Spec.Template.Spec
-		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
+		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.ServiceAccountName != "" || hasVolume(pod.Volumes, "kubernetes-api") || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
 			t.Fatalf("PostgreSQL Pod boundary = %#v", pod)
 		}
 		if pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot == nil || !*pod.SecurityContext.RunAsNonRoot || pod.SecurityContext.RunAsUser == nil || *pod.SecurityContext.RunAsUser != 999 || pod.SecurityContext.FSGroup == nil || *pod.SecurityContext.FSGroup != 999 || pod.SecurityContext.FSGroupChangePolicy == nil || *pod.SecurityContext.FSGroupChangePolicy != corev1.FSGroupChangeOnRootMismatch {
@@ -616,6 +623,202 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	}
 	if got := PostgreSQLDataPVCPrefix(cluster.Name, 1); got != "demo-shard-0001-data-" || strings.Contains(got, "primary") || strings.Contains(got, "replica") {
 		t.Fatalf("PostgreSQL data PVC prefix is not role-neutral: %q", got)
+	}
+}
+
+func TestAgentQuarantinePlanProjectsExactWritableLeaseIdentity(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	images := singleMemberImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		statefulSet := object[*appsv1.StatefulSet](t, plan, PostgreSQLShardStatefulSetName(cluster.Name, shard))
+		pod := statefulSet.Spec.Template.Spec
+		if statefulSet.Annotations[PostgreSQLRuntimeAnnotation] != string(PostgreSQLRuntimeAgentQuarantine) || statefulSet.Spec.Template.Annotations[PostgreSQLRuntimeAnnotation] != string(PostgreSQLRuntimeAgentQuarantine) {
+			t.Fatalf("agent PostgreSQL runtime contract for shard %d = StatefulSet %#v Pod %#v", shard, statefulSet.Annotations, statefulSet.Spec.Template.Annotations)
+		}
+		if observed, err := ObservePostgreSQLRuntime(statefulSet.Spec.Template.Annotations, pod); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+			t.Fatalf("observe agent PostgreSQL runtime for shard %d = %q, %v", shard, observed, err)
+		}
+		if pod.ServiceAccountName != PostgreSQLAgentServiceAccountName(cluster.Name, shard) || pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
+			t.Fatalf("agent Pod identity for shard %d = %#v", shard, pod)
+		}
+		if len(pod.Containers) != 1 {
+			t.Fatalf("agent containers for shard %d = %#v", shard, pod.Containers)
+		}
+		agent := pod.Containers[0]
+		if agent.Name != "postgresql" || agent.Image != developmentPostgreSQLBootstrapImage || agent.ImagePullPolicy != corev1.PullNever || len(agent.Command) != 0 || len(agent.Args) != 0 {
+			t.Fatalf("agent runtime image for shard %d = %#v", shard, agent)
+		}
+		if len(agent.Ports) != 2 || agent.Ports[0].Name != "postgresql" || agent.Ports[0].ContainerPort != PostgreSQLPort || agent.Ports[1].Name != "agent-http" || agent.Ports[1].ContainerPort != HTTPPort {
+			t.Fatalf("agent ports for shard %d = %#v", shard, agent.Ports)
+		}
+		checkpoint := cluster.Status.PostgreSQLWritableLeases[shard]
+		wantedValues := map[string]string{
+			"PGSHARD_HTTP_BIND":                             "0.0.0.0:8080",
+			"PGSHARD_CLUSTER_ID":                            cluster.Name,
+			"PGSHARD_CLUSTER_UID":                           string(cluster.UID),
+			"PGSHARD_SHARD_ID":                              fmt.Sprintf("%d", shard),
+			"PGSHARD_WRITABLE_LEASE_NAME":                   checkpoint.LeaseName,
+			"PGSHARD_WRITABLE_LEASE_UID":                    string(checkpoint.LeaseUID),
+			"PGSHARD_MAX_LEASE_TTL_MS":                      "15000",
+			"PGSHARD_WRITABLE_LEASE_DURATION_SECONDS":       "15",
+			"PGSHARD_WRITABLE_LEASE_RENEW_DEADLINE_SECONDS": "10",
+			"PGSHARD_WRITABLE_LEASE_RETRY_MS":               "2000",
+			"PGSHARD_KUBERNETES_REQUEST_TIMEOUT_MS":         "2000",
+			"PGSHARD_POSTGRES_MODE":                         "quarantine",
+			"PGDATA":                                        "/var/lib/postgresql/18/docker",
+			"PGSHARD_POSTGRES_BIN":                          "/usr/lib/postgresql/18/bin/postgres",
+			"PGSHARD_POSTGRES_SOCKET_DIR":                   "/run/pgshard/postgres",
+			"PGSHARD_POSTGRES_HBA_FILE":                     "/etc/pgshard/quarantine.pg_hba.conf",
+			"PGSHARD_POSTGRES_SMART_SHUTDOWN_MS":            "5000",
+			"PGSHARD_POSTGRES_FAST_SHUTDOWN_MS":             "44000",
+			"PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS":        "500",
+		}
+		wantedFields := map[string]string{
+			"PGSHARD_INSTANCE_ID":     "metadata.name",
+			"PGSHARD_POD_UID":         "metadata.uid",
+			"PGSHARD_LEASE_NAMESPACE": "metadata.namespace",
+		}
+		if len(agent.Env) != len(wantedValues)+len(wantedFields) {
+			t.Fatalf("agent environment length for shard %d = %d: %#v", shard, len(agent.Env), agent.Env)
+		}
+		for _, variable := range agent.Env {
+			if value, ok := wantedValues[variable.Name]; ok {
+				if variable.Value != value || variable.ValueFrom != nil {
+					t.Fatalf("agent environment %s for shard %d = %#v, want %q", variable.Name, shard, variable, value)
+				}
+				delete(wantedValues, variable.Name)
+				continue
+			}
+			field, ok := wantedFields[variable.Name]
+			if !ok || variable.Value != "" || variable.ValueFrom == nil || variable.ValueFrom.FieldRef == nil || variable.ValueFrom.FieldRef.FieldPath != field {
+				t.Fatalf("unexpected agent environment for shard %d: %#v", shard, variable)
+			}
+			delete(wantedFields, variable.Name)
+		}
+		if len(wantedValues) != 0 || len(wantedFields) != 0 {
+			t.Fatalf("missing agent environment for shard %d: values=%#v fields=%#v", shard, wantedValues, wantedFields)
+		}
+
+		if agent.StartupProbe == nil || agent.StartupProbe.HTTPGet == nil || agent.StartupProbe.HTTPGet.Path != "/healthz" || agent.LivenessProbe == nil || agent.LivenessProbe.HTTPGet == nil || agent.LivenessProbe.HTTPGet.Path != "/healthz" || agent.ReadinessProbe == nil || agent.ReadinessProbe.HTTPGet == nil || agent.ReadinessProbe.HTTPGet.Path != "/readyz" {
+			t.Fatalf("agent probes for shard %d = startup %#v, liveness %#v, readiness %#v", shard, agent.StartupProbe, agent.LivenessProbe, agent.ReadinessProbe)
+		}
+		for _, probe := range []*corev1.Probe{agent.StartupProbe, agent.LivenessProbe, agent.ReadinessProbe} {
+			if probe.HTTPGet.Port != intstr.FromString("agent-http") || probe.HTTPGet.Scheme != corev1.URISchemeHTTP {
+				t.Fatalf("agent probe target for shard %d = %#v", shard, probe.HTTPGet)
+			}
+		}
+		if !containsVolumeMount(agent.VolumeMounts, "data", false) || !containsVolumeMount(agent.VolumeMounts, "runtime", false) || !containsVolumeMount(agent.VolumeMounts, "tmp", false) || !containsVolumeMount(agent.VolumeMounts, "kubernetes-api", true) {
+			t.Fatalf("agent mounts for shard %d = %#v", shard, agent.VolumeMounts)
+		}
+		for _, mount := range agent.VolumeMounts {
+			if mount.Name == "runtime" && mount.MountPath != "/run/pgshard" {
+				t.Fatalf("agent must create a private child below the runtime mount: %#v", mount)
+			}
+			if mount.Name == "bootstrap-secret" || mount.Name == "catalog-server-tls" || mount.Name == "catalog-bootstrap-auth" {
+				t.Fatalf("agent received bootstrap or catalog credentials: %#v", agent.VolumeMounts)
+			}
+		}
+
+		apiVolume := volumeByName(t, pod.Volumes, "kubernetes-api").Projected
+		if apiVolume == nil || apiVolume.DefaultMode == nil || *apiVolume.DefaultMode != 0o440 || len(apiVolume.Sources) != 3 {
+			t.Fatalf("agent API projection for shard %d = %#v", shard, apiVolume)
+		}
+		token := apiVolume.Sources[0].ServiceAccountToken
+		ca := apiVolume.Sources[1].ConfigMap
+		namespace := apiVolume.Sources[2].DownwardAPI
+		if token == nil || token.Path != "token" || token.Audience != "" || token.ExpirationSeconds == nil || *token.ExpirationSeconds != 600 {
+			t.Fatalf("agent token projection for shard %d = %#v", shard, token)
+		}
+		if ca == nil || ca.Name != "kube-root-ca.crt" || len(ca.Items) != 1 || ca.Items[0].Key != "ca.crt" || ca.Items[0].Path != "ca.crt" {
+			t.Fatalf("agent CA projection for shard %d = %#v", shard, ca)
+		}
+		if namespace == nil || len(namespace.Items) != 1 || namespace.Items[0].Path != "namespace" || namespace.Items[0].FieldRef == nil || namespace.Items[0].FieldRef.FieldPath != "metadata.namespace" {
+			t.Fatalf("agent namespace projection for shard %d = %#v", shard, namespace)
+		}
+	}
+}
+
+func TestPostgreSQLRuntimeObservationRejectsAnnotationShapeMismatch(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	images := singleMemberImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := object[*appsv1.StatefulSet](t, plan, PostgreSQLShardStatefulSetName(cluster.Name, 0)).Spec.Template.DeepCopy()
+
+	template.Annotations[PostgreSQLRuntimeAnnotation] = string(PostgreSQLRuntimeDirect)
+	if _, err := ObservePostgreSQLRuntime(template.Annotations, template.Spec); err == nil || !strings.Contains(err.Error(), "direct PostgreSQL runtime carries agent-quarantine") {
+		t.Fatalf("direct annotation over agent shape error = %v", err)
+	}
+	template.Annotations[PostgreSQLRuntimeAnnotation] = string(PostgreSQLRuntimeAgentQuarantine)
+	for index := range template.Spec.Containers[0].Env {
+		if template.Spec.Containers[0].Env[index].Name == "PGSHARD_POSTGRES_MODE" {
+			template.Spec.Containers[0].Env[index].Value = "direct"
+		}
+	}
+	if _, err := ObservePostgreSQLRuntime(template.Annotations, template.Spec); err == nil || !strings.Contains(err.Error(), "does not match its process composition") {
+		t.Fatalf("agent annotation over direct shape error = %v", err)
+	}
+}
+
+func TestAgentQuarantinePlanRejectsUncheckpointedWritableLeaseIdentity(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		mutate func(*pgshardv1alpha1.PgShardCluster)
+		want   string
+	}{
+		{name: "missing", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases = cluster.Status.PostgreSQLWritableLeases[:1]
+		}, want: "shard 1 is missing"},
+		{name: "out of range shard", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases[0].Shard = cluster.Spec.Shards
+		}, want: "shard 2 is invalid"},
+		{name: "wrong name", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases[0].LeaseName = "foreign-term"
+		}, want: "shard 0 is invalid"},
+		{name: "empty UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases[0].LeaseUID = ""
+		}, want: "shard 0 is invalid"},
+		{name: "duplicate shard", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases = append(cluster.Status.PostgreSQLWritableLeases, cluster.Status.PostgreSQLWritableLeases[0])
+		}, want: "shard 0 is duplicated"},
+		{name: "duplicate UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases[1].LeaseUID = cluster.Status.PostgreSQLWritableLeases[0].LeaseUID
+		}, want: "UID test-lease-uid-0000 is duplicated"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cluster := testCluster()
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+			cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+			test.mutate(cluster)
+			images := singleMemberImages()
+			images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+			if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Plan error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -2755,6 +2958,18 @@ func testPostgreSQLBootstraps(cluster *pgshardv1alpha1.PgShardCluster) []pgshard
 		})
 	}
 	return bootstraps
+}
+
+func testPostgreSQLWritableLeases(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.PostgreSQLWritableLeaseStatus {
+	checkpoints := make([]pgshardv1alpha1.PostgreSQLWritableLeaseStatus, 0, cluster.Spec.Shards)
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		checkpoints = append(checkpoints, pgshardv1alpha1.PostgreSQLWritableLeaseStatus{
+			Shard:     shard,
+			LeaseName: PostgreSQLWritableLeaseName(cluster.Name, shard),
+			LeaseUID:  types.UID(fmt.Sprintf("test-lease-uid-%04d", shard)),
+		})
+	}
+	return checkpoints
 }
 
 func singleMemberImages() Images {
