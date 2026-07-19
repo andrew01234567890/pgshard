@@ -631,8 +631,18 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			if err := base.List(ctx, budgets, client.InNamespace(cluster.Namespace), client.MatchingLabels{owned.ComponentLabel: "postgresql"}); err != nil {
 				t.Fatal(err)
 			}
-			if len(statefulSets.Items) != 0 || len(pods.Items) != 0 || len(budgets.Items) != 0 {
-				t.Fatalf("source-storage intent became a workload: StatefulSets=%d Pods=%d PostgreSQL PDBs=%d", len(statefulSets.Items), len(pods.Items), len(budgets.Items))
+			if len(statefulSets.Items) != 1 || len(pods.Items) != 0 || len(budgets.Items) != 0 {
+				t.Fatalf("bootstrap-source composition = StatefulSets=%d Pods=%d PostgreSQL PDBs=%d", len(statefulSets.Items), len(pods.Items), len(budgets.Items))
+			}
+			source := statefulSets.Items[0]
+			if source.Name != owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0) || source.Spec.Template.Labels[owned.MemberLabel] != "0000" {
+				t.Fatalf("bootstrap-source identity = %#v", source.ObjectMeta)
+			}
+			if _, role := source.Spec.Template.Labels[owned.RoleLabel]; role {
+				t.Fatalf("bootstrap source received a serving role: %#v", source.Spec.Template.Labels)
+			}
+			if observed, err := owned.ObservePostgreSQLRuntime(source.Spec.Template.Annotations, source.Spec.Template.Spec); err != nil || observed != owned.PostgreSQLRuntimeAgentQuarantine {
+				t.Fatalf("bootstrap-source runtime = %q, %v", observed, err)
 			}
 			assertCondition(t, current, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 			assertCondition(t, current, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
@@ -887,15 +897,18 @@ func TestMultiMemberSourceStorageRejectsBootstrapImageBeforeDurableWrites(t *tes
 func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		name    string
-		kind    string
-		replace bool
-		want    string
+		name         string
+		kind         string
+		replace      bool
+		mutateSource bool
+		want         string
 	}{
-		{name: "missing credential", kind: "secret", want: "is missing; explicit recovery is required"},
-		{name: "replaced credential", kind: "secret", replace: true, want: "expected recorded UID"},
+		{name: "missing bootstrap credential", kind: "secret", want: "is missing; explicit recovery is required"},
+		{name: "replaced bootstrap credential", kind: "secret", replace: true, want: "expected recorded UID"},
 		{name: "missing data", kind: "pvc", want: "is missing; restore is required"},
 		{name: "replaced data", kind: "pvc", replace: true, want: "expected recorded UID"},
+		{name: "missing writable Lease", kind: "lease", want: "is missing; explicit recovery is required"},
+		{name: "missing replication credential fences mutated source", kind: "replication-secret", mutateSource: true, want: "is missing; explicit recovery is required"},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
@@ -911,6 +924,17 @@ func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 			}
 			current := getCluster(t, ctx, base, cluster)
 			bootstrap := bootstrapForShard(t, current, 0)
+			if test.mutateSource {
+				source := &appsv1.StatefulSet{}
+				key := types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0)}
+				if err := base.Get(ctx, key, source); err != nil {
+					t.Fatal(err)
+				}
+				source.Spec.Template.Labels[owned.RoleLabel] = "primary"
+				if err := base.Update(ctx, source); err != nil {
+					t.Fatal(err)
+				}
+			}
 
 			switch test.kind {
 			case "secret":
@@ -949,6 +973,26 @@ func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+			case "lease":
+				checkpoint := current.Status.PostgreSQLWritableLeases[0]
+				lease := &coordinationv1.Lease{}
+				key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.LeaseName}
+				if err := base.Get(ctx, key, lease); err != nil {
+					t.Fatal(err)
+				}
+				if err := base.Delete(ctx, lease); err != nil {
+					t.Fatal(err)
+				}
+			case "replication-secret":
+				checkpoint := current.Status.PostgreSQLReplicationCredentials[0]
+				secret := &corev1.Secret{}
+				key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.SecretName}
+				if err := base.Get(ctx, key, secret); err != nil {
+					t.Fatal(err)
+				}
+				if err := base.Delete(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
 			default:
 				t.Fatalf("unknown test kind %q", test.kind)
 			}
@@ -964,8 +1008,8 @@ func TestMultiMemberSourceStorageIdentityLossFailsClosed(t *testing.T) {
 			if err := base.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
 				t.Fatal(err)
 			}
-			if len(statefulSets.Items) != 0 {
-				t.Fatalf("identity failure published %d PostgreSQL workloads", len(statefulSets.Items))
+			if len(statefulSets.Items) > 1 || len(statefulSets.Items) == 1 && statefulSets.Items[0].DeletionTimestamp == nil {
+				t.Fatalf("identity failure did not fence the bootstrap source: %#v", statefulSets.Items)
 			}
 		})
 	}

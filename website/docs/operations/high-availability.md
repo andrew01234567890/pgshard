@@ -332,14 +332,17 @@ outcome-unknown create fence, protected ownerless PVC, and Retain/Delete
 finalization. Status, Secret, and PVC identity are keyed by shard and member;
 the PVCs deliberately have no role label. The controller also stages one
 unpredictably named replication credential per shard: it checkpoints an empty
-Secret intent, its API UID, and then the exact immutable password digest. No
-Pod, StatefulSet, PDB, catalog credential, physical slot, `primary_conninfo`,
-initialization, or Service endpoint is created, and no workload receives the
-replication password, so this
-durable storage intent is not evidence of a primary, standby, synchronous
-replica, or HA availability. A missing or same-name recreated Secret or PVC
-fails closed against the recorded UID; changed replication material fails
-closed against its recorded digest.
+Secret intent, its API UID, and then the exact immutable password digest. Once
+those checkpoints are complete, the controller atomically initializes member
+zero and runs one role-neutral `replication-bootstrap-primary` agent per shard.
+Its immutable HBA rejects ordinary SQL, the Pod remains unready, and no
+application Service selects it. The replication Secret is not mounted and the
+fixed login is not created yet, so remote replication authentication remains
+closed. No standby, PDB, catalog credential, physical slot, `primary_conninfo`,
+or serving endpoint is created. A missing or same-name recreated Secret or PVC
+fences the bootstrap-source controller against the recorded UID; changed
+replication material fails closed against its recorded digest. This source is
+not evidence of a primary, standby, synchronous replica, or HA availability.
 
 Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
 finalizer. Before workload publication, a cluster challenge update proves that
@@ -538,10 +541,10 @@ monotonic-deadline transport. A configured writable term forces every shutdown
 through immediate process-tree fencing, and unsafe Lease/fence timing pairs are
 rejected. The operator's default runtime remains direct. For the supported
 single-member integration, explicit `agent-quarantine` injects that runtime
-into a non-serving PostgreSQL Pod. For multi-member resources it currently
-stops after protecting one role-neutral storage identity for every member and
-creates no Pod. The agent's default quarantine role keeps TCP disabled. Its
-uncomposed `replication-bootstrap-primary` role requires the same exact writable Lease,
+into a non-serving PostgreSQL Pod. For multi-member resources it now selects
+the agent's `replication-bootstrap-primary` role for member zero after every
+source-storage, Lease, and replication-credential checkpoint is complete. The
+agent's default quarantine role keeps TCP disabled. The bootstrap role requires the same exact writable Lease,
 accepts only the fixed `pgshard_replication` SCRAM role over TCP, rejects every
 ordinary database connection, and permits enough senders and physical slots to
 clone the two default M1 standbys with one bounded bootstrap-repair slot of
@@ -561,10 +564,10 @@ restart loop. Once running, it continuously repeats the recovery proof; recovery
 ending, an unknown query result, timeout, or local connection loss immediately
 fences the complete PostgreSQL process tree. A later upstream outage alone does
 not kill a server that remains safely in recovery. Writable Lease authority is
-forbidden for this role. The operator does not select either replication role
-yet. It now checkpoints one per-shard replication password through an empty
-intent, exact API UID, immutable update, and material digest, but does not
-project or consume it. There is no base-backup completion protocol, TLS wiring,
+forbidden for this role. The operator does not select the standby role yet. It
+checkpoints one per-shard replication password through an empty intent, exact
+API UID, immutable update, and material digest, but does not project or consume
+it or create the database role. There is no base-backup completion protocol, TLS wiring,
 slot creation, standby Pod, Service, or NetworkPolicy wiring. The temporary standby
 conninfo therefore explicitly disables TLS and is not a serving deployment.
 SQL and

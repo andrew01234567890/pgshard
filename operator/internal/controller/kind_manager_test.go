@@ -1114,7 +1114,52 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if haCurrent.Status.CatalogAccess != nil {
 		t.Fatalf("multi-member source intent received catalog access: %#v", haCurrent.Status.CatalogAccess)
 	}
-	assertNoPostgreSQLWorkload(t, ctx, kubeClient, namespace.Name, haCluster.Name)
+	sourceName := owned.PostgreSQLMemberStatefulSetName(haCluster.Name, 0, 0)
+	source := &appsv1.StatefulSet{}
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: sourceName}, source)
+		return err == nil, client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatalf("wait for replication bootstrap source: %v", err)
+	}
+	if source.Spec.Template.Labels[owned.MemberLabel] != "0000" {
+		t.Fatalf("replication bootstrap source member labels = %#v", source.Spec.Template.Labels)
+	}
+	if _, role := source.Spec.Template.Labels[owned.RoleLabel]; role {
+		t.Fatalf("replication bootstrap source received a serving role: %#v", source.Spec.Template.Labels)
+	}
+	sourceAgent := source.Spec.Template.Spec.Containers[0]
+	if agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_MODE") != "replication-bootstrap-primary" || agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_HBA_FILE") != "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf" {
+		t.Fatalf("replication bootstrap source environment = %#v", sourceAgent.Env)
+	}
+	for _, volume := range source.Spec.Template.Spec.Volumes {
+		if volume.Name == "replication-credential" {
+			t.Fatalf("replication bootstrap source consumed staged material: %#v", volume)
+		}
+	}
+	sourcePodName := sourceName + "-0"
+	sourcePod := &corev1.Pod{}
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: sourcePodName}, sourcePod); err != nil {
+			return false, client.IgnoreNotFound(err)
+		}
+		return sourcePod.Status.Phase == corev1.PodRunning && len(sourcePod.Status.ContainerStatuses) == 1 && sourcePod.Status.ContainerStatuses[0].State.Running != nil, nil
+	}); err != nil {
+		t.Fatalf("wait for replication bootstrap source Pod: %v; Pod=%#v", err, sourcePod)
+	}
+	if podReady(sourcePod) || sourcePod.Status.ContainerStatuses[0].Ready {
+		t.Fatalf("replication bootstrap source became routable: conditions=%#v containers=%#v", sourcePod.Status.Conditions, sourcePod.Status.ContainerStatuses)
+	}
+	var sourceStatus struct {
+		PostgresProcess string `json:"postgres_process"`
+	}
+	sourceStatusPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/status", namespace.Name, sourcePodName)
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		output, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", sourceStatusPath).CombinedOutput()
+		return err == nil && json.Unmarshal(output, &sourceStatus) == nil && sourceStatus.PostgresProcess == "running_replication_bootstrap", nil
+	}); err != nil {
+		t.Fatalf("wait for running replication bootstrap source: %v; status=%#v", err, sourceStatus)
+	}
 
 	cluster := readSingleMemberSample(t)
 	cluster.Name = "agent-quarantine"

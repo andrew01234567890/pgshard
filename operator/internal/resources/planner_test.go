@@ -779,6 +779,14 @@ func TestPostgreSQLRuntimeObservationRejectsAnnotationShapeMismatch(t *testing.T
 		t.Fatalf("direct annotation over agent shape error = %v", err)
 	}
 	template.Annotations[PostgreSQLRuntimeAnnotation] = string(PostgreSQLRuntimeAgentQuarantine)
+	conflicting := template.DeepCopy()
+	conflicting.Spec.Containers[0].Env = append(conflicting.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-bootstrap-primary"},
+		corev1.EnvVar{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"},
+	)
+	if _, err := ObservePostgreSQLRuntime(conflicting.Annotations, conflicting.Spec); err == nil || !strings.Contains(err.Error(), "does not match its process composition") {
+		t.Fatalf("agent annotation with conflicting runtime environment error = %v", err)
+	}
 	for index := range template.Spec.Containers[0].Env {
 		if template.Spec.Containers[0].Env[index].Name == "PGSHARD_POSTGRES_MODE" {
 			template.Spec.Containers[0].Env[index].Value = "direct"
@@ -2767,7 +2775,7 @@ func TestPlanFailsClosedForUnsafeIdentityOrMissingImages(t *testing.T) {
 	}
 }
 
-func TestMultiMemberAgentSourceStorageStaysOutsideTheResourcePlan(t *testing.T) {
+func TestMultiMemberAgentPlanPublishesOnlyMemberZeroBootstrapSources(t *testing.T) {
 	t.Parallel()
 	for _, members := range []int32{3, 5} {
 		members := members
@@ -2778,6 +2786,7 @@ func TestMultiMemberAgentSourceStorageStaysOutsideTheResourcePlan(t *testing.T) 
 			cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
 			cluster.Status.CatalogAccess = nil
 			cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+			cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
 			images := DevelopmentImages()
 			images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
 
@@ -2785,10 +2794,29 @@ func TestMultiMemberAgentSourceStorageStaysOutsideTheResourcePlan(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
+			sources := 0
 			for _, item := range plan {
 				switch object := item.(type) {
 				case *appsv1.StatefulSet:
-					t.Fatalf("multi-member source storage published StatefulSet %s", object.Name)
+					if object.Labels[ComponentLabel] != "postgresql" {
+						continue
+					}
+					sources++
+					if _, role := object.Spec.Template.Labels[RoleLabel]; role || object.Spec.Template.Labels[MemberLabel] != "0000" {
+						t.Fatalf("bootstrap source %s labels = %#v", object.Name, object.Spec.Template.Labels)
+					}
+					if observed, err := ObservePostgreSQLRuntime(object.Spec.Template.Annotations, object.Spec.Template.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+						t.Fatalf("observe bootstrap source %s runtime = %q, %v", object.Name, observed, err)
+					}
+					agent := object.Spec.Template.Spec.Containers[0]
+					if !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-bootstrap-primary") || !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf") {
+						t.Fatalf("bootstrap source %s agent environment = %#v", object.Name, agent.Env)
+					}
+					for _, volume := range object.Spec.Template.Spec.Volumes {
+						if volume.Name == "replication-credential" {
+							t.Fatalf("bootstrap source %s consumed staged replication material", object.Name)
+						}
+					}
 				case *policyv1.PodDisruptionBudget:
 					if object.Labels[ComponentLabel] == "postgresql" {
 						t.Fatalf("multi-member source storage published PostgreSQL PDB %s", object.Name)
@@ -2798,6 +2826,9 @@ func TestMultiMemberAgentSourceStorageStaysOutsideTheResourcePlan(t *testing.T) 
 						t.Fatalf("multi-member source storage published catalog Service %s", object.Name)
 					}
 				}
+			}
+			if sources != int(cluster.Spec.Shards) {
+				t.Fatalf("bootstrap source StatefulSets = %d, want %d", sources, cluster.Spec.Shards)
 			}
 
 			claim := PostgreSQLDataPVC(cluster, 0, "source-data", cluster.Spec.Storage.Size, cluster.Spec.Storage.StorageClassName, "source-fence", "source-fence-uid")
@@ -2865,6 +2896,68 @@ func TestMultiMemberPlanRequiresOneCompleteBootstrapPerMember(t *testing.T) {
 	duplicate.Status.PostgreSQLBootstraps = append(duplicate.Status.PostgreSQLBootstraps, repeated)
 	if _, err := Plan(duplicate, images); err == nil || !strings.Contains(err.Error(), "shard 0 member 0 is duplicated") {
 		t.Fatalf("duplicate member bootstrap error = %v", err)
+	}
+}
+
+func TestMultiMemberPlanRequiresCompleteReplicationCredentialCheckpoints(t *testing.T) {
+	t.Parallel()
+	base := testCluster()
+	base.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(base)
+	base.Status.CatalogAccess = nil
+	base.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(base)
+	base.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(base)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	for _, test := range []struct {
+		name   string
+		mutate func(*pgshardv1alpha1.PgShardCluster)
+		want   string
+	}{
+		{name: "missing", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationCredentials = cluster.Status.PostgreSQLReplicationCredentials[:1]
+		}, want: "shard 1 is missing"},
+		{name: "wrong name", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationCredentials[0].SecretName = "foreign-replication"
+		}, want: "shard 0 is invalid"},
+		{name: "empty UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationCredentials[0].SecretUID = ""
+		}, want: "shard 0 is invalid"},
+		{name: "invalid material digest", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationCredentials[0].MaterialSHA256 = "not-a-digest"
+		}, want: "shard 0 is invalid"},
+		{name: "duplicate shard", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationCredentials = append(cluster.Status.PostgreSQLReplicationCredentials, cluster.Status.PostgreSQLReplicationCredentials[0])
+		}, want: "shard 0 is duplicated"},
+		{name: "duplicate UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationCredentials[1].SecretUID = cluster.Status.PostgreSQLReplicationCredentials[0].SecretUID
+		}, want: "Secret UID test-replication-secret-uid-0000 is duplicated"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cluster := base.DeepCopy()
+			test.mutate(cluster)
+			if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Plan error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestReplicationBootstrapPrimaryHBAImageContract(t *testing.T) {
+	t.Parallel()
+	contents, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "images", "replication-bootstrap-primary.pg_hba.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "local postgres postgres peer\n" +
+		"local all all reject\n" +
+		"local replication all reject\n" +
+		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
+		"host replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"host all all 0.0.0.0/0 reject\n" +
+		"host all all ::0/0 reject\n"
+	if string(contents) != want {
+		t.Fatalf("replication bootstrap primary HBA = %q, want %q", contents, want)
 	}
 }
 
@@ -3084,6 +3177,19 @@ func testPostgreSQLWritableLeases(cluster *pgshardv1alpha1.PgShardCluster) []pgs
 			Shard:     shard,
 			LeaseName: PostgreSQLWritableLeaseName(cluster.Name, shard),
 			LeaseUID:  types.UID(fmt.Sprintf("test-lease-uid-%04d", shard)),
+		})
+	}
+	return checkpoints
+}
+
+func testPostgreSQLReplicationCredentials(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.PostgreSQLReplicationCredentialStatus {
+	checkpoints := make([]pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, 0, cluster.Spec.Shards)
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		checkpoints = append(checkpoints, pgshardv1alpha1.PostgreSQLReplicationCredentialStatus{
+			Shard:          shard,
+			SecretName:     PostgreSQLReplicationSecretPrefix(cluster.Name, shard) + strings.Repeat("d", 32),
+			SecretUID:      types.UID(fmt.Sprintf("test-replication-secret-uid-%04d", shard)),
+			MaterialSHA256: strings.Repeat("e", 64),
 		})
 	}
 	return checkpoints

@@ -223,16 +223,19 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		}
 	}
 	if err := r.ensurePostgreSQLWritableLeases(ctx, cluster); err != nil {
+		fenceErr := r.fenceMultiMemberPostgreSQLBootstrapSources(ctx, cluster)
 		statusErr := r.reportFailure(ctx, cluster, "WritableLeaseReconcileFailed", fmt.Sprintf("PostgreSQL writable-term Lease reconciliation failed: %v", err))
-		return ctrl.Result{}, errors.Join(err, statusErr)
+		return ctrl.Result{}, errors.Join(err, fenceErr, statusErr)
 	}
 	if err := r.ensurePostgreSQLBootstrap(ctx, cluster); err != nil {
+		fenceErr := r.fenceMultiMemberPostgreSQLBootstrapSources(ctx, cluster)
 		statusErr := r.reportFailure(ctx, cluster, "BootstrapReconcileFailed", fmt.Sprintf("PostgreSQL bootstrap reconciliation failed: %v", err))
-		return ctrl.Result{}, errors.Join(err, statusErr)
+		return ctrl.Result{}, errors.Join(err, fenceErr, statusErr)
 	}
 	if err := r.ensurePostgreSQLReplicationCredentials(ctx, cluster); err != nil {
+		fenceErr := r.fenceMultiMemberPostgreSQLBootstrapSources(ctx, cluster)
 		statusErr := r.reportFailure(ctx, cluster, "ReplicationCredentialReconcileFailed", fmt.Sprintf("PostgreSQL replication credential reconciliation failed: %v", err))
-		return ctrl.Result{}, errors.Join(err, statusErr)
+		return ctrl.Result{}, errors.Join(err, fenceErr, statusErr)
 	}
 	if err := r.ensureCatalogAccess(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "CatalogAccessReconcileFailed", fmt.Sprintf("shardschema access reconciliation failed: %v", err))
@@ -2004,6 +2007,45 @@ func (r *PgShardClusterReconciler) authoritativeReader() client.Reader {
 		return r.APIReader
 	}
 	return r.Client
+}
+
+// fenceMultiMemberPostgreSQLBootstrapSources removes every exact cluster-owned
+// member-zero source controller when an identity prerequisite fails. The
+// template is deliberately not trusted here: mutating the runtime or its
+// labels must not provide a way to defeat fencing.
+func (r *PgShardClusterReconciler) fenceMultiMemberPostgreSQLBootstrapSources(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	if cluster.Spec.MembersPerShard == 1 || cluster.Status.PostgreSQLBootstrapSpec == nil || cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine.String() {
+		return nil
+	}
+	reader := r.authoritativeReader()
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		name := owned.PostgreSQLMemberStatefulSetName(cluster.Name, shard, 0)
+		statefulSet := &appsv1.StatefulSet{}
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, statefulSet); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("read replication bootstrap source StatefulSet %s before fencing: %w", name, err)
+		}
+		if !metav1.IsControlledBy(statefulSet, cluster) {
+			return fmt.Errorf("refusing to fence replication bootstrap source StatefulSet %s because it is not controlled by PgShardCluster UID %s", name, cluster.UID)
+		}
+		if statefulSet.DeletionTimestamp != nil {
+			continue
+		}
+		uid := statefulSet.UID
+		resourceVersion := statefulSet.ResourceVersion
+		if uid == "" || resourceVersion == "" {
+			return fmt.Errorf("replication bootstrap source StatefulSet %s has no stable API identity", name)
+		}
+		if err := r.Delete(ctx, statefulSet,
+			client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+			client.PropagationPolicy(metav1.DeletePropagationForeground),
+		); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("fence replication bootstrap source StatefulSet %s with UID %s: %w", name, uid, err)
+		}
+	}
+	return nil
 }
 
 // migrateLegacyPostgreSQLWorkloadNames establishes an authoritative absence
