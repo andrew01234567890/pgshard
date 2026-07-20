@@ -157,6 +157,13 @@ func TestReconcileCreatesOwnedPlanAndReportsTruthfulStatus(t *testing.T) {
 	assertCondition(t, got, postgresqlAvailableCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PostgreSQLHAUnavailable")
 	assertCondition(t, got, transportSecurityCondition, metav1.ConditionFalse, "TransportTLSUnavailable")
+	postgresql := meta.FindStatusCondition(got.Status.Conditions, postgresqlAvailableCondition)
+	ready := meta.FindStatusCondition(got.Status.Conditions, readyCondition)
+	for name, condition := range map[string]*metav1.Condition{"PostgreSQLAvailable": postgresql, "Ready": ready} {
+		if condition == nil || !strings.Contains(condition.Message, "direct runtime composes no multi-member PostgreSQL data plane") || strings.Contains(condition.Message, "sources and physical standbys are composed") {
+			t.Fatalf("direct multi-member %s condition overclaims PostgreSQL composition: %#v", name, condition)
+		}
+	}
 
 	// A steady-state reconcile must preserve condition transition times.
 	transition := meta.FindStatusCondition(got.Status.Conditions, readyCondition).LastTransitionTime

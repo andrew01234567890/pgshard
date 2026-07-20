@@ -501,7 +501,7 @@ func (p *Provisioner) verifyExistingReceiptHistory(ctx context.Context, key []by
 		cluster := &clusters.Items[index]
 		challenge, hasChallenge := cluster.Annotations[podfence.HandshakeChallengeAnnotation]
 		receipt, hasReceipt := cluster.Annotations[podfence.HandshakeReceiptAnnotation]
-		if cluster.Spec.MembersPerShard != 1 {
+		if !clusterPublishesManagedPostgreSQLPods(cluster) {
 			continue
 		}
 		established := slices.Contains(cluster.Finalizers, owned.ClusterResourceFinalizer) || len(cluster.Status.PostgreSQLBootstraps) != 0
@@ -553,6 +553,14 @@ func (p *Provisioner) verifyExistingReceiptHistory(ctx context.Context, key []by
 		}
 	}
 	return nil
+}
+
+func clusterPublishesManagedPostgreSQLPods(cluster *pgshardv1alpha1.PgShardCluster) bool {
+	if cluster.Spec.MembersPerShard == 1 {
+		return true
+	}
+	return cluster.Status.PostgreSQLBootstrapSpec != nil &&
+		cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime == owned.PostgreSQLRuntimeAgentQuarantine.String()
 }
 
 func receiptBearingPostgreSQLPod(pod *corev1.Pod) bool {

@@ -453,9 +453,10 @@ primary, and never accepts a remote DSN. Missing or replaced Secret identity,
 unexpected keys, unsafe role state, wrong credentials, wrong certificates, or
 insufficient certificate lifetime fail closed. Cluster finalization deletes the
 exact intent-recorded Secret with UID and resource-version preconditions, then
-observes its absence before releasing the cluster finalizer. Unsupported HA topologies still
-select credential-free `bootstrap-unavailable` and create no PostgreSQL data
-plane. Override the defaults with `--orchestrator-image`, `--pooler-image`, and
+observes its absence before releasing the cluster finalizer. Under the
+default/direct runtime, unsupported HA topologies still select credential-free
+`bootstrap-unavailable` and create no PostgreSQL data plane. Override the
+defaults with `--orchestrator-image`, `--pooler-image`, and
 `--postgresql-image` when concrete images
 exist. The privileged `--postgresql-bootstrap-image` deliberately has no remote
 default and is required for the single-member slice and multi-member
@@ -678,9 +679,10 @@ unanchored key is not this keyless state and is never adopted during a
 mixed-version rollout: pin its fingerprint in the CA Secret while the old
 manager is healthy, before changing the manager image, or reinstall the
 pre-release development cluster.
-Once pre-anchored, every handshake on a single-member cluster is inspected and
-every established cluster handshake and managed terminal Pod receipt must
-verify before the completion marker is written. Invalid or incomplete cluster
+Once pre-anchored, every handshake for a selected runtime that publishes
+managed PostgreSQL Pods is inspected, and every established such cluster
+handshake and managed terminal Pod receipt must verify before the completion
+marker is written. Invalid or incomplete cluster
 metadata remains repairable only until the controller has published its
 lifecycle finalizer or PostgreSQL bootstrap status; no PostgreSQL storage or
 workload can precede that barrier. Users cannot establish,

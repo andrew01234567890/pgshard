@@ -406,6 +406,18 @@ func TestValidationRejectsUserSuppliedPodFencingMetadata(t *testing.T) {
 	if _, err := validator.ValidateUpdate(context.Background(), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "reserved for the pgshard controller") {
 		t.Fatalf("multi-member update error = %v", err)
 	}
+	newCluster = oldCluster.DeepCopy()
+	newCluster.Status.PostgreSQLBootstrapSpec = &PostgreSQLBootstrapSpecStatus{
+		MembersPerShard:   newCluster.Spec.MembersPerShard,
+		PostgreSQLRuntime: "agent-quarantine",
+	}
+	newCluster.Annotations = map[string]string{
+		PodFencingChallengeAnnotation: "controller-challenge",
+		PodFencingReceiptAnnotation:   "admission-receipt",
+	}
+	if _, err := validator.ValidateUpdate(controllerContext, oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "reserved for the pgshard controller") {
+		t.Fatalf("same-update runtime spoof accepted Pod fencing metadata: %v", err)
+	}
 
 	oldCluster = validCluster()
 	oldCluster.Spec.MembersPerShard = 1
@@ -427,6 +439,23 @@ func TestValidationRejectsUserSuppliedPodFencingMetadata(t *testing.T) {
 	}
 	if _, err := validator.ValidateUpdate(podFencingAdmissionContext("example-user"), oldCluster, newCluster); err == nil || !strings.Contains(err.Error(), "only be established or repaired by the pgshard controller") {
 		t.Fatalf("user-established metadata error = %v", err)
+	}
+
+	agentMultiMember := validCluster()
+	agentMultiMember.Status.PostgreSQLBootstrapSpec = &PostgreSQLBootstrapSpecStatus{
+		MembersPerShard:   agentMultiMember.Spec.MembersPerShard,
+		PostgreSQLRuntime: "agent-quarantine",
+	}
+	attestedAgentMultiMember := agentMultiMember.DeepCopy()
+	attestedAgentMultiMember.Annotations = map[string]string{
+		PodFencingChallengeAnnotation: "controller-multi-member-challenge",
+		PodFencingReceiptAnnotation:   "admission-multi-member-receipt",
+	}
+	if _, err := validator.ValidateUpdate(controllerContext, agentMultiMember, attestedAgentMultiMember); err != nil {
+		t.Fatalf("initial agent multi-member admission attestation was rejected: %v", err)
+	}
+	if _, err := validator.ValidateUpdate(podFencingAdmissionContext("example-user"), agentMultiMember, attestedAgentMultiMember); err == nil || !strings.Contains(err.Error(), "only be established or repaired by the pgshard controller") {
+		t.Fatalf("user-established agent multi-member metadata error = %v", err)
 	}
 
 	oldCluster = newCluster.DeepCopy()

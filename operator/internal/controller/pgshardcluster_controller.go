@@ -65,8 +65,9 @@ const (
 	legacyEtcdPVCCount                = 3
 )
 
-// PgShardClusterReconciler owns safe supporting resources and single-member
-// PostgreSQL primaries while failing closed on unavailable HA and SQL routing.
+// PgShardClusterReconciler owns safe supporting resources, single-member
+// PostgreSQL primaries, and non-serving multi-member bootstrap sources and
+// standbys while failing closed on unavailable HA and SQL routing.
 // Ready is never inferred merely from desired objects existing; availability
 // comes from observed workload status.
 type PgShardClusterReconciler struct {
@@ -3705,6 +3706,9 @@ func (r *PgShardClusterReconciler) supportingWorkloadsAvailable(ctx context.Cont
 
 func (r *PgShardClusterReconciler) postgresqlWorkloadsAvailable(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, string, string, error) {
 	if cluster.Spec.MembersPerShard != 1 {
+		if !multiMemberPostgreSQLDataPlaneComposed(cluster) {
+			return false, "PostgreSQLHAUnavailable", "the selected direct runtime composes no multi-member PostgreSQL data plane; bootstrap sources, physical standbys, serving activation, promotion, and recovery remain unavailable", nil
+		}
 		return false, "PostgreSQLHAUnavailable", "role-neutral bootstrap sources and physical standbys are composed, but serving activation, controller-observed replication evidence, promotion, and recovery remain unavailable", nil
 	}
 	reader := client.Reader(r.Client)
@@ -3778,7 +3782,10 @@ func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *p
 		postgresqlStatus = metav1.ConditionTrue
 	}
 	readyReason := "PostgreSQLHAUnavailable"
-	readyMessage := "role-neutral bootstrap sources and physical standbys are composed, but serving primaries remain unavailable until replication evidence, activation, promotion, and recovery are implemented"
+	readyMessage := "the selected direct runtime composes no multi-member PostgreSQL data plane; serving primaries remain unavailable"
+	if multiMemberPostgreSQLDataPlaneComposed(cluster) {
+		readyMessage = "role-neutral bootstrap sources and physical standbys are composed, but serving primaries remain unavailable until replication evidence, activation, promotion, and recovery are implemented"
+	}
 	if cluster.Spec.MembersPerShard == 1 {
 		readyReason = "DataPlaneUnavailable"
 		readyMessage = "single-member PostgreSQL primaries are supported, but SQL routing and high-availability failover are not implemented"
@@ -3821,6 +3828,12 @@ func (r *PgShardClusterReconciler) reportSuccess(ctx context.Context, cluster *p
 		},
 	}
 	return r.updateStatus(ctx, cluster, cluster.Generation, phase, conditions)
+}
+
+func multiMemberPostgreSQLDataPlaneComposed(cluster *pgshardv1alpha1.PgShardCluster) bool {
+	return cluster.Spec.MembersPerShard != 1 &&
+		cluster.Status.PostgreSQLBootstrapSpec != nil &&
+		cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime == owned.PostgreSQLRuntimeAgentQuarantine.String()
 }
 
 func (r *PgShardClusterReconciler) reportFailure(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, reason, message string) error {

@@ -383,9 +383,10 @@ authenticated and are not continuity history. An existing initialized but
 unanchored key must instead be pinned while the old manager is healthy before a
 mixed-version rollout; the new manager
 refuses to infer continuity from receipt listings because those listings cannot
-fence an older signer. It inspects every single-member cluster handshake and
-requires every established cluster handshake and managed terminal Pod receipt
-to verify before writing a separate completion marker. Invalid or incomplete
+fence an older signer. It inspects every cluster handshake for a selected
+runtime that publishes managed PostgreSQL Pods and requires every established
+such cluster handshake and managed terminal Pod receipt to verify before
+writing a separate completion marker. Invalid or incomplete
 cluster metadata remains repairable only before the lifecycle finalizer or
 PostgreSQL bootstrap status exists; PostgreSQL storage and workloads cannot
 precede that barrier. Users cannot establish, remove, or replace the handshake.
