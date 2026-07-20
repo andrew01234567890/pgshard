@@ -18,6 +18,8 @@ use kube::{Client, Config};
 use thiserror::Error;
 use tokio::sync::watch;
 
+#[cfg(test)]
+use crate::agent_status::ReplicationCorrelationSummary;
 use crate::agent_status::{
     AgentStatusCollection, AgentStatusError, AgentStatusExpectation, AgentStatusQuery,
     ExpectedWritableLease, collect_agent_statuses,
@@ -200,7 +202,11 @@ async fn observe_once_with_collector_and_clock<
                 .ok_or(IdentityBindingError::InvalidFreshnessBound)?;
             let publication_deadline = scan_deadline.min(receipt_deadline);
             if clock() >= publication_deadline
-                || !state.record_agent_status_fresh(collection.member_count, publication_deadline)
+                || !state.record_agent_status_fresh(
+                    collection.member_count,
+                    collection.replication_correlation,
+                    publication_deadline,
+                )
             {
                 return Err(IdentityBindingError::FreshnessExpired);
             }
@@ -1009,6 +1015,7 @@ mod tests {
 
     struct StubAgentStatusCollector {
         receipt: std::time::Instant,
+        replication_correlation: ReplicationCorrelationSummary,
     }
 
     impl AgentStatusCollector for StubAgentStatusCollector {
@@ -1019,6 +1026,7 @@ mod tests {
             Ok(AgentStatusCollection {
                 member_count: queries.len(),
                 earliest_receipt: self.receipt,
+                replication_correlation: self.replication_correlation,
             })
         }
     }
@@ -1056,6 +1064,10 @@ mod tests {
             Ok(AgentStatusCollection {
                 member_count: queries.len(),
                 earliest_receipt: self.receipt,
+                replication_correlation: ReplicationCorrelationSummary {
+                    correlated_shards: 1,
+                    shard_zero_correlated: true,
+                },
             })
         }
     }
@@ -1794,6 +1806,7 @@ mod tests {
             let freshness = Duration::from_millis(25);
             let collector = StubAgentStatusCollector {
                 receipt: std::time::Instant::now(),
+                replication_correlation: ReplicationCorrelationSummary::default(),
             };
 
             let error =
@@ -1847,6 +1860,7 @@ mod tests {
         let started_at = std::time::Instant::now();
         let collector = StubAgentStatusCollector {
             receipt: started_at,
+            replication_correlation: ReplicationCorrelationSummary::default(),
         };
         let mut clock = [started_at, started_at + freshness].into_iter();
 
@@ -1910,6 +1924,7 @@ mod tests {
         let started_at = std::time::Instant::now();
         let collector = StubAgentStatusCollector {
             receipt: started_at + Duration::from_millis(500),
+            replication_correlation: ReplicationCorrelationSummary::default(),
         };
         let mut clock = [started_at, started_at].into_iter();
 
@@ -2056,6 +2071,10 @@ mod tests {
         let freshness = Duration::from_secs(1);
         let collector = StubAgentStatusCollector {
             receipt: observed_at,
+            replication_correlation: ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: true,
+            },
         };
         observe_once_with_collector(&store, &collector, &targets, &state, freshness)
             .await
@@ -2069,6 +2088,10 @@ mod tests {
                 .expect("topology")
                 .agent_status_collection,
             AgentStatusCollectionState::FreshDiagnosticEvidence,
+        );
+        assert_eq!(
+            state.snapshot().agent_status.replication_correlated_shards,
+            1
         );
         assert_eq!(state.readiness(), ready);
         assert_eq!(
@@ -2206,6 +2229,7 @@ mod tests {
         // supervisor observed shutdown.
         assert!(!state.record_agent_status_fresh(
             targets.len(),
+            ReplicationCorrelationSummary::default(),
             std::time::Instant::now() + Duration::from_secs(5),
         ));
         state.record_agent_status_failure(AgentStatusFailureReason::StatusUnavailable);
@@ -2235,7 +2259,11 @@ mod tests {
         let freshness = Duration::from_secs(5);
 
         state.record_agent_status_collecting(freshness);
-        assert!(!state.record_agent_status_fresh(2, std::time::Instant::now() + freshness,));
+        assert!(!state.record_agent_status_fresh(
+            2,
+            ReplicationCorrelationSummary::default(),
+            std::time::Instant::now() + freshness,
+        ));
         assert_eq!(
             state.snapshot().agent_status.phase,
             AgentStatusPhase::Unavailable
@@ -2245,7 +2273,11 @@ mod tests {
         let earliest_receipt = std::time::Instant::now()
             .checked_sub(Duration::from_secs(6))
             .expect("test process has run for at least six seconds");
-        assert!(!state.record_agent_status_fresh(3, earliest_receipt + freshness,));
+        assert!(!state.record_agent_status_fresh(
+            3,
+            ReplicationCorrelationSummary::default(),
+            earliest_receipt + freshness,
+        ));
         let snapshot = state.snapshot();
         assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Unavailable);
         assert_eq!(

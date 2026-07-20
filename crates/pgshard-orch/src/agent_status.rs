@@ -74,12 +74,22 @@ pub(crate) struct AgentStatusQuery {
 pub(crate) struct AgentStatusCollection {
     pub(crate) member_count: usize,
     pub(crate) earliest_receipt: Instant,
+    pub(crate) replication_correlation: ReplicationCorrelationSummary,
+}
+
+/// Bounded shard-level result retained after raw replication evidence is
+/// discarded.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReplicationCorrelationSummary {
+    pub(crate) correlated_shards: usize,
+    pub(crate) shard_zero_correlated: bool,
 }
 
 /// Minimal, ephemeral replication facts needed to correlate one shard.
 ///
 /// These values exist only inside one bounded collection. The returned
-/// collection deliberately retains only member count and receipt time.
+/// collection deliberately retains only a bounded shard count and shard-zero
+/// boolean alongside member count and receipt time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MemberReplicationEvidence {
     Source {
@@ -128,11 +138,12 @@ pub(crate) async fn collect_agent_statuses(
         .map(|observation| observation.receipt)
         .min()
         .ok_or(AgentStatusError::InvalidTargetSet)?;
-    validate_replication_correlation(&observations)?;
+    let replication_correlation = validate_replication_correlation(&observations)?;
 
     Ok(AgentStatusCollection {
         member_count,
         earliest_receipt,
+        replication_correlation,
     })
 }
 
@@ -946,7 +957,7 @@ fn valid_candidate_shape(candidate: &SourceReplicationCandidateWire) -> bool {
 /// unsafe cross-endpoint time order.
 fn validate_replication_correlation(
     observations: &[CollectedAgentStatus],
-) -> Result<(), AgentStatusError> {
+) -> Result<ReplicationCorrelationSummary, AgentStatusError> {
     let mut shards: BTreeMap<u32, Vec<&CollectedAgentStatus>> = BTreeMap::new();
     let mut members = HashSet::with_capacity(observations.len());
     for observation in observations {
@@ -959,7 +970,8 @@ fn validate_replication_correlation(
             .push(observation);
     }
 
-    for observations in shards.values() {
+    let mut summary = ReplicationCorrelationSummary::default();
+    for (shard_id, observations) in &shards {
         let evidence_count = observations
             .iter()
             .filter(|observation| observation.replication.is_some())
@@ -1010,8 +1022,15 @@ fn validate_replication_correlation(
                 return Err(AgentStatusError::ReplicationEvidenceMismatch);
             }
         }
+        summary.correlated_shards = summary
+            .correlated_shards
+            .checked_add(1)
+            .ok_or(AgentStatusError::ReplicationEvidenceMismatch)?;
+        if *shard_id == 0 {
+            summary.shard_zero_correlated = true;
+        }
     }
-    Ok(())
+    Ok(summary)
 }
 
 fn validate_generation_absent(status: &AgentStatusV1) -> Result<(), AgentStatusError> {
@@ -1602,14 +1621,24 @@ mod tests {
 
     #[test]
     fn correlates_complete_replication_evidence_and_accepts_wholly_missing_evidence() {
-        validate_replication_correlation(&correlated_observations())
+        let correlated = validate_replication_correlation(&correlated_observations())
             .expect("coherent shard evidence");
+        assert_eq!(
+            correlated,
+            ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: true,
+            }
+        );
 
         let mut missing = correlated_observations();
         for observation in &mut missing {
             observation.replication = None;
         }
-        validate_replication_correlation(&missing).expect("optional evidence wholly absent");
+        assert_eq!(
+            validate_replication_correlation(&missing).expect("optional evidence wholly absent"),
+            ReplicationCorrelationSummary::default()
+        );
 
         let mut partial = correlated_observations();
         partial[1].replication = None;
@@ -1617,6 +1646,20 @@ mod tests {
             validate_replication_correlation(&partial),
             Err(AgentStatusError::PartialReplicationEvidence)
         ));
+
+        let mut multi_shard = correlated_observations();
+        let mut shard_one = multi_shard.clone();
+        for observation in &mut shard_one {
+            observation.shard_id = 1;
+        }
+        multi_shard.extend(shard_one);
+        assert_eq!(
+            validate_replication_correlation(&multi_shard).expect("two correlated shards"),
+            ReplicationCorrelationSummary {
+                correlated_shards: 2,
+                shard_zero_correlated: true,
+            }
+        );
     }
 
     #[test]
