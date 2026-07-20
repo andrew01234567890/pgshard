@@ -883,9 +883,29 @@ func assertPostgreSQLStatusMetadataImmutable(t *testing.T, ctx context.Context, 
 	if !podfence.IsManagedPostgreSQLPod(current) {
 		t.Fatalf("PostgreSQL Pod identity changed despite status webhook denials: %#v", current.ObjectMeta)
 	}
-	delete(current.Annotations, owned.PostgreSQLRuntimeAnnotation)
-	if err := kubeClient.Update(ctx, current); !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "identity") {
+	baselineUID := current.UID
+	baselineRuntime, hasBaselineRuntime := current.Annotations[owned.PostgreSQLRuntimeAnnotation]
+	if !hasBaselineRuntime || baselineRuntime == "" {
+		t.Fatalf("PostgreSQL Pod lacks its runtime identity before ordinary webhook denial: %#v", current.ObjectMeta)
+	}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &corev1.Pod{}
+		if err := kubeClient.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		delete(latest.Annotations, owned.PostgreSQLRuntimeAnnotation)
+		return kubeClient.Update(ctx, latest)
+	})
+	if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "identity") {
 		t.Fatalf("ordinary update removed PostgreSQL runtime identity: %v, want webhook denial", err)
+	}
+	stored := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, key, stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRuntime, hasStoredRuntime := stored.Annotations[owned.PostgreSQLRuntimeAnnotation]
+	if stored.UID != baselineUID || !hasStoredRuntime || storedRuntime != baselineRuntime || !podfence.IsManagedPostgreSQLPod(stored) {
+		t.Fatalf("PostgreSQL Pod identity changed despite ordinary webhook denial: %#v", stored.ObjectMeta)
 	}
 }
 
