@@ -2273,9 +2273,9 @@ mod tests {
             "operator/go.mod",
             "website/package.json",
             "ui/package.json",
-            "tests/integration/Cargo.toml",
+            "crates/pgshard-integration-tests/Cargo.toml",
             "deploy/docker-bake.hcl",
-            "tests/e2e/Cargo.toml",
+            "crates/pgshard-e2e/Cargo.toml",
             "benchmarks/Cargo.toml",
         ] {
             assert!(

@@ -134,9 +134,9 @@ jobs:
           exists_at_head_or_base operator/go.mod && go_exists=true
           exists_at_head_or_base website/package.json && website_exists=true
           exists_at_head_or_base ui/package.json && ui_exists=true
-          exists_at_head_or_base tests/integration/Cargo.toml && integration_exists=true
+          exists_at_head_or_base crates/pgshard-integration-tests/Cargo.toml && integration_exists=true
           exists_at_head_or_base deploy/docker-bake.hcl && images_exists=true
-          exists_at_head_or_base tests/e2e/Cargo.toml && kind_exists=true
+          exists_at_head_or_base crates/pgshard-e2e/Cargo.toml && kind_exists=true
           exists_at_head_or_base benchmarks/Cargo.toml && performance_exists=true
 
           emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^contracts/replication-slot-names\.json$|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
@@ -150,9 +150,9 @@ jobs:
           emit_component go "$go_exists" '^operator/|^proto/|^contracts/replication-slot-names\.json$|^Makefile$|^\.github/workflows/'
           emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/workflows/'
           emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/workflows/'
-          emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
+          emit_component integration "$integration_exists" '^crates/|^operator/|^proto/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
           emit_component images "$images_exists" '^deploy/|^extensions/|^Dockerfile|/Dockerfile$|^\.dockerignore$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
-          emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
+          emit_component kind "$kind_exists" '^deploy/|^charts/|^crates/|^operator/|^ui/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
           emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^Makefile$|^\.github/workflows/'
           current_website_exists=false
           [[ -f website/package.json ]] && current_website_exists=true
