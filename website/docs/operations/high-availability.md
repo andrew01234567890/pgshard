@@ -75,26 +75,38 @@ flush, so a slow storage barrier cannot authorize an expired or changed term.
 The record is cell-scoped rather than member-scoped: a later member may advance
 it only by holding a higher term from the same exact cell Lease.
 
-After the postmaster is created and tracked by pidfd, it remains
-`StartingQuarantined`. The HBA permits only the operating-system `postgres`
-identity to connect as `postgres` to the `postgres` database over the private
-0700 Unix socket; every other local connection and every replication connection
-is rejected, and TCP remains disabled. In a fixed `pg_catalog` search path with
-bounded transaction, statement, lock, and idle timeouts plus
-`synchronous_commit=on`, the agent locks a singleton row in an owned,
-WAL-logged `pgshard_internal.writable_generation` table. It accepts only an
+After the postmaster is created and tracked by pidfd, the singleton quarantine
+runtime remains `StartingQuarantined`. Its HBA permits only the operating-system
+`postgres` identity to connect as `postgres` to the `postgres` database over the
+private 0700 Unix socket; every other local connection and every replication
+connection is rejected, and TCP remains disabled. The multi-member bootstrap
+source instead remains `StartingReplicationBootstrap`; its separate HBA admits
+only the checkpointed physical-replication identity while ordinary SQL remains
+denied. In a fixed `pg_catalog` search path, the agent locks a singleton row in
+an owned, WAL-logged
+`pgshard_internal.writable_generation` table. The local path retains bounded
+transaction, statement, lock, and idle timeouts and commits with
+`synchronous_commit=local`. The remote-apply path uses the same bounded
+preflight, then disables its statement and transaction timeouts immediately
+before the final authority check and `synchronous_commit=remote_apply` commit.
+It accepts only an
 empty record, exact replay, or a higher term in the same Lease universe. The
 attempt-private authority must still exactly match immediately before commit.
 If the commit response is lost, a fresh connection accepts the exact requested
 row as committed; the exact old or empty state may retry only while authority
 still matches. Malformed, foreign, conflicting, higher, or otherwise changed
-state fences the postmaster. The same fence applies to unknown reread timeout,
-shutdown, Lease loss, publication timeout, and child exit. Only a committed or
-reconciled row followed by one final exact authority check advances the process
-to `RunningQuarantined`.
+state fences the postmaster. The same fence applies to an unknown reread,
+shutdown, Lease loss, and child exit. The local path also fails closed on its
+bounded publication timeout. The remote-apply path has no fixed wall timeout:
+the source remains `StartingReplicationBootstrap` only while the exact
+authority, shutdown state, and tracked postmaster remain valid. A committed or
+reconciled row followed by one final exact authority check advances the local
+singleton to `RunningQuarantined`, or either the asynchronous local source or
+the synchronous remote-apply source to `RunningReplicationBootstrap`; none of
+these states makes the Pod ready or serving.
 
-A private opt-in publication mode exercises the next durability boundary against
-a disposable PostgreSQL 18 primary and physical standby. It commits with
+The synchronous multi-member `agent-quarantine` source now composes the next
+durability boundary. It commits with
 `synchronous_commit=remote_apply`, then captures a primary flush barrier and
 accepts exactly one canonical managed standby identity only while its walsender
 is streaming through its same-named active physical slot and selected as `sync`
@@ -102,10 +114,13 @@ or `quorum`. Both the standby flush and
 replay positions must cover that barrier before the primary row and
 attempt-private authority are rechecked. Missing, duplicate, asynchronous,
 lagging, unknown, disconnected, or changed evidence remains fail closed. The
-live test pauses standby replay, observes the primary publication blocked in
-PostgreSQL's synchronous-replication wait, resumes replay, and requires the exact
-row to be readable on the standby before publication returns. The operator and
-agent runtime do not select this mode yet.
+live tests pause standby replay, observe the primary publication blocked in
+PostgreSQL's synchronous-replication wait, resume replay, and require the exact
+row to be readable on the standby before publication returns. The candidate
+set is derived only from immutable `membersPerShard` and `durability`: exact
+members 1..2 or 1..4 under `ANY 1`. Asynchronous multi-member sources instead
+select explicit local generation durability without synchronous candidates.
+This is a non-serving startup floor, not a serving-traffic guarantee.
 
 With writable coordination enabled,
 every agent shutdown clears local term evidence and immediately enters the
@@ -149,10 +164,14 @@ even after the StatefulSet and Pod are deleted. Before planning, the controller
 also authoritatively classifies both the `OnDelete` StatefulSet template and
 the live Pod, including when an earlier template already differs from its Pod.
 Changing modes requires a future explicitly fenced replacement workflow.
-These durable records are only non-serving startup floors. The WAL-backed row
-has a tested synchronous-replay proof primitive, but this runtime still disables
-physical replication and therefore provides no runtime synchronous-replica
-durability guarantee.
+These durable records are only non-serving startup floors. The multi-member
+runtime composes physical standbys and proves synchronous replay of the
+generation transaction before the source reaches
+`RunningReplicationBootstrap`. That proof does not provide a runtime
+application-write durability guarantee: this
+source does not accept or route application traffic, and its global PostgreSQL
+configuration remains `synchronous_commit=local` outside the explicit
+generation transaction.
 PostgreSQL SQL write and prepare hooks do not yet reject stale request
 generations, standby copies are not yet reconciled as promotion evidence, and
 promotion proof plus serving activation remain absent. This is therefore not
@@ -343,7 +362,10 @@ replication Secret projection. It verifies the checkpointed digest, creates or
 validates the fixed least-privilege SCRAM login, proves the exact password over
 the physical-replication protocol, and immediately reserves one exact slot for
 each other configured member before publishing the durable HBA. The running
-agent has no Secret mount. No standby configuration, PDB, catalog credential,
+agent has no Secret or generated-config mount. Synchronous resources inject
+the exact immutable nonzero-member candidate set and remain Starting until one
+same-named active slot has replayed the generation barrier; asynchronous
+resources use explicit local generation durability. No PDB, catalog credential,
 `primary_conninfo`, or serving endpoint is created on the source. Every
 nonzero member receives one role-neutral singleton standby workload over its
 already-checkpointed PVC. Its init container verifies the credential digest,
@@ -359,7 +381,13 @@ TLS, standby-specific Service, or serving endpoint is created. A missing or
 same-name recreated Secret or PVC fences every physical-member controller
 against the recorded UIDs; changed replication material fails closed against
 its recorded digest. These workloads are not evidence of a serving primary,
-synchronous durability, promotion safety, or HA availability.
+serving-traffic durability, promotion safety, or HA availability.
+
+A v0.73 source Pod remains lifecycle-fenced and locally durable after its
+`OnDelete` template gains this contract. It does not become synchronous in
+place. Explicitly replace member zero after the template update to adopt the
+remote-apply startup floor over the same protected PVC; automated replacement,
+promotion, and serving activation remain unavailable.
 
 Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
 finalizer. Before workload publication, a cluster challenge update proves that

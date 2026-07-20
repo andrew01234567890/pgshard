@@ -1,6 +1,7 @@
 //! WAL-backed writable-generation publication through quarantined `PostgreSQL`.
 #![cfg_attr(test, allow(dead_code))]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -32,8 +33,11 @@ const TRANSACTION_SETTINGS: &str = "\
     SET LOCAL statement_timeout = '5s';\
     SET LOCAL transaction_timeout = '10s';\
     SET LOCAL idle_in_transaction_session_timeout = '5s';";
-const LOCAL_COMMIT: &str = "SET LOCAL synchronous_commit = on";
+const LOCAL_COMMIT: &str = "SET LOCAL synchronous_commit = local";
 const REMOTE_APPLY_COMMIT: &str = "SET LOCAL synchronous_commit = remote_apply";
+const DISABLE_REMOTE_COMMIT_TIMEOUTS: &str = "\
+    SET LOCAL statement_timeout = 0;\
+    SET LOCAL transaction_timeout = 0;";
 const CREATE_SCHEMA: &str = "CREATE SCHEMA pgshard_internal AUTHORIZATION postgres";
 const SCHEMA_IS_SAFE: &str = "\
     SELECT n.nspowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'postgres') \
@@ -127,41 +131,55 @@ const UPDATE_GENERATION: &str = "\
     WHERE singleton = true";
 const CURRENT_FLUSH_LSN: &str = "SELECT pg_catalog.pg_current_wal_flush_lsn()::text";
 const SYNCHRONOUS_STANDBY_OBSERVATION: &str = "\
-    SELECT r.state, r.sync_state, \
+    SELECT r.application_name, r.state, r.sync_state, \
            r.flush_lsn >= $2::text::pg_catalog.pg_lsn, \
            r.replay_lsn >= $2::text::pg_catalog.pg_lsn \
     FROM pg_catalog.pg_stat_replication AS r \
     JOIN pg_catalog.pg_replication_slots AS s ON s.active_pid = r.pid \
-    WHERE r.application_name = $1 AND s.slot_name = $1 \
+    WHERE r.application_name = ANY($1::text[]) \
+      AND s.slot_name = r.application_name \
       AND s.slot_type = 'physical' AND NOT s.temporary AND s.active \
-    ORDER BY r.pid";
+    ORDER BY r.application_name, r.pid";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GenerationDurability<'a> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GenerationDurability {
     Local,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the synchronous proof is intentionally uncomposed until runtime replicas exist"
-        )
-    )]
-    ExactSynchronousStandby {
-        application_name: &'a str,
-    },
+    RemoteApplyAnyOne { application_names: Vec<String> },
 }
 
-impl GenerationDurability<'_> {
-    const fn transaction_setting(self) -> &'static str {
+impl GenerationDurability {
+    pub(crate) fn remote_apply_any_one(
+        application_names: Vec<String>,
+    ) -> Result<Self, PostgresGenerationError> {
+        let durability = Self::RemoteApplyAnyOne { application_names };
+        validate_generation_durability(&durability)?;
+        Ok(durability)
+    }
+
+    const fn transaction_setting(&self) -> &'static str {
         match self {
             Self::Local => LOCAL_COMMIT,
-            Self::ExactSynchronousStandby { .. } => REMOTE_APPLY_COMMIT,
+            Self::RemoteApplyAnyOne { .. } => REMOTE_APPLY_COMMIT,
+        }
+    }
+
+    pub(crate) const fn is_remote_apply(&self) -> bool {
+        matches!(self, Self::RemoteApplyAnyOne { .. })
+    }
+
+    pub(crate) fn synchronous_standby_names_setting(&self) -> String {
+        match self {
+            Self::Local => String::new(),
+            Self::RemoteApplyAnyOne { application_names } => {
+                format!("ANY 1 ({})", application_names.join(", "))
+            }
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SynchronousStandbyObservation {
+    application_name: String,
     state: String,
     sync_state: String,
     flush_covers_barrier: Option<bool>,
@@ -190,6 +208,7 @@ static TEST_STABLE_PUBLICATION_GATE: std::sync::Mutex<Option<StablePublicationGa
 /// `authority_exact` must consult the attempt-private authority channel. It is
 /// checked before every connection attempt and immediately before `COMMIT`.
 /// The caller supplies the outer shutdown, child-exit, and timeout race.
+#[cfg(test)]
 pub(crate) async fn publish_writable_generation<F>(
     socket_dir: &Path,
     requested: &DurableWritableGeneration,
@@ -201,16 +220,16 @@ where
     publish_writable_generation_with_durability(
         socket_dir,
         requested,
-        GenerationDurability::Local,
+        &GenerationDurability::Local,
         authority_exact,
     )
     .await
 }
 
-async fn publish_writable_generation_with_durability<F>(
+pub(crate) async fn publish_writable_generation_with_durability<F>(
     socket_dir: &Path,
     requested: &DurableWritableGeneration,
-    durability: GenerationDurability<'_>,
+    durability: &GenerationDurability,
     authority_exact: &F,
 ) -> Result<(), PostgresGenerationError>
 where
@@ -274,6 +293,7 @@ where
             WritableGenerationTransition::Replay => {}
         }
 
+        prepare_remote_apply_commit(&transaction, durability).await?;
         // No await or state-changing operation may be inserted between this
         // exact authority observation and dispatching COMMIT.
         if !authority_exact() {
@@ -317,14 +337,35 @@ where
     }
 }
 
-fn validate_generation_durability(
-    durability: GenerationDurability<'_>,
+async fn prepare_remote_apply_commit(
+    transaction: &tokio_postgres::Transaction<'_>,
+    durability: &GenerationDurability,
+) -> Result<(), tokio_postgres::Error> {
+    if durability.is_remote_apply() {
+        // Remote apply may legitimately wait while every managed standby is
+        // cloning or unavailable. The supervisor still races this future
+        // against authority loss, shutdown, and postmaster exit.
+        transaction
+            .batch_execute(DISABLE_REMOTE_COMMIT_TIMEOUTS)
+            .await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_generation_durability(
+    durability: &GenerationDurability,
 ) -> Result<(), PostgresGenerationError> {
-    let GenerationDurability::ExactSynchronousStandby { application_name } = durability else {
+    let GenerationDurability::RemoteApplyAnyOne { application_names } = durability else {
         return Ok(());
     };
-    if !is_canonical_managed_member_name(application_name) {
-        return Err(PostgresGenerationError::InvalidSynchronousStandbyTarget);
+    if !matches!(application_names.len(), 2 | 4) {
+        return Err(PostgresGenerationError::InvalidSynchronousStandbySet);
+    }
+    for (index, application_name) in application_names.iter().enumerate() {
+        let expected = format!("pgshard_member_{:04}", index + 1);
+        if application_name != &expected || !is_canonical_managed_member_name(application_name) {
+            return Err(PostgresGenerationError::InvalidSynchronousStandbySet);
+        }
     }
     Ok(())
 }
@@ -342,13 +383,13 @@ pub(crate) fn is_canonical_managed_member_name(name: &str) -> bool {
 async fn prove_publication_durability<F>(
     socket_dir: &Path,
     requested: &DurableWritableGeneration,
-    durability: GenerationDurability<'_>,
+    durability: &GenerationDurability,
     authority_exact: &F,
 ) -> Result<(), PostgresGenerationError>
 where
     F: Fn() -> bool,
 {
-    let GenerationDurability::ExactSynchronousStandby { application_name } = durability else {
+    let GenerationDurability::RemoteApplyAnyOne { application_names } = durability else {
         return Ok(());
     };
     if !authority_exact() {
@@ -368,14 +409,14 @@ where
             .client
             .query(
                 SYNCHRONOUS_STANDBY_OBSERVATION,
-                &[&application_name, &barrier],
+                &[application_names, &barrier],
             )
             .await?;
         let observations = rows
             .iter()
             .map(parse_synchronous_standby_observation)
             .collect::<Result<Vec<_>, _>>()?;
-        match classify_synchronous_standby_observations(&observations)? {
+        match classify_synchronous_standby_observations(application_names, &observations)? {
             SynchronousStandbyProof::Pending => sleep(CONNECT_RETRY_DELAY).await,
             SynchronousStandbyProof::Replayed => break,
         }
@@ -392,34 +433,47 @@ fn parse_synchronous_standby_observation(
     row: &tokio_postgres::Row,
 ) -> Result<SynchronousStandbyObservation, tokio_postgres::Error> {
     Ok(SynchronousStandbyObservation {
-        state: row.try_get(0)?,
-        sync_state: row.try_get(1)?,
-        flush_covers_barrier: row.try_get(2)?,
-        replay_covers_barrier: row.try_get(3)?,
+        application_name: row.try_get(0)?,
+        state: row.try_get(1)?,
+        sync_state: row.try_get(2)?,
+        flush_covers_barrier: row.try_get(3)?,
+        replay_covers_barrier: row.try_get(4)?,
     })
 }
 
 fn classify_synchronous_standby_observations(
+    candidates: &[String],
     observations: &[SynchronousStandbyObservation],
 ) -> Result<SynchronousStandbyProof, PostgresGenerationError> {
-    let [observation] = observations else {
-        return if observations.len() > 1 {
-            Err(PostgresGenerationError::AmbiguousSynchronousStandby {
-                matches: observations.len(),
-            })
-        } else {
-            Ok(SynchronousStandbyProof::Pending)
-        };
-    };
-    if observation.state == "streaming"
-        && matches!(observation.sync_state.as_str(), "sync" | "quorum")
-        && observation.flush_covers_barrier == Some(true)
-        && observation.replay_covers_barrier == Some(true)
-    {
-        Ok(SynchronousStandbyProof::Replayed)
-    } else {
-        Ok(SynchronousStandbyProof::Pending)
+    let candidate_set: BTreeSet<_> = candidates.iter().map(String::as_str).collect();
+    let mut identity_counts = BTreeMap::new();
+    for observation in observations {
+        *identity_counts
+            .entry(observation.application_name.as_str())
+            .or_insert(0_usize) += 1;
     }
+    if let Some((application_name, matches)) = identity_counts
+        .into_iter()
+        .find(|(_, matches)| *matches > 1)
+    {
+        return Err(PostgresGenerationError::AmbiguousSynchronousStandby {
+            application_name: application_name.to_owned(),
+            matches,
+        });
+    }
+    Ok(
+        if observations.iter().any(|observation| {
+            candidate_set.contains(observation.application_name.as_str())
+                && observation.state == "streaming"
+                && matches!(observation.sync_state.as_str(), "sync" | "quorum")
+                && observation.flush_covers_barrier == Some(true)
+                && observation.replay_covers_barrier == Some(true)
+        }) {
+            SynchronousStandbyProof::Replayed
+        } else {
+            SynchronousStandbyProof::Pending
+        },
+    )
 }
 
 fn verify_synchronous_publication(
@@ -658,12 +712,18 @@ pub enum PostgresGenerationError {
     /// Ambiguous reconciliation observed neither the old nor requested value.
     #[error("PostgreSQL writable-generation row changed during ambiguous commit recovery")]
     AmbiguousGenerationChanged,
-    /// The exact synchronous target is not a canonical managed member identity.
-    #[error("PostgreSQL writable-generation synchronous target is not a managed member identity")]
-    InvalidSynchronousStandbyTarget,
-    /// More than one physical walsender claimed the exact managed standby identity.
-    #[error("PostgreSQL exposed {matches} walsenders for the exact synchronous standby identity")]
+    /// The remote-apply candidate set is not one supported complete topology.
+    #[error(
+        "PostgreSQL writable-generation synchronous candidates must be the exact sorted member 1..2 or 1..4 set"
+    )]
+    InvalidSynchronousStandbySet,
+    /// More than one physical walsender claimed one managed standby identity.
+    #[error(
+        "PostgreSQL exposed {matches} walsenders for synchronous standby identity {application_name:?}"
+    )]
     AmbiguousSynchronousStandby {
+        /// Duplicated physical standby identity.
+        application_name: String,
         /// Number of matching physical walsenders.
         matches: usize,
     },
@@ -709,12 +769,14 @@ mod tests {
     }
 
     fn standby_observation(
+        application_name: &str,
         state: &str,
         sync_state: &str,
         flush_covers_barrier: Option<bool>,
         replay_covers_barrier: Option<bool>,
     ) -> SynchronousStandbyObservation {
         SynchronousStandbyObservation {
+            application_name: application_name.to_owned(),
             state: state.to_owned(),
             sync_state: sync_state.to_owned(),
             flush_covers_barrier,
@@ -723,28 +785,48 @@ mod tests {
     }
 
     #[test]
-    fn synchronous_target_requires_canonical_managed_member_name() {
-        assert!(validate_generation_durability(GenerationDurability::Local).is_ok());
-        assert!(
-            validate_generation_durability(GenerationDurability::ExactSynchronousStandby {
-                application_name: "pgshard_member_0001",
-            })
-            .is_ok()
-        );
-        for application_name in [
-            "",
-            "walreceiver",
-            "pgshard_member_001",
-            "pgshard_member_00001",
-            "pgshard_member_abcd",
+    fn synchronous_candidates_require_complete_sorted_managed_topology() {
+        assert!(validate_generation_durability(&GenerationDurability::Local).is_ok());
+        for names in [
+            vec!["pgshard_member_0001", "pgshard_member_0002"],
+            vec![
+                "pgshard_member_0001",
+                "pgshard_member_0002",
+                "pgshard_member_0003",
+                "pgshard_member_0004",
+            ],
+        ] {
+            assert!(
+                GenerationDurability::remote_apply_any_one(
+                    names.into_iter().map(str::to_owned).collect()
+                )
+                .is_ok()
+            );
+        }
+        for names in [
+            vec![],
+            vec!["pgshard_member_0001"],
+            vec!["pgshard_member_0002", "pgshard_member_0001"],
+            vec!["pgshard_member_0001", "pgshard_member_0001"],
+            vec!["pgshard_member_0001", "pgshard_member_0003"],
+            vec!["pgshard_member_0001", "walreceiver"],
         ] {
             assert!(matches!(
-                validate_generation_durability(GenerationDurability::ExactSynchronousStandby {
-                    application_name,
-                }),
-                Err(PostgresGenerationError::InvalidSynchronousStandbyTarget)
+                GenerationDurability::remote_apply_any_one(
+                    names.into_iter().map(str::to_owned).collect()
+                ),
+                Err(PostgresGenerationError::InvalidSynchronousStandbySet)
             ));
         }
+        assert_eq!(
+            GenerationDurability::remote_apply_any_one(vec![
+                "pgshard_member_0001".to_owned(),
+                "pgshard_member_0002".to_owned(),
+            ])
+            .expect("valid any-one topology")
+            .synchronous_standby_names_setting(),
+            "ANY 1 (pgshard_member_0001, pgshard_member_0002)"
+        );
     }
 
     #[test]
@@ -765,38 +847,101 @@ mod tests {
 
     #[test]
     fn synchronous_classifier_requires_one_streaming_selected_replayed_standby() {
+        let candidates = vec![
+            "pgshard_member_0001".to_owned(),
+            "pgshard_member_0002".to_owned(),
+        ];
         for sync_state in ["sync", "quorum"] {
             assert_eq!(
-                classify_synchronous_standby_observations(&[standby_observation(
-                    "streaming",
-                    sync_state,
-                    Some(true),
-                    Some(true),
-                )])
+                classify_synchronous_standby_observations(
+                    &candidates,
+                    &[standby_observation(
+                        "pgshard_member_0002",
+                        "streaming",
+                        sync_state,
+                        Some(true),
+                        Some(true),
+                    )]
+                )
                 .expect("exact synchronous standby proves replay"),
                 SynchronousStandbyProof::Replayed
             );
         }
 
         let adverse = [
-            standby_observation("startup", "quorum", Some(true), Some(true)),
-            standby_observation("catchup", "quorum", Some(true), Some(true)),
-            standby_observation("streaming", "async", Some(true), Some(true)),
-            standby_observation("streaming", "potential", Some(true), Some(true)),
-            standby_observation("streaming", "quorum", None, Some(true)),
-            standby_observation("streaming", "quorum", Some(true), None),
-            standby_observation("streaming", "quorum", Some(false), Some(true)),
-            standby_observation("streaming", "quorum", Some(true), Some(false)),
+            standby_observation(
+                "pgshard_member_0001",
+                "startup",
+                "quorum",
+                Some(true),
+                Some(true),
+            ),
+            standby_observation(
+                "pgshard_member_0001",
+                "catchup",
+                "quorum",
+                Some(true),
+                Some(true),
+            ),
+            standby_observation(
+                "pgshard_member_0001",
+                "streaming",
+                "async",
+                Some(true),
+                Some(true),
+            ),
+            standby_observation(
+                "pgshard_member_0001",
+                "streaming",
+                "potential",
+                Some(true),
+                Some(true),
+            ),
+            standby_observation(
+                "pgshard_member_0001",
+                "streaming",
+                "quorum",
+                None,
+                Some(true),
+            ),
+            standby_observation(
+                "pgshard_member_0001",
+                "streaming",
+                "quorum",
+                Some(true),
+                None,
+            ),
+            standby_observation(
+                "pgshard_member_0001",
+                "streaming",
+                "quorum",
+                Some(false),
+                Some(true),
+            ),
+            standby_observation(
+                "pgshard_member_0001",
+                "streaming",
+                "quorum",
+                Some(true),
+                Some(false),
+            ),
+            standby_observation(
+                "pgshard_member_0003",
+                "streaming",
+                "quorum",
+                Some(true),
+                Some(true),
+            ),
         ];
         for observation in adverse {
             assert_eq!(
-                classify_synchronous_standby_observations(&[observation])
+                classify_synchronous_standby_observations(&candidates, &[observation])
                     .expect("transiently unsafe standby remains pending"),
                 SynchronousStandbyProof::Pending
             );
         }
         assert_eq!(
-            classify_synchronous_standby_observations(&[])
+            classify_synchronous_standby_observations(&candidates, &[])
                 .expect("missing exact standby remains pending"),
             SynchronousStandbyProof::Pending
         );
@@ -804,13 +949,29 @@ mod tests {
 
     #[test]
     fn synchronous_classifier_rejects_duplicate_identity() {
+        let candidates = vec![
+            "pgshard_member_0001".to_owned(),
+            "pgshard_member_0002".to_owned(),
+        ];
         let observations = [
-            standby_observation("streaming", "quorum", Some(true), Some(true)),
-            standby_observation("streaming", "quorum", Some(true), Some(true)),
+            standby_observation(
+                "pgshard_member_0001",
+                "streaming",
+                "quorum",
+                Some(true),
+                Some(true),
+            ),
+            standby_observation(
+                "pgshard_member_0001",
+                "streaming",
+                "quorum",
+                Some(true),
+                Some(true),
+            ),
         ];
         assert!(matches!(
-            classify_synchronous_standby_observations(&observations),
-            Err(PostgresGenerationError::AmbiguousSynchronousStandby { matches: 2 })
+            classify_synchronous_standby_observations(&candidates, &observations),
+            Err(PostgresGenerationError::AmbiguousSynchronousStandby { matches: 2, .. })
         ));
     }
 
@@ -902,7 +1063,7 @@ mod tests {
     fn publication_sql_is_fixed_logged_and_local() {
         assert!(TRANSACTION_SETTINGS.contains("search_path = pg_catalog"));
         assert!(TRANSACTION_SETTINGS.contains("ISOLATION LEVEL READ COMMITTED"));
-        assert!(LOCAL_COMMIT.contains("synchronous_commit = on"));
+        assert!(LOCAL_COMMIT.contains("synchronous_commit = local"));
         assert!(REMOTE_APPLY_COMMIT.contains("synchronous_commit = remote_apply"));
         assert!(TRANSACTION_SETTINGS.contains("lock_timeout"));
         assert!(TRANSACTION_SETTINGS.contains("statement_timeout"));
@@ -936,7 +1097,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires disposable primary and streaming-standby PostgreSQL 18 Unix sockets"]
-    async fn live_postgres18_proves_exact_synchronous_generation_replay() {
+    async fn live_postgres18_proves_any_one_synchronous_generation_replay() {
         let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
             .map(std::path::PathBuf::from)
             .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
@@ -1076,15 +1237,12 @@ mod tests {
         socket_dir: &Path,
         generation: &DurableWritableGeneration,
     ) -> Result<(), PostgresGenerationError> {
-        publish_writable_generation_with_durability(
-            socket_dir,
-            generation,
-            GenerationDurability::ExactSynchronousStandby {
-                application_name: "pgshard_member_0001",
-            },
-            &|| true,
-        )
-        .await
+        let durability = GenerationDurability::remote_apply_any_one(vec![
+            "pgshard_member_0001".to_owned(),
+            "pgshard_member_0002".to_owned(),
+        ])?;
+        publish_writable_generation_with_durability(socket_dir, generation, &durability, &|| true)
+            .await
     }
 
     async fn assert_unsafe_schema_rejected_before_ddl(

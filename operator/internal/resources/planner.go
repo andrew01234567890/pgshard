@@ -33,14 +33,16 @@ import (
 )
 
 const (
-	ManagedByLabel              = "app.kubernetes.io/managed-by"
-	InstanceLabel               = "app.kubernetes.io/instance"
-	ComponentLabel              = "app.kubernetes.io/component"
-	ClusterLabel                = "pgshard.io/cluster"
-	ShardLabel                  = "pgshard.io/shard"
-	RoleLabel                   = "pgshard.io/role"
-	MemberLabel                 = "pgshard.io/member"
-	PostgreSQLRuntimeAnnotation = "pgshard.io/postgresql-runtime"
+	ManagedByLabel                           = "app.kubernetes.io/managed-by"
+	InstanceLabel                            = "app.kubernetes.io/instance"
+	ComponentLabel                           = "app.kubernetes.io/component"
+	ClusterLabel                             = "pgshard.io/cluster"
+	ShardLabel                               = "pgshard.io/shard"
+	RoleLabel                                = "pgshard.io/role"
+	MemberLabel                              = "pgshard.io/member"
+	PostgreSQLRuntimeAnnotation              = "pgshard.io/postgresql-runtime"
+	PostgreSQLGenerationDurabilityAnnotation = "pgshard.io/postgresql-generation-durability"
+	PostgreSQLSynchronousStandbysAnnotation  = "pgshard.io/postgresql-synchronous-standbys"
 
 	ManagedByValue = "pgshard-operator"
 	// ClusterResourceFinalizer protects operator-owned resources and marks a
@@ -2032,7 +2034,7 @@ func ObservePostgreSQLRuntime(annotations map[string]string, spec corev1.PodSpec
 	}
 
 	annotated := PostgreSQLRuntime(annotations[PostgreSQLRuntimeAnnotation])
-	agentShape := postgresqlAgentShape(spec, *postgres)
+	agentShape := postgresqlAgentShape(annotations, spec, *postgres)
 	switch annotated {
 	case "", PostgreSQLRuntimeDirect:
 		if agentShape {
@@ -2047,6 +2049,43 @@ func ObservePostgreSQLRuntime(annotations map[string]string, spec corev1.PodSpec
 	default:
 		return "", fmt.Errorf("PostgreSQL runtime annotation %q is invalid", annotated)
 	}
+}
+
+// ObservePostgreSQLRuntimeForCluster additionally binds a structurally valid
+// replication-bootstrap source to the PgShardCluster's immutable topology and
+// durability. Pod annotations describe shape; they are not an independent
+// authority that may downgrade or shrink the source's generation contract.
+func ObservePostgreSQLRuntimeForCluster(cluster *pgshardv1alpha1.PgShardCluster, annotations map[string]string, spec corev1.PodSpec) (PostgreSQLRuntime, error) {
+	if cluster == nil {
+		return "", fmt.Errorf("cluster is nil")
+	}
+	observed, err := ObservePostgreSQLRuntime(annotations, spec)
+	if err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		return observed, err
+	}
+	for _, container := range spec.Containers {
+		if container.Name != "postgresql" {
+			continue
+		}
+		mode, modeOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_MODE")
+		if !modeOK || mode != "replication-bootstrap-primary" {
+			return observed, nil
+		}
+		if postgresqlLegacyBootstrapGenerationShape(annotations, container) {
+			return observed, nil
+		}
+		wantDurability, wantCandidates := postgresqlGenerationDurability(cluster)
+		gotDurability, durabilityOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_GENERATION_DURABILITY")
+		gotCandidates, candidatesOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES")
+		annotatedCandidates, candidatesAnnotated := annotations[PostgreSQLSynchronousStandbysAnnotation]
+		if !durabilityOK || gotDurability != wantDurability || annotations[PostgreSQLGenerationDurabilityAnnotation] != wantDurability ||
+			(wantCandidates == "" && (candidatesOK || candidatesAnnotated)) ||
+			(wantCandidates != "" && (!candidatesOK || gotCandidates != wantCandidates || !candidatesAnnotated || annotatedCandidates != wantCandidates)) {
+			return "", fmt.Errorf("replication-bootstrap source generation durability does not match immutable cluster topology")
+		}
+		return observed, nil
+	}
+	return "", fmt.Errorf("PostgreSQL runtime has no postgresql container")
 }
 
 // IsPostgreSQLReplicationBootstrapSourcePod recognizes only the deterministic,
@@ -2083,6 +2122,23 @@ func IsPostgreSQLReplicationBootstrapSourcePod(pod *corev1.Pod) bool {
 		hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_HBA_FILE")
 		return modeOK && hbaFileOK && mode == "replication-bootstrap-primary" &&
 			hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+	}
+	return false
+}
+
+// IsCurrentPostgreSQLReplicationBootstrapSourcePod excludes the complete
+// pre-generation-durability source shape retained by
+// IsPostgreSQLReplicationBootstrapSourcePod only for existing Pod lifecycle
+// fencing. New Pod bindings must carry the current generation contract.
+func IsCurrentPostgreSQLReplicationBootstrapSourcePod(pod *corev1.Pod) bool {
+	if !IsPostgreSQLReplicationBootstrapSourcePod(pod) {
+		return false
+	}
+	for index := range pod.Spec.Containers {
+		container := pod.Spec.Containers[index]
+		if container.Name == "postgresql" {
+			return !postgresqlLegacyBootstrapGenerationShape(pod.Annotations, container)
+		}
 	}
 	return false
 }
@@ -2140,7 +2196,7 @@ func IsPostgreSQLReplicationStandbyPod(pod *corev1.Pod) bool {
 	return false
 }
 
-func postgresqlAgentShape(spec corev1.PodSpec, postgres corev1.Container) bool {
+func postgresqlAgentShape(annotations map[string]string, spec corev1.PodSpec, postgres corev1.Container) bool {
 	if spec.ServiceAccountName == "" || spec.AutomountServiceAccountToken == nil || *spec.AutomountServiceAccountToken || len(postgres.Command) != 0 || len(postgres.Args) != 0 {
 		return false
 	}
@@ -2149,6 +2205,14 @@ func postgresqlAgentShape(spec corev1.PodSpec, postgres corev1.Container) bool {
 	quarantine := modeOK && hbaFileOK && mode == "quarantine" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
 	bootstrapSource := modeOK && hbaFileOK && mode == "replication-bootstrap-primary" && hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
 	standby := modeOK && hbaFileOK && mode == "replication-standby" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
+	if bootstrapSource {
+		bootstrapSource = postgresqlBootstrapGenerationShape(annotations, postgres)
+	} else if annotations[PostgreSQLGenerationDurabilityAnnotation] != "" ||
+		annotations[PostgreSQLSynchronousStandbysAnnotation] != "" ||
+		containerHasEnvironment(postgres, "PGSHARD_POSTGRES_GENERATION_DURABILITY") ||
+		containerHasEnvironment(postgres, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES") {
+		return false
+	}
 	if standby {
 		source, sourceOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_HOST")
 		port, portOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_PORT")
@@ -2195,6 +2259,44 @@ func postgresqlAgentShape(spec corev1.PodSpec, postgres corev1.Container) bool {
 	return probeHTTPPath(postgres.StartupProbe) == "/healthz" &&
 		probeHTTPPath(postgres.LivenessProbe) == "/healthz" &&
 		probeHTTPPath(postgres.ReadinessProbe) == "/readyz"
+}
+
+func postgresqlBootstrapGenerationShape(annotations map[string]string, postgres corev1.Container) bool {
+	if postgresqlLegacyBootstrapGenerationShape(annotations, postgres) {
+		return true
+	}
+	durability, durabilityOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_GENERATION_DURABILITY")
+	if !durabilityOK || annotations[PostgreSQLGenerationDurabilityAnnotation] != durability {
+		return false
+	}
+
+	annotatedCandidates, candidatesAnnotated := annotations[PostgreSQLSynchronousStandbysAnnotation]
+	switch durability {
+	case "local":
+		return !candidatesAnnotated && !containerHasEnvironment(postgres, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES")
+	case "remote-apply-any-one":
+		candidates, candidatesOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES")
+		return candidatesOK && candidatesAnnotated && candidates == annotatedCandidates && canonicalPostgreSQLSynchronousStandbySet(candidates)
+	default:
+		return false
+	}
+}
+
+// postgresqlLegacyBootstrapGenerationShape recognizes only the complete
+// pre-generation-durability source shape shipped by v0.73. This keeps its
+// already-finalized Pod inside lifecycle fencing while an OnDelete template is
+// upgraded. Any partial setting is a conflicting shape, not a legacy one.
+func postgresqlLegacyBootstrapGenerationShape(annotations map[string]string, postgres corev1.Container) bool {
+	_, durabilityAnnotated := annotations[PostgreSQLGenerationDurabilityAnnotation]
+	_, candidatesAnnotated := annotations[PostgreSQLSynchronousStandbysAnnotation]
+	return !durabilityAnnotated && !candidatesAnnotated &&
+		!containerHasEnvironment(postgres, "PGSHARD_POSTGRES_GENERATION_DURABILITY") &&
+		!containerHasEnvironment(postgres, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES")
+}
+
+func canonicalPostgreSQLSynchronousStandbySet(candidates string) bool {
+	return candidates == "pgshard_member_0001,pgshard_member_0002" ||
+		candidates == "pgshard_member_0001,pgshard_member_0002,pgshard_member_0003,pgshard_member_0004"
 }
 
 func canonicalPostgreSQLMemberSlot(slot string) bool {
@@ -3693,6 +3795,7 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 		bootstrapPullPolicy = corev1.PullNever
 	}
 	agent := postgresqlReplicationBootstrapPrimaryContainer(cluster, shard, images.PostgreSQLBootstrap, bootstrapPullPolicy, postgresSecurity, writableLease)
+	generationDurability, synchronousStandbys := postgresqlGenerationDurability(cluster)
 	bootstrapContainer := corev1.Container{
 		Name:            "bootstrap-postgresql",
 		Image:           images.PostgreSQLBootstrap,
@@ -3728,9 +3831,13 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 	automount := false
 	enableServiceLinks := false
 	podAnnotations := map[string]string{
-		ConfigHashAnnotation:              configurationHash,
-		PostgreSQLPodClusterUIDAnnotation: string(cluster.UID),
-		PostgreSQLRuntimeAnnotation:       images.PostgreSQLRuntime.String(),
+		ConfigHashAnnotation:                     configurationHash,
+		PostgreSQLPodClusterUIDAnnotation:        string(cluster.UID),
+		PostgreSQLRuntimeAnnotation:              images.PostgreSQLRuntime.String(),
+		PostgreSQLGenerationDurabilityAnnotation: generationDurability,
+	}
+	if synchronousStandbys != "" {
+		podAnnotations[PostgreSQLSynchronousStandbysAnnotation] = synchronousStandbys
 	}
 	volumes := []corev1.Volume{
 		{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: bootstrap.PVCName}}},
@@ -3750,6 +3857,10 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 	statefulSetMetadata.Labels[ShardLabel] = shardLabel(shard)
 	statefulSetMetadata.Labels[MemberLabel] = memberLabel(0)
 	statefulSetMetadata.Annotations[PostgreSQLRuntimeAnnotation] = images.PostgreSQLRuntime.String()
+	statefulSetMetadata.Annotations[PostgreSQLGenerationDurabilityAnnotation] = generationDurability
+	if synchronousStandbys != "" {
+		statefulSetMetadata.Annotations[PostgreSQLSynchronousStandbysAnnotation] = synchronousStandbys
+	}
 	return &appsv1.StatefulSet{
 		ObjectMeta: statefulSetMetadata,
 		Spec: appsv1.StatefulSetSpec{
@@ -3922,7 +4033,28 @@ func postgresqlAgentQuarantineContainer(cluster *pgshardv1alpha1.PgShardCluster,
 }
 
 func postgresqlReplicationBootstrapPrimaryContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
-	return postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "replication-bootstrap-primary", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf")
+	container := postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "replication-bootstrap-primary", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf")
+	durability, synchronousStandbys := postgresqlGenerationDurability(cluster)
+	container.Env = append(container.Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_GENERATION_DURABILITY", Value: durability})
+	if synchronousStandbys != "" {
+		container.Env = append(container.Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", Value: synchronousStandbys})
+	}
+	return container
+}
+
+// postgresqlGenerationDurability derives the source's startup floor only from
+// the immutable topology and durability fields. The exact member identities
+// are passed directly to the agent; generated PostgreSQL configuration is not
+// an authority for this decision.
+func postgresqlGenerationDurability(cluster *pgshardv1alpha1.PgShardCluster) (string, string) {
+	if cluster.Spec.Durability == pgshardv1alpha1.DurabilityAsynchronous {
+		return "local", ""
+	}
+	candidates := make([]string, 0, cluster.Spec.MembersPerShard-1)
+	for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
+		candidates = append(candidates, "pgshard_member_"+memberLabel(member))
+	}
+	return "remote-apply-any-one", strings.Join(candidates, ",")
 }
 
 func postgresqlReplicationStandbyContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, sourceHost, slotName string) corev1.Container {

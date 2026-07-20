@@ -220,6 +220,16 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		response := admission.Denied("managed PostgreSQL Pod cannot bind while its PgShardCluster is deleting")
 		return nil, &response
 	}
+	if owned.IsPostgreSQLReplicationBootstrapSourcePod(pod) {
+		if !owned.IsCurrentPostgreSQLReplicationBootstrapSourcePod(pod) {
+			response := admission.Denied("legacy PostgreSQL replication-bootstrap source cannot receive a new Pod binding")
+			return nil, &response
+		}
+		if _, err := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec); err != nil {
+			response := admission.Denied(fmt.Sprintf("PostgreSQL replication-bootstrap source does not match its PgShardCluster generation contract: %v", err))
+			return nil, &response
+		}
+	}
 	if binding.Target.Kind != "Node" || binding.Target.Name == "" {
 		response := admission.Denied("managed PostgreSQL Pod binding must select a named Node")
 		return nil, &response
@@ -638,7 +648,14 @@ func managedIdentityEqual(oldPod, newPod *corev1.Pod) bool {
 			return false
 		}
 	}
-	for _, key := range []string{owned.PostgreSQLPodClusterUIDAnnotation, owned.PostgreSQLRuntimeAnnotation, NodeUIDAnnotation, NodeBootIDAnnotation} {
+	for _, key := range []string{
+		owned.PostgreSQLPodClusterUIDAnnotation,
+		owned.PostgreSQLRuntimeAnnotation,
+		owned.PostgreSQLGenerationDurabilityAnnotation,
+		owned.PostgreSQLSynchronousStandbysAnnotation,
+		NodeUIDAnnotation,
+		NodeBootIDAnnotation,
+	} {
 		oldValue, oldHas := oldPod.Annotations[key]
 		newValue, newHas := newPod.Annotations[key]
 		if oldHas != newHas || oldValue != newValue {

@@ -546,7 +546,14 @@ They require the checkpointed per-cell Lease name and UID, the role-neutral
 ServiceAccount, a 600-second projected token with namespace CA/name, downward
 API Pod identity, the parent runtime mount, agent health/readiness probes, and
 the absence of bootstrap and catalog credentials from the running container.
-Missing, duplicated, or mismatched Lease checkpoints fail planning. The direct
+For multi-member sources they also require the unique literal generation mode:
+local with no candidate setting for asynchronous resources, or
+`remote-apply-any-one` with the exact ordered nonzero-member set for synchronous
+three- and five-member resources. Missing, duplicate, reordered, skipped,
+member-zero, extra, downgraded, and immutable-topology-mismatched settings fail
+closed. A complete v0.73 source shape remains classified for lifecycle fencing,
+while every partial upgrade shape is rejected. Missing, duplicated, or
+mismatched Lease checkpoints fail planning. The direct
 runtime test separately proves it receives neither the ServiceAccount nor the
 projected API volume. The manager KIND test removes the cell RoleBinding after
 stopping reconciliation, verifies exact `get` and `update` denial, observes the
@@ -565,7 +572,12 @@ authority changing between the durability barrier and exec. Publication
 failpoints stop after staging-file sync, after rename, and immediately before
 the PGDATA directory sync; each interrupted view is exactly the prior or
 requested canonical generation, every case proves the postmaster absent, and
-the next attempt completes the barrier before it starts. Renewals are counted
+the next attempt completes the barrier before it starts. The manager KIND path
+also pauses both synchronous candidates, advances the source to a higher Lease
+term, and proves it remains Starting beyond the local ten-second publication
+ceiling without churning that term. Resuming the second candidate must make the
+source Running, leave all members unready, expose exact `ANY 1`, and reproduce
+the source generation bytes on that standby. Renewals are counted
 only when the Lease's `renewTime` strictly advances, not from unrelated
 resource-version changes.
 It then pauses reconciliation without removing Lease permissions, scales the

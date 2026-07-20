@@ -16,6 +16,7 @@ readonly standby_socket="pgshard-generation-standby-socket-${suffix}"
 readonly standby_credentials="pgshard-generation-standby-credentials-${suffix}"
 readonly replication_password="pgshard_generation_replication_test"
 readonly standby_application_name="pgshard_member_0001"
+readonly synchronous_standby_names="pgshard_member_0001, pgshard_member_0002"
 readonly replication_role="pgshard_replication"
 readonly standby_passfile="/run/pgshard/credentials/primary.pass"
 readonly ambient_password_canary="pgshard_ambient_password_canary"
@@ -287,7 +288,7 @@ docker exec --user 999:999 "$primary" psql -X --no-password \
   --host=/var/run/postgresql --username=postgres --dbname=postgres \
   --set=ON_ERROR_STOP=1 \
   --command="ALTER SYSTEM SET synchronous_standby_names = \
-             'ANY 1 (${standby_application_name})'" >/dev/null
+             'ANY 1 (${synchronous_standby_names})'" >/dev/null
 docker exec --user 999:999 "$primary" psql -X --no-password \
   --host=/var/run/postgresql --username=postgres --dbname=postgres \
   --set=ON_ERROR_STOP=1 --command="SELECT pg_catalog.pg_reload_conf()" >/dev/null
@@ -319,7 +320,7 @@ docker run --rm --user 999:999 --network none --read-only \
   --entrypoint /test/pgshard-agent-test \
   "$image" \
   --ignored --exact \
-  postgres_generation::tests::live_postgres18_proves_exact_synchronous_generation_replay \
+  postgres_generation::tests::live_postgres18_proves_any_one_synchronous_generation_replay \
   --nocapture
 
 if [[ -n "$runtime_image" ]]; then

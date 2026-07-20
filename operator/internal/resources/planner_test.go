@@ -3013,7 +3013,18 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 
 					if member == "0000" {
 						sources++
-						if !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-bootstrap-primary") || !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf") {
+						wantCandidates := make([]string, 0, members-1)
+						for candidate := int32(1); candidate < members; candidate++ {
+							wantCandidates = append(wantCandidates, "pgshard_member_"+memberLabel(candidate))
+						}
+						wantCandidateCSV := strings.Join(wantCandidates, ",")
+						if !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-bootstrap-primary") ||
+							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf") ||
+							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_GENERATION_DURABILITY", "remote-apply-any-one") ||
+							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", wantCandidateCSV) ||
+							object.Spec.Template.Annotations[PostgreSQLGenerationDurabilityAnnotation] != "remote-apply-any-one" ||
+							object.Spec.Template.Annotations[PostgreSQLSynchronousStandbysAnnotation] != wantCandidateCSV ||
+							containerHasVolumeMount(agent, "postgresql-config") {
 							t.Fatalf("bootstrap source %s agent environment = %#v", object.Name, agent.Env)
 						}
 						if !containsVolumeMount(bootstrapContainer.VolumeMounts, "replication-credential", true) ||
@@ -3037,6 +3048,8 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", slotName) ||
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_PASSFILE", "/run/pgshard/standby-auth/passfile") ||
 						!containerHasReadOnlyMount(agent, "standby-passfile", "/run/pgshard/standby-auth") ||
+						containerHasEnvironment(agent, "PGSHARD_POSTGRES_GENERATION_DURABILITY") ||
+						containerHasEnvironment(agent, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES") ||
 						podHasServiceAccountTokenProjection(object.Spec.Template.Spec) {
 						t.Fatalf("standby %s runtime authority = %#v", object.Name, object.Spec.Template.Spec)
 					}
@@ -3138,11 +3151,60 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 	}
 }
 
+func TestMultiMemberAgentGenerationDurabilityFollowsImmutableTopology(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		members    int32
+		durability pgshardv1alpha1.DurabilityMode
+		wantMode   string
+		wantNames  string
+	}{
+		{name: "asynchronous-three", members: 3, durability: pgshardv1alpha1.DurabilityAsynchronous, wantMode: "local"},
+		{name: "synchronous-three", members: 3, durability: pgshardv1alpha1.DurabilitySynchronous, wantMode: "remote-apply-any-one", wantNames: "pgshard_member_0001,pgshard_member_0002"},
+		{name: "synchronous-five", members: 5, durability: pgshardv1alpha1.DurabilitySynchronous, wantMode: "remote-apply-any-one", wantNames: "pgshard_member_0001,pgshard_member_0002,pgshard_member_0003,pgshard_member_0004"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			pod := testReplicationBootstrapSourcePodFor(t, test.members, test.durability)
+			agent := pod.Spec.Containers[0]
+			if mode, ok := containerUniqueLiteralEnvironment(agent, "PGSHARD_POSTGRES_GENERATION_DURABILITY"); !ok || mode != test.wantMode {
+				t.Fatalf("generation durability = %q, %t, want %q", mode, ok, test.wantMode)
+			}
+			if pod.Annotations[PostgreSQLGenerationDurabilityAnnotation] != test.wantMode {
+				t.Fatalf("generation durability annotation = %q, want %q", pod.Annotations[PostgreSQLGenerationDurabilityAnnotation], test.wantMode)
+			}
+			if test.wantNames == "" {
+				if containerHasEnvironment(agent, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES") {
+					t.Fatalf("asynchronous source received synchronous candidates: %#v", agent.Env)
+				}
+				if _, present := pod.Annotations[PostgreSQLSynchronousStandbysAnnotation]; present {
+					t.Fatalf("asynchronous source received synchronous annotation: %#v", pod.Annotations)
+				}
+			} else {
+				if names, ok := containerUniqueLiteralEnvironment(agent, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES"); !ok || names != test.wantNames {
+					t.Fatalf("synchronous candidates = %q, %t, want %q", names, ok, test.wantNames)
+				}
+				if pod.Annotations[PostgreSQLSynchronousStandbysAnnotation] != test.wantNames {
+					t.Fatalf("synchronous candidate annotation = %q, want %q", pod.Annotations[PostgreSQLSynchronousStandbysAnnotation], test.wantNames)
+				}
+			}
+			if !IsPostgreSQLReplicationBootstrapSourcePod(pod) {
+				t.Fatal("exact planned source was not classified")
+			}
+		})
+	}
+}
+
 func TestReplicationBootstrapSourcePodClassificationIsExact(t *testing.T) {
 	t.Parallel()
 	pod := testReplicationBootstrapSourcePod(t)
 	if !IsPostgreSQLReplicationBootstrapSourcePod(pod) {
 		t.Fatalf("planned role-neutral source Pod was not recognized: %#v", pod.ObjectMeta)
+	}
+	if !IsCurrentPostgreSQLReplicationBootstrapSourcePod(pod) {
+		t.Fatalf("planned role-neutral source Pod did not carry the current generation contract: %#v", pod.ObjectMeta)
 	}
 	for _, test := range []struct {
 		name   string
@@ -3169,6 +3231,48 @@ func TestReplicationBootstrapSourcePodClassificationIsExact(t *testing.T) {
 		{name: "duplicate mode", mutate: func(pod *corev1.Pod) {
 			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-bootstrap-primary"})
 		}},
+		{name: "missing generation durability", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = slices.DeleteFunc(pod.Spec.Containers[0].Env, func(environment corev1.EnvVar) bool {
+				return environment.Name == "PGSHARD_POSTGRES_GENERATION_DURABILITY"
+			})
+		}},
+		{name: "duplicate generation durability", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_GENERATION_DURABILITY", Value: "remote-apply-any-one"})
+		}},
+		{name: "downgraded generation durability", mutate: func(pod *corev1.Pod) {
+			setLiteralEnvironment(pod, "PGSHARD_POSTGRES_GENERATION_DURABILITY", "local")
+		}},
+		{name: "missing synchronous candidates", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = slices.DeleteFunc(pod.Spec.Containers[0].Env, func(environment corev1.EnvVar) bool {
+				return environment.Name == "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES"
+			})
+		}},
+		{name: "duplicate synchronous candidates", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", Value: "pgshard_member_0001,pgshard_member_0002"})
+		}},
+		{name: "reordered synchronous candidates", mutate: func(pod *corev1.Pod) {
+			const value = "pgshard_member_0002,pgshard_member_0001"
+			setLiteralEnvironment(pod, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", value)
+			pod.Annotations[PostgreSQLSynchronousStandbysAnnotation] = value
+		}},
+		{name: "skipped synchronous candidate", mutate: func(pod *corev1.Pod) {
+			const value = "pgshard_member_0001,pgshard_member_0003"
+			setLiteralEnvironment(pod, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", value)
+			pod.Annotations[PostgreSQLSynchronousStandbysAnnotation] = value
+		}},
+		{name: "member zero synchronous candidate", mutate: func(pod *corev1.Pod) {
+			const value = "pgshard_member_0000,pgshard_member_0001"
+			setLiteralEnvironment(pod, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", value)
+			pod.Annotations[PostgreSQLSynchronousStandbysAnnotation] = value
+		}},
+		{name: "extra synchronous candidate", mutate: func(pod *corev1.Pod) {
+			const value = "pgshard_member_0001,pgshard_member_0002,pgshard_member_0003"
+			setLiteralEnvironment(pod, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", value)
+			pod.Annotations[PostgreSQLSynchronousStandbysAnnotation] = value
+		}},
+		{name: "different synchronous annotation", mutate: func(pod *corev1.Pod) {
+			pod.Annotations[PostgreSQLSynchronousStandbysAnnotation] = "pgshard_member_0002,pgshard_member_0001"
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -3181,10 +3285,111 @@ func TestReplicationBootstrapSourcePodClassificationIsExact(t *testing.T) {
 	}
 }
 
+func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 5
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilitySynchronous
+	pod := testReplicationBootstrapSourcePodFor(t, cluster.Spec.MembersPerShard, cluster.Spec.Durability)
+	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		t.Fatalf("observe exact five-member source = %q, %v", observed, err)
+	}
+
+	wrongTopology := pod.DeepCopy()
+	const threeMemberCandidates = "pgshard_member_0001,pgshard_member_0002"
+	setLiteralEnvironment(wrongTopology, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", threeMemberCandidates)
+	wrongTopology.Annotations[PostgreSQLSynchronousStandbysAnnotation] = threeMemberCandidates
+	if observed, err := ObservePostgreSQLRuntime(wrongTopology.Annotations, wrongTopology.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		t.Fatalf("canonical but wrong-size source should remain structurally recognizable: %q, %v", observed, err)
+	}
+	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, wrongTopology.Annotations, wrongTopology.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
+		t.Fatalf("wrong-size source topology error = %v", err)
+	}
+
+	downgraded := pod.DeepCopy()
+	setLiteralEnvironment(downgraded, "PGSHARD_POSTGRES_GENERATION_DURABILITY", "local")
+	downgraded.Spec.Containers[0].Env = slices.DeleteFunc(downgraded.Spec.Containers[0].Env, func(environment corev1.EnvVar) bool {
+		return environment.Name == "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES"
+	})
+	downgraded.Annotations[PostgreSQLGenerationDurabilityAnnotation] = "local"
+	delete(downgraded.Annotations, PostgreSQLSynchronousStandbysAnnotation)
+	if observed, err := ObservePostgreSQLRuntime(downgraded.Annotations, downgraded.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		t.Fatalf("self-consistent downgrade should remain structurally recognizable: %q, %v", observed, err)
+	}
+	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, downgraded.Annotations, downgraded.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
+		t.Fatalf("source durability downgrade error = %v", err)
+	}
+}
+
+func TestLegacyBootstrapSourceRemainsFencedDuringGenerationUpgrade(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	pod := testReplicationBootstrapSourcePod(t)
+	legacy := pod.DeepCopy()
+	legacy.Spec.Containers[0].Env = slices.DeleteFunc(legacy.Spec.Containers[0].Env, func(environment corev1.EnvVar) bool {
+		return environment.Name == "PGSHARD_POSTGRES_GENERATION_DURABILITY" || environment.Name == "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES"
+	})
+	delete(legacy.Annotations, PostgreSQLGenerationDurabilityAnnotation)
+	delete(legacy.Annotations, PostgreSQLSynchronousStandbysAnnotation)
+	if !IsPostgreSQLReplicationBootstrapSourcePod(legacy) {
+		t.Fatal("complete v0.73 bootstrap source shape lost lifecycle classification")
+	}
+	if IsCurrentPostgreSQLReplicationBootstrapSourcePod(legacy) {
+		t.Fatal("complete v0.73 bootstrap source shape was accepted as a current generation")
+	}
+	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, legacy.Annotations, legacy.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		t.Fatalf("observe complete v0.73 source = %q, %v", observed, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{name: "environment only", mutate: func(pod *corev1.Pod) {
+			setLiteralEnvironment(pod, "PGSHARD_POSTGRES_GENERATION_DURABILITY", "remote-apply-any-one")
+		}},
+		{name: "annotation only", mutate: func(pod *corev1.Pod) {
+			pod.Annotations[PostgreSQLGenerationDurabilityAnnotation] = "remote-apply-any-one"
+		}},
+		{name: "candidate without durability", mutate: func(pod *corev1.Pod) {
+			setLiteralEnvironment(pod, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", "pgshard_member_0001,pgshard_member_0002")
+			pod.Annotations[PostgreSQLSynchronousStandbysAnnotation] = "pgshard_member_0001,pgshard_member_0002"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			partial := legacy.DeepCopy()
+			test.mutate(partial)
+			if IsPostgreSQLReplicationBootstrapSourcePod(partial) {
+				t.Fatalf("partial generation settings retained source classification: %#v", partial.Spec.Containers[0].Env)
+			}
+			if _, err := ObservePostgreSQLRuntimeForCluster(cluster, partial.Annotations, partial.Spec); err == nil {
+				t.Fatal("partial generation settings passed cluster-aware observation")
+			}
+		})
+	}
+}
+
+func setLiteralEnvironment(pod *corev1.Pod, name, value string) {
+	for index := range pod.Spec.Containers[0].Env {
+		if pod.Spec.Containers[0].Env[index].Name == name {
+			pod.Spec.Containers[0].Env[index].Value = value
+			pod.Spec.Containers[0].Env[index].ValueFrom = nil
+			return
+		}
+	}
+	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: name, Value: value})
+}
+
 func testReplicationBootstrapSourcePod(t *testing.T) *corev1.Pod {
+	return testReplicationBootstrapSourcePodFor(t, 3, pgshardv1alpha1.DurabilitySynchronous)
+}
+
+func testReplicationBootstrapSourcePodFor(t *testing.T, members int32, durability pgshardv1alpha1.DurabilityMode) *corev1.Pod {
 	t.Helper()
 	cluster := testCluster()
-	cluster.Spec.MembersPerShard = 3
+	cluster.Spec.MembersPerShard = members
+	cluster.Spec.Durability = durability
 	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
 	cluster.Status.CatalogAccess = nil
 	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
