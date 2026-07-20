@@ -304,13 +304,21 @@ func reservedPodFencingMetadataUpdateErrors(oldCluster, newCluster *PgShardClust
 	if !newCluster.DeletionTimestamp.IsZero() {
 		return field.ErrorList{field.Forbidden(annotationsPath, "controller-owned Pod fencing metadata is immutable during deletion")}, false
 	}
-	if newCluster.Spec.MembersPerShard != 1 {
+	if !publishesManagedPostgreSQLPods(oldCluster) {
 		return reservedPodFencingMetadataErrors(newCluster), false
 	}
 	if !newHasChallenge || !newHasReceipt || newChallenge == "" || newReceipt == "" {
 		return field.ErrorList{field.Forbidden(annotationsPath, "Pod fencing challenge and receipt must be preserved or replaced by a non-empty admission attestation")}, false
 	}
 	return nil, true
+}
+
+func publishesManagedPostgreSQLPods(cluster *PgShardCluster) bool {
+	if cluster.Spec.MembersPerShard == 1 {
+		return true
+	}
+	return cluster.Status.PostgreSQLBootstrapSpec != nil &&
+		cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime == "agent-quarantine"
 }
 
 func (v *PgShardClusterValidator) validatePodFencingMetadataAttestation(ctx context.Context, cluster *PgShardCluster) (field.ErrorList, error) {

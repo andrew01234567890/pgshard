@@ -68,9 +68,6 @@ func (a *HandshakeAttestor) Handle(ctx context.Context, request admission.Reques
 	if err := a.decoder.Decode(request, cluster); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode PgShardCluster fencing handshake: %w", err))
 	}
-	if cluster.Spec.MembersPerShard != 1 {
-		return admission.Allowed("cluster does not publish direct PostgreSQL Pods")
-	}
 	challenge := cluster.Annotations[HandshakeChallengeAnnotation]
 	if challenge == "" {
 		return admission.Allowed("PostgreSQL Pod fencing handshake is unchanged")
@@ -586,7 +583,9 @@ func IsManagedPostgreSQLPod(pod *corev1.Pod) bool {
 		pod.Labels[owned.ComponentLabel] == "postgresql" &&
 		pod.Labels[owned.ClusterLabel] != "" &&
 		pod.Labels[owned.ShardLabel] != "" &&
-		(pod.Labels[owned.RoleLabel] != "" || owned.IsPostgreSQLReplicationBootstrapSourcePod(pod)) &&
+		(pod.Labels[owned.RoleLabel] != "" ||
+			owned.IsPostgreSQLReplicationBootstrapSourcePod(pod) ||
+			owned.IsPostgreSQLReplicationStandbyPod(pod)) &&
 		pod.Labels[owned.MemberLabel] != "" &&
 		pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != "" &&
 		slices.Contains(pod.Finalizers, owned.PostgreSQLPodTerminationFinalizer)

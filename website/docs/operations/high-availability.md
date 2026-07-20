@@ -343,12 +343,23 @@ replication Secret projection. It verifies the checkpointed digest, creates or
 validates the fixed least-privilege SCRAM login, proves the exact password over
 the physical-replication protocol, and immediately reserves one exact slot for
 each other configured member before publishing the durable HBA. The running
-agent has no Secret mount. No standby, PDB, catalog credential,
-`primary_conninfo`, or serving endpoint is created. A missing or same-name
-recreated Secret or PVC fences the bootstrap-source controller against the
-recorded UID; changed
-replication material fails closed against its recorded digest. This source is
-not evidence of a primary, standby, synchronous replica, or HA availability.
+agent has no Secret mount. No standby configuration, PDB, catalog credential,
+`primary_conninfo`, or serving endpoint is created on the source. Every
+nonzero member receives one role-neutral singleton standby workload over its
+already-checkpointed PVC. Its init container verifies the credential digest,
+identifies the exact member-zero PostgreSQL system, clones through the member's
+pre-created slot into disposable staging, proves recovery, removes copied
+writable-generation evidence, and atomically publishes a clone marker bound to
+the source, target PVC, creation-fence Secret, replication Secret, material
+digest, and system identifier. It converts the raw credential into one `0400`
+memory-backed passfile. The running standby receives only that passfile
+read-only, has no Kubernetes API token or writable-Lease environment, keeps TCP
+closed, and remains unready. No PostgreSQL PDB, catalog credential, replication
+TLS, standby-specific Service, or serving endpoint is created. A missing or
+same-name recreated Secret or PVC fences every physical-member controller
+against the recorded UIDs; changed replication material fails closed against
+its recorded digest. These workloads are not evidence of a serving primary,
+synchronous durability, promotion safety, or HA availability.
 
 Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
 finalizer. Before workload publication, a cluster challenge update proves that
@@ -372,9 +383,10 @@ authenticated and are not continuity history. An existing initialized but
 unanchored key must instead be pinned while the old manager is healthy before a
 mixed-version rollout; the new manager
 refuses to infer continuity from receipt listings because those listings cannot
-fence an older signer. It inspects every single-member cluster handshake and
-requires every established cluster handshake and managed terminal Pod receipt
-to verify before writing a separate completion marker. Invalid or incomplete
+fence an older signer. It inspects every cluster handshake for a selected
+runtime that publishes managed PostgreSQL Pods and requires every established
+such cluster handshake and managed terminal Pod receipt to verify before
+writing a separate completion marker. Invalid or incomplete
 cluster metadata remains repairable only before the lifecycle finalizer or
 PostgreSQL bootstrap status exists; PostgreSQL storage and workloads cannot
 precede that barrier. Users cannot establish, remove, or replace the handshake.
@@ -557,8 +569,8 @@ ordinary database connection, and explicitly permits up to four configured
 member senders and slots plus one bounded bootstrap-repair sender and slot of
 headroom. Logical consumers remain uncomposed here. The role deliberately
 clears synchronous standby selection and uses local commit while bootstrapping,
-so it is neither a durable nor serving primary. A separate uncomposed
-`replication-standby` role requires
+so it is neither a durable nor serving primary. Every nonzero member now uses
+the separate `replication-standby` role, which requires
 an exact protected `standby.signal`, a recovery control-file state, a canonical
 member slot, and a runtime-owned `0400` passfile outside PGDATA and the socket
 directory. The passfile must contain one bounded record for the exact configured
@@ -572,17 +584,22 @@ restart loop. Once running, it continuously repeats the recovery proof; recovery
 ending, an unknown query result, timeout, or local connection loss immediately
 fences the complete PostgreSQL process tree. A later upstream outage alone does
 not kill a server that remains safely in recovery. Writable Lease authority is
-forbidden for this role. The operator does not select the standby role yet. It
-checkpoints one per-shard replication password through an empty intent, exact
-API UID, immutable update, and material digest. The source init container alone
-projects it, proves its digest and physical-protocol authentication, creates the
-fixed replication role, and reserves the exact member slots; the main agent has
-no credential mount. There is no base-backup completion protocol, TLS wiring,
-standby Pod, standby-specific Service, or standby-specific NetworkPolicy.
-The role-neutral source can be selected by the existing shard headless Service and
-cluster PostgreSQL NetworkPolicy, but its unready state, absent serving role, and
-replication-only HBA keep it outside application routing. The temporary standby
-conninfo therefore explicitly disables TLS and is not a serving deployment.
+forbidden for this role. The operator checkpoints one per-shard replication
+password through an empty intent, exact API UID, immutable update, and material
+digest. Source and standby init containers alone project it. The source proves
+its digest and physical-protocol authentication, creates the fixed replication
+role, and reserves the exact member slots. Each standby init identifies member
+zero, performs one bounded crash-safe physical base backup through its exact
+slot, starts and stops the clone once to complete backup recovery, and publishes
+the complete clone atomically. It formats one exact memory-backed passfile for
+the main standby agent, which receives neither the raw credential nor any
+Kubernetes API token. There is no replication TLS, standby-specific Service,
+standby-specific NetworkPolicy, controller-side replay-liveness authority, or
+serving activation.
+The role-neutral members can be selected by the existing shard headless Service
+and cluster PostgreSQL NetworkPolicy, but their unready state, absent serving
+role, and restrictive HBAs keep them outside application routing. The standby
+conninfo explicitly disables TLS and is not a serving deployment.
 SQL and
 prepare target-side generation enforcement, replicated promotion evidence,
 peer isolation, promotion, and serving activation remain absent. The

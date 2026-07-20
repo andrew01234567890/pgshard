@@ -3,6 +3,7 @@ package podfence
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +102,14 @@ func TestBindingAdmissionAcceptsOnlyTheExactRoleNeutralBootstrapSource(t *testin
 	delete(pod.Annotations, NodeBootIDAnnotation)
 	if !IsManagedPostgreSQLPod(pod) {
 		t.Fatalf("exact role-neutral bootstrap source is not managed: %#v", pod.ObjectMeta)
+	}
+	standby := roleNeutralStandbyPod()
+	if !IsManagedPostgreSQLPod(standby) {
+		t.Fatalf("exact role-neutral physical standby is not managed: %#v", standby.ObjectMeta)
+	}
+	standby.Labels[owned.RoleLabel] = "replica"
+	if owned.IsPostgreSQLReplicationStandbyPod(standby) {
+		t.Fatalf("role-labeled physical standby bypassed its exact role-neutral classifier: %#v", standby.ObjectMeta)
 	}
 	generic := managedPod()
 	delete(generic.Labels, owned.RoleLabel)
@@ -296,50 +305,56 @@ func TestBindingAdmissionRejectsPostMutationPathConfusion(t *testing.T) {
 
 func TestHandshakeAttestorAcknowledgesTheCurrentChallenge(t *testing.T) {
 	t.Parallel()
-	scheme := testScheme(t)
-	cluster := &pgshardv1alpha1.PgShardCluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "example", Namespace: "database", UID: "cluster-uid",
-			Annotations: map[string]string{HandshakeChallengeAnnotation: "challenge-a"},
-		},
-		Spec: pgshardv1alpha1.PgShardClusterSpec{MembersPerShard: 1},
-	}
-	raw := marshalObject(t, cluster)
-	codec := NewStaticHandshakeCodec([]byte("0123456789abcdef0123456789abcdef"))
-	response := NewHandshakeAttestor(codec, scheme).Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
-		Operation: admissionv1.Update, Object: runtime.RawExtension{Raw: raw},
-	}})
-	if !response.Allowed {
-		t.Fatalf("fencing handshake denied: %#v", response.Result)
-	}
-	got := &pgshardv1alpha1.PgShardCluster{}
-	if err := json.Unmarshal(applyResponsePatch(t, raw, response), got); err != nil {
-		t.Fatal(err)
-	}
-	verified, err := codec.Verify(context.Background(), got)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !verified {
-		t.Fatalf("fencing handshake receipt = %#v", got.Annotations)
-	}
-	replayed := got.DeepCopy()
-	replayed.UID = "another-cluster-uid"
-	verified, err = codec.Verify(context.Background(), replayed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if verified {
-		t.Fatal("fencing handshake receipt was replayable across cluster UIDs")
-	}
-	missingChallenge := got.DeepCopy()
-	delete(missingChallenge.Annotations, HandshakeChallengeAnnotation)
-	verified, err = codec.Verify(context.Background(), missingChallenge)
-	if err != nil {
-		t.Fatalf("receipt-only handshake verification: %v", err)
-	}
-	if verified {
-		t.Fatal("receipt-only handshake was authenticated without a challenge")
+	for _, members := range []int32{1, 3, 5} {
+		members := members
+		t.Run(fmt.Sprintf("members=%d", members), func(t *testing.T) {
+			t.Parallel()
+			scheme := testScheme(t)
+			cluster := &pgshardv1alpha1.PgShardCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "example", Namespace: "database", UID: "cluster-uid",
+					Annotations: map[string]string{HandshakeChallengeAnnotation: "challenge-a"},
+				},
+				Spec: pgshardv1alpha1.PgShardClusterSpec{MembersPerShard: members},
+			}
+			raw := marshalObject(t, cluster)
+			codec := NewStaticHandshakeCodec([]byte("0123456789abcdef0123456789abcdef"))
+			response := NewHandshakeAttestor(codec, scheme).Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+				Operation: admissionv1.Update, Object: runtime.RawExtension{Raw: raw},
+			}})
+			if !response.Allowed {
+				t.Fatalf("fencing handshake denied: %#v", response.Result)
+			}
+			got := &pgshardv1alpha1.PgShardCluster{}
+			if err := json.Unmarshal(applyResponsePatch(t, raw, response), got); err != nil {
+				t.Fatal(err)
+			}
+			verified, err := codec.Verify(context.Background(), got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !verified {
+				t.Fatalf("fencing handshake receipt = %#v", got.Annotations)
+			}
+			replayed := got.DeepCopy()
+			replayed.UID = "another-cluster-uid"
+			verified, err = codec.Verify(context.Background(), replayed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if verified {
+				t.Fatal("fencing handshake receipt was replayable across cluster UIDs")
+			}
+			missingChallenge := got.DeepCopy()
+			delete(missingChallenge.Annotations, HandshakeChallengeAnnotation)
+			verified, err = codec.Verify(context.Background(), missingChallenge)
+			if err != nil {
+				t.Fatalf("receipt-only handshake verification: %v", err)
+			}
+			if verified {
+				t.Fatal("receipt-only handshake was authenticated without a challenge")
+			}
+		})
 	}
 }
 
@@ -787,6 +802,46 @@ func roleNeutralBootstrapSourcePod() *corev1.Pod {
 		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz"}}},
 	}}
 	pod.Spec.Volumes = []corev1.Volume{{Name: "kubernetes-api", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{}}}}
+	return pod
+}
+
+func roleNeutralStandbyPod() *corev1.Pod {
+	pod := managedPod()
+	pod.Name = owned.PostgreSQLMemberStatefulSetName(pod.Labels[owned.ClusterLabel], 0, 1) + "-0"
+	pod.Labels[owned.MemberLabel] = "0001"
+	delete(pod.Labels, owned.RoleLabel)
+	pod.Annotations[owned.PostgreSQLRuntimeAnnotation] = string(owned.PostgreSQLRuntimeAgentQuarantine)
+	automount := false
+	pod.Spec.AutomountServiceAccountToken = &automount
+	pod.Spec.ServiceAccountName = owned.PostgreSQLStandbyServiceAccountName(pod.Labels[owned.ClusterLabel], 0)
+	pod.Spec.Containers = []corev1.Container{{
+		Name: "postgresql",
+		Env: []corev1.EnvVar{
+			{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"},
+			{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/quarantine.pg_hba.conf"},
+			{Name: "PGSHARD_POSTGRES_PRIMARY_HOST", Value: "example-shard-0000-0.example-shard-0000.database.svc"},
+			{Name: "PGSHARD_POSTGRES_PRIMARY_PORT", Value: "5432"},
+			{Name: "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", Value: "pgshard_member_0001"},
+			{Name: "PGSHARD_POSTGRES_PRIMARY_PASSFILE", Value: "/run/pgshard/standby-auth/passfile"},
+		},
+		Ports: []corev1.ContainerPort{{Name: "agent-http", ContainerPort: owned.HTTPPort, Protocol: corev1.ProtocolTCP}},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "runtime", MountPath: "/run/pgshard"},
+			{Name: "standby-passfile", MountPath: "/run/pgshard/standby-auth", ReadOnly: true},
+		},
+		StartupProbe:   &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz"}}},
+		LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz"}}},
+		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz"}}},
+	}}
+	pod.Spec.Volumes = []corev1.Volume{
+		{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+		{
+			Name: "standby-passfile",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				Medium: corev1.StorageMediumMemory,
+			}},
+		},
+	}
 	return pod
 }
 

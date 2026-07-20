@@ -700,6 +700,15 @@ func TestBootstrapRefusesPreAnchoredKeyThatCannotVerifyReceiptHistory(t *testing
 		{name: "cluster", object: func(t *testing.T, key []byte) client.Object {
 			return clusterWithHandshakeReceipt(t, key, "mismatched-cluster")
 		}, want: "handshake receipt does not match"},
+		{name: "agent multi-member cluster", object: func(t *testing.T, key []byte) client.Object {
+			cluster := clusterWithHandshakeReceipt(t, key, "mismatched-agent-multi-member-cluster")
+			cluster.Spec.MembersPerShard = 3
+			cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
+				MembersPerShard:   3,
+				PostgreSQLRuntime: owned.PostgreSQLRuntimeAgentQuarantine.String(),
+			}
+			return cluster
+		}, want: "handshake receipt does not match"},
 		{name: "Pod", object: func(t *testing.T, key []byte) client.Object {
 			return podWithTerminationReceipt(t, key, "mismatched-pod")
 		}, want: "termination receipt does not match"},
@@ -812,9 +821,10 @@ func TestBootstrapIgnoresReceiptsOutsideManagedFencingIdentities(t *testing.T) {
 	}
 	clearFreshBootstrapState(t, ctx, kubeClient)
 	differentKey := bytes.Repeat([]byte{0xff}, podfence.SecretKeyBytes)
-	multiMember := clusterWithHandshakeReceipt(t, differentKey, "unrelated-multi-member")
-	multiMember.Spec.MembersPerShard = 3
-	if err := kubeClient.Create(ctx, multiMember); err != nil {
+	directMultiMember := clusterWithHandshakeReceipt(t, differentKey, "direct-multi-member")
+	directMultiMember.Spec.MembersPerShard = 3
+	directMultiMember.Status.PostgreSQLBootstraps = nil
+	if err := kubeClient.Create(ctx, directMultiMember); err != nil {
 		t.Fatal(err)
 	}
 	unprovisioned := clusterWithHandshakeReceipt(t, differentKey, "unprovisioned-single-member")
