@@ -6,13 +6,18 @@
 //! only over the same identity-tagged private channel; [`AgentState`] is shared
 //! for observability but cannot authorize this attempt's postmaster.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) use pgshard_types::writable_generation::DurableWritableGeneration;
 use thiserror::Error;
 use tokio::sync::watch;
 
+#[cfg(test)]
+use crate::boottime::system_clock;
+use crate::boottime::{BoottimeClock, BoottimeInstant};
 use crate::coordination::{
     self, WritableLeaseConfig, WritableLeaseError, WritableLeaseReleaseOutcome,
     WritableLeaseShutdown,
@@ -42,7 +47,7 @@ struct WritableAttemptIdentity;
 #[derive(Clone, Debug)]
 struct WritableAuthority {
     identity: Arc<WritableAttemptIdentity>,
-    deadline: Instant,
+    deadline: BoottimeInstant,
     generation: DurableWritableGeneration,
 }
 
@@ -55,19 +60,21 @@ pub(crate) struct WritableLeaseAttempt {
 #[derive(Debug)]
 pub(crate) struct WritablePostgresAttempt {
     identity: Arc<WritableAttemptIdentity>,
+    clock: Arc<dyn BoottimeClock>,
     authority: watch::Receiver<Option<WritableAuthority>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct WritableAuthorityObserver {
     identity: Arc<WritableAttemptIdentity>,
+    clock: Arc<dyn BoottimeClock>,
     authority: watch::Receiver<Option<WritableAuthority>>,
 }
 
 impl WritableLeaseAttempt {
     pub(crate) fn install_authority(
         &self,
-        deadline: Instant,
+        deadline: BoottimeInstant,
         generation: DurableWritableGeneration,
     ) {
         self.authority.send_replace(Some(WritableAuthority {
@@ -84,7 +91,12 @@ impl WritableLeaseAttempt {
 
 impl WritablePostgresAttempt {
     pub(crate) fn authority_valid_for(&self, required: Duration) -> bool {
-        authority_valid_for(&self.identity, self.authority.borrow().as_ref(), required)
+        authority_valid_for(
+            &self.identity,
+            self.authority.borrow().as_ref(),
+            required,
+            self.clock.as_ref(),
+        )
     }
 
     async fn authority_changed(&mut self) -> Result<(), watch::error::RecvError> {
@@ -94,6 +106,7 @@ impl WritablePostgresAttempt {
     pub(crate) fn authority_observer(&self) -> WritableAuthorityObserver {
         WritableAuthorityObserver {
             identity: Arc::clone(&self.identity),
+            clock: Arc::clone(&self.clock),
             authority: self.authority.clone(),
         }
     }
@@ -106,8 +119,62 @@ impl WritableAuthorityObserver {
     ) -> Option<DurableWritableGeneration> {
         let authority = self.authority.borrow();
         let authority = authority.as_ref()?;
-        authority_valid_for(&self.identity, Some(authority), required)
-            .then(|| authority.generation.clone())
+        authority_valid_for(
+            &self.identity,
+            Some(authority),
+            required,
+            self.clock.as_ref(),
+        )
+        .then(|| authority.generation.clone())
+    }
+
+    /// Binds synchronously to the current exact authorized generation, then
+    /// waits until it no longer has authority beyond `required`, including
+    /// when a suspend-aware absolute deadline elapses. Clock and timer failures
+    /// are treated exactly like lost authority.
+    pub(crate) fn wait_until_current_generation_invalid(
+        mut self,
+        required: Duration,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let expected = self.generation_valid_for(required);
+        Box::pin(async move {
+            let Some(expected) = expected else {
+                return;
+            };
+            loop {
+                let cutoff = {
+                    let authority = self.authority.borrow();
+                    let Some(authority) = authority.as_ref() else {
+                        return;
+                    };
+                    if !Arc::ptr_eq(&self.identity, &authority.identity)
+                        || authority.generation != expected
+                    {
+                        return;
+                    }
+                    let Some(cutoff) = authority.deadline.checked_sub(required) else {
+                        return;
+                    };
+                    cutoff
+                };
+                match self.clock.now() {
+                    Ok(now) if now < cutoff => {}
+                    Ok(_) | Err(_) => return,
+                }
+                tokio::select! {
+                    biased;
+                    changed = self.authority.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    result = self.clock.wait_until(cutoff) => {
+                        let _ = result;
+                        return;
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -115,10 +182,13 @@ fn authority_valid_for(
     identity: &Arc<WritableAttemptIdentity>,
     authority: Option<&WritableAuthority>,
     required: Duration,
+    clock: &dyn BoottimeClock,
 ) -> bool {
     authority.is_some_and(|authority| {
         Arc::ptr_eq(identity, &authority.identity)
-            && authority.deadline.saturating_duration_since(Instant::now()) > required
+            && clock
+                .now()
+                .is_ok_and(|now| authority.deadline.saturating_duration_since(now) > required)
     })
 }
 
@@ -176,7 +246,7 @@ pub async fn supervise_attempt(
 ) -> Result<WritableAttemptOutcome, WritableAttemptError> {
     let margin = writable_lease.shutdown_margin();
     let (attempt_shutdown_tx, attempt_shutdown_rx) = watch::channel(false);
-    let (lease_attempt, mut postgres_attempt) = writable_attempt_pair();
+    let (lease_attempt, mut postgres_attempt) = writable_attempt_pair(state.boottime_clock());
     let postmaster_state = state.clone();
     let postmaster_shutdown = attempt_shutdown_rx.clone();
     let postmaster = async move {
@@ -199,6 +269,25 @@ pub async fn supervise_attempt(
     };
     let coordination =
         coordination::supervise(writable_lease, state, attempt_shutdown_rx, lease_attempt);
+    Box::pin(join_supervisors(
+        shutdown,
+        attempt_shutdown_tx,
+        postmaster,
+        coordination,
+    ))
+    .await
+}
+
+pub(crate) async fn join_supervisors<P, C>(
+    shutdown: watch::Receiver<bool>,
+    attempt_shutdown_tx: watch::Sender<bool>,
+    postmaster: P,
+    coordination: C,
+) -> Result<WritableAttemptOutcome, WritableAttemptError>
+where
+    P: Future<Output = Result<WritablePostgresStopped, PostgresError>>,
+    C: Future<Output = Result<WritableLeaseShutdown, WritableLeaseError>>,
+{
     tokio::pin!(postmaster);
     tokio::pin!(coordination);
     tokio::select! {
@@ -253,7 +342,9 @@ pub async fn supervise_attempt(
     }
 }
 
-fn writable_attempt_pair() -> (WritableLeaseAttempt, WritablePostgresAttempt) {
+fn writable_attempt_pair(
+    clock: Arc<dyn BoottimeClock>,
+) -> (WritableLeaseAttempt, WritablePostgresAttempt) {
     let identity = Arc::new(WritableAttemptIdentity);
     let (authority, authority_observer) = watch::channel(None::<WritableAuthority>);
     (
@@ -263,6 +354,7 @@ fn writable_attempt_pair() -> (WritableLeaseAttempt, WritablePostgresAttempt) {
         },
         WritablePostgresAttempt {
             identity,
+            clock,
             authority: authority_observer,
         },
     )
@@ -270,7 +362,14 @@ fn writable_attempt_pair() -> (WritableLeaseAttempt, WritablePostgresAttempt) {
 
 #[cfg(test)]
 pub(crate) fn writable_attempt_pair_for_test() -> (WritableLeaseAttempt, WritablePostgresAttempt) {
-    writable_attempt_pair()
+    writable_attempt_pair(system_clock())
+}
+
+#[cfg(test)]
+pub(crate) fn writable_attempt_pair_with_clock_for_test(
+    clock: Arc<dyn BoottimeClock>,
+) -> (WritableLeaseAttempt, WritablePostgresAttempt) {
+    writable_attempt_pair(clock)
 }
 
 pub(crate) fn same_writable_attempt(
@@ -338,6 +437,10 @@ async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
 mod tests {
     use super::*;
 
+    fn now() -> BoottimeInstant {
+        system_clock().now().expect("read CLOCK_BOOTTIME")
+    }
+
     #[test]
     fn durable_generation_has_one_canonical_bounded_encoding() {
         let generation = durable_generation_for_test(42);
@@ -368,8 +471,8 @@ mod tests {
 
     #[test]
     fn only_paired_capabilities_share_an_identity() {
-        let (first_lease, first_postgres) = writable_attempt_pair();
-        let (second_lease, second_postgres) = writable_attempt_pair();
+        let (first_lease, first_postgres) = writable_attempt_pair(system_clock());
+        let (second_lease, second_postgres) = writable_attempt_pair(system_clock());
 
         assert!(same_writable_attempt(&first_lease, &first_postgres));
         assert!(same_writable_attempt(&second_lease, &second_postgres));
@@ -379,10 +482,12 @@ mod tests {
 
     #[test]
     fn authority_is_scoped_to_one_attempt() {
-        let (first_lease, first_postgres) = writable_attempt_pair();
-        let (_second_lease, second_postgres) = writable_attempt_pair();
+        let (first_lease, first_postgres) = writable_attempt_pair(system_clock());
+        let (_second_lease, second_postgres) = writable_attempt_pair(system_clock());
         first_lease.install_authority(
-            Instant::now() + Duration::from_secs(5),
+            now()
+                .checked_add(Duration::from_secs(5))
+                .expect("test deadline fits"),
             durable_generation_for_test(1),
         );
 
@@ -391,12 +496,106 @@ mod tests {
     }
 
     #[test]
+    fn suspend_like_jump_and_clock_failure_revoke_private_authority() {
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let (lease_attempt, postgres_attempt) =
+            writable_attempt_pair_with_clock_for_test(clock.clone());
+        lease_attempt.install_authority(
+            clock
+                .now()
+                .expect("fake clock")
+                .checked_add(Duration::from_millis(100))
+                .expect("test deadline fits"),
+            durable_generation_for_test(1),
+        );
+        assert!(postgres_attempt.authority_valid_for(Duration::ZERO));
+
+        clock
+            .advance(Duration::from_millis(101))
+            .expect("advance fake boot clock across suspend");
+        assert!(!postgres_attempt.authority_valid_for(Duration::ZERO));
+
+        lease_attempt.install_authority(
+            clock
+                .now()
+                .expect("fake clock")
+                .checked_add(Duration::from_secs(1))
+                .expect("test deadline fits"),
+            durable_generation_for_test(1),
+        );
+        clock.fail();
+        assert!(!postgres_attempt.authority_valid_for(Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn private_authority_wait_uses_the_injected_absolute_boot_deadline() {
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let (lease_attempt, postgres_attempt) =
+            writable_attempt_pair_with_clock_for_test(clock.clone());
+        lease_attempt.install_authority(
+            clock
+                .now()
+                .expect("fake clock")
+                .checked_add(Duration::from_millis(100))
+                .expect("test deadline fits"),
+            durable_generation_for_test(1),
+        );
+        let mut wait = Box::pin(
+            postgres_attempt
+                .authority_observer()
+                .wait_until_current_generation_invalid(Duration::ZERO),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut wait)
+                .await
+                .is_err(),
+            "authority wait completed before its boot deadline"
+        );
+        clock
+            .advance(Duration::from_millis(100))
+            .expect("advance fake boot clock to deadline");
+        tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("fake absolute boot deadline wakes promptly");
+    }
+
+    #[tokio::test]
+    async fn private_authority_wait_cannot_rebind_before_its_first_poll() {
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let (lease_attempt, postgres_attempt) =
+            writable_attempt_pair_with_clock_for_test(clock.clone());
+        let deadline = clock
+            .now()
+            .expect("fake clock")
+            .checked_add(Duration::from_secs(1))
+            .expect("test deadline fits");
+        lease_attempt.install_authority(deadline, durable_generation_for_test(1));
+
+        let wait = postgres_attempt
+            .authority_observer()
+            .wait_until_current_generation_invalid(Duration::ZERO);
+        lease_attempt.install_authority(deadline, durable_generation_for_test(2));
+
+        tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("bound generation change wakes before first poll");
+    }
+
+    #[test]
     fn mismatched_authority_tag_is_rejected() {
-        let (first_lease, first_postgres) = writable_attempt_pair();
-        let (second_lease, _second_postgres) = writable_attempt_pair();
+        let (first_lease, first_postgres) = writable_attempt_pair(system_clock());
+        let (second_lease, _second_postgres) = writable_attempt_pair(system_clock());
         first_lease.authority.send_replace(Some(WritableAuthority {
             identity: Arc::clone(&second_lease.identity),
-            deadline: Instant::now() + Duration::from_secs(5),
+            deadline: now()
+                .checked_add(Duration::from_secs(5))
+                .expect("test deadline fits"),
             generation: durable_generation_for_test(1),
         }));
 
@@ -405,7 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_start_waits_for_authority_beyond_the_fencing_margin() {
-        let (lease_attempt, mut postgres_attempt) = writable_attempt_pair();
+        let (lease_attempt, mut postgres_attempt) = writable_attempt_pair(system_clock());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut wait = Box::pin(wait_for_initial_writable_authority(
             &mut postgres_attempt,
@@ -420,7 +619,9 @@ mod tests {
             "PostgreSQL start advanced without authority"
         );
         lease_attempt.install_authority(
-            Instant::now() + Duration::from_secs(5),
+            now()
+                .checked_add(Duration::from_secs(5))
+                .expect("test deadline fits"),
             durable_generation_for_test(1),
         );
 
@@ -433,7 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_start_waits_for_a_renewal_after_authority_enters_the_margin() {
-        let (lease_attempt, mut postgres_attempt) = writable_attempt_pair();
+        let (lease_attempt, mut postgres_attempt) = writable_attempt_pair(system_clock());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut wait = Box::pin(wait_for_initial_writable_authority(
             &mut postgres_attempt,
@@ -442,7 +643,9 @@ mod tests {
         ));
 
         lease_attempt.install_authority(
-            Instant::now() + Duration::from_secs(5),
+            now()
+                .checked_add(Duration::from_secs(5))
+                .expect("test deadline fits"),
             durable_generation_for_test(1),
         );
         assert!(
@@ -453,7 +656,9 @@ mod tests {
         );
 
         lease_attempt.install_authority(
-            Instant::now() + Duration::from_secs(10),
+            now()
+                .checked_add(Duration::from_secs(10))
+                .expect("test deadline fits"),
             durable_generation_for_test(1),
         );
         assert!(
@@ -465,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_before_authority_leaves_postgres_unstarted() {
-        let (_lease_attempt, mut postgres_attempt) = writable_attempt_pair();
+        let (_lease_attempt, mut postgres_attempt) = writable_attempt_pair(system_clock());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         shutdown_tx.send(true).expect("request shutdown");
 

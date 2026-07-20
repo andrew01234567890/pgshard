@@ -2,12 +2,14 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pgshard_types::writable_generation::DurableWritableGeneration;
 use pgshard_types::{PgLsn, ShardId};
 use serde::{Serialize, Serializer};
 use thiserror::Error;
+
+use crate::boottime::{BoottimeClock, BoottimeError, BoottimeInstant, system_clock};
 
 /// Maximum age of a role/fence observation that can authorize readiness.
 pub const POSTGRES_OBSERVATION_MAX_AGE_MS: u64 = 5_000;
@@ -99,7 +101,7 @@ pub struct FencingLease {
     #[serde(serialize_with = "serialize_u64_decimal")]
     pub epoch: u64,
     /// Lease expiration as Unix time in milliseconds for status reporting.
-    /// Live authority is bounded independently by a local monotonic deadline.
+    /// Live authority is bounded independently by a local suspend-aware deadline.
     #[serde(serialize_with = "serialize_u64_decimal")]
     pub valid_until_unix_ms: u64,
 }
@@ -304,12 +306,13 @@ pub struct AgentSnapshot {
 }
 
 /// Thread-safe state shared by reconciliation and HTTP handlers.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AgentState {
     inner: Arc<RwLock<AgentInner>>,
     last_checked_unix_ms: Arc<AtomicU64>,
     highest_lease_epoch: Arc<AtomicU64>,
     max_lease_ttl_ms: u64,
+    boottime: Arc<dyn BoottimeClock>,
 }
 
 #[derive(Debug, Default)]
@@ -321,7 +324,19 @@ struct AgentInner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LeaseDeadline {
     epoch: u64,
-    expires_at: Instant,
+    expires_at: BoottimeInstant,
+}
+
+impl Default for AgentState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            last_checked_unix_ms: Arc::default(),
+            highest_lease_epoch: Arc::default(),
+            max_lease_ttl_ms: 0,
+            boottime: system_clock(),
+        }
+    }
 }
 
 impl AgentState {
@@ -334,6 +349,14 @@ impl AgentState {
     pub fn with_identity(
         identity: AgentIdentity,
         max_lease_ttl_ms: u64,
+    ) -> Result<Self, LeaseInstallError> {
+        Self::with_identity_and_clock(identity, max_lease_ttl_ms, system_clock())
+    }
+
+    fn with_identity_and_clock(
+        identity: AgentIdentity,
+        max_lease_ttl_ms: u64,
+        boottime: Arc<dyn BoottimeClock>,
     ) -> Result<Self, LeaseInstallError> {
         if !(1..=300_000).contains(&max_lease_ttl_ms) {
             return Err(LeaseInstallError::InvalidMaximumLeaseTtl(max_lease_ttl_ms));
@@ -349,7 +372,21 @@ impl AgentState {
             last_checked_unix_ms: Arc::new(AtomicU64::new(0)),
             highest_lease_epoch: Arc::new(AtomicU64::new(0)),
             max_lease_ttl_ms,
+            boottime,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_clock(
+        identity: AgentIdentity,
+        max_lease_ttl_ms: u64,
+        boottime: Arc<dyn BoottimeClock>,
+    ) -> Result<Self, LeaseInstallError> {
+        Self::with_identity_and_clock(identity, max_lease_ttl_ms, boottime)
+    }
+
+    pub(crate) fn boottime_clock(&self) -> Arc<dyn BoottimeClock> {
+        Arc::clone(&self.boottime)
     }
 
     /// Returns a consistent state snapshot.
@@ -427,7 +464,7 @@ impl AgentState {
     /// # Errors
     ///
     /// Returns an error for the wrong instance, a reserved or stale epoch, or a
-    /// renewal that shortens the existing monotonic authorization. Wall-clock
+    /// renewal that shortens the existing boot-time authorization. Wall-clock
     /// expiry is status-only and is clamped when the system clock moves
     /// backwards.
     pub fn install_lease(
@@ -435,11 +472,11 @@ impl AgentState {
         lease: FencingLease,
         now_unix_ms: u64,
     ) -> Result<LeaseInstallOutcome, LeaseInstallError> {
-        let now = Instant::now();
+        let now = self.boottime.now()?;
         self.install_lease_at(lease, now_unix_ms, now, now)
     }
 
-    /// Installs authority whose monotonic validity window began at
+    /// Installs authority whose suspend-aware validity window began at
     /// `valid_from`. Callers performing a remote compare-and-swap must capture
     /// that instant before dispatch and pass the later `observed_at` instant so
     /// response latency consumes rather than extends the lease.
@@ -447,9 +484,12 @@ impl AgentState {
         &self,
         mut lease: FencingLease,
         valid_from_unix_ms: u64,
-        valid_from: Instant,
-        observed_at: Instant,
+        valid_from: BoottimeInstant,
+        observed_at: BoottimeInstant,
     ) -> Result<LeaseInstallOutcome, LeaseInstallError> {
+        if observed_at < valid_from {
+            return Err(BoottimeError::RegressiveObservation.into());
+        }
         let Some(ttl_ms) = lease.valid_until_unix_ms.checked_sub(valid_from_unix_ms) else {
             return Err(LeaseInstallError::Expired);
         };
@@ -547,15 +587,24 @@ impl AgentState {
         }
     }
 
-    /// Evaluates readiness against the current wall and monotonic clocks.
+    /// Evaluates readiness against the current reporting wall clock and
+    /// suspend-aware authority clock.
     #[must_use]
     pub fn readiness(&self) -> Readiness {
-        self.readiness_at(unix_time_ms(), Instant::now())
+        let now_unix_ms = unix_time_ms();
+        match self.boottime.now() {
+            Ok(now) => self.readiness_at(now_unix_ms, now),
+            Err(_) => Readiness {
+                ready: false,
+                reason: ReadinessReason::AuthorityClockUnavailable,
+            },
+        }
     }
 
-    /// Evaluates deterministic readiness at supplied wall and monotonic times.
+    /// Evaluates deterministic readiness at supplied reporting wall and boot
+    /// times.
     #[must_use]
-    pub fn readiness_at(&self, now_unix_ms: u64, now: Instant) -> Readiness {
+    pub fn readiness_at(&self, now_unix_ms: u64, now: BoottimeInstant) -> Readiness {
         let previous = self
             .last_checked_unix_ms
             .fetch_max(now_unix_ms, Ordering::AcqRel);
@@ -572,7 +621,7 @@ impl AgentState {
     }
 
     #[cfg(test)]
-    pub(crate) fn lease_deadline(&self) -> Option<Instant> {
+    pub(crate) fn lease_deadline(&self) -> Option<BoottimeInstant> {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -631,15 +680,18 @@ pub enum LeaseInstallError {
         /// Minimum safe next term.
         minimum: u64,
     },
-    /// A monotonic lease deadline could not be represented.
-    #[error("fencing lease monotonic deadline overflowed")]
+    /// A suspend-aware lease deadline could not be represented.
+    #[error("fencing lease boot-time deadline overflowed")]
     DeadlineOverflow,
-    /// Reported lease state exists without its matching monotonic authority.
-    #[error("fencing lease has no matching monotonic deadline")]
+    /// Reported lease state exists without its matching boot-time authority.
+    #[error("fencing lease has no matching boot-time deadline")]
     DeadlineMissing,
-    /// A renewal cannot move the monotonic deadline backwards.
-    #[error("lease renewal cannot shorten its monotonic deadline")]
+    /// A renewal cannot move the suspend-aware deadline backwards.
+    #[error("lease renewal cannot shorten its boot-time deadline")]
     RegressiveDeadline,
+    /// The suspend-aware local authority clock could not be read.
+    #[error("suspend-aware authority clock is unavailable: {0}")]
+    AuthorityClock(#[from] BoottimeError),
 }
 
 /// Machine-readable reason for accepting or rejecting traffic.
@@ -666,8 +718,10 @@ pub enum ReadinessReason {
     LeaseOwnerMismatch,
     /// Epoch zero can never authorize an instance.
     LeaseEpochInvalid,
-    /// Reported lease state has no matching local monotonic authority.
+    /// Reported lease state has no matching local suspend-aware authority.
     LeaseDeadlineMissing,
+    /// The suspend-aware local authority clock could not be read.
+    AuthorityClockUnavailable,
     /// The installed lease is no longer valid.
     LeaseExpired,
     /// `PostgreSQL` has not been inspected successfully.
@@ -699,7 +753,7 @@ fn evaluate_readiness(
     snapshot: &AgentSnapshot,
     lease_deadline: Option<LeaseDeadline>,
     now_unix_ms: u64,
-    now: Instant,
+    now: BoottimeInstant,
 ) -> Readiness {
     let reason = match (
         &snapshot.identity,
@@ -950,6 +1004,14 @@ fn unix_time_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn test_boottime_now() -> BoottimeInstant {
+        system_clock().now().expect("read CLOCK_BOOTTIME")
+    }
+
+    fn advance(at: BoottimeInstant, duration: Duration) -> BoottimeInstant {
+        at.checked_add(duration).expect("test boot time fits")
+    }
+
     fn identity() -> AgentIdentity {
         AgentIdentity {
             cluster_id: "cluster-1".to_owned(),
@@ -1058,7 +1120,7 @@ mod tests {
         state: &AgentState,
         lease: FencingLease,
         valid_from_unix_ms: u64,
-        valid_from: Instant,
+        valid_from: BoottimeInstant,
     ) -> Result<LeaseInstallOutcome, LeaseInstallError> {
         state.install_lease_at(lease, valid_from_unix_ms, valid_from, valid_from)
     }
@@ -1360,7 +1422,7 @@ mod tests {
 
     #[test]
     fn readiness_fails_closed_without_identity_or_lease() {
-        let now = Instant::now();
+        let now = test_boottime_now();
         assert_eq!(
             AgentState::default().readiness_at(100, now).reason,
             ReadinessReason::IdentityMissing
@@ -1374,7 +1436,7 @@ mod tests {
     #[test]
     fn readiness_rejects_wrong_owner_and_expired_lease() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         state.set_postgres(primary());
         assert!(matches!(
             install(
@@ -1407,7 +1469,7 @@ mod tests {
         .expect("install expired fixture");
         assert_eq!(
             state
-                .readiness_at(100, now + Duration::from_millis(1))
+                .readiness_at(100, advance(now, Duration::from_millis(1)))
                 .reason,
             ReadinessReason::LeaseExpired
         );
@@ -1416,7 +1478,7 @@ mod tests {
     #[test]
     fn readiness_requires_role_specific_lsn() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         install(
             &state,
             FencingLease {
@@ -1445,7 +1507,7 @@ mod tests {
     #[test]
     fn readiness_accepts_current_matching_fence() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         state.set_postgres(primary());
         install(
             &state,
@@ -1470,7 +1532,7 @@ mod tests {
     #[test]
     fn quarantine_process_state_overrides_valid_authority() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         state.set_postgres(primary());
         install(
             &state,
@@ -1526,7 +1588,7 @@ mod tests {
     #[test]
     fn readiness_rejects_invalid_and_stale_observation_time() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         install(
             &state,
             FencingLease {
@@ -1558,7 +1620,7 @@ mod tests {
     #[test]
     fn readiness_rejects_a_stale_postgres_fence() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         state.set_postgres(primary());
         install(
             &state,
@@ -1578,9 +1640,9 @@ mod tests {
     }
 
     #[test]
-    fn clock_rollback_cannot_revive_an_expired_lease() {
+    fn wall_clock_rollback_cannot_revive_an_expired_lease() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         state.set_postgres(primary());
         install(
             &state,
@@ -1595,27 +1657,27 @@ mod tests {
         .expect("install lease");
         assert!(
             state
-                .readiness_at(199, now + Duration::from_millis(99))
+                .readiness_at(199, advance(now, Duration::from_millis(99)))
                 .ready
         );
         assert_eq!(
             state
-                .readiness_at(200, now + Duration::from_millis(100))
+                .readiness_at(200, advance(now, Duration::from_millis(100)))
                 .reason,
             ReadinessReason::LeaseExpired
         );
         assert_eq!(
             state
-                .readiness_at(150, now + Duration::from_millis(100))
+                .readiness_at(150, advance(now, Duration::from_millis(100)))
                 .reason,
             ReadinessReason::LeaseExpired
         );
     }
 
     #[test]
-    fn wall_clock_jump_cannot_expire_live_monotonic_authority() {
+    fn wall_clock_jump_cannot_expire_live_boottime_authority() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         state.set_postgres(primary());
         install(
             &state,
@@ -1630,7 +1692,7 @@ mod tests {
         .expect("install lease");
 
         assert_eq!(
-            state.readiness_at(300, now + Duration::from_millis(50)),
+            state.readiness_at(300, advance(now, Duration::from_millis(50))),
             Readiness {
                 ready: true,
                 reason: ReadinessReason::Ready,
@@ -1639,9 +1701,87 @@ mod tests {
     }
 
     #[test]
+    fn suspend_like_boottime_jump_expires_authority_without_using_realtime() {
+        let initial = BoottimeInstant::from_nanos_for_test(1_000_000_000);
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(initial));
+        let state = AgentState::with_test_clock(identity(), 10_000, clock.clone())
+            .expect("valid fake-clock state");
+        state.set_postgres(primary());
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "instance-1".to_owned(),
+                    epoch: 3,
+                    valid_until_unix_ms: 200,
+                },
+                100,
+            )
+            .expect("install fake-clock authority");
+
+        assert!(
+            state
+                .readiness_at(100, clock.now().expect("fake clock"))
+                .ready
+        );
+        // This models a host suspend/resume: wall time is deliberately held
+        // constant while CLOCK_BOOTTIME advances past the authority deadline.
+        clock
+            .advance(Duration::from_millis(101))
+            .expect("advance fake boot clock");
+        assert_eq!(
+            state.readiness_at(100, clock.now().expect("fake clock")),
+            Readiness {
+                ready: false,
+                reason: ReadinessReason::LeaseExpired,
+            }
+        );
+    }
+
+    #[test]
+    fn authority_clock_failure_and_deadline_overflow_fail_closed() {
+        let initial = BoottimeInstant::from_nanos_for_test(1_000_000_000);
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(initial));
+        let failed_clock_state = AgentState::with_test_clock(identity(), 10_000, clock.clone())
+            .expect("valid fake-clock state");
+        clock.fail();
+        assert!(matches!(
+            failed_clock_state.install_lease(
+                FencingLease {
+                    owner_instance: "instance-1".to_owned(),
+                    epoch: 3,
+                    valid_until_unix_ms: 200,
+                },
+                100,
+            ),
+            Err(LeaseInstallError::AuthorityClock(_))
+        ));
+        assert_eq!(
+            failed_clock_state.readiness().reason,
+            ReadinessReason::AuthorityClockUnavailable
+        );
+
+        let state = state();
+        let near_limit = BoottimeInstant::from_nanos_for_test(u64::MAX - 1);
+        assert_eq!(
+            state.install_lease_at(
+                FencingLease {
+                    owner_instance: "instance-1".to_owned(),
+                    epoch: 3,
+                    valid_until_unix_ms: 102,
+                },
+                100,
+                near_limit,
+                near_limit,
+            ),
+            Err(LeaseInstallError::DeadlineOverflow)
+        );
+        assert!(state.snapshot().lease.is_none());
+    }
+
+    #[test]
     fn delayed_install_consumes_authority_window() {
         let state = state();
-        let valid_from = Instant::now();
+        let valid_from = test_boottime_now();
         let lease = FencingLease {
             owner_instance: "instance-1".to_owned(),
             epoch: 3,
@@ -1652,29 +1792,54 @@ mod tests {
                 lease.clone(),
                 100,
                 valid_from,
-                valid_from + Duration::from_millis(99),
+                advance(valid_from, Duration::from_millis(99)),
             ),
             Ok(LeaseInstallOutcome::Installed)
         );
         assert_eq!(
             state.lease_deadline(),
-            Some(valid_from + Duration::from_millis(100))
+            Some(advance(valid_from, Duration::from_millis(100)))
         );
         assert_eq!(
             state.install_lease_at(
                 FencingLease { epoch: 4, ..lease },
                 100,
                 valid_from,
-                valid_from + Duration::from_millis(100),
+                advance(valid_from, Duration::from_millis(100)),
             ),
             Err(LeaseInstallError::Expired)
         );
     }
 
     #[test]
-    fn renewal_cannot_regress_monotonic_deadline() {
+    fn regressive_boottime_observation_cannot_install_authority() {
         let state = state();
-        let now = Instant::now();
+        let valid_from = BoottimeInstant::from_nanos_for_test(2_000_000_000);
+        let observed_at = BoottimeInstant::from_nanos_for_test(1_999_999_999);
+
+        assert_eq!(
+            state.install_lease_at(
+                FencingLease {
+                    owner_instance: "instance-1".to_owned(),
+                    epoch: 3,
+                    valid_until_unix_ms: 200,
+                },
+                100,
+                valid_from,
+                observed_at,
+            ),
+            Err(LeaseInstallError::AuthorityClock(
+                BoottimeError::RegressiveObservation,
+            ))
+        );
+        assert!(state.snapshot().lease.is_none());
+        assert!(state.lease_deadline().is_none());
+    }
+
+    #[test]
+    fn renewal_cannot_regress_boottime_deadline() {
+        let state = state();
+        let now = test_boottime_now();
         install(
             &state,
             FencingLease {
@@ -1705,7 +1870,7 @@ mod tests {
     #[test]
     fn renewal_clamps_status_expiry_when_wall_clock_moves_backwards() {
         let state = state();
-        let initial_valid_from = Instant::now();
+        let initial_valid_from = test_boottime_now();
         assert_eq!(
             state.install_lease_at(
                 FencingLease {
@@ -1720,7 +1885,7 @@ mod tests {
             Ok(LeaseInstallOutcome::Installed)
         );
 
-        let later_valid_from = initial_valid_from + Duration::from_secs(1);
+        let later_valid_from = advance(initial_valid_from, Duration::from_secs(1));
         assert_eq!(
             state.install_lease_at(
                 FencingLease {
@@ -1743,14 +1908,14 @@ mod tests {
         );
         assert_eq!(
             state.lease_deadline(),
-            Some(initial_valid_from + Duration::from_secs(7))
+            Some(advance(initial_valid_from, Duration::from_secs(7)))
         );
     }
 
     #[test]
     fn status_json_uses_exact_decimal_strings() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         state.set_postgres(primary());
         install(
             &state,
@@ -1773,7 +1938,7 @@ mod tests {
     #[test]
     fn lease_terms_are_monotonic_and_clear_revokes_the_term() {
         let state = state();
-        let now = Instant::now();
+        let now = test_boottime_now();
         let lease = FencingLease {
             owner_instance: "instance-1".to_owned(),
             epoch: 7,
@@ -1819,7 +1984,7 @@ mod tests {
             epoch: 3,
             valid_until_unix_ms,
         };
-        let now = Instant::now();
+        let now = test_boottime_now();
         assert_eq!(
             install(&state, lease(100), 100, now),
             Err(LeaseInstallError::Expired)

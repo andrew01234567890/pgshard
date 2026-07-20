@@ -38,7 +38,7 @@ kube = { version = "4.0.0", default-features = false, features = ["client", "rin
 log = { version = "=0.4.33", features = ["max_level_off", "release_max_level_off"] }
 postgres-protocol = "0.6.12"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
-rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
+rustix = { version = "1.1.4", features = ["fs", "process", "thread", "time"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.15.0"
 semver = "1.0.26"
