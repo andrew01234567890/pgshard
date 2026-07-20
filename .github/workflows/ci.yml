@@ -53,6 +53,7 @@ jobs:
         id: detect
         env:
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
         shell: bash
@@ -64,9 +65,13 @@ jobs:
           case "$EVENT_NAME" in
             pull_request) base="$PR_BASE_SHA" ;;
             push)
-              if [[ -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
-                base="$PUSH_BEFORE_SHA"
-              fi
+              # A green endpoint may repair an earlier failed release. When
+              # its predecessor is untagged, test every component changed
+              # since the latest released first-parent commit so that the
+              # endpoint aggregate safely covers the complete release gap.
+              base="$(
+                .github/scripts/ci-diff-base.sh "$GITHUB_SHA" "$PUSH_BEFORE_SHA"
+              )"
               ;;
             schedule|workflow_dispatch) force_all=true ;;
           esac
@@ -78,7 +83,11 @@ jobs:
           fi
 
           changed() {
-            "$force_all" || grep -Eq "$1" "$RUNNER_TEMP/changed-files"
+            # This helper controls the release authorization range. Changes to
+            # it must exercise every available component before they can
+            # authorize an aggregate endpoint.
+            "$force_all" || grep -Eq "$1|^\.github/scripts/ci-diff-base\.sh$" \
+              "$RUNNER_TEMP/changed-files"
           }
 
           exists_at_head_or_base() {
@@ -167,6 +176,7 @@ jobs:
       - name: Validate title and public content
         env:
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -177,10 +187,21 @@ jobs:
           if [[ "$EVENT_NAME" == pull_request ]]; then
             cargo run --locked -p pgshard-release -- validate --subject "$PR_TITLE"
             cargo run --locked -p pgshard-release -- audit --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
-          elif [[ "$EVENT_NAME" == push && -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+          elif [[ "$EVENT_NAME" == push ]]; then
             cargo run --locked -p pgshard-release -- validate
+            audit_base="$(
+              .github/scripts/ci-diff-base.sh --audit \
+                "$GITHUB_SHA" "$PUSH_BEFORE_SHA"
+            )"
             cargo run --locked -p pgshard-release -- audit \
-              --base "$PUSH_BEFORE_SHA" --head "$GITHUB_SHA"
+              --base "$audit_base" --head "$GITHUB_SHA"
+          elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            cargo run --locked -p pgshard-release -- validate
+            audit_base="$(
+              .github/scripts/ci-diff-base.sh --audit "$GITHUB_SHA"
+            )"
+            cargo run --locked -p pgshard-release -- audit \
+              --base "$audit_base" --head "$GITHUB_SHA"
           else
             cargo run --locked -p pgshard-release -- validate
           fi

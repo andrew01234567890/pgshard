@@ -43,7 +43,7 @@ enum ReleaseCommand {
         #[arg(long, default_value = "HEAD")]
         head: String,
     },
-    /// Print the version that the selected commit would receive.
+    /// Print the next aggregate version through the selected commit.
     Next {
         /// Commit to inspect.
         #[arg(long, default_value = "HEAD")]
@@ -82,12 +82,20 @@ enum Bump {
     Major,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PlannedRelease {
     sha: String,
-    message: String,
+    messages: Vec<String>,
     version: Version,
     previous_tag: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReleaseCandidate {
+    sha: String,
+    messages: Vec<String>,
+    state: AggregateState,
+    existing_tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,17 +256,28 @@ fn main() -> Result<()> {
         ReleaseCommand::Next { sha } => {
             let sha = git(&["rev-parse", &format!("{sha}^{{commit}}")])?;
             if let Some(tag) = semver_tag_at(&sha)? {
+                ensure_release_exists(&tag, &sha)?;
                 println!("{}", tag.trim_start_matches('v'));
             } else {
                 let plan = release_plan(&sha)?;
-                let release = plan
+                ensure_release_plan_baseline(&plan)?;
+                let endpoint = plan
                     .last()
                     .context("selected commit is outside the release history")?;
                 ensure!(
-                    release.sha == sha,
+                    endpoint.sha == sha,
                     "selected commit is not first-parent releasable"
                 );
-                println!("{}", release.version);
+                let current = plan
+                    .first()
+                    .and_then(|release| release.previous_tag.as_deref())
+                    .map(|tag| Version::parse(tag.trim_start_matches('v')))
+                    .transpose()?;
+                let messages = plan
+                    .iter()
+                    .flat_map(|release| release.messages.iter().cloned())
+                    .collect::<Vec<_>>();
+                println!("{}", aggregate_next_version(current.as_ref(), &messages)?);
             }
         }
         ReleaseCommand::Validate { subject } => {
@@ -407,21 +426,61 @@ fn publish(requested_sha: &str, ready_only: bool) -> Result<()> {
 
     let plan = release_plan(&sha)?;
     ensure!(!plan.is_empty(), "no releasable first-parent commits found");
+    ensure_release_plan_baseline(&plan)?;
 
-    // One workflow for a descendant may run before an ancestor's workflow.
-    // Publish the gap oldest-first. Strict callers wait for each exact
-    // aggregate; ready-only callers stop at the first unchecked commit so a
-    // later successful workflow can retry the live gap.
+    let current = plan
+        .first()
+        .and_then(|release| release.previous_tag.as_deref())
+        .map(|tag| Version::parse(tag.trim_start_matches('v')))
+        .transpose()?;
+    let previous_tag = plan
+        .first()
+        .and_then(|release| release.previous_tag.clone());
+    let mut candidates = Vec::with_capacity(plan.len());
     for release in plan {
-        if ready_only && exact_aggregate_state(&repository, &release.sha)? != AggregateState::Passed
-        {
-            println!(
-                "release deferred at {} until its exact CI aggregate succeeds",
-                release.sha
-            );
-            break;
-        }
+        let state = exact_aggregate_state(&repository, &release.sha)?;
+        let existing_tag = semver_tag_at(&release.sha)?;
+        candidates.push(ReleaseCandidate {
+            sha: release.sha,
+            messages: release.messages,
+            state,
+            existing_tag,
+        });
+    }
+
+    if !ready_only {
+        let endpoint = candidates
+            .last_mut()
+            .context("no releasable first-parent commits found")?;
+        endpoint.state = wait_for_aggregate_terminal(&repository, &endpoint.sha)?;
+        let endpoint = candidates
+            .last()
+            .context("no releasable first-parent commits found")?;
+        ensure!(
+            endpoint.state == AggregateState::Passed,
+            "release endpoint {} does not have a successful exact-head CI aggregate",
+            endpoint.sha
+        );
+    }
+
+    // Leading successful commits retain one release each. After the first
+    // non-passing aggregate, only the requested endpoint may close the gap:
+    // its widened CI range covers the full untagged history, while an earlier
+    // successful aggregate may have used the old one-commit detector. Apply
+    // the strongest bump across that complete recovery range only once.
+    let releases = aggregate_release_plan(current, previous_tag, &candidates)?;
+    for release in releases {
         publish_one(&repository, &release)?;
+    }
+
+    let recovery_start = release_recovery_start(&candidates);
+    if recovery_start < candidates.len()
+        && candidates.last().map(|candidate| candidate.state) != Some(AggregateState::Passed)
+    {
+        println!(
+            "release deferred from {} until a later exact CI aggregate succeeds",
+            candidates[recovery_start].sha
+        );
     }
     Ok(())
 }
@@ -447,11 +506,10 @@ fn publish_one(repository: &str, release: &PlannedRelease) -> Result<()> {
         );
     }
 
-    let subject = release.message.lines().next().unwrap_or_default();
     let notes = release_notes(
         repository,
         &release.sha,
-        subject,
+        &release.messages,
         release.previous_tag.as_deref(),
     );
     let mut args = vec![
@@ -482,13 +540,20 @@ fn publish_one(repository: &str, release: &PlannedRelease) -> Result<()> {
 }
 
 fn ensure_ci_passed(repository: &str, sha: &str) -> Result<()> {
+    match wait_for_aggregate_terminal(repository, sha)? {
+        AggregateState::Passed => Ok(()),
+        AggregateState::Failed => {
+            bail!("commit {sha} has a failed exact-head CI aggregate check")
+        }
+        AggregateState::Pending => unreachable!("wait returns only terminal aggregate states"),
+    }
+}
+
+fn wait_for_aggregate_terminal(repository: &str, sha: &str) -> Result<AggregateState> {
     let started = Instant::now();
     loop {
         match exact_aggregate_state(repository, sha)? {
-            AggregateState::Passed => return Ok(()),
-            AggregateState::Failed => {
-                bail!("commit {sha} has a failed exact-head CI aggregate check")
-            }
+            state @ (AggregateState::Passed | AggregateState::Failed) => return Ok(state),
             AggregateState::Pending if started.elapsed() >= CI_WAIT_TIMEOUT => {
                 bail!("timed out waiting for exact-head CI aggregate on commit {sha}")
             }
@@ -575,7 +640,7 @@ fn release_plan(sha: &str) -> Result<Vec<PlannedRelease>> {
         let version = next_version(current.as_ref(), &message)?;
         plan.push(PlannedRelease {
             sha: commit.clone(),
-            message,
+            messages: vec![message],
             version: version.clone(),
             previous_tag: previous_tag.clone(),
         });
@@ -583,6 +648,76 @@ fn release_plan(sha: &str) -> Result<Vec<PlannedRelease>> {
         current = Some(version);
     }
     Ok(plan)
+}
+
+fn aggregate_release_plan(
+    mut current: Option<Version>,
+    mut previous_tag: Option<String>,
+    candidates: &[ReleaseCandidate],
+) -> Result<Vec<PlannedRelease>> {
+    let mut releases = Vec::new();
+
+    for candidate in candidates {
+        ensure!(
+            candidate.existing_tag.is_none(),
+            "release history contains a tagged gap at {}",
+            candidate.sha
+        );
+    }
+
+    let recovery_start = release_recovery_start(candidates);
+
+    for candidate in &candidates[..recovery_start] {
+        let version = aggregate_next_version(current.as_ref(), &candidate.messages)?;
+        releases.push(PlannedRelease {
+            sha: candidate.sha.clone(),
+            messages: candidate.messages.clone(),
+            version: version.clone(),
+            previous_tag: previous_tag.clone(),
+        });
+        previous_tag = Some(format!("v{version}"));
+        current = Some(version);
+    }
+
+    let recovery = &candidates[recovery_start..];
+    let Some(endpoint) = recovery.last() else {
+        return Ok(releases);
+    };
+    if endpoint.state != AggregateState::Passed {
+        return Ok(releases);
+    }
+
+    let messages = recovery
+        .iter()
+        .flat_map(|candidate| candidate.messages.iter().cloned())
+        .collect::<Vec<_>>();
+    let version = aggregate_next_version(current.as_ref(), &messages)?;
+    releases.push(PlannedRelease {
+        sha: endpoint.sha.clone(),
+        messages,
+        version,
+        previous_tag,
+    });
+
+    Ok(releases)
+}
+
+fn ensure_release_plan_baseline(plan: &[PlannedRelease]) -> Result<()> {
+    let Some(tag) = plan
+        .first()
+        .and_then(|release| release.previous_tag.as_deref())
+    else {
+        return Ok(());
+    };
+    let sha = tag_target(tag)?.context("release baseline tag disappeared")?;
+    ensure_release_exists(tag, &sha)
+}
+
+fn release_recovery_start(candidates: &[ReleaseCandidate]) -> usize {
+    candidates
+        .iter()
+        .position(|candidate| candidate.state != AggregateState::Passed)
+        .unwrap_or(candidates.len())
 }
 
 fn first_parent_chain(sha: &str) -> Result<Vec<String>> {
@@ -602,7 +737,21 @@ fn commit_contains(sha: &str, path: &str) -> bool {
 }
 
 fn next_version(current: Option<&Version>, message: &str) -> Result<Version> {
-    let bump = parse_bump(message)?;
+    aggregate_next_version(current, &[message.to_owned()])
+}
+
+fn aggregate_next_version(current: Option<&Version>, messages: &[String]) -> Result<Version> {
+    ensure!(
+        !messages.is_empty(),
+        "a release must contain at least one commit"
+    );
+    let bump = messages
+        .iter()
+        .map(|message| parse_bump(message))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max_by_key(|bump| bump_precedence(*bump))
+        .context("a release must contain at least one commit")?;
     let Some(current) = current else {
         return Ok(FIRST_VERSION);
     };
@@ -627,6 +776,14 @@ fn next_version(current: Option<&Version>, message: &str) -> Result<Version> {
     next.pre = semver::Prerelease::EMPTY;
     next.build = semver::BuildMetadata::EMPTY;
     Ok(next)
+}
+
+fn bump_precedence(bump: Bump) -> u8 {
+    match bump {
+        Bump::Patch => 0,
+        Bump::Minor => 1,
+        Bump::Major => 2,
+    }
 }
 
 fn parse_bump(message: &str) -> Result<Bump> {
@@ -708,8 +865,14 @@ fn semver_tag_at(sha: &str) -> Result<Option<String>> {
 }
 
 fn release_tag_version(tag: &str) -> Option<Version> {
-    tag.strip_prefix('v')
-        .and_then(|value| Version::parse(value).ok())
+    let version = tag
+        .strip_prefix('v')
+        .and_then(|value| Version::parse(value).ok())?;
+    if version.pre.is_empty() && version.build.is_empty() {
+        Some(version)
+    } else {
+        None
+    }
 }
 
 fn tag_target(tag: &str) -> Result<Option<String>> {
@@ -728,14 +891,24 @@ fn commit_message(sha: &str) -> Result<String> {
     git(&["show", "-s", "--format=%B", sha])
 }
 
-fn release_notes(repository: &str, sha: &str, subject: &str, previous_tag: Option<&str>) -> String {
+fn release_notes(
+    repository: &str,
+    sha: &str,
+    messages: &[String],
+    previous_tag: Option<&str>,
+) -> String {
     let short_sha = &sha[..sha.len().min(12)];
     let compare = previous_tag.map_or_else(
         || format!("https://github.com/{repository}/commit/{sha}"),
         |tag| format!("https://github.com/{repository}/compare/{tag}...{sha}"),
     );
+    let changes = messages
+        .iter()
+        .map(|message| format!("- {}", message.lines().next().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "## Change\n\n- {subject}\n- Commit: [`{short_sha}`](https://github.com/{repository}/commit/{sha})\n\n[Compare changes]({compare})\n\nThis prerelease contains source code only. No container images, binaries, charts, or packages are published."
+        "## Changes\n\n{changes}\n\nRelease commit: [`{short_sha}`](https://github.com/{repository}/commit/{sha})\n\n[Compare changes]({compare})\n\nThis prerelease contains source code only. No container images, binaries, charts, or packages are published."
     )
 }
 
@@ -1290,13 +1463,21 @@ fn ensure_release_exists(tag: &str, sha: &str) -> Result<()> {
         tagged_sha == sha,
         "existing release tag points to another commit"
     );
-    let status = Command::new("gh")
-        .args(["release", "view", tag])
-        .status()
-        .context("failed to inspect GitHub Release")?;
+    let release_sha = run(
+        "gh",
+        [
+            "release",
+            "view",
+            tag,
+            "--json",
+            "targetCommitish",
+            "--jq",
+            ".targetCommitish",
+        ],
+    )?;
     ensure!(
-        status.success(),
-        "tag exists without the required GitHub Release"
+        release_sha == sha,
+        "GitHub Release {tag} does not target exact commit {sha}"
     );
     Ok(())
 }
@@ -1345,12 +1526,36 @@ fn output_bytes(program: &str, output: Output) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn release_candidate(sha: &str, message: &str, state: AggregateState) -> ReleaseCandidate {
+        ReleaseCandidate {
+            sha: sha.to_owned(),
+            messages: vec![message.to_owned()],
+            state,
+            existing_tag: None,
+        }
+    }
+
     #[test]
     fn first_release_is_fixed() {
         assert_eq!(
             next_version(None, "docs: start documentation").unwrap(),
             FIRST_VERSION
         );
+    }
+
+    #[test]
+    fn release_tags_are_plain_canonical_semver_only() {
+        assert_eq!(release_tag_version("v0.75.0"), Some(Version::new(0, 75, 0)));
+        for rejected in [
+            "0.75.0",
+            "v01.75.0",
+            "v0.75",
+            "v0.75.0-rc.1",
+            "v0.75.0+build.1",
+            "v18446744073709551616.0.0",
+        ] {
+            assert_eq!(release_tag_version(rejected), None, "accepted {rejected}");
+        }
     }
 
     #[test]
@@ -1390,6 +1595,231 @@ mod tests {
             next_version(Some(&current), "refactor!: replace protocol").unwrap(),
             Version::new(2, 0, 0)
         );
+    }
+
+    #[test]
+    fn failed_feature_folds_into_green_fix_as_one_minor_release() {
+        let candidates = vec![
+            release_candidate(
+                "failed-feature",
+                "feat(operator): require durable bootstrap generation",
+                AggregateState::Failed,
+            ),
+            release_candidate(
+                "green-fix",
+                "test(operator): retry identity conflict",
+                AggregateState::Passed,
+            ),
+        ];
+
+        let releases = aggregate_release_plan(
+            Some(Version::new(0, 74, 0)),
+            Some("v0.74.0".to_owned()),
+            &candidates,
+        )
+        .unwrap();
+
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].sha, "green-fix");
+        assert_eq!(releases[0].version, Version::new(0, 75, 0));
+        assert_eq!(releases[0].previous_tag.as_deref(), Some("v0.74.0"));
+        assert_eq!(releases[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn old_narrow_green_commit_cannot_close_a_recovery_gap() {
+        let candidates = vec![
+            release_candidate(
+                "failed-feature",
+                "feat(operator): require durable bootstrap generation",
+                AggregateState::Failed,
+            ),
+            release_candidate(
+                "old-narrow-green",
+                "test(operator): retry identity conflict",
+                AggregateState::Passed,
+            ),
+            release_candidate(
+                "new-full-gap-green",
+                "fix(release): widen catch-up validation",
+                AggregateState::Passed,
+            ),
+        ];
+
+        let releases = aggregate_release_plan(
+            Some(Version::new(0, 74, 0)),
+            Some("v0.74.0".to_owned()),
+            &candidates,
+        )
+        .unwrap();
+
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].sha, "new-full-gap-green");
+        assert_eq!(releases[0].version, Version::new(0, 75, 0));
+        assert_eq!(releases[0].messages.len(), 3);
+    }
+
+    #[test]
+    fn recovery_gap_folds_through_old_green_run_to_the_new_endpoint() {
+        let candidates = vec![
+            release_candidate(
+                "missing-aggregate",
+                "fix(operator): preserve state",
+                AggregateState::Pending,
+            ),
+            release_candidate(
+                "old-narrow-green",
+                "test(operator): cover state preservation",
+                AggregateState::Passed,
+            ),
+            release_candidate(
+                "full-gap-green",
+                "docs: describe state preservation",
+                AggregateState::Passed,
+            ),
+        ];
+
+        let releases = aggregate_release_plan(
+            Some(Version::new(0, 75, 0)),
+            Some("v0.75.0".to_owned()),
+            &candidates,
+        )
+        .unwrap();
+
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].sha, "full-gap-green");
+        assert_eq!(releases[0].version, Version::new(0, 75, 1));
+        assert_eq!(releases[0].messages.len(), 3);
+    }
+
+    #[test]
+    fn trailing_nonpassed_gap_is_not_skipped() {
+        let candidates = vec![
+            release_candidate(
+                "failed",
+                "feat(router): add routing mode",
+                AggregateState::Failed,
+            ),
+            release_candidate(
+                "old-narrow-green",
+                "test(router): cover routing mode",
+                AggregateState::Passed,
+            ),
+            release_candidate(
+                "pending",
+                "fix(router): finish routing mode",
+                AggregateState::Pending,
+            ),
+        ];
+
+        assert_eq!(release_recovery_start(&candidates), 0);
+        assert!(
+            aggregate_release_plan(
+                Some(Version::new(0, 75, 0)),
+                Some("v0.75.0".to_owned()),
+                &candidates,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn all_green_backlog_keeps_one_release_per_commit() {
+        let candidates = vec![
+            release_candidate(
+                "feature",
+                "feat(router): add routing mode",
+                AggregateState::Passed,
+            ),
+            release_candidate(
+                "tests",
+                "test(router): cover routing mode",
+                AggregateState::Passed,
+            ),
+        ];
+
+        let releases = aggregate_release_plan(
+            Some(Version::new(0, 74, 0)),
+            Some("v0.74.0".to_owned()),
+            &candidates,
+        )
+        .unwrap();
+
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].sha, "feature");
+        assert_eq!(releases[0].version, Version::new(0, 75, 0));
+        assert_eq!(releases[1].sha, "tests");
+        assert_eq!(releases[1].version, Version::new(0, 75, 1));
+        assert_eq!(releases[1].previous_tag.as_deref(), Some("v0.75.0"));
+    }
+
+    #[test]
+    fn aggregate_release_applies_the_strongest_bump_once() {
+        let candidates = vec![
+            release_candidate(
+                "breaking",
+                "refactor!: replace protocol",
+                AggregateState::Failed,
+            ),
+            release_candidate(
+                "feature",
+                "feat(router): add routing mode",
+                AggregateState::Pending,
+            ),
+            release_candidate(
+                "patch-endpoint",
+                "fix(router): finish routing mode",
+                AggregateState::Passed,
+            ),
+        ];
+
+        let releases = aggregate_release_plan(
+            Some(Version::new(1, 7, 4)),
+            Some("v1.7.4".to_owned()),
+            &candidates,
+        )
+        .unwrap();
+
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].version, Version::new(2, 0, 0));
+        assert_eq!(releases[0].messages.len(), 3);
+    }
+
+    #[test]
+    fn aggregate_release_rejects_a_tagged_gap() {
+        let mut candidate = release_candidate(
+            "unexpected-tag",
+            "fix(router): finish routing mode",
+            AggregateState::Passed,
+        );
+        candidate.existing_tag = Some("v0.76.0".to_owned());
+
+        let error = aggregate_release_plan(
+            Some(Version::new(0, 75, 0)),
+            Some("v0.75.0".to_owned()),
+            &[candidate],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tagged gap"));
+    }
+
+    #[test]
+    fn folded_release_notes_retain_every_subject() {
+        let notes = release_notes(
+            "owner/repository",
+            &"a".repeat(40),
+            &[
+                "feat(operator): add generation\n\nbody".to_owned(),
+                "test(operator): retry identity conflict".to_owned(),
+            ],
+            Some("v0.74.0"),
+        );
+
+        assert!(notes.contains("- feat(operator): add generation"));
+        assert!(notes.contains("- test(operator): retry identity conflict"));
+        assert!(notes.contains("compare/v0.74.0..."));
+        assert!(notes.contains("source code only"));
     }
 
     #[test]
@@ -1461,6 +1891,10 @@ mod tests {
         ));
         assert_eq!(ci.matches("queue: max").count(), 1);
         assert!(ci.contains("aggregate:"));
+        assert_eq!(ci.matches(".github/scripts/ci-diff-base.sh").count(), 3);
+        assert!(ci.contains("latest released first-parent commit"));
+        assert!(ci.contains("^\\.github/scripts/ci-diff-base\\.sh$"));
+        assert_eq!(ci.matches("ci-diff-base.sh --audit").count(), 2);
         assert!(release.contains("workflow_run:"));
         assert!(release.contains("workflows: [CI]"));
         assert!(release.contains("github.event.workflow_run.conclusion == 'success'"));
