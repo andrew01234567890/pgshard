@@ -6,8 +6,10 @@ description: SemVer rules and source-only GitHub releases.
 # Releases and versioning
 
 Every successful new commit on `main` at or after the repository's release-start
-marker receives exactly one SemVer tag and a source-only GitHub Release.
-Milestone 1 releases use `0.x` prerelease versions. The initial foundation
+marker normally receives one SemVer tag and a source-only GitHub Release. If an
+earlier commit could not be released, its complete untagged first-parent gap is
+instead recovered by one later green endpoint release.
+Before 1.0, releases use `0.x` prerelease versions. The initial foundation
 commit predates the release-start marker and remains an untagged bootstrap
 commit rather than bypassing the exact-head CI release gate.
 
@@ -16,16 +18,20 @@ commit rather than bypassing the exact-head CI release gate.
 - The first green squash commit containing the release-start marker is `v0.1.0`.
 - Before 1.0, `feat`, `!`, or a `BREAKING CHANGE:` footer increments the minor version.
 - `fix`, `perf`, `refactor`, `revert`, `docs`, `test`, `build`, `ci`, and `chore` increment patch.
+- A recovered gap applies its highest Conventional Commit bump once relative to the preceding tag. For example, a failed `feat` followed by a green `test` fix advances `v0.74.0` to `v0.75.0`, not `v0.75.1`.
 - Promotion to 1.0 is an explicit maintainer decision and is not performed by the automated pre-1.0 calculator.
 - Pull request titles follow Conventional Commits because squash merge makes the title the `main` commit subject.
 
 The release planner is serialized and idempotent. Queue order is not trusted:
 it finds the nearest SemVer tag on the selected commit's first-parent history
-and considers every untagged first-parent commit oldest-first. Strict exact-SHA
-publication waits for every planned ancestor's exact aggregate check and fails
-if a completed aggregate failed. Normal main reconciliation, described below,
-instead stops before the first unchecked commit. Neither mode releases an
-unchecked gap or creates a version-bump commit.
+and considers every untagged first-parent commit oldest-first. A leading run of
+successful exact aggregates retains one release per commit. After the first
+failed, absent, or pending aggregate, the planner does not trust an intermediate
+success that may have used an older narrow change detector. It folds the entire
+remaining gap into the requested endpoint, and releases it only when that exact
+endpoint aggregate succeeds. A non-passing trailing endpoint defers the gap;
+an unexpected tag inside it fails closed. Neither mode creates a version-bump
+commit.
 Documentation-only and CI-only default-branch commits still receive patch
 releases.
 
@@ -34,16 +40,23 @@ pushes, scheduled validation, and exact-SHA Dependabot dispatches share a
 maximum-depth concurrency queue, so only one such run builds at a time while
 pull requests retain independent CI capacity. GitHub processes this queue
 first-in-first-out by the time each run starts waiting, rather than by dispatch
-or commit order.
+or commit order. For a main push whose predecessor has no exact SemVer tag,
+component detection and the public-history audit widen their base to the latest
+first-parent SemVer tag with a GitHub Release targeting that exact commit. An
+orphan or mismatched tag cannot narrow CI and is rejected as a release planner
+baseline. The later green endpoint therefore validates every
+component changed anywhere in the gap. With no release tag, component detection
+runs against every tracked file and auditing starts immediately before the
+release marker. Release-eligible exact-SHA dispatches run the same full-gap
+audit as main pushes.
 
 Publication runs in a separate trusted `workflow_run` workflow after successful
 CI and retains its own serialized queue. Normal main publication resolves the
-live main tip and publishes only its oldest contiguous CI-green prefix. A
-reordered descendant therefore defers at the first unchecked ancestor without
-holding or failing the build queue; every later successful completion retries
-the live gap. Exact-SHA Dependabot publication retains its strict wait before
-deleting the temporary tag. The release planner always publishes untagged
-first-parent commits oldest-first.
+live main tip. It publishes a leading all-green prefix oldest-first, then either
+publishes one aggregate release at a green live endpoint for the remaining gap
+or defers while that endpoint is not green. Every later successful completion
+retries the live gap. Exact-SHA Dependabot publication retains its strict wait
+before deleting the temporary tag.
 
 Pages deployment is reconciled after publication under that same serialized
 workflow. It resolves the live main SHA, requires an exact source release at
@@ -111,4 +124,8 @@ compiled identity matches both values.
 
 ## Publishing boundary
 
-Milestone 1 does **not** publish container images, Helm charts, operator bundles, binaries, crates, npm packages, SBOMs, or provenance to a registry or GitHub Release. Releases contain generated notes and GitHub's source archives only. Image archives remain local to the CI job that builds and inspects them; they are not uploaded as workflow artifacts.
+Before 1.0, the project does **not** publish container images, Helm charts,
+operator bundles, binaries, crates, npm packages, SBOMs, or provenance to a
+registry or GitHub Release. Releases contain generated notes and GitHub's source
+archives only. Image archives remain local to the CI job that builds and
+inspects them; they are not uploaded as workflow artifacts.
