@@ -295,7 +295,10 @@ BEGIN
         '858ff7c989f5aabb02fe978100b1cba3090cef600636cc5b7fc0a0fb2c9e3a11',
         '5cef33e65f629aee202b314a13081a54bd64df19e8efbfc710df7abb1a97f32e',
         '0b8dd28bbbad4d55039f300d1969ba0737c5f783b286d3f7b206a94ea7b08efb',
-        '34beddb4cdfaf101bdb63b4f69283793afea56d50afb26116f039e012fec96d6'
+        '34beddb4cdfaf101bdb63b4f69283793afea56d50afb26116f039e012fec96d6',
+        '5afea1e30125a63b1e8535eac5e9a5d5973fdf174ba679d4225146a248ac10f9',
+        'ba61f0700ca4ab33c7fee9375242fb3e1a967a8b809e1b74f5dfc870993fa74c',
+        '08f82695f718b2765df8e2d05999eb702a227e3053500930f75f26e33a3fa4d5'
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '42501',
@@ -399,6 +402,216 @@ BEGIN
 END
 $pgshard_reject_executable_relation_metadata$;
 
+-- The executable-metadata hash above covers every constraint, default, and
+-- index but PostgreSQL omits base-column types and order from that inventory.
+-- A colliding pre-existing operation relation must therefore be absent or
+-- match the released physical shape exactly before trusted ownership is
+-- installed. Older released catalogs legitimately have neither request nor
+-- status relation but do contain the permanent tombstone relation.
+DO $pgshard_validate_operation_relation_shapes$
+DECLARE
+    mismatched_relation text;
+    operation_relation_count integer;
+BEGIN
+    SELECT count(*)
+      INTO operation_relation_count
+      FROM pg_catalog.pg_class AS relations
+      JOIN pg_catalog.pg_namespace AS namespaces
+        ON namespaces.oid = relations.relnamespace
+     WHERE namespaces.nspname = 'pgshard_catalog'
+       AND relations.relname IN ('operation_requests', 'operation_status');
+    IF operation_relation_count = 1 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing operation relations are incomplete';
+    END IF;
+
+    SELECT relations.relname
+      INTO mismatched_relation
+      FROM pg_catalog.pg_class AS relations
+      JOIN pg_catalog.pg_namespace AS namespaces
+        ON namespaces.oid = relations.relnamespace
+     WHERE namespaces.nspname = 'pgshard_catalog'
+       AND relations.relname IN (
+           'operation_requests',
+           'operation_status',
+           'operation_tombstones'
+       )
+       AND (
+           relations.relrowsecurity
+           OR relations.relforcerowsecurity
+           OR EXISTS (
+               SELECT
+                 FROM pg_catalog.pg_policy AS policies
+                WHERE policies.polrelid = relations.oid
+           )
+       )
+     ORDER BY relations.oid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing operation relation has unsupported row security',
+            DETAIL = mismatched_relation;
+    END IF;
+
+    WITH expected(
+        relation_name,
+        column_number,
+        column_name,
+        type_schema,
+        type_name,
+        is_not_null
+    ) AS (
+        VALUES
+            ('operation_requests', 1, 'operation_id', 'pg_catalog', 'uuid', true),
+            ('operation_requests', 2, 'fingerprint_version', 'pg_catalog', 'int2', true),
+            ('operation_requests', 3, 'request_fingerprint', 'pg_catalog', 'bytea', true),
+            ('operation_requests', 4, 'trusted_catalog_cluster_id', 'pg_catalog', 'uuid', true),
+            ('operation_requests', 5, 'trusted_kubernetes_cluster_uid', 'pg_catalog', 'text', true),
+            ('operation_requests', 6, 'cluster_name', 'pgshard_catalog', 'resource_name', true),
+            ('operation_requests', 7, 'shard_id', 'pg_catalog', 'int8', true),
+            ('operation_requests', 8, 'operation_kind', 'pgshard_catalog', 'sql_identifier', true),
+            ('operation_requests', 9, 'payload', 'pg_catalog', 'bytea', true),
+            ('operation_requests', 10, 'required_catalog_epoch', 'pg_catalog', 'int8', true),
+            ('operation_requests', 11, 'required_fencing_epoch', 'pg_catalog', 'int8', true),
+            ('operation_requests', 12, 'deadline_unix_micros', 'pg_catalog', 'int8', true),
+            ('operation_requests', 13, 'accepted_at', 'pg_catalog', 'timestamptz', true),
+            ('operation_status', 1, 'operation_id', 'pg_catalog', 'uuid', true),
+            ('operation_status', 2, 'phase', 'pg_catalog', 'text', true),
+            ('operation_status', 3, 'accepted_at', 'pg_catalog', 'timestamptz', true),
+            ('operation_tombstones', 1, 'operation_kind', 'pgshard_catalog', 'sql_identifier', true),
+            ('operation_tombstones', 2, 'operation_id', 'pg_catalog', 'uuid', true),
+            ('operation_tombstones', 3, 'request_fingerprint', 'pg_catalog', 'bytea', true),
+            ('operation_tombstones', 4, 'outcome_code', 'pgshard_catalog', 'sql_identifier', true),
+            ('operation_tombstones', 5, 'result_fingerprint', 'pg_catalog', 'bytea', false),
+            ('operation_tombstones', 6, 'completed_at', 'pg_catalog', 'timestamptz', true)
+    ),
+    present AS (
+        SELECT relations.oid,
+               relations.relname,
+               relations.relkind,
+               relations.relpersistence
+          FROM pg_catalog.pg_class AS relations
+          JOIN pg_catalog.pg_namespace AS namespaces
+            ON namespaces.oid = relations.relnamespace
+         WHERE namespaces.nspname = 'pgshard_catalog'
+           AND relations.relname IN (
+               'operation_requests',
+               'operation_status',
+               'operation_tombstones'
+           )
+    )
+    SELECT present.relname
+      INTO mismatched_relation
+      FROM present
+     WHERE present.relkind <> 'r'
+        OR present.relpersistence <> 'p'
+        OR (
+            SELECT count(*)
+              FROM pg_catalog.pg_attribute AS attributes
+             WHERE attributes.attrelid = present.oid
+               AND attributes.attnum > 0
+               AND NOT attributes.attisdropped
+        ) <> (
+            SELECT count(*)
+              FROM expected
+             WHERE expected.relation_name = present.relname
+        )
+        OR EXISTS (
+            SELECT
+              FROM expected
+              LEFT JOIN pg_catalog.pg_attribute AS attributes
+                ON attributes.attrelid = present.oid
+               AND attributes.attnum = expected.column_number
+               AND NOT attributes.attisdropped
+              LEFT JOIN pg_catalog.pg_type AS types
+                ON types.oid = attributes.atttypid
+              LEFT JOIN pg_catalog.pg_namespace AS type_namespaces
+                ON type_namespaces.oid = types.typnamespace
+             WHERE expected.relation_name = present.relname
+               AND (
+                   attributes.attname IS DISTINCT FROM expected.column_name
+                   OR type_namespaces.nspname IS DISTINCT FROM expected.type_schema
+                   OR types.typname IS DISTINCT FROM expected.type_name
+                   OR attributes.attnotnull IS DISTINCT FROM expected.is_not_null
+                   OR attributes.attidentity <> ''
+                   OR attributes.attgenerated <> ''
+               )
+        )
+     ORDER BY present.oid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing operation relation has a noncanonical column shape',
+            DETAIL = mismatched_relation;
+    END IF;
+
+    IF operation_relation_count = 2 THEN
+        IF (
+           (
+               SELECT count(*)
+                 FROM pg_catalog.pg_constraint AS constraints
+                 JOIN pg_catalog.pg_class AS relations
+                   ON relations.oid = constraints.conrelid
+                 JOIN pg_catalog.pg_namespace AS namespaces
+                   ON namespaces.oid = relations.relnamespace
+                WHERE namespaces.nspname = 'pgshard_catalog'
+                  AND relations.relname IN (
+                      'operation_requests',
+                      'operation_status'
+                  )
+           ) <> 32
+           OR (
+               SELECT count(*)
+                 FROM pg_catalog.pg_constraint AS constraints
+                 JOIN pg_catalog.pg_class AS relations
+                   ON relations.oid = constraints.conrelid
+                 JOIN pg_catalog.pg_namespace AS namespaces
+                   ON namespaces.oid = relations.relnamespace
+                WHERE namespaces.nspname = 'pgshard_catalog'
+                  AND (relations.relname, constraints.conname) IN (
+                      ('operation_requests', 'operation_requests_pkey'),
+                      ('operation_requests', 'operation_requests_operation_id_check'),
+                      ('operation_requests', 'operation_requests_fingerprint_version_check'),
+                      ('operation_requests', 'operation_requests_request_fingerprint_check'),
+                      ('operation_requests', 'operation_requests_trusted_catalog_cluster_id_check'),
+                      ('operation_requests', 'operation_requests_trusted_kubernetes_cluster_uid_check'),
+                      ('operation_requests', 'operation_requests_cluster_name_check'),
+                      ('operation_requests', 'operation_requests_shard_id_check'),
+                      ('operation_requests', 'operation_requests_operation_kind_check'),
+                      ('operation_requests', 'operation_requests_payload_check'),
+                      ('operation_requests', 'operation_requests_required_catalog_epoch_check'),
+                      ('operation_requests', 'operation_requests_required_fencing_epoch_check'),
+                      ('operation_requests', 'operation_requests_deadline_unix_micros_check'),
+                      ('operation_status', 'operation_status_pkey'),
+                      ('operation_status', 'operation_status_operation_id_fkey'),
+                      ('operation_status', 'operation_status_phase_check')
+                  )
+           ) <> 16
+           OR (
+               SELECT count(*)
+                 FROM pg_catalog.pg_attrdef AS defaults
+                 JOIN pg_catalog.pg_class AS relations
+                   ON relations.oid = defaults.adrelid
+                 JOIN pg_catalog.pg_namespace AS namespaces
+                   ON namespaces.oid = relations.relnamespace
+                WHERE namespaces.nspname = 'pgshard_catalog'
+                  AND relations.relname IN (
+                      'operation_requests',
+                      'operation_status'
+                  )
+           ) <> 3
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '42501',
+                MESSAGE = 'pre-existing operation relations have noncanonical integrity metadata';
+        END IF;
+    END IF;
+END
+$pgshard_validate_operation_relation_shapes$;
+
 DO $pgshard_role_bootstrap$
 DECLARE
     bootstrap_superuser_oid CONSTANT pg_catalog.oid := 10;
@@ -430,7 +643,8 @@ BEGIN
              WHERE roles.rolname IN (
                        'pgshard_catalog_owner',
                        'pgshard_catalog_reader',
-                       'pgshard_catalog_admin'
+                       'pgshard_catalog_admin',
+                       'pgshard_operation_writer'
                    )
         ) THEN
             RAISE EXCEPTION USING
@@ -747,6 +961,8 @@ BEGIN
                              ('managed_replication_slots', 'managed_replication_slots_protect_history', 'protect_managed_replication_slot', 31),
                              ('managed_replication_slots', 'managed_replication_slots_touch_catalog', 'touch_catalog_state', 28),
                              ('managed_slot_creation_attempts', 'managed_slot_creation_attempts_protect_history', 'protect_managed_slot_creation_attempt', 31),
+                             ('operation_requests', 'operation_requests_immutable', 'reject_all_changes', 27),
+                             ('operation_status', 'operation_status_immutable', 'reject_all_changes', 27),
                              ('operation_tombstones', 'operation_tombstone_immutable', 'reject_all_changes', 27),
                              ('registered_tables', 'registered_tables_lock_catalog', 'lock_catalog_state', 30),
                              ('registered_tables', 'registered_tables_touch_catalog', 'touch_catalog_state', 28),
@@ -831,7 +1047,8 @@ BEGIN
 
     IF catalog_schema_owner_name IN (
         'pgshard_catalog_reader',
-        'pgshard_catalog_admin'
+        'pgshard_catalog_admin',
+        'pgshard_operation_writer'
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '42501',
@@ -974,7 +1191,8 @@ BEGIN
     FOREACH role_name IN ARRAY ARRAY[
         'pgshard_catalog_owner',
         'pgshard_catalog_reader',
-        'pgshard_catalog_admin'
+        'pgshard_catalog_admin',
+        'pgshard_operation_writer'
     ]
     LOOP
         SELECT roles.rolsuper,
@@ -1028,7 +1246,8 @@ BEGIN
          WHERE granted_roles.rolname IN (
                    'pgshard_catalog_owner',
                    'pgshard_catalog_reader',
-                   'pgshard_catalog_admin'
+                   'pgshard_catalog_admin',
+                   'pgshard_operation_writer'
                )
            AND memberships.admin_option
     ) THEN
@@ -1044,7 +1263,10 @@ BEGIN
             ON member_roles.oid = memberships.member
           JOIN pg_catalog.pg_roles AS granted_roles
             ON granted_roles.oid = memberships.roleid
-         WHERE member_roles.rolname = 'pgshard_catalog_reader'
+         WHERE member_roles.rolname IN (
+                   'pgshard_catalog_reader',
+                   'pgshard_operation_writer'
+               )
             OR (
                 member_roles.rolname = 'pgshard_catalog_admin'
                 AND granted_roles.rolname <> 'pgshard_catalog_reader'
@@ -1069,6 +1291,18 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '42501',
             MESSAGE = 'pre-existing pgshard_catalog_owner role has a member';
+    END IF;
+
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.pg_auth_members AS memberships
+          JOIN pg_catalog.pg_roles AS granted_roles
+            ON granted_roles.oid = memberships.roleid
+         WHERE granted_roles.rolname = 'pgshard_operation_writer'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_operation_writer role has a member';
     END IF;
 END
 $pgshard_roles$;
@@ -1360,6 +1594,7 @@ $pgshard_drop_existing_user_triggers$;
 
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_reader;
 GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_catalog_admin;
+GRANT USAGE ON SCHEMA pgshard_catalog TO pgshard_operation_writer;
 
 DO $pgshard_domains$
 BEGIN
@@ -2173,6 +2408,88 @@ CREATE TABLE IF NOT EXISTS pgshard_catalog.operation_tombstones (
 
 COMMENT ON TABLE pgshard_catalog.operation_tombstones IS
     'Permanent idempotency records. Only fixed-size fingerprints are retained; request/result bodies and secrets are forbidden.';
+
+-- Operation IDs are cluster-global across every operation class. A catalog
+-- created by an older release may have admitted the same UUID under two kinds;
+-- fail that upgrade rather than guessing which permanent identity should win.
+DO $pgshard_operation_tombstone_global_identity$
+BEGIN
+    IF EXISTS (
+        SELECT operation_id
+          FROM pgshard_catalog.operation_tombstones
+         GROUP BY operation_id
+        HAVING count(*) > 1
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'duplicate operation UUIDs block catalog upgrade',
+            DETAIL = 'operation IDs are now global across every operation kind';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT
+          FROM pg_catalog.pg_constraint AS constraints
+         WHERE constraints.conrelid =
+                   'pgshard_catalog.operation_tombstones'::pg_catalog.regclass
+           AND constraints.conname = 'operation_tombstones_operation_id_key'
+           AND constraints.contype = 'u'
+    ) THEN
+        ALTER TABLE pgshard_catalog.operation_tombstones
+            ADD CONSTRAINT operation_tombstones_operation_id_key
+            UNIQUE (operation_id);
+    END IF;
+END
+$pgshard_operation_tombstone_global_identity$;
+
+CREATE TABLE IF NOT EXISTS pgshard_catalog.operation_requests (
+    operation_id uuid PRIMARY KEY
+        CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::uuid),
+    fingerprint_version smallint NOT NULL DEFAULT 1
+        CHECK (fingerprint_version = 1),
+    request_fingerprint bytea NOT NULL
+        CHECK (octet_length(request_fingerprint) = 32),
+    trusted_catalog_cluster_id uuid NOT NULL
+        CHECK (trusted_catalog_cluster_id <> '00000000-0000-0000-0000-000000000000'::uuid),
+    trusted_kubernetes_cluster_uid text NOT NULL
+        CHECK (
+            octet_length(trusted_kubernetes_cluster_uid) BETWEEN 1 AND 128
+            AND trusted_kubernetes_cluster_uid COLLATE "C" ~ '^[A-Za-z0-9._-]+$'
+        ),
+    cluster_name pgshard_catalog.resource_name NOT NULL
+        CHECK (
+            cluster_name COLLATE "C" ~ '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$'
+            AND octet_length(cluster_name) BETWEEN 1 AND 63
+        ),
+    shard_id bigint NOT NULL CHECK (shard_id BETWEEN 0 AND 4294967295),
+    operation_kind pgshard_catalog.sql_identifier NOT NULL
+        CHECK (operation_kind IN (
+            'switchover',
+            'failover',
+            'backup',
+            'restore',
+            'ddl',
+            'reshard',
+            'authorization'
+        )),
+    payload bytea NOT NULL CHECK (octet_length(payload) <= 65536),
+    required_catalog_epoch bigint NOT NULL CHECK (required_catalog_epoch > 0),
+    required_fencing_epoch bigint NOT NULL CHECK (required_fencing_epoch > 0),
+    deadline_unix_micros bigint NOT NULL CHECK (deadline_unix_micros > 0),
+    accepted_at timestamptz NOT NULL DEFAULT statement_timestamp()
+);
+
+COMMENT ON TABLE pgshard_catalog.operation_requests IS
+    'Permanent exact operation envelopes accepted by the catalog. Raw rows are hidden from reader and administrator roles.';
+
+CREATE TABLE IF NOT EXISTS pgshard_catalog.operation_status (
+    operation_id uuid PRIMARY KEY
+        REFERENCES pgshard_catalog.operation_requests(operation_id),
+    phase text NOT NULL DEFAULT 'pending' CHECK (phase = 'pending'),
+    accepted_at timestamptz NOT NULL
+);
+
+COMMENT ON TABLE pgshard_catalog.operation_status IS
+    'One-to-one durable operation state. This uncomposed Milestone 1 slice permits only pending and claims no durable execution.';
 
 INSERT INTO pgshard_catalog.cluster_configuration(singleton)
 VALUES (true)
@@ -5811,6 +6128,329 @@ COMMENT ON FUNCTION pgshard_catalog.install_database_genesis(
 ) IS
     'Idempotently installs one immutable genesis database topology or rejects a conflicting retry.';
 
+CREATE OR REPLACE FUNCTION pgshard_catalog.accept_operation(
+    p_operation_id uuid,
+    p_expected_catalog_cluster_id uuid,
+    p_trusted_kubernetes_cluster_uid text,
+    p_cluster_name text,
+    p_shard_id bigint,
+    p_operation_kind text,
+    p_payload bytea,
+    p_required_catalog_epoch bigint,
+    p_required_fencing_epoch bigint,
+    p_deadline_unix_micros bigint
+)
+RETURNS TABLE (
+    acceptance text,
+    request_fingerprint bytea,
+    accepted_at_unix_micros bigint
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    actual_catalog_cluster_id uuid;
+    computed_fingerprint bytea;
+    field_bytes bytea;
+    fingerprint_material bytea;
+    existing_request pgshard_catalog.operation_requests%ROWTYPE;
+    existing_tombstone pgshard_catalog.operation_tombstones%ROWTYPE;
+    observed_phase text;
+    observed_status_accepted_at timestamptz;
+    request_accepted_at timestamptz;
+BEGIN
+    PERFORM pg_catalog.set_config('synchronous_commit', 'on', true);
+
+    IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '25000',
+            MESSAGE = 'operation acceptance requires READ COMMITTED isolation';
+    END IF;
+
+    IF p_operation_id IS NULL
+       OR p_operation_id = '00000000-0000-0000-0000-000000000000'::uuid THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'operation ID must be a non-nil UUID';
+    END IF;
+    IF p_expected_catalog_cluster_id IS NULL
+       OR p_expected_catalog_cluster_id =
+              '00000000-0000-0000-0000-000000000000'::uuid THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'expected catalog cluster ID must be a non-nil UUID';
+    END IF;
+    IF p_trusted_kubernetes_cluster_uid IS NULL
+       OR octet_length(p_trusted_kubernetes_cluster_uid) NOT BETWEEN 1 AND 128
+       OR p_trusted_kubernetes_cluster_uid COLLATE "C" !~ '^[A-Za-z0-9._-]+$' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'trusted Kubernetes cluster UID is invalid';
+    END IF;
+    IF p_cluster_name IS NULL
+       OR octet_length(p_cluster_name) NOT BETWEEN 1 AND 63
+       OR p_cluster_name COLLATE "C" !~ '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'operation cluster name is invalid';
+    END IF;
+    IF p_shard_id IS NULL OR p_shard_id NOT BETWEEN 0 AND 4294967295 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'operation shard ID is outside the uint32 range';
+    END IF;
+    IF p_operation_kind IS NULL
+       OR p_operation_kind NOT IN (
+           'switchover',
+           'failover',
+           'backup',
+           'restore',
+           'ddl',
+           'reshard',
+           'authorization'
+       ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'operation kind is unsupported';
+    END IF;
+    IF p_payload IS NULL OR octet_length(p_payload) > 65536 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'operation payload exceeds 65536 bytes';
+    END IF;
+    IF p_required_catalog_epoch IS NULL OR p_required_catalog_epoch <= 0
+       OR p_required_fencing_epoch IS NULL OR p_required_fencing_epoch <= 0
+       OR p_deadline_unix_micros IS NULL OR p_deadline_unix_micros <= 0 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'operation epochs and deadline must be positive bigint values';
+    END IF;
+
+    -- All acceptance calls take the same relation locks in the same order.
+    -- This deliberately serializes the still-low-volume Milestone 1 ingress
+    -- path and makes an exact retry wait out an ambiguous first COMMIT.
+    LOCK TABLE pgshard_catalog.operation_requests IN SHARE ROW EXCLUSIVE MODE;
+    LOCK TABLE pgshard_catalog.operation_status IN SHARE ROW EXCLUSIVE MODE;
+    LOCK TABLE pgshard_catalog.operation_tombstones IN SHARE ROW EXCLUSIVE MODE;
+
+    SELECT configuration.cluster_id
+      INTO STRICT actual_catalog_cluster_id
+      FROM pgshard_catalog.cluster_configuration AS configuration
+     WHERE configuration.singleton;
+    IF actual_catalog_cluster_id <> p_expected_catalog_cluster_id THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'operation catalog cluster identity mismatch';
+    END IF;
+
+    -- The domain/version tag is fixed. Every request and trust-anchor field is
+    -- encoded as a four-byte network-order length followed by exact bytes.
+    fingerprint_material :=
+        pg_catalog.convert_to('pgshard.operation-request.v1', 'UTF8');
+
+    field_bytes := pg_catalog.uuid_send(p_operation_id);
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := pg_catalog.uuid_send(p_expected_catalog_cluster_id);
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := pg_catalog.convert_to(p_trusted_kubernetes_cluster_uid, 'UTF8');
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := pg_catalog.convert_to(p_cluster_name, 'UTF8');
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := pg_catalog.int8send(p_shard_id);
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := pg_catalog.convert_to(p_operation_kind, 'UTF8');
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := p_payload;
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := pg_catalog.int8send(p_required_catalog_epoch);
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := pg_catalog.int8send(p_required_fencing_epoch);
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := pg_catalog.int8send(p_deadline_unix_micros);
+    fingerprint_material := fingerprint_material
+        || pg_catalog.int4send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    computed_fingerprint := pg_catalog.sha256(fingerprint_material);
+
+    SELECT tombstones.*
+      INTO existing_tombstone
+      FROM pgshard_catalog.operation_tombstones AS tombstones
+     WHERE tombstones.operation_id = p_operation_id;
+    IF FOUND THEN
+        acceptance := 'conflict';
+        request_fingerprint := existing_tombstone.request_fingerprint;
+        -- Released tombstones record terminal completion, not acceptance, and
+        -- older administrators could supply infinity or a pre-epoch value.
+        -- Preserve the UUID/fingerprint conflict without inventing a time.
+        accepted_at_unix_micros := NULL;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    SELECT requests.*
+      INTO existing_request
+      FROM pgshard_catalog.operation_requests AS requests
+     WHERE requests.operation_id = p_operation_id;
+    IF FOUND THEN
+        SELECT statuses.phase, statuses.accepted_at
+          INTO observed_phase, observed_status_accepted_at
+          FROM pgshard_catalog.operation_status AS statuses
+         WHERE statuses.operation_id = p_operation_id;
+        IF NOT FOUND
+           OR observed_phase <> 'pending'
+           OR observed_status_accepted_at IS DISTINCT FROM existing_request.accepted_at THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'accepted operation has corrupt or missing pending status';
+        END IF;
+
+        request_fingerprint := existing_request.request_fingerprint;
+        accepted_at_unix_micros := pg_catalog.floor(
+            EXTRACT(epoch FROM existing_request.accepted_at) * 1000000
+        )::bigint;
+        IF existing_request.fingerprint_version = 1
+           AND existing_request.request_fingerprint = computed_fingerprint
+           AND existing_request.trusted_catalog_cluster_id =
+                   p_expected_catalog_cluster_id
+           AND existing_request.trusted_kubernetes_cluster_uid =
+                   p_trusted_kubernetes_cluster_uid
+           AND existing_request.cluster_name = p_cluster_name
+           AND existing_request.shard_id = p_shard_id
+           AND existing_request.operation_kind = p_operation_kind
+           AND existing_request.payload = p_payload
+           AND existing_request.required_catalog_epoch = p_required_catalog_epoch
+           AND existing_request.required_fencing_epoch = p_required_fencing_epoch
+           AND existing_request.deadline_unix_micros = p_deadline_unix_micros THEN
+            acceptance := 'replay';
+        ELSE
+            acceptance := 'conflict';
+        END IF;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    request_accepted_at := pg_catalog.clock_timestamp();
+    INSERT INTO pgshard_catalog.operation_requests(
+        operation_id,
+        fingerprint_version,
+        request_fingerprint,
+        trusted_catalog_cluster_id,
+        trusted_kubernetes_cluster_uid,
+        cluster_name,
+        shard_id,
+        operation_kind,
+        payload,
+        required_catalog_epoch,
+        required_fencing_epoch,
+        deadline_unix_micros,
+        accepted_at
+    ) VALUES (
+        p_operation_id,
+        1,
+        computed_fingerprint,
+        p_expected_catalog_cluster_id,
+        p_trusted_kubernetes_cluster_uid,
+        p_cluster_name,
+        p_shard_id,
+        p_operation_kind,
+        p_payload,
+        p_required_catalog_epoch,
+        p_required_fencing_epoch,
+        p_deadline_unix_micros,
+        request_accepted_at
+    );
+    INSERT INTO pgshard_catalog.operation_status(operation_id, phase, accepted_at)
+    VALUES (p_operation_id, 'pending', request_accepted_at);
+
+    acceptance := 'accepted';
+    request_fingerprint := computed_fingerprint;
+    accepted_at_unix_micros := pg_catalog.floor(
+        EXTRACT(epoch FROM request_accepted_at) * 1000000
+    )::bigint;
+    RETURN NEXT;
+END
+$function$;
+
+COMMENT ON FUNCTION pgshard_catalog.accept_operation(
+    uuid,
+    uuid,
+    text,
+    text,
+    bigint,
+    text,
+    bytea,
+    bigint,
+    bigint,
+    bigint
+) IS
+    'Atomically accepts one exact immutable request, returns an exact replay, or preserves the original fingerprint on conflict.';
+
+CREATE OR REPLACE FUNCTION pgshard_catalog.get_operation(p_operation_id uuid)
+RETURNS TABLE (
+    request_fingerprint bytea,
+    phase text,
+    accepted_at_unix_micros bigint
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pgshard_catalog, pg_temp
+AS $function$
+DECLARE
+    observed_fingerprint bytea;
+    observed_phase text;
+    request_accepted_at timestamptz;
+    status_accepted_at timestamptz;
+BEGIN
+    IF p_operation_id IS NULL
+       OR p_operation_id = '00000000-0000-0000-0000-000000000000'::uuid THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'operation ID must be a non-nil UUID';
+    END IF;
+
+    SELECT requests.request_fingerprint,
+           statuses.phase,
+           requests.accepted_at,
+           statuses.accepted_at
+      INTO observed_fingerprint,
+           observed_phase,
+           request_accepted_at,
+           status_accepted_at
+      FROM pgshard_catalog.operation_requests AS requests
+      LEFT JOIN pgshard_catalog.operation_status AS statuses
+        ON statuses.operation_id = requests.operation_id
+     WHERE requests.operation_id = p_operation_id;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    IF observed_phase IS DISTINCT FROM 'pending'
+       OR status_accepted_at IS DISTINCT FROM request_accepted_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'accepted operation has corrupt or missing pending status';
+    END IF;
+
+    request_fingerprint := observed_fingerprint;
+    phase := observed_phase;
+    accepted_at_unix_micros := pg_catalog.floor(
+        EXTRACT(epoch FROM request_accepted_at) * 1000000
+    )::bigint;
+    RETURN NEXT;
+END
+$function$;
+
+COMMENT ON FUNCTION pgshard_catalog.get_operation(uuid) IS
+    'Returns bounded acceptance state without exposing the exact request envelope or payload.';
+
 DROP TRIGGER IF EXISTS cluster_configuration_immutable ON pgshard_catalog.cluster_configuration;
 CREATE TRIGGER cluster_configuration_immutable
 BEFORE UPDATE OR DELETE ON pgshard_catalog.cluster_configuration
@@ -5829,6 +6469,16 @@ FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.protect_routing_range_history();
 DROP TRIGGER IF EXISTS operation_tombstone_immutable ON pgshard_catalog.operation_tombstones;
 CREATE TRIGGER operation_tombstone_immutable
 BEFORE UPDATE OR DELETE ON pgshard_catalog.operation_tombstones
+FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.reject_all_changes();
+
+DROP TRIGGER IF EXISTS operation_requests_immutable ON pgshard_catalog.operation_requests;
+CREATE TRIGGER operation_requests_immutable
+BEFORE UPDATE OR DELETE ON pgshard_catalog.operation_requests
+FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.reject_all_changes();
+
+DROP TRIGGER IF EXISTS operation_status_immutable ON pgshard_catalog.operation_status;
+CREATE TRIGGER operation_status_immutable
+BEFORE UPDATE OR DELETE ON pgshard_catalog.operation_status
 FOR EACH ROW EXECUTE FUNCTION pgshard_catalog.reject_all_changes();
 
 DROP TRIGGER IF EXISTS cluster_state_notify ON pgshard_catalog.cluster_state;
@@ -6056,6 +6706,14 @@ REVOKE SELECT ON pgshard_catalog.managed_slot_creation_attempts
     FROM pgshard_catalog_reader;
 REVOKE SELECT ON pgshard_catalog.managed_slot_target_fences
     FROM pgshard_catalog_reader;
+REVOKE SELECT ON pgshard_catalog.operation_requests
+    FROM pgshard_catalog_reader;
+REVOKE SELECT ON pgshard_catalog.operation_status
+    FROM pgshard_catalog_reader;
+REVOKE SELECT ON pgshard_catalog.operation_tombstones
+    FROM pgshard_catalog_reader;
+REVOKE INSERT ON pgshard_catalog.operation_tombstones
+    FROM pgshard_catalog_admin;
 REVOKE SELECT ON pgshard_catalog.slot_sync_probes
     FROM pgshard_catalog_reader;
 GRANT SELECT (
@@ -6110,6 +6768,21 @@ GRANT EXECUTE ON FUNCTION pgshard_catalog.install_database_genesis(
     pgshard_catalog.sql_identifier,
     bigint[]
 ) TO pgshard_catalog_admin;
+
+GRANT EXECUTE ON FUNCTION pgshard_catalog.accept_operation(
+    uuid,
+    uuid,
+    text,
+    text,
+    bigint,
+    text,
+    bytea,
+    bigint,
+    bigint,
+    bigint
+) TO pgshard_operation_writer;
+GRANT EXECUTE ON FUNCTION pgshard_catalog.get_operation(uuid)
+    TO pgshard_operation_writer;
 
 GRANT INSERT (database_name) ON pgshard_catalog.logical_databases TO pgshard_catalog_admin;
 GRANT INSERT (shard_id, shard_number, state), UPDATE (state)
@@ -6191,7 +6864,6 @@ GRANT INSERT (
     ON pgshard_catalog.managed_replication_slots TO pgshard_catalog_admin;
 REVOKE UPDATE (consistent_point, two_phase_at, activated_at)
     ON pgshard_catalog.managed_replication_slots FROM pgshard_catalog_admin;
-GRANT INSERT ON pgshard_catalog.operation_tombstones TO pgshard_catalog_admin;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA pgshard_catalog TO pgshard_catalog_admin;
 GRANT EXECUTE ON FUNCTION pgshard_catalog.validate_routing_epoch(bigint)
     TO pgshard_catalog_admin;
