@@ -4,12 +4,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use pgshard_types::writable_generation::DurableWritableGeneration;
 use pgshard_types::{PgLsn, ShardId};
 use serde::{Serialize, Serializer};
 use thiserror::Error;
 
 /// Maximum age of a role/fence observation that can authorize readiness.
 pub const POSTGRES_OBSERVATION_MAX_AGE_MS: u64 = 5_000;
+
+/// Maximum age of one coherent physical-replication observation that may be
+/// considered by the future initial-serving gate.
+pub const REPLICATION_EVIDENCE_MAX_AGE_MS: u64 = 5_000;
 
 /// Stable identity assigned by the operator.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -120,6 +125,169 @@ where
     }
 }
 
+// Serde's `serialize_with` callback ABI passes the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_lsn<S>(value: &PgLsn, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.0.to_string())
+}
+
+/// Exact generation durability configured for the bootstrap source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum GenerationDurabilityEvidence {
+    /// The generation is durable only on the source.
+    Local,
+    /// The generation must be replayed by any one canonical managed standby.
+    RemoteApplyAnyOne {
+        /// Exact ordered member application-name candidates.
+        candidates: Vec<String>,
+    },
+}
+
+/// `pg_stat_replication` states accepted from `PostgreSQL`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationStreamState {
+    /// Walsender startup handshake is in progress.
+    Startup,
+    /// The standby is catching up to the source.
+    Catchup,
+    /// WAL is streaming continuously.
+    Streaming,
+    /// A base-backup walsender is active.
+    Backup,
+    /// Walsender shutdown is in progress.
+    Stopping,
+}
+
+/// `pg_stat_replication.sync_state` values accepted from `PostgreSQL`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationSyncState {
+    /// The standby is not a synchronous candidate.
+    Async,
+    /// The standby is a spare priority-based synchronous candidate.
+    Potential,
+    /// The standby is the selected priority-based synchronous standby.
+    Sync,
+    /// The standby participates in quorum-based synchronous replication.
+    Quorum,
+}
+
+/// One configured source-side member slot and its live walsender progress.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceReplicationCandidateEvidence {
+    /// Canonical member application and physical-slot identity.
+    pub member_slot_name: String,
+    /// Whether the permanent physical slot exists and is active.
+    pub slot_active: bool,
+    /// Whether the active slot PID and the uniquely named walsender agree.
+    pub slot_walsender_match: bool,
+    /// Current walsender state, absent while disconnected.
+    pub stream_state: Option<ReplicationStreamState>,
+    /// Current synchronous-selection state, absent while disconnected.
+    pub sync_state: Option<ReplicationSyncState>,
+    /// Last WAL position reported flushed by this standby.
+    #[serde(serialize_with = "serialize_optional_lsn")]
+    pub flush_lsn: Option<PgLsn>,
+    /// Last WAL position reported replayed by this standby.
+    #[serde(serialize_with = "serialize_optional_lsn")]
+    pub replay_lsn: Option<PgLsn>,
+}
+
+/// Coherent evidence sampled from a replication-bootstrap source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceReplicationEvidence {
+    /// Local Unix time after the complete bounded observation succeeded.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub observed_at_unix_ms: u64,
+    /// `PostgreSQL` physical-cluster identifier.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub system_identifier: u64,
+    /// Current `PostgreSQL` timeline.
+    pub timeline: u32,
+    /// Exact recovery state; a bootstrap source must report false.
+    pub in_recovery: bool,
+    /// Exact canonical writable-generation row observed under relation locks.
+    pub generation_identity: String,
+    /// Source flush position used as the exact candidate replay barrier.
+    #[serde(serialize_with = "serialize_lsn")]
+    pub generation_barrier_lsn: PgLsn,
+    /// Exact configured generation durability and candidate set.
+    pub durability: GenerationDurabilityEvidence,
+    /// One entry for every configured canonical candidate, in configured order.
+    pub candidates: Vec<SourceReplicationCandidateEvidence>,
+}
+
+/// Coherent evidence sampled from a replication standby.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StandbyReplicationEvidence {
+    /// Local Unix time after the complete bounded observation succeeded.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub observed_at_unix_ms: u64,
+    /// `PostgreSQL` physical-cluster identifier.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub system_identifier: u64,
+    /// Current `PostgreSQL` recovery timeline.
+    pub timeline: u32,
+    /// Exact recovery state; a physical standby must report true.
+    pub in_recovery: bool,
+    /// Exact canonical writable-generation row replayed locally.
+    pub generation_identity: String,
+    /// Configured canonical member application and physical-slot identity.
+    pub member_slot_name: String,
+    /// Last WAL position received from the source.
+    #[serde(serialize_with = "serialize_lsn")]
+    pub receive_lsn: PgLsn,
+    /// Last WAL position replayed locally.
+    #[serde(serialize_with = "serialize_lsn")]
+    pub replay_lsn: PgLsn,
+}
+
+/// Non-authoritative physical-replication evidence exposed in agent status.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum ReplicationEvidence {
+    /// Evidence from the writable-Lease-fenced clone source.
+    Source(SourceReplicationEvidence),
+    /// Evidence from a TCP-closed physical standby.
+    Standby(StandbyReplicationEvidence),
+}
+
+/// Pure result of evaluating whether replication evidence could support a
+/// future initial-serving transition.
+///
+/// This value is diagnostic only. It does not change readiness, role, Lease
+/// authority, or serving state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialServingEligibility {
+    /// One remote-apply standby coherently witnessed the source barrier.
+    Eligible,
+    /// The evidence is coherent, but the configured generation durability is
+    /// explicitly local-only and therefore an HA downgrade.
+    AsynchronousDurabilityDowngrade,
+    /// Required source or standby evidence is absent.
+    EvidenceMissing,
+    /// An evidence timestamp is zero or in the future.
+    EvidenceTimeInvalid,
+    /// One required observation is older than the bounded freshness window.
+    EvidenceStale,
+    /// A canonical generation could not be reconstructed exactly.
+    GenerationInvalid,
+    /// Physical-cluster or timeline identity is invalid or inconsistent.
+    PhysicalIdentityMismatch,
+    /// Source or standby recovery state contradicts its supervised role.
+    RecoveryStateMismatch,
+    /// The source evidence has a malformed or incomplete candidate set.
+    CandidateSetInvalid,
+    /// No coherent synchronous standby has replayed the sampled source barrier.
+    SynchronousWitnessMissing,
+}
+
 /// Externally reportable agent state.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct AgentSnapshot {
@@ -131,6 +299,8 @@ pub struct AgentSnapshot {
     pub postgres_process: PostgresProcessState,
     /// Current fencing lease.
     pub lease: Option<FencingLease>,
+    /// Fresh non-authoritative replication/generation evidence, when observed.
+    pub replication_evidence: Option<ReplicationEvidence>,
 }
 
 /// Thread-safe state shared by reconciliation and HTTP handlers.
@@ -203,11 +373,51 @@ impl AgentState {
 
     /// Replaces the locally supervised postmaster process state.
     pub fn set_postgres_process(&self, process: PostgresProcessState) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.snapshot.postgres_process = process;
+        if !matches!(
+            process,
+            PostgresProcessState::StartingReplicationBootstrap
+                | PostgresProcessState::RunningReplicationBootstrap
+                | PostgresProcessState::StartingReplicationStandby
+                | PostgresProcessState::RunningReplicationStandby
+        ) {
+            inner.snapshot.replication_evidence = None;
+        }
+    }
+
+    /// Replaces the last coherent physical-replication evidence atomically.
+    pub fn set_replication_evidence(&self, evidence: ReplicationEvidence) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let process_matches = matches!(
+            (&evidence, inner.snapshot.postgres_process),
+            (
+                ReplicationEvidence::Source(_),
+                PostgresProcessState::StartingReplicationBootstrap
+                    | PostgresProcessState::RunningReplicationBootstrap
+            ) | (
+                ReplicationEvidence::Standby(_),
+                PostgresProcessState::StartingReplicationStandby
+                    | PostgresProcessState::RunningReplicationStandby
+            )
+        );
+        inner.snapshot.replication_evidence = process_matches.then_some(evidence);
+    }
+
+    /// Clears replication evidence immediately after any failed SQL sample or
+    /// process lifecycle transition.
+    pub fn clear_replication_evidence(&self) {
         self.inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .snapshot
-            .postgres_process = process;
+            .replication_evidence = None;
     }
 
     /// Installs or renews a lease already authenticated by the orchestrator
@@ -571,6 +781,163 @@ fn evaluate_readiness(
     }
 }
 
+/// Classifies collected source and standby evidence without changing any
+/// agent state.
+///
+/// The classifier is deliberately stricter than current readiness: it is a
+/// building block for a future explicit serving transition, not permission to
+/// serve. Local-only generation durability is surfaced as a distinct downgrade
+/// rather than being confused with either HA eligibility or missing evidence.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn classify_initial_serving_eligibility(
+    source: Option<&SourceReplicationEvidence>,
+    standbys: &[StandbyReplicationEvidence],
+    now_unix_ms: u64,
+) -> InitialServingEligibility {
+    let Some(source) = source else {
+        return InitialServingEligibility::EvidenceMissing;
+    };
+    if !evidence_time_valid(source.observed_at_unix_ms, now_unix_ms) {
+        return InitialServingEligibility::EvidenceTimeInvalid;
+    }
+    if evidence_stale(source.observed_at_unix_ms, now_unix_ms) {
+        return InitialServingEligibility::EvidenceStale;
+    }
+    if source.system_identifier == 0 || source.timeline == 0 || source.generation_barrier_lsn.0 == 0
+    {
+        return InitialServingEligibility::PhysicalIdentityMismatch;
+    }
+    if source.in_recovery {
+        return InitialServingEligibility::RecoveryStateMismatch;
+    }
+    if !canonical_generation_identity(&source.generation_identity) {
+        return InitialServingEligibility::GenerationInvalid;
+    }
+
+    let GenerationDurabilityEvidence::RemoteApplyAnyOne { candidates } = &source.durability else {
+        return InitialServingEligibility::AsynchronousDurabilityDowngrade;
+    };
+    if !canonical_candidate_set(candidates)
+        || source.candidates.len() != candidates.len()
+        || source
+            .candidates
+            .iter()
+            .zip(candidates)
+            .any(|(observed, configured)| observed.member_slot_name != *configured)
+    {
+        return InitialServingEligibility::CandidateSetInvalid;
+    }
+
+    // `ANY 1` is existential: a malformed, stale, or otherwise unusable
+    // observation for one configured candidate must not poison a distinct
+    // candidate that supplies an exact witness. Accumulate deterministic
+    // diagnostics while considering every source-qualified candidate.
+    let mut evidence_time_invalid = false;
+    let mut stale_evidence_seen = false;
+    let mut physical_identity_mismatch = false;
+    let mut recovery_state_mismatch = false;
+    let mut generation_invalid = false;
+    let mut evidence_missing = false;
+    for candidate in &source.candidates {
+        if !candidate.slot_active
+            || !candidate.slot_walsender_match
+            || candidate.stream_state != Some(ReplicationStreamState::Streaming)
+            || !matches!(
+                candidate.sync_state,
+                Some(ReplicationSyncState::Sync | ReplicationSyncState::Quorum)
+            )
+            || candidate
+                .flush_lsn
+                .is_none_or(|lsn| lsn.0 < source.generation_barrier_lsn.0)
+            || candidate
+                .replay_lsn
+                .is_none_or(|lsn| lsn.0 < source.generation_barrier_lsn.0)
+        {
+            continue;
+        }
+
+        let matching: Vec<_> = standbys
+            .iter()
+            .filter(|standby| standby.member_slot_name == candidate.member_slot_name)
+            .collect();
+        if matching.len() != 1 {
+            evidence_missing = true;
+            continue;
+        }
+        let standby = matching[0];
+        if !evidence_time_valid(standby.observed_at_unix_ms, now_unix_ms) {
+            evidence_time_invalid = true;
+            continue;
+        }
+        if evidence_stale(standby.observed_at_unix_ms, now_unix_ms) {
+            stale_evidence_seen = true;
+            continue;
+        }
+        if standby.system_identifier != source.system_identifier
+            || standby.timeline != source.timeline
+            || standby.system_identifier == 0
+            || standby.timeline == 0
+        {
+            physical_identity_mismatch = true;
+            continue;
+        }
+        if !standby.in_recovery {
+            recovery_state_mismatch = true;
+            continue;
+        }
+        if standby.generation_identity != source.generation_identity
+            || !canonical_generation_identity(&standby.generation_identity)
+        {
+            generation_invalid = true;
+            continue;
+        }
+        if standby.receive_lsn.0 < source.generation_barrier_lsn.0
+            || standby.replay_lsn.0 < source.generation_barrier_lsn.0
+        {
+            continue;
+        }
+        return InitialServingEligibility::Eligible;
+    }
+
+    if evidence_time_invalid {
+        InitialServingEligibility::EvidenceTimeInvalid
+    } else if stale_evidence_seen {
+        InitialServingEligibility::EvidenceStale
+    } else if physical_identity_mismatch {
+        InitialServingEligibility::PhysicalIdentityMismatch
+    } else if recovery_state_mismatch {
+        InitialServingEligibility::RecoveryStateMismatch
+    } else if generation_invalid {
+        InitialServingEligibility::GenerationInvalid
+    } else if evidence_missing {
+        InitialServingEligibility::EvidenceMissing
+    } else {
+        InitialServingEligibility::SynchronousWitnessMissing
+    }
+}
+
+fn evidence_time_valid(observed_at_unix_ms: u64, now_unix_ms: u64) -> bool {
+    observed_at_unix_ms != 0 && observed_at_unix_ms <= now_unix_ms
+}
+
+fn evidence_stale(observed_at_unix_ms: u64, now_unix_ms: u64) -> bool {
+    now_unix_ms - observed_at_unix_ms > REPLICATION_EVIDENCE_MAX_AGE_MS
+}
+
+fn canonical_generation_identity(value: &str) -> bool {
+    DurableWritableGeneration::parse_canonical(value.as_bytes())
+        .is_some_and(|generation| generation.canonical_bytes() == value.as_bytes())
+}
+
+fn canonical_candidate_set(candidates: &[String]) -> bool {
+    matches!(candidates.len(), 2 | 4)
+        && candidates
+            .iter()
+            .enumerate()
+            .all(|(index, candidate)| *candidate == format!("pgshard_member_{:04}", index + 1))
+}
+
 fn unix_time_ms() -> u64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -606,6 +973,87 @@ mod tests {
         AgentState::with_identity(identity(), 10_000).expect("valid lease policy")
     }
 
+    fn generation_identity() -> String {
+        String::from_utf8(
+            DurableWritableGeneration::new(
+                "cluster-1".to_owned(),
+                "cluster-uid".to_owned(),
+                ShardId(2),
+                "database".to_owned(),
+                "writable".to_owned(),
+                "lease-uid".to_owned(),
+                "instance-1/pod/attempt".to_owned(),
+                7,
+            )
+            .expect("valid generation")
+            .canonical_bytes(),
+        )
+        .expect("canonical generation is UTF-8")
+    }
+
+    fn source_evidence() -> SourceReplicationEvidence {
+        let candidates = vec![
+            "pgshard_member_0001".to_owned(),
+            "pgshard_member_0002".to_owned(),
+        ];
+        SourceReplicationEvidence {
+            observed_at_unix_ms: 10_000,
+            system_identifier: 42,
+            timeline: 3,
+            in_recovery: false,
+            generation_identity: generation_identity(),
+            generation_barrier_lsn: PgLsn(100),
+            durability: GenerationDurabilityEvidence::RemoteApplyAnyOne {
+                candidates: candidates.clone(),
+            },
+            candidates: candidates
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, member_slot_name)| SourceReplicationCandidateEvidence {
+                        member_slot_name,
+                        slot_active: index == 0,
+                        slot_walsender_match: index == 0,
+                        stream_state: (index == 0).then_some(ReplicationStreamState::Streaming),
+                        sync_state: (index == 0).then_some(ReplicationSyncState::Quorum),
+                        flush_lsn: (index == 0).then_some(PgLsn(100)),
+                        replay_lsn: (index == 0).then_some(PgLsn(100)),
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn standby_evidence() -> StandbyReplicationEvidence {
+        StandbyReplicationEvidence {
+            observed_at_unix_ms: 10_000,
+            system_identifier: 42,
+            timeline: 3,
+            in_recovery: true,
+            generation_identity: generation_identity(),
+            member_slot_name: "pgshard_member_0001".to_owned(),
+            receive_lsn: PgLsn(100),
+            replay_lsn: PgLsn(100),
+        }
+    }
+
+    fn qualify_second_source_candidate(source: &mut SourceReplicationEvidence) {
+        let candidate = &mut source.candidates[1];
+        candidate.slot_active = true;
+        candidate.slot_walsender_match = true;
+        candidate.stream_state = Some(ReplicationStreamState::Streaming);
+        candidate.sync_state = Some(ReplicationSyncState::Quorum);
+        candidate.flush_lsn = Some(source.generation_barrier_lsn);
+        candidate.replay_lsn = Some(source.generation_barrier_lsn);
+    }
+
+    fn standby_evidence_for(member_slot_name: &str) -> StandbyReplicationEvidence {
+        StandbyReplicationEvidence {
+            member_slot_name: member_slot_name.to_owned(),
+            ..standby_evidence()
+        }
+    }
+
     fn install(
         state: &AgentState,
         lease: FencingLease,
@@ -613,6 +1061,301 @@ mod tests {
         valid_from: Instant,
     ) -> Result<LeaseInstallOutcome, LeaseInstallError> {
         state.install_lease_at(lease, valid_from_unix_ms, valid_from, valid_from)
+    }
+
+    #[test]
+    fn replication_evidence_is_atomic_status_only_state() {
+        let state = state();
+        state.set_postgres_process(PostgresProcessState::StartingReplicationBootstrap);
+        let readiness_before_evidence = state.readiness();
+        let evidence = ReplicationEvidence::Source(source_evidence());
+        state.set_replication_evidence(evidence.clone());
+        assert_eq!(state.snapshot().replication_evidence, Some(evidence));
+        let json = serde_json::to_value(state.snapshot()).expect("serialize evidence status");
+        assert_eq!(json["replication_evidence"]["role"], "source");
+        assert_eq!(json["replication_evidence"]["system_identifier"], "42");
+        assert_eq!(
+            json["replication_evidence"]["generation_barrier_lsn"],
+            "100"
+        );
+        assert_eq!(
+            state.readiness(),
+            readiness_before_evidence,
+            "evidence must never change readiness"
+        );
+        state.clear_replication_evidence();
+        assert!(state.snapshot().replication_evidence.is_none());
+
+        state.set_replication_evidence(ReplicationEvidence::Source(source_evidence()));
+        state.set_postgres_process(PostgresProcessState::Stopping);
+        assert!(state.snapshot().replication_evidence.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn initial_serving_classifier_is_pure_fail_closed_and_exhaustive() {
+        let now = 10_000;
+        let source = source_evidence();
+        let standby = standby_evidence();
+        assert_eq!(
+            classify_initial_serving_eligibility(None, &[], now),
+            InitialServingEligibility::EvidenceMissing
+        );
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                std::slice::from_ref(&standby),
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+
+        let mut changed = source.clone();
+        changed.observed_at_unix_ms = 0;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&changed),
+                std::slice::from_ref(&standby),
+                now
+            ),
+            InitialServingEligibility::EvidenceTimeInvalid
+        );
+        changed.observed_at_unix_ms = now + 1;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&changed),
+                std::slice::from_ref(&standby),
+                now
+            ),
+            InitialServingEligibility::EvidenceTimeInvalid
+        );
+        changed.observed_at_unix_ms = now - REPLICATION_EVIDENCE_MAX_AGE_MS - 1;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&changed),
+                std::slice::from_ref(&standby),
+                now
+            ),
+            InitialServingEligibility::EvidenceStale
+        );
+
+        changed = source.clone();
+        changed.system_identifier = 0;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&changed),
+                std::slice::from_ref(&standby),
+                now
+            ),
+            InitialServingEligibility::PhysicalIdentityMismatch
+        );
+        changed = source.clone();
+        changed.in_recovery = true;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&changed),
+                std::slice::from_ref(&standby),
+                now
+            ),
+            InitialServingEligibility::RecoveryStateMismatch
+        );
+        changed = source.clone();
+        changed.generation_identity.push('x');
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&changed),
+                std::slice::from_ref(&standby),
+                now
+            ),
+            InitialServingEligibility::GenerationInvalid
+        );
+        changed = source.clone();
+        changed.durability = GenerationDurabilityEvidence::Local;
+        assert_eq!(
+            classify_initial_serving_eligibility(Some(&changed), &[], now),
+            InitialServingEligibility::AsynchronousDurabilityDowngrade
+        );
+
+        changed = source.clone();
+        changed.candidates.pop();
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&changed),
+                std::slice::from_ref(&standby),
+                now
+            ),
+            InitialServingEligibility::CandidateSetInvalid
+        );
+        changed = source.clone();
+        changed.candidates[0].replay_lsn = Some(PgLsn(99));
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&changed),
+                std::slice::from_ref(&standby),
+                now
+            ),
+            InitialServingEligibility::SynchronousWitnessMissing
+        );
+        assert_eq!(
+            classify_initial_serving_eligibility(Some(&source), &[], now),
+            InitialServingEligibility::EvidenceMissing
+        );
+
+        let mut changed_standby = standby.clone();
+        changed_standby.observed_at_unix_ms = 0;
+        assert_eq!(
+            classify_initial_serving_eligibility(Some(&source), &[changed_standby], now),
+            InitialServingEligibility::EvidenceTimeInvalid
+        );
+        changed_standby = standby.clone();
+        changed_standby.observed_at_unix_ms = now - REPLICATION_EVIDENCE_MAX_AGE_MS - 1;
+        assert_eq!(
+            classify_initial_serving_eligibility(Some(&source), &[changed_standby], now),
+            InitialServingEligibility::EvidenceStale
+        );
+        changed_standby = standby.clone();
+        changed_standby.system_identifier += 1;
+        assert_eq!(
+            classify_initial_serving_eligibility(Some(&source), &[changed_standby], now),
+            InitialServingEligibility::PhysicalIdentityMismatch
+        );
+        changed_standby = standby.clone();
+        changed_standby.in_recovery = false;
+        assert_eq!(
+            classify_initial_serving_eligibility(Some(&source), &[changed_standby], now),
+            InitialServingEligibility::RecoveryStateMismatch
+        );
+        changed_standby = standby.clone();
+        changed_standby.generation_identity = generation_identity().replace("term=7", "term=8");
+        assert_eq!(
+            classify_initial_serving_eligibility(Some(&source), &[changed_standby], now),
+            InitialServingEligibility::GenerationInvalid
+        );
+        changed_standby = standby;
+        changed_standby.replay_lsn = PgLsn(99);
+        assert_eq!(
+            classify_initial_serving_eligibility(Some(&source), &[changed_standby], now),
+            InitialServingEligibility::SynchronousWitnessMissing
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn any_one_classifier_uses_a_valid_second_candidate_despite_bad_first_candidate() {
+        let now = 10_000;
+        let mut source = source_evidence();
+        qualify_second_source_candidate(&mut source);
+        let valid_second = standby_evidence_for("pgshard_member_0002");
+
+        let mut first = standby_evidence();
+        first.observed_at_unix_ms = 0;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[first, valid_second.clone()],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+        let mut first = standby_evidence();
+        first.observed_at_unix_ms = now + 1;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[first, valid_second.clone()],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+        let mut first = standby_evidence();
+        first.observed_at_unix_ms = now - REPLICATION_EVIDENCE_MAX_AGE_MS - 1;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[first, valid_second.clone()],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+
+        let mut first = standby_evidence();
+        first.system_identifier += 1;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[first, valid_second.clone()],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+        let mut first = standby_evidence();
+        first.system_identifier = 0;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[first, valid_second.clone()],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+        let mut first = standby_evidence();
+        first.in_recovery = false;
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[first, valid_second.clone()],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+
+        let mut first = standby_evidence();
+        first.generation_identity.push('x');
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[first, valid_second.clone()],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+        let mut first = standby_evidence();
+        first.generation_identity = generation_identity().replace("term=7", "term=8");
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[first, valid_second.clone()],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+        let mut first = standby_evidence();
+        first.replay_lsn = PgLsn(source.generation_barrier_lsn.0 - 1);
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[first, valid_second.clone()],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                std::slice::from_ref(&valid_second),
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
+        assert_eq!(
+            classify_initial_serving_eligibility(
+                Some(&source),
+                &[standby_evidence(), standby_evidence(), valid_second,],
+                now
+            ),
+            InitialServingEligibility::Eligible
+        );
     }
 
     #[test]

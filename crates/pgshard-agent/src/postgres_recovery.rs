@@ -37,7 +37,7 @@ pub(crate) async fn monitor_standby_recovery(
     confirmed: oneshot::Sender<()>,
 ) -> Result<(), PostgresRecoveryError> {
     #[cfg(test)]
-    if let Some(observations) = take_test_recovery_observations() {
+    if let Some(observations) = take_test_recovery_observations(&socket_dir) {
         return monitor_test_recovery(observations, confirmed).await;
     }
     let mut confirmed = Some(confirmed);
@@ -97,28 +97,31 @@ pub(crate) enum TestRecoveryObservation {
 
 #[cfg(test)]
 static TEST_RECOVERY_OBSERVATIONS: std::sync::Mutex<
-    Option<watch::Receiver<TestRecoveryObservation>>,
-> = std::sync::Mutex::new(None);
+    std::collections::BTreeMap<PathBuf, watch::Receiver<TestRecoveryObservation>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(test)]
 pub(crate) fn set_test_recovery_observations(
+    socket_dir: PathBuf,
     observations: watch::Receiver<TestRecoveryObservation>,
 ) {
     let mut slot = TEST_RECOVERY_OBSERVATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(
-        slot.replace(observations).is_none(),
+        slot.insert(socket_dir, observations).is_none(),
         "test recovery monitor already installed"
     );
 }
 
 #[cfg(test)]
-fn take_test_recovery_observations() -> Option<watch::Receiver<TestRecoveryObservation>> {
-    TEST_RECOVERY_OBSERVATIONS
+fn take_test_recovery_observations(
+    socket_dir: &Path,
+) -> Option<watch::Receiver<TestRecoveryObservation>> {
+    let mut slot = TEST_RECOVERY_OBSERVATIONS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    slot.remove(socket_dir)
 }
 
 #[cfg(test)]
