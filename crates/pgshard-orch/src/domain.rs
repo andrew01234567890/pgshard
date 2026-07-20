@@ -412,6 +412,8 @@ pub struct AgentStatusDiagnostics {
     pub fresh_members: usize,
     /// Shards whose complete agent evidence was internally correlated.
     pub replication_correlated_shards: usize,
+    /// Correlated shards whose source reported one exact target-fence ACK.
+    pub target_fence_acknowledged_shards: usize,
     /// Configured process-local maximum receipt age in milliseconds.
     pub maximum_age_ms: u64,
     /// Latest stable failure class, if any.
@@ -427,6 +429,7 @@ impl Default for AgentStatusDiagnostics {
             expected_members: 0,
             fresh_members: 0,
             replication_correlated_shards: 0,
+            target_fence_acknowledged_shards: 0,
             maximum_age_ms: 0,
             failure: None,
             diagnostic_only: true,
@@ -543,6 +546,8 @@ pub struct CatalogBootstrapObservationDiagnostics {
     pub fresh_candidates: usize,
     /// Whether complete live shard-zero replication evidence was correlated.
     pub shard_zero_replication_correlated: bool,
+    /// Whether the correlated live shard-zero source acknowledged its target fence.
+    pub shard_zero_target_fence_acknowledged: bool,
     /// Latest stable joint failure class, if any.
     pub failure: Option<CatalogBootstrapObservationFailureReason>,
     /// Explicitly states that this observation grants no authority.
@@ -556,6 +561,7 @@ impl Default for CatalogBootstrapObservationDiagnostics {
             expected_candidates: 0,
             fresh_candidates: 0,
             shard_zero_replication_correlated: false,
+            shard_zero_target_fence_acknowledged: false,
             failure: None,
             diagnostic_only: true,
         }
@@ -615,56 +621,83 @@ fn catalog_bootstrap_observation(inner: &OrchInner) -> CatalogBootstrapObservati
     let expected_candidates = inner.catalog_candidates.expected_candidates;
     let fresh_candidates = inner.catalog_candidates.fresh_candidates;
     let replication = inner.agent_replication_correlation;
-    let (phase, failure, shard_zero_replication_correlated) = if inner.agent_status.phase
-        == AgentStatusPhase::ShuttingDown
-        || inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown
-    {
-        (CatalogBootstrapObservationPhase::ShuttingDown, None, false)
-    } else if inner.agent_status.phase == AgentStatusPhase::Disabled
-        || inner.catalog_candidates.phase == CatalogCandidatePhase::Disabled
-    {
-        (CatalogBootstrapObservationPhase::Disabled, None, false)
-    } else if inner.agent_status.phase == AgentStatusPhase::Unavailable {
-        (
-            CatalogBootstrapObservationPhase::Unavailable,
-            Some(CatalogBootstrapObservationFailureReason::AgentStatusUnavailable),
-            false,
-        )
-    } else if inner.catalog_candidates.phase == CatalogCandidatePhase::Unavailable {
-        (
-            CatalogBootstrapObservationPhase::Unavailable,
-            Some(CatalogBootstrapObservationFailureReason::CatalogCandidatesUnavailable),
-            false,
-        )
-    } else if inner.agent_status.phase == AgentStatusPhase::Expired
-        || inner.catalog_candidates.phase == CatalogCandidatePhase::Expired
-    {
-        (
-            CatalogBootstrapObservationPhase::Expired,
-            Some(CatalogBootstrapObservationFailureReason::FreshnessExpired),
-            false,
-        )
-    } else if inner.agent_status.phase == AgentStatusPhase::Collecting
-        || inner.catalog_candidates.phase == CatalogCandidatePhase::Collecting
-    {
-        (CatalogBootstrapObservationPhase::Collecting, None, false)
-    } else if inner.agent_status.phase == AgentStatusPhase::Fresh
-        && inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh
-        && replication.is_some_and(|summary| summary.shard_zero_correlated)
-    {
-        (CatalogBootstrapObservationPhase::Correlated, None, true)
-    } else {
-        (
-            CatalogBootstrapObservationPhase::Unavailable,
-            Some(CatalogBootstrapObservationFailureReason::ShardZeroReplicationEvidenceUnavailable),
-            false,
-        )
-    };
+    let (phase, failure, shard_zero_replication_correlated, shard_zero_target_fence_acknowledged) =
+        if inner.agent_status.phase == AgentStatusPhase::ShuttingDown
+            || inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown
+        {
+            (
+                CatalogBootstrapObservationPhase::ShuttingDown,
+                None,
+                false,
+                false,
+            )
+        } else if inner.agent_status.phase == AgentStatusPhase::Disabled
+            || inner.catalog_candidates.phase == CatalogCandidatePhase::Disabled
+        {
+            (
+                CatalogBootstrapObservationPhase::Disabled,
+                None,
+                false,
+                false,
+            )
+        } else if inner.agent_status.phase == AgentStatusPhase::Unavailable {
+            (
+                CatalogBootstrapObservationPhase::Unavailable,
+                Some(CatalogBootstrapObservationFailureReason::AgentStatusUnavailable),
+                false,
+                false,
+            )
+        } else if inner.catalog_candidates.phase == CatalogCandidatePhase::Unavailable {
+            (
+                CatalogBootstrapObservationPhase::Unavailable,
+                Some(CatalogBootstrapObservationFailureReason::CatalogCandidatesUnavailable),
+                false,
+                false,
+            )
+        } else if inner.agent_status.phase == AgentStatusPhase::Expired
+            || inner.catalog_candidates.phase == CatalogCandidatePhase::Expired
+        {
+            (
+                CatalogBootstrapObservationPhase::Expired,
+                Some(CatalogBootstrapObservationFailureReason::FreshnessExpired),
+                false,
+                false,
+            )
+        } else if inner.agent_status.phase == AgentStatusPhase::Collecting
+            || inner.catalog_candidates.phase == CatalogCandidatePhase::Collecting
+        {
+            (
+                CatalogBootstrapObservationPhase::Collecting,
+                None,
+                false,
+                false,
+            )
+        } else if inner.agent_status.phase == AgentStatusPhase::Fresh
+            && inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh
+            && replication.is_some_and(|summary| summary.shard_zero_correlated)
+        {
+            (
+                CatalogBootstrapObservationPhase::Correlated,
+                None,
+                true,
+                replication.is_some_and(|summary| summary.shard_zero_target_fence_acknowledged),
+            )
+        } else {
+            (
+                CatalogBootstrapObservationPhase::Unavailable,
+                Some(
+                    CatalogBootstrapObservationFailureReason::ShardZeroReplicationEvidenceUnavailable,
+                ),
+                false,
+                false,
+            )
+        };
     CatalogBootstrapObservationDiagnostics {
         phase,
         expected_candidates,
         fresh_candidates,
         shard_zero_replication_correlated,
+        shard_zero_target_fence_acknowledged,
         failure,
         diagnostic_only: true,
     }
@@ -848,6 +881,7 @@ impl OrchState {
         inner.agent_status.phase = AgentStatusPhase::Collecting;
         inner.agent_status.fresh_members = 0;
         inner.agent_status.replication_correlated_shards = 0;
+        inner.agent_status.target_fence_acknowledged_shards = 0;
         inner.agent_status.maximum_age_ms =
             u64::try_from(maximum_age.as_millis()).unwrap_or(u64::MAX);
         inner.agent_status.failure = None;
@@ -874,6 +908,7 @@ impl OrchState {
         inner.agent_status.phase = AgentStatusPhase::Unavailable;
         inner.agent_status.fresh_members = 0;
         inner.agent_status.replication_correlated_shards = 0;
+        inner.agent_status.target_fence_acknowledged_shards = 0;
         inner.agent_status.failure = Some(failure);
         if let Some(topology) = &mut inner.topology
             && topology.agent_status_collection
@@ -906,8 +941,17 @@ impl OrchState {
                     .topology
                     .as_ref()
                     .map_or(0, |topology| topology.shard_count)
+            && replication_correlation.acknowledged_correlated_shards
+                <= replication_correlation.correlated_shards
             && (!replication_correlation.shard_zero_correlated
                 || replication_correlation.correlated_shards > 0)
+            && (!replication_correlation.shard_zero_target_fence_acknowledged
+                || (replication_correlation.shard_zero_correlated
+                    && replication_correlation.acknowledged_correlated_shards > 0))
+            && (!replication_correlation.shard_zero_correlated
+                || replication_correlation.acknowledged_correlated_shards
+                    != replication_correlation.correlated_shards
+                || replication_correlation.shard_zero_target_fence_acknowledged)
             && Instant::now() < deadline;
         if !valid {
             inner.agent_identity_binding_deadline = None;
@@ -915,6 +959,7 @@ impl OrchState {
             inner.agent_status.phase = AgentStatusPhase::Unavailable;
             inner.agent_status.fresh_members = 0;
             inner.agent_status.replication_correlated_shards = 0;
+            inner.agent_status.target_fence_acknowledged_shards = 0;
             inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
             return false;
         }
@@ -924,6 +969,8 @@ impl OrchState {
         inner.agent_status.fresh_members = member_count;
         inner.agent_status.replication_correlated_shards =
             replication_correlation.correlated_shards;
+        inner.agent_status.target_fence_acknowledged_shards =
+            replication_correlation.acknowledged_correlated_shards;
         inner.agent_status.failure = None;
         if let Some(topology) = &mut inner.topology {
             topology.agent_status_collection =
@@ -1026,6 +1073,7 @@ impl OrchState {
         inner.agent_status.phase = AgentStatusPhase::ShuttingDown;
         inner.agent_status.fresh_members = 0;
         inner.agent_status.replication_correlated_shards = 0;
+        inner.agent_status.target_fence_acknowledged_shards = 0;
         inner.agent_status.failure = None;
         inner.catalog_candidate_deadline = None;
         inner.catalog_candidates.phase = CatalogCandidatePhase::ShuttingDown;
@@ -1069,6 +1117,7 @@ impl OrchState {
                 inner.agent_status.phase = AgentStatusPhase::Expired;
                 inner.agent_status.fresh_members = 0;
                 inner.agent_status.replication_correlated_shards = 0;
+                inner.agent_status.target_fence_acknowledged_shards = 0;
                 inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
             }
             if let Some(topology) = &mut inner.topology
@@ -2612,6 +2661,7 @@ mod tests {
         );
         let absent = state.snapshot();
         assert_eq!(absent.agent_status.replication_correlated_shards, 0);
+        assert_eq!(absent.agent_status.target_fence_acknowledged_shards, 0);
         assert_eq!(
             absent.catalog_bootstrap_observation.phase,
             CatalogBootstrapObservationPhase::Unavailable
@@ -2622,6 +2672,11 @@ mod tests {
             !absent
                 .catalog_bootstrap_observation
                 .shard_zero_replication_correlated
+        );
+        assert!(
+            !absent
+                .catalog_bootstrap_observation
+                .shard_zero_target_fence_acknowledged
         );
         assert_eq!(
             absent.catalog_bootstrap_observation.failure,
@@ -2639,17 +2694,21 @@ mod tests {
         );
         assert_eq!(collecting.catalog_bootstrap_observation.fresh_candidates, 3);
         assert_eq!(collecting.agent_status.replication_correlated_shards, 0);
+        assert_eq!(collecting.agent_status.target_fence_acknowledged_shards, 0);
 
         assert!(state.record_agent_status_fresh(
             6,
             ReplicationCorrelationSummary {
                 correlated_shards: 2,
                 shard_zero_correlated: true,
+                acknowledged_correlated_shards: 2,
+                shard_zero_target_fence_acknowledged: true,
             },
             now + Duration::from_secs(5),
         ));
         let correlated = state.snapshot();
         assert_eq!(correlated.agent_status.replication_correlated_shards, 2);
+        assert_eq!(correlated.agent_status.target_fence_acknowledged_shards, 2);
         assert_eq!(
             correlated.catalog_bootstrap_observation.phase,
             CatalogBootstrapObservationPhase::Correlated
@@ -2660,7 +2719,25 @@ mod tests {
                 .catalog_bootstrap_observation
                 .shard_zero_replication_correlated
         );
+        assert!(
+            correlated
+                .catalog_bootstrap_observation
+                .shard_zero_target_fence_acknowledged
+        );
         assert_eq!(correlated.catalog_bootstrap_observation.failure, None);
+        let serialized = serde_json::to_string(&correlated).expect("serialize bounded diagnostics");
+        for raw_ack_field in [
+            "target_fence_acknowledgement",
+            "observed_at_unix_ms",
+            "generation_identity",
+            "deadline_boottime_ns",
+            "remaining_validity_at_ack_ms",
+            "boot_id",
+            "postmaster_pid",
+            "control_backend_pid",
+        ] {
+            assert!(!serialized.contains(raw_ack_field));
+        }
         assert_eq!(state.readiness(), ready);
 
         state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
@@ -2676,6 +2753,12 @@ mod tests {
                 .shard_zero_replication_correlated
         );
         assert_eq!(collecting.agent_status.replication_correlated_shards, 2);
+        assert_eq!(collecting.agent_status.target_fence_acknowledged_shards, 2);
+        assert!(
+            !collecting
+                .catalog_bootstrap_observation
+                .shard_zero_target_fence_acknowledged
+        );
 
         assert!(state.record_catalog_candidates_fresh(3, now + Duration::from_secs(5)));
         state.record_catalog_candidate_failure(CatalogCandidateFailureReason::CandidateUnavailable);
@@ -2699,6 +2782,17 @@ mod tests {
                 .catalog_bootstrap_observation
                 .shard_zero_replication_correlated
         );
+        assert!(
+            !candidate_failure
+                .catalog_bootstrap_observation
+                .shard_zero_target_fence_acknowledged
+        );
+        assert_eq!(
+            candidate_failure
+                .agent_status
+                .target_fence_acknowledged_shards,
+            2
+        );
         assert_eq!(state.readiness(), ready);
 
         state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
@@ -2714,6 +2808,15 @@ mod tests {
             3
         );
         assert_eq!(agent_failure.agent_status.replication_correlated_shards, 0);
+        assert_eq!(
+            agent_failure.agent_status.target_fence_acknowledged_shards,
+            0
+        );
+        assert!(
+            !agent_failure
+                .catalog_bootstrap_observation
+                .shard_zero_target_fence_acknowledged
+        );
         assert_eq!(state.readiness(), ready);
 
         state.begin_shutdown();
@@ -2727,6 +2830,12 @@ mod tests {
                 .catalog_bootstrap_observation
                 .shard_zero_replication_correlated
         );
+        assert!(
+            !shutdown
+                .catalog_bootstrap_observation
+                .shard_zero_target_fence_acknowledged
+        );
+        assert_eq!(shutdown.agent_status.target_fence_acknowledged_shards, 0);
         assert_eq!(shutdown.catalog_bootstrap_observation.failure, None);
     }
 
@@ -2739,6 +2848,8 @@ mod tests {
             ReplicationCorrelationSummary {
                 correlated_shards: 1,
                 shard_zero_correlated: true,
+                acknowledged_correlated_shards: 1,
+                shard_zero_target_fence_acknowledged: true,
             },
             now + Duration::from_secs(1),
             now + Duration::from_secs(2),
@@ -2755,6 +2866,12 @@ mod tests {
                 .shard_zero_replication_correlated
         );
         assert_eq!(expired.agent_status.replication_correlated_shards, 0);
+        assert_eq!(expired.agent_status.target_fence_acknowledged_shards, 0);
+        assert!(
+            !expired
+                .catalog_bootstrap_observation
+                .shard_zero_target_fence_acknowledged
+        );
 
         let candidate_expires = bootstrap_observation_state();
         publish_bootstrap_inputs(
@@ -2762,6 +2879,8 @@ mod tests {
             ReplicationCorrelationSummary {
                 correlated_shards: 1,
                 shard_zero_correlated: true,
+                acknowledged_correlated_shards: 1,
+                shard_zero_target_fence_acknowledged: true,
             },
             now + Duration::from_secs(2),
             now + Duration::from_secs(1),
@@ -2778,6 +2897,47 @@ mod tests {
                 .shard_zero_replication_correlated
         );
         assert_eq!(expired.agent_status.replication_correlated_shards, 1);
+        assert_eq!(expired.agent_status.target_fence_acknowledged_shards, 1);
+        assert!(
+            !expired
+                .catalog_bootstrap_observation
+                .shard_zero_target_fence_acknowledged
+        );
+    }
+
+    #[test]
+    fn rejects_impossible_target_fence_acknowledgement_summaries() {
+        for impossible in [
+            ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: true,
+                acknowledged_correlated_shards: 2,
+                shard_zero_target_fence_acknowledged: true,
+            },
+            ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: false,
+                acknowledged_correlated_shards: 1,
+                shard_zero_target_fence_acknowledged: true,
+            },
+            ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: true,
+                acknowledged_correlated_shards: 1,
+                shard_zero_target_fence_acknowledged: false,
+            },
+        ] {
+            let state = bootstrap_observation_state();
+            state.record_agent_status_collecting(Duration::from_secs(5));
+            assert!(!state.record_agent_status_fresh(
+                6,
+                impossible,
+                Instant::now() + Duration::from_secs(5),
+            ));
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot.agent_status.replication_correlated_shards, 0);
+            assert_eq!(snapshot.agent_status.target_fence_acknowledged_shards, 0);
+        }
     }
 
     #[test]

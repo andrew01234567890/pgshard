@@ -83,6 +83,8 @@ pub(crate) struct AgentStatusCollection {
 pub(crate) struct ReplicationCorrelationSummary {
     pub(crate) correlated_shards: usize,
     pub(crate) shard_zero_correlated: bool,
+    pub(crate) acknowledged_correlated_shards: usize,
+    pub(crate) shard_zero_target_fence_acknowledged: bool,
 }
 
 /// Minimal, ephemeral replication facts needed to correlate one shard.
@@ -113,6 +115,14 @@ struct CollectedAgentStatus {
     member_ordinal: u32,
     receipt: Instant,
     replication: Option<MemberReplicationEvidence>,
+    target_fence_acknowledged: bool,
+}
+
+/// Fully validated bounded facts retained for shard-level correlation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedAgentStatus {
+    replication: Option<MemberReplicationEvidence>,
+    target_fence_acknowledged: bool,
 }
 
 /// Collects every status with a fixed global concurrency bound.
@@ -224,12 +234,13 @@ async fn collect_one_inner(
         .map_err(AgentStatusError::Write)?;
     let body = read_bounded_response(&mut stream).await?;
     let status: AgentStatusV1 = serde_json::from_slice(&body)?;
-    let replication = validate_status(&status, &query.expected)?;
+    let validated = validate_status(&status, &query.expected)?;
     Ok(CollectedAgentStatus {
         shard_id: query.expected.shard_id,
         member_ordinal: query.expected.member_ordinal,
         receipt: Instant::now(),
-        replication,
+        replication: validated.replication,
+        target_fence_acknowledged: validated.target_fence_acknowledged,
     })
 }
 
@@ -601,7 +612,7 @@ impl<'de> Deserialize<'de> for CanonicalU64 {
 fn validate_status(
     status: &AgentStatusV1,
     expected: &AgentStatusExpectation,
-) -> Result<Option<MemberReplicationEvidence>, AgentStatusError> {
+) -> Result<ValidatedAgentStatus, AgentStatusError> {
     if status.schema_version != AGENT_STATUS_SCHEMA_VERSION {
         return Err(AgentStatusError::SchemaMismatch);
     }
@@ -613,7 +624,10 @@ fn validate_status(
     let source = expected.member_ordinal == 0;
     if source && expected.standby_slot_names.is_empty() {
         validate_quarantine(status, expected)?;
-        return Ok(None);
+        return Ok(ValidatedAgentStatus {
+            replication: None,
+            target_fence_acknowledged: false,
+        });
     }
     let activation = status
         .activation_config
@@ -635,7 +649,13 @@ fn validate_status(
     } else {
         validate_standby(status, activation, expected)?
     };
-    Ok(replication)
+    let target_fence_acknowledged = source
+        && status.postgres_process == PostgresProcessStateWire::RunningReplicationBootstrap
+        && status.target_fence_acknowledgement.is_some();
+    Ok(ValidatedAgentStatus {
+        replication,
+        target_fence_acknowledged,
+    })
 }
 
 fn validate_quarantine(
@@ -915,9 +935,11 @@ fn validate_generation_evidence(
             || ack.deadline_boottime_ns.0 == 0
             || ack.remaining_validity_at_ack_ms.0 < EXPECTED_TARGET_FENCE_MARGIN_MS
             || ack.remaining_validity_at_ack_ms.0 > EXPECTED_AGENT_LEASE_MAXIMUM_MS
+            || ack.deadline_boottime_ns.0 < ack.remaining_validity_at_ack_ms.0 * 1_000_000
             || ack.postmaster_pid != process.postmaster_pid
             || ack.boot_id != process.boot_id
             || ack.control_backend_pid == 0
+            || ack.control_backend_pid == ack.postmaster_pid
             || !generation_matches(&ack.generation_identity, generation)
         {
             return Err(AgentStatusError::AcknowledgementMismatch);
@@ -1028,6 +1050,15 @@ fn validate_replication_correlation(
             .ok_or(AgentStatusError::ReplicationEvidenceMismatch)?;
         if *shard_id == 0 {
             summary.shard_zero_correlated = true;
+        }
+        if source.target_fence_acknowledged {
+            summary.acknowledged_correlated_shards = summary
+                .acknowledged_correlated_shards
+                .checked_add(1)
+                .ok_or(AgentStatusError::ReplicationEvidenceMismatch)?;
+            if *shard_id == 0 {
+                summary.shard_zero_target_fence_acknowledged = true;
+            }
         }
     }
     Ok(summary)
@@ -1338,7 +1369,7 @@ mod tests {
         value["target_fence_acknowledgement"] = json!({
             "observed_at_unix_ms": "1",
             "generation_identity": value["replication_evidence"]["generation_identity"],
-            "deadline_boottime_ns": "1",
+            "deadline_boottime_ns": "3500000000",
             "remaining_validity_at_ack_ms": "3500",
             "boot_id": "11111111-2222-3333-4444-555555555555",
             "postmaster_pid": 10,
@@ -1426,7 +1457,7 @@ mod tests {
         (expected, status)
     }
 
-    fn correlated_observations() -> Vec<CollectedAgentStatus> {
+    fn correlated_observations(source_acknowledged: bool) -> Vec<CollectedAgentStatus> {
         let receipt = Instant::now();
         vec![
             CollectedAgentStatus {
@@ -1439,6 +1470,7 @@ mod tests {
                     generation_identity: "generation-7".to_owned(),
                     generation_barrier_lsn: 100,
                 }),
+                target_fence_acknowledged: source_acknowledged,
             },
             CollectedAgentStatus {
                 shard_id: 0,
@@ -1451,6 +1483,7 @@ mod tests {
                     receive_lsn: 120,
                     replay_lsn: 110,
                 }),
+                target_fence_acknowledged: false,
             },
         ]
     }
@@ -1478,7 +1511,8 @@ mod tests {
         let (expected, value) = running_source_status();
         let status: AgentStatusV1 =
             serde_json::from_value(value.clone()).expect("running source wire");
-        validate_status(&status, &expected).expect("coherent running source");
+        let validated = validate_status(&status, &expected).expect("coherent running source");
+        assert!(validated.target_fence_acknowledged);
 
         let mut wrong_fence = value.clone();
         wrong_fence["postgres"]["fencing_epoch"] = json!("8");
@@ -1491,6 +1525,24 @@ mod tests {
         let mut missing_ack = value.clone();
         missing_ack["target_fence_acknowledgement"] = Value::Null;
         let status = serde_json::from_value(missing_ack).expect("missing-ACK wire");
+        assert!(matches!(
+            validate_status(&status, &expected),
+            Err(AgentStatusError::AcknowledgementMismatch)
+        ));
+
+        let mut impossible_deadline = value.clone();
+        impossible_deadline["target_fence_acknowledgement"]["deadline_boottime_ns"] =
+            json!("3499999999");
+        let status = serde_json::from_value(impossible_deadline).expect("impossible deadline wire");
+        assert!(matches!(
+            validate_status(&status, &expected),
+            Err(AgentStatusError::AcknowledgementMismatch)
+        ));
+
+        let mut reused_postmaster_pid = value.clone();
+        reused_postmaster_pid["target_fence_acknowledgement"]["control_backend_pid"] =
+            reused_postmaster_pid["target_fence_acknowledgement"]["postmaster_pid"].clone();
+        let status = serde_json::from_value(reused_postmaster_pid).expect("reused-PID wire");
         assert!(matches!(
             validate_status(&status, &expected),
             Err(AgentStatusError::AcknowledgementMismatch)
@@ -1583,6 +1635,24 @@ mod tests {
     }
 
     #[test]
+    fn starting_source_correlates_without_acknowledging_the_target_fence() {
+        let (expected, mut value) = running_source_status();
+        value["postgres_process"] = json!("starting_replication_bootstrap");
+        value["target_fence_acknowledgement"] = Value::Null;
+        let status = serde_json::from_value(value).expect("starting source wire");
+        let validated = validate_status(&status, &expected).expect("coherent starting source");
+        assert!(validated.replication.is_some());
+        assert!(!validated.target_fence_acknowledged);
+
+        let summary = validate_replication_correlation(&correlated_observations(false))
+            .expect("starting shard still has coherent replication evidence");
+        assert_eq!(summary.correlated_shards, 1);
+        assert!(summary.shard_zero_correlated);
+        assert_eq!(summary.acknowledged_correlated_shards, 0);
+        assert!(!summary.shard_zero_target_fence_acknowledged);
+    }
+
+    #[test]
     fn source_candidate_shape_is_cross_validated() {
         let (expected, mut value) = running_source_status();
         value["replication_evidence"]["candidates"][0]["stream_state"] = json!("streaming");
@@ -1621,17 +1691,19 @@ mod tests {
 
     #[test]
     fn correlates_complete_replication_evidence_and_accepts_wholly_missing_evidence() {
-        let correlated = validate_replication_correlation(&correlated_observations())
+        let correlated = validate_replication_correlation(&correlated_observations(true))
             .expect("coherent shard evidence");
         assert_eq!(
             correlated,
             ReplicationCorrelationSummary {
                 correlated_shards: 1,
                 shard_zero_correlated: true,
+                acknowledged_correlated_shards: 1,
+                shard_zero_target_fence_acknowledged: true,
             }
         );
 
-        let mut missing = correlated_observations();
+        let mut missing = correlated_observations(true);
         for observation in &mut missing {
             observation.replication = None;
         }
@@ -1640,14 +1712,14 @@ mod tests {
             ReplicationCorrelationSummary::default()
         );
 
-        let mut partial = correlated_observations();
+        let mut partial = correlated_observations(true);
         partial[1].replication = None;
         assert!(matches!(
             validate_replication_correlation(&partial),
             Err(AgentStatusError::PartialReplicationEvidence)
         ));
 
-        let mut multi_shard = correlated_observations();
+        let mut multi_shard = correlated_observations(true);
         let mut shard_one = multi_shard.clone();
         for observation in &mut shard_one {
             observation.shard_id = 1;
@@ -1658,6 +1730,25 @@ mod tests {
             ReplicationCorrelationSummary {
                 correlated_shards: 2,
                 shard_zero_correlated: true,
+                acknowledged_correlated_shards: 2,
+                shard_zero_target_fence_acknowledged: true,
+            }
+        );
+
+        let mut shard_one_only = correlated_observations(false);
+        let mut acknowledged_shard_one = correlated_observations(true);
+        for observation in &mut acknowledged_shard_one {
+            observation.shard_id = 1;
+        }
+        shard_one_only.extend(acknowledged_shard_one);
+        assert_eq!(
+            validate_replication_correlation(&shard_one_only)
+                .expect("only the nonzero shard acknowledged its target fence"),
+            ReplicationCorrelationSummary {
+                correlated_shards: 2,
+                shard_zero_correlated: true,
+                acknowledged_correlated_shards: 1,
+                shard_zero_target_fence_acknowledged: false,
             }
         );
     }
@@ -1665,7 +1756,7 @@ mod tests {
     #[test]
     fn rejects_cross_member_system_timeline_generation_and_lsn_mismatches() {
         for mismatch in ["system", "timeline", "generation", "lsn"] {
-            let mut observations = correlated_observations();
+            let mut observations = correlated_observations(true);
             let Some(MemberReplicationEvidence::Standby {
                 system_identifier,
                 timeline,
