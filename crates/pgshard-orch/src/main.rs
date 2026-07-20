@@ -51,12 +51,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.clone(),
         wait_for_shutdown(shutdown_rx.clone()),
     );
+    Box::pin(supervise_services(
+        state,
+        shutdown_tx,
+        coordination_future,
+        identity_binding_future,
+        server_future,
+        shutdown_signal(),
+    ))
+    .await
+}
+
+async fn supervise_services<C, I, S, H, CE, SE>(
+    state: OrchState,
+    shutdown_tx: watch::Sender<bool>,
+    coordination_future: C,
+    identity_binding_future: I,
+    server_future: S,
+    shutdown_future: H,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    C: Future<Output = Result<(), CE>>,
+    I: Future<Output = ()>,
+    S: Future<Output = Result<(), SE>>,
+    H: Future<Output = ()>,
+    CE: std::error::Error + 'static,
+    SE: std::error::Error + 'static,
+{
     tokio::pin!(coordination_future);
     tokio::pin!(identity_binding_future);
     tokio::pin!(server_future);
+    tokio::pin!(shutdown_future);
 
     tokio::select! {
-        () = shutdown_signal() => {
+        () = &mut shutdown_future => {
             state.begin_shutdown();
             let _ = shutdown_tx.send(true);
             match tokio::time::timeout(SHUTDOWN_GRACE, async {
@@ -254,5 +282,88 @@ async fn shutdown_signal() {
             }
             _ = terminate.recv() => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use tokio::sync::oneshot;
+
+    async fn stop_successfully(shutdown: watch::Receiver<bool>) -> io::Result<()> {
+        wait_for_shutdown(shutdown).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_supervisor_polls_identity_binding_during_normal_operation() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (identity_started_tx, identity_started_rx) = oneshot::channel();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let identity_shutdown = shutdown_rx.clone();
+        let supervisor = supervise_services(
+            OrchState::default(),
+            shutdown_tx,
+            stop_successfully(shutdown_rx.clone()),
+            async move {
+                let _ = identity_started_tx.send(());
+                wait_for_shutdown(identity_shutdown).await;
+            },
+            stop_successfully(shutdown_rx),
+            async move {
+                let _ = stop_rx.await;
+            },
+        );
+        tokio::pin!(supervisor);
+        let identity_start = tokio::time::timeout(Duration::from_secs(1), identity_started_rx);
+        tokio::pin!(identity_start);
+
+        tokio::select! {
+            result = &mut supervisor => panic!("service supervisor stopped before identity binding started: {result:?}"),
+            result = &mut identity_start => result.expect("identity binding was not polled").expect("identity binding start signal"),
+        }
+        stop_tx.send(()).expect("request graceful shutdown");
+        supervisor.await.expect("graceful service shutdown");
+    }
+
+    #[tokio::test]
+    async fn identity_binding_completion_stops_peer_services_and_fails_process() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (coordination_stopped_tx, coordination_stopped_rx) = oneshot::channel();
+        let (server_stopped_tx, server_stopped_rx) = oneshot::channel();
+        let coordination_shutdown = shutdown_rx.clone();
+        let coordination = async move {
+            wait_for_shutdown(coordination_shutdown).await;
+            let _ = coordination_stopped_tx.send(());
+            Ok::<(), io::Error>(())
+        };
+        let server = async move {
+            wait_for_shutdown(shutdown_rx).await;
+            let _ = server_stopped_tx.send(());
+            Ok::<(), io::Error>(())
+        };
+
+        let error = supervise_services(
+            OrchState::default(),
+            shutdown_tx,
+            coordination,
+            async {},
+            server,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("unexpected identity-binding completion must fail the process");
+
+        assert_eq!(
+            error.to_string(),
+            "orchestrator identity binding stopped before process shutdown"
+        );
+        coordination_stopped_rx
+            .await
+            .expect("coordination observed shutdown");
+        server_stopped_rx
+            .await
+            .expect("HTTP server observed shutdown");
     }
 }

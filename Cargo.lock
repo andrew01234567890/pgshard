@@ -1606,6 +1606,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "futures-util",
  "k8s-openapi",
  "kube",
  "pgshard-catalog",

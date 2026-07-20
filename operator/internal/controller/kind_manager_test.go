@@ -2280,7 +2280,6 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 		t.Fatalf("orchestrator deployment has no desired replicas: %#v", deployment.Spec.Replicas)
 	}
 	wantedReplicas := int(*deployment.Spec.Replicas)
-	observed := make(map[types.UID]struct{}, wantedReplicas)
 	var lastObservation string
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
 		controllerEndpoints := &corev1.Endpoints{}
@@ -2311,11 +2310,9 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 		}); err != nil {
 			return false, err
 		}
-		current := make(map[types.UID]struct{}, wantedReplicas)
 		active := make([]corev1.Pod, 0, wantedReplicas)
 		for _, pod := range pods.Items {
 			if pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodRunning {
-				current[pod.UID] = struct{}{}
 				active = append(active, pod)
 			}
 		}
@@ -2323,15 +2320,7 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 			lastObservation = fmt.Sprintf("active orchestrator replicas=%d want=%d", len(active), wantedReplicas)
 			return false, nil
 		}
-		for uid := range observed {
-			if _, exists := current[uid]; !exists {
-				delete(observed, uid)
-			}
-		}
 		for _, pod := range active {
-			if _, alreadyObserved := observed[pod.UID]; alreadyObserved {
-				continue
-			}
 			var snapshot struct {
 				CoordinationReady bool `json:"coordination_ready"`
 				Topology          *struct {
@@ -2344,7 +2333,7 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 			cancel()
 			if err != nil || json.Unmarshal(output, &snapshot) != nil || snapshot.Topology == nil || snapshot.Topology.AgentStatusCollection != wantedCollectionState || !snapshot.CoordinationReady {
 				lastObservation = fmt.Sprintf("orchestrator %s status error=%v output=%q snapshot=%#v", pod.Name, err, output, snapshot)
-				continue
+				return false, nil
 			}
 			readyPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/readyz", cluster.Namespace, pod.Name)
 			requestCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
@@ -2352,11 +2341,10 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 			cancel()
 			if err != nil {
 				lastObservation = fmt.Sprintf("orchestrator %s readiness changed after diagnostic binding: %v output=%q", pod.Name, err, output)
-				continue
+				return false, nil
 			}
-			observed[pod.UID] = struct{}{}
 		}
-		return len(observed) == wantedReplicas, nil
+		return true, nil
 	}); err != nil {
 		t.Fatalf("wait for fresh identity-bound diagnostics from every orchestrator replica: %v; last=%s", err, lastObservation)
 	}

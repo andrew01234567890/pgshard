@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{EndpointAddress, EndpointPort, Endpoints, Pod};
@@ -30,6 +31,7 @@ const MANAGED_BY_VALUE: &str = "pgshard-operator";
 const OWNER_API_VERSION: &str = "pgshard.io/v1alpha1";
 const OWNER_KIND: &str = "PgShardCluster";
 const PROCESS_INCARNATION_HEX_LENGTH: usize = 24;
+const MAX_CONCURRENT_BINDINGS: usize = 64;
 
 /// Repeatedly observes the complete finite target set without retaining stale
 /// evidence between attempts.
@@ -137,33 +139,72 @@ async fn bind_once<S: IdentityStore>(
     if targets.is_empty() {
         return Err(IdentityBindingError::InvalidTargetSet);
     }
+    let shards = group_shards(targets)?;
     let mut pods = HashMap::with_capacity(targets.len());
     let mut stateful_set_uids = HashSet::with_capacity(targets.len());
     let mut pod_uids = HashSet::with_capacity(targets.len());
     let mut pod_ips = HashSet::with_capacity(targets.len());
-    let mut shards: Vec<Vec<&UnboundAgentObservationTarget>> = Vec::new();
-    for target in targets {
-        let stateful_set = store.get_stateful_set(target.stateful_set()).await?;
-        let stateful_set_uid = validate_stateful_set(&stateful_set, target)?;
+    let members = stream::iter(targets)
+        .map(|target| bind_member(store, target))
+        .buffer_unordered(MAX_CONCURRENT_BINDINGS)
+        .try_collect::<Vec<_>>()
+        .await?;
+    for member in members {
+        let target = member.target;
+        let stateful_set_uid = member.stateful_set_uid;
+        let identity = member.pod;
         if !stateful_set_uids.insert(stateful_set_uid.clone()) {
             return Err(IdentityBindingError::InvalidTargetSet);
         }
-        let pod = store.get_pod(target.instance_id()).await?;
-        let identity = validate_pod(&pod, target, &stateful_set_uid)?;
         if !pod_uids.insert(identity.uid.clone())
             || !pod_ips.insert(identity.ip.clone())
             || pods.insert(target.instance_id(), identity).is_some()
         {
             return Err(IdentityBindingError::InvalidTargetSet);
         }
+    }
+    let pods = &pods;
+    stream::iter(shards)
+        .map(|shard| bind_shard(store, shard, pods))
+        .buffer_unordered(MAX_CONCURRENT_BINDINGS)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(())
+}
+
+struct BoundMember<'a> {
+    target: &'a UnboundAgentObservationTarget,
+    stateful_set_uid: String,
+    pod: PodIdentity,
+}
+
+async fn bind_member<'a, S: IdentityStore>(
+    store: &S,
+    target: &'a UnboundAgentObservationTarget,
+) -> Result<BoundMember<'a>, IdentityBindingError> {
+    let stateful_set = store.get_stateful_set(target.stateful_set()).await?;
+    let stateful_set_uid = validate_stateful_set(&stateful_set, target)?;
+    let pod = store.get_pod(target.instance_id()).await?;
+    let pod = validate_pod(&pod, target, &stateful_set_uid)?;
+    Ok(BoundMember {
+        target,
+        stateful_set_uid,
+        pod,
+    })
+}
+
+fn group_shards(
+    targets: &[UnboundAgentObservationTarget],
+) -> Result<Vec<Vec<&UnboundAgentObservationTarget>>, IdentityBindingError> {
+    let mut shards: Vec<Vec<&UnboundAgentObservationTarget>> = Vec::new();
+    for target in targets {
         match shards.last_mut() {
             Some(shard) if shard[0].shard_id() == target.shard_id() => shard.push(target),
             _ => shards.push(vec![target]),
         }
     }
-
     let mut seen_shards = HashSet::with_capacity(shards.len());
-    for shard in shards {
+    for shard in &shards {
         let first = shard[0];
         if !seen_shards.insert(first.shard_id())
             || shard.iter().any(|target| {
@@ -178,11 +219,20 @@ async fn bind_once<S: IdentityStore>(
         {
             return Err(IdentityBindingError::InvalidTargetSet);
         }
-        let endpoints = store.get_endpoints(first.shard_service()).await?;
-        validate_endpoints(&endpoints, &shard, &pods)?;
-        let lease = store.get_lease(first.writable_lease_name()).await?;
-        validate_lease(&lease, &shard, &pods)?;
     }
+    Ok(shards)
+}
+
+async fn bind_shard<S: IdentityStore>(
+    store: &S,
+    shard: Vec<&UnboundAgentObservationTarget>,
+    pods: &HashMap<&str, PodIdentity>,
+) -> Result<(), IdentityBindingError> {
+    let first = shard[0];
+    let endpoints = store.get_endpoints(first.shard_service()).await?;
+    validate_endpoints(&endpoints, &shard, pods)?;
+    let lease = store.get_lease(first.writable_lease_name()).await?;
+    validate_lease(&lease, &shard, pods)?;
     Ok(())
 }
 
@@ -635,7 +685,7 @@ enum IdentityBindingError {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use k8s_openapi::api::apps::v1::StatefulSetSpec;
     use k8s_openapi::api::coordination::v1::LeaseSpec;
@@ -651,27 +701,32 @@ mod tests {
     const CLUSTER_UID: &str = "11111111-2222-3333-4444-555555555555";
 
     fn target(member: u32) -> UnboundAgentObservationTarget {
+        target_at(0, member)
+    }
+
+    fn target_at(shard: u32, member: u32) -> UnboundAgentObservationTarget {
+        let shard_service = format!("demo-shard-{shard:04}");
         let workload = if member == 0 {
-            "demo-shard-0000".to_owned()
+            shard_service.clone()
         } else {
-            format!("demo-shard-0000-m{member:04}")
+            format!("{shard_service}-m{member:04}")
         };
         UnboundAgentObservationTarget {
             cluster_id: "demo".to_owned(),
             cluster_uid: CLUSTER_UID.to_owned(),
             namespace: "database".to_owned(),
-            shard_id: 0,
-            shard_service: "demo-shard-0000".to_owned(),
+            shard_id: shard,
+            shard_service: shard_service.clone(),
             member_ordinal: member,
             stateful_set: workload.clone(),
             instance_id: format!("{workload}-0"),
-            dns_name: format!("{workload}-0.demo-shard-0000.database.svc"),
+            dns_name: format!("{workload}-0.{shard_service}.database.svc"),
             agent_http_port: 8_080,
             postgresql_port: 5_432,
             physical_slot: format!("pgshard_member_{member:04}"),
             writable_lease_namespace: "database".to_owned(),
-            writable_lease_name: "demo-shard-0000-term".to_owned(),
-            writable_lease_uid: "lease-uid-0".to_owned(),
+            writable_lease_name: format!("{shard_service}-term"),
+            writable_lease_uid: format!("lease-uid-{shard}"),
         }
     }
 
@@ -680,7 +735,11 @@ mod tests {
             metadata: ObjectMeta {
                 name: Some(target.stateful_set().to_owned()),
                 namespace: Some(target.namespace().to_owned()),
-                uid: Some(format!("stateful-set-uid-{}", target.member_ordinal())),
+                uid: Some(format!(
+                    "stateful-set-uid-{}-{}",
+                    target.shard_id(),
+                    target.member_ordinal()
+                )),
                 resource_version: Some(format!("stateful-set-rv-{}", target.member_ordinal())),
                 labels: Some(BTreeMap::from([
                     (CLUSTER_LABEL.to_owned(), target.cluster_id().to_owned()),
@@ -713,15 +772,19 @@ mod tests {
 
     fn pod(target: &UnboundAgentObservationTarget, stateful_set: &StatefulSet) -> Pod {
         let service_account_name = if target.member_ordinal() == 0 {
-            "demo-shard-0000-agent"
+            format!("{}-agent", target.shard_service())
         } else {
-            "demo-shard-0000-standby"
+            format!("{}-standby", target.shard_service())
         };
         Pod {
             metadata: ObjectMeta {
                 name: Some(target.instance_id().to_owned()),
                 namespace: Some(target.namespace().to_owned()),
-                uid: Some(format!("pod-uid-{}", target.member_ordinal())),
+                uid: Some(format!(
+                    "pod-uid-{}-{}",
+                    target.shard_id(),
+                    target.member_ordinal()
+                )),
                 resource_version: Some(format!("pod-rv-{}", target.member_ordinal())),
                 labels: Some(BTreeMap::from([
                     (CLUSTER_LABEL.to_owned(), target.cluster_id().to_owned()),
@@ -748,12 +811,16 @@ mod tests {
                 ..ObjectMeta::default()
             },
             spec: Some(PodSpec {
-                service_account_name: Some(service_account_name.to_owned()),
+                service_account_name: Some(service_account_name),
                 containers: Vec::new(),
                 ..PodSpec::default()
             }),
             status: Some(PodStatus {
-                pod_ip: Some(format!("10.0.0.{}", target.member_ordinal() + 10)),
+                pod_ip: Some(format!(
+                    "10.{}.0.{}",
+                    target.shard_id() + 1,
+                    target.member_ordinal() + 10
+                )),
                 ..PodStatus::default()
             }),
         }
@@ -783,7 +850,7 @@ mod tests {
     fn endpoints(targets: &[UnboundAgentObservationTarget], pods: &[Pod]) -> Endpoints {
         Endpoints {
             metadata: ObjectMeta {
-                name: Some("demo-shard-0000".to_owned()),
+                name: Some(targets[0].shard_service().to_owned()),
                 namespace: Some("database".to_owned()),
                 uid: Some("endpoints-uid".to_owned()),
                 resource_version: Some("endpoints-rv".to_owned()),
@@ -816,12 +883,12 @@ mod tests {
         }
     }
 
-    fn lease(holder: Option<&str>) -> Lease {
+    fn lease(target: &UnboundAgentObservationTarget, holder: Option<&str>) -> Lease {
         Lease {
             metadata: ObjectMeta {
-                name: Some("demo-shard-0000-term".to_owned()),
+                name: Some(target.writable_lease_name().to_owned()),
                 namespace: Some("database".to_owned()),
-                uid: Some("lease-uid-0".to_owned()),
+                uid: Some(target.writable_lease_uid().to_owned()),
                 resource_version: Some("lease-rv".to_owned()),
                 owner_references: Some(vec![OwnerReference {
                     api_version: OWNER_API_VERSION.to_owned(),
@@ -923,6 +990,73 @@ mod tests {
         }
     }
 
+    struct ActiveRequest<'a> {
+        active: &'a AtomicUsize,
+    }
+
+    impl Drop for ActiveRequest<'_> {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ScaleStore {
+        stateful_sets: HashMap<String, StatefulSet>,
+        pods: HashMap<String, Pod>,
+        endpoints: HashMap<String, Endpoints>,
+        leases: HashMap<String, Lease>,
+        active: AtomicUsize,
+        maximum_active: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    impl ScaleStore {
+        async fn request(&self) -> ActiveRequest<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum_active.fetch_max(active, Ordering::SeqCst);
+            let request = ActiveRequest {
+                active: &self.active,
+            };
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            request
+        }
+    }
+
+    impl IdentityStore for ScaleStore {
+        async fn get_stateful_set(&self, name: &str) -> Result<StatefulSet, IdentityBindingError> {
+            let _request = self.request().await;
+            self.stateful_sets
+                .get(name)
+                .cloned()
+                .ok_or_else(|| IdentityBindingError::StatefulSetIdentityMismatch(name.to_owned()))
+        }
+
+        async fn get_pod(&self, name: &str) -> Result<Pod, IdentityBindingError> {
+            let _request = self.request().await;
+            self.pods
+                .get(name)
+                .cloned()
+                .ok_or_else(|| IdentityBindingError::PodIdentityMismatch(name.to_owned()))
+        }
+
+        async fn get_endpoints(&self, name: &str) -> Result<Endpoints, IdentityBindingError> {
+            let _request = self.request().await;
+            self.endpoints
+                .get(name)
+                .cloned()
+                .ok_or_else(|| IdentityBindingError::EndpointIdentityMismatch(name.to_owned()))
+        }
+
+        async fn get_lease(&self, name: &str) -> Result<Lease, IdentityBindingError> {
+            let _request = self.request().await;
+            self.leases
+                .get(name)
+                .cloned()
+                .ok_or_else(|| IdentityBindingError::LeaseIdentityMismatch(name.to_owned()))
+        }
+    }
+
     fn store() -> (Vec<UnboundAgentObservationTarget>, MemoryStore) {
         let targets = (0..3).map(target).collect::<Vec<_>>();
         let stateful_sets = targets.iter().map(stateful_set).collect::<Vec<_>>();
@@ -956,9 +1090,72 @@ mod tests {
                     .collect(),
             ),
             endpoints: Mutex::new(endpoints(&targets, &pods)),
-            lease: Mutex::new(lease(Some(&holder))),
+            lease: Mutex::new(lease(&targets[0], Some(&holder))),
         };
         (targets, store)
+    }
+
+    fn scale_store(
+        shard_count: u32,
+        members_per_shard: u32,
+    ) -> (Vec<UnboundAgentObservationTarget>, ScaleStore) {
+        let mut targets = Vec::new();
+        let mut stateful_sets = HashMap::new();
+        let mut pods = HashMap::new();
+        let mut endpoint_sets = HashMap::new();
+        let mut leases = HashMap::new();
+        for shard in 0..shard_count {
+            let shard_targets = (0..members_per_shard)
+                .map(|member| target_at(shard, member))
+                .collect::<Vec<_>>();
+            let shard_stateful_sets = shard_targets.iter().map(stateful_set).collect::<Vec<_>>();
+            let shard_pods = shard_targets
+                .iter()
+                .zip(&shard_stateful_sets)
+                .map(|(target, stateful_set)| pod(target, stateful_set))
+                .collect::<Vec<_>>();
+            for stateful_set in shard_stateful_sets {
+                stateful_sets.insert(
+                    stateful_set
+                        .metadata
+                        .name
+                        .clone()
+                        .expect("StatefulSet name"),
+                    stateful_set,
+                );
+            }
+            for pod in &shard_pods {
+                pods.insert(pod.metadata.name.clone().expect("Pod name"), pod.clone());
+            }
+            let first = &shard_targets[0];
+            endpoint_sets.insert(
+                first.shard_service().to_owned(),
+                endpoints(&shard_targets, &shard_pods),
+            );
+            let holder = format!(
+                "{}/{}/{}",
+                first.instance_id(),
+                shard_pods[0].metadata.uid.as_deref().expect("Pod UID"),
+                "0123456789abcdef01234567"
+            );
+            leases.insert(
+                first.writable_lease_name().to_owned(),
+                lease(first, Some(&holder)),
+            );
+            targets.extend(shard_targets);
+        }
+        (
+            targets,
+            ScaleStore {
+                stateful_sets,
+                pods,
+                endpoints: endpoint_sets,
+                leases,
+                active: AtomicUsize::new(0),
+                maximum_active: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+            },
+        )
     }
 
     fn observation_state(targets: &[UnboundAgentObservationTarget]) -> OrchState {
@@ -983,6 +1180,27 @@ mod tests {
     async fn binds_exact_pods_endpoints_and_holder_pod() {
         let (targets, store) = store();
         bind_once(&store, &targets).await.expect("bind identities");
+    }
+
+    #[tokio::test]
+    async fn maximum_topology_reads_are_concurrent_but_strictly_bounded() {
+        const SHARDS: u32 = 128;
+        const MEMBERS_PER_SHARD: u32 = 5;
+        let (targets, store) = scale_store(SHARDS, MEMBERS_PER_SHARD);
+
+        bind_once(&store, &targets)
+            .await
+            .expect("bind maximum supported topology");
+
+        assert_eq!(
+            store.maximum_active.load(Ordering::SeqCst),
+            MAX_CONCURRENT_BINDINGS
+        );
+        assert_eq!(store.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            (SHARDS * MEMBERS_PER_SHARD * 2 + SHARDS * 2) as usize
+        );
     }
 
     #[tokio::test]
