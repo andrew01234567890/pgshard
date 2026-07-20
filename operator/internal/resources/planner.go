@@ -2332,7 +2332,8 @@ func containerUniqueFieldEnvironment(container corev1.Container, name, fieldPath
 		}
 		if found || environment.Value != "" || environment.ValueFrom == nil ||
 			environment.ValueFrom.FieldRef == nil ||
-			environment.ValueFrom.FieldRef.APIVersion != "" ||
+			(environment.ValueFrom.FieldRef.APIVersion != "" &&
+				environment.ValueFrom.FieldRef.APIVersion != corev1.SchemeGroupVersion.String()) ||
 			environment.ValueFrom.FieldRef.FieldPath != fieldPath ||
 			environment.ValueFrom.ResourceFieldRef != nil ||
 			environment.ValueFrom.ConfigMapKeyRef != nil ||

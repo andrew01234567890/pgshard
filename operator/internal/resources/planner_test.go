@@ -821,6 +821,66 @@ func TestPostgreSQLRuntimeObservationRejectsAnnotationShapeMismatch(t *testing.T
 	}
 }
 
+func TestPostgreSQLRuntimeObservationAcceptsDefaultedPodUIDFieldRef(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 3
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.CatalogAccess = nil
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := PostgreSQLMemberStatefulSetName(cluster.Name, 0, 1)
+	standby := object[*appsv1.StatefulSet](t, plan, name).DeepCopy()
+	defaulted := false
+	for index := range standby.Spec.Template.Spec.Containers[0].Env {
+		environment := &standby.Spec.Template.Spec.Containers[0].Env[index]
+		if environment.Name == "PGSHARD_POD_UID" && environment.ValueFrom != nil && environment.ValueFrom.FieldRef != nil {
+			environment.ValueFrom.FieldRef.APIVersion = corev1.SchemeGroupVersion.String()
+			defaulted = true
+		}
+	}
+	if !defaulted {
+		t.Fatal("standby is missing the downward API Pod UID environment")
+	}
+
+	encoded, err := json.Marshal(standby)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := &appsv1.StatefulSet{}
+	if err := json.Unmarshal(encoded, stored); err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := ObservePostgreSQLRuntime(stored.Spec.Template.Annotations, stored.Spec.Template.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		t.Fatalf("observe API-defaulted standby runtime = %q, %v", observed, err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: *stored.Spec.Template.ObjectMeta.DeepCopy(),
+		Spec:       *stored.Spec.Template.Spec.DeepCopy(),
+	}
+	pod.Name = name + "-0"
+	pod.Namespace = cluster.Namespace
+	if !IsPostgreSQLReplicationStandbyPod(pod) {
+		t.Fatalf("API-defaulted standby was not classified: %#v", pod.Spec.Containers[0].Env)
+	}
+
+	for index := range stored.Spec.Template.Spec.Containers[0].Env {
+		environment := &stored.Spec.Template.Spec.Containers[0].Env[index]
+		if environment.Name == "PGSHARD_POD_UID" {
+			environment.ValueFrom.FieldRef.APIVersion = "v2"
+		}
+	}
+	if _, err := ObservePostgreSQLRuntime(stored.Spec.Template.Annotations, stored.Spec.Template.Spec); err == nil || !strings.Contains(err.Error(), "does not match its process composition") {
+		t.Fatalf("non-canonical Pod UID field API version error = %v", err)
+	}
+}
+
 func TestAgentQuarantinePlanRejectsUncheckpointedWritableLeaseIdentity(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
