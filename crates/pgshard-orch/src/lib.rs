@@ -8,6 +8,7 @@ pub mod coordination;
 pub mod domain;
 mod endpoint;
 pub mod http;
+pub mod identity_binding;
 mod postgres_connection;
 pub mod slot_catalog;
 pub mod slot_mutator;

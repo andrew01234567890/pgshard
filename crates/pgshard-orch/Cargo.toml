@@ -12,6 +12,7 @@ publish = false
 axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["env"] }
+futures-util.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }

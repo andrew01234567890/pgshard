@@ -398,6 +398,9 @@ struct OrchInner {
     coordination_lease_uid: Option<String>,
     coordination_resource_version: Option<String>,
     coordination_deadline: Option<Instant>,
+    // Diagnostic-only identity evidence is never retained past this process-
+    // local monotonic deadline and never participates in authority decisions.
+    agent_identity_binding_deadline: Option<Instant>,
     topology: Option<TopologyDiagnostics>,
 }
 
@@ -549,14 +552,40 @@ impl OrchState {
         inner.leader = false;
     }
 
+    /// Replaces the diagnostic identity-binding state. This evidence never
+    /// participates in readiness, leadership, leases, or operation authority.
+    pub(crate) fn record_agent_identity_binding(&self, deadline: Option<Instant>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bound = deadline.is_some_and(|deadline| Instant::now() < deadline);
+        inner.agent_identity_binding_deadline = bound.then_some(deadline).flatten();
+        if let Some(topology) = &mut inner.topology
+            && topology.agent_status_collection
+                != crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
+        {
+            topology.agent_status_collection = if bound {
+                crate::topology::AgentStatusCollectionState::DisabledAgentStatusCollectorRequired
+            } else {
+                crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired
+            };
+        }
+    }
+
     /// Removes externally visible readiness before process shutdown begins.
     pub fn begin_shutdown(&self) {
         self.record_coordination_unavailable();
+        self.record_agent_identity_binding(None);
     }
 
     /// Returns a consistent reportable snapshot.
     #[must_use]
     pub fn snapshot(&self) -> OrchSnapshot {
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> OrchSnapshot {
         let mut inner = self
             .inner
             .lock()
@@ -564,10 +593,23 @@ impl OrchState {
         let coordination_ready = inner.coordination_ready
             && inner
                 .coordination_deadline
-                .is_some_and(|deadline| Instant::now() < deadline);
+                .is_some_and(|deadline| now < deadline);
         if !coordination_ready {
             inner.coordination_ready = false;
             inner.leader = false;
+        }
+        let identity_binding_live = inner
+            .agent_identity_binding_deadline
+            .is_some_and(|deadline| now < deadline);
+        if !identity_binding_live {
+            inner.agent_identity_binding_deadline = None;
+            if let Some(topology) = &mut inner.topology
+                && topology.agent_status_collection
+                    != crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
+            {
+                topology.agent_status_collection =
+                    crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired;
+            }
         }
         let mut leases: Vec<_> = inner.leases.values().cloned().collect();
         leases.sort_by_key(|lease| lease.shard_id);
@@ -583,6 +625,11 @@ impl OrchState {
             coordination_resource_version: inner.coordination_resource_version.clone(),
             topology: inner.topology.clone(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_at_for_test(&self, now: Instant) -> OrchSnapshot {
+        self.snapshot_at(now)
     }
 
     /// Registers an operation idempotently for this process lifetime.
@@ -1979,6 +2026,24 @@ mod tests {
         );
         assert_eq!(state.snapshot().topology, Some(topology));
         assert!(state.snapshot().leases.is_empty());
+    }
+
+    #[test]
+    fn disabled_agent_runtime_baseline_survives_expiry_and_shutdown_paths() {
+        let topology = TopologyDiagnostics {
+            schema_version: crate::topology::TOPOLOGY_SCHEMA_VERSION.to_owned(),
+            cluster_object_uid: "cluster-uid".to_owned(),
+            shard_count: 1,
+            member_count: 1,
+            agent_status_collection:
+                crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired,
+        };
+        let state = OrchState::with_identity_and_topology(identity(), 1_000, topology.clone())
+            .expect("valid state");
+        state.record_agent_identity_binding(None);
+        assert_eq!(state.snapshot().topology, Some(topology.clone()));
+        state.begin_shutdown();
+        assert_eq!(state.snapshot().topology, Some(topology));
     }
 
     #[test]

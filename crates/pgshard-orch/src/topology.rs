@@ -163,10 +163,17 @@ pub struct TopologyDiagnostics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatusCollectionState {
+    /// This process was started without the explicit agent-quarantine runtime
+    /// contract. No agent endpoint observation is attempted.
+    DisabledAgentRuntimeRequired,
     /// Discovery is valid, but the document deliberately lacks runtime Pod
     /// UIDs. Querying agents before another authoritative source supplies
     /// those UIDs could accept status from a replaced Pod incarnation.
     DisabledPodIdentityRequired,
+    /// Every expected Pod, Endpoint, and writable-term Lease was bound to one
+    /// exact live Kubernetes object incarnation. Agent HTTP collection remains
+    /// disabled until a separate, freshness-bounded collector is implemented.
+    DisabledAgentStatusCollectorRequired,
 }
 
 /// One topology-derived endpoint that is not yet bound to a runtime Pod UID.
@@ -176,19 +183,21 @@ pub enum AgentStatusCollectionState {
 /// must define that boundary separately.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnboundAgentObservationTarget {
-    cluster_id: String,
-    cluster_uid: String,
-    namespace: String,
-    shard_id: u32,
-    member_ordinal: u32,
-    instance_id: String,
-    dns_name: String,
-    agent_http_port: u16,
-    postgresql_port: u16,
-    physical_slot: String,
-    writable_lease_namespace: String,
-    writable_lease_name: String,
-    writable_lease_uid: String,
+    pub(crate) cluster_id: String,
+    pub(crate) cluster_uid: String,
+    pub(crate) namespace: String,
+    pub(crate) shard_id: u32,
+    pub(crate) shard_service: String,
+    pub(crate) member_ordinal: u32,
+    pub(crate) stateful_set: String,
+    pub(crate) instance_id: String,
+    pub(crate) dns_name: String,
+    pub(crate) agent_http_port: u16,
+    pub(crate) postgresql_port: u16,
+    pub(crate) physical_slot: String,
+    pub(crate) writable_lease_namespace: String,
+    pub(crate) writable_lease_name: String,
+    pub(crate) writable_lease_uid: String,
 }
 
 impl UnboundAgentObservationTarget {
@@ -216,10 +225,22 @@ impl UnboundAgentObservationTarget {
         self.shard_id
     }
 
+    /// Returns the deterministic headless Service and Endpoints object name.
+    #[must_use]
+    pub fn shard_service(&self) -> &str {
+        &self.shard_service
+    }
+
     /// Returns the stable member ordinal.
     #[must_use]
     pub const fn member_ordinal(&self) -> u32 {
         self.member_ordinal
+    }
+
+    /// Returns the exact controller `StatefulSet` name for this member.
+    #[must_use]
+    pub fn stateful_set(&self) -> &str {
+        &self.stateful_set
     }
 
     /// Returns the stable member instance name.
@@ -335,13 +356,17 @@ impl TopologyV1 {
 
     /// Returns a bounded, non-authoritative status summary.
     #[must_use]
-    pub fn diagnostics(&self) -> TopologyDiagnostics {
+    pub fn diagnostics(&self, identity_binding_enabled: bool) -> TopologyDiagnostics {
         TopologyDiagnostics {
             schema_version: self.schema_version.clone(),
             cluster_object_uid: self.cluster_object_uid.clone(),
             shard_count: self.shards.len(),
             member_count: self.shards.iter().map(|shard| shard.members.len()).sum(),
-            agent_status_collection: AgentStatusCollectionState::DisabledPodIdentityRequired,
+            agent_status_collection: if identity_binding_enabled {
+                AgentStatusCollectionState::DisabledPodIdentityRequired
+            } else {
+                AgentStatusCollectionState::DisabledAgentRuntimeRequired
+            },
         }
     }
 
@@ -356,12 +381,19 @@ impl TopologyV1 {
             Vec::with_capacity(self.shards.iter().map(|shard| shard.members.len()).sum());
         for shard in &self.shards {
             for member in &shard.members {
+                let stateful_set = member
+                    .instance_id
+                    .strip_suffix("-0")
+                    .unwrap_or(&member.instance_id)
+                    .to_owned();
                 targets.push(UnboundAgentObservationTarget {
                     cluster_id: self.cluster.clone(),
                     cluster_uid: self.cluster_object_uid.clone(),
                     namespace: self.namespace.clone(),
                     shard_id: shard.id,
+                    shard_service: shard.service.clone(),
                     member_ordinal: member.ordinal,
+                    stateful_set,
                     instance_id: member.instance_id.clone(),
                     dns_name: member.dns_name.clone(),
                     agent_http_port: member.agent_http_port,
@@ -756,7 +788,11 @@ mod tests {
     fn validates_exact_topology_and_yields_only_unbound_agent_targets() {
         let topology = parse(&valid_topology()).expect("valid topology");
         assert_eq!(
-            topology.diagnostics(),
+            topology.diagnostics(false).agent_status_collection,
+            AgentStatusCollectionState::DisabledAgentRuntimeRequired,
+        );
+        assert_eq!(
+            topology.diagnostics(true),
             TopologyDiagnostics {
                 schema_version: TOPOLOGY_SCHEMA_VERSION.to_owned(),
                 cluster_object_uid: CLUSTER_UID.to_owned(),

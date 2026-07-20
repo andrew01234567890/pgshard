@@ -2883,8 +2883,14 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		t.Fatalf("orchestrator ServiceAccount token policy = %#v", serviceAccount.AutomountServiceAccountToken)
 	}
 	role := object[*rbacv1.Role](t, plan, "demo-orchestrator")
-	if len(role.Rules) != 1 || !reflect.DeepEqual(role.Rules[0].APIGroups, []string{"coordination.k8s.io"}) || !reflect.DeepEqual(role.Rules[0].Resources, []string{"leases"}) || !reflect.DeepEqual(role.Rules[0].ResourceNames, []string{"demo-orch-lease"}) || !reflect.DeepEqual(role.Rules[0].Verbs, []string{"get", "update"}) {
-		t.Fatalf("orchestrator Lease Role is broader than required: %#v", role.Rules)
+	wantRules := []rbacv1.PolicyRule{{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{"demo-orch-lease"}, Verbs: []string{"get", "update"}}}
+	if !reflect.DeepEqual(role.Rules, wantRules) {
+		t.Fatalf("direct orchestrator Role exceeds its exact leadership Lease: %#v", role.Rules)
+	}
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.Verbs, "list") || slices.Contains(rule.Verbs, "watch") || slices.Contains(rule.Verbs, "create") || slices.Contains(rule.Verbs, "patch") || slices.Contains(rule.Verbs, "delete") || len(rule.ResourceNames) == 0 {
+			t.Fatalf("orchestrator identity-observation Role has unbounded or mutable authority: %#v", rule)
+		}
 	}
 	roleBinding := object[*rbacv1.RoleBinding](t, plan, "demo-orchestrator")
 	if roleBinding.RoleRef.APIGroup != rbacv1.GroupName || roleBinding.RoleRef.Kind != "Role" || roleBinding.RoleRef.Name != role.Name || len(roleBinding.Subjects) != 1 || roleBinding.Subjects[0].Kind != "ServiceAccount" || roleBinding.Subjects[0].Name != serviceAccount.Name || roleBinding.Subjects[0].Namespace != cluster.Namespace {
@@ -2962,6 +2968,9 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	if len(wantedFields) != 0 || envValue(orchestratorEnv, "PGSHARD_LEASE_NAME") != lease.Name || envValue(orchestratorEnv, "PGSHARD_TOPOLOGY_FILE") != "/etc/pgshard/topology/cluster.json" {
 		t.Fatalf("orchestrator Lease environment is incomplete: missing=%#v env=%#v", wantedFields, orchestratorEnv)
 	}
+	if envValue(orchestratorEnv, "PGSHARD_IDENTITY_BINDING_MODE") != "disabled" {
+		t.Fatalf("direct orchestrator enabled identity binding: %#v", orchestratorEnv)
+	}
 	orchestratorContainer := orchestrator.Spec.Template.Spec.Containers[0]
 	if !containerHasReadOnlyMount(orchestratorContainer, "topology", "/etc/pgshard/topology") || configMapVolumeName(t, orchestrator.Spec.Template.Spec.Volumes, "topology") != cluster.Name+TopologyConfigSuffix {
 		t.Fatalf("orchestrator topology projection is incomplete: container=%#v volumes=%#v", orchestratorContainer.VolumeMounts, orchestrator.Spec.Template.Spec.Volumes)
@@ -3020,6 +3029,40 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		if len(agentPeers) != 1 || agentPeers[0].PodSelector == nil || agentPeers[0].NamespaceSelector != nil || agentPeers[0].IPBlock != nil || !maps.Equal(agentPeers[0].PodSelector.MatchLabels, componentSelector(cluster, "orchestrator")) || len(agentPeers[0].PodSelector.MatchExpressions) != 0 {
 			t.Fatalf("PostgreSQL agent diagnostic peers = %#v", agentPeers)
 		}
+	}
+}
+
+func TestAgentQuarantineExplicitlyScopesOrchestratorIdentityObservation(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	role := object[*rbacv1.Role](t, plan, "demo-orchestrator")
+	wantRules := []rbacv1.PolicyRule{
+		{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{"demo-orch-lease"}, Verbs: []string{"get", "update"}},
+		{APIGroups: []string{appsv1.GroupName}, Resources: []string{"statefulsets"}, ResourceNames: []string{"demo-shard-0000", "demo-shard-0000-m0001", "demo-shard-0000-m0002", "demo-shard-0001", "demo-shard-0001-m0001", "demo-shard-0001-m0002"}, Verbs: []string{"get"}},
+		{APIGroups: []string{corev1.GroupName}, Resources: []string{"pods"}, ResourceNames: []string{"demo-shard-0000-0", "demo-shard-0000-m0001-0", "demo-shard-0000-m0002-0", "demo-shard-0001-0", "demo-shard-0001-m0001-0", "demo-shard-0001-m0002-0"}, Verbs: []string{"get"}},
+		{APIGroups: []string{corev1.GroupName}, Resources: []string{"endpoints"}, ResourceNames: []string{"demo-shard-0000", "demo-shard-0001"}, Verbs: []string{"get"}},
+		{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{"demo-shard-0000-term", "demo-shard-0001-term"}, Verbs: []string{"get"}},
+	}
+	if !reflect.DeepEqual(role.Rules, wantRules) {
+		t.Fatalf("agent-quarantine identity-observation Role is not exact: %#v", role.Rules)
+	}
+	for _, rule := range role.Rules {
+		if len(rule.ResourceNames) == 0 || slices.Contains(rule.Verbs, "list") || slices.Contains(rule.Verbs, "watch") || slices.Contains(rule.Verbs, "create") || slices.Contains(rule.Verbs, "patch") || slices.Contains(rule.Verbs, "delete") {
+			t.Fatalf("agent-quarantine observation authority is unbounded or mutable: %#v", rule)
+		}
+	}
+	orchestrator := object[*appsv1.Deployment](t, plan, "demo-orchestrator")
+	if got := envValue(orchestrator.Spec.Template.Spec.Containers[0].Env, "PGSHARD_IDENTITY_BINDING_MODE"); got != "kubernetes" {
+		t.Fatalf("agent-quarantine identity-binding mode = %q, want kubernetes", got)
 	}
 }
 
