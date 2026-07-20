@@ -9,6 +9,7 @@ use pgshard_types::ShardId;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
 
+use crate::agent_status::ReplicationCorrelationSummary;
 use crate::topology::TopologyDiagnostics;
 
 const DEFAULT_MAX_LEASE_TTL_MS: u64 = 15_000;
@@ -363,6 +364,8 @@ pub struct OrchSnapshot {
     pub agent_status: AgentStatusDiagnostics,
     /// Freshness-bounded, diagnostic-only catalog-candidate summary.
     pub catalog_candidates: CatalogCandidateDiagnostics,
+    /// Joint, diagnostic-only correlation of live catalog bootstrap inputs.
+    pub catalog_bootstrap_observation: CatalogBootstrapObservationDiagnostics,
 }
 
 /// Lifecycle of diagnostic-only remote agent-status evidence.
@@ -407,6 +410,8 @@ pub struct AgentStatusDiagnostics {
     pub expected_members: usize,
     /// Complete fresh member count, or zero when no complete result is live.
     pub fresh_members: usize,
+    /// Shards whose complete agent evidence was internally correlated.
+    pub replication_correlated_shards: usize,
     /// Configured process-local maximum receipt age in milliseconds.
     pub maximum_age_ms: u64,
     /// Latest stable failure class, if any.
@@ -421,6 +426,7 @@ impl Default for AgentStatusDiagnostics {
             phase: AgentStatusPhase::Disabled,
             expected_members: 0,
             fresh_members: 0,
+            replication_correlated_shards: 0,
             maximum_age_ms: 0,
             failure: None,
             diagnostic_only: true,
@@ -493,6 +499,69 @@ impl Default for CatalogCandidateDiagnostics {
     }
 }
 
+/// Lifecycle of the joint, diagnostic-only catalog bootstrap observation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogBootstrapObservationPhase {
+    /// The explicit multi-member observation contract is absent.
+    #[default]
+    Disabled,
+    /// At least one required input is being collected without last-good use.
+    Collecting,
+    /// Live candidates and shard-zero replication evidence are correlated.
+    Correlated,
+    /// A required input is unavailable or shard-zero evidence is absent.
+    Unavailable,
+    /// At least one required monotonic input deadline elapsed.
+    Expired,
+    /// Process shutdown cleared the joint observation.
+    ShuttingDown,
+}
+
+/// Stable, bounded failure classes for the joint bootstrap observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogBootstrapObservationFailureReason {
+    /// Live agent-status evidence is unavailable.
+    AgentStatusUnavailable,
+    /// Live catalog-candidate evidence is unavailable.
+    CatalogCandidatesUnavailable,
+    /// One required process-local freshness deadline elapsed.
+    FreshnessExpired,
+    /// Every shard-zero member reported no replication evidence.
+    ShardZeroReplicationEvidenceUnavailable,
+}
+
+/// Bounded joint summary; it contains no identities, generations, or LSNs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CatalogBootstrapObservationDiagnostics {
+    /// Current joint observation lifecycle.
+    pub phase: CatalogBootstrapObservationPhase,
+    /// Exact shard-zero candidate cardinality expected from the live input.
+    pub expected_candidates: usize,
+    /// Currently live candidate count, independent of agent evidence outcome.
+    pub fresh_candidates: usize,
+    /// Whether complete live shard-zero replication evidence was correlated.
+    pub shard_zero_replication_correlated: bool,
+    /// Latest stable joint failure class, if any.
+    pub failure: Option<CatalogBootstrapObservationFailureReason>,
+    /// Explicitly states that this observation grants no authority.
+    pub diagnostic_only: bool,
+}
+
+impl Default for CatalogBootstrapObservationDiagnostics {
+    fn default() -> Self {
+        Self {
+            phase: CatalogBootstrapObservationPhase::Disabled,
+            expected_candidates: 0,
+            fresh_candidates: 0,
+            shard_zero_replication_correlated: false,
+            failure: None,
+            diagnostic_only: true,
+        }
+    }
+}
+
 /// Machine-readable reason the orchestrator is not yet safe to serve control
 /// operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -534,11 +603,71 @@ struct OrchInner {
     // local monotonic deadline and never participates in authority decisions.
     agent_identity_binding_deadline: Option<Instant>,
     agent_status: AgentStatusDiagnostics,
+    agent_replication_correlation: Option<ReplicationCorrelationSummary>,
     // Catalog-candidate evidence is independently diagnostic and cannot alter
     // coordination, agent status, readiness, leadership, or operation state.
     catalog_candidate_deadline: Option<Instant>,
     catalog_candidates: CatalogCandidateDiagnostics,
     topology: Option<TopologyDiagnostics>,
+}
+
+fn catalog_bootstrap_observation(inner: &OrchInner) -> CatalogBootstrapObservationDiagnostics {
+    let expected_candidates = inner.catalog_candidates.expected_candidates;
+    let fresh_candidates = inner.catalog_candidates.fresh_candidates;
+    let replication = inner.agent_replication_correlation;
+    let (phase, failure, shard_zero_replication_correlated) = if inner.agent_status.phase
+        == AgentStatusPhase::ShuttingDown
+        || inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown
+    {
+        (CatalogBootstrapObservationPhase::ShuttingDown, None, false)
+    } else if inner.agent_status.phase == AgentStatusPhase::Disabled
+        || inner.catalog_candidates.phase == CatalogCandidatePhase::Disabled
+    {
+        (CatalogBootstrapObservationPhase::Disabled, None, false)
+    } else if inner.agent_status.phase == AgentStatusPhase::Unavailable {
+        (
+            CatalogBootstrapObservationPhase::Unavailable,
+            Some(CatalogBootstrapObservationFailureReason::AgentStatusUnavailable),
+            false,
+        )
+    } else if inner.catalog_candidates.phase == CatalogCandidatePhase::Unavailable {
+        (
+            CatalogBootstrapObservationPhase::Unavailable,
+            Some(CatalogBootstrapObservationFailureReason::CatalogCandidatesUnavailable),
+            false,
+        )
+    } else if inner.agent_status.phase == AgentStatusPhase::Expired
+        || inner.catalog_candidates.phase == CatalogCandidatePhase::Expired
+    {
+        (
+            CatalogBootstrapObservationPhase::Expired,
+            Some(CatalogBootstrapObservationFailureReason::FreshnessExpired),
+            false,
+        )
+    } else if inner.agent_status.phase == AgentStatusPhase::Collecting
+        || inner.catalog_candidates.phase == CatalogCandidatePhase::Collecting
+    {
+        (CatalogBootstrapObservationPhase::Collecting, None, false)
+    } else if inner.agent_status.phase == AgentStatusPhase::Fresh
+        && inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh
+        && replication.is_some_and(|summary| summary.shard_zero_correlated)
+    {
+        (CatalogBootstrapObservationPhase::Correlated, None, true)
+    } else {
+        (
+            CatalogBootstrapObservationPhase::Unavailable,
+            Some(CatalogBootstrapObservationFailureReason::ShardZeroReplicationEvidenceUnavailable),
+            false,
+        )
+    };
+    CatalogBootstrapObservationDiagnostics {
+        phase,
+        expected_candidates,
+        fresh_candidates,
+        shard_zero_replication_correlated,
+        failure,
+        diagnostic_only: true,
+    }
 }
 
 /// Thread-safe registry for operation IDs and shard leases.
@@ -715,8 +844,10 @@ impl OrchState {
             return;
         }
         inner.agent_identity_binding_deadline = None;
+        inner.agent_replication_correlation = None;
         inner.agent_status.phase = AgentStatusPhase::Collecting;
         inner.agent_status.fresh_members = 0;
+        inner.agent_status.replication_correlated_shards = 0;
         inner.agent_status.maximum_age_ms =
             u64::try_from(maximum_age.as_millis()).unwrap_or(u64::MAX);
         inner.agent_status.failure = None;
@@ -739,8 +870,10 @@ impl OrchState {
             return;
         }
         inner.agent_identity_binding_deadline = None;
+        inner.agent_replication_correlation = None;
         inner.agent_status.phase = AgentStatusPhase::Unavailable;
         inner.agent_status.fresh_members = 0;
+        inner.agent_status.replication_correlated_shards = 0;
         inner.agent_status.failure = Some(failure);
         if let Some(topology) = &mut inner.topology
             && topology.agent_status_collection
@@ -753,7 +886,12 @@ impl OrchState {
 
     /// Atomically publishes only one complete, still-live collection summary.
     #[must_use]
-    pub(crate) fn record_agent_status_fresh(&self, member_count: usize, deadline: Instant) -> bool {
+    pub(crate) fn record_agent_status_fresh(
+        &self,
+        member_count: usize,
+        replication_correlation: ReplicationCorrelationSummary,
+        deadline: Instant,
+    ) -> bool {
         let mut inner = self
             .inner
             .lock()
@@ -763,17 +901,29 @@ impl OrchState {
         }
         let valid = member_count > 0
             && member_count == inner.agent_status.expected_members
+            && replication_correlation.correlated_shards
+                <= inner
+                    .topology
+                    .as_ref()
+                    .map_or(0, |topology| topology.shard_count)
+            && (!replication_correlation.shard_zero_correlated
+                || replication_correlation.correlated_shards > 0)
             && Instant::now() < deadline;
         if !valid {
             inner.agent_identity_binding_deadline = None;
+            inner.agent_replication_correlation = None;
             inner.agent_status.phase = AgentStatusPhase::Unavailable;
             inner.agent_status.fresh_members = 0;
+            inner.agent_status.replication_correlated_shards = 0;
             inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
             return false;
         }
         inner.agent_identity_binding_deadline = Some(deadline);
+        inner.agent_replication_correlation = Some(replication_correlation);
         inner.agent_status.phase = AgentStatusPhase::Fresh;
         inner.agent_status.fresh_members = member_count;
+        inner.agent_status.replication_correlated_shards =
+            replication_correlation.correlated_shards;
         inner.agent_status.failure = None;
         if let Some(topology) = &mut inner.topology {
             topology.agent_status_collection =
@@ -872,8 +1022,10 @@ impl OrchState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.agent_identity_binding_deadline = None;
+        inner.agent_replication_correlation = None;
         inner.agent_status.phase = AgentStatusPhase::ShuttingDown;
         inner.agent_status.fresh_members = 0;
+        inner.agent_status.replication_correlated_shards = 0;
         inner.agent_status.failure = None;
         inner.catalog_candidate_deadline = None;
         inner.catalog_candidates.phase = CatalogCandidatePhase::ShuttingDown;
@@ -913,8 +1065,10 @@ impl OrchState {
         if !identity_binding_live {
             inner.agent_identity_binding_deadline = None;
             if inner.agent_status.phase == AgentStatusPhase::Fresh {
+                inner.agent_replication_correlation = None;
                 inner.agent_status.phase = AgentStatusPhase::Expired;
                 inner.agent_status.fresh_members = 0;
+                inner.agent_status.replication_correlated_shards = 0;
                 inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
             }
             if let Some(topology) = &mut inner.topology
@@ -937,6 +1091,7 @@ impl OrchState {
                     Some(CatalogCandidateFailureReason::FreshnessExpired);
             }
         }
+        let catalog_bootstrap_observation = catalog_bootstrap_observation(&inner);
         let mut leases: Vec<_> = inner.leases.values().cloned().collect();
         leases.sort_by_key(|lease| lease.shard_id);
         OrchSnapshot {
@@ -952,6 +1107,7 @@ impl OrchState {
             topology: inner.topology.clone(),
             agent_status: inner.agent_status.clone(),
             catalog_candidates: inner.catalog_candidates.clone(),
+            catalog_bootstrap_observation,
         }
     }
 
@@ -1594,6 +1750,34 @@ mod tests {
 
     fn state() -> OrchState {
         OrchState::with_identity(identity(), 100).expect("valid lease policy")
+    }
+
+    fn bootstrap_observation_state() -> OrchState {
+        OrchState::with_identity_and_topology(
+            identity(),
+            100,
+            TopologyDiagnostics {
+                schema_version: crate::topology::TOPOLOGY_SCHEMA_VERSION.to_owned(),
+                cluster_object_uid: "cluster-uid".to_owned(),
+                shard_count: 2,
+                member_count: 6,
+                agent_status_collection:
+                    crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired,
+            },
+        )
+        .expect("bootstrap observation state")
+    }
+
+    fn publish_bootstrap_inputs(
+        state: &OrchState,
+        replication: ReplicationCorrelationSummary,
+        agent_deadline: Instant,
+        candidate_deadline: Instant,
+    ) {
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        assert!(state.record_agent_status_fresh(6, replication, agent_deadline));
+        assert!(state.record_catalog_candidates_fresh(3, candidate_deadline));
     }
 
     fn execution(fencing_epoch: u64) -> ExecutionPreconditions {
@@ -2391,7 +2575,11 @@ mod tests {
 
         state.record_agent_status_collecting(Duration::from_secs(5));
         state.record_agent_status_failure(AgentStatusFailureReason::StatusUnavailable);
-        assert!(!state.record_agent_status_fresh(3, Instant::now() + Duration::from_secs(5)));
+        assert!(!state.record_agent_status_fresh(
+            3,
+            ReplicationCorrelationSummary::default(),
+            Instant::now() + Duration::from_secs(5),
+        ));
         let snapshot = state.snapshot_at(Instant::now() + Duration::from_secs(10));
 
         assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::ShuttingDown);
@@ -2401,6 +2589,195 @@ mod tests {
             snapshot.topology.expect("topology").agent_status_collection,
             crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired,
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn joint_bootstrap_observation_requires_shard_zero_without_changing_authority() {
+        let state = bootstrap_observation_state();
+        let now = Instant::now();
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv",
+            true,
+            now + Duration::from_mins(1),
+        ));
+        let ready = state.readiness();
+
+        publish_bootstrap_inputs(
+            &state,
+            ReplicationCorrelationSummary::default(),
+            now + Duration::from_secs(5),
+            now + Duration::from_secs(5),
+        );
+        let absent = state.snapshot();
+        assert_eq!(absent.agent_status.replication_correlated_shards, 0);
+        assert_eq!(
+            absent.catalog_bootstrap_observation.phase,
+            CatalogBootstrapObservationPhase::Unavailable
+        );
+        assert_eq!(absent.catalog_bootstrap_observation.expected_candidates, 3);
+        assert_eq!(absent.catalog_bootstrap_observation.fresh_candidates, 3);
+        assert!(
+            !absent
+                .catalog_bootstrap_observation
+                .shard_zero_replication_correlated
+        );
+        assert_eq!(
+            absent.catalog_bootstrap_observation.failure,
+            Some(CatalogBootstrapObservationFailureReason::ShardZeroReplicationEvidenceUnavailable)
+        );
+        assert!(absent.catalog_bootstrap_observation.diagnostic_only);
+        assert_eq!(state.readiness(), ready);
+        assert!(state.snapshot().leader);
+
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        let collecting = state.snapshot();
+        assert_eq!(
+            collecting.catalog_bootstrap_observation.phase,
+            CatalogBootstrapObservationPhase::Collecting
+        );
+        assert_eq!(collecting.catalog_bootstrap_observation.fresh_candidates, 3);
+        assert_eq!(collecting.agent_status.replication_correlated_shards, 0);
+
+        assert!(state.record_agent_status_fresh(
+            6,
+            ReplicationCorrelationSummary {
+                correlated_shards: 2,
+                shard_zero_correlated: true,
+            },
+            now + Duration::from_secs(5),
+        ));
+        let correlated = state.snapshot();
+        assert_eq!(correlated.agent_status.replication_correlated_shards, 2);
+        assert_eq!(
+            correlated.catalog_bootstrap_observation.phase,
+            CatalogBootstrapObservationPhase::Correlated
+        );
+        assert_eq!(correlated.catalog_bootstrap_observation.fresh_candidates, 3);
+        assert!(
+            correlated
+                .catalog_bootstrap_observation
+                .shard_zero_replication_correlated
+        );
+        assert_eq!(correlated.catalog_bootstrap_observation.failure, None);
+        assert_eq!(state.readiness(), ready);
+
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        let collecting = state.snapshot();
+        assert_eq!(
+            collecting.catalog_bootstrap_observation.phase,
+            CatalogBootstrapObservationPhase::Collecting
+        );
+        assert_eq!(collecting.catalog_bootstrap_observation.fresh_candidates, 0);
+        assert!(
+            !collecting
+                .catalog_bootstrap_observation
+                .shard_zero_replication_correlated
+        );
+        assert_eq!(collecting.agent_status.replication_correlated_shards, 2);
+
+        assert!(state.record_catalog_candidates_fresh(3, now + Duration::from_secs(5)));
+        state.record_catalog_candidate_failure(CatalogCandidateFailureReason::CandidateUnavailable);
+        let candidate_failure = state.snapshot();
+        assert_eq!(
+            candidate_failure.catalog_bootstrap_observation.phase,
+            CatalogBootstrapObservationPhase::Unavailable
+        );
+        assert_eq!(
+            candidate_failure.catalog_bootstrap_observation.failure,
+            Some(CatalogBootstrapObservationFailureReason::CatalogCandidatesUnavailable)
+        );
+        assert_eq!(
+            candidate_failure
+                .catalog_bootstrap_observation
+                .fresh_candidates,
+            0
+        );
+        assert!(
+            !candidate_failure
+                .catalog_bootstrap_observation
+                .shard_zero_replication_correlated
+        );
+        assert_eq!(state.readiness(), ready);
+
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        assert!(state.record_catalog_candidates_fresh(3, now + Duration::from_secs(5)));
+        state.record_agent_status_failure(AgentStatusFailureReason::StatusUnavailable);
+        let agent_failure = state.snapshot();
+        assert_eq!(
+            agent_failure.catalog_bootstrap_observation.failure,
+            Some(CatalogBootstrapObservationFailureReason::AgentStatusUnavailable)
+        );
+        assert_eq!(
+            agent_failure.catalog_bootstrap_observation.fresh_candidates,
+            3
+        );
+        assert_eq!(agent_failure.agent_status.replication_correlated_shards, 0);
+        assert_eq!(state.readiness(), ready);
+
+        state.begin_shutdown();
+        let shutdown = state.snapshot();
+        assert_eq!(
+            shutdown.catalog_bootstrap_observation.phase,
+            CatalogBootstrapObservationPhase::ShuttingDown
+        );
+        assert!(
+            !shutdown
+                .catalog_bootstrap_observation
+                .shard_zero_replication_correlated
+        );
+        assert_eq!(shutdown.catalog_bootstrap_observation.failure, None);
+    }
+
+    #[test]
+    fn either_input_deadline_expires_the_joint_observation_without_last_good() {
+        let now = Instant::now();
+        let agent_expires = bootstrap_observation_state();
+        publish_bootstrap_inputs(
+            &agent_expires,
+            ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: true,
+            },
+            now + Duration::from_secs(1),
+            now + Duration::from_secs(2),
+        );
+        let expired = agent_expires.snapshot_at_for_test(now + Duration::from_secs(1));
+        assert_eq!(
+            expired.catalog_bootstrap_observation.phase,
+            CatalogBootstrapObservationPhase::Expired
+        );
+        assert_eq!(expired.catalog_bootstrap_observation.fresh_candidates, 3);
+        assert!(
+            !expired
+                .catalog_bootstrap_observation
+                .shard_zero_replication_correlated
+        );
+        assert_eq!(expired.agent_status.replication_correlated_shards, 0);
+
+        let candidate_expires = bootstrap_observation_state();
+        publish_bootstrap_inputs(
+            &candidate_expires,
+            ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: true,
+            },
+            now + Duration::from_secs(2),
+            now + Duration::from_secs(1),
+        );
+        let expired = candidate_expires.snapshot_at_for_test(now + Duration::from_secs(1));
+        assert_eq!(
+            expired.catalog_bootstrap_observation.phase,
+            CatalogBootstrapObservationPhase::Expired
+        );
+        assert_eq!(expired.catalog_bootstrap_observation.fresh_candidates, 0);
+        assert!(
+            !expired
+                .catalog_bootstrap_observation
+                .shard_zero_replication_correlated
+        );
+        assert_eq!(expired.agent_status.replication_correlated_shards, 1);
     }
 
     #[test]

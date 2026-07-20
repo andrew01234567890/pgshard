@@ -2007,12 +2007,20 @@ func assertKINDCatalogCandidateDiagnosticsUnavailable(t *testing.T, ctx context.
 					Failure         *string `json:"failure"`
 					DiagnosticOnly  bool    `json:"diagnostic_only"`
 				} `json:"catalog_candidates"`
+				CatalogBootstrapObservation struct {
+					Phase                          string  `json:"phase"`
+					ExpectedCandidates             int     `json:"expected_candidates"`
+					FreshCandidates                int     `json:"fresh_candidates"`
+					ShardZeroReplicationCorrelated bool    `json:"shard_zero_replication_correlated"`
+					Failure                        *string `json:"failure"`
+					DiagnosticOnly                 bool    `json:"diagnostic_only"`
+				} `json:"catalog_bootstrap_observation"`
 			}
 			statusPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/status", cluster.Namespace, pod.Name)
 			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			output, err := exec.CommandContext(requestCtx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
 			cancel()
-			if err != nil || json.Unmarshal(output, &snapshot) != nil || !snapshot.CoordinationReady || snapshot.CatalogCandidates.Phase != "unavailable" || snapshot.CatalogCandidates.FreshCandidates != 0 || snapshot.CatalogCandidates.Failure == nil || *snapshot.CatalogCandidates.Failure != "validation_failed" || !snapshot.CatalogCandidates.DiagnosticOnly {
+			if err != nil || json.Unmarshal(output, &snapshot) != nil || !snapshot.CoordinationReady || snapshot.CatalogCandidates.Phase != "unavailable" || snapshot.CatalogCandidates.FreshCandidates != 0 || snapshot.CatalogCandidates.Failure == nil || *snapshot.CatalogCandidates.Failure != "validation_failed" || !snapshot.CatalogCandidates.DiagnosticOnly || snapshot.CatalogBootstrapObservation.Phase != "unavailable" || snapshot.CatalogBootstrapObservation.ExpectedCandidates != int(cluster.Spec.MembersPerShard) || snapshot.CatalogBootstrapObservation.FreshCandidates != 0 || snapshot.CatalogBootstrapObservation.ShardZeroReplicationCorrelated || snapshot.CatalogBootstrapObservation.Failure == nil || *snapshot.CatalogBootstrapObservation.Failure != "catalog_candidates_unavailable" || !snapshot.CatalogBootstrapObservation.DiagnosticOnly {
 				last = fmt.Sprintf("pod=%s error=%v output=%q snapshot=%#v", pod.Name, err, output, snapshot)
 				return false, nil
 			}
@@ -2370,12 +2378,18 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 	const wantedCollectionState = "fresh_diagnostic_evidence"
 	wantedMembers := int(cluster.Spec.Shards * cluster.Spec.MembersPerShard)
 	wantedCandidates := int(cluster.Spec.MembersPerShard)
+	wantedCorrelatedShards := int(cluster.Spec.Shards)
 	wantedCatalogPhase := "fresh"
 	wantedCatalogMaximumAgeMS := uint64(5000)
+	wantedBootstrapPhase := "correlated"
+	wantedShardZeroReplicationCorrelated := true
 	if cluster.Spec.MembersPerShard == 1 {
 		wantedCandidates = 0
+		wantedCorrelatedShards = 0
 		wantedCatalogPhase = "disabled"
 		wantedCatalogMaximumAgeMS = 0
+		wantedBootstrapPhase = "disabled"
+		wantedShardZeroReplicationCorrelated = false
 	}
 	deployment := &appsv1.Deployment{}
 	deploymentKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorSuffix}
@@ -2433,12 +2447,13 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 					AgentStatusCollection string `json:"agent_status_collection"`
 				} `json:"topology"`
 				AgentStatus struct {
-					Phase           string  `json:"phase"`
-					ExpectedMembers int     `json:"expected_members"`
-					FreshMembers    int     `json:"fresh_members"`
-					MaximumAgeMS    uint64  `json:"maximum_age_ms"`
-					Failure         *string `json:"failure"`
-					DiagnosticOnly  bool    `json:"diagnostic_only"`
+					Phase                       string  `json:"phase"`
+					ExpectedMembers             int     `json:"expected_members"`
+					FreshMembers                int     `json:"fresh_members"`
+					ReplicationCorrelatedShards int     `json:"replication_correlated_shards"`
+					MaximumAgeMS                uint64  `json:"maximum_age_ms"`
+					Failure                     *string `json:"failure"`
+					DiagnosticOnly              bool    `json:"diagnostic_only"`
 				} `json:"agent_status"`
 				CatalogCandidates struct {
 					Phase              string  `json:"phase"`
@@ -2448,12 +2463,20 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 					Failure            *string `json:"failure"`
 					DiagnosticOnly     bool    `json:"diagnostic_only"`
 				} `json:"catalog_candidates"`
+				CatalogBootstrapObservation struct {
+					Phase                          string  `json:"phase"`
+					ExpectedCandidates             int     `json:"expected_candidates"`
+					FreshCandidates                int     `json:"fresh_candidates"`
+					ShardZeroReplicationCorrelated bool    `json:"shard_zero_replication_correlated"`
+					Failure                        *string `json:"failure"`
+					DiagnosticOnly                 bool    `json:"diagnostic_only"`
+				} `json:"catalog_bootstrap_observation"`
 			}
 			statusPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/status", cluster.Namespace, pod.Name)
 			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			output, err := exec.CommandContext(requestCtx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
 			cancel()
-			if err != nil || json.Unmarshal(output, &snapshot) != nil || snapshot.Topology == nil || snapshot.Topology.AgentStatusCollection != wantedCollectionState || !snapshot.CoordinationReady || snapshot.AgentStatus.Phase != "fresh" || snapshot.AgentStatus.ExpectedMembers != wantedMembers || snapshot.AgentStatus.FreshMembers != wantedMembers || snapshot.AgentStatus.MaximumAgeMS != 5000 || snapshot.AgentStatus.Failure != nil || !snapshot.AgentStatus.DiagnosticOnly || snapshot.CatalogCandidates.Phase != wantedCatalogPhase || snapshot.CatalogCandidates.ExpectedCandidates != wantedCandidates || snapshot.CatalogCandidates.FreshCandidates != wantedCandidates || snapshot.CatalogCandidates.MaximumAgeMS != wantedCatalogMaximumAgeMS || snapshot.CatalogCandidates.Failure != nil || !snapshot.CatalogCandidates.DiagnosticOnly {
+			if err != nil || json.Unmarshal(output, &snapshot) != nil || snapshot.Topology == nil || snapshot.Topology.AgentStatusCollection != wantedCollectionState || !snapshot.CoordinationReady || snapshot.AgentStatus.Phase != "fresh" || snapshot.AgentStatus.ExpectedMembers != wantedMembers || snapshot.AgentStatus.FreshMembers != wantedMembers || snapshot.AgentStatus.ReplicationCorrelatedShards != wantedCorrelatedShards || snapshot.AgentStatus.MaximumAgeMS != 5000 || snapshot.AgentStatus.Failure != nil || !snapshot.AgentStatus.DiagnosticOnly || snapshot.CatalogCandidates.Phase != wantedCatalogPhase || snapshot.CatalogCandidates.ExpectedCandidates != wantedCandidates || snapshot.CatalogCandidates.FreshCandidates != wantedCandidates || snapshot.CatalogCandidates.MaximumAgeMS != wantedCatalogMaximumAgeMS || snapshot.CatalogCandidates.Failure != nil || !snapshot.CatalogCandidates.DiagnosticOnly || snapshot.CatalogBootstrapObservation.Phase != wantedBootstrapPhase || snapshot.CatalogBootstrapObservation.ExpectedCandidates != wantedCandidates || snapshot.CatalogBootstrapObservation.FreshCandidates != wantedCandidates || snapshot.CatalogBootstrapObservation.ShardZeroReplicationCorrelated != wantedShardZeroReplicationCorrelated || snapshot.CatalogBootstrapObservation.Failure != nil || !snapshot.CatalogBootstrapObservation.DiagnosticOnly {
 				lastObservation = fmt.Sprintf("orchestrator %s status error=%v output=%q snapshot=%#v", pod.Name, err, output, snapshot)
 				return false, nil
 			}
