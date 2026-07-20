@@ -975,12 +975,14 @@ func assertClusterFencingMetadataImmutable(t *testing.T, ctx context.Context, ku
 		},
 	} {
 		t.Run("cluster fencing metadata "+test.name+" is denied", func(t *testing.T) {
-			cluster := &pgshardv1alpha1.PgShardCluster{}
-			if err := kubeClient.Get(ctx, key, cluster); err != nil {
-				t.Fatal(err)
-			}
-			test.mutate(cluster)
-			err := kubeClient.Update(ctx, cluster)
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				cluster := &pgshardv1alpha1.PgShardCluster{}
+				if err := kubeClient.Get(ctx, key, cluster); err != nil {
+					return err
+				}
+				test.mutate(cluster)
+				return kubeClient.Update(ctx, cluster)
+			})
 			if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("fencing metadata %s error = %v, want webhook denial", test.name, err)
 			}
