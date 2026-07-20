@@ -15,6 +15,7 @@ use crate::domain::AgentIdentity;
 use crate::postgres::{
     PostgresConfig, PostgresConfigError, PostgresRuntimeRole, PostgresStandbyConfig,
 };
+use crate::postgres_generation::GenerationDurability;
 use crate::telemetry::TelemetryConfig;
 
 /// Validated process configuration.
@@ -41,6 +42,12 @@ enum PostgresMode {
     Quarantine,
     ReplicationBootstrapPrimary,
     ReplicationStandby,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PostgresGenerationDurabilityMode {
+    Local,
+    RemoteApplyAnyOne,
 }
 
 #[derive(Debug, Parser)]
@@ -135,6 +142,12 @@ struct RawConfig {
     #[arg(long, env = "PGSHARD_POSTGRES_PRIMARY_PASSFILE")]
     postgres_primary_passfile: Option<PathBuf>,
 
+    #[arg(long, env = "PGSHARD_POSTGRES_GENERATION_DURABILITY", value_enum)]
+    postgres_generation_durability: Option<PostgresGenerationDurabilityMode>,
+
+    #[arg(long, env = "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES")]
+    postgres_synchronous_standby_names: Option<String>,
+
     #[arg(
         long,
         env = "PGSHARD_POSTGRES_SMART_SHUTDOWN_MS",
@@ -163,16 +176,50 @@ impl RawConfig {
             || self.postgres_primary_port.is_some()
             || self.postgres_primary_slot_name.is_some()
             || self.postgres_primary_passfile.is_some();
-        let (role, standby) = match self.postgres_mode {
+        let generation_setting_supplied = self.postgres_generation_durability.is_some()
+            || self.postgres_synchronous_standby_names.is_some();
+        let (role, standby, generation_durability) = match self.postgres_mode {
             PostgresMode::Disabled => {
                 if standby_setting_supplied {
                     return Err(ConfigError::ReplicationStandbySettingsRequireMode);
                 }
+                if generation_setting_supplied {
+                    return Err(ConfigError::GenerationDurabilityRequiresBootstrapPrimary);
+                }
                 return Ok(None);
             }
-            PostgresMode::Quarantine => (PostgresRuntimeRole::Quarantine, None),
+            PostgresMode::Quarantine => (
+                PostgresRuntimeRole::Quarantine,
+                None,
+                GenerationDurability::Local,
+            ),
             PostgresMode::ReplicationBootstrapPrimary => {
-                (PostgresRuntimeRole::ReplicationBootstrapPrimary, None)
+                let mode = self
+                    .postgres_generation_durability
+                    .ok_or(ConfigError::GenerationDurabilityRequired)?;
+                let durability = match mode {
+                    PostgresGenerationDurabilityMode::Local => {
+                        if self.postgres_synchronous_standby_names.is_some() {
+                            return Err(ConfigError::SynchronousStandbyNamesRequireRemoteApply);
+                        }
+                        GenerationDurability::Local
+                    }
+                    PostgresGenerationDurabilityMode::RemoteApplyAnyOne => {
+                        let names = self
+                            .postgres_synchronous_standby_names
+                            .as_deref()
+                            .ok_or(ConfigError::SynchronousStandbyNamesRequired)?;
+                        GenerationDurability::remote_apply_any_one(
+                            names.split(',').map(str::to_owned).collect(),
+                        )
+                        .map_err(|_| ConfigError::InvalidSynchronousStandbySet)?
+                    }
+                };
+                (
+                    PostgresRuntimeRole::ReplicationBootstrapPrimary,
+                    None,
+                    durability,
+                )
             }
             PostgresMode::ReplicationStandby => {
                 let primary_host = self
@@ -193,11 +240,18 @@ impl RawConfig {
                     primary_slot_name,
                     primary_passfile,
                 )?;
-                (PostgresRuntimeRole::ReplicationStandby, Some(standby))
+                (
+                    PostgresRuntimeRole::ReplicationStandby,
+                    Some(standby),
+                    GenerationDurability::Local,
+                )
             }
         };
         if standby_setting_supplied && standby.is_none() {
             return Err(ConfigError::ReplicationStandbySettingsRequireMode);
+        }
+        if role != PostgresRuntimeRole::ReplicationBootstrapPrimary && generation_setting_supplied {
+            return Err(ConfigError::GenerationDurabilityRequiresBootstrapPrimary);
         }
         let data_dir = self
             .postgres_data_dir
@@ -206,6 +260,7 @@ impl RawConfig {
         PostgresConfig::new_for_role(
             role,
             standby,
+            generation_durability,
             data_dir,
             self.postgres_bin.clone(),
             self.postgres_socket_dir.clone(),
@@ -445,6 +500,25 @@ pub enum ConfigError {
     /// A standby requires one complete upstream identity and credential path.
     #[error("PostgreSQL replication-standby settings are incomplete")]
     IncompleteReplicationStandbySettings,
+    /// Generation durability is source-only and must not silently change other roles.
+    #[error("PostgreSQL generation durability settings require replication-bootstrap-primary mode")]
+    GenerationDurabilityRequiresBootstrapPrimary,
+    /// A replication bootstrap source must explicitly choose its publication durability.
+    #[error(
+        "PostgreSQL replication-bootstrap-primary mode requires explicit generation durability"
+    )]
+    GenerationDurabilityRequired,
+    /// Remote-apply publication requires the complete managed candidate set.
+    #[error("remote-apply-any-one generation durability requires synchronous standby names")]
+    SynchronousStandbyNamesRequired,
+    /// Candidate names have no meaning for locally durable publication.
+    #[error("PostgreSQL synchronous standby names require remote-apply-any-one durability")]
+    SynchronousStandbyNamesRequireRemoteApply,
+    /// Candidate names must be one exact complete supported managed topology.
+    #[error(
+        "PostgreSQL synchronous standby names must be the exact sorted member 1..2 or 1..4 CSV"
+    )]
+    InvalidSynchronousStandbySet,
     /// Target-side fencing cannot finish inside the reserved Lease margin.
     #[error(
         "writable-term Lease shutdown margin {shutdown_margin_ms} ms must exceed PostgreSQL target-fence budget {target_fence_budget_ms} ms"
@@ -503,6 +577,27 @@ mod tests {
             "pgshard_member_0001",
             "--postgres-primary-passfile",
             "/etc/pgshard/replication/passfile",
+        ]);
+        args
+    }
+
+    fn replication_bootstrap_primary_args() -> Vec<&'static str> {
+        let mut args = required_args();
+        args.extend([
+            "--cluster-uid",
+            "11111111-2222-3333-4444-555555555555",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--lease-namespace",
+            "database",
+            "--writable-lease-name",
+            "cluster-1-cell-0003-writable",
+            "--writable-lease-uid",
+            "99999999-8888-7777-6666-555555555555",
+            "--postgres-mode",
+            "replication-bootstrap-primary",
+            "--postgres-data-dir",
+            "/var/lib/postgresql/data",
         ]);
         args
     }
@@ -598,6 +693,8 @@ mod tests {
         unleased.extend([
             "--postgres-mode",
             "replication-bootstrap-primary",
+            "--postgres-generation-durability",
+            "local",
             "--postgres-data-dir",
             "/var/lib/postgresql/data",
         ]);
@@ -620,6 +717,8 @@ mod tests {
             "99999999-8888-7777-6666-555555555555",
             "--postgres-mode",
             "replication-bootstrap-primary",
+            "--postgres-generation-durability",
+            "local",
             "--postgres-data-dir",
             "/var/lib/postgresql/data",
         ]);
@@ -631,6 +730,115 @@ mod tests {
                 .as_ref()
                 .is_some_and(PostgresConfig::requires_writable_authority)
         );
+    }
+
+    #[test]
+    fn replication_bootstrap_primary_requires_explicit_generation_durability() {
+        assert!(matches!(
+            AgentConfig::try_parse_from(replication_bootstrap_primary_args()),
+            Err(ConfigError::GenerationDurabilityRequired)
+        ));
+
+        let mut local = replication_bootstrap_primary_args();
+        local.extend(["--postgres-generation-durability", "local"]);
+        let config = AgentConfig::try_parse_from(local).expect("explicit local durability");
+        assert_eq!(
+            config
+                .postgres
+                .as_ref()
+                .expect("PostgreSQL source")
+                .generation_durability(),
+            &GenerationDurability::Local
+        );
+    }
+
+    #[test]
+    fn accepts_only_complete_remote_apply_candidate_sets() {
+        for names in [
+            "pgshard_member_0001,pgshard_member_0002",
+            "pgshard_member_0001,pgshard_member_0002,pgshard_member_0003,pgshard_member_0004",
+        ] {
+            let mut args = replication_bootstrap_primary_args();
+            args.extend([
+                "--postgres-generation-durability",
+                "remote-apply-any-one",
+                "--postgres-synchronous-standby-names",
+                names,
+            ]);
+            let config = AgentConfig::try_parse_from(args).expect("complete remote topology");
+            assert_eq!(
+                config
+                    .postgres
+                    .as_ref()
+                    .expect("PostgreSQL source")
+                    .generation_durability()
+                    .synchronous_standby_names_setting(),
+                format!("ANY 1 ({})", names.replace(',', ", "))
+            );
+        }
+
+        for names in [
+            "",
+            "pgshard_member_0001",
+            "pgshard_member_0002,pgshard_member_0001",
+            "pgshard_member_0001,pgshard_member_0001",
+            "pgshard_member_0001,pgshard_member_0003",
+            "pgshard_member_0001, pgshard_member_0002",
+        ] {
+            let mut args = replication_bootstrap_primary_args();
+            args.extend([
+                "--postgres-generation-durability",
+                "remote-apply-any-one",
+                "--postgres-synchronous-standby-names",
+                names,
+            ]);
+            assert!(matches!(
+                AgentConfig::try_parse_from(args),
+                Err(ConfigError::InvalidSynchronousStandbySet)
+            ));
+        }
+    }
+
+    #[test]
+    fn generation_durability_settings_are_source_only_and_consistent() {
+        let mut local_with_names = replication_bootstrap_primary_args();
+        local_with_names.extend([
+            "--postgres-generation-durability",
+            "local",
+            "--postgres-synchronous-standby-names",
+            "pgshard_member_0001,pgshard_member_0002",
+        ]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(local_with_names),
+            Err(ConfigError::SynchronousStandbyNamesRequireRemoteApply)
+        ));
+
+        let mut remote_without_names = replication_bootstrap_primary_args();
+        remote_without_names.extend(["--postgres-generation-durability", "remote-apply-any-one"]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(remote_without_names),
+            Err(ConfigError::SynchronousStandbyNamesRequired)
+        ));
+
+        for mode in ["quarantine", "replication-standby"] {
+            let mut args = if mode == "replication-standby" {
+                replication_standby_args()
+            } else {
+                let mut args = required_args();
+                args.extend([
+                    "--postgres-mode",
+                    "quarantine",
+                    "--postgres-data-dir",
+                    "/var/lib/postgresql/data",
+                ]);
+                args
+            };
+            args.extend(["--postgres-generation-durability", "local"]);
+            assert!(matches!(
+                AgentConfig::try_parse_from(args),
+                Err(ConfigError::GenerationDurabilityRequiresBootstrapPrimary)
+            ));
+        }
     }
 
     #[test]

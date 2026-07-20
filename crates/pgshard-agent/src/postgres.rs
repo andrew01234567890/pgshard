@@ -38,8 +38,10 @@ use tokio::time::{Instant, sleep, timeout};
 use crate::domain::{AgentState, PostgresProcessState};
 #[cfg(not(test))]
 use crate::postgres_generation;
-use crate::postgres_generation::PostgresGenerationError;
-use crate::postgres_generation::is_canonical_managed_member_name;
+use crate::postgres_generation::{
+    GenerationDurability, PostgresGenerationError, is_canonical_managed_member_name,
+    validate_generation_durability,
+};
 use crate::postgres_recovery::{self, PostgresRecoveryError};
 #[cfg(test)]
 use crate::writable::durable_generation_for_test;
@@ -255,6 +257,7 @@ impl PostgresStandbyConfig {
 pub struct PostgresConfig {
     role: PostgresRuntimeRole,
     standby: Option<PostgresStandbyConfig>,
+    generation_durability: GenerationDurability,
     data_dir: PathBuf,
     executable: PathBuf,
     controldata_executable: PathBuf,
@@ -284,6 +287,7 @@ impl PostgresConfig {
         Self::new_for_role(
             PostgresRuntimeRole::Quarantine,
             None,
+            GenerationDurability::Local,
             data_dir,
             executable,
             socket_dir,
@@ -316,6 +320,7 @@ impl PostgresConfig {
         Self::new_for_role(
             PostgresRuntimeRole::ReplicationBootstrapPrimary,
             None,
+            GenerationDurability::Local,
             data_dir,
             executable,
             socket_dir,
@@ -345,6 +350,7 @@ impl PostgresConfig {
         Self::new_for_role(
             PostgresRuntimeRole::ReplicationStandby,
             Some(standby),
+            GenerationDurability::Local,
             data_dir,
             executable,
             socket_dir,
@@ -359,6 +365,7 @@ impl PostgresConfig {
     pub(crate) fn new_for_role(
         role: PostgresRuntimeRole,
         standby: Option<PostgresStandbyConfig>,
+        generation_durability: GenerationDurability,
         data_dir: PathBuf,
         executable: PathBuf,
         socket_dir: PathBuf,
@@ -370,6 +377,13 @@ impl PostgresConfig {
         if (role == PostgresRuntimeRole::ReplicationStandby) != standby.is_some() {
             return Err(PostgresConfigError::InvalidStandbyComposition);
         }
+        if role != PostgresRuntimeRole::ReplicationBootstrapPrimary
+            && generation_durability != GenerationDurability::Local
+        {
+            return Err(PostgresConfigError::InvalidGenerationDurabilityComposition);
+        }
+        validate_generation_durability(&generation_durability)
+            .map_err(|_| PostgresConfigError::InvalidGenerationDurabilityComposition)?;
         validate_absolute_normal_path("PGDATA", &data_dir, false)?;
         validate_absolute_normal_path("PostgreSQL executable", &executable, false)?;
         let controldata_executable = executable
@@ -426,6 +440,7 @@ impl PostgresConfig {
         Ok(Self {
             role,
             standby,
+            generation_durability,
             data_dir,
             executable,
             controldata_executable,
@@ -441,6 +456,18 @@ impl PostgresConfig {
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub(crate) fn generation_durability(&self) -> &GenerationDurability {
+        &self.generation_durability
+    }
+
+    fn synchronous_standby_names_argument(&self) -> String {
+        format!(
+            "synchronous_standby_names={}",
+            self.generation_durability
+                .synchronous_standby_names_setting()
+        )
     }
 
     /// Returns whether starting this role requires writable-Lease authority.
@@ -1545,7 +1572,7 @@ impl PreparedPostgres {
             .arg("-c")
             .arg("wal_level=logical")
             .arg("-c")
-            .arg("synchronous_standby_names=")
+            .arg(self.config.synchronous_standby_names_argument())
             .arg("-c")
             .arg("synchronous_commit=local")
             .arg("-c")
@@ -1683,9 +1710,27 @@ where
             PostgresStartDecision::StartWritable(current) if current == *generation
         )
     };
-    let publication = publish_postgres_generation(socket_dir, generation, &authority_exact);
+    let generation_durability = shutdown_config.generation_durability();
+    let publication = publish_postgres_generation(
+        socket_dir,
+        generation,
+        generation_durability,
+        &authority_exact,
+    );
+    let mut publication = Box::pin(async {
+        if generation_durability.is_remote_apply() {
+            publication.await
+        } else {
+            timeout(WRITABLE_GENERATION_PUBLICATION_TIMEOUT, publication)
+                .await
+                .map_err(|_| {
+                    PostgresError::WritableGenerationPublicationTimeout(
+                        WRITABLE_GENERATION_PUBLICATION_TIMEOUT,
+                    )
+                })?
+        }
+    });
     let authority_lost = wait_for_authority_loss(&authority_exact);
-    tokio::pin!(publication);
     tokio::pin!(authority_lost);
     let result = tokio::select! {
         biased;
@@ -1718,15 +1763,9 @@ where
                 PostgresError::StartupAuthorityChanged,
             ).await);
         }
-        result = timeout(WRITABLE_GENERATION_PUBLICATION_TIMEOUT, &mut publication) => result,
+        result = publication.as_mut() => result,
     };
-    let publication_error = match result {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(error),
-        Err(_) => Some(PostgresError::WritableGenerationPublicationTimeout(
-            WRITABLE_GENERATION_PUBLICATION_TIMEOUT,
-        )),
-    };
+    let publication_error = result.err();
     if let Some(error) = publication_error {
         return Err(
             cleanup_tracked_startup_failure(state, process, pidfd, process_group, error).await,
@@ -1748,6 +1787,7 @@ where
 async fn publish_postgres_generation<F>(
     socket_dir: &Path,
     generation: &DurableWritableGeneration,
+    durability: &GenerationDurability,
     authority_exact: &F,
 ) -> Result<(), PostgresError>
 where
@@ -1757,6 +1797,7 @@ where
     {
         let _ = socket_dir;
         let _ = generation;
+        let _ = durability;
         let gate = TEST_POSTGRES_GENERATION_PUBLICATION_GATE.with(|slot| slot.borrow_mut().take());
         if let Some(mut gate) = gate {
             while !*gate.borrow_and_update() && gate.changed().await.is_ok() {}
@@ -1770,9 +1811,16 @@ where
     }
     #[cfg(not(test))]
     {
-        postgres_generation::publish_writable_generation(socket_dir, generation, authority_exact)
-            .await
-            .map_err(PostgresError::from)
+        Box::pin(
+            postgres_generation::publish_writable_generation_with_durability(
+                socket_dir,
+                generation,
+                durability,
+                authority_exact,
+            ),
+        )
+        .await
+        .map_err(PostgresError::from)
     }
 }
 
@@ -4174,6 +4222,9 @@ pub enum PostgresConfigError {
     /// Standby fields and runtime role did not form one exact composition.
     #[error("PostgreSQL standby settings are incomplete or supplied for another runtime role")]
     InvalidStandbyComposition,
+    /// Synchronous publication durability is valid only for the bootstrap source.
+    #[error("PostgreSQL generation durability is incompatible with the selected runtime role")]
+    InvalidGenerationDurabilityComposition,
     /// The primary endpoint was not a bounded DNS name.
     #[error("PostgreSQL primary host {0:?} must be a bounded ASCII DNS name")]
     InvalidPrimaryHost(String),
@@ -6202,7 +6253,14 @@ mod tests {
         fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect replication HBA");
-        let config = PostgresConfig::new_replication_bootstrap_primary(
+        let config = PostgresConfig::new_for_role(
+            PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            None,
+            GenerationDurability::remote_apply_any_one(vec![
+                "pgshard_member_0001".to_owned(),
+                "pgshard_member_0002".to_owned(),
+            ])
+            .expect("valid any-one topology"),
             fixture.path().to_owned(),
             executable,
             socket,
@@ -6228,7 +6286,7 @@ mod tests {
             "max_wal_senders=5",
             "max_replication_slots=5",
             "wal_level=logical",
-            "synchronous_standby_names=",
+            "synchronous_standby_names=ANY 1 (pgshard_member_0001, pgshard_member_0002)",
             "synchronous_commit=local",
             "archive_mode=off",
         ] {
@@ -6275,6 +6333,27 @@ mod tests {
                 .supervise(agent_state(), std::future::pending())
                 .await,
             Err(PostgresError::WritableAuthorityRequired)
+        ));
+    }
+
+    #[test]
+    fn postgres_config_revalidates_remote_generation_candidates() {
+        assert!(matches!(
+            PostgresConfig::new_for_role(
+                PostgresRuntimeRole::ReplicationBootstrapPrimary,
+                None,
+                GenerationDurability::RemoteApplyAnyOne {
+                    application_names: vec!["pgshard_member_0001".to_owned()],
+                },
+                PathBuf::from("/var/lib/postgresql/data"),
+                PathBuf::from("/usr/lib/postgresql/18/bin/postgres"),
+                PathBuf::from("/run/pgshard/postgres"),
+                PathBuf::from("/etc/pgshard/replication-primary.pg_hba.conf"),
+                Duration::from_secs(5),
+                Duration::from_secs(44),
+                Duration::from_millis(500),
+            ),
+            Err(PostgresConfigError::InvalidGenerationDurabilityComposition)
         ));
     }
 
