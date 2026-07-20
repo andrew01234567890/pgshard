@@ -1547,6 +1547,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if observed.Identity.ClusterID != cluster.Name || observed.Identity.InstanceID != podName || observed.Lease.OwnerInstance != podName || observed.Lease.Epoch != strconv.FormatInt(int64(*liveLease.Spec.LeaseTransitions), 10) {
 		t.Fatalf("agent status does not match Kubernetes identity: status=%#v Lease=%#v", observed, liveLease.Spec)
 	}
+	assertKINDOrchestratorBindsControllerEndpoints(t, ctx, kubeClient, current)
 
 	waitForQuarantinedPostgreSQL(t, ctx, namespace.Name, podName, "initial acquisition")
 	assertDurableWritableGeneration(
@@ -2270,7 +2271,8 @@ func assertKINDCanI(t *testing.T, ctx context.Context, identity, namespace strin
 
 func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
 	t.Helper()
-	const wantedCollectionState = "disabled_agent_status_collector_required"
+	const wantedCollectionState = "fresh_diagnostic_evidence"
+	wantedMembers := int(cluster.Spec.Shards * cluster.Spec.MembersPerShard)
 	deployment := &appsv1.Deployment{}
 	deploymentKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorSuffix}
 	if err := kubeClient.Get(ctx, deploymentKey, deployment); err != nil {
@@ -2326,12 +2328,20 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 				Topology          *struct {
 					AgentStatusCollection string `json:"agent_status_collection"`
 				} `json:"topology"`
+				AgentStatus struct {
+					Phase           string  `json:"phase"`
+					ExpectedMembers int     `json:"expected_members"`
+					FreshMembers    int     `json:"fresh_members"`
+					MaximumAgeMS    uint64  `json:"maximum_age_ms"`
+					Failure         *string `json:"failure"`
+					DiagnosticOnly  bool    `json:"diagnostic_only"`
+				} `json:"agent_status"`
 			}
 			statusPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/status", cluster.Namespace, pod.Name)
 			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			output, err := exec.CommandContext(requestCtx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
 			cancel()
-			if err != nil || json.Unmarshal(output, &snapshot) != nil || snapshot.Topology == nil || snapshot.Topology.AgentStatusCollection != wantedCollectionState || !snapshot.CoordinationReady {
+			if err != nil || json.Unmarshal(output, &snapshot) != nil || snapshot.Topology == nil || snapshot.Topology.AgentStatusCollection != wantedCollectionState || !snapshot.CoordinationReady || snapshot.AgentStatus.Phase != "fresh" || snapshot.AgentStatus.ExpectedMembers != wantedMembers || snapshot.AgentStatus.FreshMembers != wantedMembers || snapshot.AgentStatus.MaximumAgeMS != 5000 || snapshot.AgentStatus.Failure != nil || !snapshot.AgentStatus.DiagnosticOnly {
 				lastObservation = fmt.Sprintf("orchestrator %s status error=%v output=%q snapshot=%#v", pod.Name, err, output, snapshot)
 				return false, nil
 			}

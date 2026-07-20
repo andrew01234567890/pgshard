@@ -170,10 +170,10 @@ pub enum AgentStatusCollectionState {
     /// UIDs. Querying agents before another authoritative source supplies
     /// those UIDs could accept status from a replaced Pod incarnation.
     DisabledPodIdentityRequired,
-    /// Every expected Pod, Endpoint, and writable-term Lease was bound to one
-    /// exact live Kubernetes object incarnation. Agent HTTP collection remains
-    /// disabled until a separate, freshness-bounded collector is implemented.
-    DisabledAgentStatusCollectorRequired,
+    /// Every expected response was validated inside one Kubernetes identity
+    /// bracket and remains inside a process-local freshness window. This is
+    /// diagnostic evidence only and grants no runtime authority.
+    FreshDiagnosticEvidence,
 }
 
 /// One topology-derived endpoint that is not yet bound to a runtime Pod UID.
@@ -198,6 +198,7 @@ pub struct UnboundAgentObservationTarget {
     pub(crate) writable_lease_namespace: String,
     pub(crate) writable_lease_name: String,
     pub(crate) writable_lease_uid: String,
+    pub(crate) synchronous_durability: bool,
 }
 
 impl UnboundAgentObservationTarget {
@@ -289,6 +290,12 @@ impl UnboundAgentObservationTarget {
     #[must_use]
     pub fn writable_lease_uid(&self) -> &str {
         &self.writable_lease_uid
+    }
+
+    /// Returns whether the topology requires remote-apply durability.
+    #[must_use]
+    pub const fn synchronous_durability(&self) -> bool {
+        self.synchronous_durability
     }
 }
 
@@ -402,6 +409,7 @@ impl TopologyV1 {
                     writable_lease_namespace: shard.writable_lease.namespace.clone(),
                     writable_lease_name: shard.writable_lease.name.clone(),
                     writable_lease_uid: shard.writable_lease.uid.clone(),
+                    synchronous_durability: self.durability == Durability::Synchronous,
                 });
             }
         }

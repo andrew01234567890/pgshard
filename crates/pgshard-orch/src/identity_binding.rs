@@ -6,19 +6,23 @@
 //! to one reconciliation and are discarded immediately afterward.
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::coordination::v1::Lease;
+use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::api::core::v1::{EndpointAddress, EndpointPort, Endpoints, Pod};
 use kube::api::Api;
 use kube::{Client, Config};
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::domain::OrchState;
+use crate::agent_status::{
+    AgentStatusCollection, AgentStatusError, AgentStatusExpectation, AgentStatusQuery,
+    ExpectedWritableLease, collect_agent_statuses,
+};
+use crate::domain::{AgentStatusFailureReason, OrchState};
 use crate::topology::UnboundAgentObservationTarget;
 
 const CLUSTER_LABEL: &str = "pgshard.io/cluster";
@@ -32,6 +36,8 @@ const OWNER_API_VERSION: &str = "pgshard.io/v1alpha1";
 const OWNER_KIND: &str = "PgShardCluster";
 const PROCESS_INCARNATION_HEX_LENGTH: usize = 24;
 const MAX_CONCURRENT_BINDINGS: usize = 64;
+const MAXIMUM_WRITABLE_LEASE_DURATION_SECONDS: i32 = 300;
+const GO_ZERO_TIME_UNIX_SECONDS: i64 = -62_135_596_800;
 
 /// Repeatedly observes the complete finite target set without retaining stale
 /// evidence between attempts.
@@ -43,16 +49,39 @@ pub async fn supervise(
     retry_period: Duration,
     freshness: Duration,
 ) {
-    state.record_agent_identity_binding(None);
+    state.record_agent_status_collecting(freshness);
     let store = match KubernetesIdentityStore::new(&targets, request_timeout) {
         Ok(store) => store,
         Err(error) => {
+            state.record_agent_status_failure(AgentStatusFailureReason::IdentityUnavailable);
             tracing::warn!(reason = %error, "Kubernetes identity binding disabled");
             wait_until_shutdown(&mut shutdown).await;
+            state.begin_shutdown();
             return;
         }
     };
 
+    supervise_with_store(
+        &store,
+        &DirectAgentStatusCollector,
+        &targets,
+        &state,
+        &mut shutdown,
+        retry_period,
+        freshness,
+    )
+    .await;
+}
+
+async fn supervise_with_store<S: IdentityStore, C: AgentStatusCollector>(
+    store: &S,
+    collector: &C,
+    targets: &[UnboundAgentObservationTarget],
+    state: &OrchState,
+    shutdown: &mut watch::Receiver<bool>,
+    retry_period: Duration,
+    freshness: Duration,
+) {
     loop {
         if *shutdown.borrow() {
             break;
@@ -67,7 +96,7 @@ pub async fn supervise(
                 }
                 continue;
             }
-            result = observe_once(&store, &targets, &state, freshness) => result,
+            result = observe_once_with_collector(store, collector, targets, state, freshness) => result,
         };
         match result {
             Ok(()) => {}
@@ -75,47 +104,120 @@ pub async fn supervise(
                 tracing::warn!(reason = %error, "Kubernetes identity binding unavailable");
             }
         }
-        if wait_or_stop(&mut shutdown, retry_period).await {
+        if wait_or_stop(shutdown, retry_period).await {
             break;
         }
     }
-    state.record_agent_identity_binding(None);
+    // A requested stop is terminal for diagnostic state. `begin_shutdown`
+    // also makes any already-completed collector write a no-op if it races
+    // this point.
+    state.begin_shutdown();
 }
 
+#[cfg(test)]
 async fn observe_once<S: IdentityStore>(
     store: &S,
     targets: &[UnboundAgentObservationTarget],
     state: &OrchState,
     freshness: Duration,
 ) -> Result<(), IdentityBindingError> {
-    observe_once_with_clock(store, targets, state, freshness, std::time::Instant::now).await
+    observe_once_with_collector(
+        store,
+        &DirectAgentStatusCollector,
+        targets,
+        state,
+        freshness,
+    )
+    .await
 }
 
-async fn observe_once_with_clock<S: IdentityStore, F: FnMut() -> std::time::Instant>(
+trait AgentStatusCollector: Send + Sync {
+    async fn collect(
+        &self,
+        queries: Vec<AgentStatusQuery>,
+    ) -> Result<AgentStatusCollection, AgentStatusError>;
+}
+
+struct DirectAgentStatusCollector;
+
+impl AgentStatusCollector for DirectAgentStatusCollector {
+    async fn collect(
+        &self,
+        queries: Vec<AgentStatusQuery>,
+    ) -> Result<AgentStatusCollection, AgentStatusError> {
+        collect_agent_statuses(queries).await
+    }
+}
+
+async fn observe_once_with_collector<S: IdentityStore, C: AgentStatusCollector>(
     store: &S,
+    collector: &C,
+    targets: &[UnboundAgentObservationTarget],
+    state: &OrchState,
+    freshness: Duration,
+) -> Result<(), IdentityBindingError> {
+    observe_once_with_collector_and_clock(
+        store,
+        collector,
+        targets,
+        state,
+        freshness,
+        std::time::Instant::now,
+    )
+    .await
+}
+
+async fn observe_once_with_collector_and_clock<
+    S: IdentityStore,
+    C: AgentStatusCollector,
+    F: FnMut() -> std::time::Instant,
+>(
+    store: &S,
+    collector: &C,
     targets: &[UnboundAgentObservationTarget],
     state: &OrchState,
     freshness: Duration,
     mut clock: F,
 ) -> Result<(), IdentityBindingError> {
-    state.record_agent_identity_binding(None);
-    let deadline = clock()
-        .checked_add(freshness)
-        .ok_or(IdentityBindingError::InvalidFreshnessBound)?;
-    match tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline),
-        bind_once(store, targets),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => return Err(IdentityBindingError::FreshnessBoundExceeded(freshness)),
+    state.record_agent_status_collecting(freshness);
+    let result = async {
+        // One absolute bound covers both complete, bounded Kubernetes scans,
+        // every agent request, identity comparison, and atomic publication.
+        let scan_deadline = clock()
+            .checked_add(freshness)
+            .ok_or(IdentityBindingError::InvalidFreshnessBound)?;
+        let operation = async {
+            let before = bind_once(store, targets).await?;
+            let queries = build_status_queries(targets, &before)?;
+            let collection = collector.collect(queries).await?;
+            let after = bind_once(store, targets).await?;
+            if before != after {
+                return Err(IdentityBindingError::IdentityChanged);
+            }
+            let receipt_deadline = collection
+                .earliest_receipt
+                .checked_add(freshness)
+                .ok_or(IdentityBindingError::InvalidFreshnessBound)?;
+            let publication_deadline = scan_deadline.min(receipt_deadline);
+            if clock() >= publication_deadline
+                || !state.record_agent_status_fresh(collection.member_count, publication_deadline)
+            {
+                return Err(IdentityBindingError::FreshnessExpired);
+            }
+            Ok(())
+        };
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(scan_deadline), operation)
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(IdentityBindingError::FreshnessBoundExceeded(freshness)),
+        }
     }
-    if clock() >= deadline {
-        return Err(IdentityBindingError::FreshnessBoundExceeded(freshness));
+    .await;
+    if let Err(error) = &result {
+        state.record_agent_status_failure(error.failure_reason());
     }
-    state.record_agent_identity_binding(Some(deadline));
-    Ok(())
+    result
 }
 
 async fn wait_until_shutdown(shutdown: &mut watch::Receiver<bool>) {
@@ -135,12 +237,15 @@ async fn wait_or_stop(shutdown: &mut watch::Receiver<bool>, duration: Duration) 
 async fn bind_once<S: IdentityStore>(
     store: &S,
     targets: &[UnboundAgentObservationTarget],
-) -> Result<(), IdentityBindingError> {
+) -> Result<BoundIdentitySet, IdentityBindingError> {
     if targets.is_empty() {
         return Err(IdentityBindingError::InvalidTargetSet);
     }
     let shards = group_shards(targets)?;
     let mut pods = HashMap::with_capacity(targets.len());
+    let mut stateful_sets = HashMap::with_capacity(targets.len());
+    let mut endpoints_by_name = HashMap::new();
+    let mut leases_by_name = HashMap::new();
     let mut stateful_set_uids = HashSet::with_capacity(targets.len());
     let mut pod_uids = HashSet::with_capacity(targets.len());
     let mut pod_ips = HashSet::with_capacity(targets.len());
@@ -151,9 +256,13 @@ async fn bind_once<S: IdentityStore>(
         .await?;
     for member in members {
         let target = member.target;
-        let stateful_set_uid = member.stateful_set_uid;
+        let stateful_set = member.stateful_set;
         let identity = member.pod;
-        if !stateful_set_uids.insert(stateful_set_uid.clone()) {
+        if !stateful_set_uids.insert(stateful_set.uid.clone())
+            || stateful_sets
+                .insert(target.stateful_set().to_owned(), stateful_set)
+                .is_some()
+        {
             return Err(IdentityBindingError::InvalidTargetSet);
         }
         if !pod_uids.insert(identity.uid.clone())
@@ -164,17 +273,36 @@ async fn bind_once<S: IdentityStore>(
         }
     }
     let pods = &pods;
-    stream::iter(shards)
+    let bound_shards = stream::iter(shards)
         .map(|shard| bind_shard(store, shard, pods))
         .buffer_unordered(MAX_CONCURRENT_BINDINGS)
         .try_collect::<Vec<_>>()
         .await?;
-    Ok(())
+    for shard in bound_shards {
+        if endpoints_by_name
+            .insert(shard.service_name.to_owned(), shard.endpoints)
+            .is_some()
+            || leases_by_name
+                .insert(shard.lease_name.to_owned(), shard.lease)
+                .is_some()
+        {
+            return Err(IdentityBindingError::InvalidTargetSet);
+        }
+    }
+    Ok(BoundIdentitySet {
+        stateful_sets,
+        pods: pods
+            .iter()
+            .map(|(name, identity)| ((*name).to_owned(), identity.clone()))
+            .collect(),
+        endpoints: endpoints_by_name,
+        leases: leases_by_name,
+    })
 }
 
 struct BoundMember<'a> {
     target: &'a UnboundAgentObservationTarget,
-    stateful_set_uid: String,
+    stateful_set: ObjectIdentity,
     pod: PodIdentity,
 }
 
@@ -183,12 +311,12 @@ async fn bind_member<'a, S: IdentityStore>(
     target: &'a UnboundAgentObservationTarget,
 ) -> Result<BoundMember<'a>, IdentityBindingError> {
     let stateful_set = store.get_stateful_set(target.stateful_set()).await?;
-    let stateful_set_uid = validate_stateful_set(&stateful_set, target)?;
+    let stateful_set = validate_stateful_set(&stateful_set, target)?;
     let pod = store.get_pod(target.instance_id()).await?;
-    let pod = validate_pod(&pod, target, &stateful_set_uid)?;
+    let pod = validate_pod(&pod, target, &stateful_set.uid)?;
     Ok(BoundMember {
         target,
-        stateful_set_uid,
+        stateful_set,
         pod,
     })
 }
@@ -223,29 +351,121 @@ fn group_shards(
     Ok(shards)
 }
 
-async fn bind_shard<S: IdentityStore>(
+struct BoundShard<'a> {
+    service_name: &'a str,
+    endpoints: ObjectIdentity,
+    lease_name: &'a str,
+    lease: LeaseIdentity,
+}
+
+async fn bind_shard<'a, S: IdentityStore>(
     store: &S,
-    shard: Vec<&UnboundAgentObservationTarget>,
+    shard: Vec<&'a UnboundAgentObservationTarget>,
     pods: &HashMap<&str, PodIdentity>,
-) -> Result<(), IdentityBindingError> {
+) -> Result<BoundShard<'a>, IdentityBindingError> {
     let first = shard[0];
     let endpoints = store.get_endpoints(first.shard_service()).await?;
-    validate_endpoints(&endpoints, &shard, pods)?;
+    let endpoints = validate_endpoints(&endpoints, &shard, pods)?;
     let lease = store.get_lease(first.writable_lease_name()).await?;
-    validate_lease(&lease, &shard, pods)?;
-    Ok(())
+    let lease = validate_lease(&lease, &shard, pods)?;
+    Ok(BoundShard {
+        service_name: first.shard_service(),
+        endpoints,
+        lease_name: first.writable_lease_name(),
+        lease,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObjectIdentity {
+    uid: String,
+    resource_version: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PodIdentity {
     uid: String,
+    resource_version: String,
     ip: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LeaseIdentity {
+    object: ObjectIdentity,
+    holder_identity: Option<String>,
+    transitions: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundIdentitySet {
+    stateful_sets: HashMap<String, ObjectIdentity>,
+    pods: HashMap<String, PodIdentity>,
+    endpoints: HashMap<String, ObjectIdentity>,
+    leases: HashMap<String, LeaseIdentity>,
+}
+
+fn build_status_queries(
+    targets: &[UnboundAgentObservationTarget],
+    bound: &BoundIdentitySet,
+) -> Result<Vec<AgentStatusQuery>, IdentityBindingError> {
+    let mut queries = Vec::with_capacity(targets.len());
+    for target in targets {
+        let source = targets
+            .iter()
+            .find(|candidate| {
+                candidate.shard_id() == target.shard_id() && candidate.member_ordinal() == 0
+            })
+            .ok_or(IdentityBindingError::InvalidTargetSet)?;
+        let standby_slot_names = targets
+            .iter()
+            .filter(|candidate| {
+                candidate.shard_id() == target.shard_id() && candidate.member_ordinal() != 0
+            })
+            .map(|candidate| candidate.physical_slot().to_owned())
+            .collect();
+        let pod = bound
+            .pods
+            .get(target.instance_id())
+            .ok_or(IdentityBindingError::InvalidTargetSet)?;
+        let ip = pod
+            .ip
+            .parse::<IpAddr>()
+            .map_err(|_| IdentityBindingError::InvalidTargetSet)?;
+        let lease = bound
+            .leases
+            .get(target.writable_lease_name())
+            .ok_or(IdentityBindingError::InvalidTargetSet)?;
+        queries.push(AgentStatusQuery {
+            address: SocketAddr::new(ip, target.agent_http_port()),
+            expected: AgentStatusExpectation {
+                cluster_id: target.cluster_id().to_owned(),
+                cluster_uid: target.cluster_uid().to_owned(),
+                shard_id: target.shard_id(),
+                member_ordinal: target.member_ordinal(),
+                instance_id: target.instance_id().to_owned(),
+                pod_uid: pod.uid.clone(),
+                source_instance_id: source.instance_id().to_owned(),
+                source_dns_name: source.dns_name().to_owned(),
+                member_slot_name: target.physical_slot().to_owned(),
+                standby_slot_names,
+                synchronous_durability: target.synchronous_durability(),
+                writable_lease: ExpectedWritableLease {
+                    namespace: target.writable_lease_namespace().to_owned(),
+                    name: target.writable_lease_name().to_owned(),
+                    uid: lease.object.uid.clone(),
+                    holder_identity: lease.holder_identity.clone(),
+                    transitions: lease.transitions,
+                },
+            },
+        });
+    }
+    Ok(queries)
 }
 
 fn validate_stateful_set(
     stateful_set: &StatefulSet,
     target: &UnboundAgentObservationTarget,
-) -> Result<String, IdentityBindingError> {
+) -> Result<ObjectIdentity, IdentityBindingError> {
     let metadata = &stateful_set.metadata;
     if metadata.name.as_deref() != Some(target.stateful_set())
         || metadata.namespace.as_deref() != Some(target.namespace())
@@ -264,12 +484,16 @@ fn validate_stateful_set(
             target.stateful_set().to_owned(),
         ));
     }
-    require_resource_version(metadata.resource_version.as_deref())?;
+    let resource_version =
+        require_resource_version(metadata.resource_version.as_deref())?.to_owned();
     let uid = require_uid(metadata.uid.as_deref())?.to_owned();
     validate_cluster_owner(metadata.owner_references.as_deref(), target).map_err(|()| {
         IdentityBindingError::StatefulSetIdentityMismatch(target.stateful_set().to_owned())
     })?;
-    Ok(uid)
+    Ok(ObjectIdentity {
+        uid,
+        resource_version,
+    })
 }
 
 fn validate_cluster_owner(
@@ -319,7 +543,8 @@ fn validate_pod(
             target.instance_id().to_owned(),
         ));
     }
-    require_resource_version(metadata.resource_version.as_deref())?;
+    let resource_version =
+        require_resource_version(metadata.resource_version.as_deref())?.to_owned();
     let uid = require_uid(metadata.uid.as_deref())?.to_owned();
     let owners = metadata.owner_references.as_deref().unwrap_or_default();
     if owners.len() != 1
@@ -360,14 +585,18 @@ fn validate_pod(
         .filter(|value| value.parse::<IpAddr>().is_ok())
         .ok_or_else(|| IdentityBindingError::PodIdentityMismatch(target.instance_id().to_owned()))?
         .to_owned();
-    Ok(PodIdentity { uid, ip })
+    Ok(PodIdentity {
+        uid,
+        resource_version,
+        ip,
+    })
 }
 
 fn validate_endpoints(
     endpoints: &Endpoints,
     targets: &[&UnboundAgentObservationTarget],
     pods: &HashMap<&str, PodIdentity>,
-) -> Result<(), IdentityBindingError> {
+) -> Result<ObjectIdentity, IdentityBindingError> {
     let first = targets[0];
     let metadata = &endpoints.metadata;
     if metadata.name.as_deref() != Some(first.shard_service())
@@ -378,8 +607,9 @@ fn validate_endpoints(
             first.shard_service().to_owned(),
         ));
     }
-    require_uid(metadata.uid.as_deref())?;
-    require_resource_version(metadata.resource_version.as_deref())?;
+    let uid = require_uid(metadata.uid.as_deref())?.to_owned();
+    let resource_version =
+        require_resource_version(metadata.resource_version.as_deref())?.to_owned();
 
     let expected: HashMap<_, _> = targets
         .iter()
@@ -425,7 +655,10 @@ fn validate_endpoints(
             first.shard_service().to_owned(),
         ));
     }
-    Ok(())
+    Ok(ObjectIdentity {
+        uid,
+        resource_version,
+    })
 }
 
 fn validate_endpoint_ports(
@@ -490,7 +723,7 @@ fn validate_lease(
     lease: &Lease,
     targets: &[&UnboundAgentObservationTarget],
     pods: &HashMap<&str, PodIdentity>,
-) -> Result<(), IdentityBindingError> {
+) -> Result<LeaseIdentity, IdentityBindingError> {
     let first = targets[0];
     let metadata = &lease.metadata;
     if metadata.name.as_deref() != Some(first.writable_lease_name())
@@ -502,7 +735,8 @@ fn validate_lease(
             first.writable_lease_name().to_owned(),
         ));
     }
-    require_resource_version(metadata.resource_version.as_deref())?;
+    let resource_version =
+        require_resource_version(metadata.resource_version.as_deref())?.to_owned();
     let owners: Vec<_> = metadata.owner_references.iter().flatten().collect();
     if owners.len() != 1
         || owners[0].api_version != OWNER_API_VERSION
@@ -522,12 +756,27 @@ fn validate_lease(
             first.writable_lease_name().to_owned(),
         ));
     }
+    let pristine = spec.is_none_or(|spec| {
+        spec.holder_identity.is_none()
+            && spec.lease_duration_seconds.is_none()
+            && spec.acquire_time.is_none()
+            && spec.renew_time.is_none()
+            && spec.lease_transitions.is_none()
+    });
+    if !pristine && !valid_writable_lease_term(spec.expect("non-pristine Lease has a spec")) {
+        return Err(IdentityBindingError::LeaseIdentityMismatch(
+            first.writable_lease_name().to_owned(),
+        ));
+    }
     if let Some(holder) = spec.and_then(|spec| spec.holder_identity.as_deref()) {
         let mut pieces = holder.split('/');
         let instance = pieces.next().unwrap_or_default();
         let pod_uid = pieces.next().unwrap_or_default();
         let incarnation = pieces.next().unwrap_or_default();
-        if pieces.next().is_some()
+        if holder.is_empty()
+            || holder.len() > 128
+            || holder.trim() != holder
+            || pieces.next().is_some()
             || incarnation.len() != PROCESS_INCARNATION_HEX_LENGTH
             || !incarnation
                 .bytes()
@@ -542,7 +791,36 @@ fn validate_lease(
             ));
         }
     }
-    Ok(())
+    let holder_identity = spec.and_then(|spec| spec.holder_identity.clone());
+    let transitions = spec
+        .and_then(|spec| spec.lease_transitions)
+        .map_or(Ok(0_u64), |value| {
+            u64::try_from(value).map_err(|_| {
+                IdentityBindingError::LeaseIdentityMismatch(first.writable_lease_name().to_owned())
+            })
+        })?;
+    Ok(LeaseIdentity {
+        object: ObjectIdentity {
+            uid: first.writable_lease_uid().to_owned(),
+            resource_version,
+        },
+        holder_identity,
+        transitions,
+    })
+}
+
+fn valid_writable_lease_term(spec: &LeaseSpec) -> bool {
+    spec.lease_duration_seconds
+        .is_some_and(|seconds| (1..=MAXIMUM_WRITABLE_LEASE_DURATION_SECONDS).contains(&seconds))
+        && spec.acquire_time.as_ref().is_some_and(nonzero_microtime)
+        && spec.renew_time.as_ref().is_some_and(nonzero_microtime)
+        && spec
+            .lease_transitions
+            .is_some_and(|transitions| transitions >= 1)
+}
+
+fn nonzero_microtime(value: &k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime) -> bool {
+    value.0.as_second() != GO_ZERO_TIME_UNIX_SECONDS || value.0.subsec_nanosecond() != 0
 }
 
 fn require_uid(value: Option<&str>) -> Result<&str, IdentityBindingError> {
@@ -665,8 +943,14 @@ enum IdentityBindingError {
     LeaseIdentityMismatch(String),
     #[error("identity-binding freshness deadline overflowed the monotonic clock")]
     InvalidFreshnessBound,
-    #[error("identity-binding scan exceeded its freshness bound of {0:?}")]
+    #[error("identity-binding and agent-status operation exceeded its freshness bound of {0:?}")]
     FreshnessBoundExceeded(Duration),
+    #[error("Kubernetes identity changed while agent status was collected")]
+    IdentityChanged,
+    #[error("agent-status collection expired before atomic publication")]
+    FreshnessExpired,
+    #[error(transparent)]
+    AgentStatus(#[from] AgentStatusError),
     #[error("in-cluster Kubernetes configuration is unavailable: {0}")]
     InClusterConfiguration(String),
     #[error("Kubernetes client initialization failed: {0}")]
@@ -681,24 +965,100 @@ enum IdentityBindingError {
     },
 }
 
+impl IdentityBindingError {
+    const fn failure_reason(&self) -> AgentStatusFailureReason {
+        match self {
+            Self::AgentStatus(_) => AgentStatusFailureReason::StatusUnavailable,
+            Self::IdentityChanged => AgentStatusFailureReason::IdentityChanged,
+            Self::InvalidFreshnessBound
+            | Self::FreshnessBoundExceeded(_)
+            | Self::FreshnessExpired => AgentStatusFailureReason::FreshnessExpired,
+            Self::InvalidTargetSet
+            | Self::InvalidObjectMetadata
+            | Self::StatefulSetIdentityMismatch(_)
+            | Self::PodIdentityMismatch(_)
+            | Self::EndpointIdentityMismatch(_)
+            | Self::LeaseIdentityMismatch(_)
+            | Self::InClusterConfiguration(_)
+            | Self::KubernetesClient(_)
+            | Self::RequestTimedOut(_)
+            | Self::Kubernetes { .. } => AgentStatusFailureReason::IdentityUnavailable,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use k8s_openapi::api::apps::v1::StatefulSetSpec;
     use k8s_openapi::api::coordination::v1::LeaseSpec;
     use k8s_openapi::api::core::v1::{EndpointSubset, ObjectReference, PodSpec, PodStatus};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta, OwnerReference};
+    use tokio::sync::Notify;
 
     use super::*;
-    use crate::domain::OrchestratorIdentity;
+    use crate::domain::{AgentStatusPhase, OrchestratorIdentity};
     use crate::topology::{
         AgentStatusCollectionState, TOPOLOGY_SCHEMA_VERSION, TopologyDiagnostics,
     };
 
     const CLUSTER_UID: &str = "11111111-2222-3333-4444-555555555555";
+
+    struct StubAgentStatusCollector {
+        receipt: std::time::Instant,
+    }
+
+    impl AgentStatusCollector for StubAgentStatusCollector {
+        async fn collect(
+            &self,
+            queries: Vec<AgentStatusQuery>,
+        ) -> Result<AgentStatusCollection, AgentStatusError> {
+            Ok(AgentStatusCollection {
+                member_count: queries.len(),
+                earliest_receipt: self.receipt,
+            })
+        }
+    }
+
+    struct MutatingAgentStatusCollector<'a> {
+        store: &'a MemoryStore,
+        receipt: std::time::Instant,
+    }
+
+    struct BlockingAgentStatusCollector {
+        started: Arc<Notify>,
+    }
+
+    impl AgentStatusCollector for BlockingAgentStatusCollector {
+        async fn collect(
+            &self,
+            _queries: Vec<AgentStatusQuery>,
+        ) -> Result<AgentStatusCollection, AgentStatusError> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    impl AgentStatusCollector for MutatingAgentStatusCollector<'_> {
+        async fn collect(
+            &self,
+            queries: Vec<AgentStatusQuery>,
+        ) -> Result<AgentStatusCollection, AgentStatusError> {
+            self.store
+                .endpoints
+                .lock()
+                .expect("endpoints")
+                .metadata
+                .resource_version = Some("endpoints-rv-after-request".to_owned());
+            Ok(AgentStatusCollection {
+                member_count: queries.len(),
+                earliest_receipt: self.receipt,
+            })
+        }
+    }
 
     fn target(member: u32) -> UnboundAgentObservationTarget {
         target_at(0, member)
@@ -727,6 +1087,7 @@ mod tests {
             writable_lease_namespace: "database".to_owned(),
             writable_lease_name: format!("{shard_service}-term"),
             writable_lease_uid: format!("lease-uid-{shard}"),
+            synchronous_durability: true,
         }
     }
 
@@ -884,6 +1245,9 @@ mod tests {
     }
 
     fn lease(target: &UnboundAgentObservationTarget, holder: Option<&str>) -> Lease {
+        let now = MicroTime(
+            k8s_openapi::jiff::Timestamp::new(1_700_000_000, 0).expect("fixture timestamp"),
+        );
         Lease {
             metadata: ObjectMeta {
                 name: Some(target.writable_lease_name().to_owned()),
@@ -902,7 +1266,12 @@ mod tests {
             },
             spec: Some(LeaseSpec {
                 holder_identity: holder.map(str::to_owned),
-                ..LeaseSpec::default()
+                lease_duration_seconds: Some(15),
+                acquire_time: Some(now.clone()),
+                renew_time: Some(now),
+                lease_transitions: Some(7),
+                preferred_holder: None,
+                strategy: None,
             }),
         }
     }
@@ -954,7 +1323,8 @@ mod tests {
 
     struct SlowRecreatingStore {
         inner: MemoryStore,
-        recreated: AtomicBool,
+        pod_reads: AtomicUsize,
+        delayed_pod_read: usize,
         delay: Duration,
     }
 
@@ -964,7 +1334,8 @@ mod tests {
         }
 
         async fn get_pod(&self, name: &str) -> Result<Pod, IdentityBindingError> {
-            if !self.recreated.swap(true, Ordering::SeqCst) {
+            let pod_read = self.pod_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if pod_read == self.delayed_pod_read {
                 let stateful_set_name = name
                     .strip_suffix("-0")
                     .ok_or_else(|| IdentityBindingError::PodIdentityMismatch(name.to_owned()))?;
@@ -1410,46 +1781,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_scan_with_recreated_early_object_cannot_publish_a_snapshot() {
-        let (targets, inner) = store();
-        let store = SlowRecreatingStore {
-            inner,
-            recreated: AtomicBool::new(false),
-            delay: Duration::from_millis(250),
-        };
-        let state = observation_state(&targets);
-        let freshness = Duration::from_millis(25);
+    async fn slow_first_or_second_scan_with_recreation_cannot_publish_a_snapshot() {
+        for (stage, delayed_pod_read) in [("first", 1), ("second", 4)] {
+            let (targets, inner) = store();
+            let store = SlowRecreatingStore {
+                inner,
+                pod_reads: AtomicUsize::new(0),
+                delayed_pod_read,
+                delay: Duration::from_millis(250),
+            };
+            let state = observation_state(&targets);
+            let freshness = Duration::from_millis(25);
+            let collector = StubAgentStatusCollector {
+                receipt: std::time::Instant::now(),
+            };
 
-        let error = observe_once(&store, &targets, &state, freshness)
-            .await
-            .expect_err("the complete scan must fit inside the freshness bound");
+            let error =
+                match observe_once_with_collector(&store, &collector, &targets, &state, freshness)
+                    .await
+                {
+                    Ok(()) => panic!("slow {stage} scan unexpectedly published"),
+                    Err(error) => error,
+                };
 
-        assert!(matches!(
-            error,
-            IdentityBindingError::FreshnessBoundExceeded(bound) if bound == freshness
-        ));
-        assert!(store.recreated.load(Ordering::SeqCst));
-        assert_eq!(
-            store
-                .inner
-                .stateful_sets
-                .lock()
-                .expect("StatefulSets")
-                .get(targets[0].stateful_set())
-                .expect("recreated StatefulSet")
-                .metadata
-                .uid
-                .as_deref(),
-            Some("replacement-stateful-set")
-        );
-        assert_eq!(
-            state
-                .snapshot()
-                .topology
-                .expect("topology")
-                .agent_status_collection,
-            AgentStatusCollectionState::DisabledPodIdentityRequired,
-        );
+            assert!(
+                matches!(
+                    error,
+                    IdentityBindingError::FreshnessBoundExceeded(bound) if bound == freshness
+                ),
+                "slow {stage} scan returned {error}",
+            );
+            assert!(store.pod_reads.load(Ordering::SeqCst) >= delayed_pod_read);
+            assert_eq!(
+                store
+                    .inner
+                    .stateful_sets
+                    .lock()
+                    .expect("StatefulSets")
+                    .get(targets[0].stateful_set())
+                    .expect("recreated StatefulSet")
+                    .metadata
+                    .uid
+                    .as_deref(),
+                Some("replacement-stateful-set")
+            );
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Unavailable);
+            assert_eq!(snapshot.agent_status.fresh_members, 0);
+            assert_eq!(
+                snapshot.agent_status.failure,
+                Some(AgentStatusFailureReason::FreshnessExpired),
+            );
+            assert_eq!(
+                snapshot.topology.expect("topology").agent_status_collection,
+                AgentStatusCollectionState::DisabledPodIdentityRequired,
+            );
+        }
     }
 
     #[tokio::test]
@@ -1458,27 +1845,200 @@ mod tests {
         let state = observation_state(&targets);
         let freshness = Duration::from_secs(1);
         let started_at = std::time::Instant::now();
+        let collector = StubAgentStatusCollector {
+            receipt: started_at,
+        };
         let mut clock = [started_at, started_at + freshness].into_iter();
 
-        let error = observe_once_with_clock(&store, &targets, &state, freshness, || {
-            clock.next().expect("start and completion readings")
-        })
+        let error = observe_once_with_collector_and_clock(
+            &store,
+            &collector,
+            &targets,
+            &state,
+            freshness,
+            || clock.next().expect("start and completion readings"),
+        )
         .await
         .expect_err("evidence is stale at the exact freshness boundary");
+
+        assert!(matches!(error, IdentityBindingError::FreshnessExpired));
+        assert!(clock.next().is_none());
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Unavailable);
+        assert_eq!(snapshot.agent_status.fresh_members, 0);
+        assert_eq!(
+            snapshot.agent_status.failure,
+            Some(AgentStatusFailureReason::FreshnessExpired),
+        );
+        assert_eq!(
+            snapshot.topology.expect("topology").agent_status_collection,
+            AgentStatusCollectionState::DisabledPodIdentityRequired,
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_collection_cannot_outlive_the_complete_operation_deadline() {
+        let (targets, store) = store();
+        let state = observation_state(&targets);
+        let freshness = Duration::from_millis(25);
+        let collector = BlockingAgentStatusCollector {
+            started: Arc::new(Notify::new()),
+        };
+
+        let error = observe_once_with_collector(&store, &collector, &targets, &state, freshness)
+            .await
+            .expect_err("the collection must share the complete operation deadline");
 
         assert!(matches!(
             error,
             IdentityBindingError::FreshnessBoundExceeded(bound) if bound == freshness
         ));
-        assert!(clock.next().is_none());
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Unavailable);
+        assert_eq!(snapshot.agent_status.fresh_members, 0);
+        assert_eq!(
+            snapshot.agent_status.failure,
+            Some(AgentStatusFailureReason::FreshnessExpired),
+        );
+    }
+
+    #[tokio::test]
+    async fn published_deadline_is_capped_by_the_initial_scan_deadline() {
+        let (targets, store) = store();
+        let state = observation_state(&targets);
+        let freshness = Duration::from_secs(1);
+        let started_at = std::time::Instant::now();
+        let collector = StubAgentStatusCollector {
+            receipt: started_at + Duration::from_millis(500),
+        };
+        let mut clock = [started_at, started_at].into_iter();
+
+        observe_once_with_collector_and_clock(
+            &store,
+            &collector,
+            &targets,
+            &state,
+            freshness,
+            || clock.next().expect("start and completion readings"),
+        )
+        .await
+        .expect("complete collection inside the shared deadline");
+
         assert_eq!(
             state
-                .snapshot()
+                .snapshot_at_for_test(
+                    (started_at + freshness)
+                        .checked_sub(Duration::from_nanos(1))
+                        .expect("fresh deadline has a preceding instant"),
+                )
+                .topology
+                .expect("topology")
+                .agent_status_collection,
+            AgentStatusCollectionState::FreshDiagnosticEvidence,
+        );
+        assert_eq!(
+            state
+                .snapshot_at_for_test(started_at + freshness)
                 .topology
                 .expect("topology")
                 .agent_status_collection,
             AgentStatusCollectionState::DisabledPodIdentityRequired,
         );
+    }
+
+    #[tokio::test]
+    async fn writable_lease_runtime_shape_accepts_only_exact_pristine_released_or_held_terms() {
+        let (targets, store) = store();
+        let original = store.lease.lock().expect("lease").clone();
+        let held = original.spec.clone().expect("held term");
+        let mut released = held.clone();
+        released.holder_identity = None;
+        for (name, spec) in [
+            ("pristine", LeaseSpec::default()),
+            ("released", released),
+            ("held", held.clone()),
+        ] {
+            let mut candidate = original.clone();
+            candidate.spec = Some(spec);
+            *store.lease.lock().expect("lease") = candidate;
+            bind_once(&store, &targets)
+                .await
+                .unwrap_or_else(|error| panic!("valid {name} Lease rejected: {error}"));
+        }
+
+        let zero_time = MicroTime(
+            k8s_openapi::jiff::Timestamp::new(GO_ZERO_TIME_UNIX_SECONDS, 0)
+                .expect("Go zero timestamp"),
+        );
+        let mut cases = Vec::new();
+        let mut spec = held.clone();
+        spec.holder_identity = None;
+        spec.lease_duration_seconds = None;
+        cases.push(("released without duration", spec));
+        let mut spec = held.clone();
+        spec.holder_identity = None;
+        spec.acquire_time = None;
+        cases.push(("released without acquire time", spec));
+        let mut spec = held.clone();
+        spec.holder_identity = None;
+        spec.renew_time = None;
+        cases.push(("released without renew time", spec));
+        let mut spec = held.clone();
+        spec.holder_identity = None;
+        spec.lease_transitions = None;
+        cases.push(("released without transitions", spec));
+        let mut spec = held.clone();
+        spec.lease_duration_seconds = None;
+        cases.push(("held without duration", spec));
+        let mut spec = held.clone();
+        spec.acquire_time = None;
+        cases.push(("held without acquire time", spec));
+        let mut spec = held.clone();
+        spec.renew_time = None;
+        cases.push(("held without renew time", spec));
+        let mut spec = held.clone();
+        spec.lease_transitions = None;
+        cases.push(("held without transitions", spec));
+        let mut spec = held.clone();
+        spec.lease_duration_seconds = Some(0);
+        cases.push(("zero duration", spec));
+        let mut spec = held.clone();
+        spec.lease_duration_seconds = Some(301);
+        cases.push(("oversized duration", spec));
+        let mut spec = held.clone();
+        spec.acquire_time = Some(zero_time.clone());
+        cases.push(("zero acquire time", spec));
+        let mut spec = held.clone();
+        spec.renew_time = Some(zero_time);
+        cases.push(("zero renew time", spec));
+        let mut spec = held.clone();
+        spec.lease_transitions = Some(0);
+        cases.push(("zero transitions", spec));
+        let mut spec = held.clone();
+        spec.lease_transitions = Some(-1);
+        cases.push(("negative transitions", spec));
+        let mut spec = held.clone();
+        spec.holder_identity = Some(String::new());
+        cases.push(("empty holder", spec));
+        let mut spec = held.clone();
+        spec.preferred_holder = Some("preferred".to_owned());
+        cases.push(("preferred holder", spec));
+        let mut spec = held;
+        spec.strategy = Some("OldestEmulationVersion".to_owned());
+        cases.push(("coordinated strategy", spec));
+
+        for (name, spec) in cases {
+            let mut candidate = original.clone();
+            candidate.spec = Some(spec);
+            *store.lease.lock().expect("lease") = candidate;
+            assert!(
+                matches!(
+                    bind_once(&store, &targets).await,
+                    Err(IdentityBindingError::LeaseIdentityMismatch(_))
+                ),
+                "malformed {name} Lease was accepted",
+            );
+        }
     }
 
     #[tokio::test]
@@ -1494,7 +2054,10 @@ mod tests {
 
         let observed_at = std::time::Instant::now();
         let freshness = Duration::from_secs(1);
-        observe_once_with_clock(&store, &targets, &state, freshness, || observed_at)
+        let collector = StubAgentStatusCollector {
+            receipt: observed_at,
+        };
+        observe_once_with_collector(&store, &collector, &targets, &state, freshness)
             .await
             .expect("initial binding");
         let ready = state.readiness();
@@ -1505,7 +2068,7 @@ mod tests {
                 .topology
                 .expect("topology")
                 .agent_status_collection,
-            AgentStatusCollectionState::DisabledAgentStatusCollectorRequired,
+            AgentStatusCollectionState::FreshDiagnosticEvidence,
         );
         assert_eq!(state.readiness(), ready);
         assert_eq!(
@@ -1518,7 +2081,7 @@ mod tests {
         );
         assert_eq!(state.readiness(), ready);
 
-        observe_once_with_clock(&store, &targets, &state, freshness, || observed_at)
+        observe_once_with_collector(&store, &collector, &targets, &state, freshness)
             .await
             .expect("restore binding for refresh failure");
 
@@ -1546,6 +2109,148 @@ mod tests {
                 .expect("topology")
                 .agent_status_collection,
             AgentStatusCollectionState::DisabledPodIdentityRequired,
+        );
+    }
+
+    #[tokio::test]
+    async fn post_request_identity_change_discards_the_complete_collection() {
+        let (targets, store) = store();
+        let state = OrchState::with_identity_and_topology(
+            OrchestratorIdentity {
+                cluster_id: "demo".to_owned(),
+                orchestrator_id: "demo-orchestrator-0".to_owned(),
+            },
+            1_000,
+            TopologyDiagnostics {
+                schema_version: TOPOLOGY_SCHEMA_VERSION.to_owned(),
+                cluster_object_uid: CLUSTER_UID.to_owned(),
+                shard_count: 1,
+                member_count: targets.len(),
+                agent_status_collection: AgentStatusCollectionState::DisabledPodIdentityRequired,
+            },
+        )
+        .expect("state");
+        let collector = MutatingAgentStatusCollector {
+            store: &store,
+            receipt: std::time::Instant::now(),
+        };
+
+        assert!(matches!(
+            observe_once_with_collector(
+                &store,
+                &collector,
+                &targets,
+                &state,
+                Duration::from_secs(1),
+            )
+            .await,
+            Err(IdentityBindingError::IdentityChanged)
+        ));
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Unavailable);
+        assert_eq!(snapshot.agent_status.fresh_members, 0);
+        assert_eq!(
+            snapshot.agent_status.failure,
+            Some(AgentStatusFailureReason::IdentityChanged)
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_cancels_collection_and_blocks_late_publication() {
+        let (targets, store) = store();
+        let state = OrchState::with_identity_and_topology(
+            OrchestratorIdentity {
+                cluster_id: "demo".to_owned(),
+                orchestrator_id: "demo-orchestrator-0".to_owned(),
+            },
+            1_000,
+            TopologyDiagnostics {
+                schema_version: TOPOLOGY_SCHEMA_VERSION.to_owned(),
+                cluster_object_uid: CLUSTER_UID.to_owned(),
+                shard_count: 1,
+                member_count: targets.len(),
+                agent_status_collection: AgentStatusCollectionState::DisabledPodIdentityRequired,
+            },
+        )
+        .expect("state");
+        let started = Arc::new(Notify::new());
+        let collector = BlockingAgentStatusCollector {
+            started: Arc::clone(&started),
+        };
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let supervision = supervise_with_store(
+            &store,
+            &collector,
+            &targets,
+            &state,
+            &mut shutdown_rx,
+            Duration::from_mins(1),
+            Duration::from_secs(5),
+        );
+        tokio::pin!(supervision);
+        tokio::select! {
+            () = started.notified() => {}
+            () = &mut supervision => panic!("supervisor exited before shutdown"),
+        }
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(100), &mut supervision)
+            .await
+            .expect("shutdown cancellation remains bounded");
+        assert_eq!(
+            state.snapshot().agent_status.phase,
+            AgentStatusPhase::ShuttingDown
+        );
+
+        // Models a completed in-flight request attempting to publish after the
+        // supervisor observed shutdown.
+        assert!(!state.record_agent_status_fresh(
+            targets.len(),
+            std::time::Instant::now() + Duration::from_secs(5),
+        ));
+        state.record_agent_status_failure(AgentStatusFailureReason::StatusUnavailable);
+        assert_eq!(
+            state.snapshot().agent_status.phase,
+            AgentStatusPhase::ShuttingDown
+        );
+    }
+
+    #[test]
+    fn partial_or_older_than_five_seconds_collection_cannot_publish() {
+        let state = OrchState::with_identity_and_topology(
+            OrchestratorIdentity {
+                cluster_id: "demo".to_owned(),
+                orchestrator_id: "demo-orchestrator-0".to_owned(),
+            },
+            1_000,
+            TopologyDiagnostics {
+                schema_version: TOPOLOGY_SCHEMA_VERSION.to_owned(),
+                cluster_object_uid: CLUSTER_UID.to_owned(),
+                shard_count: 1,
+                member_count: 3,
+                agent_status_collection: AgentStatusCollectionState::DisabledPodIdentityRequired,
+            },
+        )
+        .expect("state");
+        let freshness = Duration::from_secs(5);
+
+        state.record_agent_status_collecting(freshness);
+        assert!(!state.record_agent_status_fresh(2, std::time::Instant::now() + freshness,));
+        assert_eq!(
+            state.snapshot().agent_status.phase,
+            AgentStatusPhase::Unavailable
+        );
+
+        state.record_agent_status_collecting(freshness);
+        let earliest_receipt = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(6))
+            .expect("test process has run for at least six seconds");
+        assert!(!state.record_agent_status_fresh(3, earliest_receipt + freshness,));
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Unavailable);
+        assert_eq!(
+            snapshot.agent_status.failure,
+            Some(AgentStatusFailureReason::FreshnessExpired),
         );
     }
 }
