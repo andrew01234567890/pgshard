@@ -204,17 +204,20 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "PostgreSQLRuntimeChangeRejected", fmt.Sprintf("PostgreSQL runtime selection is unsafe: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
-	if err := r.verifyPostgreSQLPodFencingNamespace(ctx, cluster); err != nil {
-		statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing is unavailable: %v", err))
-		return ctrl.Result{}, errors.Join(err, statusErr)
-	}
-	fencingReady, err := r.ensurePostgreSQLPodFencingHandshake(ctx, cluster)
-	if err != nil {
-		statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing admission handshake failed: %v", err))
-		return ctrl.Result{}, errors.Join(err, statusErr)
-	}
-	if !fencingReady {
-		return ctrl.Result{Requeue: true}, nil
+	publishesPostgreSQLPods := cluster.Spec.MembersPerShard == 1 || images.PostgreSQLRuntime == owned.PostgreSQLRuntimeAgentQuarantine
+	if publishesPostgreSQLPods {
+		if err := r.verifyPostgreSQLPodFencingNamespace(ctx, cluster); err != nil {
+			statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing is unavailable: %v", err))
+			return ctrl.Result{}, errors.Join(err, statusErr)
+		}
+		fencingReady, err := r.ensurePostgreSQLPodFencingHandshake(ctx, cluster)
+		if err != nil {
+			statusErr := r.reportFailure(ctx, cluster, "PodFencingUnavailable", fmt.Sprintf("PostgreSQL Pod fencing admission handshake failed: %v", err))
+			return ctrl.Result{}, errors.Join(err, statusErr)
+		}
+		if !fencingReady {
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 	if !controllerutil.ContainsFinalizer(cluster, resourceFinalizer) {
 		controllerutil.AddFinalizer(cluster, resourceFinalizer)
@@ -639,9 +642,6 @@ func validateRetiredEtcdPVC(claim *corev1.PersistentVolumeClaim, cluster *pgshar
 }
 
 func (r *PgShardClusterReconciler) verifyPostgreSQLPodFencingNamespace(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
-	if cluster.Spec.MembersPerShard != 1 {
-		return nil
-	}
 	namespace := &corev1.Namespace{}
 	if err := r.authoritativeReader().Get(ctx, types.NamespacedName{Name: cluster.Namespace}, namespace); err != nil {
 		return fmt.Errorf("read namespace %s before PostgreSQL creation: %w", cluster.Namespace, err)
@@ -656,9 +656,6 @@ func (r *PgShardClusterReconciler) verifyPostgreSQLPodFencingNamespace(ctx conte
 }
 
 func (r *PgShardClusterReconciler) ensurePostgreSQLPodFencingHandshake(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
-	if cluster.Spec.MembersPerShard != 1 {
-		return true, nil
-	}
 	verified, err := r.podFencingHandshakeCodec().Verify(ctx, cluster)
 	if err != nil {
 		return false, fmt.Errorf("verify Pod fencing admission receipt: %w", err)

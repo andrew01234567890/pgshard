@@ -17,7 +17,7 @@ API. The controller now reconciles the safe supporting-resource slice:
   `pgshard.io/role` and `pgshard.io/member` labels, a generated per-shard
   immutable bootstrap credential, and restricted Pod security;
 - for a three- or five-member topology only when the manager explicitly selects
-  `agent-quarantine`, one uninitialized source-storage intent for every stable
+  `agent-quarantine`, one protected source-storage intent for every stable
   physical member using the same exact-UID Secret/PVC lifecycle, plus one
   staged immutable physical-replication credential per shard and one
   role-neutral, non-serving member-zero replication-bootstrap source per shard,
@@ -52,7 +52,8 @@ the Secret tombstone to the PVC. Any workload is published only after that
 ownership inversion is complete. Multi-member status and resource labels key
 that lifecycle by both shard and immutable member. After every storage, Lease,
 and replication-credential checkpoint is complete, the explicit agent runtime
-publishes only member zero as a non-serving bootstrap source. Deleting the
+publishes member zero as a non-serving bootstrap source and every nonzero
+member as a role-neutral physical standby. Deleting the
 Secret therefore cannot cascade to current data, while deleting the protected PVC cascades to the credential
 tombstone and reserves the claim name until every mounting workload has been
 pruned. Original timed-out PVC creates carry the tombstone owner but never the
@@ -548,8 +549,10 @@ per requested physical cell and creates an unmounted least-privilege API
 identity for its future agents, but no PostgreSQL agent is configured to hold
 one by default. A manager started explicitly with
 `--postgresql-runtime=agent-quarantine` composes the bounded token and exact
-Lease identity into each singleton PostgreSQL Pod, but those Pods intentionally
-remain unready and expose no PostgreSQL TCP listener. The manager end-to-end
+Lease identity into each writable source Pod. Physical standbys instead use an
+unprivileged ServiceAccount with no API token or writable-Lease environment.
+All of those Pods intentionally remain unready and expose no ordinary
+PostgreSQL TCP listener. The manager end-to-end
 test checks the exact cluster UID, cell, Lease identity, holder, and transition
 term in PGDATA after initial acquisition, same-container recovery at a higher
 term, and clean-release Pod replacement. Rust supervisor and publication-fault
@@ -567,15 +570,16 @@ same process-table probe must first detect the pinned process while it is known
 to be running, preventing a vacuous absence check.
 
 For the multi-member development sample above, the pooler remains unready,
-application Services have no ready endpoints, no PostgreSQL workload is
-created, and the cluster reports `Ready=False` with
-`PostgreSQLHAUnavailable`. Orchestrator readiness is process-incarnation
-evidence only: durable operation records, shard-term authority, and automated
-failover are not implemented. A default/direct manager creates no PostgreSQL
-storage. An explicitly `agent-quarantine` manager creates only the protected,
-uninitialized source-storage intents for every stable member; it does not start
-the agent or PostgreSQL for a multi-member resource. The named backup PVC is only validated
-configuration; no backup job or repository is created.
+application Services have no ready endpoints, and the cluster reports
+`Ready=False` with `PostgreSQLHAUnavailable`. Orchestrator readiness is
+process-incarnation evidence only: durable operation records, shard-term
+authority, and automated failover are not implemented. A default/direct
+manager creates no PostgreSQL storage. An explicitly `agent-quarantine`
+manager creates the protected storage intents, starts one role-neutral
+replication-bootstrap source, and clones every nonzero member into a
+role-neutral physical standby. Every PostgreSQL Pod remains unready and
+non-serving. The named backup PVC is only validated configuration; no backup
+job or repository is created.
 The manager end-to-end test also pauses reconciliation, deletes the Lease, and
 proves the same orchestrator Pod incarnations lose readiness without restarting.
 Because a recreated Lease has a new API UID, those processes stay fail closed;

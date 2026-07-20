@@ -3,6 +3,7 @@ package podfence
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -304,50 +305,56 @@ func TestBindingAdmissionRejectsPostMutationPathConfusion(t *testing.T) {
 
 func TestHandshakeAttestorAcknowledgesTheCurrentChallenge(t *testing.T) {
 	t.Parallel()
-	scheme := testScheme(t)
-	cluster := &pgshardv1alpha1.PgShardCluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "example", Namespace: "database", UID: "cluster-uid",
-			Annotations: map[string]string{HandshakeChallengeAnnotation: "challenge-a"},
-		},
-		Spec: pgshardv1alpha1.PgShardClusterSpec{MembersPerShard: 1},
-	}
-	raw := marshalObject(t, cluster)
-	codec := NewStaticHandshakeCodec([]byte("0123456789abcdef0123456789abcdef"))
-	response := NewHandshakeAttestor(codec, scheme).Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
-		Operation: admissionv1.Update, Object: runtime.RawExtension{Raw: raw},
-	}})
-	if !response.Allowed {
-		t.Fatalf("fencing handshake denied: %#v", response.Result)
-	}
-	got := &pgshardv1alpha1.PgShardCluster{}
-	if err := json.Unmarshal(applyResponsePatch(t, raw, response), got); err != nil {
-		t.Fatal(err)
-	}
-	verified, err := codec.Verify(context.Background(), got)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !verified {
-		t.Fatalf("fencing handshake receipt = %#v", got.Annotations)
-	}
-	replayed := got.DeepCopy()
-	replayed.UID = "another-cluster-uid"
-	verified, err = codec.Verify(context.Background(), replayed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if verified {
-		t.Fatal("fencing handshake receipt was replayable across cluster UIDs")
-	}
-	missingChallenge := got.DeepCopy()
-	delete(missingChallenge.Annotations, HandshakeChallengeAnnotation)
-	verified, err = codec.Verify(context.Background(), missingChallenge)
-	if err != nil {
-		t.Fatalf("receipt-only handshake verification: %v", err)
-	}
-	if verified {
-		t.Fatal("receipt-only handshake was authenticated without a challenge")
+	for _, members := range []int32{1, 3, 5} {
+		members := members
+		t.Run(fmt.Sprintf("members=%d", members), func(t *testing.T) {
+			t.Parallel()
+			scheme := testScheme(t)
+			cluster := &pgshardv1alpha1.PgShardCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "example", Namespace: "database", UID: "cluster-uid",
+					Annotations: map[string]string{HandshakeChallengeAnnotation: "challenge-a"},
+				},
+				Spec: pgshardv1alpha1.PgShardClusterSpec{MembersPerShard: members},
+			}
+			raw := marshalObject(t, cluster)
+			codec := NewStaticHandshakeCodec([]byte("0123456789abcdef0123456789abcdef"))
+			response := NewHandshakeAttestor(codec, scheme).Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+				Operation: admissionv1.Update, Object: runtime.RawExtension{Raw: raw},
+			}})
+			if !response.Allowed {
+				t.Fatalf("fencing handshake denied: %#v", response.Result)
+			}
+			got := &pgshardv1alpha1.PgShardCluster{}
+			if err := json.Unmarshal(applyResponsePatch(t, raw, response), got); err != nil {
+				t.Fatal(err)
+			}
+			verified, err := codec.Verify(context.Background(), got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !verified {
+				t.Fatalf("fencing handshake receipt = %#v", got.Annotations)
+			}
+			replayed := got.DeepCopy()
+			replayed.UID = "another-cluster-uid"
+			verified, err = codec.Verify(context.Background(), replayed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if verified {
+				t.Fatal("fencing handshake receipt was replayable across cluster UIDs")
+			}
+			missingChallenge := got.DeepCopy()
+			delete(missingChallenge.Annotations, HandshakeChallengeAnnotation)
+			verified, err = codec.Verify(context.Background(), missingChallenge)
+			if err != nil {
+				t.Fatalf("receipt-only handshake verification: %v", err)
+			}
+			if verified {
+				t.Fatal("receipt-only handshake was authenticated without a challenge")
+			}
+		})
 	}
 }
 

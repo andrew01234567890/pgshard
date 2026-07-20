@@ -68,9 +68,6 @@ func (a *HandshakeAttestor) Handle(ctx context.Context, request admission.Reques
 	if err := a.decoder.Decode(request, cluster); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode PgShardCluster fencing handshake: %w", err))
 	}
-	if cluster.Spec.MembersPerShard != 1 {
-		return admission.Allowed("cluster does not publish direct PostgreSQL Pods")
-	}
 	challenge := cluster.Annotations[HandshakeChallengeAnnotation]
 	if challenge == "" {
 		return admission.Allowed("PostgreSQL Pod fencing handshake is unchanged")

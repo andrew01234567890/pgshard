@@ -2480,12 +2480,70 @@ func TestCatalogAccessNearExpiryDegradesReconciliationWithoutRotation(t *testing
 	}
 }
 
-func TestReconcileRefusesSingleMemberPostgreSQLWithoutPodFencingNamespace(t *testing.T) {
+func TestReconcileRefusesPostgreSQLWorkloadsWithoutPodFencingNamespace(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		members int32
+		agent   bool
+	}{
+		{name: "direct singleton", members: 1},
+		{name: "agent multi-member", members: 3, agent: true},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.MembersPerShard = test.members
+			if test.members == 1 {
+				cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			}
+			base := newFakeClient(t, cluster)
+			namespace := &corev1.Namespace{}
+			if err := base.Get(ctx, types.NamespacedName{Name: cluster.Namespace}, namespace); err != nil {
+				t.Fatal(err)
+			}
+			delete(namespace.Labels, podfence.NamespaceLabel)
+			if err := base.Update(ctx, namespace); err != nil {
+				t.Fatal(err)
+			}
+
+			reconciler := developmentReconciler(base, base)
+			if test.agent {
+				reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+			}
+			if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "must be labelled pgshard.io/pod-fencing=enabled") {
+				t.Fatalf("unfenced namespace reconcile error = %v", err)
+			}
+			got := getCluster(t, ctx, base, cluster)
+			assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PodFencingUnavailable")
+			if len(got.Status.PostgreSQLBootstraps) != 0 || controllerutil.ContainsFinalizer(got, resourceFinalizer) {
+				t.Fatalf("unfenced namespace crossed the PostgreSQL creation barrier: status=%#v finalizers=%#v", got.Status, got.Finalizers)
+			}
+			secrets := &corev1.SecretList{}
+			claims := &corev1.PersistentVolumeClaimList{}
+			statefulSets := &appsv1.StatefulSetList{}
+			if err := base.List(ctx, secrets, client.InNamespace(cluster.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if err := base.List(ctx, claims, client.InNamespace(cluster.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if err := base.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if len(secrets.Items) != 0 || len(claims.Items) != 0 || len(statefulSets.Items) != 0 {
+				t.Fatalf("unfenced namespace created PostgreSQL resources: secrets=%d claims=%d StatefulSets=%d", len(secrets.Items), len(claims.Items), len(statefulSets.Items))
+			}
+		})
+	}
+}
+
+func TestReconcileDirectMultiMemberSkipsUnusedPodFencingPreflight(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	cluster := validCluster()
-	cluster.Spec.MembersPerShard = 1
-	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
 	base := newFakeClient(t, cluster)
 	namespace := &corev1.Namespace{}
 	if err := base.Get(ctx, types.NamespacedName{Name: cluster.Namespace}, namespace); err != nil {
@@ -2495,30 +2553,20 @@ func TestReconcileRefusesSingleMemberPostgreSQLWithoutPodFencingNamespace(t *tes
 	if err := base.Update(ctx, namespace); err != nil {
 		t.Fatal(err)
 	}
+	current := getCluster(t, ctx, base, cluster)
+	delete(current.Annotations, podfence.HandshakeChallengeAnnotation)
+	delete(current.Annotations, podfence.HandshakeReceiptAnnotation)
+	if err := base.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
 
 	reconciler := developmentReconciler(base, base)
-	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "must be labelled pgshard.io/pod-fencing=enabled") {
-		t.Fatalf("unfenced namespace reconcile error = %v", err)
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
 	}
 	got := getCluster(t, ctx, base, cluster)
-	assertCondition(t, got, readyCondition, metav1.ConditionFalse, "PodFencingUnavailable")
-	if len(got.Status.PostgreSQLBootstraps) != 0 || controllerutil.ContainsFinalizer(got, resourceFinalizer) {
-		t.Fatalf("unfenced namespace crossed the PostgreSQL creation barrier: status=%#v finalizers=%#v", got.Status, got.Finalizers)
-	}
-	secrets := &corev1.SecretList{}
-	claims := &corev1.PersistentVolumeClaimList{}
-	statefulSets := &appsv1.StatefulSetList{}
-	if err := base.List(ctx, secrets, client.InNamespace(cluster.Namespace)); err != nil {
-		t.Fatal(err)
-	}
-	if err := base.List(ctx, claims, client.InNamespace(cluster.Namespace)); err != nil {
-		t.Fatal(err)
-	}
-	if err := base.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
-		t.Fatal(err)
-	}
-	if len(secrets.Items) != 0 || len(claims.Items) != 0 || len(statefulSets.Items) != 0 {
-		t.Fatalf("unfenced namespace created PostgreSQL resources: secrets=%d claims=%d StatefulSets=%d", len(secrets.Items), len(claims.Items), len(statefulSets.Items))
+	if !controllerutil.ContainsFinalizer(got, resourceFinalizer) || len(got.Status.PostgreSQLBootstraps) != 0 {
+		t.Fatalf("direct multi-member reconciliation = status %#v finalizers %#v", got.Status, got.Finalizers)
 	}
 }
 
@@ -2987,6 +3035,61 @@ func TestReconcileWaitsForPodFencingAdmissionHandshake(t *testing.T) {
 	current = getCluster(t, ctx, base, cluster)
 	if !contains(current.Finalizers, resourceFinalizer) {
 		t.Fatalf("acknowledged fencing handshake did not open creation barrier: %#v", current.Finalizers)
+	}
+}
+
+func TestAgentMultiMemberReconcileWaitsForPodFencingAdmissionHandshake(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	base := newFakeClient(t, cluster)
+	current := getCluster(t, ctx, base, cluster)
+	current.Annotations[podfence.HandshakeChallengeAnnotation] = "forged"
+	current.Annotations[podfence.HandshakeReceiptAnnotation] = "forged"
+	if err := base.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := developmentReconciler(base, base)
+	reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if current.Annotations[podfence.HandshakeChallengeAnnotation] == "" || current.Annotations[podfence.HandshakeChallengeAnnotation] == "forged" || current.Annotations[podfence.HandshakeReceiptAnnotation] != "" || contains(current.Finalizers, resourceFinalizer) || len(current.Status.PostgreSQLBootstraps) != 0 {
+		t.Fatalf("unacknowledged multi-member fencing handshake crossed creation barrier: annotations=%#v finalizers=%#v bootstraps=%#v", current.Annotations, current.Finalizers, current.Status.PostgreSQLBootstraps)
+	}
+
+	codec := podfence.NewStaticHandshakeCodec([]byte(testPodFencingKey))
+	admitted := interceptedClient(t, base, interceptor.Funcs{Patch: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+		if candidate, ok := object.(*pgshardv1alpha1.PgShardCluster); ok {
+			receipt, err := codec.Receipt(ctx, candidate)
+			if err != nil {
+				return err
+			}
+			candidate.Annotations[podfence.HandshakeReceiptAnnotation] = receipt
+		}
+		return kubeClient.Patch(ctx, object, patch, options...)
+	}})
+	reconciler = developmentReconciler(admitted, base)
+	reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	verified, err := codec.Verify(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verified || contains(current.Finalizers, resourceFinalizer) || len(current.Status.PostgreSQLBootstraps) != 0 {
+		t.Fatalf("acknowledged multi-member handshake crossed requeue barrier: annotations=%#v finalizers=%#v bootstraps=%#v", current.Annotations, current.Finalizers, current.Status.PostgreSQLBootstraps)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if !contains(current.Finalizers, resourceFinalizer) || len(current.Status.PostgreSQLBootstraps) == 0 {
+		t.Fatalf("acknowledged multi-member handshake did not open creation barrier: finalizers=%#v bootstraps=%#v", current.Finalizers, current.Status.PostgreSQLBootstraps)
 	}
 }
 
@@ -6185,17 +6288,15 @@ func withPodFencingNamespaces(t *testing.T, objects []client.Object) []client.Ob
 		if cluster.UID == "" {
 			cluster.UID = types.UID(utiluuid.NewUUID())
 		}
-		if cluster.Spec.MembersPerShard == 1 {
-			if cluster.Annotations == nil {
-				cluster.Annotations = make(map[string]string, 2)
-			}
-			cluster.Annotations[podfence.HandshakeChallengeAnnotation] = "test-admission-handshake"
-			receipt, err := podfence.NewStaticHandshakeCodec([]byte(testPodFencingKey)).Receipt(context.Background(), cluster)
-			if err != nil {
-				t.Fatal(err)
-			}
-			cluster.Annotations[podfence.HandshakeReceiptAnnotation] = receipt
+		if cluster.Annotations == nil {
+			cluster.Annotations = make(map[string]string, 2)
 		}
+		cluster.Annotations[podfence.HandshakeChallengeAnnotation] = "test-admission-handshake"
+		receipt, err := podfence.NewStaticHandshakeCodec([]byte(testPodFencingKey)).Receipt(context.Background(), cluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cluster.Annotations[podfence.HandshakeReceiptAnnotation] = receipt
 		namespace := namespaces[cluster.Namespace]
 		if namespace == nil {
 			namespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cluster.Namespace}}

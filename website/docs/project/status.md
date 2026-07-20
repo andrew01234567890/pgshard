@@ -129,15 +129,18 @@ hostname validation, SCRAM channel binding, and a writable catalog primary.
 Finalization deletes and observes that exact key material absent before the
 cluster finalizer is released. In the one-member development topology, catalog
 readiness also makes the explicit shard-zero compatibility relay ready.
-Unsupported HA topologies still use credential-free `bootstrap-unavailable`,
-create no PostgreSQL data plane, and remain application-unready. The
+Unsupported default/direct HA topologies still use credential-free
+`bootstrap-unavailable`, create no PostgreSQL data plane, and remain
+application-unready. Explicit `agent-quarantine` HA instead composes the
+non-serving source and physical standbys described above. The
 compatibility state is evidence only of a raw singleton relay, not pooling,
 shard routing, or HA.
 
 A limited direct-PostgreSQL development slice can be installed from the current
 source. The admission Kustomization installs the CRD, manager, self-managed
-serving certificate, and fail-closed webhook configurations. Direct PostgreSQL
-namespaces must opt into the binding fence with the documented namespace label;
+serving certificate, and fail-closed webhook configurations. Every namespace
+where the selected runtime will publish managed PostgreSQL Pods must opt into
+the binding fence with the documented namespace label;
 the separate certificate-free overlay is only for supporting-controller
 debugging and must not manage PostgreSQL Pods. Automatic admission CA rotation
 is not implemented. Catalog TLS rotation is also absent: its static development
