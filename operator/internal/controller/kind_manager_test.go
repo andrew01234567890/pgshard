@@ -1929,9 +1929,7 @@ func assertKINDSynchronousGenerationWaitsForRemoteReplay(t *testing.T, ctx conte
 		owned.PostgreSQLMemberStatefulSetName(cluster.Name, shard, 2) + "-0",
 	}
 	for _, podName := range standbyPods {
-		if state, err := runPostgreSQLPodQuery(ctx, namespace, podName, "SELECT pg_catalog.pg_wal_replay_pause(); SELECT pg_catalog.pg_get_wal_replay_pause_state();"); err != nil || state != "paused" {
-			t.Fatalf("pause physical replay on %s: state=%q error=%v", podName, state, err)
-		}
+		setPhysicalStandbyReplayPaused(t, ctx, namespace, podName, true)
 	}
 	replayResumed := false
 	t.Cleanup(func() {
@@ -2076,9 +2074,7 @@ func assertKINDSynchronousGenerationWaitsForRemoteReplay(t *testing.T, ctx conte
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	if state, err := runPostgreSQLPodQuery(ctx, namespace, standbyPods[1], "SELECT pg_catalog.pg_wal_replay_resume(); SELECT pg_catalog.pg_get_wal_replay_pause_state();"); err != nil || state != "not paused" {
-		t.Fatalf("resume second synchronous candidate: state=%q error=%v", state, err)
-	}
+	setPhysicalStandbyReplayPaused(t, ctx, namespace, standbyPods[1], false)
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
 		status, err := readStatus(ctx)
 		if err != nil {
@@ -2188,6 +2184,29 @@ func waitForPhysicalStandbyReplay(t *testing.T, ctx context.Context, namespace, 
 		return lastErr == nil && last == want, nil
 	}); err != nil {
 		t.Fatalf("wait for physical replay on Pod %s: %v; want=%q last=%q error=%v", podName, err, want, last, lastErr)
+	}
+}
+
+func setPhysicalStandbyReplayPaused(t *testing.T, ctx context.Context, namespace, podName string, paused bool) {
+	t.Helper()
+	action := "pause"
+	request := "SELECT pg_catalog.pg_wal_replay_pause();"
+	want := "paused"
+	if !paused {
+		action = "resume"
+		request = "SELECT pg_catalog.pg_wal_replay_resume();"
+		want = "not paused"
+	}
+	if _, err := runPostgreSQLPodQuery(ctx, namespace, podName, request); err != nil {
+		t.Fatalf("request physical replay %s on %s: %v", action, podName, err)
+	}
+	var state string
+	var stateErr error
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		state, stateErr = runPostgreSQLPodQuery(ctx, namespace, podName, "SELECT pg_catalog.pg_get_wal_replay_pause_state();")
+		return stateErr == nil && state == want, nil
+	}); err != nil {
+		t.Fatalf("wait for physical replay %s on %s: %v; want=%q state=%q error=%v", action, podName, err, want, state, stateErr)
 	}
 }
 
