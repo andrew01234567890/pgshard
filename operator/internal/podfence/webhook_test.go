@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -103,6 +104,11 @@ func TestBindingAdmissionAcceptsOnlyTheExactRoleNeutralBootstrapSource(t *testin
 	if !IsManagedPostgreSQLPod(pod) {
 		t.Fatalf("exact role-neutral bootstrap source is not managed: %#v", pod.ObjectMeta)
 	}
+	partialSource := pod.DeepCopy()
+	partialSource.Spec.Containers[0].Env = append(partialSource.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_GENERATION_DURABILITY", Value: "remote-apply-any-one"})
+	if IsManagedPostgreSQLPod(partialSource) {
+		t.Fatalf("partial generation upgrade was accepted as a managed bootstrap source: %#v", partialSource.Spec.Containers[0].Env)
+	}
 	standby := roleNeutralStandbyPod()
 	if !IsManagedPostgreSQLPod(standby) {
 		t.Fatalf("exact role-neutral physical standby is not managed: %#v", standby.ObjectMeta)
@@ -154,6 +160,61 @@ func TestBindingAdmissionAcceptsOnlyTheExactRoleNeutralBootstrapSource(t *testin
 	validated = NewBindingValidator(reader, scheme).Handle(context.Background(), request)
 	if validated.Allowed || validated.Result == nil || !strings.Contains(validated.Result.Message, "does not match") {
 		t.Fatalf("present-empty role binding response = %#v", validated)
+	}
+}
+
+func TestBindingAdmissionDeniesNewLegacyBootstrapSourceButRetainsItsLifecycleFence(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	legacy := roleNeutralBootstrapSourcePod()
+	legacy.Spec.NodeName = ""
+	legacy.DeletionTimestamp = nil
+	delete(legacy.Annotations, NodeUIDAnnotation)
+	delete(legacy.Annotations, NodeBootIDAnnotation)
+	delete(legacy.Annotations, owned.PostgreSQLGenerationDurabilityAnnotation)
+	delete(legacy.Annotations, owned.PostgreSQLSynchronousStandbysAnnotation)
+	legacy.Spec.Containers[0].Env = slices.DeleteFunc(legacy.Spec.Containers[0].Env, func(environment corev1.EnvVar) bool {
+		return environment.Name == "PGSHARD_POSTGRES_GENERATION_DURABILITY" || environment.Name == "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES"
+	})
+	if !IsManagedPostgreSQLPod(legacy) {
+		t.Fatal("complete v0.73 bootstrap source lost lifecycle fencing")
+	}
+	if owned.IsCurrentPostgreSQLReplicationBootstrapSourcePod(legacy) {
+		t.Fatal("complete v0.73 bootstrap source was accepted as a current generation")
+	}
+
+	node := testNode("node-a", "node-uid-a", "boot-a")
+	cluster := managedClusterForPod(legacy)
+	cluster.Spec.MembersPerShard = 3
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilitySynchronous
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(legacy, node, cluster).Build()
+	binding := &corev1.Binding{
+		ObjectMeta: metav1.ObjectMeta{Name: legacy.Name, Namespace: legacy.Namespace, UID: legacy.UID},
+		Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+	}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: legacy.Name, Namespace: legacy.Namespace, Operation: admissionv1.Create, SubResource: "binding",
+		Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+	}}
+	for name, handler := range map[string]admission.Handler{
+		"attestor":  NewBindingAttestor(reader, scheme),
+		"validator": NewBindingValidator(reader, scheme),
+	} {
+		response := handler.Handle(context.Background(), request)
+		if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "legacy") {
+			t.Fatalf("%s legacy binding response = %#v", name, response)
+		}
+	}
+
+	boundLegacy := legacy.DeepCopy()
+	boundLegacy.Spec.NodeName = "node-a"
+	boundLegacy.Annotations[NodeUIDAnnotation] = "node-uid-a"
+	boundLegacy.Annotations[NodeBootIDAnnotation] = "boot-a"
+	changed := boundLegacy.DeepCopy()
+	changed.Annotations[NodeUIDAnnotation] = "replacement"
+	response := NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, boundLegacy, changed, ""))
+	if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "immutable") {
+		t.Fatalf("legacy lifecycle identity mutation response = %#v", response)
 	}
 }
 
@@ -714,6 +775,12 @@ func TestRoleNeutralBootstrapSourceIdentityIsImmutable(t *testing.T) {
 		{name: "present-empty role", mutate: func(pod *corev1.Pod) { pod.Labels[owned.RoleLabel] = "" }},
 		{name: "missing runtime annotation", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, owned.PostgreSQLRuntimeAnnotation) }},
 		{name: "empty runtime annotation", mutate: func(pod *corev1.Pod) { pod.Annotations[owned.PostgreSQLRuntimeAnnotation] = "" }},
+		{name: "missing generation durability", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, owned.PostgreSQLGenerationDurabilityAnnotation) }},
+		{name: "changed generation durability", mutate: func(pod *corev1.Pod) { pod.Annotations[owned.PostgreSQLGenerationDurabilityAnnotation] = "local" }},
+		{name: "missing synchronous candidates", mutate: func(pod *corev1.Pod) { delete(pod.Annotations, owned.PostgreSQLSynchronousStandbysAnnotation) }},
+		{name: "changed synchronous candidates", mutate: func(pod *corev1.Pod) {
+			pod.Annotations[owned.PostgreSQLSynchronousStandbysAnnotation] = "pgshard_member_0001"
+		}},
 	} {
 		mutation := mutation
 		for _, subresource := range []string{"", "status"} {
@@ -735,6 +802,38 @@ func TestRoleNeutralBootstrapSourceIdentityIsImmutable(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestGenerationAnnotationCannotBeAFirstStepToEscapeTheLifecycleFence(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	for _, firstSubresource := range []string{"", "status"} {
+		firstSubresource := firstSubresource
+		t.Run(firstSubresource, func(t *testing.T) {
+			t.Parallel()
+			oldPod := roleNeutralBootstrapSourcePod()
+			firstStep := oldPod.DeepCopy()
+			delete(firstStep.Annotations, owned.PostgreSQLGenerationDurabilityAnnotation)
+
+			var firstResponse admission.Response
+			if firstSubresource == "status" {
+				request, _ := statusRequest(t, oldPod, firstStep, "system:node:node-a", []string{"system:nodes"})
+				firstResponse = NewStatusAttestor(fake.NewClientBuilder().WithScheme(scheme).Build(), testCodec(), scheme).Handle(context.Background(), request)
+			} else {
+				firstResponse = NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, firstStep, ""))
+			}
+			if firstResponse.Allowed || firstResponse.Result == nil || !strings.Contains(firstResponse.Result.Message, "identity") {
+				t.Fatalf("first annotation-stripping step through %q response = %#v", firstSubresource, firstResponse)
+			}
+
+			secondStep := firstStep.DeepCopy()
+			secondStep.Finalizers = nil
+			secondResponse := NewMetadataValidator(testCodec(), scheme).Handle(context.Background(), updateRequest(t, oldPod, secondStep, ""))
+			if secondResponse.Allowed || secondResponse.Result == nil || !strings.Contains(secondResponse.Result.Message, "immutable") {
+				t.Fatalf("two-step finalizer escape retry after rejected %q mutation response = %#v", firstSubresource, secondResponse)
+			}
+		})
 	}
 }
 
@@ -783,6 +882,8 @@ func roleNeutralBootstrapSourcePod() *corev1.Pod {
 	pod := managedPod()
 	delete(pod.Labels, owned.RoleLabel)
 	pod.Annotations[owned.PostgreSQLRuntimeAnnotation] = string(owned.PostgreSQLRuntimeAgentQuarantine)
+	pod.Annotations[owned.PostgreSQLGenerationDurabilityAnnotation] = "remote-apply-any-one"
+	pod.Annotations[owned.PostgreSQLSynchronousStandbysAnnotation] = "pgshard_member_0001,pgshard_member_0002"
 	automount := false
 	pod.Spec.AutomountServiceAccountToken = &automount
 	pod.Spec.ServiceAccountName = owned.PostgreSQLAgentServiceAccountName(pod.Labels[owned.ClusterLabel], 0)
@@ -791,6 +892,8 @@ func roleNeutralBootstrapSourcePod() *corev1.Pod {
 		Env: []corev1.EnvVar{
 			{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-bootstrap-primary"},
 			{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"},
+			{Name: "PGSHARD_POSTGRES_GENERATION_DURABILITY", Value: "remote-apply-any-one"},
+			{Name: "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", Value: "pgshard_member_0001,pgshard_member_0002"},
 		},
 		Ports: []corev1.ContainerPort{{Name: "agent-http", ContainerPort: owned.HTTPPort, Protocol: corev1.ProtocolTCP}},
 		VolumeMounts: []corev1.VolumeMount{

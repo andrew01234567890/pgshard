@@ -379,7 +379,7 @@ func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context
 				if !metav1.IsControlledBy(statefulSet, cluster) {
 					return fmt.Errorf("StatefulSet %s is not controlled by PgShardCluster UID %s", name, cluster.UID)
 				}
-				observed, observeErr := owned.ObservePostgreSQLRuntime(statefulSet.Spec.Template.Annotations, statefulSet.Spec.Template.Spec)
+				observed, observeErr := owned.ObservePostgreSQLRuntimeForCluster(cluster, statefulSet.Spec.Template.Annotations, statefulSet.Spec.Template.Spec)
 				if observeErr != nil {
 					return fmt.Errorf("observe StatefulSet %s runtime: %w", name, observeErr)
 				}
@@ -399,7 +399,7 @@ func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context
 			if err != nil {
 				return fmt.Errorf("read Pod %s runtime: %w", podName, err)
 			}
-			observed, observeErr := owned.ObservePostgreSQLRuntime(pod.Annotations, pod.Spec)
+			observed, observeErr := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec)
 			if observeErr != nil {
 				return fmt.Errorf("observe Pod %s runtime: %w", podName, observeErr)
 			}

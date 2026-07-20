@@ -93,8 +93,8 @@ shutdown, Lease loss, publication timeout, and child exit. Only a committed or
 reconciled row followed by one final exact authority check advances the process
 to `RunningQuarantined`.
 
-A private opt-in publication mode exercises the next durability boundary against
-a disposable PostgreSQL 18 primary and physical standby. It commits with
+The synchronous multi-member `agent-quarantine` source now composes the next
+durability boundary. It commits with
 `synchronous_commit=remote_apply`, then captures a primary flush barrier and
 accepts exactly one canonical managed standby identity only while its walsender
 is streaming through its same-named active physical slot and selected as `sync`
@@ -102,10 +102,13 @@ or `quorum`. Both the standby flush and
 replay positions must cover that barrier before the primary row and
 attempt-private authority are rechecked. Missing, duplicate, asynchronous,
 lagging, unknown, disconnected, or changed evidence remains fail closed. The
-live test pauses standby replay, observes the primary publication blocked in
+live tests pause standby replay, observe the primary publication blocked in
 PostgreSQL's synchronous-replication wait, resumes replay, and requires the exact
-row to be readable on the standby before publication returns. The operator and
-agent runtime do not select this mode yet.
+row to be readable on the standby before publication returns. The candidate
+set is derived only from immutable `membersPerShard` and `durability`: exact
+members 1..2 or 1..4 under `ANY 1`. Asynchronous multi-member sources instead
+select explicit local generation durability without synchronous candidates.
+This is a non-serving startup floor, not a serving-traffic guarantee.
 
 With writable coordination enabled,
 every agent shutdown clears local term evidence and immediately enters the
@@ -343,7 +346,10 @@ replication Secret projection. It verifies the checkpointed digest, creates or
 validates the fixed least-privilege SCRAM login, proves the exact password over
 the physical-replication protocol, and immediately reserves one exact slot for
 each other configured member before publishing the durable HBA. The running
-agent has no Secret mount. No standby configuration, PDB, catalog credential,
+agent has no Secret or generated-config mount. Synchronous resources inject
+the exact immutable nonzero-member candidate set and remain Starting until one
+same-named active slot has replayed the generation barrier; asynchronous
+resources use explicit local generation durability. No PDB, catalog credential,
 `primary_conninfo`, or serving endpoint is created on the source. Every
 nonzero member receives one role-neutral singleton standby workload over its
 already-checkpointed PVC. Its init container verifies the credential digest,
@@ -359,7 +365,13 @@ TLS, standby-specific Service, or serving endpoint is created. A missing or
 same-name recreated Secret or PVC fences every physical-member controller
 against the recorded UIDs; changed replication material fails closed against
 its recorded digest. These workloads are not evidence of a serving primary,
-synchronous durability, promotion safety, or HA availability.
+serving-traffic durability, promotion safety, or HA availability.
+
+A v0.73 source Pod remains lifecycle-fenced and locally durable after its
+`OnDelete` template gains this contract. It does not become synchronous in
+place. Explicitly replace member zero after the template update to adopt the
+remote-apply startup floor over the same protected PVC; automated replacement,
+promotion, and serving activation remain unavailable.
 
 Each managed PostgreSQL Pod is created with a cluster-UID-bound termination
 finalizer. Before workload publication, a cluster challenge update proves that

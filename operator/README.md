@@ -121,9 +121,13 @@ projection. Before publishing the durable HBA, it verifies the checkpointed
 material digest, creates or validates the fixed least-privilege
 `pgshard_replication` SCRAM login, proves the exact password over PostgreSQL's
 physical-replication protocol, and reserves one exact physical slot for every
-other configured member. The running agent has no Secret mount. Ordinary SQL
-remains closed and the source remains non-serving, although authenticated
-physical cloning is now possible. Every other member receives one singleton,
+other configured member. The running agent has no Secret or generated-config
+mount. For an asynchronous resource it publishes each writable-generation row
+with local durability. For a synchronous three- or five-member resource it
+derives the exact immutable nonzero-member set, configures `ANY 1`, commits the
+row with `remote_apply`, and remains Starting until one same-named active slot
+has replayed the post-commit barrier. Ordinary SQL remains closed and the
+source remains non-serving. Every other member receives one singleton,
 role-neutral standby workload over its already-checkpointed PVC. Its init
 container verifies the same credential digest, clones from member zero through
 the member's exact slot, publishes the complete clone atomically, and converts
@@ -131,8 +135,17 @@ the raw Secret into one private memory-backed passfile. The running standby
 agent receives that passfile read-only but receives neither the raw Secret nor
 Kubernetes writable-Lease authority; it keeps TCP closed and continuously
 proves recovery. All member Pods remain unready and outside application
-routing. This is non-serving physical bootstrap composition, not evidence of a
-serving primary, synchronous durability, promotion safety, or HA availability.
+routing. This is a synchronous non-serving startup floor where requested, not
+evidence of a serving primary, serving-traffic durability, promotion safety,
+or HA availability.
+
+An existing v0.73 bootstrap-source Pod has no generation-durability settings.
+It remains recognized and termination-fenced while the `OnDelete` StatefulSet
+template is upgraded, but it continues using its earlier local publication
+behavior. After the template update, an operator must explicitly replace that
+member-zero Pod to adopt the synchronous startup floor; the replacement uses
+the same protected PVC and waits for an exact nonzero standby before leaving
+Starting. No automatic serving or promotion transition is implied.
 PostgreSQL StatefulSets use `OnDelete` updates. A controller image, bootstrap
 image, script, or generated-configuration change therefore updates the desired
 template without concurrently deleting every singleton primary. Until a

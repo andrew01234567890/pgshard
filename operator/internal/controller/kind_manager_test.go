@@ -1154,7 +1154,12 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatalf("replication bootstrap source received a serving role: %#v", source.Spec.Template.Labels)
 	}
 	sourceAgent := source.Spec.Template.Spec.Containers[0]
-	if agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_MODE") != "replication-bootstrap-primary" || agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_HBA_FILE") != "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf" {
+	if agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_MODE") != "replication-bootstrap-primary" ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_HBA_FILE") != "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf" ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_GENERATION_DURABILITY") != "remote-apply-any-one" ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES") != "pgshard_member_0001,pgshard_member_0002" ||
+		source.Spec.Template.Annotations[owned.PostgreSQLGenerationDurabilityAnnotation] != "remote-apply-any-one" ||
+		source.Spec.Template.Annotations[owned.PostgreSQLSynchronousStandbysAnnotation] != "pgshard_member_0001,pgshard_member_0002" {
 		t.Fatalf("replication bootstrap source environment = %#v", sourceAgent.Env)
 	}
 	if podContainerHasNamedVolumeMount(sourceAgent.VolumeMounts, "replication-credential") {
@@ -1214,6 +1219,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatalf("replication bootstrap materialized state = %q", replicationState)
 	}
 	assertKINDPhysicalStandbys(t, ctx, kubeClient, haCurrent, sourcePodName)
+	assertKINDSynchronousGenerationWaitsForRemoteReplay(t, ctx, kubeClient, haCurrent, sourcePodName)
 
 	cluster := readSingleMemberSample(t)
 	cluster.Name = "agent-quarantine"
@@ -1904,6 +1910,218 @@ func assertKINDPhysicalStandbys(t *testing.T, ctx context.Context, kubeClient cl
 	}
 	for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
 		waitForPhysicalStandbyReplay(t, ctx, namespace, standbys[member].podName, 2, "after-restart")
+	}
+}
+
+func assertKINDSynchronousGenerationWaitsForRemoteReplay(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster, sourcePodName string) {
+	t.Helper()
+	const shard = int32(0)
+	if cluster.Spec.MembersPerShard != 3 || cluster.Spec.Durability != pgshardv1alpha1.DurabilitySynchronous {
+		t.Fatalf("synchronous generation fixture topology = members %d durability %q", cluster.Spec.MembersPerShard, cluster.Spec.Durability)
+	}
+	if len(cluster.Status.PostgreSQLWritableLeases) != 1 {
+		t.Fatalf("synchronous generation fixture writable Leases = %#v", cluster.Status.PostgreSQLWritableLeases)
+	}
+	checkpoint := cluster.Status.PostgreSQLWritableLeases[0]
+	namespace := cluster.Namespace
+	standbyPods := []string{
+		owned.PostgreSQLMemberStatefulSetName(cluster.Name, shard, 1) + "-0",
+		owned.PostgreSQLMemberStatefulSetName(cluster.Name, shard, 2) + "-0",
+	}
+	for _, podName := range standbyPods {
+		if state, err := runPostgreSQLPodQuery(ctx, namespace, podName, "SELECT pg_catalog.pg_wal_replay_pause(); SELECT pg_catalog.pg_get_wal_replay_pause_state();"); err != nil || state != "paused" {
+			t.Fatalf("pause physical replay on %s: state=%q error=%v", podName, state, err)
+		}
+	}
+	replayResumed := false
+	t.Cleanup(func() {
+		if replayResumed {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		for _, podName := range standbyPods {
+			if _, err := runPostgreSQLPodQuery(cleanupCtx, namespace, podName, "SELECT pg_catalog.pg_wal_replay_resume();"); err != nil {
+				t.Errorf("resume physical replay on %s during cleanup: %v", podName, err)
+			}
+		}
+	})
+
+	leaseKey := types.NamespacedName{Namespace: namespace, Name: checkpoint.LeaseName}
+	initialLease := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, initialLease); err != nil {
+		t.Fatal(err)
+	}
+	if initialLease.Spec.HolderIdentity == nil || initialLease.Spec.LeaseTransitions == nil || initialLease.Spec.RenewTime == nil {
+		t.Fatalf("initial synchronous source Lease = %#v", initialLease.Spec)
+	}
+	initialHolder := *initialLease.Spec.HolderIdentity
+	initialTerm := *initialLease.Spec.LeaseTransitions
+
+	managerRestored := false
+	t.Cleanup(func() {
+		if managerRestored {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		for _, arguments := range [][]string{
+			{"--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1"},
+			{"--namespace", "pgshard-system", "rollout", "status", "deployment/pgshard-controller-manager", "--timeout=120s"},
+		} {
+			output, err := exec.CommandContext(cleanupCtx, "kubectl", arguments...).CombinedOutput()
+			if err != nil {
+				t.Errorf("restore manager with kubectl %s: %v\n%s", strings.Join(arguments, " "), err, output)
+			}
+		}
+	})
+
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=0")
+	waitForManagerReplicas(t, ctx, kubeClient, 0)
+	bindingKey := types.NamespacedName{Namespace: namespace, Name: owned.PostgreSQLAgentServiceAccountName(cluster.Name, shard)}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		binding := &rbacv1.RoleBinding{}
+		err := kubeClient.Get(ctx, bindingKey, binding)
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		uid := binding.UID
+		resourceVersion := binding.ResourceVersion
+		if err := kubeClient.Delete(ctx, binding, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+		return false, nil
+	}); err != nil {
+		t.Fatalf("remove synchronous source Lease permission: %v", err)
+	}
+
+	type sourceStatus struct {
+		PostgresProcess string `json:"postgres_process"`
+	}
+	statusPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/status", namespace, sourcePodName)
+	readStatus := func(ctx context.Context) (sourceStatus, error) {
+		var status sourceStatus
+		output, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
+		if err != nil {
+			return status, fmt.Errorf("read source status: %w: %s", err, output)
+		}
+		if err := json.Unmarshal(output, &status); err != nil {
+			return status, fmt.Errorf("decode source status: %w", err)
+		}
+		return status, nil
+	}
+	var lastStatus sourceStatus
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		status, err := readStatus(ctx)
+		if err != nil {
+			return false, nil
+		}
+		lastStatus = status
+		return status.PostgresProcess == "fenced" || status.PostgresProcess == "validated", nil
+	}); err != nil {
+		t.Fatalf("wait for synchronous source authority fence: %v; status=%#v", err, lastStatus)
+	}
+
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1")
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "rollout", "status", "deployment/pgshard-controller-manager", "--timeout=120s")
+	waitForManagerReplicas(t, ctx, kubeClient, 1)
+	managerRestored = true
+
+	recoveredLease := &coordinationv1.Lease{}
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		recoveredLease = &coordinationv1.Lease{}
+		if err := kubeClient.Get(ctx, leaseKey, recoveredLease); err != nil {
+			return false, err
+		}
+		return recoveredLease.Spec.LeaseTransitions != nil && *recoveredLease.Spec.LeaseTransitions > initialTerm &&
+			recoveredLease.Spec.HolderIdentity != nil && *recoveredLease.Spec.HolderIdentity != initialHolder && recoveredLease.Spec.RenewTime != nil, nil
+	}); err != nil {
+		t.Fatalf("wait for synchronous source higher term: %v; Lease=%#v", err, recoveredLease)
+	}
+	waitTerm := *recoveredLease.Spec.LeaseTransitions
+	waitHolder := *recoveredLease.Spec.HolderIdentity
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		status, err := readStatus(ctx)
+		if err != nil {
+			return false, nil
+		}
+		lastStatus = status
+		return status.PostgresProcess == "starting_replication_bootstrap", nil
+	}); err != nil {
+		t.Fatalf("wait for synchronous source publication start: %v; status=%#v", err, lastStatus)
+	}
+
+	// Local generation publication is capped at ten seconds. Holding both
+	// standbys' replay paused beyond that boundary proves the composed remote
+	// path remains Starting and is governed by Lease/shutdown authority instead.
+	waitDeadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		status, err := readStatus(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.PostgresProcess != "starting_replication_bootstrap" {
+			t.Fatalf("synchronous source left Starting before remote replay: %#v", status)
+		}
+		stableLease := &coordinationv1.Lease{}
+		if err := kubeClient.Get(ctx, leaseKey, stableLease); err != nil {
+			t.Fatal(err)
+		}
+		if stableLease.Spec.LeaseTransitions == nil || *stableLease.Spec.LeaseTransitions != waitTerm || stableLease.Spec.HolderIdentity == nil || *stableLease.Spec.HolderIdentity != waitHolder {
+			t.Fatalf("synchronous source churned Lease term while awaiting replay: %#v", stableLease.Spec)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if state, err := runPostgreSQLPodQuery(ctx, namespace, standbyPods[1], "SELECT pg_catalog.pg_wal_replay_resume(); SELECT pg_catalog.pg_get_wal_replay_pause_state();"); err != nil || state != "not paused" {
+		t.Fatalf("resume second synchronous candidate: state=%q error=%v", state, err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		status, err := readStatus(ctx)
+		if err != nil {
+			return false, nil
+		}
+		lastStatus = status
+		return status.PostgresProcess == "running_replication_bootstrap", nil
+	}); err != nil {
+		t.Fatalf("wait for synchronous source after candidate replay: %v; status=%#v", err, lastStatus)
+	}
+	finalLease := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, finalLease); err != nil {
+		t.Fatal(err)
+	}
+	if finalLease.Spec.LeaseTransitions == nil || *finalLease.Spec.LeaseTransitions != waitTerm || finalLease.Spec.HolderIdentity == nil || *finalLease.Spec.HolderIdentity != waitHolder {
+		t.Fatalf("synchronous source changed Lease term across remote publication: %#v", finalLease.Spec)
+	}
+
+	synchronousState, err := runPostgreSQLPodQuery(ctx, namespace, sourcePodName, "SELECT pg_catalog.current_setting('synchronous_standby_names') || '|' || pg_catalog.current_setting('synchronous_commit') || '|' || (EXISTS (SELECT 1 FROM pg_catalog.pg_stat_replication WHERE application_name = 'pgshard_member_0002' AND state = 'streaming' AND sync_state IN ('sync', 'quorum')))::text;")
+	if err != nil || synchronousState != "ANY 1 (pgshard_member_0001, pgshard_member_0002)|local|true" {
+		t.Fatalf("active synchronous source contract = %q, error=%v", synchronousState, err)
+	}
+	sourceGeneration, err := runPostgreSQLPodQuery(ctx, namespace, sourcePodName, "SELECT pg_catalog.encode(generation, 'hex') FROM pgshard_internal.writable_generation WHERE singleton;")
+	if err != nil || sourceGeneration == "" {
+		t.Fatalf("read source generation row: bytes=%q error=%v", sourceGeneration, err)
+	}
+	standbyGeneration, err := runPostgreSQLPodQuery(ctx, namespace, standbyPods[1], "SELECT pg_catalog.encode(generation, 'hex') FROM pgshard_internal.writable_generation WHERE singleton;")
+	if err != nil || standbyGeneration != sourceGeneration {
+		t.Fatalf("synchronous generation was not replayed to second candidate: source=%q standby=%q error=%v", sourceGeneration, standbyGeneration, err)
+	}
+	if _, err := runPostgreSQLPodQuery(ctx, namespace, standbyPods[0], "SELECT pg_catalog.pg_wal_replay_resume();"); err != nil {
+		t.Fatalf("resume first synchronous candidate: %v", err)
+	}
+	replayResumed = true
+	for member, podName := range standbyPods {
+		assertKINDPhysicalStandbyFailClosed(t, ctx, kubeClient, namespace, podName, int32(member+1))
+	}
+	sourcePod := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: sourcePodName}, sourcePod); err != nil {
+		t.Fatal(err)
+	}
+	if podReady(sourcePod) || sourcePod.Status.ContainerStatuses[0].Ready {
+		t.Fatalf("synchronous source became routable: conditions=%#v containers=%#v", sourcePod.Status.Conditions, sourcePod.Status.ContainerStatuses)
 	}
 }
 
