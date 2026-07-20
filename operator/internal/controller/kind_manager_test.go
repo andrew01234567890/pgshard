@@ -2339,13 +2339,18 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 				} `json:"topology"`
 			}
 			statusPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/status", cluster.Namespace, pod.Name)
-			output, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
+			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			output, err := exec.CommandContext(requestCtx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
+			cancel()
 			if err != nil || json.Unmarshal(output, &snapshot) != nil || snapshot.Topology == nil || snapshot.Topology.AgentStatusCollection != wantedCollectionState || !snapshot.CoordinationReady {
 				lastObservation = fmt.Sprintf("orchestrator %s status error=%v output=%q snapshot=%#v", pod.Name, err, output, snapshot)
 				continue
 			}
 			readyPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/readyz", cluster.Namespace, pod.Name)
-			if output, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", readyPath).CombinedOutput(); err != nil {
+			requestCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
+			output, err = exec.CommandContext(requestCtx, "kubectl", "get", "--raw", readyPath).CombinedOutput()
+			cancel()
+			if err != nil {
 				lastObservation = fmt.Sprintf("orchestrator %s readiness changed after diagnostic binding: %v output=%q", pod.Name, err, output)
 				continue
 			}
