@@ -3051,6 +3051,8 @@ func TestAgentQuarantineExplicitlyScopesOrchestratorIdentityObservation(t *testi
 		{APIGroups: []string{corev1.GroupName}, Resources: []string{"pods"}, ResourceNames: []string{"demo-shard-0000-0", "demo-shard-0000-m0001-0", "demo-shard-0000-m0002-0", "demo-shard-0001-0", "demo-shard-0001-m0001-0", "demo-shard-0001-m0002-0"}, Verbs: []string{"get"}},
 		{APIGroups: []string{corev1.GroupName}, Resources: []string{"endpoints"}, ResourceNames: []string{"demo-shard-0000", "demo-shard-0001"}, Verbs: []string{"get"}},
 		{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{"demo-shard-0000-term", "demo-shard-0001-term"}, Verbs: []string{"get"}},
+		{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardclusters/status"}, ResourceNames: []string{"demo"}, Verbs: []string{"get"}},
+		{APIGroups: []string{corev1.GroupName}, Resources: []string{"configmaps"}, ResourceNames: []string{"demo-shard-0000-cfg", "demo-shard-0000-m0001-cfg", "demo-shard-0000-m0002-cfg"}, Verbs: []string{"get"}},
 	}
 	if !reflect.DeepEqual(role.Rules, wantRules) {
 		t.Fatalf("agent-quarantine identity-observation Role is not exact: %#v", role.Rules)

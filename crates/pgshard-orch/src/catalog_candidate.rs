@@ -1,0 +1,1703 @@
+//! Diagnostic-only observation of inert shard-zero catalog candidates.
+//!
+//! This module validates immutable operator publications. It does not read
+//! referenced Secrets or PVCs, mount candidate data, connect to `PostgreSQL`, or
+//! grant serving, routing, writable, promotion, failover, or bootstrap authority.
+
+use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
+use std::time::{Duration, Instant};
+
+use k8s_openapi::api::core::v1::ConfigMap;
+use kube::Client;
+use kube::api::{Api, DynamicObject};
+use kube::config::Config;
+use kube::core::{ApiResource, GroupVersionKind};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use tokio::sync::watch;
+
+use crate::domain::{CatalogCandidateFailureReason, OrchState};
+use crate::topology::{CatalogCandidateObservationPlan, CatalogCandidateTopologyMember};
+
+const CANDIDATE_SCHEMA_VERSION: &str = "pgshard.catalog-bootstrap-candidate.v1";
+const CANDIDATE_PAYLOAD_KEY: &str = "candidate.json";
+const MAXIMUM_CANDIDATE_PAYLOAD_BYTES: usize = 16 * 1_024;
+const MAXIMUM_CANDIDATE_FRESHNESS: Duration = Duration::from_secs(5);
+const CANDIDATE_PAYLOAD_DOMAIN: &[u8] = b"pgshard-catalog-bootstrap-candidate-payload-v1\0";
+const DISCOVERY_TOPOLOGY_DOMAIN: &[u8] = b"pgshard-catalog-candidate-discovery-topology-v1\0";
+
+const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
+const INSTANCE_LABEL: &str = "app.kubernetes.io/instance";
+const COMPONENT_LABEL: &str = "app.kubernetes.io/component";
+const CLUSTER_LABEL: &str = "pgshard.io/cluster";
+const SHARD_LABEL: &str = "pgshard.io/shard";
+const MEMBER_LABEL: &str = "pgshard.io/member";
+const ROLE_LABEL: &str = "pgshard.io/role";
+const APPLY_OWNERSHIP_ANNOTATION: &str = "pgshard.io/apply-ownership";
+const CONFIG_HASH_ANNOTATION: &str = "pgshard.io/config-hash";
+
+/// Runs the independent, diagnostic-only candidate observer until shutdown.
+pub async fn supervise(
+    plan: CatalogCandidateObservationPlan,
+    state: OrchState,
+    mut shutdown: watch::Receiver<bool>,
+    request_timeout: Duration,
+    retry_period: Duration,
+    freshness: Duration,
+) {
+    state.record_catalog_candidates_collecting(plan.members.len(), freshness);
+    if validate_plan(&plan, freshness).is_err() {
+        state.record_catalog_candidate_failure(CatalogCandidateFailureReason::ValidationFailed);
+        wait_until_shutdown(&mut shutdown).await;
+        state.record_catalog_candidate_shutdown();
+        return;
+    }
+    let store = match KubernetesCandidateStore::new(&plan, request_timeout) {
+        Ok(store) => store,
+        Err(error) => {
+            state.record_catalog_candidate_failure(error.failure_reason());
+            tracing::warn!(reason = %error, "catalog-candidate observation disabled");
+            wait_until_shutdown(&mut shutdown).await;
+            state.record_catalog_candidate_shutdown();
+            return;
+        }
+    };
+    supervise_with_store(
+        &store,
+        &plan,
+        &state,
+        &mut shutdown,
+        retry_period,
+        freshness,
+    )
+    .await;
+    state.record_catalog_candidate_shutdown();
+}
+
+async fn supervise_with_store<S: CandidateStore>(
+    store: &S,
+    plan: &CatalogCandidateObservationPlan,
+    state: &OrchState,
+    shutdown: &mut watch::Receiver<bool>,
+    retry_period: Duration,
+    freshness: Duration,
+) {
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let result = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            result = observe_once(store, plan, state, freshness) => result,
+        };
+        if let Err(error) = result {
+            tracing::warn!(reason = %error, "catalog-candidate diagnostics unavailable");
+        }
+        if wait_or_stop(shutdown, retry_period).await {
+            break;
+        }
+    }
+    state.record_catalog_candidate_shutdown();
+}
+
+async fn observe_once<S: CandidateStore>(
+    store: &S,
+    plan: &CatalogCandidateObservationPlan,
+    state: &OrchState,
+    freshness: Duration,
+) -> Result<(), CatalogCandidateError> {
+    state.record_catalog_candidates_collecting(plan.members.len(), freshness);
+    let started = Instant::now();
+    let result = async {
+        let before = read_bound_candidates(store, plan).await?;
+        let after = read_bound_candidates(store, plan).await?;
+        if before != after {
+            return Err(CatalogCandidateError::EvidenceChanged);
+        }
+        let deadline = started
+            .checked_add(freshness)
+            .ok_or(CatalogCandidateError::FreshnessExpired)?;
+        if !state.record_catalog_candidates_fresh(plan.members.len(), deadline) {
+            return Err(CatalogCandidateError::FreshnessExpired);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = &result {
+        state.record_catalog_candidate_failure(error.failure_reason());
+    }
+    result
+}
+
+async fn read_bound_candidates<S: CandidateStore>(
+    store: &S,
+    plan: &CatalogCandidateObservationPlan,
+) -> Result<BoundCandidateSet, CatalogCandidateError> {
+    let cluster = store.get_cluster_status().await?;
+    let status = validate_cluster_status(&cluster, plan)?;
+    let mut objects = Vec::with_capacity(plan.members.len());
+    for (member, checkpoint) in plan.members.iter().zip(&status.candidates) {
+        let configuration = store.get_candidate(&checkpoint.config_map_name).await?;
+        objects.push(validate_candidate(
+            &configuration,
+            plan,
+            member,
+            checkpoint,
+            &status,
+        )?);
+    }
+    validate_candidate_set(&objects)?;
+    Ok(BoundCandidateSet {
+        cluster: status.fingerprint,
+        candidates: objects,
+    })
+}
+
+fn validate_plan(
+    plan: &CatalogCandidateObservationPlan,
+    freshness: Duration,
+) -> Result<(), CatalogCandidateError> {
+    if !matches!(plan.members.len(), 3 | 5)
+        || plan.shard_count == 0
+        || freshness.is_zero()
+        || freshness > MAXIMUM_CANDIDATE_FRESHNESS
+        || !valid_name(&plan.cluster_id)
+        || !valid_name(&plan.namespace)
+        || !valid_uid(&plan.cluster_uid)
+        || !valid_name(&plan.topology_config_map)
+        || !valid_name(&plan.writable_lease_name)
+        || !valid_uid(&plan.writable_lease_uid)
+    {
+        return Err(CatalogCandidateError::InvalidPlan);
+    }
+    for (ordinal, member) in plan.members.iter().enumerate() {
+        if member.ordinal != u32::try_from(ordinal).unwrap_or(u32::MAX)
+            || !valid_name(&member.config_map_name())
+        {
+            return Err(CatalogCandidateError::InvalidPlan);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundCandidateSet {
+    cluster: ClusterFingerprint,
+    candidates: Vec<CandidateFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClusterFingerprint {
+    uid: String,
+    resource_version: String,
+    generation: i64,
+    status: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidateFingerprint {
+    name: String,
+    uid: String,
+    resource_version: String,
+    payload_sha256: String,
+    document: CandidateDocumentV1,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedClusterStatus {
+    fingerprint: ClusterFingerprint,
+    candidates: Vec<CandidateCheckpoint>,
+    bootstraps: Vec<BootstrapCheckpoint>,
+    writable_lease: ObjectReference,
+    replication_credential: MaterialReference,
+    catalog_access: CatalogAccessReference,
+}
+
+fn validate_cluster_status(
+    cluster: &DynamicObject,
+    plan: &CatalogCandidateObservationPlan,
+) -> Result<ValidatedClusterStatus, CatalogCandidateError> {
+    let types = cluster
+        .types
+        .as_ref()
+        .ok_or(CatalogCandidateError::InvalidClusterStatus)?;
+    if types.api_version != "pgshard.io/v1alpha1" || types.kind != "PgShardCluster" {
+        return Err(CatalogCandidateError::InvalidClusterStatus);
+    }
+    let metadata = &cluster.metadata;
+    let uid = exact_metadata_value(metadata.uid.as_deref(), &plan.cluster_uid)?;
+    let resource_version = require_resource_version(metadata.resource_version.as_deref())?;
+    let generation = metadata
+        .generation
+        .filter(|generation| *generation > 0)
+        .ok_or(CatalogCandidateError::InvalidClusterStatus)?;
+    if metadata.name.as_deref() != Some(plan.cluster_id.as_str())
+        || metadata.namespace.as_deref() != Some(plan.namespace.as_str())
+        || metadata.deletion_timestamp.is_some()
+    {
+        return Err(CatalogCandidateError::InvalidClusterStatus);
+    }
+    let status_value = cluster
+        .data
+        .get("status")
+        .cloned()
+        .ok_or(CatalogCandidateError::InvalidClusterStatus)?;
+    let status: ClusterStatus = serde_json::from_value(status_value.clone())?;
+    if status.observed_generation != generation
+        || status.bootstrap_spec.shards != plan.shard_count
+        || status.bootstrap_spec.members_per_shard != plan.members.len()
+        || status.bootstrap_spec.postgresql_runtime != "agent-quarantine"
+        || status.bootstrap_spec.durability
+            != if plan.synchronous_durability {
+                "Synchronous"
+            } else {
+                "Asynchronous"
+            }
+        || !matches!(
+            status.phase.as_str(),
+            "Pending" | "Reconciling" | "Ready" | "Degraded"
+        )
+        || status.conditions.len() > 32
+        || !valid_digest(&status.bootstrap_spec.database_topology_sha256)
+        || status.bootstrap_spec.storage_size.is_empty()
+        || status.bootstrap_spec.storage_size.len() > 64
+        || status
+            .bootstrap_spec
+            .storage_class_name
+            .as_ref()
+            .is_some_and(|name| name.len() > 253)
+        || !matches!(
+            status.bootstrap_spec.deletion_policy.as_str(),
+            "Retain" | "Delete"
+        )
+    {
+        return Err(CatalogCandidateError::InvalidClusterStatus);
+    }
+    let candidates = validate_candidate_checkpoints(&status.catalog_candidates, plan)?;
+    let bootstraps = validate_bootstrap_checkpoints(&status.bootstraps, plan)?;
+    let writable_lease = select_writable_lease(&status.writable_leases, plan)?;
+    let replication_credential =
+        select_replication_credential(&status.replication_credentials, plan)?;
+    let catalog_access = validate_catalog_access(status.catalog_access)?;
+    Ok(ValidatedClusterStatus {
+        fingerprint: ClusterFingerprint {
+            uid: uid.to_owned(),
+            resource_version: resource_version.to_owned(),
+            generation,
+            status: status_value,
+        },
+        candidates,
+        bootstraps,
+        writable_lease,
+        replication_credential,
+        catalog_access,
+    })
+}
+
+fn validate_candidate_checkpoints(
+    checkpoints: &[CandidateCheckpoint],
+    plan: &CatalogCandidateObservationPlan,
+) -> Result<Vec<CandidateCheckpoint>, CatalogCandidateError> {
+    if checkpoints.len() != plan.members.len() {
+        return Err(CatalogCandidateError::InvalidCheckpointSet);
+    }
+    let mut ordered = vec![None; plan.members.len()];
+    let mut names = HashSet::with_capacity(checkpoints.len());
+    let mut uids = HashSet::with_capacity(checkpoints.len());
+    let mut digests = HashSet::with_capacity(checkpoints.len());
+    for checkpoint in checkpoints {
+        let Some(member) = plan.members.get(checkpoint.member) else {
+            return Err(CatalogCandidateError::InvalidCheckpointSet);
+        };
+        if checkpoint.config_map_name != member.config_map_name()
+            || !valid_uid(&checkpoint.config_map_uid)
+            || !valid_digest(&checkpoint.payload_sha256)
+            || !names.insert(checkpoint.config_map_name.as_str())
+            || !uids.insert(checkpoint.config_map_uid.as_str())
+            || !digests.insert(checkpoint.payload_sha256.as_str())
+            || ordered[checkpoint.member]
+                .replace(checkpoint.clone())
+                .is_some()
+        {
+            return Err(CatalogCandidateError::InvalidCheckpointSet);
+        }
+    }
+    ordered
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(CatalogCandidateError::InvalidCheckpointSet)
+}
+
+fn validate_bootstrap_checkpoints(
+    checkpoints: &[BootstrapCheckpoint],
+    plan: &CatalogCandidateObservationPlan,
+) -> Result<Vec<BootstrapCheckpoint>, CatalogCandidateError> {
+    let checkpoint_count = plan
+        .shard_count
+        .checked_mul(plan.members.len())
+        .ok_or(CatalogCandidateError::InvalidCheckpointSet)?;
+    if checkpoints.len() != checkpoint_count {
+        return Err(CatalogCandidateError::InvalidCheckpointSet);
+    }
+    let mut ordered = vec![None; checkpoint_count];
+    let mut secret_names = HashSet::with_capacity(checkpoints.len());
+    let mut secret_uids = HashSet::with_capacity(checkpoints.len());
+    let mut pvc_names = HashSet::with_capacity(checkpoints.len());
+    let mut pvc_uids = HashSet::with_capacity(checkpoints.len());
+    for checkpoint in checkpoints {
+        if checkpoint.shard >= plan.shard_count
+            || checkpoint.member >= plan.members.len()
+            || !valid_name(&checkpoint.secret_name)
+            || !valid_uid(&checkpoint.secret_uid)
+            || !checkpoint.pvc_fence_detached
+            || checkpoint.pvc_creation_abandoned
+            || !valid_name(&checkpoint.pvc_name)
+            || !valid_uid(&checkpoint.pvc_uid)
+            || checkpoint.pvc_storage_class_name.is_none()
+            || !secret_names.insert(checkpoint.secret_name.as_str())
+            || !secret_uids.insert(checkpoint.secret_uid.as_str())
+            || !pvc_names.insert(checkpoint.pvc_name.as_str())
+            || !pvc_uids.insert(checkpoint.pvc_uid.as_str())
+        {
+            return Err(CatalogCandidateError::InvalidCheckpointSet);
+        }
+        let index = checkpoint
+            .shard
+            .checked_mul(plan.members.len())
+            .and_then(|index| index.checked_add(checkpoint.member))
+            .ok_or(CatalogCandidateError::InvalidCheckpointSet)?;
+        if ordered[index].replace(checkpoint.clone()).is_some() {
+            return Err(CatalogCandidateError::InvalidCheckpointSet);
+        }
+    }
+    ordered
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .map(|ordered| ordered.into_iter().take(plan.members.len()).collect())
+        .ok_or(CatalogCandidateError::InvalidCheckpointSet)
+}
+
+fn select_writable_lease(
+    checkpoints: &[WritableLeaseCheckpoint],
+    plan: &CatalogCandidateObservationPlan,
+) -> Result<ObjectReference, CatalogCandidateError> {
+    if checkpoints.len() != plan.shard_count {
+        return Err(CatalogCandidateError::InvalidCheckpointSet);
+    }
+    let mut ordered = vec![None; plan.shard_count];
+    let mut names = HashSet::with_capacity(checkpoints.len());
+    let mut uids = HashSet::with_capacity(checkpoints.len());
+    for checkpoint in checkpoints {
+        if checkpoint.shard >= plan.shard_count
+            || !valid_name(&checkpoint.lease_name)
+            || !valid_uid(&checkpoint.lease_uid)
+            || !names.insert(checkpoint.lease_name.as_str())
+            || !uids.insert(checkpoint.lease_uid.as_str())
+            || ordered[checkpoint.shard]
+                .replace(ObjectReference {
+                    name: checkpoint.lease_name.clone(),
+                    uid: checkpoint.lease_uid.clone(),
+                })
+                .is_some()
+        {
+            return Err(CatalogCandidateError::InvalidCheckpointSet);
+        }
+    }
+    let checkpoint = ordered
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(CatalogCandidateError::InvalidCheckpointSet)?
+        .into_iter()
+        .next()
+        .ok_or(CatalogCandidateError::InvalidCheckpointSet)?;
+    if checkpoint.name != plan.writable_lease_name || checkpoint.uid != plan.writable_lease_uid {
+        return Err(CatalogCandidateError::InvalidCheckpointSet);
+    }
+    Ok(checkpoint)
+}
+
+fn select_replication_credential(
+    checkpoints: &[ReplicationCredentialCheckpoint],
+    plan: &CatalogCandidateObservationPlan,
+) -> Result<MaterialReference, CatalogCandidateError> {
+    if checkpoints.len() != plan.shard_count {
+        return Err(CatalogCandidateError::InvalidCheckpointSet);
+    }
+    let mut ordered = vec![None; plan.shard_count];
+    let mut names = HashSet::with_capacity(checkpoints.len());
+    let mut uids = HashSet::with_capacity(checkpoints.len());
+    for checkpoint in checkpoints {
+        if checkpoint.shard >= plan.shard_count
+            || !valid_name(&checkpoint.secret_name)
+            || !valid_uid(&checkpoint.secret_uid)
+            || !valid_digest(&checkpoint.material_sha256)
+            || !names.insert(checkpoint.secret_name.as_str())
+            || !uids.insert(checkpoint.secret_uid.as_str())
+            || ordered[checkpoint.shard]
+                .replace(MaterialReference {
+                    name: checkpoint.secret_name.clone(),
+                    uid: checkpoint.secret_uid.clone(),
+                    material_sha256: checkpoint.material_sha256.clone(),
+                })
+                .is_some()
+        {
+            return Err(CatalogCandidateError::InvalidCheckpointSet);
+        }
+    }
+    ordered
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(CatalogCandidateError::InvalidCheckpointSet)?
+        .into_iter()
+        .next()
+        .ok_or(CatalogCandidateError::InvalidCheckpointSet)
+}
+
+fn validate_catalog_access(
+    checkpoint: CatalogAccessCheckpoint,
+) -> Result<CatalogAccessReference, CatalogCandidateError> {
+    if !valid_name(&checkpoint.secret_name)
+        || !valid_uid(&checkpoint.secret_uid)
+        || !valid_digest(&checkpoint.client_sha256)
+        || !valid_digest(&checkpoint.server_sha256)
+    {
+        return Err(CatalogCandidateError::InvalidCheckpointSet);
+    }
+    Ok(CatalogAccessReference {
+        name: checkpoint.secret_name,
+        uid: checkpoint.secret_uid,
+        client_sha256: checkpoint.client_sha256,
+        server_sha256: checkpoint.server_sha256,
+    })
+}
+
+fn validate_candidate(
+    configuration: &ConfigMap,
+    plan: &CatalogCandidateObservationPlan,
+    member: &CatalogCandidateTopologyMember,
+    checkpoint: &CandidateCheckpoint,
+    status: &ValidatedClusterStatus,
+) -> Result<CandidateFingerprint, CatalogCandidateError> {
+    let expected_name = member.config_map_name();
+    let metadata = &configuration.metadata;
+    if metadata.name.as_deref() != Some(expected_name.as_str())
+        || metadata.namespace.as_deref() != Some(plan.namespace.as_str())
+        || metadata.uid.as_deref() != Some(checkpoint.config_map_uid.as_str())
+        || metadata.deletion_timestamp.is_some()
+        || metadata
+            .finalizers
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
+        || configuration.immutable != Some(true)
+        || configuration
+            .binary_data
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
+    {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    let uid = require_uid(metadata.uid.as_deref())?;
+    let resource_version = require_resource_version(metadata.resource_version.as_deref())?;
+    validate_candidate_metadata(configuration, plan, member, checkpoint)?;
+    let data = configuration
+        .data
+        .as_ref()
+        .ok_or(CatalogCandidateError::InvalidCandidate)?;
+    if data.len() != 1 {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    let payload = data
+        .get(CANDIDATE_PAYLOAD_KEY)
+        .ok_or(CatalogCandidateError::InvalidCandidate)?;
+    if payload.is_empty()
+        || payload.len() > MAXIMUM_CANDIDATE_PAYLOAD_BYTES
+        || !payload.ends_with('\n')
+        || payload
+            .strip_suffix('\n')
+            .is_none_or(|body| body.ends_with('\n'))
+    {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    let document: CandidateDocumentV1 = serde_json::from_slice(payload.as_bytes())?;
+    let mut canonical = serde_json::to_vec(&document)?;
+    canonical.push(b'\n');
+    if canonical != payload.as_bytes() {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    let payload_sha256 = domain_digest(CANDIDATE_PAYLOAD_DOMAIN, payload.as_bytes());
+    if payload_sha256 != checkpoint.payload_sha256 {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    validate_candidate_document(&document, plan, member, status)?;
+    Ok(CandidateFingerprint {
+        name: expected_name,
+        uid: uid.to_owned(),
+        resource_version: resource_version.to_owned(),
+        payload_sha256,
+        document,
+    })
+}
+
+fn validate_candidate_metadata(
+    configuration: &ConfigMap,
+    plan: &CatalogCandidateObservationPlan,
+    member: &CatalogCandidateTopologyMember,
+    checkpoint: &CandidateCheckpoint,
+) -> Result<(), CatalogCandidateError> {
+    let expected_labels = BTreeMap::from([
+        ("app.kubernetes.io/name".to_owned(), "pgshard".to_owned()),
+        (MANAGED_BY_LABEL.to_owned(), "pgshard-operator".to_owned()),
+        (INSTANCE_LABEL.to_owned(), plan.cluster_id.clone()),
+        (
+            COMPONENT_LABEL.to_owned(),
+            "postgresql-catalog-bootstrap".to_owned(),
+        ),
+        (CLUSTER_LABEL.to_owned(), plan.cluster_id.clone()),
+        (SHARD_LABEL.to_owned(), "0000".to_owned()),
+        (MEMBER_LABEL.to_owned(), format!("{:04}", member.ordinal)),
+    ]);
+    let expected_annotations = BTreeMap::from([
+        (APPLY_OWNERSHIP_ANNOTATION.to_owned(), "v1".to_owned()),
+        (
+            CONFIG_HASH_ANNOTATION.to_owned(),
+            checkpoint.payload_sha256.clone(),
+        ),
+    ]);
+    if configuration.metadata.labels.as_ref() != Some(&expected_labels)
+        || configuration.metadata.annotations.as_ref() != Some(&expected_annotations)
+        || configuration
+            .metadata
+            .labels
+            .as_ref()
+            .is_some_and(|labels| labels.contains_key(ROLE_LABEL))
+    {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    let owners = configuration
+        .metadata
+        .owner_references
+        .as_deref()
+        .ok_or(CatalogCandidateError::InvalidCandidate)?;
+    if owners.len() != 1 {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    let owner = &owners[0];
+    if owner.api_version != "pgshard.io/v1alpha1"
+        || owner.kind != "PgShardCluster"
+        || owner.name != plan.cluster_id
+        || owner.uid != plan.cluster_uid
+        || owner.controller != Some(true)
+        || owner.block_owner_deletion != Some(true)
+    {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    Ok(())
+}
+
+fn validate_candidate_document(
+    document: &CandidateDocumentV1,
+    plan: &CatalogCandidateObservationPlan,
+    member: &CatalogCandidateTopologyMember,
+    status: &ValidatedClusterStatus,
+) -> Result<(), CatalogCandidateError> {
+    let bootstrap = status
+        .bootstraps
+        .get(member.ordinal as usize)
+        .ok_or(CatalogCandidateError::InvalidCandidate)?;
+    if document.schema_version != CANDIDATE_SCHEMA_VERSION
+        || document.cluster_object_uid != plan.cluster_uid
+        || document.shard != 0
+        || document.member != member.ordinal
+        || document.instance_id != member.instance_id
+        || document.discovery_topology.config_map.name != plan.topology_config_map
+        || document.discovery_topology.members.len() != plan.members.len()
+        || document.bootstrap.secret.name != bootstrap.secret_name
+        || document.bootstrap.secret.uid != bootstrap.secret_uid
+        || document.bootstrap.pvc.name != bootstrap.pvc_name
+        || document.bootstrap.pvc.uid != bootstrap.pvc_uid
+        || document.writable_lease != status.writable_lease
+        || document.replication_credential != status.replication_credential
+        || document.catalog_access != status.catalog_access
+    {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    for (actual, expected) in document
+        .discovery_topology
+        .members
+        .iter()
+        .zip(&plan.members)
+    {
+        if actual.ordinal != expected.ordinal
+            || actual.instance_id != expected.instance_id
+            || actual.dns_name != expected.dns_name
+            || actual.postgresql_port != expected.postgresql_port
+            || actual.agent_http_port != expected.agent_http_port
+            || actual.physical_slot != expected.physical_slot
+        {
+            return Err(CatalogCandidateError::InvalidCandidate);
+        }
+    }
+    let digest_input = DiscoveryDigestInput {
+        config_map: document.discovery_topology.config_map.clone(),
+        members: document.discovery_topology.members.clone(),
+    };
+    let encoded = serde_json::to_vec(&digest_input)?;
+    let digest = domain_digest(DISCOVERY_TOPOLOGY_DOMAIN, &encoded);
+    if document.discovery_topology.sha256 != digest {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    Ok(())
+}
+
+fn validate_candidate_set(
+    candidates: &[CandidateFingerprint],
+) -> Result<(), CatalogCandidateError> {
+    if !matches!(candidates.len(), 3 | 5) {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    let mut names = HashSet::with_capacity(candidates.len());
+    let mut uids = HashSet::with_capacity(candidates.len());
+    let mut digests = HashSet::with_capacity(candidates.len());
+    let mut secret_names = HashSet::with_capacity(candidates.len());
+    let mut secret_uids = HashSet::with_capacity(candidates.len());
+    let mut pvc_names = HashSet::with_capacity(candidates.len());
+    let mut pvc_uids = HashSet::with_capacity(candidates.len());
+    for candidate in candidates {
+        let document = &candidate.document;
+        if !names.insert(candidate.name.as_str())
+            || !uids.insert(candidate.uid.as_str())
+            || !digests.insert(candidate.payload_sha256.as_str())
+            || !secret_names.insert(document.bootstrap.secret.name.as_str())
+            || !secret_uids.insert(document.bootstrap.secret.uid.as_str())
+            || !pvc_names.insert(document.bootstrap.pvc.name.as_str())
+            || !pvc_uids.insert(document.bootstrap.pvc.uid.as_str())
+        {
+            return Err(CatalogCandidateError::InvalidCandidate);
+        }
+    }
+    let first = &candidates[0].document;
+    if candidates.iter().skip(1).any(|candidate| {
+        candidate.document.discovery_topology != first.discovery_topology
+            || candidate.document.writable_lease != first.writable_lease
+            || candidate.document.replication_credential != first.replication_credential
+            || candidate.document.catalog_access != first.catalog_access
+    }) {
+        return Err(CatalogCandidateError::InvalidCandidate);
+    }
+    Ok(())
+}
+
+fn domain_digest(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update(bytes);
+    let digest = hash.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn exact_metadata_value<'a>(
+    value: Option<&'a str>,
+    expected: &str,
+) -> Result<&'a str, CatalogCandidateError> {
+    let value = require_uid(value)?;
+    if value != expected {
+        return Err(CatalogCandidateError::InvalidClusterStatus);
+    }
+    Ok(value)
+}
+
+fn require_uid(value: Option<&str>) -> Result<&str, CatalogCandidateError> {
+    value
+        .filter(|value| valid_uid(value))
+        .ok_or(CatalogCandidateError::InvalidObjectMetadata)
+}
+
+fn require_resource_version(value: Option<&str>) -> Result<&str, CatalogCandidateError> {
+    value
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or(CatalogCandidateError::InvalidObjectMetadata)
+}
+
+fn valid_uid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+}
+
+fn valid_name(value: &str) -> bool {
+    // Kubernetes DNS1123 subdomain names bound the complete value to 253
+    // bytes; unlike DNS labels, their regex does not cap each dot-separated
+    // segment at 63 bytes.
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+        })
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+async fn wait_until_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
+}
+
+async fn wait_or_stop(shutdown: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    tokio::select! {
+        () = tokio::time::sleep(duration) => false,
+        result = shutdown.changed() => result.is_err() || *shutdown.borrow(),
+    }
+}
+
+trait CandidateStore: Send + Sync {
+    async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError>;
+    async fn get_candidate(&self, name: &str) -> Result<ConfigMap, CatalogCandidateError>;
+}
+
+struct KubernetesCandidateStore {
+    cluster_name: String,
+    clusters: Api<DynamicObject>,
+    candidates: Api<ConfigMap>,
+    request_timeout: Duration,
+}
+
+impl KubernetesCandidateStore {
+    fn new(
+        plan: &CatalogCandidateObservationPlan,
+        request_timeout: Duration,
+    ) -> Result<Self, CatalogCandidateError> {
+        let mut client_config = Config::incluster()
+            .map_err(|error| CatalogCandidateError::InClusterConfiguration(error.to_string()))?;
+        client_config.connect_timeout = Some(request_timeout);
+        client_config.read_timeout = Some(request_timeout);
+        client_config.write_timeout = Some(request_timeout);
+        client_config.default_retry = false;
+        let client = Client::try_from(client_config)
+            .map_err(|error| CatalogCandidateError::KubernetesClient(error.to_string()))?;
+        let resource = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk("pgshard.io", "v1alpha1", "PgShardCluster"),
+            "pgshardclusters",
+        );
+        Ok(Self {
+            cluster_name: plan.cluster_id.clone(),
+            clusters: Api::namespaced_with(client.clone(), &plan.namespace, &resource),
+            candidates: Api::namespaced(client, &plan.namespace),
+            request_timeout,
+        })
+    }
+}
+
+impl CandidateStore for KubernetesCandidateStore {
+    async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError> {
+        match tokio::time::timeout(
+            self.request_timeout,
+            self.clusters.get_subresource("status", &self.cluster_name),
+        )
+        .await
+        {
+            Ok(Ok(cluster)) => Ok(cluster),
+            Ok(Err(source)) => Err(CatalogCandidateError::KubernetesStatus(Box::new(source))),
+            Err(_) => Err(CatalogCandidateError::StatusRequestTimedOut),
+        }
+    }
+
+    async fn get_candidate(&self, name: &str) -> Result<ConfigMap, CatalogCandidateError> {
+        match tokio::time::timeout(self.request_timeout, self.candidates.get(name)).await {
+            Ok(Ok(configuration)) => Ok(configuration),
+            Ok(Err(source)) => Err(CatalogCandidateError::KubernetesCandidate(Box::new(source))),
+            Err(_) => Err(CatalogCandidateError::CandidateRequestTimedOut),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum CatalogCandidateError {
+    #[error("catalog-candidate observation plan is invalid")]
+    InvalidPlan,
+    #[error("PgShardCluster status is absent, stale, deleting, or inconsistent")]
+    InvalidClusterStatus,
+    #[error("catalog-candidate checkpoint set is incomplete or inconsistent")]
+    InvalidCheckpointSet,
+    #[error("catalog-candidate ConfigMap identity or payload is invalid")]
+    InvalidCandidate,
+    #[error("Kubernetes object UID or resource version is missing or malformed")]
+    InvalidObjectMetadata,
+    #[error("catalog-candidate evidence changed across the observation bracket")]
+    EvidenceChanged,
+    #[error("catalog-candidate observation expired before atomic publication")]
+    FreshnessExpired,
+    #[error("in-cluster Kubernetes configuration is unavailable: {0}")]
+    InClusterConfiguration(String),
+    #[error("Kubernetes client initialization failed: {0}")]
+    KubernetesClient(String),
+    #[error("PgShardCluster status request timed out")]
+    StatusRequestTimedOut,
+    #[error("catalog-candidate ConfigMap request timed out")]
+    CandidateRequestTimedOut,
+    #[error("Kubernetes API could not read PgShardCluster status: {0}")]
+    KubernetesStatus(#[source] Box<kube::Error>),
+    #[error("Kubernetes API could not read catalog-candidate ConfigMap: {0}")]
+    KubernetesCandidate(#[source] Box<kube::Error>),
+    #[error("catalog-candidate JSON is invalid: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+impl CatalogCandidateError {
+    const fn failure_reason(&self) -> CatalogCandidateFailureReason {
+        match self {
+            Self::StatusRequestTimedOut
+            | Self::KubernetesStatus(_)
+            | Self::InClusterConfiguration(_)
+            | Self::KubernetesClient(_) => CatalogCandidateFailureReason::ClusterStatusUnavailable,
+            Self::CandidateRequestTimedOut | Self::KubernetesCandidate(_) => {
+                CatalogCandidateFailureReason::CandidateUnavailable
+            }
+            Self::EvidenceChanged => CatalogCandidateFailureReason::EvidenceChanged,
+            Self::FreshnessExpired => CatalogCandidateFailureReason::FreshnessExpired,
+            Self::InvalidPlan
+            | Self::InvalidClusterStatus
+            | Self::InvalidCheckpointSet
+            | Self::InvalidCandidate
+            | Self::InvalidObjectMetadata
+            | Self::Json(_) => CatalogCandidateFailureReason::ValidationFailed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusterStatus {
+    observed_generation: i64,
+    phase: String,
+    #[serde(default)]
+    conditions: Vec<Value>,
+    #[serde(rename = "postgresqlBootstrapSpec")]
+    bootstrap_spec: BootstrapSpec,
+    #[serde(rename = "postgresqlBootstraps")]
+    bootstraps: Vec<BootstrapCheckpoint>,
+    #[serde(rename = "postgresqlWritableLeases")]
+    writable_leases: Vec<WritableLeaseCheckpoint>,
+    #[serde(rename = "postgresqlReplicationCredentials")]
+    replication_credentials: Vec<ReplicationCredentialCheckpoint>,
+    #[serde(rename = "postgresqlCatalogCandidates")]
+    catalog_candidates: Vec<CandidateCheckpoint>,
+    catalog_access: CatalogAccessCheckpoint,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapSpec {
+    shards: usize,
+    members_per_shard: usize,
+    durability: String,
+    #[serde(rename = "postgresqlRuntime")]
+    postgresql_runtime: String,
+    #[serde(rename = "databaseTopologySHA256", default)]
+    database_topology_sha256: String,
+    storage_size: String,
+    #[serde(default)]
+    storage_class_name: Option<String>,
+    deletion_policy: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapCheckpoint {
+    shard: usize,
+    member: usize,
+    secret_name: String,
+    #[serde(rename = "secretUID")]
+    secret_uid: String,
+    #[serde(default)]
+    pvc_fence_detached: bool,
+    #[serde(rename = "pvcName", default)]
+    pvc_name: String,
+    #[serde(rename = "pvcUID", default)]
+    pvc_uid: String,
+    #[serde(rename = "pvcCreationAbandoned", default)]
+    pvc_creation_abandoned: bool,
+    #[serde(rename = "pvcStorageClassName", default)]
+    pvc_storage_class_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WritableLeaseCheckpoint {
+    shard: usize,
+    lease_name: String,
+    #[serde(rename = "leaseUID")]
+    lease_uid: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplicationCredentialCheckpoint {
+    shard: usize,
+    secret_name: String,
+    #[serde(rename = "secretUID")]
+    secret_uid: String,
+    #[serde(rename = "materialSHA256")]
+    material_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogAccessCheckpoint {
+    secret_name: String,
+    #[serde(rename = "secretUID")]
+    secret_uid: String,
+    #[serde(rename = "clientSHA256")]
+    client_sha256: String,
+    #[serde(rename = "serverSHA256")]
+    server_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidateCheckpoint {
+    member: usize,
+    config_map_name: String,
+    #[serde(rename = "configMapUID")]
+    config_map_uid: String,
+    #[serde(rename = "payloadSHA256")]
+    payload_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CandidateDocumentV1 {
+    schema_version: String,
+    #[serde(rename = "clusterObjectUID")]
+    cluster_object_uid: String,
+    shard: u32,
+    member: u32,
+    #[serde(rename = "instanceID")]
+    instance_id: String,
+    discovery_topology: DiscoveryTopology,
+    bootstrap: BootstrapReference,
+    writable_lease: ObjectReference,
+    replication_credential: MaterialReference,
+    catalog_access: CatalogAccessReference,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiscoveryTopology {
+    config_map: NameReference,
+    members: Vec<DiscoveryMember>,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryDigestInput {
+    config_map: NameReference,
+    members: Vec<DiscoveryMember>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NameReference {
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiscoveryMember {
+    ordinal: u32,
+    instance_id: String,
+    dns_name: String,
+    postgresql_port: u16,
+    agent_http_port: u16,
+    physical_slot: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectReference {
+    name: String,
+    uid: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapReference {
+    secret: ObjectReference,
+    pvc: ObjectReference,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MaterialReference {
+    name: String,
+    uid: String,
+    #[serde(rename = "materialSHA256")]
+    material_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogAccessReference {
+    name: String,
+    uid: String,
+    #[serde(rename = "clientSHA256")]
+    client_sha256: String,
+    #[serde(rename = "serverSHA256")]
+    server_sha256: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::future::pending;
+    use std::sync::Mutex;
+
+    use k8s_openapi::ByteString;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+    use kube::core::TypeMeta;
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::{AgentStatusPhase, CatalogCandidatePhase, OrchestratorIdentity};
+
+    struct StubStore {
+        clusters: Mutex<VecDeque<DynamicObject>>,
+        candidates: BTreeMap<String, ConfigMap>,
+    }
+
+    impl CandidateStore for StubStore {
+        async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError> {
+            let mut clusters = self.clusters.lock().expect("clusters");
+            if clusters.len() > 1 {
+                Ok(clusters.pop_front().expect("cluster response"))
+            } else {
+                Ok(clusters.front().expect("cluster response").clone())
+            }
+        }
+
+        async fn get_candidate(&self, name: &str) -> Result<ConfigMap, CatalogCandidateError> {
+            self.candidates
+                .get(name)
+                .cloned()
+                .ok_or(CatalogCandidateError::InvalidCandidate)
+        }
+    }
+
+    struct BlockingStore;
+
+    impl CandidateStore for BlockingStore {
+        async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError> {
+            pending().await
+        }
+
+        async fn get_candidate(&self, _name: &str) -> Result<ConfigMap, CatalogCandidateError> {
+            pending().await
+        }
+    }
+
+    fn plan_with_members(member_count: u32) -> CatalogCandidateObservationPlan {
+        let members = (0..member_count)
+            .map(|ordinal| {
+                let suffix = if ordinal == 0 {
+                    String::new()
+                } else {
+                    format!("-m{ordinal:04}")
+                };
+                let stateful_set = format!("demo-shard-0000{suffix}");
+                CatalogCandidateTopologyMember {
+                    ordinal,
+                    stateful_set: stateful_set.clone(),
+                    instance_id: format!("{stateful_set}-0"),
+                    dns_name: format!("{stateful_set}-0.demo-shard-0000.ns.svc"),
+                    postgresql_port: 5_432,
+                    agent_http_port: 8_080,
+                    physical_slot: format!("pgshard_member_{ordinal:04}"),
+                }
+            })
+            .collect();
+        CatalogCandidateObservationPlan {
+            cluster_id: "demo".to_owned(),
+            cluster_uid: "cluster-uid".to_owned(),
+            namespace: "ns".to_owned(),
+            shard_count: 2,
+            synchronous_durability: true,
+            topology_config_map: "demo-topology".to_owned(),
+            writable_lease_name: "demo-shard-0000-term".to_owned(),
+            writable_lease_uid: "lease-uid-0".to_owned(),
+            members,
+        }
+    }
+
+    fn plan() -> CatalogCandidateObservationPlan {
+        plan_with_members(3)
+    }
+
+    fn bootstrap_secret_name(cluster: &str, shard: usize, member: usize) -> String {
+        format!(
+            "{cluster}-shard-{shard:04}-member-{member:04}-auth-{}",
+            "a".repeat(32)
+        )
+    }
+
+    fn bootstrap_pvc_name(cluster: &str, shard: usize, member: usize) -> String {
+        format!(
+            "{cluster}-shard-{shard:04}-member-{member:04}-data-{}",
+            "b".repeat(32)
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fixture_for_plan(
+        plan: CatalogCandidateObservationPlan,
+    ) -> (
+        CatalogCandidateObservationPlan,
+        DynamicObject,
+        BTreeMap<String, ConfigMap>,
+    ) {
+        let discovery_members = plan
+            .members
+            .iter()
+            .map(|member| DiscoveryMember {
+                ordinal: member.ordinal,
+                instance_id: member.instance_id.clone(),
+                dns_name: member.dns_name.clone(),
+                postgresql_port: member.postgresql_port,
+                agent_http_port: member.agent_http_port,
+                physical_slot: member.physical_slot.clone(),
+            })
+            .collect::<Vec<_>>();
+        let config_map = NameReference {
+            name: plan.topology_config_map.clone(),
+        };
+        let discovery_digest = domain_digest(
+            DISCOVERY_TOPOLOGY_DOMAIN,
+            &serde_json::to_vec(&DiscoveryDigestInput {
+                config_map: config_map.clone(),
+                members: discovery_members.clone(),
+            })
+            .expect("discovery JSON"),
+        );
+        let writable_lease = ObjectReference {
+            name: plan.writable_lease_name.clone(),
+            uid: plan.writable_lease_uid.clone(),
+        };
+        let replication_credential = MaterialReference {
+            name: "demo-replication-aabb".to_owned(),
+            uid: "replication-uid-0".to_owned(),
+            material_sha256: "e".repeat(64),
+        };
+        let catalog_access = CatalogAccessReference {
+            name: "demo-catalog-aabb".to_owned(),
+            uid: "catalog-uid".to_owned(),
+            client_sha256: "b".repeat(64),
+            server_sha256: "c".repeat(64),
+        };
+        let mut candidates = BTreeMap::new();
+        let mut candidate_checkpoints = Vec::new();
+        let mut bootstrap_checkpoints = Vec::new();
+        for shard in 0..plan.shard_count {
+            for member in 0..plan.members.len() {
+                bootstrap_checkpoints.push(json!({
+                    "shard": shard,
+                    "member": member,
+                    "secretName": bootstrap_secret_name(&plan.cluster_id, shard, member),
+                    "secretUID": format!("bootstrap-uid-{shard}-{member}"),
+                    "pvcFenceDetached": true,
+                    "pvcName": bootstrap_pvc_name(&plan.cluster_id, shard, member),
+                    "pvcUID": format!("data-uid-{shard}-{member}"),
+                    "pvcStorageClassName": "fast"
+                }));
+            }
+        }
+        for member in &plan.members {
+            let document = CandidateDocumentV1 {
+                schema_version: CANDIDATE_SCHEMA_VERSION.to_owned(),
+                cluster_object_uid: plan.cluster_uid.clone(),
+                shard: 0,
+                member: member.ordinal,
+                instance_id: member.instance_id.clone(),
+                discovery_topology: DiscoveryTopology {
+                    config_map: config_map.clone(),
+                    members: discovery_members.clone(),
+                    sha256: discovery_digest.clone(),
+                },
+                bootstrap: BootstrapReference {
+                    secret: ObjectReference {
+                        name: bootstrap_secret_name(&plan.cluster_id, 0, member.ordinal as usize),
+                        uid: format!("bootstrap-uid-0-{}", member.ordinal),
+                    },
+                    pvc: ObjectReference {
+                        name: bootstrap_pvc_name(&plan.cluster_id, 0, member.ordinal as usize),
+                        uid: format!("data-uid-0-{}", member.ordinal),
+                    },
+                },
+                writable_lease: writable_lease.clone(),
+                replication_credential: replication_credential.clone(),
+                catalog_access: catalog_access.clone(),
+            };
+            let mut payload = serde_json::to_vec(&document).expect("candidate JSON");
+            payload.push(b'\n');
+            let payload = String::from_utf8(payload).expect("UTF-8 candidate");
+            let payload_sha256 = domain_digest(CANDIDATE_PAYLOAD_DOMAIN, payload.as_bytes());
+            let name = member.config_map_name();
+            let uid = format!("candidate-uid-{}", member.ordinal);
+            candidate_checkpoints.push(json!({
+                "member": member.ordinal,
+                "configMapName": name,
+                "configMapUID": uid,
+                "payloadSHA256": payload_sha256
+            }));
+            let labels = BTreeMap::from([
+                ("app.kubernetes.io/name".to_owned(), "pgshard".to_owned()),
+                (MANAGED_BY_LABEL.to_owned(), "pgshard-operator".to_owned()),
+                (INSTANCE_LABEL.to_owned(), plan.cluster_id.clone()),
+                (
+                    COMPONENT_LABEL.to_owned(),
+                    "postgresql-catalog-bootstrap".to_owned(),
+                ),
+                (CLUSTER_LABEL.to_owned(), plan.cluster_id.clone()),
+                (SHARD_LABEL.to_owned(), "0000".to_owned()),
+                (MEMBER_LABEL.to_owned(), format!("{:04}", member.ordinal)),
+            ]);
+            let annotations = BTreeMap::from([
+                (APPLY_OWNERSHIP_ANNOTATION.to_owned(), "v1".to_owned()),
+                (CONFIG_HASH_ANNOTATION.to_owned(), payload_sha256),
+            ]);
+            candidates.insert(
+                name.clone(),
+                ConfigMap {
+                    metadata: ObjectMeta {
+                        name: Some(name),
+                        namespace: Some(plan.namespace.clone()),
+                        uid: Some(uid),
+                        resource_version: Some(format!("rv-{}", member.ordinal)),
+                        labels: Some(labels),
+                        annotations: Some(annotations),
+                        owner_references: Some(vec![OwnerReference {
+                            api_version: "pgshard.io/v1alpha1".to_owned(),
+                            kind: "PgShardCluster".to_owned(),
+                            name: plan.cluster_id.clone(),
+                            uid: plan.cluster_uid.clone(),
+                            controller: Some(true),
+                            block_owner_deletion: Some(true),
+                        }]),
+                        ..ObjectMeta::default()
+                    },
+                    immutable: Some(true),
+                    data: Some(BTreeMap::from([(
+                        CANDIDATE_PAYLOAD_KEY.to_owned(),
+                        payload,
+                    )])),
+                    ..ConfigMap::default()
+                },
+            );
+        }
+        let status = json!({
+            "observedGeneration": 7,
+            "phase": "Ready",
+            "conditions": [],
+            "postgresqlBootstrapSpec": {
+                "shards": 2,
+                "membersPerShard": plan.members.len(),
+                "durability": "Synchronous",
+                "postgresqlRuntime": "agent-quarantine",
+                "databaseTopologySHA256": "a".repeat(64),
+                "storageSize": "10Gi",
+                "storageClassName": "fast",
+                "deletionPolicy": "Retain"
+            },
+            "postgresqlBootstraps": bootstrap_checkpoints,
+            "postgresqlWritableLeases": [
+                {"shard": 0, "leaseName": plan.writable_lease_name, "leaseUID": plan.writable_lease_uid},
+                {"shard": 1, "leaseName": "demo-shard-0001-term", "leaseUID": "lease-uid-1"}
+            ],
+            "postgresqlReplicationCredentials": [
+                {"shard": 0, "secretName": replication_credential.name, "secretUID": replication_credential.uid, "materialSHA256": replication_credential.material_sha256},
+                {"shard": 1, "secretName": "demo-replication-ccdd", "secretUID": "replication-uid-1", "materialSHA256": "f".repeat(64)}
+            ],
+            "postgresqlCatalogCandidates": candidate_checkpoints,
+            "catalogAccess": {"secretName": catalog_access.name, "secretUID": catalog_access.uid, "clientSHA256": catalog_access.client_sha256, "serverSHA256": catalog_access.server_sha256}
+        });
+        let cluster = DynamicObject {
+            types: Some(TypeMeta {
+                api_version: "pgshard.io/v1alpha1".to_owned(),
+                kind: "PgShardCluster".to_owned(),
+            }),
+            metadata: ObjectMeta {
+                name: Some(plan.cluster_id.clone()),
+                namespace: Some(plan.namespace.clone()),
+                uid: Some(plan.cluster_uid.clone()),
+                resource_version: Some("cluster-rv".to_owned()),
+                generation: Some(7),
+                ..ObjectMeta::default()
+            },
+            data: json!({"status": status}),
+        };
+        (plan, cluster, candidates)
+    }
+
+    fn fixture() -> (
+        CatalogCandidateObservationPlan,
+        DynamicObject,
+        BTreeMap<String, ConfigMap>,
+    ) {
+        fixture_for_plan(plan())
+    }
+
+    fn store(cluster: DynamicObject, candidates: BTreeMap<String, ConfigMap>) -> StubStore {
+        StubStore {
+            clusters: Mutex::new(VecDeque::from([cluster])),
+            candidates,
+        }
+    }
+
+    fn reverse_status_array(cluster: &mut DynamicObject, field: &str) {
+        cluster.data["status"][field]
+            .as_array_mut()
+            .expect("status map-list")
+            .reverse();
+    }
+
+    fn state() -> OrchState {
+        OrchState::with_identity(
+            OrchestratorIdentity {
+                cluster_id: "demo".to_owned(),
+                orchestrator_id: "orch-0".to_owned(),
+            },
+            15_000,
+        )
+        .expect("state")
+    }
+
+    #[tokio::test]
+    async fn accepts_exact_canonical_candidate_set() {
+        let (plan, cluster, candidates) = fixture();
+        let bound = read_bound_candidates(&store(cluster, candidates), &plan)
+            .await
+            .expect("bound candidates");
+        assert_eq!(bound.candidates.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn accepts_shuffled_map_lists_for_complete_three_and_five_member_sets() {
+        for member_count in [3, 5] {
+            let (plan, mut cluster, candidates) = fixture_for_plan(plan_with_members(member_count));
+            for field in [
+                "postgresqlBootstraps",
+                "postgresqlWritableLeases",
+                "postgresqlReplicationCredentials",
+                "postgresqlCatalogCandidates",
+            ] {
+                reverse_status_array(&mut cluster, field);
+            }
+            let validated = validate_cluster_status(&cluster, &plan).expect("shuffled status");
+            assert_eq!(validated.candidates.len(), member_count as usize);
+            assert!(
+                validated
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .all(|(member, checkpoint)| checkpoint.member == member)
+            );
+            assert!(
+                validated
+                    .bootstraps
+                    .iter()
+                    .enumerate()
+                    .all(
+                        |(member, checkpoint)| checkpoint.shard == 0 && checkpoint.member == member
+                    )
+            );
+            let bound = read_bound_candidates(&store(cluster, candidates), &plan)
+                .await
+                .expect("complete shuffled candidate set");
+            assert_eq!(bound.candidates.len(), member_count as usize);
+        }
+    }
+
+    #[test]
+    fn accepts_additive_unversioned_status_fields_and_fingerprints_raw_status() {
+        let (plan, mut cluster, _) = fixture();
+        let status = cluster.data["status"]
+            .as_object_mut()
+            .expect("status object");
+        status.insert("futureTopLevelField".to_owned(), json!({"value": 7}));
+        status["postgresqlBootstrapSpec"]
+            .as_object_mut()
+            .expect("bootstrap spec")
+            .insert("futureSpecField".to_owned(), json!(true));
+        for field in [
+            "postgresqlBootstraps",
+            "postgresqlWritableLeases",
+            "postgresqlReplicationCredentials",
+            "postgresqlCatalogCandidates",
+        ] {
+            status[field][0]
+                .as_object_mut()
+                .expect("nested checkpoint")
+                .insert("futureCheckpointField".to_owned(), json!("ignored"));
+        }
+        status["catalogAccess"]
+            .as_object_mut()
+            .expect("catalog access")
+            .insert("futureAccessField".to_owned(), json!([1, 2, 3]));
+        let raw_status = cluster.data["status"].clone();
+
+        let validated = validate_cluster_status(&cluster, &plan).expect("additive status fields");
+        assert_eq!(validated.fingerprint.status, raw_status);
+    }
+
+    #[test]
+    fn payload_digest_uses_exact_domain_and_bytes() {
+        assert_eq!(
+            domain_digest(CANDIDATE_PAYLOAD_DOMAIN, b"{}\n"),
+            "050e522beb772aada3dd0c85e282839ec56ed4388c5ac0c2e77c243ff738ebbf"
+        );
+        assert_ne!(
+            domain_digest(CANDIDATE_PAYLOAD_DOMAIN, b"{}"),
+            domain_digest(CANDIDATE_PAYLOAD_DOMAIN, b"{}\n")
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_payloads_and_metadata() {
+        let (plan, cluster, candidates) = fixture();
+        let status = validate_cluster_status(&cluster, &plan).expect("status");
+        let member = &plan.members[0];
+        let checkpoint = &status.candidates[0];
+        for mutation in [
+            "unknown-field",
+            "extra-newline",
+            "binary-data",
+            "role-label",
+        ] {
+            let mut candidate = candidates[&member.config_map_name()].clone();
+            match mutation {
+                "unknown-field" => {
+                    let payload = candidate
+                        .data
+                        .as_mut()
+                        .expect("data")
+                        .get_mut(CANDIDATE_PAYLOAD_KEY)
+                        .expect("payload");
+                    let mut value: Value = serde_json::from_str(payload).expect("JSON");
+                    value
+                        .as_object_mut()
+                        .expect("object")
+                        .insert("unexpected".to_owned(), json!(true));
+                    *payload = format!("{}\n", serde_json::to_string(&value).expect("JSON"));
+                }
+                "extra-newline" => candidate
+                    .data
+                    .as_mut()
+                    .expect("data")
+                    .get_mut(CANDIDATE_PAYLOAD_KEY)
+                    .expect("payload")
+                    .push('\n'),
+                "binary-data" => {
+                    candidate.binary_data =
+                        Some(BTreeMap::from([("x".to_owned(), ByteString::default())]));
+                }
+                "role-label" => {
+                    candidate
+                        .metadata
+                        .labels
+                        .as_mut()
+                        .expect("labels")
+                        .insert(ROLE_LABEL.to_owned(), "primary".to_owned());
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_candidate(&candidate, &plan, member, checkpoint, &status).is_err(),
+                "mutation {mutation} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_candidate_checkpoint_cardinality_and_duplicates() {
+        let (plan, cluster, _) = fixture();
+        let status_value = cluster.data.get("status").expect("status");
+        let status: ClusterStatus =
+            serde_json::from_value(status_value.clone()).expect("status DTO");
+        let mut missing = status.catalog_candidates.clone();
+        missing.pop();
+        assert!(validate_candidate_checkpoints(&missing, &plan).is_err());
+        let mut duplicate = status.catalog_candidates;
+        duplicate[1].payload_sha256 = duplicate[0].payload_sha256.clone();
+        assert!(validate_candidate_checkpoints(&duplicate, &plan).is_err());
+
+        let mut duplicate_lease = status.writable_leases.clone();
+        duplicate_lease[1].lease_uid = duplicate_lease[0].lease_uid.clone();
+        assert!(select_writable_lease(&duplicate_lease, &plan).is_err());
+
+        let mut missing_credential = status.replication_credentials;
+        missing_credential.pop();
+        assert!(select_replication_credential(&missing_credential, &plan).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_extra_duplicate_and_mismatched_map_keys() {
+        let (plan, cluster, _) = fixture();
+
+        let mut missing = cluster.clone();
+        missing.data["status"]["postgresqlCatalogCandidates"]
+            .as_array_mut()
+            .expect("candidates")
+            .pop();
+        assert!(validate_cluster_status(&missing, &plan).is_err());
+
+        let mut extra = cluster.clone();
+        let extra_candidate = extra.data["status"]["postgresqlCatalogCandidates"][0].clone();
+        extra.data["status"]["postgresqlCatalogCandidates"]
+            .as_array_mut()
+            .expect("candidates")
+            .push(extra_candidate);
+        assert!(validate_cluster_status(&extra, &plan).is_err());
+
+        let mut duplicate = cluster.clone();
+        duplicate.data["status"]["postgresqlBootstraps"][1]["shard"] = json!(0);
+        duplicate.data["status"]["postgresqlBootstraps"][1]["member"] = json!(0);
+        assert!(validate_cluster_status(&duplicate, &plan).is_err());
+
+        let mut mismatched = cluster.clone();
+        mismatched.data["status"]["postgresqlWritableLeases"][0]["shard"] = json!(99);
+        assert!(validate_cluster_status(&mismatched, &plan).is_err());
+
+        let mut duplicate_replication = cluster;
+        duplicate_replication.data["status"]["postgresqlReplicationCredentials"][1]["shard"] =
+            json!(0);
+        assert!(validate_cluster_status(&duplicate_replication, &plan).is_err());
+    }
+
+    #[test]
+    fn accepts_only_supported_three_or_five_member_plans() {
+        let mut five = plan();
+        for ordinal in 3..5 {
+            let stateful_set = format!("demo-shard-0000-m{ordinal:04}");
+            five.members.push(CatalogCandidateTopologyMember {
+                ordinal,
+                stateful_set: stateful_set.clone(),
+                instance_id: format!("{stateful_set}-0"),
+                dns_name: format!("{stateful_set}-0.demo-shard-0000.ns.svc"),
+                postgresql_port: 5_432,
+                agent_http_port: 8_080,
+                physical_slot: format!("pgshard_member_{ordinal:04}"),
+            });
+        }
+        assert!(validate_plan(&five, Duration::from_secs(5)).is_ok());
+        five.members.pop();
+        assert!(validate_plan(&five, Duration::from_secs(5)).is_err());
+        assert!(validate_plan(&plan(), Duration::from_millis(5_001)).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_pre_post_resource_version_change_without_last_good() {
+        let (plan, cluster, candidates) = fixture();
+        let mut changed = cluster.clone();
+        changed.metadata.resource_version = Some("cluster-rv-2".to_owned());
+        let store = StubStore {
+            clusters: Mutex::new(VecDeque::from([cluster, changed])),
+            candidates,
+        };
+        let state = state();
+        let error = observe_once(&store, &plan, &state, Duration::from_secs(5))
+            .await
+            .expect_err("changed bracket");
+        assert!(matches!(error, CatalogCandidateError::EvidenceChanged));
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.catalog_candidates.phase,
+            CatalogCandidatePhase::Unavailable
+        );
+        assert_eq!(snapshot.catalog_candidates.fresh_candidates, 0);
+        assert_eq!(
+            snapshot.catalog_candidates.failure,
+            Some(CatalogCandidateFailureReason::EvidenceChanged)
+        );
+    }
+
+    #[tokio::test]
+    async fn expiration_and_shutdown_are_terminal_and_do_not_couple_state() {
+        let (plan, cluster, candidates) = fixture();
+        let store = store(cluster, candidates);
+        let state = state();
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv",
+            true,
+            Instant::now() + Duration::from_secs(30),
+        ));
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        let error = observe_once(&store, &plan, &state, Duration::ZERO)
+            .await
+            .expect_err("zero freshness");
+        assert!(matches!(error, CatalogCandidateError::FreshnessExpired));
+        let snapshot = state.snapshot();
+        assert!(snapshot.coordination_ready);
+        assert!(snapshot.leader);
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Collecting);
+        assert_eq!(
+            snapshot.catalog_candidates.phase,
+            CatalogCandidatePhase::Unavailable
+        );
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn({
+            let state = state.clone();
+            let plan = plan.clone();
+            async move {
+                supervise_with_store(
+                    &BlockingStore,
+                    &plan,
+                    &state,
+                    &mut shutdown_rx,
+                    Duration::from_secs(30),
+                    Duration::from_secs(5),
+                )
+                .await;
+            }
+        });
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("bounded shutdown")
+            .expect("supervisor task");
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.catalog_candidates.phase,
+            CatalogCandidatePhase::ShuttingDown
+        );
+        assert!(snapshot.coordination_ready);
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Collecting);
+    }
+}

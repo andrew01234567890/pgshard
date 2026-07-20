@@ -201,6 +201,39 @@ pub struct UnboundAgentObservationTarget {
     pub(crate) synchronous_durability: bool,
 }
 
+/// Exact, role-neutral shard-zero catalog-candidate identities derived from
+/// the already validated discovery topology.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogCandidateObservationPlan {
+    pub(crate) cluster_id: String,
+    pub(crate) cluster_uid: String,
+    pub(crate) namespace: String,
+    pub(crate) shard_count: usize,
+    pub(crate) synchronous_durability: bool,
+    pub(crate) topology_config_map: String,
+    pub(crate) writable_lease_name: String,
+    pub(crate) writable_lease_uid: String,
+    pub(crate) members: Vec<CatalogCandidateTopologyMember>,
+}
+
+/// One canonical shard-zero member carried by a candidate document.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogCandidateTopologyMember {
+    pub(crate) ordinal: u32,
+    pub(crate) stateful_set: String,
+    pub(crate) instance_id: String,
+    pub(crate) dns_name: String,
+    pub(crate) postgresql_port: u16,
+    pub(crate) agent_http_port: u16,
+    pub(crate) physical_slot: String,
+}
+
+impl CatalogCandidateTopologyMember {
+    pub(crate) fn config_map_name(&self) -> String {
+        format!("{}-cfg", self.stateful_set)
+    }
+}
+
 impl UnboundAgentObservationTarget {
     /// Returns the cluster name expected in agent status.
     #[must_use]
@@ -414,6 +447,43 @@ impl TopologyV1 {
             }
         }
         targets
+    }
+
+    /// Returns the finite shard-zero candidate set only for the explicit
+    /// multi-member topology supported by the operator contract.
+    #[must_use]
+    pub fn catalog_candidate_observation_plan(&self) -> Option<CatalogCandidateObservationPlan> {
+        if !matches!(self.members_per_shard, 3 | 5) {
+            return None;
+        }
+        let shard = self.shards.first()?;
+        let members = shard
+            .members
+            .iter()
+            .map(|member| {
+                let stateful_set = member.instance_id.strip_suffix("-0")?.to_owned();
+                Some(CatalogCandidateTopologyMember {
+                    ordinal: member.ordinal,
+                    stateful_set,
+                    instance_id: member.instance_id.clone(),
+                    dns_name: member.dns_name.clone(),
+                    postgresql_port: member.postgresql_port,
+                    agent_http_port: member.agent_http_port,
+                    physical_slot: member.physical_slot.clone(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(CatalogCandidateObservationPlan {
+            cluster_id: self.cluster.clone(),
+            cluster_uid: self.cluster_object_uid.clone(),
+            namespace: self.namespace.clone(),
+            shard_count: self.shards.len(),
+            synchronous_durability: self.durability == Durability::Synchronous,
+            topology_config_map: format!("{}-topology", self.cluster),
+            writable_lease_name: shard.writable_lease.name.clone(),
+            writable_lease_uid: shard.writable_lease.uid.clone(),
+            members,
+        })
     }
 
     fn validate(&self, expected: ExpectedTopologyIdentity<'_>) -> Result<(), TopologyError> {
@@ -814,6 +884,19 @@ mod tests {
         assert_eq!(targets[0].instance_id(), "demo-shard-0000-0");
         assert_eq!(targets[2].physical_slot(), "pgshard_member_0002");
         assert_eq!(targets[2].writable_lease_uid(), "lease-uid-0");
+        let candidates = topology
+            .catalog_candidate_observation_plan()
+            .expect("multi-member candidate plan");
+        assert_eq!(candidates.members.len(), 3);
+        assert_eq!(
+            candidates.members[0].config_map_name(),
+            "demo-shard-0000-cfg"
+        );
+        assert_eq!(
+            candidates.members[2].config_map_name(),
+            "demo-shard-0000-m0002-cfg"
+        );
+        assert_eq!(candidates.writable_lease_uid, "lease-uid-0");
     }
 
     #[test]

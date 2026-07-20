@@ -361,6 +361,8 @@ pub struct OrchSnapshot {
     pub topology: Option<TopologyDiagnostics>,
     /// Freshness-bounded, diagnostic-only agent-status collection summary.
     pub agent_status: AgentStatusDiagnostics,
+    /// Freshness-bounded, diagnostic-only catalog-candidate summary.
+    pub catalog_candidates: CatalogCandidateDiagnostics,
 }
 
 /// Lifecycle of diagnostic-only remote agent-status evidence.
@@ -426,6 +428,71 @@ impl Default for AgentStatusDiagnostics {
     }
 }
 
+/// Lifecycle of diagnostic-only catalog-candidate evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogCandidatePhase {
+    /// The explicit multi-member runtime contract is absent.
+    #[default]
+    Disabled,
+    /// A new complete observation is in progress; no older evidence remains.
+    Collecting,
+    /// Every expected immutable candidate is fresh and exactly bound.
+    Fresh,
+    /// The latest complete observation failed closed.
+    Unavailable,
+    /// The process-local freshness window elapsed.
+    Expired,
+    /// Process shutdown cleared all candidate evidence.
+    ShuttingDown,
+}
+
+/// Stable, bounded candidate-observation failure classes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogCandidateFailureReason {
+    /// The exact `PgShardCluster` status subresource could not be read.
+    ClusterStatusUnavailable,
+    /// One exact candidate `ConfigMap` could not be read.
+    CandidateUnavailable,
+    /// Status or a candidate object changed across the read bracket.
+    EvidenceChanged,
+    /// An identity, checkpoint, metadata, payload, or digest was invalid.
+    ValidationFailed,
+    /// The complete observation exceeded its monotonic freshness bound.
+    FreshnessExpired,
+}
+
+/// Bounded summary only; names, UIDs, digests, and payloads are never retained.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CatalogCandidateDiagnostics {
+    /// Current observation lifecycle.
+    pub phase: CatalogCandidatePhase,
+    /// Exact candidate cardinality required for a complete publication.
+    pub expected_candidates: usize,
+    /// Complete fresh candidate count, or zero without live evidence.
+    pub fresh_candidates: usize,
+    /// Configured process-local maximum age in milliseconds.
+    pub maximum_age_ms: u64,
+    /// Latest stable failure class, if any.
+    pub failure: Option<CatalogCandidateFailureReason>,
+    /// Explicitly states that this evidence grants no authority.
+    pub diagnostic_only: bool,
+}
+
+impl Default for CatalogCandidateDiagnostics {
+    fn default() -> Self {
+        Self {
+            phase: CatalogCandidatePhase::Disabled,
+            expected_candidates: 0,
+            fresh_candidates: 0,
+            maximum_age_ms: 0,
+            failure: None,
+            diagnostic_only: true,
+        }
+    }
+}
+
 /// Machine-readable reason the orchestrator is not yet safe to serve control
 /// operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -467,6 +534,10 @@ struct OrchInner {
     // local monotonic deadline and never participates in authority decisions.
     agent_identity_binding_deadline: Option<Instant>,
     agent_status: AgentStatusDiagnostics,
+    // Catalog-candidate evidence is independently diagnostic and cannot alter
+    // coordination, agent status, readiness, leadership, or operation state.
+    catalog_candidate_deadline: Option<Instant>,
+    catalog_candidates: CatalogCandidateDiagnostics,
     topology: Option<TopologyDiagnostics>,
 }
 
@@ -545,6 +616,7 @@ impl OrchState {
             inner: Arc::new(Mutex::new(OrchInner {
                 identity: Some(identity),
                 agent_status,
+                catalog_candidates: CatalogCandidateDiagnostics::default(),
                 topology,
                 ..OrchInner::default()
             })),
@@ -710,6 +782,88 @@ impl OrchState {
         true
     }
 
+    /// Clears earlier candidate evidence before a new complete read bracket.
+    pub(crate) fn record_catalog_candidates_collecting(
+        &self,
+        expected_candidates: usize,
+        maximum_age: Duration,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown {
+            return;
+        }
+        inner.catalog_candidate_deadline = None;
+        inner.catalog_candidates.phase = CatalogCandidatePhase::Collecting;
+        inner.catalog_candidates.expected_candidates = expected_candidates;
+        inner.catalog_candidates.fresh_candidates = 0;
+        inner.catalog_candidates.maximum_age_ms =
+            u64::try_from(maximum_age.as_millis()).unwrap_or(u64::MAX);
+        inner.catalog_candidates.failure = None;
+    }
+
+    /// Records one failed-closed candidate observation without last-good data.
+    pub(crate) fn record_catalog_candidate_failure(&self, failure: CatalogCandidateFailureReason) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown {
+            return;
+        }
+        inner.catalog_candidate_deadline = None;
+        inner.catalog_candidates.phase = CatalogCandidatePhase::Unavailable;
+        inner.catalog_candidates.fresh_candidates = 0;
+        inner.catalog_candidates.failure = Some(failure);
+    }
+
+    /// Atomically publishes one complete, still-live candidate count only.
+    #[must_use]
+    pub(crate) fn record_catalog_candidates_fresh(
+        &self,
+        candidate_count: usize,
+        deadline: Instant,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown {
+            return false;
+        }
+        let valid = matches!(candidate_count, 3 | 5)
+            && candidate_count == inner.catalog_candidates.expected_candidates
+            && Instant::now() < deadline;
+        if !valid {
+            inner.catalog_candidate_deadline = None;
+            inner.catalog_candidates.phase = CatalogCandidatePhase::Unavailable;
+            inner.catalog_candidates.fresh_candidates = 0;
+            inner.catalog_candidates.failure =
+                Some(CatalogCandidateFailureReason::FreshnessExpired);
+            return false;
+        }
+        inner.catalog_candidate_deadline = Some(deadline);
+        inner.catalog_candidates.phase = CatalogCandidatePhase::Fresh;
+        inner.catalog_candidates.fresh_candidates = candidate_count;
+        inner.catalog_candidates.failure = None;
+        true
+    }
+
+    /// Makes shutdown terminal for candidate diagnostics without coupling it to
+    /// the independent coordination or agent-status state machines.
+    pub(crate) fn record_catalog_candidate_shutdown(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.catalog_candidate_deadline = None;
+        inner.catalog_candidates.phase = CatalogCandidatePhase::ShuttingDown;
+        inner.catalog_candidates.fresh_candidates = 0;
+        inner.catalog_candidates.failure = None;
+    }
+
     /// Removes externally visible readiness before process shutdown begins.
     pub fn begin_shutdown(&self) {
         self.record_coordination_unavailable();
@@ -721,6 +875,10 @@ impl OrchState {
         inner.agent_status.phase = AgentStatusPhase::ShuttingDown;
         inner.agent_status.fresh_members = 0;
         inner.agent_status.failure = None;
+        inner.catalog_candidate_deadline = None;
+        inner.catalog_candidates.phase = CatalogCandidatePhase::ShuttingDown;
+        inner.catalog_candidates.fresh_candidates = 0;
+        inner.catalog_candidates.failure = None;
         if let Some(topology) = &mut inner.topology
             && topology.agent_status_collection
                 != crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
@@ -767,6 +925,18 @@ impl OrchState {
                     crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired;
             }
         }
+        let catalog_candidate_live = inner
+            .catalog_candidate_deadline
+            .is_some_and(|deadline| now < deadline);
+        if !catalog_candidate_live {
+            inner.catalog_candidate_deadline = None;
+            if inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh {
+                inner.catalog_candidates.phase = CatalogCandidatePhase::Expired;
+                inner.catalog_candidates.fresh_candidates = 0;
+                inner.catalog_candidates.failure =
+                    Some(CatalogCandidateFailureReason::FreshnessExpired);
+            }
+        }
         let mut leases: Vec<_> = inner.leases.values().cloned().collect();
         leases.sort_by_key(|lease| lease.shard_id);
         OrchSnapshot {
@@ -781,6 +951,7 @@ impl OrchState {
             coordination_resource_version: inner.coordination_resource_version.clone(),
             topology: inner.topology.clone(),
             agent_status: inner.agent_status.clone(),
+            catalog_candidates: inner.catalog_candidates.clone(),
         }
     }
 

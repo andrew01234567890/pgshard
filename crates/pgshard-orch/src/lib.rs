@@ -4,6 +4,7 @@
 //! does not select `PostgreSQL` promotion candidates or claim failover safety.
 
 pub(crate) mod agent_status;
+pub mod catalog_candidate;
 pub mod config;
 pub mod coordination;
 pub mod domain;
