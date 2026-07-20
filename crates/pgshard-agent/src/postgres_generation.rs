@@ -1841,11 +1841,9 @@ mod tests {
             &second,
         )
         .await;
-        primary
-            .client
-            .batch_execute("DROP SCHEMA pgshard_internal CASCADE")
-            .await
-            .expect("remove disposable generation schema");
+        // The caller-provided clusters are explicitly disposable. Preserve the
+        // final exact generation so the lifecycle harness can prove that a
+        // supervised standby establishes and retains live evidence for it.
     }
 
     #[allow(clippy::too_many_lines)]

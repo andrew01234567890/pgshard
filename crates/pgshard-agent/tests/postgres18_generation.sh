@@ -21,6 +21,17 @@ readonly replication_role="pgshard_replication"
 readonly standby_passfile="/run/pgshard/credentials/primary.pass"
 readonly ambient_password_canary="pgshard_ambient_password_canary"
 readonly runtime_image="${PGSHARD_AGENT_RUNTIME_TEST_IMAGE:-}"
+printf -v final_generation_identity '%s\n' \
+  'format=1' \
+  'cluster_name=cluster-1' \
+  'cluster_uid=cluster-1-uid' \
+  'shard=0' \
+  'lease_namespace=database' \
+  'lease_name=cluster-1-lease' \
+  'lease_uid=cluster-1-lease-uid' \
+  'holder=holder-d' \
+  'term=4'
+readonly final_generation_identity
 fixture_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/pgshard-generation.XXXXXX")"
 readonly fixture_dir
 readonly primary_hba="$fixture_dir/primary.pg_hba.conf"
@@ -118,6 +129,29 @@ wait_ready() {
   done
   docker logs "$container" >&2
   return 1
+}
+
+fail_container() {
+  local container_name="$1"
+  shift
+  echo "$*" >&2
+  docker inspect --format \
+    'container={{.Name}} running={{.State.Running}} exit_code={{.State.ExitCode}} error={{.State.Error}}' \
+    "$container_name" >&2 || true
+  docker logs "$container_name" >&2 || true
+  exit 1
+}
+
+require_container_exit_code() {
+  local container_name="$1"
+  local expected="$2"
+  local purpose="$3"
+  local actual
+  actual="$(docker inspect --format '{{.State.ExitCode}}' "$container_name")"
+  if [[ "$actual" != "$expected" ]]; then
+    fail_container "$container_name" \
+      "$purpose: expected container exit code $expected, observed $actual"
+  fi
 }
 
 normalize_standby_socket() {
@@ -218,9 +252,18 @@ if [[ -n "$runtime_image" ]]; then
     ' -- "$standby"
   }
   wait_agent_standby_running() {
+    local status
     for _ in $(seq 1 120); do
-      if standby_status \
-          | jq --exit-status '.postgres_process == "running_replication_standby"' \
+      status="$(standby_status 2>/dev/null || true)"
+      if jq --arg generation "$final_generation_identity" \
+          --arg member_slot "$standby_application_name" \
+          --exit-status '
+            .postgres_process == "running_replication_standby" and
+            .replication_evidence.role == "standby" and
+            .replication_evidence.generation_identity == $generation and
+            .replication_evidence.member_slot_name == $member_slot and
+            .replication_evidence.in_recovery == true
+          ' <<<"$status" \
           >/dev/null 2>&1 && \
         [[ "$(docker exec --user 999:999 "$standby" psql -X --no-password \
           --host=/run/pgshard/postgres --username=postgres --dbname=postgres \
@@ -234,37 +277,34 @@ if [[ -n "$runtime_image" ]]; then
       fi
       sleep 0.25
     done
-    standby_status \
-      | jq --exit-status '.postgres_process == "running_replication_standby"' \
-      >/dev/null
+    status="$(standby_status 2>/dev/null || true)"
+    echo "last supervised standby status: ${status:-<unavailable>}" >&2
+    fail_container "$standby" \
+      "supervised standby did not report exact final-generation replication evidence before the deadline"
   }
-  start_agent_standby
-  wait_agent_standby_running
-  postmaster_environment="$(docker exec --user 999:999 "$standby" /bin/sh -ceu '
-    postmaster_pid="$(cat /run/pgshard/postgres/postmaster.external.pid)"
-    tr "\000" "\n" < "/proc/$postmaster_pid/environ"
-  ')"
-  [[ "$postmaster_environment" != *PGPASSWORD=* ]]
-  [[ "$postmaster_environment" != *"$ambient_password_canary"* ]]
-else
-  docker run --detach --name "$standby" \
-    --network "$network" \
-    --volume "$standby_data:/var/lib/postgresql/18/docker" \
-    --volume "$standby_socket:/var/run/postgresql" \
-    --volume "$standby_credentials:/run/pgshard/credentials:ro" \
-    --mount "type=bind,src=$repo_root/deploy/images/quarantine.pg_hba.conf,dst=/etc/pgshard-generation-standby-hba.conf,readonly" \
-    --env PGDATA=/var/lib/postgresql/18/docker \
-    --env POSTGRES_PASSWORD=disposable-standby-password \
-    "$image" \
-    -c listen_addresses= \
-    -c hba_file=/etc/pgshard-generation-standby-hba.conf \
-    -c "primary_conninfo=host=primary port=5432 user=${replication_role} application_name=${standby_application_name} passfile=${standby_passfile} sslmode=disable" \
-    -c "primary_slot_name=${standby_application_name}" \
-    -c max_wal_senders=4 \
-    -c hot_standby=on \
-    -c event_triggers=off >/dev/null
-  wait_ready "$standby"
 fi
+
+# Keep the generation-mutating test isolated from the fail-closed evidence
+# monitor. The test mutates evidence invariants and advances generations; a raw
+# PostgreSQL standby keeps those operations separate while preserving the final
+# exact generation for the later supervised lifecycle assertions.
+docker run --detach --name "$standby" \
+  --network "$network" \
+  --volume "$standby_data:/var/lib/postgresql/18/docker" \
+  --volume "$standby_socket:/var/run/postgresql" \
+  --volume "$standby_credentials:/run/pgshard/credentials:ro" \
+  --mount "type=bind,src=$repo_root/deploy/images/quarantine.pg_hba.conf,dst=/etc/pgshard-generation-standby-hba.conf,readonly" \
+  --env PGDATA=/var/lib/postgresql/18/docker \
+  --env POSTGRES_PASSWORD=disposable-standby-password \
+  "$image" \
+  -c listen_addresses= \
+  -c hba_file=/etc/pgshard-generation-standby-hba.conf \
+  -c "primary_conninfo=host=primary port=5432 user=${replication_role} application_name=${standby_application_name} passfile=${standby_passfile} sslmode=disable" \
+  -c "primary_slot_name=${standby_application_name}" \
+  -c max_wal_senders=4 \
+  -c hot_standby=on \
+  -c event_triggers=off >/dev/null
+wait_ready "$standby"
 
 for _ in $(seq 1 120); do
   if [[ "$(docker exec --user 999:999 "$primary" psql -X --no-password \
@@ -310,6 +350,28 @@ test "$(docker exec --user 999:999 "$primary" psql -X --no-password \
              WHERE application_name = '${standby_application_name}' \
                AND state = 'streaming' AND sync_state = 'quorum'")" = 1
 
+wait_primary_streaming_quorum() {
+  local count
+  for _ in $(seq 1 120); do
+    count="$(docker exec --user 999:999 "$primary" psql -X --no-password \
+      --host=/var/run/postgresql --username=postgres --dbname=postgres \
+      --tuples-only --no-align \
+      --command="SELECT count(*) FROM pg_catalog.pg_stat_replication \
+                 WHERE application_name = '${standby_application_name}' \
+                   AND state = 'streaming' AND sync_state = 'quorum'")"
+    if [[ "$count" = 1 ]]; then
+      return 0
+    fi
+    if [[ "$(docker inspect --format '{{.State.Running}}' "$standby")" != true ]]; then
+      fail_container "$standby" \
+        "supervised standby exited before primary streaming quorum was restored"
+    fi
+    sleep 0.25
+  done
+  fail_container "$standby" \
+    "primary did not report the supervised standby as streaming quorum before the deadline"
+}
+
 docker run --rm --user 999:999 --network none --read-only \
   --cap-drop ALL --security-opt no-new-privileges \
   --volume "$primary_socket:/primary-socket" \
@@ -324,20 +386,50 @@ docker run --rm --user 999:999 --network none --read-only \
   --nocapture
 
 if [[ -n "$runtime_image" ]]; then
+  if ! docker stop --time 10 "$standby" >/dev/null; then
+    fail_container "$standby" \
+      "raw standby did not stop after the generation-mutating test"
+  fi
+  require_container_exit_code "$standby" 0 \
+    "raw standby clean-stop assertion failed after the generation-mutating test"
+  docker rm "$standby" >/dev/null
+  normalize_standby_socket
+
+  start_agent_standby
+  wait_agent_standby_running
+  wait_primary_streaming_quorum
+  postmaster_environment="$(docker exec --user 999:999 "$standby" /bin/sh -ceu '
+    postmaster_pid="$(cat /run/pgshard/postgres/postmaster.external.pid)"
+    tr "\000" "\n" < "/proc/$postmaster_pid/environ"
+  ')"
+  if [[ "$postmaster_environment" == *PGPASSWORD=* ]] || \
+      [[ "$postmaster_environment" == *"$ambient_password_canary"* ]]; then
+    fail_container "$standby" \
+      "supervised standby postmaster inherited an ambient password"
+  fi
+
   # Kill the container before the agent's 5-second smart-stop deadline. A
   # monitor connection left open would block smart shutdown and fail this
   # clean-exit assertion instead of being masked by the agent's fast fallback.
-  docker stop --time 4 "$standby" >/dev/null
-  test "$(docker inspect --format '{{.State.ExitCode}}' "$standby")" -eq 0
+  if ! docker stop --time 4 "$standby" >/dev/null; then
+    fail_container "$standby" "supervised standby did not stop on SIGTERM"
+  fi
+  require_container_exit_code "$standby" 0 \
+    "supervised standby clean-stop assertion failed"
   clean_control_data="$(docker run --rm --user 999:999 \
     --volume "$standby_data:/standby:ro" \
     --entrypoint /usr/lib/postgresql/18/bin/pg_controldata \
     "$image" /standby)"
-  [[ "$clean_control_data" = *'Database cluster state:               shut down in recovery'* ]]
+  if [[ "$clean_control_data" != \
+      *'Database cluster state:               shut down in recovery'* ]]; then
+    fail_container "$standby" \
+      "supervised standby control data did not record a clean recovery shutdown"
+  fi
   docker rm "$standby" >/dev/null
   normalize_standby_socket
   start_agent_standby
   wait_agent_standby_running
+  wait_primary_streaming_quorum
   docker exec --user 999:999 "$standby" \
     pg_ctl -D /var/lib/postgresql/18/docker promote -W || true
   for _ in $(seq 1 120); do
@@ -346,8 +438,24 @@ if [[ -n "$runtime_image" ]]; then
     fi
     sleep 0.25
   done
-  test "$(docker inspect --format '{{.State.Running}}' "$standby")" = false
-  test "$(docker inspect --format '{{.State.ExitCode}}' "$standby")" -ne 0
+  if [[ "$(docker inspect --format '{{.State.Running}}' "$standby")" != false ]]; then
+    fail_container "$standby" \
+      "promoted supervised standby remained running instead of fencing"
+  fi
+  if [[ "$(docker inspect --format '{{.State.ExitCode}}' "$standby")" = 0 ]]; then
+    fail_container "$standby" \
+      "promoted supervised standby exited successfully instead of reporting a fence"
+  fi
   standby_logs="$(docker logs "$standby" 2>&1)"
-  [[ "$standby_logs" = *'StandbyRecovery { source: RecoveryEnded }'* ]]
+  if [[ "$standby_logs" != *'received promote request'* ]] ||
+      [[ "$standby_logs" != *'archive recovery complete'* ]]; then
+    fail_container "$standby" \
+      "promoted supervised standby logs omitted PostgreSQL promotion evidence"
+  fi
+  if [[ "$standby_logs" != *'StandbyRecovery { source: RecoveryEnded }'* ]] &&
+      [[ "$standby_logs" != \
+        *'ReplicationEvidence { source: Observation { source: InvalidReplicationEvidence } }'* ]]; then
+    fail_container "$standby" \
+      "promoted supervised standby logs omitted an exact fail-closed fence"
+  fi
 fi
