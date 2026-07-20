@@ -30,6 +30,7 @@ const HTTP_ACCEPT_MAX_FAILURE_DURATION: Duration = Duration::from_secs(30);
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const AGENT_STATUS_SCHEMA_VERSION: &str = "pgshard.agent.status.v1";
 
 trait TcpAcceptor: Send {
     async fn accept(&mut self) -> io::Result<TcpStream>;
@@ -354,8 +355,21 @@ async fn readiness(State(state): State<AgentState>) -> Response {
     (status, Json(readiness)).into_response()
 }
 
-async fn status(State(state): State<AgentState>) -> Json<AgentSnapshot> {
-    Json(state.snapshot())
+#[derive(Serialize)]
+struct AgentStatus {
+    schema_version: &'static str,
+    #[serde(flatten)]
+    snapshot: AgentSnapshot,
+}
+
+async fn status(State(state): State<AgentState>) -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(AgentStatus {
+            schema_version: AGENT_STATUS_SCHEMA_VERSION,
+            snapshot: state.snapshot(),
+        }),
+    )
 }
 
 async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
@@ -508,6 +522,35 @@ mod tests {
         assert!(body.contains("pgshard_agent_postgres_process_up 1\n"));
         assert!(body.contains("pgshard_agent_postgres_replication_bootstrap 0\n"));
         assert!(body.contains("pgshard_agent_postgres_replication_standby 1\n"));
+    }
+
+    #[tokio::test]
+    async fn status_has_an_exact_non_cacheable_schema_envelope() {
+        let response = status(State(AgentState::default())).await.into_response();
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&header::HeaderValue::from_static("no-store")),
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("application/json")),
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("bounded status response");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("status JSON");
+        assert_eq!(
+            value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_str),
+            Some(AGENT_STATUS_SCHEMA_VERSION),
+        );
+        assert_eq!(
+            value
+                .get("postgres_process")
+                .and_then(serde_json::Value::as_str),
+            Some("disabled")
+        );
     }
 
     struct ErrorOnceAcceptor {

@@ -359,6 +359,71 @@ pub struct OrchSnapshot {
     pub coordination_resource_version: Option<String>,
     /// Validated operator-published discovery topology, when configured.
     pub topology: Option<TopologyDiagnostics>,
+    /// Freshness-bounded, diagnostic-only agent-status collection summary.
+    pub agent_status: AgentStatusDiagnostics,
+}
+
+/// Lifecycle of diagnostic-only remote agent-status evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusPhase {
+    /// The explicit runtime contract for agent observation is absent.
+    #[default]
+    Disabled,
+    /// A new all-members collection is in progress; no older evidence remains.
+    Collecting,
+    /// Every expected member was validated within one live monotonic window.
+    Fresh,
+    /// The latest collection failed closed without publishing partial evidence.
+    Unavailable,
+    /// The last complete collection passed its process-local freshness deadline.
+    Expired,
+    /// Process shutdown cleared all agent evidence.
+    ShuttingDown,
+}
+
+/// Stable failure classes for diagnostic-only collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusFailureReason {
+    /// Kubernetes identity or topology evidence was unavailable or invalid.
+    IdentityUnavailable,
+    /// One direct agent request or response was unavailable or invalid.
+    StatusUnavailable,
+    /// Kubernetes identity changed across the request bracket.
+    IdentityChanged,
+    /// The complete collection could not be published before its deadline.
+    FreshnessExpired,
+}
+
+/// Bounded summary only; raw remote status is never retained.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AgentStatusDiagnostics {
+    /// Current collection lifecycle.
+    pub phase: AgentStatusPhase,
+    /// Finite member count required for an atomic complete result.
+    pub expected_members: usize,
+    /// Complete fresh member count, or zero when no complete result is live.
+    pub fresh_members: usize,
+    /// Configured process-local maximum receipt age in milliseconds.
+    pub maximum_age_ms: u64,
+    /// Latest stable failure class, if any.
+    pub failure: Option<AgentStatusFailureReason>,
+    /// Explicitly states that this evidence grants no authority.
+    pub diagnostic_only: bool,
+}
+
+impl Default for AgentStatusDiagnostics {
+    fn default() -> Self {
+        Self {
+            phase: AgentStatusPhase::Disabled,
+            expected_members: 0,
+            fresh_members: 0,
+            maximum_age_ms: 0,
+            failure: None,
+            diagnostic_only: true,
+        }
+    }
 }
 
 /// Machine-readable reason the orchestrator is not yet safe to serve control
@@ -401,6 +466,7 @@ struct OrchInner {
     // Diagnostic-only identity evidence is never retained past this process-
     // local monotonic deadline and never participates in authority decisions.
     agent_identity_binding_deadline: Option<Instant>,
+    agent_status: AgentStatusDiagnostics,
     topology: Option<TopologyDiagnostics>,
 }
 
@@ -461,9 +527,24 @@ impl OrchState {
         if !(1..=MAX_LEASE_TTL_MS).contains(&max_lease_ttl_ms) {
             return Err(OrchError::InvalidMaximumLeaseTtl(max_lease_ttl_ms));
         }
+        let agent_status = match topology.as_ref() {
+            Some(topology) => AgentStatusDiagnostics {
+                phase: if topology.agent_status_collection
+                    == crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
+                {
+                    AgentStatusPhase::Disabled
+                } else {
+                    AgentStatusPhase::Unavailable
+                },
+                expected_members: topology.member_count,
+                ..AgentStatusDiagnostics::default()
+            },
+            None => AgentStatusDiagnostics::default(),
+        };
         Ok(Self {
             inner: Arc::new(Mutex::new(OrchInner {
                 identity: Some(identity),
+                agent_status,
                 topology,
                 ..OrchInner::default()
             })),
@@ -552,31 +633,101 @@ impl OrchState {
         inner.leader = false;
     }
 
-    /// Replaces the diagnostic identity-binding state. This evidence never
-    /// participates in readiness, leadership, leases, or operation authority.
-    pub(crate) fn record_agent_identity_binding(&self, deadline: Option<Instant>) {
+    /// Clears earlier evidence before a new all-members collection begins.
+    pub(crate) fn record_agent_status_collecting(&self, maximum_age: Duration) {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let bound = deadline.is_some_and(|deadline| Instant::now() < deadline);
-        inner.agent_identity_binding_deadline = bound.then_some(deadline).flatten();
+        if inner.agent_status.phase == AgentStatusPhase::ShuttingDown {
+            return;
+        }
+        inner.agent_identity_binding_deadline = None;
+        inner.agent_status.phase = AgentStatusPhase::Collecting;
+        inner.agent_status.fresh_members = 0;
+        inner.agent_status.maximum_age_ms =
+            u64::try_from(maximum_age.as_millis()).unwrap_or(u64::MAX);
+        inner.agent_status.failure = None;
         if let Some(topology) = &mut inner.topology
             && topology.agent_status_collection
                 != crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
         {
-            topology.agent_status_collection = if bound {
-                crate::topology::AgentStatusCollectionState::DisabledAgentStatusCollectorRequired
-            } else {
-                crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired
-            };
+            topology.agent_status_collection =
+                crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired;
         }
+    }
+
+    /// Records a failed-closed collection without retaining partial status.
+    pub(crate) fn record_agent_status_failure(&self, failure: AgentStatusFailureReason) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.agent_status.phase == AgentStatusPhase::ShuttingDown {
+            return;
+        }
+        inner.agent_identity_binding_deadline = None;
+        inner.agent_status.phase = AgentStatusPhase::Unavailable;
+        inner.agent_status.fresh_members = 0;
+        inner.agent_status.failure = Some(failure);
+        if let Some(topology) = &mut inner.topology
+            && topology.agent_status_collection
+                != crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
+        {
+            topology.agent_status_collection =
+                crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired;
+        }
+    }
+
+    /// Atomically publishes only one complete, still-live collection summary.
+    #[must_use]
+    pub(crate) fn record_agent_status_fresh(&self, member_count: usize, deadline: Instant) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.agent_status.phase == AgentStatusPhase::ShuttingDown {
+            return false;
+        }
+        let valid = member_count > 0
+            && member_count == inner.agent_status.expected_members
+            && Instant::now() < deadline;
+        if !valid {
+            inner.agent_identity_binding_deadline = None;
+            inner.agent_status.phase = AgentStatusPhase::Unavailable;
+            inner.agent_status.fresh_members = 0;
+            inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
+            return false;
+        }
+        inner.agent_identity_binding_deadline = Some(deadline);
+        inner.agent_status.phase = AgentStatusPhase::Fresh;
+        inner.agent_status.fresh_members = member_count;
+        inner.agent_status.failure = None;
+        if let Some(topology) = &mut inner.topology {
+            topology.agent_status_collection =
+                crate::topology::AgentStatusCollectionState::FreshDiagnosticEvidence;
+        }
+        true
     }
 
     /// Removes externally visible readiness before process shutdown begins.
     pub fn begin_shutdown(&self) {
         self.record_coordination_unavailable();
-        self.record_agent_identity_binding(None);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.agent_identity_binding_deadline = None;
+        inner.agent_status.phase = AgentStatusPhase::ShuttingDown;
+        inner.agent_status.fresh_members = 0;
+        inner.agent_status.failure = None;
+        if let Some(topology) = &mut inner.topology
+            && topology.agent_status_collection
+                != crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
+        {
+            topology.agent_status_collection =
+                crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired;
+        }
     }
 
     /// Returns a consistent reportable snapshot.
@@ -603,6 +754,11 @@ impl OrchState {
             .is_some_and(|deadline| now < deadline);
         if !identity_binding_live {
             inner.agent_identity_binding_deadline = None;
+            if inner.agent_status.phase == AgentStatusPhase::Fresh {
+                inner.agent_status.phase = AgentStatusPhase::Expired;
+                inner.agent_status.fresh_members = 0;
+                inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
+            }
             if let Some(topology) = &mut inner.topology
                 && topology.agent_status_collection
                     != crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
@@ -624,6 +780,7 @@ impl OrchState {
             coordination_lease_uid: inner.coordination_lease_uid.clone(),
             coordination_resource_version: inner.coordination_resource_version.clone(),
             topology: inner.topology.clone(),
+            agent_status: inner.agent_status.clone(),
         }
     }
 
@@ -2040,10 +2197,39 @@ mod tests {
         };
         let state = OrchState::with_identity_and_topology(identity(), 1_000, topology.clone())
             .expect("valid state");
-        state.record_agent_identity_binding(None);
+        state.record_agent_status_failure(AgentStatusFailureReason::IdentityUnavailable);
         assert_eq!(state.snapshot().topology, Some(topology.clone()));
         state.begin_shutdown();
         assert_eq!(state.snapshot().topology, Some(topology));
+    }
+
+    #[test]
+    fn requested_shutdown_is_terminal_for_all_agent_status_writes() {
+        let topology = TopologyDiagnostics {
+            schema_version: crate::topology::TOPOLOGY_SCHEMA_VERSION.to_owned(),
+            cluster_object_uid: "cluster-uid".to_owned(),
+            shard_count: 1,
+            member_count: 3,
+            agent_status_collection:
+                crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired,
+        };
+        let state = OrchState::with_identity_and_topology(identity(), 1_000, topology)
+            .expect("valid state");
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.begin_shutdown();
+
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.record_agent_status_failure(AgentStatusFailureReason::StatusUnavailable);
+        assert!(!state.record_agent_status_fresh(3, Instant::now() + Duration::from_secs(5)));
+        let snapshot = state.snapshot_at(Instant::now() + Duration::from_secs(10));
+
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::ShuttingDown);
+        assert_eq!(snapshot.agent_status.fresh_members, 0);
+        assert_eq!(snapshot.agent_status.failure, None);
+        assert_eq!(
+            snapshot.topology.expect("topology").agent_status_collection,
+            crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired,
+        );
     }
 
     #[test]
