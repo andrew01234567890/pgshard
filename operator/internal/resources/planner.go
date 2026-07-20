@@ -68,6 +68,9 @@ const (
 	PoolerRPort    int32 = 5434
 	HTTPPort       int32 = 8080
 
+	topologySchemaVersion       = "pgshard.topology.v1"
+	maximumTopologyPayloadBytes = 900 * 1024
+
 	defaultPostgreSQLImage              = "docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
 	developmentPostgreSQLBootstrapImage = "pgshard/postgres-agent:dev"
 
@@ -3026,15 +3029,17 @@ func postgresqlStringLiteral(value string) string {
 }
 
 type topologyDocument struct {
-	Cluster         string                `json:"cluster"`
-	Namespace       string                `json:"namespace"`
-	Durability      string                `json:"durability"`
-	MembersPerShard int32                 `json:"membersPerShard"`
-	Listeners       []topologyListener    `json:"listeners"`
-	Shards          []topologyShard       `json:"shards"`
-	Databases       []topologyDatabase    `json:"databases,omitempty"`
-	Backup          topologyBackup        `json:"backup"`
-	Observability   topologyObservability `json:"observability"`
+	SchemaVersion    string                `json:"schemaVersion"`
+	Cluster          string                `json:"cluster"`
+	ClusterObjectUID types.UID             `json:"clusterObjectUID"`
+	Namespace        string                `json:"namespace"`
+	Durability       string                `json:"durability"`
+	MembersPerShard  int32                 `json:"membersPerShard"`
+	Listeners        []topologyListener    `json:"listeners"`
+	Shards           []topologyShard       `json:"shards"`
+	Databases        []topologyDatabase    `json:"databases,omitempty"`
+	Backup           topologyBackup        `json:"backup"`
+	Observability    topologyObservability `json:"observability"`
 }
 
 type topologyListener struct {
@@ -3044,8 +3049,31 @@ type topologyListener struct {
 }
 
 type topologyShard struct {
-	ID      int32  `json:"id"`
-	Service string `json:"service"`
+	ID            int32                 `json:"id"`
+	Service       string                `json:"service"`
+	WritableLease topologyWritableLease `json:"writableLease"`
+	Members       []topologyMember      `json:"members"`
+}
+
+// topologyWritableLease identifies the exact operator-checkpointed
+// coordination universe for a shard. It describes where agents report
+// writable evidence; it does not make a member writable.
+type topologyWritableLease struct {
+	Namespace string    `json:"namespace"`
+	Name      string    `json:"name"`
+	UID       types.UID `json:"uid"`
+}
+
+// topologyMember is deterministic discovery data. Runtime role, health,
+// readiness, and serving authority must come from independently validated
+// evidence and are deliberately absent from this document.
+type topologyMember struct {
+	Ordinal        int32  `json:"ordinal"`
+	InstanceID     string `json:"instanceId"`
+	DNSName        string `json:"dnsName"`
+	PostgreSQLPort int32  `json:"postgresqlPort"`
+	AgentHTTPPort  int32  `json:"agentHttpPort"`
+	PhysicalSlot   string `json:"physicalSlot"`
 }
 
 type topologyDatabase struct {
@@ -3071,11 +3099,17 @@ type topologyObservability struct {
 }
 
 func renderTopology(cluster *pgshardv1alpha1.PgShardCluster) (string, error) {
+	writableLeases, err := postgresqlWritableLeases(cluster)
+	if err != nil {
+		return "", fmt.Errorf("render topology: %w", err)
+	}
 	document := topologyDocument{
-		Cluster:         cluster.Name,
-		Namespace:       cluster.Namespace,
-		Durability:      string(cluster.Spec.Durability),
-		MembersPerShard: cluster.Spec.MembersPerShard,
+		SchemaVersion:    topologySchemaVersion,
+		Cluster:          cluster.Name,
+		ClusterObjectUID: cluster.UID,
+		Namespace:        cluster.Namespace,
+		Durability:       string(cluster.Spec.Durability),
+		MembersPerShard:  cluster.Spec.MembersPerShard,
 		Listeners: []topologyListener{
 			{Mode: "rw", Service: cluster.Name + "-rw", TargetPort: PoolerRWPort},
 			{Mode: "ro", Service: cluster.Name + "-ro", TargetPort: PoolerROPort},
@@ -3090,7 +3124,29 @@ func renderTopology(cluster *pgshardv1alpha1.PgShardCluster) (string, error) {
 		},
 	}
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
-		document.Shards = append(document.Shards, topologyShard{ID: shard, Service: shardName(cluster.Name, shard)})
+		lease := writableLeases[shard]
+		topology := topologyShard{
+			ID:      shard,
+			Service: shardName(cluster.Name, shard),
+			WritableLease: topologyWritableLease{
+				Namespace: cluster.Namespace,
+				Name:      lease.LeaseName,
+				UID:       lease.LeaseUID,
+			},
+			Members: make([]topologyMember, 0, cluster.Spec.MembersPerShard),
+		}
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			instanceID := PostgreSQLMemberStatefulSetName(cluster.Name, shard, member) + "-0"
+			topology.Members = append(topology.Members, topologyMember{
+				Ordinal:        member,
+				InstanceID:     instanceID,
+				DNSName:        postgresqlMemberPodDNS(cluster.Name, shard, member, cluster.Namespace),
+				PostgreSQLPort: PostgreSQLPort,
+				AgentHTTPPort:  HTTPPort,
+				PhysicalSlot:   "pgshard_member_" + memberLabel(member),
+			})
+		}
+		document.Shards = append(document.Shards, topology)
 	}
 	for _, database := range sortedDatabaseTemplates(cluster) {
 		document.Databases = append(document.Databases, topologyDatabase{
@@ -3109,9 +3165,12 @@ func renderTopology(cluster *pgshardv1alpha1.PgShardCluster) (string, error) {
 	if repository := cluster.Spec.Backup.Repository; repository.Filesystem != nil {
 		document.Backup.PersistentVolumeClaim = repository.Filesystem.PersistentVolumeClaimName
 	}
-	encoded, err := json.MarshalIndent(document, "", "  ")
+	encoded, err := json.Marshal(document)
 	if err != nil {
 		return "", fmt.Errorf("render topology: %w", err)
+	}
+	if len(encoded)+1 > maximumTopologyPayloadBytes {
+		return "", fmt.Errorf("render topology: encoded document is %d bytes, exceeding the %d-byte safety limit", len(encoded)+1, maximumTopologyPayloadBytes)
 	}
 	return string(encoded) + "\n", nil
 }
@@ -4314,10 +4373,12 @@ func orchestratorLease(cluster *pgshardv1alpha1.PgShardCluster) *coordinationv1.
 func postgresqlNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	postgresqlPort := intstr.FromInt32(PostgreSQLPort)
+	agentHTTPPort := intstr.FromInt32(HTTPPort)
 	selector := componentSelector(cluster, "postgresql")
 	selector[ShardLabel] = shardLabel(shard)
 	postgresqlPeer := maps.Clone(selector)
 	controlPeer := map[string]string{ClusterLabel: cluster.Name}
+	orchestratorPeer := componentSelector(cluster, "orchestrator")
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: ownedMeta(cluster, shardName(cluster.Name, shard)+"-ingress", "postgresql", nil),
 		Spec: networkingv1.NetworkPolicySpec{
@@ -4336,6 +4397,10 @@ func postgresqlNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster, shard int3
 				{
 					From:  []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: postgresqlPeer}}},
 					Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &postgresqlPort}},
+				},
+				{
+					From:  []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: orchestratorPeer}}},
+					Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &agentHTTPPort}},
 				},
 			},
 		},

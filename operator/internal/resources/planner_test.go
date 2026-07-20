@@ -187,6 +187,8 @@ func TestMaximumValidClusterFitsKubernetesConfigMaps(t *testing.T) {
 	cluster.Name = strings.Repeat("c", pgshardv1alpha1.MaximumClusterNameLength)
 	cluster.Namespace = strings.Repeat("n", 63)
 	cluster.Spec.Shards = pgshardv1alpha1.MaximumShards
+	cluster.Spec.MembersPerShard = 5
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
 	cluster.Spec.Databases = make([]pgshardv1alpha1.DatabaseTemplate, pgshardv1alpha1.MaximumDatabases)
 	for index := range cluster.Spec.Databases {
 		cluster.Spec.Databases[index] = pgshardv1alpha1.DatabaseTemplate{
@@ -231,6 +233,12 @@ func TestMaximumValidClusterFitsKubernetesConfigMaps(t *testing.T) {
 		if len(encoded) >= 1024*1024 {
 			t.Fatalf("maximum valid ConfigMap %s serializes to %d bytes", object.Name, len(encoded))
 		}
+		if object.Name == cluster.Name+TopologyConfigSuffix && len(object.Data["cluster.json"]) > maximumTopologyPayloadBytes {
+			t.Fatalf("maximum valid topology payload is %d bytes, exceeding the %d-byte safety limit", len(object.Data["cluster.json"]), maximumTopologyPayloadBytes)
+		}
+		if object.Name == cluster.Name+TopologyConfigSuffix {
+			t.Logf("maximum topology payload=%d bytes ConfigMap object=%d bytes", len(object.Data["cluster.json"]), len(encoded))
+		}
 	}
 }
 
@@ -238,6 +246,7 @@ func TestTopologyDocumentKeepsIndependentDatabasePlacements(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
 	cluster.Spec.Shards = 8
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
 	cluster.Spec.Databases = []pgshardv1alpha1.DatabaseTemplate{
 		{Name: "b-dedicated", Shards: 3, Cells: []int32{5, 6, 7}},
 		{Name: "a", Shards: 5, Cells: []int32{0, 1, 2, 3, 4}},
@@ -249,8 +258,17 @@ func TestTopologyDocumentKeepsIndependentDatabasePlacements(t *testing.T) {
 	}
 	topology := object[*corev1.ConfigMap](t, plan, cluster.Name+TopologyConfigSuffix)
 	var document topologyDocument
-	if err := json.Unmarshal([]byte(topology.Data["cluster.json"]), &document); err != nil {
+	rawTopology := topology.Data["cluster.json"]
+	if !json.Valid([]byte(rawTopology)) || strings.Contains(rawTopology, "\n  ") {
+		t.Fatalf("topology is not valid compact JSON: %q", rawTopology)
+	}
+	if err := json.Unmarshal([]byte(rawTopology), &document); err != nil {
 		t.Fatal(err)
+	}
+	for _, forbidden := range []string{`"role"`, `"primary"`, `"serving"`, `"ready"`} {
+		if strings.Contains(rawTopology, forbidden) {
+			t.Fatalf("topology contains runtime authority field %s: %s", forbidden, rawTopology)
+		}
 	}
 	want := []topologyDatabase{
 		{Name: "a", Shards: 5, Cells: []int32{0, 1, 2, 3, 4}},
@@ -259,6 +277,70 @@ func TestTopologyDocumentKeepsIndependentDatabasePlacements(t *testing.T) {
 	}
 	if !reflect.DeepEqual(document.Databases, want) {
 		t.Fatalf("database topology document = %#v, want %#v", document.Databases, want)
+	}
+	if document.SchemaVersion != topologySchemaVersion || document.ClusterObjectUID != cluster.UID || document.Cluster != cluster.Name || document.Namespace != cluster.Namespace {
+		t.Fatalf("topology identity = %#v", document)
+	}
+	if len(document.Shards) != int(cluster.Spec.Shards) {
+		t.Fatalf("topology shards = %d, want %d", len(document.Shards), cluster.Spec.Shards)
+	}
+	for shard, topology := range document.Shards {
+		shardID := int32(shard)
+		if topology.ID != shardID || topology.Service != shardName(cluster.Name, shardID) ||
+			topology.WritableLease != (topologyWritableLease{
+				Namespace: cluster.Namespace,
+				Name:      PostgreSQLWritableLeaseName(cluster.Name, shardID),
+				UID:       types.UID(fmt.Sprintf("test-lease-uid-%04d", shardID)),
+			}) {
+			t.Fatalf("topology shard %d identity = %#v", shard, topology)
+		}
+		if len(topology.Members) != int(cluster.Spec.MembersPerShard) {
+			t.Fatalf("topology shard %d members = %#v", shard, topology.Members)
+		}
+		for member, discovery := range topology.Members {
+			memberID := int32(member)
+			instanceID := PostgreSQLMemberStatefulSetName(cluster.Name, shardID, memberID) + "-0"
+			if discovery != (topologyMember{
+				Ordinal:        memberID,
+				InstanceID:     instanceID,
+				DNSName:        postgresqlMemberPodDNS(cluster.Name, shardID, memberID, cluster.Namespace),
+				PostgreSQLPort: PostgreSQLPort,
+				AgentHTTPPort:  HTTPPort,
+				PhysicalSlot:   "pgshard_member_" + memberLabel(memberID),
+			}) {
+				t.Fatalf("topology shard %d member %d = %#v", shard, member, discovery)
+			}
+		}
+	}
+}
+
+func TestTopologyRejectsIncompleteWritableLeaseIdentity(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		mutate func(*pgshardv1alpha1.PgShardCluster)
+	}{
+		{name: "missing", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases = cluster.Status.PostgreSQLWritableLeases[:1]
+		}},
+		{name: "wrong-name", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases[0].LeaseName = "foreign-term"
+		}},
+		{name: "empty-uid", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases[0].LeaseUID = ""
+		}},
+		{name: "duplicate-uid", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLWritableLeases[1].LeaseUID = cluster.Status.PostgreSQLWritableLeases[0].LeaseUID
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cluster := testCluster()
+			test.mutate(cluster)
+			if _, err := Plan(cluster, DefaultImages()); err == nil || !strings.Contains(err.Error(), "writable-term Lease") {
+				t.Fatalf("Plan error = %v", err)
+			}
+		})
 	}
 }
 
@@ -2920,7 +3002,7 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 	}
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		postgresqlPolicy := object[*networkingv1.NetworkPolicy](t, plan, shardName(cluster.Name, shard)+"-ingress")
-		if postgresqlPolicy.Spec.PodSelector.MatchLabels[ShardLabel] != shardLabel(shard) || len(postgresqlPolicy.Spec.Ingress) != 2 || postgresqlPolicy.Spec.Ingress[0].Ports[0].Port.IntVal != PostgreSQLPort || postgresqlPolicy.Spec.Ingress[1].Ports[0].Port.IntVal != PostgreSQLPort {
+		if postgresqlPolicy.Spec.PodSelector.MatchLabels[ShardLabel] != shardLabel(shard) || len(postgresqlPolicy.Spec.Ingress) != 3 || postgresqlPolicy.Spec.Ingress[0].Ports[0].Port.IntVal != PostgreSQLPort || postgresqlPolicy.Spec.Ingress[1].Ports[0].Port.IntVal != PostgreSQLPort || postgresqlPolicy.Spec.Ingress[2].Ports[0].Port.IntVal != HTTPPort {
 			t.Fatalf("PostgreSQL NetworkPolicy = %#v", postgresqlPolicy.Spec)
 		}
 		controlPeers := postgresqlPolicy.Spec.Ingress[0].From
@@ -2930,6 +3012,10 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 		postgresqlPeers := postgresqlPolicy.Spec.Ingress[1].From
 		if len(postgresqlPeers) != 1 || postgresqlPeers[0].PodSelector == nil || postgresqlPeers[0].PodSelector.MatchLabels[ClusterLabel] != cluster.Name || postgresqlPeers[0].PodSelector.MatchLabels[ComponentLabel] != "postgresql" || postgresqlPeers[0].PodSelector.MatchLabels[ShardLabel] != shardLabel(shard) {
 			t.Fatalf("PostgreSQL same-shard peers = %#v", postgresqlPeers)
+		}
+		agentPeers := postgresqlPolicy.Spec.Ingress[2].From
+		if len(agentPeers) != 1 || agentPeers[0].PodSelector == nil || agentPeers[0].NamespaceSelector != nil || agentPeers[0].IPBlock != nil || !maps.Equal(agentPeers[0].PodSelector.MatchLabels, componentSelector(cluster, "orchestrator")) || len(agentPeers[0].PodSelector.MatchExpressions) != 0 {
+			t.Fatalf("PostgreSQL agent diagnostic peers = %#v", agentPeers)
 		}
 	}
 }
@@ -3760,6 +3846,7 @@ func TestMaximumClusterNameUsesBoundedOrchestratorIdentity(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
 	cluster.Name = strings.Repeat("a", pgshardv1alpha1.MaximumClusterNameLength)
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
 	plan, err := Plan(cluster, DefaultImages())
 	if err != nil {
 		t.Fatal(err)
@@ -3843,7 +3930,7 @@ func TestPostgreSQLWritableLeaseNameFitsDNSLabelAtMaximumClusterLength(t *testin
 func testCluster() *pgshardv1alpha1.PgShardCluster {
 	prometheus := true
 	storageClass := "test-storage"
-	return &pgshardv1alpha1.PgShardCluster{
+	cluster := &pgshardv1alpha1.PgShardCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "database", UID: types.UID("cluster-uid"), Generation: 3},
 		Spec: pgshardv1alpha1.PgShardClusterSpec{
 			Shards:          2,
@@ -3874,6 +3961,8 @@ func testCluster() *pgshardv1alpha1.PgShardCluster {
 			Databases:     []pgshardv1alpha1.DatabaseTemplate{{Name: "app"}, {Name: "analytics"}},
 		},
 	}
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	return cluster
 }
 
 func object[T client.Object](t *testing.T, plan []client.Object, name string) T {
