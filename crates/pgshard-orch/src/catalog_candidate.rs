@@ -740,11 +740,13 @@ fn valid_uid(value: &str) -> bool {
 }
 
 fn valid_name(value: &str) -> bool {
+    // Kubernetes DNS1123 subdomain names bound the complete value to 253
+    // bytes; unlike DNS labels, their regex does not cap each dot-separated
+    // segment at 63 bytes.
     !value.is_empty()
         && value.len() <= 253
         && value.split('.').all(|label| {
             !label.is_empty()
-                && label.len() <= 63
                 && label
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -1157,6 +1159,20 @@ mod tests {
         plan_with_members(3)
     }
 
+    fn bootstrap_secret_name(cluster: &str, shard: usize, member: usize) -> String {
+        format!(
+            "{cluster}-shard-{shard:04}-member-{member:04}-auth-{}",
+            "a".repeat(32)
+        )
+    }
+
+    fn bootstrap_pvc_name(cluster: &str, shard: usize, member: usize) -> String {
+        format!(
+            "{cluster}-shard-{shard:04}-member-{member:04}-data-{}",
+            "b".repeat(32)
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn fixture_for_plan(
         plan: CatalogCandidateObservationPlan,
@@ -1211,10 +1227,10 @@ mod tests {
                 bootstrap_checkpoints.push(json!({
                     "shard": shard,
                     "member": member,
-                    "secretName": format!("bootstrap-{shard}-{member}"),
+                    "secretName": bootstrap_secret_name(&plan.cluster_id, shard, member),
                     "secretUID": format!("bootstrap-uid-{shard}-{member}"),
                     "pvcFenceDetached": true,
-                    "pvcName": format!("data-{shard}-{member}"),
+                    "pvcName": bootstrap_pvc_name(&plan.cluster_id, shard, member),
                     "pvcUID": format!("data-uid-{shard}-{member}"),
                     "pvcStorageClassName": "fast"
                 }));
@@ -1234,11 +1250,11 @@ mod tests {
                 },
                 bootstrap: BootstrapReference {
                     secret: ObjectReference {
-                        name: format!("bootstrap-0-{}", member.ordinal),
+                        name: bootstrap_secret_name(&plan.cluster_id, 0, member.ordinal as usize),
                         uid: format!("bootstrap-uid-0-{}", member.ordinal),
                     },
                     pvc: ObjectReference {
-                        name: format!("data-0-{}", member.ordinal),
+                        name: bootstrap_pvc_name(&plan.cluster_id, 0, member.ordinal as usize),
                         uid: format!("data-uid-0-{}", member.ordinal),
                     },
                 },
