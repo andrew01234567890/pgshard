@@ -24,6 +24,7 @@ printf '%s\n' \
   'local postgres postgres peer' \
   'local all all reject' \
   'local replication all reject' \
+  'host replication postgres 127.0.0.1/32 trust' \
   'host all all 127.0.0.1/32 trust' \
   'host all all ::1/128 trust' >"$hba_file"
 chmod 0444 "$hba_file"
@@ -44,6 +45,7 @@ docker run --rm --user 999:999 \
   --no-instructions >/dev/null
 
 start_postgres() {
+  local synchronous_standby_names="${1:-}"
   docker run --detach --name "$container" --user 999:999 \
     --volume "$data_volume:/pgdata" \
     --volume "$socket_volume:/socket" \
@@ -54,7 +56,9 @@ start_postgres() {
     -c hba_file=/tmp/pgshard-target-fence-hba.conf \
     -c unix_socket_directories=/socket \
     -c unix_socket_permissions=0700 \
-    -c shared_preload_libraries=pgshard_fence >/dev/null
+    -c shared_preload_libraries=pgshard_fence \
+    -c "synchronous_standby_names=$synchronous_standby_names" \
+    -c synchronous_commit=on >/dev/null
 
   for _ in $(seq 1 120); do
     if docker exec --user 999:999 "$container" psql -X --no-password \
@@ -89,6 +93,13 @@ ordinary_sql() {
     --set=ON_ERROR_STOP=1 --tuples-only --no-align --command="$1"
 }
 
+remote_identify_system() {
+  docker exec --user 999:999 "$container" psql -X --no-password \
+    --dbname='host=127.0.0.1 port=5432 user=postgres replication=true sslmode=disable' \
+    --set=ON_ERROR_STOP=1 --tuples-only --no-align \
+    --command='IDENTIFY_SYSTEM'
+}
+
 expect_ordinary_failure() {
   if ordinary_sql 'SELECT 1' >/dev/null 2>&1; then
     echo "ordinary session unexpectedly passed the target fence: $1" >&2
@@ -96,8 +107,12 @@ expect_ordinary_failure() {
   fi
 }
 
-start_postgres
+start_postgres 'ANY 1 (pgshard_member_0001)'
 expect_ordinary_failure disarmed
+if remote_identify_system >/dev/null 2>&1; then
+  echo "remote replication unexpectedly passed the disarmed target fence" >&2
+  exit 1
+fi
 docker build \
   --file deploy/images/rust.Dockerfile \
   --target postgres-fence-test-runner \
@@ -110,10 +125,28 @@ docker run --rm --user 999:999 \
   "$test_image" \
   postgres_fence::tests::live_postgres18_installs_renews_and_detects_control_session_loss \
   --ignored --exact
+remote_identity="$(remote_identify_system)"
+if [[ ! "$remote_identity" =~ ^[1-9][0-9]*\|[1-9][0-9]*\|[0-9A-F]+/[0-9A-F]+\|$ ]]; then
+  echo "remote replication returned an invalid post-install identity" >&2
+  exit 1
+fi
 
 stop_postgres
 start_postgres
 expect_ordinary_failure rust_session_restart
+control_sql 'ALTER FUNCTION pg_catalog.pgshard_fence_install(bytea, bytea) SECURITY DEFINER' >/dev/null
+docker run --rm --user 999:999 \
+  --volume "$socket_volume:/socket" \
+  --env PGSHARD_TARGET_FENCE_TEST_SOCKET=/socket \
+  "$test_image" \
+  postgres_fence::tests::live_postgres18_rejects_incompatible_extension_before_installation \
+  --ignored --exact
+expect_ordinary_failure incompatible_catalog
+if remote_identify_system >/dev/null 2>&1; then
+  echo "remote replication passed after incompatible target rejection" >&2
+  exit 1
+fi
+control_sql 'ALTER FUNCTION pg_catalog.pgshard_fence_install(bytea, bytea) SECURITY INVOKER' >/dev/null
 control_sql 'CREATE EXTENSION IF NOT EXISTS pgshard_fence WITH SCHEMA pg_catalog' >/dev/null
 
 boottime_ns="$(docker exec "$container" awk '{printf "%.0f\n", $1 * 1000000000}' /proc/uptime)"

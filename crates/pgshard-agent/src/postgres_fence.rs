@@ -26,8 +26,92 @@ const CONNECTION_OPTIONS: &str = "-c search_path=pg_catalog \
     -c synchronous_commit=on -c log_statement=none \
     -c log_min_error_statement=panic -c log_parameter_max_length=0 \
     -c log_parameter_max_length_on_error=0";
-const CREATE_EXTENSION: &str =
-    "CREATE EXTENSION IF NOT EXISTS pgshard_fence WITH SCHEMA pg_catalog";
+// Extension bootstrap is local target setup, not the WAL-backed writable
+// generation publication.  A replication source can require synchronous
+// standby replay before any standby has been admitted through this fence, so
+// waiting for synchronous replication here would deadlock target installation
+// with the first standby's IDENTIFY_SYSTEM request.  SET LOCAL leaves the
+// retained control session's fail-closed `synchronous_commit=on` default intact.
+const CREATE_EXTENSION: &str = "\
+    BEGIN;\
+    SET LOCAL synchronous_commit = local;\
+    CREATE EXTENSION IF NOT EXISTS pgshard_fence WITH SCHEMA pg_catalog;\
+    COMMIT";
+const EXTENSION_IDENTITY_CHECK_COUNT: usize = 6;
+const VALIDATE_EXTENSION_IDENTITY: &str = r#"
+    WITH extension_identity AS (
+        SELECT e.oid, e.extowner, e.extnamespace, e.extrelocatable,
+               e.extversion, e.extconfig, e.extcondition,
+               owner.rolname::text AS owner_name,
+               namespace.nspname::text AS namespace_name
+        FROM pg_catalog.pg_extension AS e
+        JOIN pg_catalog.pg_roles AS owner ON owner.oid = e.extowner
+        JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = e.extnamespace
+        WHERE e.extname = 'pgshard_fence'
+    ), extension_members AS (
+        SELECT dependency.classid, dependency.objid, dependency.objsubid
+        FROM extension_identity AS extension
+        JOIN pg_catalog.pg_depend AS dependency
+          ON dependency.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+         AND dependency.refobjid = extension.oid
+         AND dependency.refobjsubid = 0
+         AND dependency.deptype = 'e'
+    ), member_function AS (
+        SELECT function.*, namespace.nspname::text AS namespace_name,
+               owner.rolname::text AS owner_name, language.lanname::text AS language_name
+        FROM extension_members AS member
+        JOIN pg_catalog.pg_proc AS function
+          ON member.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+         AND member.objid = function.oid
+         AND member.objsubid = 0
+        JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = function.pronamespace
+        JOIN pg_catalog.pg_roles AS owner ON owner.oid = function.proowner
+        JOIN pg_catalog.pg_language AS language ON language.oid = function.prolang
+    ), function_acl AS (
+        SELECT acl.grantor, acl.grantee, acl.privilege_type, acl.is_grantable,
+               function.proowner
+        FROM member_function AS function
+        CROSS JOIN LATERAL pg_catalog.aclexplode(function.proacl) AS acl
+    )
+    SELECT ARRAY[
+        (SELECT count(*) = 1 FROM extension_identity),
+        (SELECT count(*) = 1 AND COALESCE(bool_and(
+             owner_name = 'postgres' AND namespace_name = 'pg_catalog'
+             AND extversion = '1.0' AND NOT extrelocatable
+             AND extconfig IS NULL AND extcondition IS NULL), false)
+         FROM extension_identity),
+        (SELECT count(*) = 1 FROM extension_members),
+        (SELECT count(*) = 1 FROM member_function),
+        (SELECT count(*) = 1 AND COALESCE(bool_and(
+             proname = 'pgshard_fence_install' AND namespace_name = 'pg_catalog'
+             AND owner_name = 'postgres' AND language_name = 'c'
+             AND probin = '$libdir/pgshard_fence' AND prosrc = 'pgshard_fence_install'
+             AND prokind = 'f' AND NOT prosecdef AND NOT proleakproof
+             AND proisstrict AND NOT proretset AND provolatile = 'v' AND proparallel = 'u'
+             AND proconfig IS NULL AND provariadic = 0 AND prosupport = 0
+             AND procost = 1 AND prorows = 0
+             AND pronargs = 2 AND pronargdefaults = 0 AND proargdefaults IS NULL
+             AND protrftypes IS NULL AND prosqlbody IS NULL
+             AND prorettype = 'pg_catalog.record'::pg_catalog.regtype
+             AND proargtypes = ARRAY[
+                 'pg_catalog.bytea'::pg_catalog.regtype,
+                 'pg_catalog.bytea'::pg_catalog.regtype]::pg_catalog.oidvector
+             AND proallargtypes = ARRAY[
+                 'pg_catalog.bytea'::pg_catalog.regtype,
+                 'pg_catalog.bytea'::pg_catalog.regtype,
+                 'pg_catalog.bytea'::pg_catalog.regtype,
+                 'pg_catalog.bytea'::pg_catalog.regtype]::oid[]
+             AND proargmodes = ARRAY['i', 'i', 'o', 'o']::pg_catalog."char"[]
+             AND proargnames = ARRAY[
+                 'identity', 'deadline_boottime_ns',
+                 'installed_identity', 'installed_deadline_boottime_ns']::text[]), false)
+         FROM member_function),
+        (SELECT count(*) = 1 AND COALESCE(bool_and(
+             grantor = proowner AND grantee = proowner
+             AND privilege_type = 'EXECUTE' AND NOT is_grantable), false)
+         FROM function_acl)
+    ]::boolean[]
+"#;
 const INSTALL_AUTHORITY: &str = "\
     SELECT installed_identity, installed_deadline_boottime_ns \
     FROM pg_catalog.pgshard_fence_install($1::bytea, $2::bytea)";
@@ -62,6 +146,7 @@ impl TargetFenceSession {
             }
         };
         connection.client.batch_execute(CREATE_EXTENSION).await?;
+        validate_extension_identity(&connection.client, socket_dir).await?;
         let mut session = Self {
             socket_dir: socket_dir.to_owned(),
             connection,
@@ -145,6 +230,25 @@ impl TargetFenceSession {
     }
 }
 
+async fn validate_extension_identity(
+    client: &Client,
+    socket_dir: &Path,
+) -> Result<(), PostgresFenceError> {
+    let row = client.query_one(VALIDATE_EXTENSION_IDENTITY, &[]).await?;
+    let checks = row.try_get::<_, Vec<bool>>(0)?;
+    if extension_identity_is_exact(&checks) {
+        Ok(())
+    } else {
+        Err(PostgresFenceError::CatalogIdentityMismatch {
+            socket_dir: socket_dir.to_owned(),
+        })
+    }
+}
+
+fn extension_identity_is_exact(checks: &[bool]) -> bool {
+    checks.len() == EXTENSION_IDENTITY_CHECK_COUNT && checks.iter().all(|check| *check)
+}
+
 pub(crate) fn validate_expected_authority(
     observer: &WritableAuthorityObserver,
     expected_generation: &DurableWritableGeneration,
@@ -218,6 +322,12 @@ pub enum PostgresFenceError {
     /// The retained `PostgreSQL` protocol driver task could not be joined.
     #[error("PostgreSQL target-fence control task failed: {0}")]
     ConnectionDriver(#[source] tokio::task::JoinError),
+    /// The installed extension catalog shape differs from the released target.
+    #[error("PostgreSQL target fence at {socket_dir:?} has an incompatible catalog identity")]
+    CatalogIdentityMismatch {
+        /// Private socket directory whose target failed catalog attestation.
+        socket_dir: PathBuf,
+    },
     /// `PostgreSQL` did not echo the exact installed immutable record.
     #[error("PostgreSQL target fence at {socket_dir:?} returned a non-exact authority ACK")]
     AcknowledgementMismatch {
@@ -259,6 +369,33 @@ mod tests {
         assert_eq!(1_u64.to_be_bytes(), [0, 0, 0, 0, 0, 0, 0, 1]);
     }
 
+    #[test]
+    fn extension_bootstrap_is_local_without_weakening_the_retained_session() {
+        assert!(CREATE_EXTENSION.starts_with("BEGIN;"));
+        assert!(CREATE_EXTENSION.contains("SET LOCAL synchronous_commit = local;"));
+        assert!(CREATE_EXTENSION.ends_with("COMMIT"));
+        assert!(CONNECTION_OPTIONS.contains("synchronous_commit=on"));
+        assert!(!CONNECTION_OPTIONS.contains("synchronous_commit=local"));
+    }
+
+    #[test]
+    fn extension_catalog_identity_requires_every_exact_check() {
+        assert!(extension_identity_is_exact(
+            &[true; EXTENSION_IDENTITY_CHECK_COUNT]
+        ));
+        assert!(!extension_identity_is_exact(
+            &[true; EXTENSION_IDENTITY_CHECK_COUNT - 1]
+        ));
+        assert!(!extension_identity_is_exact(
+            &[true; EXTENSION_IDENTITY_CHECK_COUNT + 1]
+        ));
+        for rejected in 0..EXTENSION_IDENTITY_CHECK_COUNT {
+            let mut checks = [true; EXTENSION_IDENTITY_CHECK_COUNT];
+            checks[rejected] = false;
+            assert!(!extension_identity_is_exact(&checks));
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires a peer-authenticated PostgreSQL 18 target-fence Unix socket"]
     async fn live_postgres18_installs_renews_and_detects_control_session_loss() {
@@ -274,13 +411,17 @@ mod tests {
             .expect("bounded initial deadline");
         lease_attempt.install_authority(initial_deadline, generation.clone());
         let observer = postgres_attempt.authority_observer();
-        let mut session = TargetFenceSession::connect_and_install(
-            &socket_dir,
-            &observer,
-            &generation,
-            Duration::from_secs(1),
+        let mut session = tokio::time::timeout(
+            Duration::from_secs(3),
+            TargetFenceSession::connect_and_install(
+                &socket_dir,
+                &observer,
+                &generation,
+                Duration::from_secs(1),
+            ),
         )
         .await
+        .expect("target installation completed without a synchronous standby")
         .expect("install exact initial authority");
         assert_eq!(
             session.installed,
@@ -289,6 +430,14 @@ mod tests {
                 generation: generation.clone(),
             })
         );
+        let retained_commit_mode = session
+            .connection
+            .client
+            .query_one("SHOW synchronous_commit", &[])
+            .await
+            .expect("read retained control-session commit mode")
+            .get::<_, String>(0);
+        assert_eq!(retained_commit_mode, "on");
 
         let renewed_deadline = initial_deadline
             .checked_add(Duration::from_secs(30))
@@ -343,5 +492,40 @@ mod tests {
             ),
             "unexpected retained-session failure: {error}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a peer-authenticated PostgreSQL 18 target with an altered extension"]
+    async fn live_postgres18_rejects_incompatible_extension_before_installation() {
+        let socket_dir = PathBuf::from(
+            std::env::var_os("PGSHARD_TARGET_FENCE_TEST_SOCKET")
+                .expect("PGSHARD_TARGET_FENCE_TEST_SOCKET is required"),
+        );
+        let generation = durable_generation_for_test(1);
+        let (lease_attempt, postgres_attempt) = writable_attempt_pair_for_test();
+        let deadline = BoottimeInstant::now()
+            .expect("read target deadline clock")
+            .checked_add(Duration::from_secs(30))
+            .expect("bounded target deadline");
+        lease_attempt.install_authority(deadline, generation.clone());
+        let observer = postgres_attempt.authority_observer();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            TargetFenceSession::connect_and_install(
+                &socket_dir,
+                &observer,
+                &generation,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("incompatible target validation remained bounded");
+        let Err(error) = result else {
+            panic!("incompatible target installed authority");
+        };
+        assert!(matches!(
+            error,
+            PostgresFenceError::CatalogIdentityMismatch { .. }
+        ));
     }
 }
