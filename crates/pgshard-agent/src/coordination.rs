@@ -1,7 +1,7 @@
 //! Per-cell Kubernetes Lease coordination for writable `PostgreSQL` terms.
 
 use std::cmp;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
@@ -13,6 +13,9 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::boottime::system_clock;
+use crate::boottime::{BoottimeClock, BoottimeError, BoottimeInstant};
 use crate::domain::{AgentIdentity, AgentState, FencingLease, LeaseInstallError};
 use crate::postgres::WritablePostgresStopped;
 use crate::writable::{DurableWritableGeneration, WritableLeaseAttempt, same_writable_attempt};
@@ -208,7 +211,7 @@ struct WritableLeaseRelease {
 /// Acquires and renews the exact operator-owned writable-term Lease.
 ///
 /// The caller must start this future only for a candidate already proven safe
-/// to promote. A successful Lease update is anchored to a local monotonic
+/// to promote. A successful Lease update is anchored to a local suspend-aware
 /// instant captured before dispatch; response latency consumes the authority
 /// window. Once authority has been held, preemption or local expiry is
 /// terminal so the caller can stop `PostgreSQL`. Shutdown clears local authority
@@ -220,7 +223,7 @@ struct WritableLeaseRelease {
 ///
 /// Returns on permanent identity/protocol failure, preemption, local authority
 /// expiry, or agent-state rejection. Transient API failures are retried only
-/// within the last successfully established monotonic deadline.
+/// within the last successfully established boot-time deadline.
 pub(crate) async fn supervise(
     config: WritableLeaseConfig,
     state: AgentState,
@@ -231,6 +234,7 @@ pub(crate) async fn supervise(
     supervise_with_store(&store, &config, state, shutdown, attempt).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn supervise_with_store<S: LeaseStore>(
     store: &S,
     config: &WritableLeaseConfig,
@@ -244,13 +248,14 @@ async fn supervise_with_store<S: LeaseStore>(
     let mut retry = INITIAL_RETRY;
     let mut held_deadline = None;
     let mut release = None;
+    let clock = state.boottime_clock();
 
     loop {
         if stopping(&shutdown) {
             revoke_authority(&state, &attempt);
             return Ok(writable_lease_shutdown(config, release, attempt));
         }
-        let renewal_cutoff = if let Some(deadline) = held_deadline {
+        let current_cutoff = if let Some(deadline) = held_deadline {
             let Some(cutoff) = renewal_cutoff(deadline, config) else {
                 revoke_authority(&state, &attempt);
                 return Err(WritableLeaseError::RenewDeadlineExceeded);
@@ -268,11 +273,20 @@ async fn supervise_with_store<S: LeaseStore>(
                 }
                 continue;
             }
-            () = wait_for_renewal_cutoff(renewal_cutoff) => {
+            cutoff = wait_for_renewal_cutoff(current_cutoff, clock.as_ref()) => {
                 revoke_authority(&state, &attempt);
-                return Err(WritableLeaseError::RenewDeadlineExceeded);
+                return match cutoff {
+                    Ok(()) => Err(WritableLeaseError::RenewDeadlineExceeded),
+                    Err(error) => Err(error.into()),
+                };
             }
-            result = reconcile_once(store, config, &holder_identity, &mut observed_holder) => result,
+            result = reconcile_once_with_clock(
+                store,
+                config,
+                &holder_identity,
+                &mut observed_holder,
+                clock.as_ref(),
+            ) => result,
         };
 
         let delay = match result {
@@ -307,7 +321,14 @@ async fn supervise_with_store<S: LeaseStore>(
             }
             Err(error) if !error.is_permanent() => {
                 let delay = if let Some(deadline) = held_deadline {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let now = match clock.now() {
+                        Ok(now) => now,
+                        Err(error) => {
+                            revoke_authority(&state, &attempt);
+                            return Err(error.into());
+                        }
+                    };
+                    let remaining = deadline.saturating_duration_since(now);
                     let shutdown_margin =
                         config.lease_duration.saturating_sub(config.renew_deadline);
                     let renewal_time = remaining.saturating_sub(shutdown_margin);
@@ -329,9 +350,26 @@ async fn supervise_with_store<S: LeaseStore>(
             }
         };
 
-        if wait_or_stop(&mut shutdown, delay).await {
-            revoke_authority(&state, &attempt);
-            return Ok(writable_lease_shutdown(config, release, attempt));
+        let wait =
+            wait_before_next_reconcile(&mut shutdown, delay, held_deadline, config, clock.as_ref())
+                .await;
+        let wait = match wait {
+            Ok(wait) => wait,
+            Err(error) => {
+                revoke_authority(&state, &attempt);
+                return Err(error);
+            }
+        };
+        match wait {
+            WaitOutcome::Stopped => {
+                revoke_authority(&state, &attempt);
+                return Ok(writable_lease_shutdown(config, release, attempt));
+            }
+            WaitOutcome::RenewalCutoff => {
+                revoke_authority(&state, &attempt);
+                return Err(WritableLeaseError::RenewDeadlineExceeded);
+            }
+            WaitOutcome::Elapsed => {}
         }
     }
 }
@@ -375,11 +413,30 @@ fn install_authority(
     Ok(())
 }
 
+#[cfg(test)]
 async fn reconcile_once<S: LeaseStore>(
     store: &S,
     config: &WritableLeaseConfig,
     holder_identity: &str,
     observed_holder: &mut Option<ObservedHolder>,
+) -> Result<CoordinationStep, WritableLeaseError> {
+    let clock = system_clock();
+    reconcile_once_with_clock(
+        store,
+        config,
+        holder_identity,
+        observed_holder,
+        clock.as_ref(),
+    )
+    .await
+}
+
+async fn reconcile_once_with_clock<S: LeaseStore>(
+    store: &S,
+    config: &WritableLeaseConfig,
+    holder_identity: &str,
+    observed_holder: &mut Option<ObservedHolder>,
+    clock: &dyn BoottimeClock,
 ) -> Result<CoordinationStep, WritableLeaseError> {
     let lease = store.get().await?;
     let evidence = validate_lease(&lease, config)?;
@@ -391,11 +448,21 @@ async fn reconcile_once<S: LeaseStore>(
 
     if current_holder == Some(holder_identity) {
         *observed_holder = None;
-        return replace_as_holder(store, config, lease, evidence, holder_identity, false).await;
+        return replace_as_holder(
+            store,
+            config,
+            lease,
+            evidence,
+            holder_identity,
+            false,
+            clock,
+        )
+        .await;
     }
     if current_holder.is_none() {
         *observed_holder = None;
-        return replace_as_holder(store, config, lease, evidence, holder_identity, true).await;
+        return replace_as_holder(store, config, lease, evidence, holder_identity, true, clock)
+            .await;
     }
 
     let occupied_duration = occupied_lease_duration(&spec)?;
@@ -405,7 +472,7 @@ async fn reconcile_once<S: LeaseStore>(
         lease_duration_seconds: spec.lease_duration_seconds,
         resource_version: evidence.resource_version.clone(),
     };
-    let now = Instant::now();
+    let now = clock.now()?;
     let unchanged_since = match observed_holder {
         Some(observed) if observed.record == record => observed.unchanged_since,
         _ => {
@@ -427,7 +494,7 @@ async fn reconcile_once<S: LeaseStore>(
     }
 
     *observed_holder = None;
-    replace_as_holder(store, config, lease, evidence, holder_identity, true).await
+    replace_as_holder(store, config, lease, evidence, holder_identity, true, clock).await
 }
 
 async fn replace_as_holder<S: LeaseStore>(
@@ -437,6 +504,7 @@ async fn replace_as_holder<S: LeaseStore>(
     previous: LeaseEvidence,
     holder_identity: &str,
     transition: bool,
+    clock: &dyn BoottimeClock,
 ) -> Result<CoordinationStep, WritableLeaseError> {
     let now = MicroTime(Timestamp::now());
     let mut spec = lease.spec.take().unwrap_or_default();
@@ -458,10 +526,13 @@ async fn replace_as_holder<S: LeaseStore>(
     spec.renew_time = Some(now);
     lease.spec = Some(spec);
 
-    let valid_from = Instant::now();
+    let valid_from = clock.now()?;
     let valid_from_unix_ms = unix_time_ms();
     let updated = store.replace(&lease).await?;
-    let observed_at = Instant::now();
+    let observed_at = clock.now()?;
+    if observed_at < valid_from {
+        return Err(BoottimeError::RegressiveObservation.into());
+    }
     let evidence = validate_lease(&updated, config)?;
     let updated_spec = updated
         .spec
@@ -643,7 +714,7 @@ struct HolderRecord {
 #[derive(Clone, Debug)]
 struct ObservedHolder {
     record: HolderRecord,
-    unchanged_since: Instant,
+    unchanged_since: BoottimeInstant,
 }
 
 #[derive(Clone, Debug)]
@@ -660,9 +731,9 @@ struct AuthorityObservation {
     epoch: u64,
     valid_from_unix_ms: u64,
     valid_until_unix_ms: u64,
-    valid_from: Instant,
-    observed_at: Instant,
-    deadline: Instant,
+    valid_from: BoottimeInstant,
+    observed_at: BoottimeInstant,
+    deadline: BoottimeInstant,
     delay: Duration,
     release: Box<WritableLeaseRelease>,
 }
@@ -745,9 +816,69 @@ async fn wait_or_stop(shutdown: &mut watch::Receiver<bool>, duration: Duration) 
     }
 }
 
-async fn wait_for_renewal_cutoff(cutoff: Option<Instant>) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitOutcome {
+    Elapsed,
+    Stopped,
+    RenewalCutoff,
+}
+
+async fn wait_before_next_reconcile(
+    shutdown: &mut watch::Receiver<bool>,
+    delay: Duration,
+    held_deadline: Option<BoottimeInstant>,
+    config: &WritableLeaseConfig,
+    clock: &dyn BoottimeClock,
+) -> Result<WaitOutcome, WritableLeaseError> {
+    let Some(deadline) = held_deadline else {
+        return Ok(if wait_or_stop(shutdown, delay).await {
+            WaitOutcome::Stopped
+        } else {
+            WaitOutcome::Elapsed
+        });
+    };
+    let cutoff =
+        renewal_cutoff(deadline, config).ok_or(WritableLeaseError::RenewDeadlineExceeded)?;
+    let wake_at = clock
+        .now()?
+        .checked_add(delay)
+        .ok_or(WritableLeaseError::AuthorityDeadlineOverflow)?;
+    let wake_at_cutoff = wake_at >= cutoff;
+    let outcome = wait_until_or_stop(shutdown, cmp::min(wake_at, cutoff), clock).await?;
+    Ok(if outcome == WaitOutcome::Elapsed && wake_at_cutoff {
+        WaitOutcome::RenewalCutoff
+    } else {
+        outcome
+    })
+}
+
+async fn wait_until_or_stop(
+    shutdown: &mut watch::Receiver<bool>,
+    deadline: BoottimeInstant,
+    clock: &dyn BoottimeClock,
+) -> Result<WaitOutcome, BoottimeError> {
+    if stopping(shutdown) {
+        return Ok(WaitOutcome::Stopped);
+    }
+    tokio::select! {
+        biased;
+        result = shutdown.changed() => {
+            if result.is_err() || stopping(shutdown) {
+                Ok(WaitOutcome::Stopped)
+            } else {
+                Ok(WaitOutcome::Elapsed)
+            }
+        }
+        result = clock.wait_until(deadline) => result.map(|()| WaitOutcome::Elapsed),
+    }
+}
+
+async fn wait_for_renewal_cutoff(
+    cutoff: Option<BoottimeInstant>,
+    clock: &dyn BoottimeClock,
+) -> Result<(), BoottimeError> {
     match cutoff {
-        Some(cutoff) => tokio::time::sleep_until(tokio::time::Instant::from_std(cutoff)).await,
+        Some(cutoff) => clock.wait_until(cutoff).await,
         None => std::future::pending().await,
     }
 }
@@ -760,11 +891,18 @@ fn new_process_incarnation() -> String {
     Uuid::new_v4().simple().to_string()[..PROCESS_INCARNATION_HEX_LENGTH].to_owned()
 }
 
-fn renewal_window_open(deadline: Instant, config: &WritableLeaseConfig, now: Instant) -> bool {
+fn renewal_window_open(
+    deadline: BoottimeInstant,
+    config: &WritableLeaseConfig,
+    now: BoottimeInstant,
+) -> bool {
     renewal_cutoff(deadline, config).is_some_and(|cutoff| now < cutoff)
 }
 
-fn renewal_cutoff(deadline: Instant, config: &WritableLeaseConfig) -> Option<Instant> {
+fn renewal_cutoff(
+    deadline: BoottimeInstant,
+    config: &WritableLeaseConfig,
+) -> Option<BoottimeInstant> {
     deadline.checked_sub(config.shutdown_margin())
 }
 
@@ -857,6 +995,12 @@ pub enum WritableLeaseError {
     /// Renewal could not be proven while enough Lease time remained to fence.
     #[error("writable-term Lease renewal deadline was exceeded")]
     RenewDeadlineExceeded,
+    /// `CLOCK_BOOTTIME` could not represent a local authority deadline.
+    #[error("writable-term authority deadline overflowed")]
+    AuthorityDeadlineOverflow,
+    /// The suspend-aware authority clock or its absolute timer failed.
+    #[error("suspend-aware authority clock failed: {0}")]
+    AuthorityClock(#[from] BoottimeError),
 }
 
 impl WritableLeaseError {
@@ -880,7 +1024,9 @@ impl WritableLeaseError {
             | Self::PostgresProofMismatch
             | Self::AgentState(_)
             | Self::AuthorityPreempted
-            | Self::RenewDeadlineExceeded => true,
+            | Self::RenewDeadlineExceeded
+            | Self::AuthorityDeadlineOverflow
+            | Self::AuthorityClock(_) => true,
         }
     }
 }
@@ -888,7 +1034,7 @@ impl WritableLeaseError {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -899,6 +1045,14 @@ mod tests {
 
     const PROCESS_A: &str = "0123456789abcdef01234567";
     const PROCESS_B: &str = "89abcdef0123456789abcdef";
+
+    fn test_boottime_now() -> BoottimeInstant {
+        system_clock().now().expect("read CLOCK_BOOTTIME")
+    }
+
+    fn advance(at: BoottimeInstant, duration: Duration) -> BoottimeInstant {
+        at.checked_add(duration).expect("test boot time fits")
+    }
 
     fn config() -> WritableLeaseConfig {
         WritableLeaseConfig::new(
@@ -1102,7 +1256,7 @@ mod tests {
             panic!("empty Lease was not claimed");
         };
         assert_eq!(authority.epoch, 1);
-        assert!(authority.observed_at < authority.valid_from + config.lease_duration);
+        assert!(authority.observed_at < advance(authority.valid_from, config.lease_duration));
 
         let state =
             AgentState::with_identity(config.identity.clone(), 10_000).expect("valid agent state");
@@ -1120,7 +1274,7 @@ mod tests {
             .expect("install claimed authority");
         assert_eq!(
             state.lease_deadline(),
-            Some(authority.valid_from + config.lease_duration)
+            Some(advance(authority.valid_from, config.lease_duration))
         );
     }
 
@@ -1376,7 +1530,7 @@ mod tests {
         observed
             .as_mut()
             .expect("recorded prior process")
-            .unchanged_since = Instant::now()
+            .unchanged_since = test_boottime_now()
             .checked_sub(elapsed)
             .expect("test instant can move before takeover window");
         let takeover = reconcile_once(&store, &config, &restarted_holder, &mut observed)
@@ -1419,7 +1573,7 @@ mod tests {
                 .expect("observe foreign holder"),
             CoordinationStep::Follower { .. }
         ));
-        observed.as_mut().expect("recorded holder").unchanged_since = Instant::now()
+        observed.as_mut().expect("recorded holder").unchanged_since = test_boottime_now()
             .checked_sub(Duration::from_secs(1))
             .expect("test instant can move back one second");
         let step = reconcile_once(&store, &config, &holder(&config), &mut observed)
@@ -1449,7 +1603,7 @@ mod tests {
         reconcile_once(&store, &config, &holder(&config), &mut observed)
             .await
             .expect("first observation");
-        observed.as_mut().expect("recorded holder").unchanged_since = Instant::now()
+        observed.as_mut().expect("recorded holder").unchanged_since = test_boottime_now()
             .checked_sub(Duration::from_secs(1))
             .expect("test instant can move back one second");
         store
@@ -1482,6 +1636,48 @@ mod tests {
             reconcile_once(&store, &config, &holder(&config), &mut observed,).await,
             Err(WritableLeaseError::RenewDeadlineExceeded)
         ));
+    }
+
+    #[tokio::test]
+    async fn authority_clock_failure_revokes_held_state_and_private_capability() {
+        let config = config();
+        let store = FakeStore::new(lease(&config));
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = AgentState::with_test_clock(config.identity.clone(), 10_000, clock.clone())
+            .expect("valid fake-clock state");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (lease_attempt, postgres_attempt) =
+            crate::writable::writable_attempt_pair_with_clock_for_test(clock.clone());
+        let mut supervision = Box::pin(supervise_with_store(
+            &store,
+            &config,
+            state.clone(),
+            shutdown_rx,
+            lease_attempt,
+        ));
+        loop {
+            tokio::select! {
+                result = &mut supervision => panic!("supervision stopped before acquisition: {result:?}"),
+                () = tokio::task::yield_now() => {
+                    if postgres_attempt.authority_valid_for(Duration::ZERO) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        clock.fail();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), supervision)
+                .await
+                .expect("clock failure stops supervision promptly"),
+            Err(WritableLeaseError::AuthorityClock(_))
+        ));
+        assert!(state.snapshot().lease.is_none());
+        assert!(state.lease_deadline().is_none());
+        assert!(!postgres_attempt.authority_valid_for(Duration::ZERO));
     }
 
     #[tokio::test]
@@ -1546,11 +1742,11 @@ mod tests {
     }
 
     #[test]
-    fn wall_clock_regression_preserves_later_monotonic_renewal() {
+    fn wall_clock_regression_preserves_later_boottime_renewal() {
         let config = config();
         let state =
             AgentState::with_identity(config.identity.clone(), 10_000).expect("valid agent state");
-        let initial_valid_from = Instant::now();
+        let initial_valid_from = test_boottime_now();
         state
             .install_lease_at(
                 FencingLease {
@@ -1573,13 +1769,13 @@ mod tests {
             valid_until_unix_ms: 6_500,
             valid_from: later_valid_from,
             observed_at: later_valid_from,
-            deadline: later_valid_from + config.lease_duration,
+            deadline: advance(later_valid_from, config.lease_duration),
             delay: config.retry_period,
             release: Box::new(WritableLeaseRelease {
                 lease: lease(&config),
             }),
         };
-        install_authority(&state, &config, &renewal).expect("later monotonic renewal");
+        install_authority(&state, &config, &renewal).expect("later boot-time renewal");
         assert_eq!(
             state
                 .snapshot()
@@ -1589,7 +1785,7 @@ mod tests {
         );
         assert_eq!(
             state.lease_deadline(),
-            Some(initial_valid_from + Duration::from_secs(7))
+            Some(advance(initial_valid_from, Duration::from_secs(7)))
         );
     }
 
@@ -1626,7 +1822,7 @@ mod tests {
         let config = config();
         let state =
             AgentState::with_identity(config.identity.clone(), 10_000).expect("valid agent state");
-        let valid_from = Instant::now();
+        let valid_from = test_boottime_now();
         state
             .install_lease_at(
                 FencingLease {
@@ -1641,13 +1837,13 @@ mod tests {
             .expect("install authority");
         let renewal_deadline = valid_from
             .checked_add(config.renew_deadline)
-            .expect("test renewal deadline fits Instant");
+            .expect("test renewal deadline fits boot time");
         let immediately_before = renewal_deadline
             .checked_sub(Duration::from_nanos(1))
-            .expect("test renewal deadline is after Instant origin");
+            .expect("test renewal deadline is after boot-clock origin");
         let deadline = state
             .lease_deadline()
-            .expect("installed monotonic deadline");
+            .expect("installed boot-time deadline");
         assert!(renewal_window_open(deadline, &config, immediately_before));
         assert!(!renewal_window_open(deadline, &config, renewal_deadline));
         assert!(

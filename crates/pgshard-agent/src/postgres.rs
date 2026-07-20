@@ -49,6 +49,12 @@ use crate::writable::durable_generation_for_test;
 use crate::writable::{DurableWritableGeneration, WritablePostgresAttempt};
 
 const POSTGRES_MAJOR: &str = "18";
+type AuthorityLossFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+struct AuthorityLossFutures {
+    publication: Option<AuthorityLossFuture>,
+    running: Option<AuthorityLossFuture>,
+}
 const PG_CONTROL_FILE_SIZE: u64 = 8_192;
 const MAX_POSTGRES_LOCK_FILE_BYTES: u64 = 8_192;
 const MAX_EXTERNAL_PID_FILE_BYTES: u64 = 64;
@@ -907,6 +913,7 @@ impl PreparedPostgres {
                 PostgresStopMode::Graceful
             },
             || PostgresStartDecision::Start,
+            None,
         )
         .await
     }
@@ -937,20 +944,52 @@ impl PreparedPostgres {
         }
         let required_margin = required_margin.max(self.config.target_fence_budget());
         let authority = attempt.authority_observer();
-        self.supervise_with_writable_authority_guard(
+        let publication_expiry = attempt.authority_observer();
+        let running_expiry = attempt.authority_observer();
+        self.supervise_with_writable_authority_guard_and_loss(
             state,
             shutdown,
             move || authority.generation_valid_for(required_margin),
+            Some(AuthorityLossFutures {
+                publication: Some(
+                    publication_expiry.wait_until_current_generation_invalid(required_margin),
+                ),
+                running: Some(
+                    running_expiry.wait_until_current_generation_invalid(required_margin),
+                ),
+            }),
             attempt,
         )
         .await
     }
 
+    #[cfg(test)]
     async fn supervise_with_writable_authority_guard<G>(
+        self,
+        state: AgentState,
+        shutdown: watch::Receiver<bool>,
+        startup_guard: G,
+        attempt: WritablePostgresAttempt,
+    ) -> Result<WritablePostgresStopped, PostgresError>
+    where
+        G: Fn() -> Option<DurableWritableGeneration>,
+    {
+        self.supervise_with_writable_authority_guard_and_loss(
+            state,
+            shutdown,
+            startup_guard,
+            None,
+            attempt,
+        )
+        .await
+    }
+
+    async fn supervise_with_writable_authority_guard_and_loss<G>(
         self,
         state: AgentState,
         mut shutdown: watch::Receiver<bool>,
         startup_guard: G,
+        authority_loss: Option<AuthorityLossFutures>,
         attempt: WritablePostgresAttempt,
     ) -> Result<WritablePostgresStopped, PostgresError>
     where
@@ -985,6 +1024,7 @@ impl PreparedPostgres {
                     PostgresStartDecision::AuthorityMissing
                 }
             },
+            authority_loss,
         )
         .await?;
         Ok(WritablePostgresStopped { attempt })
@@ -995,6 +1035,7 @@ impl PreparedPostgres {
         state: AgentState,
         shutdown: impl Future<Output = PostgresStopMode>,
         startup_guard: G,
+        mut authority_loss: Option<AuthorityLossFutures>,
     ) -> Result<(), PostgresError>
     where
         G: Fn() -> PostgresStartDecision,
@@ -1046,6 +1087,9 @@ impl PreparedPostgres {
 
         let source_generation =
             if let PostgresStartAuthorization::Writable(generation) = authorization {
+                let publication_authority_loss = authority_loss
+                    .as_mut()
+                    .and_then(|authority_loss| authority_loss.publication.take());
                 let publication = publish_generation_before_running(
                     &state,
                     &mut process_group_fence,
@@ -1056,6 +1100,7 @@ impl PreparedPostgres {
                     &socket_dir,
                     &generation,
                     &startup_guard,
+                    publication_authority_loss,
                 )
                 .await;
                 match publication {
@@ -1073,6 +1118,9 @@ impl PreparedPostgres {
             } else {
                 None
             };
+        let running_authority_loss = authority_loss
+            .as_mut()
+            .and_then(|authority_loss| authority_loss.running.take());
         let result = supervise_running_postmaster(
             &state,
             &mut process_group_fence,
@@ -1082,6 +1130,7 @@ impl PreparedPostgres {
             shutdown.as_mut(),
             source_generation.as_ref(),
             &startup_guard,
+            running_authority_loss,
         )
         .await;
         process_group_fence.disarm_if_reaped();
@@ -1713,6 +1762,7 @@ async fn publish_generation_before_running<F, G>(
     socket_dir: &Path,
     generation: &DurableWritableGeneration,
     startup_guard: &G,
+    authority_deadline: Option<AuthorityLossFuture>,
 ) -> Result<WritablePublicationOutcome, PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -1744,7 +1794,7 @@ where
                 })?
         }
     });
-    let authority_lost = wait_for_authority_loss(&authority_exact);
+    let authority_lost = wait_for_authority_loss(&authority_exact, authority_deadline);
     tokio::pin!(authority_lost);
     let result = tokio::select! {
         biased;
@@ -1881,12 +1931,27 @@ async fn stop_tracked_postmaster(
     result
 }
 
-async fn wait_for_authority_loss<F>(authority_exact: &F)
-where
+async fn wait_for_authority_loss<F>(
+    authority_exact: &F,
+    authority_deadline: Option<AuthorityLossFuture>,
+) where
     F: Fn() -> bool,
 {
-    while authority_exact() {
-        sleep(Duration::from_millis(10)).await;
+    if let Some(deadline_wait) = authority_deadline {
+        deadline_wait.await;
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        // Writable production paths always supply the absolute boot-time
+        // watcher. Missing wiring is treated as immediate authority loss.
+        let _ = authority_exact;
+    }
+    #[cfg(test)]
+    {
+        while authority_exact() {
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -1922,6 +1987,7 @@ async fn supervise_running_postmaster<F, G>(
     mut shutdown: Pin<&mut F>,
     source_generation: Option<&DurableWritableGeneration>,
     startup_guard: &G,
+    authority_deadline: Option<AuthorityLossFuture>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -1950,6 +2016,7 @@ where
             shutdown.as_mut(),
             generation,
             startup_guard,
+            authority_deadline,
         )
         .await;
     }
@@ -1963,6 +2030,7 @@ where
             shutdown.as_mut(),
             generation,
             startup_guard,
+            authority_deadline,
         )
         .await;
     }
@@ -2002,6 +2070,7 @@ async fn supervise_writable_quarantine<F, G>(
     mut shutdown: Pin<&mut F>,
     generation: &DurableWritableGeneration,
     startup_guard: &G,
+    authority_deadline: Option<AuthorityLossFuture>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -2014,10 +2083,11 @@ where
             PostgresStartDecision::StartWritable(current) if current == *generation
         )
     };
-    let authority_lost = wait_for_authority_loss(&authority_exact);
+    let authority_lost = wait_for_authority_loss(&authority_exact, authority_deadline);
     tokio::pin!(authority_lost);
     state.set_postgres_process(config.running_process_state());
     tokio::select! {
+        biased;
         status = wait_pidfd_exit(pidfd) => {
             state.clear_replication_evidence();
             state.set_postgres_process(PostgresProcessState::Stopping);
@@ -2061,6 +2131,7 @@ async fn supervise_replication_source<F, G>(
     mut shutdown: Pin<&mut F>,
     generation: &DurableWritableGeneration,
     startup_guard: &G,
+    authority_deadline: Option<AuthorityLossFuture>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -2078,10 +2149,11 @@ where
         generation.clone(),
         config.generation_durability().clone(),
     ));
-    let authority_lost = wait_for_authority_loss(&authority_exact);
+    let authority_lost = wait_for_authority_loss(&authority_exact, authority_deadline);
     tokio::pin!(authority_lost);
     state.set_postgres_process(config.running_process_state());
     tokio::select! {
+        biased;
         status = wait_pidfd_exit(pidfd) => {
             state.clear_replication_evidence();
             state.set_postgres_process(PostgresProcessState::Stopping);
@@ -2098,6 +2170,15 @@ where
             state.set_postgres_process(PostgresProcessState::Failed);
             Err(error)
         }
+        result = &mut evidence_monitor => {
+            Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                replication_evidence_error(result),
+            ).await)
+        }
         stop_mode = shutdown.as_mut() => {
             drop(evidence_monitor);
             stop_tracked_postmaster(
@@ -2111,15 +2192,6 @@ where
                 pidfd,
                 process_group,
                 PostgresError::StartupAuthorityChanged,
-            ).await)
-        }
-        result = &mut evidence_monitor => {
-            Err(cleanup_tracked_startup_failure(
-                state,
-                process,
-                pidfd,
-                process_group,
-                replication_evidence_error(result),
             ).await)
         }
     }
@@ -5091,6 +5163,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::boottime::{BoottimeClock, BoottimeInstant, FakeBoottimeClock};
     use crate::domain::{AgentIdentity, FencingLease, ReplicationEvidence};
     use pgshard_types::ShardId;
 
@@ -6155,7 +6228,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn replication_evidence_loss_fences_standby_and_source_supervisors() {
+    async fn replication_evidence_loss_fences_standby_and_wins_source_shutdown_race() {
         let root = TempDir::new().expect("create standby evidence-loss fixture");
         let data_dir = root.path().join("data");
         pgdata_fixture_at(&data_dir);
@@ -6280,7 +6353,7 @@ mod tests {
             socket_dir,
             evidence_rx,
         );
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let supervisor_state = state.clone();
         let supervisor = tokio::spawn(async move {
             prepared
@@ -6315,6 +6388,9 @@ mod tests {
         evidence_tx
             .send(crate::postgres_replication::TestReplicationEvidenceObservation::Failed)
             .expect("lose source evidence");
+        shutdown_tx
+            .send(true)
+            .expect("race source evidence loss with composed shutdown");
         let result = timeout(Duration::from_secs(2), supervisor)
             .await
             .expect("source evidence loss fenced inside cleanup bound")
@@ -7662,6 +7738,256 @@ mod tests {
             state.snapshot().postgres_process,
             PostgresProcessState::Fenced
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AuthorityClockTestPhase {
+        Publication,
+        Running,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AuthorityClockTestFault {
+        SuspendJump,
+        ClockFailure,
+    }
+
+    #[tokio::test]
+    async fn boottime_faults_during_publication_and_running_fence_the_complete_process_tree() {
+        for phase in [
+            AuthorityClockTestPhase::Publication,
+            AuthorityClockTestPhase::Running,
+        ] {
+            for fault in [
+                AuthorityClockTestFault::SuspendJump,
+                AuthorityClockTestFault::ClockFailure,
+            ] {
+                assert_boottime_fault_fences_complete_process_tree(phase, fault).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn composed_exact_boottime_cutoff_deterministically_returns_retry() {
+        let root = TempDir::new().expect("create composed cutoff fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let running = root.path().join("postmaster-running");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\ntrap 'exit 0' QUIT\n: > '{}'\nwhile :; do :; done\n",
+                running.display()
+            ),
+        );
+        let config = test_config(data_dir, executable, root.path().join("socket"));
+        let required_margin = config.target_fence_budget();
+        let prepared = prepare_fixture(config).expect("prepare composed cutoff supervisor");
+        let initial = BoottimeInstant::from_nanos_for_test(1_000_000_000);
+        let clock = Arc::new(FakeBoottimeClock::new(initial));
+        let state = AgentState::with_test_clock(
+            AgentIdentity {
+                cluster_id: "cluster-1".to_owned(),
+                shard_id: ShardId(0),
+                instance_id: "cluster-1-shard-0-0".to_owned(),
+            },
+            10_000,
+            clock.clone(),
+        )
+        .expect("valid composed cutoff state");
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "cluster-1-shard-0-0".to_owned(),
+                    epoch: 1,
+                    valid_until_unix_ms: 6_000,
+                },
+                1_000,
+            )
+            .expect("install composed cutoff authority");
+        let deadline = state.lease_deadline().expect("composed cutoff deadline");
+        let cutoff = deadline
+            .checked_sub(required_margin)
+            .expect("composed cutoff follows boot-clock origin");
+        let (lease_attempt, postgres_attempt) =
+            crate::writable::writable_attempt_pair_with_clock_for_test(clock.clone());
+        lease_attempt.install_authority(deadline, durable_generation_for_test(1));
+        let (attempt_shutdown_tx, attempt_shutdown_rx) = watch::channel(false);
+        let (_external_shutdown_tx, external_shutdown_rx) = watch::channel(false);
+        let postmaster_state = state.clone();
+        let postmaster = async move {
+            prepared
+                .supervise_with_writable_authority(
+                    postmaster_state,
+                    attempt_shutdown_rx,
+                    Duration::ZERO,
+                    postgres_attempt,
+                )
+                .await
+        };
+        let coordination_clock = clock.clone();
+        let coordination = async move {
+            coordination_clock
+                .wait_until(cutoff)
+                .await
+                .expect("fake coordination cutoff wait");
+            Err::<crate::coordination::WritableLeaseShutdown, _>(
+                crate::coordination::WritableLeaseError::RenewDeadlineExceeded,
+            )
+        };
+        let supervisor = tokio::spawn(crate::writable::join_supervisors(
+            external_shutdown_rx,
+            attempt_shutdown_tx,
+            postmaster,
+            coordination,
+        ));
+
+        wait_for_marker(&running).await;
+        timeout(Duration::from_secs(1), async {
+            while state.snapshot().postgres_process != PostgresProcessState::RunningQuarantined {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("postmaster reached running before exact cutoff");
+        clock
+            .advance(cutoff.saturating_duration_since(initial))
+            .expect("advance fake clock to exact cutoff");
+
+        let outcome = timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("composed exact cutoff completed inside fence bound")
+            .expect("join composed exact cutoff supervisor")
+            .expect("exact coordination cutoff is recoverable");
+        assert!(matches!(
+            outcome,
+            crate::writable::WritableAttemptOutcome::Retry(
+                crate::coordination::WritableLeaseError::RenewDeadlineExceeded
+            )
+        ));
+        assert!(state.snapshot().lease.is_none());
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Fenced
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_boottime_fault_fences_complete_process_tree(
+        phase: AuthorityClockTestPhase,
+        fault: AuthorityClockTestFault,
+    ) {
+        let root = TempDir::new().expect("create boot-clock process-fence fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let descendant = root.path().join("descendant-pid");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\ntrap '' TERM INT QUIT\n(trap '' TERM INT QUIT; while :; do :; done) &\nprintf '%s\\n' \"$!\" > '{}'\nwhile :; do :; done\n",
+                descendant.display()
+            ),
+        );
+        let config = test_config(data_dir, executable, root.path().join("socket"));
+        let prepared = prepare_fixture(config.clone()).expect("prepare boot-clock supervisor");
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = AgentState::with_test_clock(
+            AgentIdentity {
+                cluster_id: "cluster-1".to_owned(),
+                shard_id: ShardId(0),
+                instance_id: "cluster-1-shard-0-0".to_owned(),
+            },
+            10_000,
+            clock.clone(),
+        )
+        .expect("valid boot-clock agent state");
+        state
+            .install_lease(
+                FencingLease {
+                    owner_instance: "cluster-1-shard-0-0".to_owned(),
+                    epoch: 1,
+                    valid_until_unix_ms: 6_000,
+                },
+                1_000,
+            )
+            .expect("install boot-clock authority");
+        let (lease_attempt, postgres_attempt) =
+            crate::writable::writable_attempt_pair_with_clock_for_test(clock.clone());
+        lease_attempt.install_authority(
+            state.lease_deadline().expect("boot-clock deadline"),
+            durable_generation_for_test(1),
+        );
+        let publication_gate = match phase {
+            AuthorityClockTestPhase::Publication => {
+                let (sender, receiver) = watch::channel(false);
+                gate_next_postgres_generation_publication(receiver);
+                Some(sender)
+            }
+            AuthorityClockTestPhase::Running => None,
+        };
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let supervisor_state = state.clone();
+        let supervisor = tokio::spawn(async move {
+            prepared
+                .supervise_with_writable_authority(
+                    supervisor_state,
+                    shutdown_rx,
+                    Duration::ZERO,
+                    postgres_attempt,
+                )
+                .await
+        });
+
+        wait_for_marker(&descendant).await;
+        let expected_state = match phase {
+            AuthorityClockTestPhase::Publication => PostgresProcessState::StartingQuarantined,
+            AuthorityClockTestPhase::Running => PostgresProcessState::RunningQuarantined,
+        };
+        timeout(Duration::from_secs(1), async {
+            while state.snapshot().postgres_process != expected_state {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("postmaster reached the injected boot-clock fault phase");
+
+        match fault {
+            AuthorityClockTestFault::SuspendJump => clock
+                .advance(Duration::from_secs(6))
+                .expect("advance boot clock beyond authority"),
+            AuthorityClockTestFault::ClockFailure => clock.fail(),
+        }
+        let result = timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("boot-clock fault fenced inside the cleanup bound")
+            .expect("join boot-clock fault supervisor");
+        assert!(
+            matches!(result, Err(PostgresError::StartupAuthorityChanged)),
+            "unexpected {phase:?}/{fault:?} result: {result:?}"
+        );
+        assert!(state.snapshot().lease.is_none());
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+        let descendant_pid = fs::read_to_string(&descendant)
+            .expect("read boot-clock descendant PID")
+            .trim_ascii()
+            .parse::<u32>()
+            .expect("parse boot-clock descendant PID");
+        if let Ok(status) = fs::read_to_string(format!("/proc/{descendant_pid}/status")) {
+            assert!(
+                status.lines().any(|line| line.starts_with("State:\tZ")),
+                "live descendant survived {phase:?}/{fault:?} process fencing"
+            );
+        }
+        drop(publication_gate);
+        let reacquired = prepare_fixture(config).expect("reacquire boot-clock-fenced PGDATA");
+        drop(reacquired);
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 //! Runtime foundations for the `PostgreSQL` instance agent.
 
+pub mod boottime;
 pub mod config;
 pub mod coordination;
 pub mod domain;
