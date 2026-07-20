@@ -51,6 +51,13 @@ struct WritableAuthority {
     generation: DurableWritableGeneration,
 }
 
+/// Exact authority snapshot installed into the local `PostgreSQL` target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WritableAuthoritySnapshot {
+    pub(crate) deadline: BoottimeInstant,
+    pub(crate) generation: DurableWritableGeneration,
+}
+
 #[derive(Debug)]
 pub(crate) struct WritableLeaseAttempt {
     identity: Arc<WritableAttemptIdentity>,
@@ -64,7 +71,7 @@ pub(crate) struct WritablePostgresAttempt {
     authority: watch::Receiver<Option<WritableAuthority>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct WritableAuthorityObserver {
     identity: Arc<WritableAttemptIdentity>,
     clock: Arc<dyn BoottimeClock>,
@@ -113,10 +120,10 @@ impl WritablePostgresAttempt {
 }
 
 impl WritableAuthorityObserver {
-    pub(crate) fn generation_valid_for(
+    pub(crate) fn snapshot_valid_for(
         &self,
         required: Duration,
-    ) -> Option<DurableWritableGeneration> {
+    ) -> Option<WritableAuthoritySnapshot> {
         let authority = self.authority.borrow();
         let authority = authority.as_ref()?;
         authority_valid_for(
@@ -125,7 +132,30 @@ impl WritableAuthorityObserver {
             required,
             self.clock.as_ref(),
         )
-        .then(|| authority.generation.clone())
+        .then(|| WritableAuthoritySnapshot {
+            deadline: authority.deadline,
+            generation: authority.generation.clone(),
+        })
+    }
+
+    pub(crate) fn generation_valid_for(
+        &self,
+        required: Duration,
+    ) -> Option<DurableWritableGeneration> {
+        self.snapshot_valid_for(required)
+            .map(|snapshot| snapshot.generation)
+    }
+
+    pub(crate) fn snapshot_is_current(
+        &self,
+        expected: &WritableAuthoritySnapshot,
+        required: Duration,
+    ) -> bool {
+        self.snapshot_valid_for(required).as_ref() == Some(expected)
+    }
+
+    pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.authority.changed().await
     }
 
     /// Binds synchronously to the current exact authorized generation, then

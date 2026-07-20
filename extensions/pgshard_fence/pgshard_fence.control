@@ -1,0 +1,5 @@
+comment = 'Fail-closed local writable-authority target fence'
+default_version = '1.0'
+module_pathname = '$libdir/pgshard_fence'
+relocatable = false
+superuser = true

@@ -63,6 +63,15 @@ impl BoottimeInstant {
         Duration::from_nanos(self.0.saturating_sub(earlier.0))
     }
 
+    /// Returns the exact nanosecond position on Linux's boot clock.
+    ///
+    /// This representation is passed unchanged to the local `PostgreSQL`
+    /// target fence. It is not a duration relative to the observation time.
+    #[must_use]
+    pub(crate) const fn as_nanos(self) -> u64 {
+        self.0
+    }
+
     fn to_timespec(self) -> Timespec {
         Timespec {
             tv_sec: i64::try_from(self.0 / NANOS_PER_SECOND)
