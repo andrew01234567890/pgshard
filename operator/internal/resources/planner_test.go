@@ -821,6 +821,66 @@ func TestPostgreSQLRuntimeObservationRejectsAnnotationShapeMismatch(t *testing.T
 	}
 }
 
+func TestPostgreSQLRuntimeObservationAcceptsDefaultedPodUIDFieldRef(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Spec.MembersPerShard = 3
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.CatalogAccess = nil
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := PostgreSQLMemberStatefulSetName(cluster.Name, 0, 1)
+	standby := object[*appsv1.StatefulSet](t, plan, name).DeepCopy()
+	defaulted := false
+	for index := range standby.Spec.Template.Spec.Containers[0].Env {
+		environment := &standby.Spec.Template.Spec.Containers[0].Env[index]
+		if environment.Name == "PGSHARD_POD_UID" && environment.ValueFrom != nil && environment.ValueFrom.FieldRef != nil {
+			environment.ValueFrom.FieldRef.APIVersion = corev1.SchemeGroupVersion.String()
+			defaulted = true
+		}
+	}
+	if !defaulted {
+		t.Fatal("standby is missing the downward API Pod UID environment")
+	}
+
+	encoded, err := json.Marshal(standby)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := &appsv1.StatefulSet{}
+	if err := json.Unmarshal(encoded, stored); err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := ObservePostgreSQLRuntime(stored.Spec.Template.Annotations, stored.Spec.Template.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		t.Fatalf("observe API-defaulted standby runtime = %q, %v", observed, err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: *stored.Spec.Template.ObjectMeta.DeepCopy(),
+		Spec:       *stored.Spec.Template.Spec.DeepCopy(),
+	}
+	pod.Name = name + "-0"
+	pod.Namespace = cluster.Namespace
+	if !IsPostgreSQLReplicationStandbyPod(pod) {
+		t.Fatalf("API-defaulted standby was not classified: %#v", pod.Spec.Containers[0].Env)
+	}
+
+	for index := range stored.Spec.Template.Spec.Containers[0].Env {
+		environment := &stored.Spec.Template.Spec.Containers[0].Env[index]
+		if environment.Name == "PGSHARD_POD_UID" {
+			environment.ValueFrom.FieldRef.APIVersion = "v2"
+		}
+	}
+	if _, err := ObservePostgreSQLRuntime(stored.Spec.Template.Annotations, stored.Spec.Template.Spec); err == nil || !strings.Contains(err.Error(), "does not match its process composition") {
+		t.Fatalf("non-canonical Pod UID field API version error = %v", err)
+	}
+}
+
 func TestAgentQuarantinePlanRejectsUncheckpointedWritableLeaseIdentity(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -3043,6 +3103,8 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 					slotName := "pgshard_member_" + member
 					if object.Spec.Template.Spec.ServiceAccountName != PostgreSQLStandbyServiceAccountName(cluster.Name, shard) ||
 						object.Spec.Template.Spec.AutomountServiceAccountToken == nil || *object.Spec.Template.Spec.AutomountServiceAccountToken ||
+						envValue(agent.Env, "PGSHARD_CLUSTER_UID") != string(cluster.UID) ||
+						envFieldPath(agent.Env, "PGSHARD_POD_UID") != "metadata.uid" ||
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-standby") ||
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_HOST", sourceHost) ||
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", slotName) ||
@@ -3053,7 +3115,7 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						podHasServiceAccountTokenProjection(object.Spec.Template.Spec) {
 						t.Fatalf("standby %s runtime authority = %#v", object.Name, object.Spec.Template.Spec)
 					}
-					for _, forbidden := range []string{"PGSHARD_CLUSTER_UID", "PGSHARD_POD_UID", "PGSHARD_WRITABLE_LEASE_NAME", "PGSHARD_WRITABLE_LEASE_UID", "PGSHARD_LEASE_NAMESPACE"} {
+					for _, forbidden := range []string{"PGSHARD_WRITABLE_LEASE_NAME", "PGSHARD_WRITABLE_LEASE_UID", "PGSHARD_LEASE_NAMESPACE"} {
 						if containerHasEnvironment(agent, forbidden) {
 							t.Fatalf("standby %s received writable authority %s", object.Name, forbidden)
 						}
@@ -3459,8 +3521,8 @@ func TestReplicationStandbyPodClassificationIsExact(t *testing.T) {
 			setEnvironment(pod, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", "pgshard_member_0002")
 		}},
 		{name: "different passfile", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POSTGRES_PRIMARY_PASSFILE", "/other") }},
-		{name: "writable cluster UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_CLUSTER_UID", "cluster-uid") }},
-		{name: "writable Pod UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POD_UID", "pod-uid") }},
+		{name: "different cluster UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_CLUSTER_UID", "other-cluster-uid") }},
+		{name: "literal Pod UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POD_UID", "pod-uid") }},
 		{name: "writable Lease", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_WRITABLE_LEASE_NAME", "lease") }},
 		{name: "duplicate mode", mutate: func(pod *corev1.Pod) {
 			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"})
@@ -3951,6 +4013,15 @@ func envValue(variables []corev1.EnvVar, name string) string {
 	for _, variable := range variables {
 		if variable.Name == name {
 			return variable.Value
+		}
+	}
+	return ""
+}
+
+func envFieldPath(variables []corev1.EnvVar, name string) string {
+	for _, variable := range variables {
+		if variable.Name == name && variable.ValueFrom != nil && variable.ValueFrom.FieldRef != nil {
+			return variable.ValueFrom.FieldRef.FieldPath
 		}
 	}
 	return ""

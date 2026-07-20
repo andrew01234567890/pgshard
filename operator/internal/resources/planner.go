@@ -2146,7 +2146,8 @@ func IsCurrentPostgreSQLReplicationBootstrapSourcePod(pod *corev1.Pod) bool {
 // IsPostgreSQLReplicationStandbyPod recognizes only one deterministic,
 // role-neutral nonzero member composed as a TCP-closed physical standby. The
 // classifier deliberately includes its upstream Pod DNS, pre-created slot,
-// private passfile, and lack of writable-term or Kubernetes API authority.
+// private passfile, immutable runtime identity, and lack of writable-term or
+// Kubernetes API authority.
 func IsPostgreSQLReplicationStandbyPod(pod *corev1.Pod) bool {
 	if pod == nil {
 		return false
@@ -2218,9 +2219,12 @@ func postgresqlAgentShape(annotations map[string]string, spec corev1.PodSpec, po
 		port, portOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_PORT")
 		slot, slotOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME")
 		passfile, passfileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_PASSFILE")
+		clusterUID, clusterUIDOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_CLUSTER_UID")
 		standby = sourceOK && source != "" && portOK && port == "5432" &&
 			slotOK && canonicalPostgreSQLMemberSlot(slot) && passfileOK &&
-			passfile == "/run/pgshard/standby-auth/passfile"
+			passfile == "/run/pgshard/standby-auth/passfile" &&
+			clusterUIDOK && clusterUID != "" && clusterUID == annotations[PostgreSQLPodClusterUIDAnnotation] &&
+			containerUniqueFieldEnvironment(postgres, "PGSHARD_POD_UID", "metadata.uid")
 	}
 	if (!quarantine && !bootstrapSource && !standby) ||
 		!containerHasPort(postgres, "agent-http", HTTPPort) ||
@@ -2237,8 +2241,6 @@ func postgresqlAgentShape(annotations map[string]string, spec corev1.PodSpec, po
 			return false
 		}
 		for _, name := range []string{
-			"PGSHARD_CLUSTER_UID",
-			"PGSHARD_POD_UID",
 			"PGSHARD_LEASE_NAMESPACE",
 			"PGSHARD_WRITABLE_LEASE_NAME",
 			"PGSHARD_WRITABLE_LEASE_UID",
@@ -2320,6 +2322,27 @@ func containerUniqueLiteralEnvironment(container corev1.Container, name string) 
 		found = true
 	}
 	return value, found
+}
+
+func containerUniqueFieldEnvironment(container corev1.Container, name, fieldPath string) bool {
+	found := false
+	for _, environment := range container.Env {
+		if environment.Name != name {
+			continue
+		}
+		if found || environment.Value != "" || environment.ValueFrom == nil ||
+			environment.ValueFrom.FieldRef == nil ||
+			(environment.ValueFrom.FieldRef.APIVersion != "" &&
+				environment.ValueFrom.FieldRef.APIVersion != corev1.SchemeGroupVersion.String()) ||
+			environment.ValueFrom.FieldRef.FieldPath != fieldPath ||
+			environment.ValueFrom.ResourceFieldRef != nil ||
+			environment.ValueFrom.ConfigMapKeyRef != nil ||
+			environment.ValueFrom.SecretKeyRef != nil {
+			return false
+		}
+		found = true
+	}
+	return found
 }
 
 func containerHasLiteralEnvironment(container corev1.Container, name, value string) bool {
@@ -4061,8 +4084,10 @@ func postgresqlReplicationStandbyContainer(cluster *pgshardv1alpha1.PgShardClust
 	environment := []corev1.EnvVar{
 		{Name: "PGSHARD_HTTP_BIND", Value: "0.0.0.0:8080"},
 		{Name: "PGSHARD_CLUSTER_ID", Value: cluster.Name},
+		{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
 		{Name: "PGSHARD_SHARD_ID", Value: fmt.Sprintf("%d", shard)},
 		{Name: "PGSHARD_INSTANCE_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: "PGSHARD_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
 		{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"},
 		{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"},
 		{Name: "PGSHARD_POSTGRES_BIN", Value: "/usr/lib/postgresql/18/bin/postgres"},

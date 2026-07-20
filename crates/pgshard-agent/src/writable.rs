@@ -154,6 +154,24 @@ impl WritableAuthorityObserver {
         self.snapshot_valid_for(required).as_ref() == Some(expected)
     }
 
+    /// Returns the exact remaining local boot-clock validity for a still
+    /// current authority snapshot.
+    pub(crate) fn remaining_validity(
+        &self,
+        expected: &WritableAuthoritySnapshot,
+    ) -> Option<Duration> {
+        let authority = self.authority.borrow();
+        let authority = authority.as_ref()?;
+        if !Arc::ptr_eq(&self.identity, &authority.identity)
+            || authority.deadline != expected.deadline
+            || authority.generation != expected.generation
+        {
+            return None;
+        }
+        let now = self.clock.now().ok()?;
+        (now < authority.deadline).then(|| authority.deadline.saturating_duration_since(now))
+    }
+
     pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.authority.changed().await
     }

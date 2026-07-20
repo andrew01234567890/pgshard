@@ -11,7 +11,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::coordination::WritableLeaseConfig;
-use crate::domain::AgentIdentity;
+use crate::domain::{ActivationConfigEvidence, AgentIdentity};
 use crate::postgres::{
     PostgresConfig, PostgresConfigError, PostgresRuntimeRole, PostgresStandbyConfig,
 };
@@ -33,6 +33,8 @@ pub struct AgentConfig {
     pub telemetry: TelemetryConfig,
     /// Optional fail-closed `PostgreSQL` process supervision.
     pub postgres: Option<PostgresConfig>,
+    /// Optional exact non-serving activation configuration evidence.
+    pub activation_config: Option<ActivationConfigEvidence>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -309,9 +311,9 @@ impl AgentConfig {
             shard_id: ShardId(raw.shard_id),
             instance_id: raw.instance_id,
         };
-        let writable_setting_supplied = raw.cluster_uid.is_some()
-            || raw.pod_uid.is_some()
-            || raw.lease_namespace.is_some()
+        let activation_cluster_uid = raw.cluster_uid.clone();
+        let activation_pod_uid = raw.pod_uid.clone();
+        let writable_setting_supplied = raw.lease_namespace.is_some()
             || raw.writable_lease_uid.is_some()
             || raw.writable_lease_duration_seconds.is_some()
             || raw.writable_lease_renew_deadline_seconds.is_some()
@@ -361,6 +363,14 @@ impl AgentConfig {
             None => None,
         };
 
+        let activation_config = build_activation_config(
+            &identity,
+            postgres.as_ref(),
+            writable_lease.as_ref(),
+            activation_cluster_uid,
+            activation_pod_uid,
+        )?;
+
         let otlp_endpoint = raw
             .otlp_endpoint
             .as_deref()
@@ -375,12 +385,49 @@ impl AgentConfig {
             writable_lease,
             telemetry: TelemetryConfig { otlp_endpoint },
             postgres,
+            activation_config,
         })
     }
 }
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn build_activation_config(
+    identity: &AgentIdentity,
+    postgres: Option<&PostgresConfig>,
+    writable_lease: Option<&WritableLeaseConfig>,
+    cluster_uid: Option<String>,
+    pod_uid: Option<String>,
+) -> Result<Option<ActivationConfigEvidence>, ConfigError> {
+    if let Some(writable_lease) = writable_lease {
+        let postgres = postgres.ok_or(ConfigError::WritableLeaseRequiresPostgres)?;
+        return Ok(postgres.requires_writable_authority().then(|| {
+            writable_lease.activation_config(
+                postgres.generation_durability().evidence(),
+                duration_millis(postgres.target_fence_budget()),
+            )
+        }));
+    }
+    if postgres.is_some_and(PostgresConfig::is_replication_standby) {
+        return match (cluster_uid, pod_uid) {
+            (Some(cluster_uid), Some(pod_uid))
+                if activation_uid(&cluster_uid) && activation_uid(&pod_uid) =>
+            {
+                Ok(postgres.and_then(|postgres| {
+                    postgres.standby_activation_config(identity.clone(), cluster_uid, pod_uid)
+                }))
+            }
+            (Some(_), Some(_)) => Err(ConfigError::InvalidActivationIdentity),
+            (None, None) => Ok(None),
+            _ => Err(ConfigError::IncompleteActivationIdentity),
+        };
+    }
+    if cluster_uid.is_some() || pod_uid.is_some() {
+        return Err(ConfigError::IncompleteWritableLease);
+    }
+    Ok(None)
 }
 
 fn validate_writable_postgres_pair(
@@ -428,6 +475,14 @@ fn validate_identifier(name: &'static str, value: &str) -> Result<(), ConfigErro
         });
     }
     Ok(())
+}
+
+fn activation_uid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn validate_otlp_endpoint(value: &str) -> Result<Url, ConfigError> {
@@ -529,6 +584,12 @@ pub enum ConfigError {
         /// Configured immediate-stop and process-tree cleanup budget.
         target_fence_budget_ms: u64,
     },
+    /// Standby activation evidence requires both exact Kubernetes object UIDs.
+    #[error("PostgreSQL standby activation evidence requires both cluster and Pod UIDs")]
+    IncompleteActivationIdentity,
+    /// One activation identity is not a bounded canonical Kubernetes UID.
+    #[error("PostgreSQL activation cluster and Pod UIDs must be 1-128 safe ASCII characters")]
+    InvalidActivationIdentity,
     /// Endpoint URL parsing failed.
     #[error("invalid OTLP endpoint {value:?}: {source}")]
     InvalidOtlpEndpoint {
@@ -631,6 +692,7 @@ mod tests {
         assert!(config.writable_lease.is_none());
         assert!(config.telemetry.otlp_endpoint.is_none());
         assert!(config.postgres.is_none());
+        assert!(config.activation_config.is_none());
     }
 
     #[test]
@@ -685,6 +747,7 @@ mod tests {
         ]);
         let config = AgentConfig::try_parse_from(args).expect("valid writable Lease config");
         assert!(config.writable_lease.is_some());
+        assert!(config.activation_config.is_none());
     }
 
     #[test]
@@ -730,6 +793,27 @@ mod tests {
                 .as_ref()
                 .is_some_and(PostgresConfig::requires_writable_authority)
         );
+        let activation = config
+            .activation_config
+            .expect("source activation identity");
+        assert_eq!(activation.identity, config.identity);
+        assert_eq!(
+            activation.cluster_uid,
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(activation.pod_uid, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert!(matches!(
+            activation.postgres,
+            crate::domain::ActivationPostgresConfig::Source {
+                lease_namespace,
+                lease_name,
+                lease_uid,
+                durability: crate::domain::GenerationDurabilityEvidence::Local,
+                target_fence_required_margin_ms: 3_500,
+            } if lease_namespace == "database"
+                && lease_name == "cluster-1-cell-0003-writable"
+                && lease_uid == "99999999-8888-7777-6666-555555555555"
+        ));
     }
 
     #[test]
@@ -856,6 +940,51 @@ mod tests {
         let config = AgentConfig::try_parse_from(replication_standby_args())
             .expect("replication standby with default port");
         assert_eq!(config.postgres, Some(expected_replication_standby(5432)));
+        assert!(config.activation_config.is_none());
+    }
+
+    #[test]
+    fn standby_activation_identity_is_exact_complete_and_optional() {
+        let mut args = replication_standby_args();
+        args.extend([
+            "--cluster-uid",
+            "11111111-2222-3333-4444-555555555555",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        ]);
+        let config = AgentConfig::try_parse_from(args).expect("standby activation identity");
+        let activation = config.activation_config.expect("standby activation config");
+        assert_eq!(activation.identity, config.identity);
+        assert!(matches!(
+            activation.postgres,
+            crate::domain::ActivationPostgresConfig::Standby {
+                primary_host,
+                primary_port: 5432,
+                member_slot_name,
+            } if primary_host == "cluster-1-shard-0003-member-0000.database.svc"
+                && member_slot_name == "pgshard_member_0001"
+        ));
+
+        for setting in ["--cluster-uid", "--pod-uid"] {
+            let mut partial = replication_standby_args();
+            partial.extend([setting, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]);
+            assert!(matches!(
+                AgentConfig::try_parse_from(partial),
+                Err(ConfigError::IncompleteActivationIdentity)
+            ));
+        }
+
+        let mut unsafe_uid = replication_standby_args();
+        unsafe_uid.extend([
+            "--cluster-uid",
+            "cluster/uid",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        ]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(unsafe_uid),
+            Err(ConfigError::InvalidActivationIdentity)
+        ));
     }
 
     #[test]
