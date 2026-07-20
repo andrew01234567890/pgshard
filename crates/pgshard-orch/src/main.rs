@@ -7,6 +7,7 @@ use pgshard_orch::identity_binding;
 use pgshard_orch::topology::{
     ExpectedTopologyIdentity, TopologyDiagnostics, TopologyError, TopologyV1,
 };
+use std::future::Future;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -80,41 +81,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         coordination_result = &mut coordination_future => {
             state.begin_shutdown();
             let _ = shutdown_tx.send(true);
-            if let Ok(server_result) =
-                tokio::time::timeout(SHUTDOWN_GRACE, async {
-                    tokio::join!(&mut identity_binding_future, &mut server_future)
-                }).await
+            if let Some(((), server_result)) =
+                drain_pair(&mut identity_binding_future, &mut server_future).await
             {
-                server_result.1?;
-            } else {
-                tracing::warn!(
-                    grace_seconds = SHUTDOWN_GRACE.as_secs(),
-                    "orchestrator HTTP drain grace expired"
-                );
+                server_result?;
             }
             coordination_result?;
             return Err("orchestrator coordination stopped before process shutdown".into());
         }
+        () = &mut identity_binding_future => {
+            state.begin_shutdown();
+            let _ = shutdown_tx.send(true);
+            if let Some((coordination_result, server_result)) =
+                drain_pair(&mut coordination_future, &mut server_future).await
+            {
+                coordination_result?;
+                server_result?;
+            }
+            return Err("orchestrator identity binding stopped before process shutdown".into());
+        }
         server_result = &mut server_future => {
             state.begin_shutdown();
             let _ = shutdown_tx.send(true);
-            if let Ok(coordination_result) =
-                tokio::time::timeout(SHUTDOWN_GRACE, async {
-                    tokio::join!(&mut coordination_future, &mut identity_binding_future)
-                }).await
+            if let Some((coordination_result, ())) =
+                drain_pair(&mut coordination_future, &mut identity_binding_future).await
             {
-                coordination_result.0?;
-            } else {
-                tracing::warn!(
-                    grace_seconds = SHUTDOWN_GRACE.as_secs(),
-                    "orchestrator coordination shutdown grace expired"
-                );
+                coordination_result?;
             }
             server_result?;
         }
     }
     tracing::info!("orchestrator shutdown complete");
     Ok(())
+}
+
+async fn drain_pair<A, B>(first: &mut A, second: &mut B) -> Option<(A::Output, B::Output)>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+{
+    if let Ok(results) =
+        tokio::time::timeout(SHUTDOWN_GRACE, async { tokio::join!(first, second) }).await
+    {
+        Some(results)
+    } else {
+        tracing::warn!(
+            grace_seconds = SHUTDOWN_GRACE.as_secs(),
+            "orchestrator service drain grace expired"
+        );
+        None
+    }
 }
 
 fn configured_topology(
