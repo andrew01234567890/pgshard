@@ -1424,6 +1424,8 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatalf("replication bootstrap materialized state = %q", replicationState)
 	}
 	assertKINDPhysicalStandbys(t, ctx, kubeClient, haCurrent, sourcePodName)
+	assertKINDOrchestratorObservationRBAC(t, ctx, haCurrent)
+	assertKINDOrchestratorBindsControllerEndpoints(t, ctx, kubeClient, haCurrent)
 	assertKINDSynchronousGenerationWaitsForRemoteReplay(t, ctx, kubeClient, haCurrent, sourcePodName)
 	assertKINDCatalogCandidateConfigurationsInert(t, ctx, kubeClient, haCurrent)
 	assertKINDCatalogCandidateReplacementFailsClosed(t, ctx, kubeClient, haCurrent)
@@ -2191,6 +2193,168 @@ func runPostgreSQLServiceQuery(t *testing.T, ctx context.Context, kubeClient cli
 		t.Fatalf("wait for PostgreSQL client Pod: %v", err)
 	}
 	return strings.TrimSpace(runKubectl(t, ctx, "--namespace", namespace, "logs", clientPod.Name))
+}
+
+func assertKINDOrchestratorObservationRBAC(t *testing.T, ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	identity := "system:serviceaccount:" + cluster.Namespace + ":" + cluster.Name + owned.OrchestratorSuffix
+	statefulSets := make([]string, 0, cluster.Spec.Shards*cluster.Spec.MembersPerShard)
+	pods := make([]string, 0, cluster.Spec.Shards*cluster.Spec.MembersPerShard)
+	endpoints := make([]string, 0, cluster.Spec.Shards)
+	writableLeases := make([]string, 0, cluster.Spec.Shards)
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		endpoints = append(endpoints, fmt.Sprintf("%s-shard-%04d", cluster.Name, shard))
+		writableLeases = append(writableLeases, owned.PostgreSQLWritableLeaseName(cluster.Name, shard))
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			name := owned.PostgreSQLMemberStatefulSetName(cluster.Name, shard, member)
+			statefulSets = append(statefulSets, name)
+			pods = append(pods, name+"-0")
+		}
+	}
+
+	for _, name := range statefulSets {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "statefulsets.apps/"+name)
+	}
+	for _, name := range pods {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "pods/"+name)
+	}
+	for _, name := range endpoints {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "endpoints/"+name)
+	}
+	for _, name := range writableLeases {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "leases.coordination.k8s.io/"+name)
+	}
+	orchestratorLease := cluster.Name + owned.OrchestratorLeaseSuffix
+	assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "leases.coordination.k8s.io/"+orchestratorLease)
+	assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "update", "leases.coordination.k8s.io/"+orchestratorLease)
+
+	for _, denied := range []struct {
+		resource     string
+		exactAllowed string
+	}{
+		{resource: "statefulsets.apps", exactAllowed: statefulSets[0]},
+		{resource: "pods", exactAllowed: pods[0]},
+		{resource: "endpoints", exactAllowed: endpoints[0]},
+		{resource: "leases.coordination.k8s.io", exactAllowed: writableLeases[0]},
+	} {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, "get", denied.resource+"/foreign-object")
+		for _, verb := range []string{"list", "watch"} {
+			assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, denied.resource)
+		}
+		for _, verb := range []string{"update", "patch", "delete"} {
+			assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, denied.resource+"/"+denied.exactAllowed)
+		}
+		for _, verb := range []string{"create", "deletecollection"} {
+			assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, denied.resource)
+		}
+	}
+	for _, verb := range []string{"patch", "delete"} {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, "leases.coordination.k8s.io/"+orchestratorLease)
+	}
+	for _, verb := range []string{"create", "deletecollection"} {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, "leases.coordination.k8s.io")
+	}
+}
+
+func assertKINDCanI(t *testing.T, ctx context.Context, identity, namespace string, allowed bool, verb, resource string) {
+	t.Helper()
+	output, err := exec.CommandContext(ctx, "kubectl", "auth", "can-i", verb, resource, "--namespace", namespace, "--as="+identity).CombinedOutput()
+	want := "no"
+	if allowed {
+		want = "yes"
+	}
+	if got := strings.TrimSpace(string(output)); got != want {
+		t.Fatalf("kubectl auth can-i %s %s as %s = %q (error=%v), want %q", verb, resource, identity, got, err, want)
+	}
+}
+
+func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	const wantedCollectionState = "disabled_agent_status_collector_required"
+	deployment := &appsv1.Deployment{}
+	deploymentKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorSuffix}
+	if err := kubeClient.Get(ctx, deploymentKey, deployment); err != nil {
+		t.Fatal(err)
+	}
+	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas < 1 {
+		t.Fatalf("orchestrator deployment has no desired replicas: %#v", deployment.Spec.Replicas)
+	}
+	wantedReplicas := int(*deployment.Spec.Replicas)
+	observed := make(map[types.UID]struct{}, wantedReplicas)
+	var lastObservation string
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
+		controllerEndpoints := &corev1.Endpoints{}
+		endpointKey := types.NamespacedName{Namespace: cluster.Namespace, Name: fmt.Sprintf("%s-shard-%04d", cluster.Name, 0)}
+		if err := kubeClient.Get(ctx, endpointKey, controllerEndpoints); err != nil {
+			lastObservation = fmt.Sprintf("read controller Endpoints: %v", err)
+			return false, client.IgnoreNotFound(err)
+		}
+		addresses := 0
+		for _, subset := range controllerEndpoints.Subsets {
+			for _, address := range append(append([]corev1.EndpointAddress(nil), subset.Addresses...), subset.NotReadyAddresses...) {
+				if address.TargetRef == nil || address.TargetRef.Kind != "Pod" || address.TargetRef.Name == "" || address.TargetRef.UID == "" || (address.TargetRef.APIVersion != "" && address.TargetRef.APIVersion != "v1") {
+					lastObservation = fmt.Sprintf("noncanonical controller endpoint address: %#v", address)
+					return false, nil
+				}
+				addresses++
+			}
+		}
+		if addresses != int(cluster.Spec.MembersPerShard) {
+			lastObservation = fmt.Sprintf("controller endpoint address count=%d want=%d", addresses, cluster.Spec.MembersPerShard)
+			return false, nil
+		}
+
+		pods := &corev1.PodList{}
+		if err := kubeClient.List(ctx, pods, client.InNamespace(cluster.Namespace), client.MatchingLabels{
+			owned.ClusterLabel:   cluster.Name,
+			owned.ComponentLabel: "orchestrator",
+		}); err != nil {
+			return false, err
+		}
+		current := make(map[types.UID]struct{}, wantedReplicas)
+		active := make([]corev1.Pod, 0, wantedReplicas)
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodRunning {
+				current[pod.UID] = struct{}{}
+				active = append(active, pod)
+			}
+		}
+		if len(active) != wantedReplicas {
+			lastObservation = fmt.Sprintf("active orchestrator replicas=%d want=%d", len(active), wantedReplicas)
+			return false, nil
+		}
+		for uid := range observed {
+			if _, exists := current[uid]; !exists {
+				delete(observed, uid)
+			}
+		}
+		for _, pod := range active {
+			if _, alreadyObserved := observed[pod.UID]; alreadyObserved {
+				continue
+			}
+			var snapshot struct {
+				CoordinationReady bool `json:"coordination_ready"`
+				Topology          *struct {
+					AgentStatusCollection string `json:"agent_status_collection"`
+				} `json:"topology"`
+			}
+			statusPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/status", cluster.Namespace, pod.Name)
+			output, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
+			if err != nil || json.Unmarshal(output, &snapshot) != nil || snapshot.Topology == nil || snapshot.Topology.AgentStatusCollection != wantedCollectionState || !snapshot.CoordinationReady {
+				lastObservation = fmt.Sprintf("orchestrator %s status error=%v output=%q snapshot=%#v", pod.Name, err, output, snapshot)
+				continue
+			}
+			readyPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/readyz", cluster.Namespace, pod.Name)
+			if output, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", readyPath).CombinedOutput(); err != nil {
+				lastObservation = fmt.Sprintf("orchestrator %s readiness changed after diagnostic binding: %v output=%q", pod.Name, err, output)
+				continue
+			}
+			observed[pod.UID] = struct{}{}
+		}
+		return len(observed) == wantedReplicas, nil
+	}); err != nil {
+		t.Fatalf("wait for fresh identity-bound diagnostics from every orchestrator replica: %v; last=%s", err, lastObservation)
+	}
 }
 
 func assertKINDPhysicalStandbys(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster, sourcePodName string) {

@@ -3,6 +3,7 @@
 use pgshard_orch::config::{ConfigError, OrchConfig};
 use pgshard_orch::coordination::{CoordinationConfig, supervise};
 use pgshard_orch::domain::OrchState;
+use pgshard_orch::identity_binding;
 use pgshard_orch::topology::{
     ExpectedTopologyIdentity, TopologyDiagnostics, TopologyError, TopologyV1,
 };
@@ -13,26 +14,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = match OrchConfig::from_env() {
-        Ok(config) => config,
-        Err(ConfigError::Arguments(error)) => error.exit(),
-        Err(error) => return Err(error.into()),
-    };
-    let topology_diagnostics = load_topology(&config)?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    let telemetry = config.telemetry.status();
-    if telemetry.endpoint_configured {
-        tracing::warn!(reason = telemetry.reason, "OpenTelemetry export disabled");
-    } else {
-        tracing::info!(reason = telemetry.reason, "OpenTelemetry export disabled");
-    }
-
+    let (config, topology) = initialize()?;
+    let identity_binding_enabled = config.identity_binding_mode.enabled();
+    let (topology_diagnostics, observation_targets) =
+        configured_topology(&topology, identity_binding_enabled);
     let coordination = CoordinationConfig::new(
         config.lease_namespace,
         config.lease_name,
@@ -51,12 +36,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log_start(config.http_bind, config.lease_ttl_ms, &topology_diagnostics);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let coordination_future = supervise(coordination, state.clone(), shutdown_rx.clone());
+    let identity_binding_future = supervise_identity_binding(
+        identity_binding_enabled,
+        observation_targets,
+        state.clone(),
+        shutdown_rx.clone(),
+        config.kubernetes_request_timeout,
+        config.kubernetes_lease_retry_period,
+        config.identity_binding_freshness,
+    );
     let server_future = pgshard_orch::http::serve(
         config.http_bind,
         state.clone(),
-        wait_for_shutdown(shutdown_rx),
+        wait_for_shutdown(shutdown_rx.clone()),
     );
     tokio::pin!(coordination_future);
+    tokio::pin!(identity_binding_future);
     tokio::pin!(server_future);
 
     tokio::select! {
@@ -64,9 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.begin_shutdown();
             let _ = shutdown_tx.send(true);
             match tokio::time::timeout(SHUTDOWN_GRACE, async {
-                tokio::join!(&mut coordination_future, &mut server_future)
+                tokio::join!(
+                    &mut coordination_future,
+                    &mut identity_binding_future,
+                    &mut server_future
+                )
             }).await {
-                Ok((coordination_result, server_result)) => {
+                Ok((coordination_result, (), server_result)) => {
                     coordination_result?;
                     server_result?;
                 }
@@ -82,9 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.begin_shutdown();
             let _ = shutdown_tx.send(true);
             if let Ok(server_result) =
-                tokio::time::timeout(SHUTDOWN_GRACE, &mut server_future).await
+                tokio::time::timeout(SHUTDOWN_GRACE, async {
+                    tokio::join!(&mut identity_binding_future, &mut server_future)
+                }).await
             {
-                server_result?;
+                server_result.1?;
             } else {
                 tracing::warn!(
                     grace_seconds = SHUTDOWN_GRACE.as_secs(),
@@ -98,9 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.begin_shutdown();
             let _ = shutdown_tx.send(true);
             if let Ok(coordination_result) =
-                tokio::time::timeout(SHUTDOWN_GRACE, &mut coordination_future).await
+                tokio::time::timeout(SHUTDOWN_GRACE, async {
+                    tokio::join!(&mut coordination_future, &mut identity_binding_future)
+                }).await
             {
-                coordination_result?;
+                coordination_result.0?;
             } else {
                 tracing::warn!(
                     grace_seconds = SHUTDOWN_GRACE.as_secs(),
@@ -114,7 +117,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_topology(config: &OrchConfig) -> Result<TopologyDiagnostics, TopologyError> {
+fn configured_topology(
+    topology: &TopologyV1,
+    identity_binding_enabled: bool,
+) -> (
+    TopologyDiagnostics,
+    Vec<pgshard_orch::topology::UnboundAgentObservationTarget>,
+) {
+    let diagnostics = topology.diagnostics(identity_binding_enabled);
+    let targets = if identity_binding_enabled {
+        topology.agent_observation_targets()
+    } else {
+        Vec::new()
+    };
+    (diagnostics, targets)
+}
+
+async fn supervise_identity_binding(
+    enabled: bool,
+    targets: Vec<pgshard_orch::topology::UnboundAgentObservationTarget>,
+    state: OrchState,
+    shutdown: watch::Receiver<bool>,
+    request_timeout: Duration,
+    retry_period: Duration,
+    freshness: Duration,
+) {
+    if enabled {
+        identity_binding::supervise(
+            targets,
+            state,
+            shutdown,
+            request_timeout,
+            retry_period,
+            freshness,
+        )
+        .await;
+    } else {
+        wait_for_shutdown(shutdown).await;
+    }
+}
+
+fn initialize() -> Result<(OrchConfig, TopologyV1), Box<dyn std::error::Error>> {
+    let config = match OrchConfig::from_env() {
+        Ok(config) => config,
+        Err(ConfigError::Arguments(error)) => error.exit(),
+        Err(error) => return Err(error.into()),
+    };
+    let topology = load_topology(&config)?;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let telemetry = config.telemetry.status();
+    if telemetry.endpoint_configured {
+        tracing::warn!(reason = telemetry.reason, "OpenTelemetry export disabled");
+    } else {
+        tracing::info!(reason = telemetry.reason, "OpenTelemetry export disabled");
+    }
+    Ok((config, topology))
+}
+
+fn load_topology(config: &OrchConfig) -> Result<TopologyV1, TopologyError> {
     TopologyV1::load(
         &config.topology_file,
         ExpectedTopologyIdentity {
@@ -123,7 +189,6 @@ fn load_topology(config: &OrchConfig) -> Result<TopologyDiagnostics, TopologyErr
             namespace: &config.lease_namespace,
         },
     )
-    .map(|topology| topology.diagnostics())
 }
 
 fn log_start(bind: std::net::SocketAddr, lease_ttl_ms: u64, topology: &TopologyDiagnostics) {

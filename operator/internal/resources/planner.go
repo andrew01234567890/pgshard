@@ -2654,7 +2654,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		orchestratorService(cluster),
 		poolerService(cluster),
 		orchestratorServiceAccount(cluster),
-		orchestratorLeaseRole(cluster),
+		orchestratorLeaseRole(cluster, images.PostgreSQLRuntime.agentQuarantine()),
 		orchestratorLeaseRoleBinding(cluster),
 		orchestratorLease(cluster),
 	)
@@ -2707,7 +2707,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		poolerCatalogAccess = nil
 	}
 	objects = append(objects,
-		orchestratorDeployment(cluster, images.Orchestrator, topologyHash),
+		orchestratorDeployment(cluster, images.Orchestrator, topologyHash, images.PostgreSQLRuntime),
 		poolerDeployment(cluster, images.Pooler, topologyHash, poolerCatalogAccess),
 		podDisruptionBudget(cluster, "orchestrator", 1),
 		podDisruptionBudget(cluster, "pooler", 1),
@@ -4096,6 +4096,8 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 		)
 	}
 	statefulSetMetadata := ownedMeta(cluster, name, "postgresql", nil)
+	statefulSetMetadata.Labels[ShardLabel] = shardLabel(shard)
+	statefulSetMetadata.Labels[MemberLabel] = memberLabel(0)
 	statefulSetMetadata.Annotations[PostgreSQLRuntimeAnnotation] = images.PostgreSQLRuntime.String()
 	return &appsv1.StatefulSet{
 		ObjectMeta: statefulSetMetadata,
@@ -4621,16 +4623,34 @@ func orchestratorServiceAccount(cluster *pgshardv1alpha1.PgShardCluster) *corev1
 	}
 }
 
-func orchestratorLeaseRole(cluster *pgshardv1alpha1.PgShardCluster) *rbacv1.Role {
+func orchestratorLeaseRole(cluster *pgshardv1alpha1.PgShardCluster, identityBinding bool) *rbacv1.Role {
 	name := cluster.Name + OrchestratorSuffix
+	rules := []rbacv1.PolicyRule{{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{cluster.Name + OrchestratorLeaseSuffix}, Verbs: []string{"get", "update"}}}
+	if !identityBinding {
+		return &rbacv1.Role{ObjectMeta: ownedMeta(cluster, name, "orchestrator", nil), Rules: rules}
+	}
+	statefulSetNames := make([]string, 0, cluster.Spec.Shards*cluster.Spec.MembersPerShard)
+	podNames := make([]string, 0, cluster.Spec.Shards*cluster.Spec.MembersPerShard)
+	endpointNames := make([]string, 0, cluster.Spec.Shards)
+	writableLeaseNames := make([]string, 0, cluster.Spec.Shards)
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		endpointNames = append(endpointNames, shardName(cluster.Name, shard))
+		writableLeaseNames = append(writableLeaseNames, PostgreSQLWritableLeaseName(cluster.Name, shard))
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			statefulSetName := PostgreSQLMemberStatefulSetName(cluster.Name, shard, member)
+			statefulSetNames = append(statefulSetNames, statefulSetName)
+			podNames = append(podNames, statefulSetName+"-0")
+		}
+	}
+	rules = append(rules,
+		rbacv1.PolicyRule{APIGroups: []string{appsv1.GroupName}, Resources: []string{"statefulsets"}, ResourceNames: statefulSetNames, Verbs: []string{"get"}},
+		rbacv1.PolicyRule{APIGroups: []string{corev1.GroupName}, Resources: []string{"pods"}, ResourceNames: podNames, Verbs: []string{"get"}},
+		rbacv1.PolicyRule{APIGroups: []string{corev1.GroupName}, Resources: []string{"endpoints"}, ResourceNames: endpointNames, Verbs: []string{"get"}},
+		rbacv1.PolicyRule{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: writableLeaseNames, Verbs: []string{"get"}},
+	)
 	return &rbacv1.Role{
 		ObjectMeta: ownedMeta(cluster, name, "orchestrator", nil),
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups:     []string{coordinationv1.GroupName},
-			Resources:     []string{"leases"},
-			ResourceNames: []string{cluster.Name + OrchestratorLeaseSuffix},
-			Verbs:         []string{"get", "update"},
-		}},
+		Rules:      rules,
 	}
 }
 
@@ -4697,9 +4717,13 @@ func postgresqlNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster, shard int3
 	}
 }
 
-func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash string) *appsv1.Deployment {
+func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash string, postgresqlRuntime PostgreSQLRuntime) *appsv1.Deployment {
 	const replicas int32 = 3
 	selector := componentSelector(cluster, "orchestrator")
+	identityBindingMode := "disabled"
+	if postgresqlRuntime.agentQuarantine() {
+		identityBindingMode = "kubernetes"
+	}
 	env := []corev1.EnvVar{
 		{Name: "PGSHARD_CLUSTER_ID", Value: cluster.Name},
 		{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
@@ -4708,6 +4732,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 		{Name: "PGSHARD_LEASE_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
 		{Name: "PGSHARD_LEASE_NAME", Value: cluster.Name + OrchestratorLeaseSuffix},
 		{Name: "PGSHARD_TOPOLOGY_FILE", Value: "/etc/pgshard/topology/cluster.json"},
+		{Name: "PGSHARD_IDENTITY_BINDING_MODE", Value: identityBindingMode},
 	}
 	if cluster.Spec.Observability.OpenTelemetryEndpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: cluster.Spec.Observability.OpenTelemetryEndpoint})

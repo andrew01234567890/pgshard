@@ -55,12 +55,12 @@ fn loads_a_bounded_configmap_style_symlink_without_collecting_agent_status() {
 
     let topology =
         TopologyV1::load(directory.path().join("cluster.json"), expected()).expect("load topology");
-    let diagnostics = topology.diagnostics();
+    let diagnostics = topology.diagnostics(false);
     assert_eq!(diagnostics.shard_count, 1);
     assert_eq!(diagnostics.member_count, 1);
     assert_eq!(
         diagnostics.agent_status_collection,
-        AgentStatusCollectionState::DisabledPodIdentityRequired
+        AgentStatusCollectionState::DisabledAgentRuntimeRequired
     );
     let target = topology
         .agent_observation_targets()

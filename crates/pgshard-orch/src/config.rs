@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use thiserror::Error;
 use url::Url;
 
@@ -39,8 +39,29 @@ pub struct OrchConfig {
     pub kubernetes_lease_retry_period: Duration,
     /// Bound for one Kubernetes API request.
     pub kubernetes_request_timeout: Duration,
+    /// Whether diagnostic Kubernetes identity binding is enabled.
+    pub identity_binding_mode: IdentityBindingMode,
+    /// Monotonic lifetime of one successful diagnostic identity observation.
+    pub identity_binding_freshness: Duration,
     /// OpenTelemetry configuration placeholder.
     pub telemetry: TelemetryConfig,
+}
+
+/// Explicit runtime policy for read-only Kubernetes identity observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum IdentityBindingMode {
+    /// Do not read `PostgreSQL` workload identities from the Kubernetes API.
+    Disabled,
+    /// Bind the exact operator-owned `StatefulSet`, Pod, Endpoints, and Lease set.
+    Kubernetes,
+}
+
+impl IdentityBindingMode {
+    /// Returns whether the diagnostic observer may access Kubernetes objects.
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        matches!(self, Self::Kubernetes)
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -98,6 +119,21 @@ struct RawConfig {
     )]
     kubernetes_request_timeout_ms: u64,
 
+    #[arg(
+        long,
+        env = "PGSHARD_IDENTITY_BINDING_MODE",
+        value_enum,
+        default_value = "disabled"
+    )]
+    identity_binding_mode: IdentityBindingMode,
+
+    #[arg(
+        long,
+        env = "PGSHARD_IDENTITY_BINDING_FRESHNESS_MS",
+        default_value_t = 5_000
+    )]
+    identity_binding_freshness_ms: u64,
+
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 }
@@ -142,6 +178,11 @@ impl OrchConfig {
                 raw.kubernetes_request_timeout_ms,
             ));
         }
+        if !(100..=5_000).contains(&raw.identity_binding_freshness_ms) {
+            return Err(ConfigError::InvalidIdentityBindingFreshness(
+                raw.identity_binding_freshness_ms,
+            ));
+        }
         if !(100..=30_000).contains(&raw.kubernetes_lease_retry_ms) {
             return Err(ConfigError::InvalidKubernetesLeaseRetry(
                 raw.kubernetes_lease_retry_ms,
@@ -177,6 +218,8 @@ impl OrchConfig {
             kubernetes_lease_duration: Duration::from_secs(raw.kubernetes_lease_duration_seconds),
             kubernetes_lease_retry_period: Duration::from_millis(raw.kubernetes_lease_retry_ms),
             kubernetes_request_timeout: Duration::from_millis(raw.kubernetes_request_timeout_ms),
+            identity_binding_mode: raw.identity_binding_mode,
+            identity_binding_freshness: Duration::from_millis(raw.identity_binding_freshness_ms),
             telemetry: TelemetryConfig { otlp_endpoint },
         })
     }
@@ -277,6 +320,9 @@ pub enum ConfigError {
     /// One Kubernetes API request is outside the supported bound.
     #[error("Kubernetes request timeout {0} ms must be between 100 and 5000")]
     InvalidKubernetesRequestTimeout(u64),
+    /// Successful identity evidence would be retained outside its bounded policy.
+    #[error("identity-binding freshness {0} ms must be between 100 and 5000 ms")]
+    InvalidIdentityBindingFreshness(u64),
     /// Candidate polling is outside the supported bound.
     #[error("Kubernetes Lease retry period {0} ms must be between 100 and 30000")]
     InvalidKubernetesLeaseRetry(u64),
@@ -357,7 +403,44 @@ mod tests {
         assert_eq!(config.kubernetes_lease_duration, Duration::from_secs(15));
         assert_eq!(config.kubernetes_lease_retry_period, Duration::from_secs(2));
         assert_eq!(config.kubernetes_request_timeout, Duration::from_secs(1));
+        assert_eq!(config.identity_binding_mode, IdentityBindingMode::Disabled);
+        assert_eq!(config.identity_binding_freshness, Duration::from_secs(5));
         assert_eq!(config.topology_file, PathBuf::from(DEFAULT_TOPOLOGY_FILE));
+    }
+
+    #[test]
+    fn accepts_only_explicit_bounded_identity_binding_configuration() {
+        let mut values = args();
+        values.extend([
+            "--identity-binding-mode",
+            "kubernetes",
+            "--identity-binding-freshness-ms",
+            "750",
+        ]);
+        let config = OrchConfig::try_parse_from(values).expect("enabled binding config");
+        assert_eq!(
+            config.identity_binding_mode,
+            IdentityBindingMode::Kubernetes
+        );
+        assert_eq!(
+            config.identity_binding_freshness,
+            Duration::from_millis(750)
+        );
+
+        for freshness in ["99", "5001"] {
+            let mut values = args();
+            values.extend(["--identity-binding-freshness-ms", freshness]);
+            assert!(matches!(
+                OrchConfig::try_parse_from(values),
+                Err(ConfigError::InvalidIdentityBindingFreshness(_))
+            ));
+        }
+        let mut values = args();
+        values.extend(["--identity-binding-mode", "automatic"]);
+        assert!(matches!(
+            OrchConfig::try_parse_from(values),
+            Err(ConfigError::Arguments(_))
+        ));
     }
 
     #[test]
