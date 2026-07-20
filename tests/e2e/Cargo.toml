@@ -1,0 +1,12 @@
+[package]
+name = "pgshard-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Entry point for pgshard end-to-end tests against disposable clusters"
+
+[lints]
+workspace = true

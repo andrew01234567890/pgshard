@@ -10,6 +10,8 @@ members = [
   "crates/pgshard-release",
   "crates/pgshard-types",
   "crates/pgshard-version",
+  "tests/e2e",
+  "tests/integration",
 ]
 resolver = "3"
 

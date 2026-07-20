@@ -150,9 +150,9 @@ jobs:
           emit_component go "$go_exists" '^operator/|^proto/|^contracts/replication-slot-names\.json$|^Makefile$|^\.github/workflows/'
           emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/workflows/'
           emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/workflows/'
-          emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^Makefile$|^\.github/workflows/'
+          emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
           emit_component images "$images_exists" '^deploy/|^extensions/|^Dockerfile|/Dockerfile$|^\.dockerignore$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
-          emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
+          emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
           emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^Makefile$|^\.github/workflows/'
           current_website_exists=false
           [[ -f website/package.json ]] && current_website_exists=true
@@ -610,7 +610,7 @@ jobs:
           PGSHARD_KIND_E2E: "true"
         run: >-
           go test -race -count=1
-          -run '^(TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks|TestKINDDeletionWaitsForPVCBeforeSameNameRecreate|TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence|TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership)$'
+          -run '^(TestKINDCRDRejectsUnsafeSpecTransitionsWithoutWebhooks|TestKINDDeletionWaitsForOwnedResourcesBeforeSameNameRecreate|TestKINDGarbageCollectorDeletesLatePostgreSQLCreationFence|TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership)$'
           ./internal/controller
       - name: Delete disposable Kubernetes cluster
         if: always()
@@ -824,14 +824,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [protocol, catalog, pgoutput]
+        # Register only a suite backed by a live fixture. Catalog retains its
+        # dedicated PostgreSQL job; cross-shard and failover suites are absent.
+        suite: [postgres18-wire]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: --set wal_level=logical --set max_prepared_transactions=10
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
       - name: Run integration suite
         env:
           PGSHARD_INTEGRATION_SUITE: ${{ matrix.suite }}
+          PGSHARD_PGWIRE_TEST_ADDRESS: 127.0.0.1:5432
         run: cargo run --locked -p pgshard-integration-tests -- --suite "$PGSHARD_INTEGRATION_SUITE"
 
   images:
@@ -1446,20 +1466,59 @@ jobs:
       fail-fast: false
       matrix:
         scenario:
-          - bootstrap-routing
-          - transactions-failover
-          - backup-restore
-          - ddl-reshard
-          - observability
+          # Broader M1 scenarios remain absent until they have executable
+          # fixtures. Do not represent planned coverage as passing tests.
+          - operator-api-safety
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+      - name: Select repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Create disposable Kubernetes cluster
+        run: |
+          go install sigs.k8s.io/kind@v0.32.0
+          kind create cluster \
+            --name pgshard-system-e2e \
+            --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
+            --wait 90s
+          test "$(kubectl config current-context)" = kind-pgshard-system-e2e
+          test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"
+          kubectl apply --server-side --field-manager=pgshard-ci \
+            -f operator/config/crd/bases/pgshard.io_pgshardclusters.yaml
       - name: Run KIND scenario
         env:
           PGSHARD_E2E_SCENARIO: ${{ matrix.scenario }}
-          PGSHARD_IMAGE_PUSH: "false"
+          PGSHARD_E2E_KUBE_CONTEXT: kind-pgshard-system-e2e
         run: cargo run --locked -p pgshard-e2e -- --scenario "$PGSHARD_E2E_SCENARIO"
+      - name: Capture KIND diagnostics
+        if: failure()
+        run: kubectl get namespaces,customresourcedefinitions --show-labels || true
+      - name: Delete disposable Kubernetes cluster
+        if: always()
+        run: |
+          set -euo pipefail
+          kind delete cluster --name pgshard-system-e2e
+          clusters="$(kind get clusters)"
+          containers="$(docker ps --all --filter 'name=^/pgshard-system-e2e-control-plane$' --format '{{.Names}}')"
+          if grep --fixed-strings --line-regexp --quiet \
+            pgshard-system-e2e <<<"$clusters"
+          then
+            echo "KIND cluster pgshard-system-e2e remains after deletion" >&2
+            exit 1
+          fi
+          if grep --fixed-strings --line-regexp --quiet \
+            pgshard-system-e2e-control-plane <<<"$containers"
+          then
+            echo "KIND control-plane container remains after deletion" >&2
+            exit 1
+          fi
 
   performance:
     name: Performance / ${{ matrix.suite }}

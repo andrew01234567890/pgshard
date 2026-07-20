@@ -1600,6 +1600,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgshard-e2e"
+version = "0.1.0"
+
+[[package]]
+name = "pgshard-integration-tests"
+version = "0.1.0"
+
+[[package]]
 name = "pgshard-orch"
 version = "0.1.0"
 dependencies = [
