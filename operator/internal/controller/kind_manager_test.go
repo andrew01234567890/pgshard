@@ -930,11 +930,13 @@ func assertPostgreSQLSpecImmutable(t *testing.T, ctx context.Context, kubeClient
 		},
 	} {
 		t.Run("spec is immutable through "+test.name, func(t *testing.T) {
-			current := &corev1.Pod{}
-			if err := kubeClient.Get(ctx, key, current); err != nil {
-				t.Fatal(err)
-			}
-			err := test.update(current)
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				current := &corev1.Pod{}
+				if err := kubeClient.Get(ctx, key, current); err != nil {
+					return err
+				}
+				return test.update(current)
+			})
 			if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "spec and generation are immutable") {
 				t.Fatalf("PostgreSQL Pod %s update error = %v, want webhook denial", test.name, err)
 			}
@@ -1091,6 +1093,20 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	haCluster.Namespace = namespace.Name
 	haCluster.Spec.Shards = 1
 	haCluster.Spec.Databases = nil
+	// Keep all three PostgreSQL members schedulable on the single KIND worker,
+	// including while a deleted standby is being replaced. The development
+	// sample's production-oriented one-CPU request leaves no room for that
+	// replacement alongside KIND's platform and pgshard workloads.
+	haCluster.Spec.PostgreSQL.Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("250m"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("1"),
+			corev1.ResourceMemory: resource.MustParse("2Gi"),
+		},
+	}
 	if err := kubeClient.Create(ctx, haCluster); err != nil {
 		t.Fatal(err)
 	}
