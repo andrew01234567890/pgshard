@@ -9,6 +9,8 @@ use pgshard_types::ShardId;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
 
+use crate::topology::TopologyDiagnostics;
+
 const DEFAULT_MAX_LEASE_TTL_MS: u64 = 15_000;
 const MAX_LEASE_TTL_MS: u64 = 300_000;
 
@@ -355,6 +357,8 @@ pub struct OrchSnapshot {
     pub coordination_lease_uid: Option<String>,
     /// Resource version returned by the latest authoritative Lease operation.
     pub coordination_resource_version: Option<String>,
+    /// Validated operator-published discovery topology, when configured.
+    pub topology: Option<TopologyDiagnostics>,
 }
 
 /// Machine-readable reason the orchestrator is not yet safe to serve control
@@ -394,6 +398,7 @@ struct OrchInner {
     coordination_lease_uid: Option<String>,
     coordination_resource_version: Option<String>,
     coordination_deadline: Option<Instant>,
+    topology: Option<TopologyDiagnostics>,
 }
 
 /// Thread-safe registry for operation IDs and shard leases.
@@ -424,12 +429,39 @@ impl OrchState {
         identity: OrchestratorIdentity,
         max_lease_ttl_ms: u64,
     ) -> Result<Self, OrchError> {
+        Self::with_identity_and_optional_topology(identity, max_lease_ttl_ms, None)
+    }
+
+    /// Creates state with a configured process identity and one already
+    /// validated, diagnostic-only discovery topology.
+    ///
+    /// Topology presence does not affect readiness, leadership, or operation
+    /// authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrchError::InvalidMaximumLeaseTtl`] for a zero or unbounded
+    /// policy.
+    pub fn with_identity_and_topology(
+        identity: OrchestratorIdentity,
+        max_lease_ttl_ms: u64,
+        topology: TopologyDiagnostics,
+    ) -> Result<Self, OrchError> {
+        Self::with_identity_and_optional_topology(identity, max_lease_ttl_ms, Some(topology))
+    }
+
+    fn with_identity_and_optional_topology(
+        identity: OrchestratorIdentity,
+        max_lease_ttl_ms: u64,
+        topology: Option<TopologyDiagnostics>,
+    ) -> Result<Self, OrchError> {
         if !(1..=MAX_LEASE_TTL_MS).contains(&max_lease_ttl_ms) {
             return Err(OrchError::InvalidMaximumLeaseTtl(max_lease_ttl_ms));
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(OrchInner {
                 identity: Some(identity),
+                topology,
                 ..OrchInner::default()
             })),
             max_lease_ttl_ms,
@@ -549,6 +581,7 @@ impl OrchState {
             leader: inner.leader,
             coordination_lease_uid: inner.coordination_lease_uid.clone(),
             coordination_resource_version: inner.coordination_resource_version.clone(),
+            topology: inner.topology.clone(),
         }
     }
 
@@ -1922,6 +1955,30 @@ mod tests {
         let json = serde_json::to_value(state.snapshot()).expect("serialize status");
         assert_eq!(json["leases"][0]["epoch"], (u64::MAX - 1).to_string());
         assert_eq!(json["leases"][0]["expires_at_unix_ms"], "200");
+    }
+
+    #[test]
+    fn topology_diagnostics_never_change_readiness() {
+        let topology = TopologyDiagnostics {
+            schema_version: crate::topology::TOPOLOGY_SCHEMA_VERSION.to_owned(),
+            cluster_object_uid: "cluster-uid".to_owned(),
+            shard_count: 2,
+            member_count: 6,
+            agent_status_collection:
+                crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired,
+        };
+        let state = OrchState::with_identity_and_topology(identity(), 1_000, topology.clone())
+            .expect("valid state");
+
+        assert_eq!(
+            state.readiness(),
+            OrchReadiness {
+                ready: false,
+                reason: OrchReadinessReason::CoordinationUnavailable,
+            }
+        );
+        assert_eq!(state.snapshot().topology, Some(topology));
+        assert!(state.snapshot().leases.is_empty());
     }
 
     #[test]

@@ -3,7 +3,6 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"strings"
 
 	"github.com/andrew01234567890/pgshard/operator/internal/tuning"
@@ -349,26 +348,197 @@ func ValidateOpenTelemetryEndpoint(value string) error {
 	return ValidateCredentialFreeHTTPSEndpoint(value)
 }
 
-// ValidateCredentialFreeHTTPSEndpoint accepts only a concrete HTTP(S) origin
-// or path and rejects URL components commonly abused to embed credentials.
+// ValidateCredentialFreeHTTPSEndpoint accepts one deliberately narrow,
+// portable HTTP(S) origin/path grammar shared with the Rust topology reader.
 func ValidateCredentialFreeHTTPSEndpoint(value string) error {
+	if value == "" {
+		return fmt.Errorf("must not be empty")
+	}
 	if len(value) > MaximumEndpointLength {
 		return fmt.Errorf("must not exceed %d bytes", MaximumEndpointLength)
 	}
-	if strings.TrimSpace(value) != value {
-		return fmt.Errorf("must not contain surrounding whitespace")
+	for index := 0; index < len(value); index++ {
+		if value[index] <= 0x20 || value[index] >= 0x7f || value[index] == '\\' {
+			return fmt.Errorf("must contain only portable visible ASCII endpoint characters")
+		}
 	}
-	endpoint, err := url.Parse(value)
-	if err != nil {
-		return fmt.Errorf("must be a valid URL: %w", err)
+	if strings.ContainsAny(value, "@?#") {
+		return fmt.Errorf("must not contain user information, a query delimiter, or a fragment delimiter")
 	}
-	if (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.Host == "" {
-		return fmt.Errorf("must be an HTTP(S) URL with a host")
+	remainder := ""
+	switch {
+	case strings.HasPrefix(value, "http://"):
+		remainder = strings.TrimPrefix(value, "http://")
+	case strings.HasPrefix(value, "https://"):
+		remainder = strings.TrimPrefix(value, "https://")
+	default:
+		return fmt.Errorf("must use the lowercase http or https scheme")
 	}
-	if endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
-		return fmt.Errorf("must not contain user information, a query string, or a fragment")
+	authority, path := remainder, ""
+	if pathStart := strings.IndexByte(remainder, '/'); pathStart >= 0 {
+		authority, path = remainder[:pathStart], remainder[pathStart:]
+	}
+	if !validPortableHTTPAuthority(authority) {
+		return fmt.Errorf("must contain a lowercase DNS or canonical IPv4 host and optional port 1 through 65535")
+	}
+	if !validPortableHTTPPath(path) {
+		return fmt.Errorf("path must contain only nonempty unreserved segments and valid unreserved percent escapes")
 	}
 	return nil
+}
+
+func validPortableHTTPAuthority(authority string) bool {
+	if authority == "" || strings.ContainsAny(authority, "[]") || strings.Count(authority, ":") > 1 {
+		return false
+	}
+	host := authority
+	if separator := strings.LastIndexByte(authority, ':'); separator >= 0 {
+		host = authority[:separator]
+		if !validCanonicalDecimal(authority[separator+1:], 65535, false) {
+			return false
+		}
+	}
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	numeric := true
+	for index := 0; index < len(host); index++ {
+		if (host[index] < '0' || host[index] > '9') && host[index] != '.' {
+			numeric = false
+			break
+		}
+	}
+	if numeric {
+		parts := strings.Split(host, ".")
+		if len(parts) != 4 {
+			return false
+		}
+		for _, part := range parts {
+			if !validCanonicalDecimal(part, 255, true) {
+				return false
+			}
+		}
+		return true
+	}
+	labels := strings.Split(host, ".")
+	if whatwgIPv4NumberSpelling(labels[len(labels)-1]) {
+		return false
+	}
+	for _, label := range labels {
+		if !validPortableDNSLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func whatwgIPv4NumberSpelling(label string) bool {
+	digits := label
+	base := byte(10)
+	if strings.HasPrefix(label, "0x") {
+		digits = label[2:]
+		base = 16
+	}
+	for index := 0; index < len(digits); index++ {
+		if digits[index] >= '0' && digits[index] <= '9' {
+			continue
+		}
+		if base == 16 && digits[index] >= 'a' && digits[index] <= 'f' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validPortableDNSLabel(label string) bool {
+	reservedIDNAPrefix := len(label) >= 4 && strings.EqualFold(label[:4], "xn--")
+	if label == "" || len(label) > 63 || reservedIDNAPrefix || label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for index := 0; index < len(label); index++ {
+		if (label[index] < 'a' || label[index] > 'z') && (label[index] < '0' || label[index] > '9') && label[index] != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validCanonicalDecimal(value string, maximum uint32, allowZero bool) bool {
+	if value == "" || (len(value) > 1 && value[0] == '0') {
+		return false
+	}
+	var parsed uint32
+	for index := 0; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+		parsed = parsed*10 + uint32(value[index]-'0')
+		if parsed > maximum {
+			return false
+		}
+	}
+	return allowZero || parsed > 0
+}
+
+func validPortableHTTPPath(path string) bool {
+	if path == "" || path == "/" {
+		return true
+	}
+	if path[0] != '/' || path[len(path)-1] == '/' {
+		return false
+	}
+	for _, segment := range strings.Split(path[1:], "/") {
+		if segment == "" {
+			return false
+		}
+		decoded := make([]byte, 0, len(segment))
+		for index := 0; index < len(segment); {
+			if segment[index] != '%' {
+				if !portableHTTPUnreserved(segment[index]) {
+					return false
+				}
+				decoded = append(decoded, segment[index])
+				index++
+				continue
+			}
+			if index+2 >= len(segment) {
+				return false
+			}
+			high, highOK := hexadecimalNibble(segment[index+1])
+			low, lowOK := hexadecimalNibble(segment[index+2])
+			if !highOK || !lowOK {
+				return false
+			}
+			decodedByte := high<<4 | low
+			if !portableHTTPUnreserved(decodedByte) {
+				return false
+			}
+			decoded = append(decoded, decodedByte)
+			index += 3
+		}
+		if string(decoded) == "." || string(decoded) == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func portableHTTPUnreserved(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || strings.ContainsRune("-._~", rune(value))
+}
+
+func hexadecimalNibble(value byte) (byte, bool) {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0', true
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10, true
+	case value >= 'A' && value <= 'F':
+		return value - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 // ValidateObjectReferenceName applies the Kubernetes name grammar shared by

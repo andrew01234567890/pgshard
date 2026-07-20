@@ -4417,6 +4417,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 		{Name: "PGSHARD_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
 		{Name: "PGSHARD_LEASE_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
 		{Name: "PGSHARD_LEASE_NAME", Value: cluster.Name + OrchestratorLeaseSuffix},
+		{Name: "PGSHARD_TOPOLOGY_FILE", Value: "/etc/pgshard/topology/cluster.json"},
 	}
 	if cluster.Spec.Observability.OpenTelemetryEndpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: cluster.Spec.Observability.OpenTelemetryEndpoint})
@@ -4430,7 +4431,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 		Resources:       resources("100m", "128Mi", "1", "512Mi"),
 		ReadinessProbe:  httpReadinessProbe("/readyz", "http"),
 		LivenessProbe:   httpLivenessProbe("/healthz", "http"),
-		VolumeMounts:    []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard", ReadOnly: true}},
+		VolumeMounts:    []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true}},
 	}})
 	automountServiceAccountToken := true
 	podSpec.AutomountServiceAccountToken = &automountServiceAccountToken
