@@ -25,6 +25,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -81,6 +82,7 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	if len(current.Status.PostgreSQLReplicationCredentials) != 0 {
 		t.Fatalf("direct runtime staged replication credentials: %#v", current.Status.PostgreSQLReplicationCredentials)
 	}
+	assertKINDHAAuthorityDiscoveryFoundation(t, ctx, kubeClient, current)
 	assertPostgreSQLRoleProfiles(t, ctx, kubeClient, current)
 
 	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "orchestrator", 3, true)
@@ -89,6 +91,171 @@ func TestKINDManagerReconcilesFailClosedDevelopmentCluster(t *testing.T) {
 	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertNoPostgreSQLWorkload(t, ctx, kubeClient, namespace.Name, cluster.Name)
 	assertOrchestratorReadinessTracksLeaseIdentity(t, ctx, kubeClient, namespace.Name, cluster.Name)
+	assertKINDWritableLeaseReplacementFailsClosed(t, ctx, kubeClient, current)
+}
+
+func assertKINDHAAuthorityDiscoveryFoundation(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	if len(cluster.Status.PostgreSQLWritableLeases) != int(cluster.Spec.Shards) {
+		t.Fatalf("writable-term Lease checkpoints = %#v", cluster.Status.PostgreSQLWritableLeases)
+	}
+	checkpoints := make(map[int32]pgshardv1alpha1.PostgreSQLWritableLeaseStatus, len(cluster.Status.PostgreSQLWritableLeases))
+	for _, checkpoint := range cluster.Status.PostgreSQLWritableLeases {
+		if checkpoint.Shard < 0 || checkpoint.Shard >= cluster.Spec.Shards || checkpoint.LeaseName != owned.PostgreSQLWritableLeaseName(cluster.Name, checkpoint.Shard) || checkpoint.LeaseUID == "" {
+			t.Fatalf("invalid writable-term Lease checkpoint: %#v", checkpoint)
+		}
+		checkpoints[checkpoint.Shard] = checkpoint
+	}
+
+	topologyConfig := &corev1.ConfigMap{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.TopologyConfigSuffix}, topologyConfig); err != nil {
+		t.Fatalf("get topology ConfigMap: %v", err)
+	}
+	type topologyMember struct {
+		Ordinal        int32  `json:"ordinal"`
+		InstanceID     string `json:"instanceId"`
+		DNSName        string `json:"dnsName"`
+		PostgreSQLPort int32  `json:"postgresqlPort"`
+		AgentHTTPPort  int32  `json:"agentHttpPort"`
+		PhysicalSlot   string `json:"physicalSlot"`
+	}
+	type topologyShard struct {
+		ID            int32  `json:"id"`
+		Service       string `json:"service"`
+		WritableLease struct {
+			Namespace string    `json:"namespace"`
+			Name      string    `json:"name"`
+			UID       types.UID `json:"uid"`
+		} `json:"writableLease"`
+		Members []topologyMember `json:"members"`
+	}
+	var topology struct {
+		SchemaVersion    string          `json:"schemaVersion"`
+		Cluster          string          `json:"cluster"`
+		ClusterObjectUID types.UID       `json:"clusterObjectUID"`
+		Namespace        string          `json:"namespace"`
+		Shards           []topologyShard `json:"shards"`
+	}
+	rawTopology := topologyConfig.Data["cluster.json"]
+	if !json.Valid([]byte(rawTopology)) || strings.Contains(rawTopology, "\n  ") {
+		t.Fatalf("topology is not compact valid JSON: %q", rawTopology)
+	}
+	if err := json.Unmarshal([]byte(rawTopology), &topology); err != nil {
+		t.Fatalf("decode topology: %v", err)
+	}
+	if topology.SchemaVersion != "pgshard.topology.v1" || topology.Cluster != cluster.Name || topology.ClusterObjectUID != cluster.UID || topology.Namespace != cluster.Namespace || len(topology.Shards) != int(cluster.Spec.Shards) {
+		t.Fatalf("topology identity/shape = %#v", topology)
+	}
+	for _, forbidden := range []string{`"role"`, `"primary"`, `"serving"`, `"ready"`} {
+		if strings.Contains(rawTopology, forbidden) {
+			t.Fatalf("topology contains runtime authority field %s: %s", forbidden, rawTopology)
+		}
+	}
+
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		checkpoint, ok := checkpoints[shard]
+		if !ok {
+			t.Fatalf("missing writable-term Lease checkpoint for shard %d", shard)
+		}
+		liveLease := &coordinationv1.Lease{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.LeaseName}, liveLease); err != nil {
+			t.Fatalf("get writable-term Lease for shard %d: %v", shard, err)
+		}
+		if liveLease.UID != checkpoint.LeaseUID || !metav1.IsControlledBy(liveLease, cluster) || !reflect.DeepEqual(liveLease.Spec, coordinationv1.LeaseSpec{}) {
+			t.Fatalf("writable-term Lease for shard %d = %#v, checkpoint=%#v", shard, liveLease, checkpoint)
+		}
+
+		discovery := topology.Shards[shard]
+		if discovery.ID != shard || discovery.Service != fmt.Sprintf("%s-shard-%04d", cluster.Name, shard) || discovery.WritableLease.Namespace != cluster.Namespace || discovery.WritableLease.Name != checkpoint.LeaseName || discovery.WritableLease.UID != checkpoint.LeaseUID || len(discovery.Members) != int(cluster.Spec.MembersPerShard) {
+			t.Fatalf("topology discovery for shard %d = %#v", shard, discovery)
+		}
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			memberDiscovery := discovery.Members[member]
+			instanceID := owned.PostgreSQLMemberStatefulSetName(cluster.Name, shard, member) + "-0"
+			wantDNS := fmt.Sprintf("%s.%s-shard-%04d.%s.svc", instanceID, cluster.Name, shard, cluster.Namespace)
+			if memberDiscovery.Ordinal != member || memberDiscovery.InstanceID != instanceID || memberDiscovery.DNSName != wantDNS || memberDiscovery.PostgreSQLPort != 5432 || memberDiscovery.AgentHTTPPort != 8080 || memberDiscovery.PhysicalSlot != fmt.Sprintf("pgshard_member_%04d", member) {
+				t.Fatalf("topology discovery for shard %d member %d = %#v", shard, member, memberDiscovery)
+			}
+		}
+
+		agentName := owned.PostgreSQLAgentServiceAccountName(cluster.Name, shard)
+		serviceAccount := &corev1.ServiceAccount{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: agentName}, serviceAccount); err != nil {
+			t.Fatalf("get PostgreSQL agent ServiceAccount for shard %d: %v", shard, err)
+		}
+		role := &rbacv1.Role{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: agentName}, role); err != nil {
+			t.Fatalf("get PostgreSQL agent Role for shard %d: %v", shard, err)
+		}
+		binding := &rbacv1.RoleBinding{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: agentName}, binding); err != nil {
+			t.Fatalf("get PostgreSQL agent RoleBinding for shard %d: %v", shard, err)
+		}
+		if serviceAccount.AutomountServiceAccountToken == nil || *serviceAccount.AutomountServiceAccountToken || len(role.Rules) != 1 || !reflect.DeepEqual(role.Rules[0].ResourceNames, []string{checkpoint.LeaseName}) || !reflect.DeepEqual(role.Rules[0].Verbs, []string{"get", "update"}) || binding.RoleRef.Name != agentName || len(binding.Subjects) != 1 || binding.Subjects[0].Name != agentName || binding.Subjects[0].Namespace != cluster.Namespace {
+			t.Fatalf("PostgreSQL agent authority for shard %d is not exact: ServiceAccount=%#v Role=%#v RoleBinding=%#v", shard, serviceAccount, role, binding)
+		}
+
+		policy := &networkingv1.NetworkPolicy{}
+		policyName := fmt.Sprintf("%s-shard-%04d-ingress", cluster.Name, shard)
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: policyName}, policy); err != nil {
+			t.Fatalf("get PostgreSQL NetworkPolicy for shard %d: %v", shard, err)
+		}
+		diagnosticRuleFound := false
+		for _, ingress := range policy.Spec.Ingress {
+			if len(ingress.Ports) != 1 || ingress.Ports[0].Port == nil || ingress.Ports[0].Port.IntVal != 8080 {
+				continue
+			}
+			if diagnosticRuleFound || len(ingress.From) != 1 || ingress.From[0].PodSelector == nil || ingress.From[0].NamespaceSelector != nil || ingress.From[0].IPBlock != nil || !maps.Equal(ingress.From[0].PodSelector.MatchLabels, map[string]string{owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "orchestrator"}) {
+				t.Fatalf("PostgreSQL diagnostic ingress for shard %d is broader than the orchestrator: %#v", shard, ingress)
+			}
+			diagnosticRuleFound = true
+		}
+		if !diagnosticRuleFound {
+			t.Fatalf("PostgreSQL diagnostic ingress for shard %d is missing", shard)
+		}
+	}
+}
+
+func assertKINDWritableLeaseReplacementFailsClosed(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	checkpoint := cluster.Status.PostgreSQLWritableLeases[0]
+	liveLease := &coordinationv1.Lease{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.LeaseName}
+	if err := kubeClient.Get(ctx, key, liveLease); err != nil {
+		t.Fatalf("get writable-term Lease before replacement: %v", err)
+	}
+	uid := liveLease.UID
+	resourceVersion := liveLease.ResourceVersion
+	if err := kubeClient.Delete(ctx, liveLease, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil {
+		t.Fatalf("delete writable-term Lease: %v", err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, key, &coordinationv1.Lease{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatalf("wait for writable-term Lease deletion: %v", err)
+	}
+	replacement := owned.PostgreSQLWritableLease(cluster, checkpoint.Shard)
+	if err := kubeClient.Create(ctx, replacement); err != nil {
+		t.Fatalf("create replacement writable-term Lease: %v", err)
+	}
+	if replacement.UID == "" || replacement.UID == checkpoint.LeaseUID {
+		t.Fatalf("replacement writable-term Lease UID = %s, recorded UID = %s", replacement.UID, checkpoint.LeaseUID)
+	}
+	failed := &pgshardv1alpha1.PgShardCluster{}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), failed); err != nil {
+			return false, err
+		}
+		condition := meta.FindStatusCondition(failed.Status.Conditions, readyCondition)
+		return failed.Status.Phase == "Degraded" && condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "WritableLeaseReconcileFailed", nil
+	}); err != nil {
+		t.Fatalf("wait for replacement writable-term Lease to fail closed: %v; status=%#v", err, failed.Status)
+	}
+	if !reflect.DeepEqual(failed.Status.PostgreSQLWritableLeases, cluster.Status.PostgreSQLWritableLeases) {
+		t.Fatalf("replacement writable-term Lease changed checkpoints: before=%#v after=%#v", cluster.Status.PostgreSQLWritableLeases, failed.Status.PostgreSQLWritableLeases)
+	}
+	assertNoPostgreSQLWorkload(t, ctx, kubeClient, cluster.Namespace, cluster.Name)
 }
 
 func TestKINDRestoreTopologyMismatchIsRejectedBeforeMutation(t *testing.T) {

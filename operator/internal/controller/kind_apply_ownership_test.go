@@ -586,6 +586,7 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 	if err := kubeClient.Get(ctx, legacyRequest.NamespacedName, legacy); err != nil {
 		t.Fatal(err)
 	}
+	checkpointWritableLeasesForLegacyPlanning(t, ctx, kubeClient, reconciler, legacy)
 	legacyPlan, err := owned.Plan(legacy, owned.DefaultImages())
 	if err != nil {
 		t.Fatal(err)
@@ -594,9 +595,10 @@ func TestKINDServerSideApplyPrunesAndIsolatesScaleOwnership(t *testing.T) {
 		_, writableLease := object.(*coordinationv1.Lease)
 		component := object.GetLabels()[owned.ComponentLabel]
 		if (writableLease && component == "postgresql") || component == "postgresql-agent" {
-			// These resources were introduced after the pre-SSA controller
-			// represented by this fixture. Let reconciliation create their
-			// canonical metadata instead of fabricating legacy incarnations.
+			// Writable Lease envelopes are already staged solely to obtain the
+			// live UID checkpoints required by the current planner. They and the
+			// later agent-access resources are not part of the pre-SSA desired
+			// object fixture; reconciliation applies their canonical ownership.
 			continue
 		}
 		// The pre-SSA controller created desired objects without a field owner or
@@ -763,7 +765,7 @@ func exerciseCompletedLegacyApplyMigration(
 	registerCleanup func(ctrl.Request),
 ) {
 	t.Helper()
-	cluster := createBareLegacyCluster(t, ctx, kubeClient, namespace, "legacy-completed", registerCleanup)
+	cluster := createLeaseCheckpointedLegacyCluster(t, ctx, kubeClient, reconciler, namespace, "legacy-completed", registerCleanup)
 	fullConfiguration := plannedTopologyConfiguration(t, cluster)
 	fullConfiguration.Data["legacy-only"] = "remove during migration"
 	fullPooler := plannedPoolerDeployment(t, cluster)
@@ -855,7 +857,7 @@ func exerciseLegacyHPAtoFixedMigration(
 	if completed {
 		name = "legacy-fixed-completed"
 	}
-	cluster := createBareLegacyCluster(t, ctx, kubeClient, namespace, name, registerCleanup)
+	cluster := createLeaseCheckpointedLegacyCluster(t, ctx, kubeClient, reconciler, namespace, name, registerCleanup)
 	pooler := plannedPoolerDeployment(t, cluster)
 	removeApplyOwnershipMarker(pooler)
 	if err := kubeClient.Create(ctx, pooler.DeepCopy()); err != nil {
@@ -1004,10 +1006,11 @@ func exerciseFullReconcileHPAtoFixedWithCachedMiss(
 	}
 }
 
-func createBareLegacyCluster(
+func createLeaseCheckpointedLegacyCluster(
 	t *testing.T,
 	ctx context.Context,
 	kubeClient client.Client,
+	reconciler *PgShardClusterReconciler,
 	namespace, name string,
 	registerCleanup func(ctrl.Request),
 ) *pgshardv1alpha1.PgShardCluster {
@@ -1031,7 +1034,31 @@ func createBareLegacyCluster(
 	if err := kubeClient.Get(ctx, request.NamespacedName, cluster); err != nil {
 		t.Fatal(err)
 	}
+	checkpointWritableLeasesForLegacyPlanning(t, ctx, kubeClient, reconciler, cluster)
 	return cluster
+}
+
+func checkpointWritableLeasesForLegacyPlanning(
+	t *testing.T,
+	ctx context.Context,
+	kubeClient client.Client,
+	reconciler *PgShardClusterReconciler,
+	cluster *pgshardv1alpha1.PgShardCluster,
+) {
+	t.Helper()
+	// Current topology documents are bound to live writable-term Lease UIDs.
+	// Stage only those coordination envelopes and their status checkpoints so
+	// legacy Apply fixtures can be rendered without fabricating identities;
+	// all other desired resources remain absent until each fixture creates them.
+	if err := reconciler.ensurePostgreSQLWritableLeases(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if len(cluster.Status.PostgreSQLWritableLeases) != int(cluster.Spec.Shards) {
+		t.Fatalf("legacy planning Lease checkpoints = %#v, want %d", cluster.Status.PostgreSQLWritableLeases, cluster.Spec.Shards)
+	}
 }
 
 func plannedPostgreSQLConfiguration(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster) *corev1.ConfigMap {
