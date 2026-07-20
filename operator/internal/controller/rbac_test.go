@@ -24,6 +24,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		resource string
 		verbs    []string
 	}{
+		{group: "", resource: "endpoints", verbs: []string{"get"}},
 		{group: "", resource: "events", verbs: []string{"create", "patch"}},
 		{group: "", resource: "namespaces", verbs: []string{"get"}},
 		{group: "", resource: "nodes", verbs: []string{"get"}},
@@ -55,7 +56,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 			t.Errorf("cluster-wide manager role grants forbidden Namespace verb %q", forbidden)
 		}
 	}
-	for _, forbidden := range []string{"create", "delete", "get", "list", "patch", "update", "watch"} {
+	for _, forbidden := range []string{"create", "delete", "list", "patch", "update", "watch"} {
 		if roleAllows(role, "", "endpoints", []string{forbidden}) {
 			t.Errorf("cluster-wide manager role grants forbidden Endpoints verb %q", forbidden)
 		}
