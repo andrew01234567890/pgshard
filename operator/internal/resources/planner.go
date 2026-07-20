@@ -58,6 +58,7 @@ const (
 	CatalogTLSCertificateKey         = "tls.crt"
 	CatalogTLSPrivateKeyKey          = "tls.key"
 	TopologyConfigSuffix             = "-topology"
+	PostgreSQLCatalogCandidateSuffix = "-cfg"
 	OrchestratorSuffix               = "-orchestrator"
 	OrchestratorLeaseSuffix          = "-orch-lease"
 	PoolerSuffix                     = "-pooler"
@@ -68,8 +69,11 @@ const (
 	PoolerRPort    int32 = 5434
 	HTTPPort       int32 = 8080
 
-	topologySchemaVersion       = "pgshard.topology.v1"
-	maximumTopologyPayloadBytes = 900 * 1024
+	topologySchemaVersion               = "pgshard.topology.v1"
+	maximumTopologyPayloadBytes         = 900 * 1024
+	catalogCandidateSchemaVersion       = "pgshard.catalog-bootstrap-candidate.v1"
+	catalogCandidateConfigurationKey    = "candidate.json"
+	maximumCatalogCandidatePayloadBytes = 16 * 1024
 
 	defaultPostgreSQLImage              = "docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
 	developmentPostgreSQLBootstrapImage = "pgshard/postgres-agent:dev"
@@ -2599,6 +2603,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	if err != nil {
 		return nil, err
 	}
+	topologyConfiguration := discoveryTopologyConfigMap(cluster, topologyConfig)
 	topologyHash := configHash(topologyConfig)
 	var bootstraps map[postgresqlBootstrapKey]pgshardv1alpha1.PostgreSQLBootstrapStatus
 	if cluster.Spec.MembersPerShard == 1 || images.PostgreSQLRuntime.agentQuarantine() {
@@ -2615,7 +2620,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		}
 	}
 	var catalogAccess *pgshardv1alpha1.CatalogAccessStatus
-	if cluster.Spec.MembersPerShard == 1 {
+	if cluster.Spec.MembersPerShard == 1 || images.PostgreSQLRuntime.agentQuarantine() {
 		catalogAccess = cluster.Status.CatalogAccess
 		if catalogAccess == nil || catalogAccess.SecretUID == "" ||
 			!CatalogAccessSecretNameIsValid(cluster.Name, catalogAccess.SecretName) ||
@@ -2631,11 +2636,18 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			return nil, err
 		}
 	}
+	var catalogCandidateConfigurations []*corev1.ConfigMap
+	if cluster.Spec.MembersPerShard > 1 && images.PostgreSQLRuntime.agentQuarantine() {
+		catalogCandidateConfigurations, err = postgresqlCatalogCandidateConfigMaps(cluster)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	objects := make([]client.Object, 0, 18+(7+cluster.Spec.MembersPerShard)*cluster.Spec.Shards)
 	objects = append(objects,
 		immutableConfigMap(cluster, postgresqlConfigName, postgresqlConfig),
-		configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": topologyConfig}),
+		topologyConfiguration,
 		applicationService(cluster, "rw", cluster.Spec.Services.ReadWrite, PoolerRWPort),
 		applicationService(cluster, "ro", cluster.Spec.Services.ReadOnly, PoolerROPort),
 		applicationService(cluster, "r", cluster.Spec.Services.Read, PoolerRPort),
@@ -2646,6 +2658,9 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		orchestratorLeaseRoleBinding(cluster),
 		orchestratorLease(cluster),
 	)
+	for _, configuration := range catalogCandidateConfigurations {
+		objects = append(objects, configuration)
+	}
 	if cluster.Spec.MembersPerShard == 1 {
 		objects = append(objects, catalogService(cluster))
 	}
@@ -2687,9 +2702,13 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		}
 	}
 
+	poolerCatalogAccess := catalogAccess
+	if cluster.Spec.MembersPerShard != 1 {
+		poolerCatalogAccess = nil
+	}
 	objects = append(objects,
 		orchestratorDeployment(cluster, images.Orchestrator, topologyHash),
-		poolerDeployment(cluster, images.Pooler, topologyHash, catalogAccess),
+		poolerDeployment(cluster, images.Pooler, topologyHash, poolerCatalogAccess),
 		podDisruptionBudget(cluster, "orchestrator", 1),
 		podDisruptionBudget(cluster, "pooler", 1),
 	)
@@ -2786,6 +2805,271 @@ func postgresqlReplicationCredentials(cluster *pgshardv1alpha1.PgShardCluster) (
 		}
 	}
 	return credentials, nil
+}
+
+type catalogCandidateConfigurationDocument struct {
+	SchemaVersion         string                                 `json:"schemaVersion"`
+	ClusterObjectUID      types.UID                              `json:"clusterObjectUID"`
+	Shard                 int32                                  `json:"shard"`
+	Member                int32                                  `json:"member"`
+	InstanceID            string                                 `json:"instanceID"`
+	DiscoveryTopology     catalogCandidateDiscoveryTopology      `json:"discoveryTopology"`
+	Bootstrap             catalogCandidateBootstrapReference     `json:"bootstrap"`
+	WritableLease         catalogCandidateObjectReference        `json:"writableLease"`
+	ReplicationCredential catalogCandidateMaterialReference      `json:"replicationCredential"`
+	CatalogAccess         catalogCandidateCatalogAccessReference `json:"catalogAccess"`
+}
+
+type catalogCandidateNameReference struct {
+	Name string `json:"name"`
+}
+
+// catalogCandidateDiscoveryTopology binds a candidate to the stable discovery
+// ConfigMap name and the immutable shard-zero member identities. The published
+// ConfigMap's payload intentionally is not bound here: accepted observability
+// and backup updates change that broader discovery document. It deliberately
+// carries no runtime role, health, readiness, or authority.
+type catalogCandidateDiscoveryTopology struct {
+	ConfigMap catalogCandidateNameReference `json:"configMap"`
+	Members   []topologyMember              `json:"members"`
+	SHA256    string                        `json:"sha256"`
+}
+
+type catalogCandidateObjectReference struct {
+	Name string    `json:"name"`
+	UID  types.UID `json:"uid"`
+}
+
+type catalogCandidateBootstrapReference struct {
+	Secret catalogCandidateObjectReference `json:"secret"`
+	PVC    catalogCandidateObjectReference `json:"pvc"`
+}
+
+type catalogCandidateMaterialReference struct {
+	Name           string    `json:"name"`
+	UID            types.UID `json:"uid"`
+	MaterialSHA256 string    `json:"materialSHA256"`
+}
+
+type catalogCandidateCatalogAccessReference struct {
+	Name         string    `json:"name"`
+	UID          types.UID `json:"uid"`
+	ClientSHA256 string    `json:"clientSHA256"`
+	ServerSHA256 string    `json:"serverSHA256"`
+}
+
+// PostgreSQLCatalogCandidateConfigMapName is the deterministic, role-neutral
+// identity of one shard-zero candidate's immutable catalog-bootstrap inputs.
+// Member-specific singleton workload names remain within the DNS-label bound,
+// including at the maximum admitted cluster name.
+func PostgreSQLCatalogCandidateConfigMapName(cluster string, member int32) string {
+	return PostgreSQLMemberStatefulSetName(cluster, 0, member) + PostgreSQLCatalogCandidateSuffix
+}
+
+// DesiredPostgreSQLCatalogCandidateConfigMaps renders one inert immutable
+// configuration per shard-zero member. Nothing mounts these objects in the
+// current plan: they only bind immutable member, Secret, PVC, Lease, TLS, and
+// replication identities needed by a future fenced bootstrap step. Mutable
+// PostgreSQL tuning and the broader discovery payload are selected only when
+// that later step is prepared, so accepted cluster updates cannot drift these
+// immutable objects.
+func DesiredPostgreSQLCatalogCandidateConfigMaps(cluster *pgshardv1alpha1.PgShardCluster) ([]*corev1.ConfigMap, error) {
+	if cluster == nil {
+		return nil, fmt.Errorf("cluster is nil")
+	}
+	if cluster.UID == "" {
+		return nil, fmt.Errorf("cluster UID is empty")
+	}
+	if cluster.Spec.MembersPerShard != 3 && cluster.Spec.MembersPerShard != 5 {
+		return nil, fmt.Errorf("catalog candidate configuration requires a 3- or 5-member topology")
+	}
+	bootstraps, err := postgresqlBootstraps(cluster)
+	if err != nil {
+		return nil, err
+	}
+	leases, err := postgresqlWritableLeases(cluster)
+	if err != nil {
+		return nil, err
+	}
+	credentials, err := postgresqlReplicationCredentials(cluster)
+	if err != nil {
+		return nil, err
+	}
+	catalogAccess := cluster.Status.CatalogAccess
+	if catalogAccess == nil || catalogAccess.SecretUID == "" ||
+		!CatalogAccessSecretNameIsValid(cluster.Name, catalogAccess.SecretName) ||
+		!validCatalogMaterialSHA256(catalogAccess.ClientSHA256) ||
+		!validCatalogMaterialSHA256(catalogAccess.ServerSHA256) {
+		return nil, fmt.Errorf("catalog access creation result is missing or invalid")
+	}
+	discoveryTopology, err := desiredCatalogCandidateDiscoveryTopology(cluster)
+	if err != nil {
+		return nil, err
+	}
+	lease := leases[0]
+	replicationCredential := credentials[0]
+	configurations := make([]*corev1.ConfigMap, 0, cluster.Spec.MembersPerShard)
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		bootstrap := bootstraps[postgresqlBootstrapKey{shard: 0, member: member}]
+		document := catalogCandidateConfigurationDocument{
+			SchemaVersion:     catalogCandidateSchemaVersion,
+			ClusterObjectUID:  cluster.UID,
+			Shard:             0,
+			Member:            member,
+			InstanceID:        PostgreSQLMemberStatefulSetName(cluster.Name, 0, member) + "-0",
+			DiscoveryTopology: discoveryTopology,
+			Bootstrap: catalogCandidateBootstrapReference{
+				Secret: catalogCandidateObjectReference{Name: bootstrap.SecretName, UID: bootstrap.SecretUID},
+				PVC:    catalogCandidateObjectReference{Name: bootstrap.PVCName, UID: bootstrap.PVCUID},
+			},
+			WritableLease: catalogCandidateObjectReference{Name: lease.LeaseName, UID: lease.LeaseUID},
+			ReplicationCredential: catalogCandidateMaterialReference{
+				Name: replicationCredential.SecretName, UID: replicationCredential.SecretUID, MaterialSHA256: replicationCredential.MaterialSHA256,
+			},
+			CatalogAccess: catalogCandidateCatalogAccessReference{
+				Name: catalogAccess.SecretName, UID: catalogAccess.SecretUID,
+				ClientSHA256: catalogAccess.ClientSHA256, ServerSHA256: catalogAccess.ServerSHA256,
+			},
+		}
+		encoded, err := json.Marshal(document)
+		if err != nil {
+			return nil, fmt.Errorf("encode catalog candidate member %d configuration: %w", member, err)
+		}
+		encoded = append(encoded, '\n')
+		if len(encoded) > maximumCatalogCandidatePayloadBytes {
+			return nil, fmt.Errorf("catalog candidate member %d configuration is %d bytes, exceeding the %d-byte safety limit", member, len(encoded), maximumCatalogCandidatePayloadBytes)
+		}
+		name := PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member)
+		configuration := immutableConfigMap(cluster, name, map[string]string{catalogCandidateConfigurationKey: string(encoded)})
+		configuration.Labels[ComponentLabel] = "postgresql-catalog-bootstrap"
+		configuration.Labels[ShardLabel] = shardLabel(0)
+		configuration.Labels[MemberLabel] = memberLabel(member)
+		configuration.Annotations[ConfigHashAnnotation] = PostgreSQLCatalogCandidatePayloadSHA256(configuration)
+		configurations = append(configurations, configuration)
+	}
+	return configurations, nil
+}
+
+func desiredCatalogCandidateDiscoveryTopology(cluster *pgshardv1alpha1.PgShardCluster) (catalogCandidateDiscoveryTopology, error) {
+	reference := catalogCandidateDiscoveryTopology{
+		ConfigMap: catalogCandidateNameReference{Name: cluster.Name + TopologyConfigSuffix},
+		Members:   make([]topologyMember, 0, cluster.Spec.MembersPerShard),
+	}
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		reference.Members = append(reference.Members, topologyMember{
+			Ordinal:        member,
+			InstanceID:     PostgreSQLMemberStatefulSetName(cluster.Name, 0, member) + "-0",
+			DNSName:        postgresqlMemberPodDNS(cluster.Name, 0, member, cluster.Namespace),
+			PostgreSQLPort: PostgreSQLPort,
+			AgentHTTPPort:  HTTPPort,
+			PhysicalSlot:   "pgshard_member_" + memberLabel(member),
+		})
+	}
+	reference.SHA256 = catalogCandidateDiscoveryTopologySHA256(reference)
+	if err := validateCatalogCandidateDiscoveryTopology(cluster, reference); err != nil {
+		return catalogCandidateDiscoveryTopology{}, err
+	}
+	return reference, nil
+}
+
+func catalogCandidateDiscoveryTopologySHA256(reference catalogCandidateDiscoveryTopology) string {
+	if reference.ConfigMap.Name == "" || (len(reference.Members) != 3 && len(reference.Members) != 5) {
+		return ""
+	}
+	digestInput := struct {
+		ConfigMap catalogCandidateNameReference `json:"configMap"`
+		Members   []topologyMember              `json:"members"`
+	}{ConfigMap: reference.ConfigMap, Members: reference.Members}
+	encoded, err := json.Marshal(digestInput)
+	if err != nil {
+		return ""
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("pgshard-catalog-candidate-discovery-topology-v1\x00"))
+	_, _ = hash.Write(encoded)
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func validateCatalogCandidateDiscoveryTopology(cluster *pgshardv1alpha1.PgShardCluster, reference catalogCandidateDiscoveryTopology) error {
+	if cluster == nil {
+		return fmt.Errorf("catalog candidate discovery topology is nil")
+	}
+	if cluster.Spec.MembersPerShard != 3 && cluster.Spec.MembersPerShard != 5 {
+		return fmt.Errorf("catalog candidate discovery topology requires exact 3- or 5-member membership")
+	}
+	wantName := cluster.Name + TopologyConfigSuffix
+	if len(reference.Members) != int(cluster.Spec.MembersPerShard) {
+		return fmt.Errorf("catalog candidate discovery topology does not contain exact shard-zero membership")
+	}
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		if reference.Members[member] != (topologyMember{
+			Ordinal:        member,
+			InstanceID:     PostgreSQLMemberStatefulSetName(cluster.Name, 0, member) + "-0",
+			DNSName:        postgresqlMemberPodDNS(cluster.Name, 0, member, cluster.Namespace),
+			PostgreSQLPort: PostgreSQLPort,
+			AgentHTTPPort:  HTTPPort,
+			PhysicalSlot:   "pgshard_member_" + memberLabel(member),
+		}) {
+			return fmt.Errorf("catalog candidate discovery topology member %d is not the exact published member", member)
+		}
+	}
+	if reference.ConfigMap.Name != wantName ||
+		reference.SHA256 == "" || reference.SHA256 != catalogCandidateDiscoveryTopologySHA256(reference) {
+		return fmt.Errorf("catalog candidate discovery topology reference digest is invalid")
+	}
+	return nil
+}
+
+// PostgreSQLCatalogCandidatePayloadSHA256 binds the exact bounded payload
+// bytes stored in one candidate ConfigMap.
+func PostgreSQLCatalogCandidatePayloadSHA256(configuration *corev1.ConfigMap) string {
+	if configuration == nil || len(configuration.Data) != 1 || len(configuration.BinaryData) != 0 {
+		return ""
+	}
+	payload, ok := configuration.Data[catalogCandidateConfigurationKey]
+	if !ok || len(payload) == 0 || len(payload) > maximumCatalogCandidatePayloadBytes {
+		return ""
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("pgshard-catalog-bootstrap-candidate-payload-v1\x00"))
+	_, _ = hash.Write([]byte(payload))
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func postgresqlCatalogCandidateConfigMaps(cluster *pgshardv1alpha1.PgShardCluster) ([]*corev1.ConfigMap, error) {
+	desired, err := DesiredPostgreSQLCatalogCandidateConfigMaps(cluster)
+	if err != nil {
+		return nil, err
+	}
+	checkpoints := make(map[int32]pgshardv1alpha1.PostgreSQLCatalogCandidateStatus, len(cluster.Status.PostgreSQLCatalogCandidates))
+	uids := make(map[types.UID]struct{}, len(cluster.Status.PostgreSQLCatalogCandidates))
+	for _, checkpoint := range cluster.Status.PostgreSQLCatalogCandidates {
+		if checkpoint.Member < 0 || checkpoint.Member >= cluster.Spec.MembersPerShard ||
+			checkpoint.ConfigMapName != PostgreSQLCatalogCandidateConfigMapName(cluster.Name, checkpoint.Member) ||
+			checkpoint.ConfigMapUID == "" || len(checkpoint.ConfigMapUID) > 128 ||
+			!validCatalogMaterialSHA256(checkpoint.PayloadSHA256) {
+			return nil, fmt.Errorf("PostgreSQL catalog candidate checkpoint for member %d is invalid", checkpoint.Member)
+		}
+		if _, duplicate := checkpoints[checkpoint.Member]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL catalog candidate checkpoint for member %d is duplicated", checkpoint.Member)
+		}
+		if _, duplicate := uids[checkpoint.ConfigMapUID]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL catalog candidate ConfigMap UID %s is duplicated", checkpoint.ConfigMapUID)
+		}
+		checkpoints[checkpoint.Member] = checkpoint
+		uids[checkpoint.ConfigMapUID] = struct{}{}
+	}
+	for member, configuration := range desired {
+		checkpoint, ok := checkpoints[int32(member)]
+		if !ok {
+			return nil, fmt.Errorf("PostgreSQL catalog candidate checkpoint for member %d is missing", member)
+		}
+		digest := PostgreSQLCatalogCandidatePayloadSHA256(configuration)
+		if checkpoint.ConfigMapName != configuration.Name || checkpoint.PayloadSHA256 != digest {
+			return nil, fmt.Errorf("PostgreSQL catalog candidate checkpoint for member %d differs from the immutable configuration", member)
+		}
+	}
+	return desired, nil
 }
 
 func renderPostgreSQLConfiguration(configuration pgshardv1alpha1.ResolvedPostgreSQLConfiguration) map[string]string {
@@ -3212,6 +3496,12 @@ func configMap(cluster *pgshardv1alpha1.PgShardCluster, name string, data map[st
 		ObjectMeta: ownedMeta(cluster, name, "configuration", nil),
 		Data:       data,
 	}
+}
+
+func discoveryTopologyConfigMap(cluster *pgshardv1alpha1.PgShardCluster, encoded string) *corev1.ConfigMap {
+	configuration := configMap(cluster, cluster.Name+TopologyConfigSuffix, map[string]string{"cluster.json": encoded})
+	configuration.Annotations[ConfigHashAnnotation] = configMapDataHash(configuration.Data)
+	return configuration
 }
 
 func immutableConfigMap(cluster *pgshardv1alpha1.PgShardCluster, name string, data map[string]string) *corev1.ConfigMap {

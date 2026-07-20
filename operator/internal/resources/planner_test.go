@@ -908,7 +908,6 @@ func TestPostgreSQLRuntimeObservationAcceptsDefaultedPodUIDFieldRef(t *testing.T
 	cluster := testCluster()
 	cluster.Spec.MembersPerShard = 3
 	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
-	cluster.Status.CatalogAccess = nil
 	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
 	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
 	images := DevelopmentImages()
@@ -3118,7 +3117,6 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 			cluster := testCluster()
 			cluster.Spec.MembersPerShard = members
 			cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
-			cluster.Status.CatalogAccess = nil
 			cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
 			cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
 			images := DevelopmentImages()
@@ -3300,6 +3298,205 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 				t.Fatal("distinct members share a bootstrap resource prefix")
 			}
 		})
+	}
+}
+
+func TestMultiMemberCatalogCandidateConfigurationsAreImmutableAndInert(t *testing.T) {
+	t.Parallel()
+	for _, members := range []int32{3, 5} {
+		members := members
+		t.Run(fmt.Sprintf("members=%d", members), func(t *testing.T) {
+			t.Parallel()
+			cluster := testCluster()
+			cluster.Spec.MembersPerShard = members
+			cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+			cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+			cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+			images := DevelopmentImages()
+			images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+			plan, err := Plan(cluster, images)
+			if err != nil {
+				t.Fatal(err)
+			}
+			topologyConfiguration := object[*corev1.ConfigMap](t, plan, cluster.Name+TopologyConfigSuffix)
+			topologyDataSHA256 := configMapDataHash(topologyConfiguration.Data)
+			if topologyConfiguration.Annotations[ConfigHashAnnotation] != topologyDataSHA256 {
+				t.Fatalf("published discovery topology hash = %q, want %q", topologyConfiguration.Annotations[ConfigHashAnnotation], topologyDataSHA256)
+			}
+			var discoveryDocument topologyDocument
+			if err := json.Unmarshal([]byte(topologyConfiguration.Data["cluster.json"]), &discoveryDocument); err != nil {
+				t.Fatal(err)
+			}
+			if len(discoveryDocument.Shards) == 0 || len(discoveryDocument.Shards[0].Members) != int(members) {
+				t.Fatalf("published shard-zero discovery = %#v", discoveryDocument.Shards)
+			}
+
+			seen := make(map[string]struct{}, members)
+			for member := int32(0); member < members; member++ {
+				name := PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member)
+				configuration := object[*corev1.ConfigMap](t, plan, name)
+				if configuration.Immutable == nil || !*configuration.Immutable || len(configuration.Data) != 1 || len(configuration.BinaryData) != 0 {
+					t.Fatalf("catalog candidate %d ConfigMap shape = %#v", member, configuration)
+				}
+				if configuration.Labels[ShardLabel] != "0000" || configuration.Labels[MemberLabel] != memberLabel(member) {
+					t.Fatalf("catalog candidate %d labels = %#v", member, configuration.Labels)
+				}
+				if _, role := configuration.Labels[RoleLabel]; role {
+					t.Fatalf("catalog candidate %d carries a serving role: %#v", member, configuration.Labels)
+				}
+				digest := PostgreSQLCatalogCandidatePayloadSHA256(configuration)
+				if configuration.Annotations[ConfigHashAnnotation] != digest || digest != cluster.Status.PostgreSQLCatalogCandidates[member].PayloadSHA256 {
+					t.Fatalf("catalog candidate %d payload digest = %q annotation=%q status=%q", member, digest, configuration.Annotations[ConfigHashAnnotation], cluster.Status.PostgreSQLCatalogCandidates[member].PayloadSHA256)
+				}
+				if _, duplicate := seen[digest]; duplicate {
+					t.Fatalf("catalog candidates share payload digest %s", digest)
+				}
+				seen[digest] = struct{}{}
+
+				var document catalogCandidateConfigurationDocument
+				if err := json.Unmarshal([]byte(configuration.Data[catalogCandidateConfigurationKey]), &document); err != nil {
+					t.Fatal(err)
+				}
+				if document.DiscoveryTopology.ConfigMap.Name != topologyConfiguration.Name ||
+					document.DiscoveryTopology.SHA256 != catalogCandidateDiscoveryTopologySHA256(document.DiscoveryTopology) ||
+					!reflect.DeepEqual(document.DiscoveryTopology.Members, discoveryDocument.Shards[0].Members) {
+					t.Fatalf("catalog candidate %d discovery binding = %#v, topology=%#v", member, document.DiscoveryTopology, discoveryDocument.Shards[0])
+				}
+				bootstrap := cluster.Status.PostgreSQLBootstraps[member]
+				lease := cluster.Status.PostgreSQLWritableLeases[0]
+				replication := cluster.Status.PostgreSQLReplicationCredentials[0]
+				if document.SchemaVersion != catalogCandidateSchemaVersion || document.ClusterObjectUID != cluster.UID || document.Shard != 0 || document.Member != member ||
+					document.InstanceID != PostgreSQLMemberStatefulSetName(cluster.Name, 0, member)+"-0" ||
+					document.Bootstrap.Secret.Name != bootstrap.SecretName || document.Bootstrap.Secret.UID != bootstrap.SecretUID ||
+					document.Bootstrap.PVC.Name != bootstrap.PVCName || document.Bootstrap.PVC.UID != bootstrap.PVCUID ||
+					document.WritableLease.Name != lease.LeaseName || document.WritableLease.UID != lease.LeaseUID ||
+					document.ReplicationCredential.Name != replication.SecretName || document.ReplicationCredential.UID != replication.SecretUID || document.ReplicationCredential.MaterialSHA256 != replication.MaterialSHA256 ||
+					document.CatalogAccess.Name != cluster.Status.CatalogAccess.SecretName || document.CatalogAccess.UID != cluster.Status.CatalogAccess.SecretUID ||
+					document.CatalogAccess.ClientSHA256 != cluster.Status.CatalogAccess.ClientSHA256 || document.CatalogAccess.ServerSHA256 != cluster.Status.CatalogAccess.ServerSHA256 {
+					t.Fatalf("catalog candidate %d document = %#v", member, document)
+				}
+			}
+
+			for _, item := range plan {
+				switch workload := item.(type) {
+				case *appsv1.StatefulSet:
+					for _, volume := range workload.Spec.Template.Spec.Volumes {
+						if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, PostgreSQLCatalogCandidateSuffix) {
+							t.Fatalf("StatefulSet %s mounted inert catalog candidate configuration %s", workload.Name, volume.ConfigMap.Name)
+						}
+					}
+				case *appsv1.Deployment:
+					for _, volume := range workload.Spec.Template.Spec.Volumes {
+						if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, PostgreSQLCatalogCandidateSuffix) {
+							t.Fatalf("Deployment %s mounted inert catalog candidate configuration %s", workload.Name, volume.ConfigMap.Name)
+						}
+					}
+				}
+			}
+			pooler := object[*appsv1.Deployment](t, plan, cluster.Name+PoolerSuffix)
+			for _, volume := range pooler.Spec.Template.Spec.Volumes {
+				if volume.Secret != nil && volume.Secret.SecretName == cluster.Status.CatalogAccess.SecretName {
+					t.Fatalf("multi-member pooler received inert catalog TLS or credential material: %#v", volume.Secret)
+				}
+			}
+			for _, item := range plan {
+				if service, ok := item.(*corev1.Service); ok && service.Name == CatalogServiceName(cluster.Name) {
+					t.Fatal("multi-member catalog candidate foundation created a serving catalog Service")
+				}
+			}
+		})
+	}
+}
+
+func TestCatalogCandidateDiscoveryTopologyBindingFailsClosed(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	reference, err := desiredCatalogCandidateDiscoveryTopology(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCatalogCandidateDiscoveryTopology(cluster, reference); err != nil {
+		t.Fatalf("exact discovery topology binding was rejected: %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*catalogCandidateDiscoveryTopology)
+	}{
+		{name: "different ConfigMap name", mutate: func(reference *catalogCandidateDiscoveryTopology) {
+			reference.ConfigMap.Name = "foreign-topology"
+			reference.SHA256 = catalogCandidateDiscoveryTopologySHA256(*reference)
+		}},
+		{name: "missing roster member", mutate: func(reference *catalogCandidateDiscoveryTopology) {
+			reference.Members = reference.Members[:len(reference.Members)-1]
+			reference.SHA256 = catalogCandidateDiscoveryTopologySHA256(*reference)
+		}},
+		{name: "reordered roster", mutate: func(reference *catalogCandidateDiscoveryTopology) {
+			reference.Members[0], reference.Members[1] = reference.Members[1], reference.Members[0]
+			reference.SHA256 = catalogCandidateDiscoveryTopologySHA256(*reference)
+		}},
+		{name: "different member identity", mutate: func(reference *catalogCandidateDiscoveryTopology) {
+			reference.Members[0].DNSName = "foreign.default.svc"
+			reference.SHA256 = catalogCandidateDiscoveryTopologySHA256(*reference)
+		}},
+		{name: "different reference digest", mutate: func(reference *catalogCandidateDiscoveryTopology) {
+			reference.SHA256 = strings.Repeat("f", 64)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			changedReference := reference
+			changedReference.Members = append([]topologyMember(nil), reference.Members...)
+			test.mutate(&changedReference)
+			if err := validateCatalogCandidateDiscoveryTopology(cluster, changedReference); err == nil {
+				t.Fatal("changed discovery topology binding was accepted")
+			}
+		})
+	}
+}
+
+func TestCatalogCandidateIdentitySurvivesAdmittedMutableUpdates(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	before, err := DesiredPostgreSQLCatalogCandidateConfigMaps(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated := cluster.DeepCopy()
+	updated.Spec.PostgreSQL.Parameters = map[string]string{"max_wal_size": "2GB"}
+	updated.Spec.Pooler.Scaling.HPA.MaxReplicas++
+	updated.Spec.Observability.OpenTelemetryEndpoint = "http://otel-collector.default.svc:4317"
+	if _, err := (&pgshardv1alpha1.PgShardClusterValidator{}).ValidateUpdate(context.Background(), cluster, updated); err != nil {
+		t.Fatalf("mutable update used by regression test was rejected: %v", err)
+	}
+	after, err := DesiredPostgreSQLCatalogCandidateConfigMaps(updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != len(after) {
+		t.Fatalf("candidate count changed across mutable update: before=%d after=%d", len(before), len(after))
+	}
+	for member := range before {
+		if !reflect.DeepEqual(before[member].Data, after[member].Data) ||
+			before[member].Annotations[ConfigHashAnnotation] != after[member].Annotations[ConfigHashAnnotation] {
+			t.Fatalf("candidate member %d drifted across admitted mutable update: before=%#v after=%#v", member, before[member].Data, after[member].Data)
+		}
+	}
+
+	beforeTopology, err := renderTopology(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterTopology, err := renderTopology(updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configHash(beforeTopology) == configHash(afterTopology) {
+		t.Fatal("mutable observability update did not change the broader discovery payload exercised by the regression")
 	}
 }
 
@@ -3543,7 +3740,6 @@ func testReplicationBootstrapSourcePodFor(t *testing.T, members int32, durabilit
 	cluster.Spec.MembersPerShard = members
 	cluster.Spec.Durability = durability
 	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
-	cluster.Status.CatalogAccess = nil
 	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
 	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
 	images := DevelopmentImages()
@@ -3667,7 +3863,6 @@ func testReplicationStandbyPod(t *testing.T) *corev1.Pod {
 	cluster := testCluster()
 	cluster.Spec.MembersPerShard = 3
 	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
-	cluster.Status.CatalogAccess = nil
 	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
 	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
 	images := DevelopmentImages()
@@ -3720,7 +3915,6 @@ func TestMultiMemberPlanRequiresOneCompleteBootstrapPerMember(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
 	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
-	cluster.Status.CatalogAccess = nil
 	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
 	images := DevelopmentImages()
 	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
@@ -3749,7 +3943,6 @@ func TestMultiMemberPlanRequiresCompleteReplicationCredentialCheckpoints(t *test
 	t.Parallel()
 	base := testCluster()
 	base.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(base)
-	base.Status.CatalogAccess = nil
 	base.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(base)
 	base.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(base)
 	images := DevelopmentImages()
@@ -3777,6 +3970,49 @@ func TestMultiMemberPlanRequiresCompleteReplicationCredentialCheckpoints(t *test
 		{name: "duplicate UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
 			cluster.Status.PostgreSQLReplicationCredentials[1].SecretUID = cluster.Status.PostgreSQLReplicationCredentials[0].SecretUID
 		}, want: "Secret UID test-replication-secret-uid-0000 is duplicated"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cluster := base.DeepCopy()
+			test.mutate(cluster)
+			if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Plan error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestMultiMemberPlanRequiresExactCatalogCandidateCheckpoints(t *testing.T) {
+	t.Parallel()
+	base := testCluster()
+	base.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(base)
+	base.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(base)
+	base.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(base)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	for _, test := range []struct {
+		name   string
+		mutate func(*pgshardv1alpha1.PgShardCluster)
+		want   string
+	}{
+		{name: "missing", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLCatalogCandidates = cluster.Status.PostgreSQLCatalogCandidates[:2]
+		}, want: "member 2 is missing"},
+		{name: "wrong name", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLCatalogCandidates[0].ConfigMapName = "foreign"
+		}, want: "member 0 is invalid"},
+		{name: "empty UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLCatalogCandidates[0].ConfigMapUID = ""
+		}, want: "member 0 is invalid"},
+		{name: "wrong payload", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLCatalogCandidates[0].PayloadSHA256 = strings.Repeat("f", 64)
+		}, want: "member 0 differs"},
+		{name: "duplicate member", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLCatalogCandidates = append(cluster.Status.PostgreSQLCatalogCandidates, cluster.Status.PostgreSQLCatalogCandidates[0])
+		}, want: "member 0 is duplicated"},
+		{name: "duplicate UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLCatalogCandidates[1].ConfigMapUID = cluster.Status.PostgreSQLCatalogCandidates[0].ConfigMapUID
+		}, want: "ConfigMap UID test-catalog-candidate-config-uid-0000 is duplicated"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -3920,6 +4156,7 @@ func TestPostgreSQLWritableLeaseNameFitsDNSLabelAtMaximumClusterLength(t *testin
 		PostgreSQLWritableLeaseName(cluster, pgshardv1alpha1.MaximumShards-1),
 		PostgreSQLAgentServiceAccountName(cluster, pgshardv1alpha1.MaximumShards-1),
 		PostgreSQLStandbyServiceAccountName(cluster, pgshardv1alpha1.MaximumShards-1),
+		PostgreSQLCatalogCandidateConfigMapName(cluster, 4),
 	}
 	for _, name := range names {
 		if messages := validation.IsDNS1123Label(name); len(messages) != 0 {
@@ -4040,6 +4277,20 @@ func testPostgreSQLReplicationCredentials(cluster *pgshardv1alpha1.PgShardCluste
 			SecretName:     PostgreSQLReplicationSecretPrefix(cluster.Name, shard) + strings.Repeat("d", 32),
 			SecretUID:      types.UID(fmt.Sprintf("test-replication-secret-uid-%04d", shard)),
 			MaterialSHA256: strings.Repeat("e", 64),
+		})
+	}
+	cluster.Status.PostgreSQLReplicationCredentials = checkpoints
+	desired, err := DesiredPostgreSQLCatalogCandidateConfigMaps(cluster)
+	if err != nil {
+		panic(fmt.Sprintf("build test catalog candidate configurations: %v", err))
+	}
+	cluster.Status.PostgreSQLCatalogCandidates = make([]pgshardv1alpha1.PostgreSQLCatalogCandidateStatus, 0, len(desired))
+	for member, configuration := range desired {
+		cluster.Status.PostgreSQLCatalogCandidates = append(cluster.Status.PostgreSQLCatalogCandidates, pgshardv1alpha1.PostgreSQLCatalogCandidateStatus{
+			Member:        int32(member),
+			ConfigMapName: configuration.Name,
+			ConfigMapUID:  types.UID(fmt.Sprintf("test-catalog-candidate-config-uid-%04d", member)),
+			PayloadSHA256: PostgreSQLCatalogCandidatePayloadSHA256(configuration),
 		})
 	}
 	return checkpoints

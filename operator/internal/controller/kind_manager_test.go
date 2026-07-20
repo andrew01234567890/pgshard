@@ -1304,13 +1304,25 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(haCluster), haCurrent); err != nil {
 			return false, err
 		}
-		if len(haCurrent.Status.PostgreSQLBootstraps) != int(haCluster.Spec.MembersPerShard) || len(haCurrent.Status.PostgreSQLReplicationCredentials) != 1 {
+		if len(haCurrent.Status.PostgreSQLBootstraps) != int(haCluster.Spec.MembersPerShard) || len(haCurrent.Status.PostgreSQLReplicationCredentials) != 1 ||
+			len(haCurrent.Status.PostgreSQLCatalogCandidates) != int(haCluster.Spec.MembersPerShard) {
 			return false, nil
 		}
 		recorded := haCurrent.Status.PostgreSQLReplicationCredentials[0]
-		return recorded.Shard == 0 && recorded.SecretUID != "" && validCatalogAccessDigest(recorded.MaterialSHA256), nil
+		catalogAccess := haCurrent.Status.CatalogAccess
+		if recorded.Shard != 0 || recorded.SecretUID == "" || !validCatalogAccessDigest(recorded.MaterialSHA256) ||
+			catalogAccess == nil || catalogAccess.SecretUID == "" || !validCatalogAccessDigest(catalogAccess.ClientSHA256) || !validCatalogAccessDigest(catalogAccess.ServerSHA256) {
+			return false, nil
+		}
+		for member, checkpoint := range haCurrent.Status.PostgreSQLCatalogCandidates {
+			if checkpoint.Member != int32(member) || checkpoint.ConfigMapName != owned.PostgreSQLCatalogCandidateConfigMapName(haCluster.Name, int32(member)) ||
+				checkpoint.ConfigMapUID == "" || !validCatalogAccessDigest(checkpoint.PayloadSHA256) {
+				return false, nil
+			}
+		}
+		return true, nil
 	}); err != nil {
-		t.Fatalf("wait for staged multi-member replication credential: %v; status=%#v", err, haCurrent.Status)
+		t.Fatalf("wait for complete multi-member catalog candidate status: %v; status=%#v", err, haCurrent.Status)
 	}
 	recordedReplication := &haCurrent.Status.PostgreSQLReplicationCredentials[0]
 	replicationSecret := &corev1.Secret{}
@@ -1325,8 +1337,12 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if !immutable || len(replicationSecret.Data) != 1 || !hasReplicationPassword || len(replicationPassword) != hex.EncodedLen(postgresqlPasswordBytes) {
 		t.Fatalf("staged multi-member replication Secret metadata: immutable=%t dataKeys=%d hasPassword=%t passwordBytes=%d uid=%q", immutable, len(replicationSecret.Data), hasReplicationPassword, len(replicationPassword), replicationSecret.UID)
 	}
-	if haCurrent.Status.CatalogAccess != nil {
-		t.Fatalf("multi-member source intent received catalog access: %#v", haCurrent.Status.CatalogAccess)
+	catalogAccessSecret := &corev1.Secret{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: haCurrent.Status.CatalogAccess.SecretName}, catalogAccessSecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCheckpointedCatalogAccess(catalogAccessSecret, haCurrent, haCurrent.Status.CatalogAccess); err != nil {
+		t.Fatal(err)
 	}
 	sourceName := owned.PostgreSQLMemberStatefulSetName(haCluster.Name, 0, 0)
 	source := &appsv1.StatefulSet{}
@@ -1409,6 +1425,8 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}
 	assertKINDPhysicalStandbys(t, ctx, kubeClient, haCurrent, sourcePodName)
 	assertKINDSynchronousGenerationWaitsForRemoteReplay(t, ctx, kubeClient, haCurrent, sourcePodName)
+	assertKINDCatalogCandidateConfigurationsInert(t, ctx, kubeClient, haCurrent)
+	assertKINDCatalogCandidateReplacementFailsClosed(t, ctx, kubeClient, haCurrent)
 
 	cluster := readSingleMemberSample(t)
 	cluster.Name = "agent-quarantine"
@@ -1799,6 +1817,183 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		*restartedLease.Spec.HolderIdentity,
 		*restartedLease.Spec.LeaseTransitions,
 	)
+}
+
+func assertKINDCatalogCandidateConfigurationsInert(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	desired, err := owned.DesiredPostgreSQLCatalogCandidateConfigMaps(cluster)
+	if err != nil {
+		t.Fatalf("build exact catalog candidate configurations: %v", err)
+	}
+	if len(desired) != int(cluster.Spec.MembersPerShard) || len(cluster.Status.PostgreSQLCatalogCandidates) != len(desired) {
+		t.Fatalf("catalog candidate desired/status cardinality = %d/%d, want %d", len(desired), len(cluster.Status.PostgreSQLCatalogCandidates), cluster.Spec.MembersPerShard)
+	}
+	topology := &corev1.ConfigMap{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.TopologyConfigSuffix}, topology); err != nil {
+		t.Fatalf("get published discovery topology: %v", err)
+	}
+	type discoveryMember struct {
+		Ordinal        int32  `json:"ordinal"`
+		InstanceID     string `json:"instanceId"`
+		DNSName        string `json:"dnsName"`
+		PostgreSQLPort int32  `json:"postgresqlPort"`
+		AgentHTTPPort  int32  `json:"agentHttpPort"`
+		PhysicalSlot   string `json:"physicalSlot"`
+	}
+	type candidateDocument struct {
+		Shard             int32 `json:"shard"`
+		Member            int32 `json:"member"`
+		DiscoveryTopology struct {
+			ConfigMap struct {
+				Name string `json:"name"`
+			} `json:"configMap"`
+			Members []discoveryMember `json:"members"`
+			SHA256  string            `json:"sha256"`
+		} `json:"discoveryTopology"`
+	}
+	names := make(map[string]struct{}, len(desired))
+	uids := make(map[types.UID]struct{}, len(desired))
+	digests := make(map[string]struct{}, len(desired))
+	for member, wanted := range desired {
+		checkpoint := cluster.Status.PostgreSQLCatalogCandidates[member]
+		configuration := &corev1.ConfigMap{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.ConfigMapName}, configuration); err != nil {
+			t.Fatalf("get catalog candidate member %d: %v", member, err)
+		}
+		if checkpoint.Member != int32(member) || checkpoint.ConfigMapName != wanted.Name || checkpoint.ConfigMapUID != configuration.UID ||
+			checkpoint.PayloadSHA256 != owned.PostgreSQLCatalogCandidatePayloadSHA256(configuration) ||
+			configuration.Immutable == nil || !*configuration.Immutable || len(configuration.Data) != 1 || len(configuration.BinaryData) != 0 ||
+			!maps.Equal(configuration.Data, wanted.Data) || !maps.Equal(configuration.Labels, wanted.Labels) || !maps.Equal(configuration.Annotations, wanted.Annotations) ||
+			!metav1.IsControlledBy(configuration, cluster) || len(configuration.Finalizers) != 0 {
+			t.Fatalf("catalog candidate member %d is not exact and inert: checkpoint=%#v ConfigMap=%#v", member, checkpoint, configuration)
+		}
+		if _, role := configuration.Labels[owned.RoleLabel]; role {
+			t.Fatalf("catalog candidate member %d carries a serving role: %#v", member, configuration.Labels)
+		}
+		if _, duplicate := names[configuration.Name]; duplicate {
+			t.Fatalf("catalog candidate ConfigMap name %s is duplicated", configuration.Name)
+		}
+		if _, duplicate := uids[configuration.UID]; duplicate {
+			t.Fatalf("catalog candidate ConfigMap UID %s is duplicated", configuration.UID)
+		}
+		if _, duplicate := digests[checkpoint.PayloadSHA256]; duplicate {
+			t.Fatalf("catalog candidate payload digest %s is duplicated", checkpoint.PayloadSHA256)
+		}
+		names[configuration.Name] = struct{}{}
+		uids[configuration.UID] = struct{}{}
+		digests[checkpoint.PayloadSHA256] = struct{}{}
+
+		var document candidateDocument
+		if err := json.Unmarshal([]byte(configuration.Data["candidate.json"]), &document); err != nil {
+			t.Fatalf("decode catalog candidate member %d: %v", member, err)
+		}
+		if document.Shard != 0 || document.Member != int32(member) || document.DiscoveryTopology.ConfigMap.Name != topology.Name ||
+			!validCatalogAccessDigest(document.DiscoveryTopology.SHA256) ||
+			len(document.DiscoveryTopology.Members) != int(cluster.Spec.MembersPerShard) {
+			t.Fatalf("catalog candidate member %d discovery reference = %#v", member, document.DiscoveryTopology)
+		}
+		for ordinal, discovery := range document.DiscoveryTopology.Members {
+			memberID := int32(ordinal)
+			instanceID := owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, memberID) + "-0"
+			wantDNS := fmt.Sprintf("%s.%s-shard-0000.%s.svc", instanceID, cluster.Name, cluster.Namespace)
+			if discovery.Ordinal != memberID || discovery.InstanceID != instanceID || discovery.DNSName != wantDNS ||
+				discovery.PostgreSQLPort != 5432 || discovery.AgentHTTPPort != 8080 || discovery.PhysicalSlot != fmt.Sprintf("pgshard_member_%04d", memberID) {
+				t.Fatalf("catalog candidate %d discovery member %d = %#v", member, ordinal, discovery)
+			}
+		}
+	}
+	assertKINDCatalogCandidatesNotConsumed(t, ctx, kubeClient, cluster)
+}
+
+func assertKINDCatalogCandidateReplacementFailsClosed(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	checkpoints := append([]pgshardv1alpha1.PostgreSQLCatalogCandidateStatus(nil), cluster.Status.PostgreSQLCatalogCandidates...)
+	catalogAccess := cluster.Status.CatalogAccess.DeepCopy()
+	checkpoint := checkpoints[1]
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.ConfigMapName}
+	original := &corev1.ConfigMap{}
+	if err := kubeClient.Get(ctx, key, original); err != nil {
+		t.Fatalf("get catalog candidate before replacement: %v", err)
+	}
+	uid := original.UID
+	resourceVersion := original.ResourceVersion
+	if err := kubeClient.Delete(ctx, original, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil {
+		t.Fatalf("delete catalog candidate: %v", err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, key, &corev1.ConfigMap{})
+		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	}); err != nil {
+		t.Fatalf("wait for catalog candidate deletion: %v", err)
+	}
+	desired, err := owned.DesiredPostgreSQLCatalogCandidateConfigMaps(cluster)
+	if err != nil {
+		t.Fatalf("build replacement catalog candidate: %v", err)
+	}
+	replacement := desired[checkpoint.Member].DeepCopy()
+	if err := kubeClient.Create(ctx, replacement); err != nil {
+		t.Fatalf("create replacement catalog candidate: %v", err)
+	}
+	if replacement.UID == "" || replacement.UID == checkpoint.ConfigMapUID {
+		t.Fatalf("replacement catalog candidate UID = %s, recorded UID = %s", replacement.UID, checkpoint.ConfigMapUID)
+	}
+
+	failed := &pgshardv1alpha1.PgShardCluster{}
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), failed); err != nil {
+			return false, err
+		}
+		condition := meta.FindStatusCondition(failed.Status.Conditions, reconciledCondition)
+		return failed.Status.Phase == "Degraded" && condition != nil && condition.Status == metav1.ConditionFalse &&
+			condition.Reason == "CatalogCandidateReconcileFailed" &&
+			strings.Contains(condition.Message, string(checkpoint.ConfigMapUID)) &&
+			strings.Contains(condition.Message, string(replacement.UID)), nil
+	}); err != nil {
+		t.Fatalf("wait for manager to report both recorded UID %s and replacement UID %s: %v; status=%#v", checkpoint.ConfigMapUID, replacement.UID, err, failed.Status)
+	}
+	if !reflect.DeepEqual(failed.Status.PostgreSQLCatalogCandidates, checkpoints) || !reflect.DeepEqual(failed.Status.CatalogAccess, catalogAccess) {
+		t.Fatalf("replacement changed catalog checkpoints: candidates before=%#v after=%#v access before=%#v after=%#v", checkpoints, failed.Status.PostgreSQLCatalogCandidates, catalogAccess, failed.Status.CatalogAccess)
+	}
+	observed := &corev1.ConfigMap{}
+	if err := kubeClient.Get(ctx, key, observed); err != nil {
+		t.Fatalf("get rejected replacement catalog candidate: %v", err)
+	}
+	if observed.UID != replacement.UID {
+		t.Fatalf("controller adopted or replaced rejected catalog candidate UID %s with %s", replacement.UID, observed.UID)
+	}
+	assertKINDCatalogCandidatesNotConsumed(t, ctx, kubeClient, failed)
+}
+
+func assertKINDCatalogCandidatesNotConsumed(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	statefulSets := &appsv1.StatefulSetList{}
+	deployments := &appsv1.DeploymentList{}
+	if err := kubeClient.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.List(ctx, deployments, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	for _, workload := range statefulSets.Items {
+		for _, volume := range workload.Spec.Template.Spec.Volumes {
+			if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, owned.PostgreSQLCatalogCandidateSuffix) {
+				t.Fatalf("StatefulSet %s consumed inert catalog candidate %s", workload.Name, volume.ConfigMap.Name)
+			}
+		}
+	}
+	for _, workload := range deployments.Items {
+		for _, volume := range workload.Spec.Template.Spec.Volumes {
+			if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, owned.PostgreSQLCatalogCandidateSuffix) {
+				t.Fatalf("Deployment %s consumed inert catalog candidate %s", workload.Name, volume.ConfigMap.Name)
+			}
+			if volume.Secret != nil && cluster.Status.CatalogAccess != nil && volume.Secret.SecretName == cluster.Status.CatalogAccess.SecretName {
+				t.Fatalf("Deployment %s consumed staged multi-member catalog access %s", workload.Name, volume.Secret.SecretName)
+			}
+		}
+	}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: owned.CatalogServiceName(cluster.Name)}, &corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("multi-member catalog candidate foundation published catalog Service: %v", err)
+	}
 }
 
 func TestKINDManagerDeletePolicyReleasesBoundPostgreSQLPVC(t *testing.T) {
