@@ -7,5 +7,6 @@ pub mod http;
 pub mod postgres;
 pub mod postgres_generation;
 pub(crate) mod postgres_recovery;
+pub(crate) mod postgres_replication;
 pub mod telemetry;
 pub mod writable;

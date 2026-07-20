@@ -3,8 +3,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use pgshard_types::PgLsn;
 use pgshard_types::writable_generation::{
     DurableWritableGeneration, WritableGenerationTransition, WritableGenerationTransitionError,
     classify_writable_generation_transition,
@@ -13,6 +14,11 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_postgres::{Client, Config, NoTls};
+
+use crate::domain::{
+    GenerationDurabilityEvidence, ReplicationStreamState, ReplicationSyncState,
+    SourceReplicationCandidateEvidence, SourceReplicationEvidence, StandbyReplicationEvidence,
+};
 
 #[cfg(test)]
 use tokio::sync::oneshot;
@@ -123,6 +129,10 @@ const LOCK_GENERATION_CATALOG_ROWS: &str = "\
     FOR UPDATE OF n, c, i, ic";
 const SELECT_FOR_UPDATE: &str = "\
     SELECT singleton, generation FROM pgshard_internal.writable_generation FOR UPDATE";
+const LOCK_GENERATION_TABLE_ACCESS_SHARE: &str = "\
+    LOCK TABLE ONLY pgshard_internal.writable_generation IN ACCESS SHARE MODE";
+const SELECT_GENERATION: &str = "\
+    SELECT singleton, generation FROM pgshard_internal.writable_generation";
 const INSERT_GENERATION: &str = "\
     INSERT INTO pgshard_internal.writable_generation (singleton, generation) \
     VALUES (true, $1)";
@@ -140,6 +150,43 @@ const SYNCHRONOUS_STANDBY_OBSERVATION: &str = "\
       AND s.slot_name = r.application_name \
       AND s.slot_type = 'physical' AND NOT s.temporary AND s.active \
     ORDER BY r.application_name, r.pid";
+const SOURCE_IDENTITY_OBSERVATION: &str = "\
+    SELECT s.system_identifier::text, c.timeline_id::text, \
+           pg_catalog.pg_is_in_recovery(), \
+           pg_catalog.current_setting('synchronous_standby_names') \
+    FROM pg_catalog.pg_control_system() AS s \
+    CROSS JOIN pg_catalog.pg_control_checkpoint() AS c";
+const SOURCE_WAL_OBSERVATION: &str = "\
+    SELECT pg_catalog.pg_current_wal_flush_lsn()::text";
+const SOURCE_CANDIDATE_OBSERVATION: &str = "\
+    SELECT candidate.member_slot_name, s.slot_name IS NOT NULL, s.slot_type::text, \
+           s.temporary, COALESCE(s.active, false), \
+           COALESCE(s.active_pid = r.pid, false), r.state::text, r.sync_state::text, \
+           r.flush_lsn::text, r.replay_lsn::text, \
+           COALESCE(r.flush_lsn >= $2::text::pg_catalog.pg_lsn, false), \
+           COALESCE(r.replay_lsn >= $2::text::pg_catalog.pg_lsn, false) \
+    FROM unnest($1::text[]) WITH ORDINALITY \
+         AS candidate(member_slot_name, candidate_ordinal) \
+    LEFT JOIN pg_catalog.pg_replication_slots AS s \
+      ON s.slot_name = candidate.member_slot_name \
+    LEFT JOIN pg_catalog.pg_stat_replication AS r \
+      ON r.application_name = candidate.member_slot_name \
+    ORDER BY candidate.candidate_ordinal, r.pid";
+const STANDBY_IDENTITY_OBSERVATION: &str = "\
+    SELECT s.system_identifier::text, c.timeline_id::text, \
+           pg_catalog.pg_is_in_recovery(), \
+           pg_catalog.current_setting('primary_slot_name') \
+    FROM pg_catalog.pg_control_system() AS s \
+    CROSS JOIN pg_catalog.pg_control_checkpoint() AS c";
+const STANDBY_WAL_OBSERVATION: &str = "\
+    SELECT pg_catalog.pg_last_wal_receive_lsn()::text, \
+           pg_catalog.pg_last_wal_replay_lsn()::text";
+const EVIDENCE_TRANSACTION_SETTINGS: &str = "\
+    SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;\
+    SET LOCAL search_path = pg_catalog;\
+    SET LOCAL statement_timeout = '2s';\
+    SET LOCAL transaction_timeout = '5s';\
+    SET LOCAL idle_in_transaction_session_timeout = '2s';";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GenerationDurability {
@@ -175,6 +222,24 @@ impl GenerationDurability {
             }
         }
     }
+
+    pub(crate) fn evidence(&self) -> GenerationDurabilityEvidence {
+        match self {
+            Self::Local => GenerationDurabilityEvidence::Local,
+            Self::RemoteApplyAnyOne { application_names } => {
+                GenerationDurabilityEvidence::RemoteApplyAnyOne {
+                    candidates: application_names.clone(),
+                }
+            }
+        }
+    }
+
+    fn application_names(&self) -> &[String] {
+        match self {
+            Self::Local => &[],
+            Self::RemoteApplyAnyOne { application_names } => application_names,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,6 +266,357 @@ struct StablePublicationGate {
 #[cfg(test)]
 static TEST_STABLE_PUBLICATION_GATE: std::sync::Mutex<Option<StablePublicationGate>> =
     std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static TEST_EVIDENCE_ACCESS_SHARE_GATE: std::sync::Mutex<Option<StablePublicationGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static TEST_EVIDENCE_SNAPSHOT_GATE: std::sync::Mutex<Option<StablePublicationGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static TEST_EVIDENCE_WAL_CAPTURE_GATE: std::sync::Mutex<Option<StablePublicationGate>> =
+    std::sync::Mutex::new(None);
+
+/// One retained peer-authenticated `PostgreSQL` session used for bounded
+/// replication-evidence samples. Keeping this session alive prevents the
+/// 250 ms monitor cadence from creating a fresh backend on every sample.
+pub(crate) struct ReplicationEvidenceSession {
+    connection: ConnectedPostgres,
+}
+
+/// Establishes the one session a replication-evidence monitor retains until
+/// it terminates or loses its first confirmed stream.
+pub(crate) async fn connect_replication_evidence(
+    socket_dir: &Path,
+) -> Result<ReplicationEvidenceSession, PostgresGenerationError> {
+    Ok(ReplicationEvidenceSession {
+        connection: connect_with_application(socket_dir, "pgshard-replication-evidence").await?,
+    })
+}
+
+impl ReplicationEvidenceSession {
+    /// Samples one coherent source generation barrier and every configured
+    /// member slot on this retained session.
+    pub(crate) async fn observe_source(
+        &mut self,
+        expected_generation: &DurableWritableGeneration,
+        durability: &GenerationDurability,
+    ) -> Result<SourceReplicationEvidence, PostgresGenerationError> {
+        validate_generation_durability(durability)?;
+        let observed_at_unix_ms = unix_time_ms();
+        // PostgreSQL's WAL-position functions read live shared state rather
+        // than MVCC state. Complete a separately bounded transaction before
+        // beginning the repeatable-read generation transaction, so its fixed
+        // snapshot cannot precede this WAL barrier and pair an old row with
+        // newer durability.
+        let wal_transaction = self.connection.client.transaction().await?;
+        wal_transaction
+            .batch_execute(EVIDENCE_TRANSACTION_SETTINGS)
+            .await?;
+        let wal_row = wal_transaction
+            .query_one(SOURCE_WAL_OBSERVATION, &[])
+            .await?;
+        let barrier_text = wal_row.try_get::<_, String>(0)?;
+        let generation_barrier_lsn = parse_pg_lsn(&barrier_text)?;
+        if generation_barrier_lsn.0 == 0 {
+            return Err(PostgresGenerationError::InvalidReplicationEvidence);
+        }
+        wal_transaction.rollback().await?;
+        #[cfg(test)]
+        evidence_wal_capture_checkpoint().await;
+
+        let transaction = self.connection.client.transaction().await?;
+        transaction
+            .batch_execute(EVIDENCE_TRANSACTION_SETTINGS)
+            .await?;
+        transaction
+            .batch_execute(LOCK_GENERATION_TABLE_ACCESS_SHARE)
+            .await?;
+        #[cfg(test)]
+        evidence_access_share_checkpoint().await;
+        let generation = read_generation_evidence(&transaction).await?;
+        if &generation != expected_generation {
+            return Err(PostgresGenerationError::GenerationEvidenceChanged);
+        }
+
+        let row = transaction
+            .query_one(SOURCE_IDENTITY_OBSERVATION, &[])
+            .await?;
+        let system_identifier = parse_system_identifier(&row.try_get::<_, String>(0)?)?;
+        let timeline = parse_timeline(&row.try_get::<_, String>(1)?)?;
+        let in_recovery = row.try_get::<_, bool>(2)?;
+        let runtime_synchronous_standby_names = row.try_get::<_, String>(3)?;
+        if in_recovery
+            || runtime_synchronous_standby_names != durability.synchronous_standby_names_setting()
+        {
+            return Err(PostgresGenerationError::InvalidReplicationEvidence);
+        }
+
+        let candidate_rows = transaction
+            .query(
+                SOURCE_CANDIDATE_OBSERVATION,
+                &[&durability.application_names(), &barrier_text],
+            )
+            .await?;
+        let candidates = parse_source_candidate_evidence(
+            durability.application_names(),
+            &candidate_rows,
+            generation_barrier_lsn,
+        )?;
+        transaction.rollback().await?;
+
+        Ok(SourceReplicationEvidence {
+            observed_at_unix_ms,
+            system_identifier,
+            timeline,
+            in_recovery,
+            generation_identity: canonical_generation_text(&generation),
+            generation_barrier_lsn,
+            durability: durability.evidence(),
+            candidates,
+        })
+    }
+
+    /// Samples one coherent standby identity, replay position, and exact
+    /// replayed generation on this retained session.
+    pub(crate) async fn observe_standby(
+        &mut self,
+        expected_member_slot_name: &str,
+    ) -> Result<StandbyReplicationEvidence, PostgresGenerationError> {
+        if !is_canonical_managed_member_name(expected_member_slot_name) {
+            return Err(PostgresGenerationError::InvalidReplicationEvidence);
+        }
+        let observed_at_unix_ms = unix_time_ms();
+        // Capture both live receiver/replay positions in a separately bounded
+        // transaction that ends before the fixed generation snapshot begins.
+        // A concurrent replay may therefore make these values conservative,
+        // but they are never sampled after the generation snapshot.
+        let wal_transaction = self.connection.client.transaction().await?;
+        wal_transaction
+            .batch_execute(EVIDENCE_TRANSACTION_SETTINGS)
+            .await?;
+        let wal_row = wal_transaction
+            .query_one(STANDBY_WAL_OBSERVATION, &[])
+            .await?;
+        let receive_lsn = parse_pg_lsn(&wal_row.try_get::<_, String>(0)?)?;
+        let replay_lsn = parse_pg_lsn(&wal_row.try_get::<_, String>(1)?)?;
+        if receive_lsn.0 == 0 || replay_lsn.0 == 0 {
+            return Err(PostgresGenerationError::InvalidReplicationEvidence);
+        }
+        wal_transaction.rollback().await?;
+        #[cfg(test)]
+        evidence_wal_capture_checkpoint().await;
+
+        let transaction = self.connection.client.transaction().await?;
+        transaction
+            .batch_execute(EVIDENCE_TRANSACTION_SETTINGS)
+            .await?;
+        transaction
+            .batch_execute(LOCK_GENERATION_TABLE_ACCESS_SHARE)
+            .await?;
+        #[cfg(test)]
+        evidence_access_share_checkpoint().await;
+        let generation = read_generation_evidence(&transaction).await?;
+        let row = transaction
+            .query_one(STANDBY_IDENTITY_OBSERVATION, &[])
+            .await?;
+        let system_identifier = parse_system_identifier(&row.try_get::<_, String>(0)?)?;
+        let timeline = parse_timeline(&row.try_get::<_, String>(1)?)?;
+        let in_recovery = row.try_get::<_, bool>(2)?;
+        let member_slot_name = row.try_get::<_, String>(3)?;
+        if !in_recovery || member_slot_name != expected_member_slot_name {
+            return Err(PostgresGenerationError::InvalidReplicationEvidence);
+        }
+        transaction.rollback().await?;
+
+        Ok(StandbyReplicationEvidence {
+            observed_at_unix_ms,
+            system_identifier,
+            timeline,
+            in_recovery,
+            generation_identity: canonical_generation_text(&generation),
+            member_slot_name,
+            receive_lsn,
+            replay_lsn,
+        })
+    }
+}
+
+async fn read_generation_evidence(
+    transaction: &tokio_postgres::Transaction<'_>,
+) -> Result<DurableWritableGeneration, PostgresGenerationError> {
+    if query_safety(transaction, SCHEMA_IS_SAFE).await? != Some(true) {
+        return Err(PostgresGenerationError::UnsafeSchema);
+    }
+    if query_safety(transaction, RELATION_IS_SAFE).await? != Some(true) {
+        return Err(PostgresGenerationError::UnsafeRelation);
+    }
+    #[cfg(test)]
+    evidence_snapshot_checkpoint().await;
+    // The explicit AccessShareLock already held through transaction end keeps
+    // target shape/name DDL out. Plain SELECT does not strengthen that lock or
+    // acquire a write-capable catalog/tuple lock.
+    let rows = transaction.query(SELECT_GENERATION, &[]).await?;
+    if query_safety(transaction, SCHEMA_IS_SAFE).await? != Some(true) {
+        return Err(PostgresGenerationError::UnsafeSchema);
+    }
+    if query_safety(transaction, RELATION_IS_SAFE).await? != Some(true) {
+        return Err(PostgresGenerationError::UnsafeRelation);
+    }
+    parse_locked_generation_rows(&rows)?.ok_or(PostgresGenerationError::GenerationEvidenceMissing)
+}
+
+fn parse_source_candidate_evidence(
+    expected_candidates: &[String],
+    rows: &[tokio_postgres::Row],
+    generation_barrier_lsn: PgLsn,
+) -> Result<Vec<SourceReplicationCandidateEvidence>, PostgresGenerationError> {
+    if rows.len() != expected_candidates.len() {
+        return Err(PostgresGenerationError::InvalidReplicationEvidence);
+    }
+    rows.iter()
+        .zip(expected_candidates)
+        .map(|(row, expected)| {
+            let member_slot_name = row.try_get::<_, String>(0)?;
+            let slot_exists = row.try_get::<_, bool>(1)?;
+            let slot_type = row.try_get::<_, Option<String>>(2)?;
+            let slot_temporary = row.try_get::<_, Option<bool>>(3)?;
+            let slot_active = row.try_get::<_, bool>(4)?;
+            let slot_walsender_match = row.try_get::<_, bool>(5)?;
+            let stream_state = row
+                .try_get::<_, Option<String>>(6)?
+                .map(|value| parse_replication_stream_state(&value))
+                .transpose()?;
+            let sync_state = row
+                .try_get::<_, Option<String>>(7)?
+                .map(|value| parse_replication_sync_state(&value))
+                .transpose()?;
+            let flush_lsn = row
+                .try_get::<_, Option<String>>(8)?
+                .map(|value| parse_pg_lsn(&value))
+                .transpose()?;
+            let replay_lsn = row
+                .try_get::<_, Option<String>>(9)?
+                .map(|value| parse_pg_lsn(&value))
+                .transpose()?;
+            let flush_covers_generation_barrier = row.try_get::<_, bool>(10)?;
+            let replay_covers_generation_barrier = row.try_get::<_, bool>(11)?;
+            if member_slot_name != *expected
+                || (slot_exists
+                    && (slot_type.as_deref() != Some("physical") || slot_temporary != Some(false)))
+                || (!slot_exists
+                    && (slot_type.is_some()
+                        || slot_temporary.is_some()
+                        || slot_active
+                        || slot_walsender_match))
+                || stream_state.is_some() != sync_state.is_some()
+                || flush_covers_generation_barrier
+                    != flush_lsn.is_some_and(|lsn| lsn.0 >= generation_barrier_lsn.0)
+                || replay_covers_generation_barrier
+                    != replay_lsn.is_some_and(|lsn| lsn.0 >= generation_barrier_lsn.0)
+            {
+                return Err(PostgresGenerationError::InvalidReplicationEvidence);
+            }
+            Ok(SourceReplicationCandidateEvidence {
+                member_slot_name,
+                slot_active,
+                slot_walsender_match,
+                stream_state,
+                sync_state,
+                flush_lsn,
+                replay_lsn,
+            })
+        })
+        .collect()
+}
+
+fn parse_replication_stream_state(
+    value: &str,
+) -> Result<ReplicationStreamState, PostgresGenerationError> {
+    match value {
+        "startup" => Ok(ReplicationStreamState::Startup),
+        "catchup" => Ok(ReplicationStreamState::Catchup),
+        "streaming" => Ok(ReplicationStreamState::Streaming),
+        "backup" => Ok(ReplicationStreamState::Backup),
+        "stopping" => Ok(ReplicationStreamState::Stopping),
+        _ => Err(PostgresGenerationError::InvalidReplicationEvidence),
+    }
+}
+
+fn parse_replication_sync_state(
+    value: &str,
+) -> Result<ReplicationSyncState, PostgresGenerationError> {
+    match value {
+        "async" => Ok(ReplicationSyncState::Async),
+        "potential" => Ok(ReplicationSyncState::Potential),
+        "sync" => Ok(ReplicationSyncState::Sync),
+        "quorum" => Ok(ReplicationSyncState::Quorum),
+        _ => Err(PostgresGenerationError::InvalidReplicationEvidence),
+    }
+}
+
+fn parse_system_identifier(value: &str) -> Result<u64, PostgresGenerationError> {
+    parse_canonical_decimal(value)
+        .filter(|value| *value > 0)
+        .ok_or(PostgresGenerationError::InvalidReplicationEvidence)
+}
+
+fn parse_timeline(value: &str) -> Result<u32, PostgresGenerationError> {
+    parse_canonical_decimal(value)
+        .filter(|value| *value > 0)
+        .ok_or(PostgresGenerationError::InvalidReplicationEvidence)
+}
+
+fn parse_canonical_decimal<T>(value: &str) -> Option<T>
+where
+    T: std::str::FromStr + ToString,
+{
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let parsed = value.parse::<T>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+fn parse_pg_lsn(value: &str) -> Result<PgLsn, PostgresGenerationError> {
+    let (high, low) = value
+        .split_once('/')
+        .ok_or(PostgresGenerationError::InvalidReplicationEvidence)?;
+    if high.is_empty()
+        || low.is_empty()
+        || high.len() > 8
+        || low.len() > 8
+        || !high.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !low.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || high.bytes().any(|byte| byte.is_ascii_lowercase())
+        || low.bytes().any(|byte| byte.is_ascii_lowercase())
+        || (high.len() > 1 && high.starts_with('0'))
+        || (low.len() > 1 && low.starts_with('0'))
+    {
+        return Err(PostgresGenerationError::InvalidReplicationEvidence);
+    }
+    let high = u32::from_str_radix(high, 16)
+        .map_err(|_| PostgresGenerationError::InvalidReplicationEvidence)?;
+    let low = u32::from_str_radix(low, 16)
+        .map_err(|_| PostgresGenerationError::InvalidReplicationEvidence)?;
+    Ok(PgLsn((u64::from(high) << 32) | u64::from(low)))
+}
+
+fn canonical_generation_text(generation: &DurableWritableGeneration) -> String {
+    String::from_utf8(generation.canonical_bytes())
+        .expect("canonical writable generation is always UTF-8")
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
 
 /// Publishes one generation to a singleton WAL-logged row in the `postgres`
 /// database over the private Unix socket.
@@ -559,8 +975,98 @@ fn gate_next_stable_publication() -> (oneshot::Receiver<()>, oneshot::Sender<()>
 }
 
 #[cfg(test)]
+fn gate_next_evidence_access_share() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let mut gate = TEST_EVIDENCE_ACCESS_SHARE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        gate.replace(StablePublicationGate {
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .is_none(),
+        "test already has an evidence AccessShare gate"
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+fn gate_next_evidence_snapshot() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let mut gate = TEST_EVIDENCE_SNAPSHOT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        gate.replace(StablePublicationGate {
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .is_none(),
+        "test already has an evidence snapshot gate"
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+fn gate_next_evidence_wal_capture() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let mut gate = TEST_EVIDENCE_WAL_CAPTURE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        gate.replace(StablePublicationGate {
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .is_none(),
+        "test already has an evidence WAL-capture gate"
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
 async fn stable_publication_checkpoint() {
     let gate = TEST_STABLE_PUBLICATION_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(test)]
+async fn evidence_access_share_checkpoint() {
+    let gate = TEST_EVIDENCE_ACCESS_SHARE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(test)]
+async fn evidence_snapshot_checkpoint() {
+    let gate = TEST_EVIDENCE_SNAPSHOT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(test)]
+async fn evidence_wal_capture_checkpoint() {
+    let gate = TEST_EVIDENCE_WAL_CAPTURE_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
@@ -657,13 +1163,20 @@ fn parse_generation(bytes: &[u8]) -> Result<DurableWritableGeneration, PostgresG
 }
 
 async fn connect(socket_dir: &Path) -> Result<ConnectedPostgres, tokio_postgres::Error> {
+    connect_with_application(socket_dir, "pgshard-generation-publisher").await
+}
+
+async fn connect_with_application(
+    socket_dir: &Path,
+    application_name: &'static str,
+) -> Result<ConnectedPostgres, tokio_postgres::Error> {
     let mut config = Config::new();
     config
         .host_path(socket_dir)
         .port(5432)
         .user("postgres")
         .dbname("postgres")
-        .application_name("pgshard-generation-publisher")
+        .application_name(application_name)
         .options(CONNECTION_OPTIONS);
     let (client, connection) = config.connect(NoTls).await?;
     let driver = tokio::spawn(async move {
@@ -730,6 +1243,16 @@ pub enum PostgresGenerationError {
     /// The primary generation changed before synchronous proof completed.
     #[error("PostgreSQL writable-generation row changed during synchronous durability proof")]
     SynchronousGenerationChanged,
+    /// No singleton generation row is visible in the coherent SQL sample.
+    #[error("PostgreSQL writable-generation evidence is missing")]
+    GenerationEvidenceMissing,
+    /// The observed source generation differs from exact startup authority.
+    #[error("PostgreSQL writable-generation evidence changed after publication")]
+    GenerationEvidenceChanged,
+    /// A `PostgreSQL` identity, LSN, runtime setting, slot, or walsender value was
+    /// absent, noncanonical, ambiguous, or internally inconsistent.
+    #[error("PostgreSQL replication evidence is invalid or incoherent")]
+    InvalidReplicationEvidence,
     /// The requested transition violates the durable fencing floor.
     #[error(transparent)]
     UnsafeTransition(#[from] WritableGenerationTransitionError),
@@ -781,6 +1304,109 @@ mod tests {
             sync_state: sync_state.to_owned(),
             flush_covers_barrier,
             replay_covers_barrier,
+        }
+    }
+
+    #[test]
+    fn replication_evidence_scalar_parsers_accept_only_canonical_values() {
+        assert_eq!(parse_system_identifier("1").expect("system ID"), 1);
+        assert_eq!(
+            parse_system_identifier(&u64::MAX.to_string()).expect("maximum system ID"),
+            u64::MAX
+        );
+        assert_eq!(
+            parse_timeline("4294967295").expect("maximum timeline"),
+            u32::MAX
+        );
+        for invalid in [
+            "",
+            "0",
+            "01",
+            "+1",
+            " 1",
+            "1 ",
+            "1.0",
+            "18446744073709551616",
+        ] {
+            assert!(matches!(
+                parse_system_identifier(invalid),
+                Err(PostgresGenerationError::InvalidReplicationEvidence)
+            ));
+        }
+        for invalid in ["", "0", "01", "4294967296"] {
+            assert!(matches!(
+                parse_timeline(invalid),
+                Err(PostgresGenerationError::InvalidReplicationEvidence)
+            ));
+        }
+
+        assert_eq!(parse_pg_lsn("0/0").expect("zero LSN"), PgLsn(0));
+        assert_eq!(
+            parse_pg_lsn("1/2").expect("small LSN"),
+            PgLsn((1_u64 << 32) | 2)
+        );
+        assert_eq!(
+            parse_pg_lsn("FFFFFFFF/FFFFFFFF").expect("maximum LSN"),
+            PgLsn(u64::MAX)
+        );
+        for invalid in [
+            "",
+            "1",
+            "1/",
+            "/1",
+            "1/2/3",
+            "01/2",
+            "1/02",
+            "a/1",
+            "A/b",
+            "100000000/0",
+            "0/100000000",
+            "G/0",
+            " 1/2",
+        ] {
+            assert!(matches!(
+                parse_pg_lsn(invalid),
+                Err(PostgresGenerationError::InvalidReplicationEvidence)
+            ));
+        }
+    }
+
+    #[test]
+    fn replication_state_parsers_are_closed_over_postgres_values() {
+        for (value, expected) in [
+            ("startup", ReplicationStreamState::Startup),
+            ("catchup", ReplicationStreamState::Catchup),
+            ("streaming", ReplicationStreamState::Streaming),
+            ("backup", ReplicationStreamState::Backup),
+            ("stopping", ReplicationStreamState::Stopping),
+        ] {
+            assert_eq!(
+                parse_replication_stream_state(value).expect("known stream state"),
+                expected
+            );
+        }
+        for invalid in ["", "STREAMING", "streaming ", "unknown"] {
+            assert!(matches!(
+                parse_replication_stream_state(invalid),
+                Err(PostgresGenerationError::InvalidReplicationEvidence)
+            ));
+        }
+        for (value, expected) in [
+            ("async", ReplicationSyncState::Async),
+            ("potential", ReplicationSyncState::Potential),
+            ("sync", ReplicationSyncState::Sync),
+            ("quorum", ReplicationSyncState::Quorum),
+        ] {
+            assert_eq!(
+                parse_replication_sync_state(value).expect("known sync state"),
+                expected
+            );
+        }
+        for invalid in ["", "SYNC", "quorum ", "unknown"] {
+            assert!(matches!(
+                parse_replication_sync_state(invalid),
+                Err(PostgresGenerationError::InvalidReplicationEvidence)
+            ));
         }
     }
 
@@ -1091,12 +1717,25 @@ mod tests {
         assert!(SYNCHRONOUS_STANDBY_OBSERVATION.contains("slot_type = 'physical'"));
         assert!(SYNCHRONOUS_STANDBY_OBSERVATION.contains("flush_lsn"));
         assert!(SYNCHRONOUS_STANDBY_OBSERVATION.contains("replay_lsn"));
+        assert!(EVIDENCE_TRANSACTION_SETTINGS.contains("REPEATABLE READ, READ ONLY"));
+        assert!(LOCK_GENERATION_TABLE_ACCESS_SHARE.contains("TABLE ONLY"));
+        assert!(LOCK_GENERATION_TABLE_ACCESS_SHARE.contains("ACCESS SHARE MODE"));
+        assert!(!LOCK_GENERATION_TABLE_ACCESS_SHARE.contains("ROW EXCLUSIVE"));
+        assert!(!EVIDENCE_TRANSACTION_SETTINGS.contains("FOR UPDATE"));
+        assert!(!SELECT_GENERATION.contains("FOR UPDATE"));
+        assert!(SOURCE_WAL_OBSERVATION.contains("pg_current_wal_flush_lsn"));
+        assert!(!SOURCE_IDENTITY_OBSERVATION.contains("pg_current_wal_flush_lsn"));
+        assert!(STANDBY_WAL_OBSERVATION.contains("pg_last_wal_receive_lsn"));
+        assert!(STANDBY_WAL_OBSERVATION.contains("pg_last_wal_replay_lsn"));
+        assert!(!STANDBY_IDENTITY_OBSERVATION.contains("pg_last_wal_receive_lsn"));
+        assert!(!STANDBY_IDENTITY_OBSERVATION.contains("pg_last_wal_replay_lsn"));
         assert!(CONNECTION_OPTIONS.contains("event_triggers=off"));
         assert!(CONNECTION_OPTIONS.contains("log_statement=none"));
     }
 
     #[tokio::test]
     #[ignore = "requires disposable primary and streaming-standby PostgreSQL 18 Unix sockets"]
+    #[allow(clippy::too_many_lines)]
     async fn live_postgres18_proves_any_one_synchronous_generation_replay() {
         let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
             .map(std::path::PathBuf::from)
@@ -1174,6 +1813,8 @@ mod tests {
             .expect("advance synchronously replayed generation");
         assert_replayed_generation(&standby.client, &second).await;
 
+        assert_live_replication_evidence(&socket_dir, &standby_socket_dir, &second).await;
+
         let row = primary
             .client
             .query_one(
@@ -1194,11 +1835,536 @@ mod tests {
             row.try_get::<_, String>(1).expect("relation persistence"),
             "p"
         );
+        assert_evidence_wal_capture_precedes_generation_snapshot(
+            &socket_dir,
+            &standby_socket_dir,
+            &second,
+        )
+        .await;
         primary
             .client
             .batch_execute("DROP SCHEMA pgshard_internal CASCADE")
             .await
             .expect("remove disposable generation schema");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_live_replication_evidence(
+        source_socket: &Path,
+        standby_socket: &Path,
+        generation: &DurableWritableGeneration,
+    ) {
+        let durability = GenerationDurability::remote_apply_any_one(vec![
+            "pgshard_member_0001".to_owned(),
+            "pgshard_member_0002".to_owned(),
+        ])
+        .expect("valid live evidence durability");
+        let mut source_session = connect_replication_evidence(source_socket)
+            .await
+            .expect("connect retained source evidence session");
+        let source_backend_pid_before = source_session
+            .connection
+            .client
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .await
+            .expect("read source evidence backend pid")
+            .try_get::<_, i32>(0)
+            .expect("source evidence backend pid");
+        let source_backend_count_before = replication_evidence_backend_count(&source_session).await;
+        let wal_insert_lsn_before = current_wal_insert_lsn(&source_session).await;
+        let source_evidence = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let evidence = source_session
+                    .observe_source(generation, &durability)
+                    .await
+                    .expect("observe exact source generation evidence");
+                if source_has_synchronous_witness(&evidence) {
+                    break evidence;
+                }
+                sleep(CONNECT_RETRY_DELAY).await;
+            }
+        })
+        .await
+        .expect("synchronous source evidence converged");
+        for _ in 0..3 {
+            source_session
+                .observe_source(generation, &durability)
+                .await
+                .expect("repeat source evidence sample on retained session");
+        }
+        let source_backend_pid_after = source_session
+            .connection
+            .client
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .await
+            .expect("re-read source evidence backend pid")
+            .try_get::<_, i32>(0)
+            .expect("source evidence backend pid");
+        assert_eq!(source_backend_pid_after, source_backend_pid_before);
+        assert_eq!(source_backend_count_before, 1);
+        assert_eq!(replication_evidence_backend_count(&source_session).await, 1);
+        assert_eq!(
+            current_wal_insert_lsn(&source_session).await,
+            wal_insert_lsn_before
+        );
+        assert_evidence_access_share_blocks_ddl(
+            source_socket,
+            generation,
+            &durability,
+            "BEGIN; ALTER TABLE pgshard_internal.writable_generation \
+             ADD COLUMN concurrent_shape integer; ROLLBACK",
+        )
+        .await;
+        assert_evidence_access_share_blocks_ddl(
+            source_socket,
+            generation,
+            &durability,
+            "BEGIN; DROP TABLE pgshard_internal.writable_generation; \
+             CREATE TABLE pgshard_internal.writable_generation (\
+                 singleton boolean, generation bytea); ROLLBACK",
+        )
+        .await;
+        assert_evidence_access_share_blocks_rls_commit(source_socket, generation, &durability)
+            .await;
+        assert_evidence_timestamp_is_conservative_for_default_acl_commit(
+            source_socket,
+            generation,
+            &durability,
+        )
+        .await;
+
+        let mut standby_session = connect_replication_evidence(standby_socket)
+            .await
+            .expect("connect retained standby evidence session");
+        let standby_evidence = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let evidence = standby_session
+                    .observe_standby("pgshard_member_0001")
+                    .await
+                    .expect("observe exact standby generation evidence");
+                if evidence.replay_lsn.0 >= source_evidence.generation_barrier_lsn.0 {
+                    break evidence;
+                }
+                sleep(CONNECT_RETRY_DELAY).await;
+            }
+        })
+        .await
+        .expect("standby evidence replayed the sampled source barrier");
+        assert_eq!(
+            source_evidence.generation_identity,
+            canonical_generation_text(generation)
+        );
+        assert_eq!(
+            standby_evidence.generation_identity,
+            source_evidence.generation_identity
+        );
+        assert_eq!(
+            standby_evidence.system_identifier,
+            source_evidence.system_identifier
+        );
+        assert_eq!(standby_evidence.timeline, source_evidence.timeline);
+        assert!(!source_evidence.in_recovery);
+        assert!(standby_evidence.in_recovery);
+        assert!(source_has_synchronous_witness(&source_evidence));
+        let now_unix_ms = source_evidence
+            .observed_at_unix_ms
+            .max(standby_evidence.observed_at_unix_ms);
+        assert_eq!(
+            crate::domain::classify_initial_serving_eligibility(
+                Some(&source_evidence),
+                &[standby_evidence],
+                now_unix_ms,
+            ),
+            crate::domain::InitialServingEligibility::Eligible
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_evidence_wal_capture_precedes_generation_snapshot(
+        source_socket: &Path,
+        standby_socket: &Path,
+        current_generation: &DurableWritableGeneration,
+    ) {
+        let durability = GenerationDurability::remote_apply_any_one(vec![
+            "pgshard_member_0001".to_owned(),
+            "pgshard_member_0002".to_owned(),
+        ])
+        .expect("valid temporal evidence durability");
+
+        // A source sample blocked after its flush-position read has not begun
+        // its repeatable-read transaction. Advancing the generation here must
+        // therefore be observed as an exact-generation mismatch, rather than
+        // returning the old row paired with WAL flushed by the new commit.
+        let third = generation("cluster-1", "holder-c", 3);
+        let (source_captured, release_source) = gate_next_evidence_wal_capture();
+        let source_observation_socket = source_socket.to_owned();
+        let source_observation_generation = current_generation.clone();
+        let source_observation_durability = durability.clone();
+        let source_observation = tokio::spawn(async move {
+            let mut session = connect_replication_evidence(&source_observation_socket).await?;
+            session
+                .observe_source(
+                    &source_observation_generation,
+                    &source_observation_durability,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), source_captured)
+            .await
+            .expect("source captured WAL before its generation snapshot")
+            .expect("source retained pre-snapshot WAL gate");
+        publish_synchronous_generation(source_socket, &third)
+            .await
+            .expect("advance generation while source evidence is pre-snapshot");
+        release_source
+            .send(())
+            .expect("release source pre-snapshot WAL gate");
+        assert!(matches!(
+            source_observation
+                .await
+                .expect("join source temporal observation"),
+            Err(PostgresGenerationError::GenerationEvidenceChanged)
+        ));
+
+        // A standby sample blocked at the same boundary may see a later
+        // generation after replay resumes, but its receive/replay positions
+        // remain the earlier values. They must not satisfy the later source
+        // barrier until a fresh complete standby sample is taken.
+        let fourth = generation("cluster-1", "holder-d", 4);
+        let (standby_captured, release_standby) = gate_next_evidence_wal_capture();
+        let standby_observation_socket = standby_socket.to_owned();
+        let standby_observation = tokio::spawn(async move {
+            let mut session = connect_replication_evidence(&standby_observation_socket).await?;
+            session.observe_standby("pgshard_member_0001").await
+        });
+        tokio::time::timeout(Duration::from_secs(5), standby_captured)
+            .await
+            .expect("standby captured WAL before its generation snapshot")
+            .expect("standby retained pre-snapshot WAL gate");
+        publish_synchronous_generation(source_socket, &fourth)
+            .await
+            .expect("advance generation while standby evidence is pre-snapshot");
+        assert_replayed_generation(
+            &connect(standby_socket)
+                .await
+                .expect("connect temporal standby verification")
+                .client,
+            &fourth,
+        )
+        .await;
+        release_standby
+            .send(())
+            .expect("release standby pre-snapshot WAL gate");
+        let conservative_standby = standby_observation
+            .await
+            .expect("join standby temporal observation")
+            .expect("standby temporal observation remains coherent");
+        assert_eq!(
+            conservative_standby.generation_identity,
+            canonical_generation_text(&fourth)
+        );
+
+        let mut source_session = connect_replication_evidence(source_socket)
+            .await
+            .expect("connect temporal source evidence session");
+        let source_evidence = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let evidence = source_session
+                    .observe_source(&fourth, &durability)
+                    .await
+                    .expect("observe later source generation");
+                if source_has_synchronous_witness(&evidence) {
+                    break evidence;
+                }
+                sleep(CONNECT_RETRY_DELAY).await;
+            }
+        })
+        .await
+        .expect("later source evidence converged");
+        assert!(conservative_standby.receive_lsn.0 < source_evidence.generation_barrier_lsn.0);
+        assert!(conservative_standby.replay_lsn.0 < source_evidence.generation_barrier_lsn.0);
+        let now_unix_ms = source_evidence
+            .observed_at_unix_ms
+            .max(conservative_standby.observed_at_unix_ms);
+        assert_eq!(
+            crate::domain::classify_initial_serving_eligibility(
+                Some(&source_evidence),
+                &[conservative_standby],
+                now_unix_ms,
+            ),
+            crate::domain::InitialServingEligibility::SynchronousWitnessMissing
+        );
+
+        let mut standby_session = connect_replication_evidence(standby_socket)
+            .await
+            .expect("connect fresh temporal standby evidence session");
+        let fresh_standby = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let evidence = standby_session
+                    .observe_standby("pgshard_member_0001")
+                    .await
+                    .expect("observe fresh standby evidence");
+                if evidence.replay_lsn.0 >= source_evidence.generation_barrier_lsn.0 {
+                    break evidence;
+                }
+                sleep(CONNECT_RETRY_DELAY).await;
+            }
+        })
+        .await
+        .expect("fresh standby evidence reached the later source barrier");
+        let now_unix_ms = source_evidence
+            .observed_at_unix_ms
+            .max(fresh_standby.observed_at_unix_ms);
+        assert_eq!(
+            crate::domain::classify_initial_serving_eligibility(
+                Some(&source_evidence),
+                &[fresh_standby],
+                now_unix_ms,
+            ),
+            crate::domain::InitialServingEligibility::Eligible
+        );
+    }
+
+    async fn assert_evidence_access_share_blocks_ddl(
+        socket_dir: &Path,
+        generation: &DurableWritableGeneration,
+        durability: &GenerationDurability,
+        ddl: &'static str,
+    ) {
+        let (entered, release) = gate_next_evidence_access_share();
+        let observation_socket = socket_dir.to_owned();
+        let observation_generation = generation.clone();
+        let observation_durability = durability.clone();
+        let observation = tokio::spawn(async move {
+            let mut session = connect_replication_evidence(&observation_socket).await?;
+            session
+                .observe_source(&observation_generation, &observation_durability)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("evidence sample acquired target AccessShare")
+            .expect("evidence sample retained AccessShare gate");
+        let change_started_at_unix_ms = unix_time_ms();
+
+        let attacker = connect(socket_dir).await.expect("connect evidence DDL");
+        let attacker_pid = attacker
+            .client
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .await
+            .expect("read evidence DDL backend PID")
+            .try_get::<_, i32>(0)
+            .expect("evidence DDL backend PID");
+        let ddl_task = tokio::spawn(async move { attacker.client.batch_execute(ddl).await });
+        let observer = connect(socket_dir).await.expect("observe evidence DDL");
+        wait_for_backend_lock(&observer.client, attacker_pid).await;
+        assert!(
+            !ddl_task.is_finished(),
+            "target shape/name DDL passed the evidence AccessShare lock"
+        );
+
+        release.send(()).expect("release evidence AccessShare gate");
+        let evidence = observation
+            .await
+            .expect("join locked evidence sample")
+            .expect("locked evidence sample remains coherent");
+        assert!(
+            evidence.observed_at_unix_ms <= change_started_at_unix_ms,
+            "evidence timestamp must precede target DDL attempt"
+        );
+        ddl_task
+            .await
+            .expect("join blocked evidence DDL")
+            .expect("target DDL proceeds only after evidence sample releases");
+    }
+
+    async fn assert_evidence_access_share_blocks_rls_commit(
+        socket_dir: &Path,
+        generation: &DurableWritableGeneration,
+        durability: &GenerationDurability,
+    ) {
+        let (entered, release) = gate_next_evidence_access_share();
+        let observation_socket = socket_dir.to_owned();
+        let observation_generation = generation.clone();
+        let observation_durability = durability.clone();
+        let observation = tokio::spawn(async move {
+            let mut session = connect_replication_evidence(&observation_socket).await?;
+            session
+                .observe_source(&observation_generation, &observation_durability)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("RLS evidence sample acquired target AccessShare")
+            .expect("RLS evidence sample retained AccessShare gate");
+        let change_started_at_unix_ms = unix_time_ms();
+
+        let attacker = connect(socket_dir)
+            .await
+            .expect("connect concurrent RLS DDL");
+        let attacker_pid = attacker
+            .client
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .await
+            .expect("read concurrent RLS backend PID")
+            .try_get::<_, i32>(0)
+            .expect("concurrent RLS backend PID");
+        let rls = tokio::spawn(async move {
+            attacker
+                .client
+                .batch_execute(
+                    "ALTER TABLE pgshard_internal.writable_generation \
+                     ENABLE ROW LEVEL SECURITY",
+                )
+                .await
+        });
+        let observer = connect(socket_dir)
+            .await
+            .expect("observe concurrent RLS DDL");
+        wait_for_backend_lock(&observer.client, attacker_pid).await;
+        assert!(!rls.is_finished(), "RLS DDL passed evidence AccessShare");
+
+        release.send(()).expect("release RLS evidence gate");
+        match observation.await.expect("join RLS evidence sample") {
+            Ok(evidence) => assert!(evidence.observed_at_unix_ms <= change_started_at_unix_ms),
+            Err(PostgresGenerationError::UnsafeRelation) => {}
+            Err(error) => panic!("unexpected concurrent RLS evidence result: {error}"),
+        }
+        rls.await
+            .expect("join concurrent RLS DDL")
+            .expect("RLS commits after evidence AccessShare releases");
+
+        let mut session = connect_replication_evidence(socket_dir)
+            .await
+            .expect("connect post-RLS evidence session");
+        assert!(matches!(
+            session.observe_source(generation, durability).await,
+            Err(PostgresGenerationError::UnsafeRelation)
+        ));
+        observer
+            .client
+            .batch_execute(
+                "ALTER TABLE pgshard_internal.writable_generation \
+                 DISABLE ROW LEVEL SECURITY",
+            )
+            .await
+            .expect("restore evidence relation RLS state");
+        session
+            .observe_source(generation, durability)
+            .await
+            .expect("evidence recovers after RLS state restoration");
+    }
+
+    async fn assert_evidence_timestamp_is_conservative_for_default_acl_commit(
+        socket_dir: &Path,
+        generation: &DurableWritableGeneration,
+        durability: &GenerationDurability,
+    ) {
+        let (entered, release) = gate_next_evidence_snapshot();
+        let observation_socket = socket_dir.to_owned();
+        let observation_generation = generation.clone();
+        let observation_durability = durability.clone();
+        let observation = tokio::spawn(async move {
+            let mut session = connect_replication_evidence(&observation_socket).await?;
+            session
+                .observe_source(&observation_generation, &observation_durability)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("ACL evidence sample established repeatable-read snapshot")
+            .expect("ACL evidence sample retained snapshot gate");
+        let change_started_at_unix_ms = unix_time_ms();
+
+        let attacker = connect(socket_dir)
+            .await
+            .expect("connect concurrent default-ACL change");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            attacker.client.batch_execute(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE postgres \
+                 IN SCHEMA pgshard_internal \
+                 GRANT SELECT ON TABLES TO PUBLIC",
+            ),
+        )
+        .await
+        .expect("default-ACL commit remains compatible with target AccessShare")
+        .expect("commit concurrent default-ACL change");
+        assert_eq!(default_acl_count(&attacker.client).await, 1);
+
+        release.send(()).expect("release ACL snapshot gate");
+        let evidence = observation
+            .await
+            .expect("join ACL evidence sample")
+            .expect("repeatable-read evidence retains its pre-ACL snapshot");
+        assert!(
+            evidence.observed_at_unix_ms <= change_started_at_unix_ms,
+            "evidence returned across concurrent ACL commit must be timestamped before it"
+        );
+
+        let mut session = connect_replication_evidence(socket_dir)
+            .await
+            .expect("connect post-ACL evidence session");
+        assert!(matches!(
+            session.observe_source(generation, durability).await,
+            Err(PostgresGenerationError::UnsafeSchema)
+        ));
+        attacker
+            .client
+            .batch_execute(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE postgres \
+                 IN SCHEMA pgshard_internal \
+                 REVOKE SELECT ON TABLES FROM PUBLIC",
+            )
+            .await
+            .expect("restore default ACLs");
+        assert_eq!(default_acl_count(&attacker.client).await, 0);
+        session
+            .observe_source(generation, durability)
+            .await
+            .expect("evidence recovers after default-ACL restoration");
+    }
+
+    async fn replication_evidence_backend_count(session: &ReplicationEvidenceSession) -> i64 {
+        session
+            .connection
+            .client
+            .query_one(
+                "SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity \
+                 WHERE application_name = 'pgshard-replication-evidence'",
+                &[],
+            )
+            .await
+            .expect("count replication evidence backends")
+            .try_get(0)
+            .expect("replication evidence backend count")
+    }
+
+    async fn current_wal_insert_lsn(session: &ReplicationEvidenceSession) -> String {
+        session
+            .connection
+            .client
+            .query_one("SELECT pg_catalog.pg_current_wal_insert_lsn()::text", &[])
+            .await
+            .expect("read current WAL insert LSN")
+            .try_get(0)
+            .expect("current WAL insert LSN")
+    }
+
+    fn source_has_synchronous_witness(evidence: &SourceReplicationEvidence) -> bool {
+        evidence.candidates.iter().any(|candidate| {
+            candidate.member_slot_name == "pgshard_member_0001"
+                && candidate.slot_active
+                && candidate.slot_walsender_match
+                && candidate.stream_state == Some(ReplicationStreamState::Streaming)
+                && candidate.sync_state == Some(ReplicationSyncState::Quorum)
+                && candidate
+                    .flush_lsn
+                    .is_some_and(|lsn| lsn.0 >= evidence.generation_barrier_lsn.0)
+                && candidate
+                    .replay_lsn
+                    .is_some_and(|lsn| lsn.0 >= evidence.generation_barrier_lsn.0)
+        })
     }
 
     async fn assert_remote_apply_blocks_on_paused_replay(

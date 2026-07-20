@@ -43,6 +43,7 @@ use crate::postgres_generation::{
     validate_generation_durability,
 };
 use crate::postgres_recovery::{self, PostgresRecoveryError};
+use crate::postgres_replication::{self, ReplicationEvidenceError};
 #[cfg(test)]
 use crate::writable::durable_generation_for_test;
 use crate::writable::{DurableWritableGeneration, WritablePostgresAttempt};
@@ -482,6 +483,12 @@ impl PostgresConfig {
 
     fn is_replication_standby(&self) -> bool {
         self.role == PostgresRuntimeRole::ReplicationStandby
+    }
+
+    fn standby_member_slot_name(&self) -> Option<&str> {
+        self.standby
+            .as_ref()
+            .map(|standby| standby.slot_name.as_str())
     }
 
     fn runtime_network_settings(
@@ -992,6 +999,7 @@ impl PreparedPostgres {
     where
         G: Fn() -> PostgresStartDecision,
     {
+        state.clear_replication_evidence();
         tokio::pin!(shutdown);
         if shutdown_requested(shutdown.as_mut()).await {
             state.set_postgres_process(PostgresProcessState::Validated);
@@ -1036,31 +1044,35 @@ impl PreparedPostgres {
             return Ok(());
         };
 
-        if let PostgresStartAuthorization::Writable(generation) = authorization {
-            let publication = publish_generation_before_running(
-                &state,
-                &mut process_group_fence,
-                &pidfd,
-                process_group,
-                shutdown.as_mut(),
-                &shutdown_config,
-                &socket_dir,
-                &generation,
-                &startup_guard,
-            )
-            .await;
-            match publication {
-                Ok(WritablePublicationOutcome::Published) => {}
-                Ok(WritablePublicationOutcome::Stopped) => {
-                    process_group_fence.disarm_if_reaped();
-                    return Ok(());
+        let source_generation =
+            if let PostgresStartAuthorization::Writable(generation) = authorization {
+                let publication = publish_generation_before_running(
+                    &state,
+                    &mut process_group_fence,
+                    &pidfd,
+                    process_group,
+                    shutdown.as_mut(),
+                    &shutdown_config,
+                    &socket_dir,
+                    &generation,
+                    &startup_guard,
+                )
+                .await;
+                match publication {
+                    Ok(WritablePublicationOutcome::Published) => {}
+                    Ok(WritablePublicationOutcome::Stopped) => {
+                        process_group_fence.disarm_if_reaped();
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        process_group_fence.disarm_if_reaped();
+                        return Err(error);
+                    }
                 }
-                Err(error) => {
-                    process_group_fence.disarm_if_reaped();
-                    return Err(error);
-                }
-            }
-        }
+                Some(generation)
+            } else {
+                None
+            };
         let result = supervise_running_postmaster(
             &state,
             &mut process_group_fence,
@@ -1068,6 +1080,8 @@ impl PreparedPostgres {
             process_group,
             &shutdown_config,
             shutdown.as_mut(),
+            source_generation.as_ref(),
+            &startup_guard,
         )
         .await;
         process_group_fence.disarm_if_reaped();
@@ -1832,6 +1846,7 @@ async fn stop_tracked_postmaster(
     config: &PostgresConfig,
     stop_mode: PostgresStopMode,
 ) -> Result<(), PostgresError> {
+    state.clear_replication_evidence();
     state.clear_lease();
     state.set_postgres_process(PostgresProcessState::Stopping);
     let result = match stop_mode {
@@ -1882,6 +1897,7 @@ async fn cleanup_tracked_startup_failure(
     process_group: Pid,
     error: PostgresError,
 ) -> PostgresError {
+    state.clear_replication_evidence();
     state.clear_lease();
     state.set_postgres_process(PostgresProcessState::Stopping);
     let error = cleanup_after_error(
@@ -1897,16 +1913,19 @@ async fn cleanup_tracked_startup_failure(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn supervise_running_postmaster<F>(
+async fn supervise_running_postmaster<F, G>(
     state: &AgentState,
     process: &mut PostgresProcessFence,
     pidfd: &AsyncFd<OwnedFd>,
     process_group: Pid,
     config: &PostgresConfig,
     mut shutdown: Pin<&mut F>,
+    source_generation: Option<&DurableWritableGeneration>,
+    startup_guard: &G,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
+    G: Fn() -> PostgresStartDecision,
 {
     if config.is_replication_standby() {
         return supervise_replication_standby(
@@ -1919,9 +1938,38 @@ where
         )
         .await;
     }
+    if config.role == PostgresRuntimeRole::ReplicationBootstrapPrimary {
+        let generation = source_generation
+            .expect("replication bootstrap source always has writable generation authority");
+        return supervise_replication_source(
+            state,
+            process,
+            pidfd,
+            process_group,
+            config,
+            shutdown.as_mut(),
+            generation,
+            startup_guard,
+        )
+        .await;
+    }
+    if let Some(generation) = source_generation {
+        return supervise_writable_quarantine(
+            state,
+            process,
+            pidfd,
+            process_group,
+            config,
+            shutdown.as_mut(),
+            generation,
+            startup_guard,
+        )
+        .await;
+    }
     state.set_postgres_process(config.running_process_state());
     tokio::select! {
         status = wait_pidfd_exit(pidfd) => {
+            state.clear_replication_evidence();
             state.set_postgres_process(PostgresProcessState::Stopping);
             let error = cleanup_after_error(
                 &mut process.child,
@@ -1945,6 +1993,139 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn supervise_writable_quarantine<F, G>(
+    state: &AgentState,
+    process: &mut PostgresProcessFence,
+    pidfd: &AsyncFd<OwnedFd>,
+    process_group: Pid,
+    config: &PostgresConfig,
+    mut shutdown: Pin<&mut F>,
+    generation: &DurableWritableGeneration,
+    startup_guard: &G,
+) -> Result<(), PostgresError>
+where
+    F: Future<Output = PostgresStopMode>,
+    G: Fn() -> PostgresStartDecision,
+{
+    debug_assert_eq!(config.role, PostgresRuntimeRole::Quarantine);
+    let authority_exact = || {
+        matches!(
+            startup_guard(),
+            PostgresStartDecision::StartWritable(current) if current == *generation
+        )
+    };
+    let authority_lost = wait_for_authority_loss(&authority_exact);
+    tokio::pin!(authority_lost);
+    state.set_postgres_process(config.running_process_state());
+    tokio::select! {
+        status = wait_pidfd_exit(pidfd) => {
+            state.clear_replication_evidence();
+            state.set_postgres_process(PostgresProcessState::Stopping);
+            let error = cleanup_after_error(
+                &mut process.child,
+                Some(pidfd),
+                Some(process_group),
+                &process.child_subreaper,
+                match status {
+                    Ok(status) => PostgresError::UnexpectedExit(status),
+                    Err(error) => error,
+                },
+            ).await;
+            state.set_postgres_process(PostgresProcessState::Failed);
+            Err(error)
+        }
+        stop_mode = shutdown.as_mut() => {
+            stop_tracked_postmaster(
+                state, process, pidfd, process_group, config, stop_mode,
+            ).await
+        }
+        () = &mut authority_lost => {
+            Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                PostgresError::StartupAuthorityChanged,
+            ).await)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_replication_source<F, G>(
+    state: &AgentState,
+    process: &mut PostgresProcessFence,
+    pidfd: &AsyncFd<OwnedFd>,
+    process_group: Pid,
+    config: &PostgresConfig,
+    mut shutdown: Pin<&mut F>,
+    generation: &DurableWritableGeneration,
+    startup_guard: &G,
+) -> Result<(), PostgresError>
+where
+    F: Future<Output = PostgresStopMode>,
+    G: Fn() -> PostgresStartDecision,
+{
+    let authority_exact = || {
+        matches!(
+            startup_guard(),
+            PostgresStartDecision::StartWritable(current) if current == *generation
+        )
+    };
+    let mut evidence_monitor = Box::pin(postgres_replication::monitor_source_replication_evidence(
+        state.clone(),
+        config.socket_dir.clone(),
+        generation.clone(),
+        config.generation_durability().clone(),
+    ));
+    let authority_lost = wait_for_authority_loss(&authority_exact);
+    tokio::pin!(authority_lost);
+    state.set_postgres_process(config.running_process_state());
+    tokio::select! {
+        status = wait_pidfd_exit(pidfd) => {
+            state.clear_replication_evidence();
+            state.set_postgres_process(PostgresProcessState::Stopping);
+            let error = cleanup_after_error(
+                &mut process.child,
+                Some(pidfd),
+                Some(process_group),
+                &process.child_subreaper,
+                match status {
+                    Ok(status) => PostgresError::UnexpectedExit(status),
+                    Err(error) => error,
+                },
+            ).await;
+            state.set_postgres_process(PostgresProcessState::Failed);
+            Err(error)
+        }
+        stop_mode = shutdown.as_mut() => {
+            drop(evidence_monitor);
+            stop_tracked_postmaster(
+                state, process, pidfd, process_group, config, stop_mode,
+            ).await
+        }
+        () = &mut authority_lost => {
+            Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                PostgresError::StartupAuthorityChanged,
+            ).await)
+        }
+        result = &mut evidence_monitor => {
+            Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                replication_evidence_error(result),
+            ).await)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn supervise_replication_standby<F>(
     state: &AgentState,
     process: &mut PostgresProcessFence,
@@ -1956,11 +2137,21 @@ async fn supervise_replication_standby<F>(
 where
     F: Future<Output = PostgresStopMode>,
 {
+    let member_slot_name = config
+        .standby_member_slot_name()
+        .expect("replication standby config always has a member slot")
+        .to_owned();
     let (confirmed_tx, mut confirmed_rx) = oneshot::channel();
     let mut recovery_monitor = Box::pin(postgres_recovery::monitor_standby_recovery(
         config.socket_dir.clone(),
         confirmed_tx,
     ));
+    let mut evidence_monitor =
+        Box::pin(postgres_replication::monitor_standby_replication_evidence(
+            state.clone(),
+            config.socket_dir.clone(),
+            member_slot_name,
+        ));
 
     let confirmation = tokio::select! {
         status = wait_pidfd_exit(pidfd) => {
@@ -1987,6 +2178,15 @@ where
                 standby_monitor_error(result),
             ).await);
         }
+        result = &mut evidence_monitor => {
+            return Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                replication_evidence_error(result),
+            ).await);
+        }
         result = &mut confirmed_rx => result,
     };
     match confirmation {
@@ -2006,6 +2206,7 @@ where
     state.set_postgres_process(config.running_process_state());
     tokio::select! {
         status = wait_pidfd_exit(pidfd) => {
+            state.clear_replication_evidence();
             state.set_postgres_process(PostgresProcessState::Stopping);
             let error = cleanup_after_error(
                 &mut process.child,
@@ -2022,6 +2223,7 @@ where
         }
         stop_mode = shutdown.as_mut() => {
             drop(recovery_monitor);
+            drop(evidence_monitor);
             stop_tracked_postmaster(
                 state, process, pidfd, process_group, config, stop_mode,
             ).await
@@ -2035,6 +2237,24 @@ where
                 standby_monitor_error(result),
             ).await)
         }
+        result = &mut evidence_monitor => {
+            Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                replication_evidence_error(result),
+            ).await)
+        }
+    }
+}
+
+fn replication_evidence_error(result: Result<(), ReplicationEvidenceError>) -> PostgresError {
+    match result {
+        Ok(()) => PostgresError::ReplicationEvidenceMonitorStopped,
+        Err(error) => PostgresError::ReplicationEvidence {
+            source: Box::new(error),
+        },
     }
 }
 
@@ -4709,6 +4929,16 @@ pub enum PostgresError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// Continuous replication evidence ended without returning a failure.
+    #[error("PostgreSQL replication evidence monitor stopped unexpectedly")]
+    ReplicationEvidenceMonitorStopped,
+    /// A previously coherent replication evidence stream was lost.
+    #[error("monitor PostgreSQL replication evidence: {source}")]
+    ReplicationEvidence {
+        /// Exact bounded SQL observation failure without row or credential data.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// The blocking revalidation worker did not complete normally.
     #[error("PostgreSQL pre-spawn validation task failed: {0}")]
     ValidationTask(#[source] tokio::task::JoinError),
@@ -4861,7 +5091,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::domain::{AgentIdentity, FencingLease};
+    use crate::domain::{AgentIdentity, FencingLease, ReplicationEvidence};
     use pgshard_types::ShardId;
 
     use super::*;
@@ -5863,12 +6093,19 @@ mod tests {
                 ),
             );
             let socket = root.path().join("socket");
-            let (config, _) = standby_test_config(&root, data_dir, executable, socket);
+            let (config, _) = standby_test_config(&root, data_dir, executable, socket.clone());
             let prepared = prepare_fixture(config).expect("prepare standby supervisor");
             let state = agent_state();
             let (observed_tx, observed_rx) =
                 watch::channel(crate::postgres_recovery::TestRecoveryObservation::Pending);
-            crate::postgres_recovery::set_test_recovery_observations(observed_rx);
+            crate::postgres_recovery::set_test_recovery_observations(socket.clone(), observed_rx);
+            let (evidence_tx, evidence_rx) = watch::channel(
+                crate::postgres_replication::TestReplicationEvidenceObservation::Pending,
+            );
+            crate::postgres_replication::set_test_replication_evidence_observations(
+                socket,
+                evidence_rx,
+            );
             let supervisor_state = state.clone();
             let supervisor = tokio::spawn(async move {
                 prepared
@@ -5883,10 +6120,20 @@ mod tests {
             observed_tx
                 .send(crate::postgres_recovery::TestRecoveryObservation::InRecovery)
                 .expect("confirm recovery");
+            evidence_tx
+                .send(crate::postgres_replication::TestReplicationEvidenceObservation::Confirmed)
+                .expect("confirm standby evidence before recovery loss");
             timeout(Duration::from_secs(1), async {
-                while state.snapshot().postgres_process
-                    != PostgresProcessState::RunningReplicationStandby
-                {
+                loop {
+                    let snapshot = state.snapshot();
+                    if snapshot.postgres_process == PostgresProcessState::RunningReplicationStandby
+                        && matches!(
+                            snapshot.replication_evidence,
+                            Some(ReplicationEvidence::Standby(_))
+                        )
+                    {
+                        break;
+                    }
                     tokio::task::yield_now().await;
                 }
             })
@@ -5902,7 +6149,267 @@ mod tests {
                 state.snapshot().postgres_process,
                 PostgresProcessState::Failed
             );
+            assert!(state.snapshot().replication_evidence.is_none());
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn replication_evidence_loss_fences_standby_and_source_supervisors() {
+        let root = TempDir::new().expect("create standby evidence-loss fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let marker = root.path().join("standby-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\nprintf started > '{}'\ntrap '' TERM INT QUIT\nwhile :; do sleep 1; done\n",
+                marker.display()
+            ),
+        );
+        let socket_dir = root.path().join("socket");
+        let (config, _) = standby_test_config(&root, data_dir, executable, socket_dir.clone());
+        let prepared = prepare_fixture(config).expect("prepare standby evidence-loss supervisor");
+        let state = agent_state();
+        let (recovery_tx, recovery_rx) =
+            watch::channel(crate::postgres_recovery::TestRecoveryObservation::Pending);
+        crate::postgres_recovery::set_test_recovery_observations(socket_dir.clone(), recovery_rx);
+        let (evidence_tx, evidence_rx) = watch::channel(
+            crate::postgres_replication::TestReplicationEvidenceObservation::Pending,
+        );
+        crate::postgres_replication::set_test_replication_evidence_observations(
+            socket_dir,
+            evidence_rx,
+        );
+        let supervisor_state = state.clone();
+        let supervisor = tokio::spawn(async move {
+            prepared
+                .supervise(supervisor_state, std::future::pending())
+                .await
+        });
+        wait_for_marker(&marker).await;
+        recovery_tx
+            .send(crate::postgres_recovery::TestRecoveryObservation::InRecovery)
+            .expect("confirm standby recovery");
+        evidence_tx
+            .send(crate::postgres_replication::TestReplicationEvidenceObservation::Confirmed)
+            .expect("confirm standby evidence");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = state.snapshot();
+                if snapshot.postgres_process == PostgresProcessState::RunningReplicationStandby
+                    && matches!(
+                        snapshot.replication_evidence,
+                        Some(ReplicationEvidence::Standby(_))
+                    )
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("standby reached running with evidence");
+        evidence_tx
+            .send(crate::postgres_replication::TestReplicationEvidenceObservation::Failed)
+            .expect("lose standby evidence");
+        let result = timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("standby evidence loss fenced inside cleanup bound")
+            .expect("join standby evidence-loss supervisor");
+        assert!(matches!(
+            result,
+            Err(PostgresError::ReplicationEvidence { .. })
+        ));
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+        assert!(state.snapshot().replication_evidence.is_none());
+        assert!(state.snapshot().lease.is_none());
+
+        let root = TempDir::new().expect("create source evidence-loss fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let marker = root.path().join("source-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\nprintf started > '{}'\ntrap '' TERM INT QUIT\nwhile :; do sleep 1; done\n",
+                marker.display()
+            ),
+        );
+        let hba = root
+            .path()
+            .join("replication-bootstrap-primary.pg_hba.conf");
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT)
+            .expect("write source evidence-loss HBA");
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+            .expect("protect source evidence-loss HBA");
+        let socket_dir = root.path().join("socket");
+        let config = PostgresConfig::new_for_role(
+            PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            None,
+            GenerationDurability::remote_apply_any_one(vec![
+                "pgshard_member_0001".to_owned(),
+                "pgshard_member_0002".to_owned(),
+            ])
+            .expect("valid source evidence durability"),
+            data_dir,
+            executable,
+            socket_dir.clone(),
+            hba,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid source evidence-loss config");
+        let prepared = prepare_fixture(config).expect("prepare source evidence-loss supervisor");
+        let state = state_with_writable_lease(1);
+        let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        lease_attempt.install_authority(
+            state.lease_deadline().expect("monotonic source deadline"),
+            durable_generation_for_test(1),
+        );
+        let (evidence_tx, evidence_rx) = watch::channel(
+            crate::postgres_replication::TestReplicationEvidenceObservation::Pending,
+        );
+        crate::postgres_replication::set_test_replication_evidence_observations(
+            socket_dir,
+            evidence_rx,
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let supervisor_state = state.clone();
+        let supervisor = tokio::spawn(async move {
+            prepared
+                .supervise_with_writable_authority(
+                    supervisor_state,
+                    shutdown_rx,
+                    Duration::ZERO,
+                    postgres_attempt,
+                )
+                .await
+        });
+        wait_for_marker(&marker).await;
+        evidence_tx
+            .send(crate::postgres_replication::TestReplicationEvidenceObservation::Confirmed)
+            .expect("confirm source evidence");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = state.snapshot();
+                if snapshot.postgres_process == PostgresProcessState::RunningReplicationBootstrap
+                    && matches!(
+                        snapshot.replication_evidence,
+                        Some(ReplicationEvidence::Source(_))
+                    )
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source reached running with evidence");
+        evidence_tx
+            .send(crate::postgres_replication::TestReplicationEvidenceObservation::Failed)
+            .expect("lose source evidence");
+        let result = timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("source evidence loss fenced inside cleanup bound")
+            .expect("join source evidence-loss supervisor");
+        assert!(matches!(
+            result,
+            Err(PostgresError::ReplicationEvidence { .. })
+        ));
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+        assert!(state.snapshot().replication_evidence.is_none());
+        assert!(state.snapshot().lease.is_none());
+    }
+
+    #[tokio::test]
+    async fn writable_quarantine_never_starts_replication_evidence_monitor() {
+        let root = TempDir::new().expect("create writable-quarantine evidence fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let marker = root.path().join("quarantine-started");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\nprintf started > '{}'\ntrap '' TERM INT QUIT\nwhile :; do sleep 1; done\n",
+                marker.display()
+            ),
+        );
+        let socket_dir = root.path().join("socket");
+        let prepared = prepare_fixture(test_config(data_dir, executable, socket_dir.clone()))
+            .expect("prepare writable quarantine evidence fixture");
+        let state = state_with_writable_lease(1);
+        let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        lease_attempt.install_authority(
+            state
+                .lease_deadline()
+                .expect("writable quarantine monotonic deadline"),
+            durable_generation_for_test(1),
+        );
+        let (_evidence_tx, evidence_rx) =
+            watch::channel(crate::postgres_replication::TestReplicationEvidenceObservation::Failed);
+        crate::postgres_replication::set_test_replication_evidence_observations(
+            socket_dir.clone(),
+            evidence_rx,
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let supervisor_state = state.clone();
+        let supervisor = tokio::spawn(async move {
+            prepared
+                .supervise_with_writable_authority(
+                    supervisor_state,
+                    shutdown_rx,
+                    Duration::ZERO,
+                    postgres_attempt,
+                )
+                .await
+        });
+
+        wait_for_marker(&marker).await;
+        timeout(Duration::from_secs(1), async {
+            while state.snapshot().postgres_process != PostgresProcessState::RunningQuarantined {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writable quarantine reached running state");
+        sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::RunningQuarantined
+        );
+        assert!(state.snapshot().replication_evidence.is_none());
+        assert!(
+            crate::postgres_replication::remove_test_replication_evidence_observations(&socket_dir),
+            "writable quarantine consumed a replication-evidence failure injection"
+        );
+        assert!(!supervisor.is_finished());
+
+        lease_attempt.clear_authority();
+        let result = timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("writable quarantine fenced after authority loss")
+            .expect("join writable-quarantine supervisor");
+        assert!(matches!(
+            result,
+            Err(PostgresError::StartupAuthorityChanged)
+        ));
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+        assert!(state.snapshot().replication_evidence.is_none());
+        assert!(state.snapshot().lease.is_none());
     }
 
     #[tokio::test]
