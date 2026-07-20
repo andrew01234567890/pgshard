@@ -4648,6 +4648,16 @@ func orchestratorLeaseRole(cluster *pgshardv1alpha1.PgShardCluster, identityBind
 		rbacv1.PolicyRule{APIGroups: []string{corev1.GroupName}, Resources: []string{"endpoints"}, ResourceNames: endpointNames, Verbs: []string{"get"}},
 		rbacv1.PolicyRule{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: writableLeaseNames, Verbs: []string{"get"}},
 	)
+	if cluster.Spec.MembersPerShard == 3 || cluster.Spec.MembersPerShard == 5 {
+		catalogCandidateNames := make([]string, 0, cluster.Spec.MembersPerShard)
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			catalogCandidateNames = append(catalogCandidateNames, PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member))
+		}
+		rules = append(rules,
+			rbacv1.PolicyRule{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardclusters/status"}, ResourceNames: []string{cluster.Name}, Verbs: []string{"get"}},
+			rbacv1.PolicyRule{APIGroups: []string{corev1.GroupName}, Resources: []string{"configmaps"}, ResourceNames: catalogCandidateNames, Verbs: []string{"get"}},
+		)
+	}
 	return &rbacv1.Role{
 		ObjectMeta: ownedMeta(cluster, name, "orchestrator", nil),
 		Rules:      rules,

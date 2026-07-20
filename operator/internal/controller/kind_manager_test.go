@@ -1964,7 +1964,71 @@ func assertKINDCatalogCandidateReplacementFailsClosed(t *testing.T, ctx context.
 	if observed.UID != replacement.UID {
 		t.Fatalf("controller adopted or replaced rejected catalog candidate UID %s with %s", replacement.UID, observed.UID)
 	}
+	assertKINDCatalogCandidateDiagnosticsUnavailable(t, ctx, kubeClient, failed)
 	assertKINDCatalogCandidatesNotConsumed(t, ctx, kubeClient, failed)
+}
+
+func assertKINDCatalogCandidateDiagnosticsUnavailable(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	deployment := &appsv1.Deployment{}
+	deploymentKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorSuffix}
+	if err := kubeClient.Get(ctx, deploymentKey, deployment); err != nil {
+		t.Fatal(err)
+	}
+	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas < 1 {
+		t.Fatalf("orchestrator deployment has no desired replicas: %#v", deployment.Spec.Replicas)
+	}
+	wantedReplicas := int(*deployment.Spec.Replicas)
+	var last string
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		pods := &corev1.PodList{}
+		if err := kubeClient.List(ctx, pods, client.InNamespace(cluster.Namespace), client.MatchingLabels{
+			owned.ClusterLabel:   cluster.Name,
+			owned.ComponentLabel: "orchestrator",
+		}); err != nil {
+			return false, err
+		}
+		active := make([]corev1.Pod, 0, wantedReplicas)
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodRunning {
+				active = append(active, pod)
+			}
+		}
+		if len(active) != wantedReplicas {
+			last = fmt.Sprintf("active orchestrator replicas=%d want=%d", len(active), wantedReplicas)
+			return false, nil
+		}
+		for _, pod := range active {
+			var snapshot struct {
+				CoordinationReady bool `json:"coordination_ready"`
+				CatalogCandidates struct {
+					Phase           string  `json:"phase"`
+					FreshCandidates int     `json:"fresh_candidates"`
+					Failure         *string `json:"failure"`
+					DiagnosticOnly  bool    `json:"diagnostic_only"`
+				} `json:"catalog_candidates"`
+			}
+			statusPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/status", cluster.Namespace, pod.Name)
+			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			output, err := exec.CommandContext(requestCtx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
+			cancel()
+			if err != nil || json.Unmarshal(output, &snapshot) != nil || !snapshot.CoordinationReady || snapshot.CatalogCandidates.Phase != "unavailable" || snapshot.CatalogCandidates.FreshCandidates != 0 || snapshot.CatalogCandidates.Failure == nil || *snapshot.CatalogCandidates.Failure != "validation_failed" || !snapshot.CatalogCandidates.DiagnosticOnly {
+				last = fmt.Sprintf("pod=%s error=%v output=%q snapshot=%#v", pod.Name, err, output, snapshot)
+				return false, nil
+			}
+			readyPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/readyz", cluster.Namespace, pod.Name)
+			requestCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
+			output, err = exec.CommandContext(requestCtx, "kubectl", "get", "--raw", readyPath).CombinedOutput()
+			cancel()
+			if err != nil {
+				last = fmt.Sprintf("pod=%s readiness error=%v output=%q", pod.Name, err, output)
+				return false, nil
+			}
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("wait for fail-closed catalog-candidate diagnostics with live readiness: %v; last=%s", err, last)
+	}
 }
 
 func assertKINDCatalogCandidatesNotConsumed(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
@@ -2203,6 +2267,7 @@ func assertKINDOrchestratorObservationRBAC(t *testing.T, ctx context.Context, cl
 	pods := make([]string, 0, cluster.Spec.Shards*cluster.Spec.MembersPerShard)
 	endpoints := make([]string, 0, cluster.Spec.Shards)
 	writableLeases := make([]string, 0, cluster.Spec.Shards)
+	catalogCandidates := make([]string, 0, cluster.Spec.MembersPerShard)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		endpoints = append(endpoints, fmt.Sprintf("%s-shard-%04d", cluster.Name, shard))
 		writableLeases = append(writableLeases, owned.PostgreSQLWritableLeaseName(cluster.Name, shard))
@@ -2211,6 +2276,9 @@ func assertKINDOrchestratorObservationRBAC(t *testing.T, ctx context.Context, cl
 			statefulSets = append(statefulSets, name)
 			pods = append(pods, name+"-0")
 		}
+	}
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		catalogCandidates = append(catalogCandidates, owned.PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member))
 	}
 
 	for _, name := range statefulSets {
@@ -2225,6 +2293,10 @@ func assertKINDOrchestratorObservationRBAC(t *testing.T, ctx context.Context, cl
 	for _, name := range writableLeases {
 		assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "leases.coordination.k8s.io/"+name)
 	}
+	assertKINDCanISubresource(t, ctx, identity, cluster.Namespace, true, "get", "pgshardclusters.pgshard.io", cluster.Name, "status")
+	for _, name := range catalogCandidates {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "configmaps/"+name)
+	}
 	orchestratorLease := cluster.Name + owned.OrchestratorLeaseSuffix
 	assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "leases.coordination.k8s.io/"+orchestratorLease)
 	assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "update", "leases.coordination.k8s.io/"+orchestratorLease)
@@ -2237,6 +2309,7 @@ func assertKINDOrchestratorObservationRBAC(t *testing.T, ctx context.Context, cl
 		{resource: "pods", exactAllowed: pods[0]},
 		{resource: "endpoints", exactAllowed: endpoints[0]},
 		{resource: "leases.coordination.k8s.io", exactAllowed: writableLeases[0]},
+		{resource: "configmaps", exactAllowed: catalogCandidates[0]},
 	} {
 		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, "get", denied.resource+"/foreign-object")
 		for _, verb := range []string{"list", "watch"} {
@@ -2252,8 +2325,19 @@ func assertKINDOrchestratorObservationRBAC(t *testing.T, ctx context.Context, cl
 	for _, verb := range []string{"patch", "delete"} {
 		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, "leases.coordination.k8s.io/"+orchestratorLease)
 	}
+	assertKINDCanI(t, ctx, identity, cluster.Namespace, false, "get", "pgshardclusters.pgshard.io/"+cluster.Name)
+	assertKINDCanISubresource(t, ctx, identity, cluster.Namespace, false, "get", "pgshardclusters.pgshard.io", "foreign-object", "status")
+	for _, verb := range []string{"update", "patch", "delete"} {
+		assertKINDCanISubresource(t, ctx, identity, cluster.Namespace, false, verb, "pgshardclusters.pgshard.io", cluster.Name, "status")
+	}
 	for _, verb := range []string{"create", "deletecollection"} {
 		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, "leases.coordination.k8s.io")
+	}
+	for _, resource := range []string{"secrets", "persistentvolumeclaims"} {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, "get", resource+"/foreign-object")
+		for _, verb := range []string{"list", "watch", "create", "deletecollection"} {
+			assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, resource)
+		}
 	}
 }
 
@@ -2269,10 +2353,30 @@ func assertKINDCanI(t *testing.T, ctx context.Context, identity, namespace strin
 	}
 }
 
+func assertKINDCanISubresource(t *testing.T, ctx context.Context, identity, namespace string, allowed bool, verb, resource, name, subresource string) {
+	t.Helper()
+	output, err := exec.CommandContext(ctx, "kubectl", "auth", "can-i", verb, resource+"/"+name, "--subresource="+subresource, "--namespace", namespace, "--as="+identity).CombinedOutput()
+	want := "no"
+	if allowed {
+		want = "yes"
+	}
+	if got := strings.TrimSpace(string(output)); got != want {
+		t.Fatalf("kubectl auth can-i %s %s/%s --subresource=%s as %s = %q (error=%v), want %q", verb, resource, name, subresource, identity, got, err, want)
+	}
+}
+
 func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
 	t.Helper()
 	const wantedCollectionState = "fresh_diagnostic_evidence"
 	wantedMembers := int(cluster.Spec.Shards * cluster.Spec.MembersPerShard)
+	wantedCandidates := int(cluster.Spec.MembersPerShard)
+	wantedCatalogPhase := "fresh"
+	wantedCatalogMaximumAgeMS := uint64(5000)
+	if cluster.Spec.MembersPerShard == 1 {
+		wantedCandidates = 0
+		wantedCatalogPhase = "disabled"
+		wantedCatalogMaximumAgeMS = 0
+	}
 	deployment := &appsv1.Deployment{}
 	deploymentKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + owned.OrchestratorSuffix}
 	if err := kubeClient.Get(ctx, deploymentKey, deployment); err != nil {
@@ -2336,12 +2440,20 @@ func assertKINDOrchestratorBindsControllerEndpoints(t *testing.T, ctx context.Co
 					Failure         *string `json:"failure"`
 					DiagnosticOnly  bool    `json:"diagnostic_only"`
 				} `json:"agent_status"`
+				CatalogCandidates struct {
+					Phase              string  `json:"phase"`
+					ExpectedCandidates int     `json:"expected_candidates"`
+					FreshCandidates    int     `json:"fresh_candidates"`
+					MaximumAgeMS       uint64  `json:"maximum_age_ms"`
+					Failure            *string `json:"failure"`
+					DiagnosticOnly     bool    `json:"diagnostic_only"`
+				} `json:"catalog_candidates"`
 			}
 			statusPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/status", cluster.Namespace, pod.Name)
 			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			output, err := exec.CommandContext(requestCtx, "kubectl", "get", "--raw", statusPath).CombinedOutput()
 			cancel()
-			if err != nil || json.Unmarshal(output, &snapshot) != nil || snapshot.Topology == nil || snapshot.Topology.AgentStatusCollection != wantedCollectionState || !snapshot.CoordinationReady || snapshot.AgentStatus.Phase != "fresh" || snapshot.AgentStatus.ExpectedMembers != wantedMembers || snapshot.AgentStatus.FreshMembers != wantedMembers || snapshot.AgentStatus.MaximumAgeMS != 5000 || snapshot.AgentStatus.Failure != nil || !snapshot.AgentStatus.DiagnosticOnly {
+			if err != nil || json.Unmarshal(output, &snapshot) != nil || snapshot.Topology == nil || snapshot.Topology.AgentStatusCollection != wantedCollectionState || !snapshot.CoordinationReady || snapshot.AgentStatus.Phase != "fresh" || snapshot.AgentStatus.ExpectedMembers != wantedMembers || snapshot.AgentStatus.FreshMembers != wantedMembers || snapshot.AgentStatus.MaximumAgeMS != 5000 || snapshot.AgentStatus.Failure != nil || !snapshot.AgentStatus.DiagnosticOnly || snapshot.CatalogCandidates.Phase != wantedCatalogPhase || snapshot.CatalogCandidates.ExpectedCandidates != wantedCandidates || snapshot.CatalogCandidates.FreshCandidates != wantedCandidates || snapshot.CatalogCandidates.MaximumAgeMS != wantedCatalogMaximumAgeMS || snapshot.CatalogCandidates.Failure != nil || !snapshot.CatalogCandidates.DiagnosticOnly {
 				lastObservation = fmt.Sprintf("orchestrator %s status error=%v output=%q snapshot=%#v", pod.Name, err, output, snapshot)
 				return false, nil
 			}

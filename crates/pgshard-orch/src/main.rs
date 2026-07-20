@@ -1,11 +1,13 @@
 //! `pgshard-orch` Linux container entry point.
 
+use pgshard_orch::catalog_candidate;
 use pgshard_orch::config::{ConfigError, OrchConfig};
 use pgshard_orch::coordination::{CoordinationConfig, supervise};
 use pgshard_orch::domain::OrchState;
 use pgshard_orch::identity_binding;
 use pgshard_orch::topology::{
-    ExpectedTopologyIdentity, TopologyDiagnostics, TopologyError, TopologyV1,
+    CatalogCandidateObservationPlan, ExpectedTopologyIdentity, TopologyDiagnostics, TopologyError,
+    TopologyV1,
 };
 use std::future::Future;
 use std::time::Duration;
@@ -17,7 +19,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config, topology) = initialize()?;
     let identity_binding_enabled = config.identity_binding_mode.enabled();
-    let (topology_diagnostics, observation_targets) =
+    let (topology_diagnostics, observation_targets, candidate_plan) =
         configured_topology(&topology, identity_binding_enabled);
     let coordination = CoordinationConfig::new(
         config.lease_namespace,
@@ -46,40 +48,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.kubernetes_lease_retry_period,
         config.identity_binding_freshness,
     );
+    let catalog_candidate_future = supervise_catalog_candidates(
+        identity_binding_enabled,
+        candidate_plan,
+        state.clone(),
+        shutdown_rx.clone(),
+        config.kubernetes_request_timeout,
+        config.kubernetes_lease_retry_period,
+        config.identity_binding_freshness,
+    );
     let server_future = pgshard_orch::http::serve(
         config.http_bind,
         state.clone(),
         wait_for_shutdown(shutdown_rx.clone()),
     );
+    let diagnostic_future =
+        supervise_diagnostics(identity_binding_future, catalog_candidate_future);
     Box::pin(supervise_services(
         state,
         shutdown_tx,
         coordination_future,
-        identity_binding_future,
+        diagnostic_future,
         server_future,
         shutdown_signal(),
     ))
     .await
 }
 
-async fn supervise_services<C, I, S, H, CE, SE>(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticService {
+    AgentIdentityBinding,
+    CatalogCandidate,
+}
+
+impl DiagnosticService {
+    const fn stopped_message(self) -> &'static str {
+        match self {
+            Self::AgentIdentityBinding => {
+                "orchestrator identity binding stopped before process shutdown"
+            }
+            Self::CatalogCandidate => {
+                "orchestrator catalog candidate observation stopped before process shutdown"
+            }
+        }
+    }
+}
+
+async fn supervise_diagnostics<I, D>(identity_binding: I, catalog_candidate: D) -> DiagnosticService
+where
+    I: Future<Output = ()>,
+    D: Future<Output = ()>,
+{
+    tokio::pin!(identity_binding);
+    tokio::pin!(catalog_candidate);
+    tokio::select! {
+        () = &mut identity_binding => DiagnosticService::AgentIdentityBinding,
+        () = &mut catalog_candidate => DiagnosticService::CatalogCandidate,
+    }
+}
+
+async fn supervise_services<C, D, S, H, CE, SE>(
     state: OrchState,
     shutdown_tx: watch::Sender<bool>,
     coordination_future: C,
-    identity_binding_future: I,
+    diagnostic_future: D,
     server_future: S,
     shutdown_future: H,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     C: Future<Output = Result<(), CE>>,
-    I: Future<Output = ()>,
+    D: Future<Output = DiagnosticService>,
     S: Future<Output = Result<(), SE>>,
     H: Future<Output = ()>,
     CE: std::error::Error + 'static,
     SE: std::error::Error + 'static,
 {
     tokio::pin!(coordination_future);
-    tokio::pin!(identity_binding_future);
+    tokio::pin!(diagnostic_future);
     tokio::pin!(server_future);
     tokio::pin!(shutdown_future);
 
@@ -90,11 +135,11 @@ where
             match tokio::time::timeout(SHUTDOWN_GRACE, async {
                 tokio::join!(
                     &mut coordination_future,
-                    &mut identity_binding_future,
+                    &mut diagnostic_future,
                     &mut server_future
                 )
             }).await {
-                Ok((coordination_result, (), server_result)) => {
+                Ok((coordination_result, _, server_result)) => {
                     coordination_result?;
                     server_result?;
                 }
@@ -109,15 +154,15 @@ where
         coordination_result = &mut coordination_future => {
             state.begin_shutdown();
             let _ = shutdown_tx.send(true);
-            if let Some(((), server_result)) =
-                drain_pair(&mut identity_binding_future, &mut server_future).await
+            if let Some((_, server_result)) =
+                drain_pair(&mut diagnostic_future, &mut server_future).await
             {
                 server_result?;
             }
             coordination_result?;
             return Err("orchestrator coordination stopped before process shutdown".into());
         }
-        () = &mut identity_binding_future => {
+        diagnostic_service = &mut diagnostic_future => {
             state.begin_shutdown();
             let _ = shutdown_tx.send(true);
             if let Some((coordination_result, server_result)) =
@@ -126,13 +171,13 @@ where
                 coordination_result?;
                 server_result?;
             }
-            return Err("orchestrator identity binding stopped before process shutdown".into());
+            return Err(diagnostic_service.stopped_message().into());
         }
         server_result = &mut server_future => {
             state.begin_shutdown();
             let _ = shutdown_tx.send(true);
-            if let Some((coordination_result, ())) =
-                drain_pair(&mut coordination_future, &mut identity_binding_future).await
+            if let Some((coordination_result, _)) =
+                drain_pair(&mut coordination_future, &mut diagnostic_future).await
             {
                 coordination_result?;
             }
@@ -167,6 +212,7 @@ fn configured_topology(
 ) -> (
     TopologyDiagnostics,
     Vec<pgshard_orch::topology::UnboundAgentObservationTarget>,
+    Option<CatalogCandidateObservationPlan>,
 ) {
     let diagnostics = topology.diagnostics(identity_binding_enabled);
     let targets = if identity_binding_enabled {
@@ -174,7 +220,10 @@ fn configured_topology(
     } else {
         Vec::new()
     };
-    (diagnostics, targets)
+    let candidate_plan = identity_binding_enabled
+        .then(|| topology.catalog_candidate_observation_plan())
+        .flatten();
+    (diagnostics, targets, candidate_plan)
 }
 
 async fn supervise_identity_binding(
@@ -189,6 +238,30 @@ async fn supervise_identity_binding(
     if enabled {
         identity_binding::supervise(
             targets,
+            state,
+            shutdown,
+            request_timeout,
+            retry_period,
+            freshness,
+        )
+        .await;
+    } else {
+        wait_for_shutdown(shutdown).await;
+    }
+}
+
+async fn supervise_catalog_candidates(
+    enabled: bool,
+    plan: Option<CatalogCandidateObservationPlan>,
+    state: OrchState,
+    shutdown: watch::Receiver<bool>,
+    request_timeout: Duration,
+    retry_period: Duration,
+    freshness: Duration,
+) {
+    if enabled && let Some(plan) = plan {
+        catalog_candidate::supervise(
+            plan,
             state,
             shutdown,
             request_timeout,
@@ -300,28 +373,44 @@ mod tests {
     async fn service_supervisor_polls_identity_binding_during_normal_operation() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (identity_started_tx, identity_started_rx) = oneshot::channel();
+        let (catalog_started_tx, catalog_started_rx) = oneshot::channel();
         let (stop_tx, stop_rx) = oneshot::channel();
         let identity_shutdown = shutdown_rx.clone();
-        let supervisor = supervise_services(
-            OrchState::default(),
-            shutdown_tx,
-            stop_successfully(shutdown_rx.clone()),
+        let catalog_shutdown = shutdown_rx.clone();
+        let diagnostics = supervise_diagnostics(
             async move {
                 let _ = identity_started_tx.send(());
                 wait_for_shutdown(identity_shutdown).await;
             },
+            async move {
+                let _ = catalog_started_tx.send(());
+                wait_for_shutdown(catalog_shutdown).await;
+            },
+        );
+        let supervisor = supervise_services(
+            OrchState::default(),
+            shutdown_tx,
+            stop_successfully(shutdown_rx.clone()),
+            diagnostics,
             stop_successfully(shutdown_rx),
             async move {
                 let _ = stop_rx.await;
             },
         );
         tokio::pin!(supervisor);
-        let identity_start = tokio::time::timeout(Duration::from_secs(1), identity_started_rx);
-        tokio::pin!(identity_start);
+        let diagnostic_start = tokio::time::timeout(Duration::from_secs(1), async {
+            identity_started_rx
+                .await
+                .expect("identity binding start signal");
+            catalog_started_rx
+                .await
+                .expect("catalog candidate start signal");
+        });
+        tokio::pin!(diagnostic_start);
 
         tokio::select! {
             result = &mut supervisor => panic!("service supervisor stopped before identity binding started: {result:?}"),
-            result = &mut identity_start => result.expect("identity binding was not polled").expect("identity binding start signal"),
+            result = &mut diagnostic_start => result.expect("diagnostic services were not both polled"),
         }
         stop_tx.send(()).expect("request graceful shutdown");
         supervisor.await.expect("graceful service shutdown");
@@ -329,6 +418,26 @@ mod tests {
 
     #[tokio::test]
     async fn identity_binding_completion_stops_peer_services_and_fails_process() {
+        assert_diagnostic_completion_fails_process(
+            DiagnosticService::AgentIdentityBinding,
+            "orchestrator identity binding stopped before process shutdown",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn catalog_candidate_completion_stops_peer_services_and_fails_process() {
+        assert_diagnostic_completion_fails_process(
+            DiagnosticService::CatalogCandidate,
+            "orchestrator catalog candidate observation stopped before process shutdown",
+        )
+        .await;
+    }
+
+    async fn assert_diagnostic_completion_fails_process(
+        diagnostic_service: DiagnosticService,
+        expected_error: &str,
+    ) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (coordination_stopped_tx, coordination_stopped_rx) = oneshot::channel();
         let (server_stopped_tx, server_stopped_rx) = oneshot::channel();
@@ -343,22 +452,34 @@ mod tests {
             let _ = server_stopped_tx.send(());
             Ok::<(), io::Error>(())
         };
+        let complete_identity = diagnostic_service == DiagnosticService::AgentIdentityBinding;
+        let diagnostics = supervise_diagnostics(
+            async move {
+                if complete_identity {
+                    return;
+                }
+                std::future::pending::<()>().await;
+            },
+            async move {
+                if !complete_identity {
+                    return;
+                }
+                std::future::pending::<()>().await;
+            },
+        );
 
         let error = supervise_services(
             OrchState::default(),
             shutdown_tx,
             coordination,
-            async {},
+            diagnostics,
             server,
             std::future::pending(),
         )
         .await
-        .expect_err("unexpected identity-binding completion must fail the process");
+        .expect_err("unexpected diagnostic completion must fail the process");
 
-        assert_eq!(
-            error.to_string(),
-            "orchestrator identity binding stopped before process shutdown"
-        );
+        assert_eq!(error.to_string(), expected_error);
         coordination_stopped_rx
             .await
             .expect("coordination observed shutdown");
