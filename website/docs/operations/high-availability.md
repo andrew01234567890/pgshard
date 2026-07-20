@@ -75,23 +75,35 @@ flush, so a slow storage barrier cannot authorize an expired or changed term.
 The record is cell-scoped rather than member-scoped: a later member may advance
 it only by holding a higher term from the same exact cell Lease.
 
-After the postmaster is created and tracked by pidfd, it remains
-`StartingQuarantined`. The HBA permits only the operating-system `postgres`
-identity to connect as `postgres` to the `postgres` database over the private
-0700 Unix socket; every other local connection and every replication connection
-is rejected, and TCP remains disabled. In a fixed `pg_catalog` search path with
-bounded transaction, statement, lock, and idle timeouts plus
-`synchronous_commit=on`, the agent locks a singleton row in an owned,
-WAL-logged `pgshard_internal.writable_generation` table. It accepts only an
+After the postmaster is created and tracked by pidfd, the singleton quarantine
+runtime remains `StartingQuarantined`. Its HBA permits only the operating-system
+`postgres` identity to connect as `postgres` to the `postgres` database over the
+private 0700 Unix socket; every other local connection and every replication
+connection is rejected, and TCP remains disabled. The multi-member bootstrap
+source instead remains `StartingReplicationBootstrap`; its separate HBA admits
+only the checkpointed physical-replication identity while ordinary SQL remains
+denied. In a fixed `pg_catalog` search path, the agent locks a singleton row in
+an owned, WAL-logged
+`pgshard_internal.writable_generation` table. The local path retains bounded
+transaction, statement, lock, and idle timeouts and commits with
+`synchronous_commit=local`. The remote-apply path uses the same bounded
+preflight, then disables its statement and transaction timeouts immediately
+before the final authority check and `synchronous_commit=remote_apply` commit.
+It accepts only an
 empty record, exact replay, or a higher term in the same Lease universe. The
 attempt-private authority must still exactly match immediately before commit.
 If the commit response is lost, a fresh connection accepts the exact requested
 row as committed; the exact old or empty state may retry only while authority
 still matches. Malformed, foreign, conflicting, higher, or otherwise changed
-state fences the postmaster. The same fence applies to unknown reread timeout,
-shutdown, Lease loss, publication timeout, and child exit. Only a committed or
-reconciled row followed by one final exact authority check advances the process
-to `RunningQuarantined`.
+state fences the postmaster. The same fence applies to an unknown reread,
+shutdown, Lease loss, and child exit. The local path also fails closed on its
+bounded publication timeout. The remote-apply path has no fixed wall timeout:
+the source remains `StartingReplicationBootstrap` only while the exact
+authority, shutdown state, and tracked postmaster remain valid. A committed or
+reconciled row followed by one final exact authority check advances the local
+singleton to `RunningQuarantined`, or either the asynchronous local source or
+the synchronous remote-apply source to `RunningReplicationBootstrap`; none of
+these states makes the Pod ready or serving.
 
 The synchronous multi-member `agent-quarantine` source now composes the next
 durability boundary. It commits with
@@ -103,7 +115,7 @@ replay positions must cover that barrier before the primary row and
 attempt-private authority are rechecked. Missing, duplicate, asynchronous,
 lagging, unknown, disconnected, or changed evidence remains fail closed. The
 live tests pause standby replay, observe the primary publication blocked in
-PostgreSQL's synchronous-replication wait, resumes replay, and requires the exact
+PostgreSQL's synchronous-replication wait, resume replay, and require the exact
 row to be readable on the standby before publication returns. The candidate
 set is derived only from immutable `membersPerShard` and `durability`: exact
 members 1..2 or 1..4 under `ANY 1`. Asynchronous multi-member sources instead
@@ -152,10 +164,14 @@ even after the StatefulSet and Pod are deleted. Before planning, the controller
 also authoritatively classifies both the `OnDelete` StatefulSet template and
 the live Pod, including when an earlier template already differs from its Pod.
 Changing modes requires a future explicitly fenced replacement workflow.
-These durable records are only non-serving startup floors. The WAL-backed row
-has a tested synchronous-replay proof primitive, but this runtime still disables
-physical replication and therefore provides no runtime synchronous-replica
-durability guarantee.
+These durable records are only non-serving startup floors. The multi-member
+runtime composes physical standbys and proves synchronous replay of the
+generation transaction before the source reaches
+`RunningReplicationBootstrap`. That proof does not provide a runtime
+application-write durability guarantee: this
+source does not accept or route application traffic, and its global PostgreSQL
+configuration remains `synchronous_commit=local` outside the explicit
+generation transaction.
 PostgreSQL SQL write and prepare hooks do not yet reject stale request
 generations, standby copies are not yet reconciled as promotion evidence, and
 promotion proof plus serving activation remain absent. This is therefore not

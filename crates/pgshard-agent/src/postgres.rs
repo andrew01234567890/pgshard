@@ -191,7 +191,7 @@ fn generation_publication_checkpoint(
 pub enum PostgresRuntimeRole {
     /// No TCP listener and no replication ingress.
     Quarantine,
-    /// Asynchronous writable-Lease-fenced bootstrap source for physical clones.
+    /// Writable-Lease-fenced bootstrap source for physical clones.
     ReplicationBootstrapPrimary,
     /// TCP-closed physical standby that must remain in recovery.
     ReplicationStandby,
