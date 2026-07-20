@@ -32,10 +32,15 @@ use thiserror::Error;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
+#[cfg(test)]
+use tokio::sync::mpsc;
 use tokio::sync::{oneshot, watch};
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::domain::{AgentState, PostgresProcessState};
+use crate::postgres_fence::PostgresFenceError;
+#[cfg(not(test))]
+use crate::postgres_fence::TargetFenceSession;
 #[cfg(not(test))]
 use crate::postgres_generation;
 use crate::postgres_generation::{
@@ -45,15 +50,21 @@ use crate::postgres_generation::{
 use crate::postgres_recovery::{self, PostgresRecoveryError};
 use crate::postgres_replication::{self, ReplicationEvidenceError};
 #[cfg(test)]
+use crate::writable::WritableAuthoritySnapshot;
+#[cfg(test)]
 use crate::writable::durable_generation_for_test;
-use crate::writable::{DurableWritableGeneration, WritablePostgresAttempt};
+use crate::writable::{
+    DurableWritableGeneration, WritableAuthorityObserver, WritablePostgresAttempt,
+};
 
 const POSTGRES_MAJOR: &str = "18";
 type AuthorityLossFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type TargetFenceFuture = Pin<Box<dyn Future<Output = Result<(), PostgresFenceError>> + Send>>;
 
 struct AuthorityLossFutures {
     publication: Option<AuthorityLossFuture>,
     running: Option<AuthorityLossFuture>,
+    target: Option<WritableAuthorityObserver>,
 }
 const PG_CONTROL_FILE_SIZE: u64 = 8_192;
 const MAX_POSTGRES_LOCK_FILE_BYTES: u64 = 8_192;
@@ -112,6 +123,28 @@ fn gate_next_postgres_generation_publication(receiver: watch::Receiver<bool>) {
         assert!(
             slot.borrow_mut().replace(receiver).is_none(),
             "test thread already has a PostgreSQL generation-publication gate"
+        );
+    });
+}
+
+#[cfg(test)]
+struct TestTargetFenceAdapter {
+    installations: mpsc::Sender<WritableAuthoritySnapshot>,
+    disconnect: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_TARGET_FENCE_ADAPTER:
+        std::cell::RefCell<Option<TestTargetFenceAdapter>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_test_target_fence_adapter(adapter: TestTargetFenceAdapter) {
+    TEST_TARGET_FENCE_ADAPTER.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(adapter).is_none(),
+            "test thread already has a target-fence adapter"
         );
     });
 }
@@ -946,7 +979,11 @@ impl PreparedPostgres {
         let authority = attempt.authority_observer();
         let publication_expiry = attempt.authority_observer();
         let running_expiry = attempt.authority_observer();
-        self.supervise_with_writable_authority_guard_and_loss(
+        let target = self
+            .config
+            .requires_writable_authority()
+            .then(|| attempt.authority_observer());
+        Box::pin(self.supervise_with_writable_authority_guard_and_loss(
             state,
             shutdown,
             move || authority.generation_valid_for(required_margin),
@@ -957,9 +994,10 @@ impl PreparedPostgres {
                 running: Some(
                     running_expiry.wait_until_current_generation_invalid(required_margin),
                 ),
+                target,
             }),
             attempt,
-        )
+        ))
         .await
     }
 
@@ -1030,6 +1068,7 @@ impl PreparedPostgres {
         Ok(WritablePostgresStopped { attempt })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn supervise_with_stop_mode_and_start_guard<G>(
         self,
         state: AgentState,
@@ -1085,11 +1124,15 @@ impl PreparedPostgres {
             return Ok(());
         };
 
+        let mut target_fence = None;
         let source_generation =
             if let PostgresStartAuthorization::Writable(generation) = authorization {
                 let publication_authority_loss = authority_loss
                     .as_mut()
                     .and_then(|authority_loss| authority_loss.publication.take());
+                let target_authority = authority_loss
+                    .as_mut()
+                    .and_then(|authority_loss| authority_loss.target.take());
                 let publication = publish_generation_before_running(
                     &state,
                     &mut process_group_fence,
@@ -1101,10 +1144,14 @@ impl PreparedPostgres {
                     &generation,
                     &startup_guard,
                     publication_authority_loss,
+                    target_authority,
+                    shutdown_config.target_fence_budget(),
                 )
                 .await;
                 match publication {
-                    Ok(WritablePublicationOutcome::Published) => {}
+                    Ok(WritablePublicationOutcome::Published(monitor)) => {
+                        target_fence = monitor;
+                    }
                     Ok(WritablePublicationOutcome::Stopped) => {
                         process_group_fence.disarm_if_reaped();
                         return Ok(());
@@ -1131,6 +1178,7 @@ impl PreparedPostgres {
             source_generation.as_ref(),
             &startup_guard,
             running_authority_loss,
+            target_fence,
         )
         .await;
         process_group_fence.disarm_if_reaped();
@@ -1577,9 +1625,16 @@ impl PreparedPostgres {
         Ok(Some((process_group_fence, pidfd, pid, authorization)))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn command(&self) -> Command {
         let (listen_addresses, max_wal_senders, max_replication_slots, archive_mode) =
             self.config.runtime_network_settings();
+        let target_fenced = self.config.requires_writable_authority();
+        let shared_preload_libraries = if target_fenced {
+            "shared_preload_libraries=pgshard_fence"
+        } else {
+            "shared_preload_libraries="
+        };
         let data_directory = setting_with_path("data_directory=", &self.config.data_dir);
         let hba_file = setting_with_path("hba_file=", &self.config.hba_file);
         let mut external_pid_file = OsString::from("external_pid_file=");
@@ -1637,7 +1692,19 @@ impl PreparedPostgres {
             .arg("-c")
             .arg(self.config.synchronous_standby_names_argument())
             .arg("-c")
-            .arg("synchronous_commit=local")
+            .arg("synchronous_commit=local");
+        if target_fenced {
+            for setting in [
+                "autovacuum=off",
+                "max_worker_processes=0",
+                "max_parallel_workers=0",
+                "max_parallel_workers_per_gather=0",
+                "max_prepared_transactions=0",
+            ] {
+                command.arg("-c").arg(setting);
+            }
+        }
+        command
             .arg("-c")
             .arg("max_logical_replication_workers=0")
             .arg("-c")
@@ -1649,7 +1716,7 @@ impl PreparedPostgres {
             .arg("-c")
             .arg("max_slot_wal_keep_size=-1")
             .arg("-c")
-            .arg("shared_preload_libraries=");
+            .arg(shared_preload_libraries);
         force_generation_publication_settings(&mut command);
         command
             .arg("-c")
@@ -1745,13 +1812,96 @@ fn force_generation_publication_settings(command: &mut Command) {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WritablePublicationOutcome {
-    Published,
+    Published(Option<TargetFenceFuture>),
     Stopped,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[cfg(not(test))]
+async fn install_target_fence_monitor(
+    socket_dir: &Path,
+    target_authority: Option<WritableAuthorityObserver>,
+    generation: &DurableWritableGeneration,
+    required_margin: Duration,
+) -> Result<Option<TargetFenceFuture>, PostgresFenceError> {
+    let Some(observer) = target_authority else {
+        return Ok(None);
+    };
+    let session =
+        TargetFenceSession::connect_and_install(socket_dir, &observer, generation, required_margin)
+            .await?;
+    Ok(Some(
+        Box::pin(session.supervise(observer, generation.clone(), required_margin))
+            as TargetFenceFuture,
+    ))
+}
+
+#[cfg(test)]
+async fn install_target_fence_monitor(
+    _socket_dir: &Path,
+    target_authority: Option<WritableAuthorityObserver>,
+    generation: &DurableWritableGeneration,
+    required_margin: Duration,
+) -> Result<Option<TargetFenceFuture>, PostgresFenceError> {
+    let Some(mut observer) = target_authority else {
+        return Ok(None);
+    };
+    let initial =
+        crate::postgres_fence::validate_expected_authority(&observer, generation, required_margin)?;
+    let adapter = TEST_TARGET_FENCE_ADAPTER.with(|slot| slot.borrow_mut().take());
+    if let Some(adapter) = adapter.as_ref() {
+        adapter
+            .installations
+            .send(initial.clone())
+            .await
+            .map_err(|_| PostgresFenceError::AuthorityChannelClosed)?;
+    }
+    let expected_generation = generation.clone();
+    Ok(Some(Box::pin(async move {
+        let mut installed = initial;
+        let (installations, mut disconnect) = match adapter {
+            Some(adapter) => (Some(adapter.installations), Some(adapter.disconnect)),
+            None => (None, None),
+        };
+        loop {
+            tokio::select! {
+                biased;
+                () = wait_for_test_target_disconnect(&mut disconnect) => {
+                    return Err(PostgresFenceError::ConnectionEnded);
+                }
+                changed = observer.changed() => {
+                    changed.map_err(|_| PostgresFenceError::AuthorityChannelClosed)?;
+                }
+            }
+            let requested = crate::postgres_fence::validate_expected_authority(
+                &observer,
+                &expected_generation,
+                required_margin,
+            )?;
+            if requested != installed {
+                if let Some(installations) = installations.as_ref() {
+                    installations
+                        .send(requested.clone())
+                        .await
+                        .map_err(|_| PostgresFenceError::AuthorityChannelClosed)?;
+                }
+                installed = requested;
+            }
+        }
+    }) as TargetFenceFuture))
+}
+
+#[cfg(test)]
+async fn wait_for_test_target_disconnect(disconnect: &mut Option<oneshot::Receiver<()>>) {
+    match disconnect.as_mut() {
+        Some(disconnect) => {
+            let _ = disconnect.await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn publish_generation_before_running<F, G>(
     state: &AgentState,
     process: &mut PostgresProcessFence,
@@ -1763,6 +1913,8 @@ async fn publish_generation_before_running<F, G>(
     generation: &DurableWritableGeneration,
     startup_guard: &G,
     authority_deadline: Option<AuthorityLossFuture>,
+    target_authority: Option<WritableAuthorityObserver>,
+    target_required_margin: Duration,
 ) -> Result<WritablePublicationOutcome, PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -1774,6 +1926,71 @@ where
             PostgresStartDecision::StartWritable(current) if current == *generation
         )
     };
+    let target_installation = install_target_fence_monitor(
+        socket_dir,
+        target_authority,
+        generation,
+        target_required_margin,
+    );
+    tokio::pin!(target_installation);
+    let authority_lost = wait_for_authority_loss(&authority_exact, authority_deadline);
+    tokio::pin!(authority_lost);
+    let target_fence = tokio::select! {
+        biased;
+        status = wait_pidfd_exit(pidfd) => {
+            let error = match status {
+                Ok(status) => PostgresError::UnexpectedExit(status),
+                Err(error) => error,
+            };
+            return Err(cleanup_tracked_startup_failure(
+                state, process, pidfd, process_group, error,
+            ).await);
+        }
+        stop_mode = shutdown.as_mut() => {
+            stop_tracked_postmaster(
+                state,
+                process,
+                pidfd,
+                process_group,
+                shutdown_config,
+                stop_mode,
+            ).await?;
+            return Ok(WritablePublicationOutcome::Stopped);
+        }
+        () = &mut authority_lost => {
+            return Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                PostgresError::StartupAuthorityChanged,
+            ).await);
+        }
+        result = &mut target_installation => result,
+    };
+    let mut target_fence = match target_fence {
+        Ok(target_fence) => target_fence,
+        Err(error) => {
+            return Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                PostgresError::from(error),
+            )
+            .await);
+        }
+    };
+    if !authority_exact() {
+        return Err(cleanup_tracked_startup_failure(
+            state,
+            process,
+            pidfd,
+            process_group,
+            PostgresError::StartupAuthorityChanged,
+        )
+        .await);
+    }
     let generation_durability = shutdown_config.generation_durability();
     let publication = publish_postgres_generation(
         socket_dir,
@@ -1794,8 +2011,6 @@ where
                 })?
         }
     });
-    let authority_lost = wait_for_authority_loss(&authority_exact, authority_deadline);
-    tokio::pin!(authority_lost);
     let result = tokio::select! {
         biased;
         status = wait_pidfd_exit(pidfd) => {
@@ -1827,6 +2042,15 @@ where
                 PostgresError::StartupAuthorityChanged,
             ).await);
         }
+        error = wait_for_target_fence(&mut target_fence) => {
+            return Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                PostgresError::from(error),
+            ).await);
+        }
         result = publication.as_mut() => result,
     };
     let publication_error = result.err();
@@ -1845,7 +2069,7 @@ where
         )
         .await);
     }
-    Ok(WritablePublicationOutcome::Published)
+    Ok(WritablePublicationOutcome::Published(target_fence))
 }
 
 async fn publish_postgres_generation<F>(
@@ -1955,6 +2179,16 @@ async fn wait_for_authority_loss<F>(
     }
 }
 
+async fn wait_for_target_fence(target_fence: &mut Option<TargetFenceFuture>) -> PostgresFenceError {
+    match target_fence.as_mut() {
+        Some(target_fence) => match target_fence.as_mut().await {
+            Ok(()) => PostgresFenceError::UnexpectedStop,
+            Err(error) => error,
+        },
+        None => std::future::pending().await,
+    }
+}
+
 async fn cleanup_tracked_startup_failure(
     state: &AgentState,
     process: &mut PostgresProcessFence,
@@ -1988,6 +2222,7 @@ async fn supervise_running_postmaster<F, G>(
     source_generation: Option<&DurableWritableGeneration>,
     startup_guard: &G,
     authority_deadline: Option<AuthorityLossFuture>,
+    target_fence: Option<TargetFenceFuture>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -2017,6 +2252,7 @@ where
             generation,
             startup_guard,
             authority_deadline,
+            target_fence,
         )
         .await;
     }
@@ -2031,6 +2267,7 @@ where
             generation,
             startup_guard,
             authority_deadline,
+            target_fence,
         )
         .await;
     }
@@ -2071,6 +2308,7 @@ async fn supervise_writable_quarantine<F, G>(
     generation: &DurableWritableGeneration,
     startup_guard: &G,
     authority_deadline: Option<AuthorityLossFuture>,
+    mut target_fence: Option<TargetFenceFuture>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -2118,6 +2356,15 @@ where
                 PostgresError::StartupAuthorityChanged,
             ).await)
         }
+        error = wait_for_target_fence(&mut target_fence) => {
+            Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                PostgresError::from(error),
+            ).await)
+        }
     }
 }
 
@@ -2132,6 +2379,7 @@ async fn supervise_replication_source<F, G>(
     generation: &DurableWritableGeneration,
     startup_guard: &G,
     authority_deadline: Option<AuthorityLossFuture>,
+    mut target_fence: Option<TargetFenceFuture>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -2192,6 +2440,15 @@ where
                 pidfd,
                 process_group,
                 PostgresError::StartupAuthorityChanged,
+            ).await)
+        }
+        error = wait_for_target_fence(&mut target_fence) => {
+            Err(cleanup_tracked_startup_failure(
+                state,
+                process,
+                pidfd,
+                process_group,
+                PostgresError::from(error),
             ).await)
         }
     }
@@ -4988,6 +5245,9 @@ pub enum PostgresError {
     /// WAL-backed generation publication failed while `PostgreSQL` was non-serving.
     #[error("publish WAL-backed PostgreSQL writable generation: {0}")]
     PublishWritableGeneration(#[from] PostgresGenerationError),
+    /// The shared-preload target did not install or continuously renew exact authority.
+    #[error("install PostgreSQL target-fence authority: {0}")]
+    TargetFence(#[from] PostgresFenceError),
     /// WAL-backed generation publication did not finish within the startup bound.
     #[error("WAL-backed PostgreSQL writable-generation publication exceeded {0:?}")]
     WritableGenerationPublicationTimeout(Duration),
@@ -6821,6 +7081,18 @@ mod tests {
                 .any(|argument| argument.as_bytes().starts_with(b"max_replication_slots=")),
             "quarantine must preserve persistent slots instead of shrinking their startup capacity"
         );
+        for source_only in [
+            "autovacuum=off",
+            "max_worker_processes=0",
+            "max_parallel_workers=0",
+            "max_parallel_workers_per_gather=0",
+            "max_prepared_transactions=0",
+        ] {
+            assert!(
+                !arguments.contains(&OsStr::new(source_only)),
+                "quarantine inherited source-only setting {source_only:?}"
+            );
+        }
     }
 
     #[test]
@@ -6872,13 +7144,23 @@ mod tests {
             "synchronous_standby_names=ANY 1 (pgshard_member_0001, pgshard_member_0002)",
             "synchronous_commit=local",
             "archive_mode=off",
+            "shared_preload_libraries=pgshard_fence",
+            "autovacuum=off",
+            "max_worker_processes=0",
+            "max_parallel_workers=0",
+            "max_parallel_workers_per_gather=0",
+            "max_prepared_transactions=0",
         ] {
             assert!(
                 arguments.contains(&OsStr::new(required)),
                 "missing {required:?}"
             );
         }
-        for forbidden in ["listen_addresses=", "max_wal_senders=0"] {
+        for forbidden in [
+            "listen_addresses=",
+            "max_wal_senders=0",
+            "shared_preload_libraries=",
+        ] {
             assert!(
                 !arguments.contains(&OsStr::new(forbidden)),
                 "replication bootstrap primary retained quarantine setting {forbidden:?}"
@@ -8377,6 +8659,143 @@ mod tests {
             );
         }
         let reacquired = prepare_fixture(config).expect("reacquire target-fenced PGDATA");
+        drop(reacquired);
+    }
+
+    fn target_adapter_process_tree_config(root: &TempDir) -> (PostgresConfig, PathBuf) {
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let descendant = root.path().join("descendant-pid");
+        let executable = root.path().join("postgres");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\ntrap '' TERM INT QUIT\n(trap '' TERM INT QUIT; while :; do :; done) &\nprintf '%s\\n' \"$!\" > '{}'\nwhile :; do :; done\n",
+                descendant.display()
+            ),
+        );
+        let hba = root
+            .path()
+            .join("replication-bootstrap-primary.pg_hba.conf");
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT)
+            .expect("write target-adapter HBA");
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+            .expect("protect target-adapter HBA");
+        let config = PostgresConfig::new_for_role(
+            PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            None,
+            GenerationDurability::remote_apply_any_one(vec![
+                "pgshard_member_0001".to_owned(),
+                "pgshard_member_0002".to_owned(),
+            ])
+            .expect("valid target-adapter durability"),
+            data_dir,
+            executable,
+            root.path().join("socket"),
+            hba,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid target-adapter config");
+        (config, descendant)
+    }
+
+    #[tokio::test]
+    async fn target_ack_renewal_and_connection_loss_gate_publication_and_fence_process_tree() {
+        let root = TempDir::new().expect("create target-adapter process-tree fixture");
+        let (config, descendant) = target_adapter_process_tree_config(&root);
+        let prepared = prepare_fixture(config.clone()).expect("prepare target-adapter fixture");
+        let state = state_with_writable_lease(1);
+        let (lease_attempt, postgres_attempt) = crate::writable::writable_attempt_pair_for_test();
+        let generation = durable_generation_for_test(1);
+        let initial_deadline = state.lease_deadline().expect("initial target deadline");
+        lease_attempt.install_authority(initial_deadline, generation.clone());
+        let (installations_tx, mut installations_rx) = tokio::sync::mpsc::channel(4);
+        let (disconnect_tx, disconnect_rx) = oneshot::channel();
+        inject_test_target_fence_adapter(TestTargetFenceAdapter {
+            installations: installations_tx,
+            disconnect: disconnect_rx,
+        });
+        let (_publication_tx, publication_rx) = watch::channel(false);
+        gate_next_postgres_generation_publication(publication_rx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let supervisor_state = state.clone();
+        let supervisor = tokio::spawn(async move {
+            prepared
+                .supervise_with_writable_authority(
+                    supervisor_state,
+                    shutdown_rx,
+                    Duration::ZERO,
+                    postgres_attempt,
+                )
+                .await
+        });
+
+        let initial = timeout(Duration::from_secs(1), installations_rx.recv())
+            .await
+            .expect("initial target ACK preceded publication")
+            .expect("initial target adapter remained connected");
+        assert_eq!(
+            initial,
+            WritableAuthoritySnapshot {
+                deadline: initial_deadline,
+                generation: generation.clone(),
+            }
+        );
+        wait_for_marker(&descendant).await;
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::StartingReplicationBootstrap,
+            "target ACK must not bypass WAL generation publication"
+        );
+
+        let renewed_deadline = initial_deadline
+            .checked_add(Duration::from_secs(1))
+            .expect("bounded target renewal");
+        lease_attempt.install_authority(renewed_deadline, generation.clone());
+        let renewed = timeout(Duration::from_secs(1), installations_rx.recv())
+            .await
+            .expect("target renewal was observed")
+            .expect("target adapter remained connected through renewal");
+        assert_eq!(
+            renewed,
+            WritableAuthoritySnapshot {
+                deadline: renewed_deadline,
+                generation,
+            }
+        );
+
+        disconnect_tx
+            .send(())
+            .expect("inject retained target-session loss");
+        let result = timeout(Duration::from_secs(3), supervisor)
+            .await
+            .expect("target-session loss fenced inside cleanup bound")
+            .expect("join target-adapter supervisor");
+        assert!(matches!(
+            result,
+            Err(PostgresError::TargetFence(
+                PostgresFenceError::ConnectionEnded
+            ))
+        ));
+        assert!(state.snapshot().lease.is_none());
+        assert_eq!(
+            state.snapshot().postgres_process,
+            PostgresProcessState::Failed
+        );
+        let descendant_pid = fs::read_to_string(&descendant)
+            .expect("read target-adapter descendant PID")
+            .trim_ascii()
+            .parse::<u32>()
+            .expect("parse target-adapter descendant PID");
+        if let Ok(status) = fs::read_to_string(format!("/proc/{descendant_pid}/status")) {
+            assert!(
+                status.lines().any(|line| line.starts_with("State:\tZ")),
+                "live descendant survived retained target-session loss"
+            );
+        }
+        let reacquired = prepare_fixture(config).expect("reacquire target-session-fenced PGDATA");
         drop(reacquired);
     }
 

@@ -2294,6 +2294,7 @@ mod tests {
             .find(|line| line.contains("emit_component images"))
             .expect("image CI trigger");
         for input in [
+            "^extensions/",
             "^\\.dockerignore$",
             "^Cargo\\.(toml|lock)$",
             "^rust-toolchain\\.toml$",
@@ -2310,8 +2311,10 @@ mod tests {
             .expect("PostgreSQL agent lifecycle trigger");
         for input in [
             "^crates/(pgshard-agent|pgshard-types|pgshard-version)/",
+            "^extensions/pgshard_fence/",
             "images/rust\\.Dockerfile",
             "images/quarantine\\.pg_hba\\.conf",
+            "images/replication-bootstrap-primary\\.pg_hba\\.conf",
         ] {
             assert!(
                 postgres_agent_trigger.contains(input),
