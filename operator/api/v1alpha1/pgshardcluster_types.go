@@ -316,12 +316,39 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=shard
 	PostgreSQLReplicationCredentials []PostgreSQLReplicationCredentialStatus `json:"postgresqlReplicationCredentials,omitempty"`
+	// PostgreSQLCatalogCandidates binds every shard-zero member to one immutable,
+	// cluster-aware catalog bootstrap configuration. These ConfigMaps are not
+	// mounted by the current non-serving workloads. Missing or recreated
+	// checkpointed objects require explicit recovery.
+	// +kubebuilder:validation:MaxItems=5
+	// +listType=map
+	// +listMapKey=member
+	PostgreSQLCatalogCandidates []PostgreSQLCatalogCandidateStatus `json:"postgresqlCatalogCandidates,omitempty"`
 	// CatalogAccess records the staged creation and API identity of the
 	// catalog-only credential and TLS Secret. The operator first creates an empty
 	// non-consumable Secret, checkpoints its UID, then atomically installs
 	// immutable material and checkpoints its digests. A missing or replaced
 	// checkpointed Secret requires explicit recovery.
 	CatalogAccess *CatalogAccessStatus `json:"catalogAccess,omitempty"`
+}
+
+// PostgreSQLCatalogCandidateStatus pins one shard-zero member's immutable
+// catalog-bootstrap configuration to its API identity and exact payload. The
+// payload contains only references to already checkpointed immutable inputs;
+// it grants no serving role or writable authority.
+type PostgreSQLCatalogCandidateStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=4
+	Member int32 `json:"member"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	ConfigMapName string `json:"configMapName"`
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	ConfigMapUID types.UID `json:"configMapUID"`
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	PayloadSHA256 string `json:"payloadSHA256"`
 }
 
 // PostgreSQLReplicationCredentialStatus binds one shard to a staged shared

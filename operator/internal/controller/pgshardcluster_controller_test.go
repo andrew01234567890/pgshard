@@ -582,8 +582,11 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			if current.Status.PostgreSQLBootstrapSpec == nil || current.Status.PostgreSQLBootstrapSpec.MembersPerShard != members || current.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine.String() {
 				t.Fatalf("multi-member source-storage snapshot = %#v", current.Status.PostgreSQLBootstrapSpec)
 			}
-			if current.Status.CatalogAccess != nil {
-				t.Fatalf("multi-member source storage created catalog access: %#v", current.Status.CatalogAccess)
+			if current.Status.CatalogAccess == nil || current.Status.CatalogAccess.SecretUID == "" || current.Status.CatalogAccess.ClientSHA256 == "" || current.Status.CatalogAccess.ServerSHA256 == "" {
+				t.Fatalf("multi-member catalog input identity = %#v", current.Status.CatalogAccess)
+			}
+			if len(current.Status.PostgreSQLCatalogCandidates) != int(members) {
+				t.Fatalf("catalog candidate checkpoints = %#v, want %d", current.Status.PostgreSQLCatalogCandidates, members)
 			}
 			if len(current.Status.PostgreSQLBootstraps) != int(members) {
 				t.Fatalf("multi-member source storage has %d records, want %d: %#v", len(current.Status.PostgreSQLBootstraps), members, current.Status.PostgreSQLBootstraps)
@@ -625,6 +628,17 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 					}
 					resourceUIDs[uid] = struct{}{}
 				}
+				checkpoint := current.Status.PostgreSQLCatalogCandidates[member]
+				if checkpoint.Member != member || checkpoint.ConfigMapName != owned.PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member) || checkpoint.ConfigMapUID == "" || checkpoint.PayloadSHA256 == "" {
+					t.Fatalf("catalog candidate member %d checkpoint = %#v", member, checkpoint)
+				}
+				configuration := &corev1.ConfigMap{}
+				if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.ConfigMapName}, configuration); err != nil {
+					t.Fatal(err)
+				}
+				if configuration.UID != checkpoint.ConfigMapUID || configuration.Immutable == nil || !*configuration.Immutable || owned.PostgreSQLCatalogCandidatePayloadSHA256(configuration) != checkpoint.PayloadSHA256 || configuration.Labels[owned.RoleLabel] != "" {
+					t.Fatalf("catalog candidate member %d immutable identity = %#v data=%#v", member, configuration.ObjectMeta, configuration.Data)
+				}
 			}
 			statefulSets := &appsv1.StatefulSetList{}
 			pods := &corev1.PodList{}
@@ -650,6 +664,13 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			}
 			if _, role := source.Spec.Template.Labels[owned.RoleLabel]; role {
 				t.Fatalf("bootstrap source received a serving role: %#v", source.Spec.Template.Labels)
+			}
+			for _, statefulSet := range statefulSets.Items {
+				for _, volume := range statefulSet.Spec.Template.Spec.Volumes {
+					if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, owned.PostgreSQLCatalogCandidateSuffix) {
+						t.Fatalf("non-serving member %s mounted inert catalog candidate configuration %s", statefulSet.Name, volume.ConfigMap.Name)
+					}
+				}
 			}
 			if observed, err := owned.ObservePostgreSQLRuntime(source.Spec.Template.Annotations, source.Spec.Template.Spec); err != nil || observed != owned.PostgreSQLRuntimeAgentQuarantine {
 				t.Fatalf("bootstrap-source runtime = %q, %v", observed, err)
@@ -706,6 +727,60 @@ func TestDirectMultiMemberRuntimeDoesNotCreateSourceStorage(t *testing.T) {
 	}
 	if len(secrets.Items) != 0 || len(claims.Items) != 0 || len(statefulSets.Items) != 0 {
 		t.Fatalf("direct multi-member runtime created source storage or workloads: Secrets=%d PVCs=%d StatefulSets=%d", len(secrets.Items), len(claims.Items), len(statefulSets.Items))
+	}
+}
+
+func TestReconcileFailsClosedForReplacedCatalogCandidateConfiguration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, nil)
+	reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	if len(current.Status.PostgreSQLCatalogCandidates) != int(cluster.Spec.MembersPerShard) {
+		t.Fatalf("catalog candidate checkpoints = %#v", current.Status.PostgreSQLCatalogCandidates)
+	}
+	checkpoint := current.Status.PostgreSQLCatalogCandidates[1]
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.ConfigMapName}
+	original := &corev1.ConfigMap{}
+	if err := base.Get(ctx, key, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	replacement := original.DeepCopy()
+	replacement.UID = ""
+	replacement.ResourceVersion = ""
+	replacement.CreationTimestamp = metav1.Time{}
+	if err := base.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.UID == checkpoint.ConfigMapUID {
+		t.Fatal("replacement fixture reused the checkpointed ConfigMap UID")
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "expected recorded UID") ||
+		!strings.Contains(err.Error(), string(checkpoint.ConfigMapUID)) || !strings.Contains(err.Error(), string(replacement.UID)) ||
+		!strings.Contains(err.Error(), "explicit recovery is required") {
+		t.Fatalf("replacement catalog candidate reconciliation error = %v", err)
+	}
+	observed := &corev1.ConfigMap{}
+	if err := base.Get(ctx, key, observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.UID != replacement.UID {
+		t.Fatalf("reconciliation replaced foreign candidate ConfigMap UID %s with %s", replacement.UID, observed.UID)
+	}
+	degraded := getCluster(t, ctx, base, cluster)
+	assertCondition(t, degraded, reconciledCondition, metav1.ConditionFalse, "CatalogCandidateReconcileFailed")
+	if degraded.Status.PostgreSQLCatalogCandidates[1] != checkpoint {
+		t.Fatalf("replacement changed candidate checkpoint: before=%#v after=%#v", checkpoint, degraded.Status.PostgreSQLCatalogCandidates[1])
 	}
 }
 

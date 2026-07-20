@@ -652,6 +652,50 @@ spec:
                 - shard
                 - member
                 x-kubernetes-list-type: map
+              postgresqlCatalogCandidates:
+                description: |-
+                  PostgreSQLCatalogCandidates binds every shard-zero member to one immutable,
+                  cluster-aware catalog bootstrap configuration. These ConfigMaps are not
+                  mounted by the current non-serving workloads. Missing or recreated
+                  checkpointed objects require explicit recovery.
+                items:
+                  description: |-
+                    PostgreSQLCatalogCandidateStatus pins one shard-zero member's immutable
+                    catalog-bootstrap configuration to its API identity and exact payload. The
+                    payload contains only references to already checkpointed immutable inputs;
+                    it grants no serving role or writable authority.
+                  properties:
+                    configMapName:
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    configMapUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      maxLength: 128
+                      minLength: 1
+                      type: string
+                    member:
+                      format: int32
+                      maximum: 4
+                      minimum: 0
+                      type: integer
+                    payloadSHA256:
+                      pattern: ^[0-9a-f]{64}$
+                      type: string
+                  required:
+                  - configMapName
+                  - configMapUID
+                  - member
+                  - payloadSHA256
+                  type: object
+                maxItems: 5
+                type: array
+                x-kubernetes-list-map-keys:
+                - member
+                x-kubernetes-list-type: map
               postgresqlReplicationCredentials:
                 description: |-
                   PostgreSQLReplicationCredentials records one staged, immutable physical-
