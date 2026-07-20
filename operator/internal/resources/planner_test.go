@@ -2960,8 +2960,12 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 			delete(wantedFields, variable.Name)
 		}
 	}
-	if len(wantedFields) != 0 || envValue(orchestratorEnv, "PGSHARD_LEASE_NAME") != lease.Name {
+	if len(wantedFields) != 0 || envValue(orchestratorEnv, "PGSHARD_LEASE_NAME") != lease.Name || envValue(orchestratorEnv, "PGSHARD_TOPOLOGY_FILE") != "/etc/pgshard/topology/cluster.json" {
 		t.Fatalf("orchestrator Lease environment is incomplete: missing=%#v env=%#v", wantedFields, orchestratorEnv)
+	}
+	orchestratorContainer := orchestrator.Spec.Template.Spec.Containers[0]
+	if !containerHasReadOnlyMount(orchestratorContainer, "topology", "/etc/pgshard/topology") || configMapVolumeName(t, orchestrator.Spec.Template.Spec.Volumes, "topology") != cluster.Name+TopologyConfigSuffix {
+		t.Fatalf("orchestrator topology projection is incomplete: container=%#v volumes=%#v", orchestratorContainer.VolumeMounts, orchestrator.Spec.Template.Spec.Volumes)
 	}
 	pooler := object[*appsv1.Deployment](t, plan, "demo-pooler")
 	poolerContainer := pooler.Spec.Template.Spec.Containers[0]

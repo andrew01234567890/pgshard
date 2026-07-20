@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
@@ -9,7 +10,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::domain::OrchestratorIdentity;
+use crate::endpoint::valid_credential_free_http_endpoint;
 use crate::telemetry::TelemetryConfig;
+use crate::topology::DEFAULT_TOPOLOGY_FILE;
 
 /// Validated orchestrator configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +27,8 @@ pub struct OrchConfig {
     pub pod_uid: String,
     /// Namespace containing the operator-owned leadership Lease.
     pub lease_namespace: String,
+    /// Operator-projected immutable discovery topology.
+    pub topology_file: PathBuf,
     /// Name of the operator-owned leadership Lease.
     pub lease_name: String,
     /// Default requested operation-lease duration.
@@ -61,6 +66,13 @@ struct RawConfig {
 
     #[arg(long, env = "PGSHARD_LEASE_NAME")]
     lease_name: String,
+
+    #[arg(
+        long,
+        env = "PGSHARD_TOPOLOGY_FILE",
+        default_value = DEFAULT_TOPOLOGY_FILE
+    )]
+    topology_file: PathBuf,
 
     #[arg(long, env = "PGSHARD_LEASE_TTL_MS", default_value_t = 15_000)]
     lease_ttl_ms: u64,
@@ -159,6 +171,7 @@ impl OrchConfig {
             cluster_uid: raw.cluster_uid,
             pod_uid: raw.pod_uid,
             lease_namespace: raw.lease_namespace,
+            topology_file: raw.topology_file,
             lease_name: raw.lease_name,
             lease_ttl_ms: raw.lease_ttl_ms,
             kubernetes_lease_duration: Duration::from_secs(raw.kubernetes_lease_duration_seconds),
@@ -208,23 +221,29 @@ fn validate_uid(name: &'static str, value: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_otlp_endpoint(value: &str) -> Result<Url, ConfigError> {
-    if value.trim() != value {
+    if !valid_credential_free_http_endpoint(value) {
         return Err(ConfigError::UnsafeOtlpEndpoint(value.to_owned()));
     }
     let endpoint = Url::parse(value).map_err(|source| ConfigError::InvalidOtlpEndpoint {
         value: value.to_owned(),
         source,
     })?;
-    if !matches!(endpoint.scheme(), "http" | "https")
-        || endpoint.host_str().is_none()
-        || !endpoint.username().is_empty()
-        || endpoint.password().is_some()
-        || endpoint.query().is_some()
-        || endpoint.fragment().is_some()
-    {
+    if endpoint.host_str() != portable_endpoint_literal_host(value) {
         return Err(ConfigError::UnsafeOtlpEndpoint(value.to_owned()));
     }
     Ok(endpoint)
+}
+
+fn portable_endpoint_literal_host(value: &str) -> Option<&str> {
+    let remainder = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))?;
+    let authority = remainder.split('/').next()?;
+    Some(
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _port)| host),
+    )
 }
 
 /// Configuration parsing or validation failure.
@@ -288,7 +307,30 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
+
     use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct EndpointFixture {
+        cases: Vec<EndpointCase>,
+        maximum_length: usize,
+        version: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EndpointCase {
+        name: String,
+        value: String,
+        valid: bool,
+    }
+
+    fn shared_endpoint_fixture() -> EndpointFixture {
+        serde_json::from_str(include_str!("../../../contracts/http-endpoints-v1.json"))
+            .expect("valid endpoint fixture")
+    }
 
     fn args() -> Vec<&'static str> {
         vec![
@@ -315,6 +357,7 @@ mod tests {
         assert_eq!(config.kubernetes_lease_duration, Duration::from_secs(15));
         assert_eq!(config.kubernetes_lease_retry_period, Duration::from_secs(2));
         assert_eq!(config.kubernetes_request_timeout, Duration::from_secs(1));
+        assert_eq!(config.topology_file, PathBuf::from(DEFAULT_TOPOLOGY_FILE));
     }
 
     #[test]
@@ -387,6 +430,68 @@ mod tests {
                 OrchConfig::try_parse_from(values),
                 Err(ConfigError::UnsafeOtlpEndpoint(_))
             ));
+        }
+    }
+
+    #[test]
+    fn every_valid_shared_endpoint_retains_its_exact_host_identity_end_to_end() {
+        let fixture = shared_endpoint_fixture();
+        assert_eq!(fixture.version, "pgshard.http-endpoint.v1");
+        assert_eq!(
+            fixture.maximum_length,
+            crate::endpoint::MAXIMUM_HTTP_ENDPOINT_BYTES
+        );
+        let valid_cases: Vec<_> = fixture.cases.iter().filter(|test| test.valid).collect();
+        assert!(!valid_cases.is_empty());
+        for test in valid_cases {
+            let literal_host = portable_endpoint_literal_host(&test.value)
+                .expect("valid contract endpoint has a literal host");
+            let endpoint = validate_otlp_endpoint(&test.value)
+                .unwrap_or_else(|error| panic!("{}: {error}", test.name));
+            assert_eq!(endpoint.host_str(), Some(literal_host), "{}", test.name);
+
+            let mut values: Vec<String> = args().into_iter().map(str::to_owned).collect();
+            values.extend(["--otlp-endpoint".to_owned(), test.value.clone()]);
+            let config = OrchConfig::try_parse_from(values)
+                .unwrap_or_else(|error| panic!("{}: {error}", test.name));
+            let configured = config
+                .telemetry
+                .otlp_endpoint
+                .as_ref()
+                .expect("fixture endpoint configured");
+            assert_eq!(configured, &endpoint, "{}", test.name);
+            assert_eq!(configured.host_str(), Some(literal_host), "{}", test.name);
+        }
+    }
+
+    #[test]
+    fn every_invalid_shared_endpoint_is_rejected_before_runtime_url_use() {
+        let invalid_cases: Vec<_> = shared_endpoint_fixture()
+            .cases
+            .into_iter()
+            .filter(|test| !test.valid)
+            .collect();
+        assert!(!invalid_cases.is_empty());
+        for test in invalid_cases {
+            assert!(
+                matches!(
+                    validate_otlp_endpoint(&test.value),
+                    Err(ConfigError::UnsafeOtlpEndpoint(_))
+                ),
+                "{}",
+                test.name
+            );
+
+            let mut values: Vec<String> = args().into_iter().map(str::to_owned).collect();
+            values.extend(["--otlp-endpoint".to_owned(), test.value]);
+            assert!(
+                matches!(
+                    OrchConfig::try_parse_from(values),
+                    Err(ConfigError::UnsafeOtlpEndpoint(_))
+                ),
+                "{}",
+                test.name
+            );
         }
     }
 }

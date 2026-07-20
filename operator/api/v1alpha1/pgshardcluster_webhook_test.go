@@ -3,8 +3,12 @@ package v1alpha1
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -551,6 +555,64 @@ func TestValidationRejectsUnsafeOpenTelemetryEndpoints(t *testing.T) {
 	cluster.Spec.Observability.OpenTelemetryEndpoint = "https://collector.example.com:4317/v1/traces"
 	if _, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster); err != nil {
 		t.Fatalf("safe endpoint rejected: %v", err)
+	}
+}
+
+func TestValidationRejectsServiceMonitorWhenPrometheusIsDisabled(t *testing.T) {
+	t.Parallel()
+	cluster := validCluster()
+	disabled := false
+	cluster.Spec.Observability.Prometheus = &disabled
+	cluster.Spec.Observability.ServiceMonitor = true
+	_, err := (&PgShardClusterValidator{}).ValidateCreate(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "serviceMonitor") || !strings.Contains(err.Error(), "requires Prometheus") {
+		t.Fatalf("ServiceMonitor without Prometheus was admitted: %v", err)
+	}
+}
+
+func TestCredentialFreeHTTPSEndpointMatchesSharedGoldenContract(t *testing.T) {
+	t.Parallel()
+	type endpointCase struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+		Valid bool   `json:"valid"`
+	}
+	var fixture struct {
+		Version       string         `json:"version"`
+		MaximumLength int            `json:"maximumLength"`
+		Cases         []endpointCase `json:"cases"`
+	}
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate endpoint golden fixture")
+	}
+	payload, err := os.ReadFile(filepath.Join(filepath.Dir(sourceFile), "..", "..", "..", "contracts", "http-endpoints-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(payload, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.Version != "pgshard.http-endpoint.v1" || fixture.MaximumLength != MaximumEndpointLength || len(fixture.Cases) == 0 {
+		t.Fatalf("invalid endpoint fixture identity: %#v", fixture)
+	}
+	for _, test := range fixture.Cases {
+		test := test
+		t.Run(test.Name, func(t *testing.T) {
+			t.Parallel()
+			err := ValidateCredentialFreeHTTPSEndpoint(test.Value)
+			if (err == nil) != test.Valid {
+				t.Fatalf("valid=%t, error=%v", test.Valid, err)
+			}
+		})
+	}
+	prefix := "https://collector.example.invalid/"
+	maximum := prefix + strings.Repeat("x", MaximumEndpointLength-len(prefix))
+	if err := ValidateCredentialFreeHTTPSEndpoint(maximum); err != nil {
+		t.Fatalf("exact maximum endpoint rejected: %v", err)
+	}
+	if err := ValidateCredentialFreeHTTPSEndpoint(maximum + "x"); err == nil {
+		t.Fatal("endpoint above exact maximum accepted")
 	}
 }
 

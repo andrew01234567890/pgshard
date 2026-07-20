@@ -6,6 +6,7 @@
 pub mod config;
 pub mod coordination;
 pub mod domain;
+mod endpoint;
 pub mod http;
 mod postgres_connection;
 pub mod slot_catalog;
@@ -14,6 +15,7 @@ pub mod slot_observer;
 pub mod slot_probe_catalog;
 pub mod standby_slots;
 pub mod telemetry;
+pub mod topology;
 
 fn parse_lsn(value: &str) -> Option<pgshard_types::PgLsn> {
     let (high, low) = value.split_once('/')?;

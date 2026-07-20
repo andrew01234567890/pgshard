@@ -17,8 +17,10 @@ kube.workspace = true
 pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true

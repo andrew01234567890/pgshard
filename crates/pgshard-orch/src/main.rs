@@ -3,6 +3,9 @@
 use pgshard_orch::config::{ConfigError, OrchConfig};
 use pgshard_orch::coordination::{CoordinationConfig, supervise};
 use pgshard_orch::domain::OrchState;
+use pgshard_orch::topology::{
+    ExpectedTopologyIdentity, TopologyDiagnostics, TopologyError, TopologyV1,
+};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -15,6 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(ConfigError::Arguments(error)) => error.exit(),
         Err(error) => return Err(error.into()),
     };
+    let topology_diagnostics = load_topology(&config)?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -39,14 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.kubernetes_lease_retry_period,
         config.kubernetes_request_timeout,
     )?;
-    let state = OrchState::with_identity(config.identity, config.lease_ttl_ms)?;
-    tracing::info!(
-        bind = %config.http_bind,
-        lease_ttl_ms = config.lease_ttl_ms,
-        version = pgshard_version::VERSION,
-        git_sha = pgshard_version::GIT_SHA,
-        "starting orchestrator HTTP server; durable operation persistence and automated failover remain disabled"
-    );
+    let state = OrchState::with_identity_and_topology(
+        config.identity,
+        config.lease_ttl_ms,
+        topology_diagnostics.clone(),
+    )?;
+    log_start(config.http_bind, config.lease_ttl_ms, &topology_diagnostics);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let coordination_future = supervise(coordination, state.clone(), shutdown_rx.clone());
     let server_future = pgshard_orch::http::serve(
@@ -110,6 +112,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!("orchestrator shutdown complete");
     Ok(())
+}
+
+fn load_topology(config: &OrchConfig) -> Result<TopologyDiagnostics, TopologyError> {
+    TopologyV1::load(
+        &config.topology_file,
+        ExpectedTopologyIdentity {
+            cluster_id: &config.identity.cluster_id,
+            cluster_uid: &config.cluster_uid,
+            namespace: &config.lease_namespace,
+        },
+    )
+    .map(|topology| topology.diagnostics())
+}
+
+fn log_start(bind: std::net::SocketAddr, lease_ttl_ms: u64, topology: &TopologyDiagnostics) {
+    tracing::info!(
+        bind = %bind,
+        lease_ttl_ms,
+        version = pgshard_version::VERSION,
+        git_sha = pgshard_version::GIT_SHA,
+        topology_schema = %topology.schema_version,
+        topology_shards = topology.shard_count,
+        topology_members = topology.member_count,
+        "starting orchestrator HTTP server; durable operation persistence and automated failover remain disabled"
+    );
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
