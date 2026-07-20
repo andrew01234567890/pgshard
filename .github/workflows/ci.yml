@@ -140,7 +140,7 @@ jobs:
           exists_at_head_or_base benchmarks/Cargo.toml && performance_exists=true
 
           emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^contracts/replication-slot-names\.json$|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
-          emit_component postgres_agent "$postgres_agent_exists" '^crates/(pgshard-agent|pgshard-types|pgshard-version)/|^crates/pgshard-catalog/migrations/0001_shardschema\.sql$|^extensions/pgshard_fence/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^\.cargo/|^\.dockerignore$|^deploy/(docker-bake\.hcl|images/rust\.Dockerfile|images/quarantine\.pg_hba\.conf|images/replication-bootstrap-primary\.pg_hba\.conf)$|^Makefile$|^\.github/workflows/ci\.yml$'
+          emit_component postgres_agent "$postgres_agent_exists" '^crates/(pgshard-agent|pgshard-types|pgshard-version)/|^crates/pgshard-catalog/migrations/0001_shardschema\.sql$|^extensions/pgshard_fence/|^patches/postgresql/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^\.cargo/|^\.dockerignore$|^deploy/(docker-bake\.hcl|images/rust\.Dockerfile|images/quarantine\.pg_hba\.conf|images/replication-bootstrap-primary\.pg_hba\.conf)$|^Makefile$|^\.github/workflows/ci\.yml$'
           emit_component catalog "$catalog_exists" '^crates/pgshard-catalog/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component orch_catalog "$orch_catalog_exists" '^crates/(pgshard-orch|pgshard-catalog|pgshard-types)/|^operator/internal/tuning/|^contracts/replication-slot-names\.json$|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
           emit_component pgwire "$pgwire_exists" '^crates/pgshard-pgwire/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
@@ -151,7 +151,7 @@ jobs:
           emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/workflows/'
           emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/workflows/'
           emit_component integration "$integration_exists" '^tests/integration/|^crates/|^operator/|^proto/|^Makefile$|^\.github/workflows/'
-          emit_component images "$images_exists" '^deploy/|^extensions/|^Dockerfile|/Dockerfile$|^\.dockerignore$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
+          emit_component images "$images_exists" '^deploy/|^extensions/|^patches/postgresql/|^Dockerfile|/Dockerfile$|^\.dockerignore$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
           emit_component kind "$kind_exists" '^tests/e2e/|^deploy/|^charts/|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
           emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^Makefile$|^\.github/workflows/'
           current_website_exists=false
@@ -878,7 +878,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.postgres_agent == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -908,6 +908,10 @@ jobs:
           test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$PGSHARD_BUILD_VERSION"
           test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$PGSHARD_GIT_SHA"
           test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" | sed -n 's/^PG_MAJOR=//p')" = "18"
+          docker run --rm --platform linux/amd64 --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint /usr/lib/postgresql/18/bin/postgres "$image" --version | \
+            grep --fixed-strings '18.4 (Debian 18.4-1.pgdg13+1)'
           expected_migration_sha="$(sha256sum crates/pgshard-catalog/migrations/0001_shardschema.sql | awk '{print $1}')"
           image_migration_sha="$(docker run --rm --platform linux/amd64 --network none --read-only \
             --cap-drop ALL --security-opt no-new-privileges \
@@ -929,7 +933,7 @@ jobs:
           docker run --rm --platform linux/amd64 --network none --read-only \
             --cap-drop ALL --security-opt no-new-privileges \
             "$image" --help >/dev/null
-      - name: Exercise the fail-closed PostgreSQL target fence
+      - name: Exercise upstream PostgreSQL and the fail-closed target fence
         env:
           PGSHARD_AGENT_RUNTIME_TEST_IMAGE: pgshard/postgres-agent:ci
         run: make agent-target-fence-test

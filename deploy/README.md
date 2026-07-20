@@ -92,9 +92,11 @@ untracked source changes are present. Source archives must provide
 identity variables; the Bake definition rejects missing and all-zero identity.
 
 The files are written under `artifacts/images/`. The `postgres-agent` archive
-contains PostgreSQL 18, the Rust agent, and the read-only source catalog
-migration so initialization and lifecycle tests can exercise the real
-postmaster without publishing an image. The bake definition has no
+contains the exact source-pinned PostgreSQL 18.4 fence-core build documented in
+`extensions/pgshard_fence/README.md`, the matching fence extension, the Rust
+agent, and the read-only source catalog migration so initialization and
+lifecycle tests can exercise the real postmaster without publishing an image.
+The bake definition has no
 registry output or push target. The generic CI image job builds the four
 unprivileged/supporting archives, while the lifecycle and manager jobs each
 build the PostgreSQL image for their independent contracts. They load images

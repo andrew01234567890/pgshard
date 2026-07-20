@@ -1,0 +1,234 @@
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 47c04f2..3858cca 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -7025,7 +7025,10 @@ CreateCheckPoint(int flags)
+ 	 * enable XLogInsertAllowed.
+ 	 */
+ 	if (flags & CHECKPOINT_END_OF_RECOVERY)
++	{
+ 		oldXLogAllowed = LocalSetXLogInsertAllowed();
++		PgshardFenceRecoveryWalAllowed = true;
++	}
+ 
+ 	checkPoint.ThisTimeLineID = XLogCtl->InsertTimeLineID;
+ 	if (flags & CHECKPOINT_END_OF_RECOVERY)
+@@ -7265,7 +7268,10 @@ CreateCheckPoint(int flags)
+ 	if (shutdown)
+ 	{
+ 		if (flags & CHECKPOINT_END_OF_RECOVERY)
++		{
+ 			LocalXLogInsertAllowed = oldXLogAllowed;
++			PgshardFenceRecoveryWalAllowed = false;
++		}
+ 		else
+ 			LocalXLogInsertAllowed = 0; /* never again write WAL */
+ 	}
+diff --git a/src/backend/access/transam/xloginsert.c b/src/backend/access/transam/xloginsert.c
+index 5ee9d0b..c921f0d 100644
+--- a/src/backend/access/transam/xloginsert.c
++++ b/src/backend/access/transam/xloginsert.c
+@@ -488,6 +488,18 @@ XLogInsert(RmgrId rmid, uint8 info)
+ 				  XLR_CHECK_CONSISTENCY)) != 0)
+ 		elog(PANIC, "invalid xlog info mask %02X", info);
+ 
++	/*
++	 * Complete crash recovery even while the writable fence is closed, but
++	 * never begin a new primary WAL record without current authority.  Most
++	 * callers are already inside a critical section, so PANIC is intentional:
++	 * recovery is safer than allowing a page change without its WAL record.
++	 */
++	if (!AmStartupProcess() && !RecoveryInProgress() &&
++		!PgshardFenceRecoveryWalAllowed &&
++		unlikely(PgshardFenceWalInsertHook != NULL) &&
++		PgshardFenceWalInsertHook() != PGSHARD_FENCE_AUTHORITY_ALLOWED)
++		elog(PANIC, "pgshard writable authority does not permit WAL insertion");
++
+ 	TRACE_POSTGRESQL_WAL_INSERT(rmid, info);
+ 
+ 	/*
+diff --git a/src/backend/postmaster/autovacuum.c b/src/backend/postmaster/autovacuum.c
+index 66620fb..c41b410 100644
+--- a/src/backend/postmaster/autovacuum.c
++++ b/src/backend/postmaster/autovacuum.c
+@@ -554,7 +554,10 @@ AutoVacLauncherMain(const void *startup_data, size_t startup_data_len)
+ 	if (!AutoVacuumingActive())
+ 	{
+ 		if (!ShutdownRequestPending)
++		{
++			CHECK_FOR_INTERRUPTS();
+ 			do_start_worker();
++		}
+ 		proc_exit(0);			/* done */
+ 	}
+ 
+@@ -746,6 +749,8 @@ AutoVacLauncherMain(const void *startup_data, size_t startup_data_len)
+ static void
+ ProcessAutoVacLauncherInterrupts(void)
+ {
++	CHECK_FOR_INTERRUPTS();
++
+ 	/* the normal shutdown case */
+ 	if (ShutdownRequestPending)
+ 		AutoVacLauncherShutdown();
+@@ -798,6 +803,14 @@ AutoVacLauncherShutdown(void)
+ 	proc_exit(0);				/* done */
+ }
+ 
++/* Private pgshard fence ABI: preserve the launcher's normal shared cleanup. */
++void
++PgshardFenceAutoVacLauncherShutdown(void)
++{
++	Assert(AmAutoVacuumLauncherProcess());
++	AutoVacLauncherShutdown();
++}
++
+ /*
+  * Determine the time to sleep, based on the database list.
+  *
+@@ -1577,6 +1590,7 @@ AutoVacWorkerMain(const void *startup_data, size_t startup_data_len)
+ 					 INIT_PG_OVERRIDE_ALLOW_CONNS,
+ 					 dbname);
+ 		SetProcessingMode(NormalProcessing);
++		CHECK_FOR_INTERRUPTS();
+ 		set_ps_display(dbname);
+ 		ereport(DEBUG1,
+ 				(errmsg_internal("autovacuum: processing database \"%s\"", dbname)));
+diff --git a/src/backend/postmaster/bgworker.c b/src/backend/postmaster/bgworker.c
+index 2a3c5b6..e02fb00 100644
+--- a/src/backend/postmaster/bgworker.c
++++ b/src/backend/postmaster/bgworker.c
+@@ -823,6 +823,9 @@ BackgroundWorkerMain(const void *startup_data, size_t startup_data_len)
+ 	 * Early initialization.
+ 	 */
+ 	BaseInit();
++
++	if (unlikely(PgshardFenceInterruptHook != NULL))
++		PgshardFenceInterruptHook();
+ 
+ 	/*
+ 	 * Look up the entry point function, loading its library if necessary.
+diff --git a/src/backend/postmaster/checkpointer.c b/src/backend/postmaster/checkpointer.c
+index 3914ac8..52d04f8 100644
+--- a/src/backend/postmaster/checkpointer.c
++++ b/src/backend/postmaster/checkpointer.c
+@@ -283,6 +283,7 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
+ 		pgaio_error_cleanup();
+ 		UnlockBuffers();
+ 		ReleaseAuxProcessResources(false);
++		PgshardFenceRecoveryWalAllowed = false;
+ 		AtEOXact_Buffers(false);
+ 		AtEOXact_SMgr();
+ 		AtEOXact_Files(false);
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 5124d39..9f83d14 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -3311,6 +3311,8 @@ LaunchMissingBackgroundProcesses(void)
+ 	 * physical files are put in place.
+ 	 */
+ 	if (!IsBinaryUpgrade && AutoVacLauncherPMChild == NULL &&
++		(PgshardFenceWalInsertHook == NULL ||
++		 PgshardFenceWalInsertHook() == PGSHARD_FENCE_AUTHORITY_ALLOWED) &&
+ 		(AutoVacuumingActive() || start_autovac_launcher) &&
+ 		pmState == PM_RUN)
+ 	{
+@@ -4227,6 +4229,19 @@ maybe_start_bgworkers(void)
+ 		HaveCrashedWorker = false;
+ 		return;
+ 	}
++	if (!RecoveryInProgress() && PgshardFenceWalInsertHook != NULL)
++	{
++		PgshardFenceAuthorityStatus fence_status = PgshardFenceWalInsertHook();
++
++		if (fence_status == PGSHARD_FENCE_AUTHORITY_RETRY)
++			return;
++		if (fence_status != PGSHARD_FENCE_AUTHORITY_ALLOWED)
++		{
++			StartWorkerNeeded = false;
++			HaveCrashedWorker = false;
++			return;
++		}
++	}
+ 
+ 	/* Don't need to be called again unless we find a reason for it below */
+ 	StartWorkerNeeded = false;
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index 115a634..ab5b88c 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -3301,6 +3301,8 @@ ProcessInterrupts(void)
+ 	/* OK to accept any interrupts now? */
+ 	if (InterruptHoldoffCount != 0 || CritSectionCount != 0)
+ 		return;
++	if (unlikely(PgshardFenceInterruptHook != NULL))
++		PgshardFenceInterruptHook();
+ 	InterruptPending = false;
+ 
+ 	if (ProcDiePending)
+diff --git a/src/backend/utils/init/globals.c b/src/backend/utils/init/globals.c
+index d31cb45..bf66e72 100644
+--- a/src/backend/utils/init/globals.c
++++ b/src/backend/utils/init/globals.c
+@@ -44,6 +44,11 @@ volatile uint32 InterruptHoldoffCount = 0;
+ volatile uint32 QueryCancelHoldoffCount = 0;
+ volatile uint32 CritSectionCount = 0;
+ 
++const uint32 PgshardFenceCoreAbi = PGSHARD_FENCE_CORE_ABI;
++PgshardFenceInterruptHookType PgshardFenceInterruptHook = NULL;
++PgshardFenceWalInsertHookType PgshardFenceWalInsertHook = NULL;
++bool		PgshardFenceRecoveryWalAllowed = false;
++
+ int			MyProcPid;
+ pg_time_t	MyStartTime;
+ TimestampTz MyStartTimestamp;
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index 9a7d733..7068a0f 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -108,6 +108,24 @@ extern PGDLLIMPORT volatile uint32 CritSectionCount;
+ /* in tcop/postgres.c */
+ extern void ProcessInterrupts(void);
+ 
++/*
++ * Private ABI for the pgshard PostgreSQL 18 runtime image.  The matching
++ * shared-preload library refuses to build or load without this exact ABI.
++ */
++#define PGSHARD_FENCE_CORE_ABI 1
++typedef void (*PgshardFenceInterruptHookType) (void);
++typedef enum PgshardFenceAuthorityStatus
++{
++	PGSHARD_FENCE_AUTHORITY_DENIED = 0,
++	PGSHARD_FENCE_AUTHORITY_ALLOWED,
++	PGSHARD_FENCE_AUTHORITY_RETRY,
++} PgshardFenceAuthorityStatus;
++typedef PgshardFenceAuthorityStatus (*PgshardFenceWalInsertHookType) (void);
++extern PGDLLIMPORT const uint32 PgshardFenceCoreAbi;
++extern PGDLLIMPORT PgshardFenceInterruptHookType PgshardFenceInterruptHook;
++extern PGDLLIMPORT PgshardFenceWalInsertHookType PgshardFenceWalInsertHook;
++extern PGDLLIMPORT bool PgshardFenceRecoveryWalAllowed;
++
+ /* Test whether an interrupt is pending */
+ #ifndef WIN32
+ #define INTERRUPTS_PENDING_CONDITION() \
+@@ -122,6 +141,8 @@ extern void ProcessInterrupts(void);
+ /* Service interrupt, if one is pending and it's safe to service it now */
+ #define CHECK_FOR_INTERRUPTS() \
+ do { \
++	if (unlikely(PgshardFenceInterruptHook != NULL)) \
++		PgshardFenceInterruptHook(); \
+ 	if (INTERRUPTS_PENDING_CONDITION()) \
+ 		ProcessInterrupts(); \
+ } while(0)
+diff --git a/src/include/postmaster/autovacuum.h b/src/include/postmaster/autovacuum.h
+index e8135f4..62f945e 100644
+--- a/src/include/postmaster/autovacuum.h
++++ b/src/include/postmaster/autovacuum.h
+@@ -60,6 +60,7 @@ extern void AutoVacWorkerFailed(void);
+ 
+ pg_noreturn extern void AutoVacLauncherMain(const void *startup_data, size_t startup_data_len);
+ pg_noreturn extern void AutoVacWorkerMain(const void *startup_data, size_t startup_data_len);
++pg_noreturn extern void PgshardFenceAutoVacLauncherShutdown(void);
+ 
+ extern bool AutoVacuumRequestWork(AutoVacuumWorkItemType type,
+ 								  Oid relationId, BlockNumber blkno);

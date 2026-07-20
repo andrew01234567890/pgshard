@@ -75,10 +75,10 @@ RUN rm -f /etc/apt/sources.list.d/pgdg.list && \
       bison build-essential ca-certificates curl flex libcurl4-openssl-dev \
       libicu-dev libkrb5-dev libldap2-dev liblz4-dev libpam0g-dev \
       libreadline-dev libssl-dev liburing-dev libxml2-dev libzstd-dev \
-      pkg-config uuid-dev zlib1g-dev && \
-    rm -rf /var/lib/apt/lists/* && \
+      patch pkg-config uuid-dev zlib1g-dev && \
     test "$(dpkg-query --show --showformat='${Version}' postgresql-18)" = \
-      '18.4-1.pgdg13+1'
+      '18.4-1.pgdg13+1' && \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /src/postgresql
 RUN curl --fail --location --silent --show-error \
       "https://ftp.postgresql.org/pub/source/v18.4/postgresql-18.4.tar.gz" \
@@ -89,7 +89,9 @@ RUN curl --fail --location --silent --show-error \
     tar --extract --gzip --file /tmp/postgresql.tar.gz --strip-components=1 && \
     grep --fixed-strings --line-regexp \
       'AC_INIT([PostgreSQL], [18.4], [pgsql-bugs@lists.postgresql.org], [], [https://www.postgresql.org/])' \
-      configure.ac && \
+      configure.ac
+COPY patches/postgresql/f5cc81719e6da4cbdb1f797c48b693e91018153a-pgshard-fence.patch /src/postgresql/pgshard-fence.patch
+RUN patch --batch --forward --fuzz=0 --strip=1 --input=pgshard-fence.patch && \
     CFLAGS='-O2 -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fno-omit-frame-pointer' \
     CPPFLAGS='-D_FORTIFY_SOURCE=2' \
     LDFLAGS='-Wl,-z,relro -Wl,-z,now' \
@@ -107,10 +109,19 @@ RUN curl --fail --location --silent --show-error \
     make --jobs="$(nproc)" && \
     make install && \
     /usr/lib/postgresql/18/bin/postgres --version | \
-      grep --fixed-strings '18.4 (Debian 18.4-1.pgdg13+1)'
+      grep --fixed-strings '18.4 (Debian 18.4-1.pgdg13+1)' && \
+    nm --dynamic /usr/lib/postgresql/18/bin/postgres | grep --fixed-strings 'PgshardFenceCoreAbi' && \
+    install -D -m 0755 /usr/lib/postgresql/18/bin/postgres /out/usr/lib/postgresql/18/bin/postgres
 COPY extensions/pgshard_fence /src/pgshard_fence
 RUN make -C /src/pgshard_fence PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config && \
     make -C /src/pgshard_fence install DESTDIR=/out PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+
+FROM postgres-fence-build AS postgres-core-check
+
+RUN chown -R postgres:postgres /src/postgresql && \
+    gosu postgres make check && \
+    printf '%s\n' 'PostgreSQL 18.4 core regression check passed' \
+      >/out/postgres-core-check.ok
 
 FROM docker.io/library/postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a AS postgres-agent
 
@@ -124,6 +135,7 @@ LABEL org.opencontainers.image.source="https://github.com/andrew01234567890/pgsh
 COPY --from=postgres-agent-build --chown=0:0 /out/pgshard-agent /usr/local/bin/pgshard-agent
 COPY --from=postgres-agent-build --chown=0:0 /out/pgshard-catalog-material-digest /usr/local/bin/pgshard-catalog-material-digest
 COPY --from=postgres-agent-build --chown=0:0 /out/pgshard-scram-verifier /usr/local/bin/pgshard-scram-verifier
+COPY --from=postgres-fence-build --chown=0:0 /out/usr/lib/postgresql/18/bin/postgres /usr/lib/postgresql/18/bin/postgres
 COPY --from=postgres-fence-build --chown=0:0 /out/usr/lib/postgresql/18/lib/pgshard_fence.so /usr/lib/postgresql/18/lib/pgshard_fence.so
 COPY --from=postgres-fence-build --chown=0:0 /out/usr/share/postgresql/18/extension/pgshard_fence.control /usr/share/postgresql/18/extension/pgshard_fence.control
 COPY --from=postgres-fence-build --chown=0:0 /out/usr/share/postgresql/18/extension/pgshard_fence--1.0.sql /usr/share/postgresql/18/extension/pgshard_fence--1.0.sql
@@ -138,5 +150,6 @@ ENTRYPOINT ["/usr/local/bin/pgshard-agent"]
 
 FROM postgres-agent AS postgres-fence-test-runner
 
+COPY --from=postgres-core-check --chown=0:0 /out/postgres-core-check.ok /usr/share/pgshard/postgres-core-check.ok
 COPY --from=postgres-fence-test-build --chown=0:0 /out/pgshard-agent-tests /usr/local/bin/pgshard-agent-tests
 ENTRYPOINT ["/usr/local/bin/pgshard-agent-tests"]
