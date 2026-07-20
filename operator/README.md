@@ -253,16 +253,28 @@ Shard-0000 bootstrap also creates one fixed `pgshard_pooler_catalog` login with
 only the catalog reader role, proves that the immutable Secret password matches
 its SCRAM verifier, and replaces restored or edited `pg_hba.conf` rules with an
 operator-owned order that rejects plaintext catalog access and every other use
-of that login. The verifier is generated in the bootstrap image from bounded
+of that login. A second unpredictably named immutable Secret separately stages
+the future orchestrator writer password. Its API UID and a digest over that
+password plus the existing catalog CA are checkpointed before singleton
+shard-0000 bootstrap can consume it. Bootstrap creates the fixed
+`pgshard_orchestrator_catalog` login through a crash-recoverable `NOLOGIN`
+shape, grants only the nondelegable `pgshard_operation_writer` membership,
+installs the same bounded session policy, and proves SCRAM authentication,
+operation-routine execution, and raw-table denial before publishing its
+TLS-only HBA rule. The writer Secret is never mounted into PostgreSQL, the
+pooler, or the orchestrator; multi-member topology only stages it until a
+serving catalog exists, and the durable orchestrator connector remains
+uncomposed. The verifiers are generated in the bootstrap image from bounded
 stdin and installed as an extended-protocol bind value; neither the plaintext
-password nor verifier appears in PostgreSQL query text. Bootstrap sessions also
+passwords nor verifiers appear in PostgreSQL query text. Bootstrap sessions also
 force and verify `synchronous_commit=on`, `zero_damaged_pages=off`, and
 `ignore_checksum_failure=off` above restored database and role defaults before
 the first catalog scan. The running shard-0000 PostgreSQL process serves the ready-only
 catalog Service over TLS 1.3. Poolers receive only the password and CA
 certificate; PostgreSQL receives only the serving certificate and key; the
-bootstrap init container temporarily receives both retained projections so it
-can verify their checkpointed SHA-256 values before touching PGDATA. The CA
+bootstrap init container temporarily receives the reader, writer, and server
+projections so it can verify their checkpointed SHA-256 values before touching
+PGDATA. The CA
 private key is discarded after issuance and is never stored in Kubernetes.
 In the one-member development slice, the read-write Service exposes only the
 documented shard-zero compatibility relay; read-only, any-instance, HA routing,

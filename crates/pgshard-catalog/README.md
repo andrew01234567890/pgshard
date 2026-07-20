@@ -71,9 +71,12 @@ COMMIT response remains outcome-unknown and is reconciled only by retrying the
 exact request on a fresh session. Raw envelopes, payloads, status rows, and
 tombstones are hidden from reader and administrator roles. A fixed NOLOGIN
 `pgshard_operation_writer` role can execute only the security-definer accept
-and bounded get routines and has no direct table access. No login credential,
-orchestrator connector, endpoint, operation execution, or recovery loop is
-composed yet, so orchestrator `persistence_enabled` truthfully remains false.
+and bounded get routines and has no direct table access. The operator stages a
+separate immutable credential and singleton bootstrap creates and authenticates
+one fixed login that inherits only this role; that credential is not mounted by
+the orchestrator. No writer connector, endpoint, operation execution, or
+recovery loop is composed yet, so orchestrator `persistence_enabled` truthfully
+remains false.
 
 The migration expects a pre-created UTF8 database, a short-lived superuser
 bootstrap principal, and an external connection gate that prevents new

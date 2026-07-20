@@ -135,6 +135,177 @@ BEGIN
             catalog_relation.relname
         );
     END LOOP;
+
+    -- A released operator may provision exactly one login for the otherwise
+    -- NOLOGIN operation-writer group. Reapplication accepts only that fixed,
+    -- non-owning and nondelegable role with the canonical database-local
+    -- session policy. The only intermediate shape is a NOLOGIN role with no
+    -- verifier; bootstrap subsequently installs and proves its exact Secret
+    -- password before publishing a serving HBA.
+    IF EXISTS (
+        SELECT
+          FROM pg_catalog.pg_authid AS roles
+         WHERE roles.rolname = 'pgshard_orchestrator_catalog'
+           AND (
+               roles.rolsuper
+               OR NOT roles.rolinherit
+               OR roles.rolcreaterole
+               OR roles.rolcreatedb
+               OR roles.rolreplication
+               OR roles.rolbypassrls
+               OR roles.rolconnlimit <> -1
+               OR NOT (
+                   (
+                       roles.rolcanlogin
+                       AND roles.rolpassword LIKE 'SCRAM-SHA-256$4096:%'
+                   )
+                   OR (
+                       NOT roles.rolcanlogin
+                       AND roles.rolpassword IS NULL
+                   )
+               )
+               OR roles.rolvaliduntil IS NOT NULL
+               OR NOT EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_database AS databases
+                     JOIN pg_catalog.pg_db_role_setting AS settings
+                       ON settings.setdatabase = databases.oid
+                      AND settings.setrole = roles.oid
+                    WHERE databases.datname = 'shardschema'
+                      AND settings.setconfig = ARRAY[
+                          'search_path=pg_catalog',
+                          'statement_timeout=30s',
+                          'lock_timeout=5s',
+                          'transaction_timeout=120s',
+                          'idle_in_transaction_session_timeout=30s',
+                          'default_transaction_read_only=off',
+                          'row_security=off',
+                          'synchronous_commit=on',
+                          'zero_damaged_pages=off',
+                          'ignore_checksum_failure=off',
+                          'jit=off'
+                      ]::text[]
+               )
+               OR EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_db_role_setting AS settings
+                    WHERE settings.setrole = roles.oid
+                      AND NOT EXISTS (
+                          SELECT
+                            FROM pg_catalog.pg_database AS databases
+                           WHERE databases.datname = 'shardschema'
+                             AND (settings.setdatabase, settings.setrole) =
+                                 (databases.oid, roles.oid)
+                      )
+               )
+               OR (
+                   SELECT pg_catalog.count(*)
+                     FROM pg_catalog.pg_auth_members AS memberships
+                    WHERE memberships.member = roles.oid
+               ) <> 1
+               OR NOT EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_auth_members AS memberships
+                     JOIN pg_catalog.pg_roles AS granted_roles
+                       ON granted_roles.oid = memberships.roleid
+                    WHERE memberships.member = roles.oid
+                      AND granted_roles.rolname = 'pgshard_operation_writer'
+                      AND memberships.grantor = (
+                          SELECT principals.oid
+                            FROM pg_catalog.pg_roles AS principals
+                           WHERE principals.rolname = current_user
+                      )
+                      AND NOT memberships.admin_option
+                      AND memberships.inherit_option
+                      AND NOT memberships.set_option
+               )
+               OR EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_auth_members AS memberships
+                    WHERE memberships.roleid = roles.oid
+               )
+               OR EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_database AS databases
+                    WHERE databases.datdba = roles.oid
+               )
+               OR EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_tablespace AS tablespaces
+                    WHERE tablespaces.spcowner = roles.oid
+               )
+               OR EXISTS (
+                   SELECT
+                     FROM (
+                         SELECT namespaces.nspowner AS owner
+                           FROM pg_catalog.pg_namespace AS namespaces
+                         UNION ALL
+                         SELECT relations.relowner
+                           FROM pg_catalog.pg_class AS relations
+                         UNION ALL
+                         SELECT routines.proowner
+                           FROM pg_catalog.pg_proc AS routines
+                         UNION ALL
+                         SELECT types.typowner
+                           FROM pg_catalog.pg_type AS types
+                     ) AS owned_objects
+                    WHERE owned_objects.owner = roles.oid
+               )
+               OR EXISTS (
+                   SELECT
+                     FROM (
+                         SELECT acl.grantee
+                           FROM pg_catalog.pg_namespace AS namespaces
+                           CROSS JOIN LATERAL pg_catalog.aclexplode(namespaces.nspacl) AS acl
+                          WHERE namespaces.nspname = 'pgshard_catalog'
+                         UNION ALL
+                         SELECT acl.grantee
+                           FROM pg_catalog.pg_class AS relations
+                           JOIN pg_catalog.pg_namespace AS namespaces
+                             ON namespaces.oid = relations.relnamespace
+                           CROSS JOIN LATERAL pg_catalog.aclexplode(relations.relacl) AS acl
+                          WHERE namespaces.nspname = 'pgshard_catalog'
+                         UNION ALL
+                         SELECT acl.grantee
+                           FROM pg_catalog.pg_attribute AS attributes
+                           JOIN pg_catalog.pg_class AS relations
+                             ON relations.oid = attributes.attrelid
+                           JOIN pg_catalog.pg_namespace AS namespaces
+                             ON namespaces.oid = relations.relnamespace
+                           CROSS JOIN LATERAL pg_catalog.aclexplode(attributes.attacl) AS acl
+                          WHERE namespaces.nspname = 'pgshard_catalog'
+                         UNION ALL
+                         SELECT acl.grantee
+                           FROM pg_catalog.pg_proc AS routines
+                           JOIN pg_catalog.pg_namespace AS namespaces
+                             ON namespaces.oid = routines.pronamespace
+                           CROSS JOIN LATERAL pg_catalog.aclexplode(routines.proacl) AS acl
+                          WHERE namespaces.nspname = 'pgshard_catalog'
+                         UNION ALL
+                         SELECT acl.grantee
+                           FROM pg_catalog.pg_type AS types
+                           JOIN pg_catalog.pg_namespace AS namespaces
+                             ON namespaces.oid = types.typnamespace
+                           CROSS JOIN LATERAL pg_catalog.aclexplode(types.typacl) AS acl
+                          WHERE namespaces.nspname = 'pgshard_catalog'
+                         UNION ALL
+                         SELECT acl.grantee
+                           FROM pg_catalog.pg_default_acl AS defaults
+                           CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS acl
+                     ) AS direct_grants
+                    WHERE direct_grants.grantee = roles.oid
+               )
+               OR EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_default_acl AS defaults
+                    WHERE defaults.defaclrole = roles.oid
+               )
+           )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing pgshard_orchestrator_catalog role has unsafe attributes';
+    END IF;
 END
 $pgshard_lock_existing_catalog_relations$;
 
@@ -1183,6 +1354,363 @@ BEGIN
 END
 $pgshard_role_bootstrap$;
 
+-- The operation-writer login is network reachable after bootstrap.  Its fixed
+-- group membership is therefore insufficient unless the dedicated database
+-- also excludes restored executable objects and every privilege or ownership
+-- dependency outside the released catalog surface.  In particular, a
+-- SECURITY DEFINER routine outside pgshard_catalog is executable by PUBLIC by
+-- default and could otherwise turn the bounded writer into its superuser
+-- owner.  Temporary objects are session-private and cannot be reached by the
+-- separately authenticated writer session.
+DO $pgshard_writer_escape_surfaces$
+DECLARE
+    current_database_oid oid;
+    unsafe_surface text;
+BEGIN
+    SELECT databases.oid
+      INTO STRICT current_database_oid
+      FROM pg_catalog.pg_database AS databases
+     WHERE databases.datname = pg_catalog.current_database();
+
+    SELECT surfaces.identity
+      INTO unsafe_surface
+      FROM (
+          SELECT relations.oid AS object_oid,
+                 pg_catalog.format(
+                     'relation %I.%I',
+                     namespaces.nspname,
+                     relations.relname
+                 ) AS identity
+            FROM pg_catalog.pg_class AS relations
+            JOIN pg_catalog.pg_namespace AS namespaces
+              ON namespaces.oid = relations.relnamespace
+           WHERE relations.oid >= 16384
+             AND namespaces.nspname <> 'pgshard_catalog'
+             AND namespaces.nspname !~ '^pg_(temp|toast_temp)_[0-9]+$'
+             AND NOT (
+                 namespaces.nspname = 'pg_toast'
+                 AND (
+                     (
+                         relations.relkind = 't'
+                         AND EXISTS (
+                             SELECT
+                               FROM pg_catalog.pg_class AS base_relations
+                              WHERE base_relations.reltoastrelid = relations.oid
+                         )
+                     )
+                     OR (
+                         relations.relkind = 'i'
+                         AND EXISTS (
+                             SELECT
+                               FROM pg_catalog.pg_index AS indexes
+                               JOIN pg_catalog.pg_class AS toast_relations
+                                 ON toast_relations.oid = indexes.indrelid
+                              WHERE indexes.indexrelid = relations.oid
+                                AND toast_relations.relkind = 't'
+                                AND EXISTS (
+                                    SELECT
+                                      FROM pg_catalog.pg_class AS base_relations
+                                     WHERE base_relations.reltoastrelid =
+                                               toast_relations.oid
+                                )
+                         )
+                     )
+                 )
+             )
+          UNION ALL
+          SELECT routines.oid,
+                 pg_catalog.format(
+                     'routine %I.%I',
+                     namespaces.nspname,
+                     routines.proname
+                 )
+            FROM pg_catalog.pg_proc AS routines
+            JOIN pg_catalog.pg_namespace AS namespaces
+              ON namespaces.oid = routines.pronamespace
+           WHERE routines.oid >= 16384
+             AND namespaces.nspname <> 'pgshard_catalog'
+             AND namespaces.nspname !~ '^pg_(temp|toast_temp)_[0-9]+$'
+          UNION ALL
+          SELECT types.oid,
+                 pg_catalog.format(
+                     'type %I.%I',
+                     namespaces.nspname,
+                     types.typname
+                 )
+            FROM pg_catalog.pg_type AS types
+            JOIN pg_catalog.pg_namespace AS namespaces
+              ON namespaces.oid = types.typnamespace
+           WHERE types.oid >= 16384
+             AND namespaces.nspname <> 'pgshard_catalog'
+             AND namespaces.nspname !~ '^pg_(temp|toast_temp)_[0-9]+$'
+      ) AS surfaces
+     ORDER BY surfaces.object_oid, surfaces.identity
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing shardschema contains an unmanaged executable object',
+            DETAIL = unsafe_surface;
+    END IF;
+
+    -- PUBLIC may retain only the stock, nondelegable system-catalog reads and
+    -- namespace/language usage.  pg_init_privs supplies the immutable initdb
+    -- baseline for pg_catalog relations, columns, and routines; user objects
+    -- were rejected above.
+    SELECT public_grants.identity
+      INTO unsafe_surface
+      FROM (
+          SELECT relations.oid AS object_oid,
+                 pg_catalog.format(
+                     'relation %I.%I privilege %s',
+                     namespaces.nspname,
+                     relations.relname,
+                     acl.privilege_type
+                 ) AS identity
+            FROM pg_catalog.pg_class AS relations
+            JOIN pg_catalog.pg_namespace AS namespaces
+              ON namespaces.oid = relations.relnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(relations.relacl) AS acl
+           WHERE acl.grantee = 0
+             AND (
+                 (namespaces.nspname = 'pg_catalog' AND NOT EXISTS (
+                     SELECT
+                       FROM pg_catalog.pg_init_privs AS initial
+                       CROSS JOIN LATERAL
+                            pg_catalog.aclexplode(initial.initprivs) AS initial_acl
+                      WHERE initial.classoid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                        AND initial.objoid = relations.oid
+                        AND initial.objsubid = 0
+                        AND initial.privtype = 'i'
+                        AND initial_acl.grantee = 0
+                        AND initial_acl.privilege_type = acl.privilege_type
+                        AND initial_acl.is_grantable = acl.is_grantable
+                 ))
+                 OR (namespaces.nspname = 'information_schema'
+                     AND (acl.privilege_type <> 'SELECT' OR acl.is_grantable))
+                 OR namespaces.nspname NOT IN ('pg_catalog', 'information_schema')
+             )
+          UNION ALL
+          SELECT relations.oid,
+                 pg_catalog.format(
+                     'column %I.%I.%I privilege %s',
+                     namespaces.nspname,
+                     relations.relname,
+                     attributes.attname,
+                     acl.privilege_type
+                 )
+            FROM pg_catalog.pg_attribute AS attributes
+            JOIN pg_catalog.pg_class AS relations
+              ON relations.oid = attributes.attrelid
+            JOIN pg_catalog.pg_namespace AS namespaces
+              ON namespaces.oid = relations.relnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(attributes.attacl) AS acl
+           WHERE namespaces.nspname = 'pg_catalog'
+             AND acl.grantee = 0
+             AND NOT EXISTS (
+                 SELECT
+                   FROM pg_catalog.pg_init_privs AS initial
+                   CROSS JOIN LATERAL
+                        pg_catalog.aclexplode(initial.initprivs) AS initial_acl
+                  WHERE initial.classoid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                    AND initial.objoid = relations.oid
+                    AND initial.objsubid = attributes.attnum
+                    AND initial.privtype = 'i'
+                    AND initial_acl.grantee = 0
+                    AND initial_acl.privilege_type = acl.privilege_type
+                    AND initial_acl.is_grantable = acl.is_grantable
+             )
+          UNION ALL
+          SELECT routines.oid,
+                 pg_catalog.format(
+                     'routine %I.%I privilege %s',
+                     namespaces.nspname,
+                     routines.proname,
+                     acl.privilege_type
+                 )
+            FROM pg_catalog.pg_proc AS routines
+            JOIN pg_catalog.pg_namespace AS namespaces
+              ON namespaces.oid = routines.pronamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(routines.proacl) AS acl
+           WHERE namespaces.nspname = 'pg_catalog'
+             AND acl.grantee = 0
+             AND NOT EXISTS (
+                 SELECT
+                   FROM pg_catalog.pg_init_privs AS initial
+                   CROSS JOIN LATERAL
+                        pg_catalog.aclexplode(initial.initprivs) AS initial_acl
+                  WHERE initial.classoid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                    AND initial.objoid = routines.oid
+                    AND initial.objsubid = 0
+                    AND initial.privtype = 'i'
+                    AND initial_acl.grantee = 0
+                    AND initial_acl.privilege_type = acl.privilege_type
+                    AND initial_acl.is_grantable = acl.is_grantable
+             )
+          UNION ALL
+          SELECT namespaces.oid,
+                 pg_catalog.format(
+                     'schema %I privilege %s',
+                     namespaces.nspname,
+                     acl.privilege_type
+                 )
+           FROM pg_catalog.pg_namespace AS namespaces
+            CROSS JOIN LATERAL pg_catalog.aclexplode(namespaces.nspacl) AS acl
+           WHERE acl.grantee = 0
+             AND (
+                 namespaces.nspname NOT IN (
+                     'pg_catalog',
+                     'information_schema',
+                     'public'
+                 )
+                 OR acl.privilege_type <> 'USAGE'
+                 OR acl.is_grantable
+             )
+          UNION ALL
+          SELECT databases.oid,
+                 pg_catalog.format(
+                     'database %I privilege %s',
+                     databases.datname,
+                     acl.privilege_type
+                 )
+            FROM pg_catalog.pg_database AS databases
+            CROSS JOIN LATERAL pg_catalog.aclexplode(databases.datacl) AS acl
+           WHERE databases.oid = current_database_oid
+             AND acl.grantee = 0
+             AND (acl.privilege_type NOT IN ('CONNECT', 'TEMPORARY') OR acl.is_grantable)
+          UNION ALL
+          SELECT languages.oid,
+                 pg_catalog.format(
+                     'language %I privilege %s',
+                     languages.lanname,
+                     acl.privilege_type
+                 )
+            FROM pg_catalog.pg_language AS languages
+            CROSS JOIN LATERAL pg_catalog.aclexplode(languages.lanacl) AS acl
+           WHERE acl.grantee = 0
+             AND (acl.privilege_type <> 'USAGE' OR acl.is_grantable)
+          UNION ALL
+          SELECT tablespaces.oid,
+                 pg_catalog.format(
+                     'tablespace %I privilege %s',
+                     tablespaces.spcname,
+                     acl.privilege_type
+                 )
+            FROM pg_catalog.pg_tablespace AS tablespaces
+            CROSS JOIN LATERAL pg_catalog.aclexplode(tablespaces.spcacl) AS acl
+           WHERE acl.grantee = 0
+          UNION ALL
+          SELECT wrappers.oid,
+                 pg_catalog.format(
+                     'foreign-data wrapper %I privilege %s',
+                     wrappers.fdwname,
+                     acl.privilege_type
+                 )
+            FROM pg_catalog.pg_foreign_data_wrapper AS wrappers
+            CROSS JOIN LATERAL pg_catalog.aclexplode(wrappers.fdwacl) AS acl
+           WHERE acl.grantee = 0
+          UNION ALL
+          SELECT servers.oid,
+                 pg_catalog.format(
+                     'foreign server %I privilege %s',
+                     servers.srvname,
+                     acl.privilege_type
+                 )
+            FROM pg_catalog.pg_foreign_server AS servers
+            CROSS JOIN LATERAL pg_catalog.aclexplode(servers.srvacl) AS acl
+           WHERE acl.grantee = 0
+          UNION ALL
+          SELECT parameters.oid,
+                 pg_catalog.format(
+                     'parameter %I privilege %s',
+                     parameters.parname,
+                     acl.privilege_type
+                 )
+            FROM pg_catalog.pg_parameter_acl AS parameters
+            CROSS JOIN LATERAL pg_catalog.aclexplode(parameters.paracl) AS acl
+           WHERE acl.grantee = 0
+          UNION ALL
+          SELECT large_objects.oid,
+                 pg_catalog.format(
+                     'large object %s privilege %s',
+                     large_objects.oid,
+                     acl.privilege_type
+                 )
+            FROM pg_catalog.pg_largeobject_metadata AS large_objects
+            CROSS JOIN LATERAL pg_catalog.aclexplode(large_objects.lomacl) AS acl
+           WHERE acl.grantee = 0
+      ) AS public_grants
+     ORDER BY public_grants.object_oid, public_grants.identity
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing shardschema grants PUBLIC an unsafe privilege',
+            DETAIL = unsafe_surface;
+    END IF;
+
+    -- pg_shdepend spans the current and other databases plus shared objects,
+    -- so this catches direct ACLs and ownership that a schema-local scan would
+    -- miss.  Only the released writer group's ACLs on the managed schema and
+    -- its fixed routines may survive; their exact shape is validated below.
+    SELECT pg_catalog.format(
+               '%s dependency on %s:%s',
+               roles.rolname,
+               dependencies.classid::pg_catalog.regclass,
+               dependencies.objid
+           )
+      INTO unsafe_surface
+      FROM pg_catalog.pg_shdepend AS dependencies
+      JOIN pg_catalog.pg_roles AS roles
+        ON roles.oid = dependencies.refobjid
+     WHERE dependencies.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+       AND roles.rolname IN (
+               'pgshard_operation_writer',
+               'pgshard_orchestrator_catalog'
+           )
+       AND NOT (
+           roles.rolname = 'pgshard_operation_writer'
+           AND dependencies.dbid = current_database_oid
+           AND dependencies.deptype = 'a'
+           AND (
+               (
+                   dependencies.classid =
+                       'pg_catalog.pg_namespace'::pg_catalog.regclass
+                   AND EXISTS (
+                       SELECT
+                         FROM pg_catalog.pg_namespace AS namespaces
+                        WHERE namespaces.oid = dependencies.objid
+                          AND namespaces.nspname = 'pgshard_catalog'
+                   )
+               )
+               OR (
+                   dependencies.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                   AND EXISTS (
+                       SELECT
+                         FROM pg_catalog.pg_proc AS routines
+                         JOIN pg_catalog.pg_namespace AS namespaces
+                           ON namespaces.oid = routines.pronamespace
+                        WHERE routines.oid = dependencies.objid
+                          AND namespaces.nspname = 'pgshard_catalog'
+                   )
+               )
+           )
+       )
+     ORDER BY roles.rolname,
+              dependencies.dbid,
+              dependencies.classid,
+              dependencies.objid,
+              dependencies.objsubid
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501',
+            MESSAGE = 'pre-existing operation writer has privileges or ownership outside the fixed catalog boundary',
+            DETAIL = unsafe_surface;
+    END IF;
+END
+$pgshard_writer_escape_surfaces$;
+
 DO $pgshard_roles$
 DECLARE
     role_name text;
@@ -1296,13 +1824,26 @@ BEGIN
     IF EXISTS (
         SELECT
           FROM pg_catalog.pg_auth_members AS memberships
+          JOIN pg_catalog.pg_roles AS member_roles
+            ON member_roles.oid = memberships.member
           JOIN pg_catalog.pg_roles AS granted_roles
             ON granted_roles.oid = memberships.roleid
          WHERE granted_roles.rolname = 'pgshard_operation_writer'
+           AND (
+               member_roles.rolname <> 'pgshard_orchestrator_catalog'
+               OR memberships.grantor <> (
+                   SELECT principals.oid
+                     FROM pg_catalog.pg_roles AS principals
+                    WHERE principals.rolname = current_user
+               )
+               OR memberships.admin_option
+               OR NOT memberships.inherit_option
+               OR memberships.set_option
+           )
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '42501',
-            MESSAGE = 'pre-existing pgshard_operation_writer role has a member';
+            MESSAGE = 'pre-existing pgshard_operation_writer role has an unsafe member';
     END IF;
 END
 $pgshard_roles$;

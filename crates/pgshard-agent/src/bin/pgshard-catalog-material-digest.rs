@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use pgshard_types::catalog_material::{
-    CATALOG_CLIENT_DIGEST_DOMAIN, CATALOG_SERVER_DIGEST_DOMAIN,
+    CATALOG_CLIENT_DIGEST_DOMAIN, CATALOG_SERVER_DIGEST_DOMAIN, OPERATION_WRITER_DIGEST_DOMAIN,
     POSTGRESQL_REPLICATION_DIGEST_DOMAIN, catalog_material_sha256,
 };
 use rustix::fs::{Mode, OFlags};
@@ -32,12 +32,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "catalog server private key",
             Some("catalog server certificate"),
         ),
+        "operation-writer" => (
+            OPERATION_WRITER_DIGEST_DOMAIN,
+            "operation-writer password",
+            Some("catalog CA certificate"),
+        ),
         "replication" => (
             POSTGRESQL_REPLICATION_DIGEST_DOMAIN,
             "PostgreSQL replication password",
             None,
         ),
-        _ => return Err("material profile must be client, server, or replication".into()),
+        _ => {
+            return Err(
+                "material profile must be client, server, operation-writer, or replication".into(),
+            );
+        }
     };
 
     let key = read_bounded_file(&key_path, key_description, MAXIMUM_KEY_BYTES)?;
@@ -49,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         catalog_material_sha256(domain, &key, std::iter::empty())
     };
     if arguments.next().is_some() {
-        return Err("usage: pgshard-catalog-material-digest <client|server> <key-file> <value-file> | pgshard-catalog-material-digest replication <password-file>".into());
+        return Err("usage: pgshard-catalog-material-digest <client|server|operation-writer> <key-file> <value-file> | pgshard-catalog-material-digest replication <password-file>".into());
     }
     let mut stdout = io::stdout().lock();
     stdout.write_all(fingerprint.as_bytes())?;

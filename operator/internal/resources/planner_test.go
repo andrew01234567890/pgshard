@@ -43,6 +43,9 @@ func TestCatalogMaterialSHA256MatchesRustContract(t *testing.T) {
 	if got, want := CatalogServerMaterialSHA256([]byte("catalog-certificate"), nil), "219f722b1a1d47cb6b569c6c6bc6e9dfe5131f6d4e8fc507bcf93c106df8409d"; got != want {
 		t.Fatalf("server material SHA-256 = %q, want shared Rust vector %q", got, want)
 	}
+	if got, want := OperationWriterMaterialSHA256([]byte("writer-password"), []byte("catalog-ca")), "62592029f6dfabdf02e2ad5cdcd3f030107f69decfd7363a44efd61d7e6597ee"; got != want {
+		t.Fatalf("operation-writer material SHA-256 = %q, want shared Rust vector %q", got, want)
+	}
 }
 
 func TestPostgreSQLBootstrapScriptHasValidBashSyntax(t *testing.T) {
@@ -468,6 +471,18 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	if !containsVolumeMount(poolerContainer.VolumeMounts, "catalog-client", true) {
 		t.Fatalf("pooler catalog mount = %#v", poolerContainer.VolumeMounts)
 	}
+	if hasVolume(pooler.Spec.Template.Spec.Volumes, "catalog-operation-writer-auth") || containsVolumeMount(poolerContainer.VolumeMounts, "catalog-operation-writer-auth", true) {
+		t.Fatalf("pooler received operation-writer material: volumes=%#v mounts=%#v", pooler.Spec.Template.Spec.Volumes, poolerContainer.VolumeMounts)
+	}
+	orchestrator := object[*appsv1.Deployment](t, plan, cluster.Name+OrchestratorSuffix)
+	if hasVolume(orchestrator.Spec.Template.Spec.Volumes, "catalog-operation-writer-auth") {
+		t.Fatalf("orchestrator received operation-writer material before connector composition: %#v", orchestrator.Spec.Template.Spec.Volumes)
+	}
+	for _, container := range orchestrator.Spec.Template.Spec.Containers {
+		if containsVolumeMount(container.VolumeMounts, "catalog-operation-writer-auth", true) {
+			t.Fatalf("orchestrator mounted operation-writer material before connector composition: %#v", container.VolumeMounts)
+		}
+	}
 
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		name := PostgreSQLShardStatefulSetName(cluster.Name, shard)
@@ -576,6 +591,8 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			!strings.Contains(bootstrap.Command[2], "ee17a64c8eec5e2e9a44f29d4764edac90680980f61df35bdb2284c01b57c4d9") ||
 			!strings.Contains(bootstrap.Command[2], "2720fa78d0bc96c21311b1656eeaabbb3e745ea65fa9d1ea701ffb67cde1b1d9") ||
 			!strings.Contains(bootstrap.Command[2], "ceec4ff5d633d28afacf1e93fbc2547591017e57f172dc3a8072814bb6d3867a") ||
+			!strings.Contains(bootstrap.Command[2], "54927a3786f0bbf15490edc1b57731d4a19581b7568bcf23a4412c8e3c049d9c") ||
+			!strings.Contains(bootstrap.Command[2], "b6373f4b09db046d1ec1610809ae1a1db3c4cec35d8956139110576d87c5e3e2") ||
 			!strings.Contains(bootstrap.Command[2], "pg_catalog.pg_sequence") ||
 			!strings.Contains(bootstrap.Command[2], "pg_catalog.pg_rewrite") ||
 			!strings.Contains(bootstrap.Command[2], "internal-trigger|") ||
@@ -599,15 +616,18 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			!strings.Contains(bootstrap.Command[2], "database genesis topology is missing or not a regular file") ||
 			!strings.Contains(bootstrap.Command[2], "database topology preflight is missing or not a regular file") ||
 			!strings.Contains(bootstrap.Command[2], "CREATE ROLE pgshard_pooler_catalog") ||
+			!strings.Contains(bootstrap.Command[2], "CREATE ROLE pgshard_orchestrator_catalog") ||
 			!strings.Contains(bootstrap.Command[2], "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE") ||
 			!strings.Contains(bootstrap.Command[2], "roles.rolpassword LIKE 'SCRAM-SHA-256\\$4096:%'") ||
 			!strings.Contains(bootstrap.Command[2], "pgshard-scram-verifier") ||
 			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest client") != 1 ||
 			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest server") != 1 ||
+			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest operation-writer") != 1 ||
 			strings.Count(bootstrap.Command[2], "pgshard-catalog-material-digest replication") != 1 ||
 			!strings.Contains(bootstrap.Command[2], "SET rolpassword = $1, rolcanlogin = true") ||
 			strings.Contains(bootstrap.Command[2], "PASSWORD '$catalog_password'") ||
 			!strings.Contains(bootstrap.Command[2], "PGPASSWORD=\"$catalog_password\"") ||
+			!strings.Contains(bootstrap.Command[2], "PGPASSWORD=\"$operation_writer_password\"") ||
 			!strings.Contains(bootstrap.Command[2], "hostnossl shardschema all all reject") ||
 			!strings.Contains(bootstrap.Command[2], "hostssl shardschema pgshard_pooler_catalog all scram-sha-256") ||
 			!strings.Contains(bootstrap.Command[2], "hostssl shardschema all all reject") ||
@@ -624,18 +644,21 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		}
 		expectedHBAOrder := "'local all postgres trust' \\\n" +
 			"  'local all pgshard_pooler_catalog reject' \\\n" +
+			"  'local all pgshard_orchestrator_catalog reject' \\\n" +
 			"  'local all all trust' \\\n" +
 			"  'hostnossl shardschema all all reject' \\\n" +
 			"  'hostssl shardschema pgshard_pooler_catalog all scram-sha-256' \\\n" +
+			"  'hostssl shardschema pgshard_orchestrator_catalog all scram-sha-256' \\\n" +
 			"  'hostssl shardschema all all reject' \\\n" +
 			"  'host all pgshard_pooler_catalog all reject' \\\n" +
+			"  'host all pgshard_orchestrator_catalog all reject' \\\n" +
 			"  'host all all all scram-sha-256'"
 		if !strings.Contains(bootstrap.Command[2], expectedHBAOrder) {
 			t.Fatal("catalog HBA rules are not ordered before the generic host grant")
 		}
 		expectedEnvironmentLength := 11
 		if shard == 0 {
-			expectedEnvironmentLength = 13
+			expectedEnvironmentLength = 14
 		}
 		if len(bootstrap.Env) != expectedEnvironmentLength || bootstrap.Env[0].Name != "PGSHARD_CLUSTER_UID" || bootstrap.Env[0].Value != string(cluster.UID) || bootstrap.Env[1].Name != "PGSHARD_SHARD_ID" || bootstrap.Env[1].Value != shardLabel(shard) ||
 			bootstrap.Env[2].Name != "PGSHARD_POSTGRESQL_MAJOR" || bootstrap.Env[2].Value != pgshardv1alpha1.PostgreSQLMajor18 ||
@@ -649,7 +672,7 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			bootstrap.Env[10].Name != "PGSHARD_NODE_BOOT_ID" || bootstrap.Env[10].ValueFrom == nil || bootstrap.Env[10].ValueFrom.FieldRef == nil || bootstrap.Env[10].ValueFrom.FieldRef.FieldPath != "metadata.annotations['pgshard.io/postgresql-node-boot-id']" {
 			t.Fatalf("PostgreSQL bootstrap identity = %#v", bootstrap.Env)
 		}
-		if shard == 0 && (bootstrap.Env[11].Name != "PGSHARD_CATALOG_CLIENT_SHA256" || bootstrap.Env[11].Value != cluster.Status.CatalogAccess.ClientSHA256 || bootstrap.Env[12].Name != "PGSHARD_CATALOG_SERVER_SHA256" || bootstrap.Env[12].Value != cluster.Status.CatalogAccess.ServerSHA256) {
+		if shard == 0 && (bootstrap.Env[11].Name != "PGSHARD_CATALOG_CLIENT_SHA256" || bootstrap.Env[11].Value != cluster.Status.CatalogAccess.ClientSHA256 || bootstrap.Env[12].Name != "PGSHARD_CATALOG_SERVER_SHA256" || bootstrap.Env[12].Value != cluster.Status.CatalogAccess.ServerSHA256 || bootstrap.Env[13].Name != "PGSHARD_OPERATION_WRITER_SHA256" || bootstrap.Env[13].Value != cluster.Status.OperationWriterAccess.MaterialSHA256) {
 			t.Fatalf("PostgreSQL catalog material checkpoint = %#v", bootstrap.Env)
 		}
 		if configMapVolumeName(t, pod.Volumes, "postgresql-config") != configuration.Name || !containsVolumeMount(bootstrap.VolumeMounts, "postgresql-config", true) {
@@ -684,11 +707,15 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			if catalogAuth.Secret == nil || catalogAuth.Secret.SecretName != cluster.Status.CatalogAccess.SecretName || !reflect.DeepEqual(secretItemKeys(catalogAuth.Secret.Items), []string{CatalogPasswordKey, CatalogCACertificateKey}) {
 				t.Fatalf("catalog bootstrap password projection = %#v", catalogAuth.Secret)
 			}
-			if !containsVolumeMount(postgres.VolumeMounts, "catalog-server-tls", true) || containsVolumeMount(postgres.VolumeMounts, "catalog-bootstrap-auth", true) || !containsVolumeMount(bootstrap.VolumeMounts, "catalog-bootstrap-auth", true) || !containsVolumeMount(bootstrap.VolumeMounts, "catalog-server-tls", true) {
+			writerAuth := volumeByName(t, pod.Volumes, "catalog-operation-writer-auth")
+			if writerAuth.Secret == nil || writerAuth.Secret.SecretName != cluster.Status.OperationWriterAccess.SecretName || !reflect.DeepEqual(secretItemKeys(writerAuth.Secret.Items), []string{OperationWriterPasswordKey}) {
+				t.Fatalf("operation-writer bootstrap password projection = %#v", writerAuth.Secret)
+			}
+			if !containsVolumeMount(postgres.VolumeMounts, "catalog-server-tls", true) || containsVolumeMount(postgres.VolumeMounts, "catalog-bootstrap-auth", true) || containsVolumeMount(postgres.VolumeMounts, "catalog-operation-writer-auth", true) || !containsVolumeMount(bootstrap.VolumeMounts, "catalog-bootstrap-auth", true) || !containsVolumeMount(bootstrap.VolumeMounts, "catalog-operation-writer-auth", true) || !containsVolumeMount(bootstrap.VolumeMounts, "catalog-server-tls", true) {
 				t.Fatalf("catalog least-privilege mounts: PostgreSQL=%#v bootstrap=%#v", postgres.VolumeMounts, bootstrap.VolumeMounts)
 			}
 		} else {
-			for _, name := range []string{"catalog-server-tls", "catalog-bootstrap-auth"} {
+			for _, name := range []string{"catalog-server-tls", "catalog-bootstrap-auth", "catalog-operation-writer-auth"} {
 				if hasVolume(pod.Volumes, name) || containsVolumeMount(postgres.VolumeMounts, name, true) || containsVolumeMount(bootstrap.VolumeMounts, name, true) {
 					t.Fatalf("non-catalog shard %d received catalog material %q", shard, name)
 				}
@@ -711,6 +738,12 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		t.Fatalf("catalog access intent Secret = %#v", catalogIntent)
 	}
 	assertOwned(t, catalogIntent, cluster)
+	writerName := OperationWriterAccessSecretPrefix(cluster.Name) + strings.Repeat("c", 32)
+	writerIntent := OperationWriterAccessIntentSecret(cluster, writerName)
+	if writerIntent.Name != writerName || !OperationWriterAccessSecretNameIsValid(cluster.Name, writerIntent.Name) || writerIntent.Immutable != nil || len(writerIntent.Data) != 0 || writerIntent.Annotations[OperationWriterAccessClusterUIDAnnotation] != string(cluster.UID) {
+		t.Fatalf("operation-writer access intent Secret = %#v", writerIntent)
+	}
+	assertOwned(t, writerIntent, cluster)
 	replicationName := PostgreSQLReplicationSecretPrefix(cluster.Name, 1) + strings.Repeat("b", 32)
 	replicationIntent := PostgreSQLReplicationIntentSecret(cluster, 1, replicationName)
 	if replicationIntent.Name != replicationName || !PostgreSQLReplicationSecretNameIsValid(cluster.Name, 1, replicationIntent.Name) || PostgreSQLReplicationSecretNameIsValid(cluster.Name, 0, replicationIntent.Name) || replicationIntent.Immutable != nil || len(replicationIntent.Data) != 0 || replicationIntent.Labels[ShardLabel] != "0001" || replicationIntent.Annotations[PostgreSQLReplicationClusterUIDAnnotation] != string(cluster.UID) {
@@ -739,6 +772,40 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 	}
 	if got := PostgreSQLDataPVCPrefix(cluster.Name, 1); got != "demo-shard-0001-member-0000-data-" || strings.Contains(got, "primary") || strings.Contains(got, "replica") {
 		t.Fatalf("PostgreSQL data PVC prefix is not role-neutral: %q", got)
+	}
+}
+
+func TestSingleMemberPlanRequiresCompleteOperationWriterAccess(t *testing.T) {
+	t.Parallel()
+	base := testCluster()
+	base.Spec.MembersPerShard = 1
+	base.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(base)
+	for _, test := range []struct {
+		name   string
+		mutate func(*pgshardv1alpha1.PgShardCluster)
+	}{
+		{name: "missing", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.OperationWriterAccess = nil
+		}},
+		{name: "foreign name", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.OperationWriterAccess.SecretName = "foreign-writer"
+		}},
+		{name: "missing UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.OperationWriterAccess.SecretUID = ""
+		}},
+		{name: "invalid digest", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.OperationWriterAccess.MaterialSHA256 = "not-a-digest"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cluster := base.DeepCopy()
+			test.mutate(cluster)
+			if _, err := Plan(cluster, singleMemberImages()); err == nil || !strings.Contains(err.Error(), "operation-writer access creation result is missing or invalid") {
+				t.Fatalf("Plan error = %v", err)
+			}
+		})
 	}
 }
 
@@ -841,7 +908,7 @@ func TestAgentQuarantinePlanProjectsExactWritableLeaseIdentity(t *testing.T) {
 			if mount.Name == "runtime" && mount.MountPath != "/run/pgshard" {
 				t.Fatalf("agent must create a private child below the runtime mount: %#v", mount)
 			}
-			if mount.Name == "bootstrap-secret" || mount.Name == "catalog-server-tls" || mount.Name == "catalog-bootstrap-auth" {
+			if mount.Name == "bootstrap-secret" || mount.Name == "catalog-server-tls" || mount.Name == "catalog-bootstrap-auth" || mount.Name == "catalog-operation-writer-auth" {
 				t.Fatalf("agent received bootstrap or catalog credentials: %#v", agent.VolumeMounts)
 			}
 		}
@@ -1234,6 +1301,15 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(catalogAuthDirectory, CatalogCACertificateKey), catalogCA, 0o444); err != nil {
 		t.Fatal(err)
 	}
+	operationWriterAuthDirectory := newTraversableFixtureDirectory("pgshard-operation-writer-auth-")
+	const operationWriterPassword = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	if err := os.WriteFile(
+		filepath.Join(operationWriterAuthDirectory, OperationWriterPasswordKey),
+		[]byte(operationWriterPassword),
+		0o444,
+	); err != nil {
+		t.Fatal(err)
+	}
 	catalogTLSDirectory := newTraversableFixtureDirectory("pgshard-catalog-tls-")
 	catalogServerCertificate := []byte("bootstrap-e2e-server-certificate\n")
 	catalogServerPrivateKey := []byte("bootstrap-e2e-server-private-key\n")
@@ -1245,6 +1321,7 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 	}
 	catalogClientSHA256 := CatalogClientMaterialSHA256([]byte(catalogPassword), catalogCA)
 	catalogServerSHA256 := CatalogServerMaterialSHA256(catalogServerCertificate, catalogServerPrivateKey)
+	operationWriterSHA256 := OperationWriterMaterialSHA256([]byte(operationWriterPassword), catalogCA)
 	configurationDirectory := newTraversableFixtureDirectory("pgshard-bootstrap-config-")
 	if err := os.WriteFile(filepath.Join(configurationDirectory, "postgresql.conf"), []byte(strings.Join([]string{
 		"fsync = on",
@@ -1325,6 +1402,7 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 			"--volume", secretDirectory + ":/etc/pgshard/bootstrap:ro",
 			"--volume", replicationDirectory + ":/etc/pgshard/replication:ro",
 			"--volume", catalogAuthDirectory + ":/etc/pgshard/catalog-auth:ro",
+			"--volume", operationWriterAuthDirectory + ":/etc/pgshard/operation-writer-auth:ro",
 			"--volume", catalogTLSDirectory + ":/etc/pgshard/catalog-tls:ro",
 			"--volume", configurationDirectory + ":/etc/pgshard/postgresql-source:ro",
 			"--volume", legacyMigration + ":/tmp/v0_49_0_shardschema.sql:ro",
@@ -1379,6 +1457,7 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 			"PGSHARD_NODE_BOOT_ID=bootstrap-e2e-boot",
 			"PGSHARD_CATALOG_CLIENT_SHA256=" + catalogClientSHA256,
 			"PGSHARD_CATALOG_SERVER_SHA256=" + catalogServerSHA256,
+			"PGSHARD_OPERATION_WRITER_SHA256=" + operationWriterSHA256,
 		}
 	}
 	replicationBootstrapEnvironment := func(password string, members int) []string {
@@ -1399,6 +1478,9 @@ func TestPostgreSQLBootstrapDockerRecoveryAndConflict(t *testing.T) {
 		output, err := runBootstrapContainer(dataParent, bootstrapScript(dataParent), bootstrapEnvironment(installCatalog, shardCount)...)
 		if strings.Contains(output, catalogPassword) {
 			t.Fatalf("PostgreSQL bootstrap logged the catalog password:\n%s", output)
+		}
+		if strings.Contains(output, operationWriterPassword) {
+			t.Fatalf("PostgreSQL bootstrap logged the operation-writer password:\n%s", output)
 		}
 		return output, err
 	}
@@ -1618,6 +1700,12 @@ if PGPASSWORD="$(</etc/pgshard/catalog-auth/catalog-password)" \
   echo "catalog login unexpectedly escaped through a local socket" >&2
   exit 1
 fi
+if PGPASSWORD="$(</etc/pgshard/operation-writer-auth/operation-writer-password)" \
+  psql -X --no-password --host="$socket" --username=pgshard_orchestrator_catalog --dbname=postgres \
+    --set=ON_ERROR_STOP=1 --command='SELECT 1'; then
+  echo "operation-writer login unexpectedly escaped through a local socket" >&2
+  exit 1
+fi
 pg_ctl -D "$PGDATA" -w -t 45 stop -m fast >/dev/null
 trap - EXIT
 `
@@ -1637,6 +1725,15 @@ trap - EXIT
 			t.Fatalf("query catalog fixture: %v\n%s", err, output)
 		}
 		return strings.TrimSpace(output)
+	}
+	if got := catalogSQL(legacyUpgradeDataParent, "ALTER ROLE pgshard_orchestrator_catalog NOLOGIN PASSWORD NULL"); got != "ALTER ROLE" {
+		t.Fatalf("stage interrupted operation-writer credential = %q", got)
+	}
+	if output, err := bootstrap(legacyUpgradeDataParent, true, 1); err != nil {
+		t.Fatalf("recover staged operation-writer credential: %v\n%s", err, output)
+	}
+	if got := catalogSQL(legacyUpgradeDataParent, "SELECT rolcanlogin AND rolpassword LIKE 'SCRAM-SHA-256$4096:%' FROM pg_catalog.pg_authid WHERE rolname = 'pgshard_orchestrator_catalog'"); got != "t" {
+		t.Fatalf("recovered operation-writer login is not exact SCRAM: %q", got)
 	}
 	catalogRoleSQL := func(dataParent, sql string) string {
 		t.Helper()
@@ -1699,7 +1796,7 @@ SELECT pg_catalog.row_to_json(role_state)::text
 	           roles.rolpassword AS password_verifier
 	      FROM pg_catalog.pg_authid AS roles
 	     WHERE pg_catalog.left(roles.rolname, 16) = 'pgshard_catalog_'
-	        OR roles.rolname = 'pgshard_pooler_catalog'
+	        OR roles.rolname IN ('pgshard_pooler_catalog', 'pgshard_orchestrator_catalog')
      ORDER BY roles.rolname
   ) AS role_state;
 SELECT pg_catalog.row_to_json(membership_state)::text
@@ -2382,6 +2479,9 @@ PREPARE TRANSACTION 'pgshard_bootstrap_lock';
 		logs, _ := runDocker("logs", containerName)
 		if strings.Contains(logs, catalogPassword) {
 			t.Fatalf("%s logged the catalog password before forced death:\n%s", boundary, logs)
+		}
+		if strings.Contains(logs, operationWriterPassword) {
+			t.Fatalf("%s logged the operation-writer password before forced death:\n%s", boundary, logs)
 		}
 		if output, err := runDocker("kill", "--signal", "KILL", containerName); err != nil {
 			t.Fatalf("SIGKILL %s bootstrap container: %v\n%s", boundary, err, output)
@@ -4289,6 +4389,11 @@ func testPostgreSQLBootstraps(cluster *pgshardv1alpha1.PgShardCluster) []pgshard
 		SecretUID:    "test-catalog-secret-uid",
 		ClientSHA256: strings.Repeat("b", 64),
 		ServerSHA256: strings.Repeat("c", 64),
+	}
+	cluster.Status.OperationWriterAccess = &pgshardv1alpha1.OperationWriterAccessStatus{
+		SecretName:     OperationWriterAccessSecretPrefix(cluster.Name) + strings.Repeat("d", 32),
+		SecretUID:      "test-operation-writer-secret-uid",
+		MaterialSHA256: strings.Repeat("e", 64),
 	}
 	bootstraps := make([]pgshardv1alpha1.PostgreSQLBootstrapStatus, 0, cluster.Spec.Shards*cluster.Spec.MembersPerShard)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {

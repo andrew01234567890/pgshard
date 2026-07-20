@@ -531,6 +531,28 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              operationWriterAccess:
+                description: |-
+                  OperationWriterAccess records a separately projected, staged catalog
+                  operation-writer credential. It is not mounted by any orchestrator until
+                  a later connector slice is composed.
+                properties:
+                  materialSHA256:
+                    description: MaterialSHA256 binds the exact password and catalog
+                      CA projections.
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                  secretName:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  secretUID:
+                    description: SecretUID is empty only before the empty Secret identity
+                      is observed.
+                    type: string
+                required:
+                - secretName
+                type: object
               phase:
                 enum:
                 - Pending

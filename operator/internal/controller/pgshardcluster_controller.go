@@ -177,6 +177,13 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		if deletingReplicationCredential {
 			return ctrl.Result{RequeueAfter: retryDelay}, nil
 		}
+		deletingOperationWriterAccess, err := r.deleteOperationWriterAccessForFinalization(ctx, cluster)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("delete shardschema operation-writer material during cluster deletion: %w", err)
+		}
+		if deletingOperationWriterAccess {
+			return ctrl.Result{RequeueAfter: retryDelay}, nil
+		}
 		deletingCatalogAccess, err := r.deleteCatalogAccessForFinalization(ctx, cluster)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("delete shardschema access material during cluster deletion: %w", err)
@@ -244,6 +251,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	}
 	if err := r.ensureCatalogAccess(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "CatalogAccessReconcileFailed", fmt.Sprintf("shardschema access reconciliation failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if err := r.ensureOperationWriterAccess(ctx, cluster); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "OperationWriterAccessReconcileFailed", fmt.Sprintf("shardschema operation-writer access reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 	if err := r.ensurePostgreSQLCatalogCandidateConfigurations(ctx, cluster); err != nil {
@@ -1657,6 +1668,301 @@ func catalogAccessStatus(secret *corev1.Secret) *pgshardv1alpha1.CatalogAccessSt
 			secret.Data[owned.CatalogTLSCertificateKey],
 			secret.Data[owned.CatalogTLSPrivateKeyKey],
 		),
+	}
+}
+
+// ensureOperationWriterAccess stages a separately projected catalog writer
+// credential only after the exact CatalogAccess Secret and all of its material
+// checkpoints have been observed. Only singleton shard-zero bootstrap may
+// mount it; the orchestrator and multi-member data plane do not consume it.
+func (r *PgShardClusterReconciler) ensureOperationWriterAccess(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	active := cluster.Spec.MembersPerShard == 1 ||
+		(cluster.Status.PostgreSQLBootstrapSpec != nil && cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime == owned.PostgreSQLRuntimeAgentQuarantine.String())
+	if !active {
+		if cluster.Status.OperationWriterAccess != nil {
+			return fmt.Errorf("operation-writer access exists without an active single-member or agent-quarantine PostgreSQL runtime contract")
+		}
+		return nil
+	}
+
+	reader := r.authoritativeReader()
+	catalogCA, err := r.checkpointedCatalogCA(ctx, cluster, reader)
+	if err != nil {
+		return fmt.Errorf("operation-writer access requires complete catalog access: %w", err)
+	}
+	if cluster.Status.OperationWriterAccess == nil {
+		return r.createOperationWriterAccessIntent(ctx, cluster, catalogCA, reader)
+	}
+
+	recorded := cluster.Status.OperationWriterAccess
+	if !validOperationWriterAccessStatus(cluster.Name, recorded) {
+		return fmt.Errorf("recorded operation-writer access state is invalid")
+	}
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+	if err := reader.Get(ctx, key, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			if recorded.SecretUID == "" {
+				return r.createOperationWriterAccessIntent(ctx, cluster, catalogCA, reader)
+			}
+			return fmt.Errorf("operation-writer access Secret %s with recorded UID %s is missing; explicit recovery is required", recorded.SecretName, recorded.SecretUID)
+		}
+		return fmt.Errorf("read operation-writer access Secret %s: %w", recorded.SecretName, err)
+	}
+	if recorded.SecretUID == "" {
+		if err := validateOperationWriterAccessIntentSecret(secret, cluster, recorded.SecretName); err != nil {
+			return err
+		}
+		if secret.UID == "" || secret.ResourceVersion == "" {
+			return fmt.Errorf("operation-writer access intent Secret %s has no stable API identity", secret.Name)
+		}
+		cluster.Status.OperationWriterAccess = &pgshardv1alpha1.OperationWriterAccessStatus{
+			SecretName: recorded.SecretName,
+			SecretUID:  secret.UID,
+		}
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint operation-writer access Secret identity: %w", err)
+		}
+		recorded = cluster.Status.OperationWriterAccess
+	} else if secret.UID != recorded.SecretUID {
+		return fmt.Errorf("operation-writer access Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, secret.UID, recorded.SecretUID)
+	}
+	if recorded.MaterialSHA256 == "" {
+		return r.materializeOperationWriterAccess(ctx, cluster, secret, recorded, catalogCA, reader)
+	}
+	return validateCheckpointedOperationWriterAccess(secret, cluster, recorded, catalogCA)
+}
+
+func (r *PgShardClusterReconciler) checkpointedCatalogCA(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, reader client.Reader) ([]byte, error) {
+	recorded := cluster.Status.CatalogAccess
+	if !catalogAccessStatusIsComplete(cluster.Name, recorded) {
+		return nil, fmt.Errorf("recorded catalog access state is incomplete or invalid")
+	}
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+	if err := reader.Get(ctx, key, secret); err != nil {
+		return nil, fmt.Errorf("read checkpointed catalog access Secret %s: %w", recorded.SecretName, err)
+	}
+	if err := validateCheckpointedCatalogAccess(secret, cluster, recorded); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), secret.Data[owned.CatalogCACertificateKey]...), nil
+}
+
+func catalogAccessStatusIsComplete(cluster string, status *pgshardv1alpha1.CatalogAccessStatus) bool {
+	return validCatalogAccessStatus(cluster, status) && status.SecretUID != "" &&
+		validCatalogAccessDigest(status.ClientSHA256) && validCatalogAccessDigest(status.ServerSHA256)
+}
+
+func (r *PgShardClusterReconciler) createOperationWriterAccessIntent(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, catalogCA []byte, reader client.Reader) error {
+	recorded := cluster.Status.OperationWriterAccess
+	if recorded == nil {
+		name, err := randomBootstrapName(owned.OperationWriterAccessSecretPrefix(cluster.Name))
+		if err != nil {
+			return fmt.Errorf("generate operation-writer access Secret name: %w", err)
+		}
+		recorded = &pgshardv1alpha1.OperationWriterAccessStatus{SecretName: name}
+		cluster.Status.OperationWriterAccess = recorded
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return fmt.Errorf("checkpoint operation-writer access creation intent: %w", err)
+		}
+	} else if !validOperationWriterAccessStatus(cluster.Name, recorded) || recorded.SecretUID != "" {
+		return fmt.Errorf("cannot create operation-writer access intent from invalid or completed state")
+	}
+
+	name := recorded.SecretName
+	candidate := owned.OperationWriterAccessIntentSecret(cluster, name)
+	if createErr := r.Create(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); createErr != nil {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
+		if readErr := reader.Get(ctx, key, observed); readErr != nil {
+			if apierrors.IsNotFound(readErr) {
+				return fmt.Errorf("create operation-writer access Secret %s: %w", name, createErr)
+			}
+			return errors.Join(
+				fmt.Errorf("create operation-writer access Secret %s: %w", name, createErr),
+				fmt.Errorf("resolve operation-writer access Secret creation outcome: %w", readErr),
+			)
+		}
+		candidate = observed
+	}
+	if candidate.UID == "" || candidate.ResourceVersion == "" {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
+		if err := reader.Get(ctx, key, observed); err != nil {
+			return fmt.Errorf("read created operation-writer access Secret %s: %w", name, err)
+		}
+		candidate = observed
+	}
+	if err := validateOperationWriterAccessIntentSecret(candidate, cluster, name); err != nil {
+		return err
+	}
+	cluster.Status.OperationWriterAccess = &pgshardv1alpha1.OperationWriterAccessStatus{
+		SecretName: name,
+		SecretUID:  candidate.UID,
+	}
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint operation-writer access Secret identity: %w", err)
+	}
+	return r.materializeOperationWriterAccess(ctx, cluster, candidate, cluster.Status.OperationWriterAccess, catalogCA, reader)
+}
+
+func (r *PgShardClusterReconciler) materializeOperationWriterAccess(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret, recorded *pgshardv1alpha1.OperationWriterAccessStatus, catalogCA []byte, reader client.Reader) error {
+	if secret.UID != recorded.SecretUID || recorded.SecretUID == "" || secret.ResourceVersion == "" {
+		return fmt.Errorf("operation-writer access Secret %s identity changed before material installation", recorded.SecretName)
+	}
+	if err := validateOperationWriterAccessIntentSecret(secret, cluster, recorded.SecretName); err != nil {
+		// An outcome-unknown update may already have installed complete immutable
+		// material. Adopt only the exact recorded UID and fully validated bytes.
+		if completeErr := validateOperationWriterAccessSecret(secret, cluster, recorded.SecretName); completeErr != nil {
+			return errors.Join(err, completeErr)
+		}
+		return r.checkpointOperationWriterAccessMaterial(ctx, cluster, secret, recorded, catalogCA)
+	}
+
+	material, err := newOperationWriterAccessMaterial()
+	if err != nil {
+		return err
+	}
+	candidate := secret.DeepCopy()
+	canonical := owned.OperationWriterAccessIntentSecret(cluster, recorded.SecretName)
+	candidate.GenerateName = ""
+	candidate.Labels = maps.Clone(canonical.Labels)
+	candidate.Annotations = maps.Clone(canonical.Annotations)
+	candidate.OwnerReferences = append([]metav1.OwnerReference(nil), canonical.OwnerReferences...)
+	candidate.Finalizers = nil
+	candidate.Type = corev1.SecretTypeOpaque
+	immutable := true
+	candidate.Immutable = &immutable
+	candidate.Data = material
+	candidate.StringData = nil
+	if updateErr := r.Update(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); updateErr != nil {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+		if readErr := reader.Get(ctx, key, observed); readErr != nil {
+			return errors.Join(
+				fmt.Errorf("install immutable operation-writer access material in Secret %s: %w", recorded.SecretName, updateErr),
+				fmt.Errorf("resolve operation-writer access material update outcome: %w", readErr),
+			)
+		}
+		if observed.UID != recorded.SecretUID {
+			return fmt.Errorf("operation-writer access Secret %s has UID %s, expected recorded UID %s after material update; explicit recovery is required", recorded.SecretName, observed.UID, recorded.SecretUID)
+		}
+		if intentErr := validateOperationWriterAccessIntentSecret(observed, cluster, recorded.SecretName); intentErr == nil {
+			return fmt.Errorf("install immutable operation-writer access material in Secret %s: %w", recorded.SecretName, updateErr)
+		}
+		candidate = observed
+	}
+	return r.checkpointOperationWriterAccessMaterial(ctx, cluster, candidate, recorded, catalogCA)
+}
+
+func (r *PgShardClusterReconciler) checkpointOperationWriterAccessMaterial(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret, recorded *pgshardv1alpha1.OperationWriterAccessStatus, catalogCA []byte) error {
+	if err := validateOperationWriterAccessSecret(secret, cluster, recorded.SecretName); err != nil {
+		return err
+	}
+	observed := operationWriterAccessStatus(secret, catalogCA)
+	if observed.SecretUID != recorded.SecretUID {
+		return fmt.Errorf("operation-writer access Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, observed.SecretUID, recorded.SecretUID)
+	}
+	cluster.Status.OperationWriterAccess = observed
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint operation-writer access material: %w", err)
+	}
+	return nil
+}
+
+func validateCheckpointedOperationWriterAccess(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.OperationWriterAccessStatus, catalogCA []byte) error {
+	if err := validateOperationWriterAccessSecret(secret, cluster, recorded.SecretName); err != nil {
+		return err
+	}
+	observed := operationWriterAccessStatus(secret, catalogCA)
+	if observed.SecretUID != recorded.SecretUID {
+		return fmt.Errorf("operation-writer access Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.SecretName, observed.SecretUID, recorded.SecretUID)
+	}
+	if observed.MaterialSHA256 != recorded.MaterialSHA256 {
+		return fmt.Errorf("operation-writer access Secret %s material differs from the checkpointed creation result; explicit recovery is required", recorded.SecretName)
+	}
+	return nil
+}
+
+func validOperationWriterAccessStatus(cluster string, status *pgshardv1alpha1.OperationWriterAccessStatus) bool {
+	if status == nil || !owned.OperationWriterAccessSecretNameIsValid(cluster, status.SecretName) || len(status.SecretUID) > 128 {
+		return false
+	}
+	if status.SecretUID == "" {
+		return status.MaterialSHA256 == ""
+	}
+	return status.MaterialSHA256 == "" || validCatalogAccessDigest(status.MaterialSHA256)
+}
+
+func newOperationWriterAccessMaterial() (map[string][]byte, error) {
+	randomPassword := make([]byte, postgresqlPasswordBytes)
+	if _, err := rand.Read(randomPassword); err != nil {
+		return nil, fmt.Errorf("generate shardschema operation-writer credential: %w", err)
+	}
+	password := make([]byte, hex.EncodedLen(len(randomPassword)))
+	hex.Encode(password, randomPassword)
+	return map[string][]byte{owned.OperationWriterPasswordKey: password}, nil
+}
+
+func validateOperationWriterAccessSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string) error {
+	if !owned.OperationWriterAccessSecretNameIsValid(cluster.Name, expectedName) {
+		return fmt.Errorf("operation-writer access Secret name %s is not a valid unpredictable cluster-bound name", expectedName)
+	}
+	if secret.DeletionTimestamp != nil || !operationWriterAccessSecretMetadataMatches(secret, cluster, expectedName, false) {
+		return fmt.Errorf("operation-writer access Secret %s metadata is not bound to the exact PgShardCluster", expectedName)
+	}
+	if secret.UID == "" || secret.ResourceVersion == "" {
+		return fmt.Errorf("operation-writer access Secret %s has no stable API identity", expectedName)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || secret.Immutable == nil || !*secret.Immutable {
+		return fmt.Errorf("operation-writer access Secret %s must be immutable and have type Opaque", expectedName)
+	}
+	if len(secret.Data) != 1 || len(secret.StringData) != 0 {
+		return fmt.Errorf("operation-writer access Secret %s has an unexpected key set", expectedName)
+	}
+	password, ok := secret.Data[owned.OperationWriterPasswordKey]
+	if !ok {
+		return fmt.Errorf("operation-writer access Secret %s has an unexpected key set", expectedName)
+	}
+	decoded := make([]byte, postgresqlPasswordBytes)
+	if len(password) != hex.EncodedLen(postgresqlPasswordBytes) {
+		return fmt.Errorf("operation-writer access Secret %s password has an invalid shape", expectedName)
+	}
+	if _, err := hex.Decode(decoded, password); err != nil || hex.EncodeToString(decoded) != string(password) {
+		return fmt.Errorf("operation-writer access Secret %s password is not canonical lowercase hexadecimal", expectedName)
+	}
+	return nil
+}
+
+func validateOperationWriterAccessIntentSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string) error {
+	if !owned.OperationWriterAccessSecretNameIsValid(cluster.Name, expectedName) {
+		return fmt.Errorf("operation-writer access Secret name %s is not a valid unpredictable cluster-bound name", expectedName)
+	}
+	if secret.DeletionTimestamp != nil || !operationWriterAccessSecretMetadataMatches(secret, cluster, expectedName, false) {
+		return fmt.Errorf("operation-writer access intent Secret %s metadata is not bound to the exact PgShardCluster", expectedName)
+	}
+	if secret.UID == "" || secret.ResourceVersion == "" {
+		return fmt.Errorf("operation-writer access intent Secret %s has no stable API identity", expectedName)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || (secret.Immutable != nil && *secret.Immutable) || len(secret.Data) != 0 || len(secret.StringData) != 0 {
+		return fmt.Errorf("operation-writer access intent Secret %s must be empty, mutable, and have type Opaque", expectedName)
+	}
+	return nil
+}
+
+func operationWriterAccessSecretMetadataMatches(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string, allowFinalizers bool) bool {
+	canonical := owned.OperationWriterAccessIntentSecret(cluster, expectedName)
+	return secret.Name == canonical.Name && secret.Namespace == canonical.Namespace && secret.GenerateName == "" &&
+		maps.Equal(secret.Labels, canonical.Labels) && maps.Equal(secret.Annotations, canonical.Annotations) &&
+		reflect.DeepEqual(secret.OwnerReferences, canonical.OwnerReferences) && (allowFinalizers || len(secret.Finalizers) == 0)
+}
+
+func operationWriterAccessStatus(secret *corev1.Secret, catalogCA []byte) *pgshardv1alpha1.OperationWriterAccessStatus {
+	return &pgshardv1alpha1.OperationWriterAccessStatus{
+		SecretName:     secret.Name,
+		SecretUID:      secret.UID,
+		MaterialSHA256: owned.OperationWriterMaterialSHA256(secret.Data[owned.OperationWriterPasswordKey], catalogCA),
 	}
 }
 
@@ -3287,6 +3593,140 @@ func validatePostgreSQLReplicationCredentialForDeletion(secret *corev1.Secret, c
 	return nil
 }
 
+func (r *PgShardClusterReconciler) deleteOperationWriterAccessForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	if r.APIReader == nil {
+		return false, fmt.Errorf("authoritative API reader is required for operation-writer access deletion")
+	}
+	recorded := cluster.Status.OperationWriterAccess
+	if recorded == nil {
+		return false, nil
+	}
+	if !validOperationWriterAccessStatus(cluster.Name, recorded) {
+		return false, fmt.Errorf("recorded operation-writer access state is invalid")
+	}
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+	if err := r.APIReader.Get(ctx, key, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read operation-writer access Secret %s during finalization: %w", recorded.SecretName, err)
+	}
+	if recorded.SecretUID != "" && recorded.MaterialSHA256 == "" {
+		if secret.UID != recorded.SecretUID {
+			return false, fmt.Errorf("operation-writer access Secret %s has UID %s, expected recorded UID %s during finalization", recorded.SecretName, secret.UID, recorded.SecretUID)
+		}
+		if intentErr := validateOperationWriterAccessIntentForDeletion(secret, cluster, recorded.SecretName); intentErr == nil {
+			return r.deleteOperationWriterAccessSecret(ctx, secret)
+		}
+		if err := validateOperationWriterAccessSecretForFinalization(secret, cluster, recorded.SecretName); err != nil {
+			return false, fmt.Errorf("operation-writer access Secret %s is neither the checkpointed empty intent nor valid installed material during finalization: %w", recorded.SecretName, err)
+		}
+		catalogCA, err := r.checkpointedCatalogCAForFinalization(ctx, cluster)
+		if err != nil {
+			return false, fmt.Errorf("bind installed operation-writer material to catalog access during finalization: %w", err)
+		}
+		cluster.Status.OperationWriterAccess = operationWriterAccessStatus(secret, catalogCA)
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return false, fmt.Errorf("checkpoint installed operation-writer material during finalization: %w", err)
+		}
+		// Observe the durable material checkpoint on a subsequent authoritative
+		// read before issuing the UID/resourceVersion-conditional deletion.
+		return true, nil
+	}
+	var catalogCA []byte
+	if recorded.MaterialSHA256 != "" {
+		var err error
+		catalogCA, err = r.checkpointedCatalogCAForFinalization(ctx, cluster)
+		if err != nil {
+			return false, fmt.Errorf("bind operation-writer material to catalog access during finalization: %w", err)
+		}
+	}
+	if err := validateOperationWriterAccessForDeletion(secret, cluster, recorded, catalogCA); err != nil {
+		return false, err
+	}
+	return r.deleteOperationWriterAccessSecret(ctx, secret)
+}
+
+func (r *PgShardClusterReconciler) checkpointedCatalogCAForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) ([]byte, error) {
+	recorded := cluster.Status.CatalogAccess
+	if !catalogAccessStatusIsComplete(cluster.Name, recorded) {
+		return nil, fmt.Errorf("recorded catalog access state is incomplete or invalid")
+	}
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.SecretName}
+	if err := r.APIReader.Get(ctx, key, secret); err != nil {
+		return nil, fmt.Errorf("read catalog access Secret %s during finalization: %w", recorded.SecretName, err)
+	}
+	if secret.Name != recorded.SecretName || secret.Namespace != cluster.Namespace || secret.UID != recorded.SecretUID {
+		return nil, fmt.Errorf("catalog access Secret %s identity differs from its checkpoint during finalization", recorded.SecretName)
+	}
+	observed := catalogAccessStatus(secret)
+	if observed.ClientSHA256 != recorded.ClientSHA256 || observed.ServerSHA256 != recorded.ServerSHA256 {
+		return nil, fmt.Errorf("catalog access Secret %s material differs from its checkpoint during finalization", recorded.SecretName)
+	}
+	return append([]byte(nil), secret.Data[owned.CatalogCACertificateKey]...), nil
+}
+
+func validateOperationWriterAccessForDeletion(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.OperationWriterAccessStatus, catalogCA []byte) error {
+	if secret.Name != recorded.SecretName || secret.Namespace != cluster.Namespace {
+		return fmt.Errorf("operation-writer access Secret %s identity is not bound to the deleting PgShardCluster", recorded.SecretName)
+	}
+	if recorded.SecretUID != "" {
+		if secret.UID != recorded.SecretUID {
+			return fmt.Errorf("operation-writer access Secret %s has UID %s, expected recorded UID %s during finalization", recorded.SecretName, secret.UID, recorded.SecretUID)
+		}
+		if recorded.MaterialSHA256 == "" {
+			return validateOperationWriterAccessIntentForDeletion(secret, cluster, recorded.SecretName)
+		}
+		if err := validateOperationWriterAccessSecretForFinalization(secret, cluster, recorded.SecretName); err != nil {
+			return fmt.Errorf("operation-writer access Secret %s changed from its checkpointed shape during finalization: %w", recorded.SecretName, err)
+		}
+		observed := operationWriterAccessStatus(secret, catalogCA)
+		if observed.MaterialSHA256 != recorded.MaterialSHA256 {
+			return fmt.Errorf("operation-writer access Secret %s material differs from the checkpointed creation result during finalization", recorded.SecretName)
+		}
+		return nil
+	}
+	return validateOperationWriterAccessIntentForDeletion(secret, cluster, recorded.SecretName)
+}
+
+func validateOperationWriterAccessIntentForDeletion(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string) error {
+	if !owned.OperationWriterAccessSecretNameIsValid(cluster.Name, expectedName) ||
+		!operationWriterAccessSecretMetadataMatches(secret, cluster, expectedName, true) {
+		return fmt.Errorf("operation-writer access intent Secret %s metadata is not bound to the exact deleting PgShardCluster", expectedName)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || (secret.Immutable != nil && *secret.Immutable) || len(secret.Data) != 0 || len(secret.StringData) != 0 {
+		return fmt.Errorf("operation-writer access intent Secret %s must be empty, mutable, and have type Opaque during finalization", expectedName)
+	}
+	return nil
+}
+
+func validateOperationWriterAccessSecretForFinalization(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, expectedName string) error {
+	// Deletion timestamps and finalizers are lifecycle state, not material or
+	// ownership changes. Normalize only those fields before reusing the strict
+	// live validator for an outcome-unknown material installation.
+	candidate := secret.DeepCopy()
+	candidate.DeletionTimestamp = nil
+	candidate.Finalizers = nil
+	return validateOperationWriterAccessSecret(candidate, cluster, expectedName)
+}
+
+func (r *PgShardClusterReconciler) deleteOperationWriterAccessSecret(ctx context.Context, secret *corev1.Secret) (bool, error) {
+	if secret.DeletionTimestamp != nil {
+		return true, nil
+	}
+	uid := secret.UID
+	resourceVersion := secret.ResourceVersion
+	if uid == "" || resourceVersion == "" {
+		return false, fmt.Errorf("operation-writer access Secret %s has no stable API identity", secret.Name)
+	}
+	if err := r.Delete(ctx, secret, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("delete operation-writer access Secret %s with UID %s: %w", secret.Name, secret.UID, err)
+	}
+	return true, nil
+}
+
 func (r *PgShardClusterReconciler) deleteCatalogAccessForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	if r.APIReader == nil {
 		return false, fmt.Errorf("authoritative API reader is required for catalog access deletion")
@@ -4068,7 +4508,7 @@ func (r *PgShardClusterReconciler) updateStatus(ctx context.Context, cluster *pg
 }
 
 func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
-	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !slices.EqualFunc(left.PostgreSQLReplicationCredentials, right.PostgreSQLReplicationCredentials, postgreSQLReplicationCredentialsEqual) || !slices.EqualFunc(left.PostgreSQLCatalogCandidates, right.PostgreSQLCatalogCandidates, postgreSQLCatalogCandidatesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) {
+	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !slices.EqualFunc(left.PostgreSQLReplicationCredentials, right.PostgreSQLReplicationCredentials, postgreSQLReplicationCredentialsEqual) || !slices.EqualFunc(left.PostgreSQLCatalogCandidates, right.PostgreSQLCatalogCandidates, postgreSQLCatalogCandidatesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) || !operationWriterAccessStatusesEqual(left.OperationWriterAccess, right.OperationWriterAccess) {
 		return false
 	}
 	for index := range left.Conditions {
@@ -4097,6 +4537,13 @@ func catalogAccessStatusesEqual(left, right *pgshardv1alpha1.CatalogAccessStatus
 	}
 	return left.SecretName == right.SecretName && left.SecretUID == right.SecretUID &&
 		left.ClientSHA256 == right.ClientSHA256 && left.ServerSHA256 == right.ServerSHA256
+}
+
+func operationWriterAccessStatusesEqual(left, right *pgshardv1alpha1.OperationWriterAccessStatus) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.SecretName == right.SecretName && left.SecretUID == right.SecretUID && left.MaterialSHA256 == right.MaterialSHA256
 }
 
 func bootstrapSpecsEqual(left, right *pgshardv1alpha1.PostgreSQLBootstrapSpecStatus) bool {

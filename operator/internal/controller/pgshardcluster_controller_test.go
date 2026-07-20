@@ -2510,6 +2510,550 @@ func TestCatalogAccessSecretLossReplacementAndMutationFailClosed(t *testing.T) {
 	}
 }
 
+func TestOperationWriterAccessWaitsForCompleteCatalogAndCheckpointsSeparateMaterial(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+
+	if err := reconciler.ensureOperationWriterAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "requires complete catalog access") {
+		t.Fatalf("operation-writer access before CatalogAccess completion = %v", err)
+	}
+	if got := getCluster(t, ctx, base, cluster).Status.OperationWriterAccess; got != nil {
+		t.Fatalf("incomplete CatalogAccess created operation-writer state: %#v", got)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensureCatalogAccess(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensureOperationWriterAccess(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	recorded := current.Status.OperationWriterAccess
+	if recorded == nil || !owned.OperationWriterAccessSecretNameIsValid(current.Name, recorded.SecretName) || recorded.SecretUID == "" || !validCatalogAccessDigest(recorded.MaterialSHA256) {
+		t.Fatalf("operation-writer access checkpoint = %#v", recorded)
+	}
+	writer := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: recorded.SecretName}, writer); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOperationWriterAccessSecret(writer, current, recorded.SecretName); err != nil {
+		t.Fatalf("operation-writer Secret is invalid: %v", err)
+	}
+	catalog := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: current.Status.CatalogAccess.SecretName}, catalog); err != nil {
+		t.Fatal(err)
+	}
+	if got := owned.OperationWriterMaterialSHA256(writer.Data[owned.OperationWriterPasswordKey], catalog.Data[owned.CatalogCACertificateKey]); got != recorded.MaterialSHA256 {
+		t.Fatalf("operation-writer material digest = %q, want %q", recorded.MaterialSHA256, got)
+	}
+	password := append([]byte(nil), writer.Data[owned.OperationWriterPasswordKey]...)
+	if err := reconciler.ensureOperationWriterAccess(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	unchanged := &corev1.Secret{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(writer), unchanged); err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.UID != writer.UID || !reflect.DeepEqual(unchanged.Data[owned.OperationWriterPasswordKey], password) {
+		t.Fatal("steady-state reconciliation replaced or rotated operation-writer material")
+	}
+}
+
+func TestOperationWriterAccessRecoversOutcomeUnknownCreateAndMaterialUpdate(t *testing.T) {
+	t.Parallel()
+	newReadyCatalog := func(t *testing.T) (context.Context, *pgshardv1alpha1.PgShardCluster, client.Client) {
+		t.Helper()
+		ctx := context.Background()
+		cluster := validCluster()
+		cluster.Spec.Shards = 1
+		cluster.Spec.MembersPerShard = 1
+		cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+		base := newFakeClient(t, cluster)
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(base, base).ensureCatalogAccess(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		return ctx, cluster, base
+	}
+
+	t.Run("late empty create is adopted", func(t *testing.T) {
+		t.Parallel()
+		ctx, cluster, base := newReadyCatalog(t)
+		var delayed *corev1.Secret
+		firstClient := interceptedClient(t, base, interceptor.Funcs{
+			Create: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.CreateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if !ok || secret.Labels[owned.ComponentLabel] != "shardschema-operation-writer" {
+					return fmt.Errorf("unexpected create during delayed operation-writer test: %T", object)
+				}
+				delayed = secret.DeepCopy()
+				return apierrors.NewTimeoutError("injected outcome-unknown operation-writer Secret create", 1)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(firstClient, base).ensureOperationWriterAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "outcome-unknown operation-writer Secret create") {
+			t.Fatalf("initial create error = %v", err)
+		}
+		persisted := getCluster(t, ctx, base, cluster)
+		if delayed == nil || persisted.Status.OperationWriterAccess == nil || persisted.Status.OperationWriterAccess.SecretUID != "" || len(delayed.Data) != 0 || delayed.Immutable != nil {
+			t.Fatalf("outcome-unknown create state = status %#v delayed %#v", persisted.Status.OperationWriterAccess, delayed)
+		}
+		injected := false
+		retryClient := interceptedClient(t, base, interceptor.Funcs{
+			Create: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.CreateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if ok && secret.Labels[owned.ComponentLabel] == "shardschema-operation-writer" && !injected {
+					injected = true
+					if err := base.Create(ctx, delayed); err != nil {
+						return err
+					}
+				}
+				return kubeClient.Create(ctx, object, options...)
+			},
+		})
+		if err := developmentReconciler(retryClient, base).ensureOperationWriterAccess(ctx, persisted); err != nil {
+			t.Fatalf("late empty Create was not recovered: %v", err)
+		}
+		persisted = getCluster(t, ctx, base, cluster)
+		if !injected || persisted.Status.OperationWriterAccess.SecretUID == "" || persisted.Status.OperationWriterAccess.MaterialSHA256 == "" {
+			t.Fatalf("late Create escaped the checkpointed identity: injected=%t status=%#v", injected, persisted.Status.OperationWriterAccess)
+		}
+	})
+
+	t.Run("late material update is adopted", func(t *testing.T) {
+		t.Parallel()
+		ctx, cluster, base := newReadyCatalog(t)
+		var delayed *corev1.Secret
+		firstClient := interceptedClient(t, base, interceptor.Funcs{
+			Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if !ok || secret.Labels[owned.ComponentLabel] != "shardschema-operation-writer" {
+					return fmt.Errorf("unexpected update during delayed operation-writer material test: %T", object)
+				}
+				delayed = secret.DeepCopy()
+				return apierrors.NewTimeoutError("injected outcome-unknown operation-writer material update", 1)
+			},
+		})
+		current := getCluster(t, ctx, base, cluster)
+		if err := developmentReconciler(firstClient, base).ensureOperationWriterAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "outcome-unknown operation-writer material update") {
+			t.Fatalf("initial material error = %v", err)
+		}
+		persisted := getCluster(t, ctx, base, cluster)
+		if delayed == nil || persisted.Status.OperationWriterAccess == nil || persisted.Status.OperationWriterAccess.SecretUID == "" || persisted.Status.OperationWriterAccess.MaterialSHA256 != "" {
+			t.Fatalf("outcome-unknown material state = status %#v delayed %#v", persisted.Status.OperationWriterAccess, delayed)
+		}
+		injected := false
+		retryClient := interceptedClient(t, base, interceptor.Funcs{
+			Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+				secret, ok := object.(*corev1.Secret)
+				if ok && secret.Labels[owned.ComponentLabel] == "shardschema-operation-writer" && !injected {
+					injected = true
+					if err := base.Update(ctx, delayed); err != nil {
+						return err
+					}
+				}
+				return kubeClient.Update(ctx, object, options...)
+			},
+		})
+		if err := developmentReconciler(retryClient, base).ensureOperationWriterAccess(ctx, persisted); err != nil {
+			t.Fatalf("late material update was not adopted: %v", err)
+		}
+		persisted = getCluster(t, ctx, base, cluster)
+		if !injected || persisted.Status.OperationWriterAccess.MaterialSHA256 == "" {
+			t.Fatalf("late material winner was not checkpointed: injected=%t status=%#v", injected, persisted.Status.OperationWriterAccess)
+		}
+	})
+}
+
+func TestOperationWriterFinalizationCheckpointsOutcomeUnknownMaterialBeforeDeletion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Finalizers = []string{resourceFinalizer}
+	base := newFakeClient(t, cluster)
+	current := getCluster(t, ctx, base, cluster)
+	if err := developmentReconciler(base, base).ensureCatalogAccess(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpointRejected := false
+	writeClient := interceptedClient(t, base, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, kubeClient client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			candidate, ok := object.(*pgshardv1alpha1.PgShardCluster)
+			if subresource == "status" && ok && candidate.Status.OperationWriterAccess != nil && candidate.Status.OperationWriterAccess.MaterialSHA256 != "" && !checkpointRejected {
+				checkpointRejected = true
+				return apierrors.NewTimeoutError("injected uncommitted operation-writer material checkpoint", 1)
+			}
+			return kubeClient.SubResource(subresource).Update(ctx, object, options...)
+		},
+	})
+	current = getCluster(t, ctx, base, cluster)
+	if err := developmentReconciler(writeClient, base).ensureOperationWriterAccess(ctx, current); err == nil || !strings.Contains(err.Error(), "uncommitted operation-writer material checkpoint") {
+		t.Fatalf("material checkpoint error = %v", err)
+	}
+	persisted := getCluster(t, ctx, base, cluster)
+	recorded := persisted.Status.OperationWriterAccess
+	if !checkpointRejected || recorded == nil || recorded.SecretUID == "" || recorded.MaterialSHA256 != "" {
+		t.Fatalf("pre-digest outcome-unknown state = rejected=%t status=%#v", checkpointRejected, recorded)
+	}
+	key := types.NamespacedName{Namespace: persisted.Namespace, Name: recorded.SecretName}
+	writer := &corev1.Secret{}
+	if err := base.Get(ctx, key, writer); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOperationWriterAccessSecret(writer, persisted, recorded.SecretName); err != nil {
+		t.Fatalf("installed outcome-unknown material = %v", err)
+	}
+	writer.Annotations["test.pgshard.io/unexpected"] = "changed"
+	if err := base.Update(ctx, writer); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, persisted); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := developmentReconciler(base, base)
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "neither the checkpointed empty intent nor valid installed material") {
+		t.Fatalf("malformed pre-digest finalization error = %v", err)
+	}
+	blocked := &corev1.Secret{}
+	if err := base.Get(ctx, key, blocked); err != nil || blocked.DeletionTimestamp != nil {
+		t.Fatalf("malformed pre-digest Secret began deletion: metadata=%#v error=%v", blocked.ObjectMeta, err)
+	}
+	delete(blocked.Annotations, "test.pgshard.io/unexpected")
+	if err := base.Update(ctx, blocked); err != nil {
+		t.Fatal(err)
+	}
+	result, err := reconciler.Reconcile(ctx, requestFor(cluster))
+	if err != nil || result.RequeueAfter != retryDelay {
+		t.Fatalf("outcome-unknown material adoption result=%#v error=%v", result, err)
+	}
+	adopted := getCluster(t, ctx, base, cluster)
+	if adopted.Status.OperationWriterAccess == nil || adopted.Status.OperationWriterAccess.MaterialSHA256 == "" {
+		t.Fatalf("finalization did not checkpoint installed material: %#v", adopted.Status.OperationWriterAccess)
+	}
+	if err := base.Get(ctx, key, &corev1.Secret{}); err != nil {
+		t.Fatalf("writer was deleted in the material-adoption reconcile: %v", err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(ctx, key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("adopted operation-writer material survived the following deletion reconcile: %v", err)
+	}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: adopted.Namespace, Name: adopted.Status.CatalogAccess.SecretName}, &corev1.Secret{}); err != nil {
+		t.Fatalf("CatalogAccess was deleted before adopted writer absence: %v", err)
+	}
+}
+
+func TestOperationWriterFinalizationCannotOrphanLateIntentBeforeUIDCheckpoint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	base := newFakeClient(t, cluster)
+	current := getCluster(t, ctx, base, cluster)
+	if err := developmentReconciler(base, base).ensureCatalogAccess(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	name := owned.OperationWriterAccessSecretPrefix(current.Name) + strings.Repeat("a", 32)
+	current.Status.OperationWriterAccess = &pgshardv1alpha1.OperationWriterAccessStatus{SecretName: name}
+	if err := base.Status().Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	absentReader := interceptedClient(t, base, interceptor.Funcs{
+		Get: func(ctx context.Context, kubeClient client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+			if _, ok := object.(*corev1.Secret); ok && key.Namespace == current.Namespace && key.Name == name {
+				return apierrors.NewNotFound(corev1.Resource("secrets"), name)
+			}
+			return kubeClient.Get(ctx, key, object, options...)
+		},
+	})
+	deleting, err := developmentReconciler(base, absentReader).deleteOperationWriterAccessForFinalization(ctx, current)
+	if err != nil || deleting {
+		t.Fatalf("absent pre-UID writer intent barrier = deleting %t, error %v", deleting, err)
+	}
+
+	delayed := owned.OperationWriterAccessIntentSecret(current, name)
+	delayed.UID = "late-empty-writer-intent-uid"
+	if err := base.Create(ctx, delayed); err != nil {
+		t.Fatal(err)
+	}
+	observed := &corev1.Secret{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(delayed), observed); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOperationWriterAccessIntentSecret(observed, current, name); err != nil {
+		t.Fatalf("late Create was not the empty operation-writer intent: %v", err)
+	}
+	if len(observed.Data) != 0 || len(observed.StringData) != 0 || !metav1.IsControlledBy(observed, current) {
+		t.Fatalf("late operation-writer Create carried material or escaped cluster GC: %#v", observed)
+	}
+	observed.Finalizers = []string{"test.pgshard.io/hold-late-writer-intent"}
+	if err := base.Update(ctx, observed); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, observed); err != nil {
+		t.Fatal(err)
+	}
+	deleting, err = developmentReconciler(base, base).deleteOperationWriterAccessForFinalization(ctx, current)
+	if err != nil || !deleting {
+		t.Fatalf("already deleting late empty operation-writer intent cleanup = deleting %t, error %v", deleting, err)
+	}
+}
+
+func TestOperationWriterAccessLossReplacementAndMutationFailClosed(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, context.Context, client.Client, *pgshardv1alpha1.PgShardCluster, *corev1.Secret)
+		want   string
+	}{
+		{
+			name: "missing",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, _ *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret) {
+				t.Helper()
+				if err := kubeClient.Delete(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "is missing; explicit recovery is required",
+		},
+		{
+			name: "replacement",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret) {
+				t.Helper()
+				if err := kubeClient.Delete(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
+				replacement := secret.DeepCopy()
+				replacement.ResourceVersion = ""
+				replacement.UID = "replacement-operation-writer-uid"
+				replacement.OwnerReferences = owned.OperationWriterAccessIntentSecret(cluster, secret.Name).OwnerReferences
+				if err := kubeClient.Create(ctx, replacement); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "expected recorded UID",
+		},
+		{
+			name: "unexpected key",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, _ *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret) {
+				t.Helper()
+				secret.Data["unexpected"] = []byte("value")
+				if err := kubeClient.Update(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "unexpected key set",
+		},
+		{
+			name: "changed material",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, _ *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret) {
+				t.Helper()
+				password := append([]byte(nil), secret.Data[owned.OperationWriterPasswordKey]...)
+				if password[0] == 'a' {
+					password[0] = 'b'
+				} else {
+					password[0] = 'a'
+				}
+				secret.Data[owned.OperationWriterPasswordKey] = password
+				if err := kubeClient.Update(ctx, secret); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "material differs from the checkpointed creation result",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			cluster := validCluster()
+			cluster.Spec.Shards = 1
+			cluster.Spec.MembersPerShard = 1
+			cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+			base := newFakeClient(t, cluster)
+			reconciler := developmentReconciler(base, base)
+			current := getCluster(t, ctx, base, cluster)
+			if err := reconciler.ensureCatalogAccess(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			current = getCluster(t, ctx, base, cluster)
+			if err := reconciler.ensureOperationWriterAccess(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			current = getCluster(t, ctx, base, cluster)
+			recorded := *current.Status.OperationWriterAccess
+			secret := &corev1.Secret{}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: recorded.SecretName}, secret); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, ctx, base, current, secret)
+			current = getCluster(t, ctx, base, cluster)
+			err := reconciler.ensureOperationWriterAccess(ctx, current)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ensure operation-writer error = %v, want %q", err, test.want)
+			}
+			after := getCluster(t, ctx, base, cluster)
+			if after.Status.OperationWriterAccess == nil || *after.Status.OperationWriterAccess != recorded {
+				t.Fatalf("failed reconciliation changed operation-writer checkpoint: before=%#v after=%#v", recorded, after.Status.OperationWriterAccess)
+			}
+		})
+	}
+}
+
+func TestOperationWriterAccessDeletionPrecedesCatalogAccessAndBindsMaterial(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 1
+	cluster.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	cluster.Finalizers = []string{resourceFinalizer}
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensureCatalogAccess(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensureOperationWriterAccess(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	writerKey := types.NamespacedName{Namespace: current.Namespace, Name: current.Status.OperationWriterAccess.SecretName}
+	catalogKey := types.NamespacedName{Namespace: current.Namespace, Name: current.Status.CatalogAccess.SecretName}
+	writer := &corev1.Secret{}
+	if err := base.Get(ctx, writerKey, writer); err != nil {
+		t.Fatal(err)
+	}
+	originalPassword := append([]byte(nil), writer.Data[owned.OperationWriterPasswordKey]...)
+	mutatedPassword := append([]byte(nil), originalPassword...)
+	if mutatedPassword[0] == 'a' {
+		mutatedPassword[0] = 'b'
+	} else {
+		mutatedPassword[0] = 'a'
+	}
+	writer.Data[owned.OperationWriterPasswordKey] = mutatedPassword
+	writer.Finalizers = []string{"test.pgshard.io/hold-writer"}
+	if err := base.Update(ctx, writer); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "material differs from the checkpointed creation result during finalization") {
+		t.Fatalf("mutated operation-writer material finalization error = %v", err)
+	}
+	mutatedWriter := &corev1.Secret{}
+	if err := base.Get(ctx, writerKey, mutatedWriter); err != nil || mutatedWriter.DeletionTimestamp != nil {
+		t.Fatalf("material mismatch began operation-writer deletion: metadata=%#v error=%v", mutatedWriter.ObjectMeta, err)
+	}
+	catalog := &corev1.Secret{}
+	if err := base.Get(ctx, catalogKey, catalog); err != nil || catalog.DeletionTimestamp != nil {
+		t.Fatalf("material mismatch began CatalogAccess deletion: metadata=%#v error=%v", catalog.ObjectMeta, err)
+	}
+	mutatedWriter.Data[owned.OperationWriterPasswordKey] = originalPassword
+	mutatedWriter.Annotations["test.pgshard.io/foreign"] = "value"
+	if err := base.Update(ctx, mutatedWriter); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil || !strings.Contains(err.Error(), "changed from its checkpointed shape during finalization") {
+		t.Fatalf("mutated operation-writer metadata finalization error = %v", err)
+	}
+	if err := base.Get(ctx, catalogKey, catalog); err != nil || catalog.DeletionTimestamp != nil {
+		t.Fatalf("metadata mismatch began CatalogAccess deletion: metadata=%#v error=%v", catalog.ObjectMeta, err)
+	}
+	delete(mutatedWriter.Annotations, "test.pgshard.io/foreign")
+	if err := base.Update(ctx, mutatedWriter); err != nil {
+		t.Fatal(err)
+	}
+	result, err := reconciler.Reconcile(ctx, requestFor(cluster))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != retryDelay {
+		t.Fatalf("operation-writer deletion barrier result = %#v", result)
+	}
+	terminatingWriter := &corev1.Secret{}
+	if err := base.Get(ctx, writerKey, terminatingWriter); err != nil || terminatingWriter.DeletionTimestamp == nil {
+		t.Fatalf("operation-writer Secret was not held deleting: metadata=%#v error=%v", terminatingWriter.ObjectMeta, err)
+	}
+	catalog = &corev1.Secret{}
+	if err := base.Get(ctx, catalogKey, catalog); err != nil || catalog.DeletionTimestamp != nil {
+		t.Fatalf("CatalogAccess was deleted before operation-writer absence: metadata=%#v error=%v", catalog.ObjectMeta, err)
+	}
+
+	terminatingWriter.Finalizers = nil
+	if err := base.Update(ctx, terminatingWriter); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	for range 4 {
+		if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
+			t.Fatal(err)
+		}
+		if err := base.Get(ctx, requestFor(cluster).NamespacedName, &pgshardv1alpha1.PgShardCluster{}); apierrors.IsNotFound(err) {
+			break
+		}
+	}
+	if err := base.Get(ctx, writerKey, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("operation-writer Secret survived finalization: %v", err)
+	}
+	if err := base.Get(ctx, catalogKey, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("CatalogAccess Secret survived finalization: %v", err)
+	}
+}
+
+func TestStatusesEqualIncludesOperationWriterAccess(t *testing.T) {
+	t.Parallel()
+	base := pgshardv1alpha1.PgShardClusterStatus{OperationWriterAccess: &pgshardv1alpha1.OperationWriterAccessStatus{
+		SecretName:     "example-writer-0123456789abcdef0123456789abcdef",
+		SecretUID:      "writer-uid",
+		MaterialSHA256: strings.Repeat("a", 64),
+	}}
+	copyStatus := func() pgshardv1alpha1.PgShardClusterStatus {
+		copied := base
+		writer := *base.OperationWriterAccess
+		copied.OperationWriterAccess = &writer
+		return copied
+	}
+	if !statusesEqual(base, copyStatus()) {
+		t.Fatal("equal operation-writer checkpoints compare unequal")
+	}
+	for _, mutate := range []func(*pgshardv1alpha1.PgShardClusterStatus){
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.OperationWriterAccess.SecretName += "-changed"
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.OperationWriterAccess.SecretUID = "changed-uid"
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.OperationWriterAccess.MaterialSHA256 = strings.Repeat("b", 64)
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) { status.OperationWriterAccess = nil },
+	} {
+		changed := copyStatus()
+		mutate(&changed)
+		if statusesEqual(base, changed) {
+			t.Fatalf("changed operation-writer checkpoint compared equal: %#v", changed.OperationWriterAccess)
+		}
+	}
+}
+
 func TestCatalogAccessNearExpiryDegradesReconciliationWithoutRotation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
