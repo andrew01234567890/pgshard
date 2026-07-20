@@ -22,18 +22,17 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - endpoints
-  - namespaces
-  - nodes
-  verbs:
-  - get
-- apiGroups:
-  - ""
-  resources:
   - events
   verbs:
   - create
   - patch
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  - nodes
+  verbs:
+  - get
 - apiGroups:
   - ""
   resources:

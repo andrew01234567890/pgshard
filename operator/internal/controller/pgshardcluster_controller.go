@@ -85,7 +85,6 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=endpoints,verbs=get
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
