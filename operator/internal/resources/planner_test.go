@@ -3043,6 +3043,8 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 					slotName := "pgshard_member_" + member
 					if object.Spec.Template.Spec.ServiceAccountName != PostgreSQLStandbyServiceAccountName(cluster.Name, shard) ||
 						object.Spec.Template.Spec.AutomountServiceAccountToken == nil || *object.Spec.Template.Spec.AutomountServiceAccountToken ||
+						envValue(agent.Env, "PGSHARD_CLUSTER_UID") != string(cluster.UID) ||
+						envFieldPath(agent.Env, "PGSHARD_POD_UID") != "metadata.uid" ||
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-standby") ||
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_HOST", sourceHost) ||
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", slotName) ||
@@ -3053,7 +3055,7 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						podHasServiceAccountTokenProjection(object.Spec.Template.Spec) {
 						t.Fatalf("standby %s runtime authority = %#v", object.Name, object.Spec.Template.Spec)
 					}
-					for _, forbidden := range []string{"PGSHARD_CLUSTER_UID", "PGSHARD_POD_UID", "PGSHARD_WRITABLE_LEASE_NAME", "PGSHARD_WRITABLE_LEASE_UID", "PGSHARD_LEASE_NAMESPACE"} {
+					for _, forbidden := range []string{"PGSHARD_WRITABLE_LEASE_NAME", "PGSHARD_WRITABLE_LEASE_UID", "PGSHARD_LEASE_NAMESPACE"} {
 						if containerHasEnvironment(agent, forbidden) {
 							t.Fatalf("standby %s received writable authority %s", object.Name, forbidden)
 						}
@@ -3459,8 +3461,8 @@ func TestReplicationStandbyPodClassificationIsExact(t *testing.T) {
 			setEnvironment(pod, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", "pgshard_member_0002")
 		}},
 		{name: "different passfile", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POSTGRES_PRIMARY_PASSFILE", "/other") }},
-		{name: "writable cluster UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_CLUSTER_UID", "cluster-uid") }},
-		{name: "writable Pod UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POD_UID", "pod-uid") }},
+		{name: "different cluster UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_CLUSTER_UID", "other-cluster-uid") }},
+		{name: "literal Pod UID", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POD_UID", "pod-uid") }},
 		{name: "writable Lease", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_WRITABLE_LEASE_NAME", "lease") }},
 		{name: "duplicate mode", mutate: func(pod *corev1.Pod) {
 			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"})
@@ -3951,6 +3953,15 @@ func envValue(variables []corev1.EnvVar, name string) string {
 	for _, variable := range variables {
 		if variable.Name == name {
 			return variable.Value
+		}
+	}
+	return ""
+}
+
+func envFieldPath(variables []corev1.EnvVar, name string) string {
+	for _, variable := range variables {
+		if variable.Name == name && variable.ValueFrom != nil && variable.ValueFrom.FieldRef != nil {
+			return variable.ValueFrom.FieldRef.FieldPath
 		}
 	}
 	return ""

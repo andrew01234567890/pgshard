@@ -59,6 +59,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         writable_lease,
         telemetry,
         postgres,
+        activation_config,
     } = config;
     let telemetry = telemetry.status();
     if telemetry.endpoint_configured {
@@ -68,6 +69,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let state = AgentState::with_identity(identity, max_lease_ttl_ms)?;
+    if let Some(activation_config) = activation_config {
+        state.set_activation_config(activation_config);
+    }
     let postgres_config = postgres;
     let postgres = match postgres_config.clone() {
         Some(config) => {

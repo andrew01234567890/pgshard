@@ -37,7 +37,12 @@ use tokio::sync::mpsc;
 use tokio::sync::{oneshot, watch};
 use tokio::time::{Instant, sleep, timeout};
 
-use crate::domain::{AgentState, PostgresProcessState};
+use crate::domain::{
+    ActivationConfigEvidence, ActivationPostgresConfig, AgentIdentity, AgentState,
+    PostgresProcessState, canonical_linux_boot_id,
+};
+#[cfg(test)]
+use crate::domain::{GenerationDurabilityEvidence, TargetFenceAcknowledgement, unix_time_ms};
 use crate::postgres_fence::PostgresFenceError;
 #[cfg(not(test))]
 use crate::postgres_fence::TargetFenceSession;
@@ -73,6 +78,7 @@ const MAX_POSTGRES_PATH_BYTES: usize = 1_023;
 const SOCKET_LOCK_FILE: &str = ".s.PGSQL.5432.lock";
 const EXTERNAL_PID_FILE: &str = "postmaster.external.pid";
 const BOOTSTRAP_IDENTITY_FILE: &str = ".pgshard-bootstrap-complete";
+const LINUX_BOOT_ID_FILE: &str = "/proc/sys/kernel/random/boot_id";
 const DURABLE_WRITABLE_GENERATION_FILE: &str = ".pgshard-writable-generation";
 const DURABLE_WRITABLE_GENERATION_STAGING_FILE: &str = ".pgshard-writable-generation.next";
 const MAX_BOOTSTRAP_IDENTITY_BYTES: u64 = 512;
@@ -520,7 +526,7 @@ impl PostgresConfig {
         self.role == PostgresRuntimeRole::ReplicationStandby
     }
 
-    fn is_replication_standby(&self) -> bool {
+    pub(crate) fn is_replication_standby(&self) -> bool {
         self.role == PostgresRuntimeRole::ReplicationStandby
     }
 
@@ -528,6 +534,26 @@ impl PostgresConfig {
         self.standby
             .as_ref()
             .map(|standby| standby.slot_name.as_str())
+    }
+
+    /// Builds status-only activation configuration for a TCP-closed standby.
+    pub(crate) fn standby_activation_config(
+        &self,
+        identity: AgentIdentity,
+        cluster_uid: String,
+        pod_uid: String,
+    ) -> Option<ActivationConfigEvidence> {
+        let standby = self.standby.as_ref()?;
+        Some(ActivationConfigEvidence {
+            identity,
+            cluster_uid,
+            pod_uid,
+            postgres: ActivationPostgresConfig::Standby {
+                primary_host: standby.primary_host.clone(),
+                primary_port: standby.primary_port,
+                member_slot_name: standby.slot_name.clone(),
+            },
+        })
     }
 
     fn runtime_network_settings(
@@ -1512,6 +1538,7 @@ impl PreparedPostgres {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn spawn_tracked_postmaster(
         self,
         state: &AgentState,
@@ -1622,6 +1649,9 @@ impl PreparedPostgres {
                 return Err(error);
             }
         };
+        if let Some(boot_id) = read_linux_boot_id() {
+            state.set_postgres_process_identity(child_id, boot_id);
+        }
         Ok(Some((process_group_fence, pidfd, pid, authorization)))
     }
 
@@ -1823,13 +1853,27 @@ async fn install_target_fence_monitor(
     target_authority: Option<WritableAuthorityObserver>,
     generation: &DurableWritableGeneration,
     required_margin: Duration,
+    state: &AgentState,
+    postmaster_pid: u32,
 ) -> Result<Option<TargetFenceFuture>, PostgresFenceError> {
     let Some(observer) = target_authority else {
         return Ok(None);
     };
-    let session =
-        TargetFenceSession::connect_and_install(socket_dir, &observer, generation, required_margin)
-            .await?;
+    let boot_id = state
+        .snapshot()
+        .postgres_process_identity
+        .filter(|identity| identity.postmaster_pid == postmaster_pid)
+        .map(|identity| identity.boot_id);
+    let session = TargetFenceSession::connect_and_install(
+        socket_dir,
+        &observer,
+        generation,
+        required_margin,
+        state.clone(),
+        postmaster_pid,
+        boot_id,
+    )
+    .await?;
     Ok(Some(
         Box::pin(session.supervise(observer, generation.clone(), required_margin))
             as TargetFenceFuture,
@@ -1842,12 +1886,15 @@ async fn install_target_fence_monitor(
     target_authority: Option<WritableAuthorityObserver>,
     generation: &DurableWritableGeneration,
     required_margin: Duration,
+    state: &AgentState,
+    postmaster_pid: u32,
 ) -> Result<Option<TargetFenceFuture>, PostgresFenceError> {
     let Some(mut observer) = target_authority else {
         return Ok(None);
     };
     let initial =
         crate::postgres_fence::validate_expected_authority(&observer, generation, required_margin)?;
+    publish_test_target_ack(state, &observer, &initial, postmaster_pid);
     let adapter = TEST_TARGET_FENCE_ADAPTER.with(|slot| slot.borrow_mut().take());
     if let Some(adapter) = adapter.as_ref() {
         adapter
@@ -1857,6 +1904,7 @@ async fn install_target_fence_monitor(
             .map_err(|_| PostgresFenceError::AuthorityChannelClosed)?;
     }
     let expected_generation = generation.clone();
+    let evidence_state = state.clone();
     Ok(Some(Box::pin(async move {
         let mut installed = initial;
         let (installations, mut disconnect) = match adapter {
@@ -1885,10 +1933,45 @@ async fn install_target_fence_monitor(
                         .await
                         .map_err(|_| PostgresFenceError::AuthorityChannelClosed)?;
                 }
+                publish_test_target_ack(&evidence_state, &observer, &requested, postmaster_pid);
                 installed = requested;
             }
         }
     }) as TargetFenceFuture))
+}
+
+#[cfg(test)]
+fn publish_test_target_ack(
+    state: &AgentState,
+    observer: &WritableAuthorityObserver,
+    requested: &WritableAuthoritySnapshot,
+    postmaster_pid: u32,
+) {
+    let observed_at_unix_ms = unix_time_ms();
+    let remaining_validity_at_ack_ms = observer
+        .remaining_validity(requested)
+        .and_then(|remaining| u64::try_from(remaining.as_millis()).ok())
+        .filter(|remaining| *remaining != 0);
+    let boot_id = state
+        .snapshot()
+        .postgres_process_identity
+        .filter(|identity| identity.postmaster_pid == postmaster_pid)
+        .map(|identity| identity.boot_id);
+    match (remaining_validity_at_ack_ms, boot_id) {
+        (Some(remaining_validity_at_ack_ms), Some(boot_id)) => {
+            state.set_target_fence_acknowledgement(TargetFenceAcknowledgement {
+                observed_at_unix_ms,
+                generation_identity: String::from_utf8(requested.generation.canonical_bytes())
+                    .expect("canonical generation is UTF-8"),
+                deadline_boottime_ns: requested.deadline.as_nanos(),
+                remaining_validity_at_ack_ms,
+                boot_id,
+                postmaster_pid,
+                control_backend_pid: postmaster_pid.saturating_add(1),
+            });
+        }
+        _ => state.clear_target_fence_acknowledgement(),
+    }
 }
 
 #[cfg(test)]
@@ -1931,6 +2014,8 @@ where
         target_authority,
         generation,
         target_required_margin,
+        state,
+        u32::try_from(process_group.as_raw_pid()).expect("positive PostgreSQL PID fits u32"),
     );
     tokio::pin!(target_installation);
     let authority_lost = wait_for_authority_loss(&authority_exact, authority_deadline);
@@ -4753,6 +4838,18 @@ fn validate_primary_host(host: &str) -> Result<(), PostgresConfigError> {
     } else {
         Err(PostgresConfigError::InvalidPrimaryHost(host.to_owned()))
     }
+}
+
+fn read_linux_boot_id() -> Option<String> {
+    let file = File::open(LINUX_BOOT_ID_FILE).ok()?;
+    let mut bytes = Vec::with_capacity(38);
+    file.take(38).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 37 {
+        return None;
+    }
+    let value = std::str::from_utf8(&bytes).ok()?;
+    let value = value.strip_suffix('\n').unwrap_or(value);
+    canonical_linux_boot_id(value).then(|| value.to_owned())
 }
 
 fn validate_managed_member_name(name: &str) -> Result<(), PostgresConfigError> {
@@ -8702,6 +8799,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn target_ack_renewal_and_connection_loss_gate_publication_and_fence_process_tree() {
         let root = TempDir::new().expect("create target-adapter process-tree fixture");
         let (config, descendant) = target_adapter_process_tree_config(&root);
@@ -8749,6 +8847,27 @@ mod tests {
             PostgresProcessState::StartingReplicationBootstrap,
             "target ACK must not bypass WAL generation publication"
         );
+        let initial_status = state
+            .snapshot()
+            .target_fence_acknowledgement
+            .expect("initial target ACK is observable");
+        assert_eq!(
+            initial_status.deadline_boottime_ns,
+            initial_deadline.as_nanos()
+        );
+        assert_eq!(
+            initial_status.generation_identity,
+            String::from_utf8(generation.canonical_bytes()).expect("canonical generation is UTF-8")
+        );
+        assert_ne!(
+            initial_status.postmaster_pid,
+            initial_status.control_backend_pid
+        );
+        assert!(
+            u128::from(initial_status.remaining_validity_at_ack_ms)
+                > config.target_fence_budget().as_millis()
+        );
+        assert!(canonical_linux_boot_id(&initial_status.boot_id));
 
         let renewed_deadline = initial_deadline
             .checked_add(Duration::from_secs(1))
@@ -8765,6 +8884,19 @@ mod tests {
                 generation,
             }
         );
+        let renewed_status = state
+            .snapshot()
+            .target_fence_acknowledgement
+            .expect("renewed target ACK is observable");
+        assert_eq!(
+            renewed_status.deadline_boottime_ns,
+            renewed_deadline.as_nanos()
+        );
+        assert!(
+            renewed_status.remaining_validity_at_ack_ms
+                > initial_status.remaining_validity_at_ack_ms
+        );
+        assert_eq!(renewed_status.boot_id, initial_status.boot_id);
 
         disconnect_tx
             .send(())
@@ -8780,6 +8912,7 @@ mod tests {
             ))
         ));
         assert!(state.snapshot().lease.is_none());
+        assert!(state.snapshot().target_fence_acknowledgement.is_none());
         assert_eq!(
             state.snapshot().postgres_process,
             PostgresProcessState::Failed
@@ -9147,6 +9280,27 @@ mod tests {
 
     fn state_with_writable_lease(term: u64) -> AgentState {
         let state = agent_state();
+        state.set_activation_config(ActivationConfigEvidence {
+            identity: AgentIdentity {
+                cluster_id: "cluster-1".to_owned(),
+                shard_id: ShardId(0),
+                instance_id: "cluster-1-shard-0-0".to_owned(),
+            },
+            cluster_uid: "11111111-2222-3333-4444-555555555555".to_owned(),
+            pod_uid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
+            postgres: ActivationPostgresConfig::Source {
+                lease_namespace: "database".to_owned(),
+                lease_name: "cluster-1-cell-0000-writable".to_owned(),
+                lease_uid: "99999999-8888-7777-6666-555555555555".to_owned(),
+                durability: GenerationDurabilityEvidence::RemoteApplyAnyOne {
+                    candidates: vec![
+                        "pgshard_member_0001".to_owned(),
+                        "pgshard_member_0002".to_owned(),
+                    ],
+                },
+                target_fence_required_margin_ms: 3_500,
+            },
+        });
         state
             .install_lease(
                 FencingLease {

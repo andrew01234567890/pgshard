@@ -259,6 +259,106 @@ pub enum ReplicationEvidence {
     Standby(StandbyReplicationEvidence),
 }
 
+/// Exact, non-secret runtime configuration identity published in agent status.
+///
+/// This record is untrusted, non-authoritative diagnostic evidence. Publishing
+/// a source record does not authorize SQL traffic or change the postmaster's
+/// network policy. No serving or activation decision may consume it until a
+/// collector binds each response to the controller-observed Pod namespace,
+/// name, UID, queried endpoint, and expected source Lease namespace/name/UID.
+/// That binding is necessary but not sufficient: any future decision also
+/// needs live controller-observed Pod, endpoint, and Lease evidence, the exact
+/// candidate checkpoint and durable admission term, and an explicit fencing
+/// and routing policy compatible with unmodified `PostgreSQL`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActivationConfigEvidence {
+    /// Stable agent identity configured for this process.
+    pub identity: AgentIdentity,
+    /// Exact Kubernetes cluster-object incarnation.
+    pub cluster_uid: String,
+    /// Exact Kubernetes Pod incarnation running this process.
+    pub pod_uid: String,
+    /// Role-specific non-serving `PostgreSQL` configuration.
+    #[serde(flatten)]
+    pub postgres: ActivationPostgresConfig,
+}
+
+/// Role-specific configuration identity for non-serving activation evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum ActivationPostgresConfig {
+    /// Writable-Lease-fenced physical-clone source configuration.
+    Source {
+        /// Namespace containing the exact writable-term Lease.
+        lease_namespace: String,
+        /// Exact writable-term Lease name.
+        lease_name: String,
+        /// Exact writable-term Lease incarnation.
+        lease_uid: String,
+        /// Exact configured generation durability and candidate set.
+        durability: GenerationDurabilityEvidence,
+        /// Minimum remaining target-fence validity required by supervision.
+        #[serde(serialize_with = "serialize_u64_decimal")]
+        target_fence_required_margin_ms: u64,
+    },
+    /// TCP-closed physical standby configuration.
+    Standby {
+        /// Exact configured source DNS identity.
+        primary_host: String,
+        /// Exact configured source `PostgreSQL` port.
+        primary_port: u16,
+        /// Canonical member application and physical-slot identity.
+        member_slot_name: String,
+    },
+}
+
+/// Exact target-fence acknowledgement retained for the current postmaster.
+///
+/// The control-backend PID identifies the retained `PostgreSQL` session that
+/// owns the extension's statement-admission fence. The postmaster PID binds
+/// that ACK to the locally pidfd-supervised process incarnation. This ACK does
+/// not prove interruption of already-running backends, physical walsenders, or
+/// auxiliary WAL writers; complete fencing still requires the agent to stop
+/// and reap the postmaster process tree within its Lease safety margin. This
+/// ACK does not prove that process-tree absence or promotion safety has been
+/// established. These values are diagnostic and never grant authority by
+/// themselves.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TargetFenceAcknowledgement {
+    /// Local Unix time immediately after the exact target ACK was validated.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub observed_at_unix_ms: u64,
+    /// Exact canonical writable-generation bytes acknowledged by `PostgreSQL`.
+    pub generation_identity: String,
+    /// Exact local `CLOCK_BOOTTIME` deadline acknowledged by `PostgreSQL`.
+    /// This raw value is diagnostic only and is never compared across hosts.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub deadline_boottime_ns: u64,
+    /// Source-local remaining validity sampled immediately after the ACK.
+    ///
+    /// This is a diagnostic upper bound at the source's ACK instant. A remote
+    /// observer must not age it using wall time, retain it as last-known-good,
+    /// or use it for authorization. Any future collector must establish its
+    /// own monotonic request/receipt freshness bound.
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub remaining_validity_at_ack_ms: u64,
+    /// Linux boot incarnation containing the supervised postmaster and ACK.
+    pub boot_id: String,
+    /// PID of the locally pidfd-supervised postmaster.
+    pub postmaster_pid: u32,
+    /// PID of the retained `PostgreSQL` target-fence control backend.
+    pub control_backend_pid: u32,
+}
+
+/// PID identity of the currently pidfd-supervised postmaster.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PostgresProcessIdentity {
+    /// Linux PID captured from the spawned child before supervision begins.
+    pub postmaster_pid: u32,
+    /// Canonical Linux boot ID in which the pidfd was opened.
+    pub boot_id: String,
+}
+
 /// Pure result of evaluating whether replication evidence could support a
 /// future initial-serving transition.
 ///
@@ -290,7 +390,11 @@ pub enum InitialServingEligibility {
     SynchronousWitnessMissing,
 }
 
-/// Externally reportable agent state.
+/// Externally reportable, non-authoritative agent state.
+///
+/// HTTP status is self-reported diagnostic evidence. A future collector must
+/// preserve controller-observed Pod and endpoint provenance; this snapshot by
+/// itself must never authorize serving, activation, promotion, or routing.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct AgentSnapshot {
     /// Operator-assigned identity, absent until established.
@@ -303,6 +407,12 @@ pub struct AgentSnapshot {
     pub lease: Option<FencingLease>,
     /// Fresh non-authoritative replication/generation evidence, when observed.
     pub replication_evidence: Option<ReplicationEvidence>,
+    /// Exact non-serving runtime configuration identity, when configured.
+    pub activation_config: Option<ActivationConfigEvidence>,
+    /// Latest exact target-fence ACK for the current supervised source.
+    pub target_fence_acknowledgement: Option<TargetFenceAcknowledgement>,
+    /// PID identity of the current locally supervised postmaster.
+    pub postgres_process_identity: Option<PostgresProcessIdentity>,
 }
 
 /// Thread-safe state shared by reconciliation and HTTP handlers.
@@ -424,6 +534,98 @@ impl AgentState {
         ) {
             inner.snapshot.replication_evidence = None;
         }
+        if !matches!(
+            process,
+            PostgresProcessState::StartingReplicationBootstrap
+                | PostgresProcessState::RunningReplicationBootstrap
+        ) {
+            inner.snapshot.target_fence_acknowledgement = None;
+        }
+        if !matches!(
+            process,
+            PostgresProcessState::StartingQuarantined
+                | PostgresProcessState::RunningQuarantined
+                | PostgresProcessState::StartingReplicationBootstrap
+                | PostgresProcessState::RunningReplicationBootstrap
+                | PostgresProcessState::StartingReplicationStandby
+                | PostgresProcessState::RunningReplicationStandby
+        ) {
+            inner.snapshot.postgres_process_identity = None;
+        }
+    }
+
+    /// Records the exact spawned postmaster PID while the process is in a
+    /// locally supervised lifecycle.
+    pub(crate) fn set_postgres_process_identity(&self, postmaster_pid: u32, boot_id: String) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let process_running = matches!(
+            inner.snapshot.postgres_process,
+            PostgresProcessState::StartingQuarantined
+                | PostgresProcessState::RunningQuarantined
+                | PostgresProcessState::StartingReplicationBootstrap
+                | PostgresProcessState::RunningReplicationBootstrap
+                | PostgresProcessState::StartingReplicationStandby
+                | PostgresProcessState::RunningReplicationStandby
+        );
+        inner.snapshot.postgres_process_identity =
+            (process_running && postmaster_pid != 0 && canonical_linux_boot_id(&boot_id))
+                .then_some(PostgresProcessIdentity {
+                    postmaster_pid,
+                    boot_id,
+                });
+    }
+
+    /// Publishes the exact non-serving runtime configuration identity.
+    ///
+    /// Configuration is established once before the HTTP listener starts and
+    /// remains status-only for the process lifetime.
+    pub fn set_activation_config(&self, config: ActivationConfigEvidence) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.snapshot.identity.as_ref() == Some(&config.identity) {
+            inner.snapshot.activation_config = Some(config);
+        }
+    }
+
+    /// Publishes an exact target-fence ACK only while the corresponding source
+    /// postmaster is in a non-serving supervised lifecycle.
+    pub(crate) fn set_target_fence_acknowledgement(
+        &self,
+        acknowledgement: TargetFenceAcknowledgement,
+    ) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source_configured = matches!(
+            inner
+                .snapshot
+                .activation_config
+                .as_ref()
+                .map(|config| &config.postgres),
+            Some(ActivationPostgresConfig::Source { .. })
+        );
+        let source_running = matches!(
+            inner.snapshot.postgres_process,
+            PostgresProcessState::StartingReplicationBootstrap
+                | PostgresProcessState::RunningReplicationBootstrap
+        );
+        inner.snapshot.target_fence_acknowledgement =
+            (source_configured && source_running).then_some(acknowledgement);
+    }
+
+    /// Clears target-fence evidence after authority or process loss.
+    pub(crate) fn clear_target_fence_acknowledgement(&self) {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
+            .target_fence_acknowledgement = None;
     }
 
     /// Replaces the last coherent physical-replication evidence atomically.
@@ -583,6 +785,7 @@ impl AgentState {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             inner.snapshot.lease = None;
+            inner.snapshot.target_fence_acknowledgement = None;
             inner.lease_deadline = None;
         }
     }
@@ -971,6 +1174,17 @@ pub fn classify_initial_serving_eligibility(
     }
 }
 
+pub(crate) fn canonical_linux_boot_id(boot_id: &str) -> bool {
+    boot_id.len() == 36
+        && boot_id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
+}
+
 fn evidence_time_valid(observed_at_unix_ms: u64, now_unix_ms: u64) -> bool {
     observed_at_unix_ms != 0 && observed_at_unix_ms <= now_unix_ms
 }
@@ -992,7 +1206,7 @@ fn canonical_candidate_set(candidates: &[String]) -> bool {
             .all(|(index, candidate)| *candidate == format!("pgshard_member_{:04}", index + 1))
 }
 
-fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ms() -> u64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1044,7 +1258,7 @@ mod tests {
                 "database".to_owned(),
                 "writable".to_owned(),
                 "lease-uid".to_owned(),
-                "instance-1/pod/attempt".to_owned(),
+                "instance-1/pod/0123456789abcdef01234567".to_owned(),
                 7,
             )
             .expect("valid generation")
@@ -1116,6 +1330,51 @@ mod tests {
         }
     }
 
+    fn source_activation_snapshot() -> AgentSnapshot {
+        let identity = identity();
+        AgentSnapshot {
+            identity: Some(identity.clone()),
+            postgres_process: PostgresProcessState::RunningReplicationBootstrap,
+            lease: Some(FencingLease {
+                owner_instance: identity.instance_id.clone(),
+                epoch: 7,
+                valid_until_unix_ms: 100_000,
+            }),
+            replication_evidence: Some(ReplicationEvidence::Source(source_evidence())),
+            activation_config: Some(ActivationConfigEvidence {
+                identity,
+                cluster_uid: "cluster-uid".to_owned(),
+                pod_uid: "pod".to_owned(),
+                postgres: ActivationPostgresConfig::Source {
+                    lease_namespace: "database".to_owned(),
+                    lease_name: "writable".to_owned(),
+                    lease_uid: "lease-uid".to_owned(),
+                    durability: GenerationDurabilityEvidence::RemoteApplyAnyOne {
+                        candidates: vec![
+                            "pgshard_member_0001".to_owned(),
+                            "pgshard_member_0002".to_owned(),
+                        ],
+                    },
+                    target_fence_required_margin_ms: 3_500,
+                },
+            }),
+            target_fence_acknowledgement: Some(TargetFenceAcknowledgement {
+                observed_at_unix_ms: 10_000,
+                generation_identity: generation_identity(),
+                deadline_boottime_ns: 100_000,
+                remaining_validity_at_ack_ms: 60_000,
+                boot_id: "11111111-2222-3333-8444-555555555555".to_owned(),
+                postmaster_pid: 100,
+                control_backend_pid: 101,
+            }),
+            postgres_process_identity: Some(PostgresProcessIdentity {
+                postmaster_pid: 100,
+                boot_id: "11111111-2222-3333-8444-555555555555".to_owned(),
+            }),
+            ..AgentSnapshot::default()
+        }
+    }
+
     fn install(
         state: &AgentState,
         lease: FencingLease,
@@ -1151,6 +1410,66 @@ mod tests {
         state.set_replication_evidence(ReplicationEvidence::Source(source_evidence()));
         state.set_postgres_process(PostgresProcessState::Stopping);
         assert!(state.snapshot().replication_evidence.is_none());
+    }
+
+    #[test]
+    fn process_and_target_ack_evidence_are_atomic_status_only_state() {
+        let state = state();
+        state.set_activation_config(
+            source_activation_snapshot()
+                .activation_config
+                .expect("source activation config"),
+        );
+        state.set_postgres_process(PostgresProcessState::StartingReplicationBootstrap);
+        let boot_id = "11111111-2222-3333-8444-555555555555".to_owned();
+        state.set_postgres_process_identity(100, boot_id.clone());
+        let readiness_before_ack = state.readiness();
+        state.set_target_fence_acknowledgement(TargetFenceAcknowledgement {
+            observed_at_unix_ms: 10_000,
+            generation_identity: generation_identity(),
+            deadline_boottime_ns: 100_000,
+            remaining_validity_at_ack_ms: 60_000,
+            boot_id: boot_id.clone(),
+            postmaster_pid: 100,
+            control_backend_pid: 101,
+        });
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.postgres_process_identity,
+            Some(PostgresProcessIdentity {
+                postmaster_pid: 100,
+                boot_id,
+            })
+        );
+        assert_eq!(
+            snapshot
+                .target_fence_acknowledgement
+                .as_ref()
+                .expect("target ACK")
+                .control_backend_pid,
+            101
+        );
+        let json = serde_json::to_value(snapshot).expect("serialize activation status");
+        assert_eq!(json["activation_config"]["role"], "source");
+        assert_eq!(
+            json["target_fence_acknowledgement"]["deadline_boottime_ns"],
+            "100000"
+        );
+        assert_eq!(
+            json["target_fence_acknowledgement"]["remaining_validity_at_ack_ms"],
+            "60000"
+        );
+        assert_eq!(
+            state.readiness(),
+            readiness_before_ack,
+            "activation evidence must never change readiness"
+        );
+
+        state.set_postgres_process(PostgresProcessState::Stopping);
+        let snapshot = state.snapshot();
+        assert!(snapshot.target_fence_acknowledgement.is_none());
+        assert!(snapshot.postgres_process_identity.is_none());
+        assert!(snapshot.activation_config.is_some());
     }
 
     #[test]

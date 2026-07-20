@@ -16,7 +16,10 @@ use uuid::Uuid;
 #[cfg(test)]
 use crate::boottime::system_clock;
 use crate::boottime::{BoottimeClock, BoottimeError, BoottimeInstant};
-use crate::domain::{AgentIdentity, AgentState, FencingLease, LeaseInstallError};
+use crate::domain::{
+    ActivationConfigEvidence, ActivationPostgresConfig, AgentIdentity, AgentState, FencingLease,
+    GenerationDurabilityEvidence, LeaseInstallError,
+};
 use crate::postgres::WritablePostgresStopped;
 use crate::writable::{DurableWritableGeneration, WritableLeaseAttempt, same_writable_attempt};
 
@@ -149,6 +152,27 @@ impl WritableLeaseConfig {
     #[must_use]
     pub fn shutdown_margin(&self) -> Duration {
         self.lease_duration.saturating_sub(self.renew_deadline)
+    }
+
+    /// Builds status-only activation configuration from the exact writable
+    /// Lease and `PostgreSQL` durability settings.
+    pub(crate) fn activation_config(
+        &self,
+        durability: GenerationDurabilityEvidence,
+        target_fence_required_margin_ms: u64,
+    ) -> ActivationConfigEvidence {
+        ActivationConfigEvidence {
+            identity: self.identity.clone(),
+            cluster_uid: self.cluster_uid.clone(),
+            pod_uid: self.pod_uid.clone(),
+            postgres: ActivationPostgresConfig::Source {
+                lease_namespace: self.namespace.clone(),
+                lease_name: self.lease_name.clone(),
+                lease_uid: self.lease_uid.clone(),
+                durability,
+                target_fence_required_margin_ms,
+            },
+        }
     }
 }
 

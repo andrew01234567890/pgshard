@@ -1,4 +1,4 @@
-//! Peer-authenticated installation of exact writable authority into `PostgreSQL`.
+//! Peer-authenticated installation of an exact statement-admission fence.
 //!
 //! The shared-preload target starts disarmed after every postmaster start. The
 //! agent connects only through its owner-only Unix socket and immutable
@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_postgres::{Client, Config, NoTls};
 
+use crate::domain::{AgentState, TargetFenceAcknowledgement, unix_time_ms};
 use crate::writable::{
     DurableWritableGeneration, WritableAuthorityObserver, WritableAuthoritySnapshot,
 };
@@ -113,7 +114,8 @@ const VALIDATE_EXTENSION_IDENTITY: &str = r#"
     ]::boolean[]
 "#;
 const INSTALL_AUTHORITY: &str = "\
-    SELECT installed_identity, installed_deadline_boottime_ns \
+    SELECT installed_identity, installed_deadline_boottime_ns, \
+           pg_catalog.pg_backend_pid() \
     FROM pg_catalog.pgshard_fence_install($1::bytea, $2::bytea)";
 
 /// One retained target-control session that must survive every Lease renewal.
@@ -121,6 +123,9 @@ pub(crate) struct TargetFenceSession {
     socket_dir: PathBuf,
     connection: ConnectedPostgres,
     installed: Option<WritableAuthoritySnapshot>,
+    state: AgentState,
+    postmaster_pid: u32,
+    boot_id: Option<String>,
 }
 
 impl TargetFenceSession {
@@ -131,6 +136,9 @@ impl TargetFenceSession {
         observer: &WritableAuthorityObserver,
         expected_generation: &DurableWritableGeneration,
         required_margin: Duration,
+        state: AgentState,
+        postmaster_pid: u32,
+        boot_id: Option<String>,
     ) -> Result<Self, PostgresFenceError> {
         let connection = loop {
             validate_expected_authority(observer, expected_generation, required_margin)?;
@@ -151,6 +159,9 @@ impl TargetFenceSession {
             socket_dir: socket_dir.to_owned(),
             connection,
             installed: None,
+            state,
+            postmaster_pid,
+            boot_id,
         };
         session
             .install_until_stable(observer, expected_generation, required_margin)
@@ -196,7 +207,7 @@ impl TargetFenceSession {
             let requested =
                 validate_expected_authority(observer, expected_generation, required_margin)?;
             if self.installed.as_ref() != Some(&requested) {
-                self.install_exact(&requested).await?;
+                self.install_exact(&requested, observer).await?;
                 self.installed = Some(requested.clone());
             }
             if observer.snapshot_is_current(&requested, required_margin) {
@@ -208,6 +219,7 @@ impl TargetFenceSession {
     async fn install_exact(
         &mut self,
         requested: &WritableAuthoritySnapshot,
+        observer: &WritableAuthorityObserver,
     ) -> Result<(), PostgresFenceError> {
         let identity = requested.generation.canonical_bytes();
         let deadline = requested.deadline.as_nanos().to_be_bytes().to_vec();
@@ -218,6 +230,7 @@ impl TargetFenceSession {
             .await?;
         let acknowledged_identity = row.try_get::<_, Vec<u8>>(0)?;
         let acknowledged_deadline = row.try_get::<_, Vec<u8>>(1)?;
+        let control_backend_pid = row.try_get::<_, i32>(2)?;
         validate_ack(
             &identity,
             &deadline,
@@ -226,7 +239,45 @@ impl TargetFenceSession {
         )
         .map_err(|()| PostgresFenceError::AcknowledgementMismatch {
             socket_dir: self.socket_dir.clone(),
-        })
+        })?;
+        let control_backend_pid = u32::try_from(control_backend_pid)
+            .ok()
+            .filter(|pid| *pid != 0 && *pid != self.postmaster_pid)
+            .ok_or_else(|| PostgresFenceError::AcknowledgementMismatch {
+                socket_dir: self.socket_dir.clone(),
+            })?;
+        let generation_identity = String::from_utf8(identity).map_err(|_| {
+            PostgresFenceError::AcknowledgementMismatch {
+                socket_dir: self.socket_dir.clone(),
+            }
+        })?;
+        let observed_at_unix_ms = unix_time_ms();
+        let remaining_validity_at_ack_ms = observer
+            .remaining_validity(requested)
+            .and_then(|remaining| u64::try_from(remaining.as_millis()).ok())
+            .filter(|remaining| *remaining != 0)
+            .ok_or(PostgresFenceError::AuthorityChanged)?;
+        if let Some(boot_id) = self.boot_id.as_ref() {
+            self.state
+                .set_target_fence_acknowledgement(TargetFenceAcknowledgement {
+                    observed_at_unix_ms,
+                    generation_identity,
+                    deadline_boottime_ns: requested.deadline.as_nanos(),
+                    remaining_validity_at_ack_ms,
+                    boot_id: boot_id.clone(),
+                    postmaster_pid: self.postmaster_pid,
+                    control_backend_pid,
+                });
+        } else {
+            self.state.clear_target_fence_acknowledgement();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TargetFenceSession {
+    fn drop(&mut self) {
+        self.state.clear_target_fence_acknowledgement();
     }
 }
 
@@ -341,6 +392,10 @@ mod tests {
     use super::*;
 
     use crate::boottime::BoottimeInstant;
+    use crate::domain::{
+        ActivationConfigEvidence, ActivationPostgresConfig, AgentIdentity,
+        GenerationDurabilityEvidence, PostgresProcessState,
+    };
     use crate::writable::{durable_generation_for_test, writable_attempt_pair_for_test};
 
     #[test]
@@ -397,6 +452,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     #[ignore = "requires a peer-authenticated PostgreSQL 18 target-fence Unix socket"]
     async fn live_postgres18_installs_renews_and_detects_control_session_loss() {
         let socket_dir = PathBuf::from(
@@ -404,6 +460,28 @@ mod tests {
                 .expect("PGSHARD_TARGET_FENCE_TEST_SOCKET is required"),
         );
         let generation = durable_generation_for_test(1);
+        let identity = AgentIdentity {
+            cluster_id: "cluster-1".to_owned(),
+            shard_id: pgshard_types::ShardId(0),
+            instance_id: "cluster-1-shard-0-0".to_owned(),
+        };
+        let state =
+            AgentState::with_identity(identity.clone(), 60_000).expect("valid activation state");
+        state.set_activation_config(ActivationConfigEvidence {
+            identity,
+            cluster_uid: "11111111-2222-3333-4444-555555555555".to_owned(),
+            pod_uid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
+            postgres: ActivationPostgresConfig::Source {
+                lease_namespace: "database".to_owned(),
+                lease_name: "cluster-1-cell-0000-writable".to_owned(),
+                lease_uid: "99999999-8888-7777-6666-555555555555".to_owned(),
+                durability: GenerationDurabilityEvidence::Local,
+                target_fence_required_margin_ms: 1_000,
+            },
+        });
+        state.set_postgres_process(PostgresProcessState::StartingReplicationBootstrap);
+        let boot_id = "11111111-2222-3333-8444-555555555555".to_owned();
+        state.set_postgres_process_identity(999, boot_id.clone());
         let (lease_attempt, postgres_attempt) = writable_attempt_pair_for_test();
         let initial_deadline = BoottimeInstant::now()
             .expect("read initial boot clock")
@@ -418,6 +496,9 @@ mod tests {
                 &observer,
                 &generation,
                 Duration::from_secs(1),
+                state.clone(),
+                999,
+                Some(boot_id.clone()),
             ),
         )
         .await
@@ -438,6 +519,12 @@ mod tests {
             .expect("read retained control-session commit mode")
             .get::<_, String>(0);
         assert_eq!(retained_commit_mode, "on");
+        let initial_status = state
+            .snapshot()
+            .target_fence_acknowledgement
+            .expect("initial target ACK status");
+        assert!(initial_status.remaining_validity_at_ack_ms > 1_000);
+        assert_eq!(initial_status.boot_id, boot_id);
 
         let renewed_deadline = initial_deadline
             .checked_add(Duration::from_secs(30))
@@ -454,6 +541,15 @@ mod tests {
                 generation: generation.clone(),
             })
         );
+        let renewed_status = state
+            .snapshot()
+            .target_fence_acknowledgement
+            .expect("renewed target ACK status");
+        assert!(
+            renewed_status.remaining_validity_at_ack_ms
+                > initial_status.remaining_validity_at_ack_ms
+        );
+        assert_eq!(renewed_status.boot_id, initial_status.boot_id);
 
         let backend_pid = session
             .connection
@@ -492,6 +588,7 @@ mod tests {
             ),
             "unexpected retained-session failure: {error}"
         );
+        assert!(state.snapshot().target_fence_acknowledgement.is_none());
     }
 
     #[tokio::test]
@@ -509,6 +606,15 @@ mod tests {
             .expect("bounded target deadline");
         lease_attempt.install_authority(deadline, generation.clone());
         let observer = postgres_attempt.authority_observer();
+        let state = AgentState::with_identity(
+            AgentIdentity {
+                cluster_id: "cluster-1".to_owned(),
+                shard_id: pgshard_types::ShardId(0),
+                instance_id: "cluster-1-shard-0-0".to_owned(),
+            },
+            60_000,
+        )
+        .expect("valid test state");
         let result = tokio::time::timeout(
             Duration::from_secs(3),
             TargetFenceSession::connect_and_install(
@@ -516,6 +622,9 @@ mod tests {
                 &observer,
                 &generation,
                 Duration::from_secs(1),
+                state,
+                999,
+                None,
             ),
         )
         .await
