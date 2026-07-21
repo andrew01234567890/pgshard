@@ -267,6 +267,7 @@ async fn read_startup(
 fn startup_policy(parameters: pgshard_pgwire::StartupParameters<'_>) -> StartupPolicy {
     let mut explicit_database = false;
     let mut catalog_user = false;
+    let mut invalid_replication = false;
     let mut policy = StartupPolicy::default();
     for parameter in parameters.iter() {
         let Ok((name, value)) = parameter else {
@@ -282,20 +283,45 @@ fn startup_policy(parameters: pgshard_pgwire::StartupParameters<'_>) -> StartupP
             }
         } else if name == b"user" && value == b"shardschema" {
             catalog_user = true;
-        } else if name == b"replication" && !replication_disabled(value) {
-            policy.replication = true;
+        } else if name == b"replication" {
+            // PostgreSQL walsender semantics: the last recognized value wins,
+            // but any unrecognized value is FATAL regardless of position.
+            match replication_session(value) {
+                Some(replication) => policy.replication = replication,
+                None => invalid_replication = true,
+            }
         }
     }
     policy.catalog_database |= !explicit_database && catalog_user;
+    policy.replication |= invalid_replication;
     policy
 }
 
-// PostgreSQL parse_bool false spellings; every other value stays gated (fail closed).
-fn replication_disabled(value: &[u8]) -> bool {
-    const FALSE_SPELLINGS: [&[u8]; 6] = [b"false", b"off", b"no", b"0", b"f", b"n"];
-    FALSE_SPELLINGS
-        .iter()
-        .any(|spelling| value.eq_ignore_ascii_case(spelling))
+fn replication_session(value: &[u8]) -> Option<bool> {
+    if value.eq_ignore_ascii_case(b"database") {
+        return Some(true);
+    }
+    parse_bool(value)
+}
+
+// Mirrors PostgreSQL parse_bool_with_len: case-insensitive unique prefixes of
+// true/false/yes/no, whole-word on/off, and single-character 1/0.
+fn parse_bool(value: &[u8]) -> Option<bool> {
+    fn spelled(value: &[u8], word: &[u8], minimum: usize) -> bool {
+        (minimum..=word.len()).contains(&value.len())
+            && value.eq_ignore_ascii_case(&word[..value.len()])
+    }
+    match value.first()? {
+        b't' | b'T' => spelled(value, b"true", 1).then_some(true),
+        b'f' | b'F' => spelled(value, b"false", 1).then_some(false),
+        b'y' | b'Y' => spelled(value, b"yes", 1).then_some(true),
+        b'n' | b'N' => spelled(value, b"no", 1).then_some(false),
+        b'o' | b'O' if spelled(value, b"on", 2) => Some(true),
+        b'o' | b'O' if spelled(value, b"off", 3) => Some(false),
+        b'1' if value.len() == 1 => Some(true),
+        b'0' if value.len() == 1 => Some(false),
+        _ => None,
+    }
 }
 
 async fn relay_regular_startup(
@@ -533,17 +559,19 @@ mod tests {
     #[test]
     fn replication_parameter_blocks_only_replication_sessions() {
         for value in [
-            b"false".as_slice(),
-            b"off",
-            b"no",
-            b"0",
-            b"f",
+            b"f".as_slice(),
+            b"fa",
+            b"fal",
+            b"fals",
+            b"false",
             b"n",
+            b"no",
+            b"off",
+            b"0",
             b"FALSE",
-            b"Off",
             b"No",
+            b"OFF",
             b"F",
-            b"N",
         ] {
             assert!(
                 !policy_for(&[(b"user", b"postgres"), (b"replication", value)]).replication,
@@ -551,29 +579,64 @@ mod tests {
             );
         }
         for value in [
-            b"database".as_slice(),
-            b"DATABASE",
+            b"t".as_slice(),
+            b"tr",
+            b"tru",
             b"true",
-            b"on",
-            b"yes",
-            b"1",
-            b"t",
             b"y",
+            b"ye",
+            b"yes",
+            b"on",
+            b"1",
             b"TRUE",
             b"On",
-            b"Yes",
-            b"T",
             b"Y",
+            b"database",
+            b"DATABASE",
         ] {
             assert!(
                 policy_for(&[(b"user", b"postgres"), (b"replication", value)]).replication,
                 "allowed replication startup for {value:?}"
             );
         }
-        for value in [b"".as_slice(), b"2", b"maybe", b"tru", b"fals", b"of"] {
+        for value in [
+            b"o".as_slice(),
+            b"of",
+            b"maybe",
+            b"2",
+            b"",
+            b"fals e",
+            b"truex",
+            b"offf",
+            b"00",
+            b"10",
+        ] {
             assert!(
                 policy_for(&[(b"user", b"postgres"), (b"replication", value)]).replication,
                 "allowed unrecognized replication value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_replication_parameters_use_the_last_recognized_value() {
+        let cases: [(&[u8], &[u8], bool); 5] = [
+            (b"on", b"off", false),
+            (b"off", b"on", true),
+            (b"database", b"false", false),
+            (b"true", b"garbage", true),
+            (b"garbage", b"false", true),
+        ];
+        for (first, second, replication) in cases {
+            assert_eq!(
+                policy_for(&[
+                    (b"user", b"postgres"),
+                    (b"replication", first),
+                    (b"replication", second),
+                ])
+                .replication,
+                replication,
+                "replication={first:?} then replication={second:?}"
             );
         }
     }
