@@ -1103,6 +1103,8 @@ mod tests {
                     shard_zero_correlated: true,
                     acknowledged_correlated_shards: 1,
                     shard_zero_target_fence_acknowledged: true,
+                    remote_apply_witnessed_shards: 1,
+                    shard_zero_remote_apply_witnessed: true,
                 },
             })
         }
@@ -2162,6 +2164,8 @@ mod tests {
                 shard_zero_correlated: true,
                 acknowledged_correlated_shards: 1,
                 shard_zero_target_fence_acknowledged: true,
+                remote_apply_witnessed_shards: 1,
+                shard_zero_remote_apply_witnessed: true,
             },
         };
         observe_once_with_collector(&store, &collector, &targets, &state, freshness)
@@ -2169,25 +2173,14 @@ mod tests {
             .expect("initial binding");
         let ready = state.readiness();
         assert!(ready.ready);
+        let snapshot = state.snapshot();
         assert_eq!(
-            state
-                .snapshot()
-                .topology
-                .expect("topology")
-                .agent_status_collection,
+            snapshot.topology.expect("topology").agent_status_collection,
             AgentStatusCollectionState::FreshDiagnosticEvidence,
         );
-        assert_eq!(
-            state.snapshot().agent_status.replication_correlated_shards,
-            1
-        );
-        assert_eq!(
-            state
-                .snapshot()
-                .agent_status
-                .target_fence_acknowledged_shards,
-            1
-        );
+        assert_eq!(snapshot.agent_status.replication_correlated_shards, 1);
+        assert_eq!(snapshot.agent_status.target_fence_acknowledged_shards, 1);
+        assert_eq!(snapshot.agent_status.remote_apply_witnessed_shards, 1);
         assert_eq!(state.readiness(), ready);
         assert_eq!(
             state
