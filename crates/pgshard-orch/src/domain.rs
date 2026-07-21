@@ -626,9 +626,13 @@ pub struct OrchReadiness {
     pub reason: OrchReadinessReason,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct OrchInner {
     identity: Option<OrchestratorIdentity>,
+    // Downward-API identity retained only for private catalog-dispatch
+    // authorization. Public snapshots expose neither this UID nor the sealed
+    // exact dispatcher proof.
+    configured_dispatcher_pod_uid: Option<String>,
     operations: HashMap<OperationId, OperationRecord>,
     leases: HashMap<ShardId, ShardLease>,
     // Monotonic deadlines are process-local liveness authority. The Unix
@@ -875,7 +879,7 @@ impl OrchState {
         identity: OrchestratorIdentity,
         max_lease_ttl_ms: u64,
     ) -> Result<Self, OrchError> {
-        Self::with_identity_and_optional_topology(identity, max_lease_ttl_ms, None)
+        Self::with_identity_and_optional_topology(identity, max_lease_ttl_ms, None, None)
     }
 
     /// Creates state with a configured process identity and one already
@@ -893,18 +897,45 @@ impl OrchState {
         max_lease_ttl_ms: u64,
         topology: TopologyDiagnostics,
     ) -> Result<Self, OrchError> {
-        Self::with_identity_and_optional_topology(identity, max_lease_ttl_ms, Some(topology))
+        Self::with_identity_and_optional_topology(identity, max_lease_ttl_ms, Some(topology), None)
+    }
+
+    /// Creates runtime state with validated discovery topology and the exact
+    /// downward-API Pod UID authorized to publish a catalog dispatch.
+    ///
+    /// The dispatcher Pod name is the configured orchestrator identity. The
+    /// UID remains private and is used only when sealing and revalidating the
+    /// future catalog-activation publication proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrchError::InvalidMaximumLeaseTtl`] for a zero or unbounded
+    /// policy.
+    pub fn with_identity_topology_and_dispatcher(
+        identity: OrchestratorIdentity,
+        dispatcher_pod_uid: String,
+        max_lease_ttl_ms: u64,
+        topology: TopologyDiagnostics,
+    ) -> Result<Self, OrchError> {
+        Self::with_identity_and_optional_topology(
+            identity,
+            max_lease_ttl_ms,
+            Some(topology),
+            Some(dispatcher_pod_uid),
+        )
     }
 
     fn with_identity_and_optional_topology(
         identity: OrchestratorIdentity,
         max_lease_ttl_ms: u64,
         topology: Option<TopologyDiagnostics>,
+        configured_dispatcher_pod_uid: Option<String>,
     ) -> Result<Self, OrchError> {
         Self::with_identity_optional_topology_and_clock(
             identity,
             max_lease_ttl_ms,
             topology,
+            configured_dispatcher_pod_uid,
             system_boottime_clock(),
         )
     }
@@ -913,6 +944,7 @@ impl OrchState {
         identity: OrchestratorIdentity,
         max_lease_ttl_ms: u64,
         topology: Option<TopologyDiagnostics>,
+        configured_dispatcher_pod_uid: Option<String>,
         boottime: Arc<dyn BoottimeClock>,
     ) -> Result<Self, OrchError> {
         if !(1..=MAX_LEASE_TTL_MS).contains(&max_lease_ttl_ms) {
@@ -935,6 +967,7 @@ impl OrchState {
         Ok(Self {
             inner: Arc::new(Mutex::new(OrchInner {
                 identity: Some(identity),
+                configured_dispatcher_pod_uid,
                 agent_status,
                 catalog_candidates: CatalogCandidateDiagnostics::default(),
                 topology,
@@ -983,7 +1016,13 @@ impl OrchState {
         max_lease_ttl_ms: u64,
         boottime: Arc<dyn BoottimeClock>,
     ) -> Result<Self, OrchError> {
-        Self::with_identity_optional_topology_and_clock(identity, max_lease_ttl_ms, None, boottime)
+        Self::with_identity_optional_topology_and_clock(
+            identity,
+            max_lease_ttl_ms,
+            None,
+            None,
+            boottime,
+        )
     }
 
     #[cfg(test)]
@@ -997,6 +1036,24 @@ impl OrchState {
             identity,
             max_lease_ttl_ms,
             Some(topology),
+            None,
+            boottime,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_identity_topology_dispatcher_and_clock_for_test(
+        identity: OrchestratorIdentity,
+        dispatcher_pod_uid: String,
+        max_lease_ttl_ms: u64,
+        topology: TopologyDiagnostics,
+        boottime: Arc<dyn BoottimeClock>,
+    ) -> Result<Self, OrchError> {
+        Self::with_identity_optional_topology_and_clock(
+            identity,
+            max_lease_ttl_ms,
+            Some(topology),
+            Some(dispatcher_pod_uid),
             boottime,
         )
     }
@@ -1417,6 +1474,7 @@ impl OrchState {
         expire_proof_state(inner, now);
         let now = now?;
         let identity = inner.identity.as_ref()?;
+        inner.configured_dispatcher_pod_uid.as_deref()?;
         let topology = inner.topology.as_ref()?;
         let replication = inner.agent_shard_zero_replication_proof.as_ref()?;
         let candidates = inner.catalog_candidate_proof.as_ref()?;
@@ -1555,11 +1613,14 @@ impl OrchState {
         expire_proof_state(inner, now);
         let now = now?;
         let identity = inner.identity.as_ref()?;
+        let dispatcher_pod_uid = inner.configured_dispatcher_pod_uid.as_deref()?;
         let topology = inner.topology.as_ref()?;
         let replication = inner.agent_shard_zero_replication_proof.as_ref()?;
         let candidates = inner.catalog_candidate_proof.as_ref()?;
         prepare_catalog_dispatch(
             capability,
+            &identity.orchestrator_id,
+            dispatcher_pod_uid,
             replication,
             candidates,
             &identity.cluster_id,
@@ -1627,6 +1688,9 @@ impl OrchState {
         let Some(identity) = inner.identity.as_ref() else {
             return false;
         };
+        let Some(dispatcher_pod_uid) = inner.configured_dispatcher_pod_uid.as_deref() else {
+            return false;
+        };
         let Some(topology) = inner.topology.as_ref() else {
             return false;
         };
@@ -1652,6 +1716,8 @@ impl OrchState {
         };
         revalidate_catalog_dispatch(
             dispatch,
+            &identity.orchestrator_id,
+            dispatcher_pod_uid,
             replication,
             candidates,
             &identity.cluster_id,
@@ -2462,8 +2528,9 @@ mod tests {
     }
 
     fn bootstrap_observation_state() -> OrchState {
-        OrchState::with_identity_and_topology(
+        OrchState::with_identity_topology_and_dispatcher(
             identity(),
+            "dispatcher-pod-uid".to_owned(),
             100,
             TopologyDiagnostics {
                 schema_version: crate::topology::TOPOLOGY_SCHEMA_VERSION.to_owned(),
@@ -2478,8 +2545,9 @@ mod tests {
     }
 
     fn bootstrap_observation_state_with_clock(clock: Arc<dyn BoottimeClock>) -> OrchState {
-        OrchState::with_identity_and_topology_and_clock_for_test(
+        OrchState::with_identity_topology_dispatcher_and_clock_for_test(
             identity(),
+            "dispatcher-pod-uid".to_owned(),
             100,
             TopologyDiagnostics {
                 schema_version: crate::topology::TOPOLOGY_SCHEMA_VERSION.to_owned(),
@@ -2541,8 +2609,13 @@ mod tests {
             .collect::<Vec<_>>();
         ShardZeroReplicationProof {
             writable_lease: WritableLeaseProofIdentity {
+                namespace: "database".to_owned(),
                 name: "cluster-1-shard-0000-writable".to_owned(),
                 uid: "writable-lease-uid".to_owned(),
+                resource_version: "writable-lease-rv".to_owned(),
+                holder_identity: "cluster-1-shard-0000-0/pod-uid-0/0123456789abcdef01234567"
+                    .to_owned(),
+                transitions: 7,
             },
             source: ShardZeroSourceReplicationProof {
                 member: source,
@@ -2688,10 +2761,16 @@ mod tests {
             .collect();
         BoundCandidateSet {
             cluster: ClusterFingerprint {
+                name: "cluster-1".to_owned(),
+                namespace: "database".to_owned(),
                 uid: "cluster-uid".to_owned(),
                 resource_version: "cluster-rv".to_owned(),
                 generation: 7,
                 status_sha256: "6".repeat(64),
+            },
+            catalog_activation: ObjectReference {
+                name: "cluster-1-catalog-activation".to_owned(),
+                uid: "catalog-activation-uid".to_owned(),
             },
             candidates,
             shard_zero_bootstraps,
@@ -3490,6 +3569,31 @@ mod tests {
     }
 
     #[test]
+    fn catalog_capability_requires_private_configured_dispatcher_identity() {
+        let state = OrchState::with_identity_and_topology(
+            identity(),
+            100,
+            TopologyDiagnostics {
+                schema_version: crate::topology::TOPOLOGY_SCHEMA_VERSION.to_owned(),
+                cluster_object_uid: "cluster-uid".to_owned(),
+                shard_count: 2,
+                member_count: 6,
+                agent_status_collection:
+                    crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired,
+            },
+        )
+        .expect("operation-only state remains constructible");
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(5))
+            .expect("deadline");
+        publish_exact_bootstrap_authority(&state, deadline);
+
+        assert!(state.catalog_materialization_capability().is_none());
+        let public = serde_json::to_string(&state.snapshot()).expect("public snapshot");
+        assert!(!public.contains("dispatcher-pod-uid"));
+    }
+
+    #[test]
     fn exact_catalog_capability_requires_overlap_and_revalidates_generations() {
         let state = bootstrap_observation_state();
         let now = Instant::now();
@@ -3562,7 +3666,12 @@ mod tests {
             .expect("sealed exact dispatch");
         assert!(state.revalidate_catalog_bootstrap_dispatch(&dispatch));
         let debug = format!("{state:?}");
-        for private_value in ["pod-uid-0", "generation-7", "writer-uid"] {
+        for private_value in [
+            "pod-uid-0",
+            "dispatcher-pod-uid",
+            "generation-7",
+            "writer-uid",
+        ] {
             assert!(!debug.contains(private_value));
         }
         assert!(debug.contains("<redacted>"));
@@ -3573,7 +3682,13 @@ mod tests {
         // Public snapshots remain bounded summaries and never expose the
         // retained identity graphs or writer material reference.
         let encoded = serde_json::to_string(&state.snapshot()).expect("serialize snapshot");
-        for private_value in ["pod-uid-0", "generation-7", "writer-uid", &"4".repeat(64)] {
+        for private_value in [
+            "pod-uid-0",
+            "dispatcher-pod-uid",
+            "generation-7",
+            "writer-uid",
+            &"4".repeat(64),
+        ] {
             assert!(!encoded.contains(private_value));
         }
     }

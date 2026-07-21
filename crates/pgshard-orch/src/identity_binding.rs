@@ -501,6 +501,7 @@ fn build_status_queries(
                     namespace: target.writable_lease_namespace().to_owned(),
                     name: target.writable_lease_name().to_owned(),
                     uid: lease.object.uid.clone(),
+                    resource_version: lease.object.resource_version.clone(),
                     holder_identity: lease.holder_identity.clone(),
                     transitions: lease.transitions,
                 },
@@ -1658,7 +1659,14 @@ mod tests {
     #[tokio::test]
     async fn binds_exact_pods_endpoints_and_holder_pod() {
         let (targets, store) = store();
-        bind_once(&store, &targets).await.expect("bind identities");
+        let bound = bind_once(&store, &targets).await.expect("bind identities");
+        let queries = build_status_queries(&targets, &bound).expect("status queries");
+        assert!(queries.iter().all(|query| {
+            query.expected.writable_lease.resource_version == "lease-rv"
+                && query.expected.writable_lease.transitions == 7
+                && query.expected.writable_lease.holder_identity.as_deref()
+                    == Some("demo-shard-0000-0/pod-uid-0-0/0123456789abcdef01234567")
+        }));
     }
 
     #[tokio::test]
