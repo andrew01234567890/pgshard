@@ -172,10 +172,10 @@ pub enum CatalogActivationEndpointState {
 ///
 /// This value is move-only and non-serializable. It grants no SQL, serving,
 /// readiness, routing, fencing, Lease, process, or execution authority.
-#[derive(Debug)]
 #[must_use = "durably accepted catalog activation must be handled explicitly"]
 pub struct DurablyAcceptedCatalogActivation {
     acceptance: DurableCatalogActivationAcceptance,
+    request: CatalogActivationRequest,
 }
 
 impl DurablyAcceptedCatalogActivation {
@@ -211,12 +211,29 @@ impl DurablyAcceptedCatalogActivation {
         self.acceptance.persisted_at_unix_ms()
     }
 
+    /// Returns the exact validated request sealed to this durable acceptance.
+    ///
+    /// The request remains crate-private so this proof cannot become a public
+    /// serialization or execution surface before a materializer boundary is
+    /// reviewed separately.
+    #[allow(
+        dead_code,
+        reason = "sealed input for the next dormant materializer slice"
+    )]
+    pub(crate) fn request(&self) -> &CatalogActivationRequest {
+        &self.request
+    }
+
     fn from_observed_acceptance(
         acceptance: DurableCatalogActivationAcceptance,
+        request: ValidatedRequest,
         observed: &ValidatedObservedAcceptance,
     ) -> Result<Self, CatalogActivationConsumerError> {
         require_receipt(&acceptance, &observed.0)?;
-        Ok(Self { acceptance })
+        Ok(Self {
+            acceptance,
+            request: request.request,
+        })
     }
 }
 
@@ -230,7 +247,7 @@ pub struct CatalogActivationHandoff {
     receiver: watch::Receiver<Option<Arc<DurablyAcceptedCatalogActivation>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct CatalogActivationHandoffPublisher {
     sender: watch::Sender<Option<Arc<DurablyAcceptedCatalogActivation>>>,
 }
@@ -260,7 +277,8 @@ fn exact_acceptance(
     left: &DurablyAcceptedCatalogActivation,
     right: &DurablyAcceptedCatalogActivation,
 ) -> bool {
-    left.carrier_uid() == right.carrier_uid()
+    left.request == right.request
+        && left.carrier_uid() == right.carrier_uid()
         && left.request_sha256() == right.request_sha256()
         && left.target_pod_name() == right.target_pod_name()
         && left.target_pod_uid() == right.target_pod_uid()
@@ -482,8 +500,9 @@ async fn reconcile_once<S: CarrierStore>(
         .await?;
         let current = store.get().await?;
         let observed = validate_replaced_acceptance(config, &request, &existing, &current)?;
-        let accepted =
-            DurablyAcceptedCatalogActivation::from_observed_acceptance(receipt, &observed)?;
+        let accepted = DurablyAcceptedCatalogActivation::from_observed_acceptance(
+            receipt, request, &observed,
+        )?;
         return Ok((journal, config.capability(), Some(Arc::new(accepted))));
     }
 
@@ -511,8 +530,9 @@ async fn reconcile_once<S: CarrierStore>(
             tokio::task::yield_now().await;
             let current = store.get().await?;
             let observed = validate_replaced_acceptance(config, &request, &acceptance, &current)?;
-            let accepted =
-                DurablyAcceptedCatalogActivation::from_observed_acceptance(receipt, &observed)?;
+            let accepted = DurablyAcceptedCatalogActivation::from_observed_acceptance(
+                receipt, request, &observed,
+            )?;
             Ok((journal, config.capability(), Some(Arc::new(accepted))))
         }
         Err(replace_error) => {
@@ -531,8 +551,9 @@ async fn reconcile_once<S: CarrierStore>(
                     resolution: Box::new(resolution),
                 }
             })?;
-            let accepted =
-                DurablyAcceptedCatalogActivation::from_observed_acceptance(receipt, &observed)?;
+            let accepted = DurablyAcceptedCatalogActivation::from_observed_acceptance(
+                receipt, request, &observed,
+            )?;
             Ok((journal, config.capability(), Some(Arc::new(accepted))))
         }
     }
@@ -1814,6 +1835,7 @@ mod tests {
             .expect("persist and publish acceptance");
         assert_eq!(response, configuration.capability());
         let accepted = accepted.expect("durably accepted handoff");
+        assert_eq!(accepted.request(), &exact_request);
         assert_eq!(accepted.carrier_uid(), "carrier-uid");
         assert_eq!(accepted.request_sha256(), expected_digest);
         assert_eq!(accepted.target_pod_name(), "demo-shard-0000-0");
@@ -1829,6 +1851,7 @@ mod tests {
             .await
             .expect("restart resolves exact local accepted record");
         let replayed = replayed.expect("replayed accepted handoff");
+        assert_eq!(replayed.request(), accepted.request());
         assert_eq!(replayed.request_sha256(), accepted.request_sha256());
         assert_eq!(
             replayed.persisted_at_unix_ms(),
