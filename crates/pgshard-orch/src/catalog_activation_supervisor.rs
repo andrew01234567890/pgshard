@@ -38,8 +38,7 @@ use crate::topology::CatalogCandidateObservationPlan;
 /// cadence. Any nonempty carrier, successful publication, or ambiguous write
 /// is terminal for this process incarnation and waits for shutdown without a
 /// second write attempt.
-#[allow(dead_code)] // Wired into the process only after this composition is reviewed.
-pub(crate) async fn supervise(
+pub async fn supervise(
     plan: CatalogCandidateObservationPlan,
     state: OrchState,
     mut shutdown: watch::Receiver<bool>,
