@@ -1315,7 +1315,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 			return false, nil
 		}
 		for member, checkpoint := range haCurrent.Status.PostgreSQLCatalogCandidates {
-			if checkpoint.Member != int32(member) || checkpoint.ConfigMapName != owned.PostgreSQLCatalogCandidateConfigMapName(haCluster.Name, int32(member)) ||
+			if checkpoint.Member != int32(member) || !owned.PostgreSQLCatalogCandidateConfigMapNameIsValid(haCluster.Name, int32(member), checkpoint.ConfigMapName, checkpoint.PayloadSHA256) ||
 				checkpoint.ConfigMapUID == "" || !validCatalogAccessDigest(checkpoint.PayloadSHA256) {
 				return false, nil
 			}
@@ -2043,6 +2043,10 @@ func assertKINDCatalogCandidateDiagnosticsUnavailable(t *testing.T, ctx context.
 
 func assertKINDCatalogCandidatesNotConsumed(t *testing.T, ctx context.Context, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster) {
 	t.Helper()
+	candidateNames := make(map[string]struct{}, len(cluster.Status.PostgreSQLCatalogCandidates))
+	for _, checkpoint := range cluster.Status.PostgreSQLCatalogCandidates {
+		candidateNames[checkpoint.ConfigMapName] = struct{}{}
+	}
 	statefulSets := &appsv1.StatefulSetList{}
 	deployments := &appsv1.DeploymentList{}
 	if err := kubeClient.List(ctx, statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
@@ -2053,15 +2057,19 @@ func assertKINDCatalogCandidatesNotConsumed(t *testing.T, ctx context.Context, k
 	}
 	for _, workload := range statefulSets.Items {
 		for _, volume := range workload.Spec.Template.Spec.Volumes {
-			if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, owned.PostgreSQLCatalogCandidateSuffix) {
-				t.Fatalf("StatefulSet %s consumed inert catalog candidate %s", workload.Name, volume.ConfigMap.Name)
+			if volume.ConfigMap != nil {
+				if _, candidate := candidateNames[volume.ConfigMap.Name]; candidate {
+					t.Fatalf("StatefulSet %s consumed inert catalog candidate %s", workload.Name, volume.ConfigMap.Name)
+				}
 			}
 		}
 	}
 	for _, workload := range deployments.Items {
 		for _, volume := range workload.Spec.Template.Spec.Volumes {
-			if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, owned.PostgreSQLCatalogCandidateSuffix) {
-				t.Fatalf("Deployment %s consumed inert catalog candidate %s", workload.Name, volume.ConfigMap.Name)
+			if volume.ConfigMap != nil {
+				if _, candidate := candidateNames[volume.ConfigMap.Name]; candidate {
+					t.Fatalf("Deployment %s consumed inert catalog candidate %s", workload.Name, volume.ConfigMap.Name)
+				}
 			}
 			if volume.Secret != nil && cluster.Status.CatalogAccess != nil && volume.Secret.SecretName == cluster.Status.CatalogAccess.SecretName {
 				t.Fatalf("Deployment %s consumed staged multi-member catalog access %s", workload.Name, volume.Secret.SecretName)
@@ -2287,8 +2295,8 @@ func assertKINDOrchestratorObservationRBAC(t *testing.T, ctx context.Context, cl
 			pods = append(pods, name+"-0")
 		}
 	}
-	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
-		catalogCandidates = append(catalogCandidates, owned.PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member))
+	for _, checkpoint := range cluster.Status.PostgreSQLCatalogCandidates {
+		catalogCandidates = append(catalogCandidates, checkpoint.ConfigMapName)
 	}
 
 	for _, name := range statefulSets {

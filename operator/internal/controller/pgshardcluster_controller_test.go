@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -585,6 +586,9 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			if current.Status.CatalogAccess == nil || current.Status.CatalogAccess.SecretUID == "" || current.Status.CatalogAccess.ClientSHA256 == "" || current.Status.CatalogAccess.ServerSHA256 == "" {
 				t.Fatalf("multi-member catalog input identity = %#v", current.Status.CatalogAccess)
 			}
+			if current.Status.PostgreSQLConfiguration == nil || current.Status.PostgreSQLConfiguration.ConfigMapUID == "" || current.Status.PostgreSQLConfiguration.DataSHA256 == "" {
+				t.Fatalf("multi-member PostgreSQL configuration identity = %#v", current.Status.PostgreSQLConfiguration)
+			}
 			if len(current.Status.PostgreSQLCatalogCandidates) != int(members) {
 				t.Fatalf("catalog candidate checkpoints = %#v, want %d", current.Status.PostgreSQLCatalogCandidates, members)
 			}
@@ -629,7 +633,7 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 					resourceUIDs[uid] = struct{}{}
 				}
 				checkpoint := current.Status.PostgreSQLCatalogCandidates[member]
-				if checkpoint.Member != member || checkpoint.ConfigMapName != owned.PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member) || checkpoint.ConfigMapUID == "" || checkpoint.PayloadSHA256 == "" {
+				if checkpoint.Member != member || !owned.PostgreSQLCatalogCandidateConfigMapNameIsValid(cluster.Name, member, checkpoint.ConfigMapName, checkpoint.PayloadSHA256) || checkpoint.ConfigMapUID == "" || checkpoint.PayloadSHA256 == "" {
 					t.Fatalf("catalog candidate member %d checkpoint = %#v", member, checkpoint)
 				}
 				configuration := &corev1.ConfigMap{}
@@ -655,6 +659,10 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			if len(statefulSets.Items) != int(members) || len(pods.Items) != 0 || len(budgets.Items) != 0 {
 				t.Fatalf("physical-member composition = StatefulSets=%d Pods=%d PostgreSQL PDBs=%d", len(statefulSets.Items), len(pods.Items), len(budgets.Items))
 			}
+			candidateNames := make(map[string]struct{}, len(current.Status.PostgreSQLCatalogCandidates))
+			for _, checkpoint := range current.Status.PostgreSQLCatalogCandidates {
+				candidateNames[checkpoint.ConfigMapName] = struct{}{}
+			}
 			source := appsv1.StatefulSet{}
 			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0)}, &source); err != nil {
 				t.Fatal(err)
@@ -667,8 +675,10 @@ func TestReconcileCheckpointsNonServingMultiMemberSourceStorage(t *testing.T) {
 			}
 			for _, statefulSet := range statefulSets.Items {
 				for _, volume := range statefulSet.Spec.Template.Spec.Volumes {
-					if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, owned.PostgreSQLCatalogCandidateSuffix) {
-						t.Fatalf("non-serving member %s mounted inert catalog candidate configuration %s", statefulSet.Name, volume.ConfigMap.Name)
+					if volume.ConfigMap != nil {
+						if _, candidate := candidateNames[volume.ConfigMap.Name]; candidate {
+							t.Fatalf("non-serving member %s mounted inert catalog candidate configuration %s", statefulSet.Name, volume.ConfigMap.Name)
+						}
 					}
 				}
 			}
@@ -781,6 +791,139 @@ func TestReconcileFailsClosedForReplacedCatalogCandidateConfiguration(t *testing
 	assertCondition(t, degraded, reconciledCondition, metav1.ConditionFalse, "CatalogCandidateReconcileFailed")
 	if degraded.Status.PostgreSQLCatalogCandidates[1] != checkpoint {
 		t.Fatalf("replacement changed candidate checkpoint: before=%#v after=%#v", checkpoint, degraded.Status.PostgreSQLCatalogCandidates[1])
+	}
+}
+
+func TestReconcileFailsClosedForReplacedPostgreSQLConfiguration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, nil)
+	reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	checkpoint := *current.Status.PostgreSQLConfiguration
+	candidates := slices.Clone(current.Status.PostgreSQLCatalogCandidates)
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.ConfigMapName}
+	original := &corev1.ConfigMap{}
+	if err := base.Get(ctx, key, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	replacement := original.DeepCopy()
+	replacement.UID = ""
+	replacement.ResourceVersion = ""
+	replacement.CreationTimestamp = metav1.Time{}
+	if err := base.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.UID == checkpoint.ConfigMapUID {
+		t.Fatal("replacement fixture reused the checkpointed ConfigMap UID")
+	}
+
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err == nil ||
+		!strings.Contains(err.Error(), string(checkpoint.ConfigMapUID)) ||
+		!strings.Contains(err.Error(), string(replacement.UID)) ||
+		!strings.Contains(err.Error(), "explicit recovery is required") {
+		t.Fatalf("replacement PostgreSQL configuration reconciliation error = %v", err)
+	}
+	observed := &corev1.ConfigMap{}
+	if err := base.Get(ctx, key, observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.UID != replacement.UID {
+		t.Fatalf("reconciliation replaced foreign PostgreSQL configuration UID %s with %s", replacement.UID, observed.UID)
+	}
+	degraded := getCluster(t, ctx, base, cluster)
+	assertCondition(t, degraded, reconciledCondition, metav1.ConditionFalse, "PostgreSQLConfigurationReconcileFailed")
+	if degraded.Status.PostgreSQLConfiguration == nil || *degraded.Status.PostgreSQLConfiguration != checkpoint ||
+		!slices.Equal(degraded.Status.PostgreSQLCatalogCandidates, candidates) {
+		t.Fatalf("replacement changed sealed checkpoints: configuration before=%#v after=%#v candidates before=%#v after=%#v", checkpoint, degraded.Status.PostgreSQLConfiguration, candidates, degraded.Status.PostgreSQLCatalogCandidates)
+	}
+}
+
+func TestReconcileMigratesAndRotatesContentAddressedCatalogCandidates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, nil)
+	reconciler.Images.PostgreSQLRuntime = owned.PostgreSQLRuntimeAgentQuarantine
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatal(err)
+	}
+
+	current := getCluster(t, ctx, base, cluster)
+	initial := slices.Clone(current.Status.PostgreSQLCatalogCandidates)
+	for index, checkpoint := range initial {
+		configuration := &corev1.ConfigMap{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.ConfigMapName}
+		if err := base.Get(ctx, key, configuration); err != nil {
+			t.Fatal(err)
+		}
+		legacy := configuration.DeepCopy()
+		legacy.Name = owned.LegacyPostgreSQLCatalogCandidateConfigMapName(cluster.Name, checkpoint.Member)
+		legacy.UID = ""
+		legacy.ResourceVersion = ""
+		legacy.CreationTimestamp = metav1.Time{}
+		if err := base.Create(ctx, legacy); err != nil {
+			t.Fatal(err)
+		}
+		if err := base.Delete(ctx, configuration); err != nil {
+			t.Fatal(err)
+		}
+		current.Status.PostgreSQLCatalogCandidates[index] = pgshardv1alpha1.PostgreSQLCatalogCandidateStatus{
+			Member: checkpoint.Member, ConfigMapName: legacy.Name, ConfigMapUID: legacy.UID, PayloadSHA256: checkpoint.PayloadSHA256,
+		}
+	}
+	if err := base.Status().Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatalf("migrate intact legacy candidates: %v", err)
+	}
+	migrated := getCluster(t, ctx, base, cluster)
+	for member, checkpoint := range migrated.Status.PostgreSQLCatalogCandidates {
+		if !owned.PostgreSQLCatalogCandidateConfigMapNameIsValid(cluster.Name, int32(member), checkpoint.ConfigMapName, checkpoint.PayloadSHA256) ||
+			checkpoint.ConfigMapName != initial[member].ConfigMapName || checkpoint.ConfigMapUID == current.Status.PostgreSQLCatalogCandidates[member].ConfigMapUID {
+			t.Fatalf("legacy candidate member %d was not safely migrated: legacy=%#v migrated=%#v", member, current.Status.PostgreSQLCatalogCandidates[member], checkpoint)
+		}
+	}
+
+	beforeConfiguration := *migrated.Status.PostgreSQLConfiguration
+	beforeCandidates := slices.Clone(migrated.Status.PostgreSQLCatalogCandidates)
+	migrated.Spec.PostgreSQL.Parameters = map[string]string{"max_wal_size": "2GB"}
+	if err := base.Update(ctx, migrated); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); err != nil {
+		t.Fatalf("rotate candidates after admitted PostgreSQL update: %v", err)
+	}
+	rotated := getCluster(t, ctx, base, cluster)
+	if rotated.Status.PostgreSQLConfiguration == nil || *rotated.Status.PostgreSQLConfiguration == beforeConfiguration {
+		t.Fatalf("PostgreSQL configuration checkpoint did not rotate: before=%#v after=%#v", beforeConfiguration, rotated.Status.PostgreSQLConfiguration)
+	}
+	for member, checkpoint := range rotated.Status.PostgreSQLCatalogCandidates {
+		before := beforeCandidates[member]
+		if checkpoint.Member != int32(member) ||
+			!owned.PostgreSQLCatalogCandidateConfigMapNameIsValid(cluster.Name, int32(member), checkpoint.ConfigMapName, checkpoint.PayloadSHA256) ||
+			checkpoint.ConfigMapName == before.ConfigMapName || checkpoint.ConfigMapUID == before.ConfigMapUID || checkpoint.PayloadSHA256 == before.PayloadSHA256 {
+			t.Fatalf("catalog candidate member %d did not rotate exactly: before=%#v after=%#v", member, before, checkpoint)
+		}
+		configuration := &corev1.ConfigMap{}
+		if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.ConfigMapName}, configuration); err != nil {
+			t.Fatal(err)
+		}
+		if configuration.UID != checkpoint.ConfigMapUID || owned.PostgreSQLCatalogCandidatePayloadSHA256(configuration) != checkpoint.PayloadSHA256 {
+			t.Fatalf("rotated catalog candidate member %d object does not match its checkpoint", member)
+		}
 	}
 }
 

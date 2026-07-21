@@ -316,6 +316,12 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=shard
 	PostgreSQLReplicationCredentials []PostgreSQLReplicationCredentialStatus `json:"postgresqlReplicationCredentials,omitempty"`
+	// PostgreSQLConfiguration pins the exact immutable, content-addressed
+	// PostgreSQL ConfigMap selected for a future shard-zero catalog
+	// materialization attempt. It is recorded before candidate documents are
+	// published so their execution bundle can bind both API incarnation and
+	// canonical data bytes.
+	PostgreSQLConfiguration *PostgreSQLConfigurationStatus `json:"postgresqlConfiguration,omitempty"`
 	// PostgreSQLCatalogCandidates binds every shard-zero member to one immutable,
 	// cluster-aware catalog bootstrap configuration. These ConfigMaps are not
 	// mounted by the current non-serving workloads. Missing or recreated
@@ -334,6 +340,21 @@ type PgShardClusterStatus struct {
 	// operation-writer credential. It is not mounted by any orchestrator until
 	// a later connector slice is composed.
 	OperationWriterAccess *OperationWriterAccessStatus `json:"operationWriterAccess,omitempty"`
+}
+
+// PostgreSQLConfigurationStatus binds generated PostgreSQL inputs to one
+// immutable ConfigMap incarnation. DataSHA256 covers the canonical sorted
+// ConfigMap data representation used in the content-addressed object name.
+type PostgreSQLConfigurationStatus struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	ConfigMapName string `json:"configMapName"`
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	ConfigMapUID types.UID `json:"configMapUID"`
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	DataSHA256 string `json:"dataSHA256"`
 }
 
 // OperationWriterAccessStatus binds the future orchestrator writer credential

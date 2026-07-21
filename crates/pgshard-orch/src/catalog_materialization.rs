@@ -11,7 +11,7 @@ use crate::agent_status::{
 use crate::boottime::SuspendAwareInstant;
 use crate::catalog_candidate::{
     BootstrapReference, BoundCandidateSet, CandidateFingerprint, CatalogAccessReference,
-    ClusterFingerprint, MaterialReference, ObjectReference,
+    ClusterFingerprint, MaterialReference, MaterializationBundle, ObjectReference,
 };
 
 /// Move-only, non-serializable token for one exact overlap of live evidence.
@@ -43,6 +43,7 @@ pub(crate) struct CatalogBootstrapDispatch {
     replication_credential: MaterialReference,
     catalog_access: CatalogAccessReference,
     operation_writer_access: MaterialReference,
+    materialization_bundle: MaterializationBundle,
     source: CatalogBootstrapSource,
     remote_apply_witness: CatalogBootstrapWitness,
 }
@@ -259,6 +260,7 @@ pub(crate) fn prepare_catalog_bootstrap_dispatch(
     }
     let target_candidate = candidates.candidates.first()?.clone();
     let target_bootstrap = candidates.shard_zero_bootstraps.first()?.clone();
+    let materialization_bundle = candidates.materialization_bundles.first()?.clone();
     let source = catalog_bootstrap_source(&replication.source);
     let remote_apply_witness = catalog_bootstrap_witness(&replication.remote_apply_witness);
     let dispatch = CatalogBootstrapDispatch {
@@ -270,6 +272,7 @@ pub(crate) fn prepare_catalog_bootstrap_dispatch(
         replication_credential: candidates.replication_credential.clone(),
         catalog_access: candidates.catalog_access.clone(),
         operation_writer_access: candidates.operation_writer_access.clone(),
+        materialization_bundle,
         source,
         remote_apply_witness,
     };
@@ -387,6 +390,7 @@ fn dispatch_matches_proofs(
         && dispatch.replication_credential == candidates.replication_credential
         && dispatch.catalog_access == candidates.catalog_access
         && dispatch.operation_writer_access == candidates.operation_writer_access
+        && candidates.materialization_bundles.first() == Some(&dispatch.materialization_bundle)
         && source_matches(&dispatch.source, &replication.source)
         && witness_matches(
             &dispatch.remote_apply_witness,
@@ -561,6 +565,9 @@ fn candidate_matches_member(
     let Some(bootstrap) = candidates.shard_zero_bootstraps.get(index) else {
         return false;
     };
+    let Some(materialization_bundle) = candidates.materialization_bundles.get(index) else {
+        return false;
+    };
     document.cluster_object_uid == member.cluster_uid
         && document.shard == 0
         && document.member == member.member_ordinal
@@ -569,6 +576,7 @@ fn candidate_matches_member(
         && document.writable_lease == candidates.writable_lease
         && document.replication_credential == candidates.replication_credential
         && document.catalog_access == candidates.catalog_access
+        && document.materialization_bundle == *materialization_bundle
         && document.discovery_topology.members.len() == candidates.candidates.len()
         && discovery.ordinal == member.member_ordinal
         && discovery.instance_id == member.instance_id

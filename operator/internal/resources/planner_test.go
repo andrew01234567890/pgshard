@@ -3145,6 +3145,10 @@ func TestAgentQuarantineExplicitlyScopesOrchestratorIdentityObservation(t *testi
 	}
 
 	role := object[*rbacv1.Role](t, plan, "demo-orchestrator")
+	candidateNames := make([]string, 0, len(cluster.Status.PostgreSQLCatalogCandidates))
+	for _, checkpoint := range cluster.Status.PostgreSQLCatalogCandidates {
+		candidateNames = append(candidateNames, checkpoint.ConfigMapName)
+	}
 	wantRules := []rbacv1.PolicyRule{
 		{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{"demo-orch-lease"}, Verbs: []string{"get", "update"}},
 		{APIGroups: []string{appsv1.GroupName}, Resources: []string{"statefulsets"}, ResourceNames: []string{"demo-shard-0000", "demo-shard-0000-m0001", "demo-shard-0000-m0002", "demo-shard-0001", "demo-shard-0001-m0001", "demo-shard-0001-m0002"}, Verbs: []string{"get"}},
@@ -3152,7 +3156,7 @@ func TestAgentQuarantineExplicitlyScopesOrchestratorIdentityObservation(t *testi
 		{APIGroups: []string{corev1.GroupName}, Resources: []string{"endpoints"}, ResourceNames: []string{"demo-shard-0000", "demo-shard-0001"}, Verbs: []string{"get"}},
 		{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{"demo-shard-0000-term", "demo-shard-0001-term"}, Verbs: []string{"get"}},
 		{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardclusters/status"}, ResourceNames: []string{"demo"}, Verbs: []string{"get"}},
-		{APIGroups: []string{corev1.GroupName}, Resources: []string{"configmaps"}, ResourceNames: []string{"demo-shard-0000-cfg", "demo-shard-0000-m0001-cfg", "demo-shard-0000-m0002-cfg"}, Verbs: []string{"get"}},
+		{APIGroups: []string{corev1.GroupName}, Resources: []string{"configmaps"}, ResourceNames: candidateNames, Verbs: []string{"get"}},
 	}
 	if !reflect.DeepEqual(role.Rules, wantRules) {
 		t.Fatalf("agent-quarantine identity-observation Role is not exact: %#v", role.Rules)
@@ -3477,8 +3481,16 @@ func TestMultiMemberCatalogCandidateConfigurationsAreImmutableAndInert(t *testin
 			}
 
 			seen := make(map[string]struct{}, members)
+			candidateNames := make(map[string]struct{}, members)
+			for _, checkpoint := range cluster.Status.PostgreSQLCatalogCandidates {
+				candidateNames[checkpoint.ConfigMapName] = struct{}{}
+			}
+			postgresqlConfiguration := object[*corev1.ConfigMap](t, plan, cluster.Status.PostgreSQLConfiguration.ConfigMapName)
+			if PostgreSQLConfigurationDataSHA256(postgresqlConfiguration) != cluster.Status.PostgreSQLConfiguration.DataSHA256 {
+				t.Fatal("planned PostgreSQL configuration does not match its exact checkpoint")
+			}
 			for member := int32(0); member < members; member++ {
-				name := PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member)
+				name := cluster.Status.PostgreSQLCatalogCandidates[member].ConfigMapName
 				configuration := object[*corev1.ConfigMap](t, plan, name)
 				if configuration.Immutable == nil || !*configuration.Immutable || len(configuration.Data) != 1 || len(configuration.BinaryData) != 0 {
 					t.Fatalf("catalog candidate %d ConfigMap shape = %#v", member, configuration)
@@ -3520,20 +3532,42 @@ func TestMultiMemberCatalogCandidateConfigurationsAreImmutableAndInert(t *testin
 					document.CatalogAccess.ClientSHA256 != cluster.Status.CatalogAccess.ClientSHA256 || document.CatalogAccess.ServerSHA256 != cluster.Status.CatalogAccess.ServerSHA256 {
 					t.Fatalf("catalog candidate %d document = %#v", member, document)
 				}
+				wantedBundle, err := buildCatalogCandidateMaterializationBundle(
+					cluster, postgresqlConfiguration, cluster.Status.PostgreSQLConfiguration,
+					cluster.Status.CatalogAccess, cluster.Status.OperationWriterAccess,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(document.MaterializationBundle, wantedBundle) {
+					t.Fatalf("catalog candidate %d materialization bundle = %#v, want %#v", member, document.MaterializationBundle, wantedBundle)
+				}
+				target := object[*appsv1.StatefulSet](t, plan, document.MaterializationBundle.TargetPodTemplate.StatefulSetName)
+				if target.Spec.Template.Annotations[document.MaterializationBundle.TargetPodTemplate.ConfigurationAnnotation.Key] != document.MaterializationBundle.TargetPodTemplate.ConfigurationAnnotation.Value ||
+					target.Spec.Template.Annotations[document.MaterializationBundle.TargetPodTemplate.ShardschemaMigrationAnnotation.Key] != document.MaterializationBundle.TargetPodTemplate.ShardschemaMigrationAnnotation.Value {
+					t.Fatalf("catalog candidate %d target template annotations = %#v, bundle=%#v", member, target.Spec.Template.Annotations, document.MaterializationBundle.TargetPodTemplate)
+				}
 			}
 
 			for _, item := range plan {
 				switch workload := item.(type) {
 				case *appsv1.StatefulSet:
 					for _, volume := range workload.Spec.Template.Spec.Volumes {
-						if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, PostgreSQLCatalogCandidateSuffix) {
-							t.Fatalf("StatefulSet %s mounted inert catalog candidate configuration %s", workload.Name, volume.ConfigMap.Name)
+						if volume.ConfigMap != nil {
+							if _, candidate := candidateNames[volume.ConfigMap.Name]; candidate {
+								t.Fatalf("StatefulSet %s mounted inert catalog candidate configuration %s", workload.Name, volume.ConfigMap.Name)
+							}
+						}
+						if volume.Secret != nil && (volume.Secret.SecretName == cluster.Status.CatalogAccess.SecretName || volume.Secret.SecretName == cluster.Status.OperationWriterAccess.SecretName) {
+							t.Fatalf("StatefulSet %s received sealed catalog credential material %s", workload.Name, volume.Secret.SecretName)
 						}
 					}
 				case *appsv1.Deployment:
 					for _, volume := range workload.Spec.Template.Spec.Volumes {
-						if volume.ConfigMap != nil && strings.HasSuffix(volume.ConfigMap.Name, PostgreSQLCatalogCandidateSuffix) {
-							t.Fatalf("Deployment %s mounted inert catalog candidate configuration %s", workload.Name, volume.ConfigMap.Name)
+						if volume.ConfigMap != nil {
+							if _, candidate := candidateNames[volume.ConfigMap.Name]; candidate {
+								t.Fatalf("Deployment %s mounted inert catalog candidate configuration %s", workload.Name, volume.ConfigMap.Name)
+							}
 						}
 					}
 				}
@@ -3550,6 +3584,25 @@ func TestMultiMemberCatalogCandidateConfigurationsAreImmutableAndInert(t *testin
 				}
 			}
 		})
+	}
+}
+
+func TestCatalogServingHBAPolicyIsExactAndLeastPrivilege(t *testing.T) {
+	t.Parallel()
+	want := "local postgres postgres peer\n" +
+		"local all all reject\n" +
+		"local replication all reject\n" +
+		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
+		"host replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"hostnossl shardschema all all reject\n" +
+		"hostssl shardschema pgshard_pooler_catalog all scram-sha-256\n" +
+		"hostssl shardschema pgshard_orchestrator_catalog all scram-sha-256\n" +
+		"hostssl shardschema all all reject\n" +
+		"host all all 0.0.0.0/0 reject\n" +
+		"host all all ::0/0 reject\n"
+	if catalogServingHBAPolicyVersion != "pgshard.catalog-serving-hba.v1" || catalogServingHBAPolicy != want ||
+		!validCatalogMaterialSHA256(contentSHA256(catalogServingHBAPolicy)) {
+		t.Fatalf("catalog serving HBA policy is not exact: version=%q policy=%q digest=%q", catalogServingHBAPolicyVersion, catalogServingHBAPolicy, contentSHA256(catalogServingHBAPolicy))
 	}
 }
 
@@ -3600,7 +3653,7 @@ func TestCatalogCandidateDiscoveryTopologyBindingFailsClosed(t *testing.T) {
 	}
 }
 
-func TestCatalogCandidateIdentitySurvivesAdmittedMutableUpdates(t *testing.T) {
+func TestCatalogCandidateIdentitySealsAdmittedMaterializationUpdates(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
 	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
@@ -3618,6 +3671,18 @@ func TestCatalogCandidateIdentitySurvivesAdmittedMutableUpdates(t *testing.T) {
 	if _, err := (&pgshardv1alpha1.PgShardClusterValidator{}).ValidateUpdate(context.Background(), cluster, updated); err != nil {
 		t.Fatalf("mutable update used by regression test was rejected: %v", err)
 	}
+	if _, err := DesiredPostgreSQLCatalogCandidateConfigMaps(updated); err == nil || !strings.Contains(err.Error(), "PostgreSQL configuration creation result") {
+		t.Fatalf("stale PostgreSQL configuration checkpoint was accepted after a materialization input update: %v", err)
+	}
+	updatedConfiguration, err := DesiredPostgreSQLConfigurationConfigMap(updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated.Status.PostgreSQLConfiguration = &pgshardv1alpha1.PostgreSQLConfigurationStatus{
+		ConfigMapName: updatedConfiguration.Name,
+		ConfigMapUID:  "updated-postgresql-configuration-uid",
+		DataSHA256:    PostgreSQLConfigurationDataSHA256(updatedConfiguration),
+	}
 	after, err := DesiredPostgreSQLCatalogCandidateConfigMaps(updated)
 	if err != nil {
 		t.Fatal(err)
@@ -3626,9 +3691,9 @@ func TestCatalogCandidateIdentitySurvivesAdmittedMutableUpdates(t *testing.T) {
 		t.Fatalf("candidate count changed across mutable update: before=%d after=%d", len(before), len(after))
 	}
 	for member := range before {
-		if !reflect.DeepEqual(before[member].Data, after[member].Data) ||
-			before[member].Annotations[ConfigHashAnnotation] != after[member].Annotations[ConfigHashAnnotation] {
-			t.Fatalf("candidate member %d drifted across admitted mutable update: before=%#v after=%#v", member, before[member].Data, after[member].Data)
+		if reflect.DeepEqual(before[member].Data, after[member].Data) ||
+			before[member].Annotations[ConfigHashAnnotation] == after[member].Annotations[ConfigHashAnnotation] {
+			t.Fatalf("candidate member %d did not seal the updated exact execution bundle: before=%#v after=%#v", member, before[member].Data, after[member].Data)
 		}
 	}
 
@@ -4151,7 +4216,7 @@ func TestMultiMemberPlanRequiresExactCatalogCandidateCheckpoints(t *testing.T) {
 		}, want: "member 0 is invalid"},
 		{name: "wrong payload", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
 			cluster.Status.PostgreSQLCatalogCandidates[0].PayloadSHA256 = strings.Repeat("f", 64)
-		}, want: "member 0 differs"},
+		}, want: "member 0 is invalid"},
 		{name: "duplicate member", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
 			cluster.Status.PostgreSQLCatalogCandidates = append(cluster.Status.PostgreSQLCatalogCandidates, cluster.Status.PostgreSQLCatalogCandidates[0])
 		}, want: "member 0 is duplicated"},
@@ -4301,7 +4366,7 @@ func TestPostgreSQLWritableLeaseNameFitsDNSLabelAtMaximumClusterLength(t *testin
 		PostgreSQLWritableLeaseName(cluster, pgshardv1alpha1.MaximumShards-1),
 		PostgreSQLAgentServiceAccountName(cluster, pgshardv1alpha1.MaximumShards-1),
 		PostgreSQLStandbyServiceAccountName(cluster, pgshardv1alpha1.MaximumShards-1),
-		PostgreSQLCatalogCandidateConfigMapName(cluster, 4),
+		PostgreSQLCatalogCandidateConfigMapName(cluster, 4, strings.Repeat("f", 64)),
 	}
 	for _, name := range names {
 		if messages := validation.IsDNS1123Label(name); len(messages) != 0 {
@@ -4310,6 +4375,27 @@ func TestPostgreSQLWritableLeaseNameFitsDNSLabelAtMaximumClusterLength(t *testin
 		if len(name) > 63 {
 			t.Fatalf("writable-term resource name %q has %d bytes", name, len(name))
 		}
+	}
+}
+
+func TestPostgreSQLCatalogCandidateConfigMapNameContract(t *testing.T) {
+	t.Parallel()
+	digest := strings.Repeat("f", 64)
+	for _, test := range []struct {
+		cluster string
+		member  int32
+		want    string
+	}{
+		{cluster: "demo", member: 2, want: "demo-s0-m0002-cfg-" + strings.Repeat("f", 32)},
+		{cluster: strings.Repeat("c", pgshardv1alpha1.MaximumClusterNameLength), member: 4, want: "ccccccccccc-5de6bf7f73e3-c0004-" + strings.Repeat("f", 32)},
+	} {
+		if got := PostgreSQLCatalogCandidateConfigMapName(test.cluster, test.member, digest); got != test.want ||
+			!PostgreSQLCatalogCandidateConfigMapNameIsValid(test.cluster, test.member, got, digest) {
+			t.Fatalf("candidate ConfigMap name = %q, want %q", got, test.want)
+		}
+	}
+	if PostgreSQLCatalogCandidateConfigMapName("demo", 0, "invalid") != "" {
+		t.Fatal("invalid candidate payload digest produced a ConfigMap name")
 	}
 }
 
@@ -4430,6 +4516,15 @@ func testPostgreSQLReplicationCredentials(cluster *pgshardv1alpha1.PgShardCluste
 		})
 	}
 	cluster.Status.PostgreSQLReplicationCredentials = checkpoints
+	postgresqlConfiguration, err := DesiredPostgreSQLConfigurationConfigMap(cluster)
+	if err != nil {
+		panic(fmt.Sprintf("build test PostgreSQL configuration: %v", err))
+	}
+	cluster.Status.PostgreSQLConfiguration = &pgshardv1alpha1.PostgreSQLConfigurationStatus{
+		ConfigMapName: postgresqlConfiguration.Name,
+		ConfigMapUID:  "test-postgresql-configuration-uid",
+		DataSHA256:    PostgreSQLConfigurationDataSHA256(postgresqlConfiguration),
+	}
 	desired, err := DesiredPostgreSQLCatalogCandidateConfigMaps(cluster)
 	if err != nil {
 		panic(fmt.Sprintf("build test catalog candidate configurations: %v", err))

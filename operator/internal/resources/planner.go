@@ -75,6 +75,21 @@ const (
 	catalogCandidateSchemaVersion       = "pgshard.catalog-bootstrap-candidate.v1"
 	catalogCandidateConfigurationKey    = "candidate.json"
 	maximumCatalogCandidatePayloadBytes = 16 * 1024
+	// catalogServingHBAPolicy is sealed evidence only. No current bootstrap or
+	// postmaster consumes it; future materialization must publish these exact
+	// replication-preserving, catalog-only serving rules after revalidation.
+	catalogServingHBAPolicyVersion = "pgshard.catalog-serving-hba.v1"
+	catalogServingHBAPolicy        = "local postgres postgres peer\n" +
+		"local all all reject\n" +
+		"local replication all reject\n" +
+		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
+		"host replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"hostnossl shardschema all all reject\n" +
+		"hostssl shardschema pgshard_pooler_catalog all scram-sha-256\n" +
+		"hostssl shardschema pgshard_orchestrator_catalog all scram-sha-256\n" +
+		"hostssl shardschema all all reject\n" +
+		"host all all 0.0.0.0/0 reject\n" +
+		"host all all ::0/0 reject\n"
 
 	defaultPostgreSQLImage              = "docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
 	developmentPostgreSQLBootstrapImage = "pgshard/postgres-agent:dev"
@@ -2836,15 +2851,12 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		}
 	}
 
-	postgresql, err := cluster.ResolvedPostgreSQLConfiguration()
+	postgresqlConfiguration, err := DesiredPostgreSQLConfigurationConfigMap(cluster)
 	if err != nil {
-		return nil, fmt.Errorf("resolve PostgreSQL settings: %w", err)
+		return nil, err
 	}
-	postgresqlConfig := renderPostgreSQLConfiguration(postgresql)
-	postgresqlConfig[databaseGenesisKey] = renderDatabaseGenesisSQL(cluster)
-	postgresqlConfig[databaseTopologyPreflightKey] = renderDatabaseTopologyPreflightSQL(cluster)
-	postgresqlHash := configMapDataHash(postgresqlConfig)
-	postgresqlConfigName := PostgreSQLConfigMapName(cluster.Name, postgresqlHash)
+	postgresqlHash := PostgreSQLConfigurationDataSHA256(postgresqlConfiguration)
+	postgresqlConfigName := postgresqlConfiguration.Name
 	topologyConfig, err := renderTopology(cluster)
 	if err != nil {
 		return nil, err
@@ -2901,7 +2913,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 
 	objects := make([]client.Object, 0, 18+(7+cluster.Spec.MembersPerShard)*cluster.Spec.Shards)
 	objects = append(objects,
-		immutableConfigMap(cluster, postgresqlConfigName, postgresqlConfig),
+		postgresqlConfiguration,
 		topologyConfiguration,
 		applicationService(cluster, "rw", cluster.Spec.Services.ReadWrite, PoolerRWPort),
 		applicationService(cluster, "ro", cluster.Spec.Services.ReadOnly, PoolerROPort),
@@ -3073,6 +3085,7 @@ type catalogCandidateConfigurationDocument struct {
 	WritableLease         catalogCandidateObjectReference        `json:"writableLease"`
 	ReplicationCredential catalogCandidateMaterialReference      `json:"replicationCredential"`
 	CatalogAccess         catalogCandidateCatalogAccessReference `json:"catalogAccess"`
+	MaterializationBundle catalogCandidateMaterializationBundle  `json:"materializationBundle"`
 }
 
 type catalogCandidateNameReference struct {
@@ -3113,21 +3126,91 @@ type catalogCandidateCatalogAccessReference struct {
 	ServerSHA256 string    `json:"serverSHA256"`
 }
 
-// PostgreSQLCatalogCandidateConfigMapName is the deterministic, role-neutral
-// identity of one shard-zero candidate's immutable catalog-bootstrap inputs.
-// Member-specific singleton workload names remain within the DNS-label bound,
-// including at the maximum admitted cluster name.
-func PostgreSQLCatalogCandidateConfigMapName(cluster string, member int32) string {
+type catalogCandidateConfigurationReference struct {
+	Name       string    `json:"name"`
+	UID        types.UID `json:"uid"`
+	DataSHA256 string    `json:"dataSHA256"`
+}
+
+type catalogCandidateContentReference struct {
+	SHA256 string `json:"sha256"`
+}
+
+type catalogCandidatePolicyReference struct {
+	Version string `json:"version"`
+	SHA256  string `json:"sha256"`
+}
+
+type catalogCandidateAnnotationIdentity struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type catalogCandidatePodTemplateReference struct {
+	StatefulSetName                string                             `json:"statefulSetName"`
+	PostgreSQLRuntime              string                             `json:"postgresqlRuntime"`
+	BootstrapHBAMode               string                             `json:"bootstrapHBAMode"`
+	ConfigurationAnnotation        catalogCandidateAnnotationIdentity `json:"configurationAnnotation"`
+	ShardschemaMigrationAnnotation catalogCandidateAnnotationIdentity `json:"shardschemaMigrationAnnotation"`
+	SHA256                         string                             `json:"sha256"`
+}
+
+type catalogCandidateMaterializationBundle struct {
+	PostgreSQLConfiguration   catalogCandidateConfigurationReference `json:"postgresqlConfiguration"`
+	ShardschemaMigration      catalogCandidateContentReference       `json:"shardschemaMigration"`
+	DatabaseGenesis           catalogCandidateContentReference       `json:"databaseGenesis"`
+	DatabaseTopologyPreflight catalogCandidateContentReference       `json:"databaseTopologyPreflight"`
+	CatalogAccess             catalogCandidateCatalogAccessReference `json:"catalogAccess"`
+	OperationWriterAccess     catalogCandidateMaterialReference      `json:"operationWriterAccess"`
+	ServingHBA                catalogCandidatePolicyReference        `json:"servingHBA"`
+	TargetPodTemplate         catalogCandidatePodTemplateReference   `json:"targetPodTemplate"`
+	SHA256                    string                                 `json:"sha256"`
+}
+
+// PostgreSQLCatalogCandidateConfigMapName is the deterministic,
+// content-addressed identity of one shard-zero candidate's immutable
+// catalog-bootstrap inputs. The bounded cluster prefix plus 128 payload-digest
+// bits fits a DNS label even at the maximum admitted cluster name.
+func PostgreSQLCatalogCandidateConfigMapName(cluster string, member int32, payloadSHA256 string) string {
+	if !validCatalogMaterialSHA256(payloadSHA256) {
+		return ""
+	}
+	literal := fmt.Sprintf("%s-s0-m%04d-cfg-", cluster, member)
+	const maximumPrefixLength = 31 // leaves 32 hexadecimal characters in a DNS label
+	if len(literal) > maximumPrefixLength {
+		digest := sha256.Sum256([]byte(cluster))
+		encoded := hex.EncodeToString(digest[:6])
+		memberSuffix := fmt.Sprintf("-c%04d-", member)
+		prefixLength := maximumPrefixLength - len(encoded) - len(memberSuffix) - 1
+		literal = cluster[:prefixLength] + "-" + encoded + memberSuffix
+	}
+	return literal + payloadSHA256[:32]
+}
+
+// LegacyPostgreSQLCatalogCandidateConfigMapName identifies the fixed-name
+// candidate incarnation published before candidates became content addressed.
+// It is accepted only as the source of the controller's fail-closed one-way
+// migration; newly planned objects never use it.
+func LegacyPostgreSQLCatalogCandidateConfigMapName(cluster string, member int32) string {
 	return PostgreSQLMemberStatefulSetName(cluster, 0, member) + PostgreSQLCatalogCandidateSuffix
+}
+
+// PostgreSQLCatalogCandidateConfigMapNameIsValid binds a checkpoint name to
+// its member and full payload digest. The full digest remains in status and is
+// rechecked against the immutable object; the name carries 128 collision bits.
+func PostgreSQLCatalogCandidateConfigMapNameIsValid(cluster string, member int32, name, payloadSHA256 string) bool {
+	return validCatalogMaterialSHA256(payloadSHA256) &&
+		name == PostgreSQLCatalogCandidateConfigMapName(cluster, member, payloadSHA256)
 }
 
 // DesiredPostgreSQLCatalogCandidateConfigMaps renders one inert immutable
 // configuration per shard-zero member. Nothing mounts these objects in the
-// current plan: they only bind immutable member, Secret, PVC, Lease, TLS, and
-// replication identities needed by a future fenced bootstrap step. Mutable
-// PostgreSQL tuning and the broader discovery payload are selected only when
-// that later step is prepared, so accepted cluster updates cannot drift these
-// immutable objects.
+// current plan: they bind immutable member, Secret, PVC, Lease, TLS,
+// replication, generated PostgreSQL input, and future serving-policy
+// identities needed by a fenced bootstrap step. The broader discovery payload
+// remains role-neutral and separately observed. Any accepted materialization
+// input update changes the sealed payload and therefore publishes a new exact
+// candidate incarnation before its status checkpoint advances.
 func DesiredPostgreSQLCatalogCandidateConfigMaps(cluster *pgshardv1alpha1.PgShardCluster) ([]*corev1.ConfigMap, error) {
 	if cluster == nil {
 		return nil, fmt.Errorf("cluster is nil")
@@ -3157,6 +3240,22 @@ func DesiredPostgreSQLCatalogCandidateConfigMaps(cluster *pgshardv1alpha1.PgShar
 		!validCatalogMaterialSHA256(catalogAccess.ServerSHA256) {
 		return nil, fmt.Errorf("catalog access creation result is missing or invalid")
 	}
+	operationWriterAccess := cluster.Status.OperationWriterAccess
+	if operationWriterAccess == nil || operationWriterAccess.SecretUID == "" ||
+		!OperationWriterAccessSecretNameIsValid(cluster.Name, operationWriterAccess.SecretName) ||
+		!validCatalogMaterialSHA256(operationWriterAccess.MaterialSHA256) {
+		return nil, fmt.Errorf("operation-writer access creation result is missing or invalid")
+	}
+	postgresqlConfiguration, err := DesiredPostgreSQLConfigurationConfigMap(cluster)
+	if err != nil {
+		return nil, err
+	}
+	configurationCheckpoint := cluster.Status.PostgreSQLConfiguration
+	configurationSHA256 := PostgreSQLConfigurationDataSHA256(postgresqlConfiguration)
+	if configurationCheckpoint == nil || configurationCheckpoint.ConfigMapName != postgresqlConfiguration.Name ||
+		configurationCheckpoint.ConfigMapUID == "" || configurationCheckpoint.DataSHA256 != configurationSHA256 {
+		return nil, fmt.Errorf("PostgreSQL configuration creation result is missing or invalid")
+	}
 	discoveryTopology, err := desiredCatalogCandidateDiscoveryTopology(cluster)
 	if err != nil {
 		return nil, err
@@ -3166,6 +3265,16 @@ func DesiredPostgreSQLCatalogCandidateConfigMaps(cluster *pgshardv1alpha1.PgShar
 	configurations := make([]*corev1.ConfigMap, 0, cluster.Spec.MembersPerShard)
 	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
 		bootstrap := bootstraps[postgresqlBootstrapKey{shard: 0, member: member}]
+		materializationBundle, err := buildCatalogCandidateMaterializationBundle(
+			cluster,
+			postgresqlConfiguration,
+			configurationCheckpoint,
+			catalogAccess,
+			operationWriterAccess,
+		)
+		if err != nil {
+			return nil, err
+		}
 		document := catalogCandidateConfigurationDocument{
 			SchemaVersion:     catalogCandidateSchemaVersion,
 			ClusterObjectUID:  cluster.UID,
@@ -3185,6 +3294,7 @@ func DesiredPostgreSQLCatalogCandidateConfigMaps(cluster *pgshardv1alpha1.PgShar
 				Name: catalogAccess.SecretName, UID: catalogAccess.SecretUID,
 				ClientSHA256: catalogAccess.ClientSHA256, ServerSHA256: catalogAccess.ServerSHA256,
 			},
+			MaterializationBundle: materializationBundle,
 		}
 		encoded, err := json.Marshal(document)
 		if err != nil {
@@ -3194,15 +3304,109 @@ func DesiredPostgreSQLCatalogCandidateConfigMaps(cluster *pgshardv1alpha1.PgShar
 		if len(encoded) > maximumCatalogCandidatePayloadBytes {
 			return nil, fmt.Errorf("catalog candidate member %d configuration is %d bytes, exceeding the %d-byte safety limit", member, len(encoded), maximumCatalogCandidatePayloadBytes)
 		}
-		name := PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member)
-		configuration := immutableConfigMap(cluster, name, map[string]string{catalogCandidateConfigurationKey: string(encoded)})
+		configuration := immutableConfigMap(cluster, "", map[string]string{catalogCandidateConfigurationKey: string(encoded)})
+		payloadSHA256 := PostgreSQLCatalogCandidatePayloadSHA256(configuration)
+		configuration.Name = PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member, payloadSHA256)
 		configuration.Labels[ComponentLabel] = "postgresql-catalog-bootstrap"
 		configuration.Labels[ShardLabel] = shardLabel(0)
 		configuration.Labels[MemberLabel] = memberLabel(member)
-		configuration.Annotations[ConfigHashAnnotation] = PostgreSQLCatalogCandidatePayloadSHA256(configuration)
+		configuration.Annotations[ConfigHashAnnotation] = payloadSHA256
 		configurations = append(configurations, configuration)
 	}
 	return configurations, nil
+}
+
+func buildCatalogCandidateMaterializationBundle(
+	cluster *pgshardv1alpha1.PgShardCluster,
+	configuration *corev1.ConfigMap,
+	configurationCheckpoint *pgshardv1alpha1.PostgreSQLConfigurationStatus,
+	catalogAccess *pgshardv1alpha1.CatalogAccessStatus,
+	operationWriterAccess *pgshardv1alpha1.OperationWriterAccessStatus,
+) (catalogCandidateMaterializationBundle, error) {
+	genesis, genesisOK := configuration.Data[databaseGenesisKey]
+	preflight, preflightOK := configuration.Data[databaseTopologyPreflightKey]
+	if !genesisOK || !preflightOK {
+		return catalogCandidateMaterializationBundle{}, fmt.Errorf("PostgreSQL configuration omits exact catalog materialization inputs")
+	}
+	target := catalogCandidatePodTemplateReference{
+		StatefulSetName:   PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0),
+		PostgreSQLRuntime: PostgreSQLRuntimeAgentQuarantine.String(),
+		BootstrapHBAMode:  "replication-bootstrap-primary",
+		ConfigurationAnnotation: catalogCandidateAnnotationIdentity{
+			Key: ConfigHashAnnotation, Value: configurationCheckpoint.DataSHA256,
+		},
+		ShardschemaMigrationAnnotation: catalogCandidateAnnotationIdentity{
+			Key: shardschemaMigrationHashAnnotation, Value: shardschemaMigrationSHA256,
+		},
+	}
+	target.SHA256 = canonicalJSONSHA256("pgshard-catalog-target-pod-template-v1", struct {
+		StatefulSetName                string                             `json:"statefulSetName"`
+		PostgreSQLRuntime              string                             `json:"postgresqlRuntime"`
+		BootstrapHBAMode               string                             `json:"bootstrapHBAMode"`
+		ConfigurationAnnotation        catalogCandidateAnnotationIdentity `json:"configurationAnnotation"`
+		ShardschemaMigrationAnnotation catalogCandidateAnnotationIdentity `json:"shardschemaMigrationAnnotation"`
+	}{
+		StatefulSetName: target.StatefulSetName, PostgreSQLRuntime: target.PostgreSQLRuntime,
+		BootstrapHBAMode: target.BootstrapHBAMode, ConfigurationAnnotation: target.ConfigurationAnnotation,
+		ShardschemaMigrationAnnotation: target.ShardschemaMigrationAnnotation,
+	})
+	bundle := catalogCandidateMaterializationBundle{
+		PostgreSQLConfiguration: catalogCandidateConfigurationReference{
+			Name: configurationCheckpoint.ConfigMapName, UID: configurationCheckpoint.ConfigMapUID,
+			DataSHA256: configurationCheckpoint.DataSHA256,
+		},
+		ShardschemaMigration:      catalogCandidateContentReference{SHA256: shardschemaMigrationSHA256},
+		DatabaseGenesis:           catalogCandidateContentReference{SHA256: contentSHA256(genesis)},
+		DatabaseTopologyPreflight: catalogCandidateContentReference{SHA256: contentSHA256(preflight)},
+		CatalogAccess: catalogCandidateCatalogAccessReference{
+			Name: catalogAccess.SecretName, UID: catalogAccess.SecretUID,
+			ClientSHA256: catalogAccess.ClientSHA256, ServerSHA256: catalogAccess.ServerSHA256,
+		},
+		OperationWriterAccess: catalogCandidateMaterialReference{
+			Name: operationWriterAccess.SecretName, UID: operationWriterAccess.SecretUID,
+			MaterialSHA256: operationWriterAccess.MaterialSHA256,
+		},
+		ServingHBA: catalogCandidatePolicyReference{
+			Version: catalogServingHBAPolicyVersion, SHA256: contentSHA256(catalogServingHBAPolicy),
+		},
+		TargetPodTemplate: target,
+	}
+	bundle.SHA256 = canonicalJSONSHA256("pgshard-catalog-materialization-bundle-v1", struct {
+		PostgreSQLConfiguration   catalogCandidateConfigurationReference `json:"postgresqlConfiguration"`
+		ShardschemaMigration      catalogCandidateContentReference       `json:"shardschemaMigration"`
+		DatabaseGenesis           catalogCandidateContentReference       `json:"databaseGenesis"`
+		DatabaseTopologyPreflight catalogCandidateContentReference       `json:"databaseTopologyPreflight"`
+		CatalogAccess             catalogCandidateCatalogAccessReference `json:"catalogAccess"`
+		OperationWriterAccess     catalogCandidateMaterialReference      `json:"operationWriterAccess"`
+		ServingHBA                catalogCandidatePolicyReference        `json:"servingHBA"`
+		TargetPodTemplate         catalogCandidatePodTemplateReference   `json:"targetPodTemplate"`
+	}{
+		PostgreSQLConfiguration: bundle.PostgreSQLConfiguration, ShardschemaMigration: bundle.ShardschemaMigration,
+		DatabaseGenesis: bundle.DatabaseGenesis, DatabaseTopologyPreflight: bundle.DatabaseTopologyPreflight,
+		CatalogAccess: bundle.CatalogAccess, OperationWriterAccess: bundle.OperationWriterAccess,
+		ServingHBA: bundle.ServingHBA, TargetPodTemplate: bundle.TargetPodTemplate,
+	})
+	if bundle.SHA256 == "" || target.SHA256 == "" {
+		return catalogCandidateMaterializationBundle{}, fmt.Errorf("encode exact catalog materialization bundle")
+	}
+	return bundle, nil
+}
+
+func contentSHA256(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
+func canonicalJSONSHA256(domain string, value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(domain))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write(encoded)
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func desiredCatalogCandidateDiscoveryTopology(cluster *pgshardv1alpha1.PgShardCluster) (catalogCandidateDiscoveryTopology, error) {
@@ -3300,7 +3504,7 @@ func postgresqlCatalogCandidateConfigMaps(cluster *pgshardv1alpha1.PgShardCluste
 	uids := make(map[types.UID]struct{}, len(cluster.Status.PostgreSQLCatalogCandidates))
 	for _, checkpoint := range cluster.Status.PostgreSQLCatalogCandidates {
 		if checkpoint.Member < 0 || checkpoint.Member >= cluster.Spec.MembersPerShard ||
-			checkpoint.ConfigMapName != PostgreSQLCatalogCandidateConfigMapName(cluster.Name, checkpoint.Member) ||
+			!PostgreSQLCatalogCandidateConfigMapNameIsValid(cluster.Name, checkpoint.Member, checkpoint.ConfigMapName, checkpoint.PayloadSHA256) ||
 			checkpoint.ConfigMapUID == "" || len(checkpoint.ConfigMapUID) > 128 ||
 			!validCatalogMaterialSHA256(checkpoint.PayloadSHA256) {
 			return nil, fmt.Errorf("PostgreSQL catalog candidate checkpoint for member %d is invalid", checkpoint.Member)
@@ -3325,6 +3529,34 @@ func postgresqlCatalogCandidateConfigMaps(cluster *pgshardv1alpha1.PgShardCluste
 		}
 	}
 	return desired, nil
+}
+
+// DesiredPostgreSQLConfigurationConfigMap renders the exact immutable,
+// content-addressed PostgreSQL input object. The API-assigned UID is
+// checkpointed separately before any materialization candidate can refer to
+// this object.
+func DesiredPostgreSQLConfigurationConfigMap(cluster *pgshardv1alpha1.PgShardCluster) (*corev1.ConfigMap, error) {
+	if cluster == nil {
+		return nil, fmt.Errorf("cluster is nil")
+	}
+	postgresql, err := cluster.ResolvedPostgreSQLConfiguration()
+	if err != nil {
+		return nil, fmt.Errorf("resolve PostgreSQL settings: %w", err)
+	}
+	data := renderPostgreSQLConfiguration(postgresql)
+	data[databaseGenesisKey] = renderDatabaseGenesisSQL(cluster)
+	data[databaseTopologyPreflightKey] = renderDatabaseTopologyPreflightSQL(cluster)
+	digest := configMapDataHash(data)
+	return immutableConfigMap(cluster, PostgreSQLConfigMapName(cluster.Name, digest), data), nil
+}
+
+// PostgreSQLConfigurationDataSHA256 returns the canonical sorted-data digest
+// used by both the immutable object name and the Pod template annotation.
+func PostgreSQLConfigurationDataSHA256(configuration *corev1.ConfigMap) string {
+	if configuration == nil || len(configuration.Data) == 0 || len(configuration.BinaryData) != 0 {
+		return ""
+	}
+	return configMapDataHash(configuration.Data)
 }
 
 func renderPostgreSQLConfiguration(configuration pgshardv1alpha1.ResolvedPostgreSQLConfiguration) map[string]string {
@@ -4522,6 +4754,9 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 		PostgreSQLRuntimeAnnotation:              images.PostgreSQLRuntime.String(),
 		PostgreSQLGenerationDurabilityAnnotation: generationDurability,
 	}
+	if shard == 0 {
+		podAnnotations[shardschemaMigrationHashAnnotation] = shardschemaMigrationSHA256
+	}
 	if synchronousStandbys != "" {
 		podAnnotations[PostgreSQLSynchronousStandbysAnnotation] = synchronousStandbys
 	}
@@ -4961,14 +5196,16 @@ func orchestratorLeaseRole(cluster *pgshardv1alpha1.PgShardCluster, identityBind
 		rbacv1.PolicyRule{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: writableLeaseNames, Verbs: []string{"get"}},
 	)
 	if cluster.Spec.MembersPerShard == 3 || cluster.Spec.MembersPerShard == 5 {
-		catalogCandidateNames := make([]string, 0, cluster.Spec.MembersPerShard)
-		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
-			catalogCandidateNames = append(catalogCandidateNames, PostgreSQLCatalogCandidateConfigMapName(cluster.Name, member))
+		catalogCandidateNames := make([]string, 0, len(cluster.Status.PostgreSQLCatalogCandidates))
+		for _, checkpoint := range cluster.Status.PostgreSQLCatalogCandidates {
+			if PostgreSQLCatalogCandidateConfigMapNameIsValid(cluster.Name, checkpoint.Member, checkpoint.ConfigMapName, checkpoint.PayloadSHA256) {
+				catalogCandidateNames = append(catalogCandidateNames, checkpoint.ConfigMapName)
+			}
 		}
-		rules = append(rules,
-			rbacv1.PolicyRule{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardclusters/status"}, ResourceNames: []string{cluster.Name}, Verbs: []string{"get"}},
-			rbacv1.PolicyRule{APIGroups: []string{corev1.GroupName}, Resources: []string{"configmaps"}, ResourceNames: catalogCandidateNames, Verbs: []string{"get"}},
-		)
+		rules = append(rules, rbacv1.PolicyRule{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardclusters/status"}, ResourceNames: []string{cluster.Name}, Verbs: []string{"get"}})
+		if len(catalogCandidateNames) != 0 {
+			rules = append(rules, rbacv1.PolicyRule{APIGroups: []string{corev1.GroupName}, Resources: []string{"configmaps"}, ResourceNames: catalogCandidateNames, Verbs: []string{"get"}})
+		}
 	}
 	return &rbacv1.Role{
 		ObjectMeta: ownedMeta(cluster, name, "orchestrator", nil),

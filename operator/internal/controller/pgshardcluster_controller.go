@@ -257,6 +257,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "OperationWriterAccessReconcileFailed", fmt.Sprintf("shardschema operation-writer access reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	if err := r.ensurePostgreSQLConfiguration(ctx, cluster); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PostgreSQLConfigurationReconcileFailed", fmt.Sprintf("PostgreSQL configuration reconciliation failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	if err := r.ensurePostgreSQLCatalogCandidateConfigurations(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "CatalogCandidateReconcileFailed", fmt.Sprintf("shard-zero catalog candidate configuration reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
@@ -1284,6 +1288,128 @@ func (r *PgShardClusterReconciler) ensureCatalogAccess(ctx context.Context, clus
 	return validateCheckpointedCatalogAccess(secret, cluster, recorded)
 }
 
+// ensurePostgreSQLConfiguration publishes and checkpoints the exact immutable
+// PostgreSQL input object before any catalog candidate may seal its API
+// incarnation. Same-name replacement is always an explicit-recovery boundary;
+// a content-addressed name change may be checkpointed only after the previous
+// object is still proven intact.
+func (r *PgShardClusterReconciler) ensurePostgreSQLConfiguration(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	active := cluster.Spec.MembersPerShard > 1 && cluster.Status.PostgreSQLBootstrapSpec != nil &&
+		cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime == owned.PostgreSQLRuntimeAgentQuarantine.String()
+	if !active {
+		if cluster.Status.PostgreSQLConfiguration != nil {
+			return fmt.Errorf("PostgreSQL configuration checkpoint exists without an active multi-member agent-quarantine runtime contract")
+		}
+		return nil
+	}
+	wanted, err := owned.DesiredPostgreSQLConfigurationConfigMap(cluster)
+	if err != nil {
+		return err
+	}
+	digest := owned.PostgreSQLConfigurationDataSHA256(wanted)
+	if digest == "" || wanted.Name != owned.PostgreSQLConfigMapName(cluster.Name, digest) {
+		return fmt.Errorf("desired PostgreSQL configuration is not canonically content addressed")
+	}
+	reader := r.authoritativeReader()
+	recorded := cluster.Status.PostgreSQLConfiguration
+	if recorded != nil {
+		if recorded.ConfigMapName == "" || recorded.ConfigMapUID == "" || len(recorded.ConfigMapUID) > 128 ||
+			!validCatalogAccessDigest(recorded.DataSHA256) ||
+			recorded.ConfigMapName != owned.PostgreSQLConfigMapName(cluster.Name, recorded.DataSHA256) {
+			return fmt.Errorf("recorded PostgreSQL configuration state is invalid")
+		}
+		current := &corev1.ConfigMap{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.ConfigMapName}
+		if err := reader.Get(ctx, key, current); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("PostgreSQL configuration ConfigMap %s with recorded UID %s is missing; explicit recovery is required", recorded.ConfigMapName, recorded.ConfigMapUID)
+			}
+			return fmt.Errorf("read recorded PostgreSQL configuration ConfigMap %s: %w", recorded.ConfigMapName, err)
+		}
+		if current.UID != recorded.ConfigMapUID {
+			return fmt.Errorf("PostgreSQL configuration ConfigMap %s has UID %s, expected recorded UID %s; explicit recovery is required", recorded.ConfigMapName, current.UID, recorded.ConfigMapUID)
+		}
+		if owned.PostgreSQLConfigurationDataSHA256(current) != recorded.DataSHA256 {
+			return fmt.Errorf("PostgreSQL configuration ConfigMap %s data differs from the checkpointed creation result; explicit recovery is required", recorded.ConfigMapName)
+		}
+		recordedDesired := wanted.DeepCopy()
+		recordedDesired.Name = recorded.ConfigMapName
+		recordedDesired.Data = maps.Clone(current.Data)
+		if err := validatePostgreSQLConfigurationConfigMap(current, recordedDesired, cluster); err != nil {
+			return err
+		}
+		if recorded.ConfigMapName == wanted.Name {
+			return validatePostgreSQLConfigurationConfigMap(current, wanted, cluster)
+		}
+	}
+
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: wanted.Name}
+	configuration := &corev1.ConfigMap{}
+	if err := reader.Get(ctx, key, configuration); apierrors.IsNotFound(err) {
+		candidate := wanted.DeepCopy()
+		if createErr := r.Create(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); createErr != nil {
+			observed := &corev1.ConfigMap{}
+			if readErr := reader.Get(ctx, key, observed); readErr != nil {
+				if apierrors.IsNotFound(readErr) {
+					return fmt.Errorf("create PostgreSQL configuration ConfigMap %s: %w", wanted.Name, createErr)
+				}
+				return errors.Join(
+					fmt.Errorf("create PostgreSQL configuration ConfigMap %s: %w", wanted.Name, createErr),
+					fmt.Errorf("resolve PostgreSQL configuration ConfigMap creation outcome: %w", readErr),
+				)
+			}
+			candidate = observed
+		}
+		if candidate.UID == "" || candidate.ResourceVersion == "" {
+			observed := &corev1.ConfigMap{}
+			if err := reader.Get(ctx, key, observed); err != nil {
+				return fmt.Errorf("read created PostgreSQL configuration ConfigMap %s: %w", wanted.Name, err)
+			}
+			candidate = observed
+		}
+		configuration = candidate
+	} else if err != nil {
+		return fmt.Errorf("read PostgreSQL configuration ConfigMap %s: %w", wanted.Name, err)
+	}
+	if err := validatePostgreSQLConfigurationConfigMap(configuration, wanted, cluster); err != nil {
+		return err
+	}
+	confirmed := &corev1.ConfigMap{}
+	if err := reader.Get(ctx, key, confirmed); err != nil {
+		return fmt.Errorf("confirm PostgreSQL configuration ConfigMap %s before checkpoint: %w", wanted.Name, err)
+	}
+	if confirmed.UID != configuration.UID || confirmed.ResourceVersion != configuration.ResourceVersion ||
+		owned.PostgreSQLConfigurationDataSHA256(confirmed) != digest {
+		return fmt.Errorf("PostgreSQL configuration ConfigMap %s changed before its identity could be checkpointed", wanted.Name)
+	}
+	if err := validatePostgreSQLConfigurationConfigMap(confirmed, wanted, cluster); err != nil {
+		return err
+	}
+	cluster.Status.PostgreSQLConfiguration = &pgshardv1alpha1.PostgreSQLConfigurationStatus{
+		ConfigMapName: wanted.Name, ConfigMapUID: confirmed.UID, DataSHA256: digest,
+	}
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint PostgreSQL configuration ConfigMap identity: %w", err)
+	}
+	return nil
+}
+
+func validatePostgreSQLConfigurationConfigMap(current, desired *corev1.ConfigMap, cluster *pgshardv1alpha1.PgShardCluster) error {
+	if current == nil || desired == nil {
+		return fmt.Errorf("PostgreSQL configuration ConfigMap is nil")
+	}
+	if current.UID == "" || current.ResourceVersion == "" || current.DeletionTimestamp != nil {
+		return fmt.Errorf("PostgreSQL configuration ConfigMap %s lacks a stable live API identity", desired.Name)
+	}
+	if current.Name != desired.Name || current.Namespace != desired.Namespace || current.GenerateName != "" ||
+		!maps.Equal(current.Labels, desired.Labels) || !maps.Equal(current.Annotations, desired.Annotations) ||
+		!reflect.DeepEqual(current.OwnerReferences, desired.OwnerReferences) || len(current.Finalizers) != 0 ||
+		current.Immutable == nil || !*current.Immutable || !maps.Equal(current.Data, desired.Data) || len(current.BinaryData) != 0 {
+		return fmt.Errorf("PostgreSQL configuration ConfigMap %s is not the exact immutable object owned by PgShardCluster UID %s", desired.Name, cluster.UID)
+	}
+	return nil
+}
+
 // ensurePostgreSQLCatalogCandidateConfigurations creates one inert immutable
 // configuration identity for every shard-zero member. The current workloads
 // do not mount these ConfigMaps. UID checkpoints make deletion and same-name
@@ -1307,8 +1433,10 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLCatalogCandidateConfiguration
 	names := make(map[string]struct{}, len(cluster.Status.PostgreSQLCatalogCandidates))
 	uids := make(map[types.UID]struct{}, len(cluster.Status.PostgreSQLCatalogCandidates))
 	for index, checkpoint := range cluster.Status.PostgreSQLCatalogCandidates {
+		legacyName := owned.LegacyPostgreSQLCatalogCandidateConfigMapName(cluster.Name, checkpoint.Member)
 		if checkpoint.Member < 0 || checkpoint.Member >= cluster.Spec.MembersPerShard ||
-			checkpoint.ConfigMapName != owned.PostgreSQLCatalogCandidateConfigMapName(cluster.Name, checkpoint.Member) ||
+			(checkpoint.ConfigMapName != legacyName &&
+				!owned.PostgreSQLCatalogCandidateConfigMapNameIsValid(cluster.Name, checkpoint.Member, checkpoint.ConfigMapName, checkpoint.PayloadSHA256)) ||
 			checkpoint.ConfigMapUID == "" || len(checkpoint.ConfigMapUID) > 128 ||
 			!validCatalogAccessDigest(checkpoint.PayloadSHA256) {
 			return fmt.Errorf("recorded PostgreSQL catalog candidate for member %d is invalid", checkpoint.Member)
@@ -1331,13 +1459,40 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLCatalogCandidateConfiguration
 	for member, wanted := range desired {
 		ordinal := int32(member)
 		index, recorded := indices[ordinal]
+		if recorded {
+			checkpoint := cluster.Status.PostgreSQLCatalogCandidates[index]
+			key := types.NamespacedName{Namespace: cluster.Namespace, Name: checkpoint.ConfigMapName}
+			previous := &corev1.ConfigMap{}
+			if err := reader.Get(ctx, key, previous); err != nil {
+				if apierrors.IsNotFound(err) {
+					return fmt.Errorf("PostgreSQL catalog candidate ConfigMap %s with recorded UID %s is missing; explicit recovery is required", checkpoint.ConfigMapName, checkpoint.ConfigMapUID)
+				}
+				return fmt.Errorf("read recorded PostgreSQL catalog candidate ConfigMap %s: %w", checkpoint.ConfigMapName, err)
+			}
+			if previous.UID != checkpoint.ConfigMapUID {
+				return fmt.Errorf("PostgreSQL catalog candidate ConfigMap %s has UID %s, expected recorded UID %s; explicit recovery is required", checkpoint.ConfigMapName, previous.UID, checkpoint.ConfigMapUID)
+			}
+			if owned.PostgreSQLCatalogCandidatePayloadSHA256(previous) != checkpoint.PayloadSHA256 {
+				return fmt.Errorf("PostgreSQL catalog candidate ConfigMap %s payload differs from the checkpointed creation result; explicit recovery is required", checkpoint.ConfigMapName)
+			}
+			recordedDesired := wanted.DeepCopy()
+			recordedDesired.Name = checkpoint.ConfigMapName
+			recordedDesired.Data = maps.Clone(previous.Data)
+			recordedDesired.Annotations[owned.ConfigHashAnnotation] = checkpoint.PayloadSHA256
+			if err := validatePostgreSQLCatalogCandidateConfigMap(previous, recordedDesired, cluster); err != nil {
+				return err
+			}
+			if checkpoint.ConfigMapName == wanted.Name {
+				if err := validatePostgreSQLCatalogCandidateConfigMap(previous, wanted, cluster); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
 		key := types.NamespacedName{Namespace: cluster.Namespace, Name: wanted.Name}
 		configuration := &corev1.ConfigMap{}
 		if err := reader.Get(ctx, key, configuration); apierrors.IsNotFound(err) {
-			if recorded {
-				checkpoint := cluster.Status.PostgreSQLCatalogCandidates[index]
-				return fmt.Errorf("PostgreSQL catalog candidate ConfigMap %s with recorded UID %s is missing; explicit recovery is required", wanted.Name, checkpoint.ConfigMapUID)
-			}
 			candidate := wanted.DeepCopy()
 			if createErr := r.Create(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); createErr != nil {
 				observed := &corev1.ConfigMap{}
@@ -1369,18 +1524,14 @@ func (r *PgShardClusterReconciler) ensurePostgreSQLCatalogCandidateConfiguration
 		}
 		digest := owned.PostgreSQLCatalogCandidatePayloadSHA256(configuration)
 		if recorded {
-			checkpoint := cluster.Status.PostgreSQLCatalogCandidates[index]
-			if configuration.UID != checkpoint.ConfigMapUID {
-				return fmt.Errorf("PostgreSQL catalog candidate ConfigMap %s has UID %s, expected recorded UID %s; explicit recovery is required", wanted.Name, configuration.UID, checkpoint.ConfigMapUID)
+			cluster.Status.PostgreSQLCatalogCandidates[index] = pgshardv1alpha1.PostgreSQLCatalogCandidateStatus{
+				Member: ordinal, ConfigMapName: wanted.Name, ConfigMapUID: configuration.UID, PayloadSHA256: digest,
 			}
-			if digest != checkpoint.PayloadSHA256 {
-				return fmt.Errorf("PostgreSQL catalog candidate ConfigMap %s payload differs from the checkpointed creation result; explicit recovery is required", wanted.Name)
-			}
-			continue
+		} else {
+			cluster.Status.PostgreSQLCatalogCandidates = append(cluster.Status.PostgreSQLCatalogCandidates, pgshardv1alpha1.PostgreSQLCatalogCandidateStatus{
+				Member: ordinal, ConfigMapName: wanted.Name, ConfigMapUID: configuration.UID, PayloadSHA256: digest,
+			})
 		}
-		cluster.Status.PostgreSQLCatalogCandidates = append(cluster.Status.PostgreSQLCatalogCandidates, pgshardv1alpha1.PostgreSQLCatalogCandidateStatus{
-			Member: ordinal, ConfigMapName: wanted.Name, ConfigMapUID: configuration.UID, PayloadSHA256: digest,
-		})
 		sort.Slice(cluster.Status.PostgreSQLCatalogCandidates, func(left, right int) bool {
 			return cluster.Status.PostgreSQLCatalogCandidates[left].Member < cluster.Status.PostgreSQLCatalogCandidates[right].Member
 		})
@@ -4508,7 +4659,7 @@ func (r *PgShardClusterReconciler) updateStatus(ctx context.Context, cluster *pg
 }
 
 func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
-	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !slices.EqualFunc(left.PostgreSQLReplicationCredentials, right.PostgreSQLReplicationCredentials, postgreSQLReplicationCredentialsEqual) || !slices.EqualFunc(left.PostgreSQLCatalogCandidates, right.PostgreSQLCatalogCandidates, postgreSQLCatalogCandidatesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) || !operationWriterAccessStatusesEqual(left.OperationWriterAccess, right.OperationWriterAccess) {
+	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !slices.EqualFunc(left.PostgreSQLReplicationCredentials, right.PostgreSQLReplicationCredentials, postgreSQLReplicationCredentialsEqual) || !postgresqlConfigurationStatusesEqual(left.PostgreSQLConfiguration, right.PostgreSQLConfiguration) || !slices.EqualFunc(left.PostgreSQLCatalogCandidates, right.PostgreSQLCatalogCandidates, postgreSQLCatalogCandidatesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) || !operationWriterAccessStatusesEqual(left.OperationWriterAccess, right.OperationWriterAccess) {
 		return false
 	}
 	for index := range left.Conditions {
@@ -4517,6 +4668,13 @@ func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
 		}
 	}
 	return true
+}
+
+func postgresqlConfigurationStatusesEqual(left, right *pgshardv1alpha1.PostgreSQLConfigurationStatus) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.ConfigMapName == right.ConfigMapName && left.ConfigMapUID == right.ConfigMapUID && left.DataSHA256 == right.DataSHA256
 }
 
 func postgreSQLCatalogCandidatesEqual(left, right pgshardv1alpha1.PostgreSQLCatalogCandidateStatus) bool {
