@@ -262,8 +262,8 @@ async fn supervise_writable_runtime(
                 if attempt_started.elapsed() >= COORDINATION_RETRY_RESET {
                     retry = INITIAL_COORDINATION_RETRY;
                 }
-                if error.is_permanent() {
-                    tracing::error!(reason = %error, retry_after_ms = retry.as_millis(), "writable-term Lease coordination failed with a permanent error; PostgreSQL fenced and explicit operator recovery may be required");
+                if error.requires_operator_recovery() {
+                    tracing::error!(reason = %error, retry_after_ms = retry.as_millis(), "writable-term Lease coordination failed with an unrecoverable error; PostgreSQL fenced and explicit operator recovery is required");
                 } else {
                     tracing::warn!(reason = %error, retry_after_ms = retry.as_millis(), "writable-term Lease coordination lost; PostgreSQL fenced and coordination will retry");
                 }
