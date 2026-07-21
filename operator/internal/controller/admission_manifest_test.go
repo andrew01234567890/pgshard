@@ -155,8 +155,21 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatalf("unexpected third webhook manifest: %v", err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 6 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 7 {
 		t.Fatalf("generated webhooks = %#v / %#v", mutating.Webhooks, validating.Webhooks)
+	}
+	activationFound := false
+	for _, webhook := range validating.Webhooks {
+		if webhook.Name != "vpgshardcatalogactivation.kb.io" {
+			continue
+		}
+		activationFound = true
+		if len(webhook.Rules) != 1 || !slices.Equal(webhook.Rules[0].Rule.Resources, []string{"pgshardcatalogactivations", "pgshardcatalogactivations/status"}) || !slices.Equal(webhook.Rules[0].Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update}) {
+			t.Fatalf("catalog activation webhook coverage = %#v", webhook.Rules)
+		}
+	}
+	if !activationFound {
+		t.Fatal("catalog activation validating webhook is missing")
 	}
 	for _, webhook := range mutating.Webhooks {
 		assertWebhookPolicy(t, webhook.ClientConfig, webhook.FailurePolicy, webhook.MatchPolicy, webhook.TimeoutSeconds)

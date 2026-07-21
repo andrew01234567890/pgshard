@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,6 +85,7 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=pgshard.io,resources=pgshardcatalogactivations,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=endpoints,verbs=get
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;delete
@@ -263,6 +265,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	}
 	if err := r.ensurePostgreSQLCatalogCandidateConfigurations(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "CatalogCandidateReconcileFailed", fmt.Sprintf("shard-zero catalog candidate configuration reconciliation failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if err := r.ensureCatalogActivationCarrier(ctx, cluster); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "CatalogActivationCarrierFailed", fmt.Sprintf("catalog activation carrier reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 	migratingPostgreSQLIdentity, err := r.migrateLegacyPostgreSQLWorkloadNames(ctx, cluster)
@@ -1408,6 +1414,157 @@ func validatePostgreSQLConfigurationConfigMap(current, desired *corev1.ConfigMap
 		return fmt.Errorf("PostgreSQL configuration ConfigMap %s is not the exact immutable object owned by PgShardCluster UID %s", desired.Name, cluster.UID)
 	}
 	return nil
+}
+
+// ensureCatalogActivationCarrier creates and checkpoints one empty, fixed-name
+// request envelope only after all immutable candidate inputs exist. Once its
+// UID is checkpointed, absence or replacement is an explicit-recovery boundary
+// and is never repaired by creating or adopting another incarnation.
+func (r *PgShardClusterReconciler) ensureCatalogActivationCarrier(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	reader := r.authoritativeReader()
+	authoritativeCluster := &pgshardv1alpha1.PgShardCluster{}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(cluster), authoritativeCluster); err != nil {
+		return fmt.Errorf("read authoritative PgShardCluster before catalog activation carrier reconciliation: %w", err)
+	}
+	if authoritativeCluster.UID == "" || authoritativeCluster.UID != cluster.UID {
+		return fmt.Errorf("authoritative PgShardCluster identity changed before catalog activation carrier reconciliation")
+	}
+	if !authoritativeCluster.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("authoritative PgShardCluster is being deleted before catalog activation carrier reconciliation")
+	}
+	authoritativeCluster.DeepCopyInto(cluster)
+
+	active := cluster.Spec.MembersPerShard > 1 && cluster.Status.PostgreSQLBootstrapSpec != nil &&
+		cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime == owned.PostgreSQLRuntimeAgentQuarantine.String()
+	if !active {
+		if cluster.Status.CatalogActivation != nil {
+			return fmt.Errorf("catalog activation carrier checkpoint exists without an active multi-member agent-quarantine runtime contract")
+		}
+		return nil
+	}
+
+	wanted := pgshardv1alpha1.EmptyCatalogActivation(cluster)
+	key := client.ObjectKeyFromObject(wanted)
+	recorded := cluster.Status.CatalogActivation
+	if recorded != nil && (recorded.Name != wanted.Name || recorded.UID == "" || len(recorded.UID) > 128) {
+		return fmt.Errorf("recorded catalog activation carrier state is invalid")
+	}
+
+	current := &pgshardv1alpha1.PgShardCatalogActivation{}
+	if err := reader.Get(ctx, key, current); apierrors.IsNotFound(err) {
+		if recorded != nil {
+			return fmt.Errorf("catalog activation carrier %s with recorded UID %s is missing; explicit recovery is required", recorded.Name, recorded.UID)
+		}
+		candidate := wanted.DeepCopy()
+		if createErr := r.Create(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); createErr != nil {
+			observed := &pgshardv1alpha1.PgShardCatalogActivation{}
+			if readErr := reader.Get(ctx, key, observed); readErr != nil {
+				if apierrors.IsNotFound(readErr) {
+					return fmt.Errorf("create catalog activation carrier %s: %w", wanted.Name, createErr)
+				}
+				return errors.Join(
+					fmt.Errorf("create catalog activation carrier %s: %w", wanted.Name, createErr),
+					fmt.Errorf("resolve catalog activation carrier creation outcome: %w", readErr),
+				)
+			}
+			candidate = observed
+		}
+		if candidate.UID == "" || candidate.ResourceVersion == "" {
+			observed := &pgshardv1alpha1.PgShardCatalogActivation{}
+			if err := reader.Get(ctx, key, observed); err != nil {
+				return fmt.Errorf("read created catalog activation carrier %s: %w", wanted.Name, err)
+			}
+			candidate = observed
+		}
+		current = candidate
+	} else if err != nil {
+		return fmt.Errorf("read catalog activation carrier %s: %w", wanted.Name, err)
+	}
+
+	if err := validateCatalogActivationCarrier(current, wanted, cluster, recorded == nil); err != nil {
+		return err
+	}
+	if recorded != nil {
+		if current.UID != recorded.UID {
+			return fmt.Errorf("catalog activation carrier %s has UID %s, expected recorded UID %s; explicit recovery is required", current.Name, current.UID, recorded.UID)
+		}
+		return validateCatalogActivationCarrierContents(current, cluster)
+	}
+
+	confirmed := &pgshardv1alpha1.PgShardCatalogActivation{}
+	if err := reader.Get(ctx, key, confirmed); err != nil {
+		return fmt.Errorf("confirm catalog activation carrier %s before checkpoint: %w", wanted.Name, err)
+	}
+	if confirmed.UID != current.UID || confirmed.ResourceVersion != current.ResourceVersion {
+		return fmt.Errorf("catalog activation carrier %s changed before its identity could be checkpointed", wanted.Name)
+	}
+	if err := validateCatalogActivationCarrier(confirmed, wanted, cluster, true); err != nil {
+		return err
+	}
+	cluster.Status.CatalogActivation = &pgshardv1alpha1.CatalogActivationCarrierStatus{Name: confirmed.Name, UID: confirmed.UID}
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint catalog activation carrier identity: %w", err)
+	}
+	return nil
+}
+
+func validateCatalogActivationCarrier(current, wanted *pgshardv1alpha1.PgShardCatalogActivation, cluster *pgshardv1alpha1.PgShardCluster, requireEmpty bool) error {
+	if current == nil || wanted == nil || current.Name != wanted.Name || current.Namespace != wanted.Namespace || current.GenerateName != "" ||
+		current.UID == "" || current.ResourceVersion == "" || current.DeletionTimestamp != nil ||
+		!maps.Equal(current.Labels, wanted.Labels) || !maps.Equal(current.Annotations, wanted.Annotations) ||
+		!reflect.DeepEqual(current.OwnerReferences, wanted.OwnerReferences) || len(current.Finalizers) != 0 {
+		return fmt.Errorf("catalog activation carrier %s is not the exact object owned by PgShardCluster UID %s", wanted.Name, cluster.UID)
+	}
+	if requireEmpty && (current.Spec.Request != nil || current.Spec.RequestSHA256 != "" || current.Status.Acceptance != nil) {
+		return fmt.Errorf("uncheckpointed catalog activation carrier %s is not empty", wanted.Name)
+	}
+	return nil
+}
+
+func validateCatalogActivationCarrierContents(current *pgshardv1alpha1.PgShardCatalogActivation, cluster *pgshardv1alpha1.PgShardCluster) error {
+	if current.Spec.Request == nil {
+		if current.Spec.RequestSHA256 != "" || current.Status.Acceptance != nil {
+			return fmt.Errorf("catalog activation carrier %s has a partial request or acceptance", current.Name)
+		}
+		return nil
+	}
+	digest, err := current.Spec.Request.SHA256()
+	if err != nil {
+		return fmt.Errorf("catalog activation carrier %s request digest is invalid: %w", current.Name, err)
+	}
+	if digest != current.Spec.RequestSHA256 {
+		return fmt.Errorf("catalog activation carrier %s request digest does not match its payload", current.Name)
+	}
+	request := current.Spec.Request
+	if request.Carrier.Name != current.Name || request.Carrier.UID != current.UID || request.Cluster.Name != cluster.Name ||
+		request.Cluster.Namespace != cluster.Namespace || request.Cluster.UID != cluster.UID {
+		return fmt.Errorf("catalog activation carrier %s request is not bound to the exact carrier and cluster", current.Name)
+	}
+	if request.Cluster.Generation != strconv.FormatInt(cluster.Generation, 10) || request.Cluster.ResourceVersion != cluster.ResourceVersion {
+		return fmt.Errorf("catalog activation carrier %s request is stale for PgShardCluster generation %d resourceVersion %s", current.Name, cluster.Generation, cluster.ResourceVersion)
+	}
+	if acceptance := current.Status.Acceptance; acceptance != nil {
+		if acceptance.SchemaVersion != pgshardv1alpha1.CatalogActivationAcceptanceVersion || acceptance.CarrierUID != current.UID ||
+			acceptance.RequestSHA256 != current.Spec.RequestSHA256 || acceptance.TargetPodName != request.Source.PodName ||
+			acceptance.TargetPodUID != request.Source.PodUID || acceptance.Persistence != pgshardv1alpha1.CatalogActivationPersistenceFsync ||
+			!validCanonicalUnsignedDecimal(acceptance.PersistedAtUnixMS) {
+			return fmt.Errorf("catalog activation carrier %s acceptance does not bind the exact fsync-persisted request", current.Name)
+		}
+	}
+	return nil
+}
+
+func validCanonicalUnsignedDecimal(value string) bool {
+	if value == "" || (len(value) > 1 && value[0] == '0') {
+		return false
+	}
+	for _, digit := range []byte(value) {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
 }
 
 // ensurePostgreSQLCatalogCandidateConfigurations creates one inert immutable
@@ -4659,7 +4816,7 @@ func (r *PgShardClusterReconciler) updateStatus(ctx context.Context, cluster *pg
 }
 
 func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
-	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !slices.EqualFunc(left.PostgreSQLReplicationCredentials, right.PostgreSQLReplicationCredentials, postgreSQLReplicationCredentialsEqual) || !postgresqlConfigurationStatusesEqual(left.PostgreSQLConfiguration, right.PostgreSQLConfiguration) || !slices.EqualFunc(left.PostgreSQLCatalogCandidates, right.PostgreSQLCatalogCandidates, postgreSQLCatalogCandidatesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) || !operationWriterAccessStatusesEqual(left.OperationWriterAccess, right.OperationWriterAccess) {
+	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !slices.EqualFunc(left.PostgreSQLReplicationCredentials, right.PostgreSQLReplicationCredentials, postgreSQLReplicationCredentialsEqual) || !postgresqlConfigurationStatusesEqual(left.PostgreSQLConfiguration, right.PostgreSQLConfiguration) || !slices.EqualFunc(left.PostgreSQLCatalogCandidates, right.PostgreSQLCatalogCandidates, postgreSQLCatalogCandidatesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) || !operationWriterAccessStatusesEqual(left.OperationWriterAccess, right.OperationWriterAccess) || !catalogActivationStatusesEqual(left.CatalogActivation, right.CatalogActivation) {
 		return false
 	}
 	for index := range left.Conditions {
@@ -4668,6 +4825,13 @@ func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
 		}
 	}
 	return true
+}
+
+func catalogActivationStatusesEqual(left, right *pgshardv1alpha1.CatalogActivationCarrierStatus) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Name == right.Name && left.UID == right.UID
 }
 
 func postgresqlConfigurationStatusesEqual(left, right *pgshardv1alpha1.PostgreSQLConfigurationStatus) bool {
@@ -4760,6 +4924,7 @@ func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error 
 	return ctrl.NewControllerManagedBy(manager).
 		For(&pgshardv1alpha1.PgShardCluster{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&pgshardv1alpha1.PgShardCatalogActivation{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).

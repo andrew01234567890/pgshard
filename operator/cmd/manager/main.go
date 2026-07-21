@@ -154,6 +154,14 @@ func main() {
 			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardRestore")
 			os.Exit(1)
 		}
+		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCatalogActivation{}).
+			WithValidator(&pgshardv1alpha1.PgShardCatalogActivationValidator{
+				ControllerUsername: "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+			}).
+			Complete(); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardCatalogActivation")
+			os.Exit(1)
+		}
 		webhookServer.Register(podfence.BindingWebhookPath, &admission.Webhook{
 			Handler: podfence.NewBindingAttestor(manager.GetAPIReader(), scheme),
 		})

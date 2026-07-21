@@ -104,6 +104,15 @@ rules:
 - apiGroups:
   - pgshard.io
   resources:
+  - pgshardcatalogactivations
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - pgshard.io
+  resources:
   - pgshardclusters
   verbs:
   - get

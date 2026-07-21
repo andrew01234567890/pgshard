@@ -4211,7 +4211,7 @@ func PostgreSQLAuthSecretPrefix(cluster string, shard int32) string {
 // PostgreSQL workload name for one shard. The StatefulSet ordinal is the stable
 // member identity; primary and replica roles belong in mutable labels.
 func PostgreSQLShardStatefulSetName(cluster string, shard int32) string {
-	return fmt.Sprintf("%s-shard-%04d", boundedPostgreSQLWorkloadPrefix(cluster), shard)
+	return pgshardv1alpha1.PostgreSQLShardStatefulSetName(cluster, shard)
 }
 
 // PostgreSQLMemberStatefulSetName returns the singleton workload identity for a
@@ -4238,14 +4238,14 @@ func postgresqlMemberPodDNS(cluster string, shard, member int32, namespace strin
 // name for one physical cell. The stable member name and Pod UID belong in the
 // runtime holder identity, never in this reusable coordination envelope.
 func PostgreSQLWritableLeaseName(cluster string, shard int32) string {
-	return PostgreSQLShardStatefulSetName(cluster, shard) + "-term"
+	return pgshardv1alpha1.PostgreSQLWritableLeaseName(cluster, shard)
 }
 
 // PostgreSQLAgentServiceAccountName returns the role-neutral API identity shared
 // by candidate agents in one physical cell. Pods must explicitly opt into a
 // bounded projected token; the ServiceAccount itself never automounts one.
 func PostgreSQLAgentServiceAccountName(cluster string, shard int32) string {
-	return PostgreSQLShardStatefulSetName(cluster, shard) + "-agent"
+	return pgshardv1alpha1.PostgreSQLAgentServiceAccountName(cluster, shard)
 }
 
 func postgresqlAgentServiceAccount(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *corev1.ServiceAccount {
@@ -4326,18 +4326,7 @@ func LegacyPostgreSQLPrimaryStatefulSetName(cluster string, shard int32) string 
 // the legacy cluster-name API limit by bounding only the new PostgreSQL
 // workload prefix, with a deterministic digest preventing truncation aliases.
 func boundedPostgreSQLWorkloadPrefix(cluster string) string {
-	const (
-		maximumPrefixLength = 42
-		digestBytes         = 12
-	)
-	// Hash names at the boundary too: otherwise a longer name's bounded output
-	// could alias an accepted, literal 42-character cluster name.
-	if len(cluster) < maximumPrefixLength {
-		return cluster
-	}
-	digest := sha256.Sum256([]byte(cluster))
-	suffix := hex.EncodeToString(digest[:digestBytes])
-	return cluster[:maximumPrefixLength-len(suffix)-1] + "-" + suffix
+	return pgshardv1alpha1.PostgreSQLWorkloadPrefix(cluster)
 }
 
 // PostgreSQLMemberDataPVCPrefix is the readable, role-neutral portion of a randomly

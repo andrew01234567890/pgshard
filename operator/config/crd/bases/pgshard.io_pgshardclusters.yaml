@@ -469,6 +469,28 @@ spec:
                 required:
                 - secretName
                 type: object
+              catalogActivation:
+                description: |-
+                  CatalogActivation pins the one operator-created, initially empty carrier
+                  for a future authenticated catalog materialization request. A missing or
+                  replaced carrier is an explicit-recovery boundary and is never recreated.
+                properties:
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
