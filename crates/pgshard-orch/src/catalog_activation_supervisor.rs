@@ -18,7 +18,8 @@ use crate::catalog_activation_live_objects::{
 };
 use crate::catalog_activation_publisher::{
     CatalogActivationPublicationOutcome, CatalogActivationPublisher,
-    CatalogActivationPublisherError, PendingCatalogActivationPublication,
+    CatalogActivationPublisherError, DefinitiveCatalogActivationRejection,
+    PendingCatalogActivationPublication,
 };
 use crate::catalog_candidate::{
     AuthoritativeCandidateReader, BoundCandidateSet, CatalogCandidateError,
@@ -42,9 +43,10 @@ const AUTHORITY_POLL_PERIOD: Duration = Duration::from_millis(100);
 
 /// Runs the one-shot catalog-activation publisher until shutdown.
 ///
-/// Safe pre-publication failures are retried at the bounded observation
-/// cadence. Any nonempty carrier, successful publication, or ambiguous write
-/// is terminal for this process incarnation and waits for shutdown without a
+/// Safe pre-publication failures and definitive API rejections are retried at
+/// the bounded observation cadence. Every retry constructs a fresh proof
+/// attempt. Any nonempty carrier, successful publication, or ambiguous write is
+/// terminal for this process incarnation and waits for shutdown without a
 /// second write attempt.
 pub async fn supervise(
     plan: CatalogCandidateObservationPlan,
@@ -96,7 +98,12 @@ pub async fn supervise(
         {
             AttemptDisposition::Stopped => return,
             AttemptDisposition::Retry(error) => {
-                if error.is_authority_unavailable() {
+                if let Some(rejection) = error.definitive_publication_rejection() {
+                    tracing::warn!(
+                        http_status = rejection.status_code(),
+                        "catalog-activation publication was definitively rejected; retrying from fresh proof"
+                    );
+                } else if error.is_authority_unavailable() {
                     if logged_authority_wait {
                         tracing::debug!(reason = %error, "catalog-activation authority overlap remains unavailable");
                     } else {
@@ -115,6 +122,9 @@ pub async fn supervise(
                     ),
                     CatalogActivationPublicationOutcome::ForeignPublication => tracing::error!(
                         "catalog-activation carrier is nonempty or foreign; no write will be attempted"
+                    ),
+                    CatalogActivationPublicationOutcome::DefinitiveRejection(_) => unreachable!(
+                        "definitive publication rejections are retryable attempt results"
                     ),
                     CatalogActivationPublicationOutcome::Indeterminate => tracing::error!(
                         "catalog-activation publication outcome is indeterminate; no retry will be attempted"
@@ -392,7 +402,14 @@ async fn run_attempt<D: CatalogActivationAttemptDriver>(
     if shutdown_requested(shutdown) {
         return AttemptDisposition::Stopped;
     }
-    AttemptDisposition::Terminal(attempt.publish().await)
+    match attempt.publish().await {
+        CatalogActivationPublicationOutcome::DefinitiveRejection(rejection) => {
+            AttemptDisposition::Retry(CatalogActivationAttemptError::DefinitiveRejection(
+                rejection,
+            ))
+        }
+        outcome => AttemptDisposition::Terminal(outcome),
+    }
 }
 
 fn run_prewrite_sync(
@@ -506,6 +523,8 @@ enum CatalogActivationAttemptError {
     Challenge(#[source] CatalogActivationChallengeError),
     #[error("catalog-activation publication preflight failed: {0}")]
     Publisher(#[source] CatalogActivationPublisherError),
+    #[error("catalog-activation publication was definitively rejected")]
+    DefinitiveRejection(DefinitiveCatalogActivationRejection),
 }
 
 impl CatalogActivationAttemptError {
@@ -518,6 +537,13 @@ impl CatalogActivationAttemptError {
             configured_retry_period.min(AUTHORITY_POLL_PERIOD)
         } else {
             configured_retry_period
+        }
+    }
+
+    fn definitive_publication_rejection(&self) -> Option<&DefinitiveCatalogActivationRejection> {
+        match self {
+            Self::DefinitiveRejection(rejection) => Some(rejection),
+            _ => None,
         }
     }
 }
@@ -707,7 +733,7 @@ mod tests {
             self.record(Event::Put);
             self.paused.notify_one();
             tokio::time::sleep(self.publication_duration).await;
-            self.publication_outcome
+            self.publication_outcome.clone()
         }
     }
 
@@ -719,7 +745,7 @@ mod tests {
             CatalogActivationPublicationOutcome::Indeterminate,
         ] {
             let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-            let mut attempt = FakeAttempt::new(outcome);
+            let mut attempt = FakeAttempt::new(outcome.clone());
             let disposition = run_attempt(&mut attempt, &mut shutdown_rx).await;
             assert!(matches!(
                 disposition,
@@ -735,6 +761,39 @@ mod tests {
                 1
             );
             drop(shutdown_tx);
+        }
+    }
+
+    #[tokio::test]
+    async fn definitive_rejection_retries_only_through_a_fresh_full_attempt() {
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let rejection = DefinitiveCatalogActivationRejection::UnprocessableEntity;
+        let mut rejected_attempt = FakeAttempt::new(
+            CatalogActivationPublicationOutcome::DefinitiveRejection(rejection),
+        );
+        let disposition = run_attempt(&mut rejected_attempt, &mut shutdown_rx).await;
+        assert!(matches!(
+            disposition,
+            AttemptDisposition::Retry(CatalogActivationAttemptError::DefinitiveRejection(actual))
+                if actual == rejection
+        ));
+        assert_eq!(rejected_attempt.recorded(), COMPLETE_ORDER);
+
+        let mut fresh_attempt = FakeAttempt::new(CatalogActivationPublicationOutcome::Installed);
+        assert!(matches!(
+            run_attempt(&mut fresh_attempt, &mut shutdown_rx).await,
+            AttemptDisposition::Terminal(CatalogActivationPublicationOutcome::Installed)
+        ));
+        assert_eq!(fresh_attempt.recorded(), COMPLETE_ORDER);
+        for attempt in [&rejected_attempt, &fresh_attempt] {
+            assert_eq!(
+                attempt
+                    .recorded()
+                    .iter()
+                    .filter(|event| **event == Event::Put)
+                    .count(),
+                1
+            );
         }
     }
 
