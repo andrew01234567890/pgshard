@@ -24,7 +24,7 @@ use crate::catalog_materialization::{
 
 const CARRIER_KIND: &str = "PgShardCatalogActivation";
 const PUBLISH_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
-const PUBLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const PUBLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A validated parent-resource replacement which has not been sent.
 ///

@@ -1658,7 +1658,7 @@ mod tests {
     use crate::catalog_materialization::{
         CatalogActivationDispatcherProof, PreparedCatalogActivationRequest,
         bind_catalog_activation_live_objects, catalog_activation_publication_target,
-        prepare_catalog_activation_request,
+        prepare_catalog_activation_request, rebind_catalog_activation_live_objects,
     };
     use crate::domain::{AgentStatusPhase, CatalogCandidatePhase, OrchState, OrchestratorIdentity};
     use crate::topology::{
@@ -2563,6 +2563,9 @@ mod tests {
             assert_eq!(live.carrier_resource_version(), "carrier-rv-1");
             let prepared = prepare_catalog_activation_request(&dispatch, &live)
                 .expect("canonical activation request");
+            let rebound =
+                rebind_catalog_activation_live_objects(&dispatch, &live_candidates, &live);
+            assert!(rebound.as_ref() == Some(&live));
             prepared.request().validate().expect("validated request");
             assert_eq!(
                 prepared.sha256(),

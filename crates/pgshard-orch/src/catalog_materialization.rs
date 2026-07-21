@@ -396,6 +396,29 @@ pub(crate) fn bind_catalog_activation_live_objects(
     })
 }
 
+/// Rebinds one previously observed live-object proof to a freshly sealed
+/// dispatch without performing I/O or weakening any exact comparison.
+///
+/// A publisher uses this only after its network challenge, when it must issue
+/// fresh in-process authority and prove that the complete authoritative
+/// candidate graph and every retained live identity are unchanged.
+#[allow(dead_code)] // Composed only by the separately reviewed supervisor.
+pub(crate) fn rebind_catalog_activation_live_objects(
+    dispatch: &CatalogBootstrapDispatch,
+    candidates: &BoundCandidateSet,
+    live: &CatalogActivationLiveObjectProofs,
+) -> Option<CatalogActivationLiveObjectProofs> {
+    bind_catalog_activation_live_objects(
+        dispatch,
+        candidates,
+        live.carrier.clone(),
+        live.carrier_resource_version.clone(),
+        live.target_pod.clone(),
+        live.writable_lease.clone(),
+        live.dispatcher.clone(),
+    )
+}
+
 /// Converts one sealed dispatch and exact live-object proof into the existing
 /// canonical request contract, validates it, and computes its canonical SHA-256.
 /// The function is pure and performs no I/O or publication.
