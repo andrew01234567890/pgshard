@@ -13,18 +13,22 @@ axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["env"] }
 futures-util.workspace = true
+getrandom.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 pgshard-catalog = { path = "../pgshard-catalog", version = "=0.1.0" }
 pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
 rustix.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
@@ -32,6 +36,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 postgres-protocol.workspace = true
+rcgen = "=0.14.5"
 
 [lints]
 workspace = true

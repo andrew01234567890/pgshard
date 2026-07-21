@@ -124,6 +124,9 @@ const (
 	catalogActivationJournalRoot              = "/var/lib/postgresql/18/.pgshard-catalog-activation"
 	catalogActivationTLSVolumeName            = "catalog-activation-tls"
 	catalogActivationTLSMountPath             = "/etc/pgshard/catalog-tls"
+	catalogActivationCAVolumeName             = "catalog-activation-ca"
+	catalogActivationCAMountPath              = "/etc/pgshard/catalog-activation"
+	catalogActivationCAFilePath               = catalogActivationCAMountPath + "/ca.crt"
 )
 
 const postgresqlBootstrapScript = `set -Eeuo pipefail
@@ -3000,7 +3003,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		poolerCatalogAccess = nil
 	}
 	objects = append(objects,
-		orchestratorDeployment(cluster, images.Orchestrator, topologyHash, images.PostgreSQLRuntime),
+		orchestratorDeployment(cluster, images.Orchestrator, topologyHash, images.PostgreSQLRuntime, catalogActivation, catalogAccess),
 		poolerDeployment(cluster, images.Pooler, topologyHash, poolerCatalogAccess),
 		podDisruptionBudget(cluster, "orchestrator", 1),
 		podDisruptionBudget(cluster, "pooler", 1),
@@ -5403,7 +5406,7 @@ func postgresqlCatalogActivationTLSNetworkPolicy(cluster *pgshardv1alpha1.PgShar
 	}
 }
 
-func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash string, postgresqlRuntime PostgreSQLRuntime) *appsv1.Deployment {
+func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash string, postgresqlRuntime PostgreSQLRuntime, catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus, catalogAccess *pgshardv1alpha1.CatalogAccessStatus) *appsv1.Deployment {
 	const replicas int32 = 3
 	selector := componentSelector(cluster, "orchestrator")
 	identityBindingMode := "disabled"
@@ -5420,6 +5423,30 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 		{Name: "PGSHARD_TOPOLOGY_FILE", Value: "/etc/pgshard/topology/cluster.json"},
 		{Name: "PGSHARD_IDENTITY_BINDING_MODE", Value: identityBindingMode},
 	}
+	volumeMounts := []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true}}
+	volumes := []corev1.Volume{{
+		Name: "topology",
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix},
+		}},
+	}}
+	if catalogActivation != nil {
+		if catalogAccess == nil {
+			panic("validated catalog activation plan has no catalog access checkpoint")
+		}
+		env = append(env, corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_CA_FILE", Value: catalogActivationCAFilePath})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: catalogActivationCAVolumeName, MountPath: catalogActivationCAMountPath, ReadOnly: true})
+		volumes = append(volumes, corev1.Volume{
+			Name: catalogActivationCAVolumeName,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName:  catalogAccess.SecretName,
+				DefaultMode: ptr(int32(0o440)),
+				Items: []corev1.KeyToPath{{
+					Key: CatalogCACertificateKey, Path: "ca.crt", Mode: ptr(int32(0o440)),
+				}},
+			}},
+		})
+	}
 	if cluster.Spec.Observability.OpenTelemetryEndpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: cluster.Spec.Observability.OpenTelemetryEndpoint})
 	}
@@ -5432,7 +5459,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 		Resources:       resources("100m", "128Mi", "1", "512Mi"),
 		ReadinessProbe:  httpReadinessProbe("/readyz", "http"),
 		LivenessProbe:   httpLivenessProbe("/healthz", "http"),
-		VolumeMounts:    []corev1.VolumeMount{{Name: "topology", MountPath: "/etc/pgshard/topology", ReadOnly: true}},
+		VolumeMounts:    volumeMounts,
 	}})
 	automountServiceAccountToken := true
 	podSpec.AutomountServiceAccountToken = &automountServiceAccountToken
@@ -5452,12 +5479,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 			},
 		},
 	}
-	deployment.Spec.Template.Spec.Volumes = []corev1.Volume{{
-		Name: "topology",
-		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-			LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix},
-		}},
-	}}
+	deployment.Spec.Template.Spec.Volumes = volumes
 	return deployment
 }
 

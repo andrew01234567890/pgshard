@@ -143,11 +143,7 @@ async fn observe_once<S: CandidateStore>(
         // Anchor both local clocks before either Kubernetes read. Host suspend
         // and I/O latency consume this observation window.
         let started = state.suspend_aware_now()?;
-        let before = read_bound_candidates(store, plan).await?;
-        let after = read_bound_candidates(store, plan).await?;
-        if before != after {
-            return Err(CatalogCandidateError::EvidenceChanged);
-        }
+        let before = read_stable_bound_candidates(store, plan).await?;
         let deadline = started
             .checked_add(freshness)
             .ok_or(CatalogCandidateError::FreshnessExpired)?;
@@ -161,6 +157,72 @@ async fn observe_once<S: CandidateStore>(
         state.record_catalog_candidate_failure(error.failure_reason());
     }
     result
+}
+
+/// Reusable one-shot reader for an exact, stable pair of authoritative
+/// non-Secret Kubernetes observations.
+///
+/// This reader carries no mutation client and no publication capability. It
+/// reuses the diagnostic candidate parser so a later publisher cannot develop
+/// a second, weaker interpretation of cluster status or candidate `ConfigMaps`.
+#[allow(dead_code)] // Deliberately inert until publisher composition is reviewed.
+pub(crate) struct AuthoritativeCandidateReader {
+    store: KubernetesCandidateStore,
+    plan: CatalogCandidateObservationPlan,
+    overall_timeout: Duration,
+}
+
+#[allow(dead_code)] // Deliberately inert until publisher composition is reviewed.
+impl AuthoritativeCandidateReader {
+    /// Builds a read-only client with independent per-GET and whole-bracket
+    /// budgets. The overall budget may accumulate multiple individually
+    /// healthy reads but can never exceed the existing five-second evidence
+    /// window.
+    pub(crate) fn new(
+        plan: CatalogCandidateObservationPlan,
+        per_request_timeout: Duration,
+        overall_timeout: Duration,
+    ) -> Result<Self, CatalogCandidateError> {
+        validate_plan(&plan, MAXIMUM_CANDIDATE_FRESHNESS)?;
+        if !(Duration::from_millis(100)..=MAXIMUM_CANDIDATE_FRESHNESS)
+            .contains(&per_request_timeout)
+            || !(per_request_timeout..=MAXIMUM_CANDIDATE_FRESHNESS).contains(&overall_timeout)
+        {
+            return Err(CatalogCandidateError::InvalidPlan);
+        }
+        let store = KubernetesCandidateStore::new(&plan, per_request_timeout)?;
+        Ok(Self {
+            store,
+            plan,
+            overall_timeout,
+        })
+    }
+
+    pub(crate) async fn read(&self) -> Result<BoundCandidateSet, CatalogCandidateError> {
+        read_authoritative_with_store(&self.store, &self.plan, self.overall_timeout).await
+    }
+}
+
+async fn read_authoritative_with_store<S: CandidateStore>(
+    store: &S,
+    plan: &CatalogCandidateObservationPlan,
+    request_timeout: Duration,
+) -> Result<BoundCandidateSet, CatalogCandidateError> {
+    tokio::time::timeout(request_timeout, read_stable_bound_candidates(store, plan))
+        .await
+        .map_err(|_| CatalogCandidateError::AuthoritativeReadTimedOut)?
+}
+
+async fn read_stable_bound_candidates<S: CandidateStore>(
+    store: &S,
+    plan: &CatalogCandidateObservationPlan,
+) -> Result<BoundCandidateSet, CatalogCandidateError> {
+    let before = read_bound_candidates(store, plan).await?;
+    let after = read_bound_candidates(store, plan).await?;
+    if before != after {
+        return Err(CatalogCandidateError::EvidenceChanged);
+    }
+    Ok(before)
 }
 
 async fn read_bound_candidates<S: CandidateStore>(
@@ -1163,7 +1225,7 @@ impl CandidateStore for KubernetesCandidateStore {
 }
 
 #[derive(Debug, Error)]
-enum CatalogCandidateError {
+pub(crate) enum CatalogCandidateError {
     #[error("catalog-candidate observation plan is invalid")]
     InvalidPlan,
     #[error("PgShardCluster status is absent, stale, deleting, or inconsistent")]
@@ -1178,6 +1240,8 @@ enum CatalogCandidateError {
     EvidenceChanged,
     #[error("catalog-candidate observation expired before atomic publication")]
     FreshnessExpired,
+    #[error("authoritative catalog-candidate reread timed out")]
+    AuthoritativeReadTimedOut,
     #[error(transparent)]
     AuthorityClock(#[from] BoottimeError),
     #[error("in-cluster Kubernetes configuration is unavailable: {0}")]
@@ -1216,6 +1280,7 @@ impl CatalogCandidateError {
             | Self::InvalidCandidate
             | Self::InvalidObjectMetadata
             | Self::Json(_) => CatalogCandidateFailureReason::ValidationFailed,
+            Self::AuthoritativeReadTimedOut => CatalogCandidateFailureReason::CandidateUnavailable,
         }
     }
 }
@@ -1578,6 +1643,12 @@ mod tests {
 
     struct BlockingStore;
 
+    struct DelayedStore {
+        inner: StubStore,
+        delay: Duration,
+        per_request_timeout: Duration,
+    }
+
     impl CandidateStore for BlockingStore {
         async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError> {
             pending().await
@@ -1585,6 +1656,26 @@ mod tests {
 
         async fn get_candidate(&self, _name: &str) -> Result<ConfigMap, CatalogCandidateError> {
             pending().await
+        }
+    }
+
+    impl CandidateStore for DelayedStore {
+        async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError> {
+            tokio::time::timeout(self.per_request_timeout, async {
+                tokio::time::sleep(self.delay).await;
+                self.inner.get_cluster_status().await
+            })
+            .await
+            .map_err(|_| CatalogCandidateError::StatusRequestTimedOut)?
+        }
+
+        async fn get_candidate(&self, name: &str) -> Result<ConfigMap, CatalogCandidateError> {
+            tokio::time::timeout(self.per_request_timeout, async {
+                tokio::time::sleep(self.delay).await;
+                self.inner.get_candidate(name).await
+            })
+            .await
+            .map_err(|_| CatalogCandidateError::CandidateRequestTimedOut)?
         }
     }
 
@@ -2884,6 +2975,20 @@ mod tests {
         assert!(validate_plan(&plan(), Duration::from_millis(5_001)).is_err());
     }
 
+    #[test]
+    fn authoritative_reader_rejects_invalid_or_unbounded_budgets_before_client_creation() {
+        for (per_request, overall) in [
+            (Duration::from_millis(99), Duration::from_secs(1)),
+            (Duration::from_secs(1), Duration::from_millis(999)),
+            (Duration::from_secs(1), Duration::from_millis(5_001)),
+        ] {
+            assert!(matches!(
+                AuthoritativeCandidateReader::new(plan(), per_request, overall),
+                Err(CatalogCandidateError::InvalidPlan)
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn rejects_pre_post_cluster_resource_version_or_generation_change_without_last_good() {
         for field in ["resource-version", "generation"] {
@@ -2922,6 +3027,38 @@ mod tests {
                 Some(CatalogCandidateFailureReason::EvidenceChanged)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn authoritative_reread_has_one_global_deadline() {
+        let error =
+            read_authoritative_with_store(&BlockingStore, &plan(), Duration::from_millis(10))
+                .await
+                .expect_err("stalled authoritative read");
+        assert!(matches!(
+            error,
+            CatalogCandidateError::AuthoritativeReadTimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_reread_accumulates_healthy_gets_under_a_distinct_total_budget() {
+        let (plan, cluster, candidates) = fixture();
+        let per_request_timeout = Duration::from_millis(100);
+        let store = DelayedStore {
+            inner: store(cluster, candidates),
+            delay: Duration::from_millis(20),
+            per_request_timeout,
+        };
+        let started = Instant::now();
+        let bound = read_authoritative_with_store(&store, &plan, Duration::from_millis(500))
+            .await
+            .expect("individually healthy stable reads fit the total budget");
+        assert_eq!(bound.candidate_count(), 3);
+        assert!(
+            started.elapsed() > per_request_timeout,
+            "the test must accumulate more latency than one GET budget"
+        );
     }
 
     #[tokio::test]
