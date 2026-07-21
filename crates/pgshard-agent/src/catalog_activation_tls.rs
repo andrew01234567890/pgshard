@@ -455,6 +455,7 @@ async fn serve_connection(
     let mut server = http1::Builder::new();
     server
         .keep_alive(false)
+        .auto_date_header(false)
         .max_headers(MAXIMUM_HEADERS)
         .max_buf_size(MAXIMUM_HEADER_BYTES)
         .timer(TokioTimer::new())
@@ -710,6 +711,7 @@ impl std::fmt::Debug for TlsMaterialKind {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use axum::body::{Body, to_bytes};
@@ -823,6 +825,46 @@ mod tests {
                 .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Arc::new(config)
+    }
+
+    fn strict_challenge_response_body(response: &[u8]) -> &[u8] {
+        let delimiter = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("HTTP header terminator");
+        let header = std::str::from_utf8(&response[..delimiter]).expect("ASCII HTTP headers");
+        let mut lines = header.split("\r\n");
+        assert_eq!(lines.next(), Some("HTTP/1.1 200 OK"));
+
+        let mut headers = BTreeMap::new();
+        for line in lines {
+            let (name, value) = line.split_once(": ").expect("canonical HTTP header");
+            assert!(
+                headers.insert(name.to_ascii_lowercase(), value).is_none(),
+                "duplicate response header {name}"
+            );
+        }
+        assert_eq!(
+            headers.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "cache-control",
+                "connection",
+                "content-length",
+                "content-type"
+            ]
+        );
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["connection"], "close");
+        assert_eq!(headers["content-type"], "application/json");
+
+        let body = &response[delimiter + 4..];
+        assert_eq!(
+            headers["content-length"]
+                .parse::<usize>()
+                .expect("numeric content length"),
+            body.len()
+        );
+        body
     }
 
     #[tokio::test]
@@ -1001,7 +1043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls_listener_serves_canonical_response_and_rejects_plaintext() {
+    async fn tls_listener_matches_strict_client_framing_and_rejects_plaintext() {
         let (certificate, private_key, certificate_der) = tls_material();
         let server_config =
             server_config_from_material(certificate.as_bytes(), private_key.as_bytes())
@@ -1042,11 +1084,7 @@ mod tests {
         let mut response = Vec::new();
         tls.read_to_end(&mut response).await.expect("read response");
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
-        let separator = response
-            .windows(4)
-            .position(|bytes| bytes == b"\r\n\r\n")
-            .expect("HTTP header terminator");
-        let response_body = &response[separator + 4..];
+        let response_body = strict_challenge_response_body(&response);
         let parsed: CatalogActivationCapabilityChallengeResponse =
             serde_json::from_slice(response_body).expect("parse TLS response");
         parsed
