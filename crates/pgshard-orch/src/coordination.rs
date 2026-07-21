@@ -12,6 +12,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use crate::boottime::SuspendAwareInstant;
 use crate::domain::{OrchState, OrchestratorIdentity};
 
 const INITIAL_RETRY: Duration = Duration::from_millis(250);
@@ -171,6 +172,7 @@ async fn supervise_with_store<S: LeaseStore>(
                 config,
                 &holder_identity,
                 &mut observed_holder,
+                &state,
             ) => result,
         };
 
@@ -231,7 +233,13 @@ async fn reconcile_once<S: LeaseStore>(
     config: &CoordinationConfig,
     holder_identity: &str,
     observed_holder: &mut Option<ObservedHolder>,
+    state: &OrchState,
 ) -> Result<CoordinationObservation, CoordinationError> {
+    // Anchor follower readiness before the authoritative API read so request
+    // delay and host suspend both consume, but never extend, its lifetime.
+    let observation_deadline = state
+        .suspend_aware_deadline_after(config.lease_duration)
+        .map_err(|_| CoordinationError::AuthorityClockUnavailable)?;
     let lease = store.get().await?;
     let evidence = validate_lease(&lease, config)?;
     let spec = lease.spec.clone().unwrap_or_default();
@@ -242,12 +250,22 @@ async fn reconcile_once<S: LeaseStore>(
 
     if current_holder == Some(holder_identity) {
         *observed_holder = None;
-        return replace_as_holder(store, config, lease, evidence, holder_identity, false).await;
+        return replace_as_holder(
+            store,
+            config,
+            lease,
+            evidence,
+            holder_identity,
+            false,
+            state,
+        )
+        .await;
     }
 
     if current_holder.is_none() {
         *observed_holder = None;
-        return replace_as_holder(store, config, lease, evidence, holder_identity, true).await;
+        return replace_as_holder(store, config, lease, evidence, holder_identity, true, state)
+            .await;
     }
 
     let occupied_duration = occupied_lease_duration(&spec)?;
@@ -267,7 +285,7 @@ async fn reconcile_once<S: LeaseStore>(
             return Ok(CoordinationObservation::follower(
                 evidence,
                 config.retry_period,
-                config.lease_duration,
+                observation_deadline,
             ));
         }
     };
@@ -277,12 +295,12 @@ async fn reconcile_once<S: LeaseStore>(
         return Ok(CoordinationObservation::follower(
             evidence,
             cmp::min(config.retry_period, takeover_delay.saturating_sub(elapsed)),
-            config.lease_duration,
+            observation_deadline,
         ));
     }
 
     *observed_holder = None;
-    replace_as_holder(store, config, lease, evidence, holder_identity, true).await
+    replace_as_holder(store, config, lease, evidence, holder_identity, true, state).await
 }
 
 async fn replace_as_holder<S: LeaseStore>(
@@ -292,6 +310,7 @@ async fn replace_as_holder<S: LeaseStore>(
     previous: LeaseEvidence,
     holder_identity: &str,
     transition: bool,
+    state: &OrchState,
 ) -> Result<CoordinationObservation, CoordinationError> {
     let now = MicroTime(Timestamp::now());
     let mut spec = lease.spec.take().unwrap_or_default();
@@ -315,7 +334,9 @@ async fn replace_as_holder<S: LeaseStore>(
     // A committed replacement can be followed by an arbitrarily delayed API
     // response. Anchor local authority before dispatch so response latency can
     // consume, but never extend, the Lease validity window.
-    let valid_from = Instant::now();
+    let valid_until = state
+        .suspend_aware_deadline_after(config.lease_duration)
+        .map_err(|_| CoordinationError::AuthorityClockUnavailable)?;
     let updated = store.replace(&lease).await?;
     let evidence = validate_lease(&updated, config)?;
     let updated_spec = updated
@@ -339,7 +360,7 @@ async fn replace_as_holder<S: LeaseStore>(
         lease_uid: evidence.lease_uid,
         resource_version: evidence.resource_version,
         leader: true,
-        valid_until: valid_from + config.lease_duration,
+        valid_until,
         delay: config.lease_duration / 3,
     })
 }
@@ -381,17 +402,21 @@ struct CoordinationObservation {
     lease_uid: String,
     resource_version: String,
     leader: bool,
-    valid_until: Instant,
+    valid_until: SuspendAwareInstant,
     delay: Duration,
 }
 
 impl CoordinationObservation {
-    fn follower(evidence: LeaseEvidence, delay: Duration, validity: Duration) -> Self {
+    fn follower(
+        evidence: LeaseEvidence,
+        delay: Duration,
+        valid_until: SuspendAwareInstant,
+    ) -> Self {
         Self {
             lease_uid: evidence.lease_uid,
             resource_version: evidence.resource_version,
             leader: false,
-            valid_until: Instant::now() + validity,
+            valid_until,
             delay,
         }
     }
@@ -602,6 +627,9 @@ pub enum CoordinationError {
     /// The API response contradicted the exact resource-version write.
     #[error("Kubernetes Lease update response rejected local coordination evidence")]
     StateEvidenceRejected,
+    /// Linux suspend-aware time could not be observed safely.
+    #[error("Linux suspend-aware coordination clock is unavailable")]
+    AuthorityClockUnavailable,
 }
 
 impl CoordinationError {
@@ -620,18 +648,20 @@ impl CoordinationError {
             | Self::InvalidLeaseSpec
             | Self::UnsupportedCoordinatedElection
             | Self::LeaseTransitionOverflow
-            | Self::StateEvidenceRejected => true,
+            | Self::StateEvidenceRejected
+            | Self::AuthorityClockUnavailable => true,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
 
     use super::*;
+    use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
 
     fn config() -> CoordinationConfig {
         CoordinationConfig::new(
@@ -731,6 +761,12 @@ mod tests {
         inner: MemoryStore,
         response_delay: Duration,
         committed_at: Mutex<Option<Instant>>,
+        suspend_clock: Option<Arc<FakeBoottimeClock>>,
+    }
+
+    struct SuspendingGetStore {
+        inner: MemoryStore,
+        clock: Arc<FakeBoottimeClock>,
     }
 
     impl LeaseStore for DelayedReplaceResponseStore {
@@ -741,8 +777,26 @@ mod tests {
         async fn replace(&self, lease: &Lease) -> Result<Lease, CoordinationError> {
             let committed = self.inner.replace(lease).await?;
             *self.committed_at.lock().expect("lock commit time") = Some(Instant::now());
+            if let Some(clock) = &self.suspend_clock {
+                clock
+                    .advance(Duration::from_secs(7))
+                    .expect("advance across Lease validity");
+            }
             tokio::time::sleep(self.response_delay).await;
             Ok(committed)
+        }
+    }
+
+    impl LeaseStore for SuspendingGetStore {
+        async fn get(&self) -> Result<Lease, CoordinationError> {
+            self.clock
+                .advance(Duration::from_secs(7))
+                .expect("advance across Lease observation");
+            self.inner.get().await
+        }
+
+        async fn replace(&self, lease: &Lease) -> Result<Lease, CoordinationError> {
+            self.inner.replace(lease).await
         }
     }
 
@@ -773,9 +827,10 @@ mod tests {
     #[tokio::test]
     async fn empty_lease_is_claimed_with_resource_version_cas() {
         let config = config();
+        let state = OrchState::with_identity(config.identity.clone(), 15_000).expect("valid state");
         let store = MemoryStore::new(lease(&config));
         let holder = config.holder_identity();
-        let observation = reconcile_once(&store, &config, &holder, &mut None)
+        let observation = reconcile_once(&store, &config, &holder, &mut None, &state)
             .await
             .expect("claim Lease");
         assert!(observation.leader);
@@ -800,10 +855,11 @@ mod tests {
     #[tokio::test]
     async fn accepts_api_server_microtime_normalization_after_cas() {
         let config = config();
+        let state = OrchState::with_identity(config.identity.clone(), 15_000).expect("valid state");
         let store = MemoryStore::normalizing_renew_time(lease(&config));
         let holder = config.holder_identity();
 
-        let observation = reconcile_once(&store, &config, &holder, &mut None)
+        let observation = reconcile_once(&store, &config, &holder, &mut None, &state)
             .await
             .expect("accept normalized API response");
 
@@ -814,13 +870,15 @@ mod tests {
     #[tokio::test]
     async fn delayed_committed_replace_response_cannot_extend_leadership() {
         let config = config();
+        let state = OrchState::with_identity(config.identity.clone(), 15_000).expect("valid state");
         let store = DelayedReplaceResponseStore {
             inner: MemoryStore::new(lease(&config)),
             response_delay: Duration::from_millis(150),
             committed_at: Mutex::new(None),
+            suspend_clock: None,
         };
         let holder = config.holder_identity();
-        let observation = reconcile_once(&store, &config, &holder, &mut None)
+        let observation = reconcile_once(&store, &config, &holder, &mut None, &state)
             .await
             .expect("receive delayed committed replacement");
 
@@ -831,10 +889,9 @@ mod tests {
             .expect("lock commit time")
             .expect("store recorded commit time");
         assert!(
-            observation.valid_until <= committed_at + config.lease_duration,
+            observation.valid_until.monotonic <= committed_at + config.lease_duration,
             "local leadership must not begin after the committed replacement"
         );
-        let state = OrchState::with_identity(config.identity.clone(), 15_000).expect("valid state");
         assert!(state.record_coordination_ready(
             &observation.lease_uid,
             &observation.resource_version,
@@ -845,8 +902,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suspend_during_authoritative_get_cannot_install_follower_readiness() {
+        let config = config();
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = OrchState::with_identity_and_clock_for_test(
+            config.identity.clone(),
+            15_000,
+            clock.clone(),
+        )
+        .expect("valid state");
+        let mut occupied = lease(&config);
+        occupied.spec = Some(LeaseSpec {
+            holder_identity: Some("foreign/pod/process".to_owned()),
+            lease_duration_seconds: Some(6),
+            renew_time: Some(MicroTime(Timestamp::now())),
+            lease_transitions: Some(1),
+            ..LeaseSpec::default()
+        });
+        let store = SuspendingGetStore {
+            inner: MemoryStore::new(occupied),
+            clock,
+        };
+
+        let observation = reconcile_once(
+            &store,
+            &config,
+            &config.holder_identity(),
+            &mut None,
+            &state,
+        )
+        .await
+        .expect("observe foreign holder");
+
+        assert!(!observation.leader);
+        assert!(!state.record_coordination_ready(
+            &observation.lease_uid,
+            &observation.resource_version,
+            observation.leader,
+            observation.valid_until,
+        ));
+        assert!(!state.snapshot().coordination_ready);
+    }
+
+    #[tokio::test]
+    async fn suspend_during_committed_replace_response_cannot_install_leadership() {
+        let config = config();
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = OrchState::with_identity_and_clock_for_test(
+            config.identity.clone(),
+            15_000,
+            clock.clone(),
+        )
+        .expect("valid state");
+        let store = DelayedReplaceResponseStore {
+            inner: MemoryStore::new(lease(&config)),
+            response_delay: Duration::ZERO,
+            committed_at: Mutex::new(None),
+            suspend_clock: Some(clock),
+        };
+
+        let observation = reconcile_once(
+            &store,
+            &config,
+            &config.holder_identity(),
+            &mut None,
+            &state,
+        )
+        .await
+        .expect("receive committed replacement");
+
+        assert!(observation.leader);
+        assert!(!state.record_coordination_ready(
+            &observation.lease_uid,
+            &observation.resource_version,
+            observation.leader,
+            observation.valid_until,
+        ));
+        assert!(!state.snapshot().coordination_ready);
+    }
+
+    #[tokio::test]
     async fn foreign_holder_requires_unchanged_local_observation_window() {
         let config = config();
+        let state = OrchState::with_identity(config.identity.clone(), 15_000).expect("valid state");
         let mut occupied = lease(&config);
         occupied.spec = Some(LeaseSpec {
             holder_identity: Some("foreign/pod/process".to_owned()),
@@ -859,14 +1001,14 @@ mod tests {
         let holder = config.holder_identity();
         let mut observed = None;
 
-        let first = reconcile_once(&store, &config, &holder, &mut observed)
+        let first = reconcile_once(&store, &config, &holder, &mut observed, &state)
             .await
             .expect("observe foreign holder");
         assert!(!first.leader);
         observed.as_mut().expect("observation").unchanged_since = Instant::now()
             .checked_sub(Duration::from_secs(5))
             .expect("test Instant supports a five-second subtraction");
-        let second = reconcile_once(&store, &config, &holder, &mut observed)
+        let second = reconcile_once(&store, &config, &holder, &mut observed, &state)
             .await
             .expect("continue observing foreign holder");
         assert!(!second.leader, "local six-second duration must be honored");
@@ -874,7 +1016,7 @@ mod tests {
         observed.as_mut().expect("observation").unchanged_since = Instant::now()
             .checked_sub(Duration::from_secs(6))
             .expect("test Instant supports a six-second subtraction");
-        let claimed = reconcile_once(&store, &config, &holder, &mut observed)
+        let claimed = reconcile_once(&store, &config, &holder, &mut observed, &state)
             .await
             .expect("claim expired foreign holder");
         assert!(claimed.leader);
@@ -883,9 +1025,10 @@ mod tests {
     #[tokio::test]
     async fn shutdown_release_clears_only_our_holder() {
         let config = config();
+        let state = OrchState::with_identity(config.identity.clone(), 15_000).expect("valid state");
         let store = MemoryStore::new(lease(&config));
         let holder = config.holder_identity();
-        reconcile_once(&store, &config, &holder, &mut None)
+        reconcile_once(&store, &config, &holder, &mut None, &state)
             .await
             .expect("claim Lease");
         best_effort_release(&store, &config, &holder).await;

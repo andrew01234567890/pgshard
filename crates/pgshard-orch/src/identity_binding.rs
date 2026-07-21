@@ -24,6 +24,7 @@ use crate::agent_status::{
     AgentStatusCollection, AgentStatusError, AgentStatusExpectation, AgentStatusQuery,
     ExpectedWritableLease, collect_agent_statuses,
 };
+use crate::boottime::{BoottimeError, SuspendAwareInstant};
 use crate::domain::{AgentStatusFailureReason, OrchState};
 use crate::topology::UnboundAgentObservationTarget;
 
@@ -185,7 +186,8 @@ async fn observe_once_with_collector_and_clock<
     let result = async {
         // One absolute bound covers both complete, bounded Kubernetes scans,
         // every agent request, identity comparison, and atomic publication.
-        let scan_deadline = clock()
+        let scan_started = state.suspend_aware_now_with(&mut clock)?;
+        let scan_deadline = scan_started
             .checked_add(freshness)
             .ok_or(IdentityBindingError::InvalidFreshnessBound)?;
         let operation = async {
@@ -200,8 +202,12 @@ async fn observe_once_with_collector_and_clock<
                 .earliest_receipt
                 .checked_add(freshness)
                 .ok_or(IdentityBindingError::InvalidFreshnessBound)?;
-            let publication_deadline = scan_deadline.min(receipt_deadline);
-            if clock() >= publication_deadline
+            let publication_deadline = SuspendAwareInstant {
+                monotonic: scan_deadline.monotonic.min(receipt_deadline),
+                boottime: scan_deadline.boottime,
+            };
+            let completed_at = state.suspend_aware_now_with(&mut clock)?;
+            if !publication_deadline.is_live_at(completed_at)
                 || !state.record_agent_status_fresh(
                     collection.member_count,
                     collection.replication_correlation,
@@ -212,8 +218,11 @@ async fn observe_once_with_collector_and_clock<
             }
             Ok(())
         };
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(scan_deadline), operation)
-            .await
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(scan_deadline.monotonic),
+            operation,
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => Err(IdentityBindingError::FreshnessBoundExceeded(freshness)),
@@ -949,6 +958,8 @@ enum IdentityBindingError {
     LeaseIdentityMismatch(String),
     #[error("identity-binding freshness deadline overflowed the monotonic clock")]
     InvalidFreshnessBound,
+    #[error(transparent)]
+    AuthorityClock(#[from] BoottimeError),
     #[error("identity-binding and agent-status operation exceeded its freshness bound of {0:?}")]
     FreshnessBoundExceeded(Duration),
     #[error("Kubernetes identity changed while agent status was collected")]
@@ -977,6 +988,7 @@ impl IdentityBindingError {
             Self::AgentStatus(_) => AgentStatusFailureReason::StatusUnavailable,
             Self::IdentityChanged => AgentStatusFailureReason::IdentityChanged,
             Self::InvalidFreshnessBound
+            | Self::AuthorityClock(_)
             | Self::FreshnessBoundExceeded(_)
             | Self::FreshnessExpired => AgentStatusFailureReason::FreshnessExpired,
             Self::InvalidTargetSet
@@ -1006,6 +1018,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
     use crate::domain::{AgentStatusPhase, OrchestratorIdentity};
     use crate::topology::{
         AgentStatusCollectionState, TOPOLOGY_SCHEMA_VERSION, TopologyDiagnostics,
@@ -1018,6 +1031,11 @@ mod tests {
         replication_correlation: ReplicationCorrelationSummary,
     }
 
+    struct SuspendingAgentStatusCollector {
+        clock: Arc<FakeBoottimeClock>,
+        receipt: std::time::Instant,
+    }
+
     impl AgentStatusCollector for StubAgentStatusCollector {
         async fn collect(
             &self,
@@ -1027,6 +1045,22 @@ mod tests {
                 member_count: queries.len(),
                 earliest_receipt: self.receipt,
                 replication_correlation: self.replication_correlation,
+            })
+        }
+    }
+
+    impl AgentStatusCollector for SuspendingAgentStatusCollector {
+        async fn collect(
+            &self,
+            queries: Vec<AgentStatusQuery>,
+        ) -> Result<AgentStatusCollection, AgentStatusError> {
+            self.clock
+                .advance(Duration::from_secs(6))
+                .expect("advance across collection window");
+            Ok(AgentStatusCollection {
+                member_count: queries.len(),
+                earliest_receipt: self.receipt,
+                replication_correlation: ReplicationCorrelationSummary::default(),
             })
         }
     }
@@ -1561,6 +1595,28 @@ mod tests {
         .expect("state")
     }
 
+    fn observation_state_with_clock(
+        targets: &[UnboundAgentObservationTarget],
+        clock: Arc<FakeBoottimeClock>,
+    ) -> OrchState {
+        OrchState::with_identity_and_topology_and_clock_for_test(
+            OrchestratorIdentity {
+                cluster_id: "demo".to_owned(),
+                orchestrator_id: "demo-orchestrator-0".to_owned(),
+            },
+            1_000,
+            TopologyDiagnostics {
+                schema_version: TOPOLOGY_SCHEMA_VERSION.to_owned(),
+                cluster_object_uid: CLUSTER_UID.to_owned(),
+                shard_count: 1,
+                member_count: targets.len(),
+                agent_status_collection: AgentStatusCollectionState::DisabledPodIdentityRequired,
+            },
+            clock,
+        )
+        .expect("state")
+    }
+
     #[tokio::test]
     async fn binds_exact_pods_endpoints_and_holder_pod() {
         let (targets, store) = store();
@@ -1890,6 +1946,34 @@ mod tests {
             snapshot.topology.expect("topology").agent_status_collection,
             AgentStatusCollectionState::DisabledPodIdentityRequired,
         );
+    }
+
+    #[tokio::test]
+    async fn suspend_during_collection_cannot_publish_agent_evidence() {
+        let (targets, store) = store();
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = observation_state_with_clock(&targets, clock.clone());
+        let collector = SuspendingAgentStatusCollector {
+            clock,
+            receipt: std::time::Instant::now(),
+        };
+
+        let error = observe_once_with_collector(
+            &store,
+            &collector,
+            &targets,
+            &state,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("suspend must consume agent evidence freshness");
+
+        assert!(matches!(error, IdentityBindingError::FreshnessExpired));
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Unavailable);
+        assert_eq!(snapshot.agent_status.fresh_members, 0);
     }
 
     #[tokio::test]

@@ -10,10 +10,31 @@ use serde::{Serialize, Serializer};
 use thiserror::Error;
 
 use crate::agent_status::ReplicationCorrelationSummary;
+use crate::boottime::{
+    BoottimeClock, BoottimeError, SuspendAwareInstant, system_clock as system_boottime_clock,
+};
 use crate::topology::TopologyDiagnostics;
 
 const DEFAULT_MAX_LEASE_TTL_MS: u64 = 15_000;
 const MAX_LEASE_TTL_MS: u64 = 300_000;
+
+pub(crate) trait IntoSuspendAwareDeadline {
+    fn into_suspend_aware(self, now: SuspendAwareInstant) -> Option<SuspendAwareInstant>;
+}
+
+impl IntoSuspendAwareDeadline for SuspendAwareInstant {
+    fn into_suspend_aware(self, _now: SuspendAwareInstant) -> Option<SuspendAwareInstant> {
+        Some(self)
+    }
+}
+
+#[cfg(test)]
+impl IntoSuspendAwareDeadline for Instant {
+    fn into_suspend_aware(self, now: SuspendAwareInstant) -> Option<SuspendAwareInstant> {
+        let remaining = self.checked_duration_since(now.monotonic)?;
+        now.checked_add(remaining)
+    }
+}
 
 /// Stable identity assigned to one orchestrator process.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -604,17 +625,70 @@ struct OrchInner {
     leader: bool,
     coordination_lease_uid: Option<String>,
     coordination_resource_version: Option<String>,
-    coordination_deadline: Option<Instant>,
+    coordination_deadline: Option<SuspendAwareInstant>,
     // Diagnostic-only identity evidence is never retained past this process-
     // local monotonic deadline and never participates in authority decisions.
-    agent_identity_binding_deadline: Option<Instant>,
+    agent_identity_binding_deadline: Option<SuspendAwareInstant>,
     agent_status: AgentStatusDiagnostics,
     agent_replication_correlation: Option<ReplicationCorrelationSummary>,
     // Catalog-candidate evidence is independently diagnostic and cannot alter
     // coordination, agent status, readiness, leadership, or operation state.
-    catalog_candidate_deadline: Option<Instant>,
+    catalog_candidate_deadline: Option<SuspendAwareInstant>,
     catalog_candidates: CatalogCandidateDiagnostics,
     topology: Option<TopologyDiagnostics>,
+}
+
+fn expire_coordination_state(inner: &mut OrchInner, now: Option<SuspendAwareInstant>) -> bool {
+    let coordination_live = inner.coordination_ready
+        && inner
+            .coordination_deadline
+            .zip(now)
+            .is_some_and(|(deadline, now)| deadline.is_live_at(now));
+    if !coordination_live {
+        inner.coordination_ready = false;
+        inner.leader = false;
+        inner.coordination_deadline = None;
+    }
+    coordination_live
+}
+
+fn expire_diagnostic_state(inner: &mut OrchInner, now: Option<SuspendAwareInstant>) {
+    let identity_binding_live = inner
+        .agent_identity_binding_deadline
+        .zip(now)
+        .is_some_and(|(deadline, now)| deadline.is_live_at(now));
+    if !identity_binding_live {
+        inner.agent_identity_binding_deadline = None;
+        if inner.agent_status.phase == AgentStatusPhase::Fresh {
+            inner.agent_replication_correlation = None;
+            inner.agent_status.phase = AgentStatusPhase::Expired;
+            inner.agent_status.fresh_members = 0;
+            inner.agent_status.replication_correlated_shards = 0;
+            inner.agent_status.target_fence_acknowledged_shards = 0;
+            inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
+        }
+        if let Some(topology) = &mut inner.topology
+            && topology.agent_status_collection
+                != crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
+        {
+            topology.agent_status_collection =
+                crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired;
+        }
+    }
+
+    let catalog_candidate_live = inner
+        .catalog_candidate_deadline
+        .zip(now)
+        .is_some_and(|(deadline, now)| deadline.is_live_at(now));
+    if !catalog_candidate_live {
+        inner.catalog_candidate_deadline = None;
+        if inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh {
+            inner.catalog_candidates.phase = CatalogCandidatePhase::Expired;
+            inner.catalog_candidates.fresh_candidates = 0;
+            inner.catalog_candidates.failure =
+                Some(CatalogCandidateFailureReason::FreshnessExpired);
+        }
+    }
 }
 
 fn catalog_bootstrap_observation(inner: &OrchInner) -> CatalogBootstrapObservationDiagnostics {
@@ -704,11 +778,22 @@ fn catalog_bootstrap_observation(inner: &OrchInner) -> CatalogBootstrapObservati
 }
 
 /// Thread-safe registry for operation IDs and shard leases.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OrchState {
     inner: Arc<Mutex<OrchInner>>,
     max_lease_ttl_ms: u64,
     clock_origin: Instant,
+    boottime: Arc<dyn BoottimeClock>,
+}
+
+impl fmt::Debug for OrchState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OrchState")
+            .field("inner", &"<redacted>")
+            .field("max_lease_ttl_ms", &self.max_lease_ttl_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for OrchState {
@@ -717,6 +802,7 @@ impl Default for OrchState {
             inner: Arc::new(Mutex::new(OrchInner::default())),
             max_lease_ttl_ms: DEFAULT_MAX_LEASE_TTL_MS,
             clock_origin: Instant::now(),
+            boottime: system_boottime_clock(),
         }
     }
 }
@@ -757,6 +843,20 @@ impl OrchState {
         max_lease_ttl_ms: u64,
         topology: Option<TopologyDiagnostics>,
     ) -> Result<Self, OrchError> {
+        Self::with_identity_optional_topology_and_clock(
+            identity,
+            max_lease_ttl_ms,
+            topology,
+            system_boottime_clock(),
+        )
+    }
+
+    fn with_identity_optional_topology_and_clock(
+        identity: OrchestratorIdentity,
+        max_lease_ttl_ms: u64,
+        topology: Option<TopologyDiagnostics>,
+        boottime: Arc<dyn BoottimeClock>,
+    ) -> Result<Self, OrchError> {
         if !(1..=MAX_LEASE_TTL_MS).contains(&max_lease_ttl_ms) {
             return Err(OrchError::InvalidMaximumLeaseTtl(max_lease_ttl_ms));
         }
@@ -784,7 +884,63 @@ impl OrchState {
             })),
             max_lease_ttl_ms,
             clock_origin: Instant::now(),
+            boottime,
         })
+    }
+
+    pub(crate) fn suspend_aware_now(&self) -> Result<SuspendAwareInstant, BoottimeError> {
+        self.suspend_aware_now_with(Instant::now)
+    }
+
+    pub(crate) fn suspend_aware_now_with<F>(
+        &self,
+        mut monotonic_clock: F,
+    ) -> Result<SuspendAwareInstant, BoottimeError>
+    where
+        F: FnMut() -> Instant,
+    {
+        // BOOTTIME is sampled last so a suspend between clock reads is visible
+        // to liveness checks. Pre-I/O callers do not dispatch until both
+        // samples exist, so the ordering cannot extend an in-flight window.
+        let monotonic = monotonic_clock();
+        let boottime = self.boottime.now()?;
+        Ok(SuspendAwareInstant {
+            monotonic,
+            boottime,
+        })
+    }
+
+    pub(crate) fn suspend_aware_deadline_after(
+        &self,
+        duration: Duration,
+    ) -> Result<SuspendAwareInstant, BoottimeError> {
+        self.suspend_aware_now()?
+            .checked_add(duration)
+            .ok_or(BoottimeError::InvalidTimestamp)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_identity_and_clock_for_test(
+        identity: OrchestratorIdentity,
+        max_lease_ttl_ms: u64,
+        boottime: Arc<dyn BoottimeClock>,
+    ) -> Result<Self, OrchError> {
+        Self::with_identity_optional_topology_and_clock(identity, max_lease_ttl_ms, None, boottime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_identity_and_topology_and_clock_for_test(
+        identity: OrchestratorIdentity,
+        max_lease_ttl_ms: u64,
+        topology: TopologyDiagnostics,
+        boottime: Arc<dyn BoottimeClock>,
+    ) -> Result<Self, OrchError> {
+        Self::with_identity_optional_topology_and_clock(
+            identity,
+            max_lease_ttl_ms,
+            Some(topology),
+            boottime,
+        )
     }
 
     /// Returns whether the runtime can safely serve control operations.
@@ -794,19 +950,17 @@ impl OrchState {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Sample only after acquiring the state mutex. Otherwise contention
+        // could carry a stale timestamp across an evidence deadline.
+        let coordination_live =
+            expire_coordination_state(&mut inner, self.suspend_aware_now().ok());
         if inner.identity.is_none() {
             return OrchReadiness {
                 ready: false,
                 reason: OrchReadinessReason::IdentityMissing,
             };
         }
-        let coordination_live = inner.coordination_ready
-            && inner
-                .coordination_deadline
-                .is_some_and(|deadline| Instant::now() < deadline);
         if !coordination_live {
-            inner.coordination_ready = false;
-            inner.leader = false;
             return OrchReadiness {
                 ready: false,
                 reason: OrchReadinessReason::CoordinationUnavailable,
@@ -824,17 +978,19 @@ impl OrchState {
     /// versions are opaque and therefore recorded but never numerically ordered.
     /// A false result leaves readiness and leadership disabled.
     #[must_use]
-    pub(crate) fn record_coordination_ready(
+    pub(crate) fn record_coordination_ready<D: IntoSuspendAwareDeadline>(
         &self,
         lease_uid: &str,
         resource_version: &str,
         leader: bool,
-        deadline: Instant,
+        deadline: D,
     ) -> bool {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.suspend_aware_now().ok();
+        let deadline = now.and_then(|now| deadline.into_suspend_aware(now));
         let valid = !lease_uid.is_empty()
             && lease_uid.len() <= 128
             && !resource_version.is_empty()
@@ -843,15 +999,18 @@ impl OrchState {
                 .coordination_lease_uid
                 .as_deref()
                 .is_none_or(|current| current == lease_uid)
-            && Instant::now() < deadline;
+            && deadline
+                .zip(now)
+                .is_some_and(|(deadline, now)| deadline.is_live_at(now));
         if !valid {
             inner.coordination_ready = false;
             inner.leader = false;
+            inner.coordination_deadline = None;
             return false;
         }
         inner.coordination_lease_uid = Some(lease_uid.to_owned());
         inner.coordination_resource_version = Some(resource_version.to_owned());
-        inner.coordination_deadline = Some(deadline);
+        inner.coordination_deadline = deadline;
         inner.coordination_ready = true;
         inner.leader = leader;
         true
@@ -865,6 +1024,7 @@ impl OrchState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.coordination_ready = false;
         inner.leader = false;
+        inner.coordination_deadline = None;
     }
 
     /// Clears earlier evidence before a new all-members collection begins.
@@ -921,16 +1081,18 @@ impl OrchState {
 
     /// Atomically publishes only one complete, still-live collection summary.
     #[must_use]
-    pub(crate) fn record_agent_status_fresh(
+    pub(crate) fn record_agent_status_fresh<D: IntoSuspendAwareDeadline>(
         &self,
         member_count: usize,
         replication_correlation: ReplicationCorrelationSummary,
-        deadline: Instant,
+        deadline: D,
     ) -> bool {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.suspend_aware_now().ok();
+        let deadline = now.and_then(|now| deadline.into_suspend_aware(now));
         if inner.agent_status.phase == AgentStatusPhase::ShuttingDown {
             return false;
         }
@@ -952,7 +1114,9 @@ impl OrchState {
                 || replication_correlation.acknowledged_correlated_shards
                     != replication_correlation.correlated_shards
                 || replication_correlation.shard_zero_target_fence_acknowledged)
-            && Instant::now() < deadline;
+            && deadline
+                .zip(now)
+                .is_some_and(|(deadline, now)| deadline.is_live_at(now));
         if !valid {
             inner.agent_identity_binding_deadline = None;
             inner.agent_replication_correlation = None;
@@ -963,7 +1127,7 @@ impl OrchState {
             inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
             return false;
         }
-        inner.agent_identity_binding_deadline = Some(deadline);
+        inner.agent_identity_binding_deadline = deadline;
         inner.agent_replication_correlation = Some(replication_correlation);
         inner.agent_status.phase = AgentStatusPhase::Fresh;
         inner.agent_status.fresh_members = member_count;
@@ -1018,21 +1182,25 @@ impl OrchState {
 
     /// Atomically publishes one complete, still-live candidate count only.
     #[must_use]
-    pub(crate) fn record_catalog_candidates_fresh(
+    pub(crate) fn record_catalog_candidates_fresh<D: IntoSuspendAwareDeadline>(
         &self,
         candidate_count: usize,
-        deadline: Instant,
+        deadline: D,
     ) -> bool {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.suspend_aware_now().ok();
+        let deadline = now.and_then(|now| deadline.into_suspend_aware(now));
         if inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown {
             return false;
         }
         let valid = matches!(candidate_count, 3 | 5)
             && candidate_count == inner.catalog_candidates.expected_candidates
-            && Instant::now() < deadline;
+            && deadline
+                .zip(now)
+                .is_some_and(|(deadline, now)| deadline.is_live_at(now));
         if !valid {
             inner.catalog_candidate_deadline = None;
             inner.catalog_candidates.phase = CatalogCandidatePhase::Unavailable;
@@ -1041,7 +1209,7 @@ impl OrchState {
                 Some(CatalogCandidateFailureReason::FreshnessExpired);
             return false;
         }
-        inner.catalog_candidate_deadline = Some(deadline);
+        inner.catalog_candidate_deadline = deadline;
         inner.catalog_candidates.phase = CatalogCandidatePhase::Fresh;
         inner.catalog_candidates.fresh_candidates = candidate_count;
         inner.catalog_candidates.failure = None;
@@ -1091,56 +1259,35 @@ impl OrchState {
     /// Returns a consistent reportable snapshot.
     #[must_use]
     pub fn snapshot(&self) -> OrchSnapshot {
-        self.snapshot_at(Instant::now())
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.suspend_aware_now().ok();
+        Self::snapshot_locked(&mut inner, now)
     }
 
+    #[cfg(test)]
     fn snapshot_at(&self, now: Instant) -> OrchSnapshot {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let coordination_ready = inner.coordination_ready
-            && inner
-                .coordination_deadline
-                .is_some_and(|deadline| now < deadline);
-        if !coordination_ready {
-            inner.coordination_ready = false;
-            inner.leader = false;
-        }
-        let identity_binding_live = inner
-            .agent_identity_binding_deadline
-            .is_some_and(|deadline| now < deadline);
-        if !identity_binding_live {
-            inner.agent_identity_binding_deadline = None;
-            if inner.agent_status.phase == AgentStatusPhase::Fresh {
-                inner.agent_replication_correlation = None;
-                inner.agent_status.phase = AgentStatusPhase::Expired;
-                inner.agent_status.fresh_members = 0;
-                inner.agent_status.replication_correlated_shards = 0;
-                inner.agent_status.target_fence_acknowledged_shards = 0;
-                inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
-            }
-            if let Some(topology) = &mut inner.topology
-                && topology.agent_status_collection
-                    != crate::topology::AgentStatusCollectionState::DisabledAgentRuntimeRequired
-            {
-                topology.agent_status_collection =
-                    crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired;
-            }
-        }
-        let catalog_candidate_live = inner
-            .catalog_candidate_deadline
-            .is_some_and(|deadline| now < deadline);
-        if !catalog_candidate_live {
-            inner.catalog_candidate_deadline = None;
-            if inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh {
-                inner.catalog_candidates.phase = CatalogCandidatePhase::Expired;
-                inner.catalog_candidates.fresh_candidates = 0;
-                inner.catalog_candidates.failure =
-                    Some(CatalogCandidateFailureReason::FreshnessExpired);
-            }
-        }
-        let catalog_bootstrap_observation = catalog_bootstrap_observation(&inner);
+        let now = self
+            .boottime
+            .now()
+            .ok()
+            .map(|boottime| SuspendAwareInstant {
+                monotonic: now,
+                boottime,
+            });
+        Self::snapshot_locked(&mut inner, now)
+    }
+
+    fn snapshot_locked(inner: &mut OrchInner, now: Option<SuspendAwareInstant>) -> OrchSnapshot {
+        let coordination_ready = expire_coordination_state(inner, now);
+        expire_diagnostic_state(inner, now);
+        let catalog_bootstrap_observation = catalog_bootstrap_observation(inner);
         let mut leases: Vec<_> = inner.leases.values().cloned().collect();
         leases.sort_by_key(|lease| lease.shard_id);
         OrchSnapshot {
@@ -1766,7 +1913,51 @@ pub enum OrchError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Weak;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+    use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
+
+    struct LockAssertingBoottimeClock {
+        clock: FakeBoottimeClock,
+        state: Mutex<Option<Weak<Mutex<OrchInner>>>>,
+        enforce: AtomicBool,
+    }
+
+    impl LockAssertingBoottimeClock {
+        fn new(now: BoottimeInstant) -> Self {
+            Self {
+                clock: FakeBoottimeClock::new(now),
+                state: Mutex::new(None),
+                enforce: AtomicBool::new(false),
+            }
+        }
+
+        fn require_state_lock(&self, state: &OrchState) {
+            *self.state.lock().expect("clock state") = Some(Arc::downgrade(&state.inner));
+            self.enforce.store(true, Ordering::Release);
+        }
+    }
+
+    impl BoottimeClock for LockAssertingBoottimeClock {
+        fn now(&self) -> Result<BoottimeInstant, BoottimeError> {
+            if self.enforce.load(Ordering::Acquire) {
+                let state = self
+                    .state
+                    .lock()
+                    .expect("clock state")
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .expect("bound state");
+                assert!(matches!(
+                    state.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+            }
+            self.clock.now()
+        }
+    }
 
     fn identity() -> OrchestratorIdentity {
         OrchestratorIdentity {
@@ -1813,6 +2004,23 @@ mod tests {
                 agent_status_collection:
                     crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired,
             },
+        )
+        .expect("bootstrap observation state")
+    }
+
+    fn bootstrap_observation_state_with_clock(clock: Arc<dyn BoottimeClock>) -> OrchState {
+        OrchState::with_identity_and_topology_and_clock_for_test(
+            identity(),
+            100,
+            TopologyDiagnostics {
+                schema_version: crate::topology::TOPOLOGY_SCHEMA_VERSION.to_owned(),
+                cluster_object_uid: "cluster-uid".to_owned(),
+                shard_count: 2,
+                member_count: 6,
+                agent_status_collection:
+                    crate::topology::AgentStatusCollectionState::DisabledPodIdentityRequired,
+            },
+            clock,
         )
         .expect("bootstrap observation state")
     }
@@ -3026,5 +3234,127 @@ mod tests {
             acquire_at(&state, lease("op-1", "orch-0", 11, 1_001), 11, 900),
             Err(OrchError::LeasePastOperationDeadline { .. })
         ));
+    }
+
+    #[test]
+    fn coordination_and_diagnostics_expire_across_host_suspend() {
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+
+        assert!(state.record_coordination_ready("lease-uid", "1", true, deadline));
+        state.record_agent_status_collecting(Duration::from_secs(2));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(2));
+        assert!(state.record_agent_status_fresh(
+            6,
+            ReplicationCorrelationSummary::default(),
+            deadline,
+        ));
+        assert!(state.record_catalog_candidates_fresh(3, deadline));
+
+        clock
+            .advance(Duration::from_secs(3))
+            .expect("advance through suspend");
+        let snapshot = state.snapshot();
+        assert!(!snapshot.coordination_ready);
+        assert!(!snapshot.leader);
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Expired);
+        assert_eq!(
+            snapshot.catalog_candidates.phase,
+            CatalogCandidatePhase::Expired
+        );
+    }
+
+    #[test]
+    fn authority_clock_failure_clears_coordination_and_diagnostics() {
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+
+        assert!(state.record_coordination_ready("lease-uid", "1", true, deadline));
+        state.record_agent_status_collecting(Duration::from_secs(2));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(2));
+        assert!(state.record_agent_status_fresh(
+            6,
+            ReplicationCorrelationSummary::default(),
+            deadline,
+        ));
+        assert!(state.record_catalog_candidates_fresh(3, deadline));
+
+        clock.fail();
+        let snapshot = state.snapshot();
+        assert!(!snapshot.coordination_ready);
+        assert!(!snapshot.leader);
+        assert_eq!(snapshot.agent_status.phase, AgentStatusPhase::Expired);
+        assert_eq!(
+            snapshot.catalog_candidates.phase,
+            CatalogCandidatePhase::Expired
+        );
+        assert_eq!(
+            state.readiness().reason,
+            OrchReadinessReason::CoordinationUnavailable
+        );
+    }
+
+    #[test]
+    fn record_methods_sample_suspend_aware_time_while_state_is_locked() {
+        let clock = Arc::new(LockAssertingBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+
+        state.record_agent_status_collecting(Duration::from_secs(2));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(2));
+        clock.require_state_lock(&state);
+        assert!(state.record_coordination_ready("lease-uid", "1", true, deadline));
+        assert!(state.record_agent_status_fresh(
+            6,
+            ReplicationCorrelationSummary::default(),
+            deadline,
+        ));
+        assert!(state.record_catalog_candidates_fresh(3, deadline));
+    }
+
+    #[test]
+    fn readiness_samples_suspend_aware_time_while_state_is_locked() {
+        let clock = Arc::new(LockAssertingBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+        assert!(state.record_coordination_ready("lease-uid", "1", true, deadline));
+
+        clock.require_state_lock(&state);
+        assert!(state.readiness().ready);
+    }
+
+    #[test]
+    fn snapshot_samples_suspend_aware_time_while_state_is_locked() {
+        let clock = Arc::new(LockAssertingBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+        assert!(state.record_coordination_ready("lease-uid", "1", true, deadline));
+
+        clock.require_state_lock(&state);
+        let snapshot = state.snapshot();
+        assert!(snapshot.coordination_ready);
+        assert!(snapshot.leader);
     }
 }
