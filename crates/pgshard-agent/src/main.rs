@@ -84,7 +84,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         CatalogActivationCapabilityState::disabled()
     };
-    spawn_catalog_activation_consumer(
+    let _catalog_activation_handoff = spawn_catalog_activation_consumer(
         catalog_activation_consumer,
         catalog_activation.clone(),
         shutdown_rx.clone(),
