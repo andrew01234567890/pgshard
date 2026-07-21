@@ -32,6 +32,14 @@ use crate::catalog_materialization::{
 use crate::domain::OrchState;
 use crate::topology::CatalogCandidateObservationPlan;
 
+// The two independent proof collectors intentionally discard their previous
+// evidence before every refresh. They use the configured Kubernetes retry
+// period, so polling authority on that same cadence can remain phase-locked
+// with both proof-free refresh windows forever. This shorter local-only poll
+// observes the first overlapping proof window without increasing Kubernetes
+// traffic before initial authority exists.
+const AUTHORITY_POLL_PERIOD: Duration = Duration::from_millis(100);
+
 /// Runs the one-shot catalog-activation publisher until shutdown.
 ///
 /// Safe pre-publication failures are retried at the bounded observation
@@ -71,11 +79,12 @@ pub async fn supervise(
         }
     };
 
+    let mut logged_authority_wait = false;
     loop {
         if *shutdown.borrow() {
             return;
         }
-        match Box::pin(attempt(
+        let retry_delay = match Box::pin(attempt(
             &candidates,
             &challenge,
             &state,
@@ -87,7 +96,17 @@ pub async fn supervise(
         {
             AttemptDisposition::Stopped => return,
             AttemptDisposition::Retry(error) => {
-                tracing::warn!(reason = %error, "catalog-activation publication preconditions unavailable");
+                if error.is_authority_unavailable() {
+                    if logged_authority_wait {
+                        tracing::debug!(reason = %error, "catalog-activation authority overlap remains unavailable");
+                    } else {
+                        tracing::warn!(reason = %error, "catalog-activation authority overlap is unavailable; polling for fresh proof overlap");
+                        logged_authority_wait = true;
+                    }
+                } else {
+                    tracing::warn!(reason = %error, "catalog-activation publication preconditions unavailable");
+                }
+                error.retry_delay(retry_period)
             }
             AttemptDisposition::Terminal(outcome) => {
                 match outcome {
@@ -104,8 +123,8 @@ pub async fn supervise(
                 wait_until_shutdown(&mut shutdown).await;
                 return;
             }
-        }
-        if wait_or_stop(&mut shutdown, retry_period).await {
+        };
+        if wait_or_stop(&mut shutdown, retry_delay).await {
             return;
         }
     }
@@ -489,6 +508,20 @@ enum CatalogActivationAttemptError {
     Publisher(#[source] CatalogActivationPublisherError),
 }
 
+impl CatalogActivationAttemptError {
+    fn is_authority_unavailable(&self) -> bool {
+        matches!(self, Self::AuthorityUnavailable)
+    }
+
+    fn retry_delay(&self, configured_retry_period: Duration) -> Duration {
+        if self.is_authority_unavailable() {
+            configured_retry_period.min(AUTHORITY_POLL_PERIOD)
+        } else {
+            configured_retry_period
+        }
+    }
+}
+
 async fn wait_or_stop(shutdown: &mut watch::Receiver<bool>, duration: Duration) -> bool {
     tokio::select! {
         biased;
@@ -546,6 +579,24 @@ mod tests {
         Event::FinalRevalidate,
         Event::Put,
     ];
+
+    #[test]
+    fn authority_wait_breaks_collector_cadence_lock_without_accelerating_other_failures() {
+        let configured = Duration::from_secs(2);
+        assert_eq!(
+            CatalogActivationAttemptError::AuthorityUnavailable.retry_delay(configured),
+            AUTHORITY_POLL_PERIOD
+        );
+        assert_eq!(
+            CatalogActivationAttemptError::EvidenceChanged.retry_delay(configured),
+            configured
+        );
+        let already_faster = Duration::from_millis(50);
+        assert_eq!(
+            CatalogActivationAttemptError::AuthorityUnavailable.retry_delay(already_faster),
+            already_faster
+        );
+    }
 
     struct FakeAttempt {
         events: Arc<Mutex<Vec<Event>>>,
