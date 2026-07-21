@@ -846,6 +846,7 @@ mod tests {
     }
 
     struct GatedBody {
+        entered: Option<oneshot::Sender<()>>,
         gate: Option<oneshot::Receiver<()>>,
         payload: Option<Bytes>,
     }
@@ -859,6 +860,9 @@ mod tests {
             context: &mut Context<'_>,
         ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
             let body = self.get_mut();
+            if let Some(entered) = body.entered.take() {
+                let _ = entered.send(());
+            }
             if let Some(gate) = body.gate.as_mut() {
                 if Pin::new(gate).poll(context).is_pending() {
                     return Poll::Pending;
@@ -869,7 +873,10 @@ mod tests {
         }
     }
 
-    fn gated_challenge_request(gate: oneshot::Receiver<()>) -> Request<Body> {
+    fn gated_challenge_request(
+        entered: oneshot::Sender<()>,
+        gate: oneshot::Receiver<()>,
+    ) -> Request<Body> {
         let payload = serde_json::to_vec(&challenge()).expect("serialize challenge");
         Request::builder()
             .method(Method::POST)
@@ -881,6 +888,7 @@ mod tests {
             .header(CONTENT_LENGTH, payload.len())
             .header(CONNECTION, "close")
             .body(Body::new(GatedBody {
+                entered: Some(entered),
                 gate: Some(gate),
                 payload: Some(Bytes::from(payload)),
             }))
@@ -1105,9 +1113,15 @@ mod tests {
     #[tokio::test]
     async fn availability_withdrawn_while_body_is_pending_fails_closed() {
         let state = available_state();
+        let (entered, body_poll_entered) = oneshot::channel();
         let (release_body, gate) = oneshot::channel();
-        let handler = tokio::spawn(handle_request(gated_challenge_request(gate), state.clone()));
-        tokio::task::yield_now().await;
+        let handler = tokio::spawn(handle_request(
+            gated_challenge_request(entered, gate),
+            state.clone(),
+        ));
+        body_poll_entered
+            .await
+            .expect("handler reached the pending body");
         state.unavailable();
         release_body.send(()).expect("release pending body");
         let response = handler.await.expect("join pending-body handler");
