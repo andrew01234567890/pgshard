@@ -15,8 +15,10 @@ use crate::boottime::{
 };
 use crate::catalog_candidate::BoundCandidateSet;
 use crate::catalog_materialization::{
-    CatalogMaterializationCapability,
+    CatalogBootstrapDispatch, CatalogMaterializationCapability,
     issue_catalog_materialization_capability as issue_catalog_capability,
+    prepare_catalog_bootstrap_dispatch as prepare_catalog_dispatch,
+    revalidate_catalog_bootstrap_dispatch as revalidate_catalog_dispatch,
     revalidate_catalog_materialization_capability as revalidate_catalog_capability,
 };
 use crate::topology::TopologyDiagnostics;
@@ -1452,27 +1454,6 @@ impl OrchState {
         Self::revalidate_catalog_materialization_capability_locked(&mut inner, capability, now)
     }
 
-    #[cfg(test)]
-    fn revalidate_catalog_materialization_capability_at(
-        &self,
-        capability: &CatalogMaterializationCapability,
-        now: Instant,
-    ) -> bool {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = self
-            .boottime
-            .now()
-            .ok()
-            .map(|boottime| SuspendAwareInstant {
-                monotonic: now,
-                boottime,
-            });
-        Self::revalidate_catalog_materialization_capability_locked(&mut inner, capability, now)
-    }
-
     fn revalidate_catalog_materialization_capability_locked(
         inner: &mut OrchInner,
         capability: &CatalogMaterializationCapability,
@@ -1511,6 +1492,166 @@ impl OrchState {
         };
         revalidate_catalog_capability(
             capability,
+            replication,
+            candidates,
+            &identity.cluster_id,
+            &topology.cluster_object_uid,
+            inner.coordination_ready,
+            inner.leader,
+            inner.coordination_generation,
+            inner.agent_proof_generation,
+            inner.catalog_proof_generation,
+            coordination_lease_uid,
+            coordination_resource_version,
+            coordination_deadline,
+            agent_deadline,
+            candidate_deadline,
+            now,
+        )
+    }
+
+    /// Consumes a live capability and seals its exact target and material
+    /// inputs into one opaque, non-I/O dispatch envelope.
+    #[allow(dead_code)]
+    pub(crate) fn catalog_bootstrap_dispatch(
+        &self,
+        capability: CatalogMaterializationCapability,
+    ) -> Option<CatalogBootstrapDispatch> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.suspend_aware_now().ok();
+        Self::catalog_bootstrap_dispatch_locked(&mut inner, capability, now)
+    }
+
+    #[cfg(test)]
+    fn catalog_bootstrap_dispatch_at(
+        &self,
+        capability: CatalogMaterializationCapability,
+        now: Instant,
+    ) -> Option<CatalogBootstrapDispatch> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self
+            .boottime
+            .now()
+            .ok()
+            .map(|boottime| SuspendAwareInstant {
+                monotonic: now,
+                boottime,
+            });
+        Self::catalog_bootstrap_dispatch_locked(&mut inner, capability, now)
+    }
+
+    fn catalog_bootstrap_dispatch_locked(
+        inner: &mut OrchInner,
+        capability: CatalogMaterializationCapability,
+        now: Option<SuspendAwareInstant>,
+    ) -> Option<CatalogBootstrapDispatch> {
+        let _ = expire_coordination_state(inner, now);
+        expire_proof_state(inner, now);
+        let now = now?;
+        let identity = inner.identity.as_ref()?;
+        let topology = inner.topology.as_ref()?;
+        let replication = inner.agent_shard_zero_replication_proof.as_ref()?;
+        let candidates = inner.catalog_candidate_proof.as_ref()?;
+        prepare_catalog_dispatch(
+            capability,
+            replication,
+            candidates,
+            &identity.cluster_id,
+            &topology.cluster_object_uid,
+            inner.coordination_ready,
+            inner.leader,
+            inner.coordination_generation,
+            inner.agent_proof_generation,
+            inner.catalog_proof_generation,
+            inner.coordination_lease_uid.as_deref()?,
+            inner.coordination_resource_version.as_deref()?,
+            inner.coordination_deadline?,
+            inner.agent_identity_binding_deadline?,
+            inner.catalog_candidate_deadline?,
+            now,
+        )
+    }
+
+    /// Revalidates a sealed dispatch without extending its original deadline
+    /// or performing any external I/O.
+    #[allow(dead_code)]
+    pub(crate) fn revalidate_catalog_bootstrap_dispatch(
+        &self,
+        dispatch: &CatalogBootstrapDispatch,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.suspend_aware_now().ok();
+        Self::revalidate_catalog_bootstrap_dispatch_locked(&mut inner, dispatch, now)
+    }
+
+    #[cfg(test)]
+    fn revalidate_catalog_bootstrap_dispatch_at(
+        &self,
+        dispatch: &CatalogBootstrapDispatch,
+        now: Instant,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self
+            .boottime
+            .now()
+            .ok()
+            .map(|boottime| SuspendAwareInstant {
+                monotonic: now,
+                boottime,
+            });
+        Self::revalidate_catalog_bootstrap_dispatch_locked(&mut inner, dispatch, now)
+    }
+
+    fn revalidate_catalog_bootstrap_dispatch_locked(
+        inner: &mut OrchInner,
+        dispatch: &CatalogBootstrapDispatch,
+        now: Option<SuspendAwareInstant>,
+    ) -> bool {
+        let _ = expire_coordination_state(inner, now);
+        expire_proof_state(inner, now);
+        let Some(now) = now else {
+            return false;
+        };
+        let Some(identity) = inner.identity.as_ref() else {
+            return false;
+        };
+        let Some(topology) = inner.topology.as_ref() else {
+            return false;
+        };
+        let Some(replication) = inner.agent_shard_zero_replication_proof.as_ref() else {
+            return false;
+        };
+        let Some(candidates) = inner.catalog_candidate_proof.as_ref() else {
+            return false;
+        };
+        let Some(coordination_lease_uid) = inner.coordination_lease_uid.as_deref() else {
+            return false;
+        };
+        let Some(coordination_resource_version) = inner.coordination_resource_version.as_deref()
+        else {
+            return false;
+        };
+        let (Some(coordination_deadline), Some(agent_deadline), Some(candidate_deadline)) = (
+            inner.coordination_deadline,
+            inner.agent_identity_binding_deadline,
+            inner.catalog_candidate_deadline,
+        ) else {
+            return false;
+        };
+        revalidate_catalog_dispatch(
+            dispatch,
             replication,
             candidates,
             &identity.cluster_id,
@@ -2518,6 +2659,32 @@ mod tests {
         }
     }
 
+    fn publish_exact_bootstrap_authority(state: &OrchState, deadline: SuspendAwareInstant) {
+        let summary = ReplicationCorrelationSummary {
+            correlated_shards: 1,
+            shard_zero_correlated: true,
+            acknowledged_correlated_shards: 1,
+            shard_zero_target_fence_acknowledged: true,
+            remote_apply_witnessed_shards: 1,
+            shard_zero_remote_apply_witnessed: true,
+        };
+        state.record_agent_status_collecting(Duration::from_secs(2));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(2));
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            deadline,
+        ));
+        assert!(state.record_catalog_candidates_fresh_exact(exact_candidate_proof(), deadline));
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv-1",
+            true,
+            deadline,
+        ));
+    }
+
     fn execution(fencing_epoch: u64) -> ExecutionPreconditions {
         ExecutionPreconditions {
             catalog_epoch: 7,
@@ -3346,13 +3513,17 @@ mod tests {
         let third = state
             .catalog_materialization_capability()
             .expect("restored cross-binding");
+        let dispatch = state
+            .catalog_bootstrap_dispatch(third)
+            .expect("sealed exact dispatch");
+        assert!(state.revalidate_catalog_bootstrap_dispatch(&dispatch));
         let debug = format!("{state:?}");
         for private_value in ["pod-uid-0", "generation-7", "writer-uid"] {
             assert!(!debug.contains(private_value));
         }
         assert!(debug.contains("<redacted>"));
         state.record_coordination_unavailable();
-        assert!(!state.revalidate_catalog_materialization_capability(&third));
+        assert!(!state.revalidate_catalog_bootstrap_dispatch(&dispatch));
         assert!(state.catalog_materialization_capability().is_none());
 
         // Public snapshots remain bounded summaries and never expose the
@@ -3364,7 +3535,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_revalidation_itself_expires_and_clears_exact_proofs() {
+    fn dispatch_revalidation_itself_expires_and_clears_exact_proofs() {
         let state = bootstrap_observation_state();
         let now = Instant::now();
         let deadline = now + Duration::from_secs(2);
@@ -3394,12 +3565,15 @@ mod tests {
         let capability = state
             .catalog_materialization_capability_at(now)
             .expect("live exact capability");
+        let dispatch = state
+            .catalog_bootstrap_dispatch_at(capability, now)
+            .expect("live exact dispatch");
         let (agent_generation, catalog_generation) = {
             let inner = state.inner.lock().expect("state");
             (inner.agent_proof_generation, inner.catalog_proof_generation)
         };
 
-        assert!(!state.revalidate_catalog_materialization_capability_at(&capability, deadline,));
+        assert!(!state.revalidate_catalog_bootstrap_dispatch_at(&dispatch, deadline,));
         let inner = state.inner.lock().expect("state");
         assert!(inner.agent_shard_zero_replication_proof.is_none());
         assert!(inner.catalog_candidate_proof.is_none());
@@ -3589,6 +3763,45 @@ mod tests {
 
         assert!(!worker.join().expect("revalidation thread"));
         assert!(!state.snapshot().coordination_ready);
+    }
+
+    #[test]
+    fn dispatch_preparation_samples_clock_while_state_is_locked() {
+        let clock = Arc::new(LockAssertingBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+        publish_exact_bootstrap_authority(&state, deadline);
+        let capability = state
+            .catalog_materialization_capability()
+            .expect("live exact capability");
+
+        clock.require_state_lock(&state);
+        assert!(state.catalog_bootstrap_dispatch(capability).is_some());
+    }
+
+    #[test]
+    fn dispatch_revalidation_samples_clock_while_state_is_locked() {
+        let clock = Arc::new(LockAssertingBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+        publish_exact_bootstrap_authority(&state, deadline);
+        let capability = state
+            .catalog_materialization_capability()
+            .expect("live exact capability");
+        let dispatch = state
+            .catalog_bootstrap_dispatch(capability)
+            .expect("live exact dispatch");
+
+        clock.require_state_lock(&state);
+        assert!(state.revalidate_catalog_bootstrap_dispatch(&dispatch));
     }
 
     #[test]

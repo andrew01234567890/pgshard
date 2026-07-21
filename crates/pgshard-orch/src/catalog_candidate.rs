@@ -1755,6 +1755,10 @@ mod tests {
                 .catalog_materialization_capability()
                 .expect("validated exact proof overlap");
             assert!(state.revalidate_catalog_materialization_capability(&capability));
+            let dispatch = state
+                .catalog_bootstrap_dispatch(capability)
+                .expect("exact target and material dispatch");
+            assert!(state.revalidate_catalog_bootstrap_dispatch(&dispatch));
 
             let public = serde_json::to_string(&state.snapshot()).expect("public snapshot JSON");
             for private_value in ["pod-uid-0", "generation-7", "operation-writer-uid"] {
