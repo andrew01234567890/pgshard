@@ -167,7 +167,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{POSTGRES18_WIRE_TEST, Request, listed_rust_tests, parse_args};
+    use super::{POSTGRES18_WIRE_TEST, Request, listed_rust_tests, parse_args, run_suite};
     use std::ffi::OsString;
 
     fn args(values: &[&str]) -> Vec<OsString> {
@@ -194,6 +194,14 @@ mod tests {
         assert_eq!(
             parse_args(args(&["postgres18-wire"])),
             Err("unsupported argument \"postgres18-wire\"".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_suites_before_touching_any_fixture() {
+        assert_eq!(
+            run_suite("nonexistent"),
+            Err("unsupported suite \"nonexistent\"; executable suites: postgres18-wire".to_owned())
         );
     }
 
