@@ -282,12 +282,20 @@ fn startup_policy(parameters: pgshard_pgwire::StartupParameters<'_>) -> StartupP
             }
         } else if name == b"user" && value == b"shardschema" {
             catalog_user = true;
-        } else if name == b"replication" {
+        } else if name == b"replication" && !replication_disabled(value) {
             policy.replication = true;
         }
     }
     policy.catalog_database |= !explicit_database && catalog_user;
     policy
+}
+
+// PostgreSQL parse_bool false spellings; every other value stays gated (fail closed).
+fn replication_disabled(value: &[u8]) -> bool {
+    const FALSE_SPELLINGS: [&[u8]; 6] = [b"false", b"off", b"no", b"0", b"f", b"n"];
+    FALSE_SPELLINGS
+        .iter()
+        .any(|spelling| value.eq_ignore_ascii_case(spelling))
 }
 
 async fn relay_regular_startup(
@@ -462,6 +470,18 @@ mod tests {
         packet[..length].to_vec()
     }
 
+    fn policy_for(parameters: &[(&[u8], &[u8])]) -> StartupPolicy {
+        let packet = startup_packet(parameters);
+        let Ok(Decode::Complete {
+            frame: StartupFrame::Startup { parameters, .. },
+            ..
+        }) = decode_startup(&packet)
+        else {
+            panic!("test startup packet did not decode");
+        };
+        startup_policy(parameters)
+    }
+
     async fn regular_startup(stream: &mut TcpStream) {
         let packet = startup_packet(&[(b"user", b"postgres")]);
         stream
@@ -508,6 +528,54 @@ mod tests {
         );
         assert!(response.windows(6).any(|bytes| bytes == b"VFATAL"));
         response
+    }
+
+    #[test]
+    fn replication_parameter_blocks_only_replication_sessions() {
+        for value in [
+            b"false".as_slice(),
+            b"off",
+            b"no",
+            b"0",
+            b"f",
+            b"n",
+            b"FALSE",
+            b"Off",
+            b"No",
+            b"F",
+            b"N",
+        ] {
+            assert!(
+                !policy_for(&[(b"user", b"postgres"), (b"replication", value)]).replication,
+                "blocked non-replication startup for {value:?}"
+            );
+        }
+        for value in [
+            b"database".as_slice(),
+            b"DATABASE",
+            b"true",
+            b"on",
+            b"yes",
+            b"1",
+            b"t",
+            b"y",
+            b"TRUE",
+            b"On",
+            b"Yes",
+            b"T",
+            b"Y",
+        ] {
+            assert!(
+                policy_for(&[(b"user", b"postgres"), (b"replication", value)]).replication,
+                "allowed replication startup for {value:?}"
+            );
+        }
+        for value in [b"".as_slice(), b"2", b"maybe", b"tru", b"fals", b"of"] {
+            assert!(
+                policy_for(&[(b"user", b"postgres"), (b"replication", value)]).replication,
+                "allowed unrecognized replication value {value:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -717,6 +785,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relays_a_replication_false_startup_as_a_normal_session() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake backend");
+        let backend_address = backend_listener.local_addr().expect("fake backend address");
+        let backend_task = tokio::spawn(async move {
+            let (mut backend, _) = backend_listener.accept().await.expect("accept relay");
+            let startup = read_startup_packet(&mut backend).await;
+            backend
+                .write_all(b"ready")
+                .await
+                .expect("write ready marker");
+            startup
+        });
+        let (address, shutdown, task) = server(
+            test_policy(),
+            ready_state(),
+            Some(backend_target(backend_address)),
+        )
+        .await;
+
+        let startup = startup_packet(&[(b"user", b"postgres"), (b"replication", b"off")]);
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect replication-false client");
+        client.write_all(&startup).await.expect("send startup");
+        let mut ready = [0_u8; 5];
+        client
+            .read_exact(&mut ready)
+            .await
+            .expect("read ready marker");
+        assert_eq!(&ready, b"ready");
+        assert_eq!(backend_task.await.expect("fake backend task"), startup);
+
+        shutdown.send(()).expect("server retains shutdown receiver");
+        task.await.expect("server task").expect("clean shutdown");
+    }
+
+    #[tokio::test]
     async fn forwards_cancellation_to_the_same_configured_target() {
         let backend_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -792,6 +899,20 @@ mod tests {
                 vec![
                     (b"user".as_slice(), b"postgres".as_slice()),
                     (b"replication".as_slice(), b"database".as_slice()),
+                ],
+                b"C0A000".as_slice(),
+            ),
+            (
+                vec![
+                    (b"user".as_slice(), b"postgres".as_slice()),
+                    (b"replication".as_slice(), b"on".as_slice()),
+                ],
+                b"C0A000".as_slice(),
+            ),
+            (
+                vec![
+                    (b"user".as_slice(), b"postgres".as_slice()),
+                    (b"replication".as_slice(), b"maybe".as_slice()),
                 ],
                 b"C0A000".as_slice(),
             ),
