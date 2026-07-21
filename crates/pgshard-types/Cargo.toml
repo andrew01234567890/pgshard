@@ -15,6 +15,9 @@ sha2.workspace = true
 thiserror.workspace = true
 xxhash-rust.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [[bench]]
 name = "routing_hash"
 harness = false

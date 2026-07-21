@@ -2,7 +2,9 @@
 //!
 //! The types in this module carry exact identities and freshness evidence for
 //! a future bootstrap executor. They grant no serving, routing, SQL, or
-//! `PostgreSQL` process authority by themselves.
+//! `PostgreSQL` process authority by themselves. Capability exchange requires
+//! server-authenticated TLS and a freshly generated challenge; these serialized
+//! values alone are inert, replayable, and confer no publication authority.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,6 +18,14 @@ pub const CATALOG_ACTIVATION_REQUEST_VERSION: &str = "pgshard.catalog-activation
 /// Version of the agent's separately advertised consumer capability.
 pub const CATALOG_ACTIVATION_CAPABILITY_VERSION: &str =
     "pgshard.agent.catalog-activation-capability.v1";
+
+/// Version of the request-bound capability challenge sent over authenticated TLS.
+pub const CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_REQUEST_VERSION: &str =
+    "pgshard.catalog-activation-capability-challenge-request.v1";
+
+/// Version of the capability response bound to one exact challenge.
+pub const CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_RESPONSE_VERSION: &str =
+    "pgshard.catalog-activation-capability-challenge-response.v1";
 
 /// Name of the inert journal-and-acknowledgement consumer capability.
 pub const CATALOG_ACTIVATION_CONSUMER_VERSION: &str = "pgshard.catalog-activation-consumer.v1";
@@ -97,6 +107,243 @@ pub struct CatalogActivationCapability {
     pub carrier: CatalogActivationCapabilityCarrier,
     /// Exact target identity.
     pub target: CatalogActivationCapabilityTarget,
+}
+
+/// Inert request for an exact catalog-activation capability advertisement.
+///
+/// A caller must generate a fresh 256-bit nonce for every request and exchange
+/// this challenge only over server-authenticated TLS. The values are replayable
+/// without those transport and freshness prerequisites and grant no authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogActivationCapabilityChallenge {
+    /// Schema of this challenge request.
+    pub schema_version: String,
+    /// Fresh, nonzero 256-bit nonce as canonical lowercase hexadecimal.
+    pub nonce: String,
+    /// Digest of the exact validated activation request.
+    #[serde(rename = "requestSHA256")]
+    pub request_sha256: String,
+    /// Exact expected cluster identity.
+    pub cluster: CatalogActivationCapabilityCluster,
+    /// Exact expected carrier identity.
+    pub carrier: CatalogActivationCapabilityCarrier,
+    /// Exact expected target identity.
+    pub target: CatalogActivationCapabilityTarget,
+}
+
+/// Inert capability advertisement bound to one exact challenge.
+///
+/// Validation proves only that the response echoes its caller-provided values
+/// and identities. Server-authenticated TLS and caller-enforced nonce freshness
+/// remain prerequisites; this document alone is replayable and grants no
+/// publication authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogActivationCapabilityChallengeResponse {
+    /// Schema of this challenge response.
+    pub schema_version: String,
+    /// Exact nonce from the challenge.
+    pub nonce: String,
+    /// Exact request digest from the challenge.
+    #[serde(rename = "requestSHA256")]
+    pub request_sha256: String,
+    /// Exact advertised capability.
+    pub capability: CatalogActivationCapability,
+}
+
+/// Validation failure for an inert catalog-activation capability exchange.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum CatalogActivationCapabilityChallengeError {
+    /// The challenge does not select the supported encoding.
+    #[error("unsupported catalog activation capability challenge schema version")]
+    UnsupportedChallengeVersion,
+    /// The response does not select the supported encoding.
+    #[error("unsupported catalog activation capability challenge response schema version")]
+    UnsupportedResponseVersion,
+    /// The capability advertisement does not select the supported encoding.
+    #[error("unsupported catalog activation capability schema version")]
+    UnsupportedCapabilityVersion,
+    /// The advertised consumer contract is not the exact supported contract.
+    #[error("unsupported catalog activation consumer capability")]
+    UnsupportedConsumerVersion,
+    /// The advertised request contract is not the exact supported contract.
+    #[error("unsupported catalog activation request schema version")]
+    UnsupportedRequestVersion,
+    /// The advertised acceptance contract is not the exact supported contract.
+    #[error("unsupported catalog activation acceptance schema version")]
+    UnsupportedAcceptanceVersion,
+    /// The advertised persistence contract is not the exact supported contract.
+    #[error("unsupported catalog activation persistence contract")]
+    UnsupportedPersistence,
+    /// A bounded identity name is empty, too long, or contains unsafe bytes.
+    #[error("catalog activation capability contains an invalid bounded name")]
+    InvalidText,
+    /// A Kubernetes UID is not bounded safe ASCII.
+    #[error("catalog activation capability contains an invalid Kubernetes UID")]
+    InvalidUid,
+    /// A nonce is zero or is not canonical lowercase 256-bit hexadecimal.
+    #[error("catalog activation capability challenge contains an invalid nonce")]
+    InvalidNonce,
+    /// A request digest is not canonical lowercase SHA-256 hexadecimal.
+    #[error("catalog activation capability challenge contains an invalid request digest")]
+    InvalidDigest,
+    /// The capability is not for physical shard zero, member zero.
+    #[error("catalog activation capability contains an invalid target")]
+    InvalidTarget,
+    /// The response does not exactly match the validated challenge.
+    #[error("catalog activation capability response does not match its challenge")]
+    ResponseMismatch,
+}
+
+impl CatalogActivationCapability {
+    /// Validates the exact static contract and every bounded identity.
+    ///
+    /// This validation does not authenticate the capability or grant authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for contract drift or an invalid identity.
+    pub fn validate(&self) -> Result<(), CatalogActivationCapabilityChallengeError> {
+        if self.schema_version != CATALOG_ACTIVATION_CAPABILITY_VERSION {
+            return Err(CatalogActivationCapabilityChallengeError::UnsupportedCapabilityVersion);
+        }
+        if self.capability != CATALOG_ACTIVATION_CONSUMER_VERSION {
+            return Err(CatalogActivationCapabilityChallengeError::UnsupportedConsumerVersion);
+        }
+        if self.request_schema_version != CATALOG_ACTIVATION_REQUEST_VERSION {
+            return Err(CatalogActivationCapabilityChallengeError::UnsupportedRequestVersion);
+        }
+        if self.acceptance_schema_version != CATALOG_ACTIVATION_ACCEPTANCE_VERSION {
+            return Err(CatalogActivationCapabilityChallengeError::UnsupportedAcceptanceVersion);
+        }
+        if self.persistence != CATALOG_ACTIVATION_FSYNC_PERSISTENCE {
+            return Err(CatalogActivationCapabilityChallengeError::UnsupportedPersistence);
+        }
+        validate_capability_identities(&self.cluster, &self.carrier, &self.target)
+    }
+}
+
+impl CatalogActivationCapabilityChallenge {
+    /// Validates the challenge encoding, nonce, digest, and expected identities.
+    ///
+    /// Validation cannot establish nonce freshness; the caller must generate a
+    /// fresh nonce and use server-authenticated TLS for the future exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for a non-canonical challenge.
+    pub fn validate(&self) -> Result<(), CatalogActivationCapabilityChallengeError> {
+        if self.schema_version != CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_REQUEST_VERSION {
+            return Err(CatalogActivationCapabilityChallengeError::UnsupportedChallengeVersion);
+        }
+        validate_challenge_nonce(&self.nonce)?;
+        validate_challenge_digest(&self.request_sha256)?;
+        validate_capability_identities(&self.cluster, &self.carrier, &self.target)
+    }
+}
+
+impl CatalogActivationCapabilityChallengeResponse {
+    /// Validates this response against one exact, validated challenge.
+    ///
+    /// This comparison does not authenticate the response. The future caller
+    /// must also require server-authenticated TLS and enforce nonce freshness.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for either invalid document or any echo or identity
+    /// mismatch.
+    pub fn validate_for(
+        &self,
+        challenge: &CatalogActivationCapabilityChallenge,
+    ) -> Result<(), CatalogActivationCapabilityChallengeError> {
+        challenge.validate()?;
+        if self.schema_version != CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_RESPONSE_VERSION {
+            return Err(CatalogActivationCapabilityChallengeError::UnsupportedResponseVersion);
+        }
+        validate_challenge_nonce(&self.nonce)?;
+        validate_challenge_digest(&self.request_sha256)?;
+        self.capability.validate()?;
+        if self.nonce != challenge.nonce
+            || self.request_sha256 != challenge.request_sha256
+            || self.capability.cluster != challenge.cluster
+            || self.capability.carrier != challenge.carrier
+            || self.capability.target != challenge.target
+        {
+            return Err(CatalogActivationCapabilityChallengeError::ResponseMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn validate_capability_identities(
+    cluster: &CatalogActivationCapabilityCluster,
+    carrier: &CatalogActivationCapabilityCarrier,
+    target: &CatalogActivationCapabilityTarget,
+) -> Result<(), CatalogActivationCapabilityChallengeError> {
+    for value in [
+        &cluster.name,
+        &carrier.namespace,
+        &carrier.name,
+        &target.instance_id,
+        &target.pod_name,
+    ] {
+        validate_capability_text(value)?;
+    }
+    for value in [&cluster.uid, &carrier.uid, &target.pod_uid] {
+        validate_capability_uid(value)?;
+    }
+    if target.shard != 0 || target.member != 0 {
+        return Err(CatalogActivationCapabilityChallengeError::InvalidTarget);
+    }
+    Ok(())
+}
+
+fn validate_capability_text(value: &str) -> Result<(), CatalogActivationCapabilityChallengeError> {
+    if value.is_empty()
+        || value.len() > 253
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace())
+    {
+        return Err(CatalogActivationCapabilityChallengeError::InvalidText);
+    }
+    Ok(())
+}
+
+fn validate_capability_uid(value: &str) -> Result<(), CatalogActivationCapabilityChallengeError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(CatalogActivationCapabilityChallengeError::InvalidUid);
+    }
+    Ok(())
+}
+
+fn validate_challenge_nonce(value: &str) -> Result<(), CatalogActivationCapabilityChallengeError> {
+    if value.len() != 64
+        || value.bytes().all(|byte| byte == b'0')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CatalogActivationCapabilityChallengeError::InvalidNonce);
+    }
+    Ok(())
+}
+
+fn validate_challenge_digest(value: &str) -> Result<(), CatalogActivationCapabilityChallengeError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CatalogActivationCapabilityChallengeError::InvalidDigest);
+    }
+    Ok(())
 }
 
 /// Fsync-backed acceptance stored in the carrier status.
@@ -914,9 +1161,321 @@ mod tests {
         "demo-shard-0000-member-0000-0/source-pod-uid/0123456789abcdef01234567";
     const DISPATCHER_HOLDER: &str =
         "demo-orchestrator-0/dispatcher-uid/11111111-2222-4333-8444-555555555555";
+    const CHALLENGE_NONCE: &str =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const CHALLENGE_REQUEST_DIGEST: &str =
+        "0202020202020202020202020202020202020202020202020202020202020202";
 
     fn digest(value: u8) -> String {
         format!("{value:02x}").repeat(32)
+    }
+
+    fn capability_fixture() -> CatalogActivationCapability {
+        CatalogActivationCapability {
+            schema_version: CATALOG_ACTIVATION_CAPABILITY_VERSION.into(),
+            capability: CATALOG_ACTIVATION_CONSUMER_VERSION.into(),
+            request_schema_version: CATALOG_ACTIVATION_REQUEST_VERSION.into(),
+            acceptance_schema_version: CATALOG_ACTIVATION_ACCEPTANCE_VERSION.into(),
+            persistence: CATALOG_ACTIVATION_FSYNC_PERSISTENCE.into(),
+            cluster: CatalogActivationCapabilityCluster {
+                name: "demo".into(),
+                uid: "cluster-uid".into(),
+            },
+            carrier: CatalogActivationCapabilityCarrier {
+                namespace: "database".into(),
+                name: "demo-catalog-activation".into(),
+                uid: "carrier-uid".into(),
+            },
+            target: CatalogActivationCapabilityTarget {
+                shard: 0,
+                member: 0,
+                instance_id: "demo-shard-0000-member-0000-0".into(),
+                pod_name: "demo-shard-0000-member-0000-0".into(),
+                pod_uid: "target-pod-uid".into(),
+            },
+        }
+    }
+
+    fn challenge() -> CatalogActivationCapabilityChallenge {
+        let capability = capability_fixture();
+        CatalogActivationCapabilityChallenge {
+            schema_version: CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_REQUEST_VERSION.into(),
+            nonce: CHALLENGE_NONCE.into(),
+            request_sha256: CHALLENGE_REQUEST_DIGEST.into(),
+            cluster: capability.cluster,
+            carrier: capability.carrier,
+            target: capability.target,
+        }
+    }
+
+    fn challenge_response() -> CatalogActivationCapabilityChallengeResponse {
+        CatalogActivationCapabilityChallengeResponse {
+            schema_version: CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_RESPONSE_VERSION.into(),
+            nonce: CHALLENGE_NONCE.into(),
+            request_sha256: CHALLENGE_REQUEST_DIGEST.into(),
+            capability: capability_fixture(),
+        }
+    }
+
+    #[test]
+    fn capability_challenge_json_is_exact_and_round_trips() {
+        let challenge = challenge();
+        let expected_challenge_json = concat!(
+            "{\"schemaVersion\":\"pgshard.catalog-activation-capability-challenge-request.v1\",",
+            "\"nonce\":\"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\",",
+            "\"requestSHA256\":\"0202020202020202020202020202020202020202020202020202020202020202\",",
+            "\"cluster\":{\"name\":\"demo\",\"uid\":\"cluster-uid\"},",
+            "\"carrier\":{\"namespace\":\"database\",\"name\":\"demo-catalog-activation\",",
+            "\"uid\":\"carrier-uid\"},",
+            "\"target\":{\"shard\":0,\"member\":0,",
+            "\"instanceId\":\"demo-shard-0000-member-0000-0\",",
+            "\"podName\":\"demo-shard-0000-member-0000-0\",",
+            "\"podUID\":\"target-pod-uid\"}}"
+        );
+        let challenge_json = serde_json::to_string(&challenge).expect("serialize challenge");
+        assert_eq!(challenge_json, expected_challenge_json);
+        assert_eq!(
+            serde_json::from_str::<CatalogActivationCapabilityChallenge>(&challenge_json)
+                .expect("deserialize challenge"),
+            challenge
+        );
+
+        let response = challenge_response();
+        let expected_response_json = concat!(
+            "{\"schemaVersion\":\"pgshard.catalog-activation-capability-challenge-response.v1\",",
+            "\"nonce\":\"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\",",
+            "\"requestSHA256\":\"0202020202020202020202020202020202020202020202020202020202020202\",",
+            "\"capability\":{",
+            "\"schemaVersion\":\"pgshard.agent.catalog-activation-capability.v1\",",
+            "\"capability\":\"pgshard.catalog-activation-consumer.v1\",",
+            "\"requestSchemaVersion\":\"pgshard.catalog-activation-request.v1\",",
+            "\"acceptanceSchemaVersion\":\"pgshard.catalog-activation-acceptance.v1\",",
+            "\"persistence\":\"fsync\",",
+            "\"cluster\":{\"name\":\"demo\",\"uid\":\"cluster-uid\"},",
+            "\"carrier\":{\"namespace\":\"database\",\"name\":\"demo-catalog-activation\",",
+            "\"uid\":\"carrier-uid\"},",
+            "\"target\":{\"shard\":0,\"member\":0,",
+            "\"instanceId\":\"demo-shard-0000-member-0000-0\",",
+            "\"podName\":\"demo-shard-0000-member-0000-0\",",
+            "\"podUID\":\"target-pod-uid\"}}}"
+        );
+        let response_json = serde_json::to_string(&response).expect("serialize response");
+        assert_eq!(response_json, expected_response_json);
+        assert_eq!(
+            serde_json::from_str::<CatalogActivationCapabilityChallengeResponse>(&response_json)
+                .expect("deserialize response"),
+            response
+        );
+    }
+
+    #[test]
+    fn capability_challenge_json_rejects_unknown_fields() {
+        let challenge_json = serde_json::to_string(&challenge()).expect("serialize challenge");
+        let challenge_with_unknown = format!(
+            "{},\"unexpected\":true}}",
+            challenge_json.strip_suffix('}').expect("object JSON")
+        );
+        let error =
+            serde_json::from_str::<CatalogActivationCapabilityChallenge>(&challenge_with_unknown)
+                .expect_err("unknown challenge field must fail");
+        assert!(error.to_string().contains("unknown field"));
+
+        let response_json =
+            serde_json::to_string(&challenge_response()).expect("serialize response");
+        let response_with_unknown = format!(
+            "{},\"unexpected\":true}}",
+            response_json.strip_suffix('}').expect("object JSON")
+        );
+        let error = serde_json::from_str::<CatalogActivationCapabilityChallengeResponse>(
+            &response_with_unknown,
+        )
+        .expect_err("unknown response field must fail");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn challenge_rejects_noncanonical_nonce_and_digest() {
+        for invalid_nonce in [
+            "0".repeat(64),
+            "A".repeat(64),
+            "g".repeat(64),
+            "01".repeat(31),
+        ] {
+            let mut challenge = challenge();
+            challenge.nonce = invalid_nonce;
+            assert_eq!(
+                challenge.validate(),
+                Err(CatalogActivationCapabilityChallengeError::InvalidNonce)
+            );
+        }
+
+        for invalid_digest in ["A".repeat(64), "g".repeat(64), "01".repeat(31)] {
+            let mut challenge = challenge();
+            challenge.request_sha256 = invalid_digest;
+            assert_eq!(
+                challenge.validate(),
+                Err(CatalogActivationCapabilityChallengeError::InvalidDigest)
+            );
+        }
+    }
+
+    #[test]
+    fn capability_rejects_every_static_contract_drift() {
+        let mut capability = capability_fixture();
+        capability.schema_version = "other".into();
+        assert_eq!(
+            capability.validate(),
+            Err(CatalogActivationCapabilityChallengeError::UnsupportedCapabilityVersion)
+        );
+
+        let mut capability = capability_fixture();
+        capability.capability = "other".into();
+        assert_eq!(
+            capability.validate(),
+            Err(CatalogActivationCapabilityChallengeError::UnsupportedConsumerVersion)
+        );
+
+        let mut capability = capability_fixture();
+        capability.request_schema_version = "other".into();
+        assert_eq!(
+            capability.validate(),
+            Err(CatalogActivationCapabilityChallengeError::UnsupportedRequestVersion)
+        );
+
+        let mut capability = capability_fixture();
+        capability.acceptance_schema_version = "other".into();
+        assert_eq!(
+            capability.validate(),
+            Err(CatalogActivationCapabilityChallengeError::UnsupportedAcceptanceVersion)
+        );
+
+        let mut capability = capability_fixture();
+        capability.persistence = "other".into();
+        assert_eq!(
+            capability.validate(),
+            Err(CatalogActivationCapabilityChallengeError::UnsupportedPersistence)
+        );
+    }
+
+    #[test]
+    fn capability_identity_validation_is_bounded_and_total() {
+        let mut maximum = capability_fixture();
+        maximum.cluster.name = "a".repeat(253);
+        maximum.carrier.namespace = "b".repeat(253);
+        maximum.carrier.name = "c".repeat(253);
+        maximum.target.instance_id = "d".repeat(253);
+        maximum.target.pod_name = "e".repeat(253);
+        maximum.cluster.uid = "f".repeat(128);
+        maximum.carrier.uid = "g".repeat(128);
+        maximum.target.pod_uid = "h".repeat(128);
+        assert_eq!(maximum.validate(), Ok(()));
+
+        let mut oversized_name = capability_fixture();
+        oversized_name.target.pod_name = "a".repeat(254);
+        assert_eq!(
+            oversized_name.validate(),
+            Err(CatalogActivationCapabilityChallengeError::InvalidText)
+        );
+
+        let mut oversized_uid = capability_fixture();
+        oversized_uid.target.pod_uid = "a".repeat(129);
+        assert_eq!(
+            oversized_uid.validate(),
+            Err(CatalogActivationCapabilityChallengeError::InvalidUid)
+        );
+
+        for clear_identity in 0..8 {
+            let mut capability = capability_fixture();
+            match clear_identity {
+                0 => capability.cluster.name.clear(),
+                1 => capability.cluster.uid.clear(),
+                2 => capability.carrier.namespace.clear(),
+                3 => capability.carrier.name.clear(),
+                4 => capability.carrier.uid.clear(),
+                5 => capability.target.instance_id.clear(),
+                6 => capability.target.pod_name.clear(),
+                7 => capability.target.pod_uid.clear(),
+                _ => unreachable!("loop is bounded"),
+            }
+            assert!(capability.validate().is_err());
+        }
+
+        let mut invalid_target = capability_fixture();
+        invalid_target.target.shard = 1;
+        assert_eq!(
+            invalid_target.validate(),
+            Err(CatalogActivationCapabilityChallengeError::InvalidTarget)
+        );
+        invalid_target.target.shard = 0;
+        invalid_target.target.member = 1;
+        assert_eq!(
+            invalid_target.validate(),
+            Err(CatalogActivationCapabilityChallengeError::InvalidTarget)
+        );
+
+        let mut untrusted = capability_fixture();
+        untrusted.target.pod_name = "x".repeat(1_000_000);
+        let result = std::panic::catch_unwind(|| untrusted.validate());
+        assert_eq!(
+            result.expect("validation must not panic"),
+            Err(CatalogActivationCapabilityChallengeError::InvalidText)
+        );
+    }
+
+    #[test]
+    fn response_requires_exact_validated_challenge_and_identities() {
+        let challenge = challenge();
+        assert_eq!(challenge.validate(), Ok(()));
+        assert_eq!(challenge_response().validate_for(&challenge), Ok(()));
+
+        let mut invalid_challenge = challenge.clone();
+        invalid_challenge.schema_version = "other".into();
+        assert_eq!(
+            challenge_response().validate_for(&invalid_challenge),
+            Err(CatalogActivationCapabilityChallengeError::UnsupportedChallengeVersion)
+        );
+
+        let mut response = challenge_response();
+        response.schema_version = "other".into();
+        assert_eq!(
+            response.validate_for(&challenge),
+            Err(CatalogActivationCapabilityChallengeError::UnsupportedResponseVersion)
+        );
+
+        let mut response = challenge_response();
+        response.nonce = format!("{}0", &CHALLENGE_NONCE[..63]);
+        assert_eq!(
+            response.validate_for(&challenge),
+            Err(CatalogActivationCapabilityChallengeError::ResponseMismatch)
+        );
+
+        let mut response = challenge_response();
+        response.request_sha256 = digest(3);
+        assert_eq!(
+            response.validate_for(&challenge),
+            Err(CatalogActivationCapabilityChallengeError::ResponseMismatch)
+        );
+
+        let mut response = challenge_response();
+        response.capability.cluster.uid = "other-cluster-uid".into();
+        assert_eq!(
+            response.validate_for(&challenge),
+            Err(CatalogActivationCapabilityChallengeError::ResponseMismatch)
+        );
+
+        let mut response = challenge_response();
+        response.capability.carrier.uid = "other-carrier-uid".into();
+        assert_eq!(
+            response.validate_for(&challenge),
+            Err(CatalogActivationCapabilityChallengeError::ResponseMismatch)
+        );
+
+        let mut response = challenge_response();
+        response.capability.target.pod_uid = "other-target-pod-uid".into();
+        assert_eq!(
+            response.validate_for(&challenge),
+            Err(CatalogActivationCapabilityChallengeError::ResponseMismatch)
+        );
     }
 
     fn generation_identity_for_holder(
