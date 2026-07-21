@@ -17,7 +17,7 @@ use crate::domain::{OrchState, OrchestratorIdentity};
 
 const INITIAL_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(5);
-const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+const RELEASE_TIMEOUT_SLACK: Duration = Duration::from_millis(500);
 const RELEASED_LEASE_DURATION_SECONDS: i32 = 1;
 const OWNER_API_VERSION: &str = "pgshard.io/v1alpha1";
 const OWNER_KIND: &str = "PgShardCluster";
@@ -117,6 +117,14 @@ impl CoordinationConfig {
     fn lease_duration_seconds(&self) -> i32 {
         i32::try_from(self.lease_duration.as_secs())
             .expect("validated Kubernetes Lease duration fits i32")
+    }
+
+    // The release performs one bounded get and one bounded replace, so its
+    // outer bound must cover both request timeouts.
+    fn release_timeout(&self) -> Duration {
+        self.request_timeout
+            .saturating_mul(2)
+            .saturating_add(RELEASE_TIMEOUT_SLACK)
     }
 }
 
@@ -504,7 +512,7 @@ async fn best_effort_release<S: LeaseStore>(
         store.replace(&lease).await?;
         Ok(())
     };
-    match tokio::time::timeout(RELEASE_TIMEOUT, release).await {
+    match tokio::time::timeout(config.release_timeout(), release).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::warn!(reason = %error, "could not release Kubernetes Lease during shutdown");
@@ -1039,6 +1047,27 @@ mod tests {
             spec.lease_duration_seconds,
             Some(RELEASED_LEASE_DURATION_SECONDS)
         );
+    }
+
+    #[test]
+    fn release_timeout_covers_both_release_requests() {
+        assert!(config().release_timeout() >= config().request_timeout.saturating_mul(2));
+
+        let slowest = CoordinationConfig::new(
+            "database".to_owned(),
+            "demo-orchestrator-leader".to_owned(),
+            OrchestratorIdentity {
+                cluster_id: "demo".to_owned(),
+                orchestrator_id: "demo-orchestrator-abc12".to_owned(),
+            },
+            "11111111-2222-3333-4444-555555555555".to_owned(),
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
+            Duration::from_secs(15),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        )
+        .expect("valid coordination config");
+        assert!(slowest.release_timeout() >= slowest.request_timeout.saturating_mul(2));
     }
 
     struct PendingStore;

@@ -321,14 +321,19 @@ async fn supervise_with_store<S: LeaseStore>(
                     revoke_authority(&state, &attempt);
                     return Err(WritableLeaseError::RenewDeadlineExceeded);
                 }
+                let generation = match config.durable_generation(&holder_identity, authority.epoch)
+                {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        revoke_authority(&state, &attempt);
+                        return Err(error.into());
+                    }
+                };
                 if let Err(error) = install_authority(&state, config, &authority) {
                     attempt.clear_authority();
                     return Err(error);
                 }
-                attempt.install_authority(
-                    authority.deadline,
-                    config.durable_generation(&holder_identity, authority.epoch)?,
-                );
+                attempt.install_authority(authority.deadline, generation);
                 held_deadline = Some(authority.deadline);
                 release = Some(authority.release);
                 retry = INITIAL_RETRY;
@@ -1028,6 +1033,34 @@ pub enum WritableLeaseError {
 }
 
 impl WritableLeaseError {
+    /// Returns whether explicit operator recovery is required before a fresh
+    /// attempt can succeed.
+    #[must_use]
+    pub fn requires_operator_recovery(&self) -> bool {
+        match self {
+            Self::Kubernetes { source, .. } => matches!(
+                source.as_ref(),
+                kube::Error::Api(status) if status.code == 403
+            ),
+            Self::LeaseIdentityMismatch | Self::LeaseOwnershipMismatch => true,
+            Self::InvalidSettings
+            | Self::InClusterConfiguration(_)
+            | Self::KubernetesClient(_)
+            | Self::RequestTimedOut(_)
+            | Self::InvalidLeaseSpec
+            | Self::InvalidDurableGeneration(_)
+            | Self::UnsupportedCoordinatedElection
+            | Self::LeaseTransitionOverflow
+            | Self::StateEvidenceRejected
+            | Self::PostgresProofMismatch
+            | Self::AgentState(_)
+            | Self::AuthorityPreempted
+            | Self::RenewDeadlineExceeded
+            | Self::AuthorityDeadlineOverflow
+            | Self::AuthorityClock(_) => false,
+        }
+    }
+
     fn is_permanent(&self) -> bool {
         match self {
             Self::Kubernetes { source, .. } => matches!(
@@ -1100,6 +1133,30 @@ mod tests {
 
     fn holder(config: &WritableLeaseConfig) -> String {
         config.holder_identity(PROCESS_A)
+    }
+
+    #[test]
+    fn operator_recovery_is_required_only_for_unrecoverable_errors() {
+        let forbidden = WritableLeaseError::Kubernetes {
+            operation: "read Lease",
+            source: Box::new(kube::Error::Api(Box::new(
+                kube::core::Status::failure("forbidden", "Forbidden").with_code(403),
+            ))),
+        };
+        assert!(forbidden.requires_operator_recovery());
+        assert!(WritableLeaseError::LeaseIdentityMismatch.requires_operator_recovery());
+        assert!(WritableLeaseError::LeaseOwnershipMismatch.requires_operator_recovery());
+
+        let conflict = WritableLeaseError::Kubernetes {
+            operation: "replace Lease",
+            source: Box::new(kube::Error::Api(Box::new(
+                kube::core::Status::failure("conflict", "Conflict").with_code(409),
+            ))),
+        };
+        assert!(!conflict.requires_operator_recovery());
+        assert!(!WritableLeaseError::AuthorityPreempted.requires_operator_recovery());
+        assert!(!WritableLeaseError::RenewDeadlineExceeded.requires_operator_recovery());
+        assert!(!WritableLeaseError::RequestTimedOut("read Lease").requires_operator_recovery());
     }
 
     fn lease(config: &WritableLeaseConfig) -> Lease {
