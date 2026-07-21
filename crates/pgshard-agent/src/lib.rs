@@ -3,6 +3,7 @@
 pub mod boottime;
 pub mod catalog_activation;
 pub mod catalog_activation_consumer;
+pub mod catalog_activation_runtime;
 pub mod catalog_activation_static_inputs;
 pub mod catalog_activation_tls;
 pub mod config;

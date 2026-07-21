@@ -4,6 +4,9 @@ use pgshard_agent::catalog_activation_consumer::{
     CatalogActivationCapabilityState, CatalogActivationConsumerConfig,
     spawn_catalog_activation_consumer,
 };
+use pgshard_agent::catalog_activation_runtime::{
+    CatalogRuntimeBinding, prepare_catalog_runtime_binding,
+};
 use pgshard_agent::catalog_activation_static_inputs::{
     CatalogActivationStaticInputsConfig, CatalogMaterializationHandoff,
     spawn_catalog_activation_static_input_verifier,
@@ -85,11 +88,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(activation_config) = activation_config {
         state.set_activation_config(activation_config);
     }
-    let (catalog_activation, _catalog_materialization_handoff) = spawn_catalog_activation_stages(
+    let (catalog_activation, catalog_materialization_handoff) = spawn_catalog_activation_stages(
         catalog_activation_consumer,
         catalog_activation_static_inputs,
         shutdown_rx.clone(),
     );
+    let (catalog_runtime_binding, _catalog_runtime_handoff) =
+        prepare_catalog_runtime_binding(catalog_materialization_handoff);
     let postgres_config = postgres;
     let postgres = match postgres_config.clone() {
         Some(config) => {
@@ -125,6 +130,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         postgres,
         postgres_config,
         writable_lease,
+        catalog_runtime_binding,
         shutdown_tx.clone(),
         shutdown_rx,
     ))
@@ -165,6 +171,7 @@ async fn run_services(
     postgres: Option<PreparedPostgres>,
     postgres_config: Option<PostgresConfig>,
     writable_lease: Option<WritableLeaseConfig>,
+    catalog_runtime_binding: CatalogRuntimeBinding,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AgentRunError> {
@@ -181,6 +188,7 @@ async fn run_services(
             postgres,
             postgres_config,
             writable_lease,
+            catalog_runtime_binding,
             shutdown_tx,
             shutdown_rx,
         ))
@@ -246,6 +254,7 @@ async fn run_writable_services(
     postgres: PreparedPostgres,
     postgres_config: PostgresConfig,
     writable_lease: WritableLeaseConfig,
+    catalog_runtime_binding: CatalogRuntimeBinding,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AgentRunError> {
@@ -262,6 +271,7 @@ async fn run_writable_services(
         postgres,
         postgres_config,
         writable_lease,
+        catalog_runtime_binding,
         shutdown_rx,
     );
     tokio::pin!(http);
@@ -283,6 +293,7 @@ async fn supervise_writable_runtime(
     mut postgres: PreparedPostgres,
     postgres_config: PostgresConfig,
     writable_lease: WritableLeaseConfig,
+    catalog_runtime_binding: CatalogRuntimeBinding,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), AgentRunError> {
     let mut retry = INITIAL_COORDINATION_RETRY;
@@ -293,6 +304,7 @@ async fn supervise_writable_runtime(
             state.clone(),
             postgres,
             writable_lease.clone(),
+            catalog_runtime_binding.attempt(),
             shutdown.clone(),
         ))
         .await?

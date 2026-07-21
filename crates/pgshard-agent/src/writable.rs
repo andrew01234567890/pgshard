@@ -18,6 +18,7 @@ use tokio::sync::watch;
 #[cfg(test)]
 use crate::boottime::system_clock;
 use crate::boottime::{BoottimeClock, BoottimeInstant};
+use crate::catalog_activation_runtime::CatalogRuntimeBindingAttempt;
 use crate::coordination::{
     self, WritableLeaseConfig, WritableLeaseError, WritableLeaseReleaseOutcome,
     WritableLeaseShutdown,
@@ -152,6 +153,34 @@ impl WritableAuthorityObserver {
         required: Duration,
     ) -> bool {
         self.snapshot_valid_for(required).as_ref() == Some(expected)
+    }
+
+    /// Runs one publication step while the watch still proves the exact
+    /// attempt-private generation and its current deadline exceeds `required`.
+    ///
+    /// The watch borrow remains held through `publish`, so Lease renewal or
+    /// revocation cannot interleave between the final authority check and the
+    /// publication. Deadline renewal is deliberately allowed: the stable
+    /// generation, rather than a mutable Lease `resourceVersion` or deadline,
+    /// is the runtime identity.
+    pub(crate) fn publish_while_generation_current<R>(
+        &self,
+        expected: &DurableWritableGeneration,
+        required: Duration,
+        publish: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let authority = self.authority.borrow();
+        let authority = authority.as_ref()?;
+        if !authority_valid_for(
+            &self.identity,
+            Some(authority),
+            required,
+            self.clock.as_ref(),
+        ) || &authority.generation != expected
+        {
+            return None;
+        }
+        Some(publish())
     }
 
     /// Returns the exact remaining local boot-clock validity for a still
@@ -290,6 +319,7 @@ pub async fn supervise_attempt(
     state: AgentState,
     postgres: PreparedPostgres,
     writable_lease: WritableLeaseConfig,
+    catalog_runtime: CatalogRuntimeBindingAttempt,
     shutdown: watch::Receiver<bool>,
 ) -> Result<WritableAttemptOutcome, WritableAttemptError> {
     let margin = writable_lease.shutdown_margin();
@@ -307,11 +337,12 @@ pub async fn supervise_attempt(
         // Even shutdown before acquisition flows through the writable
         // supervisor so it can produce the linear process-tree absence proof.
         postgres
-            .supervise_with_writable_authority(
+            .supervise_with_writable_authority_and_catalog_runtime(
                 postmaster_state,
                 postmaster_shutdown,
                 margin,
                 postgres_attempt,
+                catalog_runtime,
             )
             .await
     };
@@ -541,6 +572,60 @@ mod tests {
 
         assert!(first_postgres.authority_valid_for(Duration::from_secs(1)));
         assert!(!second_postgres.authority_valid_for(Duration::ZERO));
+    }
+
+    #[test]
+    fn guarded_runtime_publication_uses_stable_generation_not_mutable_deadline() {
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let (lease_attempt, postgres_attempt) =
+            writable_attempt_pair_with_clock_for_test(clock.clone());
+        let generation = durable_generation_for_test(1);
+        lease_attempt.install_authority(
+            clock
+                .now()
+                .expect("fake clock")
+                .checked_add(Duration::from_secs(2))
+                .expect("first deadline"),
+            generation.clone(),
+        );
+        let observer = postgres_attempt.authority_observer();
+
+        // A normal Lease renewal changes the deadline but not the stable
+        // generation identity accepted by the request.
+        lease_attempt.install_authority(
+            clock
+                .now()
+                .expect("fake clock")
+                .checked_add(Duration::from_secs(3))
+                .expect("renewed deadline"),
+            generation.clone(),
+        );
+        let mut published = false;
+        assert_eq!(
+            observer.publish_while_generation_current(&generation, Duration::from_secs(1), || {
+                published = true;
+            }),
+            Some(())
+        );
+        assert!(published);
+
+        lease_attempt.install_authority(
+            clock
+                .now()
+                .expect("fake clock")
+                .checked_add(Duration::from_secs(3))
+                .expect("new generation deadline"),
+            durable_generation_for_test(2),
+        );
+        assert!(
+            observer
+                .publish_while_generation_current(&generation, Duration::from_secs(1), || panic!(
+                    "stale generation published"
+                ),)
+                .is_none()
+        );
     }
 
     #[test]

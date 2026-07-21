@@ -11,6 +11,7 @@ use pgshard_types::writable_generation::{
     classify_writable_generation_transition,
 };
 use thiserror::Error;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_postgres::{Client, Config, NoTls};
@@ -156,6 +157,11 @@ const SOURCE_IDENTITY_OBSERVATION: &str = "\
            pg_catalog.current_setting('synchronous_standby_names') \
     FROM pg_catalog.pg_control_system() AS s \
     CROSS JOIN pg_catalog.pg_control_checkpoint() AS c";
+const CATALOG_RUNTIME_IDENTITY_OBSERVATION: &str = "\
+    SELECT s.system_identifier::text, c.timeline_id::text, \
+           pg_catalog.pg_is_in_recovery() \
+    FROM pg_catalog.pg_control_system() AS s \
+    CROSS JOIN pg_catalog.pg_control_checkpoint() AS c";
 const SOURCE_WAL_OBSERVATION: &str = "\
     SELECT pg_catalog.pg_current_wal_flush_lsn()::text";
 const SOURCE_CANDIDATE_OBSERVATION: &str = "\
@@ -284,6 +290,61 @@ static TEST_EVIDENCE_WAL_CAPTURE_GATE: std::sync::Mutex<Option<StablePublication
 /// 250 ms monitor cadence from creating a fresh backend on every sample.
 pub(crate) struct ReplicationEvidenceSession {
     connection: ConnectedPostgres,
+}
+
+/// One retained peer-authenticated session bound to an exact writable source.
+///
+/// The client and its driver are deliberately opaque. Keeping this value alive
+/// keeps the Unix-socket connection tied to the postmaster incarnation; a
+/// driver end is an immediate revocation signal to the dormant catalog runtime
+/// handoff.
+pub(crate) struct CatalogRuntimeSession {
+    connection: ConnectedPostgres,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogRuntimeIdentity {
+    pub(crate) system_identifier: u64,
+    pub(crate) timeline: u32,
+}
+
+/// Connects over the fixed local peer-authenticated socket and observes an
+/// exact read-only generation and source identity in one coherent snapshot.
+pub(crate) async fn connect_catalog_runtime(
+    socket_dir: &Path,
+    expected_generation: &DurableWritableGeneration,
+) -> Result<(CatalogRuntimeSession, CatalogRuntimeIdentity), PostgresGenerationError> {
+    let mut connection =
+        connect_with_application_mode(socket_dir, "pgshard-catalog-materializer", true).await?;
+    let transaction = connection.client.transaction().await?;
+    transaction
+        .batch_execute(EVIDENCE_TRANSACTION_SETTINGS)
+        .await?;
+    transaction
+        .batch_execute(LOCK_GENERATION_TABLE_ACCESS_SHARE)
+        .await?;
+    let generation = read_generation_evidence(&transaction).await?;
+    if &generation != expected_generation {
+        return Err(PostgresGenerationError::GenerationEvidenceChanged);
+    }
+    let row = transaction
+        .query_one(CATALOG_RUNTIME_IDENTITY_OBSERVATION, &[])
+        .await?;
+    let identity = CatalogRuntimeIdentity {
+        system_identifier: parse_system_identifier(&row.try_get::<_, String>(0)?)?,
+        timeline: parse_timeline(&row.try_get::<_, String>(1)?)?,
+    };
+    if row.try_get::<_, bool>(2)? {
+        return Err(PostgresGenerationError::InvalidReplicationEvidence);
+    }
+    transaction.rollback().await?;
+    Ok((CatalogRuntimeSession { connection }, identity))
+}
+
+impl CatalogRuntimeSession {
+    pub(crate) fn driver_ended(&self) -> watch::Receiver<bool> {
+        self.connection.driver_ended.clone()
+    }
 }
 
 /// Establishes the one session a replication-evidence monitor retains until
@@ -1170,26 +1231,50 @@ async fn connect_with_application(
     socket_dir: &Path,
     application_name: &'static str,
 ) -> Result<ConnectedPostgres, tokio_postgres::Error> {
+    connect_with_application_mode(socket_dir, application_name, false).await
+}
+
+async fn connect_with_application_mode(
+    socket_dir: &Path,
+    application_name: &'static str,
+    default_read_only: bool,
+) -> Result<ConnectedPostgres, tokio_postgres::Error> {
     let mut config = Config::new();
+    let options = connection_options(default_read_only);
     config
         .host_path(socket_dir)
         .port(5432)
         .user("postgres")
         .dbname("postgres")
         .application_name(application_name)
-        .options(CONNECTION_OPTIONS);
+        .options(&options);
     let (client, connection) = config.connect(NoTls).await?;
+    let (driver_ended_tx, driver_ended) = watch::channel(false);
     let driver = tokio::spawn(async move {
         if let Err(error) = connection.await {
-            tracing::debug!(reason = %error, "PostgreSQL generation connection ended");
+            tracing::debug!(reason = %error, "PostgreSQL local agent connection ended");
         }
+        driver_ended_tx.send_replace(true);
     });
-    Ok(ConnectedPostgres { client, driver })
+    Ok(ConnectedPostgres {
+        client,
+        driver,
+        driver_ended,
+    })
+}
+
+fn connection_options(default_read_only: bool) -> String {
+    let mut options = CONNECTION_OPTIONS.to_owned();
+    if default_read_only {
+        options.push_str(" -c default_transaction_read_only=on");
+    }
+    options
 }
 
 struct ConnectedPostgres {
     client: Client,
     driver: JoinHandle<()>,
+    driver_ended: watch::Receiver<bool>,
 }
 
 impl Drop for ConnectedPostgres {
@@ -1731,6 +1816,11 @@ mod tests {
         assert!(!STANDBY_IDENTITY_OBSERVATION.contains("pg_last_wal_replay_lsn"));
         assert!(CONNECTION_OPTIONS.contains("event_triggers=off"));
         assert!(CONNECTION_OPTIONS.contains("log_statement=none"));
+        assert!(
+            connection_options(true).ends_with("-c default_transaction_read_only=on"),
+            "dormant catalog runtime session must fail read-only by default"
+        );
+        assert!(!CATALOG_RUNTIME_IDENTITY_OBSERVATION.contains("FOR UPDATE"));
     }
 
     #[tokio::test]

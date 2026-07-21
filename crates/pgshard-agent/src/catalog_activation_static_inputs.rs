@@ -78,17 +78,25 @@ pub struct CatalogMaterializationHandoff {
     receiver: watch::Receiver<Option<Arc<ValidatedCatalogStaticInputs>>>,
 }
 
+impl CatalogMaterializationHandoff {
+    pub(crate) fn into_receiver(
+        self,
+    ) -> watch::Receiver<Option<Arc<ValidatedCatalogStaticInputs>>> {
+        self.receiver
+    }
+}
+
 /// Exact request-bound input snapshots. This type is deliberately private,
 /// move-only, non-serializable, and non-debuggable.
 #[allow(
     dead_code,
     reason = "sealed input for a later dormant materializer stage"
 )]
-struct ValidatedCatalogStaticInputs {
-    accepted: Arc<DurablyAcceptedCatalogActivation>,
-    migration: Box<[u8]>,
-    genesis: Box<[u8]>,
-    preflight: Box<[u8]>,
+pub(crate) struct ValidatedCatalogStaticInputs {
+    pub(crate) accepted: Arc<DurablyAcceptedCatalogActivation>,
+    pub(crate) migration: Box<[u8]>,
+    pub(crate) genesis: Box<[u8]>,
+    pub(crate) preflight: Box<[u8]>,
 }
 
 #[derive(Clone)]
@@ -262,7 +270,7 @@ async fn wait_for_retry_or_change(
     }
 }
 
-fn exact_acceptance(
+pub(crate) fn exact_acceptance(
     left: &DurablyAcceptedCatalogActivation,
     right: &DurablyAcceptedCatalogActivation,
 ) -> bool {
