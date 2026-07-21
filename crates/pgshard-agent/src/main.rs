@@ -1,5 +1,8 @@
 //! `pgshard-agent` Linux container entry point.
 
+use pgshard_agent::catalog_activation_consumer::{
+    CatalogActivationCapabilityState, spawn_catalog_activation_consumer,
+};
 use pgshard_agent::config::{AgentConfig, ConfigError};
 use pgshard_agent::coordination::WritableLeaseConfig;
 use pgshard_agent::domain::{AgentState, PostgresProcessState};
@@ -60,6 +63,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         telemetry,
         postgres,
         activation_config,
+        catalog_activation_consumer,
     } = config;
     let telemetry = telemetry.status();
     if telemetry.endpoint_configured {
@@ -72,6 +76,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(activation_config) = activation_config {
         state.set_activation_config(activation_config);
     }
+    let catalog_activation = if catalog_activation_consumer.is_some() {
+        CatalogActivationCapabilityState::configured()
+    } else {
+        CatalogActivationCapabilityState::disabled()
+    };
+    spawn_catalog_activation_consumer(
+        catalog_activation_consumer,
+        catalog_activation.clone(),
+        shutdown_rx.clone(),
+    );
     let postgres_config = postgres;
     let postgres = match postgres_config.clone() {
         Some(config) => {
@@ -102,6 +116,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         postgres,
         postgres_config,
         writable_lease,
+        catalog_activation,
         shutdown_tx.clone(),
         shutdown_rx,
     ))
@@ -113,12 +128,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_services(
     http_bind: SocketAddr,
     state: AgentState,
     postgres: Option<PreparedPostgres>,
     postgres_config: Option<PostgresConfig>,
     writable_lease: Option<WritableLeaseConfig>,
+    catalog_activation: CatalogActivationCapabilityState,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AgentRunError> {
@@ -135,6 +152,7 @@ async fn run_services(
             postgres,
             postgres_config,
             writable_lease,
+            catalog_activation,
             shutdown_tx,
             shutdown_rx,
         ))
@@ -146,9 +164,10 @@ async fn run_services(
         let listener = tokio::net::TcpListener::bind(http_bind)
             .await
             .map_err(AgentRunError::Http)?;
-        let http = pgshard_agent::http::serve_on(
+        let http = pgshard_agent::http::serve_on_with_catalog_activation(
             listener,
             state.clone(),
+            catalog_activation,
             wait_for_shutdown(shutdown_rx.clone()),
         );
         let postmaster = postgres.supervise(state, wait_for_shutdown(shutdown_rx));
@@ -167,9 +186,14 @@ async fn run_services(
             }
         }
     } else {
-        pgshard_agent::http::serve(http_bind, state, wait_for_shutdown(shutdown_rx))
-            .await
-            .map_err(AgentRunError::Http)
+        pgshard_agent::http::serve_with_catalog_activation(
+            http_bind,
+            state,
+            catalog_activation,
+            wait_for_shutdown(shutdown_rx),
+        )
+        .await
+        .map_err(AgentRunError::Http)
     }
 }
 
@@ -180,15 +204,17 @@ async fn run_writable_services(
     postgres: PreparedPostgres,
     postgres_config: PostgresConfig,
     writable_lease: WritableLeaseConfig,
+    catalog_activation: CatalogActivationCapabilityState,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AgentRunError> {
     let listener = tokio::net::TcpListener::bind(http_bind)
         .await
         .map_err(AgentRunError::Http)?;
-    let http = pgshard_agent::http::serve_on(
+    let http = pgshard_agent::http::serve_on_with_catalog_activation(
         listener,
         state.clone(),
+        catalog_activation,
         wait_for_shutdown(shutdown_rx.clone()),
     );
     let runtime = supervise_writable_runtime(

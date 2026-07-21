@@ -10,6 +10,7 @@ use pgshard_types::ShardId;
 use thiserror::Error;
 use url::Url;
 
+use crate::catalog_activation_consumer::CatalogActivationConsumerConfig;
 use crate::coordination::WritableLeaseConfig;
 use crate::domain::{ActivationConfigEvidence, AgentIdentity};
 use crate::postgres::{
@@ -35,6 +36,8 @@ pub struct AgentConfig {
     pub postgres: Option<PostgresConfig>,
     /// Optional exact non-serving activation configuration evidence.
     pub activation_config: Option<ActivationConfigEvidence>,
+    /// Optional dormant catalog-activation consumer.
+    pub catalog_activation_consumer: Option<CatalogActivationConsumerConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -96,6 +99,18 @@ struct RawConfig {
 
     #[arg(long, env = "PGSHARD_KUBERNETES_REQUEST_TIMEOUT_MS")]
     kubernetes_request_timeout_ms: Option<u64>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAMESPACE")]
+    catalog_activation_carrier_namespace: Option<String>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME")]
+    catalog_activation_carrier_name: Option<String>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_CARRIER_UID")]
+    catalog_activation_carrier_uid: Option<String>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT")]
+    catalog_activation_journal_root: Option<PathBuf>,
 
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
@@ -313,6 +328,8 @@ impl AgentConfig {
         };
         let activation_cluster_uid = raw.cluster_uid.clone();
         let activation_pod_uid = raw.pod_uid.clone();
+        let activation_lease_namespace = raw.lease_namespace.clone();
+        let activation_request_timeout = raw.kubernetes_request_timeout_ms;
         let writable_setting_supplied = raw.lease_namespace.is_some()
             || raw.writable_lease_uid.is_some()
             || raw.writable_lease_duration_seconds.is_some()
@@ -367,8 +384,20 @@ impl AgentConfig {
             &identity,
             postgres.as_ref(),
             writable_lease.as_ref(),
-            activation_cluster_uid,
-            activation_pod_uid,
+            activation_cluster_uid.clone(),
+            activation_pod_uid.clone(),
+        )?;
+        let catalog_activation_consumer = build_catalog_activation_consumer(
+            &identity,
+            postgres.as_ref(),
+            activation_cluster_uid.as_deref(),
+            activation_pod_uid.as_deref(),
+            activation_lease_namespace.as_deref(),
+            activation_request_timeout,
+            raw.catalog_activation_carrier_namespace,
+            raw.catalog_activation_carrier_name,
+            raw.catalog_activation_carrier_uid,
+            raw.catalog_activation_journal_root,
         )?;
 
         let otlp_endpoint = raw
@@ -386,8 +415,60 @@ impl AgentConfig {
             telemetry: TelemetryConfig { otlp_endpoint },
             postgres,
             activation_config,
+            catalog_activation_consumer,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_catalog_activation_consumer(
+    identity: &AgentIdentity,
+    postgres: Option<&PostgresConfig>,
+    cluster_uid: Option<&str>,
+    pod_uid: Option<&str>,
+    lease_namespace: Option<&str>,
+    request_timeout_ms: Option<u64>,
+    carrier_namespace: Option<String>,
+    carrier_name: Option<String>,
+    carrier_uid: Option<String>,
+    journal_root: Option<PathBuf>,
+) -> Result<Option<CatalogActivationConsumerConfig>, ConfigError> {
+    let supplied = carrier_namespace.is_some()
+        || carrier_name.is_some()
+        || carrier_uid.is_some()
+        || journal_root.is_some();
+    if !supplied {
+        return Ok(None);
+    }
+    let (Some(carrier_namespace), Some(carrier_name), Some(carrier_uid), Some(journal_root)) =
+        (carrier_namespace, carrier_name, carrier_uid, journal_root)
+    else {
+        return Err(ConfigError::IncompleteCatalogActivationConsumer);
+    };
+    if identity.shard_id != ShardId(0)
+        || !postgres.is_some_and(PostgresConfig::requires_writable_authority)
+    {
+        return Err(ConfigError::InvalidCatalogActivationConsumerRole);
+    }
+    let cluster_uid = cluster_uid.ok_or(ConfigError::IncompleteCatalogActivationConsumer)?;
+    let pod_uid = pod_uid.ok_or(ConfigError::IncompleteCatalogActivationConsumer)?;
+    let lease_namespace =
+        lease_namespace.ok_or(ConfigError::IncompleteCatalogActivationConsumer)?;
+    if carrier_namespace != lease_namespace {
+        return Err(ConfigError::InvalidCatalogActivationConsumerIdentity);
+    }
+    CatalogActivationConsumerConfig::new(
+        identity.clone(),
+        cluster_uid.to_owned(),
+        pod_uid.to_owned(),
+        carrier_namespace,
+        carrier_name,
+        carrier_uid,
+        journal_root,
+        Duration::from_millis(request_timeout_ms.unwrap_or(2_000)),
+    )
+    .map(Some)
+    .map_err(|_| ConfigError::InvalidCatalogActivationConsumerIdentity)
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -590,6 +671,17 @@ pub enum ConfigError {
     /// One activation identity is not a bounded canonical Kubernetes UID.
     #[error("PostgreSQL activation cluster and Pod UIDs must be 1-128 safe ASCII characters")]
     InvalidActivationIdentity,
+    /// Only part of the dormant carrier consumer identity was supplied.
+    #[error(
+        "catalog-activation carrier namespace, name, UID, and journal root must be supplied together"
+    )]
+    IncompleteCatalogActivationConsumer,
+    /// The dormant consumer may run only on the shard-zero bootstrap source.
+    #[error("catalog-activation consumer requires shard zero replication-bootstrap-primary mode")]
+    InvalidCatalogActivationConsumerRole,
+    /// Carrier, cluster, Pod, or journal identity is unsafe or inconsistent.
+    #[error("catalog-activation consumer identity or journal root is invalid")]
+    InvalidCatalogActivationConsumerIdentity,
     /// Endpoint URL parsing failed.
     #[error("invalid OTLP endpoint {value:?}: {source}")]
     InvalidOtlpEndpoint {
@@ -663,6 +755,42 @@ mod tests {
         args
     }
 
+    fn catalog_activation_consumer_args() -> Vec<&'static str> {
+        vec![
+            "pgshard-agent",
+            "--cluster-id",
+            "cluster-1",
+            "--cluster-uid",
+            "11111111-2222-3333-4444-555555555555",
+            "--shard-id",
+            "0",
+            "--instance-id",
+            "cluster-1-shard-0000-0",
+            "--pod-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--lease-namespace",
+            "database",
+            "--writable-lease-name",
+            "cluster-1-shard-0000-term",
+            "--writable-lease-uid",
+            "99999999-8888-7777-6666-555555555555",
+            "--postgres-mode",
+            "replication-bootstrap-primary",
+            "--postgres-data-dir",
+            "/var/lib/postgresql/data",
+            "--postgres-generation-durability",
+            "local",
+            "--catalog-activation-carrier-namespace",
+            "database",
+            "--catalog-activation-carrier-name",
+            "cluster-1-catalog-activation",
+            "--catalog-activation-carrier-uid",
+            "12121212-3434-5656-7878-909090909090",
+            "--catalog-activation-journal-root",
+            "/var/lib/pgshard/catalog-activation",
+        ]
+    }
+
     fn expected_replication_standby(primary_port: u16) -> PostgresConfig {
         let standby = PostgresStandbyConfig::new(
             "cluster-1-shard-0003-member-0000.database.svc".to_owned(),
@@ -693,6 +821,43 @@ mod tests {
         assert!(config.telemetry.otlp_endpoint.is_none());
         assert!(config.postgres.is_none());
         assert!(config.activation_config.is_none());
+        assert!(config.catalog_activation_consumer.is_none());
+    }
+
+    #[test]
+    fn catalog_activation_consumer_is_all_or_none_and_source_only() {
+        let config = AgentConfig::try_parse_from(catalog_activation_consumer_args())
+            .expect("complete shard-zero source consumer");
+        assert!(config.catalog_activation_consumer.is_some());
+
+        let mut partial = catalog_activation_consumer_args();
+        partial.truncate(partial.len() - 2);
+        assert!(matches!(
+            AgentConfig::try_parse_from(partial),
+            Err(ConfigError::IncompleteCatalogActivationConsumer)
+        ));
+
+        let mut foreign_namespace = catalog_activation_consumer_args();
+        let namespace = foreign_namespace
+            .iter()
+            .position(|argument| *argument == "--catalog-activation-carrier-namespace")
+            .expect("carrier namespace argument");
+        foreign_namespace[namespace + 1] = "other";
+        assert!(matches!(
+            AgentConfig::try_parse_from(foreign_namespace),
+            Err(ConfigError::InvalidCatalogActivationConsumerIdentity)
+        ));
+
+        let mut nonzero_shard = catalog_activation_consumer_args();
+        let shard = nonzero_shard
+            .iter()
+            .position(|argument| *argument == "--shard-id")
+            .expect("shard argument");
+        nonzero_shard[shard + 1] = "1";
+        assert!(matches!(
+            AgentConfig::try_parse_from(nonzero_shard),
+            Err(ConfigError::InvalidCatalogActivationConsumerRole)
+        ));
     }
 
     #[test]
