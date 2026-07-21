@@ -616,30 +616,6 @@ impl CatalogSnapshot {
         Ok(snapshot)
     }
 
-    /// Builds a snapshot and verifies a checksum read from the same SQL
-    /// transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SnapshotError::ChecksumMismatch`] when the authoritative
-    /// checksum differs from the canonical model.
-    pub fn with_expected_checksum(
-        cluster_id: ClusterId,
-        catalog_epoch: u64,
-        routing_hash: RoutingHashConfig,
-        databases: Vec<DatabaseCatalog>,
-        expected: [u8; 32],
-    ) -> Result<Self, SnapshotError> {
-        let snapshot = Self::new(cluster_id, catalog_epoch, routing_hash, databases)?;
-        if snapshot.checksum != expected {
-            return Err(SnapshotError::ChecksumMismatch {
-                expected,
-                actual: snapshot.checksum,
-            });
-        }
-        Ok(snapshot)
-    }
-
     /// Recomputes and validates the in-memory checksum.
     ///
     /// # Errors
@@ -1188,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mismatched_hash_and_checksum() {
+    fn rejects_mismatched_hash_version() {
         let hash = RoutingHashConfig::new(1, 42).expect("hash");
         let mut wrong_table = table("events");
         wrong_table.hash_version = 2;
@@ -1203,17 +1179,6 @@ mod tests {
         assert!(matches!(
             CatalogSnapshot::new(cluster_id(), 1, hash, vec![database]),
             Err(SnapshotError::TableHashVersionMismatch { .. })
-        ));
-
-        assert!(matches!(
-            CatalogSnapshot::with_expected_checksum(
-                cluster_id(),
-                1,
-                hash,
-                vec![super::tests::database(1)],
-                [7; 32],
-            ),
-            Err(SnapshotError::ChecksumMismatch { .. })
         ));
     }
 
