@@ -187,6 +187,7 @@ async fn read_bound_candidates<S: CandidateStore>(
         .collect();
     Ok(BoundCandidateSet {
         cluster: status.fingerprint,
+        catalog_activation: status.catalog_activation,
         candidates: objects,
         shard_zero_bootstraps: status
             .bootstraps
@@ -242,6 +243,7 @@ fn validate_plan(
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct BoundCandidateSet {
     pub(crate) cluster: ClusterFingerprint,
+    pub(crate) catalog_activation: ObjectReference,
     pub(crate) candidates: Vec<CandidateFingerprint>,
     pub(crate) shard_zero_bootstraps: Vec<BootstrapReference>,
     pub(crate) writable_lease: ObjectReference,
@@ -261,6 +263,8 @@ impl BoundCandidateSet {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClusterFingerprint {
+    pub(crate) name: String,
+    pub(crate) namespace: String,
     pub(crate) uid: String,
     pub(crate) resource_version: String,
     pub(crate) generation: i64,
@@ -279,6 +283,7 @@ pub(crate) struct CandidateFingerprint {
 #[derive(Clone, Debug)]
 struct ValidatedClusterStatus {
     fingerprint: ClusterFingerprint,
+    catalog_activation: ObjectReference,
     candidates: Vec<CandidateCheckpoint>,
     bootstraps: Vec<BootstrapCheckpoint>,
     writable_lease: ObjectReference,
@@ -358,8 +363,11 @@ fn validate_cluster_status(
         validate_operation_writer_access(status.operation_writer_access, &plan.cluster_id)?;
     let postgresql_configuration =
         validate_postgresql_configuration(status.postgresql_configuration, &plan.cluster_id)?;
+    let catalog_activation = validate_catalog_activation(status.catalog_activation, plan)?;
     Ok(ValidatedClusterStatus {
         fingerprint: ClusterFingerprint {
+            name: plan.cluster_id.clone(),
+            namespace: plan.namespace.clone(),
             uid: uid.to_owned(),
             resource_version: resource_version.to_owned(),
             generation,
@@ -368,6 +376,7 @@ fn validate_cluster_status(
                 &serde_json::to_vec(&status_value)?,
             ),
         },
+        catalog_activation,
         candidates,
         bootstraps,
         writable_lease,
@@ -375,6 +384,23 @@ fn validate_cluster_status(
         catalog_access,
         operation_writer_access,
         postgresql_configuration,
+    })
+}
+
+fn validate_catalog_activation(
+    checkpoint: CatalogActivationCheckpoint,
+    plan: &CatalogCandidateObservationPlan,
+) -> Result<ObjectReference, CatalogCandidateError> {
+    let expected_name = format!("{}-catalog-activation", plan.cluster_id);
+    if checkpoint.name != expected_name
+        || !valid_name(&checkpoint.name)
+        || !valid_uid(&checkpoint.uid)
+    {
+        return Err(CatalogCandidateError::InvalidCheckpointSet);
+    }
+    Ok(ObjectReference {
+        name: checkpoint.name,
+        uid: checkpoint.uid,
     })
 }
 
@@ -1213,7 +1239,15 @@ struct ClusterStatus {
     catalog_candidates: Vec<CandidateCheckpoint>,
     catalog_access: CatalogAccessCheckpoint,
     operation_writer_access: OperationWriterAccessCheckpoint,
+    catalog_activation: CatalogActivationCheckpoint,
     postgresql_configuration: PostgreSQLConfigurationCheckpoint,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogActivationCheckpoint {
+    name: String,
+    uid: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1465,6 +1499,8 @@ mod tests {
     use k8s_openapi::ByteString;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
     use kube::core::TypeMeta;
+    use pgshard_types::ShardId;
+    use pgshard_types::writable_generation::DurableWritableGeneration;
     use serde_json::json;
 
     use super::*;
@@ -1475,6 +1511,10 @@ mod tests {
         WritableLeaseProofIdentity,
     };
     use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
+    use crate::catalog_materialization::{
+        CatalogActivationDispatcherProof, bind_catalog_activation_live_objects,
+        catalog_activation_publication_target, prepare_catalog_activation_request,
+    };
     use crate::domain::{AgentStatusPhase, CatalogCandidatePhase, OrchState, OrchestratorIdentity};
     use crate::topology::{
         AgentStatusCollectionState, TOPOLOGY_SCHEMA_VERSION, TopologyDiagnostics,
@@ -1809,6 +1849,7 @@ mod tests {
             "postgresqlCatalogCandidates": candidate_checkpoints,
             "catalogAccess": {"secretName": catalog_access.name, "secretUID": catalog_access.uid, "clientSHA256": catalog_access.client_sha256, "serverSHA256": catalog_access.server_sha256},
             "operationWriterAccess": {"secretName": operation_writer_access.name, "secretUID": operation_writer_access.uid, "materialSHA256": operation_writer_access.material_sha256},
+            "catalogActivation": {"name": format!("{}-catalog-activation", plan.cluster_id), "uid": "catalog-activation-uid"},
             "postgresqlConfiguration": {"configMapName": postgresql_configuration.name, "configMapUID": postgresql_configuration.uid, "dataSHA256": postgresql_configuration.data_sha256}
         });
         let cluster = DynamicObject {
@@ -1983,6 +2024,26 @@ mod tests {
         plan: &CatalogCandidateObservationPlan,
     ) -> ShardZeroReplicationProof {
         let source = proof_member(plan, 0);
+        let holder_identity = format!(
+            "{}/{}/0123456789abcdef01234567",
+            source.instance_id, source.pod_uid
+        );
+        let transitions = 7;
+        let generation_identity = String::from_utf8(
+            DurableWritableGeneration::new(
+                plan.cluster_id.clone(),
+                plan.cluster_uid.clone(),
+                ShardId(0),
+                plan.namespace.clone(),
+                plan.writable_lease_name.clone(),
+                plan.writable_lease_uid.clone(),
+                holder_identity.clone(),
+                transitions,
+            )
+            .expect("fixture writable generation")
+            .canonical_bytes(),
+        )
+        .expect("canonical generation UTF-8");
         let standbys = plan
             .members
             .iter()
@@ -1993,7 +2054,7 @@ mod tests {
                 member_slot_name: member.physical_slot.clone(),
                 system_identifier: 42,
                 timeline: 3,
-                canonical_generation_identity: "generation-7".to_owned(),
+                canonical_generation_identity: generation_identity.clone(),
                 generation_barrier_lsn: 100,
                 receive_lsn: 120 + u64::from(member.ordinal),
                 replay_lsn: 110 + u64::from(member.ordinal),
@@ -2001,18 +2062,22 @@ mod tests {
             .collect::<Vec<_>>();
         ShardZeroReplicationProof {
             writable_lease: WritableLeaseProofIdentity {
+                namespace: plan.namespace.clone(),
                 name: plan.writable_lease_name.clone(),
                 uid: plan.writable_lease_uid.clone(),
+                resource_version: "writable-lease-rv-7".to_owned(),
+                holder_identity,
+                transitions,
             },
             source: ShardZeroSourceReplicationProof {
                 member: source,
                 system_identifier: 42,
                 timeline: 3,
-                canonical_generation_identity: "generation-7".to_owned(),
+                canonical_generation_identity: generation_identity.clone(),
                 generation_barrier_lsn: 100,
                 target_fence_acknowledgement: TargetFenceAcknowledgementProof {
                     observed_at_unix_ms: 1,
-                    canonical_generation_identity: "generation-7".to_owned(),
+                    canonical_generation_identity: generation_identity.clone(),
                     deadline_boottime_ns: 5_000_000_000,
                     remaining_validity_at_ack_ms: 5_000,
                     remaining_validity_at_report_ms: 5_000,
@@ -2026,7 +2091,7 @@ mod tests {
                 member_slot_name: plan.members[1].physical_slot.clone(),
                 system_identifier: 42,
                 timeline: 3,
-                canonical_generation_identity: "generation-7".to_owned(),
+                canonical_generation_identity: generation_identity,
                 generation_barrier_lsn: 100,
                 receive_lsn: 121,
                 replay_lsn: 111,
@@ -2050,12 +2115,16 @@ mod tests {
                 .all(|bundle| bundle == &bound.materialization_bundles[0])
         );
         assert_eq!(bound.shard_zero_bootstraps.len(), 3);
+        assert_eq!(bound.cluster.name, "demo");
+        assert_eq!(bound.cluster.namespace, "ns");
         assert_eq!(bound.cluster.uid, "cluster-uid");
         assert_eq!(bound.cluster.resource_version, "cluster-rv");
         assert_eq!(bound.cluster.generation, 7);
         assert_eq!(bound.cluster.status_sha256.len(), 64);
         assert_eq!(bound.writable_lease.name, "demo-shard-0000-term");
         assert_eq!(bound.writable_lease.uid, "lease-uid-0");
+        assert_eq!(bound.catalog_activation.name, "demo-catalog-activation");
+        assert_eq!(bound.catalog_activation.uid, "catalog-activation-uid");
         assert_eq!(bound.replication_credential.uid, "replication-uid-0");
         assert_eq!(bound.catalog_access.uid, "catalog-uid");
         assert_eq!(
@@ -2111,15 +2180,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercises the complete inert proof-to-request chain.
     async fn validated_three_and_five_member_proofs_gate_exact_capability() {
         for member_count in [3_u32, 5] {
             let (plan, cluster, candidates) = fixture_for_plan(plan_with_members(member_count));
+            let validated_status =
+                validate_cluster_status(&cluster, &plan).expect("validated live status fixture");
+            let live_cluster = validated_status.fingerprint.clone();
+            let live_carrier = validated_status.catalog_activation.clone();
             let total_members = plan.shard_count * plan.members.len();
-            let state = OrchState::with_identity_and_topology(
+            let state = OrchState::with_identity_topology_and_dispatcher(
                 OrchestratorIdentity {
                     cluster_id: plan.cluster_id.clone(),
-                    orchestrator_id: "orch-0".to_owned(),
+                    orchestrator_id: "demo-orchestrator-0".to_owned(),
                 },
+                "dispatcher-pod-uid".to_owned(),
                 15_000,
                 TopologyDiagnostics {
                     schema_version: TOPOLOGY_SCHEMA_VERSION.to_owned(),
@@ -2171,8 +2246,155 @@ mod tests {
                 .expect("exact target and material dispatch");
             assert!(state.revalidate_catalog_bootstrap_dispatch(&dispatch));
 
+            let target = catalog_activation_publication_target(&dispatch)
+                .expect("sealed publication target");
+            assert_eq!(target.carrier_api_group(), "pgshard.io");
+            assert_eq!(target.carrier_api_version(), "v1alpha1");
+            assert_eq!(target.carrier_api_plural(), "pgshardcatalogactivations");
+            assert_eq!(target.carrier_status_subresource(), "status");
+            assert_eq!(target.carrier_namespace(), "ns");
+            assert_eq!(target.carrier_name(), "demo-catalog-activation");
+            assert_eq!(target.carrier_uid(), "catalog-activation-uid");
+            assert_eq!(target.cluster_name(), "demo");
+            assert_eq!(target.cluster_uid(), "cluster-uid");
+            assert_eq!(target.target_stateful_set_name(), "demo-shard-0000");
+            assert_eq!(target.target_pod_name(), "demo-shard-0000-0");
+            assert_eq!(target.target_pod_uid(), "pod-uid-0");
+            assert_eq!(
+                target.target_agent_dns_name(),
+                "demo-shard-0000-0.demo-shard-0000.ns.svc"
+            );
+            assert_eq!(target.target_agent_http_port(), 8_080);
+            assert_eq!(target.capability_path(), "/capabilities/catalog-activation");
+
+            let live_writable_lease = exact_replication_proof(&plan).writable_lease;
+            let dispatcher = CatalogActivationDispatcherProof {
+                pod_name: "demo-orchestrator-0".to_owned(),
+                pod_uid: "dispatcher-pod-uid".to_owned(),
+                lease_name: "demo-orch-lease".to_owned(),
+                lease_uid: "coordination-uid".to_owned(),
+                lease_resource_version: "coordination-rv-1".to_owned(),
+                lease_holder: concat!(
+                    "demo-orchestrator-0/dispatcher-pod-uid/",
+                    "123e4567-e89b-42d3-a456-426614174000"
+                )
+                .to_owned(),
+            };
+            let bind_dispatcher = |dispatcher| {
+                bind_catalog_activation_live_objects(
+                    &dispatch,
+                    live_cluster.clone(),
+                    live_carrier.clone(),
+                    ObjectReference {
+                        name: "demo-shard-0000-0".to_owned(),
+                        uid: "pod-uid-0".to_owned(),
+                    },
+                    live_writable_lease.clone(),
+                    dispatcher,
+                )
+            };
+
+            let mut foreign_name = dispatcher.clone();
+            foreign_name.pod_name = "foreign-orchestrator-0".to_owned();
+            foreign_name.lease_holder = concat!(
+                "foreign-orchestrator-0/dispatcher-pod-uid/",
+                "123e4567-e89b-42d3-a456-426614174000"
+            )
+            .to_owned();
+            assert!(bind_dispatcher(foreign_name).is_none());
+
+            let mut foreign_uid = dispatcher.clone();
+            foreign_uid.pod_uid = "foreign-dispatcher-pod-uid".to_owned();
+            foreign_uid.lease_holder = concat!(
+                "demo-orchestrator-0/foreign-dispatcher-pod-uid/",
+                "123e4567-e89b-42d3-a456-426614174000"
+            )
+            .to_owned();
+            assert!(bind_dispatcher(foreign_uid).is_none());
+
+            let mut holder_name = dispatcher.clone();
+            holder_name.lease_holder = concat!(
+                "foreign-orchestrator-0/dispatcher-pod-uid/",
+                "123e4567-e89b-42d3-a456-426614174000"
+            )
+            .to_owned();
+            assert!(bind_dispatcher(holder_name).is_none());
+
+            let mut holder_uid = dispatcher.clone();
+            holder_uid.lease_holder = concat!(
+                "demo-orchestrator-0/foreign-dispatcher-pod-uid/",
+                "123e4567-e89b-42d3-a456-426614174000"
+            )
+            .to_owned();
+            assert!(bind_dispatcher(holder_uid).is_none());
+
+            let mut foreign_lease_name = dispatcher.clone();
+            foreign_lease_name.lease_name = "foreign-orch-lease".to_owned();
+            assert!(bind_dispatcher(foreign_lease_name).is_none());
+
+            let mut foreign_lease_uid = dispatcher.clone();
+            foreign_lease_uid.lease_uid = "foreign-coordination-uid".to_owned();
+            assert!(bind_dispatcher(foreign_lease_uid).is_none());
+
+            let mut foreign_lease_resource_version = dispatcher.clone();
+            foreign_lease_resource_version.lease_resource_version =
+                "foreign-coordination-rv".to_owned();
+            assert!(bind_dispatcher(foreign_lease_resource_version).is_none());
+
+            for invalid_incarnation in [
+                "not-a-uuid",
+                "123e4567-e89b-12d3-a456-426614174000",
+                "123e4567-e89b-42d3-7456-426614174000",
+                "123E4567-E89B-42D3-A456-426614174000",
+            ] {
+                let mut invalid_holder = dispatcher.clone();
+                invalid_holder.lease_holder =
+                    format!("demo-orchestrator-0/dispatcher-pod-uid/{invalid_incarnation}");
+                assert!(bind_dispatcher(invalid_holder).is_none());
+            }
+
+            let live = bind_dispatcher(dispatcher.clone())
+                .expect("exact configured dispatcher identities cross-bind");
+            let prepared = prepare_catalog_activation_request(&dispatch, &live)
+                .expect("canonical activation request");
+            prepared.request().validate().expect("validated request");
+            assert_eq!(
+                prepared.sha256(),
+                prepared.request().sha256().expect("canonical digest")
+            );
+            assert_eq!(prepared.request().carrier.name, "demo-catalog-activation");
+            assert_eq!(prepared.request().cluster.name, "demo");
+            assert_eq!(prepared.request().cluster.namespace, "ns");
+            assert_eq!(
+                prepared.request().writable_term.resource_version,
+                "writable-lease-rv-7"
+            );
+            assert_eq!(prepared.request().writable_term.generation, "7");
+
+            let mut foreign_carrier = live_carrier;
+            foreign_carrier.uid = "replacement-carrier-uid".to_owned();
+            assert!(
+                bind_catalog_activation_live_objects(
+                    &dispatch,
+                    live_cluster,
+                    foreign_carrier,
+                    ObjectReference {
+                        name: "demo-shard-0000-0".to_owned(),
+                        uid: "pod-uid-0".to_owned(),
+                    },
+                    live_writable_lease,
+                    dispatcher,
+                )
+                .is_none()
+            );
+
             let public = serde_json::to_string(&state.snapshot()).expect("public snapshot JSON");
-            for private_value in ["pod-uid-0", "generation-7", "operation-writer-uid"] {
+            for private_value in [
+                "pod-uid-0",
+                "dispatcher-pod-uid",
+                "generation-7",
+                "operation-writer-uid",
+            ] {
                 assert!(
                     !public.contains(private_value),
                     "private exact proof leaked through public diagnostics"
@@ -2562,6 +2784,30 @@ mod tests {
             assert!(
                 validate_cluster_status(&malformed, &plan).is_err(),
                 "malformed operation-writer {field} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_foreign_catalog_activation_checkpoint() {
+        let (plan, cluster, _) = fixture();
+
+        let mut missing = cluster.clone();
+        missing.data["status"]
+            .as_object_mut()
+            .expect("status")
+            .remove("catalogActivation");
+        assert!(validate_cluster_status(&missing, &plan).is_err());
+
+        for (field, value) in [
+            ("name", json!("other-catalog-activation")),
+            ("uid", json!("")),
+        ] {
+            let mut malformed = cluster.clone();
+            malformed.data["status"]["catalogActivation"][field] = value;
+            assert!(
+                validate_cluster_status(&malformed, &plan).is_err(),
+                "malformed catalog activation {field} was accepted"
             );
         }
     }

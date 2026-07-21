@@ -26,13 +26,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.lease_name,
         config.identity.clone(),
         config.cluster_uid,
-        config.pod_uid,
+        config.pod_uid.clone(),
         config.kubernetes_lease_duration,
         config.kubernetes_lease_retry_period,
         config.kubernetes_request_timeout,
     )?;
-    let state = OrchState::with_identity_and_topology(
+    let state = OrchState::with_identity_topology_and_dispatcher(
         config.identity,
+        config.pod_uid,
         config.lease_ttl_ms,
         topology_diagnostics.clone(),
     )?;

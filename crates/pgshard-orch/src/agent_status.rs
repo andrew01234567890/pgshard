@@ -43,6 +43,7 @@ pub(crate) struct ExpectedWritableLease {
     pub(crate) namespace: String,
     pub(crate) name: String,
     pub(crate) uid: String,
+    pub(crate) resource_version: String,
     pub(crate) holder_identity: Option<String>,
     pub(crate) transitions: u64,
 }
@@ -159,10 +160,14 @@ pub(crate) struct RemoteApplyWitnessProof {
 }
 
 /// Exact Kubernetes Lease incarnation bracketed around the collection.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WritableLeaseProofIdentity {
+    pub(crate) namespace: String,
     pub(crate) name: String,
     pub(crate) uid: String,
+    pub(crate) resource_version: String,
+    pub(crate) holder_identity: String,
+    pub(crate) transitions: u64,
 }
 
 /// Bounded, exact, non-serializable shard-zero evidence. This is diagnostic
@@ -210,8 +215,7 @@ struct CollectedAgentStatus {
     instance_id: String,
     pod_uid: String,
     source_instance_id: String,
-    writable_lease_name: String,
-    writable_lease_uid: String,
+    writable_lease: ExpectedWritableLease,
     receipt: Instant,
     postgres_process_identity: Option<CollectedPostgresProcessIdentity>,
     replication: Option<MemberReplicationEvidence>,
@@ -370,8 +374,7 @@ async fn collect_one_inner(
         instance_id: query.expected.instance_id,
         pod_uid: query.expected.pod_uid,
         source_instance_id: query.expected.source_instance_id,
-        writable_lease_name: query.expected.writable_lease.name,
-        writable_lease_uid: query.expected.writable_lease.uid,
+        writable_lease: query.expected.writable_lease,
         receipt: Instant::now(),
         postgres_process_identity,
         replication: validated.replication,
@@ -1328,8 +1331,7 @@ fn validate_replication_collection(
                 || observation.cluster_id != source.cluster_id
                 || observation.cluster_uid != source.cluster_uid
                 || observation.source_instance_id != source.instance_id
-                || observation.writable_lease_name != source.writable_lease_name
-                || observation.writable_lease_uid != source.writable_lease_uid
+                || observation.writable_lease != source.writable_lease
             {
                 return Err(AgentStatusError::ReplicationEvidenceMismatch);
             }
@@ -1508,10 +1510,19 @@ fn build_shard_zero_replication_proof(
     else {
         return Err(AgentStatusError::ReplicationEvidenceMismatch);
     };
+    let holder_identity = source
+        .writable_lease
+        .holder_identity
+        .clone()
+        .ok_or(AgentStatusError::ReplicationEvidenceMismatch)?;
     Ok(ShardZeroReplicationProof {
         writable_lease: WritableLeaseProofIdentity {
-            name: source.writable_lease_name.clone(),
-            uid: source.writable_lease_uid.clone(),
+            namespace: source.writable_lease.namespace.clone(),
+            name: source.writable_lease.name.clone(),
+            uid: source.writable_lease.uid.clone(),
+            resource_version: source.writable_lease.resource_version.clone(),
+            holder_identity,
+            transitions: source.writable_lease.transitions,
         },
         source: ShardZeroSourceReplicationProof {
             member: replication_proof_member_identity(source)?,
@@ -1748,6 +1759,7 @@ mod tests {
                 namespace: "database".to_owned(),
                 name: "demo-shard-0000-term".to_owned(),
                 uid: "lease-uid-0".to_owned(),
+                resource_version: "lease-rv-0".to_owned(),
                 holder_identity: None,
                 transitions: 0,
             },
@@ -1955,8 +1967,16 @@ mod tests {
                 instance_id: "demo-shard-0000-0".to_owned(),
                 pod_uid: "pod-uid-0".to_owned(),
                 source_instance_id: "demo-shard-0000-0".to_owned(),
-                writable_lease_name: "demo-shard-0000-writable".to_owned(),
-                writable_lease_uid: "99999999-8888-7777-6666-555555555555".to_owned(),
+                writable_lease: ExpectedWritableLease {
+                    namespace: "database".to_owned(),
+                    name: "demo-shard-0000-writable".to_owned(),
+                    uid: "99999999-8888-7777-6666-555555555555".to_owned(),
+                    resource_version: "lease-rv-7".to_owned(),
+                    holder_identity: Some(
+                        "demo-shard-0000-0/pod-uid-0/0123456789abcdef01234567".to_owned(),
+                    ),
+                    transitions: 7,
+                },
                 receipt,
                 postgres_process_identity: Some(CollectedPostgresProcessIdentity {
                     postmaster_pid: 10,
@@ -1991,8 +2011,16 @@ mod tests {
                 instance_id: "demo-shard-0000-m0001-0".to_owned(),
                 pod_uid: "pod-uid-1".to_owned(),
                 source_instance_id: "demo-shard-0000-0".to_owned(),
-                writable_lease_name: "demo-shard-0000-writable".to_owned(),
-                writable_lease_uid: "99999999-8888-7777-6666-555555555555".to_owned(),
+                writable_lease: ExpectedWritableLease {
+                    namespace: "database".to_owned(),
+                    name: "demo-shard-0000-writable".to_owned(),
+                    uid: "99999999-8888-7777-6666-555555555555".to_owned(),
+                    resource_version: "lease-rv-7".to_owned(),
+                    holder_identity: Some(
+                        "demo-shard-0000-0/pod-uid-0/0123456789abcdef01234567".to_owned(),
+                    ),
+                    transitions: 7,
+                },
                 receipt,
                 postgres_process_identity: Some(CollectedPostgresProcessIdentity {
                     postmaster_pid: 20,
@@ -2463,6 +2491,18 @@ mod tests {
                 .shard_zero_proof
                 .expect("acknowledged remote-apply proof");
 
+            assert_eq!(proof.writable_lease.namespace, "database");
+            assert_eq!(proof.writable_lease.name, "demo-shard-0000-writable");
+            assert_eq!(
+                proof.writable_lease.uid,
+                "99999999-8888-7777-6666-555555555555"
+            );
+            assert_eq!(proof.writable_lease.resource_version, "lease-rv-7");
+            assert_eq!(
+                proof.writable_lease.holder_identity,
+                "demo-shard-0000-0/pod-uid-0/0123456789abcdef01234567"
+            );
+            assert_eq!(proof.writable_lease.transitions, 7);
             assert_eq!(proof.source.member.shard_id, 0);
             assert_eq!(proof.source.member.member_ordinal, 0);
             assert_eq!(proof.source.member.cluster_id, "demo");
@@ -2625,6 +2665,28 @@ mod tests {
 
     #[test]
     fn shard_zero_proof_rejects_coordinate_ack_barrier_and_witness_mismatches() {
+        for mismatch in ["resource-version", "holder", "transitions"] {
+            let mut observations = shard_zero_proof_observations(3);
+            match mismatch {
+                "resource-version" => observations[2]
+                    .writable_lease
+                    .resource_version
+                    .push_str("-changed"),
+                "holder" => observations[2]
+                    .writable_lease
+                    .holder_identity
+                    .as_mut()
+                    .expect("held lease")
+                    .push_str("-changed"),
+                "transitions" => observations[2].writable_lease.transitions += 1,
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                validate_replication_collection(&observations),
+                Err(AgentStatusError::ReplicationEvidenceMismatch)
+            ));
+        }
+
         for mismatch in ["system", "timeline", "generation"] {
             let mut observations = shard_zero_proof_observations(3);
             let Some(MemberReplicationEvidence::Standby {
