@@ -321,14 +321,19 @@ async fn supervise_with_store<S: LeaseStore>(
                     revoke_authority(&state, &attempt);
                     return Err(WritableLeaseError::RenewDeadlineExceeded);
                 }
+                let generation = match config.durable_generation(&holder_identity, authority.epoch)
+                {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        revoke_authority(&state, &attempt);
+                        return Err(error.into());
+                    }
+                };
                 if let Err(error) = install_authority(&state, config, &authority) {
                     attempt.clear_authority();
                     return Err(error);
                 }
-                attempt.install_authority(
-                    authority.deadline,
-                    config.durable_generation(&holder_identity, authority.epoch)?,
-                );
+                attempt.install_authority(authority.deadline, generation);
                 held_deadline = Some(authority.deadline);
                 release = Some(authority.release);
                 retry = INITIAL_RETRY;
