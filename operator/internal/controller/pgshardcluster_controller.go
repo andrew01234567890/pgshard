@@ -2436,42 +2436,62 @@ func legacyPostgreSQLAuthSecretPrefix(cluster string, shard int32) string {
 
 // migrateLegacyPostgreSQLAuthSecretMetadata upgrades only the exact
 // shard-scoped member-zero credential shape created before member identity was
-// explicit. The optimistic-lock patch preserves the observed API identity and
-// fails closed on replacement or concurrent mutation.
+// explicit. The resourceVersion-fenced update preserves the observed API
+// identity, fails closed on replacement, and stays within the granted Secret
+// verbs: shipped RBAC deliberately withholds patch on Secrets.
 func (r *PgShardClusterReconciler) migrateLegacyPostgreSQLAuthSecretMetadata(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, secret *corev1.Secret) error {
-	_, hasMember := secret.Labels[owned.MemberLabel]
-	_, hasRole := secret.Labels[owned.RoleLabel]
-	if bootstrap.Member != 0 || hasMember || hasRole || secret.DeletionTimestamp != nil ||
-		!legacyPostgreSQLBootstrapName(secret.Name, legacyPostgreSQLAuthSecretPrefix(cluster.Name, bootstrap.Shard)) {
-		return nil
-	}
-	if secret.UID == "" || secret.ResourceVersion == "" {
-		return fmt.Errorf("legacy credential Secret %s lacks an API identity", secret.Name)
-	}
-	if bootstrap.SecretUID != "" && secret.UID != bootstrap.SecretUID {
-		return fmt.Errorf("legacy credential Secret %s has UID %s, expected recorded UID %s", secret.Name, secret.UID, bootstrap.SecretUID)
-	}
-	if bootstrap.SecretUID == "" && !postgresqlCredentialIsClusterFenced(secret, cluster) {
-		return fmt.Errorf("uncheckpointed legacy credential Secret %s is not controlled by the exact cluster", secret.Name)
-	}
+	const maxAttempts = 4
+	originalUID := secret.UID
+	current := secret
+	var lastConflict error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		_, hasMember := current.Labels[owned.MemberLabel]
+		_, hasRole := current.Labels[owned.RoleLabel]
+		if bootstrap.Member != 0 || hasMember || hasRole || current.DeletionTimestamp != nil ||
+			!legacyPostgreSQLBootstrapName(current.Name, legacyPostgreSQLAuthSecretPrefix(cluster.Name, bootstrap.Shard)) {
+			*secret = *current
+			return nil
+		}
+		if current.UID == "" || current.ResourceVersion == "" {
+			return fmt.Errorf("legacy credential Secret %s lacks an API identity", current.Name)
+		}
+		if bootstrap.SecretUID != "" && current.UID != bootstrap.SecretUID {
+			return fmt.Errorf("legacy credential Secret %s has UID %s, expected recorded UID %s", current.Name, current.UID, bootstrap.SecretUID)
+		}
+		if bootstrap.SecretUID == "" && !postgresqlCredentialIsClusterFenced(current, cluster) {
+			return fmt.Errorf("uncheckpointed legacy credential Secret %s is not controlled by the exact cluster", current.Name)
+		}
 
-	original := secret.DeepCopy()
-	secret.Labels = maps.Clone(secret.Labels)
-	if secret.Labels == nil {
-		secret.Labels = make(map[string]string, 1)
+		migrated := current.DeepCopy()
+		if migrated.Labels == nil {
+			migrated.Labels = make(map[string]string, 1)
+		}
+		migrated.Labels[owned.MemberLabel] = "0000"
+		if err := validatePostgreSQLAuthSecret(migrated, cluster, bootstrap, bootstrap.SecretName); err != nil {
+			return fmt.Errorf("legacy credential Secret %s is not safe to migrate: %w", migrated.Name, err)
+		}
+		if err := r.Update(ctx, migrated, client.FieldOwner(owned.ManagedByValue)); err == nil {
+			if migrated.UID != originalUID {
+				return fmt.Errorf("legacy credential Secret %s changed UID during member migration", migrated.Name)
+			}
+			*secret = *migrated
+			return nil
+		} else if !apierrors.IsConflict(err) {
+			return fmt.Errorf("migrate legacy credential Secret %s to shard %d member 0: %w", migrated.Name, bootstrap.Shard, err)
+		} else {
+			lastConflict = err
+		}
+
+		fresh := &corev1.Secret{}
+		if err := r.authoritativeReader().Get(ctx, client.ObjectKeyFromObject(secret), fresh); err != nil {
+			return fmt.Errorf("reload legacy credential Secret %s after conflict: %w", secret.Name, err)
+		}
+		if fresh.UID != originalUID {
+			return fmt.Errorf("legacy credential Secret %s changed UID during member migration", secret.Name)
+		}
+		current = fresh
 	}
-	secret.Labels[owned.MemberLabel] = "0000"
-	if err := validatePostgreSQLAuthSecret(secret, cluster, bootstrap, bootstrap.SecretName); err != nil {
-		return fmt.Errorf("legacy credential Secret %s is not safe to migrate: %w", secret.Name, err)
-	}
-	patch := client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
-	if err := r.Patch(ctx, secret, patch); err != nil {
-		return fmt.Errorf("migrate legacy credential Secret %s to shard %d member 0: %w", secret.Name, bootstrap.Shard, err)
-	}
-	if secret.UID != original.UID {
-		return fmt.Errorf("legacy credential Secret %s changed UID during member migration", secret.Name)
-	}
-	return nil
+	return fmt.Errorf("migrate legacy credential Secret %s to shard %d member 0 after %d conflicts: %w", secret.Name, bootstrap.Shard, maxAttempts, lastConflict)
 }
 
 func validatePostgreSQLAuthSecret(secret *corev1.Secret, cluster *pgshardv1alpha1.PgShardCluster, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, expectedName string) error {
