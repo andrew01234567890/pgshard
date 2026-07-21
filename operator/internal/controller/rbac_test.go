@@ -34,6 +34,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		{group: "", resource: "serviceaccounts", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "coordination.k8s.io", resource: "leases", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "pgshard.io", resource: "pgshardcatalogactivations", verbs: []string{"create", "get", "list", "watch"}},
+		{group: "pgshard.io", resource: "pgshardcatalogactivations/status", verbs: []string{"update"}},
 		{group: "rbac.authorization.k8s.io", resource: "roles", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "rbac.authorization.k8s.io", resource: "rolebindings", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "storage.k8s.io", resource: "storageclasses", verbs: []string{"list"}},
@@ -77,11 +78,14 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 			t.Errorf("cluster-wide manager role grants forbidden catalog activation verb %q", forbidden)
 		}
 	}
-	for _, subresource := range []string{"pgshardcatalogactivations/status", "pgshardcatalogactivations/finalizers"} {
-		for _, verb := range []string{"create", "delete", "get", "list", "patch", "update", "watch"} {
-			if roleAllows(role, "pgshard.io", subresource, []string{verb}) {
-				t.Errorf("cluster-wide manager role grants forbidden %s verb %q", subresource, verb)
-			}
+	for _, verb := range []string{"create", "delete", "get", "list", "patch", "watch"} {
+		if roleAllows(role, "pgshard.io", "pgshardcatalogactivations/status", []string{verb}) {
+			t.Errorf("cluster-wide manager role grants forbidden catalog activation status verb %q", verb)
+		}
+	}
+	for _, verb := range []string{"create", "delete", "get", "list", "patch", "update", "watch"} {
+		if roleAllows(role, "pgshard.io", "pgshardcatalogactivations/finalizers", []string{verb}) {
+			t.Errorf("cluster-wide manager role grants forbidden catalog activation finalizers verb %q", verb)
 		}
 	}
 }

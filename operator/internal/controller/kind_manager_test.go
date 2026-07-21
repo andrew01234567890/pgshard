@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"net/http"
 	"os"
 	"os/exec"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,6 +24,7 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -35,7 +39,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1305,13 +1311,16 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 			return false, err
 		}
 		if len(haCurrent.Status.PostgreSQLBootstraps) != int(haCluster.Spec.MembersPerShard) || len(haCurrent.Status.PostgreSQLReplicationCredentials) != 1 ||
-			len(haCurrent.Status.PostgreSQLCatalogCandidates) != int(haCluster.Spec.MembersPerShard) {
+			len(haCurrent.Status.PostgreSQLCatalogCandidates) != int(haCluster.Spec.MembersPerShard) || haCurrent.Status.CatalogActivation == nil {
 			return false, nil
 		}
 		recorded := haCurrent.Status.PostgreSQLReplicationCredentials[0]
 		catalogAccess := haCurrent.Status.CatalogAccess
 		if recorded.Shard != 0 || recorded.SecretUID == "" || !validCatalogAccessDigest(recorded.MaterialSHA256) ||
 			catalogAccess == nil || catalogAccess.SecretUID == "" || !validCatalogAccessDigest(catalogAccess.ClientSHA256) || !validCatalogAccessDigest(catalogAccess.ServerSHA256) {
+			return false, nil
+		}
+		if haCurrent.Status.CatalogActivation.Name != pgshardv1alpha1.CatalogActivationName(haCluster.Name) || haCurrent.Status.CatalogActivation.UID == "" {
 			return false, nil
 		}
 		for member, checkpoint := range haCurrent.Status.PostgreSQLCatalogCandidates {
@@ -1344,6 +1353,14 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if err := validateCheckpointedCatalogAccess(catalogAccessSecret, haCurrent, haCurrent.Status.CatalogAccess); err != nil {
 		t.Fatal(err)
 	}
+	activationCheckpoint := haCurrent.Status.CatalogActivation
+	activationCarrier := &pgshardv1alpha1.PgShardCatalogActivation{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: activationCheckpoint.Name}, activationCarrier); err != nil {
+		t.Fatal(err)
+	}
+	if activationCarrier.UID != activationCheckpoint.UID || activationCarrier.Spec.Request != nil || activationCarrier.Status.Acceptance != nil {
+		t.Fatalf("catalog activation checkpoint/carrier = checkpoint %#v carrier %#v", activationCheckpoint, activationCarrier)
+	}
 	sourceName := owned.PostgreSQLMemberStatefulSetName(haCluster.Name, 0, 0)
 	source := &appsv1.StatefulSet{}
 	if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
@@ -1358,6 +1375,9 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if _, role := source.Spec.Template.Labels[owned.RoleLabel]; role {
 		t.Fatalf("replication bootstrap source received a serving role: %#v", source.Spec.Template.Labels)
 	}
+	if source.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType {
+		t.Fatalf("replication bootstrap source update strategy = %q", source.Spec.UpdateStrategy.Type)
+	}
 	sourceAgent := source.Spec.Template.Spec.Containers[0]
 	if agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_MODE") != "replication-bootstrap-primary" ||
 		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_HBA_FILE") != "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf" ||
@@ -1366,6 +1386,57 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		source.Spec.Template.Annotations[owned.PostgreSQLGenerationDurabilityAnnotation] != "remote-apply-any-one" ||
 		source.Spec.Template.Annotations[owned.PostgreSQLSynchronousStandbysAnnotation] != "pgshard_member_0001,pgshard_member_0002" {
 		t.Fatalf("replication bootstrap source environment = %#v", sourceAgent.Env)
+	}
+	const activationJournalRoot = "/var/lib/postgresql/18/.pgshard-catalog-activation"
+	if agentEnvironmentFieldPath(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAMESPACE") != "metadata.namespace" ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME") != activationCheckpoint.Name ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_CARRIER_UID") != string(activationCheckpoint.UID) ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT") != activationJournalRoot {
+		t.Fatalf("replication bootstrap source activation environment = %#v", sourceAgent.Env)
+	}
+	if len(source.Spec.Template.Spec.InitContainers) != 2 {
+		t.Fatalf("replication bootstrap source init containers = %#v", source.Spec.Template.Spec.InitContainers)
+	}
+	activationInitializer := source.Spec.Template.Spec.InitContainers[1]
+	if activationInitializer.Name != "initialize-catalog-activation-journal" || activationInitializer.Image != sourceAgent.Image ||
+		!reflect.DeepEqual(activationInitializer.Command, []string{"bash", "-ceu", "umask 077\ninstall -d -m 0700 -- /var/lib/pgshard/catalog-activation-volume/root /var/lib/pgshard/catalog-activation-volume/root/owner\nchmod u=rwx,go=,a-s,-t -- /var/lib/pgshard/catalog-activation-volume/root /var/lib/pgshard/catalog-activation-volume/root/owner"}) ||
+		activationInitializer.SecurityContext == nil || activationInitializer.SecurityContext.RunAsUser == nil || *activationInitializer.SecurityContext.RunAsUser != 999 ||
+		activationInitializer.SecurityContext.RunAsGroup == nil || *activationInitializer.SecurityContext.RunAsGroup != 999 ||
+		activationInitializer.SecurityContext.RunAsNonRoot == nil || !*activationInitializer.SecurityContext.RunAsNonRoot ||
+		activationInitializer.SecurityContext.AllowPrivilegeEscalation == nil || *activationInitializer.SecurityContext.AllowPrivilegeEscalation ||
+		activationInitializer.SecurityContext.ReadOnlyRootFilesystem == nil || !*activationInitializer.SecurityContext.ReadOnlyRootFilesystem ||
+		activationInitializer.SecurityContext.Capabilities == nil || !reflect.DeepEqual(activationInitializer.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) ||
+		len(activationInitializer.VolumeMounts) != 1 || activationInitializer.VolumeMounts[0] != (corev1.VolumeMount{Name: "catalog-activation-journal", MountPath: "/var/lib/pgshard/catalog-activation-volume"}) {
+		t.Fatalf("replication bootstrap source activation initializer = %#v", activationInitializer)
+	}
+	activationVolume := podVolumeByName(t, source.Spec.Template.Spec.Volumes, "catalog-activation-journal").EmptyDir
+	if activationVolume == nil || activationVolume.Medium != "" || activationVolume.SizeLimit == nil || activationVolume.SizeLimit.Cmp(resource.MustParse("1Mi")) != 0 {
+		t.Fatalf("replication bootstrap source activation volume = %#v", activationVolume)
+	}
+	activationMount := corev1.VolumeMount{Name: "catalog-activation-journal", MountPath: activationJournalRoot, SubPath: "root"}
+	if !slices.Contains(sourceAgent.VolumeMounts, activationMount) {
+		t.Fatalf("replication bootstrap source activation mount = %#v", sourceAgent.VolumeMounts)
+	}
+	if source.Spec.Template.Spec.SecurityContext == nil || source.Spec.Template.Spec.SecurityContext.SeccompProfile == nil || source.Spec.Template.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Fatalf("replication bootstrap source Pod security = %#v", source.Spec.Template.Spec.SecurityContext)
+	}
+	apiProjection := podVolumeByName(t, source.Spec.Template.Spec.Volumes, "kubernetes-api").Projected
+	if apiProjection == nil || apiProjection.DefaultMode == nil || *apiProjection.DefaultMode != 0o440 || len(apiProjection.Sources) != 3 ||
+		apiProjection.Sources[0].ServiceAccountToken == nil || apiProjection.Sources[0].ServiceAccountToken.ExpirationSeconds == nil || *apiProjection.Sources[0].ServiceAccountToken.ExpirationSeconds != 600 ||
+		!podContainerHasVolumeMount(sourceAgent.VolumeMounts, "kubernetes-api", true) {
+		t.Fatalf("replication bootstrap source projected API token = volume %#v mounts %#v", apiProjection, sourceAgent.VolumeMounts)
+	}
+	agentRole := &rbacv1.Role{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: owned.PostgreSQLAgentServiceAccountName(haCluster.Name, 0)}, agentRole); err != nil {
+		t.Fatal(err)
+	}
+	wantAgentRules := []rbacv1.PolicyRule{
+		{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{owned.PostgreSQLWritableLeaseName(haCluster.Name, 0)}, Verbs: []string{"get", "update"}},
+		{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardcatalogactivations"}, ResourceNames: []string{activationCheckpoint.Name}, Verbs: []string{"get"}},
+		{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardcatalogactivations/status"}, ResourceNames: []string{activationCheckpoint.Name}, Verbs: []string{"update"}},
+	}
+	if !reflect.DeepEqual(agentRole.Rules, wantAgentRules) {
+		t.Fatalf("replication bootstrap source Role = %#v, want %#v", agentRole.Rules, wantAgentRules)
 	}
 	if podContainerHasNamedVolumeMount(sourceAgent.VolumeMounts, "replication-credential") {
 		t.Fatalf("replication bootstrap source agent retained the replication credential: %#v", sourceAgent.VolumeMounts)
@@ -1400,6 +1471,11 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	if podReady(sourcePod) || sourcePod.Status.ContainerStatuses[0].Ready {
 		t.Fatalf("replication bootstrap source became routable: conditions=%#v containers=%#v", sourcePod.Status.Conditions, sourcePod.Status.ContainerStatuses)
 	}
+	kindRESTConfig := ctrl.GetConfigOrDie()
+	kindHTTPClient, err := rest.HTTPClientFor(kindRESTConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var sourceStatus struct {
 		PostgresProcess string `json:"postgres_process"`
 	}
@@ -1410,6 +1486,207 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("wait for running replication bootstrap source: %v; status=%#v", err, sourceStatus)
 	}
+	type catalogActivationCapability struct {
+		SchemaVersion           string                                `json:"schemaVersion"`
+		Capability              string                                `json:"capability"`
+		RequestSchemaVersion    string                                `json:"requestSchemaVersion"`
+		AcceptanceSchemaVersion string                                `json:"acceptanceSchemaVersion"`
+		Persistence             string                                `json:"persistence"`
+		Cluster                 struct{ Name, UID string }            `json:"cluster"`
+		Carrier                 struct{ Namespace, Name, UID string } `json:"carrier"`
+		Target                  struct {
+			Shard      int32  `json:"shard"`
+			Member     int32  `json:"member"`
+			InstanceID string `json:"instanceId"`
+			PodName    string `json:"podName"`
+			PodUID     string `json:"podUID"`
+		} `json:"target"`
+	}
+	activationCapabilityPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/capabilities/catalog-activation", namespace.Name, sourcePodName)
+	var activationCapability catalogActivationCapability
+	var lastActivationCapabilityOutput string
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		status, output, err := kindAPIRequest(ctx, kindHTTPClient, kindRESTConfig.Host, http.MethodGet, activationCapabilityPath, nil)
+		lastActivationCapabilityOutput = string(output)
+		return err == nil && status == http.StatusOK && json.Unmarshal(output, &activationCapability) == nil, nil
+	}); err != nil {
+		t.Fatalf("wait for catalog activation capability: %v; last output=%q", err, lastActivationCapabilityOutput)
+	}
+	if activationCapability.SchemaVersion != "pgshard.agent.catalog-activation-capability.v1" ||
+		activationCapability.Capability != "pgshard.catalog-activation-consumer.v1" ||
+		activationCapability.RequestSchemaVersion != pgshardv1alpha1.CatalogActivationRequestVersion ||
+		activationCapability.AcceptanceSchemaVersion != pgshardv1alpha1.CatalogActivationAcceptanceVersion ||
+		activationCapability.Persistence != pgshardv1alpha1.CatalogActivationPersistenceFsync ||
+		activationCapability.Cluster.Name != haCluster.Name || activationCapability.Cluster.UID != string(haCurrent.UID) ||
+		activationCapability.Carrier.Namespace != namespace.Name || activationCapability.Carrier.Name != activationCheckpoint.Name || activationCapability.Carrier.UID != string(activationCheckpoint.UID) ||
+		activationCapability.Target.Shard != 0 || activationCapability.Target.Member != 0 || activationCapability.Target.InstanceID != sourcePodName ||
+		activationCapability.Target.PodName != sourcePodName || activationCapability.Target.PodUID != string(sourcePod.UID) {
+		t.Fatalf("catalog activation capability = %#v", activationCapability)
+	}
+	journalMetadata := strings.TrimSpace(runKubectl(
+		t, ctx, "--namespace", namespace.Name, "exec", sourcePodName, "--container=postgresql", "--",
+		"stat", "-c", "%u:%g:%a", activationJournalRoot, activationJournalRoot+"/owner", activationJournalRoot+"/owner/journal",
+	))
+	if journalMetadata != "999:999:700\n999:999:700\n999:999:700" {
+		t.Fatalf("catalog activation journal ownership/mode = %q", journalMetadata)
+	}
+	journalFilesystem := strings.TrimSpace(runKubectl(
+		t, ctx, "--namespace", namespace.Name, "exec", sourcePodName, "--container=postgresql", "--",
+		"stat", "-f", "-c", "%T", activationJournalRoot,
+	))
+	if journalFilesystem == "tmpfs" {
+		t.Fatalf("catalog activation journal unexpectedly uses tmpfs: %q", journalFilesystem)
+	}
+	assertCanI := func(serviceAccount, verb, resourceName, subresource, want string) {
+		t.Helper()
+		arguments := []string{
+			"--namespace", namespace.Name,
+			"auth", "can-i", verb, resourceName,
+			"--as=system:serviceaccount:" + namespace.Name + ":" + serviceAccount,
+		}
+		if subresource != "" {
+			arguments = append(arguments, "--subresource="+subresource)
+		}
+		if got := strings.TrimSpace(runKubectl(t, ctx, arguments...)); got != want {
+			t.Fatalf("kubectl auth can-i %s %s as %s = %q, want %q", verb, resourceName, serviceAccount, got, want)
+		}
+	}
+	sourceServiceAccount := owned.PostgreSQLAgentServiceAccountName(haCluster.Name, 0)
+	carrierResource := "pgshardcatalogactivations.pgshard.io/" + activationCheckpoint.Name
+	assertCanI(sourceServiceAccount, "get", carrierResource, "", "yes")
+	assertCanI(sourceServiceAccount, "get", "pgshardcatalogactivations.pgshard.io/foreign-catalog-activation", "", "no")
+	assertCanI(sourceServiceAccount, "list", "pgshardcatalogactivations.pgshard.io", "", "no")
+	assertCanI(sourceServiceAccount, "update", carrierResource, "", "no")
+	assertCanI(sourceServiceAccount, "patch", carrierResource, "status", "no")
+	assertCanI(sourceServiceAccount, "update", carrierResource, "status", "yes")
+	standbyServiceAccount := owned.PostgreSQLStandbyServiceAccountName(haCluster.Name, 0)
+	assertCanI(standbyServiceAccount, "get", carrierResource, "", "no")
+	assertCanI(standbyServiceAccount, "update", carrierResource, "status", "no")
+	kubernetesClient, err := kubernetes.NewForConfig(kindRESTConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenLifetimeSeconds := int64(600)
+	boundToken, err := kubernetesClient.CoreV1().ServiceAccounts(namespace.Name).CreateToken(ctx, sourceServiceAccount, &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{
+			BoundObjectRef: &authenticationv1.BoundObjectReference{
+				Kind:       "Pod",
+				APIVersion: "v1",
+				Name:       sourcePod.Name,
+				UID:        sourcePod.UID,
+			},
+			ExpirationSeconds: &tokenLifetimeSeconds,
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundTokenConfig := rest.CopyConfig(kindRESTConfig)
+	boundTokenConfig.BearerToken = boundToken.Status.Token
+	boundTokenConfig.BearerTokenFile = ""
+	boundTokenConfig.Username = ""
+	boundTokenConfig.Password = ""
+	boundTokenConfig.CertFile = ""
+	boundTokenConfig.KeyFile = ""
+	boundTokenConfig.CertData = nil
+	boundTokenConfig.KeyData = nil
+	boundTokenConfig.ExecProvider = nil
+	boundTokenConfig.AuthProvider = nil
+	boundTokenConfig.Impersonate = rest.ImpersonationConfig{}
+	boundTokenConfig.Transport = nil
+	boundTokenConfig.WrapTransport = nil
+	boundTokenHTTPClient, err := rest.HTTPClientFor(boundTokenConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	carrierAPIPath := fmt.Sprintf("/apis/%s/%s/namespaces/%s/pgshardcatalogactivations/%s", pgshardv1alpha1.GroupVersion.Group, pgshardv1alpha1.GroupVersion.Version, namespace.Name, activationCheckpoint.Name)
+	status, body, err := kindAPIRequest(ctx, boundTokenHTTPClient, boundTokenConfig.Host, http.MethodGet, carrierAPIPath, nil)
+	boundTokenCarrier := &pgshardv1alpha1.PgShardCatalogActivation{}
+	if err != nil || status != http.StatusOK || json.Unmarshal(body, boundTokenCarrier) != nil || boundTokenCarrier.UID != activationCheckpoint.UID {
+		t.Fatalf("Pod-bound source token exact carrier GET = status %d error %v body %q", status, err, body)
+	}
+	foreignCarrierAPIPath := fmt.Sprintf("/apis/%s/%s/namespaces/%s/pgshardcatalogactivations/foreign-catalog-activation", pgshardv1alpha1.GroupVersion.Group, pgshardv1alpha1.GroupVersion.Version, namespace.Name)
+	if status, body, err := kindAPIRequest(ctx, boundTokenHTTPClient, boundTokenConfig.Host, http.MethodGet, foreignCarrierAPIPath, nil); err != nil || status != http.StatusForbidden {
+		t.Fatalf("Pod-bound source token foreign carrier GET = status %d error %v body %q", status, err, body)
+	}
+	if status, body, err := kindAPIRequest(ctx, boundTokenHTTPClient, boundTokenConfig.Host, http.MethodPut, carrierAPIPath, []byte(`{}`)); err != nil || status != http.StatusForbidden {
+		t.Fatalf("Pod-bound source token parent carrier update = status %d error %v body %q", status, err, body)
+	}
+
+	sourcePodUIDBeforeConsumerFailure := sourcePod.UID
+	sourceContainerIDBeforeConsumerFailure := sourcePod.Status.ContainerStatuses[0].ContainerID
+	sourceRestartsBeforeConsumerFailure := sourcePod.Status.ContainerStatuses[0].RestartCount
+	managerStoppedForConsumerFailure := true
+	t.Cleanup(func() {
+		if !managerStoppedForConsumerFailure {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cleanupCancel()
+		output, err := exec.CommandContext(cleanupCtx, "kubectl", "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1").CombinedOutput()
+		if err != nil {
+			t.Errorf("restore manager after catalog activation failure test: %v\n%s", err, output)
+			return
+		}
+		waitForManagerReplicas(t, cleanupCtx, kubeClient, 1)
+	})
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=0")
+	waitForManagerReplicas(t, ctx, kubeClient, 0)
+	roleKey := types.NamespacedName{Namespace: namespace.Name, Name: sourceServiceAccount}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentRole := &rbacv1.Role{}
+		if err := kubeClient.Get(ctx, roleKey, currentRole); err != nil {
+			return err
+		}
+		currentRole.Rules = []rbacv1.PolicyRule{wantAgentRules[0], wantAgentRules[2]}
+		return kubeClient.Update(ctx, currentRole)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var consumerUnavailableOutput string
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		status, output, err := kindAPIRequest(ctx, kindHTTPClient, kindRESTConfig.Host, http.MethodGet, activationCapabilityPath, nil)
+		consumerUnavailableOutput = string(output)
+		return err == nil && status == http.StatusServiceUnavailable, nil
+	}); err != nil {
+		t.Fatalf("wait for isolated catalog activation 503: %v; last output=%q", err, consumerUnavailableOutput)
+	}
+	var statusDuringConsumerFailure struct {
+		PostgresProcess string `json:"postgres_process"`
+	}
+	if output, err := exec.CommandContext(ctx, "kubectl", "get", "--raw", sourceStatusPath).CombinedOutput(); err != nil || json.Unmarshal(output, &statusDuringConsumerFailure) != nil || statusDuringConsumerFailure.PostgresProcess != sourceStatus.PostgresProcess {
+		t.Fatalf("catalog activation failure changed agent status: error=%v output=%q status=%#v", err, output, statusDuringConsumerFailure)
+	}
+	if err := kubeClient.Get(ctx, sourceKey, sourcePod); err != nil {
+		t.Fatal(err)
+	}
+	if sourcePod.UID != sourcePodUIDBeforeConsumerFailure || sourcePod.Status.Phase != corev1.PodRunning || len(sourcePod.Status.ContainerStatuses) != 1 ||
+		sourcePod.Status.ContainerStatuses[0].State.Running == nil || sourcePod.Status.ContainerStatuses[0].ContainerID != sourceContainerIDBeforeConsumerFailure ||
+		sourcePod.Status.ContainerStatuses[0].RestartCount != sourceRestartsBeforeConsumerFailure || podReady(sourcePod) || sourcePod.Status.ContainerStatuses[0].Ready {
+		t.Fatalf("catalog activation failure changed process/readiness lifecycle: %#v", sourcePod.Status)
+	}
+	if output, err := exec.CommandContext(ctx, "kubectl", "--namespace", namespace.Name, "exec", sourcePodName, "--container=postgresql", "--", "pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432").CombinedOutput(); err == nil {
+		t.Fatalf("catalog activation failure exposed PostgreSQL TCP: %s", output)
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentRole := &rbacv1.Role{}
+		if err := kubeClient.Get(ctx, roleKey, currentRole); err != nil {
+			return err
+		}
+		currentRole.Rules = wantAgentRules
+		return kubeClient.Update(ctx, currentRole)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		status, output, err := kindAPIRequest(ctx, kindHTTPClient, kindRESTConfig.Host, http.MethodGet, activationCapabilityPath, nil)
+		return err == nil && status == http.StatusOK && json.Unmarshal(output, &activationCapability) == nil, nil
+	}); err != nil {
+		t.Fatalf("wait for catalog activation consumer recovery: %v", err)
+	}
+	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1")
+	waitForManagerReplicas(t, ctx, kubeClient, 1)
+	managerStoppedForConsumerFailure = false
 	replicationState := strings.TrimSpace(runKubectl(
 		t,
 		ctx,
@@ -1424,6 +1701,11 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatalf("replication bootstrap materialized state = %q", replicationState)
 	}
 	assertKINDPhysicalStandbys(t, ctx, kubeClient, haCurrent, sourcePodName)
+	standbyPodName := owned.PostgreSQLMemberStatefulSetName(haCluster.Name, 0, 1) + "-0"
+	standbyActivationPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/capabilities/catalog-activation", namespace.Name, standbyPodName)
+	if status, output, err := kindAPIRequest(ctx, kindHTTPClient, kindRESTConfig.Host, http.MethodGet, standbyActivationPath, nil); err != nil || status != http.StatusNotFound {
+		t.Fatalf("standby catalog activation endpoint = status %d error %v output %q, want 404", status, err, output)
+	}
 	assertKINDOrchestratorObservationRBAC(t, ctx, haCurrent)
 	assertKINDOrchestratorBindsControllerEndpoints(t, ctx, kubeClient, haCurrent)
 	assertKINDSynchronousGenerationWaitsForRemoteReplay(t, ctx, kubeClient, haCurrent, sourcePodName)
@@ -3094,6 +3376,38 @@ func agentEnvironmentValue(environment []corev1.EnvVar, name string) string {
 		}
 	}
 	return ""
+}
+
+func agentEnvironmentFieldPath(environment []corev1.EnvVar, name string) string {
+	for _, variable := range environment {
+		if variable.Name == name && variable.ValueFrom != nil && variable.ValueFrom.FieldRef != nil {
+			return variable.ValueFrom.FieldRef.FieldPath
+		}
+	}
+	return ""
+}
+
+func kindAPIRequest(ctx context.Context, httpClient *http.Client, host, method, path string, body []byte) (int, []byte, error) {
+	request, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(host, "/")+path, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(body) != 0 {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 1_048_577))
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(responseBody) > 1_048_576 {
+		return 0, nil, fmt.Errorf("Kubernetes API response exceeds one MiB")
+	}
+	return response.StatusCode, responseBody, nil
 }
 
 func podVolumeByName(t *testing.T, volumes []corev1.Volume, name string) corev1.VolumeSource {
