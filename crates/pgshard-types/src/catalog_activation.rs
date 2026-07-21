@@ -13,12 +13,115 @@ use crate::{ShardId, writable_generation::DurableWritableGeneration};
 /// Version of the fixed-order catalog-activation request encoding.
 pub const CATALOG_ACTIVATION_REQUEST_VERSION: &str = "pgshard.catalog-activation-request.v1";
 
+/// Version of the agent's separately advertised consumer capability.
+pub const CATALOG_ACTIVATION_CAPABILITY_VERSION: &str =
+    "pgshard.agent.catalog-activation-capability.v1";
+
+/// Name of the inert journal-and-acknowledgement consumer capability.
+pub const CATALOG_ACTIVATION_CONSUMER_VERSION: &str = "pgshard.catalog-activation-consumer.v1";
+
+/// Version of the fsync-backed carrier acceptance record.
+pub const CATALOG_ACTIVATION_ACCEPTANCE_VERSION: &str = "pgshard.catalog-activation-acceptance.v1";
+
+/// Persistence contract used by a durable catalog-activation acceptance.
+pub const CATALOG_ACTIVATION_FSYNC_PERSISTENCE: &str = "fsync";
+
 /// Domain separator for the fixed-order request digest.
 pub const CATALOG_ACTIVATION_REQUEST_DIGEST_DOMAIN: &str = "pgshard-catalog-activation-request-v1";
 
 const POSTGRESQL_WORKLOAD_PREFIX_MAXIMUM: usize = 42;
 const POSTGRESQL_WORKLOAD_DIGEST_BYTES: usize = 12;
 const PROCESS_INCARNATION_HEX_LENGTH: usize = 24;
+
+/// Exact cluster identity advertised by the target agent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogActivationCapabilityCluster {
+    /// `PgShardCluster` name.
+    pub name: String,
+    /// API-assigned `PgShardCluster` UID.
+    pub uid: String,
+}
+
+/// Exact carrier identity advertised by the target agent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogActivationCapabilityCarrier {
+    /// Carrier namespace.
+    pub namespace: String,
+    /// Fixed carrier name.
+    pub name: String,
+    /// API-assigned carrier UID.
+    pub uid: String,
+}
+
+/// Exact shard-zero member-zero target identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogActivationCapabilityTarget {
+    /// Physical shard ordinal. This capability supports only zero.
+    pub shard: u32,
+    /// Physical member ordinal. This capability supports only zero.
+    pub member: u32,
+    /// Stable target instance identity.
+    #[serde(rename = "instanceId")]
+    pub instance_id: String,
+    /// Target Pod name.
+    pub pod_name: String,
+    /// API-assigned target Pod UID.
+    #[serde(rename = "podUID")]
+    pub pod_uid: String,
+}
+
+/// Versioned, non-authoritative advertisement for the dormant consumer.
+///
+/// This document proves only that the exact carrier was read after local
+/// journal recovery. It grants no serving, routing, SQL, process, or fencing
+/// authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogActivationCapability {
+    /// Schema of this response.
+    pub schema_version: String,
+    /// Implemented consumer contract.
+    pub capability: String,
+    /// Accepted request schema.
+    pub request_schema_version: String,
+    /// Emitted acceptance schema.
+    pub acceptance_schema_version: String,
+    /// Local acceptance persistence contract.
+    pub persistence: String,
+    /// Exact cluster identity.
+    pub cluster: CatalogActivationCapabilityCluster,
+    /// Exact carrier identity.
+    pub carrier: CatalogActivationCapabilityCarrier,
+    /// Exact target identity.
+    pub target: CatalogActivationCapabilityTarget,
+}
+
+/// Fsync-backed acceptance stored in the carrier status.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogActivationAcceptance {
+    /// Acceptance schema.
+    pub schema_version: String,
+    /// Exact carrier UID.
+    #[serde(rename = "carrierUID")]
+    pub carrier_uid: String,
+    /// Digest of the exact durable request.
+    #[serde(rename = "requestSHA256")]
+    pub request_sha256: String,
+    /// Exact accepting target Pod name.
+    pub target_pod_name: String,
+    /// API-assigned accepting target Pod UID.
+    #[serde(rename = "targetPodUID")]
+    pub target_pod_uid: String,
+    /// Persistence contract, always `fsync` in v1.
+    pub persistence: String,
+    /// Diagnostic original persistence time as canonical unsigned decimal.
+    #[serde(rename = "persistedAtUnixMS")]
+    pub persisted_at_unix_ms: String,
+}
 
 fn postgresql_workload_prefix(cluster: &str) -> String {
     if cluster.len() < POSTGRESQL_WORKLOAD_PREFIX_MAXIMUM {
@@ -30,6 +133,21 @@ fn postgresql_workload_prefix(cluster: &str) -> String {
         "{}-{suffix}",
         &cluster[..POSTGRESQL_WORKLOAD_PREFIX_MAXIMUM - suffix.len() - 1]
     )
+}
+
+/// Returns the exact Pod name for one singleton `PostgreSQL` member workload.
+///
+/// Member zero retains the original shard `StatefulSet` name. Additional stable
+/// members use the operator's `-mNNNN` suffix before the `StatefulSet` Pod
+/// ordinal.
+#[must_use]
+pub fn postgresql_member_pod_name(cluster: &str, shard: u32, member: u32) -> String {
+    let workload = format!("{}-shard-{shard:04}", postgresql_workload_prefix(cluster));
+    if member == 0 {
+        format!("{workload}-0")
+    } else {
+        format!("{workload}-m{member:04}-0")
+    }
 }
 
 fn postgresql_writable_lease_name(cluster: &str, shard: u32) -> String {
@@ -1001,6 +1119,22 @@ mod tests {
         assert_eq!(
             postgresql_writable_lease_name(&"a".repeat(50), 0),
             "aaaaaaaaaaaaaaaaa-160b4e433e384e05e537dc59-shard-0000-term"
+        );
+    }
+
+    #[test]
+    fn member_pod_name_matches_operator_topology() {
+        assert_eq!(
+            postgresql_member_pod_name("demo", 0, 0),
+            "demo-shard-0000-0"
+        );
+        assert_eq!(
+            postgresql_member_pod_name("demo", 0, 1),
+            "demo-shard-0000-m0001-0"
+        );
+        assert_eq!(
+            postgresql_member_pod_name(&"a".repeat(42), 0, 0),
+            "aaaaaaaaaaaaaaaaa-7a538607fdaab9296995929f-shard-0000-0"
         );
     }
 
