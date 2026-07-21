@@ -1033,7 +1033,9 @@ pub enum WritableLeaseError {
 }
 
 impl WritableLeaseError {
-    fn is_permanent(&self) -> bool {
+    /// Returns whether retrying without external intervention cannot succeed.
+    #[must_use]
+    pub fn is_permanent(&self) -> bool {
         match self {
             Self::Kubernetes { source, .. } => matches!(
                 source.as_ref(),
