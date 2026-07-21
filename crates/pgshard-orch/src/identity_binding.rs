@@ -1067,6 +1067,8 @@ mod tests {
                 replication_correlation: ReplicationCorrelationSummary {
                     correlated_shards: 1,
                     shard_zero_correlated: true,
+                    acknowledged_correlated_shards: 1,
+                    shard_zero_target_fence_acknowledged: true,
                 },
             })
         }
@@ -2074,6 +2076,8 @@ mod tests {
             replication_correlation: ReplicationCorrelationSummary {
                 correlated_shards: 1,
                 shard_zero_correlated: true,
+                acknowledged_correlated_shards: 1,
+                shard_zero_target_fence_acknowledged: true,
             },
         };
         observe_once_with_collector(&store, &collector, &targets, &state, freshness)
@@ -2091,6 +2095,13 @@ mod tests {
         );
         assert_eq!(
             state.snapshot().agent_status.replication_correlated_shards,
+            1
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .agent_status
+                .target_fence_acknowledged_shards,
             1
         );
         assert_eq!(state.readiness(), ready);
