@@ -21,6 +21,8 @@ use tokio::task::JoinSet;
 pub(crate) const AGENT_STATUS_SCHEMA_VERSION: &str = "pgshard.agent.status.v1";
 /// Maximum number of topology targets in one bounded collection.
 pub(crate) const MAXIMUM_AGENT_STATUS_TARGETS: usize = 128 * 5;
+/// Maximum exact members retained in the private shard-zero proof.
+pub(crate) const MAXIMUM_SHARD_ZERO_REPLICATION_PROOF_MEMBERS: usize = 5;
 /// Maximum simultaneous status connections from one orchestrator.
 pub(crate) const MAXIMUM_CONCURRENT_AGENT_STATUS_REQUESTS: usize = 16;
 /// Maximum accepted response header count.
@@ -69,12 +71,15 @@ pub(crate) struct AgentStatusQuery {
     pub(crate) expected: AgentStatusExpectation,
 }
 
-/// Bounded summary of one complete collection. Raw status is discarded.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Bounded result of one complete collection. Raw status is discarded.
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AgentStatusCollection {
     pub(crate) member_count: usize,
     pub(crate) earliest_receipt: Instant,
     pub(crate) replication_correlation: ReplicationCorrelationSummary,
+    /// Request-local exact evidence. This is never serialized or published as
+    /// topology status and confers no serving or writable authority.
+    pub(crate) shard_zero_replication_proof: Option<ShardZeroReplicationProof>,
 }
 
 /// Bounded shard-level result retained after raw replication evidence is
@@ -89,11 +94,93 @@ pub(crate) struct ReplicationCorrelationSummary {
     pub(crate) shard_zero_remote_apply_witnessed: bool,
 }
 
+/// Exact Kubernetes and `PostgreSQL` process identity for one proof member.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ReplicationProofMemberIdentity {
+    pub(crate) cluster_id: String,
+    pub(crate) cluster_uid: String,
+    pub(crate) shard_id: u32,
+    pub(crate) member_ordinal: u32,
+    pub(crate) instance_id: String,
+    pub(crate) pod_uid: String,
+    pub(crate) postmaster_pid: u32,
+    pub(crate) boot_id: String,
+}
+
+/// Source-side replication coordinate and fence evidence.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ShardZeroSourceReplicationProof {
+    pub(crate) member: ReplicationProofMemberIdentity,
+    pub(crate) system_identifier: u64,
+    pub(crate) timeline: u32,
+    pub(crate) canonical_generation_identity: String,
+    pub(crate) generation_barrier_lsn: u64,
+    pub(crate) target_fence_acknowledgement: TargetFenceAcknowledgementProof,
+}
+
+/// Standby-side replication coordinate and WAL positions.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ShardZeroStandbyReplicationProof {
+    pub(crate) member: ReplicationProofMemberIdentity,
+    pub(crate) source_instance_id: String,
+    pub(crate) member_slot_name: String,
+    pub(crate) system_identifier: u64,
+    pub(crate) timeline: u32,
+    pub(crate) canonical_generation_identity: String,
+    pub(crate) generation_barrier_lsn: u64,
+    pub(crate) receive_lsn: u64,
+    pub(crate) replay_lsn: u64,
+}
+
+/// Exact source acknowledgement whose shape and validity were checked.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct TargetFenceAcknowledgementProof {
+    pub(crate) observed_at_unix_ms: u64,
+    pub(crate) canonical_generation_identity: String,
+    pub(crate) deadline_boottime_ns: u64,
+    pub(crate) remaining_validity_at_ack_ms: u64,
+    pub(crate) remaining_validity_at_report_ms: u64,
+    pub(crate) boot_id: String,
+    pub(crate) postmaster_pid: u32,
+    pub(crate) control_backend_pid: u32,
+}
+
+/// Deterministically selected source-qualified remote-apply witness.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RemoteApplyWitnessProof {
+    pub(crate) member: ReplicationProofMemberIdentity,
+    pub(crate) member_slot_name: String,
+    pub(crate) system_identifier: u64,
+    pub(crate) timeline: u32,
+    pub(crate) canonical_generation_identity: String,
+    pub(crate) generation_barrier_lsn: u64,
+    pub(crate) receive_lsn: u64,
+    pub(crate) replay_lsn: u64,
+}
+
+/// Exact Kubernetes Lease incarnation bracketed around the collection.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct WritableLeaseProofIdentity {
+    pub(crate) name: String,
+    pub(crate) uid: String,
+}
+
+/// Bounded, exact, non-serializable shard-zero evidence. This is diagnostic
+/// input only: possession of it never grants mutation, routing, promotion, or
+/// writable authority.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ShardZeroReplicationProof {
+    pub(crate) writable_lease: WritableLeaseProofIdentity,
+    pub(crate) source: ShardZeroSourceReplicationProof,
+    pub(crate) standbys: Vec<ShardZeroStandbyReplicationProof>,
+    pub(crate) remote_apply_witness: RemoteApplyWitnessProof,
+}
+
 /// Minimal, ephemeral replication facts needed to correlate one shard.
 ///
 /// These values exist only inside one bounded collection. The returned
-/// collection deliberately retains only bounded shard counts and shard-zero
-/// booleans alongside member count and receipt time.
+/// collection retains the pre-existing bounded summary and, only for a fully
+/// proved shard zero, a bounded private exact proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MemberReplicationEvidence {
     Source {
@@ -101,6 +188,7 @@ enum MemberReplicationEvidence {
         timeline: u32,
         generation_identity: String,
         generation_barrier_lsn: u64,
+        configured_standby_slot_names: Vec<String>,
         qualified_remote_apply_candidates: Vec<String>,
     },
     Standby {
@@ -115,18 +203,44 @@ enum MemberReplicationEvidence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CollectedAgentStatus {
+    cluster_id: String,
+    cluster_uid: String,
     shard_id: u32,
     member_ordinal: u32,
+    instance_id: String,
+    pod_uid: String,
+    source_instance_id: String,
+    writable_lease_name: String,
+    writable_lease_uid: String,
     receipt: Instant,
+    postgres_process_identity: Option<CollectedPostgresProcessIdentity>,
     replication: Option<MemberReplicationEvidence>,
-    target_fence_acknowledged: bool,
+    target_fence_acknowledgement: Option<CollectedTargetFenceAcknowledgement>,
 }
 
 /// Fully validated bounded facts retained for shard-level correlation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedAgentStatus {
     replication: Option<MemberReplicationEvidence>,
-    target_fence_acknowledged: bool,
+    target_fence_acknowledgement: Option<CollectedTargetFenceAcknowledgement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CollectedPostgresProcessIdentity {
+    postmaster_pid: u32,
+    boot_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CollectedTargetFenceAcknowledgement {
+    observed_at_unix_ms: u64,
+    generation_identity: String,
+    deadline_boottime_ns: u64,
+    remaining_validity_at_ack_ms: u64,
+    remaining_validity_at_report_ms: u64,
+    boot_id: String,
+    postmaster_pid: u32,
+    control_backend_pid: u32,
 }
 
 /// Collects every status with a fixed global concurrency bound.
@@ -152,12 +266,13 @@ pub(crate) async fn collect_agent_statuses(
         .map(|observation| observation.receipt)
         .min()
         .ok_or(AgentStatusError::InvalidTargetSet)?;
-    let replication_correlation = validate_replication_correlation(&observations)?;
+    let replication = validate_replication_collection(&observations)?;
 
     Ok(AgentStatusCollection {
         member_count,
         earliest_receipt,
-        replication_correlation,
+        replication_correlation: replication.summary,
+        shard_zero_replication_proof: replication.shard_zero_proof,
     })
 }
 
@@ -239,12 +354,28 @@ async fn collect_one_inner(
     let body = read_bounded_response(&mut stream).await?;
     let status: AgentStatusV1 = serde_json::from_slice(&body)?;
     let validated = validate_status(&status, &query.expected)?;
+    let postgres_process_identity =
+        status
+            .postgres_process_identity
+            .as_ref()
+            .map(|process| CollectedPostgresProcessIdentity {
+                postmaster_pid: process.postmaster_pid,
+                boot_id: process.boot_id.clone(),
+            });
     Ok(CollectedAgentStatus {
+        cluster_id: query.expected.cluster_id,
+        cluster_uid: query.expected.cluster_uid,
         shard_id: query.expected.shard_id,
         member_ordinal: query.expected.member_ordinal,
+        instance_id: query.expected.instance_id,
+        pod_uid: query.expected.pod_uid,
+        source_instance_id: query.expected.source_instance_id,
+        writable_lease_name: query.expected.writable_lease.name,
+        writable_lease_uid: query.expected.writable_lease.uid,
         receipt: Instant::now(),
+        postgres_process_identity,
         replication: validated.replication,
-        target_fence_acknowledged: validated.target_fence_acknowledged,
+        target_fence_acknowledgement: validated.target_fence_acknowledgement,
     })
 }
 
@@ -588,6 +719,7 @@ struct AgentStatusV1 {
     replication_evidence: Option<ReplicationEvidenceWire>,
     activation_config: Option<ActivationConfigWire>,
     target_fence_acknowledgement: Option<TargetFenceAcknowledgementWire>,
+    target_fence_remaining_validity_at_report_ms: Option<CanonicalU64>,
     postgres_process_identity: Option<PostgresProcessIdentityWire>,
 }
 
@@ -630,7 +762,7 @@ fn validate_status(
         validate_quarantine(status, expected)?;
         return Ok(ValidatedAgentStatus {
             replication: None,
-            target_fence_acknowledged: false,
+            target_fence_acknowledgement: None,
         });
     }
     let activation = status
@@ -653,12 +785,31 @@ fn validate_status(
     } else {
         validate_standby(status, activation, expected)?
     };
-    let target_fence_acknowledged = source
+    let target_fence_acknowledgement = if source
         && status.postgres_process == PostgresProcessStateWire::RunningReplicationBootstrap
-        && status.target_fence_acknowledgement.is_some();
+    {
+        status
+            .target_fence_acknowledgement
+            .as_ref()
+            .zip(status.target_fence_remaining_validity_at_report_ms)
+            .map(
+                |(ack, remaining_validity_at_report_ms)| CollectedTargetFenceAcknowledgement {
+                    observed_at_unix_ms: ack.observed_at_unix_ms.0,
+                    generation_identity: ack.generation_identity.clone(),
+                    deadline_boottime_ns: ack.deadline_boottime_ns.0,
+                    remaining_validity_at_ack_ms: ack.remaining_validity_at_ack_ms.0,
+                    remaining_validity_at_report_ms: remaining_validity_at_report_ms.0,
+                    boot_id: ack.boot_id.clone(),
+                    postmaster_pid: ack.postmaster_pid,
+                    control_backend_pid: ack.control_backend_pid,
+                },
+            )
+    } else {
+        None
+    };
     Ok(ValidatedAgentStatus {
         replication,
-        target_fence_acknowledged,
+        target_fence_acknowledgement,
     })
 }
 
@@ -673,6 +824,9 @@ fn validate_quarantine(
         || status.postgres.is_some()
         || status.replication_evidence.is_some()
         || status.target_fence_acknowledgement.is_some()
+        || status
+            .target_fence_remaining_validity_at_report_ms
+            .is_some()
     {
         return Err(AgentStatusError::ConfigurationMismatch);
     }
@@ -826,6 +980,7 @@ fn validate_source(
             timeline: evidence.timeline,
             generation_identity: evidence.generation_identity.clone(),
             generation_barrier_lsn: evidence.generation_barrier_lsn.0,
+            configured_standby_slot_names: expected.standby_slot_names.clone(),
             qualified_remote_apply_candidates: qualified_remote_apply_candidates(
                 evidence, expected,
             ),
@@ -852,6 +1007,9 @@ fn validate_standby(
         || member_slot_name != &expected.member_slot_name
         || status.lease.is_some()
         || status.target_fence_acknowledgement.is_some()
+        || status
+            .target_fence_remaining_validity_at_report_ms
+            .is_some()
     {
         return Err(AgentStatusError::ConfigurationMismatch);
     }
@@ -938,10 +1096,20 @@ fn validate_generation_evidence(
     }
     let acknowledgement_required =
         status.postgres_process == PostgresProcessStateWire::RunningReplicationBootstrap;
-    if acknowledgement_required && status.target_fence_acknowledgement.is_none() {
+    if acknowledgement_required
+        && (status.target_fence_acknowledgement.is_none()
+            || status
+                .target_fence_remaining_validity_at_report_ms
+                .is_none())
+    {
         return Err(AgentStatusError::AcknowledgementMismatch);
     }
     if let Some(ack) = &status.target_fence_acknowledgement {
+        let Some(remaining_validity_at_report_ms) =
+            status.target_fence_remaining_validity_at_report_ms
+        else {
+            return Err(AgentStatusError::AcknowledgementMismatch);
+        };
         let process = status
             .postgres_process_identity
             .as_ref()
@@ -950,6 +1118,8 @@ fn validate_generation_evidence(
             || ack.deadline_boottime_ns.0 == 0
             || ack.remaining_validity_at_ack_ms.0 < EXPECTED_TARGET_FENCE_MARGIN_MS
             || ack.remaining_validity_at_ack_ms.0 > EXPECTED_AGENT_LEASE_MAXIMUM_MS
+            || remaining_validity_at_report_ms.0 < EXPECTED_TARGET_FENCE_MARGIN_MS
+            || remaining_validity_at_report_ms.0 > ack.remaining_validity_at_ack_ms.0
             || ack.deadline_boottime_ns.0 < ack.remaining_validity_at_ack_ms.0 * 1_000_000
             || ack.postmaster_pid != process.postmaster_pid
             || ack.boot_id != process.boot_id
@@ -959,6 +1129,11 @@ fn validate_generation_evidence(
         {
             return Err(AgentStatusError::AcknowledgementMismatch);
         }
+    } else if status
+        .target_fence_remaining_validity_at_report_ms
+        .is_some()
+    {
+        return Err(AgentStatusError::AcknowledgementMismatch);
     }
     Ok(())
 }
@@ -1005,13 +1180,15 @@ fn qualified_remote_apply_candidates(
         .collect()
 }
 
-fn remote_apply_witnessed(
-    observations: &[&CollectedAgentStatus],
+fn deterministic_remote_apply_witness<'a>(
+    observations: &'a [&CollectedAgentStatus],
     qualified_candidates: &[String],
     generation_barrier_lsn: u64,
-) -> bool {
-    qualified_candidates.iter().any(|slot| {
-        observations.iter().any(|observation| {
+) -> Option<&'a CollectedAgentStatus> {
+    observations
+        .iter()
+        .copied()
+        .filter(|observation| {
             matches!(
                 observation.replication.as_ref(),
                 Some(MemberReplicationEvidence::Standby {
@@ -1019,12 +1196,35 @@ fn remote_apply_witnessed(
                     receive_lsn,
                     replay_lsn,
                     ..
-                }) if member_slot_name == slot
+                }) if qualified_candidates.iter().any(|slot| slot == member_slot_name)
                     && *receive_lsn >= generation_barrier_lsn
                     && *replay_lsn >= generation_barrier_lsn
             )
         })
-    })
+        .min_by(|left, right| {
+            let Some(MemberReplicationEvidence::Standby {
+                member_slot_name: left_slot,
+                ..
+            }) = left.replication.as_ref()
+            else {
+                unreachable!("remote-apply witnesses are standbys")
+            };
+            let Some(MemberReplicationEvidence::Standby {
+                member_slot_name: right_slot,
+                ..
+            }) = right.replication.as_ref()
+            else {
+                unreachable!("remote-apply witnesses are standbys")
+            };
+            left_slot
+                .cmp(right_slot)
+                .then_with(|| left.member_ordinal.cmp(&right.member_ordinal))
+        })
+}
+
+struct ValidatedReplicationCollection {
+    summary: ReplicationCorrelationSummary,
+    shard_zero_proof: Option<ShardZeroReplicationProof>,
 }
 
 /// Correlates only the bounded facts that remain meaningful across separately
@@ -1046,9 +1246,17 @@ fn remote_apply_witnessed(
 /// order. Matching system, timeline, and generation first establishes that the
 /// locally ordered positions share one coordinate system without inventing an
 /// unsafe cross-endpoint time order.
+#[cfg(test)]
 fn validate_replication_correlation(
     observations: &[CollectedAgentStatus],
 ) -> Result<ReplicationCorrelationSummary, AgentStatusError> {
+    Ok(validate_replication_collection(observations)?.summary)
+}
+
+#[allow(clippy::too_many_lines)] // One pass keeps whole-shard validation atomic.
+fn validate_replication_collection(
+    observations: &[CollectedAgentStatus],
+) -> Result<ValidatedReplicationCollection, AgentStatusError> {
     let mut shards: BTreeMap<u32, Vec<&CollectedAgentStatus>> = BTreeMap::new();
     let mut members = HashSet::with_capacity(observations.len());
     for observation in observations {
@@ -1062,6 +1270,7 @@ fn validate_replication_correlation(
     }
 
     let mut summary = ReplicationCorrelationSummary::default();
+    let mut shard_zero_proof = None;
     for (shard_id, observations) in &shards {
         let evidence_count = observations
             .iter()
@@ -1083,6 +1292,7 @@ fn validate_replication_correlation(
             timeline,
             generation_identity,
             generation_barrier_lsn,
+            configured_standby_slot_names,
             qualified_remote_apply_candidates,
         }) = source.replication.as_ref()
         else {
@@ -1092,7 +1302,37 @@ fn validate_replication_correlation(
             return Err(AgentStatusError::ReplicationEvidenceMismatch);
         }
 
+        let source_process = source
+            .postgres_process_identity
+            .as_ref()
+            .ok_or(AgentStatusError::ReplicationEvidenceMismatch)?;
+        if source.source_instance_id != source.instance_id {
+            return Err(AgentStatusError::ReplicationEvidenceMismatch);
+        }
+        let configured_slots: HashSet<&str> = configured_standby_slot_names
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if configured_slots.len() != configured_standby_slot_names.len()
+            || configured_standby_slot_names.len() + 1 != observations.len()
+        {
+            return Err(AgentStatusError::ReplicationEvidenceMismatch);
+        }
+
+        let mut observed_slots = HashSet::with_capacity(observations.len().saturating_sub(1));
+        let mut instance_ids = HashSet::with_capacity(observations.len());
+        let mut pod_uids = HashSet::with_capacity(observations.len());
         for observation in observations {
+            if !instance_ids.insert(observation.instance_id.as_str())
+                || !pod_uids.insert(observation.pod_uid.as_str())
+                || observation.cluster_id != source.cluster_id
+                || observation.cluster_uid != source.cluster_uid
+                || observation.source_instance_id != source.instance_id
+                || observation.writable_lease_name != source.writable_lease_name
+                || observation.writable_lease_uid != source.writable_lease_uid
+            {
+                return Err(AgentStatusError::ReplicationEvidenceMismatch);
+            }
             if observation.member_ordinal == 0 {
                 continue;
             }
@@ -1100,7 +1340,7 @@ fn validate_replication_correlation(
                 system_identifier: standby_system_identifier,
                 timeline: standby_timeline,
                 generation_identity: standby_generation,
-                member_slot_name: _,
+                member_slot_name,
                 receive_lsn,
                 replay_lsn,
             }) = observation.replication.as_ref()
@@ -1111,11 +1351,18 @@ fn validate_replication_correlation(
                 || standby_timeline != timeline
                 || standby_generation != generation_identity
                 || replay_lsn > receive_lsn
+                || !configured_slots.contains(member_slot_name.as_str())
+                || !observed_slots.insert(member_slot_name.as_str())
+                || observation.postgres_process_identity.is_none()
+                || observation.target_fence_acknowledgement.is_some()
             {
                 return Err(AgentStatusError::ReplicationEvidenceMismatch);
             }
         }
-        let has_remote_apply_witness = remote_apply_witnessed(
+        if observed_slots != configured_slots {
+            return Err(AgentStatusError::ReplicationEvidenceMismatch);
+        }
+        let remote_apply_witness = deterministic_remote_apply_witness(
             observations,
             qualified_remote_apply_candidates,
             *generation_barrier_lsn,
@@ -1127,7 +1374,7 @@ fn validate_replication_correlation(
         if *shard_id == 0 {
             summary.shard_zero_correlated = true;
         }
-        if source.target_fence_acknowledged {
+        if source.target_fence_acknowledgement.is_some() {
             summary.acknowledged_correlated_shards = summary
                 .acknowledged_correlated_shards
                 .checked_add(1)
@@ -1136,7 +1383,7 @@ fn validate_replication_correlation(
                 summary.shard_zero_target_fence_acknowledged = true;
             }
         }
-        if has_remote_apply_witness {
+        if remote_apply_witness.is_some() {
             summary.remote_apply_witnessed_shards = summary
                 .remote_apply_witnessed_shards
                 .checked_add(1)
@@ -1145,14 +1392,165 @@ fn validate_replication_correlation(
                 summary.shard_zero_remote_apply_witnessed = true;
             }
         }
+
+        if *shard_id == 0
+            && observations.len() <= MAXIMUM_SHARD_ZERO_REPLICATION_PROOF_MEMBERS
+            && let (Some(acknowledgement), Some(witness)) = (
+                source.target_fence_acknowledgement.as_ref(),
+                remote_apply_witness,
+            )
+        {
+            if acknowledgement.generation_identity != *generation_identity
+                || acknowledgement.observed_at_unix_ms == 0
+                || acknowledgement.deadline_boottime_ns == 0
+                || acknowledgement.boot_id != source_process.boot_id
+                || acknowledgement.postmaster_pid != source_process.postmaster_pid
+                || acknowledgement.control_backend_pid == 0
+                || acknowledgement.control_backend_pid == acknowledgement.postmaster_pid
+                || acknowledgement.remaining_validity_at_ack_ms < EXPECTED_TARGET_FENCE_MARGIN_MS
+                || acknowledgement.remaining_validity_at_ack_ms > EXPECTED_AGENT_LEASE_MAXIMUM_MS
+                || acknowledgement.remaining_validity_at_report_ms < EXPECTED_TARGET_FENCE_MARGIN_MS
+                || acknowledgement.remaining_validity_at_report_ms
+                    > acknowledgement.remaining_validity_at_ack_ms
+                || acknowledgement.deadline_boottime_ns
+                    < acknowledgement.remaining_validity_at_ack_ms * 1_000_000
+            {
+                return Err(AgentStatusError::ReplicationEvidenceMismatch);
+            }
+            shard_zero_proof = Some(build_shard_zero_replication_proof(
+                source,
+                observations,
+                witness,
+                acknowledgement,
+            )?);
+        }
     }
-    Ok(summary)
+    Ok(ValidatedReplicationCollection {
+        summary,
+        shard_zero_proof,
+    })
+}
+
+fn replication_proof_member_identity(
+    observation: &CollectedAgentStatus,
+) -> Result<ReplicationProofMemberIdentity, AgentStatusError> {
+    let process = observation
+        .postgres_process_identity
+        .as_ref()
+        .ok_or(AgentStatusError::ReplicationEvidenceMismatch)?;
+    Ok(ReplicationProofMemberIdentity {
+        cluster_id: observation.cluster_id.clone(),
+        cluster_uid: observation.cluster_uid.clone(),
+        shard_id: observation.shard_id,
+        member_ordinal: observation.member_ordinal,
+        instance_id: observation.instance_id.clone(),
+        pod_uid: observation.pod_uid.clone(),
+        postmaster_pid: process.postmaster_pid,
+        boot_id: process.boot_id.clone(),
+    })
+}
+
+fn build_shard_zero_replication_proof(
+    source: &CollectedAgentStatus,
+    observations: &[&CollectedAgentStatus],
+    witness: &CollectedAgentStatus,
+    acknowledgement: &CollectedTargetFenceAcknowledgement,
+) -> Result<ShardZeroReplicationProof, AgentStatusError> {
+    let Some(MemberReplicationEvidence::Source {
+        system_identifier,
+        timeline,
+        generation_identity,
+        generation_barrier_lsn,
+        ..
+    }) = source.replication.as_ref()
+    else {
+        return Err(AgentStatusError::ReplicationEvidenceMismatch);
+    };
+    let mut standbys = observations
+        .iter()
+        .filter(|observation| observation.member_ordinal != 0)
+        .map(|observation| {
+            let Some(MemberReplicationEvidence::Standby {
+                system_identifier,
+                timeline,
+                generation_identity,
+                member_slot_name,
+                receive_lsn,
+                replay_lsn,
+            }) = observation.replication.as_ref()
+            else {
+                return Err(AgentStatusError::ReplicationEvidenceMismatch);
+            };
+            Ok(ShardZeroStandbyReplicationProof {
+                member: replication_proof_member_identity(observation)?,
+                source_instance_id: observation.source_instance_id.clone(),
+                member_slot_name: member_slot_name.clone(),
+                system_identifier: *system_identifier,
+                timeline: *timeline,
+                canonical_generation_identity: generation_identity.clone(),
+                generation_barrier_lsn: *generation_barrier_lsn,
+                receive_lsn: *receive_lsn,
+                replay_lsn: *replay_lsn,
+            })
+        })
+        .collect::<Result<Vec<_>, AgentStatusError>>()?;
+    standbys.sort_by_key(|standby| standby.member.member_ordinal);
+
+    let Some(MemberReplicationEvidence::Standby {
+        system_identifier: witness_system_identifier,
+        timeline: witness_timeline,
+        generation_identity: witness_generation_identity,
+        member_slot_name,
+        receive_lsn,
+        replay_lsn,
+        ..
+    }) = witness.replication.as_ref()
+    else {
+        return Err(AgentStatusError::ReplicationEvidenceMismatch);
+    };
+    Ok(ShardZeroReplicationProof {
+        writable_lease: WritableLeaseProofIdentity {
+            name: source.writable_lease_name.clone(),
+            uid: source.writable_lease_uid.clone(),
+        },
+        source: ShardZeroSourceReplicationProof {
+            member: replication_proof_member_identity(source)?,
+            system_identifier: *system_identifier,
+            timeline: *timeline,
+            canonical_generation_identity: generation_identity.clone(),
+            generation_barrier_lsn: *generation_barrier_lsn,
+            target_fence_acknowledgement: TargetFenceAcknowledgementProof {
+                observed_at_unix_ms: acknowledgement.observed_at_unix_ms,
+                canonical_generation_identity: acknowledgement.generation_identity.clone(),
+                deadline_boottime_ns: acknowledgement.deadline_boottime_ns,
+                remaining_validity_at_ack_ms: acknowledgement.remaining_validity_at_ack_ms,
+                remaining_validity_at_report_ms: acknowledgement.remaining_validity_at_report_ms,
+                boot_id: acknowledgement.boot_id.clone(),
+                postmaster_pid: acknowledgement.postmaster_pid,
+                control_backend_pid: acknowledgement.control_backend_pid,
+            },
+        },
+        standbys,
+        remote_apply_witness: RemoteApplyWitnessProof {
+            member: replication_proof_member_identity(witness)?,
+            member_slot_name: member_slot_name.clone(),
+            system_identifier: *witness_system_identifier,
+            timeline: *witness_timeline,
+            canonical_generation_identity: witness_generation_identity.clone(),
+            generation_barrier_lsn: *generation_barrier_lsn,
+            receive_lsn: *receive_lsn,
+            replay_lsn: *replay_lsn,
+        },
+    })
 }
 
 fn validate_generation_absent(status: &AgentStatusV1) -> Result<(), AgentStatusError> {
     if status.lease.is_some()
         || status.replication_evidence.is_some()
         || status.target_fence_acknowledgement.is_some()
+        || status
+            .target_fence_remaining_validity_at_report_ms
+            .is_some()
     {
         return Err(AgentStatusError::LeaseMismatch);
     }
@@ -1387,6 +1785,7 @@ mod tests {
                 "target_fence_required_margin_ms": "3500"
             },
             "target_fence_acknowledgement": null,
+            "target_fence_remaining_validity_at_report_ms": null,
             "postgres_process_identity": null
         })
     }
@@ -1460,6 +1859,7 @@ mod tests {
             "postmaster_pid": 10,
             "control_backend_pid": 11
         });
+        value["target_fence_remaining_validity_at_report_ms"] = json!("3500");
         value["postgres_process_identity"] = json!({
             "postmaster_pid": 10,
             "boot_id": "11111111-2222-3333-4444-555555555555"
@@ -1480,6 +1880,7 @@ mod tests {
             "replication_evidence": null,
             "activation_config": null,
             "target_fence_acknowledgement": null,
+            "target_fence_remaining_validity_at_report_ms": null,
             "postgres_process_identity": source["postgres_process_identity"]
         });
         (expected, status)
@@ -1534,6 +1935,7 @@ mod tests {
                 "member_slot_name": "pgshard_member_0001"
             },
             "target_fence_acknowledgement": null,
+            "target_fence_remaining_validity_at_report_ms": null,
             "postgres_process_identity": {
                 "postmaster_pid": 20,
                 "boot_id": "22222222-3333-4444-5555-666666666666"
@@ -1546,22 +1948,56 @@ mod tests {
         let receipt = Instant::now();
         vec![
             CollectedAgentStatus {
+                cluster_id: "demo".to_owned(),
+                cluster_uid: "11111111-2222-3333-4444-555555555555".to_owned(),
                 shard_id: 0,
                 member_ordinal: 0,
+                instance_id: "demo-shard-0000-0".to_owned(),
+                pod_uid: "pod-uid-0".to_owned(),
+                source_instance_id: "demo-shard-0000-0".to_owned(),
+                writable_lease_name: "demo-shard-0000-writable".to_owned(),
+                writable_lease_uid: "99999999-8888-7777-6666-555555555555".to_owned(),
                 receipt,
+                postgres_process_identity: Some(CollectedPostgresProcessIdentity {
+                    postmaster_pid: 10,
+                    boot_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+                }),
                 replication: Some(MemberReplicationEvidence::Source {
                     system_identifier: 42,
                     timeline: 3,
                     generation_identity: "generation-7".to_owned(),
                     generation_barrier_lsn: 100,
+                    configured_standby_slot_names: vec!["pgshard_member_0001".to_owned()],
                     qualified_remote_apply_candidates: vec!["pgshard_member_0001".to_owned()],
                 }),
-                target_fence_acknowledged: source_acknowledged,
+                target_fence_acknowledgement: source_acknowledged.then(|| {
+                    CollectedTargetFenceAcknowledgement {
+                        observed_at_unix_ms: 1,
+                        generation_identity: "generation-7".to_owned(),
+                        deadline_boottime_ns: 3_500_000_000,
+                        remaining_validity_at_ack_ms: 3_500,
+                        remaining_validity_at_report_ms: 3_500,
+                        boot_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+                        postmaster_pid: 10,
+                        control_backend_pid: 11,
+                    }
+                }),
             },
             CollectedAgentStatus {
+                cluster_id: "demo".to_owned(),
+                cluster_uid: "11111111-2222-3333-4444-555555555555".to_owned(),
                 shard_id: 0,
                 member_ordinal: 1,
+                instance_id: "demo-shard-0000-m0001-0".to_owned(),
+                pod_uid: "pod-uid-1".to_owned(),
+                source_instance_id: "demo-shard-0000-0".to_owned(),
+                writable_lease_name: "demo-shard-0000-writable".to_owned(),
+                writable_lease_uid: "99999999-8888-7777-6666-555555555555".to_owned(),
                 receipt,
+                postgres_process_identity: Some(CollectedPostgresProcessIdentity {
+                    postmaster_pid: 20,
+                    boot_id: "22222222-3333-4444-5555-666666666666".to_owned(),
+                }),
                 replication: Some(MemberReplicationEvidence::Standby {
                     system_identifier: 42,
                     timeline: 3,
@@ -1570,9 +2006,53 @@ mod tests {
                     receive_lsn: 120,
                     replay_lsn: 110,
                 }),
-                target_fence_acknowledged: false,
+                target_fence_acknowledgement: None,
             },
         ]
+    }
+
+    fn shard_zero_proof_observations(member_count: usize) -> Vec<CollectedAgentStatus> {
+        assert!((2..=6).contains(&member_count));
+        let mut observations = correlated_observations(true);
+        let configured_slots = (1..member_count)
+            .map(|ordinal| format!("pgshard_member_{ordinal:04}"))
+            .collect::<Vec<_>>();
+        let Some(MemberReplicationEvidence::Source {
+            configured_standby_slot_names,
+            qualified_remote_apply_candidates,
+            ..
+        }) = observations[0].replication.as_mut()
+        else {
+            panic!("source fixture")
+        };
+        *configured_standby_slot_names = configured_slots.clone();
+        *qualified_remote_apply_candidates = configured_slots.iter().rev().cloned().collect();
+
+        for ordinal_index in 2..member_count {
+            let ordinal = u32::try_from(ordinal_index).expect("bounded proof member ordinal");
+            let mut standby = observations[1].clone();
+            standby.member_ordinal = ordinal;
+            standby.instance_id = format!("demo-shard-0000-m{ordinal:04}-0");
+            standby.pod_uid = format!("pod-uid-{ordinal}");
+            standby.postgres_process_identity = Some(CollectedPostgresProcessIdentity {
+                postmaster_pid: 20 + ordinal,
+                boot_id: format!("{ordinal:08}-3333-4444-5555-666666666666"),
+            });
+            let Some(MemberReplicationEvidence::Standby {
+                member_slot_name,
+                receive_lsn,
+                replay_lsn,
+                ..
+            }) = standby.replication.as_mut()
+            else {
+                panic!("standby fixture")
+            };
+            *member_slot_name = configured_slots[ordinal_index - 1].clone();
+            *receive_lsn = 120 + u64::from(ordinal);
+            *replay_lsn = 110 + u64::from(ordinal);
+            observations.push(standby);
+        }
+        observations
     }
 
     #[test]
@@ -1599,7 +2079,7 @@ mod tests {
         let status: AgentStatusV1 =
             serde_json::from_value(value.clone()).expect("running source wire");
         let validated = validate_status(&status, &expected).expect("coherent running source");
-        assert!(validated.target_fence_acknowledged);
+        assert!(validated.target_fence_acknowledgement.is_some());
 
         let mut wrong_fence = value.clone();
         wrong_fence["postgres"]["fencing_epoch"] = json!("8");
@@ -1612,6 +2092,14 @@ mod tests {
         let mut missing_ack = value.clone();
         missing_ack["target_fence_acknowledgement"] = Value::Null;
         let status = serde_json::from_value(missing_ack).expect("missing-ACK wire");
+        assert!(matches!(
+            validate_status(&status, &expected),
+            Err(AgentStatusError::AcknowledgementMismatch)
+        ));
+
+        let mut missing_report = value.clone();
+        missing_report["target_fence_remaining_validity_at_report_ms"] = Value::Null;
+        let status = serde_json::from_value(missing_report).expect("missing-report wire");
         assert!(matches!(
             validate_status(&status, &expected),
             Err(AgentStatusError::AcknowledgementMismatch)
@@ -1635,13 +2123,56 @@ mod tests {
             Err(AgentStatusError::AcknowledgementMismatch)
         ));
 
-        let mut short_ack = value;
+        let mut short_ack = value.clone();
         short_ack["target_fence_acknowledgement"]["remaining_validity_at_ack_ms"] = json!("3499");
         let status = serde_json::from_value(short_ack).expect("short-ACK wire");
         assert!(matches!(
             validate_status(&status, &expected),
             Err(AgentStatusError::AcknowledgementMismatch)
         ));
+
+        let mut stale_report = value.clone();
+        stale_report["target_fence_acknowledgement"]["remaining_validity_at_ack_ms"] =
+            json!("15000");
+        stale_report["target_fence_acknowledgement"]["deadline_boottime_ns"] = json!("15000000000");
+        stale_report["target_fence_remaining_validity_at_report_ms"] = json!("3499");
+        let status = serde_json::from_value(stale_report).expect("stale-report wire");
+        assert!(matches!(
+            validate_status(&status, &expected),
+            Err(AgentStatusError::AcknowledgementMismatch)
+        ));
+
+        let mut inflated_report = value;
+        inflated_report["target_fence_remaining_validity_at_report_ms"] = json!("3501");
+        let status = serde_json::from_value(inflated_report).expect("inflated-report wire");
+        assert!(matches!(
+            validate_status(&status, &expected),
+            Err(AgentStatusError::AcknowledgementMismatch)
+        ));
+    }
+
+    #[test]
+    fn inactive_source_rejects_report_only_target_fence_validity() {
+        let (expected, value) = running_source_status();
+        for process in ["validated", "stopping", "fenced", "failed"] {
+            let mut inactive = value.clone();
+            inactive["postgres_process"] = json!(process);
+            inactive["postgres_process_identity"] = Value::Null;
+            inactive["postgres"] = Value::Null;
+            inactive["lease"] = Value::Null;
+            inactive["replication_evidence"] = Value::Null;
+            inactive["target_fence_acknowledgement"] = Value::Null;
+            inactive["target_fence_remaining_validity_at_report_ms"] = Value::Null;
+            let status = serde_json::from_value(inactive.clone()).expect("inactive source wire");
+            validate_status(&status, &expected).expect("coherent inactive source");
+
+            inactive["target_fence_remaining_validity_at_report_ms"] = json!("3500");
+            let status = serde_json::from_value(inactive).expect("report-only source wire");
+            assert!(matches!(
+                validate_status(&status, &expected),
+                Err(AgentStatusError::LeaseMismatch)
+            ));
+        }
     }
 
     #[test]
@@ -1710,6 +2241,7 @@ mod tests {
             "postgres",
             "replication_evidence",
             "target_fence_acknowledgement",
+            "target_fence_remaining_validity_at_report_ms",
         ] {
             let mut unexpected = value.clone();
             unexpected[field] = source[field].clone();
@@ -1726,10 +2258,11 @@ mod tests {
         let (expected, mut value) = running_source_status();
         value["postgres_process"] = json!("starting_replication_bootstrap");
         value["target_fence_acknowledgement"] = Value::Null;
+        value["target_fence_remaining_validity_at_report_ms"] = Value::Null;
         let status = serde_json::from_value(value).expect("starting source wire");
         let validated = validate_status(&status, &expected).expect("coherent starting source");
         assert!(validated.replication.is_some());
-        assert!(!validated.target_fence_acknowledged);
+        assert!(validated.target_fence_acknowledgement.is_none());
 
         let summary = validate_replication_correlation(&correlated_observations(false))
             .expect("starting shard still has coherent replication evidence");
@@ -1921,6 +2454,276 @@ mod tests {
     }
 
     #[test]
+    fn retains_exact_three_and_five_member_shard_zero_proofs() {
+        for member_count in [3, 5] {
+            let observations = shard_zero_proof_observations(member_count);
+            let validated = validate_replication_collection(&observations)
+                .expect("complete shard-zero collection");
+            let proof = validated
+                .shard_zero_proof
+                .expect("acknowledged remote-apply proof");
+
+            assert_eq!(proof.source.member.shard_id, 0);
+            assert_eq!(proof.source.member.member_ordinal, 0);
+            assert_eq!(proof.source.member.cluster_id, "demo");
+            assert_eq!(
+                proof.source.member.cluster_uid,
+                "11111111-2222-3333-4444-555555555555"
+            );
+            assert_eq!(proof.source.member.instance_id, "demo-shard-0000-0");
+            assert_eq!(proof.source.member.pod_uid, "pod-uid-0");
+            assert_eq!(proof.source.member.postmaster_pid, 10);
+            assert_eq!(
+                proof.source.member.boot_id,
+                "11111111-2222-3333-4444-555555555555"
+            );
+            assert_eq!(proof.source.system_identifier, 42);
+            assert_eq!(proof.source.timeline, 3);
+            assert_eq!(proof.source.canonical_generation_identity, "generation-7");
+            assert_eq!(proof.source.generation_barrier_lsn, 100);
+            let acknowledgement = &proof.source.target_fence_acknowledgement;
+            assert_eq!(
+                acknowledgement.canonical_generation_identity,
+                "generation-7"
+            );
+            assert_eq!(acknowledgement.remaining_validity_at_ack_ms, 3_500);
+            assert_eq!(acknowledgement.remaining_validity_at_report_ms, 3_500);
+            assert_eq!(acknowledgement.deadline_boottime_ns, 3_500_000_000);
+            assert_eq!(acknowledgement.postmaster_pid, 10);
+            assert_eq!(acknowledgement.control_backend_pid, 11);
+            assert_eq!(proof.standbys.len(), member_count - 1);
+            for (index, standby) in proof.standbys.iter().enumerate() {
+                let ordinal = u32::try_from(index).expect("bounded proof member index") + 1;
+                assert_eq!(standby.member.shard_id, 0);
+                assert_eq!(standby.member.member_ordinal, ordinal);
+                assert_eq!(standby.member.cluster_id, "demo");
+                assert_eq!(
+                    standby.member.instance_id,
+                    format!("demo-shard-0000-m{ordinal:04}-0")
+                );
+                assert_eq!(standby.member.pod_uid, format!("pod-uid-{ordinal}"));
+                assert_eq!(standby.source_instance_id, "demo-shard-0000-0");
+                let expected_pid = if ordinal == 1 { 20 } else { 20 + ordinal };
+                assert_eq!(standby.member.postmaster_pid, expected_pid);
+                assert!(!standby.member.boot_id.is_empty());
+                assert_eq!(
+                    standby.member_slot_name,
+                    format!("pgshard_member_{ordinal:04}")
+                );
+                assert_eq!(standby.system_identifier, 42);
+                assert_eq!(standby.timeline, 3);
+                assert_eq!(standby.canonical_generation_identity, "generation-7");
+                assert_eq!(standby.generation_barrier_lsn, 100);
+                assert!(standby.receive_lsn >= standby.replay_lsn);
+            }
+            assert_eq!(proof.remote_apply_witness.member.member_ordinal, 1);
+            assert_eq!(
+                proof.remote_apply_witness.member.instance_id,
+                "demo-shard-0000-m0001-0"
+            );
+            assert_eq!(proof.remote_apply_witness.member.pod_uid, "pod-uid-1");
+            assert_eq!(proof.remote_apply_witness.member.postmaster_pid, 20);
+            assert_eq!(
+                proof.remote_apply_witness.member_slot_name,
+                "pgshard_member_0001"
+            );
+            assert_eq!(proof.remote_apply_witness.system_identifier, 42);
+            assert_eq!(proof.remote_apply_witness.timeline, 3);
+            assert_eq!(
+                proof.remote_apply_witness.canonical_generation_identity,
+                "generation-7"
+            );
+            assert_eq!(proof.remote_apply_witness.generation_barrier_lsn, 100);
+            assert_eq!(proof.remote_apply_witness.receive_lsn, 120);
+            assert_eq!(proof.remote_apply_witness.replay_lsn, 110);
+        }
+    }
+
+    #[test]
+    fn shard_zero_proof_rejects_wrong_duplicate_and_missing_roles() {
+        let mut wrong_roles = shard_zero_proof_observations(3);
+        let (source, standbys) = wrong_roles.split_at_mut(1);
+        std::mem::swap(&mut source[0].replication, &mut standbys[0].replication);
+        assert!(matches!(
+            validate_replication_collection(&wrong_roles),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+
+        let mut wrong_source = shard_zero_proof_observations(3);
+        wrong_source[0].source_instance_id = "another-source".to_owned();
+        assert!(matches!(
+            validate_replication_collection(&wrong_source),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+
+        let mut wrong_standby = shard_zero_proof_observations(3);
+        wrong_standby[1].source_instance_id = "another-source".to_owned();
+        assert!(matches!(
+            validate_replication_collection(&wrong_standby),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+
+        let mut duplicate_source = shard_zero_proof_observations(3);
+        let mut second_source = duplicate_source[0].clone();
+        second_source.member_ordinal = 3;
+        second_source.instance_id = "duplicate-source".to_owned();
+        second_source.pod_uid = "duplicate-source-pod".to_owned();
+        let Some(MemberReplicationEvidence::Source {
+            configured_standby_slot_names,
+            ..
+        }) = duplicate_source[0].replication.as_mut()
+        else {
+            panic!("source fixture")
+        };
+        configured_standby_slot_names.push("pgshard_member_0003".to_owned());
+        duplicate_source.push(second_source);
+        assert!(matches!(
+            validate_replication_collection(&duplicate_source),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+
+        let mut missing_source = shard_zero_proof_observations(3);
+        missing_source.remove(0);
+        assert!(matches!(
+            validate_replication_collection(&missing_source),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+
+        let mut duplicate_standby = shard_zero_proof_observations(3);
+        let mut repeated = duplicate_standby[1].clone();
+        repeated.member_ordinal = 3;
+        repeated.instance_id = "duplicate-standby".to_owned();
+        repeated.pod_uid = "duplicate-standby-pod".to_owned();
+        let Some(MemberReplicationEvidence::Source {
+            configured_standby_slot_names,
+            ..
+        }) = duplicate_standby[0].replication.as_mut()
+        else {
+            panic!("source fixture")
+        };
+        configured_standby_slot_names.push("pgshard_member_0003".to_owned());
+        duplicate_standby.push(repeated);
+        assert!(matches!(
+            validate_replication_collection(&duplicate_standby),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+
+        let mut missing_standby = shard_zero_proof_observations(3);
+        missing_standby.pop();
+        assert!(matches!(
+            validate_replication_collection(&missing_standby),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+
+        let mut missing_process = shard_zero_proof_observations(3);
+        missing_process[2].postgres_process_identity = None;
+        assert!(matches!(
+            validate_replication_collection(&missing_process),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+    }
+
+    #[test]
+    fn shard_zero_proof_rejects_coordinate_ack_barrier_and_witness_mismatches() {
+        for mismatch in ["system", "timeline", "generation"] {
+            let mut observations = shard_zero_proof_observations(3);
+            let Some(MemberReplicationEvidence::Standby {
+                system_identifier,
+                timeline,
+                generation_identity,
+                ..
+            }) = observations[2].replication.as_mut()
+            else {
+                panic!("standby fixture")
+            };
+            match mismatch {
+                "system" => *system_identifier += 1,
+                "timeline" => *timeline += 1,
+                "generation" => generation_identity.push_str("-wrong"),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                validate_replication_collection(&observations),
+                Err(AgentStatusError::ReplicationEvidenceMismatch)
+            ));
+        }
+
+        let mut wrong_ack_generation = shard_zero_proof_observations(3);
+        wrong_ack_generation[0]
+            .target_fence_acknowledgement
+            .as_mut()
+            .expect("source ACK")
+            .generation_identity
+            .push_str("-wrong");
+        assert!(matches!(
+            validate_replication_collection(&wrong_ack_generation),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+
+        let mut zero_barrier = shard_zero_proof_observations(3);
+        let Some(MemberReplicationEvidence::Source {
+            generation_barrier_lsn,
+            ..
+        }) = zero_barrier[0].replication.as_mut()
+        else {
+            panic!("source fixture")
+        };
+        *generation_barrier_lsn = 0;
+        assert!(matches!(
+            validate_replication_collection(&zero_barrier),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+
+        let mut barrier_beyond_witness = shard_zero_proof_observations(3);
+        let Some(MemberReplicationEvidence::Source {
+            generation_barrier_lsn,
+            ..
+        }) = barrier_beyond_witness[0].replication.as_mut()
+        else {
+            panic!("source fixture")
+        };
+        *generation_barrier_lsn = 121;
+        let validated = validate_replication_collection(&barrier_beyond_witness)
+            .expect("coherent coordinates without a remote-apply witness");
+        assert!(validated.shard_zero_proof.is_none());
+        assert!(!validated.summary.shard_zero_remote_apply_witnessed);
+
+        let mut wrong_witness = shard_zero_proof_observations(3);
+        for observation in &mut wrong_witness[1..] {
+            let Some(MemberReplicationEvidence::Standby { replay_lsn, .. }) =
+                observation.replication.as_mut()
+            else {
+                panic!("standby fixture")
+            };
+            *replay_lsn = 99;
+        }
+        let validated =
+            validate_replication_collection(&wrong_witness).expect("coherent but lagging standbys");
+        assert!(validated.shard_zero_proof.is_none());
+        assert!(!validated.summary.shard_zero_remote_apply_witnessed);
+    }
+
+    #[test]
+    fn shard_zero_proof_is_hard_bounded_without_changing_the_summary() {
+        let maximum = validate_replication_collection(&shard_zero_proof_observations(5))
+            .expect("five-member collection");
+        assert_eq!(
+            maximum
+                .shard_zero_proof
+                .expect("bounded proof")
+                .standbys
+                .len(),
+            4
+        );
+
+        let over_limit = validate_replication_collection(&shard_zero_proof_observations(6))
+            .expect("coherent six-member diagnostic collection");
+        assert_eq!(over_limit.summary.correlated_shards, 1);
+        assert!(over_limit.summary.shard_zero_remote_apply_witnessed);
+        assert!(over_limit.shard_zero_proof.is_none());
+    }
+
+    #[test]
     fn remote_apply_witness_requires_any_one_matching_standby_past_the_barrier() {
         let mut lagging = correlated_observations(true);
         let Some(MemberReplicationEvidence::Standby { replay_lsn, .. }) =
@@ -1950,15 +2753,23 @@ mod tests {
 
         let mut any_one = lagging;
         let Some(MemberReplicationEvidence::Source {
+            configured_standby_slot_names,
             qualified_remote_apply_candidates,
             ..
         }) = any_one[0].replication.as_mut()
         else {
             panic!("source fixture")
         };
+        configured_standby_slot_names.push("pgshard_member_0002".to_owned());
         qualified_remote_apply_candidates.push("pgshard_member_0002".to_owned());
         let mut second_standby = any_one[1].clone();
         second_standby.member_ordinal = 2;
+        second_standby.instance_id = "demo-shard-0000-m0002-0".to_owned();
+        second_standby.pod_uid = "pod-uid-2".to_owned();
+        second_standby.postgres_process_identity = Some(CollectedPostgresProcessIdentity {
+            postmaster_pid: 30,
+            boot_id: "33333333-4444-5555-6666-777777777777".to_owned(),
+        });
         let Some(MemberReplicationEvidence::Standby {
             member_slot_name,
             receive_lsn,

@@ -509,6 +509,26 @@ impl AgentState {
             .clone()
     }
 
+    /// Returns one status snapshot and a source-local remaining target-fence
+    /// validity sampled after that snapshot was copied.
+    ///
+    /// Sampling after the copy and clamping to the original ACK observation
+    /// make this a conservative report for that exact retained ACK. A clock
+    /// failure omits the value so a remote collector must fail closed.
+    pub(crate) fn status_snapshot(&self) -> (AgentSnapshot, Option<u64>) {
+        let snapshot = self.snapshot();
+        let remaining_validity_at_report_ms = snapshot
+            .target_fence_acknowledgement
+            .as_ref()
+            .and_then(|acknowledgement| {
+                let now = self.boottime.now().ok()?.as_nanos();
+                let remaining_ms =
+                    acknowledgement.deadline_boottime_ns.saturating_sub(now) / 1_000_000;
+                Some(remaining_ms.min(acknowledgement.remaining_validity_at_ack_ms))
+            });
+        (snapshot, remaining_validity_at_report_ms)
+    }
+
     /// Replaces the locally verified `PostgreSQL` observation.
     pub fn set_postgres(&self, observation: PostgresObservation) {
         self.inner
@@ -1470,6 +1490,41 @@ mod tests {
         assert!(snapshot.target_fence_acknowledgement.is_none());
         assert!(snapshot.postgres_process_identity.is_none());
         assert!(snapshot.activation_config.is_some());
+    }
+
+    #[test]
+    fn status_report_ages_a_retained_ack_on_the_source_boottime_clock() {
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(10_000_000_000),
+        ));
+        let state = AgentState::with_test_clock(identity(), 15_000, clock.clone())
+            .expect("state with test clock");
+        state.set_activation_config(
+            source_activation_snapshot()
+                .activation_config
+                .expect("source activation config"),
+        );
+        state.set_postgres_process(PostgresProcessState::StartingReplicationBootstrap);
+        state.set_target_fence_acknowledgement(TargetFenceAcknowledgement {
+            observed_at_unix_ms: 1,
+            generation_identity: generation_identity(),
+            deadline_boottime_ns: 20_000_000_000,
+            remaining_validity_at_ack_ms: 15_000,
+            boot_id: "11111111-2222-3333-8444-555555555555".to_owned(),
+            postmaster_pid: 100,
+            control_backend_pid: 101,
+        });
+
+        let (_, remaining) = state.status_snapshot();
+        assert_eq!(remaining, Some(10_000));
+        clock
+            .advance(Duration::from_secs(8))
+            .expect("advance clock");
+        let (_, remaining) = state.status_snapshot();
+        assert_eq!(remaining, Some(2_000));
+        clock.fail();
+        let (_, remaining) = state.status_snapshot();
+        assert_eq!(remaining, None);
     }
 
     #[test]

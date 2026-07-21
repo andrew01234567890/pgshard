@@ -360,14 +360,18 @@ struct AgentStatus {
     schema_version: &'static str,
     #[serde(flatten)]
     snapshot: AgentSnapshot,
+    target_fence_remaining_validity_at_report_ms: Option<String>,
 }
 
 async fn status(State(state): State<AgentState>) -> impl IntoResponse {
+    let (snapshot, target_fence_remaining_validity_at_report_ms) = state.status_snapshot();
     (
         [(header::CACHE_CONTROL, "no-store")],
         Json(AgentStatus {
             schema_version: AGENT_STATUS_SCHEMA_VERSION,
-            snapshot: state.snapshot(),
+            snapshot,
+            target_fence_remaining_validity_at_report_ms:
+                target_fence_remaining_validity_at_report_ms.map(|value| value.to_string()),
         }),
     )
 }

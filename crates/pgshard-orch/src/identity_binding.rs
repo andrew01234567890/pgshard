@@ -198,19 +198,28 @@ async fn observe_once_with_collector_and_clock<
             if before != after {
                 return Err(IdentityBindingError::IdentityChanged);
             }
-            let receipt_deadline = collection
-                .earliest_receipt
-                .checked_add(freshness)
-                .ok_or(IdentityBindingError::InvalidFreshnessBound)?;
-            let publication_deadline = SuspendAwareInstant {
-                monotonic: scan_deadline.monotonic.min(receipt_deadline),
-                boottime: scan_deadline.boottime,
-            };
+            let acknowledgement_remaining_at_report_ms = collection
+                .shard_zero_replication_proof
+                .as_ref()
+                .map(|proof| {
+                    proof
+                        .source
+                        .target_fence_acknowledgement
+                        .remaining_validity_at_report_ms
+                });
+            let publication_deadline = publication_deadline(
+                collection.earliest_receipt,
+                scan_started,
+                scan_deadline,
+                freshness,
+                acknowledgement_remaining_at_report_ms,
+            )?;
             let completed_at = state.suspend_aware_now_with(&mut clock)?;
             if !publication_deadline.is_live_at(completed_at)
-                || !state.record_agent_status_fresh(
+                || !state.record_agent_status_fresh_exact(
                     collection.member_count,
                     collection.replication_correlation,
+                    collection.shard_zero_replication_proof,
                     publication_deadline,
                 )
             {
@@ -233,6 +242,30 @@ async fn observe_once_with_collector_and_clock<
         state.record_agent_status_failure(error.failure_reason());
     }
     result
+}
+
+fn publication_deadline(
+    earliest_receipt: std::time::Instant,
+    scan_started: SuspendAwareInstant,
+    scan_deadline: SuspendAwareInstant,
+    freshness: Duration,
+    acknowledgement_remaining_at_report_ms: Option<u64>,
+) -> Result<SuspendAwareInstant, IdentityBindingError> {
+    let receipt_deadline = earliest_receipt
+        .checked_add(freshness)
+        .ok_or(IdentityBindingError::InvalidFreshnessBound)?;
+    let mut deadline = scan_deadline;
+    deadline.monotonic = deadline.monotonic.min(receipt_deadline);
+    if let Some(remaining_ms) = acknowledgement_remaining_at_report_ms {
+        // The agent's boottime cannot be compared with this process. Anchoring
+        // the reported remaining ACK validity at our pre-request scan start is
+        // conservative whether the acknowledgement preceded or followed it.
+        let acknowledgement_deadline = scan_started
+            .checked_add(Duration::from_millis(remaining_ms))
+            .ok_or(IdentityBindingError::InvalidFreshnessBound)?;
+        deadline = deadline.min(acknowledgement_deadline);
+    }
+    Ok(deadline)
 }
 
 async fn wait_until_shutdown(shutdown: &mut watch::Receiver<bool>) {
@@ -1045,6 +1078,7 @@ mod tests {
                 member_count: queries.len(),
                 earliest_receipt: self.receipt,
                 replication_correlation: self.replication_correlation,
+                shard_zero_replication_proof: None,
             })
         }
     }
@@ -1061,6 +1095,7 @@ mod tests {
                 member_count: queries.len(),
                 earliest_receipt: self.receipt,
                 replication_correlation: ReplicationCorrelationSummary::default(),
+                shard_zero_replication_proof: None,
             })
         }
     }
@@ -1106,6 +1141,7 @@ mod tests {
                     remote_apply_witnessed_shards: 1,
                     shard_zero_remote_apply_witnessed: true,
                 },
+                shard_zero_replication_proof: None,
             })
         }
     }
@@ -1910,6 +1946,29 @@ mod tests {
                 AgentStatusCollectionState::DisabledPodIdentityRequired,
             );
         }
+    }
+
+    #[test]
+    fn target_ack_report_validity_caps_the_local_publication_deadline() {
+        let started = std::time::Instant::now();
+        let freshness = Duration::from_secs(5);
+        let scan_started = SuspendAwareInstant {
+            monotonic: started,
+            boottime: BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        };
+        let deadline = publication_deadline(
+            started + Duration::from_secs(4),
+            scan_started,
+            scan_started.checked_add(freshness).expect("scan deadline"),
+            freshness,
+            Some(3_500),
+        )
+        .expect("bounded acknowledgement deadline");
+        let expected = scan_started
+            .checked_add(Duration::from_millis(3_500))
+            .expect("acknowledgement deadline");
+        assert_eq!(deadline, expected);
+        assert!(started + Duration::from_secs(4) >= deadline.monotonic);
     }
 
     #[tokio::test]

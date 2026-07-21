@@ -31,6 +31,7 @@ const MAXIMUM_CANDIDATE_PAYLOAD_BYTES: usize = 16 * 1_024;
 const MAXIMUM_CANDIDATE_FRESHNESS: Duration = Duration::from_secs(5);
 const CANDIDATE_PAYLOAD_DOMAIN: &[u8] = b"pgshard-catalog-bootstrap-candidate-payload-v1\0";
 const DISCOVERY_TOPOLOGY_DOMAIN: &[u8] = b"pgshard-catalog-candidate-discovery-topology-v1\0";
+const CLUSTER_STATUS_FINGERPRINT_DOMAIN: &[u8] = b"pgshard-catalog-candidate-cluster-status-v1\0";
 
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 const INSTANCE_LABEL: &str = "app.kubernetes.io/instance";
@@ -131,7 +132,7 @@ async fn observe_once<S: CandidateStore>(
         let deadline = started
             .checked_add(freshness)
             .ok_or(CatalogCandidateError::FreshnessExpired)?;
-        if !state.record_catalog_candidates_fresh(plan.members.len(), deadline) {
+        if !state.record_catalog_candidates_fresh_exact(before, deadline) {
             return Err(CatalogCandidateError::FreshnessExpired);
         }
         Ok(())
@@ -164,6 +165,24 @@ async fn read_bound_candidates<S: CandidateStore>(
     Ok(BoundCandidateSet {
         cluster: status.fingerprint,
         candidates: objects,
+        shard_zero_bootstraps: status
+            .bootstraps
+            .into_iter()
+            .map(|checkpoint| BootstrapReference {
+                secret: ObjectReference {
+                    name: checkpoint.secret_name,
+                    uid: checkpoint.secret_uid,
+                },
+                pvc: ObjectReference {
+                    name: checkpoint.pvc_name,
+                    uid: checkpoint.pvc_uid,
+                },
+            })
+            .collect(),
+        writable_lease: status.writable_lease,
+        replication_credential: status.replication_credential,
+        catalog_access: status.catalog_access,
+        operation_writer_access: status.operation_writer_access,
     })
 }
 
@@ -194,27 +213,42 @@ fn validate_plan(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BoundCandidateSet {
-    cluster: ClusterFingerprint,
-    candidates: Vec<CandidateFingerprint>,
+/// Bounded exact evidence from one stable read bracket. This type is private to
+/// the crate, deliberately non-serializable, and grants no mutation authority.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BoundCandidateSet {
+    pub(crate) cluster: ClusterFingerprint,
+    pub(crate) candidates: Vec<CandidateFingerprint>,
+    pub(crate) shard_zero_bootstraps: Vec<BootstrapReference>,
+    pub(crate) writable_lease: ObjectReference,
+    pub(crate) replication_credential: MaterialReference,
+    pub(crate) catalog_access: CatalogAccessReference,
+    pub(crate) operation_writer_access: MaterialReference,
+}
+
+impl BoundCandidateSet {
+    /// Returns the number of exact shard-zero candidates in this proof.
+    #[must_use]
+    pub(crate) fn candidate_count(&self) -> usize {
+        self.candidates.len()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ClusterFingerprint {
-    uid: String,
-    resource_version: String,
-    generation: i64,
-    status: Value,
+pub(crate) struct ClusterFingerprint {
+    pub(crate) uid: String,
+    pub(crate) resource_version: String,
+    pub(crate) generation: i64,
+    pub(crate) status_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CandidateFingerprint {
-    name: String,
-    uid: String,
-    resource_version: String,
-    payload_sha256: String,
-    document: CandidateDocumentV1,
+pub(crate) struct CandidateFingerprint {
+    pub(crate) name: String,
+    pub(crate) uid: String,
+    pub(crate) resource_version: String,
+    pub(crate) payload_sha256: String,
+    pub(crate) document: CandidateDocumentV1,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +259,7 @@ struct ValidatedClusterStatus {
     writable_lease: ObjectReference,
     replication_credential: MaterialReference,
     catalog_access: CatalogAccessReference,
+    operation_writer_access: MaterialReference,
 }
 
 fn validate_cluster_status(
@@ -293,18 +328,24 @@ fn validate_cluster_status(
     let replication_credential =
         select_replication_credential(&status.replication_credentials, plan)?;
     let catalog_access = validate_catalog_access(status.catalog_access)?;
+    let operation_writer_access =
+        validate_operation_writer_access(status.operation_writer_access, &plan.cluster_id)?;
     Ok(ValidatedClusterStatus {
         fingerprint: ClusterFingerprint {
             uid: uid.to_owned(),
             resource_version: resource_version.to_owned(),
             generation,
-            status: status_value,
+            status_sha256: domain_digest(
+                CLUSTER_STATUS_FINGERPRINT_DOMAIN,
+                &serde_json::to_vec(&status_value)?,
+            ),
         },
         candidates,
         bootstraps,
         writable_lease,
         replication_credential,
         catalog_access,
+        operation_writer_access,
     })
 }
 
@@ -482,6 +523,49 @@ fn validate_catalog_access(
         uid: checkpoint.secret_uid,
         client_sha256: checkpoint.client_sha256,
         server_sha256: checkpoint.server_sha256,
+    })
+}
+
+fn validate_operation_writer_access(
+    checkpoint: OperationWriterAccessCheckpoint,
+    cluster_id: &str,
+) -> Result<MaterialReference, CatalogCandidateError> {
+    if !operation_writer_secret_name_is_valid(cluster_id, &checkpoint.secret_name)
+        || !valid_uid(&checkpoint.secret_uid)
+        || !valid_digest(&checkpoint.material_sha256)
+    {
+        return Err(CatalogCandidateError::InvalidCheckpointSet);
+    }
+    Ok(MaterialReference {
+        name: checkpoint.secret_name,
+        uid: checkpoint.secret_uid,
+        material_sha256: checkpoint.material_sha256,
+    })
+}
+
+fn operation_writer_secret_name_is_valid(cluster_id: &str, name: &str) -> bool {
+    if !valid_name(cluster_id) || !valid_name(name) {
+        return false;
+    }
+    let literal = format!("{cluster_id}-writer-");
+    let prefix = if literal.len() <= 31 {
+        literal
+    } else {
+        let Some(cluster_prefix) = cluster_id.get(..14) else {
+            return false;
+        };
+        let digest = Sha256::digest(cluster_id.as_bytes());
+        let mut encoded = String::with_capacity(12);
+        for byte in &digest[..6] {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        format!("{cluster_prefix}-wr-{encoded}-")
+    };
+    name.strip_prefix(&prefix).is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     })
 }
 
@@ -918,6 +1002,7 @@ struct ClusterStatus {
     #[serde(rename = "postgresqlCatalogCandidates")]
     catalog_candidates: Vec<CandidateCheckpoint>,
     catalog_access: CatalogAccessCheckpoint,
+    operation_writer_access: OperationWriterAccessCheckpoint,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -990,6 +1075,16 @@ struct CatalogAccessCheckpoint {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct OperationWriterAccessCheckpoint {
+    secret_name: String,
+    #[serde(rename = "secretUID")]
+    secret_uid: String,
+    #[serde(rename = "materialSHA256")]
+    material_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CandidateCheckpoint {
     member: usize,
     config_map_name: String,
@@ -1001,27 +1096,27 @@ struct CandidateCheckpoint {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CandidateDocumentV1 {
-    schema_version: String,
+pub(crate) struct CandidateDocumentV1 {
+    pub(crate) schema_version: String,
     #[serde(rename = "clusterObjectUID")]
-    cluster_object_uid: String,
-    shard: u32,
-    member: u32,
+    pub(crate) cluster_object_uid: String,
+    pub(crate) shard: u32,
+    pub(crate) member: u32,
     #[serde(rename = "instanceID")]
-    instance_id: String,
-    discovery_topology: DiscoveryTopology,
-    bootstrap: BootstrapReference,
-    writable_lease: ObjectReference,
-    replication_credential: MaterialReference,
-    catalog_access: CatalogAccessReference,
+    pub(crate) instance_id: String,
+    pub(crate) discovery_topology: DiscoveryTopology,
+    pub(crate) bootstrap: BootstrapReference,
+    pub(crate) writable_lease: ObjectReference,
+    pub(crate) replication_credential: MaterialReference,
+    pub(crate) catalog_access: CatalogAccessReference,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DiscoveryTopology {
-    config_map: NameReference,
-    members: Vec<DiscoveryMember>,
-    sha256: String,
+pub(crate) struct DiscoveryTopology {
+    pub(crate) config_map: NameReference,
+    pub(crate) members: Vec<DiscoveryMember>,
+    pub(crate) sha256: String,
 }
 
 #[derive(Serialize)]
@@ -1033,53 +1128,53 @@ struct DiscoveryDigestInput {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NameReference {
-    name: String,
+pub(crate) struct NameReference {
+    pub(crate) name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DiscoveryMember {
-    ordinal: u32,
-    instance_id: String,
-    dns_name: String,
-    postgresql_port: u16,
-    agent_http_port: u16,
-    physical_slot: String,
+pub(crate) struct DiscoveryMember {
+    pub(crate) ordinal: u32,
+    pub(crate) instance_id: String,
+    pub(crate) dns_name: String,
+    pub(crate) postgresql_port: u16,
+    pub(crate) agent_http_port: u16,
+    pub(crate) physical_slot: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ObjectReference {
-    name: String,
-    uid: String,
+pub(crate) struct ObjectReference {
+    pub(crate) name: String,
+    pub(crate) uid: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct BootstrapReference {
-    secret: ObjectReference,
-    pvc: ObjectReference,
+pub(crate) struct BootstrapReference {
+    pub(crate) secret: ObjectReference,
+    pub(crate) pvc: ObjectReference,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MaterialReference {
-    name: String,
-    uid: String,
+pub(crate) struct MaterialReference {
+    pub(crate) name: String,
+    pub(crate) uid: String,
     #[serde(rename = "materialSHA256")]
-    material_sha256: String,
+    pub(crate) material_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CatalogAccessReference {
-    name: String,
-    uid: String,
+pub(crate) struct CatalogAccessReference {
+    pub(crate) name: String,
+    pub(crate) uid: String,
     #[serde(rename = "clientSHA256")]
-    client_sha256: String,
+    pub(crate) client_sha256: String,
     #[serde(rename = "serverSHA256")]
-    server_sha256: String,
+    pub(crate) server_sha256: String,
 }
 
 #[cfg(test)]
@@ -1095,12 +1190,29 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::agent_status::{
+        RemoteApplyWitnessProof, ReplicationCorrelationSummary, ReplicationProofMemberIdentity,
+        ShardZeroReplicationProof, ShardZeroSourceReplicationProof,
+        ShardZeroStandbyReplicationProof, TargetFenceAcknowledgementProof,
+        WritableLeaseProofIdentity,
+    };
     use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
-    use crate::domain::{AgentStatusPhase, CatalogCandidatePhase, OrchestratorIdentity};
+    use crate::domain::{AgentStatusPhase, CatalogCandidatePhase, OrchState, OrchestratorIdentity};
+    use crate::topology::{
+        AgentStatusCollectionState, TOPOLOGY_SCHEMA_VERSION, TopologyDiagnostics,
+    };
 
     struct StubStore {
         clusters: Mutex<VecDeque<DynamicObject>>,
         candidates: BTreeMap<String, ConfigMap>,
+    }
+
+    struct BracketStore {
+        clusters: Mutex<VecDeque<DynamicObject>>,
+        candidate_reads: Mutex<usize>,
+        candidates_per_read: usize,
+        before_candidates: BTreeMap<String, ConfigMap>,
+        after_candidates: BTreeMap<String, ConfigMap>,
     }
 
     impl CandidateStore for StubStore {
@@ -1115,6 +1227,31 @@ mod tests {
 
         async fn get_candidate(&self, name: &str) -> Result<ConfigMap, CatalogCandidateError> {
             self.candidates
+                .get(name)
+                .cloned()
+                .ok_or(CatalogCandidateError::InvalidCandidate)
+        }
+    }
+
+    impl CandidateStore for BracketStore {
+        async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError> {
+            let mut clusters = self.clusters.lock().expect("clusters");
+            if clusters.len() > 1 {
+                Ok(clusters.pop_front().expect("cluster response"))
+            } else {
+                Ok(clusters.front().expect("cluster response").clone())
+            }
+        }
+
+        async fn get_candidate(&self, name: &str) -> Result<ConfigMap, CatalogCandidateError> {
+            let mut reads = self.candidate_reads.lock().expect("candidate reads");
+            let candidates = if *reads < self.candidates_per_read {
+                &self.before_candidates
+            } else {
+                &self.after_candidates
+            };
+            *reads += 1;
+            candidates
                 .get(name)
                 .cloned()
                 .ok_or(CatalogCandidateError::InvalidCandidate)
@@ -1251,6 +1388,11 @@ mod tests {
             client_sha256: "b".repeat(64),
             server_sha256: "c".repeat(64),
         };
+        let operation_writer_access = MaterialReference {
+            name: format!("demo-writer-{}", "d".repeat(32)),
+            uid: "operation-writer-uid".to_owned(),
+            material_sha256: "9".repeat(64),
+        };
         let mut candidates = BTreeMap::new();
         let mut candidate_checkpoints = Vec::new();
         let mut bootstrap_checkpoints = Vec::new();
@@ -1375,7 +1517,8 @@ mod tests {
                 {"shard": 1, "secretName": "demo-replication-ccdd", "secretUID": "replication-uid-1", "materialSHA256": "f".repeat(64)}
             ],
             "postgresqlCatalogCandidates": candidate_checkpoints,
-            "catalogAccess": {"secretName": catalog_access.name, "secretUID": catalog_access.uid, "clientSHA256": catalog_access.client_sha256, "serverSHA256": catalog_access.server_sha256}
+            "catalogAccess": {"secretName": catalog_access.name, "secretUID": catalog_access.uid, "clientSHA256": catalog_access.client_sha256, "serverSHA256": catalog_access.server_sha256},
+            "operationWriterAccess": {"secretName": operation_writer_access.name, "secretUID": operation_writer_access.uid, "materialSHA256": operation_writer_access.material_sha256}
         });
         let cluster = DynamicObject {
             types: Some(TypeMeta {
@@ -1410,6 +1553,22 @@ mod tests {
         }
     }
 
+    fn bracket_store(
+        before_cluster: DynamicObject,
+        after_cluster: DynamicObject,
+        before_candidates: BTreeMap<String, ConfigMap>,
+        after_candidates: BTreeMap<String, ConfigMap>,
+    ) -> BracketStore {
+        let candidates_per_read = before_candidates.len();
+        BracketStore {
+            clusters: Mutex::new(VecDeque::from([before_cluster, after_cluster])),
+            candidate_reads: Mutex::new(0),
+            candidates_per_read,
+            before_candidates,
+            after_candidates,
+        }
+    }
+
     fn reverse_status_array(cluster: &mut DynamicObject, field: &str) {
         cluster.data["status"][field]
             .as_array_mut()
@@ -1440,6 +1599,79 @@ mod tests {
         .expect("state")
     }
 
+    fn proof_member(
+        plan: &CatalogCandidateObservationPlan,
+        ordinal: u32,
+    ) -> ReplicationProofMemberIdentity {
+        let member = &plan.members[ordinal as usize];
+        ReplicationProofMemberIdentity {
+            cluster_id: plan.cluster_id.clone(),
+            cluster_uid: plan.cluster_uid.clone(),
+            shard_id: 0,
+            member_ordinal: ordinal,
+            instance_id: member.instance_id.clone(),
+            pod_uid: format!("pod-uid-{ordinal}"),
+            postmaster_pid: 100 + ordinal,
+            boot_id: format!("00000000-0000-0000-0000-{ordinal:012}"),
+        }
+    }
+
+    fn exact_replication_proof(
+        plan: &CatalogCandidateObservationPlan,
+    ) -> ShardZeroReplicationProof {
+        let source = proof_member(plan, 0);
+        let standbys = plan
+            .members
+            .iter()
+            .skip(1)
+            .map(|member| ShardZeroStandbyReplicationProof {
+                member: proof_member(plan, member.ordinal),
+                source_instance_id: source.instance_id.clone(),
+                member_slot_name: member.physical_slot.clone(),
+                system_identifier: 42,
+                timeline: 3,
+                canonical_generation_identity: "generation-7".to_owned(),
+                generation_barrier_lsn: 100,
+                receive_lsn: 120 + u64::from(member.ordinal),
+                replay_lsn: 110 + u64::from(member.ordinal),
+            })
+            .collect::<Vec<_>>();
+        ShardZeroReplicationProof {
+            writable_lease: WritableLeaseProofIdentity {
+                name: plan.writable_lease_name.clone(),
+                uid: plan.writable_lease_uid.clone(),
+            },
+            source: ShardZeroSourceReplicationProof {
+                member: source,
+                system_identifier: 42,
+                timeline: 3,
+                canonical_generation_identity: "generation-7".to_owned(),
+                generation_barrier_lsn: 100,
+                target_fence_acknowledgement: TargetFenceAcknowledgementProof {
+                    observed_at_unix_ms: 1,
+                    canonical_generation_identity: "generation-7".to_owned(),
+                    deadline_boottime_ns: 5_000_000_000,
+                    remaining_validity_at_ack_ms: 5_000,
+                    remaining_validity_at_report_ms: 5_000,
+                    boot_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+                    postmaster_pid: 100,
+                    control_backend_pid: 200,
+                },
+            },
+            remote_apply_witness: RemoteApplyWitnessProof {
+                member: proof_member(plan, 1),
+                member_slot_name: plan.members[1].physical_slot.clone(),
+                system_identifier: 42,
+                timeline: 3,
+                canonical_generation_identity: "generation-7".to_owned(),
+                generation_barrier_lsn: 100,
+                receive_lsn: 121,
+                replay_lsn: 111,
+            },
+            standbys,
+        }
+    }
+
     #[tokio::test]
     async fn accepts_exact_canonical_candidate_set() {
         let (plan, cluster, candidates) = fixture();
@@ -1447,6 +1679,127 @@ mod tests {
             .await
             .expect("bound candidates");
         assert_eq!(bound.candidates.len(), 3);
+        assert_eq!(bound.shard_zero_bootstraps.len(), 3);
+        assert_eq!(bound.cluster.uid, "cluster-uid");
+        assert_eq!(bound.cluster.resource_version, "cluster-rv");
+        assert_eq!(bound.cluster.generation, 7);
+        assert_eq!(bound.cluster.status_sha256.len(), 64);
+        assert_eq!(bound.writable_lease.name, "demo-shard-0000-term");
+        assert_eq!(bound.writable_lease.uid, "lease-uid-0");
+        assert_eq!(bound.replication_credential.uid, "replication-uid-0");
+        assert_eq!(bound.catalog_access.uid, "catalog-uid");
+        assert_eq!(
+            bound.operation_writer_access.name,
+            format!("demo-writer-{}", "d".repeat(32))
+        );
+        assert_eq!(bound.operation_writer_access.uid, "operation-writer-uid");
+        assert_eq!(
+            bound.operation_writer_access.material_sha256,
+            "9".repeat(64)
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_three_and_five_member_proofs_gate_exact_capability() {
+        for member_count in [3_u32, 5] {
+            let (plan, cluster, candidates) = fixture_for_plan(plan_with_members(member_count));
+            let total_members = plan.shard_count * plan.members.len();
+            let state = OrchState::with_identity_and_topology(
+                OrchestratorIdentity {
+                    cluster_id: plan.cluster_id.clone(),
+                    orchestrator_id: "orch-0".to_owned(),
+                },
+                15_000,
+                TopologyDiagnostics {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION.to_owned(),
+                    cluster_object_uid: plan.cluster_uid.clone(),
+                    shard_count: plan.shard_count,
+                    member_count: total_members,
+                    agent_status_collection:
+                        AgentStatusCollectionState::DisabledPodIdentityRequired,
+                },
+            )
+            .expect("state");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let summary = ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: true,
+                acknowledged_correlated_shards: 1,
+                shard_zero_target_fence_acknowledged: true,
+                remote_apply_witnessed_shards: 1,
+                shard_zero_remote_apply_witnessed: true,
+            };
+
+            state.record_agent_status_collecting(Duration::from_secs(5));
+            assert!(state.record_agent_status_fresh_exact(
+                total_members,
+                summary,
+                Some(exact_replication_proof(&plan)),
+                deadline,
+            ));
+            observe_once(
+                &store(cluster, candidates),
+                &plan,
+                &state,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("real candidate validator accepted exact proof");
+            assert!(state.record_coordination_ready(
+                "coordination-uid",
+                "coordination-rv-1",
+                true,
+                deadline,
+            ));
+            let capability = state
+                .catalog_materialization_capability()
+                .expect("validated exact proof overlap");
+            assert!(state.revalidate_catalog_materialization_capability(&capability));
+
+            let public = serde_json::to_string(&state.snapshot()).expect("public snapshot JSON");
+            for private_value in ["pod-uid-0", "generation-7", "operation-writer-uid"] {
+                assert!(
+                    !public.contains(private_value),
+                    "private exact proof leaked through public diagnostics"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_proof_keeps_public_diagnostics_summary_only() {
+        let (plan, cluster, candidates) = fixture();
+        let state = state();
+        observe_once(
+            &store(cluster, candidates),
+            &plan,
+            &state,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("fresh exact candidate proof");
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.catalog_candidates.phase,
+            CatalogCandidatePhase::Fresh
+        );
+        assert_eq!(snapshot.catalog_candidates.expected_candidates, 3);
+        assert_eq!(snapshot.catalog_candidates.fresh_candidates, 3);
+        assert_eq!(snapshot.catalog_candidates.failure, None);
+        let public = serde_json::to_string(&snapshot).expect("public snapshot JSON");
+        let writer_digest = "9".repeat(64);
+        for private_value in [
+            "cluster-rv",
+            "candidate-uid-0",
+            "bootstrap-uid-0-0",
+            "operation-writer-uid",
+            writer_digest.as_str(),
+        ] {
+            assert!(
+                !public.contains(private_value),
+                "private exact proof leaked through public diagnostics"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1509,16 +1862,23 @@ mod tests {
                 .await
                 .expect("complete shuffled candidate set");
             assert_eq!(bound.candidates.len(), member_count as usize);
+            assert_eq!(bound.shard_zero_bootstraps.len(), member_count as usize);
+            assert!(bound.candidates.iter().all(|candidate| {
+                candidate.document.discovery_topology.members.len() == member_count as usize
+            }));
         }
     }
 
     #[test]
-    fn accepts_additive_unversioned_status_fields_and_fingerprints_raw_status() {
+    fn accepts_additive_unversioned_status_fields_with_bounded_fingerprint() {
         let (plan, mut cluster, _) = fixture();
         let status = cluster.data["status"]
             .as_object_mut()
             .expect("status object");
-        status.insert("futureTopLevelField".to_owned(), json!({"value": 7}));
+        status.insert(
+            "futureTopLevelField".to_owned(),
+            json!({"value": "x".repeat(64 * 1_024)}),
+        );
         status["postgresqlBootstrapSpec"]
             .as_object_mut()
             .expect("bootstrap spec")
@@ -1539,9 +1899,14 @@ mod tests {
             .expect("catalog access")
             .insert("futureAccessField".to_owned(), json!([1, 2, 3]));
         let raw_status = cluster.data["status"].clone();
+        let expected = domain_digest(
+            CLUSTER_STATUS_FINGERPRINT_DOMAIN,
+            &serde_json::to_vec(&raw_status).expect("status JSON"),
+        );
 
         let validated = validate_cluster_status(&cluster, &plan).expect("additive status fields");
-        assert_eq!(validated.fingerprint.status, raw_status);
+        assert_eq!(validated.fingerprint.status_sha256, expected);
+        assert_eq!(validated.fingerprint.status_sha256.len(), 64);
     }
 
     #[test]
@@ -1669,6 +2034,57 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_or_malformed_operation_writer_checkpoint() {
+        let (plan, cluster, _) = fixture();
+
+        let mut missing = cluster.clone();
+        missing.data["status"]
+            .as_object_mut()
+            .expect("status")
+            .remove("operationWriterAccess");
+        assert!(validate_cluster_status(&missing, &plan).is_err());
+
+        for (field, value) in [
+            ("secretName", json!("demo-writer-not-random")),
+            ("secretUID", json!("")),
+            ("materialSHA256", json!("A".repeat(64))),
+        ] {
+            let mut malformed = cluster.clone();
+            malformed.data["status"]["operationWriterAccess"][field] = value;
+            assert!(
+                validate_cluster_status(&malformed, &plan).is_err(),
+                "malformed operation-writer {field} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_writer_name_matches_the_cluster_derived_bounded_contract() {
+        assert!(operation_writer_secret_name_is_valid(
+            "demo",
+            &format!("demo-writer-{}", "a".repeat(32))
+        ));
+        assert!(!operation_writer_secret_name_is_valid(
+            "demo",
+            &format!("other-writer-{}", "a".repeat(32))
+        ));
+
+        let cluster = "this-is-a-cluster-name-longer-than-prefix";
+        let digest = Sha256::digest(cluster.as_bytes());
+        let suffix = digest[..6].iter().fold(String::new(), |mut suffix, byte| {
+            let _ = write!(suffix, "{byte:02x}");
+            suffix
+        });
+        let name = format!("{}-wr-{suffix}-{}", &cluster[..14], "b".repeat(32));
+        assert_eq!(
+            name,
+            format!("this-is-a-clus-wr-b9e961f439c9-{}", "b".repeat(32))
+        );
+        assert_eq!(name.len(), 63);
+        assert!(operation_writer_secret_name_is_valid(cluster, &name));
+    }
+
+    #[test]
     fn accepts_only_supported_three_or_five_member_plans() {
         let mut five = plan();
         for ordinal in 3..5 {
@@ -1690,10 +2106,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_pre_post_resource_version_change_without_last_good() {
+    async fn rejects_pre_post_cluster_resource_version_or_generation_change_without_last_good() {
+        for field in ["resource-version", "generation"] {
+            let (plan, cluster, candidates) = fixture();
+            let mut changed = cluster.clone();
+            match field {
+                "resource-version" => {
+                    changed.metadata.resource_version = Some("cluster-rv-2".to_owned());
+                }
+                "generation" => {
+                    changed.metadata.generation = Some(8);
+                    changed.data["status"]["observedGeneration"] = json!(8);
+                }
+                _ => unreachable!(),
+            }
+            let store = StubStore {
+                clusters: Mutex::new(VecDeque::from([cluster, changed])),
+                candidates,
+            };
+            let state = state();
+            let error = observe_once(&store, &plan, &state, Duration::from_secs(5))
+                .await
+                .expect_err("changed bracket");
+            assert!(
+                matches!(error, CatalogCandidateError::EvidenceChanged),
+                "cluster {field} drift returned {error:?}"
+            );
+            let snapshot = state.snapshot();
+            assert_eq!(
+                snapshot.catalog_candidates.phase,
+                CatalogCandidatePhase::Unavailable
+            );
+            assert_eq!(snapshot.catalog_candidates.fresh_candidates, 0);
+            assert_eq!(
+                snapshot.catalog_candidates.failure,
+                Some(CatalogCandidateFailureReason::EvidenceChanged)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_cluster_uid_drift_across_the_double_read() {
         let (plan, cluster, candidates) = fixture();
         let mut changed = cluster.clone();
-        changed.metadata.resource_version = Some("cluster-rv-2".to_owned());
+        changed.metadata.uid = Some("replacement-cluster-uid".to_owned());
         let store = StubStore {
             clusters: Mutex::new(VecDeque::from([cluster, changed])),
             candidates,
@@ -1701,18 +2157,78 @@ mod tests {
         let state = state();
         let error = observe_once(&store, &plan, &state, Duration::from_secs(5))
             .await
-            .expect_err("changed bracket");
-        assert!(matches!(error, CatalogCandidateError::EvidenceChanged));
+            .expect_err("changed cluster UID");
+        assert!(matches!(error, CatalogCandidateError::InvalidClusterStatus));
         let snapshot = state.snapshot();
         assert_eq!(
             snapshot.catalog_candidates.phase,
             CatalogCandidatePhase::Unavailable
         );
         assert_eq!(snapshot.catalog_candidates.fresh_candidates, 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_candidate_uid_or_resource_version_drift_across_the_double_read() {
+        for field in ["uid", "resource-version"] {
+            let (plan, cluster, candidates) = fixture();
+            let mut changed_cluster = cluster.clone();
+            let mut changed_candidates = candidates.clone();
+            let name = plan.members[0].config_map_name();
+            let changed = changed_candidates.get_mut(&name).expect("candidate");
+            match field {
+                "uid" => {
+                    changed.metadata.uid = Some("replacement-candidate-uid".to_owned());
+                    changed_cluster.data["status"]["postgresqlCatalogCandidates"][0]["configMapUID"] =
+                        json!("replacement-candidate-uid");
+                }
+                "resource-version" => {
+                    changed.metadata.resource_version = Some("replacement-rv".to_owned());
+                }
+                _ => unreachable!(),
+            }
+            let store = bracket_store(cluster, changed_cluster, candidates, changed_candidates);
+            let state = state();
+            let error = observe_once(&store, &plan, &state, Duration::from_secs(5))
+                .await
+                .expect_err("changed candidate identity");
+            assert!(
+                matches!(error, CatalogCandidateError::EvidenceChanged),
+                "candidate {field} drift returned {error:?}"
+            );
+            let snapshot = state.snapshot();
+            assert_eq!(
+                snapshot.catalog_candidates.failure,
+                Some(CatalogCandidateFailureReason::EvidenceChanged)
+            );
+            assert_eq!(snapshot.catalog_candidates.fresh_candidates, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_replaced_operation_writer_checkpoint_across_the_double_read() {
+        let (plan, cluster, candidates) = fixture();
+        let mut changed = cluster.clone();
+        changed.data["status"]["operationWriterAccess"]["secretUID"] =
+            json!("replacement-operation-writer-uid");
+        let state = state();
+        let error = observe_once(
+            &StubStore {
+                clusters: Mutex::new(VecDeque::from([cluster, changed])),
+                candidates,
+            },
+            &plan,
+            &state,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("replaced operation-writer checkpoint");
+        assert!(matches!(error, CatalogCandidateError::EvidenceChanged));
+        let snapshot = state.snapshot();
         assert_eq!(
             snapshot.catalog_candidates.failure,
             Some(CatalogCandidateFailureReason::EvidenceChanged)
         );
+        assert_eq!(snapshot.catalog_candidates.fresh_candidates, 0);
     }
 
     #[tokio::test]

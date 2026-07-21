@@ -9,9 +9,15 @@ use pgshard_types::ShardId;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
 
-use crate::agent_status::ReplicationCorrelationSummary;
+use crate::agent_status::{ReplicationCorrelationSummary, ShardZeroReplicationProof};
 use crate::boottime::{
     BoottimeClock, BoottimeError, SuspendAwareInstant, system_clock as system_boottime_clock,
+};
+use crate::catalog_candidate::BoundCandidateSet;
+use crate::catalog_materialization::{
+    CatalogMaterializationCapability,
+    issue_catalog_materialization_capability as issue_catalog_capability,
+    revalidate_catalog_materialization_capability as revalidate_catalog_capability,
 };
 use crate::topology::TopologyDiagnostics;
 
@@ -633,33 +639,61 @@ struct OrchInner {
     coordination_lease_uid: Option<String>,
     coordination_resource_version: Option<String>,
     coordination_deadline: Option<SuspendAwareInstant>,
+    coordination_generation: u64,
     // Diagnostic-only identity evidence is never retained past this process-
     // local monotonic deadline and never participates in authority decisions.
     agent_identity_binding_deadline: Option<SuspendAwareInstant>,
     agent_status: AgentStatusDiagnostics,
     agent_replication_correlation: Option<ReplicationCorrelationSummary>,
+    agent_shard_zero_replication_proof: Option<ShardZeroReplicationProof>,
+    agent_proof_generation: u64,
     // Catalog-candidate evidence is independently diagnostic and cannot alter
     // coordination, agent status, readiness, leadership, or operation state.
     catalog_candidate_deadline: Option<SuspendAwareInstant>,
+    catalog_candidate_proof: Option<BoundCandidateSet>,
+    catalog_proof_generation: u64,
     catalog_candidates: CatalogCandidateDiagnostics,
     topology: Option<TopologyDiagnostics>,
 }
 
+fn advance_generation(generation: &mut u64) -> bool {
+    let Some(next) = generation.checked_add(1) else {
+        return false;
+    };
+    *generation = next;
+    true
+}
+
+fn clear_agent_proof(inner: &mut OrchInner) -> bool {
+    inner.agent_shard_zero_replication_proof = None;
+    inner.agent_identity_binding_deadline = None;
+    advance_generation(&mut inner.agent_proof_generation)
+}
+
+fn clear_catalog_proof(inner: &mut OrchInner) -> bool {
+    inner.catalog_candidate_proof = None;
+    inner.catalog_candidate_deadline = None;
+    advance_generation(&mut inner.catalog_proof_generation)
+}
+
 fn expire_coordination_state(inner: &mut OrchInner, now: Option<SuspendAwareInstant>) -> bool {
-    let coordination_live = inner.coordination_ready
+    let coordination_ready = inner.coordination_ready
         && inner
             .coordination_deadline
             .zip(now)
             .is_some_and(|(deadline, now)| deadline.is_live_at(now));
-    if !coordination_live {
+    if !coordination_ready {
+        if inner.coordination_ready || inner.leader {
+            let _ = advance_generation(&mut inner.coordination_generation);
+        }
         inner.coordination_ready = false;
         inner.leader = false;
         inner.coordination_deadline = None;
     }
-    coordination_live
+    coordination_ready
 }
 
-fn expire_diagnostic_state(inner: &mut OrchInner, now: Option<SuspendAwareInstant>) {
+fn expire_proof_state(inner: &mut OrchInner, now: Option<SuspendAwareInstant>) {
     let identity_binding_live = inner
         .agent_identity_binding_deadline
         .zip(now)
@@ -667,6 +701,7 @@ fn expire_diagnostic_state(inner: &mut OrchInner, now: Option<SuspendAwareInstan
     if !identity_binding_live {
         inner.agent_identity_binding_deadline = None;
         if inner.agent_status.phase == AgentStatusPhase::Fresh {
+            let _ = clear_agent_proof(inner);
             inner.agent_replication_correlation = None;
             inner.agent_status.phase = AgentStatusPhase::Expired;
             inner.agent_status.fresh_members = 0;
@@ -691,6 +726,7 @@ fn expire_diagnostic_state(inner: &mut OrchInner, now: Option<SuspendAwareInstan
     if !catalog_candidate_live {
         inner.catalog_candidate_deadline = None;
         if inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh {
+            let _ = clear_catalog_proof(inner);
             inner.catalog_candidates.phase = CatalogCandidatePhase::Expired;
             inner.catalog_candidates.fresh_candidates = 0;
             inner.catalog_candidates.failure =
@@ -1011,7 +1047,9 @@ impl OrchState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.suspend_aware_now().ok();
         let deadline = now.and_then(|now| deadline.into_suspend_aware(now));
-        let valid = !lease_uid.is_empty()
+        let generation_advanced = advance_generation(&mut inner.coordination_generation);
+        let valid = generation_advanced
+            && !lease_uid.is_empty()
             && lease_uid.len() <= 128
             && !resource_version.is_empty()
             && resource_version.len() <= 128
@@ -1042,6 +1080,7 @@ impl OrchState {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = advance_generation(&mut inner.coordination_generation);
         inner.coordination_ready = false;
         inner.leader = false;
         inner.coordination_deadline = None;
@@ -1056,6 +1095,7 @@ impl OrchState {
         if inner.agent_status.phase == AgentStatusPhase::ShuttingDown {
             return;
         }
+        let _ = clear_agent_proof(&mut inner);
         inner.agent_identity_binding_deadline = None;
         inner.agent_replication_correlation = None;
         inner.agent_status.phase = AgentStatusPhase::Collecting;
@@ -1084,6 +1124,7 @@ impl OrchState {
         if inner.agent_status.phase == AgentStatusPhase::ShuttingDown {
             return;
         }
+        let _ = clear_agent_proof(&mut inner);
         inner.agent_identity_binding_deadline = None;
         inner.agent_replication_correlation = None;
         inner.agent_status.phase = AgentStatusPhase::Unavailable;
@@ -1103,10 +1144,24 @@ impl OrchState {
 
     /// Atomically publishes only one complete, still-live collection summary.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn record_agent_status_fresh<D: IntoSuspendAwareDeadline>(
         &self,
         member_count: usize,
         replication_correlation: ReplicationCorrelationSummary,
+        deadline: D,
+    ) -> bool {
+        self.record_agent_status_fresh_exact(member_count, replication_correlation, None, deadline)
+    }
+
+    /// Atomically publishes one complete summary and its optional exact,
+    /// non-serializable shard-zero proof.
+    #[must_use]
+    pub(crate) fn record_agent_status_fresh_exact<D: IntoSuspendAwareDeadline>(
+        &self,
+        member_count: usize,
+        replication_correlation: ReplicationCorrelationSummary,
+        shard_zero_replication_proof: Option<ShardZeroReplicationProof>,
         deadline: D,
     ) -> bool {
         let mut inner = self
@@ -1118,7 +1173,14 @@ impl OrchState {
         if inner.agent_status.phase == AgentStatusPhase::ShuttingDown {
             return false;
         }
-        let valid = member_count > 0
+        let generation_advanced = clear_agent_proof(&mut inner);
+        let proof_shape_valid = shard_zero_replication_proof.is_none()
+            || (replication_correlation.shard_zero_correlated
+                && replication_correlation.shard_zero_target_fence_acknowledged
+                && replication_correlation.shard_zero_remote_apply_witnessed);
+        let valid = generation_advanced
+            && proof_shape_valid
+            && member_count > 0
             && member_count == inner.agent_status.expected_members
             && replication_correlation.correlated_shards
                 <= inner
@@ -1161,6 +1223,7 @@ impl OrchState {
         }
         inner.agent_identity_binding_deadline = deadline;
         inner.agent_replication_correlation = Some(replication_correlation);
+        inner.agent_shard_zero_replication_proof = shard_zero_replication_proof;
         inner.agent_status.phase = AgentStatusPhase::Fresh;
         inner.agent_status.fresh_members = member_count;
         inner.agent_status.replication_correlated_shards =
@@ -1190,6 +1253,7 @@ impl OrchState {
         if inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown {
             return;
         }
+        let _ = clear_catalog_proof(&mut inner);
         inner.catalog_candidate_deadline = None;
         inner.catalog_candidates.phase = CatalogCandidatePhase::Collecting;
         inner.catalog_candidates.expected_candidates = expected_candidates;
@@ -1208,6 +1272,7 @@ impl OrchState {
         if inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown {
             return;
         }
+        let _ = clear_catalog_proof(&mut inner);
         inner.catalog_candidate_deadline = None;
         inner.catalog_candidates.phase = CatalogCandidatePhase::Unavailable;
         inner.catalog_candidates.fresh_candidates = 0;
@@ -1216,6 +1281,7 @@ impl OrchState {
 
     /// Atomically publishes one complete, still-live candidate count only.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn record_catalog_candidates_fresh<D: IntoSuspendAwareDeadline>(
         &self,
         candidate_count: usize,
@@ -1227,14 +1293,70 @@ impl OrchState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.suspend_aware_now().ok();
         let deadline = now.and_then(|now| deadline.into_suspend_aware(now));
+        let Some(deadline) = deadline else {
+            let _ = clear_catalog_proof(&mut inner);
+            inner.catalog_candidates.phase = CatalogCandidatePhase::Unavailable;
+            inner.catalog_candidates.fresh_candidates = 0;
+            inner.catalog_candidates.failure =
+                Some(CatalogCandidateFailureReason::FreshnessExpired);
+            return false;
+        };
+        Self::record_catalog_candidates_fresh_locked(
+            &mut inner,
+            candidate_count,
+            None,
+            deadline,
+            now,
+        )
+    }
+
+    /// Atomically publishes one complete summary and its exact,
+    /// non-serializable candidate proof graph.
+    #[must_use]
+    pub(crate) fn record_catalog_candidates_fresh_exact<D: IntoSuspendAwareDeadline>(
+        &self,
+        proof: BoundCandidateSet,
+        deadline: D,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let candidate_count = proof.candidate_count();
+        let now = self.suspend_aware_now().ok();
+        let deadline = now.and_then(|now| deadline.into_suspend_aware(now));
+        let Some(deadline) = deadline else {
+            let _ = clear_catalog_proof(&mut inner);
+            inner.catalog_candidates.phase = CatalogCandidatePhase::Unavailable;
+            inner.catalog_candidates.fresh_candidates = 0;
+            inner.catalog_candidates.failure =
+                Some(CatalogCandidateFailureReason::FreshnessExpired);
+            return false;
+        };
+        Self::record_catalog_candidates_fresh_locked(
+            &mut inner,
+            candidate_count,
+            Some(proof),
+            deadline,
+            now,
+        )
+    }
+
+    fn record_catalog_candidates_fresh_locked(
+        inner: &mut OrchInner,
+        candidate_count: usize,
+        proof: Option<BoundCandidateSet>,
+        deadline: SuspendAwareInstant,
+        now: Option<SuspendAwareInstant>,
+    ) -> bool {
         if inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown {
             return false;
         }
-        let valid = matches!(candidate_count, 3 | 5)
+        let generation_advanced = clear_catalog_proof(inner);
+        let valid = generation_advanced
+            && matches!(candidate_count, 3 | 5)
             && candidate_count == inner.catalog_candidates.expected_candidates
-            && deadline
-                .zip(now)
-                .is_some_and(|(deadline, now)| deadline.is_live_at(now));
+            && now.is_some_and(|now| deadline.is_live_at(now));
         if !valid {
             inner.catalog_candidate_deadline = None;
             inner.catalog_candidates.phase = CatalogCandidatePhase::Unavailable;
@@ -1243,11 +1365,168 @@ impl OrchState {
                 Some(CatalogCandidateFailureReason::FreshnessExpired);
             return false;
         }
-        inner.catalog_candidate_deadline = deadline;
+        inner.catalog_candidate_deadline = Some(deadline);
+        inner.catalog_candidate_proof = proof;
         inner.catalog_candidates.phase = CatalogCandidatePhase::Fresh;
         inner.catalog_candidates.fresh_candidates = candidate_count;
         inner.catalog_candidates.failure = None;
         true
+    }
+
+    /// Issues a move-only token only while exact independent proof graphs and
+    /// leadership overlap. There is intentionally no runtime consumer yet.
+    #[allow(dead_code)]
+    pub(crate) fn catalog_materialization_capability(
+        &self,
+    ) -> Option<CatalogMaterializationCapability> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.suspend_aware_now().ok();
+        Self::catalog_materialization_capability_locked(&mut inner, now)
+    }
+
+    #[cfg(test)]
+    fn catalog_materialization_capability_at(
+        &self,
+        now: Instant,
+    ) -> Option<CatalogMaterializationCapability> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self
+            .boottime
+            .now()
+            .ok()
+            .map(|boottime| SuspendAwareInstant {
+                monotonic: now,
+                boottime,
+            });
+        Self::catalog_materialization_capability_locked(&mut inner, now)
+    }
+
+    fn catalog_materialization_capability_locked(
+        inner: &mut OrchInner,
+        now: Option<SuspendAwareInstant>,
+    ) -> Option<CatalogMaterializationCapability> {
+        let _ = expire_coordination_state(inner, now);
+        expire_proof_state(inner, now);
+        let now = now?;
+        let identity = inner.identity.as_ref()?;
+        let topology = inner.topology.as_ref()?;
+        let replication = inner.agent_shard_zero_replication_proof.as_ref()?;
+        let candidates = inner.catalog_candidate_proof.as_ref()?;
+        issue_catalog_capability(
+            replication,
+            candidates,
+            &identity.cluster_id,
+            &topology.cluster_object_uid,
+            inner.coordination_ready,
+            inner.leader,
+            inner.coordination_generation,
+            inner.agent_proof_generation,
+            inner.catalog_proof_generation,
+            inner.coordination_lease_uid.as_deref()?,
+            inner.coordination_resource_version.as_deref()?,
+            inner.coordination_deadline?,
+            inner.agent_identity_binding_deadline?,
+            inner.catalog_candidate_deadline?,
+            now,
+        )
+    }
+
+    /// Revalidates every monotonic generation, exact coordination observation,
+    /// freshness deadline, and proof cross-binding without extending the token.
+    #[allow(dead_code)]
+    pub(crate) fn revalidate_catalog_materialization_capability(
+        &self,
+        capability: &CatalogMaterializationCapability,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.suspend_aware_now().ok();
+        Self::revalidate_catalog_materialization_capability_locked(&mut inner, capability, now)
+    }
+
+    #[cfg(test)]
+    fn revalidate_catalog_materialization_capability_at(
+        &self,
+        capability: &CatalogMaterializationCapability,
+        now: Instant,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self
+            .boottime
+            .now()
+            .ok()
+            .map(|boottime| SuspendAwareInstant {
+                monotonic: now,
+                boottime,
+            });
+        Self::revalidate_catalog_materialization_capability_locked(&mut inner, capability, now)
+    }
+
+    fn revalidate_catalog_materialization_capability_locked(
+        inner: &mut OrchInner,
+        capability: &CatalogMaterializationCapability,
+        now: Option<SuspendAwareInstant>,
+    ) -> bool {
+        let _ = expire_coordination_state(inner, now);
+        expire_proof_state(inner, now);
+        let Some(now) = now else {
+            return false;
+        };
+        let Some(identity) = inner.identity.as_ref() else {
+            return false;
+        };
+        let Some(topology) = inner.topology.as_ref() else {
+            return false;
+        };
+        let Some(replication) = inner.agent_shard_zero_replication_proof.as_ref() else {
+            return false;
+        };
+        let Some(candidates) = inner.catalog_candidate_proof.as_ref() else {
+            return false;
+        };
+        let Some(coordination_lease_uid) = inner.coordination_lease_uid.as_deref() else {
+            return false;
+        };
+        let Some(coordination_resource_version) = inner.coordination_resource_version.as_deref()
+        else {
+            return false;
+        };
+        let (Some(coordination_deadline), Some(agent_deadline), Some(candidate_deadline)) = (
+            inner.coordination_deadline,
+            inner.agent_identity_binding_deadline,
+            inner.catalog_candidate_deadline,
+        ) else {
+            return false;
+        };
+        revalidate_catalog_capability(
+            capability,
+            replication,
+            candidates,
+            &identity.cluster_id,
+            &topology.cluster_object_uid,
+            inner.coordination_ready,
+            inner.leader,
+            inner.coordination_generation,
+            inner.agent_proof_generation,
+            inner.catalog_proof_generation,
+            coordination_lease_uid,
+            coordination_resource_version,
+            coordination_deadline,
+            agent_deadline,
+            candidate_deadline,
+            now,
+        )
     }
 
     /// Makes shutdown terminal for candidate diagnostics without coupling it to
@@ -1257,6 +1536,7 @@ impl OrchState {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = clear_catalog_proof(&mut inner);
         inner.catalog_candidate_deadline = None;
         inner.catalog_candidates.phase = CatalogCandidatePhase::ShuttingDown;
         inner.catalog_candidates.fresh_candidates = 0;
@@ -1270,6 +1550,8 @@ impl OrchState {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = clear_agent_proof(&mut inner);
+        let _ = clear_catalog_proof(&mut inner);
         inner.agent_identity_binding_deadline = None;
         inner.agent_replication_correlation = None;
         inner.agent_status.phase = AgentStatusPhase::ShuttingDown;
@@ -1321,7 +1603,7 @@ impl OrchState {
 
     fn snapshot_locked(inner: &mut OrchInner, now: Option<SuspendAwareInstant>) -> OrchSnapshot {
         let coordination_ready = expire_coordination_state(inner, now);
-        expire_diagnostic_state(inner, now);
+        expire_proof_state(inner, now);
         let catalog_bootstrap_observation = catalog_bootstrap_observation(inner);
         let mut leases: Vec<_> = inner.leases.values().cloned().collect();
         leases.sort_by_key(|lease| lease.shard_id);
@@ -1952,7 +2234,17 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::agent_status::{
+        RemoteApplyWitnessProof, ReplicationProofMemberIdentity, ShardZeroSourceReplicationProof,
+        ShardZeroStandbyReplicationProof, TargetFenceAcknowledgementProof,
+        WritableLeaseProofIdentity,
+    };
     use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
+    use crate::catalog_candidate::{
+        BootstrapReference, CandidateDocumentV1, CandidateFingerprint, CatalogAccessReference,
+        ClusterFingerprint, DiscoveryMember, DiscoveryTopology, MaterialReference, NameReference,
+        ObjectReference,
+    };
 
     struct LockAssertingBoottimeClock {
         clock: FakeBoottimeClock,
@@ -2070,6 +2362,160 @@ mod tests {
         state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
         assert!(state.record_agent_status_fresh(6, replication, agent_deadline));
         assert!(state.record_catalog_candidates_fresh(3, candidate_deadline));
+    }
+
+    fn proof_member(ordinal: u32) -> ReplicationProofMemberIdentity {
+        ReplicationProofMemberIdentity {
+            cluster_id: "cluster-1".to_owned(),
+            cluster_uid: "cluster-uid".to_owned(),
+            shard_id: 0,
+            member_ordinal: ordinal,
+            instance_id: if ordinal == 0 {
+                "cluster-1-shard-0000-0".to_owned()
+            } else {
+                format!("cluster-1-shard-0000-m{ordinal:04}-0")
+            },
+            pod_uid: format!("pod-uid-{ordinal}"),
+            postmaster_pid: 100 + ordinal,
+            boot_id: format!("00000000-0000-0000-0000-{ordinal:012}"),
+        }
+    }
+
+    fn exact_replication_proof() -> ShardZeroReplicationProof {
+        let source = proof_member(0);
+        let standbys = [1_u32, 2]
+            .into_iter()
+            .map(|ordinal| ShardZeroStandbyReplicationProof {
+                member: proof_member(ordinal),
+                source_instance_id: source.instance_id.clone(),
+                member_slot_name: format!("pgshard_member_{ordinal:04}"),
+                system_identifier: 42,
+                timeline: 3,
+                canonical_generation_identity: "generation-7".to_owned(),
+                generation_barrier_lsn: 100,
+                receive_lsn: 120 + u64::from(ordinal),
+                replay_lsn: 110 + u64::from(ordinal),
+            })
+            .collect::<Vec<_>>();
+        ShardZeroReplicationProof {
+            writable_lease: WritableLeaseProofIdentity {
+                name: "cluster-1-shard-0000-writable".to_owned(),
+                uid: "writable-lease-uid".to_owned(),
+            },
+            source: ShardZeroSourceReplicationProof {
+                member: source,
+                system_identifier: 42,
+                timeline: 3,
+                canonical_generation_identity: "generation-7".to_owned(),
+                generation_barrier_lsn: 100,
+                target_fence_acknowledgement: TargetFenceAcknowledgementProof {
+                    observed_at_unix_ms: 1,
+                    canonical_generation_identity: "generation-7".to_owned(),
+                    deadline_boottime_ns: 5_000_000_000,
+                    remaining_validity_at_ack_ms: 5_000,
+                    remaining_validity_at_report_ms: 5_000,
+                    boot_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+                    postmaster_pid: 100,
+                    control_backend_pid: 200,
+                },
+            },
+            remote_apply_witness: RemoteApplyWitnessProof {
+                member: proof_member(1),
+                member_slot_name: "pgshard_member_0001".to_owned(),
+                system_identifier: 42,
+                timeline: 3,
+                canonical_generation_identity: "generation-7".to_owned(),
+                generation_barrier_lsn: 100,
+                receive_lsn: 121,
+                replay_lsn: 111,
+            },
+            standbys,
+        }
+    }
+
+    fn exact_candidate_proof() -> BoundCandidateSet {
+        let writable_lease = ObjectReference {
+            name: "cluster-1-shard-0000-writable".to_owned(),
+            uid: "writable-lease-uid".to_owned(),
+        };
+        let replication_credential = MaterialReference {
+            name: "cluster-1-replication".to_owned(),
+            uid: "replication-uid".to_owned(),
+            material_sha256: "1".repeat(64),
+        };
+        let catalog_access = CatalogAccessReference {
+            name: "cluster-1-catalog-access".to_owned(),
+            uid: "catalog-access-uid".to_owned(),
+            client_sha256: "2".repeat(64),
+            server_sha256: "3".repeat(64),
+        };
+        let operation_writer_access = MaterialReference {
+            name: format!("cluster-1-writer-{}", "a".repeat(32)),
+            uid: "writer-uid".to_owned(),
+            material_sha256: "4".repeat(64),
+        };
+        let discovery_topology = DiscoveryTopology {
+            config_map: NameReference {
+                name: "cluster-1-database-topology".to_owned(),
+            },
+            members: (0..3)
+                .map(|ordinal| DiscoveryMember {
+                    ordinal,
+                    instance_id: proof_member(ordinal).instance_id,
+                    dns_name: format!("member-{ordinal}.database.svc"),
+                    postgresql_port: 5_432,
+                    agent_http_port: 9_180,
+                    physical_slot: format!("pgshard_member_{ordinal:04}"),
+                })
+                .collect(),
+            sha256: "5".repeat(64),
+        };
+        let shard_zero_bootstraps = (0..3)
+            .map(|ordinal| BootstrapReference {
+                secret: ObjectReference {
+                    name: format!("bootstrap-{ordinal}"),
+                    uid: format!("bootstrap-secret-uid-{ordinal}"),
+                },
+                pvc: ObjectReference {
+                    name: format!("data-{ordinal}"),
+                    uid: format!("pvc-uid-{ordinal}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        let candidates = (0..3)
+            .map(|ordinal| CandidateFingerprint {
+                name: format!("cluster-1-catalog-candidate-{ordinal}"),
+                uid: format!("candidate-uid-{ordinal}"),
+                resource_version: format!("candidate-rv-{ordinal}"),
+                payload_sha256: format!("{ordinal}").repeat(64),
+                document: CandidateDocumentV1 {
+                    schema_version: "pgshard.catalog-bootstrap-candidate.v1".to_owned(),
+                    cluster_object_uid: "cluster-uid".to_owned(),
+                    shard: 0,
+                    member: ordinal,
+                    instance_id: proof_member(ordinal).instance_id,
+                    discovery_topology: discovery_topology.clone(),
+                    bootstrap: shard_zero_bootstraps[ordinal as usize].clone(),
+                    writable_lease: writable_lease.clone(),
+                    replication_credential: replication_credential.clone(),
+                    catalog_access: catalog_access.clone(),
+                },
+            })
+            .collect();
+        BoundCandidateSet {
+            cluster: ClusterFingerprint {
+                uid: "cluster-uid".to_owned(),
+                resource_version: "cluster-rv".to_owned(),
+                generation: 7,
+                status_sha256: "6".repeat(64),
+            },
+            candidates,
+            shard_zero_bootstraps,
+            writable_lease,
+            replication_credential,
+            catalog_access,
+            operation_writer_access,
+        }
     }
 
     fn execution(fencing_epoch: u64) -> ExecutionPreconditions {
@@ -2830,6 +3276,319 @@ mod tests {
         );
         assert_eq!(state.snapshot().topology, Some(topology));
         assert!(state.snapshot().leases.is_empty());
+    }
+
+    #[test]
+    fn exact_catalog_capability_requires_overlap_and_revalidates_generations() {
+        let state = bootstrap_observation_state();
+        let now = Instant::now();
+        let summary = ReplicationCorrelationSummary {
+            correlated_shards: 1,
+            shard_zero_correlated: true,
+            acknowledged_correlated_shards: 1,
+            shard_zero_target_fence_acknowledged: true,
+            remote_apply_witnessed_shards: 1,
+            shard_zero_remote_apply_witnessed: true,
+        };
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            now + Duration::from_secs(5),
+        ));
+        assert!(state.record_catalog_candidates_fresh_exact(
+            exact_candidate_proof(),
+            now + Duration::from_secs(5),
+        ));
+        assert!(state.catalog_materialization_capability().is_none());
+
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv-1",
+            true,
+            now + Duration::from_secs(5),
+        ));
+        let first = state
+            .catalog_materialization_capability()
+            .expect("exact live proof overlap");
+        assert!(state.revalidate_catalog_materialization_capability(&first));
+
+        // Replacing either exact proof advances its private generation and
+        // irrevocably invalidates already issued tokens.
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            now + Duration::from_secs(5),
+        ));
+        assert!(!state.revalidate_catalog_materialization_capability(&first));
+        let second = state
+            .catalog_materialization_capability()
+            .expect("replacement exact proof");
+
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        assert!(!state.revalidate_catalog_materialization_capability(&second));
+        assert!(state.catalog_materialization_capability().is_none());
+
+        let mut mismatched = exact_candidate_proof();
+        mismatched.writable_lease.uid = "replacement-lease-uid".to_owned();
+        assert!(
+            state.record_catalog_candidates_fresh_exact(mismatched, now + Duration::from_secs(5),)
+        );
+        assert!(state.catalog_materialization_capability().is_none());
+
+        assert!(state.record_catalog_candidates_fresh_exact(
+            exact_candidate_proof(),
+            now + Duration::from_secs(5),
+        ));
+        let third = state
+            .catalog_materialization_capability()
+            .expect("restored cross-binding");
+        let debug = format!("{state:?}");
+        for private_value in ["pod-uid-0", "generation-7", "writer-uid"] {
+            assert!(!debug.contains(private_value));
+        }
+        assert!(debug.contains("<redacted>"));
+        state.record_coordination_unavailable();
+        assert!(!state.revalidate_catalog_materialization_capability(&third));
+        assert!(state.catalog_materialization_capability().is_none());
+
+        // Public snapshots remain bounded summaries and never expose the
+        // retained identity graphs or writer material reference.
+        let encoded = serde_json::to_string(&state.snapshot()).expect("serialize snapshot");
+        for private_value in ["pod-uid-0", "generation-7", "writer-uid", &"4".repeat(64)] {
+            assert!(!encoded.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn capability_revalidation_itself_expires_and_clears_exact_proofs() {
+        let state = bootstrap_observation_state();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(2);
+        let summary = ReplicationCorrelationSummary {
+            correlated_shards: 1,
+            shard_zero_correlated: true,
+            acknowledged_correlated_shards: 1,
+            shard_zero_target_fence_acknowledged: true,
+            remote_apply_witnessed_shards: 1,
+            shard_zero_remote_apply_witnessed: true,
+        };
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            deadline,
+        ));
+        assert!(state.record_catalog_candidates_fresh_exact(exact_candidate_proof(), deadline,));
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv-1",
+            true,
+            deadline,
+        ));
+        let capability = state
+            .catalog_materialization_capability_at(now)
+            .expect("live exact capability");
+        let (agent_generation, catalog_generation) = {
+            let inner = state.inner.lock().expect("state");
+            (inner.agent_proof_generation, inner.catalog_proof_generation)
+        };
+
+        assert!(!state.revalidate_catalog_materialization_capability_at(&capability, deadline,));
+        let inner = state.inner.lock().expect("state");
+        assert!(inner.agent_shard_zero_replication_proof.is_none());
+        assert!(inner.catalog_candidate_proof.is_none());
+        assert!(inner.agent_proof_generation > agent_generation);
+        assert!(inner.catalog_proof_generation > catalog_generation);
+        assert_eq!(inner.agent_status.phase, AgentStatusPhase::Expired);
+        assert_eq!(
+            inner.catalog_candidates.phase,
+            CatalogCandidatePhase::Expired
+        );
+    }
+
+    #[test]
+    fn capability_and_proofs_expire_across_host_suspend() {
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+        let summary = ReplicationCorrelationSummary {
+            correlated_shards: 1,
+            shard_zero_correlated: true,
+            acknowledged_correlated_shards: 1,
+            shard_zero_target_fence_acknowledged: true,
+            remote_apply_witnessed_shards: 1,
+            shard_zero_remote_apply_witnessed: true,
+        };
+        state.record_agent_status_collecting(Duration::from_secs(2));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(2));
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            deadline,
+        ));
+        assert!(state.record_catalog_candidates_fresh_exact(exact_candidate_proof(), deadline,));
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv-1",
+            true,
+            deadline,
+        ));
+        let capability = state
+            .catalog_materialization_capability()
+            .expect("live exact capability");
+        let generations = {
+            let inner = state.inner.lock().expect("state");
+            (
+                inner.coordination_generation,
+                inner.agent_proof_generation,
+                inner.catalog_proof_generation,
+            )
+        };
+
+        // Simulate suspension: CLOCK_MONOTONIC remains unchanged while
+        // CLOCK_BOOTTIME advances beyond every evidence deadline.
+        clock
+            .advance(Duration::from_secs(3))
+            .expect("advance clock");
+        assert!(!state.revalidate_catalog_materialization_capability(&capability));
+        assert_eq!(
+            state.readiness(),
+            OrchReadiness {
+                ready: false,
+                reason: OrchReadinessReason::CoordinationUnavailable,
+            }
+        );
+        let inner = state.inner.lock().expect("state");
+        assert!(inner.agent_shard_zero_replication_proof.is_none());
+        assert!(inner.catalog_candidate_proof.is_none());
+        assert!(inner.coordination_generation > generations.0);
+        assert!(inner.agent_proof_generation > generations.1);
+        assert!(inner.catalog_proof_generation > generations.2);
+        assert_eq!(inner.agent_status.phase, AgentStatusPhase::Expired);
+        assert_eq!(
+            inner.catalog_candidates.phase,
+            CatalogCandidatePhase::Expired
+        );
+    }
+
+    #[test]
+    fn authority_clock_failure_clears_all_capability_evidence() {
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+        let summary = ReplicationCorrelationSummary {
+            correlated_shards: 1,
+            shard_zero_correlated: true,
+            acknowledged_correlated_shards: 1,
+            shard_zero_target_fence_acknowledged: true,
+            remote_apply_witnessed_shards: 1,
+            shard_zero_remote_apply_witnessed: true,
+        };
+        state.record_agent_status_collecting(Duration::from_secs(2));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(2));
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            deadline,
+        ));
+        assert!(state.record_catalog_candidates_fresh_exact(exact_candidate_proof(), deadline,));
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv-1",
+            true,
+            deadline,
+        ));
+        let capability = state
+            .catalog_materialization_capability()
+            .expect("live exact capability");
+
+        clock.fail();
+        assert!(!state.revalidate_catalog_materialization_capability(&capability));
+        assert!(state.catalog_materialization_capability().is_none());
+        assert!(!state.snapshot().coordination_ready);
+        let inner = state.inner.lock().expect("state");
+        assert!(inner.agent_shard_zero_replication_proof.is_none());
+        assert!(inner.catalog_candidate_proof.is_none());
+        assert_eq!(inner.agent_status.phase, AgentStatusPhase::Expired);
+        assert_eq!(
+            inner.catalog_candidates.phase,
+            CatalogCandidatePhase::Expired
+        );
+    }
+
+    #[test]
+    fn capability_revalidation_samples_time_after_mutex_contention() {
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = bootstrap_observation_state_with_clock(clock.clone());
+        let deadline = state
+            .suspend_aware_deadline_after(Duration::from_secs(2))
+            .expect("deadline");
+        let summary = ReplicationCorrelationSummary {
+            correlated_shards: 1,
+            shard_zero_correlated: true,
+            acknowledged_correlated_shards: 1,
+            shard_zero_target_fence_acknowledged: true,
+            remote_apply_witnessed_shards: 1,
+            shard_zero_remote_apply_witnessed: true,
+        };
+        state.record_agent_status_collecting(Duration::from_secs(2));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(2));
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            deadline,
+        ));
+        assert!(state.record_catalog_candidates_fresh_exact(exact_candidate_proof(), deadline,));
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv-1",
+            true,
+            deadline,
+        ));
+        let capability = state
+            .catalog_materialization_capability()
+            .expect("live exact capability");
+
+        let guard = state.inner.lock().expect("hold state mutex");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker = std::thread::spawn({
+            let state = state.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                state.revalidate_catalog_materialization_capability(&capability)
+            }
+        });
+        barrier.wait();
+        // Give the worker time to reach the held mutex. A pre-lock clock
+        // sample would occur during this interval and incorrectly survive.
+        std::thread::sleep(Duration::from_millis(10));
+        clock
+            .advance(Duration::from_secs(3))
+            .expect("suspend across mutex wait");
+        drop(guard);
+
+        assert!(!worker.join().expect("revalidation thread"));
+        assert!(!state.snapshot().coordination_ready);
     }
 
     #[test]
