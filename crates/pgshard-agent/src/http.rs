@@ -5,7 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::extract::{FromRef, State};
+use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -19,9 +19,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, timeout};
 
-use crate::catalog_activation_consumer::{
-    CatalogActivationCapabilityState, CatalogActivationEndpointState,
-};
 use crate::domain::{AgentSnapshot, AgentState, PostgresProcessState};
 
 const MAX_HTTP_CONNECTIONS: usize = 128;
@@ -148,21 +145,6 @@ pub async fn serve(
     serve_on(listener, state, shutdown).await
 }
 
-/// Runs the HTTP server with an independently supplied activation capability.
-///
-/// # Errors
-///
-/// Returns an I/O error if the listener cannot bind or the server fails.
-pub async fn serve_with_catalog_activation(
-    bind: SocketAddr,
-    state: AgentState,
-    catalog_activation: CatalogActivationCapabilityState,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    serve_on_with_catalog_activation(listener, state, catalog_activation, shutdown).await
-}
-
 /// Runs the HTTP server on an already-bound listener until shutdown.
 ///
 /// Binding separately lets a process supervisor prove its control endpoint is
@@ -177,87 +159,22 @@ pub async fn serve_on(
     state: AgentState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    serve_acceptor_with_policy(
-        listener,
-        HttpState::new(state, CatalogActivationCapabilityState::disabled()),
-        shutdown,
-        DEFAULT_HTTP_SERVER_POLICY,
-    )
-    .await
+    serve_acceptor_with_policy(listener, state, shutdown, DEFAULT_HTTP_SERVER_POLICY).await
 }
 
-/// Runs the already-bound HTTP server with the separate capability state.
-///
-/// # Errors
-///
-/// Returns an I/O error if the server fails.
-pub async fn serve_on_with_catalog_activation(
-    listener: TcpListener,
-    state: AgentState,
-    catalog_activation: CatalogActivationCapabilityState,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
-    serve_acceptor_with_policy(
-        listener,
-        HttpState::new(state, catalog_activation),
-        shutdown,
-        DEFAULT_HTTP_SERVER_POLICY,
-    )
-    .await
-}
-
-#[derive(Clone)]
-struct HttpState {
-    agent: AgentState,
-    catalog_activation: CatalogActivationCapabilityState,
-}
-
-impl HttpState {
-    fn new(agent: AgentState, catalog_activation: CatalogActivationCapabilityState) -> Self {
-        Self {
-            agent,
-            catalog_activation,
-        }
-    }
-}
-
-impl From<AgentState> for HttpState {
-    fn from(agent: AgentState) -> Self {
-        Self::new(agent, CatalogActivationCapabilityState::disabled())
-    }
-}
-
-impl FromRef<HttpState> for AgentState {
-    fn from_ref(input: &HttpState) -> Self {
-        input.agent.clone()
-    }
-}
-
-impl FromRef<HttpState> for CatalogActivationCapabilityState {
-    fn from_ref(input: &HttpState) -> Self {
-        input.catalog_activation.clone()
-    }
-}
-
-async fn serve_acceptor_with_policy<A, S>(
+async fn serve_acceptor_with_policy<A>(
     mut acceptor: A,
-    state: S,
+    state: AgentState,
     shutdown: impl Future<Output = ()> + Send + 'static,
     policy: HttpServerPolicy,
 ) -> io::Result<()>
 where
     A: TcpAcceptor,
-    S: Into<HttpState>,
 {
-    let state = state.into();
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
         .route("/status", get(status))
-        .route(
-            "/capabilities/catalog-activation",
-            get(catalog_activation_capability),
-        )
         .route("/metrics", get(metrics))
         .with_state(state);
     let mut accept_backoff = AcceptBackoff::new(
@@ -459,24 +376,6 @@ async fn status(State(state): State<AgentState>) -> impl IntoResponse {
     )
 }
 
-async fn catalog_activation_capability(
-    State(state): State<CatalogActivationCapabilityState>,
-) -> Response {
-    match state.snapshot() {
-        CatalogActivationEndpointState::Disabled => {
-            ([(header::CACHE_CONTROL, "no-store")], StatusCode::NOT_FOUND).into_response()
-        }
-        CatalogActivationEndpointState::Unavailable => (
-            [(header::CACHE_CONTROL, "no-store")],
-            StatusCode::SERVICE_UNAVAILABLE,
-        )
-            .into_response(),
-        CatalogActivationEndpointState::Available(capability) => {
-            ([(header::CACHE_CONTROL, "no-store")], Json(capability)).into_response()
-        }
-    }
-}
-
 async fn metrics(State(state): State<AgentState>) -> impl IntoResponse {
     let snapshot = state.snapshot();
     let readiness = state.readiness();
@@ -658,116 +557,38 @@ mod tests {
         );
     }
 
-    fn catalog_activation_response()
-    -> pgshard_types::catalog_activation::CatalogActivationCapability {
-        use pgshard_types::catalog_activation::{
-            CATALOG_ACTIVATION_ACCEPTANCE_VERSION, CATALOG_ACTIVATION_CAPABILITY_VERSION,
-            CATALOG_ACTIVATION_CONSUMER_VERSION, CATALOG_ACTIVATION_FSYNC_PERSISTENCE,
-            CATALOG_ACTIVATION_REQUEST_VERSION, CatalogActivationCapability,
-            CatalogActivationCapabilityCarrier, CatalogActivationCapabilityCluster,
-            CatalogActivationCapabilityTarget,
-        };
+    #[tokio::test]
+    async fn plaintext_listener_has_no_catalog_activation_capability() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind plaintext test listener");
+        let address = listener.local_addr().expect("plaintext test address");
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(serve_on(listener, AgentState::default(), async move {
+            let _ = shutdown_receiver.await;
+        }));
 
-        CatalogActivationCapability {
-            schema_version: CATALOG_ACTIVATION_CAPABILITY_VERSION.to_owned(),
-            capability: CATALOG_ACTIVATION_CONSUMER_VERSION.to_owned(),
-            request_schema_version: CATALOG_ACTIVATION_REQUEST_VERSION.to_owned(),
-            acceptance_schema_version: CATALOG_ACTIVATION_ACCEPTANCE_VERSION.to_owned(),
-            persistence: CATALOG_ACTIVATION_FSYNC_PERSISTENCE.to_owned(),
-            cluster: CatalogActivationCapabilityCluster {
-                name: "demo".into(),
-                uid: "cluster-uid".into(),
-            },
-            carrier: CatalogActivationCapabilityCarrier {
-                namespace: "database".into(),
-                name: "demo-catalog-activation".into(),
-                uid: "carrier-uid".into(),
-            },
-            target: CatalogActivationCapabilityTarget {
-                shard: 0,
-                member: 0,
-                instance_id: "demo-shard-0000-0".into(),
-                pod_name: "demo-shard-0000-0".into(),
-                pod_uid: "pod-uid".into(),
-            },
+        for request in [
+            b"GET /capabilities/catalog-activation HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".as_slice(),
+            b"POST /capabilities/catalog-activation HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+        ] {
+            let mut stream = TcpStream::connect(address)
+                .await
+                .expect("connect plaintext listener");
+            tokio::io::AsyncWriteExt::write_all(&mut stream, request)
+                .await
+                .expect("write plaintext request");
+            let mut response = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+                .await
+                .expect("read plaintext response");
+            assert!(response.starts_with(b"HTTP/1.1 404"), "{response:?}");
         }
-    }
 
-    #[tokio::test]
-    async fn catalog_activation_capability_has_exact_non_cacheable_transitions() {
-        let disabled =
-            catalog_activation_capability(State(CatalogActivationCapabilityState::disabled()))
-                .await;
-        assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            disabled.headers().get(header::CACHE_CONTROL),
-            Some(&header::HeaderValue::from_static("no-store"))
-        );
-
-        let state = CatalogActivationCapabilityState::configured();
-        let unavailable = catalog_activation_capability(State(state.clone())).await;
-        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            unavailable.headers().get(header::CACHE_CONTROL),
-            Some(&header::HeaderValue::from_static("no-store"))
-        );
-
-        let expected = catalog_activation_response();
-        state.available(expected.clone());
-        let available = catalog_activation_capability(State(state)).await;
-        assert_eq!(available.status(), StatusCode::OK);
-        assert_eq!(
-            available.headers().get(header::CACHE_CONTROL),
-            Some(&header::HeaderValue::from_static("no-store"))
-        );
-        let body = axum::body::to_bytes(available.into_body(), 1_048_576)
-            .await
-            .expect("bounded capability response");
-        let value: serde_json::Value = serde_json::from_slice(&body).expect("capability JSON");
-        assert_eq!(
-            value
-                .as_object()
-                .expect("capability object")
-                .keys()
-                .map(String::as_str)
-                .collect::<std::collections::BTreeSet<_>>(),
-            [
-                "acceptanceSchemaVersion",
-                "capability",
-                "carrier",
-                "cluster",
-                "persistence",
-                "requestSchemaVersion",
-                "schemaVersion",
-                "target",
-            ]
-            .into_iter()
-            .collect()
-        );
-        assert_eq!(
-            serde_json::from_value::<pgshard_types::catalog_activation::CatalogActivationCapability>(value)
-                .expect("strict capability schema"),
-            expected
-        );
-    }
-
-    #[tokio::test]
-    async fn capability_state_never_changes_status_v1() {
-        let agent = AgentState::default();
-        let before = status(State(agent.clone())).await.into_response();
-        let before = axum::body::to_bytes(before.into_body(), 1_048_576)
-            .await
-            .expect("initial status");
-        let capability = CatalogActivationCapabilityState::configured();
-        capability.available(catalog_activation_response());
-        let after = status(State(agent)).await.into_response();
-        let after = axum::body::to_bytes(after.into_body(), 1_048_576)
-            .await
-            .expect("status after capability transition");
-        assert_eq!(
-            before, after,
-            "/status v1 must remain byte-for-byte unchanged"
-        );
+        shutdown_sender
+            .send(())
+            .expect("server retains shutdown receiver");
+        server.await.expect("server task").expect("clean shutdown");
     }
 
     struct ErrorOnceAcceptor {
