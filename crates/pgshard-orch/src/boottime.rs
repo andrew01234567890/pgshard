@@ -45,6 +45,13 @@ impl SuspendAwareInstant {
         })
     }
 
+    pub(crate) fn min(self, other: Self) -> Self {
+        Self {
+            monotonic: self.monotonic.min(other.monotonic),
+            boottime: self.boottime.min(other.boottime),
+        }
+    }
+
     pub(crate) fn is_live_at(self, now: Self) -> bool {
         now.monotonic < self.monotonic && now.boottime < self.boottime
     }

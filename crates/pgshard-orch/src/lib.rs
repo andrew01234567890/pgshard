@@ -6,6 +6,7 @@
 pub(crate) mod agent_status;
 mod boottime;
 pub mod catalog_candidate;
+mod catalog_materialization;
 pub mod config;
 pub mod coordination;
 pub mod domain;
