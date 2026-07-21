@@ -305,7 +305,8 @@ fn replication_session(value: &[u8]) -> Option<bool> {
 }
 
 // Mirrors PostgreSQL parse_bool_with_len: case-insensitive unique prefixes of
-// true/false/yes/no, whole-word on/off, and single-character 1/0.
+// true/false/yes/no, at-least-two-character prefixes of on/off, and
+// single-character 1/0.
 fn parse_bool(value: &[u8]) -> Option<bool> {
     fn spelled(value: &[u8], word: &[u8], minimum: usize) -> bool {
         (minimum..=word.len()).contains(&value.len())
@@ -317,7 +318,7 @@ fn parse_bool(value: &[u8]) -> Option<bool> {
         b'y' | b'Y' => spelled(value, b"yes", 1).then_some(true),
         b'n' | b'N' => spelled(value, b"no", 1).then_some(false),
         b'o' | b'O' if spelled(value, b"on", 2) => Some(true),
-        b'o' | b'O' if spelled(value, b"off", 3) => Some(false),
+        b'o' | b'O' if spelled(value, b"off", 2) => Some(false),
         b'1' if value.len() == 1 => Some(true),
         b'0' if value.len() == 1 => Some(false),
         _ => None,
@@ -566,10 +567,12 @@ mod tests {
             b"false",
             b"n",
             b"no",
+            b"of",
             b"off",
             b"0",
             b"FALSE",
             b"No",
+            b"OF",
             b"OFF",
             b"F",
         ] {
@@ -601,7 +604,9 @@ mod tests {
         }
         for value in [
             b"o".as_slice(),
-            b"of",
+            b"onx",
+            b"ofx",
+            b"onn",
             b"maybe",
             b"2",
             b"",
