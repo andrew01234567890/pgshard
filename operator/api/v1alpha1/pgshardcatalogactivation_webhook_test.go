@@ -16,6 +16,16 @@ const catalogActivationControllerUsername = "system:serviceaccount:pgshard-syste
 const activationSourceHolder = "demo-shard-0000-member-0000-0/source-pod-uid/0123456789abcdef01234567"
 const activationDispatcherHolder = "demo-orchestrator-0/dispatcher-uid/11111111-2222-4333-8444-555555555555"
 
+type catalogActivationPublicationVerifierFunc func(context.Context, *PgShardCatalogActivation, *PgShardCatalogActivation) error
+
+func (verify catalogActivationPublicationVerifierFunc) VerifyPublication(ctx context.Context, oldActivation, newActivation *PgShardCatalogActivation) error {
+	return verify(ctx, oldActivation, newActivation)
+}
+
+func acceptingCatalogActivationPublicationVerifier() CatalogActivationPublicationVerifier {
+	return catalogActivationPublicationVerifierFunc(func(context.Context, *PgShardCatalogActivation, *PgShardCatalogActivation) error { return nil })
+}
+
 func catalogActivationAdmissionContext(username string) context.Context {
 	return admission.NewContextWithRequest(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
 		UserInfo: authenticationv1.UserInfo{Username: username},
@@ -237,7 +247,7 @@ func TestCatalogActivationCreateIsControllerOwnedAndEmpty(t *testing.T) {
 }
 
 func TestCatalogActivationRequestAndAcceptanceAreOwnedSetOnce(t *testing.T) {
-	validator := &PgShardCatalogActivationValidator{}
+	validator := &PgShardCatalogActivationValidator{PublicationVerifier: acceptingCatalogActivationPublicationVerifier()}
 	oldCarrier := activationCarrier()
 	published := oldCarrier.DeepCopy()
 	request := validCatalogActivationRequest()
@@ -309,7 +319,7 @@ func TestCatalogActivationRequestAndAcceptanceAreOwnedSetOnce(t *testing.T) {
 }
 
 func TestCatalogActivationLongNameAcceptanceUsesBoundedAgentIdentity(t *testing.T) {
-	validator := &PgShardCatalogActivationValidator{}
+	validator := &PgShardCatalogActivationValidator{PublicationVerifier: acceptingCatalogActivationPublicationVerifier()}
 	clusterName := strings.Repeat("a", MaximumClusterNameLength)
 	oldCarrier := activationCarrierForCluster(clusterName)
 	published := oldCarrier.DeepCopy()
@@ -340,5 +350,68 @@ func TestCatalogActivationLongNameAcceptanceUsesBoundedAgentIdentity(t *testing.
 	rawAgent := fmt.Sprintf("system:serviceaccount:database:%s-shard-0000-agent", clusterName)
 	if _, err := validator.ValidateUpdate(catalogActivationAdmissionContextForPod(rawAgent, request.Source.PodName, string(request.Source.PodUID)), published, accepted); err == nil {
 		t.Fatal("nonexistent raw long-name agent identity was accepted")
+	}
+}
+
+func TestCatalogActivationPublicationVerificationIsFailClosedAndTransitionScoped(t *testing.T) {
+	oldCarrier := activationCarrier()
+	request := validCatalogActivationRequest()
+	published := oldCarrier.DeepCopy()
+	published.Spec.Request = &request
+	published.Spec.RequestSHA256, _ = request.SHA256()
+	publisher := "system:serviceaccount:database:demo-orchestrator"
+	publisherContext := catalogActivationAdmissionContextForPod(publisher, request.Dispatcher.PodName, string(request.Dispatcher.PodUID))
+
+	if _, err := (&PgShardCatalogActivationValidator{}).ValidateUpdate(publisherContext, oldCarrier, published); err == nil || !strings.Contains(err.Error(), "verification is unavailable") {
+		t.Fatalf("publication without verifier error = %v", err)
+	}
+
+	calls := 0
+	verifier := catalogActivationPublicationVerifierFunc(func(_ context.Context, oldObject, newObject *PgShardCatalogActivation) error {
+		calls++
+		if oldObject != oldCarrier || newObject != published {
+			t.Fatal("verifier did not receive the exact admission objects")
+		}
+		return nil
+	})
+	validator := &PgShardCatalogActivationValidator{PublicationVerifier: verifier}
+	if _, err := validator.ValidateUpdate(publisherContext, oldCarrier, published); err != nil {
+		t.Fatalf("verified publication rejected: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("verified publication calls = %d, want 1", calls)
+	}
+
+	invalidPublisher := catalogActivationAdmissionContextForPod(publisher, "foreign-pod", string(request.Dispatcher.PodUID))
+	if _, err := validator.ValidateUpdate(invalidPublisher, oldCarrier, published); err == nil {
+		t.Fatal("foreign publisher was accepted")
+	}
+	metadataMutation := published.DeepCopy()
+	metadataMutation.Labels = map[string]string{"foreign": "true"}
+	if _, err := validator.ValidateUpdate(publisherContext, oldCarrier, metadataMutation); err == nil {
+		t.Fatal("publication with mutated metadata was accepted")
+	}
+	if calls != 1 {
+		t.Fatalf("verifier called for structurally invalid publication: %d", calls)
+	}
+
+	accepted := published.DeepCopy()
+	accepted.Status.Acceptance = &CatalogActivationAcceptance{
+		SchemaVersion: CatalogActivationAcceptanceVersion, CarrierUID: accepted.UID, RequestSHA256: accepted.Spec.RequestSHA256,
+		TargetPodName: request.Source.PodName, TargetPodUID: request.Source.PodUID, Persistence: CatalogActivationPersistenceFsync, PersistedAtUnixMS: "1700000000000",
+	}
+	agent := "system:serviceaccount:database:" + PostgreSQLAgentServiceAccountName("demo", 0)
+	if _, err := validator.ValidateUpdate(catalogActivationAdmissionContextForPod(agent, request.Source.PodName, string(request.Source.PodUID)), published, accepted); err != nil {
+		t.Fatalf("agent-only acceptance rejected: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("verifier called for agent-only acceptance: %d", calls)
+	}
+
+	failing := &PgShardCatalogActivationValidator{PublicationVerifier: catalogActivationPublicationVerifierFunc(func(context.Context, *PgShardCatalogActivation, *PgShardCatalogActivation) error {
+		return fmt.Errorf("injected authoritative read failure")
+	})}
+	if _, err := failing.ValidateUpdate(publisherContext, oldCarrier, published); err == nil || !strings.Contains(err.Error(), "injected authoritative read failure") {
+		t.Fatalf("publication verifier failure = %v", err)
 	}
 }

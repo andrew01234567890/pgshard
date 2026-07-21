@@ -384,6 +384,9 @@ fn validate_cluster_status(
         .get("status")
         .cloned()
         .ok_or(CatalogCandidateError::InvalidClusterStatus)?;
+    if !go_compatible_json_domain(&status_value) {
+        return Err(CatalogCandidateError::InvalidClusterStatus);
+    }
     let status: ClusterStatus = serde_json::from_value(status_value.clone())?;
     if status.observed_generation != generation
         || status.bootstrap_spec.shards != plan.shard_count
@@ -435,7 +438,7 @@ fn validate_cluster_status(
             generation,
             status_sha256: domain_digest(
                 CLUSTER_STATUS_FINGERPRINT_DOMAIN,
-                &serde_json::to_vec(&status_value)?,
+                &go_compatible_json(&status_value)?,
             ),
         },
         catalog_activation,
@@ -447,6 +450,81 @@ fn validate_cluster_status(
         operation_writer_access,
         postgresql_configuration,
     })
+}
+
+// Kubernetes admission recomputes this digest with Go's encoding/json. Match
+// its additional string escaping without changing JSON structure or literals.
+// The caller first restricts values to this shared integer-only number domain.
+fn go_compatible_json(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
+    let encoded = serde_json::to_vec(value)?;
+    let mut compatible = Vec::with_capacity(encoded.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < encoded.len() {
+        let byte = encoded[index];
+        if !in_string {
+            compatible.push(byte);
+            if byte == b'"' {
+                in_string = true;
+            }
+            index += 1;
+            continue;
+        }
+        if escaped {
+            compatible.push(byte);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => {
+                compatible.push(byte);
+                escaped = true;
+                index += 1;
+            }
+            b'"' => {
+                compatible.push(byte);
+                in_string = false;
+                index += 1;
+            }
+            b'<' => {
+                compatible.extend_from_slice(br"\u003c");
+                index += 1;
+            }
+            b'>' => {
+                compatible.extend_from_slice(br"\u003e");
+                index += 1;
+            }
+            b'&' => {
+                compatible.extend_from_slice(br"\u0026");
+                index += 1;
+            }
+            0xe2 if encoded.get(index..index + 3) == Some(&[0xe2, 0x80, 0xa8]) => {
+                compatible.extend_from_slice(br"\u2028");
+                index += 3;
+            }
+            0xe2 if encoded.get(index..index + 3) == Some(&[0xe2, 0x80, 0xa9]) => {
+                compatible.extend_from_slice(br"\u2029");
+                index += 3;
+            }
+            _ => {
+                compatible.push(byte);
+                index += 1;
+            }
+        }
+    }
+    debug_assert!(!in_string && !escaped);
+    Ok(compatible)
+}
+
+fn go_compatible_json_domain(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) => true,
+        Value::Number(number) => number.is_i64() || number.is_u64(),
+        Value::Array(values) => values.iter().all(go_compatible_json_domain),
+        Value::Object(values) => values.values().all(go_compatible_json_domain),
+    }
 }
 
 fn validate_catalog_activation(
@@ -2647,6 +2725,46 @@ mod tests {
             domain_digest(CANDIDATE_PAYLOAD_DOMAIN, b"{}"),
             domain_digest(CANDIDATE_PAYLOAD_DOMAIN, b"{}\n")
         );
+    }
+
+    #[test]
+    fn cluster_status_digest_matches_go_canonical_json() {
+        let status = json!({
+            "condition": "<ready>&\u{2028}\u{2029}",
+            "literal": r"\u003c\u2028",
+        });
+        let encoded = go_compatible_json(&status).expect("status JSON");
+        assert_eq!(
+            encoded,
+            br#"{"condition":"\u003cready\u003e\u0026\u2028\u2029","literal":"\\u003c\\u2028"}"#
+        );
+        assert_eq!(
+            domain_digest(CLUSTER_STATUS_FINGERPRINT_DOMAIN, &encoded),
+            "cbe68afa073340a29cc0a806ed69aba0ecd325f6d7b50df8c06f29b76e0f4471"
+        );
+    }
+
+    #[test]
+    fn cluster_status_digest_rejects_non_integer_numbers() {
+        assert!(go_compatible_json_domain(&json!({
+            "null": null,
+            "bool": true,
+            "string": "value",
+            "signed": -1,
+            "unsigned": 1,
+            "nested": [{"integer": 2}],
+        })));
+        assert!(!go_compatible_json_domain(&json!({"value": 1.0})));
+        assert!(!go_compatible_json_domain(
+            &json!({"value": [{"nested": 1.25}]})
+        ));
+
+        let (plan, mut cluster, _) = fixture();
+        cluster.data["status"]["numericDrift"] = json!(1.0);
+        assert!(matches!(
+            validate_cluster_status(&cluster, &plan),
+            Err(CatalogCandidateError::InvalidClusterStatus)
+        ));
     }
 
     #[test]
