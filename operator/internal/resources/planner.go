@@ -2943,7 +2943,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		orchestratorService(cluster),
 		poolerService(cluster),
 		orchestratorServiceAccount(cluster),
-		orchestratorLeaseRole(cluster, images.PostgreSQLRuntime.agentQuarantine()),
+		orchestratorLeaseRole(cluster, images.PostgreSQLRuntime.agentQuarantine(), catalogActivation),
 		orchestratorLeaseRoleBinding(cluster),
 		orchestratorLease(cluster),
 	)
@@ -5276,7 +5276,7 @@ func orchestratorServiceAccount(cluster *pgshardv1alpha1.PgShardCluster) *corev1
 	}
 }
 
-func orchestratorLeaseRole(cluster *pgshardv1alpha1.PgShardCluster, identityBinding bool) *rbacv1.Role {
+func orchestratorLeaseRole(cluster *pgshardv1alpha1.PgShardCluster, identityBinding bool, catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus) *rbacv1.Role {
 	name := cluster.Name + OrchestratorSuffix
 	rules := []rbacv1.PolicyRule{{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{cluster.Name + OrchestratorLeaseSuffix}, Verbs: []string{"get", "update"}}}
 	if !identityBinding {
@@ -5312,6 +5312,14 @@ func orchestratorLeaseRole(cluster *pgshardv1alpha1.PgShardCluster, identityBind
 		if len(catalogCandidateNames) != 0 {
 			rules = append(rules, rbacv1.PolicyRule{APIGroups: []string{corev1.GroupName}, Resources: []string{"configmaps"}, ResourceNames: catalogCandidateNames, Verbs: []string{"get"}})
 		}
+	}
+	if catalogActivation != nil {
+		rules = append(rules, rbacv1.PolicyRule{
+			APIGroups:     []string{pgshardv1alpha1.GroupVersion.Group},
+			Resources:     []string{"pgshardcatalogactivations"},
+			ResourceNames: []string{catalogActivation.Name},
+			Verbs:         []string{"get", "update"},
+		})
 	}
 	return &rbacv1.Role{
 		ObjectMeta: ownedMeta(cluster, name, "orchestrator", nil),
