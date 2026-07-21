@@ -15,10 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
-use axum::http::header::{
-    ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, EXPECT,
-    HOST, TRANSFER_ENCODING, UPGRADE,
-};
+use axum::http::header::{ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use axum::http::uri::Authority;
 use axum::http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version,
@@ -48,6 +45,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::catalog_activation_consumer::{
     CatalogActivationCapabilityState, CatalogActivationEndpointState,
 };
+use crate::http::AcceptBackoff;
 
 /// Exact path served only by the TLS listener.
 pub const CATALOG_ACTIVATION_CAPABILITY_PATH: &str = "/capabilities/catalog-activation";
@@ -61,6 +59,9 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(1);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const ACCEPT_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
+const ACCEPT_MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
+const ACCEPT_MAX_FAILURE_DURATION: Duration = Duration::from_secs(30);
 const INITIAL_RETRY: Duration = Duration::from_millis(250);
 const MAXIMUM_RETRY: Duration = Duration::from_secs(5);
 
@@ -138,6 +139,9 @@ pub struct CatalogActivationTlsConfigError;
 #[derive(Clone, Copy)]
 struct ServerPolicy {
     maximum_connections: usize,
+    accept_initial_retry_delay: Duration,
+    accept_max_retry_delay: Duration,
+    accept_max_failure_duration: Duration,
     handshake_timeout: Duration,
     header_timeout: Duration,
     connection_timeout: Duration,
@@ -146,6 +150,9 @@ struct ServerPolicy {
 
 const DEFAULT_SERVER_POLICY: ServerPolicy = ServerPolicy {
     maximum_connections: MAXIMUM_CONNECTIONS,
+    accept_initial_retry_delay: ACCEPT_INITIAL_RETRY_DELAY,
+    accept_max_retry_delay: ACCEPT_MAX_RETRY_DELAY,
+    accept_max_failure_duration: ACCEPT_MAX_FAILURE_DURATION,
     handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
     header_timeout: HTTP_HEADER_TIMEOUT,
     connection_timeout: HTTP_CONNECTION_TIMEOUT,
@@ -372,6 +379,11 @@ async fn serve_on_with_policy(
     policy: ServerPolicy,
 ) -> io::Result<()> {
     let acceptor = TlsAcceptor::from(tls);
+    let mut accept_backoff = AcceptBackoff::new(
+        policy.accept_initial_retry_delay,
+        policy.accept_max_retry_delay,
+        policy.accept_max_failure_duration,
+    );
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
     loop {
@@ -383,26 +395,52 @@ async fn serve_on_with_policy(
                     connection_task_result(result)?;
                 }
             }
-            accepted = listener.accept(), if connections.len() < policy.maximum_connections => {
-                match accepted {
-                    Ok((stream, _)) => {
-                        connections.spawn(serve_connection(
-                            stream,
-                            acceptor.clone(),
-                            capability.clone(),
-                            policy,
-                        ));
-                    }
-                    Err(error) if is_retryable_connection_accept_error(&error) => {
-                        tracing::debug!("transient catalog-activation TLS accept error");
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => return Err(error),
-                }
+            accepted = accept_with_retry(&listener, &mut accept_backoff),
+                if connections.len() < policy.maximum_connections => {
+                let stream = accepted?;
+                connections.spawn(serve_connection(
+                    stream,
+                    acceptor.clone(),
+                    capability.clone(),
+                    policy,
+                ));
             }
         }
     }
     drain_connections(&mut connections, policy.drain_timeout).await
+}
+
+async fn accept_with_retry(
+    listener: &TcpListener,
+    backoff: &mut AcceptBackoff,
+) -> io::Result<TcpStream> {
+    loop {
+        backoff.wait().await;
+        backoff.started_accept();
+        let accepted = listener.accept().await;
+        backoff.completed_accept();
+        match accepted {
+            Ok((stream, _)) => {
+                backoff.succeeded();
+                return Ok(stream);
+            }
+            Err(error) if is_retryable_connection_accept_error(&error) => {
+                let Some(retry_delay) = backoff.failed() else {
+                    tracing::warn!(
+                        %error,
+                        "catalog-activation TLS accept outage exceeded its retry budget"
+                    );
+                    return Err(error);
+                };
+                tracing::debug!(
+                    %error,
+                    retry_after_ms = retry_delay.as_millis(),
+                    "transient catalog-activation TLS accept error"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn is_retryable_connection_accept_error(error: &io::Error) -> bool {
@@ -534,15 +572,6 @@ async fn handle_request(
         }
         Err(RequestHeaderError::Invalid) => return empty_response(StatusCode::BAD_REQUEST),
     };
-    let capability = match capability.snapshot() {
-        CatalogActivationEndpointState::Disabled => {
-            return empty_response(StatusCode::NOT_FOUND);
-        }
-        CatalogActivationEndpointState::Unavailable => {
-            return empty_response(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        CatalogActivationEndpointState::Available(capability) => capability,
-    };
     let body = match to_bytes(request.into_body(), MAXIMUM_CHALLENGE_BYTES).await {
         Ok(body) if body.len() == content_length => body,
         Ok(_) => return empty_response(StatusCode::BAD_REQUEST),
@@ -552,8 +581,22 @@ async fn handle_request(
         Ok(challenge) => challenge,
         Err(_) => return empty_response(StatusCode::BAD_REQUEST),
     };
-    if challenge.validate().is_err()
-        || capability.validate().is_err()
+    if challenge.validate().is_err() {
+        return empty_response(StatusCode::BAD_REQUEST);
+    }
+    // Snapshot only after the client-controlled body await so availability
+    // withdrawn while a body stalls fails closed instead of answering from a
+    // stale capability.
+    let capability = match capability.snapshot() {
+        CatalogActivationEndpointState::Disabled => {
+            return empty_response(StatusCode::NOT_FOUND);
+        }
+        CatalogActivationEndpointState::Unavailable => {
+            return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        CatalogActivationEndpointState::Available(capability) => capability,
+    };
+    if capability.validate().is_err()
         || capability.cluster != challenge.cluster
         || capability.carrier != challenge.carrier
         || capability.target != challenge.target
@@ -584,13 +627,7 @@ enum RequestHeaderError {
 }
 
 fn validate_headers(headers: &HeaderMap) -> Result<usize, RequestHeaderError> {
-    if headers.len() != 5
-        || !headers.keys().all(allowed_request_header)
-        || singleton(headers, TRANSFER_ENCODING).is_some()
-        || singleton(headers, CONTENT_ENCODING).is_some()
-        || singleton(headers, EXPECT).is_some()
-        || singleton(headers, UPGRADE).is_some()
-    {
+    if headers.len() != 5 || !headers.keys().all(allowed_request_header) {
         return Err(RequestHeaderError::Invalid);
     }
     let host = singleton_required(headers, HOST)?
@@ -712,11 +749,15 @@ impl std::fmt::Debug for TlsMaterialKind {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
 
     use axum::body::{Body, to_bytes};
     use axum::http::header::{ACCEPT, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
     use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Version};
+    use hyper::body::{Bytes, Frame};
     use pgshard_types::catalog_activation::{
         CATALOG_ACTIVATION_ACCEPTANCE_VERSION,
         CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_REQUEST_VERSION,
@@ -802,6 +843,48 @@ mod tests {
 
     fn challenge_request() -> Request<Body> {
         request_with_body(serde_json::to_vec(&challenge()).expect("serialize challenge"))
+    }
+
+    struct GatedBody {
+        gate: Option<oneshot::Receiver<()>>,
+        payload: Option<Bytes>,
+    }
+
+    impl hyper::body::Body for GatedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let body = self.get_mut();
+            if let Some(gate) = body.gate.as_mut() {
+                if Pin::new(gate).poll(context).is_pending() {
+                    return Poll::Pending;
+                }
+                body.gate = None;
+            }
+            Poll::Ready(body.payload.take().map(|payload| Ok(Frame::data(payload))))
+        }
+    }
+
+    fn gated_challenge_request(gate: oneshot::Receiver<()>) -> Request<Body> {
+        let payload = serde_json::to_vec(&challenge()).expect("serialize challenge");
+        Request::builder()
+            .method(Method::POST)
+            .version(Version::HTTP_11)
+            .uri(CATALOG_ACTIVATION_CAPABILITY_PATH)
+            .header(HOST, "localhost")
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_LENGTH, payload.len())
+            .header(CONNECTION, "close")
+            .body(Body::new(GatedBody {
+                gate: Some(gate),
+                payload: Some(Bytes::from(payload)),
+            }))
+            .expect("valid gated test request")
     }
 
     fn tls_material() -> (String, String, CertificateDer<'static>) {
@@ -1017,6 +1100,18 @@ mod tests {
                 .status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[tokio::test]
+    async fn availability_withdrawn_while_body_is_pending_fails_closed() {
+        let state = available_state();
+        let (release_body, gate) = oneshot::channel();
+        let handler = tokio::spawn(handle_request(gated_challenge_request(gate), state.clone()));
+        tokio::task::yield_now().await;
+        state.unavailable();
+        release_body.send(()).expect("release pending body");
+        let response = handler.await.expect("join pending-body handler");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

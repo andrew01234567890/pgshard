@@ -57,7 +57,7 @@ const DEFAULT_HTTP_SERVER_POLICY: HttpServerPolicy = HttpServerPolicy {
     accept_max_failure_duration: HTTP_ACCEPT_MAX_FAILURE_DURATION,
 };
 
-struct AcceptBackoff {
+pub(crate) struct AcceptBackoff {
     initial_delay: Duration,
     maximum_delay: Duration,
     maximum_failure_duration: Duration,
@@ -68,7 +68,7 @@ struct AcceptBackoff {
 }
 
 impl AcceptBackoff {
-    fn new(
+    pub(crate) fn new(
         initial_delay: Duration,
         maximum_delay: Duration,
         maximum_failure_duration: Duration,
@@ -85,14 +85,14 @@ impl AcceptBackoff {
         }
     }
 
-    async fn wait(&mut self) {
+    pub(crate) async fn wait(&mut self) {
         if let Some(retry_at) = self.retry_at {
             tokio::time::sleep_until(retry_at).await;
             self.retry_at = None;
         }
     }
 
-    fn failed(&mut self) -> Option<Duration> {
+    pub(crate) fn failed(&mut self) -> Option<Duration> {
         let now = Instant::now();
         let started_at = self.failure_started_at.get_or_insert(now);
         let remaining = self
@@ -108,18 +108,18 @@ impl AcceptBackoff {
         Some(delay)
     }
 
-    fn succeeded(&mut self) {
+    pub(crate) fn succeeded(&mut self) {
         self.next_delay = self.initial_delay;
         self.retry_at = None;
         self.failure_started_at = None;
         self.accept_started_at = None;
     }
 
-    fn started_accept(&mut self) {
+    pub(crate) fn started_accept(&mut self) {
         self.accept_started_at.get_or_insert_with(Instant::now);
     }
 
-    fn completed_accept(&mut self) {
+    pub(crate) fn completed_accept(&mut self) {
         let Some(started_at) = self.accept_started_at.take() else {
             return;
         };
