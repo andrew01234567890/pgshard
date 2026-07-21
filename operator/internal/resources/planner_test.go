@@ -3347,6 +3347,18 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 					t.Fatalf("PostgreSQL agent Role %s = %#v, want %#v", role.Name, role.Rules, wantRules)
 				}
 			}
+			activationPolicy := object[*networkingv1.NetworkPolicy](t, plan, shardName(cluster.Name, 0)+"-catalog-activation-tls-ingress")
+			wantActivationSelector := componentSelector(cluster, "postgresql")
+			wantActivationSelector[ShardLabel] = "0000"
+			wantActivationSelector[MemberLabel] = "0000"
+			if !maps.Equal(activationPolicy.Spec.PodSelector.MatchLabels, wantActivationSelector) ||
+				len(activationPolicy.Spec.Ingress) != 1 || len(activationPolicy.Spec.Ingress[0].From) != 1 ||
+				activationPolicy.Spec.Ingress[0].From[0].PodSelector == nil ||
+				!maps.Equal(activationPolicy.Spec.Ingress[0].From[0].PodSelector.MatchLabels, componentSelector(cluster, "orchestrator")) ||
+				len(activationPolicy.Spec.Ingress[0].Ports) != 1 || activationPolicy.Spec.Ingress[0].Ports[0].Port == nil ||
+				activationPolicy.Spec.Ingress[0].Ports[0].Port.IntVal != CatalogActivationTLSPort {
+				t.Fatalf("catalog activation TLS NetworkPolicy = %#v", activationPolicy.Spec)
+			}
 			sources := 0
 			standbys := 0
 			for _, item := range plan {
@@ -3408,13 +3420,22 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 							"PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME",
 							"PGSHARD_CATALOG_ACTIVATION_CARRIER_UID",
 							"PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT",
+							"PGSHARD_CATALOG_ACTIVATION_TLS_BIND",
+							"PGSHARD_CATALOG_ACTIVATION_TLS_CERT_FILE",
+							"PGSHARD_CATALOG_ACTIVATION_TLS_KEY_FILE",
 						}
 						if shard == 0 {
 							if envFieldPath(agent.Env, activationEnvironment[0]) != "metadata.namespace" ||
 								envValue(agent.Env, activationEnvironment[1]) != carrier.Name ||
 								envValue(agent.Env, activationEnvironment[2]) != string(carrier.UID) ||
-								envValue(agent.Env, activationEnvironment[3]) != catalogActivationJournalRoot {
+								envValue(agent.Env, activationEnvironment[3]) != catalogActivationJournalRoot ||
+								envValue(agent.Env, activationEnvironment[4]) != "0.0.0.0:8443" ||
+								envValue(agent.Env, activationEnvironment[5]) != catalogActivationTLSMountPath+"/tls.crt" ||
+								envValue(agent.Env, activationEnvironment[6]) != catalogActivationTLSMountPath+"/tls.key" {
 								t.Fatalf("shard-zero source activation environment = %#v", agent.Env)
+							}
+							if !containerHasPort(agent, "activation-tls", CatalogActivationTLSPort) {
+								t.Fatalf("shard-zero source activation TLS ports = %#v", agent.Ports)
 							}
 							if len(object.Spec.Template.Spec.InitContainers) != 2 {
 								t.Fatalf("shard-zero source init containers = %#v", object.Spec.Template.Spec.InitContainers)
@@ -3438,8 +3459,17 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 								t.Fatalf("shard-zero source journal volume = %#v", journalVolume)
 							}
 							wantMount := corev1.VolumeMount{Name: catalogActivationJournalVolumeName, MountPath: catalogActivationJournalRoot, SubPath: catalogActivationJournalSubPath}
-							if !slices.Contains(agent.VolumeMounts, wantMount) || !podHasServiceAccountTokenProjection(object.Spec.Template.Spec) {
+							wantTLSMount := corev1.VolumeMount{Name: catalogActivationTLSVolumeName, MountPath: catalogActivationTLSMountPath, ReadOnly: true}
+							if !slices.Contains(agent.VolumeMounts, wantMount) || !slices.Contains(agent.VolumeMounts, wantTLSMount) || !podHasServiceAccountTokenProjection(object.Spec.Template.Spec) {
 								t.Fatalf("shard-zero source activation mounts = %#v", agent.VolumeMounts)
+							}
+							tlsProjection := volumeByName(t, object.Spec.Template.Spec.Volumes, catalogActivationTLSVolumeName).Secret
+							if tlsProjection == nil || tlsProjection.SecretName != cluster.Status.CatalogAccess.SecretName ||
+								tlsProjection.DefaultMode == nil || *tlsProjection.DefaultMode != 0o440 ||
+								!reflect.DeepEqual(secretItemKeys(tlsProjection.Items), []string{CatalogTLSCertificateKey, CatalogTLSPrivateKeyKey}) ||
+								len(tlsProjection.Items) != 2 || tlsProjection.Items[0].Mode == nil || *tlsProjection.Items[0].Mode != 0o440 ||
+								tlsProjection.Items[1].Mode == nil || *tlsProjection.Items[1].Mode != 0o440 {
+								t.Fatalf("shard-zero source activation TLS projection = %#v", tlsProjection)
 							}
 						} else {
 							for _, name := range activationEnvironment {
@@ -3447,7 +3477,9 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 									t.Fatalf("non-consumer source %s received activation environment %s", object.Name, name)
 								}
 							}
-							if hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationJournalVolumeName) || containsNamedVolumeMount(agent.VolumeMounts, catalogActivationJournalVolumeName) || len(object.Spec.Template.Spec.InitContainers) != 1 {
+							if hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationJournalVolumeName) || hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationTLSVolumeName) ||
+								containsNamedVolumeMount(agent.VolumeMounts, catalogActivationJournalVolumeName) || containsNamedVolumeMount(agent.VolumeMounts, catalogActivationTLSVolumeName) ||
+								containerHasPort(agent, "activation-tls", CatalogActivationTLSPort) || len(object.Spec.Template.Spec.InitContainers) != 1 {
 								t.Fatalf("non-consumer source %s received activation storage: %#v", object.Name, object.Spec.Template.Spec)
 							}
 						}
@@ -3480,12 +3512,14 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 							t.Fatalf("standby %s received writable authority %s", object.Name, forbidden)
 						}
 					}
-					for _, forbidden := range []string{"PGSHARD_CATALOG_ACTIVATION_CARRIER_NAMESPACE", "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME", "PGSHARD_CATALOG_ACTIVATION_CARRIER_UID", "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT"} {
+					for _, forbidden := range []string{"PGSHARD_CATALOG_ACTIVATION_CARRIER_NAMESPACE", "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME", "PGSHARD_CATALOG_ACTIVATION_CARRIER_UID", "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT", "PGSHARD_CATALOG_ACTIVATION_TLS_BIND", "PGSHARD_CATALOG_ACTIVATION_TLS_CERT_FILE", "PGSHARD_CATALOG_ACTIVATION_TLS_KEY_FILE"} {
 						if containerHasEnvironment(agent, forbidden) {
 							t.Fatalf("standby %s received catalog activation authority %s", object.Name, forbidden)
 						}
 					}
-					if hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationJournalVolumeName) || containsNamedVolumeMount(agent.VolumeMounts, catalogActivationJournalVolumeName) || len(object.Spec.Template.Spec.InitContainers) != 1 {
+					if hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationJournalVolumeName) || hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationTLSVolumeName) ||
+						containsNamedVolumeMount(agent.VolumeMounts, catalogActivationJournalVolumeName) || containsNamedVolumeMount(agent.VolumeMounts, catalogActivationTLSVolumeName) ||
+						containerHasPort(agent, "activation-tls", CatalogActivationTLSPort) || len(object.Spec.Template.Spec.InitContainers) != 1 {
 						t.Fatalf("standby %s received catalog activation storage: %#v", object.Name, object.Spec.Template.Spec)
 					}
 					sourceBootstrap := cluster.Status.PostgreSQLBootstraps[shard*members]
@@ -3689,8 +3723,14 @@ func TestMultiMemberCatalogCandidateConfigurationsAreImmutableAndInert(t *testin
 								t.Fatalf("StatefulSet %s mounted inert catalog candidate configuration %s", workload.Name, volume.ConfigMap.Name)
 							}
 						}
-						if volume.Secret != nil && (volume.Secret.SecretName == cluster.Status.CatalogAccess.SecretName || volume.Secret.SecretName == cluster.Status.OperationWriterAccess.SecretName) {
-							t.Fatalf("StatefulSet %s received sealed catalog credential material %s", workload.Name, volume.Secret.SecretName)
+						if volume.Secret != nil && volume.Secret.SecretName == cluster.Status.OperationWriterAccess.SecretName {
+							t.Fatalf("StatefulSet %s received sealed operation-writer material %s", workload.Name, volume.Secret.SecretName)
+						}
+						if volume.Secret != nil && volume.Secret.SecretName == cluster.Status.CatalogAccess.SecretName {
+							if workload.Name != PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0) || volume.Name != catalogActivationTLSVolumeName ||
+								!reflect.DeepEqual(secretItemKeys(volume.Secret.Items), []string{CatalogTLSCertificateKey, CatalogTLSPrivateKeyKey}) {
+								t.Fatalf("StatefulSet %s received catalog material outside the exact source TLS projection: %#v", workload.Name, volume)
+							}
 						}
 					}
 				case *appsv1.Deployment:
@@ -4068,10 +4108,13 @@ func TestBootstrapSourceLifecycleClassificationDoesNotRequireCatalogActivationCo
 		return strings.HasPrefix(environment.Name, "PGSHARD_CATALOG_ACTIVATION_")
 	})
 	legacy.Spec.Containers[0].VolumeMounts = slices.DeleteFunc(legacy.Spec.Containers[0].VolumeMounts, func(mount corev1.VolumeMount) bool {
-		return mount.Name == catalogActivationJournalVolumeName
+		return mount.Name == catalogActivationJournalVolumeName || mount.Name == catalogActivationTLSVolumeName
+	})
+	legacy.Spec.Containers[0].Ports = slices.DeleteFunc(legacy.Spec.Containers[0].Ports, func(port corev1.ContainerPort) bool {
+		return port.Name == "activation-tls"
 	})
 	legacy.Spec.Volumes = slices.DeleteFunc(legacy.Spec.Volumes, func(volume corev1.Volume) bool {
-		return volume.Name == catalogActivationJournalVolumeName
+		return volume.Name == catalogActivationJournalVolumeName || volume.Name == catalogActivationTLSVolumeName
 	})
 	legacy.Spec.InitContainers = slices.DeleteFunc(legacy.Spec.InitContainers, func(container corev1.Container) bool {
 		return container.Name == "initialize-catalog-activation-journal"

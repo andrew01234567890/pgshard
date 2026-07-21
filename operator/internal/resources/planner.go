@@ -69,6 +69,8 @@ const (
 	PoolerROPort   int32 = 5433
 	PoolerRPort    int32 = 5434
 	HTTPPort       int32 = 8080
+	// CatalogActivationTLSPort is the dedicated authenticated capability port.
+	CatalogActivationTLSPort int32 = 8443
 
 	topologySchemaVersion               = "pgshard.topology.v1"
 	maximumTopologyPayloadBytes         = 900 * 1024
@@ -120,6 +122,8 @@ const (
 	catalogActivationJournalVolumeMountPath   = "/var/lib/pgshard/catalog-activation-volume"
 	catalogActivationJournalSubPath           = "root"
 	catalogActivationJournalRoot              = "/var/lib/postgresql/18/.pgshard-catalog-activation"
+	catalogActivationTLSVolumeName            = "catalog-activation-tls"
+	catalogActivationTLSMountPath             = "/etc/pgshard/catalog-tls"
 )
 
 const postgresqlBootstrapScript = `set -Eeuo pipefail
@@ -2959,6 +2963,9 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			PostgreSQLWritableLease(cluster, shard),
 			postgresqlNetworkPolicy(cluster, shard),
 		)
+		if shardCatalogActivation != nil {
+			objects = append(objects, postgresqlCatalogActivationTLSNetworkPolicy(cluster))
+		}
 		if cluster.Spec.MembersPerShard == 1 {
 			bootstrap := bootstraps[postgresqlBootstrapKey{shard: shard, member: 0}]
 			writableLease := writableLeases[shard]
@@ -2972,7 +2979,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			replicationCredential := replicationCredentials[shard]
 			objects = append(objects,
 				postgresqlStandbyServiceAccount(cluster, shard),
-				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease, replicationCredential, shardCatalogActivation),
+				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease, replicationCredential, shardCatalogActivation, catalogAccess),
 			)
 			for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
 				objects = append(objects, postgresqlReplicationStandbyStatefulSet(
@@ -4709,7 +4716,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 	}
 }
 
-func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus) *appsv1.StatefulSet {
+func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus, catalogAccess *pgshardv1alpha1.CatalogAccessStatus) *appsv1.StatefulSet {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
@@ -4740,17 +4747,24 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 	agent := postgresqlReplicationBootstrapPrimaryContainer(cluster, shard, images.PostgreSQLBootstrap, bootstrapPullPolicy, postgresSecurity, writableLease)
 	initContainers := []corev1.Container{}
 	if catalogActivation != nil {
+		if catalogAccess == nil {
+			panic("validated catalog-activation consumer has no catalog TLS checkpoint")
+		}
 		agent.Env = append(agent.Env,
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME", Value: catalogActivation.Name},
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_CARRIER_UID", Value: string(catalogActivation.UID)},
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT", Value: catalogActivationJournalRoot},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_TLS_BIND", Value: fmt.Sprintf("0.0.0.0:%d", CatalogActivationTLSPort)},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_TLS_CERT_FILE", Value: catalogActivationTLSMountPath + "/tls.crt"},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_TLS_KEY_FILE", Value: catalogActivationTLSMountPath + "/tls.key"},
 		)
+		agent.Ports = append(agent.Ports, corev1.ContainerPort{Name: "activation-tls", ContainerPort: CatalogActivationTLSPort, Protocol: corev1.ProtocolTCP})
 		agent.VolumeMounts = append(agent.VolumeMounts, corev1.VolumeMount{
 			Name:      catalogActivationJournalVolumeName,
 			MountPath: catalogActivationJournalRoot,
 			SubPath:   catalogActivationJournalSubPath,
-		})
+		}, corev1.VolumeMount{Name: catalogActivationTLSVolumeName, MountPath: catalogActivationTLSMountPath, ReadOnly: true})
 	}
 	generationDurability, synchronousStandbys := postgresqlGenerationDurability(cluster)
 	bootstrapContainer := corev1.Container{
@@ -4833,12 +4847,28 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 		postgresqlAgentKubernetesAPIVolume(),
 	}
 	if catalogActivation != nil {
-		volumes = append(volumes, corev1.Volume{
-			Name: catalogActivationJournalVolumeName,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-				SizeLimit: ptr(resource.MustParse("1Mi")),
-			}},
-		})
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: catalogActivationJournalVolumeName,
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+					SizeLimit: ptr(resource.MustParse("1Mi")),
+				}},
+			},
+			corev1.Volume{
+				Name: catalogActivationTLSVolumeName,
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName:  catalogAccess.SecretName,
+					DefaultMode: ptr(int32(0o440)),
+					// ca.crt remains reserved for the future orchestrator TLS
+					// client. No catalog password or client material enters the
+					// source agent through this exact-key projection.
+					Items: []corev1.KeyToPath{
+						{Key: CatalogTLSCertificateKey, Path: "tls.crt", Mode: ptr(int32(0o440))},
+						{Key: CatalogTLSPrivateKeyKey, Path: "tls.key", Mode: ptr(int32(0o440))},
+					},
+				}},
+			},
+		)
 	}
 	statefulSetMetadata := ownedMeta(cluster, name, "postgresql", nil)
 	statefulSetMetadata.Labels[ShardLabel] = shardLabel(shard)
@@ -5345,6 +5375,30 @@ func postgresqlNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster, shard int3
 					Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &agentHTTPPort}},
 				},
 			},
+		},
+	}
+}
+
+// postgresqlCatalogActivationTLSNetworkPolicy opens the dedicated authenticated
+// capability endpoint only on the shard-zero member-zero consumer. The normal
+// diagnostics policy remains separate so adding TLS does not widen any other
+// PostgreSQL member's ingress surface.
+func postgresqlCatalogActivationTLSNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster) *networkingv1.NetworkPolicy {
+	tcp := corev1.ProtocolTCP
+	tlsPort := intstr.FromInt32(CatalogActivationTLSPort)
+	selector := componentSelector(cluster, "postgresql")
+	selector[ShardLabel] = shardLabel(0)
+	selector[MemberLabel] = memberLabel(0)
+	orchestratorPeer := componentSelector(cluster, "orchestrator")
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: ownedMeta(cluster, shardName(cluster.Name, 0)+"-catalog-activation-tls-ingress", "postgresql", nil),
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: selector},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From:  []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: orchestratorPeer}}},
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &tlsPort}},
+			}},
 		},
 	}
 }
