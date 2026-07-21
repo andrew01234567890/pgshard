@@ -962,6 +962,149 @@ func TestLegacyMemberZeroCredentialMetadataMigratesWithoutChangingIdentity(t *te
 	}
 }
 
+func legacyMemberZeroCredentialMigrationFixture(t *testing.T) (context.Context, *pgshardv1alpha1.PgShardCluster, pgshardv1alpha1.PostgreSQLBootstrapStatus, client.Client, *corev1.Secret) {
+	t.Helper()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.Shards = 1
+	cluster.Spec.MembersPerShard = 3
+	name := legacyPostgreSQLAuthSecretPrefix(cluster.Name, 0) + strings.Repeat("a", hex.EncodedLen(bootstrapNameRandomBytes))
+	secret := owned.PostgreSQLMemberAuthSecret(cluster, 0, 0, name, []byte(strings.Repeat("b", hex.EncodedLen(postgresqlPasswordBytes))))
+	secret.UID = "legacy-member-zero-secret"
+	secret.ResourceVersion = "1"
+	delete(secret.Labels, owned.MemberLabel)
+	bootstrap := pgshardv1alpha1.PostgreSQLBootstrapStatus{Shard: 0, Member: 0, SecretName: name, SecretUID: secret.UID}
+	base := newFakeClient(t, cluster, secret)
+	observed := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, observed); err != nil {
+		t.Fatal(err)
+	}
+	return ctx, cluster, bootstrap, base, observed
+}
+
+func forbidSecretPatchVerb(t *testing.T) func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+	t.Helper()
+	return func(_ context.Context, _ client.WithWatch, object client.Object, _ client.Patch, _ ...client.PatchOption) error {
+		t.Errorf("credential migration issued a patch of %T %s, which the manager role does not grant for Secrets", object, object.GetName())
+		return apierrors.NewForbidden(corev1.Resource("secrets"), object.GetName(), fmt.Errorf("manager role does not grant patch on secrets"))
+	}
+}
+
+func TestLegacyMemberZeroCredentialMigrationDoesNotRequireForbiddenSecretPatchVerb(t *testing.T) {
+	t.Parallel()
+	ctx, cluster, bootstrap, base, observed := legacyMemberZeroCredentialMigrationFixture(t)
+	verbFenced := interceptedClient(t, base, interceptor.Funcs{Patch: forbidSecretPatchVerb(t)})
+	if err := developmentReconciler(verbFenced, base).migrateLegacyPostgreSQLAuthSecretMetadata(ctx, cluster, bootstrap, observed); err != nil {
+		t.Fatalf("migration must stay within granted Secret verbs: %v", err)
+	}
+	migrated := &corev1.Secret{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(observed), migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated.UID != bootstrap.SecretUID || migrated.Labels[owned.MemberLabel] != "0000" {
+		t.Fatalf("verb-fenced migration did not converge on the same identity: %#v", migrated.ObjectMeta)
+	}
+	if err := validatePostgreSQLAuthSecret(migrated, cluster, bootstrap, bootstrap.SecretName); err != nil {
+		t.Fatalf("migrated credential is invalid: %v", err)
+	}
+}
+
+func TestLegacyMemberZeroCredentialMigrationRetriesConflictAgainstSameIdentity(t *testing.T) {
+	t.Parallel()
+	ctx, cluster, bootstrap, base, observed := legacyMemberZeroCredentialMigrationFixture(t)
+	updates := 0
+	conflicting := interceptedClient(t, base, interceptor.Funcs{
+		Patch: forbidSecretPatchVerb(t),
+		Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			if _, ok := object.(*corev1.Secret); ok {
+				updates++
+				if updates == 1 {
+					concurrent := &corev1.Secret{}
+					if err := base.Get(ctx, client.ObjectKeyFromObject(object), concurrent); err != nil {
+						return err
+					}
+					if concurrent.Annotations == nil {
+						concurrent.Annotations = make(map[string]string, 1)
+					}
+					concurrent.Annotations["pgshard.io/test-concurrent-writer"] = "raced"
+					if err := base.Update(ctx, concurrent); err != nil {
+						return err
+					}
+				}
+			}
+			return kubeClient.Update(ctx, object, options...)
+		},
+	})
+	if err := developmentReconciler(conflicting, base).migrateLegacyPostgreSQLAuthSecretMetadata(ctx, cluster, bootstrap, observed); err != nil {
+		t.Fatalf("conflicted migration did not converge: %v", err)
+	}
+	if updates != 2 {
+		t.Fatalf("expected one conflicted update and one fenced retry, got %d updates", updates)
+	}
+	migrated := &corev1.Secret{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(observed), migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated.UID != bootstrap.SecretUID || migrated.Labels[owned.MemberLabel] != "0000" || migrated.Annotations["pgshard.io/test-concurrent-writer"] != "raced" {
+		t.Fatalf("fenced retry lost identity, member label, or the concurrent write: %#v", migrated.ObjectMeta)
+	}
+}
+
+func TestLegacyMemberZeroCredentialMigrationFailsClosedWhenReplacedDuringConflictRetry(t *testing.T) {
+	t.Parallel()
+	ctx, cluster, bootstrap, base, observed := legacyMemberZeroCredentialMigrationFixture(t)
+	replaced := false
+	replacing := interceptedClient(t, base, interceptor.Funcs{
+		Patch: forbidSecretPatchVerb(t),
+		Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			secret, ok := object.(*corev1.Secret)
+			if !ok || replaced {
+				return kubeClient.Update(ctx, object, options...)
+			}
+			replaced = true
+			doomed := &corev1.Secret{}
+			if err := base.Get(ctx, client.ObjectKeyFromObject(secret), doomed); err != nil {
+				return err
+			}
+			if err := base.Delete(ctx, doomed); err != nil {
+				return err
+			}
+			impostor := doomed.DeepCopy()
+			impostor.UID = ""
+			impostor.ResourceVersion = ""
+			impostor.CreationTimestamp = metav1.Time{}
+			if err := base.Create(ctx, impostor); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(corev1.Resource("secrets"), secret.Name, fmt.Errorf("injected concurrent write"))
+		},
+	})
+	err := developmentReconciler(replacing, base).migrateLegacyPostgreSQLAuthSecretMetadata(ctx, cluster, bootstrap, observed)
+	if err == nil || !strings.Contains(err.Error(), "changed UID during member migration") {
+		t.Fatalf("replacement during conflict retry must fail closed: %v", err)
+	}
+}
+
+func TestLegacyMemberZeroCredentialMigrationBoundsConflictRetries(t *testing.T) {
+	t.Parallel()
+	ctx, cluster, bootstrap, base, observed := legacyMemberZeroCredentialMigrationFixture(t)
+	updates := 0
+	alwaysConflicting := interceptedClient(t, base, interceptor.Funcs{
+		Patch: forbidSecretPatchVerb(t),
+		Update: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.UpdateOption) error {
+			updates++
+			return apierrors.NewConflict(corev1.Resource("secrets"), object.GetName(), fmt.Errorf("injected persistent contention"))
+		},
+	})
+	err := developmentReconciler(alwaysConflicting, base).migrateLegacyPostgreSQLAuthSecretMetadata(ctx, cluster, bootstrap, observed)
+	if err == nil || !strings.Contains(err.Error(), "after 4 conflicts") {
+		t.Fatalf("persistent contention must fail with bounded retries: %v", err)
+	}
+	if updates != 4 {
+		t.Fatalf("expected exactly 4 bounded attempts, got %d", updates)
+	}
+}
+
 func TestReconcileUpgradesMemberlessSourceStorageStatusFromPreviousRelease(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
