@@ -1678,8 +1678,11 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		sourcePod.Status.ContainerStatuses[0].RestartCount != sourceRestartsBeforeConsumerFailure || podReady(sourcePod) || sourcePod.Status.ContainerStatuses[0].Ready {
 		t.Fatalf("catalog activation failure changed process/readiness lifecycle: %#v", sourcePod.Status)
 	}
-	if output, err := exec.CommandContext(ctx, "kubectl", "--namespace", namespace.Name, "exec", sourcePodName, "--container=postgresql", "--", "pg_isready", "--quiet", "--host=127.0.0.1", "--port=5432").CombinedOutput(); err == nil {
-		t.Fatalf("catalog activation failure exposed PostgreSQL TCP: %s", output)
+	ordinarySQL, err := exec.CommandContext(ctx, "kubectl", "--namespace", namespace.Name, "exec", sourcePodName, "--container=postgresql", "--",
+		"psql", "-X", "--no-password", "--host=127.0.0.1", "--port=5432", "--username=postgres", "--dbname=postgres", "--command=SELECT 1").CombinedOutput()
+	var ordinarySQLExit *exec.ExitError
+	if !errors.As(err, &ordinarySQLExit) || ordinarySQLExit.ExitCode() != 2 || !strings.Contains(string(ordinarySQL), "pg_hba.conf rejects connection") {
+		t.Fatalf("catalog activation failure ordinary SQL denial = error %v output %q, want pg_hba rejection with exit 2", err, ordinarySQL)
 	}
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		currentRole := &rbacv1.Role{}
