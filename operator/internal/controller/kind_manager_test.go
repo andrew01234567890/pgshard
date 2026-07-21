@@ -1547,8 +1547,21 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		if subresource != "" {
 			arguments = append(arguments, "--subresource="+subresource)
 		}
-		if got := strings.TrimSpace(runKubectl(t, ctx, arguments...)); got != want {
-			t.Fatalf("kubectl auth can-i %s %s as %s = %q, want %q", verb, resourceName, serviceAccount, got, want)
+		output, err := exec.CommandContext(ctx, "kubectl", arguments...).CombinedOutput()
+		exitCode := 0
+		if err != nil {
+			var exitError *exec.ExitError
+			if !errors.As(err, &exitError) {
+				t.Fatalf("kubectl auth can-i %s %s as %s failed: %v: %s", verb, resourceName, serviceAccount, err, output)
+			}
+			exitCode = exitError.ExitCode()
+		}
+		wantExitCode := 0
+		if want == "no" {
+			wantExitCode = 1
+		}
+		if got := strings.TrimSpace(string(output)); got != want || exitCode != wantExitCode {
+			t.Fatalf("kubectl auth can-i %s %s as %s = %q (exit=%d), want %q (exit=%d)", verb, resourceName, serviceAccount, got, exitCode, want, wantExitCode)
 		}
 	}
 	sourceServiceAccount := owned.PostgreSQLAgentServiceAccountName(haCluster.Name, 0)
