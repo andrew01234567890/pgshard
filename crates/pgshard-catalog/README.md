@@ -62,6 +62,19 @@ fail before it can reinterpret durable WAL progress.
 The Rust routing snapshot intentionally does not load this registry yet;
 catalog records do not authorize a live replication session.
 
+The catalog also exposes a separate, uncomposed operation-acceptance
+repository. It permanently stores one bounded exact envelope and a pending-only
+status under a global canonical UUID, computes the versioned SHA-256 fingerprint
+inside PostgreSQL, and returns only after synchronous COMMIT. Exact retries are
+replays; any changed field or reserved tombstone UUID is a conflict. A lost
+COMMIT response remains outcome-unknown and is reconciled only by retrying the
+exact request on a fresh session. Raw envelopes, payloads, status rows, and
+tombstones are hidden from reader and administrator roles. A fixed NOLOGIN
+`pgshard_operation_writer` role can execute only the security-definer accept
+and bounded get routines and has no direct table access. No login credential,
+orchestrator connector, endpoint, operation execution, or recovery loop is
+composed yet, so orchestrator `persistence_enabled` truthfully remains false.
+
 The migration expects a pre-created UTF8 database, a short-lived superuser
 bootstrap principal, and an external connection gate that prevents new
 sessions and arbitrary concurrent schema DDL until commit. The operator runs a

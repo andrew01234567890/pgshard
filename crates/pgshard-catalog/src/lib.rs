@@ -9,6 +9,7 @@ mod cache;
 mod driver;
 mod loader;
 mod model;
+mod operation;
 mod supervisor;
 
 pub use cache::{
@@ -29,6 +30,11 @@ pub use model::{
     CatalogSnapshot, ClusterId, DatabaseCatalog, DatabaseEpochs, DatabaseId, DatabaseShardId,
     IdentifierError, RegisteredTable, RoutingHashConfig, ShardKeyType, ShardRoute, SnapshotError,
     TableName,
+};
+pub use operation::{
+    AcceptanceOutcome, AcceptanceReceipt, AcceptedOperation, KubernetesClusterUid,
+    OperationAcceptanceError, OperationId, OperationIdentity, OperationKind, OperationPhase,
+    OperationPreconditions, OperationRepository, OperationRequest, OperationRequestError,
 };
 pub use supervisor::{
     CatalogConnectionPhase, CatalogFailureKind, CatalogReadinessReason, CatalogSupervisor,

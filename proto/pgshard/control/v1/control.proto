@@ -84,8 +84,14 @@ message GetStatusResponse {
 }
 
 // OperationEnvelope is deliberately generic: operation-specific contracts live
-// in their owning versioned packages. operation_id is the cluster-global
-// idempotency key across all operation types and executors. On first acceptance,
+// in their owning versioned packages. operation_id is the exact lowercase,
+// hyphenated, non-nil UUID used as the cluster-global idempotency key across all
+// operation types and executors. cluster_id is a lowercase DNS label and
+// shard_id is the decimal spelling of one uint32 physical shard ordinal; a
+// future transport adapter must reject alternate spellings instead of
+// normalizing them into a replay. The required epochs and deadline must each
+// be in 1..=9223372036854775807 even though protobuf encodes them as uint64.
+// On first acceptance,
 // the server durably stores every field below, including the exact payload bytes
 // and deadline. A replay must match every stored value. Reusing an ID with any
 // different value is an idempotency conflict, never a replay. Milestone 1 never
@@ -117,7 +123,8 @@ enum OperationAcceptance {
   OPERATION_ACCEPTANCE_IDEMPOTENCY_CONFLICT = 3;
 }
 
-// ExecuteOperationResponse confirms durable acceptance or an idempotent replay.
+// ExecuteOperationResponse reports durable acceptance, an exact replay, or a
+// permanent idempotency conflict.
 message ExecuteOperationResponse {
   string operation_id = 1;
   OperationAcceptance acceptance = 2;

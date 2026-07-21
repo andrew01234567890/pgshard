@@ -4,6 +4,9 @@
 //! `shardschema`; the test recreates and removes `pgshard_catalog`:
 //! `PGSHARD_TEST_DATABASE_URL=... cargo test -p pgshard-catalog --test postgres18 -- --ignored`
 
+#[path = "support/commit_response_proxy.rs"]
+mod commit_response_proxy;
+
 use std::error::Error;
 use std::future::{pending, poll_fn};
 use std::sync::Arc;
@@ -18,12 +21,17 @@ use tokio_postgres::{
 use uuid::Uuid;
 
 use pgshard_catalog::{
-    CatalogCache, CatalogConnectionPhase, CatalogFailureKind, CatalogOperation,
+    AcceptanceOutcome, CatalogCache, CatalogConnectionPhase, CatalogFailureKind, CatalogOperation,
     CatalogOperationTimeout, CatalogPollInterval, CatalogReader, CatalogReadinessReason,
     CatalogRefreshError, CatalogSupervisor, CatalogSupervisorConfig, CatalogSupervisorSnapshot,
-    CatalogSupervisorStatus, DatabaseId, DatabaseShardId, InstallOutcome, LoadError,
+    CatalogSupervisorStatus, ClusterId, DatabaseId, DatabaseShardId, InstallOutcome,
+    KubernetesClusterUid, LoadError, OperationAcceptanceError, OperationId, OperationIdentity,
+    OperationKind, OperationPreconditions, OperationRepository, OperationRequest,
     run_catalog_refresh,
 };
+use pgshard_types::ShardId;
+
+use commit_response_proxy::CommitResponseProxy;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -712,7 +720,7 @@ async fn assert_pre_creation_attempt_consumer_upgrade(client: &Client) -> TestRe
     client.batch_execute("ROLLBACK").await?;
 
     client
-        .batch_execute("DROP SCHEMA pgshard_catalog CASCADE")
+        .batch_execute("DROP SCHEMA IF EXISTS pgshard_catalog CASCADE")
         .await?;
     drop_catalog_roles(client).await?;
     client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
@@ -734,6 +742,7 @@ async fn drop_catalog_roles(client: &Client) -> TestResult {
                  END IF; \
              END \
              $cleanup$; \
+             DROP ROLE IF EXISTS pgshard_operation_writer; \
              DROP ROLE IF EXISTS pgshard_catalog_admin; \
              DROP ROLE IF EXISTS pgshard_catalog_reader; \
              DROP ROLE IF EXISTS pgshard_catalog_owner",
@@ -743,50 +752,53 @@ async fn drop_catalog_roles(client: &Client) -> TestResult {
 }
 
 async fn assert_squatted_catalog_role_is_rejected(client: &Client) -> TestResult {
-    let squatter = format!("pgshard_role_squatter_{}", Uuid::new_v4().simple());
-    client
-        .batch_execute("DROP SCHEMA IF EXISTS pgshard_catalog CASCADE")
-        .await?;
-    drop_catalog_roles(client).await?;
-    client
-        .batch_execute(&format!(
-            "CREATE ROLE {squatter} NOLOGIN CREATEROLE; \
-             SET ROLE {squatter}; \
-             CREATE ROLE pgshard_catalog_reader NOLOGIN; \
-             RESET ROLE"
-        ))
-        .await?;
+    for fixed_role in ["pgshard_catalog_reader", "pgshard_operation_writer"] {
+        let squatter = format!("pgshard_role_squatter_{}", Uuid::new_v4().simple());
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS pgshard_catalog CASCADE")
+            .await?;
+        drop_catalog_roles(client).await?;
+        client
+            .batch_execute(&format!(
+                "CREATE ROLE {squatter} NOLOGIN CREATEROLE; \
+                 SET ROLE {squatter}; \
+                 CREATE ROLE {fixed_role} NOLOGIN; \
+                 RESET ROLE"
+            ))
+            .await?;
 
-    let migration = client.batch_execute(pgshard_catalog::MIGRATION_SQL).await;
-    let rollback_result = client.batch_execute("ROLLBACK").await;
-    let reset_result = client.batch_execute("RESET ROLE").await;
-    let drop_reader_result = client
-        .batch_execute("DROP ROLE IF EXISTS pgshard_catalog_reader")
-        .await;
-    let drop_squatter_result = client
-        .batch_execute(&format!("DROP ROLE IF EXISTS {squatter}"))
-        .await;
+        let migration = client.batch_execute(pgshard_catalog::MIGRATION_SQL).await;
+        let rollback_result = client.batch_execute("ROLLBACK").await;
+        let reset_result = client.batch_execute("RESET ROLE").await;
+        let drop_fixed_role_result = client
+            .batch_execute(&format!("DROP ROLE IF EXISTS {fixed_role}"))
+            .await;
+        let drop_squatter_result = client
+            .batch_execute(&format!("DROP ROLE IF EXISTS {squatter}"))
+            .await;
 
-    rollback_result?;
-    reset_result?;
-    drop_reader_result?;
-    drop_squatter_result?;
-    let error = migration.expect_err("a fixed role must not predate catalog bootstrap");
-    assert_sqlstate(&error, "42501");
-    assert_database_message(
-        &error,
-        "pgshard catalog roles exist before catalog bootstrap",
-    );
+        rollback_result?;
+        reset_result?;
+        drop_fixed_role_result?;
+        drop_squatter_result?;
+        let error = migration.expect_err("a fixed role must not predate catalog bootstrap");
+        assert_sqlstate(&error, "42501");
+        assert_database_message(
+            &error,
+            "pgshard catalog roles exist before catalog bootstrap",
+        );
+    }
     Ok(())
 }
 
 async fn assert_installation_contract(client: &Client, database_url: &str) -> TestResult {
+    assert_hostile_operation_relation_upgrade_is_rejected(client).await?;
     assert_pre_receipt_probe_upgrade(client)
         .await
-        .map_err(|error| format!("pre-receipt probe upgrade: {error}"))?;
+        .map_err(|error| format!("pre-receipt probe upgrade: {error:?}"))?;
     assert_pre_creation_attempt_consumer_upgrade(client)
         .await
-        .map_err(|error| format!("pre-creation-attempt consumer upgrade: {error}"))?;
+        .map_err(|error| format!("pre-creation-attempt consumer upgrade: {error:?}"))?;
     let epoch_after_first_migration = catalog_epoch(client).await?;
     client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
     assert_eq!(
@@ -868,6 +880,110 @@ async fn assert_installation_contract(client: &Client, database_url: &str) -> Te
         .await
         .expect_err("64-byte identifiers must be rejected");
     assert_sqlstate(&error, "23514");
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_hostile_operation_relation_upgrade_is_rejected(client: &Client) -> TestResult {
+    client
+        .batch_execute("DROP SCHEMA IF EXISTS pgshard_catalog CASCADE")
+        .await?;
+    drop_catalog_roles(client).await?;
+    client.batch_execute(V0_49_0_MIGRATION_SQL).await?;
+    for hostile_change in [
+        "ALTER TABLE pgshard_catalog.operation_tombstones SET UNLOGGED",
+        "ALTER TABLE pgshard_catalog.operation_tombstones \
+             ALTER COLUMN operation_kind TYPE text USING operation_kind::text",
+    ] {
+        client.batch_execute("BEGIN").await?;
+        client.batch_execute(hostile_change).await?;
+        let hostile_upgrade = client
+            .batch_execute(pgshard_catalog::MIGRATION_SQL)
+            .await
+            .expect_err("a noncanonical tombstone relation was adopted");
+        assert_sqlstate(&hostile_upgrade, "42501");
+        assert_database_message(
+            &hostile_upgrade,
+            "pre-existing operation relation has a noncanonical column shape",
+        );
+        client.batch_execute("ROLLBACK").await?;
+    }
+    let duplicate_tombstone_id = Uuid::new_v4().hyphenated().to_string();
+    client.batch_execute("BEGIN").await?;
+    for operation_kind in ["legacy-a", "legacy-b"] {
+        client
+            .execute(
+                "INSERT INTO pgshard_catalog.operation_tombstones( \
+                     operation_kind, operation_id, request_fingerprint, outcome_code \
+                 ) VALUES ($1::text, $2::text::uuid, decode(repeat('00', 32), 'hex'), 'done')",
+                &[&operation_kind, &duplicate_tombstone_id],
+            )
+            .await?;
+    }
+    let duplicate_upgrade = client
+        .batch_execute(pgshard_catalog::MIGRATION_SQL)
+        .await
+        .expect_err("cross-kind duplicate operation UUIDs survived forward migration");
+    assert_sqlstate(&duplicate_upgrade, "55000");
+    assert_database_message(
+        &duplicate_upgrade,
+        "duplicate operation UUIDs block catalog upgrade",
+    );
+    client.batch_execute("ROLLBACK").await?;
+
+    client
+        .batch_execute(
+            "BEGIN; \
+             CREATE TABLE pgshard_catalog.operation_requests ( \
+                 operation_id uuid NOT NULL, \
+                 fingerprint_version smallint NOT NULL, \
+                 request_fingerprint bytea NOT NULL, \
+                 trusted_catalog_cluster_id uuid NOT NULL, \
+                 trusted_kubernetes_cluster_uid text NOT NULL, \
+                 cluster_name pgshard_catalog.resource_name NOT NULL, \
+                 shard_id bigint NOT NULL, \
+                 operation_kind pgshard_catalog.sql_identifier NOT NULL, \
+                 payload bytea NOT NULL, \
+                 required_catalog_epoch bigint NOT NULL, \
+                 required_fencing_epoch bigint NOT NULL, \
+                 deadline_unix_micros bigint NOT NULL, \
+                 accepted_at timestamptz NOT NULL \
+             ); \
+             CREATE TABLE pgshard_catalog.operation_status ( \
+                 operation_id uuid NOT NULL, \
+                 phase text NOT NULL, \
+                 accepted_at timestamptz NOT NULL \
+             )",
+        )
+        .await?;
+    let migration = client
+        .batch_execute(pgshard_catalog::MIGRATION_SQL)
+        .await
+        .expect_err("underconstrained operation relations were adopted");
+    if migration.as_db_error().map(|error| error.code().code()) != Some("42501") {
+        return Err(format!("unexpected hostile operation relation error: {migration:?}").into());
+    }
+    assert_database_message(
+        &migration,
+        "pre-existing pgshard_catalog contains noncanonical executable relation metadata",
+    );
+    client.batch_execute("ROLLBACK").await?;
+    client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
+    let legacy_admin_insert_survived: bool = client
+        .query_one(
+            "SELECT pg_catalog.has_table_privilege( \
+                 'pgshard_catalog_admin', \
+                 'pgshard_catalog.operation_tombstones', \
+                 'INSERT' \
+             )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        !legacy_admin_insert_survived,
+        "v0.49 administrator retained direct tombstone INSERT"
+    );
     Ok(())
 }
 
@@ -2922,6 +3038,7 @@ async fn assert_legacy_fixed_role_acls_removed(client: &Client) -> TestResult {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn assert_catalog_role_bootstrap_rejections(client: &Client) -> TestResult {
     assert_catalog_migration_rejection(
         client,
@@ -2930,8 +3047,26 @@ async fn assert_catalog_role_bootstrap_rejections(client: &Client) -> TestResult
         &[],
     )
     .await?;
+    assert_catalog_migration_rejection(
+        client,
+        "ALTER ROLE pgshard_operation_writer LOGIN",
+        "pre-existing pgshard_operation_writer role has unsafe attributes",
+        &[],
+    )
+    .await?;
 
     assert_unsupported_schema_object_is_rejected(client).await?;
+
+    assert_catalog_migration_rejection(
+        client,
+        "ALTER TABLE pgshard_catalog.operation_tombstones ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE pgshard_catalog.operation_tombstones FORCE ROW LEVEL SECURITY; \
+         CREATE POLICY operation_tombstones_hostile_policy \
+             ON pgshard_catalog.operation_tombstones USING (false)",
+        "pre-existing operation relation has unsupported row security",
+        &[],
+    )
+    .await?;
 
     let delegable_member = format!("pgshard_delegable_{}", Uuid::new_v4().simple());
     assert_catalog_migration_rejection(
@@ -2956,6 +3091,18 @@ async fn assert_catalog_role_bootstrap_rejections(client: &Client) -> TestResult
         ),
         "pre-existing pgshard_catalog_owner role has a member",
         &[&owner_member],
+    )
+    .await?;
+
+    let writer_member = format!("pgshard_writer_member_{}", Uuid::new_v4().simple());
+    assert_catalog_migration_rejection(
+        client,
+        &format!(
+            "CREATE ROLE {writer_member} NOLOGIN; \
+             GRANT pgshard_operation_writer TO {writer_member}"
+        ),
+        "pre-existing pgshard_operation_writer role has a member",
+        &[&writer_member],
     )
     .await?;
 
@@ -3047,6 +3194,10 @@ async fn assert_catalog_inheritance_rejections(client: &Client) -> TestResult {
         (
             "GRANT pg_read_all_stats TO pgshard_catalog_admin",
             "administrator",
+        ),
+        (
+            "GRANT pg_read_all_stats TO pgshard_operation_writer",
+            "operation writer",
         ),
         ("GRANT pg_signal_backend TO pgshard_catalog_owner", "owner"),
     ] {
@@ -3909,6 +4060,40 @@ async fn assert_admin_privilege_contract(client: &mut Client) -> TestResult {
     transaction
         .batch_execute("ROLLBACK TO SAVEPOINT hidden_probe_receipts")
         .await?;
+    for (savepoint, relation) in [
+        ("hidden_operation_requests", "operation_requests"),
+        ("hidden_operation_status", "operation_status"),
+        ("hidden_operation_tombstones", "operation_tombstones"),
+    ] {
+        transaction
+            .batch_execute(&format!("SAVEPOINT {savepoint}"))
+            .await?;
+        let error = transaction
+            .query_one(
+                &format!("SELECT count(*) FROM pgshard_catalog.{relation}"),
+                &[],
+            )
+            .await
+            .expect_err("catalog administrator must not read raw operation state");
+        assert_sqlstate(&error, "42501");
+        transaction
+            .batch_execute(&format!("ROLLBACK TO SAVEPOINT {savepoint}"))
+            .await?;
+    }
+    transaction
+        .batch_execute("SAVEPOINT admin_operation_acceptance")
+        .await?;
+    let error = transaction
+        .query_opt(
+            "SELECT * FROM pgshard_catalog.get_operation(gen_random_uuid())",
+            &[],
+        )
+        .await
+        .expect_err("catalog administrator must not assume the operation writer capability");
+    assert_sqlstate(&error, "42501");
+    transaction
+        .batch_execute("ROLLBACK TO SAVEPOINT admin_operation_acceptance")
+        .await?;
     assert_hidden_target_registry(&transaction).await?;
     let unknown_receipt_state: Option<String> = transaction
         .query_one(
@@ -3939,13 +4124,28 @@ async fn assert_admin_privilege_contract(client: &mut Client) -> TestResult {
 }
 
 async fn assert_catalog_role_boundary(client: &Client) -> TestResult {
+    let fixed_roles: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_roles \
+              WHERE rolname IN ( \
+                  'pgshard_catalog_owner', \
+                  'pgshard_catalog_reader', \
+                  'pgshard_catalog_admin', \
+                  'pgshard_operation_writer' \
+              )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(fixed_roles, 4, "every fixed catalog role must exist");
     let login_roles: i64 = client
         .query_one(
             "SELECT count(*) FROM pg_catalog.pg_roles \
               WHERE rolname IN ( \
                   'pgshard_catalog_owner', \
                   'pgshard_catalog_reader', \
-                  'pgshard_catalog_admin' \
+                  'pgshard_catalog_admin', \
+                  'pgshard_operation_writer' \
               ) AND rolcanlogin",
             &[],
         )
@@ -4217,12 +4417,20 @@ async fn assert_admin_routing_write_path(
         )
         .await?;
     transaction
+        .batch_execute("SAVEPOINT admin_operation_tombstone")
+        .await?;
+    let error = transaction
         .execute(
             "INSERT INTO pgshard_catalog.operation_tombstones( \
                  operation_kind, operation_id, request_fingerprint, outcome_code \
              ) VALUES ($1::text, gen_random_uuid(), decode(repeat('00', 32), 'hex'), 'ok')",
             &[&format!("admin_{nonce}")],
         )
+        .await
+        .expect_err("catalog administrator must not write operation tombstones directly");
+    assert_sqlstate(&error, "42501");
+    transaction
+        .batch_execute("ROLLBACK TO SAVEPOINT admin_operation_tombstone")
         .await?;
     Ok(())
 }
@@ -4991,14 +5199,25 @@ async fn assert_tombstone_contract(client: &Client, fixture: &Fixture) -> TestRe
     assert_sqlstate(&error, "23514");
 
     let operation_kind = format!("test_{}", fixture.nonce);
+    let operation_id = Uuid::new_v4().to_string();
     client
         .execute(
             "INSERT INTO pgshard_catalog.operation_tombstones( \
                  operation_kind, operation_id, request_fingerprint, outcome_code \
-             ) VALUES ($1::text, gen_random_uuid(), decode(repeat('00', 32), 'hex'), 'ok')",
-            &[&operation_kind],
+             ) VALUES ($1::text, $2::text::uuid, decode(repeat('00', 32), 'hex'), 'ok')",
+            &[&operation_kind, &operation_id],
         )
         .await?;
+    let error = client
+        .execute(
+            "INSERT INTO pgshard_catalog.operation_tombstones( \
+                 operation_kind, operation_id, request_fingerprint, outcome_code \
+             ) VALUES ('other_kind', $1::text::uuid, decode(repeat('11', 32), 'hex'), 'ok')",
+            &[&operation_id],
+        )
+        .await
+        .expect_err("operation IDs must be global across tombstone kinds");
+    assert_sqlstate(&error, "23505");
     let error = client
         .execute(
             "UPDATE pgshard_catalog.operation_tombstones \
@@ -5008,6 +5227,571 @@ async fn assert_tombstone_contract(client: &Client, fixture: &Fixture) -> TestRe
         .await
         .expect_err("operation tombstones must be permanent");
     assert_sqlstate(&error, "55000");
+    Ok(())
+}
+
+struct OperationRequestInput<'a> {
+    operation_id: &'a str,
+    catalog_cluster_id: Uuid,
+    kubernetes_cluster_uid: &'a str,
+    cluster_name: &'a str,
+    shard_id: u32,
+    kind: OperationKind,
+    payload: Vec<u8>,
+    required_catalog_epoch: u64,
+    required_fencing_epoch: u64,
+    deadline_unix_micros: u64,
+}
+
+fn operation_request(input: OperationRequestInput<'_>) -> TestResult<OperationRequest> {
+    Ok(OperationRequest::new(
+        OperationId::parse_wire(input.operation_id)?,
+        OperationIdentity::new(
+            ClusterId::new(input.catalog_cluster_id)?,
+            KubernetesClusterUid::new(input.kubernetes_cluster_uid)?,
+            input.cluster_name,
+        )?,
+        ShardId(input.shard_id),
+        input.kind,
+        input.payload,
+        OperationPreconditions::new(
+            input.required_catalog_epoch,
+            input.required_fencing_epoch,
+            input.deadline_unix_micros,
+        )?,
+    )?)
+}
+
+fn default_operation_request(
+    operation_id: &str,
+    catalog_cluster_id: Uuid,
+) -> TestResult<OperationRequest> {
+    operation_request(OperationRequestInput {
+        operation_id,
+        catalog_cluster_id,
+        kubernetes_cluster_uid: "kubernetes-cluster-uid",
+        cluster_name: "cluster-a",
+        shard_id: 7,
+        kind: OperationKind::Backup,
+        payload: b"exact-payload".to_vec(),
+        required_catalog_epoch: 11,
+        required_fencing_epoch: 13,
+        deadline_unix_micros: 4_102_444_800_000_000,
+    })
+}
+
+async fn assert_operation_acceptance_rejects_existing_transaction(
+    client: &Client,
+    database_url: &str,
+    catalog_cluster_id: Uuid,
+) -> TestResult {
+    let (mut probe_client, probe_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let probe_connection_task = tokio::spawn(probe_connection);
+    let database_name = format!("operation_acceptance_probe_{}", Uuid::new_v4().simple());
+    let operation_id = Uuid::new_v4().hyphenated().to_string();
+    let request = default_operation_request(&operation_id, catalog_cluster_id)?;
+
+    probe_client.batch_execute("BEGIN").await?;
+    probe_client
+        .execute(
+            "INSERT INTO pgshard_catalog.logical_databases(database_name) VALUES ($1::text)",
+            &[&database_name],
+        )
+        .await?;
+    probe_client
+        .batch_execute("SET LOCAL ROLE pgshard_operation_writer")
+        .await?;
+
+    let acceptance = OperationRepository
+        .accept(&mut probe_client, &request)
+        .await;
+    drop(probe_client);
+    tokio::time::timeout(Duration::from_secs(5), probe_connection_task).await???;
+
+    let committed_unrelated_rows: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pgshard_catalog.logical_databases WHERE database_name = $1",
+            &[&database_name],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        committed_unrelated_rows, 0,
+        "operation acceptance committed unrelated caller work"
+    );
+    let committed_operation_rows: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pgshard_catalog.operation_requests \
+              WHERE operation_id = $1::text::uuid",
+            &[&operation_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        committed_operation_rows, 0,
+        "operation acceptance started inside a caller-owned transaction"
+    );
+
+    match acceptance {
+        Err(OperationAcceptanceError::SessionNotIdle) => Ok(()),
+        Err(error) => Err(format!("unexpected non-idle acceptance error: {error}").into()),
+        Ok(receipt) => Err(format!(
+            "operation acceptance used a caller-owned transaction: {:?}",
+            receipt.outcome
+        )
+        .into()),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_operation_acceptance_contract(
+    client: &mut Client,
+    database_url: &str,
+) -> TestResult {
+    let catalog_cluster_id = Uuid::parse_str(
+        &client
+            .query_one(
+                "SELECT cluster_id::text \
+                   FROM pgshard_catalog.cluster_configuration WHERE singleton",
+                &[],
+            )
+            .await?
+            .get::<_, String>(0),
+    )?;
+    assert_operation_acceptance_rejects_existing_transaction(
+        client,
+        database_url,
+        catalog_cluster_id,
+    )
+    .await?;
+    let repository = OperationRepository;
+    let operation_id = Uuid::new_v4().hyphenated().to_string();
+    let request = default_operation_request(&operation_id, catalog_cluster_id)?;
+
+    client
+        .batch_execute("SET ROLE pgshard_operation_writer")
+        .await?;
+    let writer_result: TestResult = async {
+        let accepted = repository.accept(client, &request).await?;
+        assert_eq!(accepted.outcome, AcceptanceOutcome::Accepted);
+        assert_eq!(accepted.request_fingerprint.len(), 32);
+
+        let observed = repository
+            .get(client, request.operation_id())
+            .await?
+            .ok_or("accepted operation was not observable through the writer routine")?;
+        assert_eq!(observed.request_fingerprint, accepted.request_fingerprint);
+        assert_eq!(
+            Some(observed.accepted_at_unix_micros),
+            accepted.accepted_at_unix_micros
+        );
+
+        let replay = repository.accept(client, &request).await?;
+        assert_eq!(replay.outcome, AcceptanceOutcome::Replay);
+        assert_eq!(replay.request_fingerprint, accepted.request_fingerprint);
+        assert_eq!(
+            replay.accepted_at_unix_micros,
+            accepted.accepted_at_unix_micros
+        );
+
+        let conflicts = [
+            operation_request(OperationRequestInput {
+                operation_id: &operation_id,
+                catalog_cluster_id,
+                kubernetes_cluster_uid: "other-kubernetes-uid",
+                cluster_name: "cluster-a",
+                shard_id: 7,
+                kind: OperationKind::Backup,
+                payload: b"exact-payload".to_vec(),
+                required_catalog_epoch: 11,
+                required_fencing_epoch: 13,
+                deadline_unix_micros: 4_102_444_800_000_000,
+            })?,
+            operation_request(OperationRequestInput {
+                operation_id: &operation_id,
+                catalog_cluster_id,
+                kubernetes_cluster_uid: "kubernetes-cluster-uid",
+                cluster_name: "cluster-b",
+                shard_id: 7,
+                kind: OperationKind::Backup,
+                payload: b"exact-payload".to_vec(),
+                required_catalog_epoch: 11,
+                required_fencing_epoch: 13,
+                deadline_unix_micros: 4_102_444_800_000_000,
+            })?,
+            operation_request(OperationRequestInput {
+                operation_id: &operation_id,
+                catalog_cluster_id,
+                kubernetes_cluster_uid: "kubernetes-cluster-uid",
+                cluster_name: "cluster-a",
+                shard_id: 8,
+                kind: OperationKind::Backup,
+                payload: b"exact-payload".to_vec(),
+                required_catalog_epoch: 11,
+                required_fencing_epoch: 13,
+                deadline_unix_micros: 4_102_444_800_000_000,
+            })?,
+            operation_request(OperationRequestInput {
+                operation_id: &operation_id,
+                catalog_cluster_id,
+                kubernetes_cluster_uid: "kubernetes-cluster-uid",
+                cluster_name: "cluster-a",
+                shard_id: 7,
+                kind: OperationKind::Restore,
+                payload: b"exact-payload".to_vec(),
+                required_catalog_epoch: 11,
+                required_fencing_epoch: 13,
+                deadline_unix_micros: 4_102_444_800_000_000,
+            })?,
+            operation_request(OperationRequestInput {
+                operation_id: &operation_id,
+                catalog_cluster_id,
+                kubernetes_cluster_uid: "kubernetes-cluster-uid",
+                cluster_name: "cluster-a",
+                shard_id: 7,
+                kind: OperationKind::Backup,
+                payload: b"changed-payload".to_vec(),
+                required_catalog_epoch: 11,
+                required_fencing_epoch: 13,
+                deadline_unix_micros: 4_102_444_800_000_000,
+            })?,
+            operation_request(OperationRequestInput {
+                operation_id: &operation_id,
+                catalog_cluster_id,
+                kubernetes_cluster_uid: "kubernetes-cluster-uid",
+                cluster_name: "cluster-a",
+                shard_id: 7,
+                kind: OperationKind::Backup,
+                payload: b"exact-payload".to_vec(),
+                required_catalog_epoch: 12,
+                required_fencing_epoch: 13,
+                deadline_unix_micros: 4_102_444_800_000_000,
+            })?,
+            operation_request(OperationRequestInput {
+                operation_id: &operation_id,
+                catalog_cluster_id,
+                kubernetes_cluster_uid: "kubernetes-cluster-uid",
+                cluster_name: "cluster-a",
+                shard_id: 7,
+                kind: OperationKind::Backup,
+                payload: b"exact-payload".to_vec(),
+                required_catalog_epoch: 11,
+                required_fencing_epoch: 14,
+                deadline_unix_micros: 4_102_444_800_000_000,
+            })?,
+            operation_request(OperationRequestInput {
+                operation_id: &operation_id,
+                catalog_cluster_id,
+                kubernetes_cluster_uid: "kubernetes-cluster-uid",
+                cluster_name: "cluster-a",
+                shard_id: 7,
+                kind: OperationKind::Backup,
+                payload: b"exact-payload".to_vec(),
+                required_catalog_epoch: 11,
+                required_fencing_epoch: 13,
+                deadline_unix_micros: 4_102_444_800_000_001,
+            })?,
+        ];
+        for conflicting_request in conflicts {
+            let conflict = repository.accept(client, &conflicting_request).await?;
+            assert_eq!(conflict.outcome, AcceptanceOutcome::Conflict);
+            assert_eq!(conflict.request_fingerprint, accepted.request_fingerprint);
+            assert_eq!(
+                conflict.accepted_at_unix_micros,
+                accepted.accepted_at_unix_micros
+            );
+        }
+
+        for relation in [
+            "cluster_configuration",
+            "operation_requests",
+            "operation_status",
+            "operation_tombstones",
+        ] {
+            let error = client
+                .query_one(
+                    &format!("SELECT count(*) FROM pgshard_catalog.{relation}"),
+                    &[],
+                )
+                .await
+                .expect_err("operation writer read a raw catalog relation");
+            assert_sqlstate(&error, "42501");
+        }
+        let error = client
+            .execute(
+                "INSERT INTO pgshard_catalog.operation_status(operation_id, phase, accepted_at) \
+                 VALUES (gen_random_uuid(), 'pending', statement_timestamp())",
+                &[],
+            )
+            .await
+            .expect_err("operation writer performed direct table DML");
+        assert_sqlstate(&error, "42501");
+        let catalog_cluster_id_text = catalog_cluster_id.hyphenated().to_string();
+        for invalid_cluster_name in ["Cluster-a", "é"] {
+            let error = client
+                .query_one(
+                    "SELECT * FROM pgshard_catalog.accept_operation( \
+                         gen_random_uuid(), $1::text::uuid, 'trusted-uid', $2::text, \
+                         0, 'backup', ''::bytea, 1, 1, 1 \
+                     )",
+                    &[&catalog_cluster_id_text, &invalid_cluster_name],
+                )
+                .await
+                .expect_err("direct operation routine accepted an invalid DNS label");
+            assert_sqlstate(&error, "22023");
+        }
+        Ok(())
+    }
+    .await;
+    let reset_result = client.batch_execute("RESET ROLE").await;
+    writer_result?;
+    reset_result?;
+
+    let rows: i64 = client
+        .query_one(
+            "SELECT count(*) \
+               FROM pgshard_catalog.operation_requests AS requests \
+               JOIN pgshard_catalog.operation_status AS statuses USING (operation_id) \
+              WHERE requests.operation_id = $1::text::uuid \
+                AND requests.accepted_at = statuses.accepted_at \
+                AND statuses.phase = 'pending'",
+            &[&operation_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        rows, 1,
+        "acceptance did not atomically create one pending row"
+    );
+
+    for statement in [
+        format!(
+            "UPDATE pgshard_catalog.operation_requests SET payload = payload \
+             WHERE operation_id = '{operation_id}'::uuid"
+        ),
+        format!(
+            "UPDATE pgshard_catalog.operation_status SET phase = phase \
+             WHERE operation_id = '{operation_id}'::uuid"
+        ),
+    ] {
+        let error = client
+            .execute(&statement, &[])
+            .await
+            .expect_err("accepted operation state was mutable");
+        assert_sqlstate(&error, "55000");
+    }
+
+    let wrong_catalog_id = Uuid::new_v4();
+    let wrong_catalog_operation_id = Uuid::new_v4().hyphenated().to_string();
+    let wrong_catalog_request =
+        default_operation_request(&wrong_catalog_operation_id, wrong_catalog_id)?;
+    client
+        .batch_execute("SET ROLE pgshard_operation_writer")
+        .await?;
+    let wrong_catalog_error = repository
+        .accept(client, &wrong_catalog_request)
+        .await
+        .expect_err("wrong catalog identity was accepted");
+    match wrong_catalog_error {
+        OperationAcceptanceError::Database(error) => assert_sqlstate(&error, "22023"),
+        error => return Err(format!("unexpected catalog identity error: {error}").into()),
+    }
+    client.batch_execute("RESET ROLE").await?;
+
+    let tombstoned_operation_id = Uuid::new_v4().hyphenated().to_string();
+    let tombstone_fingerprint = vec![7_u8; 32];
+    client
+        .execute(
+            "INSERT INTO pgshard_catalog.operation_tombstones( \
+                 operation_kind, operation_id, request_fingerprint, outcome_code, completed_at \
+             ) VALUES ('legacy', $1::text::uuid, $2::bytea, 'done', 'infinity')",
+            &[&tombstoned_operation_id, &tombstone_fingerprint],
+        )
+        .await?;
+    let tombstoned_request =
+        default_operation_request(&tombstoned_operation_id, catalog_cluster_id)?;
+    client
+        .batch_execute("SET ROLE pgshard_operation_writer")
+        .await?;
+    let tombstone_conflict = repository.accept(client, &tombstoned_request).await?;
+    assert_eq!(tombstone_conflict.outcome, AcceptanceOutcome::Conflict);
+    assert_eq!(
+        tombstone_conflict.request_fingerprint.as_slice(),
+        tombstone_fingerprint
+    );
+    assert_eq!(tombstone_conflict.accepted_at_unix_micros, None);
+    client.batch_execute("RESET ROLE").await?;
+
+    assert_operation_acceptance_time_after_lock(client, database_url, catalog_cluster_id).await?;
+    assert_operation_commit_response_loss(database_url, catalog_cluster_id).await?;
+    assert_concurrent_operation_acceptance(database_url, catalog_cluster_id).await
+}
+
+async fn assert_operation_acceptance_time_after_lock(
+    client: &mut Client,
+    database_url: &str,
+    catalog_cluster_id: Uuid,
+) -> TestResult {
+    let operation_id = Uuid::new_v4().hyphenated().to_string();
+    let request = default_operation_request(&operation_id, catalog_cluster_id)?;
+    let blocker = client.transaction().await?;
+    blocker
+        .batch_execute("LOCK TABLE pgshard_catalog.operation_requests IN ACCESS EXCLUSIVE MODE")
+        .await?;
+
+    let (mut accepting_client, accepting_connection) =
+        tokio_postgres::connect(database_url, NoTls).await?;
+    let accepting_connection_task = tokio::spawn(accepting_connection);
+    accepting_client
+        .batch_execute(
+            "SET application_name = 'pgshard-operation-acceptance-time-test'; \
+             SET ROLE pgshard_operation_writer",
+        )
+        .await?;
+    let acceptance_task = tokio::spawn(async move {
+        OperationRepository
+            .accept(&mut accepting_client, &request)
+            .await
+    });
+
+    let mut lock_wait_observed = false;
+    for _ in 0..100 {
+        lock_wait_observed = blocker
+            .query_one(
+                "SELECT EXISTS ( \
+                     SELECT FROM pg_catalog.pg_stat_activity \
+                      WHERE application_name = 'pgshard-operation-acceptance-time-test' \
+                        AND wait_event_type = 'Lock' \
+                 )",
+                &[],
+            )
+            .await?
+            .get(0);
+        if lock_wait_observed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        lock_wait_observed,
+        "acceptance did not reach the held table lock"
+    );
+    let release_floor: i64 = blocker
+        .query_one(
+            "SELECT floor(EXTRACT(epoch FROM clock_timestamp()) * 1000000)::bigint",
+            &[],
+        )
+        .await?
+        .get(0);
+    blocker.commit().await?;
+
+    let receipt = tokio::time::timeout(Duration::from_secs(5), acceptance_task).await???;
+    assert_eq!(receipt.outcome, AcceptanceOutcome::Accepted);
+    assert!(
+        receipt
+            .accepted_at_unix_micros
+            .ok_or("new acceptance omitted its timestamp")?
+            >= u64::try_from(release_floor)?,
+        "catalog acceptance time was backdated before lock release"
+    );
+    tokio::time::timeout(Duration::from_secs(5), accepting_connection_task).await???;
+    Ok(())
+}
+
+async fn assert_operation_commit_response_loss(
+    database_url: &str,
+    catalog_cluster_id: Uuid,
+) -> TestResult {
+    let operation_id = Uuid::new_v4().hyphenated().to_string();
+    let request = default_operation_request(&operation_id, catalog_cluster_id)?;
+    let mut proxy = CommitResponseProxy::start(database_url)
+        .await
+        .map_err(|error| format!("operation COMMIT proxy start: {error}"))?;
+    let (mut ambiguous_client, ambiguous_connection) =
+        tokio_postgres::connect(proxy.database_url(), NoTls).await?;
+    let ambiguous_connection_task = tokio::spawn(ambiguous_connection);
+    ambiguous_client
+        .batch_execute("SET ROLE pgshard_operation_writer")
+        .await?;
+    proxy
+        .arm_commit_response_loss()
+        .await
+        .map_err(|error| format!("operation COMMIT proxy arm: {error}"))?;
+
+    let error = OperationRepository
+        .accept(&mut ambiguous_client, &request)
+        .await
+        .expect_err("lost COMMIT response produced a definite acceptance receipt");
+    assert!(
+        matches!(error, OperationAcceptanceError::OutcomeUnknown { .. }),
+        "lost COMMIT response did not preserve outcome unknown: {error}"
+    );
+    proxy
+        .wait_for_commit()
+        .await
+        .map_err(|error| format!("operation COMMIT proxy wait: {error}"))?;
+    drop(ambiguous_client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), ambiguous_connection_task).await?;
+
+    let (mut retry_client, retry_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let retry_connection_task = tokio::spawn(retry_connection);
+    retry_client
+        .batch_execute("SET ROLE pgshard_operation_writer")
+        .await?;
+    let replay = OperationRepository
+        .accept(&mut retry_client, &request)
+        .await?;
+    assert_eq!(replay.outcome, AcceptanceOutcome::Replay);
+    drop(retry_client);
+    tokio::time::timeout(Duration::from_secs(5), retry_connection_task).await???;
+    Ok(())
+}
+
+async fn assert_concurrent_operation_acceptance(
+    database_url: &str,
+    catalog_cluster_id: Uuid,
+) -> TestResult {
+    let operation_id = Uuid::new_v4().hyphenated().to_string();
+    let left_request = default_operation_request(&operation_id, catalog_cluster_id)?;
+    let right_request = left_request.clone();
+    let (mut left, left_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (mut right, right_connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    let left_task = tokio::spawn(left_connection);
+    let right_task = tokio::spawn(right_connection);
+    left.batch_execute("SET ROLE pgshard_operation_writer")
+        .await?;
+    right
+        .batch_execute("SET ROLE pgshard_operation_writer")
+        .await?;
+    left.batch_execute("SET default_transaction_isolation = 'repeatable read'")
+        .await?;
+    right
+        .batch_execute("SET default_transaction_isolation = 'repeatable read'")
+        .await?;
+    let repository = OperationRepository;
+    let (left_result, right_result) = tokio::join!(
+        repository.accept(&mut left, &left_request),
+        repository.accept(&mut right, &right_request)
+    );
+    let outcomes = [left_result?.outcome, right_result?.outcome];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AcceptanceOutcome::Accepted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AcceptanceOutcome::Replay)
+            .count(),
+        1
+    );
+    drop(left);
+    drop(right);
+    tokio::time::timeout(Duration::from_secs(5), left_task).await???;
+    tokio::time::timeout(Duration::from_secs(5), right_task).await???;
     Ok(())
 }
 
@@ -9059,6 +9843,7 @@ async fn run_migration_and_activation_contract(
     assert_stale_target_fence_backend_generation_is_reclaimed(database_url).await?;
     assert_target_registry_lock_is_fail_fast(client, database_url).await?;
     assert_admin_write_path(client).await?;
+    assert_operation_acceptance_contract(client, database_url).await?;
     let fixture = create_fixture(client).await?;
     assert_migration_rejects_active_shard_without_restore(client, fixture.nonce).await?;
     assert_slot_sync_probe_contract(client, &fixture).await?;

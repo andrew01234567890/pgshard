@@ -97,7 +97,7 @@ const (
 	databaseGenesisPath                       = "/etc/pgshard/postgresql/database-genesis.sql"
 	databaseTopologyPreflightKey              = "database-topology-preflight.sql"
 	databaseTopologyPreflightPath             = "/etc/pgshard/postgresql/database-topology-preflight.sql"
-	shardschemaMigrationSHA256                = "5c4d0fee9d069580ae90b6c71d78db5f160f6f01fa7fc5150f797693f88ff50a"
+	shardschemaMigrationSHA256                = "8a74d1fabe9d33dbdcc018f43863b7fa3cbecbb23fef8c2ae2ed9cca2dbd0b62"
 	shardschemaMigrationHashAnnotation        = "pgshard.io/shardschema-migration-sha256"
 )
 
@@ -1317,7 +1317,9 @@ case "$catalog_core_tables" in
       "3189b8a08cf2dedb5542cdf1dd58dec2f173f848ae67612aa4263751c404ea7a"|\
       "8bb87bb746ed463bf744b7b809477e9d36ad95d7cca06e25980085bba1ae4659"|\
       "2a20ec8e1bec9f660d6656484ebbebab0b694788e5f0bda657eb33816bf884a6"|\
-      "06d2271274d6dfdeda51aba8293056b6fb23f451f1806f3dcd41763c595ee1de") ;;
+      "06d2271274d6dfdeda51aba8293056b6fb23f451f1806f3dcd41763c595ee1de"|\
+      "54927a3786f0bbf15490edc1b57731d4a19581b7568bcf23a4412c8e3c049d9c"|\
+      "b6373f4b09db046d1ec1610809ae1a1db3c4cec35d8956139110576d87c5e3e2") ;;
       *)
         echo "refusing an unsupported or malformed pre-existing shardschema catalog ($catalog_schema_fingerprint)" >&2
         exit 1
