@@ -57,6 +57,28 @@ func TestPostgreSQLBootstrapScriptHasValidBashSyntax(t *testing.T) {
 	}
 }
 
+func TestCatalogActivationJournalInitializerClearsInheritedSetgid(t *testing.T) {
+	t.Parallel()
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o2770); err != nil {
+		t.Fatal(err)
+	}
+	journalRoot := filepath.Join(parent, "root")
+	command := exec.Command("bash", "-ceu", catalogActivationJournalInitializerScript(journalRoot))
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("initialize catalog-activation journal: %v\n%s", err, output)
+	}
+	for _, path := range []string{journalRoot, filepath.Join(journalRoot, "owner")} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := info.Mode()&(os.ModePerm|os.ModeSetuid|os.ModeSetgid|os.ModeSticky), os.FileMode(0o700); got != want {
+			t.Fatalf("journal directory %s mode = %v, want %v", path, got, want)
+		}
+	}
+}
+
 func TestPostgreSQLStandbyBootstrapScriptHasValidBashSyntax(t *testing.T) {
 	t.Parallel()
 	command := exec.Command("bash", "-n")
@@ -3257,6 +3279,37 @@ func TestPlanFailsClosedForUnsafeIdentityOrMissingImages(t *testing.T) {
 	}
 }
 
+func TestPlanRequiresExactCatalogActivationCheckpointForMultiMemberAgent(t *testing.T) {
+	t.Parallel()
+	base := testCluster()
+	base.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(base)
+	base.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(base)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+
+	for _, test := range []struct {
+		name       string
+		checkpoint *pgshardv1alpha1.CatalogActivationCarrierStatus
+		want       string
+	}{
+		{name: "missing", want: "catalog activation creation result is missing"},
+		{name: "empty name", checkpoint: &pgshardv1alpha1.CatalogActivationCarrierStatus{UID: "carrier-uid"}, want: "unexpected name"},
+		{name: "wrong name", checkpoint: &pgshardv1alpha1.CatalogActivationCarrierStatus{Name: "other-catalog-activation", UID: "carrier-uid"}, want: "unexpected name"},
+		{name: "empty UID", checkpoint: &pgshardv1alpha1.CatalogActivationCarrierStatus{Name: pgshardv1alpha1.CatalogActivationName(base.Name)}, want: "invalid UID"},
+		{name: "overlong UID", checkpoint: &pgshardv1alpha1.CatalogActivationCarrierStatus{Name: pgshardv1alpha1.CatalogActivationName(base.Name), UID: types.UID(strings.Repeat("u", 129))}, want: "invalid UID"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cluster := base.DeepCopy()
+			cluster.Status.CatalogActivation = test.checkpoint
+			if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Plan() error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) {
 	t.Parallel()
 	for _, members := range []int32{3, 5} {
@@ -3274,6 +3327,25 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 			plan, err := Plan(cluster, images)
 			if err != nil {
 				t.Fatal(err)
+			}
+			carrier := cluster.Status.CatalogActivation
+			for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+				role := object[*rbacv1.Role](t, plan, PostgreSQLAgentServiceAccountName(cluster.Name, shard))
+				wantRules := []rbacv1.PolicyRule{{
+					APIGroups:     []string{coordinationv1.GroupName},
+					Resources:     []string{"leases"},
+					ResourceNames: []string{PostgreSQLWritableLeaseName(cluster.Name, shard)},
+					Verbs:         []string{"get", "update"},
+				}}
+				if shard == 0 {
+					wantRules = append(wantRules,
+						rbacv1.PolicyRule{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardcatalogactivations"}, ResourceNames: []string{carrier.Name}, Verbs: []string{"get"}},
+						rbacv1.PolicyRule{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardcatalogactivations/status"}, ResourceNames: []string{carrier.Name}, Verbs: []string{"update"}},
+					)
+				}
+				if !reflect.DeepEqual(role.Rules, wantRules) {
+					t.Fatalf("PostgreSQL agent Role %s = %#v, want %#v", role.Name, role.Rules, wantRules)
+				}
 			}
 			sources := 0
 			standbys := 0
@@ -3310,6 +3382,9 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 
 					if member == "0000" {
 						sources++
+						if object.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType {
+							t.Fatalf("bootstrap source %s update strategy = %q", object.Name, object.Spec.UpdateStrategy.Type)
+						}
 						wantCandidates := make([]string, 0, members-1)
 						for candidate := int32(1); candidate < members; candidate++ {
 							wantCandidates = append(wantCandidates, "pgshard_member_"+memberLabel(candidate))
@@ -3327,6 +3402,54 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						if !containsVolumeMount(bootstrapContainer.VolumeMounts, "replication-credential", true) ||
 							envValue(bootstrapContainer.Env, "PGSHARD_MEMBERS_PER_SHARD") != fmt.Sprintf("%d", members) {
 							t.Fatalf("bootstrap source %s replication initialization = %#v", object.Name, bootstrapContainer)
+						}
+						activationEnvironment := []string{
+							"PGSHARD_CATALOG_ACTIVATION_CARRIER_NAMESPACE",
+							"PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME",
+							"PGSHARD_CATALOG_ACTIVATION_CARRIER_UID",
+							"PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT",
+						}
+						if shard == 0 {
+							if envFieldPath(agent.Env, activationEnvironment[0]) != "metadata.namespace" ||
+								envValue(agent.Env, activationEnvironment[1]) != carrier.Name ||
+								envValue(agent.Env, activationEnvironment[2]) != string(carrier.UID) ||
+								envValue(agent.Env, activationEnvironment[3]) != catalogActivationJournalRoot {
+								t.Fatalf("shard-zero source activation environment = %#v", agent.Env)
+							}
+							if len(object.Spec.Template.Spec.InitContainers) != 2 {
+								t.Fatalf("shard-zero source init containers = %#v", object.Spec.Template.Spec.InitContainers)
+							}
+							initializer := object.Spec.Template.Spec.InitContainers[1]
+							journalRoot := catalogActivationJournalVolumeMountPath + "/" + catalogActivationJournalSubPath
+							wantCommand := []string{"bash", "-ceu", catalogActivationJournalInitializerScript(journalRoot)}
+							if initializer.Name != "initialize-catalog-activation-journal" || initializer.Image != images.PostgreSQLBootstrap ||
+								!reflect.DeepEqual(initializer.Command, wantCommand) || initializer.SecurityContext == nil ||
+								initializer.SecurityContext.RunAsUser == nil || *initializer.SecurityContext.RunAsUser != 999 ||
+								initializer.SecurityContext.RunAsGroup == nil || *initializer.SecurityContext.RunAsGroup != 999 ||
+								initializer.SecurityContext.RunAsNonRoot == nil || !*initializer.SecurityContext.RunAsNonRoot ||
+								initializer.SecurityContext.AllowPrivilegeEscalation == nil || *initializer.SecurityContext.AllowPrivilegeEscalation ||
+								initializer.SecurityContext.ReadOnlyRootFilesystem == nil || !*initializer.SecurityContext.ReadOnlyRootFilesystem ||
+								initializer.SecurityContext.Capabilities == nil || !reflect.DeepEqual(initializer.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) ||
+								len(initializer.VolumeMounts) != 1 || initializer.VolumeMounts[0] != (corev1.VolumeMount{Name: catalogActivationJournalVolumeName, MountPath: catalogActivationJournalVolumeMountPath}) {
+								t.Fatalf("shard-zero source journal initializer = %#v", initializer)
+							}
+							journalVolume := volumeByName(t, object.Spec.Template.Spec.Volumes, catalogActivationJournalVolumeName).EmptyDir
+							if journalVolume == nil || journalVolume.Medium != "" || journalVolume.SizeLimit == nil || journalVolume.SizeLimit.Cmp(resource.MustParse("1Mi")) != 0 {
+								t.Fatalf("shard-zero source journal volume = %#v", journalVolume)
+							}
+							wantMount := corev1.VolumeMount{Name: catalogActivationJournalVolumeName, MountPath: catalogActivationJournalRoot, SubPath: catalogActivationJournalSubPath}
+							if !slices.Contains(agent.VolumeMounts, wantMount) || !podHasServiceAccountTokenProjection(object.Spec.Template.Spec) {
+								t.Fatalf("shard-zero source activation mounts = %#v", agent.VolumeMounts)
+							}
+						} else {
+							for _, name := range activationEnvironment {
+								if containerHasEnvironment(agent, name) {
+									t.Fatalf("non-consumer source %s received activation environment %s", object.Name, name)
+								}
+							}
+							if hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationJournalVolumeName) || containsNamedVolumeMount(agent.VolumeMounts, catalogActivationJournalVolumeName) || len(object.Spec.Template.Spec.InitContainers) != 1 {
+								t.Fatalf("non-consumer source %s received activation storage: %#v", object.Name, object.Spec.Template.Spec)
+							}
 						}
 						continue
 					}
@@ -3356,6 +3479,14 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						if containerHasEnvironment(agent, forbidden) {
 							t.Fatalf("standby %s received writable authority %s", object.Name, forbidden)
 						}
+					}
+					for _, forbidden := range []string{"PGSHARD_CATALOG_ACTIVATION_CARRIER_NAMESPACE", "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME", "PGSHARD_CATALOG_ACTIVATION_CARRIER_UID", "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT"} {
+						if containerHasEnvironment(agent, forbidden) {
+							t.Fatalf("standby %s received catalog activation authority %s", object.Name, forbidden)
+						}
+					}
+					if hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationJournalVolumeName) || containsNamedVolumeMount(agent.VolumeMounts, catalogActivationJournalVolumeName) || len(object.Spec.Template.Spec.InitContainers) != 1 {
+						t.Fatalf("standby %s received catalog activation storage: %#v", object.Name, object.Spec.Template.Spec)
 					}
 					sourceBootstrap := cluster.Status.PostgreSQLBootstraps[shard*members]
 					targetBootstrap := cluster.Status.PostgreSQLBootstraps[shard*members+memberOrdinal]
@@ -3926,6 +4057,30 @@ func TestLegacyBootstrapSourceRemainsFencedDuringGenerationUpgrade(t *testing.T)
 				t.Fatal("partial generation settings passed cluster-aware observation")
 			}
 		})
+	}
+}
+
+func TestBootstrapSourceLifecycleClassificationDoesNotRequireCatalogActivationConsumer(t *testing.T) {
+	t.Parallel()
+	pod := testReplicationBootstrapSourcePod(t)
+	legacy := pod.DeepCopy()
+	legacy.Spec.Containers[0].Env = slices.DeleteFunc(legacy.Spec.Containers[0].Env, func(environment corev1.EnvVar) bool {
+		return strings.HasPrefix(environment.Name, "PGSHARD_CATALOG_ACTIVATION_")
+	})
+	legacy.Spec.Containers[0].VolumeMounts = slices.DeleteFunc(legacy.Spec.Containers[0].VolumeMounts, func(mount corev1.VolumeMount) bool {
+		return mount.Name == catalogActivationJournalVolumeName
+	})
+	legacy.Spec.Volumes = slices.DeleteFunc(legacy.Spec.Volumes, func(volume corev1.Volume) bool {
+		return volume.Name == catalogActivationJournalVolumeName
+	})
+	legacy.Spec.InitContainers = slices.DeleteFunc(legacy.Spec.InitContainers, func(container corev1.Container) bool {
+		return container.Name == "initialize-catalog-activation-journal"
+	})
+	if !IsPostgreSQLReplicationBootstrapSourcePod(legacy) || !IsCurrentPostgreSQLReplicationBootstrapSourcePod(legacy) {
+		t.Fatal("pre-consumer bootstrap source lost lifecycle classification")
+	}
+	if observed, err := ObservePostgreSQLRuntime(legacy.Annotations, legacy.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		t.Fatalf("observe pre-consumer source = %q, %v", observed, err)
 	}
 }
 
@@ -4506,6 +4661,10 @@ func testPostgreSQLWritableLeases(cluster *pgshardv1alpha1.PgShardCluster) []pgs
 }
 
 func testPostgreSQLReplicationCredentials(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.PostgreSQLReplicationCredentialStatus {
+	cluster.Status.CatalogActivation = &pgshardv1alpha1.CatalogActivationCarrierStatus{
+		Name: pgshardv1alpha1.CatalogActivationName(cluster.Name),
+		UID:  "test-catalog-activation-uid",
+	}
 	checkpoints := make([]pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, 0, cluster.Spec.Shards)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		checkpoints = append(checkpoints, pgshardv1alpha1.PostgreSQLReplicationCredentialStatus{

@@ -116,6 +116,10 @@ const (
 	databaseTopologyPreflightPath             = "/etc/pgshard/postgresql/database-topology-preflight.sql"
 	shardschemaMigrationSHA256                = "10f90e15f468c3e33db03cc3a3ff714a38e020c454fd5d614d255fb367142fed"
 	shardschemaMigrationHashAnnotation        = "pgshard.io/shardschema-migration-sha256"
+	catalogActivationJournalVolumeName        = "catalog-activation-journal"
+	catalogActivationJournalVolumeMountPath   = "/var/lib/pgshard/catalog-activation-volume"
+	catalogActivationJournalSubPath           = "root"
+	catalogActivationJournalRoot              = "/var/lib/postgresql/18/.pgshard-catalog-activation"
 )
 
 const postgresqlBootstrapScript = `set -Eeuo pipefail
@@ -2904,7 +2908,18 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		}
 	}
 	var catalogCandidateConfigurations []*corev1.ConfigMap
+	var catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus
 	if cluster.Spec.MembersPerShard > 1 && images.PostgreSQLRuntime.agentQuarantine() {
+		catalogActivation = cluster.Status.CatalogActivation
+		if catalogActivation == nil {
+			return nil, fmt.Errorf("catalog activation creation result is missing")
+		}
+		if catalogActivation.Name != pgshardv1alpha1.CatalogActivationName(cluster.Name) {
+			return nil, fmt.Errorf("catalog activation creation result has unexpected name %q", catalogActivation.Name)
+		}
+		if catalogActivation.UID == "" || len(catalogActivation.UID) > 128 {
+			return nil, fmt.Errorf("catalog activation creation result has invalid UID")
+		}
 		catalogCandidateConfigurations, err = postgresqlCatalogCandidateConfigMaps(cluster)
 		if err != nil {
 			return nil, err
@@ -2932,10 +2947,14 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		objects = append(objects, catalogService(cluster))
 	}
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		var shardCatalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus
+		if shard == 0 {
+			shardCatalogActivation = catalogActivation
+		}
 		objects = append(objects,
 			shardService(cluster, shard),
 			postgresqlAgentServiceAccount(cluster, shard),
-			postgresqlAgentLeaseRole(cluster, shard),
+			postgresqlAgentLeaseRole(cluster, shard, shardCatalogActivation),
 			postgresqlAgentLeaseRoleBinding(cluster, shard),
 			PostgreSQLWritableLease(cluster, shard),
 			postgresqlNetworkPolicy(cluster, shard),
@@ -2953,7 +2972,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			replicationCredential := replicationCredentials[shard]
 			objects = append(objects,
 				postgresqlStandbyServiceAccount(cluster, shard),
-				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease, replicationCredential),
+				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease, replicationCredential, shardCatalogActivation),
 			)
 			for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
 				objects = append(objects, postgresqlReplicationStandbyStatefulSet(
@@ -4273,17 +4292,34 @@ func postgresqlStandbyServiceAccount(cluster *pgshardv1alpha1.PgShardCluster, sh
 	}
 }
 
-func postgresqlAgentLeaseRole(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *rbacv1.Role {
+func postgresqlAgentLeaseRole(cluster *pgshardv1alpha1.PgShardCluster, shard int32, catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus) *rbacv1.Role {
 	metadata := ownedMeta(cluster, PostgreSQLAgentServiceAccountName(cluster.Name, shard), "postgresql-agent", nil)
 	metadata.Labels[ShardLabel] = shardLabel(shard)
+	rules := []rbacv1.PolicyRule{{
+		APIGroups:     []string{coordinationv1.GroupName},
+		Resources:     []string{"leases"},
+		ResourceNames: []string{PostgreSQLWritableLeaseName(cluster.Name, shard)},
+		Verbs:         []string{"get", "update"},
+	}}
+	if catalogActivation != nil {
+		rules = append(rules,
+			rbacv1.PolicyRule{
+				APIGroups:     []string{pgshardv1alpha1.GroupVersion.Group},
+				Resources:     []string{"pgshardcatalogactivations"},
+				ResourceNames: []string{catalogActivation.Name},
+				Verbs:         []string{"get"},
+			},
+			rbacv1.PolicyRule{
+				APIGroups:     []string{pgshardv1alpha1.GroupVersion.Group},
+				Resources:     []string{"pgshardcatalogactivations/status"},
+				ResourceNames: []string{catalogActivation.Name},
+				Verbs:         []string{"update"},
+			},
+		)
+	}
 	return &rbacv1.Role{
 		ObjectMeta: metadata,
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups:     []string{coordinationv1.GroupName},
-			Resources:     []string{"leases"},
-			ResourceNames: []string{PostgreSQLWritableLeaseName(cluster.Name, shard)},
-			Verbs:         []string{"get", "update"},
-		}},
+		Rules:      rules,
 	}
 }
 
@@ -4673,7 +4709,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 	}
 }
 
-func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) *appsv1.StatefulSet {
+func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus) *appsv1.StatefulSet {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
@@ -4702,6 +4738,20 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 		bootstrapPullPolicy = corev1.PullNever
 	}
 	agent := postgresqlReplicationBootstrapPrimaryContainer(cluster, shard, images.PostgreSQLBootstrap, bootstrapPullPolicy, postgresSecurity, writableLease)
+	initContainers := []corev1.Container{}
+	if catalogActivation != nil {
+		agent.Env = append(agent.Env,
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME", Value: catalogActivation.Name},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_CARRIER_UID", Value: string(catalogActivation.UID)},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT", Value: catalogActivationJournalRoot},
+		)
+		agent.VolumeMounts = append(agent.VolumeMounts, corev1.VolumeMount{
+			Name:      catalogActivationJournalVolumeName,
+			MountPath: catalogActivationJournalRoot,
+			SubPath:   catalogActivationJournalSubPath,
+		})
+	}
 	generationDurability, synchronousStandbys := postgresqlGenerationDurability(cluster)
 	bootstrapContainer := corev1.Container{
 		Name:            "bootstrap-postgresql",
@@ -4735,6 +4785,25 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			{Name: "replication-credential", MountPath: "/etc/pgshard/replication", ReadOnly: true},
 		},
 	}
+	initContainers = append(initContainers, bootstrapContainer)
+	if catalogActivation != nil {
+		journalRoot := catalogActivationJournalVolumeMountPath + "/" + catalogActivationJournalSubPath
+		initContainers = append(initContainers, corev1.Container{
+			Name:            "initialize-catalog-activation-journal",
+			Image:           images.PostgreSQLBootstrap,
+			ImagePullPolicy: bootstrapPullPolicy,
+			Command: []string{
+				"bash", "-ceu",
+				catalogActivationJournalInitializerScript(journalRoot),
+			},
+			Resources:       cluster.Spec.PostgreSQL.Resources,
+			SecurityContext: postgresSecurity.DeepCopy(),
+			VolumeMounts: []corev1.VolumeMount{{
+				Name:      catalogActivationJournalVolumeName,
+				MountPath: catalogActivationJournalVolumeMountPath,
+			}},
+		})
+	}
 	automount := false
 	enableServiceLinks := false
 	podAnnotations := map[string]string{
@@ -4762,6 +4831,14 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			Items:       []corev1.KeyToPath{{Key: PostgreSQLReplicationPasswordKey, Path: "replication-password", Mode: ptr(int32(0o440))}},
 		}}},
 		postgresqlAgentKubernetesAPIVolume(),
+	}
+	if catalogActivation != nil {
+		volumes = append(volumes, corev1.Volume{
+			Name: catalogActivationJournalVolumeName,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				SizeLimit: ptr(resource.MustParse("1Mi")),
+			}},
+		})
 	}
 	statefulSetMetadata := ownedMeta(cluster, name, "postgresql", nil)
 	statefulSetMetadata.Labels[ShardLabel] = shardLabel(shard)
@@ -4800,13 +4877,20 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 						FSGroupChangePolicy: &fsGroupChangePolicy,
 						SeccompProfile:      seccomp,
 					},
-					InitContainers: []corev1.Container{bootstrapContainer},
+					InitContainers: initContainers,
 					Containers:     []corev1.Container{agent},
 					Volumes:        volumes,
 				},
 			},
 		},
 	}
+}
+
+func catalogActivationJournalInitializerScript(journalRoot string) string {
+	// EmptyDir fsGroup setup leaves its root setgid, and a numeric chmod can
+	// preserve that bit on child directories. Clear every special bit so the
+	// agent's private owner-directory check sees exactly 0700.
+	return "umask 077\ninstall -d -m 0700 -- " + journalRoot + " " + journalRoot + "/owner\nchmod u=rwx,go=,a-s,-t -- " + journalRoot + " " + journalRoot + "/owner"
 }
 
 func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard, member int32, images Images, bootstrap, sourceBootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) *appsv1.StatefulSet {
