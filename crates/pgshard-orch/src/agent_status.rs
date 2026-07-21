@@ -85,13 +85,15 @@ pub(crate) struct ReplicationCorrelationSummary {
     pub(crate) shard_zero_correlated: bool,
     pub(crate) acknowledged_correlated_shards: usize,
     pub(crate) shard_zero_target_fence_acknowledged: bool,
+    pub(crate) remote_apply_witnessed_shards: usize,
+    pub(crate) shard_zero_remote_apply_witnessed: bool,
 }
 
 /// Minimal, ephemeral replication facts needed to correlate one shard.
 ///
 /// These values exist only inside one bounded collection. The returned
-/// collection deliberately retains only a bounded shard count and shard-zero
-/// boolean alongside member count and receipt time.
+/// collection deliberately retains only bounded shard counts and shard-zero
+/// booleans alongside member count and receipt time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MemberReplicationEvidence {
     Source {
@@ -99,11 +101,13 @@ enum MemberReplicationEvidence {
         timeline: u32,
         generation_identity: String,
         generation_barrier_lsn: u64,
+        qualified_remote_apply_candidates: Vec<String>,
     },
     Standby {
         system_identifier: u64,
         timeline: u32,
         generation_identity: String,
+        member_slot_name: String,
         receive_lsn: u64,
         replay_lsn: u64,
     },
@@ -822,6 +826,9 @@ fn validate_source(
             timeline: evidence.timeline,
             generation_identity: evidence.generation_identity.clone(),
             generation_barrier_lsn: evidence.generation_barrier_lsn.0,
+            qualified_remote_apply_candidates: qualified_remote_apply_candidates(
+                evidence, expected,
+            ),
         }
     }))
 }
@@ -849,6 +856,13 @@ fn validate_standby(
         return Err(AgentStatusError::ConfigurationMismatch);
     }
     if let Some(evidence) = &status.replication_evidence {
+        if !matches!(
+            status.postgres_process,
+            PostgresProcessStateWire::StartingReplicationStandby
+                | PostgresProcessStateWire::RunningReplicationStandby
+        ) {
+            return Err(AgentStatusError::ReplicationEvidenceMismatch);
+        }
         let ReplicationEvidenceWire::Standby(evidence) = evidence else {
             return Err(AgentStatusError::ReplicationEvidenceMismatch);
         };
@@ -882,6 +896,7 @@ fn validate_standby(
             system_identifier: evidence.system_identifier.0,
             timeline: evidence.timeline,
             generation_identity: evidence.generation_identity.clone(),
+            member_slot_name: evidence.member_slot_name.clone(),
             receive_lsn: evidence.receive_lsn.0,
             replay_lsn: evidence.replay_lsn.0,
         }
@@ -958,6 +973,60 @@ fn valid_candidate_shape(candidate: &SourceReplicationCandidateWire) -> bool {
         )
 }
 
+fn qualified_remote_apply_candidates(
+    evidence: &SourceReplicationEvidenceWire,
+    expected: &AgentStatusExpectation,
+) -> Vec<String> {
+    // `slot_walsender_match` is the agent's already-validated exact slot/PID
+    // correlation; no PID or other raw candidate field survives this step.
+    evidence
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            expected
+                .standby_slot_names
+                .iter()
+                .any(|slot| slot == &candidate.member_slot_name)
+                && candidate.slot_active
+                && candidate.slot_walsender_match
+                && candidate.stream_state == Some(ReplicationStreamStateWire::Streaming)
+                // `RemoteApplyAnyOne` uses PostgreSQL's quorum (`ANY`)
+                // selection. A priority-based `sync` state contradicts that
+                // durability contract and cannot witness it.
+                && candidate.sync_state == Some(ReplicationSyncStateWire::Quorum)
+                && candidate
+                    .flush_lsn
+                    .is_some_and(|lsn| lsn.0 >= evidence.generation_barrier_lsn.0)
+                && candidate
+                    .replay_lsn
+                    .is_some_and(|lsn| lsn.0 >= evidence.generation_barrier_lsn.0)
+        })
+        .map(|candidate| candidate.member_slot_name.clone())
+        .collect()
+}
+
+fn remote_apply_witnessed(
+    observations: &[&CollectedAgentStatus],
+    qualified_candidates: &[String],
+    generation_barrier_lsn: u64,
+) -> bool {
+    qualified_candidates.iter().any(|slot| {
+        observations.iter().any(|observation| {
+            matches!(
+                observation.replication.as_ref(),
+                Some(MemberReplicationEvidence::Standby {
+                    member_slot_name,
+                    receive_lsn,
+                    replay_lsn,
+                    ..
+                }) if member_slot_name == slot
+                    && *receive_lsn >= generation_barrier_lsn
+                    && *replay_lsn >= generation_barrier_lsn
+            )
+        })
+    })
+}
+
 /// Correlates only the bounded facts that remain meaningful across separately
 /// sampled agent endpoints.
 ///
@@ -1014,6 +1083,7 @@ fn validate_replication_correlation(
             timeline,
             generation_identity,
             generation_barrier_lsn,
+            qualified_remote_apply_candidates,
         }) = source.replication.as_ref()
         else {
             return Err(AgentStatusError::ReplicationEvidenceMismatch);
@@ -1030,6 +1100,7 @@ fn validate_replication_correlation(
                 system_identifier: standby_system_identifier,
                 timeline: standby_timeline,
                 generation_identity: standby_generation,
+                member_slot_name: _,
                 receive_lsn,
                 replay_lsn,
             }) = observation.replication.as_ref()
@@ -1044,6 +1115,11 @@ fn validate_replication_correlation(
                 return Err(AgentStatusError::ReplicationEvidenceMismatch);
             }
         }
+        let has_remote_apply_witness = remote_apply_witnessed(
+            observations,
+            qualified_remote_apply_candidates,
+            *generation_barrier_lsn,
+        );
         summary.correlated_shards = summary
             .correlated_shards
             .checked_add(1)
@@ -1058,6 +1134,15 @@ fn validate_replication_correlation(
                 .ok_or(AgentStatusError::ReplicationEvidenceMismatch)?;
             if *shard_id == 0 {
                 summary.shard_zero_target_fence_acknowledged = true;
+            }
+        }
+        if has_remote_apply_witness {
+            summary.remote_apply_witnessed_shards = summary
+                .remote_apply_witnessed_shards
+                .checked_add(1)
+                .ok_or(AgentStatusError::ReplicationEvidenceMismatch)?;
+            if *shard_id == 0 {
+                summary.shard_zero_remote_apply_witnessed = true;
             }
         }
     }
@@ -1360,7 +1445,7 @@ mod tests {
                     "slot_active": true,
                     "slot_walsender_match": true,
                     "stream_state": "streaming",
-                    "sync_state": "sync",
+                    "sync_state": "quorum",
                     "flush_lsn": "100",
                     "replay_lsn": "100"
                 }
@@ -1469,6 +1554,7 @@ mod tests {
                     timeline: 3,
                     generation_identity: "generation-7".to_owned(),
                     generation_barrier_lsn: 100,
+                    qualified_remote_apply_candidates: vec!["pgshard_member_0001".to_owned()],
                 }),
                 target_fence_acknowledged: source_acknowledged,
             },
@@ -1480,6 +1566,7 @@ mod tests {
                     system_identifier: 42,
                     timeline: 3,
                     generation_identity: "generation-7".to_owned(),
+                    member_slot_name: "pgshard_member_0001".to_owned(),
                     receive_lsn: 120,
                     replay_lsn: 110,
                 }),
@@ -1650,6 +1737,8 @@ mod tests {
         assert!(summary.shard_zero_correlated);
         assert_eq!(summary.acknowledged_correlated_shards, 0);
         assert!(!summary.shard_zero_target_fence_acknowledged);
+        assert_eq!(summary.remote_apply_witnessed_shards, 1);
+        assert!(summary.shard_zero_remote_apply_witnessed);
     }
 
     #[test]
@@ -1661,6 +1750,67 @@ mod tests {
             validate_status(&status, &expected),
             Err(AgentStatusError::ReplicationEvidenceMismatch)
         ));
+
+        let (expected, mut value) = running_source_status();
+        value["replication_evidence"]["candidates"][1]["flush_lsn"] = json!("99");
+        value["replication_evidence"]["candidates"][1]["replay_lsn"] = json!("100");
+        let status = serde_json::from_value(value).expect("candidate LSN mismatch wire");
+        assert!(matches!(
+            validate_status(&status, &expected),
+            Err(AgentStatusError::ReplicationEvidenceMismatch)
+        ));
+    }
+
+    #[test]
+    fn source_remote_apply_qualification_is_exact_and_barrier_bounded() {
+        fn qualified_slots(expected: &AgentStatusExpectation, value: Value) -> Vec<String> {
+            let status = serde_json::from_value(value).expect("source wire");
+            let validated = validate_status(&status, expected).expect("validated source");
+            let Some(MemberReplicationEvidence::Source {
+                qualified_remote_apply_candidates,
+                ..
+            }) = validated.replication
+            else {
+                panic!("source replication evidence")
+            };
+            qualified_remote_apply_candidates
+        }
+
+        let (expected, value) = running_source_status();
+        assert_eq!(
+            qualified_slots(&expected, value.clone()),
+            vec!["pgshard_member_0002"]
+        );
+
+        for sync_state in ["sync", "async", "potential"] {
+            let mut unselected = value.clone();
+            unselected["replication_evidence"]["candidates"][1]["sync_state"] = json!(sync_state);
+            assert!(qualified_slots(&expected, unselected).is_empty());
+        }
+
+        let mut disconnected = value.clone();
+        let candidate = &mut disconnected["replication_evidence"]["candidates"][1];
+        candidate["slot_active"] = json!(false);
+        candidate["slot_walsender_match"] = json!(false);
+        candidate["stream_state"] = Value::Null;
+        candidate["sync_state"] = Value::Null;
+        candidate["flush_lsn"] = Value::Null;
+        candidate["replay_lsn"] = Value::Null;
+        assert!(qualified_slots(&expected, disconnected).is_empty());
+
+        let mut wrong_walsender = value.clone();
+        wrong_walsender["replication_evidence"]["candidates"][1]["slot_walsender_match"] =
+            json!(false);
+        assert!(qualified_slots(&expected, wrong_walsender).is_empty());
+
+        let mut flush_lagging = value.clone();
+        flush_lagging["replication_evidence"]["candidates"][1]["flush_lsn"] = json!("99");
+        flush_lagging["replication_evidence"]["candidates"][1]["replay_lsn"] = json!("99");
+        assert!(qualified_slots(&expected, flush_lagging).is_empty());
+
+        let mut replay_lagging = value;
+        replay_lagging["replication_evidence"]["candidates"][1]["replay_lsn"] = json!("99");
+        assert!(qualified_slots(&expected, replay_lagging).is_empty());
     }
 
     #[test]
@@ -1668,6 +1818,17 @@ mod tests {
         let (expected, value) = running_standby_status();
         let status = serde_json::from_value(value.clone()).expect("standby wire");
         validate_status(&status, &expected).expect("valid standby evidence");
+
+        for process in ["validated", "stopping", "fenced", "failed"] {
+            let mut non_live = value.clone();
+            non_live["postgres_process"] = json!(process);
+            non_live["postgres_process_identity"] = Value::Null;
+            let status = serde_json::from_value(non_live).expect("non-live standby wire");
+            assert!(matches!(
+                validate_status(&status, &expected),
+                Err(AgentStatusError::ReplicationEvidenceMismatch)
+            ));
+        }
 
         for field in ["receive_lsn", "replay_lsn"] {
             let mut invalid = value.clone();
@@ -1700,6 +1861,8 @@ mod tests {
                 shard_zero_correlated: true,
                 acknowledged_correlated_shards: 1,
                 shard_zero_target_fence_acknowledged: true,
+                remote_apply_witnessed_shards: 1,
+                shard_zero_remote_apply_witnessed: true,
             }
         );
 
@@ -1732,6 +1895,8 @@ mod tests {
                 shard_zero_correlated: true,
                 acknowledged_correlated_shards: 2,
                 shard_zero_target_fence_acknowledged: true,
+                remote_apply_witnessed_shards: 2,
+                shard_zero_remote_apply_witnessed: true,
             }
         );
 
@@ -1749,8 +1914,87 @@ mod tests {
                 shard_zero_correlated: true,
                 acknowledged_correlated_shards: 1,
                 shard_zero_target_fence_acknowledged: false,
+                remote_apply_witnessed_shards: 2,
+                shard_zero_remote_apply_witnessed: true,
             }
         );
+    }
+
+    #[test]
+    fn remote_apply_witness_requires_any_one_matching_standby_past_the_barrier() {
+        let mut lagging = correlated_observations(true);
+        let Some(MemberReplicationEvidence::Standby { replay_lsn, .. }) =
+            lagging[1].replication.as_mut()
+        else {
+            panic!("standby fixture")
+        };
+        *replay_lsn = 99;
+        let summary = validate_replication_correlation(&lagging).expect("coherent lagging shard");
+        assert_eq!(summary.correlated_shards, 1);
+        assert_eq!(summary.remote_apply_witnessed_shards, 0);
+        assert!(!summary.shard_zero_remote_apply_witnessed);
+
+        let mut nonmatching = correlated_observations(true);
+        let Some(MemberReplicationEvidence::Source {
+            qualified_remote_apply_candidates,
+            ..
+        }) = nonmatching[0].replication.as_mut()
+        else {
+            panic!("source fixture")
+        };
+        *qualified_remote_apply_candidates = vec!["pgshard_member_0002".to_owned()];
+        let summary =
+            validate_replication_correlation(&nonmatching).expect("coherent nonmatching shard");
+        assert_eq!(summary.correlated_shards, 1);
+        assert_eq!(summary.remote_apply_witnessed_shards, 0);
+
+        let mut any_one = lagging;
+        let Some(MemberReplicationEvidence::Source {
+            qualified_remote_apply_candidates,
+            ..
+        }) = any_one[0].replication.as_mut()
+        else {
+            panic!("source fixture")
+        };
+        qualified_remote_apply_candidates.push("pgshard_member_0002".to_owned());
+        let mut second_standby = any_one[1].clone();
+        second_standby.member_ordinal = 2;
+        let Some(MemberReplicationEvidence::Standby {
+            member_slot_name,
+            receive_lsn,
+            replay_lsn,
+            ..
+        }) = second_standby.replication.as_mut()
+        else {
+            panic!("standby fixture")
+        };
+        *member_slot_name = "pgshard_member_0002".to_owned();
+        *receive_lsn = 110;
+        *replay_lsn = 100;
+        any_one.push(second_standby);
+        let summary = validate_replication_correlation(&any_one).expect("ANY 1 standby witness");
+        assert_eq!(summary.remote_apply_witnessed_shards, 1);
+        assert!(summary.shard_zero_remote_apply_witnessed);
+
+        let mut shard_zero_unwitnessed = correlated_observations(true);
+        let Some(MemberReplicationEvidence::Source {
+            qualified_remote_apply_candidates,
+            ..
+        }) = shard_zero_unwitnessed[0].replication.as_mut()
+        else {
+            panic!("source fixture")
+        };
+        qualified_remote_apply_candidates.clear();
+        let mut shard_one_witnessed = correlated_observations(true);
+        for observation in &mut shard_one_witnessed {
+            observation.shard_id = 1;
+        }
+        shard_zero_unwitnessed.extend(shard_one_witnessed);
+        let summary = validate_replication_correlation(&shard_zero_unwitnessed)
+            .expect("only nonzero shard witnessed remote apply");
+        assert_eq!(summary.correlated_shards, 2);
+        assert_eq!(summary.remote_apply_witnessed_shards, 1);
+        assert!(!summary.shard_zero_remote_apply_witnessed);
     }
 
     #[test]
@@ -1761,6 +2005,7 @@ mod tests {
                 system_identifier,
                 timeline,
                 generation_identity,
+                member_slot_name: _,
                 receive_lsn,
                 replay_lsn,
             }) = observations[1].replication.as_mut()

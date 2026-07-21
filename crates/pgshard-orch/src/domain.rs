@@ -435,6 +435,8 @@ pub struct AgentStatusDiagnostics {
     pub replication_correlated_shards: usize,
     /// Correlated shards whose source reported one exact target-fence ACK.
     pub target_fence_acknowledged_shards: usize,
+    /// Correlated shards with an exact any-one remote-apply barrier witness.
+    pub remote_apply_witnessed_shards: usize,
     /// Configured process-local maximum receipt age in milliseconds.
     pub maximum_age_ms: u64,
     /// Latest stable failure class, if any.
@@ -451,6 +453,7 @@ impl Default for AgentStatusDiagnostics {
             fresh_members: 0,
             replication_correlated_shards: 0,
             target_fence_acknowledged_shards: 0,
+            remote_apply_witnessed_shards: 0,
             maximum_age_ms: 0,
             failure: None,
             diagnostic_only: true,
@@ -558,6 +561,7 @@ pub enum CatalogBootstrapObservationFailureReason {
 
 /// Bounded joint summary; it contains no identities, generations, or LSNs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[allow(clippy::struct_excessive_bools)] // Exact independent status facts are intentional.
 pub struct CatalogBootstrapObservationDiagnostics {
     /// Current joint observation lifecycle.
     pub phase: CatalogBootstrapObservationPhase,
@@ -569,6 +573,8 @@ pub struct CatalogBootstrapObservationDiagnostics {
     pub shard_zero_replication_correlated: bool,
     /// Whether the correlated live shard-zero source acknowledged its target fence.
     pub shard_zero_target_fence_acknowledged: bool,
+    /// Whether one correlated live shard-zero standby witnessed remote apply.
+    pub shard_zero_remote_apply_witnessed: bool,
     /// Latest stable joint failure class, if any.
     pub failure: Option<CatalogBootstrapObservationFailureReason>,
     /// Explicitly states that this observation grants no authority.
@@ -583,6 +589,7 @@ impl Default for CatalogBootstrapObservationDiagnostics {
             fresh_candidates: 0,
             shard_zero_replication_correlated: false,
             shard_zero_target_fence_acknowledged: false,
+            shard_zero_remote_apply_witnessed: false,
             failure: None,
             diagnostic_only: true,
         }
@@ -665,6 +672,7 @@ fn expire_diagnostic_state(inner: &mut OrchInner, now: Option<SuspendAwareInstan
             inner.agent_status.fresh_members = 0;
             inner.agent_status.replication_correlated_shards = 0;
             inner.agent_status.target_fence_acknowledged_shards = 0;
+            inner.agent_status.remote_apply_witnessed_shards = 0;
             inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
         }
         if let Some(topology) = &mut inner.topology
@@ -695,83 +703,95 @@ fn catalog_bootstrap_observation(inner: &OrchInner) -> CatalogBootstrapObservati
     let expected_candidates = inner.catalog_candidates.expected_candidates;
     let fresh_candidates = inner.catalog_candidates.fresh_candidates;
     let replication = inner.agent_replication_correlation;
-    let (phase, failure, shard_zero_replication_correlated, shard_zero_target_fence_acknowledged) =
-        if inner.agent_status.phase == AgentStatusPhase::ShuttingDown
-            || inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown
-        {
-            (
-                CatalogBootstrapObservationPhase::ShuttingDown,
-                None,
-                false,
-                false,
-            )
-        } else if inner.agent_status.phase == AgentStatusPhase::Disabled
-            || inner.catalog_candidates.phase == CatalogCandidatePhase::Disabled
-        {
-            (
-                CatalogBootstrapObservationPhase::Disabled,
-                None,
-                false,
-                false,
-            )
-        } else if inner.agent_status.phase == AgentStatusPhase::Unavailable {
-            (
-                CatalogBootstrapObservationPhase::Unavailable,
-                Some(CatalogBootstrapObservationFailureReason::AgentStatusUnavailable),
-                false,
-                false,
-            )
-        } else if inner.catalog_candidates.phase == CatalogCandidatePhase::Unavailable {
-            (
-                CatalogBootstrapObservationPhase::Unavailable,
-                Some(CatalogBootstrapObservationFailureReason::CatalogCandidatesUnavailable),
-                false,
-                false,
-            )
-        } else if inner.agent_status.phase == AgentStatusPhase::Expired
-            || inner.catalog_candidates.phase == CatalogCandidatePhase::Expired
-        {
-            (
-                CatalogBootstrapObservationPhase::Expired,
-                Some(CatalogBootstrapObservationFailureReason::FreshnessExpired),
-                false,
-                false,
-            )
-        } else if inner.agent_status.phase == AgentStatusPhase::Collecting
-            || inner.catalog_candidates.phase == CatalogCandidatePhase::Collecting
-        {
-            (
-                CatalogBootstrapObservationPhase::Collecting,
-                None,
-                false,
-                false,
-            )
-        } else if inner.agent_status.phase == AgentStatusPhase::Fresh
-            && inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh
-            && replication.is_some_and(|summary| summary.shard_zero_correlated)
-        {
-            (
-                CatalogBootstrapObservationPhase::Correlated,
-                None,
-                true,
-                replication.is_some_and(|summary| summary.shard_zero_target_fence_acknowledged),
-            )
-        } else {
-            (
-                CatalogBootstrapObservationPhase::Unavailable,
-                Some(
-                    CatalogBootstrapObservationFailureReason::ShardZeroReplicationEvidenceUnavailable,
-                ),
-                false,
-                false,
-            )
-        };
+    let (
+        phase,
+        failure,
+        shard_zero_replication_correlated,
+        shard_zero_target_fence_acknowledged,
+        shard_zero_remote_apply_witnessed,
+    ) = if inner.agent_status.phase == AgentStatusPhase::ShuttingDown
+        || inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown
+    {
+        (
+            CatalogBootstrapObservationPhase::ShuttingDown,
+            None,
+            false,
+            false,
+            false,
+        )
+    } else if inner.agent_status.phase == AgentStatusPhase::Disabled
+        || inner.catalog_candidates.phase == CatalogCandidatePhase::Disabled
+    {
+        (
+            CatalogBootstrapObservationPhase::Disabled,
+            None,
+            false,
+            false,
+            false,
+        )
+    } else if inner.agent_status.phase == AgentStatusPhase::Unavailable {
+        (
+            CatalogBootstrapObservationPhase::Unavailable,
+            Some(CatalogBootstrapObservationFailureReason::AgentStatusUnavailable),
+            false,
+            false,
+            false,
+        )
+    } else if inner.catalog_candidates.phase == CatalogCandidatePhase::Unavailable {
+        (
+            CatalogBootstrapObservationPhase::Unavailable,
+            Some(CatalogBootstrapObservationFailureReason::CatalogCandidatesUnavailable),
+            false,
+            false,
+            false,
+        )
+    } else if inner.agent_status.phase == AgentStatusPhase::Expired
+        || inner.catalog_candidates.phase == CatalogCandidatePhase::Expired
+    {
+        (
+            CatalogBootstrapObservationPhase::Expired,
+            Some(CatalogBootstrapObservationFailureReason::FreshnessExpired),
+            false,
+            false,
+            false,
+        )
+    } else if inner.agent_status.phase == AgentStatusPhase::Collecting
+        || inner.catalog_candidates.phase == CatalogCandidatePhase::Collecting
+    {
+        (
+            CatalogBootstrapObservationPhase::Collecting,
+            None,
+            false,
+            false,
+            false,
+        )
+    } else if inner.agent_status.phase == AgentStatusPhase::Fresh
+        && inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh
+        && replication.is_some_and(|summary| summary.shard_zero_correlated)
+    {
+        (
+            CatalogBootstrapObservationPhase::Correlated,
+            None,
+            true,
+            replication.is_some_and(|summary| summary.shard_zero_target_fence_acknowledged),
+            replication.is_some_and(|summary| summary.shard_zero_remote_apply_witnessed),
+        )
+    } else {
+        (
+            CatalogBootstrapObservationPhase::Unavailable,
+            Some(CatalogBootstrapObservationFailureReason::ShardZeroReplicationEvidenceUnavailable),
+            false,
+            false,
+            false,
+        )
+    };
     CatalogBootstrapObservationDiagnostics {
         phase,
         expected_candidates,
         fresh_candidates,
         shard_zero_replication_correlated,
         shard_zero_target_fence_acknowledged,
+        shard_zero_remote_apply_witnessed,
         failure,
         diagnostic_only: true,
     }
@@ -1042,6 +1062,7 @@ impl OrchState {
         inner.agent_status.fresh_members = 0;
         inner.agent_status.replication_correlated_shards = 0;
         inner.agent_status.target_fence_acknowledged_shards = 0;
+        inner.agent_status.remote_apply_witnessed_shards = 0;
         inner.agent_status.maximum_age_ms =
             u64::try_from(maximum_age.as_millis()).unwrap_or(u64::MAX);
         inner.agent_status.failure = None;
@@ -1069,6 +1090,7 @@ impl OrchState {
         inner.agent_status.fresh_members = 0;
         inner.agent_status.replication_correlated_shards = 0;
         inner.agent_status.target_fence_acknowledged_shards = 0;
+        inner.agent_status.remote_apply_witnessed_shards = 0;
         inner.agent_status.failure = Some(failure);
         if let Some(topology) = &mut inner.topology
             && topology.agent_status_collection
@@ -1105,6 +1127,8 @@ impl OrchState {
                     .map_or(0, |topology| topology.shard_count)
             && replication_correlation.acknowledged_correlated_shards
                 <= replication_correlation.correlated_shards
+            && replication_correlation.remote_apply_witnessed_shards
+                <= replication_correlation.correlated_shards
             && (!replication_correlation.shard_zero_correlated
                 || replication_correlation.correlated_shards > 0)
             && (!replication_correlation.shard_zero_target_fence_acknowledged
@@ -1114,6 +1138,13 @@ impl OrchState {
                 || replication_correlation.acknowledged_correlated_shards
                     != replication_correlation.correlated_shards
                 || replication_correlation.shard_zero_target_fence_acknowledged)
+            && (!replication_correlation.shard_zero_remote_apply_witnessed
+                || (replication_correlation.shard_zero_correlated
+                    && replication_correlation.remote_apply_witnessed_shards > 0))
+            && (!replication_correlation.shard_zero_correlated
+                || replication_correlation.remote_apply_witnessed_shards
+                    != replication_correlation.correlated_shards
+                || replication_correlation.shard_zero_remote_apply_witnessed)
             && deadline
                 .zip(now)
                 .is_some_and(|(deadline, now)| deadline.is_live_at(now));
@@ -1124,6 +1155,7 @@ impl OrchState {
             inner.agent_status.fresh_members = 0;
             inner.agent_status.replication_correlated_shards = 0;
             inner.agent_status.target_fence_acknowledged_shards = 0;
+            inner.agent_status.remote_apply_witnessed_shards = 0;
             inner.agent_status.failure = Some(AgentStatusFailureReason::FreshnessExpired);
             return false;
         }
@@ -1135,6 +1167,8 @@ impl OrchState {
             replication_correlation.correlated_shards;
         inner.agent_status.target_fence_acknowledged_shards =
             replication_correlation.acknowledged_correlated_shards;
+        inner.agent_status.remote_apply_witnessed_shards =
+            replication_correlation.remote_apply_witnessed_shards;
         inner.agent_status.failure = None;
         if let Some(topology) = &mut inner.topology {
             topology.agent_status_collection =
@@ -1242,6 +1276,7 @@ impl OrchState {
         inner.agent_status.fresh_members = 0;
         inner.agent_status.replication_correlated_shards = 0;
         inner.agent_status.target_fence_acknowledged_shards = 0;
+        inner.agent_status.remote_apply_witnessed_shards = 0;
         inner.agent_status.failure = None;
         inner.catalog_candidate_deadline = None;
         inner.catalog_candidates.phase = CatalogCandidatePhase::ShuttingDown;
@@ -2870,6 +2905,7 @@ mod tests {
         let absent = state.snapshot();
         assert_eq!(absent.agent_status.replication_correlated_shards, 0);
         assert_eq!(absent.agent_status.target_fence_acknowledged_shards, 0);
+        assert_eq!(absent.agent_status.remote_apply_witnessed_shards, 0);
         assert_eq!(
             absent.catalog_bootstrap_observation.phase,
             CatalogBootstrapObservationPhase::Unavailable
@@ -2885,6 +2921,11 @@ mod tests {
             !absent
                 .catalog_bootstrap_observation
                 .shard_zero_target_fence_acknowledged
+        );
+        assert!(
+            !absent
+                .catalog_bootstrap_observation
+                .shard_zero_remote_apply_witnessed
         );
         assert_eq!(
             absent.catalog_bootstrap_observation.failure,
@@ -2903,6 +2944,7 @@ mod tests {
         assert_eq!(collecting.catalog_bootstrap_observation.fresh_candidates, 3);
         assert_eq!(collecting.agent_status.replication_correlated_shards, 0);
         assert_eq!(collecting.agent_status.target_fence_acknowledged_shards, 0);
+        assert_eq!(collecting.agent_status.remote_apply_witnessed_shards, 0);
 
         assert!(state.record_agent_status_fresh(
             6,
@@ -2911,12 +2953,15 @@ mod tests {
                 shard_zero_correlated: true,
                 acknowledged_correlated_shards: 2,
                 shard_zero_target_fence_acknowledged: true,
+                remote_apply_witnessed_shards: 2,
+                shard_zero_remote_apply_witnessed: true,
             },
             now + Duration::from_secs(5),
         ));
         let correlated = state.snapshot();
         assert_eq!(correlated.agent_status.replication_correlated_shards, 2);
         assert_eq!(correlated.agent_status.target_fence_acknowledged_shards, 2);
+        assert_eq!(correlated.agent_status.remote_apply_witnessed_shards, 2);
         assert_eq!(
             correlated.catalog_bootstrap_observation.phase,
             CatalogBootstrapObservationPhase::Correlated
@@ -2932,6 +2977,11 @@ mod tests {
                 .catalog_bootstrap_observation
                 .shard_zero_target_fence_acknowledged
         );
+        assert!(
+            correlated
+                .catalog_bootstrap_observation
+                .shard_zero_remote_apply_witnessed
+        );
         assert_eq!(correlated.catalog_bootstrap_observation.failure, None);
         let serialized = serde_json::to_string(&correlated).expect("serialize bounded diagnostics");
         for raw_ack_field in [
@@ -2943,8 +2993,22 @@ mod tests {
             "boot_id",
             "postmaster_pid",
             "control_backend_pid",
+            "member_slot_name",
+            "slot_active",
+            "slot_walsender_match",
+            "stream_state",
+            "sync_state",
+            "flush_lsn",
+            "replay_lsn",
+            "receive_lsn",
+            "generation_barrier_lsn",
+            "system_identifier",
+            "timeline",
         ] {
             assert!(!serialized.contains(raw_ack_field));
+        }
+        for raw_value in ["pgshard_member_0001", "generation-7"] {
+            assert!(!serialized.contains(raw_value));
         }
         assert_eq!(state.readiness(), ready);
 
@@ -2962,10 +3026,16 @@ mod tests {
         );
         assert_eq!(collecting.agent_status.replication_correlated_shards, 2);
         assert_eq!(collecting.agent_status.target_fence_acknowledged_shards, 2);
+        assert_eq!(collecting.agent_status.remote_apply_witnessed_shards, 2);
         assert!(
             !collecting
                 .catalog_bootstrap_observation
                 .shard_zero_target_fence_acknowledged
+        );
+        assert!(
+            !collecting
+                .catalog_bootstrap_observation
+                .shard_zero_remote_apply_witnessed
         );
 
         assert!(state.record_catalog_candidates_fresh(3, now + Duration::from_secs(5)));
@@ -2995,10 +3065,19 @@ mod tests {
                 .catalog_bootstrap_observation
                 .shard_zero_target_fence_acknowledged
         );
+        assert!(
+            !candidate_failure
+                .catalog_bootstrap_observation
+                .shard_zero_remote_apply_witnessed
+        );
         assert_eq!(
             candidate_failure
                 .agent_status
                 .target_fence_acknowledged_shards,
+            2
+        );
+        assert_eq!(
+            candidate_failure.agent_status.remote_apply_witnessed_shards,
             2
         );
         assert_eq!(state.readiness(), ready);
@@ -3020,10 +3099,16 @@ mod tests {
             agent_failure.agent_status.target_fence_acknowledged_shards,
             0
         );
+        assert_eq!(agent_failure.agent_status.remote_apply_witnessed_shards, 0);
         assert!(
             !agent_failure
                 .catalog_bootstrap_observation
                 .shard_zero_target_fence_acknowledged
+        );
+        assert!(
+            !agent_failure
+                .catalog_bootstrap_observation
+                .shard_zero_remote_apply_witnessed
         );
         assert_eq!(state.readiness(), ready);
 
@@ -3043,7 +3128,13 @@ mod tests {
                 .catalog_bootstrap_observation
                 .shard_zero_target_fence_acknowledged
         );
+        assert!(
+            !shutdown
+                .catalog_bootstrap_observation
+                .shard_zero_remote_apply_witnessed
+        );
         assert_eq!(shutdown.agent_status.target_fence_acknowledged_shards, 0);
+        assert_eq!(shutdown.agent_status.remote_apply_witnessed_shards, 0);
         assert_eq!(shutdown.catalog_bootstrap_observation.failure, None);
     }
 
@@ -3058,6 +3149,8 @@ mod tests {
                 shard_zero_correlated: true,
                 acknowledged_correlated_shards: 1,
                 shard_zero_target_fence_acknowledged: true,
+                remote_apply_witnessed_shards: 1,
+                shard_zero_remote_apply_witnessed: true,
             },
             now + Duration::from_secs(1),
             now + Duration::from_secs(2),
@@ -3075,10 +3168,16 @@ mod tests {
         );
         assert_eq!(expired.agent_status.replication_correlated_shards, 0);
         assert_eq!(expired.agent_status.target_fence_acknowledged_shards, 0);
+        assert_eq!(expired.agent_status.remote_apply_witnessed_shards, 0);
         assert!(
             !expired
                 .catalog_bootstrap_observation
                 .shard_zero_target_fence_acknowledged
+        );
+        assert!(
+            !expired
+                .catalog_bootstrap_observation
+                .shard_zero_remote_apply_witnessed
         );
 
         let candidate_expires = bootstrap_observation_state();
@@ -3089,6 +3188,8 @@ mod tests {
                 shard_zero_correlated: true,
                 acknowledged_correlated_shards: 1,
                 shard_zero_target_fence_acknowledged: true,
+                remote_apply_witnessed_shards: 1,
+                shard_zero_remote_apply_witnessed: true,
             },
             now + Duration::from_secs(2),
             now + Duration::from_secs(1),
@@ -3106,33 +3207,69 @@ mod tests {
         );
         assert_eq!(expired.agent_status.replication_correlated_shards, 1);
         assert_eq!(expired.agent_status.target_fence_acknowledged_shards, 1);
+        assert_eq!(expired.agent_status.remote_apply_witnessed_shards, 1);
         assert!(
             !expired
                 .catalog_bootstrap_observation
                 .shard_zero_target_fence_acknowledged
         );
+        assert!(
+            !expired
+                .catalog_bootstrap_observation
+                .shard_zero_remote_apply_witnessed
+        );
     }
 
     #[test]
-    fn rejects_impossible_target_fence_acknowledgement_summaries() {
+    fn rejects_impossible_bounded_correlation_summaries() {
         for impossible in [
             ReplicationCorrelationSummary {
                 correlated_shards: 1,
                 shard_zero_correlated: true,
                 acknowledged_correlated_shards: 2,
                 shard_zero_target_fence_acknowledged: true,
+                remote_apply_witnessed_shards: 0,
+                shard_zero_remote_apply_witnessed: false,
             },
             ReplicationCorrelationSummary {
                 correlated_shards: 1,
                 shard_zero_correlated: false,
                 acknowledged_correlated_shards: 1,
                 shard_zero_target_fence_acknowledged: true,
+                remote_apply_witnessed_shards: 0,
+                shard_zero_remote_apply_witnessed: false,
+            },
+            ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: true,
+                acknowledged_correlated_shards: 0,
+                shard_zero_target_fence_acknowledged: false,
+                remote_apply_witnessed_shards: 2,
+                shard_zero_remote_apply_witnessed: true,
+            },
+            ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: false,
+                acknowledged_correlated_shards: 0,
+                shard_zero_target_fence_acknowledged: false,
+                remote_apply_witnessed_shards: 1,
+                shard_zero_remote_apply_witnessed: true,
             },
             ReplicationCorrelationSummary {
                 correlated_shards: 1,
                 shard_zero_correlated: true,
                 acknowledged_correlated_shards: 1,
                 shard_zero_target_fence_acknowledged: false,
+                remote_apply_witnessed_shards: 0,
+                shard_zero_remote_apply_witnessed: false,
+            },
+            ReplicationCorrelationSummary {
+                correlated_shards: 1,
+                shard_zero_correlated: true,
+                acknowledged_correlated_shards: 0,
+                shard_zero_target_fence_acknowledged: false,
+                remote_apply_witnessed_shards: 1,
+                shard_zero_remote_apply_witnessed: false,
             },
         ] {
             let state = bootstrap_observation_state();
@@ -3145,6 +3282,7 @@ mod tests {
             let snapshot = state.snapshot();
             assert_eq!(snapshot.agent_status.replication_correlated_shards, 0);
             assert_eq!(snapshot.agent_status.target_fence_acknowledged_shards, 0);
+            assert_eq!(snapshot.agent_status.remote_apply_witnessed_shards, 0);
         }
     }
 
