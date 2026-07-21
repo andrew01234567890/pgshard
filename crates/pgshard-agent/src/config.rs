@@ -11,6 +11,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::catalog_activation_consumer::CatalogActivationConsumerConfig;
+use crate::catalog_activation_static_inputs::{
+    CatalogActivationStaticInputsConfig, CatalogActivationStaticInputsConfigError,
+};
 use crate::catalog_activation_tls::{CatalogActivationTlsConfig, CatalogActivationTlsConfigError};
 use crate::coordination::WritableLeaseConfig;
 use crate::domain::{ActivationConfigEvidence, AgentIdentity};
@@ -39,6 +42,8 @@ pub struct AgentConfig {
     pub activation_config: Option<ActivationConfigEvidence>,
     /// Optional dormant catalog-activation consumer.
     pub catalog_activation_consumer: Option<CatalogActivationConsumerConfig>,
+    /// Optional dormant verifier for request-sealed static inputs.
+    pub catalog_activation_static_inputs: Option<CatalogActivationStaticInputsConfig>,
     /// Optional dedicated TLS endpoint for the dormant consumer capability.
     pub catalog_activation_tls: Option<CatalogActivationTlsConfig>,
 }
@@ -114,6 +119,15 @@ struct RawConfig {
 
     #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT")]
     catalog_activation_journal_root: Option<PathBuf>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_MIGRATION_FILE")]
+    catalog_activation_migration_file: Option<PathBuf>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_GENESIS_FILE")]
+    catalog_activation_genesis_file: Option<PathBuf>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_PREFLIGHT_FILE")]
+    catalog_activation_preflight_file: Option<PathBuf>,
 
     #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_TLS_BIND")]
     catalog_activation_tls_bind: Option<SocketAddr>,
@@ -419,6 +433,12 @@ impl AgentConfig {
             raw.catalog_activation_tls_key_file,
             catalog_activation_consumer.is_some(),
         )?;
+        let catalog_activation_static_inputs = build_catalog_activation_static_inputs(
+            raw.catalog_activation_migration_file,
+            raw.catalog_activation_genesis_file,
+            raw.catalog_activation_preflight_file,
+            catalog_activation_consumer.is_some(),
+        )?;
 
         let otlp_endpoint = raw
             .otlp_endpoint
@@ -436,9 +456,33 @@ impl AgentConfig {
             postgres,
             activation_config,
             catalog_activation_consumer,
+            catalog_activation_static_inputs,
             catalog_activation_tls,
         })
     }
+}
+
+fn build_catalog_activation_static_inputs(
+    migration_path: Option<PathBuf>,
+    genesis_path: Option<PathBuf>,
+    preflight_path: Option<PathBuf>,
+    consumer_configured: bool,
+) -> Result<Option<CatalogActivationStaticInputsConfig>, ConfigError> {
+    let supplied = migration_path.is_some() || genesis_path.is_some() || preflight_path.is_some();
+    if !supplied {
+        return Ok(None);
+    }
+    let (Some(migration_path), Some(genesis_path), Some(preflight_path)) =
+        (migration_path, genesis_path, preflight_path)
+    else {
+        return Err(ConfigError::IncompleteCatalogActivationStaticInputs);
+    };
+    if !consumer_configured {
+        return Err(ConfigError::CatalogActivationStaticInputsRequireConsumer);
+    }
+    CatalogActivationStaticInputsConfig::new(migration_path, genesis_path, preflight_path)
+        .map(Some)
+        .map_err(ConfigError::from)
 }
 
 fn build_catalog_activation_tls(
@@ -727,6 +771,15 @@ pub enum ConfigError {
     /// Carrier, cluster, Pod, or journal identity is unsafe or inconsistent.
     #[error("catalog-activation consumer identity or journal root is invalid")]
     InvalidCatalogActivationConsumerIdentity,
+    /// Only part of the three static materialization inputs was supplied.
+    #[error("catalog-activation migration, genesis, and preflight files must be supplied together")]
+    IncompleteCatalogActivationStaticInputs,
+    /// Static activation inputs have no authority without the durable consumer.
+    #[error("catalog-activation static inputs require the catalog-activation consumer")]
+    CatalogActivationStaticInputsRequireConsumer,
+    /// A static activation input path is unsafe or ambiguous.
+    #[error(transparent)]
+    CatalogActivationStaticInputs(#[from] CatalogActivationStaticInputsConfigError),
     /// Only part of the dedicated capability TLS endpoint was supplied.
     #[error(
         "catalog-activation TLS bind, certificate file, and private-key file must be supplied together"
@@ -860,6 +913,17 @@ mod tests {
         ]
     }
 
+    fn catalog_activation_static_input_args() -> Vec<&'static str> {
+        vec![
+            "--catalog-activation-migration-file",
+            "/usr/share/pgshard/migrations/0001_shardschema.sql",
+            "--catalog-activation-genesis-file",
+            "/etc/pgshard/catalog-materialization-inputs/database-genesis.sql",
+            "--catalog-activation-preflight-file",
+            "/etc/pgshard/catalog-materialization-inputs/database-topology-preflight.sql",
+        ]
+    }
+
     fn expected_replication_standby(primary_port: u16) -> PostgresConfig {
         let standby = PostgresStandbyConfig::new(
             "cluster-1-shard-0003-member-0000.database.svc".to_owned(),
@@ -891,6 +955,7 @@ mod tests {
         assert!(config.postgres.is_none());
         assert!(config.activation_config.is_none());
         assert!(config.catalog_activation_consumer.is_none());
+        assert!(config.catalog_activation_static_inputs.is_none());
         assert!(config.catalog_activation_tls.is_none());
     }
 
@@ -961,6 +1026,52 @@ mod tests {
             AgentConfig::try_parse_from(no_consumer),
             Err(ConfigError::CatalogActivationTlsRequiresConsumer)
         ));
+    }
+
+    #[test]
+    fn catalog_activation_static_inputs_are_complete_safe_and_consumer_bound() {
+        let mut complete = catalog_activation_consumer_args();
+        complete.extend(catalog_activation_static_input_args());
+        let config = AgentConfig::try_parse_from(complete).expect("complete static inputs");
+        assert!(config.catalog_activation_static_inputs.is_some());
+
+        let mut partial = catalog_activation_consumer_args();
+        partial.extend(&catalog_activation_static_input_args()[..4]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(partial),
+            Err(ConfigError::IncompleteCatalogActivationStaticInputs)
+        ));
+
+        let mut no_consumer = required_args();
+        no_consumer.extend(catalog_activation_static_input_args());
+        assert!(matches!(
+            AgentConfig::try_parse_from(no_consumer),
+            Err(ConfigError::CatalogActivationStaticInputsRequireConsumer)
+        ));
+
+        for (setting, replacement) in [
+            ("--catalog-activation-migration-file", "relative.sql"),
+            (
+                "--catalog-activation-genesis-file",
+                "/etc/pgshard/../genesis.sql",
+            ),
+            (
+                "--catalog-activation-preflight-file",
+                "/usr/share/pgshard/migrations/0001_shardschema.sql",
+            ),
+        ] {
+            let mut args = catalog_activation_consumer_args();
+            args.extend(catalog_activation_static_input_args());
+            let index = args
+                .iter()
+                .position(|argument| *argument == setting)
+                .expect("static-input setting");
+            args[index + 1] = replacement;
+            assert!(matches!(
+                AgentConfig::try_parse_from(args),
+                Err(ConfigError::CatalogActivationStaticInputs(_))
+            ));
+        }
     }
 
     #[test]

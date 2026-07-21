@@ -124,6 +124,10 @@ const (
 	catalogActivationJournalRoot              = "/var/lib/postgresql/18/.pgshard-catalog-activation"
 	catalogActivationTLSVolumeName            = "catalog-activation-tls"
 	catalogActivationTLSMountPath             = "/etc/pgshard/catalog-tls"
+	catalogActivationStaticInputsVolumeName   = "catalog-activation-static-inputs"
+	catalogActivationStaticInputsMountPath    = "/etc/pgshard/catalog-materialization-inputs"
+	catalogActivationGenesisPath              = catalogActivationStaticInputsMountPath + "/" + databaseGenesisKey
+	catalogActivationPreflightPath            = catalogActivationStaticInputsMountPath + "/" + databaseTopologyPreflightKey
 	catalogActivationCAVolumeName             = "catalog-activation-ca"
 	catalogActivationCAMountPath              = "/etc/pgshard/catalog-activation"
 	catalogActivationCAFilePath               = catalogActivationCAMountPath + "/ca.crt"
@@ -4761,13 +4765,17 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_TLS_BIND", Value: fmt.Sprintf("0.0.0.0:%d", CatalogActivationTLSPort)},
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_TLS_CERT_FILE", Value: catalogActivationTLSMountPath + "/tls.crt"},
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_TLS_KEY_FILE", Value: catalogActivationTLSMountPath + "/tls.key"},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_MIGRATION_FILE", Value: shardschemaMigrationPath},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_GENESIS_FILE", Value: catalogActivationGenesisPath},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_PREFLIGHT_FILE", Value: catalogActivationPreflightPath},
 		)
 		agent.Ports = append(agent.Ports, corev1.ContainerPort{Name: "activation-tls", ContainerPort: CatalogActivationTLSPort, Protocol: corev1.ProtocolTCP})
 		agent.VolumeMounts = append(agent.VolumeMounts, corev1.VolumeMount{
 			Name:      catalogActivationJournalVolumeName,
 			MountPath: catalogActivationJournalRoot,
 			SubPath:   catalogActivationJournalSubPath,
-		}, corev1.VolumeMount{Name: catalogActivationTLSVolumeName, MountPath: catalogActivationTLSMountPath, ReadOnly: true})
+		}, corev1.VolumeMount{Name: catalogActivationTLSVolumeName, MountPath: catalogActivationTLSMountPath, ReadOnly: true},
+			corev1.VolumeMount{Name: catalogActivationStaticInputsVolumeName, MountPath: catalogActivationStaticInputsMountPath, ReadOnly: true})
 	}
 	generationDurability, synchronousStandbys := postgresqlGenerationDurability(cluster)
 	bootstrapContainer := corev1.Container{
@@ -4868,6 +4876,17 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 					Items: []corev1.KeyToPath{
 						{Key: CatalogTLSCertificateKey, Path: "tls.crt", Mode: ptr(int32(0o440))},
 						{Key: CatalogTLSPrivateKeyKey, Path: "tls.key", Mode: ptr(int32(0o440))},
+					},
+				}},
+			},
+			corev1.Volume{
+				Name: catalogActivationStaticInputsVolumeName,
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: configurationName},
+					DefaultMode:          ptr(int32(0o440)),
+					Items: []corev1.KeyToPath{
+						{Key: databaseGenesisKey, Path: databaseGenesisKey, Mode: ptr(int32(0o440))},
+						{Key: databaseTopologyPreflightKey, Path: databaseTopologyPreflightKey, Mode: ptr(int32(0o440))},
 					},
 				}},
 			},

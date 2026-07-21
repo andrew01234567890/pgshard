@@ -76,6 +76,23 @@ pub struct DurableCatalogActivationAcceptance {
 }
 
 impl DurableCatalogActivationAcceptance {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        carrier_uid: String,
+        request_sha256: String,
+        target_pod_name: String,
+        target_pod_uid: String,
+    ) -> Self {
+        Self {
+            carrier_uid,
+            request_sha256,
+            target_pod_name,
+            target_pod_uid,
+            persisted_at_unix_ms: "1".to_owned(),
+            _private: (),
+        }
+    }
+
     /// Returns the exact carrier UID bound by Accepted.
     #[must_use]
     pub fn carrier_uid(&self) -> &str {
