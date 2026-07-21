@@ -9,6 +9,9 @@ pub const CATALOG_CLIENT_DIGEST_DOMAIN: &str = "pgshard-catalog-client-v1";
 /// Domain separating the shard-zero catalog certificate fingerprint.
 pub const CATALOG_SERVER_DIGEST_DOMAIN: &str = "pgshard-catalog-server-v1";
 
+/// Domain separating the orchestrator's operation-writer password and CA.
+pub const OPERATION_WRITER_DIGEST_DOMAIN: &str = "pgshard-operation-writer-client-v1";
+
 /// Domain separating the per-shard physical-replication password fingerprint.
 pub const POSTGRESQL_REPLICATION_DIGEST_DOMAIN: &str = "pgshard-postgresql-replication-v1";
 
@@ -74,6 +77,14 @@ mod tests {
                 std::iter::empty(),
             ),
             "f28e708e623164f153012f8f21e13d4bbd3ad2de150d3181b69316275bb49f7e"
+        );
+        assert_eq!(
+            catalog_material_sha256(
+                OPERATION_WRITER_DIGEST_DOMAIN,
+                b"writer-password",
+                [&b"catalog-ca"[..]],
+            ),
+            "62592029f6dfabdf02e2ad5cdcd3f030107f69decfd7363a44efd61d7e6597ee"
         );
         assert_ne!(
             client,

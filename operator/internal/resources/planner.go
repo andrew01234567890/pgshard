@@ -54,6 +54,7 @@ const (
 	PostgreSQLReplicationPasswordKey = "replication-password"
 	CatalogServiceSuffix             = "-shardschema"
 	CatalogPasswordKey               = "catalog-password"
+	OperationWriterPasswordKey       = "operation-writer-password"
 	CatalogCACertificateKey          = "ca.crt"
 	CatalogTLSCertificateKey         = "tls.crt"
 	CatalogTLSPrivateKeyKey          = "tls.key"
@@ -85,6 +86,7 @@ const (
 	PostgreSQLBootstrapClusterUIDAnnotation   = "pgshard.io/bootstrap-cluster-uid"
 	PostgreSQLReplicationClusterUIDAnnotation = "pgshard.io/replication-cluster-uid"
 	CatalogAccessClusterUIDAnnotation         = "pgshard.io/catalog-access-cluster-uid"
+	OperationWriterAccessClusterUIDAnnotation = "pgshard.io/operation-writer-access-cluster-uid"
 	PostgreSQLDataClusterUIDAnnotation        = "pgshard.io/data-cluster-uid"
 	PostgreSQLDataProtectionFinalizer         = "pgshard.io/postgresql-data-protection"
 	PostgreSQLPodClusterUIDAnnotation         = "pgshard.io/postgresql-cluster-uid"
@@ -97,7 +99,7 @@ const (
 	databaseGenesisPath                       = "/etc/pgshard/postgresql/database-genesis.sql"
 	databaseTopologyPreflightKey              = "database-topology-preflight.sql"
 	databaseTopologyPreflightPath             = "/etc/pgshard/postgresql/database-topology-preflight.sql"
-	shardschemaMigrationSHA256                = "8a74d1fabe9d33dbdcc018f43863b7fa3cbecbb23fef8c2ae2ed9cca2dbd0b62"
+	shardschemaMigrationSHA256                = "10f90e15f468c3e33db03cc3a3ff714a38e020c454fd5d614d255fb367142fed"
 	shardschemaMigrationHashAnnotation        = "pgshard.io/shardschema-migration-sha256"
 )
 
@@ -235,13 +237,19 @@ if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]]; then
     exit 1
   fi
   if [[ ! "$PGSHARD_CATALOG_CLIENT_SHA256" =~ ^[0-9a-f]{64}$ ]] \
-    || [[ ! "$PGSHARD_CATALOG_SERVER_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    || [[ ! "$PGSHARD_CATALOG_SERVER_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || [[ ! "$PGSHARD_OPERATION_WRITER_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
     echo "refusing invalid checkpointed shardschema material digests" >&2
     exit 1
   fi
   catalog_password="$(</etc/pgshard/catalog-auth/catalog-password)"
   if [[ ! "$catalog_password" =~ ^[0-9a-f]{64}$ ]]; then
     echo "refusing an invalid shardschema reader credential" >&2
+    exit 1
+  fi
+  operation_writer_password="$(</etc/pgshard/operation-writer-auth/operation-writer-password)"
+  if [[ ! "$operation_writer_password" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "refusing an invalid shardschema operation-writer credential" >&2
     exit 1
   fi
   observed_catalog_client_sha="$(
@@ -254,11 +262,18 @@ if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]]; then
       /etc/pgshard/catalog-tls/tls.key \
       /etc/pgshard/catalog-tls/tls.crt
   )"
+  observed_operation_writer_sha="$(
+    pgshard-catalog-material-digest operation-writer \
+      /etc/pgshard/operation-writer-auth/operation-writer-password \
+      /etc/pgshard/catalog-auth/ca.crt
+  )"
   if [[ "$observed_catalog_client_sha" != "$PGSHARD_CATALOG_CLIENT_SHA256" ]] \
-    || [[ "$observed_catalog_server_sha" != "$PGSHARD_CATALOG_SERVER_SHA256" ]]; then
+    || [[ "$observed_catalog_server_sha" != "$PGSHARD_CATALOG_SERVER_SHA256" ]] \
+    || [[ "$observed_operation_writer_sha" != "$PGSHARD_OPERATION_WRITER_SHA256" ]]; then
     echo "refusing shardschema material that differs from the checkpointed creation result" >&2
     exit 1
   fi
+  unset observed_operation_writer_sha
 fi
 
 if [[ -f "$final/PG_VERSION" ]]; then
@@ -1593,8 +1608,160 @@ if [[ "$catalog_role_state" != "safe" ]]; then
   exit 1
 fi
 
-# The shardschema database and its fixed login are operator-owned. Only a login
-# with no per-role defaults or the exact canonical defaults reaches here. After
+# The migration above is the fail-closed authority for any pre-existing writer
+# login, including ownership and direct ACLs. Provision the sole fixed writer
+# identity through a crash-recoverable NOLOGIN shape with its canonical
+# database-local policy already installed. The SCRAM verifier and LOGIN bit are
+# then published atomically by a parameterized catalog update.
+read_operation_writer_role_state() {
+  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+      SELECT COALESCE((
+        SELECT CASE WHEN
+        NOT roles.rolsuper
+        AND roles.rolinherit
+        AND NOT roles.rolcreaterole
+        AND NOT roles.rolcreatedb
+        AND NOT roles.rolreplication
+        AND NOT roles.rolbypassrls
+        AND roles.rolconnlimit = -1
+        AND roles.rolvaliduntil IS NULL
+        AND EXISTS (
+          SELECT
+            FROM pg_catalog.pg_db_role_setting AS settings
+            JOIN pg_catalog.pg_database AS databases
+              ON databases.oid = settings.setdatabase
+           WHERE settings.setrole = roles.oid
+             AND databases.datname = 'shardschema'
+             AND settings.setconfig = ARRAY[
+                   'search_path=pg_catalog',
+                   'statement_timeout=30s',
+                   'lock_timeout=5s',
+                   'transaction_timeout=120s',
+                   'idle_in_transaction_session_timeout=30s',
+                   'default_transaction_read_only=off',
+                   'row_security=off',
+                   'synchronous_commit=on',
+                   'zero_damaged_pages=off',
+                   'ignore_checksum_failure=off',
+                   'jit=off'
+                 ]::text[]
+             AND NOT EXISTS (
+                   SELECT
+                     FROM pg_catalog.pg_db_role_setting AS other_settings
+                    WHERE other_settings.setrole = roles.oid
+                      AND (other_settings.setdatabase, other_settings.setrole)
+                          IS DISTINCT FROM (settings.setdatabase, settings.setrole)
+                 )
+        )
+        AND (
+          SELECT pg_catalog.count(*)
+            FROM pg_catalog.pg_auth_members AS memberships
+           WHERE memberships.member = roles.oid
+        ) = 1
+        AND EXISTS (
+          SELECT
+            FROM pg_catalog.pg_auth_members AS memberships
+           WHERE memberships.member = roles.oid
+             AND memberships.roleid = 'pgshard_operation_writer'::pg_catalog.regrole
+             AND memberships.grantor = (
+               SELECT principals.oid
+                 FROM pg_catalog.pg_roles AS principals
+                WHERE principals.rolname = current_user
+             )
+             AND NOT memberships.admin_option
+             AND memberships.inherit_option
+             AND NOT memberships.set_option
+        )
+        AND NOT EXISTS (
+          SELECT
+            FROM pg_catalog.pg_auth_members AS memberships
+           WHERE memberships.roleid = roles.oid
+        )
+        THEN CASE
+          WHEN roles.rolcanlogin
+            AND roles.rolpassword LIKE 'SCRAM-SHA-256\$4096:%'
+            THEN 'safe'
+          WHEN NOT roles.rolcanlogin
+            AND roles.rolpassword IS NULL
+            THEN 'staging'
+          ELSE 'unsafe'
+        END
+        ELSE 'unsafe'
+      END
+        FROM pg_catalog.pg_authid AS roles
+       WHERE roles.rolname = 'pgshard_orchestrator_catalog'
+      ), 'absent')"
+}
+
+operation_writer_role_state="$(read_operation_writer_role_state)"
+case "$operation_writer_role_state" in
+  absent)
+    psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 <<'PGSHARD_OPERATION_WRITER_LOGIN_STAGING'
+BEGIN;
+CREATE ROLE pgshard_orchestrator_catalog
+  NOLOGIN NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION
+  NOBYPASSRLS CONNECTION LIMIT -1;
+GRANT pgshard_operation_writer TO pgshard_orchestrator_catalog
+  WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET search_path = pg_catalog;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET statement_timeout = '30s';
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET lock_timeout = '5s';
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET transaction_timeout = '120s';
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET default_transaction_read_only = off;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET row_security = off;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET synchronous_commit = on;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET zero_damaged_pages = off;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET ignore_checksum_failure = off;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET jit = off;
+COMMIT;
+PGSHARD_OPERATION_WRITER_LOGIN_STAGING
+    operation_writer_role_state=staging
+    ;;
+  staging|safe) ;;
+  *)
+    echo "refusing an unsafe shardschema operation-writer role" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$operation_writer_role_state" == "staging" ]]; then
+  operation_writer_scram_verifier="$(
+    pgshard-scram-verifier < /etc/pgshard/operation-writer-auth/operation-writer-password
+  )"
+  case "$operation_writer_scram_verifier" in
+    'SCRAM-SHA-256$4096:'*) ;;
+    *)
+      echo "refusing an invalid client-generated operation-writer SCRAM verifier" >&2
+      exit 1
+      ;;
+  esac
+  operation_writer_login_update="$(
+    {
+      printf '%s\n' \
+        'UPDATE pg_catalog.pg_authid SET rolpassword = $1, rolcanlogin = true WHERE rolname = '\''pgshard_orchestrator_catalog'\'' AND NOT rolcanlogin AND rolpassword IS NULL AND NOT rolsuper AND rolinherit AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolreplication AND NOT rolbypassrls AND rolconnlimit = -1 AND rolvaliduntil IS NULL RETURNING 1'
+      printf '%s %s\n' '\bind' "'$operation_writer_scram_verifier'"
+      printf '%s\n' '\g'
+    } | psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 --quiet --no-align --tuples-only
+  )"
+  unset operation_writer_scram_verifier
+  if [[ "$operation_writer_login_update" != "1" ]]; then
+    echo "refusing a shardschema operation-writer role that changed during credential installation" >&2
+    exit 1
+  fi
+fi
+
+operation_writer_role_state="$(read_operation_writer_role_state)"
+if [[ "$operation_writer_role_state" != "safe" ]]; then
+  echo "refusing an unsafe shardschema operation-writer role" >&2
+  exit 1
+fi
+
+# The shardschema database and its fixed logins are operator-owned. Only logins
+# with no per-role defaults or the exact canonical defaults reach here. After
 # exact topology and catalog validation, remove database-wide defaults and
 # re-establish the fixed login defaults. Noncanonical per-role defaults fail
 # closed before this mutation. Otherwise settings such as
@@ -1618,6 +1785,19 @@ ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET synchronous_commit
 ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET zero_damaged_pages = off;
 ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET ignore_checksum_failure = off;
 ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET jit = off;
+ALTER ROLE pgshard_orchestrator_catalog RESET ALL;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema RESET ALL;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET search_path = pg_catalog;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET statement_timeout = '30s';
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET lock_timeout = '5s';
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET transaction_timeout = '120s';
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET default_transaction_read_only = off;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET row_security = off;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET synchronous_commit = on;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET zero_damaged_pages = off;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET ignore_checksum_failure = off;
+ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET jit = off;
 COMMIT;
 PGSHARD_CATALOG_SESSION_DEFAULTS
 
@@ -1626,6 +1806,7 @@ PGSHARD_CATALOG_SESSION_DEFAULTS
 printf '%s\n' \
   'local all postgres trust' \
   'local shardschema pgshard_pooler_catalog scram-sha-256' \
+  'local shardschema pgshard_orchestrator_catalog scram-sha-256' \
   'local all all reject' \
   'host all all 0.0.0.0/0 reject' \
   'host all all ::0/0 reject' > "$quarantine_hba"
@@ -1664,6 +1845,66 @@ if [[ "$catalog_authentication" != "1" ]]; then
   exit 1
 fi
 
+operation_writer_authentication="$(
+  PGPASSWORD="$operation_writer_password" env -u PGOPTIONS \
+    psql -X --no-password --host="$socket" --username=pgshard_orchestrator_catalog --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --no-align --tuples-only --command="
+      SELECT CASE WHEN current_user = 'pgshard_orchestrator_catalog'
+                    AND current_setting('search_path') = 'pg_catalog'
+                    AND current_setting('statement_timeout')::interval = interval '30 seconds'
+                    AND current_setting('lock_timeout')::interval = interval '5 seconds'
+                    AND current_setting('transaction_timeout')::interval = interval '120 seconds'
+                    AND current_setting('idle_in_transaction_session_timeout')::interval = interval '30 seconds'
+                    AND current_setting('default_transaction_read_only') = 'off'
+                    AND current_setting('row_security') = 'off'
+                    AND current_setting('synchronous_commit') = 'on'
+                    AND current_setting('zero_damaged_pages') = 'off'
+                    AND current_setting('ignore_checksum_failure') = 'off'
+                    AND current_setting('jit') = 'off'
+                    AND pg_catalog.pg_has_role(
+                          current_user,
+                          'pgshard_operation_writer',
+                          'USAGE'
+                        )
+                    AND NOT pg_catalog.pg_has_role(
+                          current_user,
+                          'pgshard_catalog_reader',
+                          'USAGE'
+                        )
+                    AND pg_catalog.has_function_privilege(
+                          current_user,
+                          'pgshard_catalog.accept_operation(uuid,uuid,text,text,bigint,text,bytea,bigint,bigint,bigint)',
+                          'EXECUTE'
+                        )
+                    AND pg_catalog.has_function_privilege(
+                          current_user,
+                          'pgshard_catalog.get_operation(uuid)',
+                          'EXECUTE'
+                        )
+                    AND NOT pg_catalog.has_table_privilege(
+                          current_user,
+                          'pgshard_catalog.operation_requests',
+                          'SELECT'
+                        )
+                    AND NOT pg_catalog.has_table_privilege(
+                          current_user,
+                          'pgshard_catalog.operation_tombstones',
+                          'SELECT'
+                        )
+                    AND (
+                          SELECT pg_catalog.count(*)
+                            FROM pgshard_catalog.get_operation(
+                              '00000000-0000-0000-0000-000000000001'::uuid
+                            )
+                        ) = 0
+                  THEN 1 ELSE 0 END"
+)"
+unset operation_writer_password
+if [[ "$operation_writer_authentication" != "1" ]]; then
+  echo "refusing a shardschema operation-writer credential or privilege boundary" >&2
+  exit 1
+fi
+
 # Publish the serving HBA only after every restored-catalog, role, and
 # credential check has succeeded. The catalog login has no Unix-socket or
 # non-catalog-database escape hatch; its sole serving path is TLS to
@@ -1673,11 +1914,14 @@ rm -f -- "$hba_staging"
 printf '%s\n' \
   'local all postgres trust' \
   'local all pgshard_pooler_catalog reject' \
+  'local all pgshard_orchestrator_catalog reject' \
   'local all all trust' \
   'hostnossl shardschema all all reject' \
   'hostssl shardschema pgshard_pooler_catalog all scram-sha-256' \
+  'hostssl shardschema pgshard_orchestrator_catalog all scram-sha-256' \
   'hostssl shardschema all all reject' \
   'host all pgshard_pooler_catalog all reject' \
+  'host all pgshard_orchestrator_catalog all reject' \
   'host all all all scram-sha-256' > "$hba_staging"
 chmod 0600 "$hba_staging"
 sync "$hba_staging" "$final"
@@ -2631,6 +2875,15 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			return nil, fmt.Errorf("catalog access creation result is missing or invalid")
 		}
 	}
+	var operationWriterAccess *pgshardv1alpha1.OperationWriterAccessStatus
+	if cluster.Spec.MembersPerShard == 1 {
+		operationWriterAccess = cluster.Status.OperationWriterAccess
+		if operationWriterAccess == nil || operationWriterAccess.SecretUID == "" ||
+			!OperationWriterAccessSecretNameIsValid(cluster.Name, operationWriterAccess.SecretName) ||
+			!validCatalogMaterialSHA256(operationWriterAccess.MaterialSHA256) {
+			return nil, fmt.Errorf("operation-writer access creation result is missing or invalid")
+		}
+	}
 	var replicationCredentials map[int32]pgshardv1alpha1.PostgreSQLReplicationCredentialStatus
 	if cluster.Spec.MembersPerShard > 1 && images.PostgreSQLRuntime.agentQuarantine() {
 		replicationCredentials, err = postgresqlReplicationCredentials(cluster)
@@ -2679,7 +2932,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			bootstrap := bootstraps[postgresqlBootstrapKey{shard: shard, member: 0}]
 			writableLease := writableLeases[shard]
 			objects = append(objects,
-				postgresqlShardStatefulSet(cluster, shard, images, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess, writableLease),
+				postgresqlShardStatefulSet(cluster, shard, images, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess, operationWriterAccess, writableLease),
 				postgresqlPrimaryDisruptionBudget(cluster, shard),
 			)
 		} else if images.PostgreSQLRuntime.agentQuarantine() {
@@ -3583,6 +3836,32 @@ func CatalogAccessSecretNameIsValid(cluster, name string) bool {
 	return err == nil && len(decoded) == 16 && hex.EncodeToString(decoded) == suffix
 }
 
+// OperationWriterAccessSecretPrefix returns a bounded, cluster-specific prefix
+// for a separately projected, unpredictable catalog-writer credential.
+func OperationWriterAccessSecretPrefix(cluster string) string {
+	const maximumPrefixLength = 31 // leaves 32 hexadecimal characters in a DNS label
+	literal := cluster + "-writer-"
+	if len(literal) <= maximumPrefixLength {
+		return literal
+	}
+	digest := sha256.Sum256([]byte(cluster))
+	encoded := hex.EncodeToString(digest[:6])
+	prefixLength := maximumPrefixLength - len("-wr-") - len(encoded) - 1
+	return cluster[:prefixLength] + "-wr-" + encoded + "-"
+}
+
+// OperationWriterAccessSecretNameIsValid verifies the checkpointed 128-bit
+// random suffix and bounded cluster-specific prefix.
+func OperationWriterAccessSecretNameIsValid(cluster, name string) bool {
+	prefix := OperationWriterAccessSecretPrefix(cluster)
+	if !strings.HasPrefix(name, prefix) || len(name) != len(prefix)+32 {
+		return false
+	}
+	suffix := name[len(prefix):]
+	decoded, err := hex.DecodeString(suffix)
+	return err == nil && len(decoded) == 16 && hex.EncodeToString(decoded) == suffix
+}
+
 // PostgreSQLReplicationSecretPrefix returns a bounded shard-specific prefix
 // for an unpredictable staged replication credential name. The controller
 // appends 128 bits of randomness before checkpointing the creation intent.
@@ -3621,6 +3900,12 @@ func PostgreSQLReplicationMaterialSHA256(password []byte) string {
 // by the pooler and shard-zero bootstrap init container.
 func CatalogClientMaterialSHA256(password, caCertificate []byte) string {
 	return catalogMaterialSHA256("pgshard-catalog-client-v1", password, caCertificate)
+}
+
+// OperationWriterMaterialSHA256 binds the exact separately projected writer
+// password to the immutable catalog CA used by the future orchestrator client.
+func OperationWriterMaterialSHA256(password, caCertificate []byte) string {
+	return catalogMaterialSHA256("pgshard-operation-writer-client-v1", password, caCertificate)
 }
 
 // CatalogServerMaterialSHA256 binds the exact PostgreSQL serving certificate
@@ -3877,6 +4162,18 @@ func CatalogAccessIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, name str
 	}
 }
 
+// OperationWriterAccessIntentSecret is the stable empty identity checkpointed
+// before a catalog-writer password exists. The password remains in a separate
+// Secret so reader-only Pods can never receive it through their projection.
+func OperationWriterAccessIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, name string) *corev1.Secret {
+	metadata := ownedMeta(cluster, name, "shardschema-operation-writer", nil)
+	metadata.Annotations[OperationWriterAccessClusterUIDAnnotation] = string(cluster.UID)
+	return &corev1.Secret{
+		ObjectMeta: metadata,
+		Type:       corev1.SecretTypeOpaque,
+	}
+}
+
 // PostgreSQLReplicationIntentSecret is the non-consumable empty identity
 // checkpointed before replication material exists. The controller may install
 // an immutable password only by updating this exact UID and resourceVersion.
@@ -3939,7 +4236,7 @@ func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, nam
 	return PostgreSQLMemberDataPVC(cluster, shard, 0, name, storageSize, storageClassName, fenceName, fenceUID)
 }
 
-func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) *appsv1.StatefulSet {
+func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus, operationWriterAccess *pgshardv1alpha1.OperationWriterAccessStatus, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) *appsv1.StatefulSet {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
@@ -4035,16 +4332,18 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 		},
 	}
 	if shard == 0 {
-		if catalogAccess == nil {
-			panic("validated single-member plan has no catalog access checkpoint")
+		if catalogAccess == nil || operationWriterAccess == nil {
+			panic("validated single-member plan has incomplete catalog access checkpoints")
 		}
 		bootstrap.VolumeMounts = append(bootstrap.VolumeMounts,
 			corev1.VolumeMount{Name: "catalog-bootstrap-auth", MountPath: "/etc/pgshard/catalog-auth", ReadOnly: true},
+			corev1.VolumeMount{Name: "catalog-operation-writer-auth", MountPath: "/etc/pgshard/operation-writer-auth", ReadOnly: true},
 			corev1.VolumeMount{Name: "catalog-server-tls", MountPath: "/etc/pgshard/catalog-tls", ReadOnly: true},
 		)
 		bootstrap.Env = append(bootstrap.Env,
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_CLIENT_SHA256", Value: catalogAccess.ClientSHA256},
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_SERVER_SHA256", Value: catalogAccess.ServerSHA256},
+			corev1.EnvVar{Name: "PGSHARD_OPERATION_WRITER_SHA256", Value: operationWriterAccess.MaterialSHA256},
 		)
 	}
 	automount := false
@@ -4072,6 +4371,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 	}
 	if shard == 0 {
 		catalogSecret := catalogAccess.SecretName
+		operationWriterSecret := operationWriterAccess.SecretName
 		volumes = append(volumes,
 			corev1.Volume{
 				Name: "catalog-server-tls",
@@ -4092,6 +4392,16 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 					Items: []corev1.KeyToPath{
 						{Key: CatalogPasswordKey, Path: "catalog-password"},
 						{Key: CatalogCACertificateKey, Path: "ca.crt"},
+					},
+				}},
+			},
+			corev1.Volume{
+				Name: "catalog-operation-writer-auth",
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName:  operationWriterSecret,
+					DefaultMode: ptr(int32(0o440)),
+					Items: []corev1.KeyToPath{
+						{Key: OperationWriterPasswordKey, Path: "operation-writer-password"},
 					},
 				}},
 			},

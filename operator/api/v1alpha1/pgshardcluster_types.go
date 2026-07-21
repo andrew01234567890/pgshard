@@ -330,6 +330,23 @@ type PgShardClusterStatus struct {
 	// immutable material and checkpoints its digests. A missing or replaced
 	// checkpointed Secret requires explicit recovery.
 	CatalogAccess *CatalogAccessStatus `json:"catalogAccess,omitempty"`
+	// OperationWriterAccess records a separately projected, staged catalog
+	// operation-writer credential. It is not mounted by any orchestrator until
+	// a later connector slice is composed.
+	OperationWriterAccess *OperationWriterAccessStatus `json:"operationWriterAccess,omitempty"`
+}
+
+// OperationWriterAccessStatus binds the future orchestrator writer credential
+// to one immutable Secret and to the catalog CA without exposing either value.
+type OperationWriterAccessStatus struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	SecretName string `json:"secretName"`
+	// SecretUID is empty only before the empty Secret identity is observed.
+	SecretUID types.UID `json:"secretUID,omitempty"`
+	// MaterialSHA256 binds the exact password and catalog CA projections.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	MaterialSHA256 string `json:"materialSHA256,omitempty"`
 }
 
 // PostgreSQLCatalogCandidateStatus pins one shard-zero member's immutable

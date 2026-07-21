@@ -740,8 +740,13 @@ async fn drop_catalog_roles(client: &Client) -> TestResult {
                      REVOKE pg_read_all_stats FROM pgshard_catalog_owner; \
                      DROP OWNED BY pgshard_catalog_owner; \
                  END IF; \
+                 IF pg_catalog.to_regrole('pgshard_orchestrator_catalog') IS NOT NULL \
+                    AND pg_catalog.to_regrole('pgshard_operation_writer') IS NOT NULL THEN \
+                     REVOKE pgshard_operation_writer FROM pgshard_orchestrator_catalog; \
+                 END IF; \
              END \
              $cleanup$; \
+             DROP ROLE IF EXISTS pgshard_orchestrator_catalog; \
              DROP ROLE IF EXISTS pgshard_operation_writer; \
              DROP ROLE IF EXISTS pgshard_catalog_admin; \
              DROP ROLE IF EXISTS pgshard_catalog_reader; \
@@ -1657,13 +1662,17 @@ async fn assert_migration_pins_search_path(client: &Client) -> TestResult {
         .await?;
 
     let migration = client.batch_execute(pgshard_catalog::MIGRATION_SQL).await;
-    if migration.is_err() {
-        let _ = client.batch_execute("ROLLBACK").await;
-    }
+    let rollback = client.batch_execute("ROLLBACK").await;
     let cleanup = client
         .batch_execute(&format!("RESET search_path; DROP SCHEMA {schema} CASCADE"))
         .await;
-    migration?;
+    let error = migration.expect_err("an unmanaged search-path routine must be rejected");
+    assert_sqlstate(&error, "42501");
+    assert_database_message(
+        &error,
+        "pre-existing shardschema contains an unmanaged executable object",
+    );
+    rollback?;
     cleanup?;
     Ok(())
 }
@@ -3038,6 +3047,39 @@ async fn assert_legacy_fixed_role_acls_removed(client: &Client) -> TestResult {
     Ok(())
 }
 
+fn safe_operation_writer_login_sql() -> &'static str {
+    "SET password_encryption = 'scram-sha-256'; \
+     CREATE ROLE pgshard_orchestrator_catalog \
+       LOGIN NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION \
+       NOBYPASSRLS CONNECTION LIMIT -1 \
+       PASSWORD 'pgshard-operation-writer-test-only'; \
+     RESET password_encryption; \
+     GRANT pgshard_operation_writer TO pgshard_orchestrator_catalog \
+       WITH ADMIN FALSE, INHERIT TRUE, SET FALSE; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET search_path = pg_catalog; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET statement_timeout = '30s'; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET lock_timeout = '5s'; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET transaction_timeout = '120s'; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET idle_in_transaction_session_timeout = '30s'; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET default_transaction_read_only = off; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET row_security = off; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET synchronous_commit = on; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET zero_damaged_pages = off; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET ignore_checksum_failure = off; \
+     ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+       SET jit = off"
+}
+
 #[allow(clippy::too_many_lines)]
 async fn assert_catalog_role_bootstrap_rejections(client: &Client) -> TestResult {
     assert_catalog_migration_rejection(
@@ -3051,6 +3093,141 @@ async fn assert_catalog_role_bootstrap_rejections(client: &Client) -> TestResult
         client,
         "ALTER ROLE pgshard_operation_writer LOGIN",
         "pre-existing pgshard_operation_writer role has unsafe attributes",
+        &[],
+    )
+    .await?;
+
+    client
+        .batch_execute(safe_operation_writer_login_sql())
+        .await?;
+    client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
+    client
+        .batch_execute(
+            "REVOKE pgshard_operation_writer FROM pgshard_orchestrator_catalog; \
+             DROP ROLE pgshard_orchestrator_catalog",
+        )
+        .await?;
+
+    client
+        .batch_execute(&format!(
+            "{}; ALTER ROLE pgshard_orchestrator_catalog NOLOGIN PASSWORD NULL",
+            safe_operation_writer_login_sql()
+        ))
+        .await?;
+    client.batch_execute(pgshard_catalog::MIGRATION_SQL).await?;
+    client
+        .batch_execute(
+            "REVOKE pgshard_operation_writer FROM pgshard_orchestrator_catalog; \
+             DROP ROLE pgshard_orchestrator_catalog",
+        )
+        .await?;
+
+    let writer_login = "pgshard_orchestrator_catalog".to_owned();
+    for hostile_change in [
+        "ALTER ROLE pgshard_orchestrator_catalog BYPASSRLS",
+        "ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema \
+             SET statement_timeout = '60s'",
+        "REVOKE pgshard_operation_writer FROM pgshard_orchestrator_catalog; \
+         GRANT pgshard_operation_writer TO pgshard_orchestrator_catalog \
+             WITH ADMIN FALSE, INHERIT TRUE, SET TRUE",
+        "GRANT SELECT ON pgshard_catalog.cluster_state \
+             TO pgshard_orchestrator_catalog",
+    ] {
+        assert_catalog_migration_rejection(
+            client,
+            &format!("{}; {hostile_change}", safe_operation_writer_login_sql()),
+            "pre-existing pgshard_orchestrator_catalog role has unsafe attributes",
+            &[&writer_login],
+        )
+        .await?;
+    }
+
+    assert_catalog_migration_rejection(
+        client,
+        "CREATE FUNCTION public.pgshard_hostile_writer_elevate() \
+             RETURNS text \
+             LANGUAGE SQL \
+             SECURITY DEFINER \
+             SET search_path = pg_catalog \
+             AS 'SELECT current_user'; \
+         GRANT EXECUTE ON FUNCTION public.pgshard_hostile_writer_elevate() \
+             TO PUBLIC",
+        "pre-existing shardschema contains an unmanaged executable object",
+        &[],
+    )
+    .await?;
+
+    assert_catalog_migration_rejection(
+        client,
+        "CREATE FUNCTION pg_toast.pgshard_hostile_writer_elevate() \
+             RETURNS text \
+             LANGUAGE SQL \
+             SECURITY DEFINER \
+             SET search_path = pg_catalog \
+             AS 'SELECT current_user'; \
+         GRANT USAGE ON SCHEMA pg_toast TO PUBLIC",
+        "pre-existing shardschema contains an unmanaged executable object",
+        &[],
+    )
+    .await?;
+
+    assert_catalog_migration_rejection(
+        client,
+        "GRANT USAGE ON SCHEMA pg_toast TO PUBLIC; \
+         DO $pgshard_grant_toast$ \
+         DECLARE \
+             toast_relation pg_catalog.regclass; \
+         BEGIN \
+             SELECT relations.reltoastrelid::pg_catalog.regclass \
+               INTO STRICT toast_relation \
+               FROM pg_catalog.pg_class AS relations \
+               JOIN pg_catalog.pg_namespace AS namespaces \
+                 ON namespaces.oid = relations.relnamespace \
+              WHERE namespaces.nspname = 'pgshard_catalog' \
+                AND relations.relname = 'operation_requests'; \
+             EXECUTE pg_catalog.format( \
+                 'GRANT SELECT ON TABLE %s TO PUBLIC', \
+                 toast_relation \
+             ); \
+         END \
+         $pgshard_grant_toast$",
+        "pre-existing shardschema grants PUBLIC an unsafe privilege",
+        &[],
+    )
+    .await?;
+
+    assert_catalog_migration_rejection(
+        client,
+        "GRANT SELECT ON pg_catalog.pg_authid TO pgshard_operation_writer",
+        "pre-existing operation writer has privileges or ownership outside the fixed catalog boundary",
+        &[],
+    )
+    .await?;
+
+    assert_catalog_migration_rejection(
+        client,
+        &format!(
+            "{}; GRANT SELECT ON pg_catalog.pg_authid \
+                 TO pgshard_orchestrator_catalog",
+            safe_operation_writer_login_sql()
+        ),
+        "pre-existing operation writer has privileges or ownership outside the fixed catalog boundary",
+        &[&writer_login],
+    )
+    .await?;
+
+    assert_catalog_migration_rejection(
+        client,
+        "GRANT SELECT ON pg_catalog.pg_authid TO PUBLIC",
+        "pre-existing shardschema grants PUBLIC an unsafe privilege",
+        &[],
+    )
+    .await?;
+
+    assert_catalog_migration_rejection(
+        client,
+        "GRANT ALTER SYSTEM ON PARAMETER session_preload_libraries TO PUBLIC",
+        "pre-existing shardschema grants PUBLIC an unsafe privilege",
         &[],
     )
     .await?;
@@ -3101,7 +3278,7 @@ async fn assert_catalog_role_bootstrap_rejections(client: &Client) -> TestResult
             "CREATE ROLE {writer_member} NOLOGIN; \
              GRANT pgshard_operation_writer TO {writer_member}"
         ),
-        "pre-existing pgshard_operation_writer role has a member",
+        "pre-existing pgshard_operation_writer role has an unsafe member",
         &[&writer_member],
     )
     .await?;

@@ -2879,10 +2879,10 @@ async fn run_primary_mutation_fixture(
     hostile_schema: String,
     mutation_role: String,
 ) -> TestResult {
-    let mutation_role_oid =
-        setup_primary_mutation_role(&database_url, &hostile_schema, &mutation_role).await?;
     let allocation = slot_sync_probe_allocation(&database_url, target.clone()).await?;
     let allocated = allocate_catalog_probe(&database_url, &allocation).await?;
+    let mutation_role_oid =
+        setup_primary_mutation_role(&database_url, &hostile_schema, &mutation_role).await?;
     let source = allocated.source();
     let mut hostile_config: Config = database_url.parse()?;
     hostile_config.options(format!("-csearch_path={hostile_schema},pg_catalog"));
