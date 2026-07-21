@@ -190,6 +190,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::{
         OPERATOR_API_SAFETY_TESTS, Request, go_test_selector, listed_go_tests, parse_args,
+        run_scenario,
     };
     use std::ffi::OsString;
 
@@ -220,6 +221,17 @@ mod tests {
         assert_eq!(
             parse_args(args(&["operator-api-safety"])),
             Err("unsupported argument \"operator-api-safety\"".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_scenarios_before_touching_any_cluster() {
+        assert_eq!(
+            run_scenario("nonexistent"),
+            Err(
+                "unsupported scenario \"nonexistent\"; executable scenarios: operator-api-safety"
+                    .to_owned()
+            )
         );
     }
 
