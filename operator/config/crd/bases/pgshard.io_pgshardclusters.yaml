@@ -718,6 +718,34 @@ spec:
                 x-kubernetes-list-map-keys:
                 - member
                 x-kubernetes-list-type: map
+              postgresqlConfiguration:
+                description: |-
+                  PostgreSQLConfiguration pins the exact immutable, content-addressed
+                  PostgreSQL ConfigMap selected for a future shard-zero catalog
+                  materialization attempt. It is recorded before candidate documents are
+                  published so their execution bundle can bind both API incarnation and
+                  canonical data bytes.
+                properties:
+                  configMapName:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  configMapUID:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  dataSHA256:
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                required:
+                - configMapName
+                - configMapUID
+                - dataSHA256
+                type: object
               postgresqlReplicationCredentials:
                 description: |-
                   PostgreSQLReplicationCredentials records one staged, immutable physical-

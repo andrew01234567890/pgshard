@@ -32,6 +32,25 @@ const MAXIMUM_CANDIDATE_FRESHNESS: Duration = Duration::from_secs(5);
 const CANDIDATE_PAYLOAD_DOMAIN: &[u8] = b"pgshard-catalog-bootstrap-candidate-payload-v1\0";
 const DISCOVERY_TOPOLOGY_DOMAIN: &[u8] = b"pgshard-catalog-candidate-discovery-topology-v1\0";
 const CLUSTER_STATUS_FINGERPRINT_DOMAIN: &[u8] = b"pgshard-catalog-candidate-cluster-status-v1\0";
+const MATERIALIZATION_BUNDLE_DOMAIN: &[u8] = b"pgshard-catalog-materialization-bundle-v1\0";
+const TARGET_POD_TEMPLATE_DOMAIN: &[u8] = b"pgshard-catalog-target-pod-template-v1\0";
+const CATALOG_SERVING_HBA_POLICY_VERSION: &str = "pgshard.catalog-serving-hba.v1";
+#[cfg(test)]
+const CATALOG_SERVING_HBA_POLICY: &str = concat!(
+    "local postgres postgres peer\n",
+    "local all all reject\n",
+    "local replication all reject\n",
+    "host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n",
+    "host replication pgshard_replication ::0/0 scram-sha-256\n",
+    "hostnossl shardschema all all reject\n",
+    "hostssl shardschema pgshard_pooler_catalog all scram-sha-256\n",
+    "hostssl shardschema pgshard_orchestrator_catalog all scram-sha-256\n",
+    "hostssl shardschema all all reject\n",
+    "host all all 0.0.0.0/0 reject\n",
+    "host all all ::0/0 reject\n",
+);
+const CATALOG_SERVING_HBA_POLICY_SHA256: &str =
+    "6753a3516fef3a8a459042ca474935f5b306d1b1cf591018f0698e585027af17";
 
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 const INSTANCE_LABEL: &str = "app.kubernetes.io/instance";
@@ -162,6 +181,10 @@ async fn read_bound_candidates<S: CandidateStore>(
         )?);
     }
     validate_candidate_set(&objects)?;
+    let materialization_bundles = objects
+        .iter()
+        .map(|candidate| candidate.document.materialization_bundle.clone())
+        .collect();
     Ok(BoundCandidateSet {
         cluster: status.fingerprint,
         candidates: objects,
@@ -183,6 +206,7 @@ async fn read_bound_candidates<S: CandidateStore>(
         replication_credential: status.replication_credential,
         catalog_access: status.catalog_access,
         operation_writer_access: status.operation_writer_access,
+        materialization_bundles,
     })
 }
 
@@ -224,6 +248,7 @@ pub(crate) struct BoundCandidateSet {
     pub(crate) replication_credential: MaterialReference,
     pub(crate) catalog_access: CatalogAccessReference,
     pub(crate) operation_writer_access: MaterialReference,
+    pub(crate) materialization_bundles: Vec<MaterializationBundle>,
 }
 
 impl BoundCandidateSet {
@@ -260,6 +285,7 @@ struct ValidatedClusterStatus {
     replication_credential: MaterialReference,
     catalog_access: CatalogAccessReference,
     operation_writer_access: MaterialReference,
+    postgresql_configuration: ConfigurationReference,
 }
 
 fn validate_cluster_status(
@@ -330,6 +356,8 @@ fn validate_cluster_status(
     let catalog_access = validate_catalog_access(status.catalog_access)?;
     let operation_writer_access =
         validate_operation_writer_access(status.operation_writer_access, &plan.cluster_id)?;
+    let postgresql_configuration =
+        validate_postgresql_configuration(status.postgresql_configuration, &plan.cluster_id)?;
     Ok(ValidatedClusterStatus {
         fingerprint: ClusterFingerprint {
             uid: uid.to_owned(),
@@ -346,6 +374,7 @@ fn validate_cluster_status(
         replication_credential,
         catalog_access,
         operation_writer_access,
+        postgresql_configuration,
     })
 }
 
@@ -364,7 +393,14 @@ fn validate_candidate_checkpoints(
         let Some(member) = plan.members.get(checkpoint.member) else {
             return Err(CatalogCandidateError::InvalidCheckpointSet);
         };
-        if checkpoint.config_map_name != member.config_map_name()
+        if (checkpoint.config_map_name != member.config_map_name()
+            && checkpoint.config_map_name
+                != catalog_candidate_config_map_name(
+                    &plan.cluster_id,
+                    member.ordinal,
+                    &checkpoint.payload_sha256,
+                )
+                .ok_or(CatalogCandidateError::InvalidCheckpointSet)?)
             || !valid_uid(&checkpoint.config_map_uid)
             || !valid_digest(&checkpoint.payload_sha256)
             || !names.insert(checkpoint.config_map_name.as_str())
@@ -543,6 +579,25 @@ fn validate_operation_writer_access(
     })
 }
 
+fn validate_postgresql_configuration(
+    checkpoint: PostgreSQLConfigurationCheckpoint,
+    cluster_id: &str,
+) -> Result<ConfigurationReference, CatalogCandidateError> {
+    if !valid_name(&checkpoint.config_map_name)
+        || !valid_uid(&checkpoint.config_map_uid)
+        || !valid_digest(&checkpoint.data_sha256)
+        || checkpoint.config_map_name
+            != format!("{cluster_id}-postgresql-config-{}", checkpoint.data_sha256)
+    {
+        return Err(CatalogCandidateError::InvalidCheckpointSet);
+    }
+    Ok(ConfigurationReference {
+        name: checkpoint.config_map_name,
+        uid: checkpoint.config_map_uid,
+        data_sha256: checkpoint.data_sha256,
+    })
+}
+
 fn operation_writer_secret_name_is_valid(cluster_id: &str, name: &str) -> bool {
     if !valid_name(cluster_id) || !valid_name(name) {
         return false;
@@ -569,6 +624,27 @@ fn operation_writer_secret_name_is_valid(cluster_id: &str, name: &str) -> bool {
     })
 }
 
+fn catalog_candidate_config_map_name(
+    cluster_id: &str,
+    member: u32,
+    payload_sha256: &str,
+) -> Option<String> {
+    if !valid_name(cluster_id) || !valid_digest(payload_sha256) {
+        return None;
+    }
+    let mut prefix = format!("{cluster_id}-s0-m{member:04}-cfg-");
+    if prefix.len() > 31 {
+        let cluster_prefix = cluster_id.get(..11)?;
+        let digest = Sha256::digest(cluster_id.as_bytes());
+        let mut encoded = String::with_capacity(12);
+        for byte in &digest[..6] {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        prefix = format!("{cluster_prefix}-{encoded}-c{member:04}-");
+    }
+    Some(format!("{prefix}{}", payload_sha256.get(..32)?))
+}
+
 fn validate_candidate(
     configuration: &ConfigMap,
     plan: &CatalogCandidateObservationPlan,
@@ -576,9 +652,8 @@ fn validate_candidate(
     checkpoint: &CandidateCheckpoint,
     status: &ValidatedClusterStatus,
 ) -> Result<CandidateFingerprint, CatalogCandidateError> {
-    let expected_name = member.config_map_name();
     let metadata = &configuration.metadata;
-    if metadata.name.as_deref() != Some(expected_name.as_str())
+    if metadata.name.as_deref() != Some(checkpoint.config_map_name.as_str())
         || metadata.namespace.as_deref() != Some(plan.namespace.as_str())
         || metadata.uid.as_deref() != Some(checkpoint.config_map_uid.as_str())
         || metadata.deletion_timestamp.is_some()
@@ -628,7 +703,7 @@ fn validate_candidate(
     }
     validate_candidate_document(&document, plan, member, status)?;
     Ok(CandidateFingerprint {
-        name: expected_name,
+        name: checkpoint.config_map_name.clone(),
         uid: uid.to_owned(),
         resource_version: resource_version.to_owned(),
         payload_sha256,
@@ -716,6 +791,11 @@ fn validate_candidate_document(
         || document.writable_lease != status.writable_lease
         || document.replication_credential != status.replication_credential
         || document.catalog_access != status.catalog_access
+        || document.materialization_bundle.postgresql_configuration
+            != status.postgresql_configuration
+        || document.materialization_bundle.catalog_access != status.catalog_access
+        || document.materialization_bundle.operation_writer_access != status.operation_writer_access
+        || !validate_materialization_bundle(document, plan)
     {
         return Err(CatalogCandidateError::InvalidCandidate);
     }
@@ -745,6 +825,93 @@ fn validate_candidate_document(
         return Err(CatalogCandidateError::InvalidCandidate);
     }
     Ok(())
+}
+
+fn validate_materialization_bundle(
+    document: &CandidateDocumentV1,
+    plan: &CatalogCandidateObservationPlan,
+) -> bool {
+    let bundle = &document.materialization_bundle;
+    let target = &bundle.target_pod_template;
+    if !valid_name(&bundle.postgresql_configuration.name)
+        || !valid_uid(&bundle.postgresql_configuration.uid)
+        || !valid_digest(&bundle.postgresql_configuration.data_sha256)
+        || !valid_digest(&bundle.shardschema_migration.sha256)
+        || !valid_digest(&bundle.database_genesis.sha256)
+        || !valid_digest(&bundle.database_topology_preflight.sha256)
+        || bundle.serving_hba.version != CATALOG_SERVING_HBA_POLICY_VERSION
+        || bundle.serving_hba.sha256 != CATALOG_SERVING_HBA_POLICY_SHA256
+        || target.stateful_set_name
+            != plan
+                .members
+                .first()
+                .and_then(|source| source.instance_id.strip_suffix("-0"))
+                .unwrap_or_default()
+        || target.postgresql_runtime != "agent-quarantine"
+        || target.bootstrap_hba_mode != "replication-bootstrap-primary"
+        || target.configuration_annotation.key != "pgshard.io/config-hash"
+        || target.configuration_annotation.value != bundle.postgresql_configuration.data_sha256
+        || target.shardschema_migration_annotation.key != "pgshard.io/shardschema-migration-sha256"
+        || target.shardschema_migration_annotation.value != bundle.shardschema_migration.sha256
+        || !valid_digest(&target.sha256)
+        || !valid_digest(&bundle.sha256)
+        || document.cluster_object_uid != plan.cluster_uid
+    {
+        return false;
+    }
+    let target_input = TargetPodTemplateDigestInput {
+        stateful_set_name: target.stateful_set_name.clone(),
+        postgresql_runtime: target.postgresql_runtime.clone(),
+        bootstrap_hba_mode: target.bootstrap_hba_mode.clone(),
+        configuration_annotation: target.configuration_annotation.clone(),
+        shardschema_migration_annotation: target.shardschema_migration_annotation.clone(),
+    };
+    if serde_json::to_vec(&target_input)
+        .ok()
+        .is_none_or(|encoded| domain_digest(TARGET_POD_TEMPLATE_DOMAIN, &encoded) != target.sha256)
+    {
+        return false;
+    }
+    let bundle_input = MaterializationBundleDigestInput {
+        postgresql_configuration: bundle.postgresql_configuration.clone(),
+        shardschema_migration: bundle.shardschema_migration.clone(),
+        database_genesis: bundle.database_genesis.clone(),
+        database_topology_preflight: bundle.database_topology_preflight.clone(),
+        catalog_access: bundle.catalog_access.clone(),
+        operation_writer_access: bundle.operation_writer_access.clone(),
+        serving_hba: bundle.serving_hba.clone(),
+        target_pod_template: bundle.target_pod_template.clone(),
+    };
+    serde_json::to_vec(&bundle_input)
+        .ok()
+        .is_some_and(|encoded| {
+            domain_digest(MATERIALIZATION_BUNDLE_DOMAIN, &encoded) == bundle.sha256
+        })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetPodTemplateDigestInput {
+    stateful_set_name: String,
+    postgresql_runtime: String,
+    #[serde(rename = "bootstrapHBAMode")]
+    bootstrap_hba_mode: String,
+    configuration_annotation: AnnotationIdentity,
+    shardschema_migration_annotation: AnnotationIdentity,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MaterializationBundleDigestInput {
+    postgresql_configuration: ConfigurationReference,
+    shardschema_migration: ContentReference,
+    database_genesis: ContentReference,
+    database_topology_preflight: ContentReference,
+    catalog_access: CatalogAccessReference,
+    operation_writer_access: MaterialReference,
+    #[serde(rename = "servingHBA")]
+    serving_hba: PolicyReference,
+    target_pod_template: PodTemplateReference,
 }
 
 fn validate_candidate_set(
@@ -779,6 +946,39 @@ fn validate_candidate_set(
             || candidate.document.writable_lease != first.writable_lease
             || candidate.document.replication_credential != first.replication_credential
             || candidate.document.catalog_access != first.catalog_access
+            || candidate
+                .document
+                .materialization_bundle
+                .postgresql_configuration
+                != first.materialization_bundle.postgresql_configuration
+            || candidate
+                .document
+                .materialization_bundle
+                .shardschema_migration
+                != first.materialization_bundle.shardschema_migration
+            || candidate.document.materialization_bundle.database_genesis
+                != first.materialization_bundle.database_genesis
+            || candidate
+                .document
+                .materialization_bundle
+                .database_topology_preflight
+                != first.materialization_bundle.database_topology_preflight
+            || candidate.document.materialization_bundle.catalog_access
+                != first.materialization_bundle.catalog_access
+            || candidate
+                .document
+                .materialization_bundle
+                .operation_writer_access
+                != first.materialization_bundle.operation_writer_access
+            || candidate.document.materialization_bundle.serving_hba
+                != first.materialization_bundle.serving_hba
+            || candidate
+                .document
+                .materialization_bundle
+                .target_pod_template
+                != first.materialization_bundle.target_pod_template
+            || candidate.document.materialization_bundle.sha256
+                != first.materialization_bundle.sha256
     }) {
         return Err(CatalogCandidateError::InvalidCandidate);
     }
@@ -790,6 +990,16 @@ fn domain_digest(domain: &[u8], bytes: &[u8]) -> String {
     hash.update(domain);
     hash.update(bytes);
     let digest = hash.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+#[cfg(test)]
+fn content_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
         let _ = write!(encoded, "{byte:02x}");
@@ -1003,6 +1213,17 @@ struct ClusterStatus {
     catalog_candidates: Vec<CandidateCheckpoint>,
     catalog_access: CatalogAccessCheckpoint,
     operation_writer_access: OperationWriterAccessCheckpoint,
+    postgresql_configuration: PostgreSQLConfigurationCheckpoint,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PostgreSQLConfigurationCheckpoint {
+    config_map_name: String,
+    #[serde(rename = "configMapUID")]
+    config_map_uid: String,
+    #[serde(rename = "dataSHA256")]
+    data_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1109,6 +1330,7 @@ pub(crate) struct CandidateDocumentV1 {
     pub(crate) writable_lease: ObjectReference,
     pub(crate) replication_credential: MaterialReference,
     pub(crate) catalog_access: CatalogAccessReference,
+    pub(crate) materialization_bundle: MaterializationBundle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1175,6 +1397,62 @@ pub(crate) struct CatalogAccessReference {
     pub(crate) client_sha256: String,
     #[serde(rename = "serverSHA256")]
     pub(crate) server_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ConfigurationReference {
+    pub(crate) name: String,
+    pub(crate) uid: String,
+    #[serde(rename = "dataSHA256")]
+    pub(crate) data_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContentReference {
+    pub(crate) sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicyReference {
+    pub(crate) version: String,
+    pub(crate) sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AnnotationIdentity {
+    pub(crate) key: String,
+    pub(crate) value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PodTemplateReference {
+    pub(crate) stateful_set_name: String,
+    pub(crate) postgresql_runtime: String,
+    #[serde(rename = "bootstrapHBAMode")]
+    pub(crate) bootstrap_hba_mode: String,
+    pub(crate) configuration_annotation: AnnotationIdentity,
+    pub(crate) shardschema_migration_annotation: AnnotationIdentity,
+    pub(crate) sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct MaterializationBundle {
+    pub(crate) postgresql_configuration: ConfigurationReference,
+    pub(crate) shardschema_migration: ContentReference,
+    pub(crate) database_genesis: ContentReference,
+    pub(crate) database_topology_preflight: ContentReference,
+    pub(crate) catalog_access: CatalogAccessReference,
+    pub(crate) operation_writer_access: MaterialReference,
+    #[serde(rename = "servingHBA")]
+    pub(crate) serving_hba: PolicyReference,
+    pub(crate) target_pod_template: PodTemplateReference,
+    pub(crate) sha256: String,
 }
 
 #[cfg(test)]
@@ -1393,6 +1671,11 @@ mod tests {
             uid: "operation-writer-uid".to_owned(),
             material_sha256: "9".repeat(64),
         };
+        let postgresql_configuration = ConfigurationReference {
+            name: format!("{}-postgresql-config-{}", plan.cluster_id, "7".repeat(64)),
+            uid: "postgresql-configuration-uid".to_owned(),
+            data_sha256: "7".repeat(64),
+        };
         let mut candidates = BTreeMap::new();
         let mut candidate_checkpoints = Vec::new();
         let mut bootstrap_checkpoints = Vec::new();
@@ -1411,6 +1694,12 @@ mod tests {
             }
         }
         for member in &plan.members {
+            let materialization_bundle = fixture_materialization_bundle(
+                &plan.members[0],
+                &postgresql_configuration,
+                &catalog_access,
+                &operation_writer_access,
+            );
             let document = CandidateDocumentV1 {
                 schema_version: CANDIDATE_SCHEMA_VERSION.to_owned(),
                 cluster_object_uid: plan.cluster_uid.clone(),
@@ -1435,6 +1724,7 @@ mod tests {
                 writable_lease: writable_lease.clone(),
                 replication_credential: replication_credential.clone(),
                 catalog_access: catalog_access.clone(),
+                materialization_bundle,
             };
             let mut payload = serde_json::to_vec(&document).expect("candidate JSON");
             payload.push(b'\n');
@@ -1518,7 +1808,8 @@ mod tests {
             ],
             "postgresqlCatalogCandidates": candidate_checkpoints,
             "catalogAccess": {"secretName": catalog_access.name, "secretUID": catalog_access.uid, "clientSHA256": catalog_access.client_sha256, "serverSHA256": catalog_access.server_sha256},
-            "operationWriterAccess": {"secretName": operation_writer_access.name, "secretUID": operation_writer_access.uid, "materialSHA256": operation_writer_access.material_sha256}
+            "operationWriterAccess": {"secretName": operation_writer_access.name, "secretUID": operation_writer_access.uid, "materialSHA256": operation_writer_access.material_sha256},
+            "postgresqlConfiguration": {"configMapName": postgresql_configuration.name, "configMapUID": postgresql_configuration.uid, "dataSHA256": postgresql_configuration.data_sha256}
         });
         let cluster = DynamicObject {
             types: Some(TypeMeta {
@@ -1536,6 +1827,78 @@ mod tests {
             data: json!({"status": status}),
         };
         (plan, cluster, candidates)
+    }
+
+    fn fixture_materialization_bundle(
+        member: &CatalogCandidateTopologyMember,
+        postgresql_configuration: &ConfigurationReference,
+        catalog_access: &CatalogAccessReference,
+        operation_writer_access: &MaterialReference,
+    ) -> MaterializationBundle {
+        let mut target = PodTemplateReference {
+            stateful_set_name: member
+                .instance_id
+                .strip_suffix("-0")
+                .expect("fixture StatefulSet")
+                .to_owned(),
+            postgresql_runtime: "agent-quarantine".to_owned(),
+            bootstrap_hba_mode: "replication-bootstrap-primary".to_owned(),
+            configuration_annotation: AnnotationIdentity {
+                key: "pgshard.io/config-hash".to_owned(),
+                value: postgresql_configuration.data_sha256.clone(),
+            },
+            shardschema_migration_annotation: AnnotationIdentity {
+                key: "pgshard.io/shardschema-migration-sha256".to_owned(),
+                value: "8".repeat(64),
+            },
+            sha256: String::new(),
+        };
+        target.sha256 = domain_digest(
+            TARGET_POD_TEMPLATE_DOMAIN,
+            &serde_json::to_vec(&TargetPodTemplateDigestInput {
+                stateful_set_name: target.stateful_set_name.clone(),
+                postgresql_runtime: target.postgresql_runtime.clone(),
+                bootstrap_hba_mode: target.bootstrap_hba_mode.clone(),
+                configuration_annotation: target.configuration_annotation.clone(),
+                shardschema_migration_annotation: target.shardschema_migration_annotation.clone(),
+            })
+            .expect("target digest JSON"),
+        );
+        let mut bundle = MaterializationBundle {
+            postgresql_configuration: postgresql_configuration.clone(),
+            shardschema_migration: ContentReference {
+                sha256: "8".repeat(64),
+            },
+            database_genesis: ContentReference {
+                sha256: "a".repeat(64),
+            },
+            database_topology_preflight: ContentReference {
+                sha256: "b".repeat(64),
+            },
+            catalog_access: catalog_access.clone(),
+            operation_writer_access: operation_writer_access.clone(),
+            serving_hba: PolicyReference {
+                version: CATALOG_SERVING_HBA_POLICY_VERSION.to_owned(),
+                sha256: CATALOG_SERVING_HBA_POLICY_SHA256.to_owned(),
+            },
+            target_pod_template: target,
+            sha256: String::new(),
+        };
+        bundle.sha256 = domain_digest(
+            MATERIALIZATION_BUNDLE_DOMAIN,
+            &serde_json::to_vec(&MaterializationBundleDigestInput {
+                postgresql_configuration: bundle.postgresql_configuration.clone(),
+                shardschema_migration: bundle.shardschema_migration.clone(),
+                database_genesis: bundle.database_genesis.clone(),
+                database_topology_preflight: bundle.database_topology_preflight.clone(),
+                catalog_access: bundle.catalog_access.clone(),
+                operation_writer_access: bundle.operation_writer_access.clone(),
+                serving_hba: bundle.serving_hba.clone(),
+                target_pod_template: bundle.target_pod_template.clone(),
+            })
+            .expect("bundle digest JSON"),
+        );
+        bundle
     }
 
     fn fixture() -> (
@@ -1679,6 +2042,13 @@ mod tests {
             .await
             .expect("bound candidates");
         assert_eq!(bound.candidates.len(), 3);
+        assert_eq!(bound.materialization_bundles.len(), 3);
+        assert!(
+            bound
+                .materialization_bundles
+                .iter()
+                .all(|bundle| bundle == &bound.materialization_bundles[0])
+        );
         assert_eq!(bound.shard_zero_bootstraps.len(), 3);
         assert_eq!(bound.cluster.uid, "cluster-uid");
         assert_eq!(bound.cluster.resource_version, "cluster-rv");
@@ -1696,6 +2066,47 @@ mod tests {
         assert_eq!(
             bound.operation_writer_access.material_sha256,
             "9".repeat(64)
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_content_addressed_candidate_incarnations() {
+        assert_eq!(
+            catalog_candidate_config_map_name("demo", 2, &"f".repeat(64)).as_deref(),
+            Some("demo-s0-m0002-cfg-ffffffffffffffffffffffffffffffff")
+        );
+        assert_eq!(
+            catalog_candidate_config_map_name(&"c".repeat(50), 4, &"f".repeat(64)).as_deref(),
+            Some("ccccccccccc-5de6bf7f73e3-c0004-ffffffffffffffffffffffffffffffff")
+        );
+        let (plan, mut cluster, mut candidates) = fixture();
+        for (index, member) in plan.members.iter().enumerate() {
+            let old_name = member.config_map_name();
+            let mut candidate = candidates.remove(&old_name).expect("legacy candidate");
+            let payload_sha256 =
+                cluster.data["status"]["postgresqlCatalogCandidates"][index]["payloadSHA256"]
+                    .as_str()
+                    .expect("payload digest");
+            let name =
+                catalog_candidate_config_map_name(&plan.cluster_id, member.ordinal, payload_sha256)
+                    .expect("content-addressed name");
+            assert!(valid_name(&name));
+            assert!(name.len() <= 63);
+            candidate.metadata.name = Some(name.clone());
+            cluster.data["status"]["postgresqlCatalogCandidates"][index]["configMapName"] =
+                json!(name.clone());
+            candidates.insert(name, candidate);
+        }
+
+        let bound = read_bound_candidates(&store(cluster, candidates), &plan)
+            .await
+            .expect("content-addressed candidates");
+        assert_eq!(bound.candidates.len(), plan.members.len());
+        assert!(
+            bound
+                .candidates
+                .iter()
+                .all(|candidate| candidate.name.contains("-cfg-"))
         );
     }
 
@@ -1982,6 +2393,99 @@ mod tests {
     }
 
     #[test]
+    fn rejects_recheckpointed_materialization_bundle_mismatch() {
+        let (plan, cluster, candidates) = fixture();
+        let status = validate_cluster_status(&cluster, &plan).expect("status");
+        let member = &plan.members[0];
+        let mut candidate = candidates[&member.config_map_name()].clone();
+        let payload = candidate
+            .data
+            .as_mut()
+            .expect("data")
+            .get_mut(CANDIDATE_PAYLOAD_KEY)
+            .expect("payload");
+        let mut document: CandidateDocumentV1 =
+            serde_json::from_str(payload).expect("candidate document");
+        document
+            .materialization_bundle
+            .target_pod_template
+            .configuration_annotation
+            .value = "f".repeat(64);
+        *payload = format!(
+            "{}\n",
+            serde_json::to_string(&document).expect("candidate JSON")
+        );
+        let payload_sha256 = domain_digest(CANDIDATE_PAYLOAD_DOMAIN, payload.as_bytes());
+        candidate
+            .metadata
+            .annotations
+            .as_mut()
+            .expect("annotations")
+            .insert(CONFIG_HASH_ANNOTATION.to_owned(), payload_sha256.clone());
+        let mut checkpoint = status.candidates[0].clone();
+        checkpoint.payload_sha256 = payload_sha256;
+        assert!(matches!(
+            validate_candidate(&candidate, &plan, member, &checkpoint, &status),
+            Err(CatalogCandidateError::InvalidCandidate)
+        ));
+    }
+
+    #[test]
+    fn rejects_recheckpointed_foreign_serving_hba_policy() {
+        let (plan, cluster, candidates) = fixture();
+        let status = validate_cluster_status(&cluster, &plan).expect("status");
+        let member = &plan.members[0];
+        let mut candidate = candidates[&member.config_map_name()].clone();
+        let payload = candidate
+            .data
+            .as_mut()
+            .expect("data")
+            .get_mut(CANDIDATE_PAYLOAD_KEY)
+            .expect("payload");
+        let mut document: CandidateDocumentV1 =
+            serde_json::from_str(payload).expect("candidate document");
+        let bundle = &mut document.materialization_bundle;
+        assert_eq!(
+            content_digest(CATALOG_SERVING_HBA_POLICY.as_bytes()),
+            CATALOG_SERVING_HBA_POLICY_SHA256
+        );
+        assert_eq!(bundle.serving_hba.sha256, CATALOG_SERVING_HBA_POLICY_SHA256);
+        bundle.serving_hba.sha256 = "d".repeat(64);
+        bundle.sha256 = domain_digest(
+            MATERIALIZATION_BUNDLE_DOMAIN,
+            &serde_json::to_vec(&MaterializationBundleDigestInput {
+                postgresql_configuration: bundle.postgresql_configuration.clone(),
+                shardschema_migration: bundle.shardschema_migration.clone(),
+                database_genesis: bundle.database_genesis.clone(),
+                database_topology_preflight: bundle.database_topology_preflight.clone(),
+                catalog_access: bundle.catalog_access.clone(),
+                operation_writer_access: bundle.operation_writer_access.clone(),
+                serving_hba: bundle.serving_hba.clone(),
+                target_pod_template: bundle.target_pod_template.clone(),
+            })
+            .expect("bundle digest JSON"),
+        );
+        *payload = format!(
+            "{}\n",
+            serde_json::to_string(&document).expect("candidate JSON")
+        );
+        let payload_sha256 = domain_digest(CANDIDATE_PAYLOAD_DOMAIN, payload.as_bytes());
+        candidate
+            .metadata
+            .annotations
+            .as_mut()
+            .expect("annotations")
+            .insert(CONFIG_HASH_ANNOTATION.to_owned(), payload_sha256.clone());
+        let mut checkpoint = status.candidates[0].clone();
+        checkpoint.payload_sha256 = payload_sha256;
+
+        assert!(matches!(
+            validate_candidate(&candidate, &plan, member, &checkpoint, &status),
+            Err(CatalogCandidateError::InvalidCandidate)
+        ));
+    }
+
+    #[test]
     fn rejects_candidate_checkpoint_cardinality_and_duplicates() {
         let (plan, cluster, _) = fixture();
         let status_value = cluster.data.get("status").expect("status");
@@ -2058,6 +2562,31 @@ mod tests {
             assert!(
                 validate_cluster_status(&malformed, &plan).is_err(),
                 "malformed operation-writer {field} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_postgresql_configuration_checkpoint() {
+        let (plan, cluster, _) = fixture();
+
+        let mut missing = cluster.clone();
+        missing.data["status"]
+            .as_object_mut()
+            .expect("status")
+            .remove("postgresqlConfiguration");
+        assert!(validate_cluster_status(&missing, &plan).is_err());
+
+        for (field, value) in [
+            ("configMapName", json!("foreign-postgresql-config")),
+            ("configMapUID", json!("")),
+            ("dataSHA256", json!("A".repeat(64))),
+        ] {
+            let mut malformed = cluster.clone();
+            malformed.data["status"]["postgresqlConfiguration"][field] = value;
+            assert!(
+                validate_cluster_status(&malformed, &plan).is_err(),
+                "malformed PostgreSQL configuration {field} was accepted"
             );
         }
     }
@@ -2209,7 +2738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_replaced_operation_writer_checkpoint_across_the_double_read() {
+    async fn rejects_operation_writer_checkpoint_not_bound_by_candidate() {
         let (plan, cluster, candidates) = fixture();
         let mut changed = cluster.clone();
         changed.data["status"]["operationWriterAccess"]["secretUID"] =
@@ -2226,11 +2755,11 @@ mod tests {
         )
         .await
         .expect_err("replaced operation-writer checkpoint");
-        assert!(matches!(error, CatalogCandidateError::EvidenceChanged));
+        assert!(matches!(error, CatalogCandidateError::InvalidCandidate));
         let snapshot = state.snapshot();
         assert_eq!(
             snapshot.catalog_candidates.failure,
-            Some(CatalogCandidateFailureReason::EvidenceChanged)
+            Some(CatalogCandidateFailureReason::ValidationFailed)
         );
         assert_eq!(snapshot.catalog_candidates.fresh_candidates, 0);
     }

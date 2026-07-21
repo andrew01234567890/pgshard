@@ -2382,9 +2382,10 @@ mod tests {
     };
     use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
     use crate::catalog_candidate::{
-        BootstrapReference, CandidateDocumentV1, CandidateFingerprint, CatalogAccessReference,
-        ClusterFingerprint, DiscoveryMember, DiscoveryTopology, MaterialReference, NameReference,
-        ObjectReference,
+        AnnotationIdentity, BootstrapReference, CandidateDocumentV1, CandidateFingerprint,
+        CatalogAccessReference, ClusterFingerprint, ConfigurationReference, ContentReference,
+        DiscoveryMember, DiscoveryTopology, MaterialReference, MaterializationBundle,
+        NameReference, ObjectReference, PodTemplateReference, PolicyReference,
     };
 
     struct LockAssertingBoottimeClock {
@@ -2574,6 +2575,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn exact_candidate_proof() -> BoundCandidateSet {
         let writable_lease = ObjectReference {
             name: "cluster-1-shard-0000-writable".to_owned(),
@@ -2623,6 +2625,46 @@ mod tests {
                 },
             })
             .collect::<Vec<_>>();
+        let postgresql_configuration = ConfigurationReference {
+            name: format!("cluster-1-postgresql-config-{}", "7".repeat(64)),
+            uid: "postgresql-configuration-uid".to_owned(),
+            data_sha256: "7".repeat(64),
+        };
+        let materialization_bundles = (0..3)
+            .map(|_| MaterializationBundle {
+                postgresql_configuration: postgresql_configuration.clone(),
+                shardschema_migration: ContentReference {
+                    sha256: "8".repeat(64),
+                },
+                database_genesis: ContentReference {
+                    sha256: "9".repeat(64),
+                },
+                database_topology_preflight: ContentReference {
+                    sha256: "a".repeat(64),
+                },
+                catalog_access: catalog_access.clone(),
+                operation_writer_access: operation_writer_access.clone(),
+                serving_hba: PolicyReference {
+                    version: "pgshard.catalog-serving-hba.v1".to_owned(),
+                    sha256: "b".repeat(64),
+                },
+                target_pod_template: PodTemplateReference {
+                    stateful_set_name: "cluster-1-postgresql-0".to_owned(),
+                    postgresql_runtime: "agent-quarantine".to_owned(),
+                    bootstrap_hba_mode: "replication-bootstrap-primary".to_owned(),
+                    configuration_annotation: AnnotationIdentity {
+                        key: "pgshard.io/config-hash".to_owned(),
+                        value: "7".repeat(64),
+                    },
+                    shardschema_migration_annotation: AnnotationIdentity {
+                        key: "pgshard.io/shardschema-migration-sha256".to_owned(),
+                        value: "8".repeat(64),
+                    },
+                    sha256: "c".repeat(64),
+                },
+                sha256: "d".repeat(64),
+            })
+            .collect::<Vec<_>>();
         let candidates = (0..3)
             .map(|ordinal| CandidateFingerprint {
                 name: format!("cluster-1-catalog-candidate-{ordinal}"),
@@ -2640,6 +2682,7 @@ mod tests {
                     writable_lease: writable_lease.clone(),
                     replication_credential: replication_credential.clone(),
                     catalog_access: catalog_access.clone(),
+                    materialization_bundle: materialization_bundles[ordinal as usize].clone(),
                 },
             })
             .collect();
@@ -2656,6 +2699,7 @@ mod tests {
             replication_credential,
             catalog_access,
             operation_writer_access,
+            materialization_bundles,
         }
     }
 
