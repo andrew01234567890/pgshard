@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::Client;
@@ -19,6 +21,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::watch;
 
+use crate::boottime::BoottimeError;
 use crate::domain::{CatalogCandidateFailureReason, OrchState};
 use crate::topology::{CatalogCandidateObservationPlan, CatalogCandidateTopologyMember};
 
@@ -116,8 +119,10 @@ async fn observe_once<S: CandidateStore>(
     freshness: Duration,
 ) -> Result<(), CatalogCandidateError> {
     state.record_catalog_candidates_collecting(plan.members.len(), freshness);
-    let started = Instant::now();
     let result = async {
+        // Anchor both local clocks before either Kubernetes read. Host suspend
+        // and I/O latency consume this observation window.
+        let started = state.suspend_aware_now()?;
         let before = read_bound_candidates(store, plan).await?;
         let after = read_bound_candidates(store, plan).await?;
         if before != after {
@@ -853,6 +858,8 @@ enum CatalogCandidateError {
     EvidenceChanged,
     #[error("catalog-candidate observation expired before atomic publication")]
     FreshnessExpired,
+    #[error(transparent)]
+    AuthorityClock(#[from] BoottimeError),
     #[error("in-cluster Kubernetes configuration is unavailable: {0}")]
     InClusterConfiguration(String),
     #[error("Kubernetes client initialization failed: {0}")]
@@ -880,7 +887,9 @@ impl CatalogCandidateError {
                 CatalogCandidateFailureReason::CandidateUnavailable
             }
             Self::EvidenceChanged => CatalogCandidateFailureReason::EvidenceChanged,
-            Self::FreshnessExpired => CatalogCandidateFailureReason::FreshnessExpired,
+            Self::FreshnessExpired | Self::AuthorityClock(_) => {
+                CatalogCandidateFailureReason::FreshnessExpired
+            }
             Self::InvalidPlan
             | Self::InvalidClusterStatus
             | Self::InvalidCheckpointSet
@@ -1077,7 +1086,8 @@ struct CatalogAccessReference {
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::future::pending;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use k8s_openapi::ByteString;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
@@ -1085,6 +1095,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
     use crate::domain::{AgentStatusPhase, CatalogCandidatePhase, OrchestratorIdentity};
 
     struct StubStore {
@@ -1119,6 +1130,27 @@ mod tests {
 
         async fn get_candidate(&self, _name: &str) -> Result<ConfigMap, CatalogCandidateError> {
             pending().await
+        }
+    }
+
+    struct SuspendingStore {
+        inner: StubStore,
+        clock: Arc<FakeBoottimeClock>,
+        advanced: AtomicBool,
+    }
+
+    impl CandidateStore for SuspendingStore {
+        async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError> {
+            if !self.advanced.swap(true, Ordering::AcqRel) {
+                self.clock
+                    .advance(Duration::from_secs(6))
+                    .expect("advance across candidate window");
+            }
+            self.inner.get_cluster_status().await
+        }
+
+        async fn get_candidate(&self, name: &str) -> Result<ConfigMap, CatalogCandidateError> {
+            self.inner.get_candidate(name).await
         }
     }
 
@@ -1396,6 +1428,18 @@ mod tests {
         .expect("state")
     }
 
+    fn state_with_clock(clock: Arc<FakeBoottimeClock>) -> OrchState {
+        OrchState::with_identity_and_clock_for_test(
+            OrchestratorIdentity {
+                cluster_id: "demo".to_owned(),
+                orchestrator_id: "orch-0".to_owned(),
+            },
+            15_000,
+            clock,
+        )
+        .expect("state")
+    }
+
     #[tokio::test]
     async fn accepts_exact_canonical_candidate_set() {
         let (plan, cluster, candidates) = fixture();
@@ -1403,6 +1447,32 @@ mod tests {
             .await
             .expect("bound candidates");
         assert_eq!(bound.candidates.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn suspend_during_double_read_cannot_publish_candidate_evidence() {
+        let (plan, cluster, candidates) = fixture();
+        let clock = Arc::new(FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let state = state_with_clock(clock.clone());
+        let store = SuspendingStore {
+            inner: store(cluster, candidates),
+            clock,
+            advanced: AtomicBool::new(false),
+        };
+
+        let error = observe_once(&store, &plan, &state, Duration::from_secs(5))
+            .await
+            .expect_err("suspend must consume candidate freshness");
+
+        assert!(matches!(error, CatalogCandidateError::FreshnessExpired));
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.catalog_candidates.phase,
+            CatalogCandidatePhase::Unavailable
+        );
+        assert_eq!(snapshot.catalog_candidates.fresh_candidates, 0);
     }
 
     #[tokio::test]
