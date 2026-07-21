@@ -37,6 +37,9 @@ use tokio::sync::mpsc;
 use tokio::sync::{oneshot, watch};
 use tokio::time::{Instant, sleep, timeout};
 
+use crate::catalog_activation_runtime::{
+    CatalogRuntimeBindingAttempt, supervise_catalog_runtime_binding,
+};
 use crate::domain::{
     ActivationConfigEvidence, ActivationPostgresConfig, AgentIdentity, AgentState,
     PostgresProcessState, canonical_linux_boot_id,
@@ -70,6 +73,12 @@ struct AuthorityLossFutures {
     publication: Option<AuthorityLossFuture>,
     running: Option<AuthorityLossFuture>,
     target: Option<WritableAuthorityObserver>,
+}
+
+struct CatalogRuntimeSupervision {
+    binding: CatalogRuntimeBindingAttempt,
+    authority: WritableAuthorityObserver,
+    required_margin: Duration,
 }
 const PG_CONTROL_FILE_SIZE: u64 = 8_192;
 const MAX_POSTGRES_LOCK_FILE_BYTES: u64 = 8_192;
@@ -973,6 +982,7 @@ impl PreparedPostgres {
             },
             || PostgresStartDecision::Start,
             None,
+            None,
         )
         .await
     }
@@ -989,12 +999,49 @@ impl PreparedPostgres {
     ///
     /// Returns an error if startup authority is absent or if validation,
     /// process creation, supervision, or target fencing fails.
+    #[cfg(test)]
     pub(crate) async fn supervise_with_writable_authority(
         self,
         state: AgentState,
         shutdown: watch::Receiver<bool>,
         required_margin: Duration,
         attempt: WritablePostgresAttempt,
+    ) -> Result<WritablePostgresStopped, PostgresError> {
+        self.supervise_with_optional_catalog_runtime(
+            state,
+            shutdown,
+            required_margin,
+            attempt,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn supervise_with_writable_authority_and_catalog_runtime(
+        self,
+        state: AgentState,
+        shutdown: watch::Receiver<bool>,
+        required_margin: Duration,
+        attempt: WritablePostgresAttempt,
+        catalog_runtime: CatalogRuntimeBindingAttempt,
+    ) -> Result<WritablePostgresStopped, PostgresError> {
+        self.supervise_with_optional_catalog_runtime(
+            state,
+            shutdown,
+            required_margin,
+            attempt,
+            Some(catalog_runtime),
+        )
+        .await
+    }
+
+    async fn supervise_with_optional_catalog_runtime(
+        self,
+        state: AgentState,
+        shutdown: watch::Receiver<bool>,
+        required_margin: Duration,
+        attempt: WritablePostgresAttempt,
+        catalog_runtime: Option<CatalogRuntimeBindingAttempt>,
     ) -> Result<WritablePostgresStopped, PostgresError> {
         if self.config.forbids_writable_authority() {
             state.clear_lease();
@@ -1009,6 +1056,11 @@ impl PreparedPostgres {
             .config
             .requires_writable_authority()
             .then(|| attempt.authority_observer());
+        let catalog_runtime = catalog_runtime.map(|binding| CatalogRuntimeSupervision {
+            binding,
+            authority: attempt.authority_observer(),
+            required_margin,
+        });
         Box::pin(self.supervise_with_writable_authority_guard_and_loss(
             state,
             shutdown,
@@ -1022,6 +1074,7 @@ impl PreparedPostgres {
                 ),
                 target,
             }),
+            catalog_runtime,
             attempt,
         ))
         .await
@@ -1038,13 +1091,14 @@ impl PreparedPostgres {
     where
         G: Fn() -> Option<DurableWritableGeneration>,
     {
-        self.supervise_with_writable_authority_guard_and_loss(
+        Box::pin(self.supervise_with_writable_authority_guard_and_loss(
             state,
             shutdown,
             startup_guard,
             None,
+            None,
             attempt,
-        )
+        ))
         .await
     }
 
@@ -1054,6 +1108,7 @@ impl PreparedPostgres {
         mut shutdown: watch::Receiver<bool>,
         startup_guard: G,
         authority_loss: Option<AuthorityLossFutures>,
+        catalog_runtime: Option<CatalogRuntimeSupervision>,
         attempt: WritablePostgresAttempt,
     ) -> Result<WritablePostgresStopped, PostgresError>
     where
@@ -1089,6 +1144,7 @@ impl PreparedPostgres {
                 }
             },
             authority_loss,
+            catalog_runtime,
         )
         .await?;
         Ok(WritablePostgresStopped { attempt })
@@ -1101,6 +1157,7 @@ impl PreparedPostgres {
         shutdown: impl Future<Output = PostgresStopMode>,
         startup_guard: G,
         mut authority_loss: Option<AuthorityLossFutures>,
+        mut catalog_runtime: Option<CatalogRuntimeSupervision>,
     ) -> Result<(), PostgresError>
     where
         G: Fn() -> PostgresStartDecision,
@@ -1205,6 +1262,7 @@ impl PreparedPostgres {
             &startup_guard,
             running_authority_loss,
             target_fence,
+            catalog_runtime.take(),
         )
         .await;
         process_group_fence.disarm_if_reaped();
@@ -2308,6 +2366,7 @@ async fn supervise_running_postmaster<F, G>(
     startup_guard: &G,
     authority_deadline: Option<AuthorityLossFuture>,
     target_fence: Option<TargetFenceFuture>,
+    catalog_runtime: Option<CatalogRuntimeSupervision>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -2338,6 +2397,7 @@ where
             startup_guard,
             authority_deadline,
             target_fence,
+            catalog_runtime,
         )
         .await;
     }
@@ -2465,6 +2525,7 @@ async fn supervise_replication_source<F, G>(
     startup_guard: &G,
     authority_deadline: Option<AuthorityLossFuture>,
     mut target_fence: Option<TargetFenceFuture>,
+    catalog_runtime: Option<CatalogRuntimeSupervision>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -2484,6 +2545,25 @@ where
     ));
     let authority_lost = wait_for_authority_loss(&authority_exact, authority_deadline);
     tokio::pin!(authority_lost);
+    let catalog_runtime = async {
+        match catalog_runtime {
+            Some(catalog_runtime) => {
+                supervise_catalog_runtime_binding(
+                    catalog_runtime.binding,
+                    &config.socket_dir,
+                    generation,
+                    catalog_runtime.authority,
+                    catalog_runtime.required_margin,
+                    u32::try_from(process_group.as_raw_pid())
+                        .expect("positive PostgreSQL PID fits u32"),
+                    read_linux_boot_id(),
+                )
+                .await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(catalog_runtime);
     state.set_postgres_process(config.running_process_state());
     tokio::select! {
         biased;
@@ -2536,6 +2616,7 @@ where
                 PostgresError::from(error),
             ).await)
         }
+        () = &mut catalog_runtime => unreachable!("catalog runtime binder never completes"),
     }
 }
 
