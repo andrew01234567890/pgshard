@@ -28,6 +28,7 @@ const CATALOG_ACTIVATION_API_VERSION: &str = "v1alpha1";
 const CATALOG_ACTIVATION_API_PLURAL: &str = "pgshardcatalogactivations";
 const CATALOG_ACTIVATION_STATUS_SUBRESOURCE: &str = "status";
 const CATALOG_ACTIVATION_CAPABILITY_PATH: &str = "/capabilities/catalog-activation";
+const CATALOG_ACTIVATION_TLS_PORT: u16 = 8443;
 
 /// Move-only, non-serializable token for one exact overlap of live evidence.
 ///
@@ -94,7 +95,7 @@ pub(crate) struct CatalogActivationPublicationTarget {
     target_pod_name: String,
     target_pod_uid: String,
     target_agent_dns_name: String,
-    target_agent_http_port: u16,
+    target_agent_tls_port: u16,
     capability_path: &'static str,
 }
 
@@ -234,8 +235,8 @@ impl CatalogActivationPublicationTarget {
         &self.target_agent_dns_name
     }
 
-    pub(crate) const fn target_agent_http_port(&self) -> u16 {
-        self.target_agent_http_port
+    pub(crate) const fn target_agent_tls_port(&self) -> u16 {
+        self.target_agent_tls_port
     }
 
     pub(crate) fn capability_path(&self) -> &'static str {
@@ -291,7 +292,7 @@ pub(crate) fn catalog_activation_publication_target(
         target_pod_name: dispatch.source.instance_id.clone(),
         target_pod_uid: dispatch.source.pod_uid.clone(),
         target_agent_dns_name: target_member.dns_name.clone(),
-        target_agent_http_port: target_member.agent_http_port,
+        target_agent_tls_port: CATALOG_ACTIVATION_TLS_PORT,
         capability_path: CATALOG_ACTIVATION_CAPABILITY_PATH,
     })
 }
