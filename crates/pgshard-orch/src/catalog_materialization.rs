@@ -26,9 +26,6 @@ use thiserror::Error;
 const CATALOG_ACTIVATION_API_GROUP: &str = "pgshard.io";
 const CATALOG_ACTIVATION_API_VERSION: &str = "v1alpha1";
 const CATALOG_ACTIVATION_API_PLURAL: &str = "pgshardcatalogactivations";
-const CATALOG_ACTIVATION_STATUS_SUBRESOURCE: &str = "status";
-const CATALOG_ACTIVATION_CAPABILITY_PATH: &str = "/capabilities/catalog-activation";
-const CATALOG_ACTIVATION_TLS_PORT: u16 = 8443;
 
 /// Move-only, non-serializable token for one exact overlap of live evidence.
 ///
@@ -53,6 +50,7 @@ pub(crate) struct CatalogMaterializationCapability {
 pub(crate) struct CatalogBootstrapDispatch {
     capability: CatalogMaterializationCapability,
     dispatcher: ConfiguredDispatcherIdentity,
+    bound_candidates: BoundCandidateSet,
     cluster: ClusterFingerprint,
     catalog_activation: ObjectReference,
     target_candidate: CandidateFingerprint,
@@ -78,31 +76,39 @@ struct ConfiguredDispatcherIdentity {
 /// Exact objects and agent endpoint a future publisher would have to re-read.
 ///
 /// This value is inert and contains no client, token, request body, or mutation
-/// capability. Every identifier is derived from the sealed dispatch.
+/// capability. Every identifier is derived from the sealed dispatch. It has no
+/// `Debug` implementation so the dispatcher Pod UID cannot enter diagnostics.
 #[allow(dead_code)] // Intentionally dormant until a separately reviewed publisher is composed.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct CatalogActivationPublicationTarget {
     carrier_api_group: &'static str,
     carrier_api_version: &'static str,
     carrier_api_plural: &'static str,
-    carrier_status_subresource: &'static str,
     carrier_namespace: String,
     carrier_name: String,
     carrier_uid: String,
     cluster_name: String,
     cluster_uid: String,
+    dispatcher_pod_name: String,
+    dispatcher_pod_uid: String,
+    dispatcher_lease_name: String,
+    dispatcher_lease_uid: String,
+    dispatcher_lease_resource_version: String,
+    writable_lease_name: String,
+    writable_lease_uid: String,
+    writable_lease_resource_version: String,
+    writable_lease_holder: String,
+    writable_lease_transitions: u64,
     target_stateful_set_name: String,
     target_pod_name: String,
     target_pod_uid: String,
     target_agent_dns_name: String,
-    target_agent_tls_port: u16,
-    capability_path: &'static str,
 }
 
 /// Exact publisher Pod and coordination Lease identity supplied by a future
 /// live-object validator. Construction alone grants no mutation authority.
 #[allow(dead_code)] // Input contract for a future separately reviewed live validator.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct CatalogActivationDispatcherProof {
     pub(crate) pod_name: String,
     pub(crate) pod_uid: String,
@@ -117,13 +123,21 @@ pub(crate) struct CatalogActivationDispatcherProof {
 /// Private fields make this proof constructible only through the exact
 /// dispatch comparison below. It remains inert and non-serializable.
 #[allow(dead_code)] // Proof boundary for a future separately reviewed publisher.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct CatalogActivationLiveObjectProofs {
     cluster: ClusterFingerprint,
     carrier: ObjectReference,
+    carrier_resource_version: String,
     target_pod: ObjectReference,
     writable_lease: WritableLeaseProofIdentity,
     dispatcher: CatalogActivationDispatcherProof,
+}
+
+#[allow(dead_code)] // A future CAS publisher consumes only this freshly observed version.
+impl CatalogActivationLiveObjectProofs {
+    pub(crate) fn carrier_resource_version(&self) -> &str {
+        &self.carrier_resource_version
+    }
 }
 
 /// Validated canonical request bytes-by-contract and their canonical digest.
@@ -195,10 +209,6 @@ impl CatalogActivationPublicationTarget {
         self.carrier_api_plural
     }
 
-    pub(crate) fn carrier_status_subresource(&self) -> &'static str {
-        self.carrier_status_subresource
-    }
-
     pub(crate) fn carrier_namespace(&self) -> &str {
         &self.carrier_namespace
     }
@@ -219,6 +229,46 @@ impl CatalogActivationPublicationTarget {
         &self.cluster_uid
     }
 
+    pub(crate) fn dispatcher_pod_name(&self) -> &str {
+        &self.dispatcher_pod_name
+    }
+
+    pub(crate) fn dispatcher_pod_uid(&self) -> &str {
+        &self.dispatcher_pod_uid
+    }
+
+    pub(crate) fn dispatcher_lease_name(&self) -> &str {
+        &self.dispatcher_lease_name
+    }
+
+    pub(crate) fn dispatcher_lease_uid(&self) -> &str {
+        &self.dispatcher_lease_uid
+    }
+
+    pub(crate) fn dispatcher_lease_resource_version(&self) -> &str {
+        &self.dispatcher_lease_resource_version
+    }
+
+    pub(crate) fn writable_lease_name(&self) -> &str {
+        &self.writable_lease_name
+    }
+
+    pub(crate) fn writable_lease_uid(&self) -> &str {
+        &self.writable_lease_uid
+    }
+
+    pub(crate) fn writable_lease_resource_version(&self) -> &str {
+        &self.writable_lease_resource_version
+    }
+
+    pub(crate) fn writable_lease_holder(&self) -> &str {
+        &self.writable_lease_holder
+    }
+
+    pub(crate) const fn writable_lease_transitions(&self) -> u64 {
+        self.writable_lease_transitions
+    }
+
     pub(crate) fn target_stateful_set_name(&self) -> &str {
         &self.target_stateful_set_name
     }
@@ -233,14 +283,6 @@ impl CatalogActivationPublicationTarget {
 
     pub(crate) fn target_agent_dns_name(&self) -> &str {
         &self.target_agent_dns_name
-    }
-
-    pub(crate) const fn target_agent_tls_port(&self) -> u16 {
-        self.target_agent_tls_port
-    }
-
-    pub(crate) fn capability_path(&self) -> &'static str {
-        self.capability_path
     }
 }
 
@@ -278,12 +320,24 @@ pub(crate) fn catalog_activation_publication_target(
         carrier_api_group: CATALOG_ACTIVATION_API_GROUP,
         carrier_api_version: CATALOG_ACTIVATION_API_VERSION,
         carrier_api_plural: CATALOG_ACTIVATION_API_PLURAL,
-        carrier_status_subresource: CATALOG_ACTIVATION_STATUS_SUBRESOURCE,
         carrier_namespace: dispatch.cluster.namespace.clone(),
         carrier_name: dispatch.catalog_activation.name.clone(),
         carrier_uid: dispatch.catalog_activation.uid.clone(),
         cluster_name: dispatch.cluster.name.clone(),
         cluster_uid: dispatch.cluster.uid.clone(),
+        dispatcher_pod_name: dispatch.dispatcher.pod_name.clone(),
+        dispatcher_pod_uid: dispatch.dispatcher.pod_uid.clone(),
+        dispatcher_lease_name: format!("{}-orch-lease", dispatch.cluster.name),
+        dispatcher_lease_uid: dispatch.capability.coordination_lease_uid.clone(),
+        dispatcher_lease_resource_version: dispatch
+            .capability
+            .coordination_resource_version
+            .clone(),
+        writable_lease_name: dispatch.writable_lease.name.clone(),
+        writable_lease_uid: dispatch.writable_lease.uid.clone(),
+        writable_lease_resource_version: dispatch.writable_lease.resource_version.clone(),
+        writable_lease_holder: dispatch.writable_lease.holder_identity.clone(),
+        writable_lease_transitions: dispatch.writable_lease.transitions,
         target_stateful_set_name: dispatch
             .materialization_bundle
             .target_pod_template
@@ -292,8 +346,6 @@ pub(crate) fn catalog_activation_publication_target(
         target_pod_name: dispatch.source.instance_id.clone(),
         target_pod_uid: dispatch.source.pod_uid.clone(),
         target_agent_dns_name: target_member.dns_name.clone(),
-        target_agent_tls_port: CATALOG_ACTIVATION_TLS_PORT,
-        capability_path: CATALOG_ACTIVATION_CAPABILITY_PATH,
     })
 }
 
@@ -302,14 +354,17 @@ pub(crate) fn catalog_activation_publication_target(
 #[allow(dead_code)] // Proof boundary for a future separately reviewed publisher.
 pub(crate) fn bind_catalog_activation_live_objects(
     dispatch: &CatalogBootstrapDispatch,
-    cluster: ClusterFingerprint,
+    candidates: &BoundCandidateSet,
     carrier: ObjectReference,
+    carrier_resource_version: String,
     target_pod: ObjectReference,
     writable_lease: WritableLeaseProofIdentity,
     dispatcher: CatalogActivationDispatcherProof,
 ) -> Option<CatalogActivationLiveObjectProofs> {
-    if cluster != dispatch.cluster
+    if !dispatch_matches_candidates(dispatch, candidates)
         || carrier != dispatch.catalog_activation
+        || carrier_resource_version.is_empty()
+        || carrier_resource_version.len() > 256
         || target_pod.name != dispatch.source.instance_id
         || target_pod.uid != dispatch.source.pod_uid
         || writable_lease != dispatch.writable_lease
@@ -327,8 +382,9 @@ pub(crate) fn bind_catalog_activation_live_objects(
         return None;
     }
     Some(CatalogActivationLiveObjectProofs {
-        cluster,
+        cluster: candidates.cluster.clone(),
         carrier,
+        carrier_resource_version,
         target_pod,
         writable_lease,
         dispatcher,
@@ -518,7 +574,7 @@ fn live_objects_match_dispatch(
         )
 }
 
-fn dispatcher_holder_matches(holder: &str, pod_name: &str, pod_uid: &str) -> bool {
+pub(crate) fn dispatcher_holder_matches(holder: &str, pod_name: &str, pod_uid: &str) -> bool {
     let mut pieces = holder.split('/');
     let holder_pod_name = pieces.next().unwrap_or_default();
     let holder_pod_uid = pieces.next().unwrap_or_default();
@@ -757,6 +813,7 @@ pub(crate) fn prepare_catalog_bootstrap_dispatch(
             pod_name: dispatcher_pod_name.to_owned(),
             pod_uid: dispatcher_pod_uid.to_owned(),
         },
+        bound_candidates: candidates.clone(),
         cluster: candidates.cluster.clone(),
         catalog_activation: candidates.catalog_activation.clone(),
         target_candidate,
@@ -875,26 +932,34 @@ fn dispatch_matches_proofs(
     replication: &ShardZeroReplicationProof,
     candidates: &BoundCandidateSet,
 ) -> bool {
+    dispatch_matches_candidates(dispatch, candidates)
+        && dispatch.writable_lease == replication.writable_lease
+        && source_matches(&dispatch.source, &replication.source)
+        && witness_matches(
+            &dispatch.remote_apply_witness,
+            &replication.remote_apply_witness,
+        )
+}
+
+fn dispatch_matches_candidates(
+    dispatch: &CatalogBootstrapDispatch,
+    candidates: &BoundCandidateSet,
+) -> bool {
     let Some(target_candidate) = candidates.candidates.first() else {
         return false;
     };
     let Some(target_bootstrap) = candidates.shard_zero_bootstraps.first() else {
         return false;
     };
-    dispatch.cluster == candidates.cluster
+    dispatch.bound_candidates == *candidates
+        && dispatch.cluster == candidates.cluster
         && dispatch.catalog_activation == candidates.catalog_activation
         && dispatch.target_candidate == *target_candidate
         && dispatch.target_bootstrap == *target_bootstrap
-        && dispatch.writable_lease == replication.writable_lease
         && dispatch.replication_credential == candidates.replication_credential
         && dispatch.catalog_access == candidates.catalog_access
         && dispatch.operation_writer_access == candidates.operation_writer_access
         && candidates.materialization_bundles.first() == Some(&dispatch.materialization_bundle)
-        && source_matches(&dispatch.source, &replication.source)
-        && witness_matches(
-            &dispatch.remote_apply_witness,
-            &replication.remote_apply_witness,
-        )
 }
 
 fn source_matches(
