@@ -1,5 +1,6 @@
 //! Core identifiers and deterministic routing primitives shared by pgshard.
 
+pub mod catalog_activation;
 pub mod catalog_material;
 pub mod restore;
 pub mod writable_generation;

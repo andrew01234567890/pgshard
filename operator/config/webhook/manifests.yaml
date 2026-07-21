@@ -105,6 +105,30 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-pgshard-io-v1alpha1-pgshardcatalogactivation
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpgshardcatalogactivation.kb.io
+  rules:
+  - apiGroups:
+    - pgshard.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - pgshardcatalogactivations
+    - pgshardcatalogactivations/status
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-pgshard-io-v1alpha1-pgshardcluster
       port: 9444
   failurePolicy: Fail

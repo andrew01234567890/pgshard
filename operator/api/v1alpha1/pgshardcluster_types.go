@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +28,10 @@ const (
 	// MaximumClusterNameLength preserves the public API limit from the first
 	// operator release. Longer workload identities are bounded independently.
 	MaximumClusterNameLength = 50
+	// maximumPostgreSQLWorkloadPrefixLength leaves room for the shard, member,
+	// Pod ordinal, and role suffixes appended to PostgreSQL workload identities.
+	maximumPostgreSQLWorkloadPrefixLength = 42
+	postgresqlWorkloadDigestBytes         = 12
 
 	DurabilitySynchronous  DurabilityMode = "Synchronous"
 	DurabilityAsynchronous DurabilityMode = "Asynchronous"
@@ -40,6 +45,34 @@ const (
 	DeletionRetain StorageDeletionPolicy = "Retain"
 	DeletionDelete StorageDeletionPolicy = "Delete"
 )
+
+// PostgreSQLWorkloadPrefix returns the collision-resistant bounded prefix
+// shared by every PostgreSQL workload and its coordination identities. Hash
+// names at the boundary too so a longer name cannot alias an accepted literal
+// 42-byte cluster name.
+func PostgreSQLWorkloadPrefix(cluster string) string {
+	if len(cluster) < maximumPostgreSQLWorkloadPrefixLength {
+		return cluster
+	}
+	digest := sha256.Sum256([]byte(cluster))
+	suffix := hex.EncodeToString(digest[:postgresqlWorkloadDigestBytes])
+	return cluster[:maximumPostgreSQLWorkloadPrefixLength-len(suffix)-1] + "-" + suffix
+}
+
+// PostgreSQLShardStatefulSetName returns the stable role-neutral workload name.
+func PostgreSQLShardStatefulSetName(cluster string, shard int32) string {
+	return fmt.Sprintf("%s-shard-%04d", PostgreSQLWorkloadPrefix(cluster), shard)
+}
+
+// PostgreSQLWritableLeaseName returns the exact writable-term Lease name.
+func PostgreSQLWritableLeaseName(cluster string, shard int32) string {
+	return PostgreSQLShardStatefulSetName(cluster, shard) + "-term"
+}
+
+// PostgreSQLAgentServiceAccountName returns the exact writable agent identity.
+func PostgreSQLAgentServiceAccountName(cluster string, shard int32) string {
+	return PostgreSQLShardStatefulSetName(cluster, shard) + "-agent"
+}
 
 type DurabilityMode string
 type PoolerScalingMode string
@@ -340,6 +373,22 @@ type PgShardClusterStatus struct {
 	// operation-writer credential. It is not mounted by any orchestrator until
 	// a later connector slice is composed.
 	OperationWriterAccess *OperationWriterAccessStatus `json:"operationWriterAccess,omitempty"`
+	// CatalogActivation pins the one operator-created, initially empty carrier
+	// for a future authenticated catalog materialization request. A missing or
+	// replaced carrier is an explicit-recovery boundary and is never recreated.
+	CatalogActivation *CatalogActivationCarrierStatus `json:"catalogActivation,omitempty"`
+}
+
+// CatalogActivationCarrierStatus binds the activation carrier's deterministic
+// name to one exact API incarnation.
+type CatalogActivationCarrierStatus struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	UID types.UID `json:"uid"`
 }
 
 // PostgreSQLConfigurationStatus binds generated PostgreSQL inputs to one

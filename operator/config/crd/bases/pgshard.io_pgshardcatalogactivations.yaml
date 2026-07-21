@@ -1,0 +1,770 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgshardcatalogactivations.pgshard.io
+spec:
+  group: pgshard.io
+  names:
+    kind: PgShardCatalogActivation
+    listKind: PgShardCatalogActivationList
+    plural: pgshardcatalogactivations
+    shortNames:
+    - pgsca
+    singular: pgshardcatalogactivation
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.request.cluster.name
+      name: Cluster
+      type: string
+    - jsonPath: .spec.requestSHA256
+      name: Requested
+      type: string
+    - jsonPath: .status.acceptance.requestSHA256
+      name: Accepted
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              PgShardCatalogActivationSpec is empty until a future orchestrator publishes
+              one immutable request and its independently verifiable digest.
+            properties:
+              request:
+                description: CatalogActivationRequest is one immutable, fully bound
+                  activation request.
+                properties:
+                  bootstrap:
+                    description: CatalogActivationBootstrap binds the target credential
+                      and data volume.
+                    properties:
+                      pvc:
+                        description: CatalogActivationObjectIdentity is an exact immutable
+                          Kubernetes object.
+                        properties:
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          uid:
+                            description: |-
+                              UID is a type that holds unique ID values, including UUIDs.  Because we
+                              don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                              intent and helps make sure that UIDs and names do not get conflated.
+                            maxLength: 128
+                            minLength: 1
+                            pattern: ^[A-Za-z0-9_.:-]+$
+                            type: string
+                        required:
+                        - name
+                        - uid
+                        type: object
+                      secret:
+                        description: CatalogActivationObjectIdentity is an exact immutable
+                          Kubernetes object.
+                        properties:
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          uid:
+                            description: |-
+                              UID is a type that holds unique ID values, including UUIDs.  Because we
+                              don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                              intent and helps make sure that UIDs and names do not get conflated.
+                            maxLength: 128
+                            minLength: 1
+                            pattern: ^[A-Za-z0-9_.:-]+$
+                            type: string
+                        required:
+                        - name
+                        - uid
+                        type: object
+                    required:
+                    - pvc
+                    - secret
+                    type: object
+                  candidate:
+                    description: CatalogActivationCandidate binds the selected immutable
+                      candidate document.
+                    properties:
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      payloadSHA256:
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                      resourceVersion:
+                        maxLength: 256
+                        minLength: 1
+                        type: string
+                      uid:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                    required:
+                    - name
+                    - payloadSHA256
+                    - resourceVersion
+                    - uid
+                    type: object
+                  carrier:
+                    description: CatalogActivationObjectIdentity is an exact immutable
+                      Kubernetes object.
+                    properties:
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      uid:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                    required:
+                    - name
+                    - uid
+                    type: object
+                  cluster:
+                    description: CatalogActivationCluster binds the exact PgShardCluster
+                      status snapshot.
+                    properties:
+                      generation:
+                        description: Generation is canonical unsigned decimal.
+                        maxLength: 20
+                        pattern: ^(0|[1-9][0-9]{0,19})$
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        description: Namespace contains every namespaced object bound
+                          by the request.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      resourceVersion:
+                        maxLength: 256
+                        minLength: 1
+                        type: string
+                      statusSHA256:
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                      uid:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                    required:
+                    - generation
+                    - name
+                    - namespace
+                    - resourceVersion
+                    - statusSHA256
+                    - uid
+                    type: object
+                  dispatcher:
+                    description: CatalogActivationDispatcher binds the publisher Pod
+                      and elected term.
+                    properties:
+                      leaseHolder:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      leaseName:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      leaseResourceVersion:
+                        maxLength: 256
+                        minLength: 1
+                        type: string
+                      leaseUID:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                      podName:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      podUID:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                    required:
+                    - leaseHolder
+                    - leaseName
+                    - leaseResourceVersion
+                    - leaseUID
+                    - podName
+                    - podUID
+                    type: object
+                  materials:
+                    description: CatalogActivationMaterials is the exact immutable
+                      materialization bundle.
+                    properties:
+                      catalog:
+                        description: CatalogActivationCatalogMaterialIdentity binds
+                          exact catalog TLS and client material.
+                        properties:
+                          clientSHA256:
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          serverSHA256:
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          uid:
+                            description: |-
+                              UID is a type that holds unique ID values, including UUIDs.  Because we
+                              don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                              intent and helps make sure that UIDs and names do not get conflated.
+                            maxLength: 128
+                            minLength: 1
+                            pattern: ^[A-Za-z0-9_.:-]+$
+                            type: string
+                        required:
+                        - clientSHA256
+                        - name
+                        - serverSHA256
+                        - uid
+                        type: object
+                      genesisSHA256:
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                      migrationSHA256:
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                      operationWriter:
+                        description: CatalogActivationMaterialIdentity binds an immutable
+                          object and material.
+                        properties:
+                          materialSHA256:
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          uid:
+                            description: |-
+                              UID is a type that holds unique ID values, including UUIDs.  Because we
+                              don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                              intent and helps make sure that UIDs and names do not get conflated.
+                            maxLength: 128
+                            minLength: 1
+                            pattern: ^[A-Za-z0-9_.:-]+$
+                            type: string
+                        required:
+                        - materialSHA256
+                        - name
+                        - uid
+                        type: object
+                      postgresqlConfiguration:
+                        description: CatalogActivationMaterialIdentity binds an immutable
+                          object and material.
+                        properties:
+                          materialSHA256:
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          uid:
+                            description: |-
+                              UID is a type that holds unique ID values, including UUIDs.  Because we
+                              don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                              intent and helps make sure that UIDs and names do not get conflated.
+                            maxLength: 128
+                            minLength: 1
+                            pattern: ^[A-Za-z0-9_.:-]+$
+                            type: string
+                        required:
+                        - materialSHA256
+                        - name
+                        - uid
+                        type: object
+                      preflightSHA256:
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                      replication:
+                        description: CatalogActivationMaterialIdentity binds an immutable
+                          object and material.
+                        properties:
+                          materialSHA256:
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          uid:
+                            description: |-
+                              UID is a type that holds unique ID values, including UUIDs.  Because we
+                              don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                              intent and helps make sure that UIDs and names do not get conflated.
+                            maxLength: 128
+                            minLength: 1
+                            pattern: ^[A-Za-z0-9_.:-]+$
+                            type: string
+                        required:
+                        - materialSHA256
+                        - name
+                        - uid
+                        type: object
+                      servingHBASHA256:
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                      servingHBAVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      targetTemplateSHA256:
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                    required:
+                    - catalog
+                    - genesisSHA256
+                    - migrationSHA256
+                    - operationWriter
+                    - postgresqlConfiguration
+                    - preflightSHA256
+                    - replication
+                    - servingHBASHA256
+                    - servingHBAVersion
+                    - targetTemplateSHA256
+                    type: object
+                  remoteApplyWitness:
+                    description: CatalogActivationRemoteApplyWitness is one complete
+                      standby apply proof.
+                    properties:
+                      bootID:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                      clusterName:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      clusterUID:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                      generationBarrierLSN:
+                        maxLength: 20
+                        pattern: ^[1-9][0-9]{0,19}$
+                        type: string
+                      generationIdentity:
+                        maxLength: 1024
+                        minLength: 1
+                        type: string
+                      instanceID:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      member:
+                        format: int32
+                        maximum: 4
+                        minimum: 0
+                        type: integer
+                      memberSlotName:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      podName:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      podUID:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                      postmasterPID:
+                        format: int64
+                        maximum: 4294967295
+                        minimum: 1
+                        type: integer
+                      receiveLSN:
+                        maxLength: 20
+                        pattern: ^[1-9][0-9]{0,19}$
+                        type: string
+                      replayLSN:
+                        maxLength: 20
+                        pattern: ^[1-9][0-9]{0,19}$
+                        type: string
+                      shard:
+                        format: int32
+                        maximum: 127
+                        minimum: 0
+                        type: integer
+                      systemIdentifier:
+                        maxLength: 20
+                        pattern: ^[1-9][0-9]{0,19}$
+                        type: string
+                      timeline:
+                        format: int64
+                        maximum: 4294967295
+                        minimum: 1
+                        type: integer
+                    required:
+                    - bootID
+                    - clusterName
+                    - clusterUID
+                    - generationBarrierLSN
+                    - generationIdentity
+                    - instanceID
+                    - member
+                    - memberSlotName
+                    - podName
+                    - podUID
+                    - postmasterPID
+                    - receiveLSN
+                    - replayLSN
+                    - shard
+                    - systemIdentifier
+                    - timeline
+                    type: object
+                  schemaVersion:
+                    enum:
+                    - pgshard.catalog-activation-request.v1
+                    type: string
+                  source:
+                    description: CatalogActivationSource is the exact source incarnation
+                      and generation barrier.
+                    properties:
+                      bootID:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                      clusterName:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      clusterUID:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                      generationBarrierLSN:
+                        maxLength: 20
+                        pattern: ^[1-9][0-9]{0,19}$
+                        type: string
+                      generationIdentity:
+                        maxLength: 1024
+                        minLength: 1
+                        type: string
+                      instanceID:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      member:
+                        format: int32
+                        maximum: 4
+                        minimum: 0
+                        type: integer
+                      podName:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      podUID:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                      postmasterPID:
+                        format: int64
+                        maximum: 4294967295
+                        minimum: 1
+                        type: integer
+                      shard:
+                        format: int32
+                        maximum: 127
+                        minimum: 0
+                        type: integer
+                      systemIdentifier:
+                        maxLength: 20
+                        pattern: ^[1-9][0-9]{0,19}$
+                        type: string
+                      targetFenceAcknowledgement:
+                        description: CatalogActivationTargetFenceAcknowledgement binds
+                          the source fence proof.
+                        properties:
+                          controlBackendPID:
+                            format: int64
+                            maximum: 4294967295
+                            minimum: 1
+                            type: integer
+                          deadlineBoottimeNS:
+                            maxLength: 20
+                            pattern: ^[1-9][0-9]{0,19}$
+                            type: string
+                          observedAtUnixMS:
+                            maxLength: 20
+                            pattern: ^[1-9][0-9]{0,19}$
+                            type: string
+                          remainingValidityAtAckMS:
+                            maxLength: 20
+                            pattern: ^[1-9][0-9]{0,19}$
+                            type: string
+                          remainingValidityAtReportMS:
+                            maxLength: 20
+                            pattern: ^[1-9][0-9]{0,19}$
+                            type: string
+                        required:
+                        - controlBackendPID
+                        - deadlineBoottimeNS
+                        - observedAtUnixMS
+                        - remainingValidityAtAckMS
+                        - remainingValidityAtReportMS
+                        type: object
+                      timeline:
+                        format: int64
+                        maximum: 4294967295
+                        minimum: 1
+                        type: integer
+                    required:
+                    - bootID
+                    - clusterName
+                    - clusterUID
+                    - generationBarrierLSN
+                    - generationIdentity
+                    - instanceID
+                    - member
+                    - podName
+                    - podUID
+                    - postmasterPID
+                    - shard
+                    - systemIdentifier
+                    - targetFenceAcknowledgement
+                    - timeline
+                    type: object
+                  writableTerm:
+                    description: CatalogActivationWritableTerm binds the writable
+                      Lease and holder generation.
+                    properties:
+                      generation:
+                        maxLength: 20
+                        pattern: ^[1-9][0-9]{0,19}$
+                        type: string
+                      holder:
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9._/-]+$
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      resourceVersion:
+                        maxLength: 256
+                        minLength: 1
+                        type: string
+                      uid:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9_.:-]+$
+                        type: string
+                    required:
+                    - generation
+                    - holder
+                    - name
+                    - resourceVersion
+                    - uid
+                    type: object
+                required:
+                - bootstrap
+                - candidate
+                - carrier
+                - cluster
+                - dispatcher
+                - materials
+                - remoteApplyWitness
+                - schemaVersion
+                - source
+                - writableTerm
+                type: object
+                x-kubernetes-validations:
+                - message: carrier name must be the fixed cluster activation name
+                  rule: self.carrier.name == self.cluster.name + '-catalog-activation'
+                - message: dispatcher Lease must have the fixed cluster name
+                  rule: self.dispatcher.leaseName == self.cluster.name + '-orch-lease'
+                - message: dispatcher Lease holder must bind the exact dispatcher
+                    Pod
+                  rule: self.dispatcher.leaseHolder.startsWith(self.dispatcher.podName
+                    + '/' + self.dispatcher.podUID + '/') && size(self.dispatcher.leaseHolder)
+                    == size(self.dispatcher.podName) + size(self.dispatcher.podUID)
+                    + 38
+                - message: writable Lease holder must bind the exact source process
+                    incarnation
+                  rule: self.writableTerm.holder.startsWith(self.source.instanceID
+                    + '/' + self.source.podUID + '/') && size(self.writableTerm.holder)
+                    == size(self.source.instanceID) + size(self.source.podUID) + 26
+                - message: source and witness must bind the exact cluster identity
+                  rule: self.source.clusterName == self.cluster.name && self.source.clusterUID
+                    == self.cluster.uid && self.remoteApplyWitness.clusterName ==
+                    self.cluster.name && self.remoteApplyWitness.clusterUID == self.cluster.uid
+                - message: activation requires distinct shard-zero source and witness
+                    members
+                  rule: self.source.shard == 0 && self.remoteApplyWitness.shard ==
+                    0 && self.source.member != self.remoteApplyWitness.member
+                - message: source and remote-apply witness must bind the same PostgreSQL
+                    generation
+                  rule: self.source.systemIdentifier == self.remoteApplyWitness.systemIdentifier
+                    && self.source.timeline == self.remoteApplyWitness.timeline &&
+                    self.source.generationIdentity == self.remoteApplyWitness.generationIdentity
+                    && self.source.generationBarrierLSN == self.remoteApplyWitness.generationBarrierLSN
+              requestSHA256:
+                pattern: ^[0-9a-f]{64}$
+                type: string
+            type: object
+            x-kubernetes-validations:
+            - message: request and requestSHA256 must be set together
+              rule: has(self.request) == has(self.requestSHA256)
+            - message: catalog activation request is set-once and immutable
+              rule: '!has(oldSelf.request) || (has(self.request) && self.request ==
+                oldSelf.request && self.requestSHA256 == oldSelf.requestSHA256)'
+          status:
+            description: |-
+              PgShardCatalogActivationStatus is empty until a future target agent records
+              one immutable, fsync-backed acceptance.
+            properties:
+              acceptance:
+                description: CatalogActivationAcceptance records only a durable exact-request
+                  acceptance.
+                properties:
+                  carrierUID:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    maxLength: 128
+                    minLength: 1
+                    pattern: ^[A-Za-z0-9_.:-]+$
+                    type: string
+                  persistedAtUnixMS:
+                    maxLength: 20
+                    pattern: ^(0|[1-9][0-9]{0,19})$
+                    type: string
+                  persistence:
+                    description: |-
+                      Persistence is fsync only after the future consumer has durably installed
+                      and re-read the exact request before acknowledging it.
+                    enum:
+                    - fsync
+                    type: string
+                  requestSHA256:
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                  schemaVersion:
+                    enum:
+                    - pgshard.catalog-activation-acceptance.v1
+                    type: string
+                  targetPodName:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  targetPodUID:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    maxLength: 128
+                    minLength: 1
+                    pattern: ^[A-Za-z0-9_.:-]+$
+                    type: string
+                required:
+                - carrierUID
+                - persistedAtUnixMS
+                - persistence
+                - requestSHA256
+                - schemaVersion
+                - targetPodName
+                - targetPodUID
+                type: object
+            type: object
+            x-kubernetes-validations:
+            - message: catalog activation acceptance is set-once and immutable
+              rule: '!has(oldSelf.acceptance) || (has(self.acceptance) && self.acceptance
+                == oldSelf.acceptance)'
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
