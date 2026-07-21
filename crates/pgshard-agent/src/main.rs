@@ -3,6 +3,7 @@
 use pgshard_agent::catalog_activation_consumer::{
     CatalogActivationCapabilityState, spawn_catalog_activation_consumer,
 };
+use pgshard_agent::catalog_activation_tls::spawn_catalog_activation_tls_server;
 use pgshard_agent::config::{AgentConfig, ConfigError};
 use pgshard_agent::coordination::WritableLeaseConfig;
 use pgshard_agent::domain::{AgentState, PostgresProcessState};
@@ -16,6 +17,7 @@ use tokio::sync::watch;
 
 const PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 const BLOCKING_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const TLS_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIAL_COORDINATION_RETRY: Duration = Duration::from_millis(250);
 const MAX_COORDINATION_RETRY: Duration = Duration::from_secs(5);
 const COORDINATION_RETRY_RESET: Duration = Duration::from_secs(30);
@@ -64,6 +66,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         postgres,
         activation_config,
         catalog_activation_consumer,
+        catalog_activation_tls,
     } = config;
     let telemetry = telemetry.status();
     if telemetry.endpoint_configured {
@@ -103,6 +106,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if postgres.is_some() {
         state.set_postgres_process(PostgresProcessState::Validated);
     }
+    let catalog_activation_tls_task = spawn_catalog_activation_tls_server(
+        catalog_activation_tls,
+        catalog_activation,
+        shutdown_rx.clone(),
+    );
     tracing::info!(
         bind = %http_bind,
         postgres_supervision = postgres.is_some(),
@@ -116,11 +124,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         postgres,
         postgres_config,
         writable_lease,
-        catalog_activation,
         shutdown_tx.clone(),
         shutdown_rx,
     ))
     .await;
+    let _ = shutdown_tx.send(true);
+    stop_tls_task(catalog_activation_tls_task).await;
     signal_task.abort();
     let _ = signal_task.await;
     result?;
@@ -135,7 +144,6 @@ async fn run_services(
     postgres: Option<PreparedPostgres>,
     postgres_config: Option<PostgresConfig>,
     writable_lease: Option<WritableLeaseConfig>,
-    catalog_activation: CatalogActivationCapabilityState,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AgentRunError> {
@@ -152,7 +160,6 @@ async fn run_services(
             postgres,
             postgres_config,
             writable_lease,
-            catalog_activation,
             shutdown_tx,
             shutdown_rx,
         ))
@@ -164,10 +171,9 @@ async fn run_services(
         let listener = tokio::net::TcpListener::bind(http_bind)
             .await
             .map_err(AgentRunError::Http)?;
-        let http = pgshard_agent::http::serve_on_with_catalog_activation(
+        let http = pgshard_agent::http::serve_on(
             listener,
             state.clone(),
-            catalog_activation,
             wait_for_shutdown(shutdown_rx.clone()),
         );
         let postmaster = postgres.supervise(state, wait_for_shutdown(shutdown_rx));
@@ -186,14 +192,29 @@ async fn run_services(
             }
         }
     } else {
-        pgshard_agent::http::serve_with_catalog_activation(
-            http_bind,
-            state,
-            catalog_activation,
-            wait_for_shutdown(shutdown_rx),
-        )
-        .await
-        .map_err(AgentRunError::Http)
+        pgshard_agent::http::serve(http_bind, state, wait_for_shutdown(shutdown_rx))
+            .await
+            .map_err(AgentRunError::Http)
+    }
+}
+
+async fn stop_tls_task(task: Option<tokio::task::JoinHandle<()>>) {
+    let Some(mut task) = task else {
+        return;
+    };
+    match tokio::time::timeout(TLS_TASK_SHUTDOWN_TIMEOUT, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "catalog-activation TLS supervisor task failed");
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = TLS_TASK_SHUTDOWN_TIMEOUT.as_millis(),
+                "forcing catalog-activation TLS supervisor shutdown"
+            );
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -204,17 +225,15 @@ async fn run_writable_services(
     postgres: PreparedPostgres,
     postgres_config: PostgresConfig,
     writable_lease: WritableLeaseConfig,
-    catalog_activation: CatalogActivationCapabilityState,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AgentRunError> {
     let listener = tokio::net::TcpListener::bind(http_bind)
         .await
         .map_err(AgentRunError::Http)?;
-    let http = pgshard_agent::http::serve_on_with_catalog_activation(
+    let http = pgshard_agent::http::serve_on(
         listener,
         state.clone(),
-        catalog_activation,
         wait_for_shutdown(shutdown_rx.clone()),
     );
     let runtime = supervise_writable_runtime(

@@ -3,6 +3,7 @@
 pub mod boottime;
 pub mod catalog_activation;
 pub mod catalog_activation_consumer;
+pub mod catalog_activation_tls;
 pub mod config;
 pub mod coordination;
 pub mod domain;
