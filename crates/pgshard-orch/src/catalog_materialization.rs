@@ -295,6 +295,11 @@ impl PreparedCatalogActivationRequest {
     pub(crate) fn sha256(&self) -> &str {
         &self.sha256
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(request: CatalogActivationRequest, sha256: String) -> Self {
+        Self { request, sha256 }
+    }
 }
 
 /// Derives the exact API object and direct target-agent endpoint identifiers

@@ -1654,9 +1654,11 @@ mod tests {
         WritableLeaseProofIdentity,
     };
     use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
+    use crate::catalog_activation_challenge::ExpectedCatalogActivationCapability;
     use crate::catalog_materialization::{
-        CatalogActivationDispatcherProof, bind_catalog_activation_live_objects,
-        catalog_activation_publication_target, prepare_catalog_activation_request,
+        CatalogActivationDispatcherProof, PreparedCatalogActivationRequest,
+        bind_catalog_activation_live_objects, catalog_activation_publication_target,
+        prepare_catalog_activation_request,
     };
     use crate::domain::{AgentStatusPhase, CatalogCandidatePhase, OrchState, OrchestratorIdentity};
     use crate::topology::{
@@ -2574,6 +2576,36 @@ mod tests {
                 "writable-lease-rv-7"
             );
             assert_eq!(prepared.request().writable_term.generation, "7");
+            let challenge_identity = ExpectedCatalogActivationCapability::from_prepared(&prepared)
+                .expect("request-derived challenge identity");
+            assert_eq!(challenge_identity.cluster.name, "demo");
+            assert_eq!(challenge_identity.cluster.uid, "cluster-uid");
+            assert_eq!(challenge_identity.carrier.namespace, "ns");
+            assert_eq!(challenge_identity.carrier.name, "demo-catalog-activation");
+            assert_eq!(challenge_identity.carrier.uid, "catalog-activation-uid");
+            assert_eq!(challenge_identity.target.shard, 0);
+            assert_eq!(challenge_identity.target.member, 0);
+            assert_eq!(challenge_identity.target.instance_id, "demo-shard-0000-0");
+            assert_eq!(challenge_identity.target.pod_name, "demo-shard-0000-0");
+            assert_eq!(challenge_identity.target.pod_uid, "pod-uid-0");
+
+            let mismatched_digest = PreparedCatalogActivationRequest::from_test_parts(
+                prepared.request().clone(),
+                "f".repeat(64),
+            );
+            assert!(
+                ExpectedCatalogActivationCapability::from_prepared(&mismatched_digest).is_err()
+            );
+            let mut nonzero_member_request = prepared.request().clone();
+            nonzero_member_request.source.member = 1;
+            let nonzero_member_digest = nonzero_member_request
+                .sha256()
+                .unwrap_or_else(|_| "e".repeat(64));
+            let nonzero_member = PreparedCatalogActivationRequest::from_test_parts(
+                nonzero_member_request,
+                nonzero_member_digest,
+            );
+            assert!(ExpectedCatalogActivationCapability::from_prepared(&nonzero_member).is_err());
 
             for invalid_carrier_rv in [String::new(), "x".repeat(257)] {
                 assert!(
