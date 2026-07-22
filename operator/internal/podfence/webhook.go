@@ -400,14 +400,14 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 	if IsDispatchProbeSentinel(pod) {
 		return admission.Denied(DispatchProbeSentinelMessage)
 	}
-	// Record the authenticated controller identity for an identity-probe pod. This
-	// only observes request.UserInfo (which the API server signs); it never relaxes
-	// the allow/deny decision, so an attacker who forges the probe annotation still
-	// faces normal enforcement (an unmanaged probe pod is denied under any guarded
-	// phase, and the probe only runs while INACTIVE).
-	if token := identityProbeToken(pod.Annotations); token != "" && v.probeStore != nil {
-		if role := podIdentityProbeRole(pod); role != "" {
-			v.probeStore.record(token, role, request.UserInfo.Username)
+	// Record the authenticated controller identity for an identity-probe pod, but
+	// only after the claimed owner chain is authenticated against the LIVE probe
+	// objects registered by the prober (a forged owner reference records nothing,
+	// and the store is append-only/conflict-detecting). This never relaxes the
+	// allow/deny decision.
+	if v.probeStore != nil {
+		if err := recordPodIdentityObservation(ctx, v.reader, v.probeStore, pod, request.UserInfo.Username); err != nil {
+			return admission.Errored(http.StatusInternalServerError, err)
 		}
 	}
 	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
@@ -429,7 +429,7 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 		if err != nil {
 			return admission.Errored(http.StatusInternalServerError, err)
 		}
-		if !sealed {
+		if sealed == nil {
 			return admission.Denied("namespace isolation is recreating; only pods of a sealed parent at its exact incarnation may be created")
 		}
 	}

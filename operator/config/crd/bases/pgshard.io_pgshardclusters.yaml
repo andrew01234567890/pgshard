@@ -615,10 +615,25 @@ spec:
                         contractHash:
                           pattern: ^([0-9a-f]{64})?$
                           type: string
+                        generation:
+                          description: |-
+                            Generation is the parent's spec incarnation (metadata.generation) at seal
+                            time. Unlike resourceVersion it never moves on status writes, so admission
+                            and the drift detector bind to it together with the contract hash.
+                          format: int64
+                          minimum: 0
+                          type: integer
                         kind:
                           type: string
                         name:
                           type: string
+                        replicas:
+                          description: |-
+                            Replicas is the parent's desired pod cardinality at seal time: the guarded
+                            replacement set RECREATE must prove exists (all valid) before ACTIVE.
+                          format: int32
+                          minimum: 0
+                          type: integer
                         resourceVersion:
                           type: string
                         uid:

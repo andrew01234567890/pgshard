@@ -490,6 +490,19 @@ const IsolationActivationAnnotation = "pgshard.io/activate-isolation"
 // activation.
 const IsolationActivationRequested = "requested"
 
+// IsolationDispatchTopologyAckAnnotation is the DURABLE administrator
+// acknowledgement required when the kubernetes Service EndpointSlices enumerate
+// at most one API-server backend: a single published address may be a genuine
+// single server or an opaque VIP fronting several backends the probe cannot
+// enumerate. Without the acknowledgement, activation is withheld as
+// ha-unsupported; with it, the administrator attests the published endpoint is
+// the complete physical backend set (or the provider guarantees uniform webhook
+// dispatch behind it).
+const IsolationDispatchTopologyAckAnnotation = "pgshard.io/dispatch-topology-ack"
+
+// IsolationDispatchTopologyAckSingleServer is the acknowledgement value.
+const IsolationDispatchTopologyAckSingleServer = "single-server"
+
 // SealedParent is one protected parent workload sealed into the isolation
 // receipt at its exact API incarnation and contract hash.
 type SealedParent struct {
@@ -498,6 +511,15 @@ type SealedParent struct {
 	// +kubebuilder:validation:MinLength=1
 	UID             string `json:"uid"`
 	ResourceVersion string `json:"resourceVersion,omitempty"`
+	// Generation is the parent's spec incarnation (metadata.generation) at seal
+	// time. Unlike resourceVersion it never moves on status writes, so admission
+	// and the drift detector bind to it together with the contract hash.
+	// +kubebuilder:validation:Minimum=0
+	Generation int64 `json:"generation,omitempty"`
+	// Replicas is the parent's desired pod cardinality at seal time: the guarded
+	// replacement set RECREATE must prove exists (all valid) before ACTIVE.
+	// +kubebuilder:validation:Minimum=0
+	Replicas int32 `json:"replicas,omitempty"`
 	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
 	ContractHash string `json:"contractHash,omitempty"`
 }

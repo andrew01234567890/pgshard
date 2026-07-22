@@ -65,7 +65,9 @@ func ownedReplicaSet(name string, uid, deploymentUID types.UID, hash string, rep
 func genReconciler(t *testing.T, objects ...client.Object) (*PgShardClusterReconciler, client.Client) {
 	t.Helper()
 	fakeClient := newFakeClient(t, objects...)
-	return &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient}, fakeClient
+	// Tests run with the drain bound attested at the conservative default; the
+	// unattested-withholds regression zeroes it explicitly.
+	return &PgShardClusterReconciler{Client: fakeClient, APIReader: fakeClient, AttestedRequestTimeout: supportingRevocationDrain}, fakeClient
 }
 
 func reloadGenerationRecord(t *testing.T, kubeClient client.Client, cluster *pgshardv1alpha1.PgShardCluster, class string) pgshardv1alpha1.SupportingGenerationStatus {

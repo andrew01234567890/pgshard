@@ -138,7 +138,7 @@ func preflightReconciler() *PgShardClusterReconciler {
 	return &PgShardClusterReconciler{
 		MinorGate:      fakeMinorGate{ok: true, observed: "v1.36.2"},
 		IdentityProber: fakeIdentityProber{matched: true},
-		DispatchProber: fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "tuple-abc"}},
+		DispatchProber: fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "tuple-abc"}},
 	}
 }
 
@@ -194,7 +194,7 @@ func TestRevalidateDispatchTupleInvalidation(t *testing.T) {
 	}
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
 	// The backend set changed mid-activation: the prober now reports a new tuple.
-	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "tuple-new"}}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "tuple-new"}}
 
 	valid, err := reconciler.revalidateDispatchTuple(context.Background(), cluster)
 	if err != nil {
@@ -233,12 +233,18 @@ func TestRevalidateDispatchTupleInvalidation(t *testing.T) {
 // checkpoints.
 func tlsReadyActivationCluster(name string, uid types.UID) *pgshardv1alpha1.PgShardCluster {
 	cluster := genCluster(name, uid)
+	cluster.Spec.Shards = 1
 	cluster.Spec.MembersPerShard = 3
 	cluster.Annotations = map[string]string{pgshardv1alpha1.IsolationActivationAnnotation: pgshardv1alpha1.IsolationActivationRequested}
 	cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{ReplicationTransportPolicy: pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1}
+	// COMPLETE coverage: every member of every spec shard has a checkpoint.
 	cluster.Status.PostgreSQLReplicationTLS = []pgshardv1alpha1.PostgreSQLReplicationTLSStatus{{
 		Shard: 0, CASecretName: name + "-replication-ca", CASHA256: strings.Repeat("a", 64),
-		Members: []pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{{Member: 0, ServerSHA256: strings.Repeat("b", 64)}},
+		Members: []pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{
+			{Member: 0, ServerSHA256: strings.Repeat("b", 64)},
+			{Member: 1, ServerSHA256: strings.Repeat("c", 64)},
+			{Member: 2, ServerSHA256: strings.Repeat("d", 64)},
+		},
 	}}
 	return cluster
 }
@@ -249,7 +255,7 @@ func TestReconcileIsolationActivationOptInEntersQuiesce(t *testing.T) {
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
 	reconciler.MinorGate = fakeMinorGate{ok: true, observed: "v1.36.2"}
 	reconciler.IdentityProber = fakeIdentityProber{matched: true}
-	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "tuple-abc"}}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "tuple-abc"}}
 
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
 		t.Fatal(err)
@@ -271,7 +277,7 @@ func TestReconcileIsolationActivationOptOutStaysInactive(t *testing.T) {
 	// activates (the eligibility gate short-circuits before the probers run).
 	reconciler.MinorGate = fakeMinorGate{ok: true}
 	reconciler.IdentityProber = fakeIdentityProber{matched: true}
-	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "tuple-abc"}}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "tuple-abc"}}
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +295,7 @@ func TestActivationWithheldWithoutTLSPrerequisite(t *testing.T) {
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
 	reconciler.MinorGate = fakeMinorGate{ok: true}
 	reconciler.IdentityProber = fakeIdentityProber{matched: true}
-	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "t"}}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "t"}}
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +318,7 @@ func TestActivationWithheldWithMultipleClusters(t *testing.T) {
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), clusterA, clusterB)
 	reconciler.MinorGate = fakeMinorGate{ok: true}
 	reconciler.IdentityProber = fakeIdentityProber{matched: true}
-	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "t"}}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "t"}}
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), clusterA); err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +341,7 @@ func TestActivationWithheldWithLimitRange(t *testing.T) {
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, limitRange)
 	reconciler.MinorGate = fakeMinorGate{ok: true}
 	reconciler.IdentityProber = fakeIdentityProber{matched: true}
-	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "t"}}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "t"}}
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +370,7 @@ func TestActivationWithheldWhileSupportingRolling(t *testing.T) {
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
 	reconciler.MinorGate = fakeMinorGate{ok: true}
 	reconciler.IdentityProber = fakeIdentityProber{matched: true}
-	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "t"}}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "t"}}
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
@@ -377,5 +383,94 @@ func TestActivationWithheldWhileSupportingRolling(t *testing.T) {
 	}
 	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationSupportingRollingCondition) == nil {
 		t.Fatalf("supporting-rolling condition not surfaced: %#v", reloaded.Status.Conditions)
+	}
+}
+
+func TestActivationWithheldWithoutAttestedDrainBound(t *testing.T) {
+	t.Parallel()
+	cluster := tlsReadyActivationCluster("unattestedcase", "unattestedcase-uid")
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	reconciler.AttestedRequestTimeout = 0 // explicitly unattested
+	reconciler.MinorGate = fakeMinorGate{ok: true}
+	reconciler.IdentityProber = fakeIdentityProber{matched: true}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "t"}}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if reloadReceipt(t, kubeClient, cluster) != nil {
+		t.Fatal("activation proceeded without an attested whole-request drain bound")
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationDrainUnattestedCondition) == nil {
+		t.Fatalf("drain-unattested condition not surfaced: %#v", reloaded.Status.Conditions)
+	}
+}
+
+func TestActivationWithheldOnUnprovenDispatchEnumerationWithoutAck(t *testing.T) {
+	t.Parallel()
+	cluster := tlsReadyActivationCluster("opaquecase", "opaquecase-uid")
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	reconciler.MinorGate = fakeMinorGate{ok: true}
+	reconciler.IdentityProber = fakeIdentityProber{matched: true}
+	// Converged, but a single enumerated backend cannot prove physical enumeration.
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 1, tupleHash: "t"}}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if reloadReceipt(t, kubeClient, cluster) != nil {
+		t.Fatal("activation proceeded over an unproven single-backend enumeration without the ack")
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationHAUnsupportedCondition) == nil {
+		t.Fatalf("ha-unsupported condition not surfaced for the opaque single backend: %#v", reloaded.Status.Conditions)
+	}
+
+	// With the explicit durable acknowledgement, the same single-backend proof is
+	// accepted and the cluster enters quiesce.
+	acked := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), acked); err != nil {
+		t.Fatal(err)
+	}
+	acked.Annotations[pgshardv1alpha1.IsolationDispatchTopologyAckAnnotation] = pgshardv1alpha1.IsolationDispatchTopologyAckSingleServer
+	if err := kubeClient.Update(context.Background(), acked); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), acked); err != nil {
+		t.Fatal(err)
+	}
+	if receipt := reloadReceipt(t, kubeClient, cluster); receipt == nil || receipt.Phase != pgshardv1alpha1.IsolationActivatingQuiesce {
+		t.Fatalf("the durable single-server ack did not admit the single-backend proof: %#v", receipt)
+	}
+}
+
+func TestHasReplicationTLSPrerequisiteRequiresExactTopologyCoverage(t *testing.T) {
+	t.Parallel()
+	full := tlsReadyActivationCluster("exactcase", "exactcase-uid")
+	if !hasReplicationTLSPrerequisite(full) {
+		t.Fatal("a complete {shard x member} coverage was rejected")
+	}
+	// One member short of the spec topology (membersPerShard=3, two supplied).
+	short := full.DeepCopy()
+	short.Status.PostgreSQLReplicationTLS[0].Members = short.Status.PostgreSQLReplicationTLS[0].Members[:2]
+	if hasReplicationTLSPrerequisite(short) {
+		t.Fatal("incomplete member coverage was accepted as complete")
+	}
+	// A member index outside the spec range.
+	outOfRange := full.DeepCopy()
+	outOfRange.Status.PostgreSQLReplicationTLS[0].Members[2].Member = 9
+	if hasReplicationTLSPrerequisite(outOfRange) {
+		t.Fatal("an out-of-range member index was accepted")
+	}
+	// Fewer shards than spec.shards.
+	multiShard := full.DeepCopy()
+	multiShard.Spec.Shards = 2
+	if hasReplicationTLSPrerequisite(multiShard) {
+		t.Fatal("missing a shard's coverage was accepted")
 	}
 }

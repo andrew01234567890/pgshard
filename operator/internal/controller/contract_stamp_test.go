@@ -142,3 +142,42 @@ func TestStampPlanContractsIsIdempotentAndPreservesGeneration(t *testing.T) {
 		t.Fatalf("generation drifted: %#v", second.Status.PostgreSQLMemberContracts[0])
 	}
 }
+
+func TestStampPlanContractsBumpsGenerationOnContractChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.MembersPerShard = 3
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+
+	// First stamp records generation 1 for the pooler.
+	plan := []client.Object{poolerDeploymentForContract(current)}
+	if err := reconciler.stampPlanContracts(ctx, current, plan); err != nil {
+		t.Fatal(err)
+	}
+	first := getCluster(t, ctx, base, cluster)
+	if first.Status.SupportingContracts[0].SecurityGeneration != 1 {
+		t.Fatalf("initial generation = %d, want 1", first.Status.SupportingContracts[0].SecurityGeneration)
+	}
+
+	// A security-relevant template change (a different, stricter image) changes
+	// the canonical contract, so the FULL production Plan→stamp path must durably
+	// increment the security generation — not a hand-injected gen-2.
+	current = getCluster(t, ctx, base, cluster)
+	changed := poolerDeploymentForContract(current)
+	changed.Spec.Template.Spec.Containers[0].Image = "img@sha256:" + repeatByte('c', 64)
+	if err := reconciler.stampPlanContracts(ctx, current, []client.Object{changed}); err != nil {
+		t.Fatal(err)
+	}
+	after := getCluster(t, ctx, base, cluster)
+	if after.Status.SupportingContracts[0].SecurityGeneration != 2 {
+		t.Fatalf("contract change did not bump the security generation: %#v", after.Status.SupportingContracts[0])
+	}
+	// The stamped template carries the bumped generation, so the controllers
+	// propagate it and the revocation barrier rises.
+	if changed.Spec.Template.Annotations[owned.PodSecurityGenerationAnnotation] != "2" {
+		t.Fatalf("bumped template generation = %q, want 2", changed.Spec.Template.Annotations[owned.PodSecurityGenerationAnnotation])
+	}
+}

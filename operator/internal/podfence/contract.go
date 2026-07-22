@@ -613,14 +613,25 @@ func (v *WorkloadIntegrityValidator) handleReplicaSet(ctx context.Context, reque
 	// disposable probe Deployment) records the authenticated deployment-controller
 	// username and is admitted so the replicaset controller in turn creates the
 	// probe pod (which records the replicaset-controller username at PodCreate).
-	// This is gated by the deployment-controller authorship check above, so it is
-	// not a create path for an untrusted caller.
-	if request.Operation == admissionv1.Create {
-		if token := identityProbeToken(replicaSet.Spec.Template.Annotations); token != "" {
-			if v.probeStore != nil {
-				v.probeStore.record(token, IdentityRoleDeployment, request.UserInfo.Username)
+	// This is gated by the deployment-controller authorship check above AND by
+	// authenticating the claimed owning Deployment against the live registered
+	// probe object; a ReplicaSet that merely carries the token but fails the
+	// owner-chain verification falls through to normal (denying) validation.
+	if request.Operation == admissionv1.Create && identityProbeToken(replicaSet.Spec.Template.Annotations) != "" {
+		if owner := controllerOwnerRef(replicaSet.OwnerReferences); owner != nil && owner.Kind == deploymentKind {
+			deployment := &appsv1.Deployment{}
+			err := v.reader.Get(ctx, types.NamespacedName{Namespace: request.Namespace, Name: owner.Name}, deployment)
+			if err != nil && !apierrors.IsNotFound(err) {
+				return admission.Errored(http.StatusInternalServerError, fmt.Errorf("read probe Deployment for identity observation: %w", err))
 			}
-			return admission.Allowed("identity-probe ReplicaSet observed")
+			if err == nil && deployment.UID == owner.UID {
+				if token := identityProbeToken(deployment.Annotations); token != "" {
+					if v.probeStore != nil {
+						v.probeStore.record(token, IdentityRoleDeployment, request.UserInfo.Username, IdentityOwnerKey("Deployment", deployment.Name))
+					}
+					return admission.Allowed("identity-probe ReplicaSet observed")
+				}
+			}
 		}
 	}
 	if request.Operation == admissionv1.Update {
@@ -693,10 +704,11 @@ func (v *WorkloadIntegrityValidator) handleScale(ctx context.Context, request ad
 		}
 		// Record the authenticated HPA-controller username when it scales an
 		// identity-probe Deployment. The gate above already bounds this to the
-		// HPA controller, so a probe target does not weaken the scale gate.
+		// HPA controller, and the token comes from the LIVE registered target
+		// object, so a probe target does not weaken the scale gate.
 		if v.probeStore != nil && request.UserInfo.Username == v.identities.HorizontalPodAutoscalerController && request.Resource.Resource == "deployments" {
 			if token := v.scaleTargetProbeToken(ctx, request.Namespace, request.Name); token != "" {
-				v.probeStore.record(token, IdentityRoleHPA, request.UserInfo.Username)
+				v.probeStore.record(token, IdentityRoleHPA, request.UserInfo.Username, IdentityOwnerKey("Deployment", request.Name))
 			}
 		}
 		return admission.Allowed("supporting workload scale is authorized")
@@ -721,14 +733,15 @@ func (v *WorkloadIntegrityValidator) handleScale(ctx context.Context, request ad
 	return admission.Allowed("managed member StatefulSet scale is within bounds")
 }
 
-// scaleTargetProbeToken returns the identity-probe token on a Deployment scale
-// target, or "" when the target is not a probe Deployment (or no longer exists).
+// scaleTargetProbeToken returns the identity-probe token on the LIVE Deployment
+// scale target, or "" when the target is not a probe Deployment (or no longer
+// exists).
 func (v *WorkloadIntegrityValidator) scaleTargetProbeToken(ctx context.Context, namespace, name string) string {
 	deployment := &appsv1.Deployment{}
 	if err := v.reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, deployment); err != nil {
 		return ""
 	}
-	return identityProbeToken(deployment.Spec.Template.Annotations)
+	return identityProbeToken(deployment.Annotations)
 }
 
 func (v *WorkloadIntegrityValidator) boundCluster(ctx context.Context, namespace, clusterName string, ownerRefs []metav1.OwnerReference) (*pgshardv1alpha1.PgShardCluster, *admission.Response) {

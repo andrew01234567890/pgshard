@@ -10,6 +10,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,12 +18,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// supportingRevocationDrain is the pinned maximum in-flight admission window (the
-// API server's --request-timeout). A prior supporting generation may not be
-// declared converged until at least this long after its revocation was sealed,
-// so any request that was already validating against the old generation has
-// drained.
+// supportingRevocationDrain is the conservative default in-flight admission
+// window (the upstream API-server --request-timeout default). It is used only
+// when no installation-attested bound is configured; isolation activation
+// REQUIRES the attested bound and is withheld without it.
 const supportingRevocationDrain = time.Minute
+
+// revocationDrainWindow returns the whole-request drain bound the ceremonies
+// must wait: the installation-attested maximum request lifetime when configured,
+// else the conservative default.
+func (r *PgShardClusterReconciler) revocationDrainWindow() time.Duration {
+	if r.AttestedRequestTimeout > 0 {
+		return r.AttestedRequestTimeout
+	}
+	return supportingRevocationDrain
+}
 
 type supportingClass struct {
 	class  owned.PodClass
@@ -211,11 +221,16 @@ func (r *PgShardClusterReconciler) driveSupportingRevocation(ctx context.Context
 	priorReplicaSet := replicaSetByUID(replicaSets, record.PriorReplicaSetUID)
 	if priorReplicaSet != nil {
 		if priorReplicaSet.Spec.Replicas == nil || *priorReplicaSet.Spec.Replicas != 0 {
-			zero := int32(0)
-			patch := client.MergeFrom(priorReplicaSet.DeepCopy())
-			priorReplicaSet.Spec.Replicas = &zero
-			if err := r.Patch(ctx, priorReplicaSet, patch); err != nil {
-				return false, false, fmt.Errorf("scale prior supporting ReplicaSet %s to zero: %w", priorReplicaSet.Name, err)
+			// Drain through the /scale SUBRESOURCE, never the main resource: the
+			// workload-integrity webhook accepts main-resource ReplicaSet writes only
+			// from the Deployment controller, so a main-resource patch by the operator
+			// would deny itself. The /scale handler explicitly authorizes the operator.
+			scale := &autoscalingv1.Scale{
+				ObjectMeta: metav1.ObjectMeta{Name: priorReplicaSet.Name, Namespace: priorReplicaSet.Namespace},
+				Spec:       autoscalingv1.ScaleSpec{Replicas: 0},
+			}
+			if err := r.SubResource("scale").Update(ctx, priorReplicaSet, client.WithSubResourceBody(scale)); err != nil {
+				return false, false, fmt.Errorf("scale prior supporting ReplicaSet %s to zero via /scale: %w", priorReplicaSet.Name, err)
 			}
 			record.SealedAt = metav1.Now()
 			r.resetSupportingDrain(cluster.UID, record.Class)
@@ -230,7 +245,7 @@ func (r *PgShardClusterReconciler) driveSupportingRevocation(ctx context.Context
 	}
 	// A full-second safety margin covers the metav1.Time one-second truncation and
 	// modest clock skew, so the drain never completes early.
-	if time.Since(record.SealedAt.Time) < supportingRevocationDrain+time.Second {
+	if time.Since(record.SealedAt.Time) < r.revocationDrainWindow()+time.Second {
 		return false, false, nil
 	}
 	// Sweep EVERY revoked pod of the class: any pod owned by the prior ReplicaSet,

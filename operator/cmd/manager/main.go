@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/controller"
@@ -36,13 +37,14 @@ func init() {
 }
 
 type commandOptions struct {
-	metricsAddress string
-	probeAddress   string
-	leaderElection bool
-	secureMetrics  bool
-	webhookEnabled bool
-	webhook        webhookCommandOptions
-	images         owned.Images
+	metricsAddress         string
+	probeAddress           string
+	leaderElection         bool
+	secureMetrics          bool
+	webhookEnabled         bool
+	attestedRequestTimeout time.Duration
+	webhook                webhookCommandOptions
+	images                 owned.Images
 }
 
 type webhookCommandOptions struct {
@@ -79,6 +81,7 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.StringVar(&options.webhook.replicaSetControllerName, "replicaset-controller-identity", "system:serviceaccount:kube-system:replicaset-controller", "authenticated username of the built-in ReplicaSet controller that creates managed supporting pods")
 	flags.StringVar(&options.webhook.deploymentControllerName, "deployment-controller-identity", "system:serviceaccount:kube-system:deployment-controller", "authenticated username of the built-in Deployment controller that creates managed supporting ReplicaSets")
 	flags.StringVar(&options.webhook.hpaControllerName, "horizontalpodautoscaler-controller-identity", "system:serviceaccount:kube-system:horizontal-pod-autoscaler", "authenticated username of the built-in HorizontalPodAutoscaler controller, verified by the activation identity probe")
+	flags.DurationVar(&options.attestedRequestTimeout, "attested-max-request-timeout", 0, "installation-attested maximum whole-request lifetime across every API server (the effective --request-timeout ceiling); zero means unattested, which withholds isolation activation")
 	flags.StringVar(&options.images.Orchestrator, "orchestrator-image", options.images.Orchestrator, "pgshard orchestrator image reference")
 	flags.StringVar(&options.images.Pooler, "pooler-image", options.images.Pooler, "pgshard pooler image reference")
 	flags.StringVar(&options.images.PostgreSQL, "postgresql-image", options.images.PostgreSQL, "PostgreSQL 18 image reference")
@@ -145,14 +148,16 @@ func main() {
 	}
 	identityProbeStore := podfence.NewIdentityObservationStore()
 	if err := (&controller.PgShardClusterReconciler{
-		Client:               manager.GetClient(),
-		APIReader:            manager.GetAPIReader(),
-		Images:               options.images,
-		PodFencingReceiptKey: receiptKey,
-		ControllerIdents:     controllerIdentities,
-		DispatchProber:       controller.NewServerDispatchProber(manager.GetAPIReader(), restConfig, options.webhook.namespace, options.webhook.validatingConfigurationName),
-		MinorGate:            controller.NewServerVersionGate(discoveryClient),
-		IdentityProber:       controller.NewServerControllerIdentityProber(manager.GetClient(), controllerIdentities, identityProbeStore),
+		Client:                      manager.GetClient(),
+		APIReader:                   manager.GetAPIReader(),
+		Images:                      options.images,
+		PodFencingReceiptKey:        receiptKey,
+		ControllerIdents:            controllerIdentities,
+		DispatchProber:              controller.NewServerDispatchProber(manager.GetAPIReader(), restConfig, options.webhook.namespace, options.webhook.validatingConfigurationName),
+		MinorGate:                   controller.NewServerVersionGate(discoveryClient),
+		IdentityProber:              controller.NewServerControllerIdentityProber(manager.GetClient(), controllerIdentities, identityProbeStore),
+		AttestedRequestTimeout:      options.attestedRequestTimeout,
+		ValidatingWebhookConfigName: options.webhook.validatingConfigurationName,
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
@@ -171,6 +176,7 @@ func main() {
 			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{
 				FencingReceiptVerifier:    handshakeCodec,
 				FencingControllerUsername: "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+				NamespaceStateReader:      manager.GetAPIReader(),
 			}).
 			Complete(); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardCluster")

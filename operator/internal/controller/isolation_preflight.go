@@ -19,6 +19,8 @@ const (
 	isolationMultipleClustersCondition      = "IsolationMultipleClusters"
 	isolationLimitRangePresentCondition     = "IsolationLimitRangePresent"
 	isolationSupportingRollingCondition     = "IsolationSupportingRolling"
+	isolationDrainUnattestedCondition       = "IsolationDrainBoundUnattested"
+	isolationSealedParentDriftCondition     = "IsolationSealedParentDrift"
 	dispatchUnconvergedReasonUnsupportedHA  = "ha-unsupported"
 )
 
@@ -31,16 +33,40 @@ var isolationPreflightConditions = []string{
 	isolationMultipleClustersCondition,
 	isolationLimitRangePresentCondition,
 	isolationSupportingRollingCondition,
+	isolationDrainUnattestedCondition,
+	isolationSealedParentDriftCondition,
 }
 
 // dispatchProof is the result of a dispatch-convergence probe. converged is true
 // only when EVERY live API-server backend returned the exact sentinel denial.
 // tupleHash binds the proof to {webhook-config resourceVersion, backend
 // EndpointSlice addresses + their resourceVersions}; any change invalidates it.
+// backends is the number of enumerated backend addresses: at most one means the
+// EndpointSlices do not prove physical-backend enumeration (a lone address may
+// be an opaque VIP), which requires the explicit durable single-server
+// acknowledgement annotation.
 type dispatchProof struct {
 	tupleHash string
 	converged bool
+	backends  int
 	reason    string
+}
+
+// dispatchProofAccepted layers the enumeration-trust gate onto a converged
+// proof: a proof from at most one enumerated backend is accepted only with the
+// cluster's explicit durable single-server/provider acknowledgement. It returns
+// ok, or the ha-unsupported detail to surface.
+func dispatchProofAccepted(cluster *pgshardv1alpha1.PgShardCluster, proof dispatchProof) (bool, string) {
+	if !proof.converged {
+		return false, ""
+	}
+	if proof.backends > 1 {
+		return true, ""
+	}
+	if cluster.Annotations[pgshardv1alpha1.IsolationDispatchTopologyAckAnnotation] == pgshardv1alpha1.IsolationDispatchTopologyAckSingleServer {
+		return true, ""
+	}
+	return false, fmt.Sprintf("the kubernetes Service EndpointSlices enumerate %d API-server backend(s), which cannot prove physical-backend enumeration (an opaque VIP may hide unproven backends); set the %s=%s annotation to attest the published endpoint is the complete backend set", proof.backends, pgshardv1alpha1.IsolationDispatchTopologyAckAnnotation, pgshardv1alpha1.IsolationDispatchTopologyAckSingleServer)
 }
 
 // dispatchProber proves that every live API-server backend dispatches Pod CREATE
@@ -122,6 +148,10 @@ func (r *PgShardClusterReconciler) preflightConverged(ctx context.Context, clust
 		r.setIsolationPreflightCondition(cluster, condition, reason, proof.reasonMessage())
 		return proof, false
 	}
+	if ok, detail := dispatchProofAccepted(cluster, proof); !ok {
+		r.setIsolationPreflightCondition(cluster, isolationHAUnsupportedCondition, "EnumerationUnproven", detail)
+		return proof, false
+	}
 	clearIsolationPreflightConditions(cluster)
 	return proof, true
 }
@@ -143,7 +173,8 @@ func (r *PgShardClusterReconciler) revalidateDispatchTuple(ctx context.Context, 
 			return false, fmt.Errorf("re-prove dispatch convergence: %w", err)
 		}
 	}
-	if r.DispatchProber != nil && proof.converged && proof.tupleHash == receipt.DispatchTupleHash {
+	accepted, ackDetail := dispatchProofAccepted(cluster, proof)
+	if r.DispatchProber != nil && accepted && proof.tupleHash == receipt.DispatchTupleHash {
 		return true, nil
 	}
 	// Invalidated. Hold a durable deny phase (QUIESCE) and re-enumerate; never drop
@@ -155,9 +186,14 @@ func (r *PgShardClusterReconciler) revalidateDispatchTuple(ctx context.Context, 
 	condition := isolationDispatchNotConvergedCondition
 	reason := "TupleInvalidated"
 	message := "the dispatch-convergence proof was invalidated (API-server backend set or webhook config changed during activation); the namespace is held quiesced while re-proving"
-	if proof.converged {
-		// The new tuple is itself converged: re-seal under it while staying quiesced.
+	if accepted {
+		// The new tuple is itself converged and accepted: re-seal under it while
+		// staying quiesced.
 		receipt.DispatchTupleHash = proof.tupleHash
+	} else if proof.converged {
+		condition = isolationHAUnsupportedCondition
+		reason = "EnumerationUnproven"
+		message = ackDetail
 	} else if proof.reason == dispatchUnconvergedReasonUnsupportedHA {
 		condition = isolationHAUnsupportedCondition
 		reason = "UnsupportedHA"

@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -102,11 +103,32 @@ type PodFencingReceiptVerifier interface {
 type PgShardClusterValidator struct {
 	FencingReceiptVerifier    PodFencingReceiptVerifier
 	FencingControllerUsername string
+	// NamespaceStateReader authoritatively reads a namespace's existing clusters
+	// for the isolation-exclusivity gate: creating a SECOND PgShardCluster in a
+	// namespace whose cluster holds an activating or active isolation receipt is
+	// denied continuously at admission, not only by the point-in-time preflight
+	// LIST. Optional; nil skips the gate (unit fixtures).
+	NamespaceStateReader client.Reader
 }
 
-func (v *PgShardClusterValidator) ValidateCreate(_ context.Context, cluster *PgShardCluster) (admission.Warnings, error) {
+func (v *PgShardClusterValidator) ValidateCreate(ctx context.Context, cluster *PgShardCluster) (admission.Warnings, error) {
 	allErrs := validateClusterFields(cluster)
 	allErrs = append(allErrs, reservedPodFencingMetadataErrors(cluster)...)
+	if v.NamespaceStateReader != nil {
+		list := &PgShardClusterList{}
+		if err := v.NamespaceStateReader.List(ctx, list, client.InNamespace(cluster.Namespace)); err != nil {
+			return warningsFor(cluster), fmt.Errorf("read namespace clusters for isolation exclusivity: %w", err)
+		}
+		for i := range list.Items {
+			existing := &list.Items[i]
+			receipt := existing.Status.IsolationReceipt
+			if existing.UID != cluster.UID && receipt != nil && receipt.Phase != "" && receipt.Phase != IsolationInactive {
+				allErrs = append(allErrs, field.Forbidden(field.NewPath("metadata", "namespace"),
+					fmt.Sprintf("namespace %s is isolation-%s for PgShardCluster %s; a second cluster may not be created there", cluster.Namespace, receipt.Phase, existing.Name)))
+				break
+			}
+		}
+	}
 	return warningsFor(cluster), invalidIfAny(cluster.Name, allErrs)
 }
 

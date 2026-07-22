@@ -20,10 +20,12 @@ import (
 	"github.com/andrew01234567890/pgshard/operator/internal/pki"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -41,6 +43,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -87,6 +90,15 @@ type PgShardClusterReconciler struct {
 	MinorGate        minorGate
 	IdentityProber   controllerIdentityProber
 	ControllerIdents podfence.ControllerIdentities
+	// AttestedRequestTimeout is the installation-attested maximum whole-request
+	// lifetime across every API server (the effective --request-timeout ceiling).
+	// The drain ceremonies consume it (plus a one-second truncation margin); zero
+	// means UNATTESTED, which withholds isolation activation and falls back to the
+	// conservative one-minute default for ordinary supporting rolls.
+	AttestedRequestTimeout time.Duration
+	// ValidatingWebhookConfigName scopes the dispatch-tuple watch to the pgshard
+	// validating webhook configuration.
+	ValidatingWebhookConfigName string
 }
 
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
@@ -99,12 +111,14 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get
 // +kubebuilder:rbac:groups="",resources=limitranges,verbs=get;list
-// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=apps,resources=replicasets/scale,verbs=get;update
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -311,6 +325,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	plan, err := owned.Plan(cluster, images)
 	if err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if err := r.holdPlanTemplatesDuringActivation(ctx, cluster, plan); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "ContractStampFailed", fmt.Sprintf("cannot hold protected templates during activation: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 	if err := r.stampPlanContracts(ctx, cluster, plan); err != nil {
@@ -3275,9 +3293,15 @@ func ptrString(policy *corev1.PreemptionPolicy) string {
 // the stamps in status. It mutates the plan objects in place before ownership
 // preflight and apply so the stamp is part of the desired object throughout.
 //
-// STEP-1 SCOPE: this establishes the stamping mechanism only. The security
-// generation is stamped at its current recorded value (initialized to 1); the
-// barrier/bump logic and admission-side verification are later steps.
+// PRODUCTION GENERATION BUMP: whenever a workload's canonical contract changes —
+// the desired template no longer hashes to the recorded contract at the recorded
+// generation — the security generation is durably INCREMENTED before the plan is
+// applied (the contracts checkpoint below persists ahead of applyPlan). The
+// classifier is deliberately conservative: the canonical contract normal form is
+// exactly the security-relevant surface (images, security contexts, mounts,
+// service accounts, capabilities, composition), so ANY contract change is
+// treated as security-strengthening and raises the revocation barrier; a stale
+// template can then never be admitted after the change lands.
 func (r *PgShardClusterReconciler) stampPlanContracts(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object) error {
 	memberContracts := make([]pgshardv1alpha1.PostgreSQLMemberContractStatus, 0, len(cluster.Status.PostgreSQLMemberContracts))
 	supportingContracts := make([]pgshardv1alpha1.SupportingContractStatus, 0, len(cluster.Status.SupportingContracts))
@@ -3287,6 +3311,15 @@ func (r *PgShardClusterReconciler) stampPlanContracts(ctx context.Context, clust
 			continue
 		}
 		generation := recordedContractGeneration(cluster, class, shard, member)
+		if recorded := recordedContractHash(cluster, class, shard, member); recorded != "" {
+			candidate, err := owned.ComputeContractStamp(class, string(cluster.UID), shard, member, generation, template)
+			if err != nil {
+				return fmt.Errorf("classify %s workload contract change for shard %d member %d: %w", class, shard, member, err)
+			}
+			if candidate != recorded {
+				generation++
+			}
+		}
 		hash, err := owned.ApplyContractStamp(template, class, string(cluster.UID), shard, member, generation)
 		if err != nil {
 			return fmt.Errorf("stamp %s workload contract for shard %d member %d: %w", class, shard, member, err)
@@ -3366,6 +3399,24 @@ func recordedContractGeneration(cluster *pgshardv1alpha1.PgShardCluster, class o
 		}
 	}
 	return 1
+}
+
+func recordedContractHash(cluster *pgshardv1alpha1.PgShardCluster, class owned.PodClass, shard, member int32) string {
+	switch class {
+	case owned.ClassPooler, owned.ClassOrchestrator:
+		for _, recorded := range cluster.Status.SupportingContracts {
+			if recorded.Class == string(class) {
+				return recorded.ContractHash
+			}
+		}
+	default:
+		for _, recorded := range cluster.Status.PostgreSQLMemberContracts {
+			if recorded.Shard == shard && recorded.Member == member {
+				return recorded.ContractHash
+			}
+		}
+	}
+	return ""
 }
 
 func parseIdentityLabel(value string) (int32, bool) {
@@ -5757,6 +5808,55 @@ func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error 
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
+		// The dispatch tuple is FROZEN through ACTIVE by watching its inputs: any
+		// change to the kubernetes Service EndpointSlices (the backend set) or the
+		// pgshard validating webhook configuration wakes every activating/active
+		// cluster, whose phase drive revalidates the tuple and re-quiesces on
+		// mismatch. Combined with the final re-proof before the ACTIVE write, no
+		// interval is left in which the proof can silently rot.
+		Watches(&discoveryv1.EndpointSlice{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueIsolationBoundClusters),
+			builder.WithPredicates(kubernetesBackendSliceEvents())).
+		Watches(&admissionregistrationv1.ValidatingWebhookConfiguration{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueIsolationBoundClusters),
+			builder.WithPredicates(r.dispatchWebhookConfigEvents())).
 		Named("pgshardcluster").
 		Complete(r)
+}
+
+// kubernetesBackendSliceEvents matches only the EndpointSlices that publish the
+// kubernetes Service backends in the default namespace — the exact objects the
+// dispatch tuple hashes.
+func kubernetesBackendSliceEvents() predicate.Funcs {
+	matches := func(object client.Object) bool {
+		return object.GetNamespace() == metav1.NamespaceDefault &&
+			object.GetLabels()[discoveryv1.LabelServiceName] == "kubernetes"
+	}
+	return predicate.NewPredicateFuncs(matches)
+}
+
+// dispatchWebhookConfigEvents matches only the pgshard validating webhook
+// configuration the dispatch tuple hashes.
+func (r *PgShardClusterReconciler) dispatchWebhookConfigEvents() predicate.Funcs {
+	return predicate.NewPredicateFuncs(func(object client.Object) bool {
+		return r.ValidatingWebhookConfigName != "" && object.GetName() == r.ValidatingWebhookConfigName
+	})
+}
+
+// enqueueIsolationBoundClusters wakes every cluster whose isolation receipt is
+// bound to the dispatch tuple (any phase past INACTIVE, including ACTIVE).
+func (r *PgShardClusterReconciler) enqueueIsolationBoundClusters(ctx context.Context, _ client.Object) []ctrl.Request {
+	list := &pgshardv1alpha1.PgShardClusterList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil
+	}
+	requests := []ctrl.Request{}
+	for i := range list.Items {
+		cluster := &list.Items[i]
+		if isolationReceiptPhase(cluster.Status.IsolationReceipt) == pgshardv1alpha1.IsolationInactive {
+			continue
+		}
+		requests = append(requests, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}})
+	}
+	return requests
 }

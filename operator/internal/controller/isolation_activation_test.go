@@ -2,10 +2,12 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -33,7 +35,7 @@ func (f fakeDispatchProber) Prove(ctx context.Context, namespace string) (dispat
 // convergedDispatch matches the empty tuple hash used by the drive tests, so
 // revalidateDispatchTuple treats the in-progress activation as still valid.
 func convergedDispatch(tupleHash string) fakeDispatchProber {
-	return fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: tupleHash}}
+	return fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: tupleHash}}
 }
 
 func clusterControllerRef(cluster *pgshardv1alpha1.PgShardCluster) metav1.OwnerReference {
@@ -152,8 +154,11 @@ func TestDriveIsolationQuiesceBlocksOnForeignPod(t *testing.T) {
 		ActivatedAt:   metav1.NewTime(time.Now().Add(-2 * supportingRevocationDrain)),
 		SealedParents: []pgshardv1alpha1.SealedParent{{Kind: "StatefulSet", Name: "x", UID: "sts-uid"}},
 	}
+	// The sealed parent's live incarnation matches its seal, so the drift
+	// detector does not reseal and the foreign pod is what blocks.
+	sealedLive := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: genTestNamespace, UID: "sts-uid"}}
 	foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "intruder", Namespace: genTestNamespace}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c"}}}}
-	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, foreign)
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, sealedLive, foreign)
 	reconciler.DispatchProber = convergedDispatch("")
 
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
@@ -172,14 +177,85 @@ func TestDriveIsolationQuiesceBlocksOnForeignPod(t *testing.T) {
 	}
 }
 
+// guardedPoolerChain builds a fully valid guarded replacement chain in the
+// fenced namespace: a stamped, digest-pinned pooler Deployment, its ReplicaSet,
+// a topology Node, and a BOUND live pod that passes the full shared
+// live-contract validation.
+func guardedPoolerChain(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster) (*appsv1.Deployment, *appsv1.ReplicaSet, *corev1.Node, *corev1.Pod) {
+	t.Helper()
+	controller := true
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:      map[string]string{owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "pooler"},
+			Annotations: map[string]string{owned.PostgreSQLPodClusterUIDAnnotation: string(cluster.UID)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "workload", Image: "pgshard/example@sha256:" + strings.Repeat("0", 64)}}},
+	}
+	if _, err := owned.ApplyContractStamp(&template, owned.ClassPooler, string(cluster.UID), 0, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	replicas := int32(1)
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: cluster.Name + owned.PoolerSuffix, Namespace: genTestNamespace, UID: "guard-deploy-uid", Generation: 1,
+			Labels:          map[string]string{owned.ManagedByLabel: owned.ManagedByValue, owned.ComponentLabel: "pooler", owned.ClusterLabel: cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{clusterControllerRef(cluster)},
+		},
+		Spec: appsv1.DeploymentSpec{Replicas: &replicas, Template: template},
+	}
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: deployment.Name + "-77abcde", Namespace: genTestNamespace, UID: "guard-rs-uid",
+			Labels:          map[string]string{"pod-template-hash": "77abcde"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: deployment.Name, UID: deployment.UID, Controller: &controller}},
+		},
+		Spec: appsv1.ReplicaSetSpec{Replicas: &replicas, Template: *template.DeepCopy()},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "guard-node", UID: "guard-node-uid",
+			Labels: map[string]string{corev1.LabelTopologyZone: "zone-a", corev1.LabelTopologyRegion: "region-a"},
+		},
+		Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{BootID: "guard-boot"}},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: replicaSet.Name + "-xyz", Namespace: genTestNamespace, UID: "guard-pod-uid",
+			Labels: map[string]string{
+				owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "pooler", "pod-template-hash": "77abcde",
+				corev1.LabelTopologyZone: "zone-a", corev1.LabelTopologyRegion: "region-a",
+			},
+			Annotations:     map[string]string{},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: replicaSet.Name, UID: replicaSet.UID, Controller: &controller}},
+		},
+		Spec: *template.Spec.DeepCopy(),
+	}
+	for key, value := range template.Annotations {
+		pod.Annotations[key] = value
+	}
+	pod.Spec.NodeName = node.Name
+	pod.Annotations[podfence.NodeUIDAnnotation] = string(node.UID)
+	pod.Annotations[podfence.NodeBootIDAnnotation] = node.Status.NodeInfo.BootID
+	return deployment, replicaSet, node, pod
+}
+
 func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 	t.Parallel()
 	activatedAt := metav1.Now()
 	cluster := genCluster("recreatecase", "recreatecase-uid")
+	deployment, replicaSet, node, replacement := guardedPoolerChain(t, cluster)
 	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
-		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActivatingRecreate, SecurityGeneration: 1, ActivatedAt: activatedAt,
-		// QUIESCE sealed the protected pods to recreate by exact UID.
+		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActivatingRecreate,
+		SecurityGeneration: 1, MinAcceptableSecurityGeneration: 1, ActivatedAt: activatedAt,
+		// QUIESCE sealed the protected pods to recreate by exact UID, and the
+		// parents (with their guarded replacement cardinality) at their exact
+		// incarnation.
 		RecreatePendingUIDs: []string{"pre-uid"},
+		SealedParents: []pgshardv1alpha1.SealedParent{{
+			Kind: "Deployment", Name: deployment.Name, UID: string(deployment.UID),
+			Generation: deployment.Generation, Replicas: 1,
+			ContractHash: deployment.Spec.Template.Annotations[owned.PodContractHashAnnotation],
+		}},
 	}
 	// A pre-guard member pod (created before the recreate phase) must be deleted.
 	preGuard := &corev1.Pod{
@@ -191,7 +267,7 @@ func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "postgresql"}}},
 	}
-	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, preGuard)
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, deployment, replicaSet, node, preGuard)
 	reconciler.DispatchProber = convergedDispatch("")
 
 	// First pass deletes the pre-guard pod and stays in RECREATE.
@@ -205,8 +281,25 @@ func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 		t.Fatalf("phase advanced before the pre-guard pod drained: %q", got)
 	}
 
-	// With no pre-guard pods left and a clean inventory, recreate activates.
+	// With the sealed UIDs gone but the guarded replacement NOT yet created, the
+	// namespace must NOT activate: an empty namespace is not a completed recreate.
 	fresh := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloadReceipt(t, kubeClient, cluster).Phase; got != pgshardv1alpha1.IsolationActivatingRecreate {
+		t.Fatalf("phase over an empty namespace = %q, want ACTIVATING_RECREATE (no replacements exist)", got)
+	}
+
+	// Once the controllers recreate the guarded replacement (bound + fully valid
+	// under the shared live-contract validation, at the sealed cardinality),
+	// recreate activates.
+	if err := kubeClient.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), fresh); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +308,7 @@ func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 	}
 	receipt := reloadReceipt(t, kubeClient, cluster)
 	if receipt.Phase != pgshardv1alpha1.IsolationActive {
-		t.Fatalf("phase after reguard = %q, want ACTIVE", receipt.Phase)
+		t.Fatalf("phase after guarded replacements = %q, want ACTIVE", receipt.Phase)
 	}
 	if receipt.MinAcceptableSecurityGeneration != 1 || receipt.ResidueProfileHash == "" {
 		t.Fatalf("active receipt = %#v", receipt)

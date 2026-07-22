@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -11,6 +12,8 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
+	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -142,14 +145,39 @@ func (p *serverControllerIdentityProber) Probe(ctx context.Context, cluster *pgs
 	}
 	defer p.store.Forget(token)
 	objects := identityProbeObjects(cluster.Namespace, token)
-	defer p.cleanupProbe(ctx, objects)
+	// Registration precedes creation: the owner keys are the prober-chosen names,
+	// so the webhooks accept observations only for the authoritative probe
+	// objects — never for a forged owner reference — with no create/registration
+	// race window.
+	ownerKeys := []string{}
 	for _, object := range objects {
-		if err := p.client.Create(ctx, object); err != nil {
-			return false, "", fmt.Errorf("create identity-probe object %T: %w", object, err)
+		switch object.(type) {
+		case *appsv1.StatefulSet:
+			ownerKeys = append(ownerKeys, podfence.IdentityOwnerKey("StatefulSet", object.GetName()))
+		case *appsv1.Deployment:
+			ownerKeys = append(ownerKeys, podfence.IdentityOwnerKey("Deployment", object.GetName()))
 		}
 	}
+	p.store.Register(token, ownerKeys...)
+	created := []client.Object{}
+	for _, object := range objects {
+		if err := p.client.Create(ctx, object); err != nil {
+			cleanupErr := p.cleanupProbe(ctx, created)
+			return false, "", errors.Join(fmt.Errorf("create identity-probe object %T: %w", object, err), cleanupErr)
+		}
+		created = append(created, object)
+	}
 
-	observed, complete := p.awaitObservations(ctx, token)
+	observed, conflicted, complete := p.awaitObservations(ctx, token)
+	cleanupErr := p.cleanupProbe(ctx, created)
+	if cleanupErr != nil {
+		// Cleanup must be verified: a probe workload left behind is a foreign
+		// object in the fenced namespace and must fail the probe, not be ignored.
+		return false, "", cleanupErr
+	}
+	if conflicted {
+		return false, "controller-identity probe observed conflicting verified identities for a role; refusing to activate", nil
+	}
 	if !complete {
 		return false, fmt.Sprintf("controller-identity probe did not observe every controller within %s (observed %d of 4)", p.timeout, observed.count()), nil
 	}
@@ -160,36 +188,45 @@ func (p *serverControllerIdentityProber) Probe(ctx context.Context, cluster *pgs
 }
 
 // awaitObservations polls the store until all four controller roles are recorded
-// for the token or the probe deadline elapses.
-func (p *serverControllerIdentityProber) awaitObservations(ctx context.Context, token string) (controllerIdentitySet, bool) {
+// for the token, a conflict is detected, or the probe deadline elapses.
+func (p *serverControllerIdentityProber) awaitObservations(ctx context.Context, token string) (controllerIdentitySet, bool, bool) {
 	deadline := time.Now().Add(p.timeout)
 	for {
-		roles := p.store.Observed(token)
+		roles, conflicted := p.store.Observed(token)
 		observed := controllerIdentitySet{
 			statefulSet: roles[podfence.IdentityRoleStatefulSet],
 			replicaSet:  roles[podfence.IdentityRoleReplicaSet],
 			deployment:  roles[podfence.IdentityRoleDeployment],
 			hpa:         roles[podfence.IdentityRoleHPA],
 		}
+		if conflicted {
+			return observed, true, false
+		}
 		if observed.statefulSet != "" && observed.replicaSet != "" && observed.deployment != "" && observed.hpa != "" {
-			return observed, true
+			return observed, false, true
 		}
 		if time.Now().After(deadline) {
-			return observed, false
+			return observed, false, false
 		}
 		select {
 		case <-ctx.Done():
-			return observed, false
+			return observed, false, false
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
 
-func (p *serverControllerIdentityProber) cleanupProbe(ctx context.Context, objects []client.Object) {
+// cleanupProbe deletes every probe object and VERIFIES completion; delete errors
+// are returned, never ignored.
+func (p *serverControllerIdentityProber) cleanupProbe(ctx context.Context, objects []client.Object) error {
 	background := metav1.DeletePropagationBackground
+	var errs []error
 	for _, object := range objects {
-		_ = p.client.Delete(context.WithoutCancel(ctx), object, &client.DeleteOptions{PropagationPolicy: &background})
+		if err := p.client.Delete(context.WithoutCancel(ctx), object, &client.DeleteOptions{PropagationPolicy: &background}); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("delete identity-probe object %T %s: %w", object, object.GetName(), err))
+		}
 	}
+	return errors.Join(errs...)
 }
 
 func newProbeToken() (string, error) {

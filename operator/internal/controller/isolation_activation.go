@@ -14,11 +14,13 @@ import (
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -87,9 +89,25 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 			r.setIsolationPreflightCondition(cluster, isolationSupportingRollingCondition, "SupportingRolling", "isolation activation is withheld while a supporting-generation roll is in progress")
 			return false, r.Status().Update(ctx, cluster)
 		}
+		// The drain ceremonies rest on the installation-attested maximum
+		// whole-request lifetime; without the attestation the bound is an assumption
+		// and activation is withheld.
+		if r.AttestedRequestTimeout <= 0 {
+			r.setIsolationPreflightCondition(cluster, isolationDrainUnattestedCondition, "Unattested", "isolation activation requires the installation-attested maximum API request lifetime (--attested-max-request-timeout); the whole-request drain bound cannot be assumed")
+			return false, r.Status().Update(ctx, cluster)
+		}
 		proof, ok := r.preflightConverged(ctx, cluster)
 		if !ok {
 			// The preflight surfaced its own typed condition; withhold activation.
+			return false, r.Status().Update(ctx, cluster)
+		}
+		// Namespace exclusivity is claimed race-free through an atomic Lease CREATE
+		// before the receipt write: two clusters racing the preflight LIST cannot
+		// both hold it.
+		if held, err := r.acquireIsolationExclusivityLease(ctx, cluster); err != nil {
+			return false, err
+		} else if !held {
+			r.setIsolationPreflightCondition(cluster, isolationMultipleClustersCondition, "ExclusivityHeld", "the namespace isolation-activation lease is held by another PgShardCluster")
 			return false, r.Status().Update(ctx, cluster)
 		}
 		cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
@@ -122,6 +140,13 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
 		return true, err
 	}
+	// Protected templates are frozen during the ceremony, so a supporting roll
+	// here means external interference with the admissible set: hold the durable
+	// deny phase rather than advancing.
+	if supportingRollInProgress(cluster) {
+		r.setIsolationPreflightCondition(cluster, isolationSupportingRollingCondition, "SupportingRolling", "a supporting-generation roll began mid-activation; the namespace is held quiesced until it converges")
+		return true, r.Status().Update(ctx, cluster)
+	}
 	receipt := cluster.Status.IsolationReceipt
 	if len(receipt.SealedParents) == 0 {
 		sealed, err := r.sealProtectedParents(ctx, cluster)
@@ -135,13 +160,16 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 		}
 		return true, nil
 	}
+	if drifted, err := r.resealOnSealedParentDrift(ctx, cluster); err != nil || drifted {
+		return true, err
+	}
 	// A full-second safety margin covers the one-second truncation of the
 	// metav1.Time drain start plus modest clock skew, so the drain never completes
 	// early and lets a pre-quiesce in-flight create persist.
-	if time.Since(receipt.ActivatedAt.Time) < supportingRevocationDrain+time.Second {
+	if time.Since(receipt.ActivatedAt.Time) < r.revocationDrainWindow()+time.Second {
 		return true, nil
 	}
-	blocked, residue, err := r.inventoryNamespace(ctx, cluster)
+	blocked, _, residue, err := r.inventoryNamespace(ctx, cluster, false)
 	if err != nil {
 		return false, err
 	}
@@ -157,6 +185,10 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 	receipt.ResidueProfileHash = residue
 	receipt.RecreatePendingUIDs = pending
 	receipt.Phase = pgshardv1alpha1.IsolationActivatingRecreate
+	// The isolation generation floor is enforced from the FIRST guarded create:
+	// RECREATE applies both this floor and the per-class CAS barrier, not only
+	// ACTIVE.
+	receipt.MinAcceptableSecurityGeneration = receipt.SecurityGeneration
 	receipt.ActivatedAt = metav1.Now()
 	meta.RemoveStatusCondition(&cluster.Status.Conditions, isolationActivationBlockedCondition)
 	if err := r.Status().Update(ctx, cluster); err != nil {
@@ -165,12 +197,76 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 	return true, nil
 }
 
+// resealOnSealedParentDrift compares every sealed parent to its live object. On
+// ANY drift — a parent deleted, recreated under a new UID, or its spec
+// generation/contract hash moved — it returns the ceremony to the start of
+// QUIESCE with the sealed state cleared, so the parents are re-sealed at their
+// new incarnation instead of deadlocking every replacement against a stale seal.
+func (r *PgShardClusterReconciler) resealOnSealedParentDrift(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	receipt := cluster.Status.IsolationReceipt
+	reader := r.authoritativeReader()
+	drifted := ""
+	for i := range receipt.SealedParents {
+		sealed := &receipt.SealedParents[i]
+		var liveUID string
+		var liveGeneration int64
+		var liveHash string
+		switch sealed.Kind {
+		case "StatefulSet":
+			statefulSet := &appsv1.StatefulSet{}
+			if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: sealed.Name}, statefulSet); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return false, fmt.Errorf("read sealed StatefulSet %s for drift detection: %w", sealed.Name, err)
+				}
+			} else {
+				liveUID, liveGeneration, liveHash = string(statefulSet.UID), statefulSet.Generation, statefulSet.Spec.Template.Annotations[owned.PodContractHashAnnotation]
+			}
+		case "Deployment":
+			deployment := &appsv1.Deployment{}
+			if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: sealed.Name}, deployment); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return false, fmt.Errorf("read sealed Deployment %s for drift detection: %w", sealed.Name, err)
+				}
+			} else {
+				liveUID, liveGeneration, liveHash = string(deployment.UID), deployment.Generation, deployment.Spec.Template.Annotations[owned.PodContractHashAnnotation]
+			}
+		}
+		if liveUID != sealed.UID || liveGeneration != sealed.Generation || liveHash != sealed.ContractHash {
+			drifted = sealed.Kind + "/" + sealed.Name
+			break
+		}
+	}
+	if drifted == "" {
+		return false, nil
+	}
+	receipt.Phase = pgshardv1alpha1.IsolationActivatingQuiesce
+	receipt.SealedParents = nil
+	receipt.RecreatePendingUIDs = nil
+	receipt.ActivatedAt = metav1.Now()
+	r.setIsolationPreflightCondition(cluster, isolationSealedParentDriftCondition, "SealedParentDrift", fmt.Sprintf("sealed parent %s drifted from its sealed incarnation during activation; the ceremony re-quiesced to reseal", drifted))
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return false, fmt.Errorf("reseal after sealed-parent drift: %w", err)
+	}
+	return true, nil
+}
+
 // driveIsolationRecreate deletes every sealed pre-guard protected pod (by UID,
-// including terminating ones) so the controllers recreate each under the guard,
-// and only advances to ACTIVE once none of the sealed UIDs remains and the full
-// inventory validates. It never infers authentication from CreationTimestamp.
+// including terminating ones) so the controllers recreate each under the guard.
+// It advances to ACTIVE only once: no sealed UID remains, NO pod in the
+// namespace is still terminating (authoritative API absence), every sealed
+// parent's guarded replacement set exists at its sealed cardinality and every
+// pod passes the full shared live-contract validation, and a FINAL dispatch
+// re-proof succeeds immediately before the ACTIVE status write. It never infers
+// authentication from CreationTimestamp.
 func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
+		return true, err
+	}
+	if supportingRollInProgress(cluster) {
+		r.setIsolationPreflightCondition(cluster, isolationSupportingRollingCondition, "SupportingRolling", "a supporting-generation roll began mid-activation; ACTIVE is withheld until it converges")
+		return true, r.Status().Update(ctx, cluster)
+	}
+	if drifted, err := r.resealOnSealedParentDrift(ctx, cluster); err != nil || drifted {
 		return true, err
 	}
 	receipt := cluster.Status.IsolationReceipt
@@ -184,8 +280,12 @@ func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, c
 		return false, fmt.Errorf("list pods for isolation recreate: %w", err)
 	}
 	remaining := 0
+	terminating := 0
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil {
+			terminating++
+		}
 		if _, sealed := pending[string(pod.UID)]; !sealed {
 			continue
 		}
@@ -196,17 +296,36 @@ func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, c
 			}
 		}
 	}
-	if remaining > 0 {
-		// Some pre-guard pod is still being deleted (or its guarded replacement not
-		// yet created); wait until every sealed UID is gone.
+	if remaining > 0 || terminating > 0 {
+		// A pre-guard pod is still being deleted, or SOME pod has not reached
+		// authoritative API absence; the transition blocks on every terminating pod.
 		return true, nil
 	}
-	blocked, residue, err := r.inventoryNamespace(ctx, cluster)
+	blocked, waiting, residue, err := r.inventoryNamespace(ctx, cluster, true)
 	if err != nil {
 		return false, err
 	}
 	if blocked != "" {
 		return r.blockIsolation(ctx, cluster, blocked)
+	}
+	if waiting != "" {
+		// A replacement exists but is not yet fully validated (e.g. not yet bound);
+		// wait, do not activate.
+		return true, nil
+	}
+	if complete, err := r.guardedReplacementsComplete(ctx, cluster); err != nil {
+		return false, err
+	} else if !complete {
+		// The controllers have not yet recreated every guarded replacement the
+		// sealed parents require; an EMPTY namespace must never activate.
+		return true, nil
+	}
+	// FINAL dispatch re-proof immediately before the ACTIVE CAS, closing the
+	// interval between the last revalidation and the status write; subsequent
+	// tuple changes re-quiesce via the EndpointSlice/webhook-config watches and
+	// the ACTIVE-phase revalidation.
+	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
+		return true, err
 	}
 	receipt.ResidueProfileHash = residue
 	receipt.RecreatePendingUIDs = nil
@@ -218,6 +337,48 @@ func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, c
 		return false, fmt.Errorf("activate isolation: %w", err)
 	}
 	return false, nil
+}
+
+// guardedReplacementsComplete proves the guarded replacement set: every sealed
+// parent must own exactly its sealed cardinality of live, non-terminating,
+// fully validated pods (validated by inventoryNamespace, which already resolved
+// each pod's sealed parent). It re-lists and re-validates so the count is bound
+// to the same authoritative view.
+func (r *PgShardClusterReconciler) guardedReplacementsComplete(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	receipt := cluster.Status.IsolationReceipt
+	// An EMPTY sealed-parent set can never activate: a real cluster always has
+	// protected parents, so an empty seal means the ceremony state is incoherent
+	// (and an empty namespace would otherwise activate vacuously).
+	if len(receipt.SealedParents) == 0 {
+		return false, nil
+	}
+	reader := r.authoritativeReader()
+	pods := &corev1.PodList{}
+	if err := reader.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return false, fmt.Errorf("list pods for guarded replacement proof: %w", err)
+	}
+	counts := map[string]int32{}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil {
+			return false, nil
+		}
+		verdict, err := podfence.ValidateLiveProtectedPod(ctx, reader, pod, receipt, true)
+		if err != nil {
+			return false, err
+		}
+		if verdict.Reason != "" || verdict.SealedParent == nil {
+			return false, nil
+		}
+		counts[verdict.SealedParent.Kind+"/"+verdict.SealedParent.UID]++
+	}
+	for i := range receipt.SealedParents {
+		sealed := &receipt.SealedParents[i]
+		if counts[sealed.Kind+"/"+sealed.UID] != sealed.Replicas {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // protectedPodUIDs returns the UIDs of every live protected pod in the namespace.
@@ -236,12 +397,18 @@ func (r *PgShardClusterReconciler) protectedPodUIDs(ctx context.Context, cluster
 	return uids, nil
 }
 
-// driveIsolationActive re-inventories under enforcement. On drift — a pod that no
-// longer validates the full live contract — it does not merely raise a condition;
-// it returns the receipt to ACTIVATING_QUIESCE so the parents are re-sealed, the
+// driveIsolationActive re-validates dispatch convergence (ACTIVE is not exempt:
+// a backend-set or webhook-config change re-quiesces via revalidateDispatchTuple,
+// and the EndpointSlice/webhook-config watches wake this reconcile on every such
+// event) and re-inventories under enforcement. On drift — a pod that no longer
+// validates the full live contract — it does not merely raise a condition; it
+// returns the receipt to ACTIVATING_QUIESCE so the parents are re-sealed, the
 // namespace re-drained, and every protected pod re-recreated under the guard.
 func (r *PgShardClusterReconciler) driveIsolationActive(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
-	blocked, _, err := r.inventoryNamespace(ctx, cluster)
+	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
+		return true, err
+	}
+	blocked, _, _, err := r.inventoryNamespace(ctx, cluster, false)
 	if err != nil {
 		return false, err
 	}
@@ -299,8 +466,13 @@ func (r *PgShardClusterReconciler) sealProtectedParents(ctx context.Context, clu
 		if set.Labels[owned.ComponentLabel] != "postgresql" || !metav1.IsControlledBy(set, cluster) {
 			continue
 		}
+		replicas := int32(1)
+		if set.Spec.Replicas != nil {
+			replicas = *set.Spec.Replicas
+		}
 		sealed = append(sealed, pgshardv1alpha1.SealedParent{
 			Kind: "StatefulSet", Name: set.Name, UID: string(set.UID), ResourceVersion: set.ResourceVersion,
+			Generation: set.Generation, Replicas: replicas,
 			ContractHash: set.Spec.Template.Annotations[owned.PodContractHashAnnotation],
 		})
 	}
@@ -315,8 +487,13 @@ func (r *PgShardClusterReconciler) sealProtectedParents(ctx context.Context, clu
 		if (component != "pooler" && component != "orchestrator") || !metav1.IsControlledBy(deployment, cluster) {
 			continue
 		}
+		replicas := int32(1)
+		if deployment.Spec.Replicas != nil {
+			replicas = *deployment.Spec.Replicas
+		}
 		sealed = append(sealed, pgshardv1alpha1.SealedParent{
 			Kind: "Deployment", Name: deployment.Name, UID: string(deployment.UID), ResourceVersion: deployment.ResourceVersion,
+			Generation: deployment.Generation, Replicas: replicas,
 			ContractHash: deployment.Spec.Template.Annotations[owned.PodContractHashAnnotation],
 		})
 	}
@@ -329,16 +506,23 @@ func (r *PgShardClusterReconciler) sealProtectedParents(ctx context.Context, clu
 	return sealed, nil
 }
 
-// inventoryNamespace enumerates every pod in the namespace. A foreign pod, a
-// managed-looking pod with a malformed identity, or a managed pod that is not
-// stamped at or above the receipt's security generation blocks activation and is
-// named. When the inventory is clean it returns a deterministic residue-profile
-// hash of the now-canonical stamped pods.
-func (r *PgShardClusterReconciler) inventoryNamespace(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (string, string, error) {
+// inventoryNamespace enumerates every pod in the namespace and runs the SHARED
+// full live-contract validation on each — the same live-parent, provenance,
+// LiveNormalForm-comparator, hash-recomputation, digest-pin, and generation
+// checks admission applies, via podfence.ValidateLiveProtectedPod — never a
+// coarser label/stamp re-implementation. It returns (blocked, waiting, residue):
+// blocked names a pod that permanently fails validation; waiting names a pod
+// that is transiently incomplete (terminating, or not yet bound) — under strict
+// mode (the RECREATE→ACTIVE transition) such pods hold the transition, while
+// steady mode (QUIESCE pre-drain and ACTIVE re-inventory) skips them because
+// terminating pre-guard pods are about to be deleted and a freshly created
+// guarded pod was already fully validated at admission. Under strict mode the
+// pod's sealed parent is also required.
+func (r *PgShardClusterReconciler) inventoryNamespace(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, strict bool) (string, string, string, error) {
 	reader := r.authoritativeReader()
 	pods := &corev1.PodList{}
 	if err := reader.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
-		return "", "", fmt.Errorf("inventory namespace pods: %w", err)
+		return "", "", "", fmt.Errorf("inventory namespace pods: %w", err)
 	}
 	floor := currentSecurityGeneration(cluster)
 	if cluster.Status.IsolationReceipt != nil && cluster.Status.IsolationReceipt.SecurityGeneration > floor {
@@ -348,31 +532,44 @@ func (r *PgShardClusterReconciler) inventoryNamespace(ctx context.Context, clust
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.DeletionTimestamp != nil {
+			if strict {
+				return "", pod.Name, "", nil
+			}
 			continue
 		}
 		kind := inventoryClass(pod)
 		if kind == "" {
-			return pod.Name, "", nil
+			return pod.Name, "", "", nil
 		}
 		hash := pod.Annotations[owned.PodContractHashAnnotation]
 		if hash == "" {
-			return pod.Name, "", nil
+			return pod.Name, "", "", nil
+		}
+		if pod.Spec.NodeName == "" {
+			// Created but not yet bound: full live validation is impossible. Strict
+			// mode waits for the binding; steady mode trusts the guarded admission
+			// that just validated the create.
+			if strict {
+				return "", pod.Name, "", nil
+			}
+			continue
 		}
 		generation, err := strconv.ParseInt(pod.Annotations[owned.PodSecurityGenerationAnnotation], 10, 64)
 		if err != nil || generation < floor {
-			return pod.Name, "", nil
+			return pod.Name, "", "", nil
 		}
-		// Every protected pod must be digest-pinned once isolation is active; each
-		// was already fully validated (LiveNormalForm + parent + hash + provenance)
-		// at its guarded create during RECREATE.
-		if owned.ValidateProtectedImagesDigestPinned(&pod.Spec) != nil {
-			return pod.Name, "", nil
+		verdict, err := podfence.ValidateLiveProtectedPod(ctx, reader, pod, cluster.Status.IsolationReceipt, strict)
+		if err != nil {
+			return "", "", "", err
+		}
+		if verdict.Reason != "" {
+			return pod.Name, "", "", nil
 		}
 		fingerprints = append(fingerprints, kind+":"+hash+":"+strconv.FormatInt(generation, 10))
 	}
 	sort.Strings(fingerprints)
 	sum := sha256.Sum256([]byte(strings.Join(fingerprints, "\n")))
-	return "", hex.EncodeToString(sum[:]), nil
+	return "", "", hex.EncodeToString(sum[:]), nil
 }
 
 // inventoryClass returns "member" or "supporting" for a protected pod, or "" for
@@ -422,9 +619,12 @@ func isolationOptedIn(cluster *pgshardv1alpha1.PgShardCluster, namespace *corev1
 
 // hasReplicationTLSPrerequisite reports whether a cluster's durable replication
 // transport is hardened enough to activate: the recorded transport policy is
-// server-tls-v1 and every shard has a complete replication-TLS checkpoint (CA
-// digest plus a server digest for every member). Single-member clusters gate off
-// until the ratified activation-TLS parity path lands.
+// server-tls-v1 and the TLS checkpoint set covers the EXACT spec topology — one
+// checkpoint per shard 0..spec.shards-1, each with a CA digest and a server
+// digest for every member 0..membersPerShard-1, no shard or member missing,
+// duplicated, or out of range. Any nonempty-but-incomplete coverage is
+// insufficient. Single-member clusters gate off until the ratified
+// activation-TLS parity path lands.
 func hasReplicationTLSPrerequisite(cluster *pgshardv1alpha1.PgShardCluster) bool {
 	if cluster.Spec.MembersPerShard <= 1 {
 		return false
@@ -433,14 +633,31 @@ func hasReplicationTLSPrerequisite(cluster *pgshardv1alpha1.PgShardCluster) bool
 	if spec == nil || spec.ReplicationTransportPolicy != pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1 {
 		return false
 	}
-	if len(cluster.Status.PostgreSQLReplicationTLS) == 0 {
+	shards := cluster.Spec.Shards
+	if shards < 1 {
+		shards = 1
+	}
+	if len(cluster.Status.PostgreSQLReplicationTLS) != int(shards) {
 		return false
 	}
+	seenShards := map[int32]bool{}
 	for _, shard := range cluster.Status.PostgreSQLReplicationTLS {
-		if shard.CASHA256 == "" || len(shard.Members) == 0 {
+		if shard.Shard < 0 || shard.Shard >= shards || seenShards[shard.Shard] {
 			return false
 		}
+		seenShards[shard.Shard] = true
+		if shard.CASHA256 == "" {
+			return false
+		}
+		if len(shard.Members) != int(cluster.Spec.MembersPerShard) {
+			return false
+		}
+		seenMembers := map[int32]bool{}
 		for _, member := range shard.Members {
+			if member.Member < 0 || member.Member >= cluster.Spec.MembersPerShard || seenMembers[member.Member] {
+				return false
+			}
+			seenMembers[member.Member] = true
 			if member.ServerSHA256 == "" {
 				return false
 			}
@@ -484,6 +701,88 @@ func (r *PgShardClusterReconciler) exactlyOneClusterInNamespace(ctx context.Cont
 		}
 	}
 	return live == 1, nil
+}
+
+// isolationExclusivityLeaseName is the namespace-scoped activation lock. Its
+// CREATE is atomic, so two clusters racing the preflight LIST cannot both claim
+// the namespace; the loser withholds with a typed condition. The Lease is
+// owner-referenced to its holder so a deleted cluster releases the claim via
+// garbage collection.
+const isolationExclusivityLeaseName = "pgshard-isolation-activation"
+
+func (r *PgShardClusterReconciler) acquireIsolationExclusivityLease(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	holder := string(cluster.UID)
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      isolationExclusivityLeaseName,
+			Namespace: cluster.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: pgshardv1alpha1.GroupVersion.String(),
+				Kind:       "PgShardCluster",
+				Name:       cluster.Name,
+				UID:        cluster.UID,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder},
+	}
+	if err := r.Create(ctx, lease); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return false, fmt.Errorf("create isolation exclusivity lease: %w", err)
+		}
+		existing := &coordinationv1.Lease{}
+		if err := r.authoritativeReader().Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: isolationExclusivityLeaseName}, existing); err != nil {
+			return false, fmt.Errorf("read isolation exclusivity lease: %w", err)
+		}
+		if existing.Spec.HolderIdentity == nil || *existing.Spec.HolderIdentity != holder {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// holdPlanTemplatesDuringActivation freezes every protected workload's pod
+// template at its live value while the activation ceremony (QUIESCE/RECREATE) is
+// in progress: the plan's member StatefulSets and supporting Deployments are
+// pinned to what is running, so no supporting roll can begin and no sealed
+// parent can drift mid-ceremony through the operator's own apply. Template
+// changes resume (and bump the security generation) after ACTIVE or when no
+// ceremony is running.
+func (r *PgShardClusterReconciler) holdPlanTemplatesDuringActivation(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object) error {
+	receipt := cluster.Status.IsolationReceipt
+	phase := isolationReceiptPhase(receipt)
+	if phase != pgshardv1alpha1.IsolationActivatingQuiesce && phase != pgshardv1alpha1.IsolationActivatingRecreate {
+		return nil
+	}
+	reader := r.authoritativeReader()
+	for _, object := range plan {
+		switch workload := object.(type) {
+		case *appsv1.StatefulSet:
+			live := &appsv1.StatefulSet{}
+			if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: workload.Name}, live); err != nil {
+				if apierrors.IsNotFound(err) {
+					continue
+				}
+				return fmt.Errorf("read live StatefulSet %s for activation template hold: %w", workload.Name, err)
+			}
+			if live.Labels[owned.ComponentLabel] == "postgresql" {
+				workload.Spec.Template = *live.Spec.Template.DeepCopy()
+			}
+		case *appsv1.Deployment:
+			live := &appsv1.Deployment{}
+			if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: workload.Name}, live); err != nil {
+				if apierrors.IsNotFound(err) {
+					continue
+				}
+				return fmt.Errorf("read live Deployment %s for activation template hold: %w", workload.Name, err)
+			}
+			component := live.Labels[owned.ComponentLabel]
+			if component == "pooler" || component == "orchestrator" {
+				workload.Spec.Template = *live.Spec.Template.DeepCopy()
+			}
+		}
+	}
+	return nil
 }
 
 func currentSecurityGeneration(cluster *pgshardv1alpha1.PgShardCluster) int64 {

@@ -57,6 +57,7 @@ func aggregateDispatchProof(webhookConfigResourceVersion string, probes []backen
 	proof := dispatchProof{
 		tupleHash: dispatchTupleHash(webhookConfigResourceVersion, probes),
 		converged: converged,
+		backends:  len(probes),
 	}
 	if !converged {
 		proof.reason = fmt.Sprintf("API-server backend(s) did not dispatch the sentinel to the pgshard webhook: %s", strings.Join(diverged, ", "))

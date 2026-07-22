@@ -14,24 +14,45 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-func TestIdentityObservationStoreRecordsAndForgets(t *testing.T) {
+func TestIdentityObservationStoreRegistrationAndConflicts(t *testing.T) {
 	t.Parallel()
 	store := NewIdentityObservationStore()
-	store.record("tok", IdentityRoleStatefulSet, "system:node:worker")
-	store.record("tok", IdentityRoleHPA, "system:serviceaccount:kube-system:horizontal-pod-autoscaler")
-	store.record("", IdentityRoleDeployment, "ignored")
+	stsKey := IdentityOwnerKey("StatefulSet", "probe-sts")
+	deployKey := IdentityOwnerKey("Deployment", "probe-deploy")
+	store.Register("tok", stsKey, deployKey)
 
-	observed := store.Observed("tok")
-	if observed[IdentityRoleStatefulSet] != "system:node:worker" || observed[IdentityRoleHPA] == "" {
-		t.Fatalf("store did not record observations: %#v", observed)
+	// Unregistered token and unregistered owner are both rejected.
+	store.record("other", IdentityRoleStatefulSet, "attacker", stsKey)
+	store.record("tok", IdentityRoleStatefulSet, "attacker", IdentityOwnerKey("StatefulSet", "forged"))
+	if observed, _ := store.Observed("tok"); len(observed) != 0 {
+		t.Fatalf("an unverified observation was recorded: %#v", observed)
 	}
+
+	store.record("tok", IdentityRoleStatefulSet, "system:node:worker", stsKey)
+	store.record("tok", IdentityRoleHPA, "system:serviceaccount:kube-system:horizontal-pod-autoscaler", deployKey)
+	observed, conflicted := store.Observed("tok")
+	if conflicted || observed[IdentityRoleStatefulSet] != "system:node:worker" || observed[IdentityRoleHPA] == "" {
+		t.Fatalf("store did not record verified observations: %#v conflicted=%v", observed, conflicted)
+	}
+
+	// Append-only: a later differing verified write never overwrites; it marks the
+	// role conflicted, which fails the probe closed.
+	store.record("tok", IdentityRoleStatefulSet, "system:serviceaccount:default:attacker", stsKey)
+	observed, conflicted = store.Observed("tok")
+	if observed[IdentityRoleStatefulSet] != "system:node:worker" {
+		t.Fatalf("a later writer overwrote a verified observation: %#v", observed)
+	}
+	if !conflicted {
+		t.Fatal("conflicting verified observations were not flagged")
+	}
+
 	// The returned map is a copy: mutating it must not affect the store.
 	observed[IdentityRoleStatefulSet] = "tampered"
-	if store.Observed("tok")[IdentityRoleStatefulSet] != "system:node:worker" {
+	if fresh, _ := store.Observed("tok"); fresh[IdentityRoleStatefulSet] != "system:node:worker" {
 		t.Fatal("Observed returned a live reference, not a copy")
 	}
 	store.Forget("tok")
-	if len(store.Observed("tok")) != 0 {
+	if fresh, _ := store.Observed("tok"); len(fresh) != 0 {
 		t.Fatal("Forget did not drop the token")
 	}
 }
@@ -40,7 +61,12 @@ func TestPodCreateRecordsStatefulSetIdentityProbe(t *testing.T) {
 	t.Parallel()
 	scheme := workloadScheme(t)
 	store := NewIdentityObservationStore()
-	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster()).Build()
+	store.Register("tok", IdentityOwnerKey("StatefulSet", "pgshard-idprobe-sts-tok"))
+	liveProbeSTS := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "pgshard-idprobe-sts-tok", Namespace: testWorkloadNS, UID: "sts-uid",
+		Annotations: map[string]string{IdentityProbeAnnotation: "tok"},
+	}}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster(), liveProbeSTS).Build()
 	validator := NewPodCreateValidator(reader, testControllerIdentities(), scheme).WithIdentityProbeStore(store)
 
 	controller := true
@@ -60,8 +86,44 @@ func TestPodCreateRecordsStatefulSetIdentityProbe(t *testing.T) {
 	if response := validator.Handle(context.Background(), request); !response.Allowed {
 		t.Fatalf("INACTIVE namespace denied a benign probe pod: %#v", response)
 	}
-	if got := store.Observed("tok")[IdentityRoleStatefulSet]; got != testControllerIdentities().StatefulSetController {
-		t.Fatalf("statefulset-controller identity not recorded, got %q", got)
+	observed, conflicted := store.Observed("tok")
+	if conflicted || observed[IdentityRoleStatefulSet] != testControllerIdentities().StatefulSetController {
+		t.Fatalf("statefulset-controller identity not recorded, got %#v", observed)
+	}
+}
+
+func TestPodCreateRejectsForgedOwnerIdentityObservation(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	store := NewIdentityObservationStore()
+	store.Register("tok", IdentityOwnerKey("StatefulSet", "pgshard-idprobe-sts-tok"))
+	liveProbeSTS := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "pgshard-idprobe-sts-tok", Namespace: testWorkloadNS, UID: "sts-uid",
+		Annotations: map[string]string{IdentityProbeAnnotation: "tok"},
+	}}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster(), liveProbeSTS).Build()
+	validator := NewPodCreateValidator(reader, testControllerIdentities(), scheme).WithIdentityProbeStore(store)
+
+	controller := true
+	// An attacker forges an owner reference claiming the live probe StatefulSet
+	// but with the WRONG UID (they cannot create the real object: the workload
+	// webhook only admits operator-authored StatefulSets in a fenced namespace).
+	forged := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "attacker-pod", Namespace: testWorkloadNS,
+			Annotations:     map[string]string{IdentityProbeAnnotation: "tok"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "pgshard-idprobe-sts-tok", UID: "forged-uid", Controller: &controller}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "x", Image: "attacker"}}},
+	}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: forged.Name, Namespace: testWorkloadNS, Operation: admissionv1.Create,
+		Object:   runtime.RawExtension{Raw: marshalObject(t, forged)},
+		UserInfo: authenticationv1.UserInfo{Username: "system:serviceaccount:default:attacker"},
+	}}
+	validator.Handle(context.Background(), request)
+	if observed, _ := store.Observed("tok"); len(observed) != 0 {
+		t.Fatalf("a forged owner reference poisoned the identity observations: %#v", observed)
 	}
 }
 
@@ -69,11 +131,20 @@ func TestWorkloadIntegrityRecordsDeploymentIdentityProbe(t *testing.T) {
 	t.Parallel()
 	scheme := workloadScheme(t)
 	store := NewIdentityObservationStore()
-	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster()).Build()
+	store.Register("tok", IdentityOwnerKey("Deployment", "pgshard-idprobe-deploy-tok"))
+	liveProbeDeployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name: "pgshard-idprobe-deploy-tok", Namespace: testWorkloadNS, UID: "deploy-uid",
+		Annotations: map[string]string{IdentityProbeAnnotation: "tok"},
+	}}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster(), liveProbeDeployment).Build()
 	validator := NewWorkloadIntegrityValidator(reader, testControllerIdentities(), scheme).WithIdentityProbeStore(store)
 
+	controller := true
 	replicaSet := &appsv1.ReplicaSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "pgshard-idprobe-deploy-tok-abc", Namespace: testWorkloadNS},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pgshard-idprobe-deploy-tok-abc", Namespace: testWorkloadNS,
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "pgshard-idprobe-deploy-tok", UID: "deploy-uid", Controller: &controller}},
+		},
 		Spec: appsv1.ReplicaSetSpec{
 			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{IdentityProbeAnnotation: "tok"}}},
 		},
@@ -87,8 +158,9 @@ func TestWorkloadIntegrityRecordsDeploymentIdentityProbe(t *testing.T) {
 	if response := validator.Handle(context.Background(), request); !response.Allowed {
 		t.Fatalf("probe ReplicaSet by the deployment controller was denied: %#v", response)
 	}
-	if got := store.Observed("tok")[IdentityRoleDeployment]; got != testControllerIdentities().DeploymentController {
-		t.Fatalf("deployment-controller identity not recorded, got %q", got)
+	observed, conflicted := store.Observed("tok")
+	if conflicted || observed[IdentityRoleDeployment] != testControllerIdentities().DeploymentController {
+		t.Fatalf("deployment-controller identity not recorded, got %#v", observed)
 	}
 }
 
@@ -116,5 +188,46 @@ func TestHandleScaleGatesSupportingScaleToOperatorOrHPA(t *testing.T) {
 	}
 	if response := validator.Handle(context.Background(), scaleRequest(identities.HorizontalPodAutoscalerController)); !response.Allowed {
 		t.Fatalf("the HPA controller was denied a supporting scale: %#v", response)
+	}
+}
+
+// The operator's supporting-revocation ceremony drains the prior ReplicaSet
+// through the /scale SUBRESOURCE. This regression drives the actual webhook
+// handler with the exact admission requests the API server generates for the
+// operator identity: the /scale path must admit the complete ceremony, and the
+// main-resource path (the old code path) must deny the operator — proving the
+// subresource route is required, not optional.
+func TestOperatorRevocationCeremonyAdmittedViaScaleSubresource(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	identities := testControllerIdentities()
+	controller := true
+	priorReplicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-pooler-prior", Namespace: testWorkloadNS, UID: "prior-rs-uid",
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "example-pooler", UID: "deploy-uid", Controller: &controller}},
+		},
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster(), priorReplicaSet).Build()
+	validator := NewWorkloadIntegrityValidator(reader, identities, scheme)
+
+	scaleToZero := validator.Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: priorReplicaSet.Name, Namespace: testWorkloadNS, Operation: admissionv1.Update, SubResource: "scale",
+		Resource: metav1.GroupVersionResource{Group: "apps", Version: "v1", Resource: "replicasets"},
+		UserInfo: authenticationv1.UserInfo{Username: identities.Operator},
+	}})
+	if !scaleToZero.Allowed {
+		t.Fatalf("the operator's /scale drain of the prior ReplicaSet was denied (the ceremony would deadlock): %#v", scaleToZero)
+	}
+
+	mainResource := validator.Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: priorReplicaSet.Name, Namespace: testWorkloadNS, Operation: admissionv1.Update,
+		Resource:  metav1.GroupVersionResource{Group: "apps", Version: "v1", Resource: "replicasets"},
+		Object:    runtime.RawExtension{Raw: marshalObject(t, priorReplicaSet)},
+		OldObject: runtime.RawExtension{Raw: marshalObject(t, priorReplicaSet)},
+		UserInfo:  authenticationv1.UserInfo{Username: identities.Operator},
+	}})
+	if mainResource.Allowed {
+		t.Fatal("a main-resource ReplicaSet update by the operator was allowed; the deployment-controller authorship gate is gone")
 	}
 }
