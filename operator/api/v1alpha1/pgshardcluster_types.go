@@ -538,6 +538,12 @@ type CatalogAccessStatus struct {
 	ServerSHA256 string `json:"serverSHA256,omitempty"`
 }
 
+// ReplicationTransportPolicyServerTLSV1 marks a multi-member cluster whose
+// physical replication was born strictly server-authenticated: the operator
+// stages the replication CA and per-member server certificates and every
+// standby client hop requires verify-full TLS.
+const ReplicationTransportPolicyServerTLSV1 = "server-tls-v1"
+
 // PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract. The
 // runtime is checkpointed before any credential or data volume is created so
 // deleted workload objects cannot erase the selected process composition.
@@ -547,6 +553,13 @@ type PostgreSQLBootstrapSpecStatus struct {
 	Durability      DurabilityMode `json:"durability"`
 	// +kubebuilder:validation:Enum=direct;agent-quarantine
 	PostgreSQLRuntime string `json:"postgresqlRuntime,omitempty"`
+	// ReplicationTransportPolicy is stamped only when the bootstrap contract is
+	// first recorded. Clusters provisioned before replication TLS existed have
+	// no marker and are deliberately left untouched: they receive no TLS
+	// Secrets and no workload-template change, and their physical replication
+	// stays cleartext until the cluster is recreated under a marked contract.
+	// +kubebuilder:validation:Enum=server-tls-v1
+	ReplicationTransportPolicy string `json:"replicationTransportPolicy,omitempty"`
 	// DatabaseTopologySHA256 binds provisioned storage to the complete resolved
 	// immutable logical-database genesis topology. It is omitted only on status
 	// written by releases that predate database-scoped genesis.

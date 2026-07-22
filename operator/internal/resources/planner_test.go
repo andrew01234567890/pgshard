@@ -81,10 +81,15 @@ func TestCatalogActivationJournalInitializerClearsInheritedSetgid(t *testing.T) 
 
 func TestPostgreSQLStandbyBootstrapScriptHasValidBashSyntax(t *testing.T) {
 	t.Parallel()
-	command := exec.Command("bash", "-n")
-	command.Stdin = strings.NewReader(postgresqlStandbyBootstrapScript)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("PostgreSQL standby bootstrap script syntax: %v\n%s", err, output)
+	for name, replicationTLS := range map[string]bool{"server-tls": true, "legacy-cleartext": false} {
+		command := exec.Command("bash", "-n")
+		command.Stdin = strings.NewReader(postgresqlStandbyBootstrapScript(replicationTLS))
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("PostgreSQL standby bootstrap script syntax (%s): %v\n%s", name, err, output)
+		}
+	}
+	if strings.Contains(postgresqlStandbyBootstrapScript(true), "@PGSHARD_") || strings.Contains(postgresqlStandbyBootstrapScript(false), "@PGSHARD_") {
+		t.Fatal("standby bootstrap script retained an unrendered template placeholder")
 	}
 }
 
@@ -4519,6 +4524,9 @@ func TestMultiMemberPlanRequiresCompleteReplicationTLSCheckpoints(t *testing.T) 
 		{name: "duplicate member UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
 			cluster.Status.PostgreSQLReplicationTLS[0].Members[1].SecretUID = cluster.Status.PostgreSQLReplicationTLS[0].Members[0].SecretUID
 		}, want: "is duplicated"},
+		{name: "checkpoints without the transport policy", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = ""
+		}, want: "without the \"server-tls-v1\" bootstrap transport policy"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -4528,6 +4536,69 @@ func TestMultiMemberPlanRequiresCompleteReplicationTLSCheckpoints(t *testing.T) 
 				t.Fatalf("Plan error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestMultiMemberPlanWithoutTransportPolicyStaysCleartextUnchanged(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	// A cluster provisioned before replication TLS existed has a recorded
+	// bootstrap contract without the transport policy and no TLS checkpoints.
+	cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = ""
+	cluster.Status.PostgreSQLReplicationTLS = nil
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbiddenEnvironment := []string{
+		"PGSHARD_POSTGRES_SERVER_TLS_CERT",
+		"PGSHARD_POSTGRES_SERVER_TLS_KEY",
+		"PGSHARD_REPLICATION_TLS_SERVER_SHA256",
+		"PGSHARD_REPLICATION_TLS_CA_SHA256",
+		"PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT",
+	}
+	members := 0
+	for _, item := range plan {
+		object, ok := item.(*appsv1.StatefulSet)
+		if !ok || object.Labels[ComponentLabel] != "postgresql" {
+			continue
+		}
+		members++
+		for _, volume := range object.Spec.Template.Spec.Volumes {
+			switch volume.Name {
+			case "server-tls-secret", "server-tls", "replication-ca-secret":
+				t.Fatalf("policy-less member %s received TLS volume %s", object.Name, volume.Name)
+			}
+		}
+		containers := append(append([]corev1.Container{}, object.Spec.Template.Spec.InitContainers...), object.Spec.Template.Spec.Containers...)
+		for _, container := range containers {
+			if container.Name == "prepare-server-tls" {
+				t.Fatalf("policy-less member %s received the server TLS initializer", object.Name)
+			}
+			for _, name := range forbiddenEnvironment {
+				if containerHasEnvironment(container, name) {
+					t.Fatalf("policy-less member %s container %s received TLS environment %s", object.Name, container.Name, name)
+				}
+			}
+		}
+		if object.Spec.Template.Labels[MemberLabel] == "0000" {
+			continue
+		}
+		script := object.Spec.Template.Spec.InitContainers[0].Command[2]
+		if script != postgresqlStandbyBootstrapScript(false) ||
+			strings.Count(script, "sslmode=disable") != 2 ||
+			!strings.Contains(script, "--host=\"$PGSHARD_SOURCE_HOST\"") ||
+			strings.Contains(script, "verify-full") || strings.Contains(script, "replication-tls") {
+			t.Fatalf("policy-less standby %s bootstrap script is not the exact cleartext contract", object.Name)
+		}
+	}
+	if members != int(cluster.Spec.Shards*cluster.Spec.MembersPerShard) {
+		t.Fatalf("policy-less plan published %d PostgreSQL members", members)
 	}
 }
 
@@ -4804,6 +4875,15 @@ func testPostgreSQLWritableLeases(cluster *pgshardv1alpha1.PgShardCluster) []pgs
 }
 
 func testPostgreSQLReplicationTLS(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.PostgreSQLReplicationTLSStatus {
+	if cluster.Status.PostgreSQLBootstrapSpec == nil {
+		cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
+			Shards:            cluster.Spec.Shards,
+			MembersPerShard:   cluster.Spec.MembersPerShard,
+			Durability:        cluster.Spec.Durability,
+			PostgreSQLRuntime: string(PostgreSQLRuntimeAgentQuarantine),
+		}
+	}
+	cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1
 	checkpoints := make([]pgshardv1alpha1.PostgreSQLReplicationTLSStatus, 0, cluster.Spec.Shards)
 	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 		checkpoint := pgshardv1alpha1.PostgreSQLReplicationTLSStatus{
