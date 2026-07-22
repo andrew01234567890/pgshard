@@ -3332,8 +3332,12 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		if cluster.Spec.MembersPerShard == 1 {
 			bootstrap := bootstraps[postgresqlBootstrapKey{shard: shard, member: 0}]
 			writableLease := writableLeases[shard]
+			shardStatefulSet, err := postgresqlShardStatefulSet(cluster, shard, images, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess, operationWriterAccess, writableLease)
+			if err != nil {
+				return nil, err
+			}
 			objects = append(objects,
-				postgresqlShardStatefulSet(cluster, shard, images, bootstrap.SecretName, bootstrap.PVCName, postgresqlConfigName, postgresqlHash, catalogAccess, operationWriterAccess, writableLease),
+				shardStatefulSet,
 				postgresqlPrimaryDisruptionBudget(cluster, shard),
 			)
 		} else if images.PostgreSQLRuntime.agentQuarantine() {
@@ -3368,9 +3372,13 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 	if cluster.Spec.MembersPerShard != 1 {
 		poolerCatalogAccess = nil
 	}
+	pooler, err := poolerDeployment(cluster, images.Pooler, topologyHash, poolerCatalogAccess)
+	if err != nil {
+		return nil, err
+	}
 	objects = append(objects,
 		orchestratorDeployment(cluster, images.Orchestrator, topologyHash, images.PostgreSQLRuntime),
-		poolerDeployment(cluster, images.Pooler, topologyHash, poolerCatalogAccess),
+		pooler,
 		podDisruptionBudget(cluster, "orchestrator", 1),
 		podDisruptionBudget(cluster, "pooler", 1),
 	)
@@ -5046,7 +5054,7 @@ func PostgreSQLDataPVC(cluster *pgshardv1alpha1.PgShardCluster, shard int32, nam
 	return PostgreSQLMemberDataPVC(cluster, shard, 0, name, storageSize, storageClassName, fenceName, fenceUID)
 }
 
-func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus, operationWriterAccess *pgshardv1alpha1.OperationWriterAccessStatus, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) *appsv1.StatefulSet {
+func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, secretName, pvcName, configurationName, configurationHash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus, operationWriterAccess *pgshardv1alpha1.OperationWriterAccessStatus, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) (*appsv1.StatefulSet, error) {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
@@ -5143,7 +5151,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 	}
 	if shard == 0 {
 		if catalogAccess == nil || operationWriterAccess == nil {
-			panic("validated single-member plan has incomplete catalog access checkpoints")
+			return nil, fmt.Errorf("single-member plan for shard %d has incomplete catalog access checkpoints", shard)
 		}
 		bootstrap.VolumeMounts = append(bootstrap.VolumeMounts,
 			corev1.VolumeMount{Name: "catalog-bootstrap-auth", MountPath: "/etc/pgshard/catalog-auth", ReadOnly: true},
@@ -5259,7 +5267,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 				},
 			},
 		},
-	}
+	}, nil
 }
 
 func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, replicationTLS *pgshardv1alpha1.PostgreSQLReplicationTLSStatus, catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus) *appsv1.StatefulSet {
@@ -6043,7 +6051,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 	return deployment
 }
 
-func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus) *appsv1.Deployment {
+func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash string, catalogAccess *pgshardv1alpha1.CatalogAccessStatus) (*appsv1.Deployment, error) {
 	replicas := poolerReplicas(cluster)
 	var desiredReplicas *int32
 	if cluster.Spec.Pooler.Scaling.Mode == pgshardv1alpha1.ScalingFixed {
@@ -6067,7 +6075,7 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 	volumes := []corev1.Volume{{Name: "topology", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + TopologyConfigSuffix}}}}}
 	if cluster.Spec.MembersPerShard == 1 {
 		if catalogAccess == nil {
-			panic("validated single-member plan has no catalog access checkpoint")
+			return nil, fmt.Errorf("single-member plan has no catalog access checkpoint for the pooler")
 		}
 		env = append(env,
 			corev1.EnvVar{Name: "PGSHARD_SHARDSCHEMA_HOST", Value: fmt.Sprintf("%s.%s.svc", CatalogServiceName(cluster.Name), cluster.Namespace)},
@@ -6119,7 +6127,7 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType, RollingUpdate: &appsv1.RollingUpdateDeployment{MaxUnavailable: intOrStringPtr(intstr.FromInt32(1)), MaxSurge: intOrStringPtr(intstr.FromInt32(1))}},
 			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: map[string]string{ConfigHashAnnotation: hash}}, Spec: podSpec},
 		},
-	}
+	}, nil
 }
 
 func poolerHPA(cluster *pgshardv1alpha1.PgShardCluster) *autoscalingv2.HorizontalPodAutoscaler {

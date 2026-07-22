@@ -298,6 +298,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	if err := r.stampPlanContracts(ctx, cluster, plan); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "ContractStampFailed", fmt.Sprintf("cannot stamp owned workload contracts: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	states, err := r.preflightOwnership(ctx, cluster, plan)
 	if err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "ReconcileFailed", fmt.Sprintf("owned resource reconciliation failed: %v", err))
@@ -3180,6 +3184,129 @@ func optionalStringsEqual(left, right *string) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
+}
+
+// stampPlanContracts stamps every member StatefulSet and supporting Deployment
+// pod template in the plan with its full-contract hash and security generation,
+// so the controllers propagate the stamp to every pod they create, and records
+// the stamps in status. It mutates the plan objects in place before ownership
+// preflight and apply so the stamp is part of the desired object throughout.
+//
+// STEP-1 SCOPE: this establishes the stamping mechanism only. The security
+// generation is stamped at its current recorded value (initialized to 1); the
+// barrier/bump logic and admission-side verification are later steps.
+func (r *PgShardClusterReconciler) stampPlanContracts(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object) error {
+	memberContracts := make([]pgshardv1alpha1.PostgreSQLMemberContractStatus, 0, len(cluster.Status.PostgreSQLMemberContracts))
+	supportingContracts := make([]pgshardv1alpha1.SupportingContractStatus, 0, len(cluster.Status.SupportingContracts))
+	for _, object := range plan {
+		class, shard, member, template, ok := planWorkloadContractTarget(cluster, object)
+		if !ok {
+			continue
+		}
+		generation := recordedContractGeneration(cluster, class, shard, member)
+		hash, err := owned.ApplyContractStamp(template, class, string(cluster.UID), shard, member, generation)
+		if err != nil {
+			return fmt.Errorf("stamp %s workload contract for shard %d member %d: %w", class, shard, member, err)
+		}
+		switch class {
+		case owned.ClassPooler, owned.ClassOrchestrator:
+			supportingContracts = append(supportingContracts, pgshardv1alpha1.SupportingContractStatus{
+				Class: string(class), ContractHash: hash, SecurityGeneration: generation,
+			})
+		default:
+			memberContracts = append(memberContracts, pgshardv1alpha1.PostgreSQLMemberContractStatus{
+				Shard: shard, Member: member, Class: string(class), ContractHash: hash, SecurityGeneration: generation,
+			})
+		}
+	}
+	sort.Slice(memberContracts, func(left, right int) bool {
+		if memberContracts[left].Shard != memberContracts[right].Shard {
+			return memberContracts[left].Shard < memberContracts[right].Shard
+		}
+		return memberContracts[left].Member < memberContracts[right].Member
+	})
+	sort.Slice(supportingContracts, func(left, right int) bool {
+		return supportingContracts[left].Class < supportingContracts[right].Class
+	})
+	if slices.Equal(cluster.Status.PostgreSQLMemberContracts, memberContracts) &&
+		slices.Equal(cluster.Status.SupportingContracts, supportingContracts) {
+		return nil
+	}
+	cluster.Status.PostgreSQLMemberContracts = memberContracts
+	cluster.Status.SupportingContracts = supportingContracts
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint owned workload contract stamps: %w", err)
+	}
+	return nil
+}
+
+// planWorkloadContractTarget classifies a plan object as a protected workload
+// whose pod template must be stamped, returning its class, identity, and a
+// pointer to the template to mutate. Non-protected objects return ok=false.
+func planWorkloadContractTarget(cluster *pgshardv1alpha1.PgShardCluster, object client.Object) (owned.PodClass, int32, int32, *corev1.PodTemplateSpec, bool) {
+	switch workload := object.(type) {
+	case *appsv1.StatefulSet:
+		if workload.Labels[owned.ComponentLabel] != "postgresql" {
+			return "", 0, 0, nil, false
+		}
+		shard, shardOK := parseIdentityLabel(workload.Labels[owned.ShardLabel])
+		member, memberOK := parseIdentityLabel(workload.Labels[owned.MemberLabel])
+		if !shardOK || !memberOK {
+			return "", 0, 0, nil, false
+		}
+		class := ClassForMember(cluster.Spec.MembersPerShard, member)
+		return class, shard, member, &workload.Spec.Template, true
+	case *appsv1.Deployment:
+		switch workload.Labels[owned.ComponentLabel] {
+		case "pooler":
+			return owned.ClassPooler, 0, 0, &workload.Spec.Template, true
+		case "orchestrator":
+			return owned.ClassOrchestrator, 0, 0, &workload.Spec.Template, true
+		}
+	}
+	return "", 0, 0, nil, false
+}
+
+// ClassForMember maps a member ordinal to its protected pod class. A
+// single-member topology is the serving single-member class; multi-member
+// member zero is the replication source, and every nonzero member is a standby.
+func ClassForMember(membersPerShard, member int32) owned.PodClass {
+	if membersPerShard == 1 {
+		return owned.ClassSingleMember
+	}
+	if member == 0 {
+		return owned.ClassSource
+	}
+	return owned.ClassStandby
+}
+
+func recordedContractGeneration(cluster *pgshardv1alpha1.PgShardCluster, class owned.PodClass, shard, member int32) int64 {
+	switch class {
+	case owned.ClassPooler, owned.ClassOrchestrator:
+		for _, recorded := range cluster.Status.SupportingContracts {
+			if recorded.Class == string(class) {
+				return recorded.SecurityGeneration
+			}
+		}
+	default:
+		for _, recorded := range cluster.Status.PostgreSQLMemberContracts {
+			if recorded.Shard == shard && recorded.Member == member {
+				return recorded.SecurityGeneration
+			}
+		}
+	}
+	return 1
+}
+
+func parseIdentityLabel(value string) (int32, bool) {
+	if len(value) != 4 {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || parsed < 0 {
+		return 0, false
+	}
+	return int32(parsed), true
 }
 
 func (r *PgShardClusterReconciler) applyPlan(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object, states map[string]ownershipState) error {

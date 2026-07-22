@@ -778,6 +778,53 @@ spec:
                 - configMapUID
                 - dataSHA256
                 type: object
+              postgresqlMemberContracts:
+                description: |-
+                  PostgreSQLMemberContracts records the reconciler-stamped full-contract
+                  hash and monotonic security generation for each member StatefulSet's pod
+                  template. The controller propagates the stamp to every pod it creates;
+                  admission later validates a pod against its live owning parent's stamp.
+                  The barrier/generation-bump logic is not yet implemented — the generation
+                  is stamped at its current value only.
+                items:
+                  description: |-
+                    PostgreSQLMemberContractStatus binds one member StatefulSet's pod-template
+                    contract hash to its stable physical identity and the security generation it
+                    was stamped at.
+                  properties:
+                    class:
+                      enum:
+                      - source
+                      - standby
+                      - single-member
+                      type: string
+                    contractHash:
+                      pattern: ^[0-9a-f]{64}$
+                      type: string
+                    member:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    securityGeneration:
+                      format: int64
+                      minimum: 1
+                      type: integer
+                    shard:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                  required:
+                  - class
+                  - contractHash
+                  - member
+                  - securityGeneration
+                  - shard
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - shard
+                - member
+                x-kubernetes-list-type: map
               postgresqlReplicationCredentials:
                 description: |-
                   PostgreSQLReplicationCredentials records one staged, immutable physical-
@@ -935,6 +982,37 @@ spec:
                 type: array
                 x-kubernetes-list-map-keys:
                 - shard
+                x-kubernetes-list-type: map
+              supportingContracts:
+                description: |-
+                  SupportingContracts records the reconciler-stamped full-contract hash and
+                  security generation for each supporting workload class (pooler,
+                  orchestrator).
+                items:
+                  description: |-
+                    SupportingContractStatus binds one supporting workload class's pod-template
+                    contract hash to the security generation it was stamped at.
+                  properties:
+                    class:
+                      enum:
+                      - pooler
+                      - orchestrator
+                      type: string
+                    contractHash:
+                      pattern: ^[0-9a-f]{64}$
+                      type: string
+                    securityGeneration:
+                      format: int64
+                      minimum: 1
+                      type: integer
+                  required:
+                  - class
+                  - contractHash
+                  - securityGeneration
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - class
                 x-kubernetes-list-type: map
             type: object
         type: object

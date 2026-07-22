@@ -385,6 +385,49 @@ type PgShardClusterStatus struct {
 	// for a future authenticated catalog materialization request. A missing or
 	// replaced carrier is an explicit-recovery boundary and is never recreated.
 	CatalogActivation *CatalogActivationCarrierStatus `json:"catalogActivation,omitempty"`
+	// PostgreSQLMemberContracts records the reconciler-stamped full-contract
+	// hash and monotonic security generation for each member StatefulSet's pod
+	// template. The controller propagates the stamp to every pod it creates;
+	// admission later validates a pod against its live owning parent's stamp.
+	// The barrier/generation-bump logic is not yet implemented — the generation
+	// is stamped at its current value only.
+	// +listType=map
+	// +listMapKey=shard
+	// +listMapKey=member
+	PostgreSQLMemberContracts []PostgreSQLMemberContractStatus `json:"postgresqlMemberContracts,omitempty"`
+	// SupportingContracts records the reconciler-stamped full-contract hash and
+	// security generation for each supporting workload class (pooler,
+	// orchestrator).
+	// +listType=map
+	// +listMapKey=class
+	SupportingContracts []SupportingContractStatus `json:"supportingContracts,omitempty"`
+}
+
+// PostgreSQLMemberContractStatus binds one member StatefulSet's pod-template
+// contract hash to its stable physical identity and the security generation it
+// was stamped at.
+type PostgreSQLMemberContractStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	Shard int32 `json:"shard"`
+	// +kubebuilder:validation:Minimum=0
+	Member int32 `json:"member"`
+	// +kubebuilder:validation:Enum=source;standby;single-member
+	Class string `json:"class"`
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	ContractHash string `json:"contractHash"`
+	// +kubebuilder:validation:Minimum=1
+	SecurityGeneration int64 `json:"securityGeneration"`
+}
+
+// SupportingContractStatus binds one supporting workload class's pod-template
+// contract hash to the security generation it was stamped at.
+type SupportingContractStatus struct {
+	// +kubebuilder:validation:Enum=pooler;orchestrator
+	Class string `json:"class"`
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	ContractHash string `json:"contractHash"`
+	// +kubebuilder:validation:Minimum=1
+	SecurityGeneration int64 `json:"securityGeneration"`
 }
 
 // CatalogActivationCarrierStatus binds the activation carrier's deterministic
