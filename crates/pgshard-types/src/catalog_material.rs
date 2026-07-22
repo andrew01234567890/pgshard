@@ -15,6 +15,12 @@ pub const OPERATION_WRITER_DIGEST_DOMAIN: &str = "pgshard-operation-writer-clien
 /// Domain separating the per-shard physical-replication password fingerprint.
 pub const POSTGRESQL_REPLICATION_DIGEST_DOMAIN: &str = "pgshard-postgresql-replication-v1";
 
+/// Domain separating the per-shard replication CA certificate fingerprint.
+pub const REPLICATION_TLS_CA_DIGEST_DOMAIN: &str = "pgshard-replication-tls-ca-v1";
+
+/// Domain separating the per-member replication server certificate fingerprint.
+pub const REPLICATION_TLS_SERVER_DIGEST_DOMAIN: &str = "pgshard-replication-tls-server-v1";
+
 /// Computes the canonical length-framed HMAC-SHA-256 material fingerprint.
 ///
 /// # Panics
@@ -97,6 +103,22 @@ mod tests {
         assert_ne!(
             catalog_material_sha256("ab", b"key", [&b"c"[..]]),
             catalog_material_sha256("a", b"key", [&b"bc"[..]])
+        );
+        assert_eq!(
+            catalog_material_sha256(
+                REPLICATION_TLS_CA_DIGEST_DOMAIN,
+                b"ca-pem",
+                std::iter::empty()
+            ),
+            "f2c4fad225fc50778bcff483229722f34ef0420f32fe7c1e24e5f0fee9f4fd5c"
+        );
+        assert_eq!(
+            catalog_material_sha256(
+                REPLICATION_TLS_SERVER_DIGEST_DOMAIN,
+                b"server-key",
+                [&b"server-cert"[..]],
+            ),
+            "006413f805aec7feb64e180fb1afb6f14609028b3a980e5a598d1f3e3599f514"
         );
     }
 }

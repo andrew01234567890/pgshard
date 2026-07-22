@@ -7,7 +7,8 @@ use std::path::Path;
 
 use pgshard_types::catalog_material::{
     CATALOG_CLIENT_DIGEST_DOMAIN, CATALOG_SERVER_DIGEST_DOMAIN, OPERATION_WRITER_DIGEST_DOMAIN,
-    POSTGRESQL_REPLICATION_DIGEST_DOMAIN, catalog_material_sha256,
+    POSTGRESQL_REPLICATION_DIGEST_DOMAIN, REPLICATION_TLS_CA_DIGEST_DOMAIN,
+    REPLICATION_TLS_SERVER_DIGEST_DOMAIN, catalog_material_sha256,
 };
 use rustix::fs::{Mode, OFlags};
 
@@ -42,9 +43,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "PostgreSQL replication password",
             None,
         ),
+        "replication-tls-ca" => (
+            REPLICATION_TLS_CA_DIGEST_DOMAIN,
+            "replication CA certificate",
+            None,
+        ),
+        "replication-tls-server" => (
+            REPLICATION_TLS_SERVER_DIGEST_DOMAIN,
+            "replication server private key",
+            Some("replication server certificate"),
+        ),
         _ => {
             return Err(
-                "material profile must be client, server, operation-writer, or replication".into(),
+                "material profile must be client, server, operation-writer, replication, replication-tls-ca, or replication-tls-server".into(),
             );
         }
     };
@@ -58,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         catalog_material_sha256(domain, &key, std::iter::empty())
     };
     if arguments.next().is_some() {
-        return Err("usage: pgshard-catalog-material-digest <client|server|operation-writer> <key-file> <value-file> | pgshard-catalog-material-digest replication <password-file>".into());
+        return Err("usage: pgshard-catalog-material-digest <client|server|operation-writer|replication-tls-server> <key-file> <value-file> | pgshard-catalog-material-digest <replication|replication-tls-ca> <material-file>".into());
     }
     let mut stdout = io::stdout().lock();
     stdout.write_all(fingerprint.as_bytes())?;
