@@ -1,0 +1,82 @@
+# pgshard controller-manager TokenRequest guard.
+#
+# This is an API-server-hosted ValidatingAdmissionPolicy (VAP), NOT a manager
+# webhook. A Fail webhook served by the manager would deadlock the manager's own
+# projected token at cold start (the kubelet mints it via a serviceaccounts/token
+# CREATE before the manager is Ready). A VAP runs inside the API server with no
+# dependency on the manager, so it can guard the manager SA's own token safely.
+#
+# Threat: an attacker who can call serviceaccounts/token for the manager SA can
+# mint a manager-privileged token. RBAC alone is insufficient because the
+# attacker already holds serviceaccounts/token. This policy narrows who may mint
+# a manager token to the trusted node/kubelet TCB, bound to a Pod.
+#
+# CEL cannot perform arbitrary GETs, so the policy only asserts what the request
+# itself carries (userInfo, request.name/namespace, and the TokenRequest object's
+# spec) and relies on the API server's BUILT-IN TokenRequest validation — which
+# binds the issued token to the referenced Pod's UID and the SA's existence — for
+# the rest. The trusted node holds the remaining TCB.
+#
+# CEL cannot express: that the boundObjectRef Pod is actually running the manager
+# (no GET), nor that the requesting node actually hosts that Pod. Those are
+# covered by the API server binding the token to the Pod UID + the node-authorizer
+# / NodeRestriction admission plugin, which already limits a kubelet to tokens for
+# Pods scheduled to its own node. We narrow to boundObjectRef.kind == Pod and a
+# system:node:* caller and let that TCB carry the binding.
+#
+# Install (admin, §D ceremony): kubectl apply -f this file. Tune spec.audiences to
+# your API server's --api-audiences and the expiration bound to your projected
+# token lifetime BEFORE applying, or the manager's own token will be rejected.
+#
+# UNSUPPORTED below Kubernetes 1.30 (ValidatingAdmissionPolicy is not GA). Do not
+# substitute RBAC for this control on older clusters: the attacker holds
+# serviceaccounts/token, so an RBAC deny is not equivalent to this authenticated,
+# bound, audience-scoped admission check.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: pgshard-manager-tokenrequest
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["serviceaccounts/token"]
+  variables:
+    - name: isManagerToken
+      expression: >-
+        request.namespace == 'pgshard-system' && request.name == 'pgshard-controller-manager'
+  validations:
+    - expression: >-
+        !variables.isManagerToken || request.userInfo.username.startsWith('system:node:')
+      reason: Forbidden
+      message: "pgshard controller-manager tokens may only be requested by a node kubelet"
+    - expression: >-
+        !variables.isManagerToken ||
+        (has(object.spec.boundObjectRef) && object.spec.boundObjectRef.kind == 'Pod')
+      reason: Forbidden
+      message: "pgshard controller-manager tokens must be bound to a Pod"
+    - expression: >-
+        !variables.isManagerToken ||
+        (has(object.spec.audiences) && object.spec.audiences == ['https://kubernetes.default.svc'])
+      reason: Forbidden
+      message: "pgshard controller-manager tokens must request exactly the expected audience"
+    - expression: >-
+        !variables.isManagerToken ||
+        !has(object.spec.expirationSeconds) || object.spec.expirationSeconds <= 3600
+      reason: Forbidden
+      message: "pgshard controller-manager token lifetime exceeds the bounded maximum"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: pgshard-manager-tokenrequest
+spec:
+  policyName: pgshard-manager-tokenrequest
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: pgshard-system

@@ -894,8 +894,8 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.validatingConfigurationName}, validating); err != nil {
 		return nil, fmt.Errorf("get validating webhook configuration: %w", err)
 	}
-	if len(validating.Webhooks) != 9 {
-		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly nine", len(validating.Webhooks))
+	if len(validating.Webhooks) != 11 {
+		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly eleven", len(validating.Webhooks))
 	}
 	for _, expected := range []struct {
 		name, path        string
@@ -911,6 +911,8 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 		{name: podfence.BindingValidationWebhookName, path: podfence.BindingValidationWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.PodCreateWebhookName, path: podfence.PodCreateWebhookPath, rules: matchesPostgreSQLPodCreateRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.WorkloadWebhookName, path: podfence.WorkloadWebhookPath, rules: matchesPostgreSQLWorkloadRules, namespace: podFencingNamespaceSelector()},
+		{name: podfence.PodConnectFencedWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: podFencingNamespaceSelector()},
+		{name: podfence.PodConnectManagerWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: operatorNamespaceSelector(p.namespace)},
 	} {
 		webhook := findValidatingWebhook(validating.Webhooks, expected.name)
 		if webhook == nil {
@@ -1032,6 +1034,17 @@ func matchesPostgreSQLWorkloadRules(rules []admissionregistrationv1.RuleWithOper
 		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
 }
 
+func matchesPostgreSQLConnectRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	rule := rules[0]
+	return slices.Equal(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Connect}) &&
+		slices.Equal(rule.APIGroups, []string{""}) && slices.Equal(rule.APIVersions, []string{"v1"}) &&
+		slices.Equal(rule.Resources, []string{"pods/exec", "pods/attach", "pods/portforward", "pods/proxy"}) &&
+		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
 func matchesPostgreSQLNamespaceRules(rules []admissionregistrationv1.RuleWithOperations) bool {
 	if len(rules) != 1 {
 		return false
@@ -1059,6 +1072,10 @@ func matchesCoreResourceRules(rules []admissionregistrationv1.RuleWithOperations
 
 func podFencingNamespaceSelector() *metav1.LabelSelector {
 	return &metav1.LabelSelector{MatchLabels: map[string]string{podfence.NamespaceLabel: podfence.NamespaceLabelValue}}
+}
+
+func operatorNamespaceSelector(namespace string) *metav1.LabelSelector {
+	return &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": namespace}}
 }
 
 func findMutatingWebhook(webhooks []admissionregistrationv1.MutatingWebhook, name string) *admissionregistrationv1.MutatingWebhook {

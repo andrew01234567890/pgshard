@@ -195,6 +195,9 @@ func main() {
 		webhookServer.Register(podfence.WorkloadWebhookPath, &admission.Webhook{
 			Handler: podfence.NewWorkloadIntegrityValidator(manager.GetAPIReader(), controllerIdentities, scheme),
 		})
+		webhookServer.Register(podfence.PodConnectWebhookPath, &admission.Webhook{
+			Handler: podfence.NewPodConnectDenyValidator(manager.GetAPIReader(), options.webhook.namespace),
+		})
 		webhookServer.Register(podfence.StatusValidationWebhookPath, &admission.Webhook{
 			Handler: podfence.NewStatusValidator(manager.GetAPIReader(), handshakeCodec, scheme),
 		})

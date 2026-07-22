@@ -147,3 +147,158 @@ func TestRulesAllowCombinesMatchingRules(t *testing.T) {
 		t.Fatal("ungranted verb was inferred from matching RBAC rules")
 	}
 }
+
+// The manager service account, as authored in the RBAC manifests (before the
+// kustomize namePrefix is applied).
+const (
+	managerSubjectName      = "controller-manager"
+	managerSubjectNamespace = "system"
+)
+
+type projectRole struct {
+	kind        string
+	name        string
+	rules       []rbacv1.PolicyRule
+	aggregation *rbacv1.AggregationRule
+}
+
+type projectBinding struct {
+	roleRef  rbacv1.RoleRef
+	subjects []rbacv1.Subject
+}
+
+func ruleCovers(values []string, want string) bool {
+	return slices.Contains(values, want) || slices.Contains(values, "*")
+}
+
+func policyRuleGrants(rule rbacv1.PolicyRule, apiGroup, verb string, resources ...string) bool {
+	if !ruleCovers(rule.APIGroups, apiGroup) || !ruleCovers(rule.Verbs, verb) {
+		return false
+	}
+	for _, resource := range rule.Resources {
+		if resource == "*" || slices.Contains(resources, resource) {
+			return true
+		}
+	}
+	return false
+}
+
+func grantsManagerTokenCreate(rule rbacv1.PolicyRule) bool {
+	return policyRuleGrants(rule, "", "create", "serviceaccounts/token")
+}
+
+func grantsImpersonation(rule rbacv1.PolicyRule) bool {
+	return policyRuleGrants(rule, "", "impersonate", "users", "groups", "serviceaccounts")
+}
+
+func roleRefIsProjectLocal(ref rbacv1.RoleRef, known map[string]struct{}) bool {
+	if ref.APIGroup != "rbac.authorization.k8s.io" || (ref.Kind != "Role" && ref.Kind != "ClusterRole") {
+		return false
+	}
+	_, ok := known[ref.Kind+"/"+ref.Name]
+	return ok
+}
+
+func bindsManager(subjects []rbacv1.Subject) bool {
+	for _, subject := range subjects {
+		if subject.Kind == "ServiceAccount" && subject.Name == managerSubjectName && subject.Namespace == managerSubjectNamespace {
+			return true
+		}
+	}
+	return false
+}
+
+func loadProjectRoles(t *testing.T) []projectRole {
+	t.Helper()
+	managerRole := readManifest[rbacv1.ClusterRole](t, "../../config/rbac/role.yaml")
+	configurationRole := readManifest[rbacv1.ClusterRole](t, "../../config/admission/rbac/configuration_role.yaml")
+	leaderRole := readManifest[rbacv1.Role](t, "../../config/rbac/leader_election_role.yaml")
+	certificateRole := readManifest[rbacv1.Role](t, "../../config/admission/rbac/certificate_role.yaml")
+	return []projectRole{
+		{"ClusterRole", managerRole.Name, managerRole.Rules, managerRole.AggregationRule},
+		{"ClusterRole", configurationRole.Name, configurationRole.Rules, configurationRole.AggregationRule},
+		{"Role", leaderRole.Name, leaderRole.Rules, nil},
+		{"Role", certificateRole.Name, certificateRole.Rules, nil},
+	}
+}
+
+func loadProjectBindings(t *testing.T) []projectBinding {
+	t.Helper()
+	managerBinding := readManifest[rbacv1.ClusterRoleBinding](t, "../../config/rbac/role_binding.yaml")
+	configurationBinding := readManifest[rbacv1.ClusterRoleBinding](t, "../../config/admission/rbac/configuration_role_binding.yaml")
+	leaderBinding := readManifest[rbacv1.RoleBinding](t, "../../config/rbac/leader_election_role_binding.yaml")
+	certificateBinding := readManifest[rbacv1.RoleBinding](t, "../../config/admission/rbac/certificate_role_binding.yaml")
+	return []projectBinding{
+		{managerBinding.RoleRef, managerBinding.Subjects},
+		{configurationBinding.RoleRef, configurationBinding.Subjects},
+		{leaderBinding.RoleRef, leaderBinding.Subjects},
+		{certificateBinding.RoleRef, certificateBinding.Subjects},
+	}
+}
+
+func TestManagerRBACGrantsNoTokenOrImpersonationEscalation(t *testing.T) {
+	t.Parallel()
+	roles := loadProjectRoles(t)
+	bindings := loadProjectBindings(t)
+
+	known := map[string]struct{}{}
+	byKindName := map[string]projectRole{}
+	for _, role := range roles {
+		known[role.kind+"/"+role.name] = struct{}{}
+		byKindName[role.kind+"/"+role.name] = role
+		for _, rule := range role.rules {
+			if grantsManagerTokenCreate(rule) {
+				t.Errorf("%s %q grants serviceaccounts/token create", role.kind, role.name)
+			}
+			if grantsImpersonation(rule) {
+				t.Errorf("%s %q grants impersonation of users/groups/serviceaccounts", role.kind, role.name)
+			}
+		}
+	}
+
+	managerBound := 0
+	for _, binding := range bindings {
+		if !bindsManager(binding.subjects) {
+			continue
+		}
+		managerBound++
+		if !roleRefIsProjectLocal(binding.roleRef, known) {
+			t.Errorf("manager-bound binding references a non-project-local role: %#v", binding.roleRef)
+			continue
+		}
+		if role, ok := byKindName[binding.roleRef.Kind+"/"+binding.roleRef.Name]; ok && role.aggregation != nil {
+			t.Errorf("manager-bound %s %q uses an aggregationRule", role.kind, role.name)
+		}
+	}
+	if managerBound == 0 {
+		t.Fatal("no manager-bound role bindings were found; the escalation assertions never ran")
+	}
+}
+
+func TestManagerRBACAssertionsCatchPlantedEscalation(t *testing.T) {
+	t.Parallel()
+	tokenRule := rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"serviceaccounts/token"}, Verbs: []string{"create"}}
+	if !grantsManagerTokenCreate(tokenRule) {
+		t.Fatal("a planted serviceaccounts/token create grant was not detected")
+	}
+	impersonateRule := rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"users"}, Verbs: []string{"impersonate"}}
+	if !grantsImpersonation(impersonateRule) {
+		t.Fatal("a planted impersonation grant was not detected")
+	}
+	wildcard := rbacv1.PolicyRule{APIGroups: []string{"*"}, Resources: []string{"*"}, Verbs: []string{"*"}}
+	if !grantsManagerTokenCreate(wildcard) || !grantsImpersonation(wildcard) {
+		t.Fatal("a wildcard escalation was not detected")
+	}
+	benign := rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"serviceaccounts", "pods"}, Verbs: []string{"create", "get", "list"}}
+	if grantsManagerTokenCreate(benign) || grantsImpersonation(benign) {
+		t.Fatal("a benign serviceaccounts/pods rule was wrongly flagged")
+	}
+
+	known := map[string]struct{}{"ClusterRole/manager-role": {}}
+	if roleRefIsProjectLocal(rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "cluster-admin"}, known) {
+		t.Fatal("a manager binding to the built-in cluster-admin was accepted")
+	}
+	if !roleRefIsProjectLocal(rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "manager-role"}, known) {
+		t.Fatal("the project-local manager-role roleRef was rejected")
+	}
+}

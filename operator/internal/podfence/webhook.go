@@ -52,6 +52,10 @@ const (
 	NamespaceWebhookPath         = "/validate-core-v1-postgresqlfencingnamespace"
 	PodCreateWebhookName         = "vpostgresqlpodcreate.pgshard.io"
 	PodCreateWebhookPath         = "/validate-core-v1-postgresqlpodcreate"
+
+	PodConnectWebhookPath        = "/validate-core-v1-postgresqlpodconnect"
+	PodConnectFencedWebhookName  = "vpostgresqlpodconnect.pgshard.io"
+	PodConnectManagerWebhookName = "vpostgresqlmanagerconnect.pgshard.io"
 )
 
 type HandshakeAttestor struct {
@@ -836,3 +840,5 @@ func hasTerminalPhase(pod *corev1.Pod) bool {
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodstatus,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=vpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlfencingnamespace,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=namespaces;namespaces/status;namespaces/finalize,verbs=update,versions=v1,name=vpostgresqlfencingnamespace.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-apps-v1-postgresqlworkload,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=apps,resources=statefulsets;deployments;replicasets;statefulsets/scale;deployments/scale;replicasets/scale,verbs=create;update,versions=v1,name=vpostgresqlworkload.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodconnect,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/exec;pods/attach;pods/portforward;pods/proxy,verbs=connect,versions=v1,name=vpostgresqlpodconnect.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodconnect,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/exec;pods/attach;pods/portforward;pods/proxy,verbs=connect,versions=v1,name=vpostgresqlmanagerconnect.pgshard.io,admissionReviewVersions=v1,servicePort=9444

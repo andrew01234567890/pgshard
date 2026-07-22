@@ -27,3 +27,11 @@ webhooks:
     namespaceSelector:
       matchLabels:
         pgshard.io/pod-fencing: enabled
+  - name: vpostgresqlpodconnect.pgshard.io
+    namespaceSelector:
+      matchLabels:
+        pgshard.io/pod-fencing: enabled
+  - name: vpostgresqlmanagerconnect.pgshard.io
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: pgshard-system

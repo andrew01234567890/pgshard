@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
@@ -125,15 +126,21 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		t.Fatalf("mutating webhook selector patch = %#v", mutatingSelectors.Webhooks)
 	}
 	validatingSelectors := readManifest[admissionregistrationv1.ValidatingWebhookConfiguration](t, "../../config/webhook/validating_selectors_patch.yaml")
-	if len(validatingSelectors.Webhooks) != 6 ||
+	if len(validatingSelectors.Webhooks) != 8 ||
 		validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[0].NamespaceSelector) ||
 		validatingSelectors.Webhooks[1].Name != podfence.NamespaceWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[1].ObjectSelector) ||
 		validatingSelectors.Webhooks[2].Name != podfence.StatusValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[2].NamespaceSelector) ||
 		validatingSelectors.Webhooks[3].Name != podfence.BindingValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[3].NamespaceSelector) ||
 		validatingSelectors.Webhooks[4].Name != podfence.PodCreateWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[4].NamespaceSelector) ||
-		validatingSelectors.Webhooks[5].Name != podfence.WorkloadWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) {
+		validatingSelectors.Webhooks[5].Name != podfence.WorkloadWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) ||
+		validatingSelectors.Webhooks[6].Name != podfence.PodConnectFencedWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[6].NamespaceSelector) ||
+		validatingSelectors.Webhooks[7].Name != podfence.PodConnectManagerWebhookName || !selectsOperatorNamespace(validatingSelectors.Webhooks[7].NamespaceSelector) {
 		t.Fatalf("validating webhook selector patch = %#v", validatingSelectors.Webhooks)
 	}
+}
+
+func selectsOperatorNamespace(selector *metav1.LabelSelector) bool {
+	return selector != nil && selector.MatchLabels["kubernetes.io/metadata.name"] == "pgshard-system" && len(selector.MatchLabels) == 1 && len(selector.MatchExpressions) == 0
 }
 
 func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
@@ -156,7 +163,7 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatalf("unexpected third webhook manifest: %v", err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 9 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 11 {
 		t.Fatalf("generated webhooks = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
 	activationFound := false
@@ -189,4 +196,71 @@ func assertWebhookPolicy(t *testing.T, clientConfig admissionregistrationv1.Webh
 
 func selectsFencingNamespace(selector *metav1.LabelSelector) bool {
 	return selector != nil && selector.MatchLabels[podfence.NamespaceLabel] == podfence.NamespaceLabelValue && len(selector.MatchLabels) == 1 && len(selector.MatchExpressions) == 0
+}
+
+func TestManagerTokenRequestPolicyShape(t *testing.T) {
+	t.Parallel()
+	file, err := os.Open("../../config/admission/validatingadmissionpolicy_tokenrequest.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	decoder := yamlutil.NewYAMLOrJSONDecoder(file, 4096)
+
+	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+	if err := decoder.Decode(policy); err != nil {
+		t.Fatal(err)
+	}
+	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+	if err := decoder.Decode(binding); err != nil {
+		t.Fatal(err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		t.Fatalf("unexpected third TokenRequest policy document: %v", err)
+	}
+
+	if policy.Name != "pgshard-manager-tokenrequest" || policy.Spec.FailurePolicy == nil || *policy.Spec.FailurePolicy != admissionregistrationv1.Fail {
+		t.Fatalf("policy identity/failurePolicy = %#v", policy.Spec.FailurePolicy)
+	}
+	if policy.Spec.MatchConstraints == nil || len(policy.Spec.MatchConstraints.ResourceRules) != 1 {
+		t.Fatalf("policy matchConstraints = %#v", policy.Spec.MatchConstraints)
+	}
+	rule := policy.Spec.MatchConstraints.ResourceRules[0]
+	if !slices.Contains(rule.APIGroups, "") || !slices.Contains(rule.Resources, "serviceaccounts/token") ||
+		!slices.Contains(rule.Operations, admissionregistrationv1.Create) {
+		t.Fatalf("policy resource rule = %#v", rule)
+	}
+
+	expressions := ""
+	for _, validation := range policy.Spec.Validations {
+		expressions += validation.Expression + "\n"
+	}
+	for _, predicate := range []string{
+		"request.userInfo.username.startsWith('system:node:')",
+		"object.spec.boundObjectRef.kind == 'Pod'",
+		"object.spec.audiences",
+		"object.spec.expirationSeconds",
+		"pgshard-controller-manager",
+	} {
+		if !strings.Contains(expressions+policyVariableExpressions(policy), predicate) {
+			t.Fatalf("policy validations are missing predicate %q", predicate)
+		}
+	}
+
+	if binding.Spec.PolicyName != policy.Name || !slices.Contains(binding.Spec.ValidationActions, admissionregistrationv1.Deny) {
+		t.Fatalf("policy binding = %#v", binding.Spec)
+	}
+	if binding.Spec.MatchResources == nil || binding.Spec.MatchResources.NamespaceSelector == nil ||
+		binding.Spec.MatchResources.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "pgshard-system" {
+		t.Fatalf("policy binding match resources = %#v", binding.Spec.MatchResources)
+	}
+}
+
+func policyVariableExpressions(policy *admissionregistrationv1.ValidatingAdmissionPolicy) string {
+	joined := ""
+	for _, variable := range policy.Spec.Variables {
+		joined += variable.Expression + "\n"
+	}
+	return joined
 }
