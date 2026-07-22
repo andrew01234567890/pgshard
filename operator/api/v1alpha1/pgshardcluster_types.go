@@ -349,6 +349,14 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=shard
 	PostgreSQLReplicationCredentials []PostgreSQLReplicationCredentialStatus `json:"postgresqlReplicationCredentials,omitempty"`
+	// PostgreSQLReplicationTLS records one staged replication CA and one server
+	// certificate Secret per shard member. Multi-member workloads may reference
+	// a shard's Secrets only after every member digest and the CA digest are
+	// checkpointed. Missing, replaced, or changed Secrets require explicit
+	// recovery.
+	// +listType=map
+	// +listMapKey=shard
+	PostgreSQLReplicationTLS []PostgreSQLReplicationTLSStatus `json:"postgresqlReplicationTLS,omitempty"`
 	// PostgreSQLConfiguration pins the exact immutable, content-addressed
 	// PostgreSQL ConfigMap selected for a future shard-zero catalog
 	// materialization attempt. It is recorded before candidate documents are
@@ -453,6 +461,50 @@ type PostgreSQLReplicationCredentialStatus struct {
 	// creation result.
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
 	MaterialSHA256 string `json:"materialSHA256,omitempty"`
+}
+
+// PostgreSQLReplicationTLSMemberStatus binds one shard member to a staged
+// server-certificate Secret. SecretUID is checkpointed while the Secret is
+// still empty; ServerSHA256 and NotAfter appear only after the same UID holds
+// immutable material issued by the shard's checkpointed CA.
+type PostgreSQLReplicationTLSMemberStatus struct {
+	// Member is a stable physical identity, never a mutable PostgreSQL role.
+	// +kubebuilder:validation:Minimum=0
+	Member int32 `json:"member"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	SecretName string `json:"secretName"`
+	// SecretUID is empty only before the empty Secret identity is observed.
+	SecretUID types.UID `json:"secretUID,omitempty"`
+	// ServerSHA256 binds the exact server certificate and private-key
+	// projection to the checkpointed creation result.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	ServerSHA256 string `json:"serverSHA256,omitempty"`
+	// NotAfter records the server certificate expiry.
+	NotAfter metav1.Time `json:"notAfter,omitempty"`
+}
+
+// PostgreSQLReplicationTLSStatus binds one shard to a staged replication CA
+// and its per-member server certificates. The CA digest is checkpointed only
+// after every member Secret holds validated immutable material.
+type PostgreSQLReplicationTLSStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	Shard int32 `json:"shard"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	CASecretName string `json:"caSecretName"`
+	// CASecretUID is empty only before the empty Secret identity is observed.
+	CASecretUID types.UID `json:"caSecretUID,omitempty"`
+	// CASHA256 binds the exact CA certificate projection to the checkpointed
+	// creation result.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	CASHA256 string `json:"caSHA256,omitempty"`
+	// RenewalDeadline is the moment the operator starts refusing this material
+	// instead of pretending it can rotate certificates without a restart.
+	RenewalDeadline metav1.Time `json:"renewalDeadline,omitempty"`
+	// +listType=map
+	// +listMapKey=member
+	Members []PostgreSQLReplicationTLSMemberStatus `json:"members,omitempty"`
 }
 
 // PostgreSQLWritableLeaseStatus pins one physical cell's writable-term Lease

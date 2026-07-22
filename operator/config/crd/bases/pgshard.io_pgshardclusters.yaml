@@ -806,6 +806,91 @@ spec:
                 x-kubernetes-list-map-keys:
                 - shard
                 x-kubernetes-list-type: map
+              postgresqlReplicationTLS:
+                description: |-
+                  PostgreSQLReplicationTLS records one staged replication CA and one server
+                  certificate Secret per shard member. Multi-member workloads may reference
+                  a shard's Secrets only after every member digest and the CA digest are
+                  checkpointed. Missing, replaced, or changed Secrets require explicit
+                  recovery.
+                items:
+                  description: |-
+                    PostgreSQLReplicationTLSStatus binds one shard to a staged replication CA
+                    and its per-member server certificates. The CA digest is checkpointed only
+                    after every member Secret holds validated immutable material.
+                  properties:
+                    caSHA256:
+                      description: |-
+                        CASHA256 binds the exact CA certificate projection to the checkpointed
+                        creation result.
+                      pattern: ^[0-9a-f]{64}$
+                      type: string
+                    caSecretName:
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    caSecretUID:
+                      description: CASecretUID is empty only before the empty Secret
+                        identity is observed.
+                      type: string
+                    members:
+                      items:
+                        description: |-
+                          PostgreSQLReplicationTLSMemberStatus binds one shard member to a staged
+                          server-certificate Secret. SecretUID is checkpointed while the Secret is
+                          still empty; ServerSHA256 and NotAfter appear only after the same UID holds
+                          immutable material issued by the shard's checkpointed CA.
+                        properties:
+                          member:
+                            description: Member is a stable physical identity, never
+                              a mutable PostgreSQL role.
+                            format: int32
+                            minimum: 0
+                            type: integer
+                          notAfter:
+                            description: NotAfter records the server certificate expiry.
+                            format: date-time
+                            type: string
+                          secretName:
+                            maxLength: 63
+                            minLength: 1
+                            type: string
+                          secretUID:
+                            description: SecretUID is empty only before the empty
+                              Secret identity is observed.
+                            type: string
+                          serverSHA256:
+                            description: |-
+                              ServerSHA256 binds the exact server certificate and private-key
+                              projection to the checkpointed creation result.
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                        required:
+                        - member
+                        - secretName
+                        type: object
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - member
+                      x-kubernetes-list-type: map
+                    renewalDeadline:
+                      description: |-
+                        RenewalDeadline is the moment the operator starts refusing this material
+                        instead of pretending it can rotate certificates without a restart.
+                      format: date-time
+                      type: string
+                    shard:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                  required:
+                  - caSecretName
+                  - shard
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - shard
+                x-kubernetes-list-type: map
               postgresqlWritableLeases:
                 description: |-
                   PostgreSQLWritableLeases binds every physical cell to the exact
