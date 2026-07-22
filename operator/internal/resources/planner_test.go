@@ -83,12 +83,12 @@ func TestPostgreSQLStandbyBootstrapScriptHasValidBashSyntax(t *testing.T) {
 	t.Parallel()
 	for name, replicationTLS := range map[string]bool{"server-tls": true, "legacy-cleartext": false} {
 		command := exec.Command("bash", "-n")
-		command.Stdin = strings.NewReader(postgresqlStandbyBootstrapScript(replicationTLS))
+		command.Stdin = strings.NewReader(PostgreSQLStandbyBootstrapScript(replicationTLS))
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("PostgreSQL standby bootstrap script syntax (%s): %v\n%s", name, err, output)
 		}
 	}
-	if strings.Contains(postgresqlStandbyBootstrapScript(true), "@PGSHARD_") || strings.Contains(postgresqlStandbyBootstrapScript(false), "@PGSHARD_") {
+	if strings.Contains(PostgreSQLStandbyBootstrapScript(true), "@PGSHARD_") || strings.Contains(PostgreSQLStandbyBootstrapScript(false), "@PGSHARD_") {
 		t.Fatal("standby bootstrap script retained an unrendered template placeholder")
 	}
 }
@@ -3409,7 +3409,7 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 							}
 						}
 						if prepareServerTLS == nil ||
-							!reflect.DeepEqual(prepareServerTLS.Command, []string{"bash", "-ceu", postgresqlServerTLSPrepareScript}) ||
+							!reflect.DeepEqual(prepareServerTLS.Command, []string{"bash", "-ceu", PostgreSQLServerTLSPrepareScript}) ||
 							envValue(prepareServerTLS.Env, "PGSHARD_REPLICATION_TLS_SERVER_SHA256") != memberTLS.ServerSHA256 ||
 							!containsVolumeMount(prepareServerTLS.VolumeMounts, "server-tls-secret", true) ||
 							!containsVolumeMount(prepareServerTLS.VolumeMounts, "server-tls", false) {
@@ -4055,6 +4055,9 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 	cluster := testCluster()
 	cluster.Spec.MembersPerShard = 5
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilitySynchronous
+	cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
+		ReplicationTransportPolicy: pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1,
+	}
 	pod := testReplicationBootstrapSourcePodFor(t, cluster.Spec.MembersPerShard, cluster.Spec.Durability)
 	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("observe exact five-member source = %q, %v", observed, err)
@@ -4089,6 +4092,9 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 func TestLegacyBootstrapSourceRemainsFencedDuringGenerationUpgrade(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
+	cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
+		ReplicationTransportPolicy: pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1,
+	}
 	pod := testReplicationBootstrapSourcePod(t)
 	legacy := pod.DeepCopy()
 	legacy.Spec.Containers[0].Env = slices.DeleteFunc(legacy.Spec.Containers[0].Env, func(environment corev1.EnvVar) bool {
@@ -4293,6 +4299,150 @@ func TestReplicationStandbyPodClassificationIsExact(t *testing.T) {
 			test.mutate(changed)
 			if IsPostgreSQLReplicationStandbyPod(changed) {
 				t.Fatalf("changed Pod retained standby identity: %#v", changed.ObjectMeta)
+			}
+		})
+	}
+}
+
+func testReplicationPodsForPolicy(t *testing.T, serverTLS bool) (*corev1.Pod, *corev1.Pod) {
+	t.Helper()
+	cluster := testCluster()
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	if !serverTLS {
+		cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = ""
+		cluster.Status.PostgreSQLReplicationTLS = nil
+	}
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	podFor := func(member int32) *corev1.Pod {
+		name := PostgreSQLMemberStatefulSetName(cluster.Name, 0, member)
+		for _, item := range plan {
+			statefulSet, ok := item.(*appsv1.StatefulSet)
+			if !ok || statefulSet.Name != name {
+				continue
+			}
+			return &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        name + "-0",
+					Namespace:   cluster.Namespace,
+					Labels:      maps.Clone(statefulSet.Spec.Template.Labels),
+					Annotations: maps.Clone(statefulSet.Spec.Template.Annotations),
+					Finalizers:  slices.Clone(statefulSet.Spec.Template.Finalizers),
+				},
+				Spec: *statefulSet.Spec.Template.Spec.DeepCopy(),
+			}
+		}
+		t.Fatalf("plan has no PostgreSQL member StatefulSet %s", name)
+		return nil
+	}
+	return podFor(0), podFor(1)
+}
+
+func TestClusterAwareObservationBindsReplicationTransportPolicy(t *testing.T) {
+	t.Parallel()
+	tlsSource, tlsStandby := testReplicationPodsForPolicy(t, true)
+	cleartextSource, cleartextStandby := testReplicationPodsForPolicy(t, false)
+	clusterWithPolicy := func(policy string) *pgshardv1alpha1.PgShardCluster {
+		cluster := testCluster()
+		cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{ReplicationTransportPolicy: policy}
+		return cluster
+	}
+	policyCluster := clusterWithPolicy(pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+	legacyCluster := clusterWithPolicy("")
+	unrecordedCluster := testCluster()
+
+	for name, pod := range map[string]*corev1.Pod{"source": tlsSource, "standby": tlsStandby} {
+		if observed, err := ObservePostgreSQLRuntimeForCluster(policyCluster, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+			t.Fatalf("policy cluster rejected its exact TLS %s: %q, %v", name, observed, err)
+		}
+		if _, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "transport composition does not match") {
+			t.Fatalf("legacy cluster accepted a TLS %s: %v", name, err)
+		}
+		if _, err := ObservePostgreSQLRuntimeForCluster(unrecordedCluster, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "recorded PostgreSQL bootstrap contract") {
+			t.Fatalf("unrecorded cluster accepted a replication %s: %v", name, err)
+		}
+	}
+	for name, pod := range map[string]*corev1.Pod{"source": cleartextSource, "standby": cleartextStandby} {
+		if observed, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+			t.Fatalf("legacy cluster rejected its exact cleartext %s: %q, %v", name, observed, err)
+		}
+		if _, err := ObservePostgreSQLRuntimeForCluster(policyCluster, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "transport composition does not match") {
+			t.Fatalf("policy cluster accepted a cleartext %s: %v", name, err)
+		}
+	}
+
+	dropEnvironment := func(container *corev1.Container, name string) {
+		container.Env = slices.DeleteFunc(container.Env, func(environment corev1.EnvVar) bool { return environment.Name == name })
+	}
+	dropVolume := func(pod *corev1.Pod, name string) {
+		pod.Spec.Volumes = slices.DeleteFunc(pod.Spec.Volumes, func(volume corev1.Volume) bool { return volume.Name == name })
+	}
+	for _, test := range []struct {
+		name   string
+		pod    *corev1.Pod
+		mutate func(*corev1.Pod)
+	}{
+		{name: "source without TLS certificate environment", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_SERVER_TLS_CERT")
+		}},
+		{name: "source without TLS key environment", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_SERVER_TLS_KEY")
+		}},
+		{name: "source without TLS digest environment", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_REPLICATION_TLS_SERVER_SHA256")
+		}},
+		{name: "source without the server-tls mount", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].VolumeMounts = slices.DeleteFunc(pod.Spec.Containers[0].VolumeMounts, func(mount corev1.VolumeMount) bool { return mount.Name == "server-tls" })
+		}},
+		{name: "source without the server-tls-secret volume", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "server-tls-secret")
+		}},
+		{name: "source without the server-tls staging volume", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "server-tls")
+		}},
+		{name: "source demoted to the cleartext HBA policy", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			setLiteralEnvironment(pod, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf")
+		}},
+		{name: "cleartext source carrying one TLS artifact", pod: cleartextSource, mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: "/run/pgshard/server-tls/tls.crt"})
+		}},
+		{name: "standby without the trust-anchor environment", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT")
+		}},
+		{name: "standby without the agent CA digest", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_REPLICATION_TLS_CA_SHA256")
+		}},
+		{name: "standby without the initializer CA digest", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.InitContainers[0], "PGSHARD_REPLICATION_TLS_CA_SHA256")
+		}},
+		{name: "standby without the CA projection mount", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			pod.Spec.InitContainers[0].VolumeMounts = slices.DeleteFunc(pod.Spec.InitContainers[0].VolumeMounts, func(mount corev1.VolumeMount) bool { return mount.Name == "replication-ca-secret" })
+		}},
+		{name: "standby without the replication-ca-secret volume", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "replication-ca-secret")
+		}},
+		{name: "standby demoted to the cleartext clone script", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			pod.Spec.InitContainers[0].Command = []string{"bash", "-ceu", PostgreSQLStandbyBootstrapScript(false)}
+		}},
+		{name: "cleartext standby carrying one TLS artifact", pod: cleartextStandby, mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT", Value: "/run/pgshard/standby-auth/ca.crt"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			changed := test.pod.DeepCopy()
+			test.mutate(changed)
+			if _, err := ObservePostgreSQLRuntimeForCluster(policyCluster, changed.Annotations, changed.Spec); err == nil {
+				t.Fatal("policy cluster accepted a stripped or mixed replication transport composition")
+			}
+			if _, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, changed.Annotations, changed.Spec); err == nil {
+				t.Fatal("legacy cluster accepted a stripped or mixed replication transport composition")
 			}
 		})
 	}
@@ -4590,7 +4740,7 @@ func TestMultiMemberPlanWithoutTransportPolicyStaysCleartextUnchanged(t *testing
 			continue
 		}
 		script := object.Spec.Template.Spec.InitContainers[0].Command[2]
-		if script != postgresqlStandbyBootstrapScript(false) ||
+		if script != PostgreSQLStandbyBootstrapScript(false) ||
 			strings.Count(script, "sslmode=disable") != 2 ||
 			!strings.Contains(script, "--host=\"$PGSHARD_SOURCE_HOST\"") ||
 			strings.Contains(script, "verify-full") || strings.Contains(script, "replication-tls") {

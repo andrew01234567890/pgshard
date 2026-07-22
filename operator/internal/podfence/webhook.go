@@ -230,6 +230,12 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 			return nil, &response
 		}
 	}
+	if owned.IsPostgreSQLReplicationStandbyPod(pod) {
+		if _, err := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec); err != nil {
+			response := admission.Denied(fmt.Sprintf("PostgreSQL replication standby does not match its PgShardCluster transport contract: %v", err))
+			return nil, &response
+		}
+	}
 	if binding.Target.Kind != "Node" || binding.Target.Name == "" {
 		response := admission.Denied("managed PostgreSQL Pod binding must select a named Node")
 		return nil, &response

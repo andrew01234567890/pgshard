@@ -163,6 +163,158 @@ func TestBindingAdmissionAcceptsOnlyTheExactRoleNeutralBootstrapSource(t *testin
 	}
 }
 
+func TestBindingAdmissionEnforcesReplicationTransportPolicy(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	serverTLSDigest := strings.Repeat("a", 64)
+	caDigest := strings.Repeat("b", 64)
+
+	bindablePod := func(pod *corev1.Pod) *corev1.Pod {
+		pod.Spec.NodeName = ""
+		pod.DeletionTimestamp = nil
+		delete(pod.Annotations, NodeUIDAnnotation)
+		delete(pod.Annotations, NodeBootIDAnnotation)
+		return pod
+	}
+	tlsSourcePod := func() *corev1.Pod {
+		pod := bindablePod(roleNeutralBootstrapSourcePod())
+		container := &pod.Spec.Containers[0]
+		for index := range container.Env {
+			if container.Env[index].Name == "PGSHARD_POSTGRES_HBA_FILE" {
+				container.Env[index].Value = "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf"
+			}
+		}
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: "/run/pgshard/server-tls/tls.crt"},
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_KEY", Value: "/run/pgshard/server-tls/tls.key"},
+			corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_SERVER_SHA256", Value: serverTLSDigest},
+		)
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "server-tls", MountPath: "/run/pgshard/server-tls", ReadOnly: true})
+		pod.Spec.Volumes = append(pod.Spec.Volumes,
+			corev1.Volume{Name: "server-tls-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "staged-server-tls"}}},
+			corev1.Volume{Name: "server-tls", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+		)
+		return pod
+	}
+	tlsStandbyPod := func() *corev1.Pod {
+		pod := bindablePod(roleNeutralStandbyPod())
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT", Value: "/run/pgshard/standby-auth/ca.crt"},
+			corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_CA_SHA256", Value: caDigest},
+		)
+		pod.Spec.InitContainers[0].Command = []string{"bash", "-ceu", owned.PostgreSQLStandbyBootstrapScript(true)}
+		pod.Spec.InitContainers[0].Env = append(pod.Spec.InitContainers[0].Env, corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_CA_SHA256", Value: caDigest})
+		pod.Spec.InitContainers[0].VolumeMounts = append(pod.Spec.InitContainers[0].VolumeMounts, corev1.VolumeMount{Name: "replication-ca-secret", MountPath: "/etc/pgshard/replication-tls", ReadOnly: true})
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: "replication-ca-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "staged-replication-ca"}}})
+		return pod
+	}
+	clusterFor := func(pod *corev1.Pod, policy string) *pgshardv1alpha1.PgShardCluster {
+		cluster := managedClusterForPod(pod)
+		cluster.Spec.MembersPerShard = 3
+		cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = policy
+		return cluster
+	}
+	attempt := func(t *testing.T, pod *corev1.Pod, cluster *pgshardv1alpha1.PgShardCluster) admission.Response {
+		t.Helper()
+		node := testNode("node-a", "node-uid-a", "boot-a")
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node, cluster).Build()
+		binding := &corev1.Binding{
+			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
+			Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+		}
+		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+		}}
+		return NewBindingAttestor(reader, scheme).Handle(context.Background(), request)
+	}
+
+	const policyServerTLS = pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1
+	for name, build := range map[string]func() *corev1.Pod{"source": tlsSourcePod, "standby": tlsStandbyPod} {
+		if response := attempt(t, build(), clusterFor(build(), policyServerTLS)); !response.Allowed {
+			t.Fatalf("policy cluster's exact TLS %s binding denied: %#v", name, response.Result)
+		}
+		if response := attempt(t, build(), clusterFor(build(), "")); response.Allowed {
+			t.Fatalf("legacy cluster accepted a TLS %s binding", name)
+		}
+	}
+	for name, build := range map[string]func() *corev1.Pod{
+		"source":  func() *corev1.Pod { return bindablePod(roleNeutralBootstrapSourcePod()) },
+		"standby": func() *corev1.Pod { return bindablePod(roleNeutralStandbyPod()) },
+	} {
+		if response := attempt(t, build(), clusterFor(build(), "")); !response.Allowed {
+			t.Fatalf("legacy cluster's exact cleartext %s binding denied: %#v", name, response.Result)
+		}
+		if response := attempt(t, build(), clusterFor(build(), policyServerTLS)); response.Allowed {
+			t.Fatalf("policy cluster accepted a cleartext %s binding", name)
+		}
+	}
+
+	dropEnvironment := func(container *corev1.Container, name string) {
+		container.Env = slices.DeleteFunc(container.Env, func(environment corev1.EnvVar) bool { return environment.Name == name })
+	}
+	dropVolume := func(pod *corev1.Pod, name string) {
+		pod.Spec.Volumes = slices.DeleteFunc(pod.Spec.Volumes, func(volume corev1.Volume) bool { return volume.Name == name })
+	}
+	for _, test := range []struct {
+		name   string
+		build  func() *corev1.Pod
+		mutate func(*corev1.Pod)
+	}{
+		{name: "source without TLS certificate environment", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_SERVER_TLS_CERT")
+		}},
+		{name: "source without TLS key environment", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_SERVER_TLS_KEY")
+		}},
+		{name: "source without TLS digest environment", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_REPLICATION_TLS_SERVER_SHA256")
+		}},
+		{name: "source without the server-tls mount", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].VolumeMounts = slices.DeleteFunc(pod.Spec.Containers[0].VolumeMounts, func(mount corev1.VolumeMount) bool { return mount.Name == "server-tls" })
+		}},
+		{name: "source without the server-tls-secret volume", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "server-tls-secret")
+		}},
+		{name: "source without the server-tls staging volume", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "server-tls")
+		}},
+		{name: "source demoted to the cleartext HBA policy", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Containers[0].Env {
+				if pod.Spec.Containers[0].Env[index].Name == "PGSHARD_POSTGRES_HBA_FILE" {
+					pod.Spec.Containers[0].Env[index].Value = "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+				}
+			}
+		}},
+		{name: "standby without the trust-anchor environment", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT")
+		}},
+		{name: "standby without the agent CA digest", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_REPLICATION_TLS_CA_SHA256")
+		}},
+		{name: "standby without the initializer CA digest", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.InitContainers[0], "PGSHARD_REPLICATION_TLS_CA_SHA256")
+		}},
+		{name: "standby without the CA projection mount", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			pod.Spec.InitContainers[0].VolumeMounts = slices.DeleteFunc(pod.Spec.InitContainers[0].VolumeMounts, func(mount corev1.VolumeMount) bool { return mount.Name == "replication-ca-secret" })
+		}},
+		{name: "standby without the replication-ca-secret volume", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "replication-ca-secret")
+		}},
+		{name: "standby demoted to the cleartext clone script", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			pod.Spec.InitContainers[0].Command = []string{"bash", "-ceu", owned.PostgreSQLStandbyBootstrapScript(false)}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			pod := test.build()
+			test.mutate(pod)
+			if response := attempt(t, pod, clusterFor(pod, policyServerTLS)); response.Allowed {
+				t.Fatal("policy cluster accepted a stripped replication transport binding")
+			}
+		})
+	}
+}
+
 func TestBindingAdmissionDeniesNewLegacyBootstrapSourceButRetainsItsLifecycleFence(t *testing.T) {
 	t.Parallel()
 	scheme := testScheme(t)
@@ -938,6 +1090,10 @@ func roleNeutralStandbyPod() *corev1.Pod {
 		LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz"}}},
 		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz"}}},
 	}}
+	pod.Spec.InitContainers = []corev1.Container{{
+		Name:    "bootstrap-standby",
+		Command: []string{"bash", "-ceu", owned.PostgreSQLStandbyBootstrapScript(false)},
+	}}
 	pod.Spec.Volumes = []corev1.Volume{
 		{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
 		{
@@ -950,12 +1106,19 @@ func roleNeutralStandbyPod() *corev1.Pod {
 	return pod
 }
 
+// managedClusterForPod records an empty replication transport policy: the
+// hand-built webhook fixtures reproduce the pre-TLS cleartext compositions.
 func managedClusterForPod(pod *corev1.Pod) *pgshardv1alpha1.PgShardCluster {
-	return &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{
-		Name:      pod.Labels[owned.ClusterLabel],
-		Namespace: pod.Namespace,
-		UID:       types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]),
-	}}
+	return &pgshardv1alpha1.PgShardCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Labels[owned.ClusterLabel],
+			Namespace: pod.Namespace,
+			UID:       types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]),
+		},
+		Status: pgshardv1alpha1.PgShardClusterStatus{
+			PostgreSQLBootstrapSpec: &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{},
+		},
+	}
 }
 
 func testNode(name string, uid types.UID, bootID string) *corev1.Node {

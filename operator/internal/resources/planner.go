@@ -1967,12 +1967,12 @@ cleanup_bootstrap_runtime
 sync "$final" "$parent" "$volume_root"
 `
 
-// postgresqlStandbyBootstrapScript renders the standby clone script.
+// PostgreSQLStandbyBootstrapScript renders the standby clone script.
 // replicationTLS selects the strict server-authenticated client hops for
 // clusters born under the server-tls-v1 transport policy; false reproduces the
 // pre-TLS cleartext script byte-for-byte so bootstrap contracts recorded
 // before replication TLS existed keep their exact provisioned pod templates.
-func postgresqlStandbyBootstrapScript(replicationTLS bool) string {
+func PostgreSQLStandbyBootstrapScript(replicationTLS bool) string {
 	caRequirement := ""
 	caDigestGuard := ""
 	caInstall := ""
@@ -2295,11 +2295,11 @@ rm -f -- "$expected_source_identity" "$expected_clone_identity"
 rm -rf -- "$socket"
 `
 
-// postgresqlServerTLSPrepareScript digest-verifies the projected replication
+// PostgreSQLServerTLSPrepareScript digest-verifies the projected replication
 // server keypair and republishes it as private regular files in a memory
 // EmptyDir. PostgreSQL refuses group-readable Secret-projection symlinks for
 // ssl_key_file, so the postmaster consumes only this tmpfs copy.
-const postgresqlServerTLSPrepareScript = `set -Eeuo pipefail
+const PostgreSQLServerTLSPrepareScript = `set -Eeuo pipefail
 : "${PGSHARD_REPLICATION_TLS_SERVER_SHA256:?replication server TLS digest is required}"
 if [[ ! "$PGSHARD_REPLICATION_TLS_SERVER_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   echo "refusing an invalid checkpointed replication server TLS digest" >&2
@@ -2411,9 +2411,11 @@ func ObservePostgreSQLRuntime(annotations map[string]string, spec corev1.PodSpec
 }
 
 // ObservePostgreSQLRuntimeForCluster additionally binds a structurally valid
-// replication-bootstrap source to the PgShardCluster's immutable topology and
-// durability. Pod annotations describe shape; they are not an independent
-// authority that may downgrade or shrink the source's generation contract.
+// replication member to the PgShardCluster's immutable topology, durability,
+// and recorded replication transport policy. Pod annotations and container
+// composition describe shape; they are not an independent authority that may
+// downgrade the source's generation contract or strip a policy cluster's
+// transport encryption back to cleartext.
 func ObservePostgreSQLRuntimeForCluster(cluster *pgshardv1alpha1.PgShardCluster, annotations map[string]string, spec corev1.PodSpec) (PostgreSQLRuntime, error) {
 	if cluster == nil {
 		return "", fmt.Errorf("cluster is nil")
@@ -2427,8 +2429,21 @@ func ObservePostgreSQLRuntimeForCluster(cluster *pgshardv1alpha1.PgShardCluster,
 			continue
 		}
 		mode, modeOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_MODE")
-		if !modeOK || mode != "replication-bootstrap-primary" {
+		if !modeOK || (mode != "replication-bootstrap-primary" && mode != "replication-standby") {
 			return observed, nil
+		}
+		wantShape, err := postgresqlTransportShapeForPolicy(cluster)
+		if err != nil {
+			return "", err
+		}
+		if mode == "replication-standby" {
+			if postgresqlStandbyTransportShape(spec, container) != wantShape {
+				return "", fmt.Errorf("replication standby transport composition does not match the recorded %q replication transport policy", clusterReplicationTransportPolicy(cluster))
+			}
+			return observed, nil
+		}
+		if postgresqlSourceTransportShape(spec, container) != wantShape {
+			return "", fmt.Errorf("replication-bootstrap source transport composition does not match the recorded %q replication transport policy", clusterReplicationTransportPolicy(cluster))
 		}
 		if postgresqlLegacyBootstrapGenerationShape(annotations, container) {
 			return observed, nil
@@ -2478,26 +2493,133 @@ func IsPostgreSQLReplicationBootstrapSourcePod(pod *corev1.Pod) bool {
 			continue
 		}
 		mode, modeOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_MODE")
-		hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_HBA_FILE")
-		return modeOK && hbaFileOK && mode == "replication-bootstrap-primary" &&
-			hbaFile != "" && hbaFile == postgresqlBootstrapSourceHBAFile(container)
+		return modeOK && mode == "replication-bootstrap-primary" &&
+			postgresqlSourceTransportShape(pod.Spec, container) != postgresqlTransportShapeInvalid
 	}
 	return false
 }
 
-// postgresqlBootstrapSourceHBAFile pairs the source HBA policy with projected
-// server TLS material: a source that received the operator's verified keypair
-// must run the TLS-only policy, and a policy-less legacy source must keep the
-// pre-TLS cleartext policy bytes.
-func postgresqlBootstrapSourceHBAFile(container corev1.Container) string {
-	certFile, certFileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_SERVER_TLS_CERT")
-	if !containerHasEnvironment(container, "PGSHARD_POSTGRES_SERVER_TLS_CERT") {
-		return postgresqlBootstrapPrimaryHBAFile
+// postgresqlTransportShape classifies a replication member's transport
+// composition. Only the two complete compositions are valid: the full
+// server-TLS group or the exact pre-TLS cleartext group. Any partial mix is
+// invalid so a single stripped artifact can never demote an encrypted member
+// to an accepted cleartext one.
+type postgresqlTransportShape int
+
+const (
+	postgresqlTransportShapeInvalid postgresqlTransportShape = iota
+	postgresqlTransportShapeCleartext
+	postgresqlTransportShapeServerTLS
+)
+
+// postgresqlSourceTransportShape requires, all-or-none: the server TLS
+// certificate/key/digest environment, the read-only server-tls tmpfs mount,
+// the server-tls-secret projection and server-tls staging volumes, and the
+// TLS-only HBA policy. Cleartext requires none of them plus the exact pre-TLS
+// HBA policy.
+func postgresqlSourceTransportShape(spec corev1.PodSpec, postgres corev1.Container) postgresqlTransportShape {
+	hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_HBA_FILE")
+	certFile, certFileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_SERVER_TLS_CERT")
+	keyFile, keyFileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_SERVER_TLS_KEY")
+	digest, digestOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_REPLICATION_TLS_SERVER_SHA256")
+	secretVolume := podHasSecretVolume(spec, "server-tls-secret")
+	stagingVolume := podHasMemoryEmptyDirVolume(spec, "server-tls")
+	switch {
+	case hbaFileOK && hbaFile == postgresqlBootstrapPrimaryTLSHBAFile &&
+		certFileOK && certFile == postgresqlServerTLSCertFile &&
+		keyFileOK && keyFile == postgresqlServerTLSKeyFile &&
+		digestOK && validCatalogMaterialSHA256(digest) &&
+		containerHasReadOnlyMount(postgres, "server-tls", "/run/pgshard/server-tls") &&
+		secretVolume && stagingVolume:
+		return postgresqlTransportShapeServerTLS
+	case hbaFileOK && hbaFile == postgresqlBootstrapPrimaryHBAFile &&
+		!containerHasEnvironment(postgres, "PGSHARD_POSTGRES_SERVER_TLS_CERT") &&
+		!containerHasEnvironment(postgres, "PGSHARD_POSTGRES_SERVER_TLS_KEY") &&
+		!containerHasEnvironment(postgres, "PGSHARD_REPLICATION_TLS_SERVER_SHA256") &&
+		!containerHasVolumeMount(postgres, "server-tls") &&
+		!secretVolume && !stagingVolume:
+		return postgresqlTransportShapeCleartext
+	default:
+		return postgresqlTransportShapeInvalid
 	}
-	if certFileOK && certFile == postgresqlServerTLSCertFile {
-		return postgresqlBootstrapPrimaryTLSHBAFile
+}
+
+// postgresqlStandbyTransportShape requires, all-or-none: the verify-full
+// trust-anchor environment on the agent, the matching CA digest and read-only
+// replication-ca-secret projection on the bootstrap initializer, and the exact
+// TLS clone script (whose client hops carry sslmode=verify-full,
+// sslrootcert, and channel_binding=require). Cleartext requires none of them
+// plus the byte-exact pre-TLS clone script.
+func postgresqlStandbyTransportShape(spec corev1.PodSpec, postgres corev1.Container) postgresqlTransportShape {
+	var bootstrap *corev1.Container
+	for index := range spec.InitContainers {
+		if spec.InitContainers[index].Name != "bootstrap-standby" {
+			continue
+		}
+		if bootstrap != nil {
+			return postgresqlTransportShapeInvalid
+		}
+		bootstrap = &spec.InitContainers[index]
 	}
-	return ""
+	if bootstrap == nil || len(bootstrap.Command) != 3 || bootstrap.Command[0] != "bash" || bootstrap.Command[1] != "-ceu" {
+		return postgresqlTransportShapeInvalid
+	}
+	script := bootstrap.Command[2]
+	rootCert, rootCertOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT")
+	agentDigest, agentDigestOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_REPLICATION_TLS_CA_SHA256")
+	initDigest, initDigestOK := containerUniqueLiteralEnvironment(*bootstrap, "PGSHARD_REPLICATION_TLS_CA_SHA256")
+	caVolume := podHasSecretVolume(spec, "replication-ca-secret")
+	switch {
+	case rootCertOK && rootCert == postgresqlStandbySSLRootCertFile &&
+		agentDigestOK && validCatalogMaterialSHA256(agentDigest) &&
+		initDigestOK && initDigest == agentDigest &&
+		containerHasReadOnlyMount(*bootstrap, "replication-ca-secret", "/etc/pgshard/replication-tls") &&
+		caVolume && script == PostgreSQLStandbyBootstrapScript(true):
+		return postgresqlTransportShapeServerTLS
+	case !containerHasEnvironment(postgres, "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT") &&
+		!containerHasEnvironment(postgres, "PGSHARD_REPLICATION_TLS_CA_SHA256") &&
+		!containerHasEnvironment(*bootstrap, "PGSHARD_REPLICATION_TLS_CA_SHA256") &&
+		!containerHasVolumeMount(*bootstrap, "replication-ca-secret") &&
+		!caVolume && script == PostgreSQLStandbyBootstrapScript(false):
+		return postgresqlTransportShapeCleartext
+	default:
+		return postgresqlTransportShapeInvalid
+	}
+}
+
+// postgresqlTransportShapeForPolicy maps a cluster's recorded transport policy
+// to the one member composition it permits. Replication members of a cluster
+// without a recorded bootstrap contract cannot be bound to a policy and are
+// rejected outright.
+func postgresqlTransportShapeForPolicy(cluster *pgshardv1alpha1.PgShardCluster) (postgresqlTransportShape, error) {
+	provisioned := cluster.Status.PostgreSQLBootstrapSpec
+	if provisioned == nil {
+		return postgresqlTransportShapeInvalid, fmt.Errorf("replication member exists without a recorded PostgreSQL bootstrap contract")
+	}
+	switch provisioned.ReplicationTransportPolicy {
+	case pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1:
+		return postgresqlTransportShapeServerTLS, nil
+	case "":
+		return postgresqlTransportShapeCleartext, nil
+	default:
+		return postgresqlTransportShapeInvalid, fmt.Errorf("recorded replication transport policy %q is unknown", provisioned.ReplicationTransportPolicy)
+	}
+}
+
+func clusterReplicationTransportPolicy(cluster *pgshardv1alpha1.PgShardCluster) string {
+	if cluster.Status.PostgreSQLBootstrapSpec == nil {
+		return ""
+	}
+	return cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy
+}
+
+func podHasSecretVolume(spec corev1.PodSpec, name string) bool {
+	for _, volume := range spec.Volumes {
+		if volume.Name == name {
+			return volume.Secret != nil && volume.Secret.SecretName != ""
+		}
+	}
+	return false
 }
 
 // IsCurrentPostgreSQLReplicationBootstrapSourcePod excludes the complete
@@ -2566,7 +2688,8 @@ func IsPostgreSQLReplicationStandbyPod(pod *corev1.Pod) bool {
 			source == expectedSource && slot == expectedSlot &&
 			passfile == "/run/pgshard/standby-auth/passfile" &&
 			containerHasReadOnlyMount(container, "standby-passfile", "/run/pgshard/standby-auth") &&
-			!containerHasMount(container, "replication-credential", "/etc/pgshard/replication")
+			!containerHasMount(container, "replication-credential", "/etc/pgshard/replication") &&
+			postgresqlStandbyTransportShape(pod.Spec, container) != postgresqlTransportShapeInvalid
 	}
 	return false
 }
@@ -2578,7 +2701,8 @@ func postgresqlAgentShape(annotations map[string]string, spec corev1.PodSpec, po
 	mode, modeOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_MODE")
 	hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_HBA_FILE")
 	quarantine := modeOK && hbaFileOK && mode == "quarantine" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
-	bootstrapSource := modeOK && hbaFileOK && mode == "replication-bootstrap-primary" && hbaFile != "" && hbaFile == postgresqlBootstrapSourceHBAFile(postgres)
+	bootstrapSource := modeOK && hbaFileOK && mode == "replication-bootstrap-primary" &&
+		postgresqlSourceTransportShape(spec, postgres) != postgresqlTransportShapeInvalid
 	standby := modeOK && hbaFileOK && mode == "replication-standby" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
 	if bootstrapSource {
 		bootstrapSource = postgresqlBootstrapGenerationShape(annotations, postgres)
@@ -2598,7 +2722,8 @@ func postgresqlAgentShape(annotations map[string]string, spec corev1.PodSpec, po
 			slotOK && canonicalPostgreSQLMemberSlot(slot) && passfileOK &&
 			passfile == "/run/pgshard/standby-auth/passfile" &&
 			clusterUIDOK && clusterUID != "" && clusterUID == annotations[PostgreSQLPodClusterUIDAnnotation] &&
-			containerUniqueFieldEnvironment(postgres, "PGSHARD_POD_UID", "metadata.uid")
+			containerUniqueFieldEnvironment(postgres, "PGSHARD_POD_UID", "metadata.uid") &&
+			postgresqlStandbyTransportShape(spec, postgres) != postgresqlTransportShapeInvalid
 	}
 	if (!quarantine && !bootstrapSource && !standby) ||
 		!containerHasPort(postgres, "agent-http", HTTPPort) ||
@@ -5042,7 +5167,7 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 		serverTLS = postgresqlReplicationTLSMember(*replicationTLS, 0)
 		agent.Env = append(agent.Env,
 			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: postgresqlServerTLSCertFile},
-			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_KEY", Value: "/run/pgshard/server-tls/tls.key"},
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_KEY", Value: postgresqlServerTLSKeyFile},
 			corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_SERVER_SHA256", Value: serverTLS.ServerSHA256},
 		)
 		agent.VolumeMounts = append(agent.VolumeMounts, corev1.VolumeMount{
@@ -5122,7 +5247,7 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			Name:            "prepare-server-tls",
 			Image:           images.PostgreSQLBootstrap,
 			ImagePullPolicy: bootstrapPullPolicy,
-			Command:         []string{"bash", "-ceu", postgresqlServerTLSPrepareScript},
+			Command:         []string{"bash", "-ceu", PostgreSQLServerTLSPrepareScript},
 			Env: []corev1.EnvVar{
 				{Name: "PGSHARD_REPLICATION_TLS_SERVER_SHA256", Value: serverTLS.ServerSHA256},
 			},
@@ -5273,7 +5398,7 @@ func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardClu
 		Name:            "bootstrap-standby",
 		Image:           images.PostgreSQLBootstrap,
 		ImagePullPolicy: pullPolicy,
-		Command:         []string{"bash", "-ceu", postgresqlStandbyBootstrapScript(replicationTLS != nil)},
+		Command:         []string{"bash", "-ceu", PostgreSQLStandbyBootstrapScript(replicationTLS != nil)},
 		Env: []corev1.EnvVar{
 			{Name: "PGSHARD_CLUSTER_UID", Value: string(cluster.UID)},
 			{Name: "PGSHARD_SHARD_ID", Value: shardLabel(shard)},
@@ -5390,6 +5515,8 @@ const (
 	postgresqlBootstrapPrimaryHBAFile    = "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
 	postgresqlBootstrapPrimaryTLSHBAFile = "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf"
 	postgresqlServerTLSCertFile          = "/run/pgshard/server-tls/tls.crt"
+	postgresqlServerTLSKeyFile           = "/run/pgshard/server-tls/tls.key"
+	postgresqlStandbySSLRootCertFile     = "/run/pgshard/standby-auth/ca.crt"
 )
 
 func postgresqlAgentQuarantineContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
@@ -5444,7 +5571,7 @@ func postgresqlReplicationStandbyContainer(cluster *pgshardv1alpha1.PgShardClust
 	}
 	if caSHA256 != "" {
 		environment = append(environment,
-			corev1.EnvVar{Name: "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT", Value: "/run/pgshard/standby-auth/ca.crt"},
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT", Value: postgresqlStandbySSLRootCertFile},
 			corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_CA_SHA256", Value: caSHA256},
 		)
 	}
