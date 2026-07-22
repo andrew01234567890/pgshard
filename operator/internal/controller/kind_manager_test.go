@@ -1380,7 +1380,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}
 	sourceAgent := source.Spec.Template.Spec.Containers[0]
 	if agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_MODE") != "replication-bootstrap-primary" ||
-		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_HBA_FILE") != "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf" ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_HBA_FILE") != "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf" ||
 		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_GENERATION_DURABILITY") != "remote-apply-any-one" ||
 		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES") != "pgshard_member_0001,pgshard_member_0002" ||
 		source.Spec.Template.Annotations[owned.PostgreSQLGenerationDurabilityAnnotation] != "remote-apply-any-one" ||

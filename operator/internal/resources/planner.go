@@ -2480,9 +2480,24 @@ func IsPostgreSQLReplicationBootstrapSourcePod(pod *corev1.Pod) bool {
 		mode, modeOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_MODE")
 		hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_HBA_FILE")
 		return modeOK && hbaFileOK && mode == "replication-bootstrap-primary" &&
-			hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+			hbaFile != "" && hbaFile == postgresqlBootstrapSourceHBAFile(container)
 	}
 	return false
+}
+
+// postgresqlBootstrapSourceHBAFile pairs the source HBA policy with projected
+// server TLS material: a source that received the operator's verified keypair
+// must run the TLS-only policy, and a policy-less legacy source must keep the
+// pre-TLS cleartext policy bytes.
+func postgresqlBootstrapSourceHBAFile(container corev1.Container) string {
+	certFile, certFileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_SERVER_TLS_CERT")
+	if !containerHasEnvironment(container, "PGSHARD_POSTGRES_SERVER_TLS_CERT") {
+		return postgresqlBootstrapPrimaryHBAFile
+	}
+	if certFileOK && certFile == postgresqlServerTLSCertFile {
+		return postgresqlBootstrapPrimaryTLSHBAFile
+	}
+	return ""
 }
 
 // IsCurrentPostgreSQLReplicationBootstrapSourcePod excludes the complete
@@ -2563,7 +2578,7 @@ func postgresqlAgentShape(annotations map[string]string, spec corev1.PodSpec, po
 	mode, modeOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_MODE")
 	hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_HBA_FILE")
 	quarantine := modeOK && hbaFileOK && mode == "quarantine" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
-	bootstrapSource := modeOK && hbaFileOK && mode == "replication-bootstrap-primary" && hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+	bootstrapSource := modeOK && hbaFileOK && mode == "replication-bootstrap-primary" && hbaFile != "" && hbaFile == postgresqlBootstrapSourceHBAFile(postgres)
 	standby := modeOK && hbaFileOK && mode == "replication-standby" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
 	if bootstrapSource {
 		bootstrapSource = postgresqlBootstrapGenerationShape(annotations, postgres)
@@ -5018,11 +5033,15 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 		bootstrapPullPolicy = corev1.PullNever
 	}
 	var serverTLS pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus
-	agent := postgresqlReplicationBootstrapPrimaryContainer(cluster, shard, images.PostgreSQLBootstrap, bootstrapPullPolicy, postgresSecurity, writableLease)
+	sourceHBAFile := postgresqlBootstrapPrimaryHBAFile
+	if replicationTLS != nil {
+		sourceHBAFile = postgresqlBootstrapPrimaryTLSHBAFile
+	}
+	agent := postgresqlReplicationBootstrapPrimaryContainer(cluster, shard, images.PostgreSQLBootstrap, bootstrapPullPolicy, postgresSecurity, writableLease, sourceHBAFile)
 	if replicationTLS != nil {
 		serverTLS = postgresqlReplicationTLSMember(*replicationTLS, 0)
 		agent.Env = append(agent.Env,
-			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: "/run/pgshard/server-tls/tls.crt"},
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: postgresqlServerTLSCertFile},
 			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_KEY", Value: "/run/pgshard/server-tls/tls.key"},
 			corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_SERVER_SHA256", Value: serverTLS.ServerSHA256},
 		)
@@ -5367,12 +5386,18 @@ func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardClu
 	}
 }
 
+const (
+	postgresqlBootstrapPrimaryHBAFile    = "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+	postgresqlBootstrapPrimaryTLSHBAFile = "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf"
+	postgresqlServerTLSCertFile          = "/run/pgshard/server-tls/tls.crt"
+)
+
 func postgresqlAgentQuarantineContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
 	return postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "quarantine", "/etc/pgshard/quarantine.pg_hba.conf")
 }
 
-func postgresqlReplicationBootstrapPrimaryContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
-	container := postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "replication-bootstrap-primary", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf")
+func postgresqlReplicationBootstrapPrimaryContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, hbaFile string) corev1.Container {
+	container := postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "replication-bootstrap-primary", hbaFile)
 	durability, synchronousStandbys := postgresqlGenerationDurability(cluster)
 	container.Env = append(container.Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_GENERATION_DURABILITY", Value: durability})
 	if synchronousStandbys != "" {

@@ -106,6 +106,13 @@ const QUARANTINE_HBA_CONTENT: &[u8] =
 const REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT: &[u8] = b"local postgres postgres peer\n\
 local all all reject\n\
 local replication all reject\n\
+host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n\
+host replication pgshard_replication ::0/0 scram-sha-256\n\
+host all all 0.0.0.0/0 reject\n\
+host all all ::0/0 reject\n";
+const REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT: &[u8] = b"local postgres postgres peer\n\
+local all all reject\n\
+local replication all reject\n\
 hostssl replication pgshard_replication 0.0.0.0/0 scram-sha-256\n\
 hostssl replication pgshard_replication ::0/0 scram-sha-256\n\
 hostnossl replication all 0.0.0.0/0 reject\n\
@@ -259,25 +266,56 @@ pub struct PostgresStandbyConfig {
     primary_port: u16,
     slot_name: String,
     passfile: PathBuf,
+    tls: Option<PostgresStandbyTlsConfig>,
+}
+
+/// Typed verified upstream trust anchor for a physical standby walreceiver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostgresStandbyTlsConfig {
     sslrootcert: PathBuf,
     sslrootcert_sha256: String,
+}
+
+impl PostgresStandbyTlsConfig {
+    /// Creates a validated walreceiver trust-anchor description.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an sslrootcert path that could not be embedded in
+    /// conninfo unambiguously or a non-canonical replication CA digest.
+    pub fn new(
+        sslrootcert: PathBuf,
+        sslrootcert_sha256: String,
+    ) -> Result<Self, PostgresConfigError> {
+        validate_absolute_normal_path("PostgreSQL replication sslrootcert", &sslrootcert, false)?;
+        if !conninfo_safe_path(&sslrootcert) {
+            return Err(PostgresConfigError::UnsafeSslrootcertPath(sslrootcert));
+        }
+        validate_material_sha256("PostgreSQL replication CA digest", &sslrootcert_sha256)?;
+        Ok(Self {
+            sslrootcert,
+            sslrootcert_sha256,
+        })
+    }
 }
 
 impl PostgresStandbyConfig {
     /// Creates an exact password-free primary connection description.
     ///
+    /// The upstream trust anchor is optional: with one, the walreceiver
+    /// requires verified TLS; without one, it preserves the legacy cleartext
+    /// connection exactly.
+    ///
     /// # Errors
     ///
     /// Returns an error for an unsafe host, non-canonical managed slot, zero
-    /// port, a passfile or sslrootcert path that could not be embedded
-    /// unambiguously, or a non-canonical replication CA digest.
+    /// port, or a passfile path that could not be embedded unambiguously.
     pub fn new(
         primary_host: String,
         primary_port: u16,
         slot_name: String,
         passfile: PathBuf,
-        sslrootcert: PathBuf,
-        sslrootcert_sha256: String,
+        tls: Option<PostgresStandbyTlsConfig>,
     ) -> Result<Self, PostgresConfigError> {
         validate_primary_host(&primary_host)?;
         if primary_port == 0 {
@@ -288,30 +326,33 @@ impl PostgresStandbyConfig {
         if !conninfo_safe_path(&passfile) {
             return Err(PostgresConfigError::UnsafePassfilePath(passfile));
         }
-        validate_absolute_normal_path("PostgreSQL replication sslrootcert", &sslrootcert, false)?;
-        if !conninfo_safe_path(&sslrootcert) {
-            return Err(PostgresConfigError::UnsafeSslrootcertPath(sslrootcert));
-        }
-        validate_material_sha256("PostgreSQL replication CA digest", &sslrootcert_sha256)?;
         Ok(Self {
             primary_host,
             primary_port,
             slot_name,
             passfile,
-            sslrootcert,
-            sslrootcert_sha256,
+            tls,
         })
     }
 
     fn primary_conninfo(&self) -> String {
-        format!(
-            "host={} port={} user=pgshard_replication application_name={} passfile={} sslmode=verify-full sslrootcert={} channel_binding=require",
-            self.primary_host,
-            self.primary_port,
-            self.slot_name,
-            self.passfile.display(),
-            self.sslrootcert.display()
-        )
+        match self.tls.as_ref() {
+            Some(tls) => format!(
+                "host={} port={} user=pgshard_replication application_name={} passfile={} sslmode=verify-full sslrootcert={} channel_binding=require",
+                self.primary_host,
+                self.primary_port,
+                self.slot_name,
+                self.passfile.display(),
+                tls.sslrootcert.display()
+            ),
+            None => format!(
+                "host={} port={} user=pgshard_replication application_name={} passfile={} sslmode=disable",
+                self.primary_host,
+                self.primary_port,
+                self.slot_name,
+                self.passfile.display()
+            ),
+        }
     }
 }
 
@@ -416,6 +457,8 @@ impl PostgresConfig {
     /// This role still requires exact writable-Lease authority at runtime. It
     /// opens `PostgreSQL` TCP only for the fixed `pgshard_replication` role and
     /// rejects every ordinary database connection in its immutable HBA file.
+    /// With operator-supplied server TLS material replication ingress is
+    /// TLS-only; without it the legacy cleartext composition is preserved.
     ///
     /// # Errors
     ///
@@ -423,7 +466,7 @@ impl PostgresConfig {
     /// the bounded supervisor shutdown budget.
     #[allow(clippy::too_many_arguments)]
     pub fn new_replication_bootstrap_primary(
-        server_tls: PostgresServerTlsConfig,
+        server_tls: Option<PostgresServerTlsConfig>,
         data_dir: PathBuf,
         executable: PathBuf,
         socket_dir: PathBuf,
@@ -435,7 +478,7 @@ impl PostgresConfig {
         Self::new_for_role(
             PostgresRuntimeRole::ReplicationBootstrapPrimary,
             None,
-            Some(server_tls),
+            server_tls,
             GenerationDurability::Local,
             data_dir,
             executable,
@@ -495,7 +538,7 @@ impl PostgresConfig {
         if (role == PostgresRuntimeRole::ReplicationStandby) != standby.is_some() {
             return Err(PostgresConfigError::InvalidStandbyComposition);
         }
-        if (role == PostgresRuntimeRole::ReplicationBootstrapPrimary) != server_tls.is_some() {
+        if role != PostgresRuntimeRole::ReplicationBootstrapPrimary && server_tls.is_some() {
             return Err(PostgresConfigError::InvalidServerTlsComposition);
         }
         if role != PostgresRuntimeRole::ReplicationBootstrapPrimary
@@ -537,11 +580,12 @@ impl PostgresConfig {
                     passfile: standby.passfile.clone(),
                 });
             }
-            if standby.sslrootcert.starts_with(&data_dir)
-                || standby.sslrootcert.starts_with(&socket_dir)
+            if let Some(tls) = standby.tls.as_ref()
+                && (tls.sslrootcert.starts_with(&data_dir)
+                    || tls.sslrootcert.starts_with(&socket_dir))
             {
                 return Err(PostgresConfigError::MutableSslrootcert {
-                    sslrootcert: standby.sslrootcert.clone(),
+                    sslrootcert: tls.sslrootcert.clone(),
                 });
             }
         }
@@ -3884,7 +3928,12 @@ fn validate_prepared_state(
         controldata_executable,
         expected_uid,
     )?;
-    let hba_file = validate_hba_file(&config.hba_file, expected_uid, config.role)?;
+    let hba_file = validate_hba_file(
+        &config.hba_file,
+        expected_uid,
+        config.role,
+        config.server_tls.is_some(),
+    )?;
     let socket_dir = if create_socket_dir {
         ensure_socket_dir(&config.socket_dir, expected_uid)?
     } else {
@@ -3902,7 +3951,8 @@ fn validate_prepared_state(
     let standby_sslrootcert = config
         .standby
         .as_ref()
-        .map(|standby| validate_standby_sslrootcert(standby, expected_uid))
+        .and_then(|standby| standby.tls.as_ref())
+        .map(|tls| validate_standby_sslrootcert(tls, expected_uid))
         .transpose()?;
     let server_tls = config
         .server_tls
@@ -4322,11 +4372,11 @@ fn validate_standby_passfile(
 }
 
 fn validate_standby_sslrootcert(
-    standby: &PostgresStandbyConfig,
+    tls: &PostgresStandbyTlsConfig,
     expected_uid: u32,
 ) -> Result<FileSnapshot, PostgresError> {
     let name = "PostgreSQL replication sslrootcert";
-    let path = &standby.sslrootcert;
+    let path = &tls.sslrootcert;
     let (contents, snapshot) =
         read_private_material(name, path, expected_uid, MAX_TLS_CERTIFICATE_BYTES, || {
             PostgresError::InvalidTlsMaterial {
@@ -4340,7 +4390,7 @@ fn validate_standby_sslrootcert(
         &contents,
         std::iter::empty(),
     );
-    if observed != standby.sslrootcert_sha256 {
+    if observed != tls.sslrootcert_sha256 {
         return Err(PostgresError::TlsMaterialDigestMismatch {
             name,
             path: path.to_owned(),
@@ -4759,11 +4809,15 @@ fn validate_hba_file(
     path: &Path,
     expected_uid: u32,
     role: PostgresRuntimeRole,
+    server_tls: bool,
 ) -> Result<FileSnapshot, PostgresError> {
     let name = hba_policy_name(role);
     let expected_contents = match role {
         PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationStandby => {
             QUARANTINE_HBA_CONTENT
+        }
+        PostgresRuntimeRole::ReplicationBootstrapPrimary if server_tls => {
+            REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT
         }
         PostgresRuntimeRole::ReplicationBootstrapPrimary => {
             REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT
@@ -5076,9 +5130,9 @@ pub enum PostgresConfigError {
     /// Standby fields and runtime role did not form one exact composition.
     #[error("PostgreSQL standby settings are incomplete or supplied for another runtime role")]
     InvalidStandbyComposition,
-    /// Server TLS material is required for exactly the bootstrap-source role.
+    /// Server TLS material is valid only for the bootstrap-source role.
     #[error(
-        "PostgreSQL server TLS material is required for exactly the replication-bootstrap-primary runtime role"
+        "PostgreSQL server TLS material is valid only for the replication-bootstrap-primary runtime role"
     )]
     InvalidServerTlsComposition,
     /// A checkpointed material digest was not canonical lowercase hex.
@@ -6502,14 +6556,24 @@ mod tests {
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect unsafe HBA fixture");
         assert!(matches!(
-            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine),
+            validate_hba_file(
+                &hba,
+                geteuid().as_raw(),
+                PostgresRuntimeRole::Quarantine,
+                false
+            ),
             Err(PostgresError::InvalidQuarantineHba { .. })
         ));
 
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o600)).expect("make HBA replaceable");
         fs::write(&hba, QUARANTINE_HBA_CONTENT).expect("write deny-all HBA");
         assert!(matches!(
-            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine),
+            validate_hba_file(
+                &hba,
+                geteuid().as_raw(),
+                PostgresRuntimeRole::Quarantine,
+                false
+            ),
             Err(PostgresError::UnsafePermissions {
                 name: "PostgreSQL quarantine HBA file",
                 ..
@@ -6517,7 +6581,13 @@ mod tests {
         ));
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400)).expect("protect deny-all HBA");
         assert!(
-            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine).is_ok()
+            validate_hba_file(
+                &hba,
+                geteuid().as_raw(),
+                PostgresRuntimeRole::Quarantine,
+                false
+            )
+            .is_ok()
         );
 
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o600)).expect("resize HBA");
@@ -6530,15 +6600,30 @@ mod tests {
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect oversized HBA");
         assert!(matches!(
-            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine),
+            validate_hba_file(
+                &hba,
+                geteuid().as_raw(),
+                PostgresRuntimeRole::Quarantine,
+                false
+            ),
             Err(PostgresError::InvalidQuarantineHba { .. })
         ));
     }
 
     #[test]
-    fn replication_bootstrap_primary_hba_allows_only_tls_scram_replication_role() {
+    fn replication_bootstrap_primary_hba_pairs_policy_with_server_tls_material() {
         assert_eq!(
             REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT,
+            b"local postgres postgres peer\n\
+local all all reject\n\
+local replication all reject\n\
+host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n\
+host replication pgshard_replication ::0/0 scram-sha-256\n\
+host all all 0.0.0.0/0 reject\n\
+host all all ::0/0 reject\n"
+        );
+        assert_eq!(
+            REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT,
             b"local postgres postgres peer\n\
 local all all reject\n\
 local replication all reject\n\
@@ -6554,43 +6639,79 @@ host all all ::0/0 reject\n"
         let hba = fixture
             .path()
             .join("replication-bootstrap-primary.pg_hba.conf");
-        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
-        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
-            .expect("protect replication HBA");
+        let write_hba_bytes = |contents: &[u8]| {
+            if fs::symlink_metadata(&hba).is_ok() {
+                fs::set_permissions(&hba, fs::Permissions::from_mode(0o600))
+                    .expect("make replication HBA replaceable");
+            }
+            fs::write(&hba, contents).expect("write replication HBA");
+            fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+                .expect("protect replication HBA");
+        };
+
+        write_hba_bytes(REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT);
         assert!(
             validate_hba_file(
                 &hba,
                 geteuid().as_raw(),
                 PostgresRuntimeRole::ReplicationBootstrapPrimary,
+                true,
             )
             .is_ok()
         );
+        assert!(
+            matches!(
+                validate_hba_file(
+                    &hba,
+                    geteuid().as_raw(),
+                    PostgresRuntimeRole::ReplicationBootstrapPrimary,
+                    false,
+                ),
+                Err(PostgresError::InvalidReplicationBootstrapPrimaryHba { .. })
+            ),
+            "a source without server TLS material must not accept the TLS-only policy"
+        );
         assert!(matches!(
-            validate_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine),
+            validate_hba_file(
+                &hba,
+                geteuid().as_raw(),
+                PostgresRuntimeRole::Quarantine,
+                false
+            ),
             Err(PostgresError::InvalidQuarantineHba { .. })
         ));
 
-        let plaintext_replication_hba: &[u8] = b"local postgres postgres peer\n\
-local all all reject\n\
-local replication all reject\n\
-host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n\
-host replication pgshard_replication ::0/0 scram-sha-256\n\
-host all all 0.0.0.0/0 reject\n\
-host all all ::0/0 reject\n";
-        for rejected in [
-            &b"host all all 0.0.0.0/0 scram-sha-256\n"[..],
-            plaintext_replication_hba,
-        ] {
-            fs::set_permissions(&hba, fs::Permissions::from_mode(0o600))
-                .expect("make replication HBA replaceable");
-            fs::write(&hba, rejected).expect("write rejected HBA");
-            fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
-                .expect("protect rejected HBA");
+        write_hba_bytes(REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT);
+        assert!(
+            validate_hba_file(
+                &hba,
+                geteuid().as_raw(),
+                PostgresRuntimeRole::ReplicationBootstrapPrimary,
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            matches!(
+                validate_hba_file(
+                    &hba,
+                    geteuid().as_raw(),
+                    PostgresRuntimeRole::ReplicationBootstrapPrimary,
+                    true,
+                ),
+                Err(PostgresError::InvalidReplicationBootstrapPrimaryHba { .. })
+            ),
+            "a source with server TLS material must reject the cleartext replication policy"
+        );
+
+        write_hba_bytes(b"host all all 0.0.0.0/0 scram-sha-256\n");
+        for server_tls in [false, true] {
             assert!(matches!(
                 validate_hba_file(
                     &hba,
                     geteuid().as_raw(),
                     PostgresRuntimeRole::ReplicationBootstrapPrimary,
+                    server_tls,
                 ),
                 Err(PostgresError::InvalidReplicationBootstrapPrimaryHba { .. })
             ));
@@ -6598,21 +6719,27 @@ host all all ::0/0 reject\n";
     }
 
     #[test]
-    fn baked_replication_bootstrap_primary_hba_matches_strict_policy_bytes() {
-        let baked = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/images/replication-bootstrap-primary.pg_hba.conf");
-        assert_eq!(
-            fs::read(&baked).expect("read baked replication HBA"),
-            REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT,
-            "deploy/images/replication-bootstrap-primary.pg_hba.conf must stay byte-identical to the validated policy"
-        );
-        let baked_quarantine = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/images/quarantine.pg_hba.conf");
-        assert_eq!(
-            fs::read(&baked_quarantine).expect("read baked quarantine HBA"),
-            QUARANTINE_HBA_CONTENT,
-            "deploy/images/quarantine.pg_hba.conf must stay byte-identical to the validated policy"
-        );
+    fn baked_hba_files_match_validated_policy_bytes() {
+        for (baked, expected) in [
+            (
+                "replication-bootstrap-primary.pg_hba.conf",
+                REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT,
+            ),
+            (
+                "replication-bootstrap-primary-tls.pg_hba.conf",
+                REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT,
+            ),
+            ("quarantine.pg_hba.conf", QUARANTINE_HBA_CONTENT),
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/images")
+                .join(baked);
+            assert_eq!(
+                fs::read(&path).expect("read baked HBA"),
+                expected,
+                "deploy/images/{baked} must stay byte-identical to the validated policy"
+            );
+        }
     }
 
     #[test]
@@ -6767,14 +6894,15 @@ host all all ::0/0 reject\n";
         let hba = root
             .path()
             .join("replication-bootstrap-primary.pg_hba.conf");
-        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT)
+            .expect("write replication HBA");
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect replication HBA");
         let server_tls = server_tls_fixture(root.path());
         let cert_file = root.path().join("server-tls.crt");
         let key_file = root.path().join("server-tls.key");
         let config = PostgresConfig::new_replication_bootstrap_primary(
-            server_tls,
+            Some(server_tls),
             data_dir,
             executable,
             root.path().join("socket"),
@@ -6839,14 +6967,14 @@ host all all ::0/0 reject\n";
     }
 
     #[test]
-    fn server_tls_material_is_required_for_exactly_the_bootstrap_primary_role() {
+    fn server_tls_material_is_optional_for_the_bootstrap_primary_role_only() {
         let server_tls = PostgresServerTlsConfig::new(
             PathBuf::from("/run/pgshard/server-tls/tls.crt"),
             PathBuf::from("/run/pgshard/server-tls/tls.key"),
             "1".repeat(64),
         )
         .expect("valid server TLS identity");
-        assert!(matches!(
+        assert!(
             PostgresConfig::new_for_role(
                 PostgresRuntimeRole::ReplicationBootstrapPrimary,
                 None,
@@ -6859,25 +6987,41 @@ host all all ::0/0 reject\n";
                 Duration::from_secs(5),
                 Duration::from_secs(44),
                 Duration::from_millis(500),
-            ),
-            Err(PostgresConfigError::InvalidServerTlsComposition)
-        ));
-        assert!(matches!(
-            PostgresConfig::new_for_role(
-                PostgresRuntimeRole::Quarantine,
-                None,
-                Some(server_tls),
-                GenerationDurability::Local,
-                PathBuf::from("/var/lib/postgresql/data"),
-                PathBuf::from("/usr/lib/postgresql/18/bin/postgres"),
-                PathBuf::from("/run/pgshard/postgres"),
-                PathBuf::from("/etc/pgshard/replication-primary.pg_hba.conf"),
-                Duration::from_secs(5),
-                Duration::from_secs(44),
-                Duration::from_millis(500),
-            ),
-            Err(PostgresConfigError::InvalidServerTlsComposition)
-        ));
+            )
+            .is_ok(),
+            "a bootstrap source without operator TLS material must keep its legacy composition"
+        );
+        for role in [
+            PostgresRuntimeRole::Quarantine,
+            PostgresRuntimeRole::ReplicationStandby,
+        ] {
+            let standby = (role == PostgresRuntimeRole::ReplicationStandby).then(|| {
+                PostgresStandbyConfig::new(
+                    "primary.database.svc".to_owned(),
+                    5432,
+                    "pgshard_member_0001".to_owned(),
+                    PathBuf::from("/run/pgshard/standby-auth/passfile"),
+                    None,
+                )
+                .expect("valid standby identity")
+            });
+            assert!(matches!(
+                PostgresConfig::new_for_role(
+                    role,
+                    standby,
+                    Some(server_tls.clone()),
+                    GenerationDurability::Local,
+                    PathBuf::from("/var/lib/postgresql/data"),
+                    PathBuf::from("/usr/lib/postgresql/18/bin/postgres"),
+                    PathBuf::from("/run/pgshard/postgres"),
+                    PathBuf::from("/etc/pgshard/replication-primary.pg_hba.conf"),
+                    Duration::from_secs(5),
+                    Duration::from_secs(44),
+                    Duration::from_millis(500),
+                ),
+                Err(PostgresConfigError::InvalidServerTlsComposition)
+            ));
+        }
         for digest in ["", "abc", &"F".repeat(64), &"a".repeat(63), &"g".repeat(64)] {
             assert!(matches!(
                 PostgresServerTlsConfig::new(
@@ -7169,7 +7313,7 @@ host all all ::0/0 reject\n";
         let hba = root
             .path()
             .join("replication-bootstrap-primary.pg_hba.conf");
-        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT)
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT)
             .expect("write source evidence-loss HBA");
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect source evidence-loss HBA");
@@ -7699,7 +7843,8 @@ host all all ::0/0 reject\n";
         let hba = runtime
             .path()
             .join("replication-bootstrap-primary.pg_hba.conf");
-        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT)
+            .expect("write replication HBA");
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect replication HBA");
         let server_tls = server_tls_fixture(runtime.path());
@@ -7778,8 +7923,8 @@ host all all ::0/0 reject\n";
         }
     }
 
-    #[tokio::test]
-    async fn direct_supervision_refuses_replication_bootstrap_primary_without_writable_authority() {
+    #[test]
+    fn replication_bootstrap_primary_without_tls_material_keeps_legacy_cleartext_command() {
         let fixture = pgdata_fixture();
         let executable = fixture.path().join("postgres");
         write_executable(&executable, "#!/bin/sh\nexit 0\n");
@@ -7791,8 +7936,130 @@ host all all ::0/0 reject\n";
         fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect replication HBA");
+        let config = PostgresConfig::new_for_role(
+            PostgresRuntimeRole::ReplicationBootstrapPrimary,
+            None,
+            None,
+            GenerationDurability::remote_apply_any_one(vec![
+                "pgshard_member_0001".to_owned(),
+                "pgshard_member_0002".to_owned(),
+            ])
+            .expect("valid any-one topology"),
+            fixture.path().to_owned(),
+            executable,
+            socket,
+            hba,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid legacy replication-bootstrap-primary config");
+        let prepared =
+            prepare_fixture(config).expect("prepare legacy replication bootstrap primary");
+        let command = prepared.command();
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        for required in ["listen_addresses=*", "ssl=off"] {
+            assert!(
+                arguments.contains(&OsStr::new(required)),
+                "missing {required:?}"
+            );
+        }
+        for forbidden in [
+            "ssl=on",
+            "ssl_min_protocol_version=TLSv1.3",
+            "ssl_max_protocol_version=TLSv1.3",
+        ] {
+            assert!(
+                !arguments.contains(&OsStr::new(forbidden)),
+                "legacy source unexpectedly enabled TLS with {forbidden:?}"
+            );
+        }
+        for prefix in ["ssl_cert_file=", "ssl_key_file="] {
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|argument| argument.as_bytes().starts_with(prefix.as_bytes())),
+                "legacy source configured server TLS material with {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replication_standby_without_trust_anchor_keeps_legacy_cleartext_conninfo() {
+        let root = TempDir::new().expect("create legacy standby fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let executable = root.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        write_standby_signal(&data_dir);
+        write_control_data_state(&executable, "shut down in recovery", "");
+        let passfile = root.path().join("replication.pass");
+        write_private_material(
+            &passfile,
+            b"primary.database.svc:5432:*:pgshard_replication:secret\n",
+        );
+        let hba_file = root.path().join("standby.pg_hba.conf");
+        write_hba(&hba_file);
+        let standby = PostgresStandbyConfig::new(
+            "primary.database.svc".to_owned(),
+            5432,
+            "pgshard_member_0001".to_owned(),
+            passfile.clone(),
+            None,
+        )
+        .expect("valid legacy standby identity");
+        let config = PostgresConfig::new_replication_standby(
+            standby,
+            data_dir,
+            executable,
+            root.path().join("socket"),
+            hba_file,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid legacy standby config");
+        let prepared = prepare_fixture(config).expect("prepare legacy standby without CA file");
+        let command = prepared.command();
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        let conninfo = format!(
+            "primary_conninfo=host=primary.database.svc port=5432 user=pgshard_replication application_name=pgshard_member_0001 passfile={} sslmode=disable",
+            passfile.display()
+        );
+        assert!(
+            arguments.contains(&OsStr::new(&conninfo)),
+            "missing exact legacy cleartext conninfo"
+        );
+        assert!(
+            !arguments.iter().any(|argument| {
+                let bytes = argument.as_bytes();
+                bytes
+                    .windows(b"sslrootcert=".len())
+                    .any(|window| window == b"sslrootcert=")
+                    || bytes
+                        .windows(b"channel_binding=".len())
+                        .any(|window| window == b"channel_binding=")
+            }),
+            "legacy standby walreceiver gained TLS conninfo settings"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_supervision_refuses_replication_bootstrap_primary_without_writable_authority() {
+        let fixture = pgdata_fixture();
+        let executable = fixture.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let runtime = TempDir::new().expect("create runtime fixture");
+        let socket = runtime.path().join("socket");
+        let hba = runtime
+            .path()
+            .join("replication-bootstrap-primary.pg_hba.conf");
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT)
+            .expect("write replication HBA");
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+            .expect("protect replication HBA");
         let config = PostgresConfig::new_replication_bootstrap_primary(
-            server_tls_fixture(runtime.path()),
+            Some(server_tls_fixture(runtime.path())),
             fixture.path().to_owned(),
             executable,
             socket,
@@ -9293,7 +9560,7 @@ host all all ::0/0 reject\n";
         let hba = root
             .path()
             .join("replication-bootstrap-primary.pg_hba.conf");
-        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT)
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_TLS_HBA_CONTENT)
             .expect("write target-adapter HBA");
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect target-adapter HBA");
@@ -9732,11 +9999,16 @@ host all all ::0/0 reject\n";
             5432,
             "pgshard_member_0001".to_owned(),
             passfile.clone(),
-            sslrootcert.clone(),
-            catalog_material_sha256(
-                REPLICATION_TLS_CA_DIGEST_DOMAIN,
-                STANDBY_CA_FIXTURE,
-                std::iter::empty(),
+            Some(
+                PostgresStandbyTlsConfig::new(
+                    sslrootcert.clone(),
+                    catalog_material_sha256(
+                        REPLICATION_TLS_CA_DIGEST_DOMAIN,
+                        STANDBY_CA_FIXTURE,
+                        std::iter::empty(),
+                    ),
+                )
+                .expect("valid standby trust anchor"),
             ),
         )
         .expect("valid standby identity");

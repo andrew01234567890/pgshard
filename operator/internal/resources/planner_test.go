@@ -3433,7 +3433,7 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						}
 						wantCandidateCSV := strings.Join(wantCandidates, ",")
 						if !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-bootstrap-primary") ||
-							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf") ||
+							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf") ||
 							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_GENERATION_DURABILITY", "remote-apply-any-one") ||
 							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", wantCandidateCSV) ||
 							object.Spec.Template.Annotations[PostgreSQLGenerationDurabilityAnnotation] != "remote-apply-any-one" ||
@@ -4604,11 +4604,14 @@ func TestMultiMemberPlanWithoutTransportPolicyStaysCleartextUnchanged(t *testing
 
 func TestReplicationBootstrapPrimaryHBAImageContract(t *testing.T) {
 	t.Parallel()
-	contents, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "images", "replication-bootstrap-primary.pg_hba.conf"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "local postgres postgres peer\n" +
+	wantCleartext := "local postgres postgres peer\n" +
+		"local all all reject\n" +
+		"local replication all reject\n" +
+		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
+		"host replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"host all all 0.0.0.0/0 reject\n" +
+		"host all all ::0/0 reject\n"
+	wantTLS := "local postgres postgres peer\n" +
 		"local all all reject\n" +
 		"local replication all reject\n" +
 		"hostssl replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
@@ -4617,8 +4620,17 @@ func TestReplicationBootstrapPrimaryHBAImageContract(t *testing.T) {
 		"hostnossl replication all ::0/0 reject\n" +
 		"host all all 0.0.0.0/0 reject\n" +
 		"host all all ::0/0 reject\n"
-	if string(contents) != want {
-		t.Fatalf("replication bootstrap primary HBA = %q, want %q", contents, want)
+	for baked, want := range map[string]string{
+		"replication-bootstrap-primary.pg_hba.conf":     wantCleartext,
+		"replication-bootstrap-primary-tls.pg_hba.conf": wantTLS,
+	} {
+		contents, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "images", baked))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(contents) != want {
+			t.Fatalf("%s = %q, want %q", baked, contents, want)
+		}
 	}
 }
 

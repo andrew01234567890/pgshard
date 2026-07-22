@@ -15,7 +15,7 @@ use crate::coordination::WritableLeaseConfig;
 use crate::domain::{ActivationConfigEvidence, AgentIdentity};
 use crate::postgres::{
     PostgresConfig, PostgresConfigError, PostgresRuntimeRole, PostgresServerTlsConfig,
-    PostgresStandbyConfig,
+    PostgresStandbyConfig, PostgresStandbyTlsConfig,
 };
 use crate::postgres_generation::GenerationDurability;
 use crate::telemetry::TelemetryConfig;
@@ -260,7 +260,7 @@ impl RawConfig {
                 (
                     PostgresRuntimeRole::ReplicationBootstrapPrimary,
                     None,
-                    Some(self.bootstrap_server_tls()?),
+                    self.bootstrap_server_tls()?,
                     durability,
                 )
             }
@@ -301,21 +301,20 @@ impl RawConfig {
         .map_err(ConfigError::from)
     }
 
-    fn bootstrap_server_tls(&self) -> Result<PostgresServerTlsConfig, ConfigError> {
-        let cert_file = self
-            .postgres_server_tls_cert
-            .clone()
-            .ok_or(ConfigError::IncompleteServerTlsSettings)?;
-        let key_file = self
-            .postgres_server_tls_key
-            .clone()
-            .ok_or(ConfigError::IncompleteServerTlsSettings)?;
-        let material_sha256 = self
-            .replication_tls_server_sha256
-            .clone()
-            .ok_or(ConfigError::IncompleteServerTlsSettings)?;
-        PostgresServerTlsConfig::new(cert_file, key_file, material_sha256)
-            .map_err(ConfigError::from)
+    fn bootstrap_server_tls(&self) -> Result<Option<PostgresServerTlsConfig>, ConfigError> {
+        match (
+            self.postgres_server_tls_cert.clone(),
+            self.postgres_server_tls_key.clone(),
+            self.replication_tls_server_sha256.clone(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(cert_file), Some(key_file), Some(material_sha256)) => {
+                PostgresServerTlsConfig::new(cert_file, key_file, material_sha256)
+                    .map(Some)
+                    .map_err(ConfigError::from)
+            }
+            _ => Err(ConfigError::IncompleteServerTlsSettings),
+        }
     }
 
     fn replication_standby(&self) -> Result<PostgresStandbyConfig, ConfigError> {
@@ -331,21 +330,23 @@ impl RawConfig {
             .postgres_primary_passfile
             .clone()
             .ok_or(ConfigError::IncompleteReplicationStandbySettings)?;
-        let primary_sslrootcert = self
-            .postgres_primary_sslrootcert
-            .clone()
-            .ok_or(ConfigError::IncompleteReplicationStandbySettings)?;
-        let replication_tls_ca_sha256 = self
-            .replication_tls_ca_sha256
-            .clone()
-            .ok_or(ConfigError::IncompleteReplicationStandbySettings)?;
+        let tls = match (
+            self.postgres_primary_sslrootcert.clone(),
+            self.replication_tls_ca_sha256.clone(),
+        ) {
+            (None, None) => None,
+            (Some(sslrootcert), Some(sslrootcert_sha256)) => Some(PostgresStandbyTlsConfig::new(
+                sslrootcert,
+                sslrootcert_sha256,
+            )?),
+            _ => return Err(ConfigError::IncompleteReplicationStandbySettings),
+        };
         PostgresStandbyConfig::new(
             primary_host,
             self.postgres_primary_port.unwrap_or(5432),
             primary_slot_name,
             primary_passfile,
-            primary_sslrootcert,
-            replication_tls_ca_sha256,
+            tls,
         )
         .map_err(ConfigError::from)
     }
@@ -885,13 +886,28 @@ mod tests {
     }
 
     fn expected_replication_standby(primary_port: u16) -> PostgresConfig {
+        expected_replication_standby_with_tls(
+            primary_port,
+            Some(
+                PostgresStandbyTlsConfig::new(
+                    PathBuf::from("/run/pgshard/standby-auth/ca.crt"),
+                    REPLICATION_CA_SHA256_FIXTURE.to_owned(),
+                )
+                .expect("valid standby trust anchor"),
+            ),
+        )
+    }
+
+    fn expected_replication_standby_with_tls(
+        primary_port: u16,
+        tls: Option<PostgresStandbyTlsConfig>,
+    ) -> PostgresConfig {
         let standby = PostgresStandbyConfig::new(
             "cluster-1-shard-0003-member-0000.database.svc".to_owned(),
             primary_port,
             "pgshard_member_0001".to_owned(),
             PathBuf::from("/etc/pgshard/replication/passfile"),
-            PathBuf::from("/run/pgshard/standby-auth/ca.crt"),
-            REPLICATION_CA_SHA256_FIXTURE.to_owned(),
+            tls,
         )
         .expect("valid standby identity");
         PostgresConfig::new_replication_standby(
@@ -1188,9 +1204,25 @@ mod tests {
     }
 
     #[test]
-    fn server_tls_settings_are_bootstrap_primary_only_and_complete() {
+    fn server_tls_settings_are_bootstrap_primary_only_and_all_or_none() {
         let mut with_durability = replication_bootstrap_primary_args();
         with_durability.extend(["--postgres-generation-durability", "local"]);
+
+        let mut without_tls = with_durability.clone();
+        for index in (0..3).rev() {
+            let flag = without_tls
+                .iter()
+                .position(|argument| *argument == server_tls_args()[index * 2])
+                .expect("required server TLS setting");
+            without_tls.drain(flag..=flag + 1);
+        }
+        let legacy = AgentConfig::try_parse_from(without_tls)
+            .expect("bootstrap source without operator TLS material");
+        assert!(
+            legacy.postgres.is_some(),
+            "policy-less clusters must keep their legacy cleartext source"
+        );
+
         for index in 0..3 {
             let mut incomplete = with_durability.clone();
             let flag = incomplete
@@ -1248,6 +1280,28 @@ mod tests {
         let config = AgentConfig::try_parse_from(args).expect("complete replication standby");
         assert_eq!(config.postgres, Some(expected_replication_standby(6432)));
         assert!(config.writable_lease.is_none());
+    }
+
+    #[test]
+    fn replication_standby_trust_anchor_is_optional_and_all_or_none() {
+        let mut legacy = replication_standby_args();
+        for flag in [
+            "--postgres-primary-sslrootcert",
+            "--replication-tls-ca-sha256",
+        ] {
+            let index = legacy
+                .iter()
+                .position(|argument| *argument == flag)
+                .expect("standby trust-anchor setting");
+            legacy.drain(index..=index + 1);
+        }
+        let config =
+            AgentConfig::try_parse_from(legacy).expect("legacy cleartext replication standby");
+        assert_eq!(
+            config.postgres,
+            Some(expected_replication_standby_with_tls(5432, None)),
+            "policy-less standbys must keep the legacy cleartext walreceiver"
+        );
     }
 
     #[test]
