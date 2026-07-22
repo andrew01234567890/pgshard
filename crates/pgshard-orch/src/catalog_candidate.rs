@@ -34,14 +34,15 @@ const DISCOVERY_TOPOLOGY_DOMAIN: &[u8] = b"pgshard-catalog-candidate-discovery-t
 const CLUSTER_STATUS_FINGERPRINT_DOMAIN: &[u8] = b"pgshard-catalog-candidate-cluster-status-v1\0";
 const MATERIALIZATION_BUNDLE_DOMAIN: &[u8] = b"pgshard-catalog-materialization-bundle-v1\0";
 const TARGET_POD_TEMPLATE_DOMAIN: &[u8] = b"pgshard-catalog-target-pod-template-v1\0";
-const CATALOG_SERVING_HBA_POLICY_VERSION: &str = "pgshard.catalog-serving-hba.v1";
+const CATALOG_SERVING_HBA_POLICY_VERSION: &str = "pgshard.catalog-serving-hba.v2";
 #[cfg(test)]
 const CATALOG_SERVING_HBA_POLICY: &str = concat!(
     "local postgres postgres peer\n",
     "local all all reject\n",
     "local replication all reject\n",
-    "host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n",
-    "host replication pgshard_replication ::0/0 scram-sha-256\n",
+    "hostssl replication pgshard_replication 0.0.0.0/0 scram-sha-256\n",
+    "hostssl replication pgshard_replication ::0/0 scram-sha-256\n",
+    "hostnossl replication all all reject\n",
     "hostnossl shardschema all all reject\n",
     "hostssl shardschema pgshard_pooler_catalog all scram-sha-256\n",
     "hostssl shardschema pgshard_orchestrator_catalog all scram-sha-256\n",
@@ -50,7 +51,7 @@ const CATALOG_SERVING_HBA_POLICY: &str = concat!(
     "host all all ::0/0 reject\n",
 );
 const CATALOG_SERVING_HBA_POLICY_SHA256: &str =
-    "6753a3516fef3a8a459042ca474935f5b306d1b1cf591018f0698e585027af17";
+    "f232b5738cab5c1aa30184c5490d54e647f252b8e6a8bf078138da68257be2fd";
 
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 const INSTANCE_LABEL: &str = "app.kubernetes.io/instance";
