@@ -5184,9 +5184,13 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 		{Name: "postgresql-runtime-config", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr(resource.MustParse("2Mi"))}}},
 		{Name: "bootstrap-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName, DefaultMode: ptr(int32(0o440))}}},
 	}
-	serviceAccountName := ""
+	// Always author a dedicated ServiceAccount (the already-created per-shard
+	// agent SA) so stock ServiceAccount admission never sets it to "default" or
+	// injects default-SA imagePullSecrets. Direct-runtime pods keep
+	// automountServiceAccountToken=false and no token projection, so reusing the
+	// agent SA grants them no additional authority.
+	serviceAccountName := PostgreSQLAgentServiceAccountName(cluster.Name, shard)
 	if images.PostgreSQLRuntime.agentQuarantine() {
-		serviceAccountName = PostgreSQLAgentServiceAccountName(cluster.Name, shard)
 		volumes = append(volumes, postgresqlAgentKubernetesAPIVolume())
 	}
 	if shard == 0 {

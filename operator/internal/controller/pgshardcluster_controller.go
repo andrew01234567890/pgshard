@@ -3204,12 +3204,20 @@ func (r *PgShardClusterReconciler) ensurePriorityClasses(ctx context.Context) er
 		existing := &schedulingv1.PriorityClass{}
 		err := reader.Get(ctx, types.NamespacedName{Name: desired.Name}, existing)
 		if apierrors.IsNotFound(err) {
-			if createErr := r.Create(ctx, desired.DeepCopy(), client.FieldOwner(owned.ManagedByValue)); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
+			createErr := r.Create(ctx, desired.DeepCopy(), client.FieldOwner(owned.ManagedByValue))
+			if createErr == nil {
+				continue
+			}
+			if !apierrors.IsAlreadyExists(createErr) {
 				return fmt.Errorf("create PriorityClass %s: %w", desired.Name, createErr)
 			}
-			continue
-		}
-		if err != nil {
+			// Lost a create race: authoritatively re-read the winner and
+			// validate it, rather than assuming it matches (its immutable value
+			// could conflict). A vanished winner is retried on the next reconcile.
+			if err = reader.Get(ctx, types.NamespacedName{Name: desired.Name}, existing); err != nil {
+				return fmt.Errorf("re-read raced PriorityClass %s: %w", desired.Name, err)
+			}
+		} else if err != nil {
 			return fmt.Errorf("read PriorityClass %s: %w", desired.Name, err)
 		}
 		if existing.Value != desired.Value || !preemptionPoliciesEqual(existing.PreemptionPolicy, desired.PreemptionPolicy) {

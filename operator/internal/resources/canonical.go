@@ -37,30 +37,33 @@ const (
 	// canonical normal form (a pod's stamp cannot vouch for itself).
 	PodContractHashAnnotation = "pgshard.io/contract-hash"
 	// PodSecurityGenerationAnnotation carries the monotonic per-(class,member)
-	// security generation the template was stamped at. Its integrity is bound
-	// through the hash's domain key, so it is stripped from the normal form.
+	// security generation the template was stamped at. It is stripped from the
+	// normal form; its authoritative value is injected into the hash message.
 	PodSecurityGenerationAnnotation = "pgshard.io/security-generation"
 
 	contractHashDomain = "pgshard.pod-contract.v1"
 
 	serviceAccountTokenMountPath = "/var/run/secrets/kubernetes.io/serviceaccount"
 	normalizedTokenVolumeName    = "pgshard-normalized-sa-token"
+
+	// StatefulSet/ReplicaSet controller-added pod labels.
+	labelControllerRevisionHash = "controller-revision-hash"
+	labelStatefulSetPodName     = "statefulset.kubernetes.io/pod-name"
+	labelPodIndex               = "apps.kubernetes.io/pod-index"
+	labelPodTemplateHash        = "pod-template-hash"
 )
 
-// controllerAddedPodLabels are the labels the StatefulSet and ReplicaSet
-// controllers stamp onto a pod that are absent from its template. They are
-// stripped from every normal form so a template and its pods compare equal.
-var controllerAddedPodLabels = []string{
-	"controller-revision-hash",
-	"statefulset.kubernetes.io/pod-name",
-	"apps.kubernetes.io/pod-index",
-	"pod-template-hash",
-}
+// memberControllerLabels are stamped by the StatefulSet controller and must be
+// present (and derivable) on a member pod; supporting pods must never carry
+// them. supportingControllerLabels is the ReplicaSet controller's equivalent.
+var memberControllerLabels = []string{labelControllerRevisionHash, labelStatefulSetPodName, labelPodIndex}
+
+var supportingControllerLabels = []string{labelPodTemplateHash}
 
 // nodeTopologyLabels are copied onto a bound pod by the PodTopologyLabels
-// admission plugin. LiveNormalForm permits and strips exactly these two (they
-// are validated against the bound Node by the webhook layer in a later step);
-// any other binding-copied label is unexpected residue and fails comparison.
+// admission plugin. LiveNormalForm validates them against binding evidence and
+// strips them; any other binding-copied label is unexpected residue and fails
+// comparison.
 var nodeTopologyLabels = []string{corev1.LabelTopologyZone, corev1.LabelTopologyRegion}
 
 // canonicalEncMode is a true canonical CBOR encoder: RFC 8949 §4.2.1 Core
@@ -76,25 +79,52 @@ func mustCanonicalEncMode() cbor.EncMode {
 	return mode
 }
 
+// BindingEvidence is the authoritative node/topology identity the scheduler and
+// binding webhook attest for a bound pod. LiveNormalForm requires the pod's
+// binding residue to equal this exactly before stripping it. Zone/Region are
+// empty when the bound Node carries no such label; the residue must then be
+// absent too.
+type BindingEvidence struct {
+	NodeName string
+	NodeUID  string
+	BootID   string
+	Zone     string
+	Region   string
+}
+
+// ControllerEvidence is the authoritative controller-provenance identity for a
+// pod's owning parent. The webhook layer supplies it (the live parent UID, and
+// for supporting pods the owning ReplicaSet's name and pod-template-hash);
+// step-2 callers pass what they can validate. Empty fields are validated
+// structurally only.
+type ControllerEvidence struct {
+	ParentUID              string
+	ReplicaSetName         string
+	PodTemplateHash        string
+	ControllerRevisionHash string
+}
+
 // NormContext carries the identity a normal form is derived against. Class,
-// Shard, and Member are always required; ClusterName and Namespace are used
-// only when normalizing a real pod (CREATE/LIVE) to derive and validate its
-// ordinal hostname/subdomain — the template-mode normalization used by the
-// stamp only strips those fields.
+// Shard, and Member are always required; ClusterName and Namespace bind the
+// pod to its cluster/namespace (validated in CREATE/LIVE). Provenance and
+// Binding carry the authoritative controller/binding evidence used to validate
+// and strip residue.
 type NormContext struct {
 	Class       PodClass
 	ClusterName string
 	Namespace   string
 	Shard       int32
 	Member      int32
+	Provenance  *ControllerEvidence
+	Binding     *BindingEvidence
 }
 
 type normMode int
 
 const (
 	modeTemplate normMode = iota // stamp time: strip identity/residue, no pod-side validation
-	modeCreate                   // pod CREATE: nodeName must be empty; no binding residue
-	modeLive                     // running pod: permit+strip validated binding residue
+	modeCreate                   // pod CREATE: nodeName empty; validate controller residue
+	modeLive                     // running pod: additionally validate+strip binding residue
 )
 
 // ComputeContractStamp returns the domain-separated, length-framed full-contract
@@ -102,27 +132,49 @@ const (
 //
 //	contractHash = HMAC_SHA256(
 //	    key = lengthFramed("pgshard.pod-contract.v1" ‖ class ‖ clusterUID ‖ shard ‖ member ‖ securityGeneration),
-//	    msg = canonicalCBOR(templateNormalForm))
+//	    msg = canonicalCBOR([securityGeneration, templateNormalForm]))
 //
-// The template normal form strips identity and controller/server residue and
-// canonicalizes the projected-token and priority tuples, so a stamped template
-// and any pod the controllers create from it reduce to the same normal form and
-// therefore the same hash.
+// The template normal form applies pinned k8s-1.36 defaulting and strips
+// identity/controller residue so that a stamped template and any pod the
+// controllers + API server produce from it reduce to the same normal form and
+// therefore the same hash. The authoritative security generation is injected
+// into the hashed message (not merely the key).
 func ComputeContractStamp(class PodClass, clusterUID string, shard, member int32, securityGeneration int64, template *corev1.PodTemplateSpec) (string, error) {
 	if template == nil {
 		return "", fmt.Errorf("pod template is required to compute a contract stamp")
 	}
-	tree, err := templateNormalTree(NormContext{Class: class, Shard: shard, Member: member}, template)
+	tree, err := normalTree(NormContext{Class: class, Shard: shard, Member: member}, template.ObjectMeta, template.Spec, modeTemplate)
 	if err != nil {
 		return "", err
 	}
-	message, err := canonicalEncMode.Marshal(tree)
+	return hashNormalizedContract(class, clusterUID, shard, member, securityGeneration, tree)
+}
+
+// HashAdmittedPod recomputes the contract hash from an admitted pod's metadata
+// and spec, normalized for the given lifecycle stage. A valid pod produces the
+// same hash the reconciler stamped onto its parent template.
+func HashAdmittedPod(nc NormContext, meta metav1.ObjectMeta, spec corev1.PodSpec, stage PodComparisonStage, clusterUID string, securityGeneration int64) (string, error) {
+	mode := modeCreate
+	if stage == StageLive {
+		mode = modeLive
+	}
+	tree, err := normalTree(nc, meta, spec, mode)
 	if err != nil {
-		return "", fmt.Errorf("canonical-encode template normal form: %w", err)
+		return "", err
+	}
+	return hashNormalizedContract(nc.Class, clusterUID, nc.Shard, nc.Member, securityGeneration, tree)
+}
+
+func hashNormalizedContract(class PodClass, clusterUID string, shard, member int32, securityGeneration int64, tree any) (string, error) {
+	// Inject the authoritative generation into the hashed message as a
+	// length-framed CBOR array element, in addition to the HMAC key.
+	message, err := canonicalEncMode.Marshal([]any{securityGeneration, tree})
+	if err != nil {
+		return "", fmt.Errorf("canonical-encode normalized contract: %w", err)
 	}
 	mac := hmac.New(sha256.New, contractDomainKey(class, clusterUID, shard, member, securityGeneration))
 	if _, err := mac.Write(message); err != nil {
-		return "", fmt.Errorf("hash template normal form: %w", err)
+		return "", fmt.Errorf("hash normalized contract: %w", err)
 	}
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
@@ -142,17 +194,8 @@ func ApplyContractStamp(template *corev1.PodTemplateSpec, class PodClass, cluste
 	return hash, nil
 }
 
-func templateNormalTree(nc NormContext, template *corev1.PodTemplateSpec) (any, error) {
-	normalized := template.DeepCopy()
-	if err := normalizePodContract(nc, &normalized.ObjectMeta, &normalized.Spec, modeTemplate); err != nil {
-		return nil, err
-	}
-	return jsonTree(normalized)
-}
-
 // contractDomainKey builds an unambiguous, length-framed HMAC key from the
-// domain-separation tuple. Every component is prefixed with its 8-byte
-// big-endian length so no concatenation collision is possible.
+// domain-separation tuple.
 func contractDomainKey(class PodClass, clusterUID string, shard, member int32, securityGeneration int64) []byte {
 	parts := [][]byte{
 		[]byte(contractHashDomain),
@@ -172,13 +215,25 @@ func contractDomainKey(class PodClass, clusterUID string, shard, member int32, s
 	return buffer.Bytes()
 }
 
+func normalTree(nc NormContext, meta metav1.ObjectMeta, spec corev1.PodSpec, mode normMode) (any, error) {
+	m := *meta.DeepCopy()
+	s := *spec.DeepCopy()
+	if err := normalizePodContract(nc, &m, &s, mode); err != nil {
+		return nil, err
+	}
+	return jsonTree(struct {
+		Metadata metav1.ObjectMeta `json:"metadata"`
+		Spec     corev1.PodSpec    `json:"spec"`
+	}{Metadata: m, Spec: s})
+}
+
 // ---------------------------------------------------------------------------
 // Full-spec normalization (design v7 §A2/§3)
 // ---------------------------------------------------------------------------
 
 // CreateNormalForm normalizes a pod as it appears at CREATE (before scheduling
-// binds it). It returns the normalized metadata + spec; the entire remaining
-// structure is compared by the caller — there is no capability projection.
+// binds it). The entire remaining structure is compared by the caller — there
+// is no capability projection.
 func CreateNormalForm(nc NormContext, meta metav1.ObjectMeta, spec corev1.PodSpec) (metav1.ObjectMeta, corev1.PodSpec, error) {
 	m := *meta.DeepCopy()
 	s := *spec.DeepCopy()
@@ -186,10 +241,10 @@ func CreateNormalForm(nc NormContext, meta metav1.ObjectMeta, spec corev1.PodSpe
 	return m, s, err
 }
 
-// LiveNormalForm normalizes a running (bound) pod: it additionally permits,
-// validates the shape of, and strips the scheduler/binding residue — nodeName,
-// the node-UID/boot-ID annotations, and the zone/region topology labels — so a
-// bound pod reduces to the same normal form as its template.
+// LiveNormalForm normalizes a running (bound) pod: it additionally validates
+// the scheduler/binding residue against the supplied BindingEvidence — nodeName,
+// node-UID/boot-ID annotations, and zone/region topology labels — before
+// stripping it, so a bound pod reduces to the same normal form as its template.
 func LiveNormalForm(nc NormContext, meta metav1.ObjectMeta, spec corev1.PodSpec) (metav1.ObjectMeta, corev1.PodSpec, error) {
 	m := *meta.DeepCopy()
 	s := *spec.DeepCopy()
@@ -198,11 +253,30 @@ func LiveNormalForm(nc NormContext, meta metav1.ObjectMeta, spec corev1.PodSpec)
 }
 
 func normalizePodContract(nc NormContext, meta *metav1.ObjectMeta, spec *corev1.PodSpec, mode normMode) error {
-	normalizeContractMetadata(meta, mode)
+	if err := normalizeContractMetadata(nc, meta, mode); err != nil {
+		return err
+	}
 	return normalizeContractSpec(nc, spec, mode)
 }
 
-func normalizeContractMetadata(meta *metav1.ObjectMeta, mode normMode) {
+func normalizeContractMetadata(nc NormContext, meta *metav1.ObjectMeta, mode normMode) error {
+	if mode != modeTemplate {
+		if meta.Namespace != nc.Namespace {
+			return fmt.Errorf("managed pod namespace %q does not match its cluster namespace %q", meta.Namespace, nc.Namespace)
+		}
+		if err := validateControllerOwnerReference(nc, meta); err != nil {
+			return err
+		}
+		if err := validateControllerLabels(nc, meta); err != nil {
+			return err
+		}
+		if mode == modeLive {
+			if err := validateBindingLabelsAndAnnotations(nc, meta); err != nil {
+				return err
+			}
+		}
+	}
+
 	meta.Name = ""
 	meta.GenerateName = ""
 	meta.Namespace = ""
@@ -216,7 +290,10 @@ func normalizeContractMetadata(meta *metav1.ObjectMeta, mode normMode) {
 	meta.OwnerReferences = nil
 	meta.SelfLink = ""
 
-	for _, key := range controllerAddedPodLabels {
+	for _, key := range memberControllerLabels {
+		delete(meta.Labels, key)
+	}
+	for _, key := range supportingControllerLabels {
 		delete(meta.Labels, key)
 	}
 	if mode == modeLive {
@@ -236,6 +313,117 @@ func normalizeContractMetadata(meta *metav1.ObjectMeta, mode normMode) {
 	if len(meta.Annotations) == 0 {
 		meta.Annotations = nil
 	}
+	return nil
+}
+
+func validateControllerOwnerReference(nc NormContext, meta *metav1.ObjectMeta) error {
+	controllers := make([]metav1.OwnerReference, 0, 1)
+	for _, ref := range meta.OwnerReferences {
+		if ref.Controller != nil && *ref.Controller {
+			controllers = append(controllers, ref)
+		}
+	}
+	if len(controllers) != 1 {
+		return fmt.Errorf("managed pod must have exactly one controller owner reference, found %d", len(controllers))
+	}
+	ref := controllers[0]
+	if isMemberClass(nc.Class) {
+		wantName := PostgreSQLMemberStatefulSetName(nc.ClusterName, nc.Shard, nc.Member)
+		if ref.Kind != "StatefulSet" {
+			return fmt.Errorf("member pod controller owner reference kind %q, want StatefulSet", ref.Kind)
+		}
+		if ref.Name != wantName {
+			return fmt.Errorf("member pod controller owner reference name %q, want %q", ref.Name, wantName)
+		}
+	} else {
+		if ref.Kind != "ReplicaSet" {
+			return fmt.Errorf("supporting pod controller owner reference kind %q, want ReplicaSet", ref.Kind)
+		}
+		if nc.Provenance != nil && nc.Provenance.ReplicaSetName != "" && ref.Name != nc.Provenance.ReplicaSetName {
+			return fmt.Errorf("supporting pod controller owner reference name %q, want %q", ref.Name, nc.Provenance.ReplicaSetName)
+		}
+		if ref.Name == "" {
+			return fmt.Errorf("supporting pod controller owner reference has no name")
+		}
+	}
+	if nc.Provenance != nil && nc.Provenance.ParentUID != "" && string(ref.UID) != nc.Provenance.ParentUID {
+		return fmt.Errorf("managed pod controller owner reference UID does not match the live parent")
+	}
+	return nil
+}
+
+func validateControllerLabels(nc NormContext, meta *metav1.ObjectMeta) error {
+	labels := meta.Labels
+	if isMemberClass(nc.Class) {
+		if _, present := labels[labelPodTemplateHash]; present {
+			return fmt.Errorf("member pod must not carry the ReplicaSet %q label", labelPodTemplateHash)
+		}
+		wantPodName := PostgreSQLMemberStatefulSetName(nc.ClusterName, nc.Shard, nc.Member) + "-0"
+		if labels[labelStatefulSetPodName] != wantPodName {
+			return fmt.Errorf("member pod-name label %q, want %q", labels[labelStatefulSetPodName], wantPodName)
+		}
+		if labels[labelPodIndex] != "0" {
+			return fmt.Errorf("member pod-index label %q, want \"0\"", labels[labelPodIndex])
+		}
+		revision, present := labels[labelControllerRevisionHash]
+		if !present || revision == "" {
+			return fmt.Errorf("member pod is missing its %q label", labelControllerRevisionHash)
+		}
+		if nc.Provenance != nil && nc.Provenance.ControllerRevisionHash != "" && revision != nc.Provenance.ControllerRevisionHash {
+			return fmt.Errorf("member pod controller-revision-hash does not match the live StatefulSet revision")
+		}
+		return nil
+	}
+	for _, key := range memberControllerLabels {
+		if _, present := labels[key]; present {
+			return fmt.Errorf("supporting pod must not carry the StatefulSet %q label", key)
+		}
+	}
+	hash, present := labels[labelPodTemplateHash]
+	if !present || hash == "" {
+		return fmt.Errorf("supporting pod is missing its %q label", labelPodTemplateHash)
+	}
+	if nc.Provenance != nil && nc.Provenance.PodTemplateHash != "" && hash != nc.Provenance.PodTemplateHash {
+		return fmt.Errorf("supporting pod-template-hash does not match the owning ReplicaSet")
+	}
+	return nil
+}
+
+// validateBindingLabelsAndAnnotations requires the pod's node-UID/boot-ID
+// annotations and zone/region labels to equal the authoritative binding
+// evidence exactly, and forbids any other binding-copied topology label.
+func validateBindingLabelsAndAnnotations(nc NormContext, meta *metav1.ObjectMeta) error {
+	evidence := nc.Binding
+	if evidence == nil {
+		return fmt.Errorf("live managed pod requires authoritative binding evidence")
+	}
+	if meta.Annotations[PostgreSQLNodeUIDAnnotation] != evidence.NodeUID || evidence.NodeUID == "" {
+		return fmt.Errorf("bound pod node-UID annotation does not match the authoritative binding evidence")
+	}
+	if meta.Annotations[PostgreSQLNodeBootIDAnnotation] != evidence.BootID || evidence.BootID == "" {
+		return fmt.Errorf("bound pod boot-ID annotation does not match the authoritative binding evidence")
+	}
+	if err := validateTopologyLabel(meta, corev1.LabelTopologyZone, evidence.Zone); err != nil {
+		return err
+	}
+	if err := validateTopologyLabel(meta, corev1.LabelTopologyRegion, evidence.Region); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateTopologyLabel(meta *metav1.ObjectMeta, key, want string) error {
+	value, present := meta.Labels[key]
+	if want == "" {
+		if present {
+			return fmt.Errorf("bound pod carries topology label %q the Node does not have", key)
+		}
+		return nil
+	}
+	if !present || value != want {
+		return fmt.Errorf("bound pod topology label %q does not match the bound Node", key)
+	}
+	return nil
 }
 
 func normalizeContractSpec(nc NormContext, spec *corev1.PodSpec, mode normMode) error {
@@ -245,13 +433,18 @@ func normalizeContractSpec(nc NormContext, spec *corev1.PodSpec, mode normMode) 
 	if err := normalizeOrdinalIdentity(nc, spec, mode); err != nil {
 		return err
 	}
-	if err := normalizeNodeName(spec, mode); err != nil {
+	if err := normalizeNodeName(nc, spec, mode); err != nil {
 		return err
 	}
-	normalizePriorityTuple(spec)
+	if err := normalizePriorityTuple(spec, mode); err != nil {
+		return err
+	}
 	if err := normalizeInjectedServiceAccountToken(nc.Class, spec, mode); err != nil {
 		return err
 	}
+	// Apply pinned k8s-1.36 defaulting last so the raw template and the
+	// API-server-defaulted pod converge to the same normal form.
+	applyContractDefaults(spec)
 	return nil
 }
 
@@ -259,10 +452,6 @@ func isMemberClass(class PodClass) bool {
 	return class == ClassSource || class == ClassStandby || class == ClassSingleMember
 }
 
-// normalizeOrdinalIdentity derives (member) and validates (CREATE/LIVE) the
-// StatefulSet-controller-assigned hostname/subdomain, then strips them so a
-// template (which lacks them) and a pod (which carries the derived values)
-// reduce identically. Supporting classes must not carry them.
 func normalizeOrdinalIdentity(nc NormContext, spec *corev1.PodSpec, mode normMode) error {
 	if isMemberClass(nc.Class) {
 		if mode != modeTemplate {
@@ -283,34 +472,53 @@ func normalizeOrdinalIdentity(nc NormContext, spec *corev1.PodSpec, mode normMod
 	return nil
 }
 
-func normalizeNodeName(spec *corev1.PodSpec, mode normMode) error {
-	if (mode == modeTemplate || mode == modeCreate) && spec.NodeName != "" {
-		return fmt.Errorf("managed pod must be created unassigned; spec.nodeName %q is preset", spec.NodeName)
+func normalizeNodeName(nc NormContext, spec *corev1.PodSpec, mode normMode) error {
+	switch mode {
+	case modeTemplate, modeCreate:
+		if spec.NodeName != "" {
+			return fmt.Errorf("managed pod must be created unassigned; spec.nodeName %q is preset", spec.NodeName)
+		}
+	case modeLive:
+		evidence := nc.Binding
+		if evidence == nil {
+			return fmt.Errorf("live managed pod requires authoritative binding evidence")
+		}
+		if spec.NodeName == "" || spec.NodeName != evidence.NodeName {
+			return fmt.Errorf("bound pod nodeName %q does not match the authoritative binding evidence", spec.NodeName)
+		}
 	}
 	spec.NodeName = ""
 	return nil
 }
 
-// normalizePriorityTuple resolves the {priorityClassName, priority,
-// preemptionPolicy} tuple for a pgshard-owned PriorityClass. The template
-// carries only the class name; the admitted pod carries the plugin-resolved
-// integer/policy. Filling nil→pinned makes the template match a correctly
-// resolved pod while leaving a pod that carries a wrong non-nil value to fail
-// comparison. A non-pgshard class name is left unresolved and simply mismatches
-// the template's class name.
-func normalizePriorityTuple(spec *corev1.PodSpec) {
+// normalizePriorityTuple synthesizes the {priority, preemptionPolicy} tuple
+// from a pgshard PriorityClass name ONLY in template mode. In CREATE/LIVE modes
+// an honest pod always carries the plugin-resolved values, so they are required
+// to be present and to equal the pinned resolution; a missing or wrong value
+// (e.g. a pod created without Priority admission) is rejected.
+func normalizePriorityTuple(spec *corev1.PodSpec, mode normMode) error {
 	value, ok := priorityValueForClassName(spec.PriorityClassName)
 	if !ok {
-		return
+		return nil
 	}
-	if spec.Priority == nil {
-		resolved := value
-		spec.Priority = &resolved
+	if mode == modeTemplate {
+		if spec.Priority == nil {
+			resolved := value
+			spec.Priority = &resolved
+		}
+		if spec.PreemptionPolicy == nil {
+			policy := pgShardPreemptionPolicy
+			spec.PreemptionPolicy = &policy
+		}
+		return nil
 	}
-	if spec.PreemptionPolicy == nil {
-		policy := pgShardPreemptionPolicy
-		spec.PreemptionPolicy = &policy
+	if spec.Priority == nil || *spec.Priority != value {
+		return fmt.Errorf("managed pod priority does not match the resolved value for %q", spec.PriorityClassName)
 	}
+	if spec.PreemptionPolicy == nil || *spec.PreemptionPolicy != pgShardPreemptionPolicy {
+		return fmt.Errorf("managed pod preemptionPolicy does not match the resolved policy for %q", spec.PriorityClassName)
+	}
+	return nil
 }
 
 func classExpectsInjectedToken(class PodClass) bool {
@@ -320,13 +528,11 @@ func classExpectsInjectedToken(class PodClass) bool {
 }
 
 // normalizeInjectedServiceAccountToken canonicalizes the ServiceAccount
-// plugin's randomly-named projected token as a relational tuple: for the
-// automounting class the template gets the exact expected tuple (with a fixed
-// placeholder name), and a pod's injected `kube-api-access-*` volume is
-// validated against that exact shape and renamed to the placeholder. The volume
-// name is the only free variable; any extra source, volume, or mount, or a
-// missing/mismatched tuple, fails comparison. Non-automounting classes expect
-// no such tuple (a stray one then fails comparison against the template).
+// plugin's randomly-named projected token as a relational tuple: the template
+// gets the exact expected tuple (fixed placeholder name), and a pod's injected
+// `kube-api-access-*` volume is validated against that exact shape and renamed
+// to the placeholder. The volume name is the only free variable; any extra
+// source, volume, or mount, or a missing/mismatched tuple, fails comparison.
 func normalizeInjectedServiceAccountToken(class PodClass, spec *corev1.PodSpec, mode normMode) error {
 	if !classExpectsInjectedToken(class) {
 		return nil
@@ -401,6 +607,159 @@ func expectedInjectedTokenVolumeSource() *corev1.ProjectedVolumeSource {
 			{DownwardAPI: &corev1.DownwardAPIProjection{Items: []corev1.DownwardAPIVolumeFile{{Path: "namespace", FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"}}}}},
 		},
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Pinned k8s 1.36 defaulting (design v7 §3, review blocker 1)
+//
+// Applied to BOTH the raw Plan template and the API-server-defaulted pod so
+// they converge. It mirrors the fields SetDefaults_Pod / SetObjectDefaults_*
+// add to a stored StatefulSet/Deployment pod template and to a real pod under
+// stock Kubernetes 1.36.1. It is idempotent. The real API-server round-trip
+// test is the authority that this set matches the target server; a gap
+// false-denies (fail closed), never opens.
+// ---------------------------------------------------------------------------
+
+func applyContractDefaults(spec *corev1.PodSpec) {
+	if spec.RestartPolicy == "" {
+		spec.RestartPolicy = corev1.RestartPolicyAlways
+	}
+	if spec.DNSPolicy == "" {
+		spec.DNSPolicy = corev1.DNSClusterFirst
+	}
+	if spec.SchedulerName == "" {
+		spec.SchedulerName = corev1.DefaultSchedulerName
+	}
+	if spec.TerminationGracePeriodSeconds == nil {
+		spec.TerminationGracePeriodSeconds = ptr(int64(corev1.DefaultTerminationGracePeriodSeconds))
+	}
+	if spec.SecurityContext == nil {
+		spec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+	if spec.EnableServiceLinks == nil {
+		spec.EnableServiceLinks = ptr(true)
+	}
+	for i := range spec.InitContainers {
+		applyContainerDefaults(&spec.InitContainers[i])
+	}
+	for i := range spec.Containers {
+		applyContainerDefaults(&spec.Containers[i])
+	}
+	for i := range spec.Volumes {
+		applyVolumeDefaults(&spec.Volumes[i])
+	}
+}
+
+func applyContainerDefaults(container *corev1.Container) {
+	if container.TerminationMessagePath == "" {
+		container.TerminationMessagePath = corev1.TerminationMessagePathDefault
+	}
+	if container.TerminationMessagePolicy == "" {
+		container.TerminationMessagePolicy = corev1.TerminationMessageReadFile
+	}
+	if container.ImagePullPolicy == "" {
+		container.ImagePullPolicy = defaultImagePullPolicy(container.Image)
+	}
+	for pi := range container.Ports {
+		if container.Ports[pi].Protocol == "" {
+			container.Ports[pi].Protocol = corev1.ProtocolTCP
+		}
+	}
+	applyProbeDefaults(container.LivenessProbe)
+	applyProbeDefaults(container.ReadinessProbe)
+	applyProbeDefaults(container.StartupProbe)
+	applyResourceRequestDefaults(&container.Resources)
+	for ei := range container.Env {
+		if container.Env[ei].ValueFrom != nil && container.Env[ei].ValueFrom.FieldRef != nil && container.Env[ei].ValueFrom.FieldRef.APIVersion == "" {
+			container.Env[ei].ValueFrom.FieldRef.APIVersion = "v1"
+		}
+	}
+}
+
+func applyProbeDefaults(probe *corev1.Probe) {
+	if probe == nil {
+		return
+	}
+	if probe.TimeoutSeconds == 0 {
+		probe.TimeoutSeconds = 1
+	}
+	if probe.PeriodSeconds == 0 {
+		probe.PeriodSeconds = 10
+	}
+	if probe.SuccessThreshold == 0 {
+		probe.SuccessThreshold = 1
+	}
+	if probe.FailureThreshold == 0 {
+		probe.FailureThreshold = 3
+	}
+	if probe.HTTPGet != nil && probe.HTTPGet.Scheme == "" {
+		probe.HTTPGet.Scheme = corev1.URISchemeHTTP
+	}
+}
+
+// applyResourceRequestDefaults mirrors SetDefaults_Pod's copy of each missing
+// request from its corresponding limit (which the API server applies only to
+// real Pods, not templates) so a limit-only member entry converges.
+func applyResourceRequestDefaults(resources *corev1.ResourceRequirements) {
+	if len(resources.Limits) == 0 {
+		return
+	}
+	if resources.Requests == nil {
+		resources.Requests = corev1.ResourceList{}
+	}
+	for name, quantity := range resources.Limits {
+		if _, present := resources.Requests[name]; !present {
+			resources.Requests[name] = quantity.DeepCopy()
+		}
+	}
+}
+
+func applyVolumeDefaults(volume *corev1.Volume) {
+	switch {
+	case volume.Secret != nil && volume.Secret.DefaultMode == nil:
+		volume.Secret.DefaultMode = ptr(corev1.SecretVolumeSourceDefaultMode)
+	case volume.ConfigMap != nil && volume.ConfigMap.DefaultMode == nil:
+		volume.ConfigMap.DefaultMode = ptr(corev1.ConfigMapVolumeSourceDefaultMode)
+	case volume.DownwardAPI != nil && volume.DownwardAPI.DefaultMode == nil:
+		volume.DownwardAPI.DefaultMode = ptr(corev1.DownwardAPIVolumeSourceDefaultMode)
+	case volume.Projected != nil && volume.Projected.DefaultMode == nil:
+		volume.Projected.DefaultMode = ptr(corev1.ProjectedVolumeSourceDefaultMode)
+	}
+	if volume.DownwardAPI != nil {
+		for i := range volume.DownwardAPI.Items {
+			if volume.DownwardAPI.Items[i].FieldRef != nil && volume.DownwardAPI.Items[i].FieldRef.APIVersion == "" {
+				volume.DownwardAPI.Items[i].FieldRef.APIVersion = "v1"
+			}
+		}
+	}
+	if volume.Projected != nil {
+		for si := range volume.Projected.Sources {
+			downward := volume.Projected.Sources[si].DownwardAPI
+			if downward == nil {
+				continue
+			}
+			for i := range downward.Items {
+				if downward.Items[i].FieldRef != nil && downward.Items[i].FieldRef.APIVersion == "" {
+					downward.Items[i].FieldRef.APIVersion = "v1"
+				}
+			}
+		}
+	}
+}
+
+// defaultImagePullPolicy mirrors stock container defaulting: a digest or an
+// explicit non-latest tag defaults to IfNotPresent; only an empty tag or
+// ":latest" defaults to Always.
+func defaultImagePullPolicy(image string) corev1.PullPolicy {
+	if strings.Contains(image, "@") {
+		return corev1.PullIfNotPresent
+	}
+	lastComponent := image[strings.LastIndex(image, "/")+1:]
+	colon := strings.LastIndex(lastComponent, ":")
+	if colon < 0 || lastComponent[colon+1:] == "latest" {
+		return corev1.PullAlways
+	}
+	return corev1.PullIfNotPresent
 }
 
 // ---------------------------------------------------------------------------
@@ -484,8 +843,7 @@ func ImageIsDigestPinned(image string) bool {
 // ValidateProtectedImagesDigestPinned requires every regular and init container
 // image to be digest-pinned. It is enforced only when isolation is active
 // (production); development/CI with mutable `:main`/`:dev` tags keeps working
-// when isolation is off. Ephemeral containers are always forbidden by the
-// comparator, so they are not inspected here.
+// when isolation is off.
 func ValidateProtectedImagesDigestPinned(spec *corev1.PodSpec) error {
 	for _, container := range spec.InitContainers {
 		if !ImageIsDigestPinned(container.Image) {
@@ -517,9 +875,7 @@ const (
 // (when enforceDigestPin) non-digest images on the raw pod, normalizes both
 // sides to the canonical normal form for the given lifecycle stage, and then
 // requires the COMPLETE remaining metadata+spec to be semantically equal. A
-// mismatch returns the first differing field path. `stage` selects
-// CreateNormalForm (StageCreate) or LiveNormalForm (StageLive) for the pod
-// side; the template is always normalized in template mode.
+// mismatch returns the first differing field path.
 func ComparePodToStampedTemplate(nc NormContext, podMeta metav1.ObjectMeta, podSpec corev1.PodSpec, templateMeta metav1.ObjectMeta, templateSpec corev1.PodSpec, stage PodComparisonStage, enforceDigestPin bool) error {
 	if err := ValidateNoDuplicateIdentities(&podSpec); err != nil {
 		return err

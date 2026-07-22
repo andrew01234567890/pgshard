@@ -546,7 +546,11 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("PostgreSQL data volume = %#v", dataVolume)
 		}
 		pod := statefulSet.Spec.Template.Spec
-		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.ServiceAccountName != "" || hasVolume(pod.Volumes, "kubernetes-api") || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
+		// Direct-runtime members author the dedicated (already-created) agent
+		// ServiceAccount so stock ServiceAccount admission never sets "default"
+		// or injects default-SA imagePullSecrets, but keep automount off and
+		// project no token.
+		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.ServiceAccountName != PostgreSQLAgentServiceAccountName(cluster.Name, shard) || hasVolume(pod.Volumes, "kubernetes-api") || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
 			t.Fatalf("PostgreSQL Pod boundary = %#v", pod)
 		}
 		if pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot == nil || !*pod.SecurityContext.RunAsNonRoot || pod.SecurityContext.RunAsUser == nil || *pod.SecurityContext.RunAsUser != 999 || pod.SecurityContext.FSGroup == nil || *pod.SecurityContext.FSGroup != 999 || pod.SecurityContext.FSGroupChangePolicy == nil || *pod.SecurityContext.FSGroupChangePolicy != corev1.FSGroupChangeOnRootMismatch {
