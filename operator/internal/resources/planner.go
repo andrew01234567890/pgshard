@@ -58,11 +58,15 @@ const (
 	CatalogCACertificateKey          = "ca.crt"
 	CatalogTLSCertificateKey         = "tls.crt"
 	CatalogTLSPrivateKeyKey          = "tls.key"
-	TopologyConfigSuffix             = "-topology"
-	PostgreSQLCatalogCandidateSuffix = "-cfg"
-	OrchestratorSuffix               = "-orchestrator"
-	OrchestratorLeaseSuffix          = "-orch-lease"
-	PoolerSuffix                     = "-pooler"
+
+	PostgreSQLReplicationTLSCAKey          = "ca.crt"
+	PostgreSQLReplicationTLSCertificateKey = "tls.crt"
+	PostgreSQLReplicationTLSPrivateKeyKey  = "tls.key"
+	TopologyConfigSuffix                   = "-topology"
+	PostgreSQLCatalogCandidateSuffix       = "-cfg"
+	OrchestratorSuffix                     = "-orchestrator"
+	OrchestratorLeaseSuffix                = "-orch-lease"
+	PoolerSuffix                           = "-pooler"
 
 	PostgreSQLPort int32 = 5432
 	PoolerRWPort   int32 = 5432
@@ -78,12 +82,13 @@ const (
 	// catalogServingHBAPolicy is sealed evidence only. No current bootstrap or
 	// postmaster consumes it; future materialization must publish these exact
 	// replication-preserving, catalog-only serving rules after revalidation.
-	catalogServingHBAPolicyVersion = "pgshard.catalog-serving-hba.v1"
+	catalogServingHBAPolicyVersion = "pgshard.catalog-serving-hba.v2"
 	catalogServingHBAPolicy        = "local postgres postgres peer\n" +
 		"local all all reject\n" +
 		"local replication all reject\n" +
-		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
-		"host replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"hostssl replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
+		"hostssl replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"hostnossl replication all all reject\n" +
 		"hostnossl shardschema all all reject\n" +
 		"hostssl shardschema pgshard_pooler_catalog all scram-sha-256\n" +
 		"hostssl shardschema pgshard_orchestrator_catalog all scram-sha-256\n" +
@@ -94,32 +99,33 @@ const (
 	defaultPostgreSQLImage              = "docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
 	developmentPostgreSQLBootstrapImage = "pgshard/postgres-agent:dev"
 
-	ConfigHashAnnotation                      = "pgshard.io/config-hash"
-	ApplyOwnershipAnnotation                  = "pgshard.io/apply-ownership"
-	ApplyOwnershipVersion                     = "v1"
-	RetainedFromAnnotation                    = "pgshard.io/retained-from"
-	PostgreSQLBootstrapClusterUIDAnnotation   = "pgshard.io/bootstrap-cluster-uid"
-	PostgreSQLReplicationClusterUIDAnnotation = "pgshard.io/replication-cluster-uid"
-	CatalogAccessClusterUIDAnnotation         = "pgshard.io/catalog-access-cluster-uid"
-	OperationWriterAccessClusterUIDAnnotation = "pgshard.io/operation-writer-access-cluster-uid"
-	PostgreSQLDataClusterUIDAnnotation        = "pgshard.io/data-cluster-uid"
-	PostgreSQLDataProtectionFinalizer         = "pgshard.io/postgresql-data-protection"
-	PostgreSQLPodClusterUIDAnnotation         = "pgshard.io/postgresql-cluster-uid"
-	PostgreSQLNodeUIDAnnotation               = "pgshard.io/postgresql-node-uid"
-	PostgreSQLNodeBootIDAnnotation            = "pgshard.io/postgresql-node-boot-id"
-	PostgreSQLPodTerminationFinalizer         = "pgshard.io/postgresql-termination"
-	postgresqlBootstrapMarker                 = ".pgshard-bootstrap-complete"
-	shardschemaMigrationPath                  = "/usr/share/pgshard/migrations/0001_shardschema.sql"
-	databaseGenesisKey                        = "database-genesis.sql"
-	databaseGenesisPath                       = "/etc/pgshard/postgresql/database-genesis.sql"
-	databaseTopologyPreflightKey              = "database-topology-preflight.sql"
-	databaseTopologyPreflightPath             = "/etc/pgshard/postgresql/database-topology-preflight.sql"
-	shardschemaMigrationSHA256                = "10f90e15f468c3e33db03cc3a3ff714a38e020c454fd5d614d255fb367142fed"
-	shardschemaMigrationHashAnnotation        = "pgshard.io/shardschema-migration-sha256"
-	catalogActivationJournalVolumeName        = "catalog-activation-journal"
-	catalogActivationJournalVolumeMountPath   = "/var/lib/pgshard/catalog-activation-volume"
-	catalogActivationJournalSubPath           = "root"
-	catalogActivationJournalRoot              = "/var/lib/postgresql/18/.pgshard-catalog-activation"
+	ConfigHashAnnotation                         = "pgshard.io/config-hash"
+	ApplyOwnershipAnnotation                     = "pgshard.io/apply-ownership"
+	ApplyOwnershipVersion                        = "v1"
+	RetainedFromAnnotation                       = "pgshard.io/retained-from"
+	PostgreSQLBootstrapClusterUIDAnnotation      = "pgshard.io/bootstrap-cluster-uid"
+	PostgreSQLReplicationClusterUIDAnnotation    = "pgshard.io/replication-cluster-uid"
+	PostgreSQLReplicationTLSClusterUIDAnnotation = "pgshard.io/replication-tls-cluster-uid"
+	CatalogAccessClusterUIDAnnotation            = "pgshard.io/catalog-access-cluster-uid"
+	OperationWriterAccessClusterUIDAnnotation    = "pgshard.io/operation-writer-access-cluster-uid"
+	PostgreSQLDataClusterUIDAnnotation           = "pgshard.io/data-cluster-uid"
+	PostgreSQLDataProtectionFinalizer            = "pgshard.io/postgresql-data-protection"
+	PostgreSQLPodClusterUIDAnnotation            = "pgshard.io/postgresql-cluster-uid"
+	PostgreSQLNodeUIDAnnotation                  = "pgshard.io/postgresql-node-uid"
+	PostgreSQLNodeBootIDAnnotation               = "pgshard.io/postgresql-node-boot-id"
+	PostgreSQLPodTerminationFinalizer            = "pgshard.io/postgresql-termination"
+	postgresqlBootstrapMarker                    = ".pgshard-bootstrap-complete"
+	shardschemaMigrationPath                     = "/usr/share/pgshard/migrations/0001_shardschema.sql"
+	databaseGenesisKey                           = "database-genesis.sql"
+	databaseGenesisPath                          = "/etc/pgshard/postgresql/database-genesis.sql"
+	databaseTopologyPreflightKey                 = "database-topology-preflight.sql"
+	databaseTopologyPreflightPath                = "/etc/pgshard/postgresql/database-topology-preflight.sql"
+	shardschemaMigrationSHA256                   = "10f90e15f468c3e33db03cc3a3ff714a38e020c454fd5d614d255fb367142fed"
+	shardschemaMigrationHashAnnotation           = "pgshard.io/shardschema-migration-sha256"
+	catalogActivationJournalVolumeName           = "catalog-activation-journal"
+	catalogActivationJournalVolumeMountPath      = "/var/lib/pgshard/catalog-activation-volume"
+	catalogActivationJournalSubPath              = "root"
+	catalogActivationJournalRoot                 = "/var/lib/postgresql/18/.pgshard-catalog-activation"
 )
 
 const postgresqlBootstrapScript = `set -Eeuo pipefail
@@ -1968,6 +1974,7 @@ const postgresqlStandbyBootstrapScript = `set -Eeuo pipefail
 : "${PGSHARD_SOURCE_HOST:?source Pod DNS is required}"
 : "${PGSHARD_PRIMARY_SLOT_NAME:?physical replication slot is required}"
 : "${PGSHARD_REPLICATION_MATERIAL_SHA256:?replication material digest is required}"
+: "${PGSHARD_REPLICATION_TLS_CA_SHA256:?replication CA digest is required}"
 : "${PGSHARD_TARGET_PVC_UID:?target PVC UID is required}"
 : "${PGSHARD_TARGET_SECRET_UID:?target creation-fence Secret UID is required}"
 : "${PGSHARD_SOURCE_PVC_UID:?source PVC UID is required}"
@@ -1992,6 +1999,10 @@ if [[ ! "$PGSHARD_SOURCE_HOST" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z
 fi
 if [[ ! "$PGSHARD_REPLICATION_MATERIAL_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   echo "refusing an invalid checkpointed replication material digest" >&2
+  exit 1
+fi
+if [[ ! "$PGSHARD_REPLICATION_TLS_CA_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "refusing an invalid checkpointed replication CA digest" >&2
   exit 1
 fi
 for checkpoint_uid in \
@@ -2031,6 +2042,24 @@ printf '%s:%s:*:pgshard_replication:%s\n' \
 unset replication_password
 chmod 0400 "$passfile_staging"
 mv -- "$passfile_staging" "$passfile"
+
+replication_ca_source=/etc/pgshard/replication-tls/ca.crt
+observed_replication_ca_sha="$(
+  pgshard-catalog-material-digest replication-tls-ca "$replication_ca_source"
+)"
+if [[ "$observed_replication_ca_sha" != "$PGSHARD_REPLICATION_TLS_CA_SHA256" ]]; then
+  echo "refusing a replication CA that differs from the checkpointed creation result" >&2
+  exit 1
+fi
+unset observed_replication_ca_sha
+# The running standby's primary_conninfo verifies against this exact copy, so
+# it must exist before the completed-clone fast exit below.
+replication_ca="$passfile_directory/ca.crt"
+replication_ca_staging="$passfile_directory/.ca.crt.next"
+rm -f -- "$replication_ca_staging"
+cp -- "$replication_ca_source" "$replication_ca_staging"
+chmod 0400 "$replication_ca_staging"
+mv -- "$replication_ca_staging" "$replication_ca"
 
 parent=/var/lib/postgresql/18
 volume_root="${parent%/*}"
@@ -2182,7 +2211,7 @@ export PGPASSFILE="$passfile"
 source_system_record="$(
   timeout --signal=TERM --kill-after=2s 10s \
     psql -X --no-password \
-      --dbname="host=$PGSHARD_SOURCE_HOST port=5432 user=pgshard_replication passfile=$passfile replication=true sslmode=disable" \
+      --dbname="host=$PGSHARD_SOURCE_HOST port=5432 user=pgshard_replication passfile=$passfile replication=true sslmode=verify-full sslrootcert=$replication_ca channel_binding=require" \
       --no-align --tuples-only --field-separator='|' \
       --command='IDENTIFY_SYSTEM'
 )"
@@ -2194,9 +2223,7 @@ source_system_identifier="${BASH_REMATCH[1]}"
 timeout --signal=TERM --kill-after=10s 15m \
   pg_basebackup \
     --pgdata="$staging" \
-    --host="$PGSHARD_SOURCE_HOST" \
-    --port=5432 \
-    --username=pgshard_replication \
+    --dbname="host=$PGSHARD_SOURCE_HOST port=5432 user=pgshard_replication passfile=$passfile sslmode=verify-full sslrootcert=$replication_ca channel_binding=require" \
     --slot="$PGSHARD_PRIMARY_SLOT_NAME" \
     --wal-method=stream \
     --checkpoint=fast \
@@ -2211,7 +2238,7 @@ rm -f -- \
   "$staging/.pgshard-writable-generation" \
   "$staging/.pgshard-writable-generation.next"
 
-primary_conninfo="host=$PGSHARD_SOURCE_HOST port=5432 user=pgshard_replication application_name=$PGSHARD_PRIMARY_SLOT_NAME passfile=$passfile sslmode=disable"
+primary_conninfo="host=$PGSHARD_SOURCE_HOST port=5432 user=pgshard_replication application_name=$PGSHARD_PRIMARY_SLOT_NAME passfile=$passfile sslmode=verify-full sslrootcert=$replication_ca channel_binding=require"
 pg_ctl -D "$staging" -w -t 60 start \
   -o "-c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c hba_file=/etc/pgshard/quarantine.pg_hba.conf -c external_pid_file=/tmp/pgshard-standby-bootstrap.pid -c ssl=off -c restart_after_crash=off -c primary_conninfo='$primary_conninfo' -c primary_slot_name='$PGSHARD_PRIMARY_SLOT_NAME' -c recovery_target_timeline=latest -c recovery_target_action=shutdown -c restore_command= -c archive_cleanup_command= -c recovery_end_command= -c shared_preload_libraries= -c synchronous_standby_names='' -c synchronous_commit=local"
 started=true
@@ -2237,6 +2264,37 @@ sync "$final" "$parent" "$volume_root"
 trap - EXIT
 rm -f -- "$expected_source_identity" "$expected_clone_identity"
 rm -rf -- "$socket"
+`
+
+// postgresqlServerTLSPrepareScript digest-verifies the projected replication
+// server keypair and republishes it as private regular files in a memory
+// EmptyDir. PostgreSQL refuses group-readable Secret-projection symlinks for
+// ssl_key_file, so the postmaster consumes only this tmpfs copy.
+const postgresqlServerTLSPrepareScript = `set -Eeuo pipefail
+: "${PGSHARD_REPLICATION_TLS_SERVER_SHA256:?replication server TLS digest is required}"
+if [[ ! "$PGSHARD_REPLICATION_TLS_SERVER_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "refusing an invalid checkpointed replication server TLS digest" >&2
+  exit 1
+fi
+source_directory=/etc/pgshard/server-tls-secret
+target_directory=/run/pgshard/server-tls
+observed_server_tls_sha="$(
+  pgshard-catalog-material-digest replication-tls-server \
+    "$source_directory/tls.key" "$source_directory/tls.crt"
+)"
+if [[ "$observed_server_tls_sha" != "$PGSHARD_REPLICATION_TLS_SERVER_SHA256" ]]; then
+  echo "refusing replication server TLS material that differs from the checkpointed creation result" >&2
+  exit 1
+fi
+unset observed_server_tls_sha
+umask 077
+for name in tls.crt tls.key; do
+  staging="$target_directory/.$name.next"
+  rm -f -- "$staging"
+  cp -- "$source_directory/$name" "$staging"
+  chmod 0400 -- "$staging"
+  mv -- "$staging" "$target_directory/$name"
+done
 `
 
 // Images contains controller-owned workload composition inputs. Image
@@ -2901,8 +2959,13 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		}
 	}
 	var replicationCredentials map[int32]pgshardv1alpha1.PostgreSQLReplicationCredentialStatus
+	var replicationTLS map[int32]pgshardv1alpha1.PostgreSQLReplicationTLSStatus
 	if cluster.Spec.MembersPerShard > 1 && images.PostgreSQLRuntime.agentQuarantine() {
 		replicationCredentials, err = postgresqlReplicationCredentials(cluster)
+		if err != nil {
+			return nil, err
+		}
+		replicationTLS, err = postgresqlReplicationTLS(cluster)
 		if err != nil {
 			return nil, err
 		}
@@ -2970,9 +3033,10 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 			bootstrap := bootstraps[postgresqlBootstrapKey{shard: shard, member: 0}]
 			writableLease := writableLeases[shard]
 			replicationCredential := replicationCredentials[shard]
+			shardReplicationTLS := replicationTLS[shard]
 			objects = append(objects,
 				postgresqlStandbyServiceAccount(cluster, shard),
-				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease, replicationCredential, shardCatalogActivation),
+				postgresqlReplicationBootstrapSourceStatefulSet(cluster, shard, images, bootstrap, postgresqlConfigName, postgresqlHash, writableLease, replicationCredential, shardReplicationTLS, shardCatalogActivation),
 			)
 			for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
 				objects = append(objects, postgresqlReplicationStandbyStatefulSet(
@@ -2983,6 +3047,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 					bootstraps[postgresqlBootstrapKey{shard: shard, member: member}],
 					bootstrap,
 					replicationCredential,
+					shardReplicationTLS,
 				))
 			}
 		}
@@ -3091,6 +3156,71 @@ func postgresqlReplicationCredentials(cluster *pgshardv1alpha1.PgShardCluster) (
 		}
 	}
 	return credentials, nil
+}
+
+func postgresqlReplicationTLS(cluster *pgshardv1alpha1.PgShardCluster) (map[int32]pgshardv1alpha1.PostgreSQLReplicationTLSStatus, error) {
+	statuses := make(map[int32]pgshardv1alpha1.PostgreSQLReplicationTLSStatus, len(cluster.Status.PostgreSQLReplicationTLS))
+	names := make(map[string]struct{})
+	uids := make(map[types.UID]struct{})
+	for _, tls := range cluster.Status.PostgreSQLReplicationTLS {
+		if tls.Shard < 0 || tls.Shard >= cluster.Spec.Shards ||
+			!PostgreSQLReplicationTLSCASecretNameIsValid(cluster.Name, tls.Shard, tls.CASecretName) ||
+			tls.CASecretUID == "" || !validCatalogMaterialSHA256(tls.CASHA256) || tls.RenewalDeadline.IsZero() {
+			return nil, fmt.Errorf("PostgreSQL replication TLS checkpoint for shard %d is invalid", tls.Shard)
+		}
+		if _, duplicate := statuses[tls.Shard]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL replication TLS checkpoint for shard %d is duplicated", tls.Shard)
+		}
+		if _, duplicate := names[tls.CASecretName]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL replication TLS Secret name %s is duplicated", tls.CASecretName)
+		}
+		if _, duplicate := uids[tls.CASecretUID]; duplicate {
+			return nil, fmt.Errorf("PostgreSQL replication TLS Secret UID %s is duplicated", tls.CASecretUID)
+		}
+		names[tls.CASecretName] = struct{}{}
+		uids[tls.CASecretUID] = struct{}{}
+		members := make(map[int32]struct{}, len(tls.Members))
+		for _, member := range tls.Members {
+			if member.Member < 0 || member.Member >= cluster.Spec.MembersPerShard ||
+				!PostgreSQLReplicationTLSServerSecretNameIsValid(cluster.Name, tls.Shard, member.Member, member.SecretName) ||
+				member.SecretUID == "" || !validCatalogMaterialSHA256(member.ServerSHA256) || member.NotAfter.IsZero() {
+				return nil, fmt.Errorf("PostgreSQL replication TLS checkpoint for shard %d member %d is invalid", tls.Shard, member.Member)
+			}
+			if _, duplicate := members[member.Member]; duplicate {
+				return nil, fmt.Errorf("PostgreSQL replication TLS checkpoint for shard %d member %d is duplicated", tls.Shard, member.Member)
+			}
+			if _, duplicate := names[member.SecretName]; duplicate {
+				return nil, fmt.Errorf("PostgreSQL replication TLS Secret name %s is duplicated", member.SecretName)
+			}
+			if _, duplicate := uids[member.SecretUID]; duplicate {
+				return nil, fmt.Errorf("PostgreSQL replication TLS Secret UID %s is duplicated", member.SecretUID)
+			}
+			members[member.Member] = struct{}{}
+			names[member.SecretName] = struct{}{}
+			uids[member.SecretUID] = struct{}{}
+		}
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			if _, ok := members[member]; !ok {
+				return nil, fmt.Errorf("PostgreSQL replication TLS checkpoint for shard %d member %d is missing", tls.Shard, member)
+			}
+		}
+		statuses[tls.Shard] = tls
+	}
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		if _, ok := statuses[shard]; !ok {
+			return nil, fmt.Errorf("PostgreSQL replication TLS checkpoint for shard %d is missing", shard)
+		}
+	}
+	return statuses, nil
+}
+
+func postgresqlReplicationTLSMember(tls pgshardv1alpha1.PostgreSQLReplicationTLSStatus, member int32) pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus {
+	for _, candidate := range tls.Members {
+		if candidate.Member == member {
+			return candidate
+		}
+	}
+	return pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{}
 }
 
 type catalogCandidateConfigurationDocument struct {
@@ -4147,6 +4277,80 @@ func PostgreSQLReplicationMaterialSHA256(password []byte) string {
 	return catalogMaterialSHA256("pgshard-postgresql-replication-v1", password)
 }
 
+// PostgreSQLReplicationTLSCASecretPrefix returns a bounded shard-specific
+// prefix for an unpredictable staged replication-CA Secret name. The
+// controller appends 128 bits of randomness before checkpointing the creation
+// intent.
+func PostgreSQLReplicationTLSCASecretPrefix(cluster string, shard int32) string {
+	const maximumPrefixLength = 31 // leaves 32 hexadecimal characters in a DNS label
+	literal := fmt.Sprintf("%s-tc%04d-", cluster, shard)
+	if len(literal) <= maximumPrefixLength {
+		return literal
+	}
+	digest := sha256.Sum256([]byte(cluster))
+	encoded := hex.EncodeToString(digest[:6])
+	shardSuffix := fmt.Sprintf("-tc%04d-", shard)
+	prefixLength := maximumPrefixLength - len(encoded) - len(shardSuffix) - 1
+	return cluster[:prefixLength] + "-" + encoded + shardSuffix
+}
+
+// PostgreSQLReplicationTLSCASecretNameIsValid verifies the checkpointed random
+// suffix and exact cluster/shard prefix.
+func PostgreSQLReplicationTLSCASecretNameIsValid(cluster string, shard int32, name string) bool {
+	return randomSuffixNameIsValid(PostgreSQLReplicationTLSCASecretPrefix(cluster, shard), name)
+}
+
+// PostgreSQLReplicationTLSServerSecretPrefix returns a bounded member-specific
+// prefix for an unpredictable staged replication server-certificate Secret
+// name. The controller appends 128 bits of randomness before checkpointing the
+// creation intent.
+func PostgreSQLReplicationTLSServerSecretPrefix(cluster string, shard, member int32) string {
+	const maximumPrefixLength = 31 // leaves 32 hexadecimal characters in a DNS label
+	literal := fmt.Sprintf("%s-ts%04d-m%04d-", cluster, shard, member)
+	if len(literal) <= maximumPrefixLength {
+		return literal
+	}
+	digest := sha256.Sum256([]byte(cluster))
+	encoded := hex.EncodeToString(digest[:6])
+	memberSuffix := fmt.Sprintf("-ts%04d-m%04d-", shard, member)
+	prefixLength := maximumPrefixLength - len(encoded) - len(memberSuffix) - 1
+	return cluster[:prefixLength] + "-" + encoded + memberSuffix
+}
+
+// PostgreSQLReplicationTLSServerSecretNameIsValid verifies the checkpointed
+// random suffix and exact cluster/shard/member prefix.
+func PostgreSQLReplicationTLSServerSecretNameIsValid(cluster string, shard, member int32, name string) bool {
+	return randomSuffixNameIsValid(PostgreSQLReplicationTLSServerSecretPrefix(cluster, shard, member), name)
+}
+
+func randomSuffixNameIsValid(prefix, name string) bool {
+	if !strings.HasPrefix(name, prefix) || len(name) != len(prefix)+32 {
+		return false
+	}
+	suffix := name[len(prefix):]
+	decoded, err := hex.DecodeString(suffix)
+	return err == nil && len(decoded) == 16 && hex.EncodeToString(decoded) == suffix
+}
+
+// PostgreSQLMemberTLSDNSNames returns the single exact hostname accepted by a
+// member's replication server certificate.
+func PostgreSQLMemberTLSDNSNames(cluster string, shard, member int32, namespace string) []string {
+	return []string{postgresqlMemberPodDNS(cluster, shard, member, namespace)}
+}
+
+// PostgreSQLReplicationTLSCAMaterialSHA256 binds the exact replication CA
+// certificate projection validated before any standby client connects.
+func PostgreSQLReplicationTLSCAMaterialSHA256(caCertificate []byte) string {
+	return catalogMaterialSHA256("pgshard-replication-tls-ca-v1", caCertificate)
+}
+
+// PostgreSQLReplicationTLSServerMaterialSHA256 binds the exact replication
+// server certificate and private-key projection validated before the
+// postmaster starts.
+func PostgreSQLReplicationTLSServerMaterialSHA256(serverCertificate, serverPrivateKey []byte) string {
+	return catalogMaterialSHA256("pgshard-replication-tls-server-v1", serverPrivateKey, serverCertificate)
+}
+
 // CatalogClientMaterialSHA256 binds the exact password and CA projection used
 // by the pooler and shard-zero bootstrap init container.
 func CatalogClientMaterialSHA256(password, caCertificate []byte) string {
@@ -4444,6 +4648,35 @@ func PostgreSQLReplicationIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, 
 	}
 }
 
+// PostgreSQLReplicationTLSCAIntentSecret is the non-consumable empty identity
+// checkpointed before a shard's replication CA certificate exists. The
+// controller may install the immutable certificate only by updating this exact
+// UID and resourceVersion.
+func PostgreSQLReplicationTLSCAIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, shard int32, name string) *corev1.Secret {
+	metadata := ownedMeta(cluster, name, "postgresql-replication-tls", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	metadata.Annotations[PostgreSQLReplicationTLSClusterUIDAnnotation] = string(cluster.UID)
+	return &corev1.Secret{
+		ObjectMeta: metadata,
+		Type:       corev1.SecretTypeOpaque,
+	}
+}
+
+// PostgreSQLReplicationTLSServerIntentSecret is the non-consumable empty
+// identity checkpointed before one member's replication server keypair exists.
+// The controller may install immutable material only by updating this exact
+// UID and resourceVersion.
+func PostgreSQLReplicationTLSServerIntentSecret(cluster *pgshardv1alpha1.PgShardCluster, shard, member int32, name string) *corev1.Secret {
+	metadata := ownedMeta(cluster, name, "postgresql-replication-tls", nil)
+	metadata.Labels[ShardLabel] = shardLabel(shard)
+	metadata.Labels[MemberLabel] = memberLabel(member)
+	metadata.Annotations[PostgreSQLReplicationTLSClusterUIDAnnotation] = string(cluster.UID)
+	return &corev1.Secret{
+		ObjectMeta: metadata,
+		Type:       corev1.SecretTypeOpaque,
+	}
+}
+
 // PostgreSQLMemberDataPVC returns the standalone data volume for one stable physical
 // member. A single-member volume is the current primary; multi-member
 // agent-quarantine uses the same lifecycle only as non-serving source storage
@@ -4709,7 +4942,7 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 	}
 }
 
-func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus) *appsv1.StatefulSet {
+func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard int32, images Images, bootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, configurationName, configurationHash string, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, replicationTLS pgshardv1alpha1.PostgreSQLReplicationTLSStatus, catalogActivation *pgshardv1alpha1.CatalogActivationCarrierStatus) *appsv1.StatefulSet {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
@@ -4737,7 +4970,18 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 	if images.PostgreSQLBootstrap == developmentPostgreSQLBootstrapImage {
 		bootstrapPullPolicy = corev1.PullNever
 	}
+	serverTLS := postgresqlReplicationTLSMember(replicationTLS, 0)
 	agent := postgresqlReplicationBootstrapPrimaryContainer(cluster, shard, images.PostgreSQLBootstrap, bootstrapPullPolicy, postgresSecurity, writableLease)
+	agent.Env = append(agent.Env,
+		corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: "/run/pgshard/server-tls/tls.crt"},
+		corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_KEY", Value: "/run/pgshard/server-tls/tls.key"},
+		corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_SERVER_SHA256", Value: serverTLS.ServerSHA256},
+	)
+	agent.VolumeMounts = append(agent.VolumeMounts, corev1.VolumeMount{
+		Name:      "server-tls",
+		MountPath: "/run/pgshard/server-tls",
+		ReadOnly:  true,
+	})
 	initContainers := []corev1.Container{}
 	if catalogActivation != nil {
 		agent.Env = append(agent.Env,
@@ -4804,6 +5048,21 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			}},
 		})
 	}
+	initContainers = append(initContainers, corev1.Container{
+		Name:            "prepare-server-tls",
+		Image:           images.PostgreSQLBootstrap,
+		ImagePullPolicy: bootstrapPullPolicy,
+		Command:         []string{"bash", "-ceu", postgresqlServerTLSPrepareScript},
+		Env: []corev1.EnvVar{
+			{Name: "PGSHARD_REPLICATION_TLS_SERVER_SHA256", Value: serverTLS.ServerSHA256},
+		},
+		Resources:       cluster.Spec.PostgreSQL.Resources,
+		SecurityContext: postgresSecurity.DeepCopy(),
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "server-tls-secret", MountPath: "/etc/pgshard/server-tls-secret", ReadOnly: true},
+			{Name: "server-tls", MountPath: "/run/pgshard/server-tls"},
+		},
+	})
 	automount := false
 	enableServiceLinks := false
 	podAnnotations := map[string]string{
@@ -4829,6 +5088,18 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			SecretName:  replicationCredential.SecretName,
 			DefaultMode: ptr(int32(0o440)),
 			Items:       []corev1.KeyToPath{{Key: PostgreSQLReplicationPasswordKey, Path: "replication-password", Mode: ptr(int32(0o440))}},
+		}}},
+		{Name: "server-tls-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName:  serverTLS.SecretName,
+			DefaultMode: ptr(int32(0o440)),
+			Items: []corev1.KeyToPath{
+				{Key: PostgreSQLReplicationTLSCertificateKey, Path: "tls.crt", Mode: ptr(int32(0o440))},
+				{Key: PostgreSQLReplicationTLSPrivateKeyKey, Path: "tls.key", Mode: ptr(int32(0o440))},
+			},
+		}}},
+		{Name: "server-tls", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			Medium:    corev1.StorageMediumMemory,
+			SizeLimit: ptr(resource.MustParse("1Mi")),
 		}}},
 		postgresqlAgentKubernetesAPIVolume(),
 	}
@@ -4893,7 +5164,7 @@ func catalogActivationJournalInitializerScript(journalRoot string) string {
 	return "umask 077\ninstall -d -m 0700 -- " + journalRoot + " " + journalRoot + "/owner\nchmod u=rwx,go=,a-s,-t -- " + journalRoot + " " + journalRoot + "/owner"
 }
 
-func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard, member int32, images Images, bootstrap, sourceBootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus) *appsv1.StatefulSet {
+func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard, member int32, images Images, bootstrap, sourceBootstrap pgshardv1alpha1.PostgreSQLBootstrapStatus, replicationCredential pgshardv1alpha1.PostgreSQLReplicationCredentialStatus, replicationTLS pgshardv1alpha1.PostgreSQLReplicationTLSStatus) *appsv1.StatefulSet {
 	const (
 		postgresUID = int64(999)
 		replicas    = int32(1)
@@ -4935,6 +5206,7 @@ func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardClu
 			{Name: "PGSHARD_SOURCE_HOST", Value: sourceHost},
 			{Name: "PGSHARD_PRIMARY_SLOT_NAME", Value: slotName},
 			{Name: "PGSHARD_REPLICATION_MATERIAL_SHA256", Value: replicationCredential.MaterialSHA256},
+			{Name: "PGSHARD_REPLICATION_TLS_CA_SHA256", Value: replicationTLS.CASHA256},
 			{Name: "PGSHARD_TARGET_PVC_UID", Value: string(bootstrap.PVCUID)},
 			{Name: "PGSHARD_TARGET_SECRET_UID", Value: string(bootstrap.SecretUID)},
 			{Name: "PGSHARD_SOURCE_PVC_UID", Value: string(sourceBootstrap.PVCUID)},
@@ -4948,6 +5220,7 @@ func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardClu
 			{Name: "data", MountPath: "/var/lib/postgresql"},
 			{Name: "tmp", MountPath: "/tmp"},
 			{Name: "replication-credential", MountPath: "/etc/pgshard/replication", ReadOnly: true},
+			{Name: "replication-ca-secret", MountPath: "/etc/pgshard/replication-tls", ReadOnly: true},
 			{Name: "standby-passfile", MountPath: "/run/pgshard/standby-auth"},
 		},
 	}
@@ -4959,6 +5232,7 @@ func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardClu
 		postgresSecurity,
 		sourceHost,
 		slotName,
+		replicationTLS.CASHA256,
 	)
 	automount := false
 	enableServiceLinks := false
@@ -4974,6 +5248,11 @@ func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardClu
 			SecretName:  replicationCredential.SecretName,
 			DefaultMode: ptr(int32(0o440)),
 			Items:       []corev1.KeyToPath{{Key: PostgreSQLReplicationPasswordKey, Path: "replication-password", Mode: ptr(int32(0o440))}},
+		}}},
+		{Name: "replication-ca-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName:  replicationTLS.CASecretName,
+			DefaultMode: ptr(int32(0o440)),
+			Items:       []corev1.KeyToPath{{Key: PostgreSQLReplicationTLSCAKey, Path: "ca.crt", Mode: ptr(int32(0o440))}},
 		}}},
 		{Name: "standby-passfile", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 			Medium:    corev1.StorageMediumMemory,
@@ -5051,7 +5330,7 @@ func postgresqlGenerationDurability(cluster *pgshardv1alpha1.PgShardCluster) (st
 	return "remote-apply-any-one", strings.Join(candidates, ",")
 }
 
-func postgresqlReplicationStandbyContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, sourceHost, slotName string) corev1.Container {
+func postgresqlReplicationStandbyContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, sourceHost, slotName, caSHA256 string) corev1.Container {
 	environment := []corev1.EnvVar{
 		{Name: "PGSHARD_HTTP_BIND", Value: "0.0.0.0:8080"},
 		{Name: "PGSHARD_CLUSTER_ID", Value: cluster.Name},
@@ -5068,6 +5347,8 @@ func postgresqlReplicationStandbyContainer(cluster *pgshardv1alpha1.PgShardClust
 		{Name: "PGSHARD_POSTGRES_PRIMARY_PORT", Value: "5432"},
 		{Name: "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", Value: slotName},
 		{Name: "PGSHARD_POSTGRES_PRIMARY_PASSFILE", Value: "/run/pgshard/standby-auth/passfile"},
+		{Name: "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT", Value: "/run/pgshard/standby-auth/ca.crt"},
+		{Name: "PGSHARD_REPLICATION_TLS_CA_SHA256", Value: caSHA256},
 		{Name: "PGSHARD_POSTGRES_SMART_SHUTDOWN_MS", Value: "5000"},
 		{Name: "PGSHARD_POSTGRES_FAST_SHUTDOWN_MS", Value: "44000"},
 		{Name: "PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS", Value: "500"},
