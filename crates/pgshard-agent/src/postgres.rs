@@ -15,6 +15,9 @@ use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
+use pgshard_types::catalog_material::{
+    REPLICATION_TLS_CA_DIGEST_DOMAIN, REPLICATION_TLS_SERVER_DIGEST_DOMAIN, catalog_material_sha256,
+};
 use pgshard_types::writable_generation::{
     WritableGenerationTransition, WritableGenerationTransitionError,
     classify_writable_generation_transition,
@@ -94,6 +97,10 @@ const TARGET_FENCE_CLEANUP_STAGES: u32 = 3;
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITABLE_GENERATION_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_STANDBY_PASSFILE_BYTES: u64 = 4_096;
+// Bounds mirror pgshard-catalog-material-digest so the agent accepts exactly
+// the material the operator's init containers could have digest-verified.
+const MAX_TLS_PRIVATE_KEY_BYTES: u64 = 64 * 1024;
+const MAX_TLS_CERTIFICATE_BYTES: u64 = 1024 * 1024;
 const QUARANTINE_HBA_CONTENT: &[u8] =
     b"local postgres postgres peer\nlocal all all reject\nlocal replication all reject\n";
 const REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT: &[u8] = b"local postgres postgres peer\n\
@@ -252,6 +259,8 @@ pub struct PostgresStandbyConfig {
     primary_port: u16,
     slot_name: String,
     passfile: PathBuf,
+    sslrootcert: PathBuf,
+    sslrootcert_sha256: String,
 }
 
 impl PostgresStandbyConfig {
@@ -260,12 +269,15 @@ impl PostgresStandbyConfig {
     /// # Errors
     ///
     /// Returns an error for an unsafe host, non-canonical managed slot, zero
-    /// port, or a passfile path that could not be embedded unambiguously.
+    /// port, a passfile or sslrootcert path that could not be embedded
+    /// unambiguously, or a non-canonical replication CA digest.
     pub fn new(
         primary_host: String,
         primary_port: u16,
         slot_name: String,
         passfile: PathBuf,
+        sslrootcert: PathBuf,
+        sslrootcert_sha256: String,
     ) -> Result<Self, PostgresConfigError> {
         validate_primary_host(&primary_host)?;
         if primary_port == 0 {
@@ -273,31 +285,82 @@ impl PostgresStandbyConfig {
         }
         validate_managed_member_name(&slot_name)?;
         validate_absolute_normal_path("PostgreSQL replication passfile", &passfile, false)?;
-        if !passfile
-            .as_os_str()
-            .as_bytes()
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
-        {
+        if !conninfo_safe_path(&passfile) {
             return Err(PostgresConfigError::UnsafePassfilePath(passfile));
         }
+        validate_absolute_normal_path("PostgreSQL replication sslrootcert", &sslrootcert, false)?;
+        if !conninfo_safe_path(&sslrootcert) {
+            return Err(PostgresConfigError::UnsafeSslrootcertPath(sslrootcert));
+        }
+        validate_material_sha256("PostgreSQL replication CA digest", &sslrootcert_sha256)?;
         Ok(Self {
             primary_host,
             primary_port,
             slot_name,
             passfile,
+            sslrootcert,
+            sslrootcert_sha256,
         })
     }
 
     fn primary_conninfo(&self) -> String {
         format!(
-            "host={} port={} user=pgshard_replication application_name={} passfile={} sslmode=disable",
+            "host={} port={} user=pgshard_replication application_name={} passfile={} sslmode=verify-full sslrootcert={} channel_binding=require",
             self.primary_host,
             self.primary_port,
             self.slot_name,
-            self.passfile.display()
+            self.passfile.display(),
+            self.sslrootcert.display()
         )
     }
+}
+
+/// Typed TLS server identity for the replication bootstrap source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostgresServerTlsConfig {
+    cert_file: PathBuf,
+    key_file: PathBuf,
+    material_sha256: String,
+}
+
+impl PostgresServerTlsConfig {
+    /// Creates a validated postmaster server-TLS material description.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe paths or a non-canonical material digest.
+    pub fn new(
+        cert_file: PathBuf,
+        key_file: PathBuf,
+        material_sha256: String,
+    ) -> Result<Self, PostgresConfigError> {
+        validate_absolute_normal_path("PostgreSQL server TLS certificate", &cert_file, false)?;
+        validate_absolute_normal_path("PostgreSQL server TLS key", &key_file, false)?;
+        validate_material_sha256("PostgreSQL server TLS digest", &material_sha256)?;
+        Ok(Self {
+            cert_file,
+            key_file,
+            material_sha256,
+        })
+    }
+}
+
+fn conninfo_safe_path(path: &Path) -> bool {
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+}
+
+fn validate_material_sha256(name: &'static str, digest: &str) -> Result<(), PostgresConfigError> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(PostgresConfigError::InvalidMaterialDigest { name });
+    }
+    Ok(())
 }
 
 /// Configuration for an opt-in postmaster with a fail-closed runtime role.
@@ -305,6 +368,7 @@ impl PostgresStandbyConfig {
 pub struct PostgresConfig {
     role: PostgresRuntimeRole,
     standby: Option<PostgresStandbyConfig>,
+    server_tls: Option<PostgresServerTlsConfig>,
     generation_durability: GenerationDurability,
     data_dir: PathBuf,
     executable: PathBuf,
@@ -335,6 +399,7 @@ impl PostgresConfig {
         Self::new_for_role(
             PostgresRuntimeRole::Quarantine,
             None,
+            None,
             GenerationDurability::Local,
             data_dir,
             executable,
@@ -356,7 +421,9 @@ impl PostgresConfig {
     ///
     /// Returns an error for unsafe paths or a shutdown sequence that can exceed
     /// the bounded supervisor shutdown budget.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_replication_bootstrap_primary(
+        server_tls: PostgresServerTlsConfig,
         data_dir: PathBuf,
         executable: PathBuf,
         socket_dir: PathBuf,
@@ -368,6 +435,7 @@ impl PostgresConfig {
         Self::new_for_role(
             PostgresRuntimeRole::ReplicationBootstrapPrimary,
             None,
+            Some(server_tls),
             GenerationDurability::Local,
             data_dir,
             executable,
@@ -398,6 +466,7 @@ impl PostgresConfig {
         Self::new_for_role(
             PostgresRuntimeRole::ReplicationStandby,
             Some(standby),
+            None,
             GenerationDurability::Local,
             data_dir,
             executable,
@@ -413,6 +482,7 @@ impl PostgresConfig {
     pub(crate) fn new_for_role(
         role: PostgresRuntimeRole,
         standby: Option<PostgresStandbyConfig>,
+        server_tls: Option<PostgresServerTlsConfig>,
         generation_durability: GenerationDurability,
         data_dir: PathBuf,
         executable: PathBuf,
@@ -424,6 +494,9 @@ impl PostgresConfig {
     ) -> Result<Self, PostgresConfigError> {
         if (role == PostgresRuntimeRole::ReplicationStandby) != standby.is_some() {
             return Err(PostgresConfigError::InvalidStandbyComposition);
+        }
+        if (role == PostgresRuntimeRole::ReplicationBootstrapPrimary) != server_tls.is_some() {
+            return Err(PostgresConfigError::InvalidServerTlsComposition);
         }
         if role != PostgresRuntimeRole::ReplicationBootstrapPrimary
             && generation_durability != GenerationDurability::Local
@@ -457,13 +530,29 @@ impl PostgresConfig {
         if hba_file.starts_with(&data_dir) || hba_file.starts_with(&socket_dir) {
             return Err(PostgresConfigError::MutableHbaFile { hba_file });
         }
-        if let Some(standby) = standby.as_ref()
-            && (standby.passfile.starts_with(&data_dir)
-                || standby.passfile.starts_with(&socket_dir))
-        {
-            return Err(PostgresConfigError::MutablePassfile {
-                passfile: standby.passfile.clone(),
-            });
+        if let Some(standby) = standby.as_ref() {
+            if standby.passfile.starts_with(&data_dir) || standby.passfile.starts_with(&socket_dir)
+            {
+                return Err(PostgresConfigError::MutablePassfile {
+                    passfile: standby.passfile.clone(),
+                });
+            }
+            if standby.sslrootcert.starts_with(&data_dir)
+                || standby.sslrootcert.starts_with(&socket_dir)
+            {
+                return Err(PostgresConfigError::MutableSslrootcert {
+                    sslrootcert: standby.sslrootcert.clone(),
+                });
+            }
+        }
+        if let Some(server_tls) = server_tls.as_ref() {
+            for path in [&server_tls.cert_file, &server_tls.key_file] {
+                if path.starts_with(&data_dir) || path.starts_with(&socket_dir) {
+                    return Err(PostgresConfigError::MutableServerTlsMaterial {
+                        path: path.clone(),
+                    });
+                }
+            }
         }
         for (name, value) in [
             ("smart", smart_shutdown_timeout),
@@ -488,6 +577,7 @@ impl PostgresConfig {
         Ok(Self {
             role,
             standby,
+            server_tls,
             generation_durability,
             data_dir,
             executable,
@@ -734,6 +824,9 @@ struct ValidatedPostgresState {
     external_pid_file: Option<FileSnapshot>,
     hba_file: FileSnapshot,
     standby_passfile: Option<FileSnapshot>,
+    standby_sslrootcert: Option<FileSnapshot>,
+    server_tls_cert: Option<FileSnapshot>,
+    server_tls_key: Option<FileSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1693,11 +1786,26 @@ impl PreparedPostgres {
             .arg("-c")
             .arg("unix_socket_group=")
             .arg("-c")
-            .arg("port=5432")
-            .arg("-c")
-            .arg("ssl=off")
-            .arg("-c")
-            .arg("restart_after_crash=off");
+            .arg("port=5432");
+        match self.config.server_tls.as_ref() {
+            Some(server_tls) => {
+                command
+                    .arg("-c")
+                    .arg("ssl=on")
+                    .arg("-c")
+                    .arg(setting_with_path("ssl_cert_file=", &server_tls.cert_file))
+                    .arg("-c")
+                    .arg(setting_with_path("ssl_key_file=", &server_tls.key_file))
+                    .arg("-c")
+                    .arg("ssl_min_protocol_version=TLSv1.3")
+                    .arg("-c")
+                    .arg("ssl_max_protocol_version=TLSv1.3");
+            }
+            None => {
+                command.arg("-c").arg("ssl=off");
+            }
+        }
+        command.arg("-c").arg("restart_after_crash=off");
         force_role_recovery_settings(&mut command, self.config.standby.as_ref());
         command
             .arg("-c")
@@ -3791,6 +3899,18 @@ fn validate_prepared_state(
         .as_ref()
         .map(|standby| validate_standby_passfile(standby, expected_uid))
         .transpose()?;
+    let standby_sslrootcert = config
+        .standby
+        .as_ref()
+        .map(|standby| validate_standby_sslrootcert(standby, expected_uid))
+        .transpose()?;
+    let server_tls = config
+        .server_tls
+        .as_ref()
+        .map(|server_tls| validate_server_tls_files(server_tls, expected_uid))
+        .transpose()?;
+    let (server_tls_cert, server_tls_key) =
+        server_tls.map_or((None, None), |(cert, key)| (Some(cert), Some(key)));
     Ok(ValidatedPostgresState {
         data,
         executable,
@@ -3801,6 +3921,9 @@ fn validate_prepared_state(
         external_pid_file,
         hba_file,
         standby_passfile,
+        standby_sslrootcert,
+        server_tls_cert,
+        server_tls_key,
     })
 }
 
@@ -4181,11 +4304,101 @@ fn validate_standby_passfile(
     expected_uid: u32,
 ) -> Result<FileSnapshot, PostgresError> {
     let path = &standby.passfile;
-    let metadata = strict_metadata("PostgreSQL standby passfile", path)?;
-    require_regular("PostgreSQL standby passfile", path, &metadata)?;
+    let (contents, snapshot) = read_private_material(
+        "PostgreSQL standby passfile",
+        path,
+        expected_uid,
+        MAX_STANDBY_PASSFILE_BYTES,
+        || PostgresError::InvalidStandbyPassfile {
+            path: path.to_owned(),
+        },
+    )?;
+    if !valid_standby_passfile_contents(standby, &contents) {
+        return Err(PostgresError::InvalidStandbyPassfile {
+            path: path.to_owned(),
+        });
+    }
+    Ok(snapshot)
+}
+
+fn validate_standby_sslrootcert(
+    standby: &PostgresStandbyConfig,
+    expected_uid: u32,
+) -> Result<FileSnapshot, PostgresError> {
+    let name = "PostgreSQL replication sslrootcert";
+    let path = &standby.sslrootcert;
+    let (contents, snapshot) =
+        read_private_material(name, path, expected_uid, MAX_TLS_CERTIFICATE_BYTES, || {
+            PostgresError::InvalidTlsMaterial {
+                name,
+                path: path.to_owned(),
+                maximum: MAX_TLS_CERTIFICATE_BYTES,
+            }
+        })?;
+    let observed = catalog_material_sha256(
+        REPLICATION_TLS_CA_DIGEST_DOMAIN,
+        &contents,
+        std::iter::empty(),
+    );
+    if observed != standby.sslrootcert_sha256 {
+        return Err(PostgresError::TlsMaterialDigestMismatch {
+            name,
+            path: path.to_owned(),
+        });
+    }
+    Ok(snapshot)
+}
+
+fn validate_server_tls_files(
+    server_tls: &PostgresServerTlsConfig,
+    expected_uid: u32,
+) -> Result<(FileSnapshot, FileSnapshot), PostgresError> {
+    let cert_name = "PostgreSQL server TLS certificate";
+    let key_name = "PostgreSQL server TLS key";
+    let (cert, cert_snapshot) = read_private_material(
+        cert_name,
+        &server_tls.cert_file,
+        expected_uid,
+        MAX_TLS_CERTIFICATE_BYTES,
+        || PostgresError::InvalidTlsMaterial {
+            name: cert_name,
+            path: server_tls.cert_file.clone(),
+            maximum: MAX_TLS_CERTIFICATE_BYTES,
+        },
+    )?;
+    let (key, key_snapshot) = read_private_material(
+        key_name,
+        &server_tls.key_file,
+        expected_uid,
+        MAX_TLS_PRIVATE_KEY_BYTES,
+        || PostgresError::InvalidTlsMaterial {
+            name: key_name,
+            path: server_tls.key_file.clone(),
+            maximum: MAX_TLS_PRIVATE_KEY_BYTES,
+        },
+    )?;
+    let observed = catalog_material_sha256(REPLICATION_TLS_SERVER_DIGEST_DOMAIN, &key, [&cert[..]]);
+    if observed != server_tls.material_sha256 {
+        return Err(PostgresError::TlsMaterialDigestMismatch {
+            name: "PostgreSQL server TLS material",
+            path: server_tls.cert_file.clone(),
+        });
+    }
+    Ok((cert_snapshot, key_snapshot))
+}
+
+fn read_private_material(
+    name: &'static str,
+    path: &Path,
+    expected_uid: u32,
+    maximum: u64,
+    invalid: impl Fn() -> PostgresError,
+) -> Result<(Vec<u8>, FileSnapshot), PostgresError> {
+    let metadata = strict_metadata(name, path)?;
+    require_regular(name, path, &metadata)?;
     if metadata.uid() != expected_uid {
         return Err(PostgresError::WrongOwner {
-            name: "PostgreSQL standby passfile",
+            name,
             path: path.to_owned(),
             actual: metadata.uid(),
             expected: expected_uid,
@@ -4194,16 +4407,14 @@ fn validate_standby_passfile(
     let mode = metadata.permissions().mode() & 0o7_777;
     if mode != 0o400 {
         return Err(PostgresError::UnsafePermissions {
-            name: "PostgreSQL standby passfile",
+            name,
             path: path.to_owned(),
             mode,
             expected: "runtime-UID-owned 0400",
         });
     }
-    if metadata.len() == 0 || metadata.len() > MAX_STANDBY_PASSFILE_BYTES {
-        return Err(PostgresError::InvalidStandbyPassfile {
-            path: path.to_owned(),
-        });
+    if metadata.len() == 0 || metadata.len() > maximum {
+        return Err(invalid());
     }
     let file = open(
         path,
@@ -4212,40 +4423,35 @@ fn validate_standby_passfile(
     )
     .map(File::from)
     .map_err(|source| PostgresError::Read {
-        name: "PostgreSQL standby passfile",
+        name,
         path: path.to_owned(),
         source: source.into(),
     })?;
     let fd_metadata = file.metadata().map_err(|source| PostgresError::Metadata {
-        name: "PostgreSQL standby passfile",
+        name,
         path: path.to_owned(),
         source,
     })?;
     if !same_file_identity(&metadata, &fd_metadata) {
         return Err(PostgresError::PreparedStateChanged);
     }
-    let capacity =
-        usize::try_from(metadata.len()).map_err(|_| PostgresError::InvalidStandbyPassfile {
-            path: path.to_owned(),
-        })?;
+    let capacity = usize::try_from(metadata.len()).map_err(|_| invalid())?;
     let mut contents = Vec::with_capacity(capacity);
-    file.take(MAX_STANDBY_PASSFILE_BYTES + 1)
+    file.take(maximum.saturating_add(1))
         .read_to_end(&mut contents)
         .map_err(|source| PostgresError::Read {
-            name: "PostgreSQL standby passfile",
+            name,
             path: path.to_owned(),
             source,
         })?;
-    if !valid_standby_passfile_contents(standby, &contents) {
-        return Err(PostgresError::InvalidStandbyPassfile {
-            path: path.to_owned(),
-        });
+    if contents.is_empty() || u64::try_from(contents.len()).unwrap_or(u64::MAX) > maximum {
+        return Err(invalid());
     }
-    let final_metadata = strict_metadata("PostgreSQL standby passfile", path)?;
+    let final_metadata = strict_metadata(name, path)?;
     if file_snapshot(&metadata) != file_snapshot(&final_metadata) {
         return Err(PostgresError::PreparedStateChanged);
     }
-    Ok(file_snapshot(&final_metadata))
+    Ok((contents, file_snapshot(&final_metadata)))
 }
 
 fn valid_standby_passfile_contents(standby: &PostgresStandbyConfig, contents: &[u8]) -> bool {
@@ -4870,6 +5076,17 @@ pub enum PostgresConfigError {
     /// Standby fields and runtime role did not form one exact composition.
     #[error("PostgreSQL standby settings are incomplete or supplied for another runtime role")]
     InvalidStandbyComposition,
+    /// Server TLS material is required for exactly the bootstrap-source role.
+    #[error(
+        "PostgreSQL server TLS material is required for exactly the replication-bootstrap-primary runtime role"
+    )]
+    InvalidServerTlsComposition,
+    /// A checkpointed material digest was not canonical lowercase hex.
+    #[error("{name} must be 64 lowercase hexadecimal characters")]
+    InvalidMaterialDigest {
+        /// Configuration field.
+        name: &'static str,
+    },
     /// Synchronous publication durability is valid only for the bootstrap source.
     #[error("PostgreSQL generation durability is incompatible with the selected runtime role")]
     InvalidGenerationDurabilityComposition,
@@ -4887,6 +5104,9 @@ pub enum PostgresConfigError {
     /// The passfile path could not be represented without conninfo escaping.
     #[error("PostgreSQL replication passfile path {0:?} contains unsafe conninfo bytes")]
     UnsafePassfilePath(PathBuf),
+    /// The sslrootcert path could not be represented without conninfo escaping.
+    #[error("PostgreSQL replication sslrootcert path {0:?} contains unsafe conninfo bytes")]
+    UnsafeSslrootcertPath(PathBuf),
     /// A path is not absolute, normalized, non-root, and bounded.
     #[error(
         "{name} path {path:?} must be an absolute normalized non-root path of at most 1023 bytes"
@@ -4925,6 +5145,22 @@ pub enum PostgresConfigError {
     MutablePassfile {
         /// Rejected passfile path.
         passfile: PathBuf,
+    },
+    /// The replication trust anchor was placed in mutable `PostgreSQL` state.
+    #[error(
+        "PostgreSQL replication sslrootcert {sslrootcert:?} must not be stored inside PGDATA or the socket directory"
+    )]
+    MutableSslrootcert {
+        /// Rejected sslrootcert path.
+        sslrootcert: PathBuf,
+    },
+    /// The server TLS material was placed in mutable `PostgreSQL` state.
+    #[error(
+        "PostgreSQL server TLS material {path:?} must not be stored inside PGDATA or the socket directory"
+    )]
+    MutableServerTlsMaterial {
+        /// Rejected server TLS material path.
+        path: PathBuf,
     },
     /// One shutdown phase is outside its bounded range.
     #[error("PostgreSQL {name} shutdown timeout {value:?} must be between 10ms and 55s")]
@@ -5247,6 +5483,24 @@ pub enum PostgresError {
     )]
     InvalidStandbyPassfile {
         /// Rejected credential file.
+        path: PathBuf,
+    },
+    /// Bounded replication TLS material was empty or oversized.
+    #[error("{name} at {path:?} must contain between 1 and {maximum} bytes")]
+    InvalidTlsMaterial {
+        /// TLS material being inspected.
+        name: &'static str,
+        /// Rejected material file.
+        path: PathBuf,
+        /// Accepted upper bound.
+        maximum: u64,
+    },
+    /// On-disk TLS material differs from its checkpointed creation digest.
+    #[error("{name} at {path:?} does not match the checkpointed material digest")]
+    TlsMaterialDigestMismatch {
+        /// TLS material being inspected.
+        name: &'static str,
+        /// Rejected material file.
         path: PathBuf,
     },
     /// A crash lock was malformed, partial, or too large to handle safely.
@@ -6369,7 +6623,7 @@ host all all ::0/0 reject\n";
         let executable = root.path().join("postgres");
         write_executable(&executable, "#!/bin/sh\nexit 0\n");
         let socket = root.path().join("socket");
-        let (config, passfile) =
+        let (config, passfile, _sslrootcert) =
             standby_test_config(&root, data_dir.clone(), executable.clone(), socket);
 
         assert!(prepare_fixture(config.clone()).is_ok());
@@ -6450,6 +6704,193 @@ host all all ::0/0 reject\n";
     }
 
     #[test]
+    fn replication_standby_requires_verified_private_sslrootcert() {
+        let root = TempDir::new().expect("create standby sslrootcert fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let executable = root.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let socket = root.path().join("socket");
+        let (config, _passfile, sslrootcert) =
+            standby_test_config(&root, data_dir, executable, socket);
+        assert!(prepare_fixture(config.clone()).is_ok());
+
+        write_private_material(&sslrootcert, b"tampered-replication-ca-pem");
+        assert!(matches!(
+            prepare_fixture(config.clone()),
+            Err(PostgresError::TlsMaterialDigestMismatch {
+                name: "PostgreSQL replication sslrootcert",
+                path,
+            }) if path == sslrootcert
+        ));
+
+        write_private_material(&sslrootcert, b"");
+        assert!(matches!(
+            prepare_fixture(config.clone()),
+            Err(PostgresError::InvalidTlsMaterial {
+                name: "PostgreSQL replication sslrootcert",
+                ..
+            })
+        ));
+
+        write_private_material(&sslrootcert, STANDBY_CA_FIXTURE);
+        fs::set_permissions(&sslrootcert, fs::Permissions::from_mode(0o600))
+            .expect("make sslrootcert writable");
+        assert!(matches!(
+            prepare_fixture(config.clone()),
+            Err(PostgresError::UnsafePermissions {
+                name: "PostgreSQL replication sslrootcert",
+                ..
+            })
+        ));
+        fs::set_permissions(&sslrootcert, fs::Permissions::from_mode(0o400))
+            .expect("restore sslrootcert protection");
+        assert!(prepare_fixture(config.clone()).is_ok());
+
+        fs::remove_file(&sslrootcert).expect("remove sslrootcert");
+        assert!(matches!(
+            prepare_fixture(config),
+            Err(PostgresError::Metadata {
+                name: "PostgreSQL replication sslrootcert",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn replication_bootstrap_primary_requires_verified_private_server_tls() {
+        let root = TempDir::new().expect("create server TLS fixture");
+        let data_dir = root.path().join("data");
+        pgdata_fixture_at(&data_dir);
+        let executable = root.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let hba = root
+            .path()
+            .join("replication-bootstrap-primary.pg_hba.conf");
+        fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+            .expect("protect replication HBA");
+        let server_tls = server_tls_fixture(root.path());
+        let cert_file = root.path().join("server-tls.crt");
+        let key_file = root.path().join("server-tls.key");
+        let config = PostgresConfig::new_replication_bootstrap_primary(
+            server_tls,
+            data_dir,
+            executable,
+            root.path().join("socket"),
+            hba,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid server TLS config");
+        assert!(prepare_fixture(config.clone()).is_ok());
+
+        write_private_material(&key_file, b"tampered-server-tls-key-pem");
+        assert!(matches!(
+            prepare_fixture(config.clone()),
+            Err(PostgresError::TlsMaterialDigestMismatch {
+                name: "PostgreSQL server TLS material",
+                path,
+            }) if path == cert_file
+        ));
+        write_private_material(&key_file, SERVER_TLS_KEY_FIXTURE);
+
+        write_private_material(&cert_file, b"tampered-server-tls-cert-pem");
+        assert!(matches!(
+            prepare_fixture(config.clone()),
+            Err(PostgresError::TlsMaterialDigestMismatch {
+                name: "PostgreSQL server TLS material",
+                ..
+            })
+        ));
+
+        write_private_material(&cert_file, b"");
+        assert!(matches!(
+            prepare_fixture(config.clone()),
+            Err(PostgresError::InvalidTlsMaterial {
+                name: "PostgreSQL server TLS certificate",
+                ..
+            })
+        ));
+        write_private_material(&cert_file, SERVER_TLS_CERT_FIXTURE);
+
+        fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600))
+            .expect("make server TLS key writable");
+        assert!(matches!(
+            prepare_fixture(config.clone()),
+            Err(PostgresError::UnsafePermissions {
+                name: "PostgreSQL server TLS key",
+                ..
+            })
+        ));
+        fs::set_permissions(&key_file, fs::Permissions::from_mode(0o400))
+            .expect("restore server TLS key protection");
+        assert!(prepare_fixture(config.clone()).is_ok());
+
+        fs::remove_file(&key_file).expect("remove server TLS key");
+        assert!(matches!(
+            prepare_fixture(config),
+            Err(PostgresError::Metadata {
+                name: "PostgreSQL server TLS key",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn server_tls_material_is_required_for_exactly_the_bootstrap_primary_role() {
+        let server_tls = PostgresServerTlsConfig::new(
+            PathBuf::from("/run/pgshard/server-tls/tls.crt"),
+            PathBuf::from("/run/pgshard/server-tls/tls.key"),
+            "1".repeat(64),
+        )
+        .expect("valid server TLS identity");
+        assert!(matches!(
+            PostgresConfig::new_for_role(
+                PostgresRuntimeRole::ReplicationBootstrapPrimary,
+                None,
+                None,
+                GenerationDurability::Local,
+                PathBuf::from("/var/lib/postgresql/data"),
+                PathBuf::from("/usr/lib/postgresql/18/bin/postgres"),
+                PathBuf::from("/run/pgshard/postgres"),
+                PathBuf::from("/etc/pgshard/replication-primary.pg_hba.conf"),
+                Duration::from_secs(5),
+                Duration::from_secs(44),
+                Duration::from_millis(500),
+            ),
+            Err(PostgresConfigError::InvalidServerTlsComposition)
+        ));
+        assert!(matches!(
+            PostgresConfig::new_for_role(
+                PostgresRuntimeRole::Quarantine,
+                None,
+                Some(server_tls),
+                GenerationDurability::Local,
+                PathBuf::from("/var/lib/postgresql/data"),
+                PathBuf::from("/usr/lib/postgresql/18/bin/postgres"),
+                PathBuf::from("/run/pgshard/postgres"),
+                PathBuf::from("/etc/pgshard/replication-primary.pg_hba.conf"),
+                Duration::from_secs(5),
+                Duration::from_secs(44),
+                Duration::from_millis(500),
+            ),
+            Err(PostgresConfigError::InvalidServerTlsComposition)
+        ));
+        for digest in ["", "abc", &"F".repeat(64), &"a".repeat(63), &"g".repeat(64)] {
+            assert!(matches!(
+                PostgresServerTlsConfig::new(
+                    PathBuf::from("/run/pgshard/server-tls/tls.crt"),
+                    PathBuf::from("/run/pgshard/server-tls/tls.key"),
+                    digest.to_owned(),
+                ),
+                Err(PostgresConfigError::InvalidMaterialDigest { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn replication_standby_accepts_canonical_member_slot_identities() {
         for valid in [
             "pgshard_member_0000",
@@ -6481,7 +6922,8 @@ host all all ::0/0 reject\n";
         let executable = root.path().join("postgres");
         write_executable(&executable, "#!/bin/sh\nexit 0\n");
         let socket = root.path().join("socket");
-        let (config, passfile) = standby_test_config(&root, data_dir, executable, socket);
+        let (config, passfile, sslrootcert) =
+            standby_test_config(&root, data_dir, executable, socket);
         assert_eq!(
             config.starting_process_state(),
             PostgresProcessState::StartingReplicationStandby
@@ -6496,9 +6938,11 @@ host all all ::0/0 reject\n";
         let required_settings = vec![
             "listen_addresses=".to_owned(),
             "archive_mode=off".to_owned(),
+            "ssl=off".to_owned(),
             format!(
-                "primary_conninfo=host=primary.database.svc port=5432 user=pgshard_replication application_name=pgshard_member_0001 passfile={} sslmode=disable",
-                passfile.display()
+                "primary_conninfo=host=primary.database.svc port=5432 user=pgshard_replication application_name=pgshard_member_0001 passfile={} sslmode=verify-full sslrootcert={} channel_binding=require",
+                passfile.display(),
+                sslrootcert.display()
             ),
             "primary_slot_name=pgshard_member_0001".to_owned(),
             "recovery_target_action=shutdown".to_owned(),
@@ -6522,6 +6966,13 @@ host all all ::0/0 reject\n";
                 "standby must not shrink recovery capacity with {preserved:?}"
             );
         }
+        assert!(
+            !arguments.iter().any(|argument| argument
+                .as_bytes()
+                .windows(b"sslmode=disable".len())
+                .any(|window| window == b"sslmode=disable")),
+            "standby walreceiver retained plaintext sslmode=disable"
+        );
         assert!(
             !arguments.iter().any(|argument| argument
                 .as_bytes()
@@ -6567,7 +7018,7 @@ host all all ::0/0 reject\n";
                 ),
             );
             let socket = root.path().join("socket");
-            let (config, _) = standby_test_config(&root, data_dir, executable, socket.clone());
+            let (config, _, _) = standby_test_config(&root, data_dir, executable, socket.clone());
             let prepared = prepare_fixture(config).expect("prepare standby supervisor");
             let state = agent_state();
             let (observed_tx, observed_rx) =
@@ -6643,7 +7094,7 @@ host all all ::0/0 reject\n";
             ),
         );
         let socket_dir = root.path().join("socket");
-        let (config, _) = standby_test_config(&root, data_dir, executable, socket_dir.clone());
+        let (config, _, _) = standby_test_config(&root, data_dir, executable, socket_dir.clone());
         let prepared = prepare_fixture(config).expect("prepare standby evidence-loss supervisor");
         let state = agent_state();
         let (recovery_tx, recovery_rx) =
@@ -6726,6 +7177,7 @@ host all all ::0/0 reject\n";
         let config = PostgresConfig::new_for_role(
             PostgresRuntimeRole::ReplicationBootstrapPrimary,
             None,
+            Some(server_tls_fixture(root.path())),
             GenerationDurability::remote_apply_any_one(vec![
                 "pgshard_member_0001".to_owned(),
                 "pgshard_member_0002".to_owned(),
@@ -6897,7 +7349,7 @@ host all all ::0/0 reject\n";
         let executable = root.path().join("postgres");
         write_executable(&executable, "#!/bin/sh\nexit 0\n");
         let socket = root.path().join("socket");
-        let (config, _) = standby_test_config(&root, data_dir, executable, socket);
+        let (config, _, _) = standby_test_config(&root, data_dir, executable, socket);
         let prepared = prepare_fixture(config).expect("prepare standby authority fixture");
         let state = agent_state();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -7180,6 +7632,7 @@ host all all ::0/0 reject\n";
         for required in [
             "listen_addresses=",
             "unix_socket_group=",
+            "ssl=off",
             "restart_after_crash=off",
             "primary_conninfo=",
             "primary_slot_name=",
@@ -7249,9 +7702,11 @@ host all all ::0/0 reject\n";
         fs::write(&hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT).expect("write replication HBA");
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect replication HBA");
+        let server_tls = server_tls_fixture(runtime.path());
         let config = PostgresConfig::new_for_role(
             PostgresRuntimeRole::ReplicationBootstrapPrimary,
             None,
+            Some(server_tls),
             GenerationDurability::remote_apply_any_one(vec![
                 "pgshard_member_0001".to_owned(),
                 "pgshard_member_0002".to_owned(),
@@ -7291,16 +7746,30 @@ host all all ::0/0 reject\n";
             "max_parallel_workers=0",
             "max_parallel_workers_per_gather=0",
             "max_prepared_transactions=0",
+            "ssl=on",
+            "ssl_min_protocol_version=TLSv1.3",
+            "ssl_max_protocol_version=TLSv1.3",
         ] {
             assert!(
                 arguments.contains(&OsStr::new(required)),
                 "missing {required:?}"
             );
         }
+        let mut ssl_cert_file = OsString::from("ssl_cert_file=");
+        ssl_cert_file.push(runtime.path().join("server-tls.crt"));
+        let mut ssl_key_file = OsString::from("ssl_key_file=");
+        ssl_key_file.push(runtime.path().join("server-tls.key"));
+        for required in [&ssl_cert_file, &ssl_key_file] {
+            assert!(
+                arguments.contains(&required.as_os_str()),
+                "missing exact validated server TLS material setting {required:?}"
+            );
+        }
         for forbidden in [
             "listen_addresses=",
             "max_wal_senders=0",
             "shared_preload_libraries=",
+            "ssl=off",
         ] {
             assert!(
                 !arguments.contains(&OsStr::new(forbidden)),
@@ -7323,6 +7792,7 @@ host all all ::0/0 reject\n";
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
             .expect("protect replication HBA");
         let config = PostgresConfig::new_replication_bootstrap_primary(
+            server_tls_fixture(runtime.path()),
             fixture.path().to_owned(),
             executable,
             socket,
@@ -7348,6 +7818,14 @@ host all all ::0/0 reject\n";
             PostgresConfig::new_for_role(
                 PostgresRuntimeRole::ReplicationBootstrapPrimary,
                 None,
+                Some(
+                    PostgresServerTlsConfig::new(
+                        PathBuf::from("/run/pgshard/server-tls/tls.crt"),
+                        PathBuf::from("/run/pgshard/server-tls/tls.key"),
+                        "0".repeat(64),
+                    )
+                    .expect("valid server TLS identity"),
+                ),
                 GenerationDurability::RemoteApplyAnyOne {
                     application_names: vec!["pgshard_member_0001".to_owned()],
                 },
@@ -7555,7 +8033,7 @@ host all all ::0/0 reject\n";
                 &format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
             );
             let socket = root.path().join("socket");
-            let (config, passfile) =
+            let (config, passfile, _) =
                 standby_test_config(&root, data_dir.clone(), executable, socket);
             let prepared = prepare_fixture(config).expect("prepare standby fixture");
             let path = if mutate_signal {
@@ -7889,21 +8367,20 @@ host all all ::0/0 reject\n";
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let result = prepared
-            .supervise_with_writable_authority_guard(
-                state.clone(),
-                shutdown_rx,
-                || {
-                    let call = calls.fetch_add(1, Ordering::AcqRel);
-                    Some(writable_generation(
-                        if call == 0 { 1 } else { 2 },
-                        TEST_WRITABLE_HOLDER,
-                        TEST_WRITABLE_LEASE_UID,
-                    ))
-                },
-                crate::writable::writable_attempt_pair_for_test().1,
-            )
-            .await;
+        let result = Box::pin(prepared.supervise_with_writable_authority_guard(
+            state.clone(),
+            shutdown_rx,
+            || {
+                let call = calls.fetch_add(1, Ordering::AcqRel);
+                Some(writable_generation(
+                    if call == 0 { 1 } else { 2 },
+                    TEST_WRITABLE_HOLDER,
+                    TEST_WRITABLE_LEASE_UID,
+                ))
+            },
+            crate::writable::writable_attempt_pair_for_test().1,
+        ))
+        .await;
 
         assert!(matches!(
             result,
@@ -7952,14 +8429,13 @@ host all all ::0/0 reject\n";
             .expect("install authority rejected by the final guard");
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let result = prepared
-            .supervise_with_writable_authority_guard(
-                state.clone(),
-                shutdown_rx,
-                || None,
-                crate::writable::writable_attempt_pair_for_test().1,
-            )
-            .await;
+        let result = Box::pin(prepared.supervise_with_writable_authority_guard(
+            state.clone(),
+            shutdown_rx,
+            || None,
+            crate::writable::writable_attempt_pair_for_test().1,
+        ))
+        .await;
 
         assert!(matches!(
             result,
@@ -8452,22 +8928,21 @@ host all all ::0/0 reject\n";
                 .expect("release final exec-handoff guard");
         });
 
-        let result = prepared
-            .supervise_with_writable_authority_guard(
-                state.clone(),
-                shutdown_rx,
-                || {
-                    guard_entered_tx
-                        .send(())
-                        .expect("publish final exec-handoff guard");
-                    guard_continue_rx
-                        .recv_timeout(Duration::from_secs(1))
-                        .expect("wait for shutdown publication");
-                    Some(durable_generation_for_test(1))
-                },
-                crate::writable::writable_attempt_pair_for_test().1,
-            )
-            .await;
+        let result = Box::pin(prepared.supervise_with_writable_authority_guard(
+            state.clone(),
+            shutdown_rx,
+            || {
+                guard_entered_tx
+                    .send(())
+                    .expect("publish final exec-handoff guard");
+                guard_continue_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("wait for shutdown publication");
+                Some(durable_generation_for_test(1))
+            },
+            crate::writable::writable_attempt_pair_for_test().1,
+        ))
+        .await;
         signal.join().expect("join shutdown publisher");
 
         assert!(result.is_ok(), "shutdown handoff failed: {result:?}");
@@ -8825,6 +9300,7 @@ host all all ::0/0 reject\n";
         let config = PostgresConfig::new_for_role(
             PostgresRuntimeRole::ReplicationBootstrapPrimary,
             None,
+            Some(server_tls_fixture(root.path())),
             GenerationDurability::remote_apply_any_one(vec![
                 "pgshard_member_0001".to_owned(),
                 "pgshard_member_0002".to_owned(),
@@ -9232,22 +9708,23 @@ host all all ::0/0 reject\n";
         .expect("valid test config")
     }
 
+    const STANDBY_CA_FIXTURE: &[u8] = b"standby-replication-ca-pem";
+
     fn standby_test_config(
         root: &TempDir,
         data_dir: PathBuf,
         executable: PathBuf,
         socket_dir: PathBuf,
-    ) -> (PostgresConfig, PathBuf) {
+    ) -> (PostgresConfig, PathBuf, PathBuf) {
         write_standby_signal(&data_dir);
         write_control_data_state(&executable, "shut down in recovery", "");
         let passfile = root.path().join("replication.pass");
-        fs::write(
+        write_private_material(
             &passfile,
             b"primary.database.svc:5432:*:pgshard_replication:secret\n",
-        )
-        .expect("write standby passfile");
-        fs::set_permissions(&passfile, fs::Permissions::from_mode(0o400))
-            .expect("protect standby passfile");
+        );
+        let sslrootcert = root.path().join("replication-ca.crt");
+        write_private_material(&sslrootcert, STANDBY_CA_FIXTURE);
         let hba_file = root.path().join("standby.pg_hba.conf");
         write_hba(&hba_file);
         let standby = PostgresStandbyConfig::new(
@@ -9255,6 +9732,12 @@ host all all ::0/0 reject\n";
             5432,
             "pgshard_member_0001".to_owned(),
             passfile.clone(),
+            sslrootcert.clone(),
+            catalog_material_sha256(
+                REPLICATION_TLS_CA_DIGEST_DOMAIN,
+                STANDBY_CA_FIXTURE,
+                std::iter::empty(),
+            ),
         )
         .expect("valid standby identity");
         let config = PostgresConfig::new_replication_standby(
@@ -9268,7 +9751,37 @@ host all all ::0/0 reject\n";
             Duration::from_millis(100),
         )
         .expect("valid standby test config");
-        (config, passfile)
+        (config, passfile, sslrootcert)
+    }
+
+    fn write_private_material(path: &Path, contents: &[u8]) {
+        if fs::symlink_metadata(path).is_ok() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("make private material replaceable");
+        }
+        fs::write(path, contents).expect("write private material fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o400))
+            .expect("protect private material fixture");
+    }
+
+    const SERVER_TLS_CERT_FIXTURE: &[u8] = b"source-server-tls-cert-pem";
+    const SERVER_TLS_KEY_FIXTURE: &[u8] = b"source-server-tls-key-pem";
+
+    fn server_tls_fixture(root: &Path) -> PostgresServerTlsConfig {
+        let cert_file = root.join("server-tls.crt");
+        let key_file = root.join("server-tls.key");
+        write_private_material(&cert_file, SERVER_TLS_CERT_FIXTURE);
+        write_private_material(&key_file, SERVER_TLS_KEY_FIXTURE);
+        PostgresServerTlsConfig::new(
+            cert_file,
+            key_file,
+            catalog_material_sha256(
+                REPLICATION_TLS_SERVER_DIGEST_DOMAIN,
+                SERVER_TLS_KEY_FIXTURE,
+                [SERVER_TLS_CERT_FIXTURE],
+            ),
+        )
+        .expect("valid server TLS fixture")
     }
 
     fn write_standby_signal(data_dir: &Path) {
