@@ -24,6 +24,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -3377,6 +3378,7 @@ func Plan(cluster *pgshardv1alpha1.PgShardCluster, images Images) ([]client.Obje
 		return nil, err
 	}
 	objects = append(objects,
+		poolerServiceAccount(cluster),
 		orchestratorDeployment(cluster, images.Orchestrator, topologyHash, images.PostgreSQLRuntime),
 		pooler,
 		podDisruptionBudget(cluster, "orchestrator", 1),
@@ -5249,6 +5251,8 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken:  &automount,
+					PriorityClassName:             MemberPriorityClassName,
+					Tolerations:                   defaultNodeConditionTolerations(),
 					ServiceAccountName:            serviceAccountName,
 					EnableServiceLinks:            &enableServiceLinks,
 					TerminationGracePeriodSeconds: ptr(int64(60)),
@@ -5477,6 +5481,8 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken:  &automount,
+					PriorityClassName:             MemberPriorityClassName,
+					Tolerations:                   defaultNodeConditionTolerations(),
 					ServiceAccountName:            PostgreSQLAgentServiceAccountName(cluster.Name, shard),
 					EnableServiceLinks:            &enableServiceLinks,
 					TerminationGracePeriodSeconds: ptr(int64(60)),
@@ -5631,6 +5637,8 @@ func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardClu
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken:  &automount,
+					PriorityClassName:             MemberPriorityClassName,
+					Tolerations:                   defaultNodeConditionTolerations(),
 					ServiceAccountName:            PostgreSQLStandbyServiceAccountName(cluster.Name, shard),
 					EnableServiceLinks:            &enableServiceLinks,
 					TerminationGracePeriodSeconds: ptr(int64(60)),
@@ -6119,6 +6127,7 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 	}})
 	podSpec.TerminationGracePeriodSeconds = ptr(int64(60))
 	podSpec.Volumes = volumes
+	podSpec.ServiceAccountName = PoolerServiceAccountName(cluster.Name)
 	return &appsv1.Deployment{
 		ObjectMeta: ownedMeta(cluster, cluster.Name+PoolerSuffix, "pooler", nil),
 		Spec: appsv1.DeploymentSpec{
@@ -6170,6 +6179,94 @@ func podDisruptionBudget(cluster *pgshardv1alpha1.PgShardCluster, component stri
 	return budget
 }
 
+const (
+	// MemberPriorityClassName and SupportingPriorityClassName are the two
+	// installation-scoped, immutable PriorityClasses every protected pod
+	// template authors. Authoring priorityClassName (never an explicit integer
+	// priority, which the Priority admission plugin forbids) lets the plugin
+	// resolve the {priorityClassName, priority, preemptionPolicy} tuple; the
+	// contract normalizer resolves the same tuple from these pinned constants,
+	// so the admitted pod's resolved values compare exactly.
+	MemberPriorityClassName     = "pgshard-member"
+	SupportingPriorityClassName = "pgshard-supporting"
+
+	// MemberPriorityValue and SupportingPriorityValue are the pinned, immutable
+	// PriorityClass values. Member pods outrank supporting pods so a scheduler
+	// evicts a pooler/orchestrator before a data-plane member under pressure.
+	MemberPriorityValue     int32 = 1000
+	SupportingPriorityValue int32 = 500
+
+	// nodeConditionTolerationSeconds matches what DefaultTolerationSeconds would
+	// inject; authoring the two tolerations makes that plugin a no-op.
+	nodeConditionTolerationSeconds int64 = 300
+)
+
+// pgShardPreemptionPolicy is the pinned preemption policy of both pgshard
+// PriorityClasses. It is explicit (not left to the API default) so the admitted
+// pod deterministically carries it and the normalizer can resolve it.
+var pgShardPreemptionPolicy = corev1.PreemptLowerPriority
+
+// PgShardPriorityClasses returns the two installation-scoped PriorityClasses.
+// They carry NO PgShardCluster ownerReference (they are shared installation
+// constants, not per-cluster owned): the operator creates them idempotently and
+// validates value+preemptionPolicy on collision, and never deletes them per
+// cluster.
+func PgShardPriorityClasses() []*schedulingv1.PriorityClass {
+	preemption := pgShardPreemptionPolicy
+	return []*schedulingv1.PriorityClass{
+		{
+			ObjectMeta:       metav1.ObjectMeta{Name: MemberPriorityClassName, Labels: map[string]string{ManagedByLabel: ManagedByValue}},
+			Value:            MemberPriorityValue,
+			PreemptionPolicy: &preemption,
+			Description:      "pgshard data-plane member pods (installation-scoped, immutable).",
+		},
+		{
+			ObjectMeta:       metav1.ObjectMeta{Name: SupportingPriorityClassName, Labels: map[string]string{ManagedByLabel: ManagedByValue}},
+			Value:            SupportingPriorityValue,
+			PreemptionPolicy: &preemption,
+			Description:      "pgshard supporting pods (pooler, orchestrator) (installation-scoped, immutable).",
+		},
+	}
+}
+
+// priorityValueForClassName resolves the pinned priority value for a pgshard
+// PriorityClass name, reporting whether the name is a known pgshard class.
+func priorityValueForClassName(name string) (int32, bool) {
+	switch name {
+	case MemberPriorityClassName:
+		return MemberPriorityValue, true
+	case SupportingPriorityClassName:
+		return SupportingPriorityValue, true
+	default:
+		return 0, false
+	}
+}
+
+// defaultNodeConditionTolerations authors exactly the tolerations the
+// DefaultTolerationSeconds admission plugin would otherwise inject, so it
+// injects nothing and the admitted pod carries precisely these.
+func defaultNodeConditionTolerations() []corev1.Toleration {
+	seconds := nodeConditionTolerationSeconds
+	return []corev1.Toleration{
+		{Key: corev1.TaintNodeNotReady, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: &seconds},
+		{Key: corev1.TaintNodeUnreachable, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: &seconds},
+	}
+}
+
+// PoolerServiceAccountName is the dedicated, empty ServiceAccount the pooler
+// runs as. A dedicated SA with no imagePullSecrets prevents the ServiceAccount
+// admission plugin from injecting default-SA imagePullSecrets into the pod.
+func PoolerServiceAccountName(cluster string) string {
+	return cluster + PoolerSuffix
+}
+
+func poolerServiceAccount(cluster *pgshardv1alpha1.PgShardCluster) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		ObjectMeta:                   ownedMeta(cluster, PoolerServiceAccountName(cluster.Name), "pooler", nil),
+		AutomountServiceAccountToken: ptr(false),
+	}
+}
+
 func securePodSpec(selector map[string]string, containers []corev1.Container) corev1.PodSpec {
 	runAsNonRoot := true
 	runAsUser := int64(10001)
@@ -6185,6 +6282,8 @@ func securePodSpec(selector map[string]string, containers []corev1.Container) co
 	return corev1.PodSpec{
 		AutomountServiceAccountToken: &automount,
 		EnableServiceLinks:           &enableServiceLinks,
+		PriorityClassName:            SupportingPriorityClassName,
+		Tolerations:                  defaultNodeConditionTolerations(),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsNonRoot:        &runAsNonRoot,
 			RunAsUser:           &runAsUser,
@@ -6273,9 +6372,21 @@ func poolerReplicas(cluster *pgshardv1alpha1.PgShardCluster) int32 {
 }
 
 func resources(requestCPU, requestMemory, limitCPU, limitMemory string) corev1.ResourceRequirements {
+	// Ephemeral storage is set on both requests and limits so a namespace
+	// LimitRange cannot inject a default for that dimension (LimitRanges are
+	// additionally forbidden in fenced namespaces).
+	const ephemeralStorage = "1Gi"
 	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(requestCPU), corev1.ResourceMemory: resource.MustParse(requestMemory)},
-		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(limitCPU), corev1.ResourceMemory: resource.MustParse(limitMemory)},
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse(requestCPU),
+			corev1.ResourceMemory:           resource.MustParse(requestMemory),
+			corev1.ResourceEphemeralStorage: resource.MustParse(ephemeralStorage),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse(limitCPU),
+			corev1.ResourceMemory:           resource.MustParse(limitMemory),
+			corev1.ResourceEphemeralStorage: resource.MustParse(ephemeralStorage),
+		},
 	}
 }
 

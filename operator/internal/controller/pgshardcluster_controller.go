@@ -27,6 +27,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -101,6 +102,7 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=list
+// +kubebuilder:rbac:groups=scheduling.k8s.io,resources=priorityclasses,verbs=get;create
 
 func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	cluster := &pgshardv1alpha1.PgShardCluster{}
@@ -292,6 +294,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	if migratingPostgreSQLIdentity {
 		statusErr := r.reportFailure(ctx, cluster, "PostgreSQLIdentityMigration", "stopping the legacy role-named PostgreSQL workload before creating its role-neutral replacement")
 		return ctrl.Result{RequeueAfter: retryDelay}, statusErr
+	}
+	if err := r.ensurePriorityClasses(ctx); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PriorityClassUnavailable", fmt.Sprintf("pgshard PriorityClasses are unavailable: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 	plan, err := owned.Plan(cluster, images)
 	if err != nil {
@@ -3184,6 +3190,47 @@ func optionalStringsEqual(left, right *string) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
+}
+
+// ensurePriorityClasses idempotently installs the two installation-scoped
+// pgshard PriorityClasses that every protected pod template authors. They carry
+// no PgShardCluster ownerReference: they are shared installation constants. On
+// collision their value and preemptionPolicy are validated exactly (both are
+// immutable in the API); a mismatch is a fail-closed explicit-recovery error,
+// never a silent mutation or deletion.
+func (r *PgShardClusterReconciler) ensurePriorityClasses(ctx context.Context) error {
+	reader := r.authoritativeReader()
+	for _, desired := range owned.PgShardPriorityClasses() {
+		existing := &schedulingv1.PriorityClass{}
+		err := reader.Get(ctx, types.NamespacedName{Name: desired.Name}, existing)
+		if apierrors.IsNotFound(err) {
+			if createErr := r.Create(ctx, desired.DeepCopy(), client.FieldOwner(owned.ManagedByValue)); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
+				return fmt.Errorf("create PriorityClass %s: %w", desired.Name, createErr)
+			}
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read PriorityClass %s: %w", desired.Name, err)
+		}
+		if existing.Value != desired.Value || !preemptionPoliciesEqual(existing.PreemptionPolicy, desired.PreemptionPolicy) {
+			return fmt.Errorf("PriorityClass %s exists with value %d/preemptionPolicy %v, expected the pinned %d/%v; installation constant conflict requires explicit recovery", desired.Name, existing.Value, ptrString(existing.PreemptionPolicy), desired.Value, ptrString(desired.PreemptionPolicy))
+		}
+	}
+	return nil
+}
+
+func preemptionPoliciesEqual(left, right *corev1.PreemptionPolicy) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func ptrString(policy *corev1.PreemptionPolicy) string {
+	if policy == nil {
+		return "<nil>"
+	}
+	return string(*policy)
 }
 
 // stampPlanContracts stamps every member StatefulSet and supporting Deployment
