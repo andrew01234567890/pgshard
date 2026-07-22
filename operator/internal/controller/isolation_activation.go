@@ -51,6 +51,12 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 
 	switch isolationReceiptPhase(receipt) {
 	case pgshardv1alpha1.IsolationInactive:
+		// TODO(isolation-rollout): step 8's distinct-v2-Service upgrade rollout +
+		// bridge choreography (staging activation across a bad8a18→new in-place
+		// UPGRADE, not a fresh deploy) is deferred and would be sequenced here at the
+		// INACTIVE→QUIESCE entry — an upgrade would gate/stage the activation start.
+		// Fresh CI deploys are unaffected (they activate directly on opt-in).
+		//
 		// Opt-in (trigger + fenced namespace) is checked BEFORE any prerequisite
 		// or probe so a non-opted-in cluster stays silently inactive and never
 		// probes the API servers.

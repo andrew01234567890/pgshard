@@ -26,6 +26,9 @@ spec:
             - --webhook-mutating-configuration-name=pgshard-mutating-webhook-configuration
             - --webhook-validating-configuration-name=pgshard-validating-webhook-configuration
             - --webhook-cert-dir=/run/pgshard/webhook
+            # KIND's kube-apiserver --request-timeout default is 1m; attesting it
+            # lets the isolation-activation drain ceremonies proceed (opt-in only).
+            - --attested-max-request-timeout=1m
             - --orchestrator-image=pgshard/orchestrator:dev
             - --pooler-image=pgshard/pooler:dev
             - --postgresql-image=docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500

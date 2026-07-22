@@ -32,8 +32,13 @@ func multiMemberPlannableCluster() *pgshardv1alpha1.PgShardCluster {
 
 func planWorkloadTemplate(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster, name string) (*corev1.PodTemplateSpec, bool) {
 	t.Helper()
+	return planWorkloadTemplateWithRuntime(t, cluster, name, PostgreSQLRuntimeAgentQuarantine)
+}
+
+func planWorkloadTemplateWithRuntime(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster, name string, runtime PostgreSQLRuntime) (*corev1.PodTemplateSpec, bool) {
+	t.Helper()
 	images := DevelopmentImages()
-	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	images.PostgreSQLRuntime = runtime
 	plan, err := Plan(cluster, images)
 	if err != nil {
 		t.Fatal(err)
@@ -265,6 +270,126 @@ func TestComparatorRejectsAdversarialMutations(t *testing.T) {
 				t.Fatalf("mutation %q error = %v, want containing %q", mutation.name, err, mutation.want)
 			}
 		})
+	}
+}
+
+// TestComparatorPinsSingleMemberCatalogServingTLS proves the activation-TLS
+// parity property (v7 §9): the single-member catalog-serving pod's
+// catalog-server-tls volume (its catalog Secret name + key projection), the
+// postmaster ssl_cert_file/ssl_key_file arguments, and ssl=on are all inside the
+// stamped canonical contract, so §1/§3 already pin them — a foreign catalog
+// Secret name or altered catalog ssl arguments make the pod diverge from its
+// stamped template and are DENIED by the comparator.
+//
+// NOTE: multi-member activation-TLS is DEFERRED — the shard-0 SOURCE pod has no
+// catalog-server-tls volume (it does not serve the catalog directly), so this
+// parity assertion is scoped to the single-member catalog-serving class.
+func TestComparatorPinsSingleMemberCatalogServingTLS(t *testing.T) {
+	t.Parallel()
+	cluster := singleMemberPlannableCluster()
+	object := PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0)
+	// Direct runtime keeps the postmaster ssl_* arguments on the postgresql
+	// container (agent-quarantine relocates the postmaster); the catalog-server-tls
+	// volume is present in either runtime.
+	baseTemplate, _ := planWorkloadTemplateWithRuntime(t, cluster, object, PostgreSQLRuntimeDirect)
+	if baseTemplate == nil {
+		t.Fatalf("plan has no single-member catalog-serving workload %s", object)
+	}
+	// Confirm the honest catalog-serving pod carries the pinned TLS surface, so the
+	// mutations below are exercising real, present fields.
+	assertHasCatalogServerTLSVolume(t, baseTemplate.Spec)
+	assertHasCatalogSSLArgs(t, baseTemplate.Spec)
+
+	nc := NormContext{Class: ClassSingleMember, ClusterName: cluster.Name, Namespace: cluster.Namespace, Shard: 0, Member: 0}
+	mutations := []struct {
+		name   string
+		mutate func(*corev1.PodSpec)
+	}{
+		{"foreign catalog-server-tls secret name", func(s *corev1.PodSpec) {
+			for i := range s.Volumes {
+				if s.Volumes[i].Name == "catalog-server-tls" && s.Volumes[i].Secret != nil {
+					s.Volumes[i].Secret.SecretName = "attacker-catalog-tls"
+				}
+			}
+		}},
+		{"removed catalog-server-tls volume", func(s *corev1.PodSpec) {
+			kept := s.Volumes[:0]
+			for _, volume := range s.Volumes {
+				if volume.Name != "catalog-server-tls" {
+					kept = append(kept, volume)
+				}
+			}
+			s.Volumes = kept
+		}},
+		{"altered ssl_cert_file arg", func(s *corev1.PodSpec) {
+			replaceContainerArgValue(s, "postgresql", "ssl_cert_file=/etc/pgshard/catalog-tls/tls.crt", "ssl_cert_file=/tmp/attacker.crt")
+		}},
+		{"altered ssl_key_file arg", func(s *corev1.PodSpec) {
+			replaceContainerArgValue(s, "postgresql", "ssl_key_file=/etc/pgshard/catalog-tls/tls.key", "ssl_key_file=/tmp/attacker.key")
+		}},
+		{"ssl disabled", func(s *corev1.PodSpec) {
+			replaceContainerArgValue(s, "postgresql", "ssl=on", "ssl=off")
+		}},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			t.Parallel()
+			template := baseTemplate.DeepCopy()
+			podMeta, podSpec, templateMeta, templateSpec := stampAndAdmit(t, template, nc, false)
+			mutation.mutate(&podSpec)
+			err := ComparePodToStampedTemplate(nc, podMeta, podSpec, templateMeta, templateSpec, StageCreate, false)
+			if err == nil || !strings.Contains(err.Error(), "does not match") {
+				t.Fatalf("catalog-TLS mutation %q error = %v, want a contract mismatch", mutation.name, err)
+			}
+		})
+	}
+}
+
+func assertHasCatalogServerTLSVolume(t *testing.T, spec corev1.PodSpec) {
+	t.Helper()
+	for _, volume := range spec.Volumes {
+		if volume.Name == "catalog-server-tls" && volume.Secret != nil && volume.Secret.SecretName != "" {
+			return
+		}
+	}
+	t.Fatal("honest single-member catalog-serving pod is missing its catalog-server-tls Secret volume")
+}
+
+func assertHasCatalogSSLArgs(t *testing.T, spec corev1.PodSpec) {
+	t.Helper()
+	for _, container := range spec.Containers {
+		if container.Name != "postgresql" {
+			continue
+		}
+		var haveCert, haveKey, haveOn bool
+		for _, arg := range container.Args {
+			switch arg {
+			case "ssl_cert_file=/etc/pgshard/catalog-tls/tls.crt":
+				haveCert = true
+			case "ssl_key_file=/etc/pgshard/catalog-tls/tls.key":
+				haveKey = true
+			case "ssl=on":
+				haveOn = true
+			}
+		}
+		if haveCert && haveKey && haveOn {
+			return
+		}
+		t.Fatalf("postgresql container missing pinned catalog ssl args: cert=%t key=%t on=%t", haveCert, haveKey, haveOn)
+	}
+	t.Fatal("honest single-member catalog-serving pod has no postgresql container")
+}
+
+func replaceContainerArgValue(spec *corev1.PodSpec, container, oldArg, newArg string) {
+	for i := range spec.Containers {
+		if spec.Containers[i].Name != container {
+			continue
+		}
+		for j := range spec.Containers[i].Args {
+			if spec.Containers[i].Args[j] == oldArg {
+				spec.Containers[i].Args[j] = newArg
+			}
+		}
 	}
 }
 
